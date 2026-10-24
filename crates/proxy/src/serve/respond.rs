@@ -17,7 +17,7 @@ use crate::map_head::MapHead;
 use crate::metrics::{Answer, LimitCounters};
 use crate::random::{random, unguessable};
 use crate::ratelimit::local::LocalLimiter;
-use crate::ratelimit::{Limited, Limiter, RATELIMIT, Undecided};
+use crate::ratelimit::{KeyedBy, Limited, Limiter, LookUp, RATELIMIT, Undecided};
 use crate::request::{Decision, Opening, Rejection, decide};
 use crate::request_body::{Counts, RequestBody};
 use crate::routed::Through;
@@ -160,7 +160,7 @@ impl Worker {
     /// How a request from `client` fares against the rate limits of `rule` it is under,
     /// `limited` marking them: undecided, never admitted unlimited, with no thread to
     /// decide them with.
-    fn rate_limits(&self, rule: &CompiledRule, limited: u64, client: Requester) -> Limited {
+    fn rate_limits(&self, rule: &CompiledRule, limited: u64, client: KeyedBy<'_>) -> Limited {
         match self.limiting() {
             Some(Limiting::Asynchronous(limiter)) => {
                 limiter.decide_all(&rule.limits, limited, client)
@@ -197,7 +197,7 @@ impl Worker {
     /// counts it `dry_run_refused` and lets it go on. A key held no fresh copy of is asked
     /// about, in places dry runs have of their own, and counted when the answer comes; one
     /// not decided — no place, no time, no thread to decide it — counts `dry_run_uncounted`.
-    fn dry_run(&self, under: Under<'_>, client: Requester) {
+    fn dry_run(&self, under: Under<'_>, client: KeyedBy<'_>) {
         let limiting = self.limiting();
         let mut marked = under.marked;
         while marked != 0 {
@@ -270,7 +270,7 @@ impl Worker {
         &self,
         listener: usize,
         under: Under<'_>,
-        client: Requester,
+        client: KeyedBy<'_>,
         call: Option<Call>,
         told: &[(usize, u64)],
     ) -> Response<Body> {
@@ -461,7 +461,15 @@ impl Worker {
             let dry = directed.limited & dry_runs(rule);
             let enforced = directed.limited & !dry;
             if enforced != 0 {
-                let (admitted, told) = match self.rate_limits(rule, enforced, requester) {
+                // With the request's fields, for a limit keyed by a header (07 §2).
+                let (admitted, told) = match self.rate_limits(
+                    rule,
+                    enforced,
+                    KeyedBy {
+                        client: requester,
+                        fields: Some(&LookUp(head.outgoing())),
+                    },
+                ) {
                     Limited::Admit => (true, None),
                     Limited::Refuse => (false, None),
                     Limited::Later(decided) => match decided.decided().await {
@@ -477,7 +485,11 @@ impl Worker {
                 };
                 if !admitted {
                     let told = told.as_deref().unwrap_or_default();
-                    return self.refused(listener, under, requester, call, told).into();
+                    let by = KeyedBy {
+                        client: requester,
+                        fields: Some(&LookUp(head.outgoing())),
+                    };
+                    return self.refused(listener, under, by, call, told).into();
                 }
                 self.count_limits(rule, enforced, slots, |counters| &counters.admitted);
             }
@@ -487,7 +499,11 @@ impl Worker {
                     marked: dry,
                     slots,
                 };
-                self.dry_run(under, requester);
+                let by = KeyedBy {
+                    client: requester,
+                    fields: Some(&LookUp(head.outgoing())),
+                };
+                self.dry_run(under, by);
             }
         }
         // A WebSocket that an HTTP/2 or HTTP/3 client asks for holds a backend of its own

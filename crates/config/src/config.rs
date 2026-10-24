@@ -79,6 +79,12 @@ pub struct RateLimiting {
     /// mode takes.
     #[serde(default)]
     pub service: Option<RateLimitService>,
+    /// Experimental: whether a limit may be keyed by a request header,
+    /// `key: 'headers["x-api-key"]'` — what the client says rather than what the gateway
+    /// established — so that limits keyed by something besides the client can be tried
+    /// ([07 §2](../../../docs/07-config-and-dsl.md)). Off when left out.
+    #[serde(default)]
+    pub experimental_header_keys: Option<bool>,
 }
 
 /// How a data plane enforces its rate limits ([06 §4](../../../docs/06-rate-limiting.md)).

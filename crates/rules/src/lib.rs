@@ -10,7 +10,7 @@
 //! Compiled, a rule reads the context's fields by position, never by name, and allocates
 //! nothing to decide a request; its size is bounded, so is its cost. A key may only be what
 //! the gateway established — an authentication result or the client's address — never
-//! what the client said (23 §4.1).
+//! what the client said (23 §4.1), unless the schema allows it, as an experiment.
 //!
 //! Pure: no I/O; the request and the tables are the caller's ([`Context`], [`Tables`]).
 
@@ -190,7 +190,7 @@ impl Rule {
 fn compile_key(checker: &Checker<'_>, source: &str) -> Result<Key, Error> {
     let node = syntax::parse(source)?;
     let (typed, ty) = checker.check(&node)?;
-    if ty.said {
+    if ty.said && !checker.schema.said_keys {
         return Err(Error {
             at: node.at,
             message: "a key must be what the gateway established — an authentication result or \

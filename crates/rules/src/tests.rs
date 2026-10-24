@@ -100,6 +100,7 @@ impl Tables for Data {
 fn schema() -> Schema {
     Schema {
         tables: vec![("accounts".into(), vec!["rps".into(), "burst".into()])],
+        said_keys: false,
     }
 }
 
@@ -514,6 +515,22 @@ fn plain_rules_report_the_field_that_is_wrong() {
                 ..base.clone()
             },
             "key",
+            "what the client said",
+        ),
+        (
+            PlainRule {
+                key: plain::Key::Field("headers[\"X-Api-Key\"]".into()),
+                ..base.clone()
+            },
+            "key",
+            "not a field's name",
+        ),
+        (
+            PlainRule {
+                key: plain::Key::Field("headers[x]".into()),
+                ..base.clone()
+            },
+            "key",
             "not a field's name",
         ),
         (
@@ -553,6 +570,40 @@ fn plain_rules_report_the_field_that_is_wrong() {
     assert_ne!(
         compiled.evaluate(&request, &Data::default()),
         Outcome::NotApplicable
+    );
+}
+
+/// With the schema allowing keys the client says, a plain rule may be keyed by a header,
+/// written as the language writes one: counted by its value, and, without the header,
+/// nothing to count by.
+#[test]
+fn a_plain_rule_keyed_by_a_header_counts_by_its_value() {
+    let rule = PlainRule {
+        name: "p".into(),
+        methods: Vec::new(),
+        path_prefix: None,
+        key: plain::Key::Field("headers[\"x-api-key\"]".into()),
+        limit: plain::Limit::Count(5),
+    };
+    let allowing = Schema {
+        said_keys: true,
+        ..schema()
+    };
+    let compiled = rule.compile(&allowing).unwrap();
+    let with = Request {
+        headers: vec![("x-api-key".into(), "k-123".into())],
+        ..Request::default()
+    };
+    assert_eq!(
+        compiled.evaluate(&with, &Data::default()),
+        Outcome::Applies {
+            key: KeyValue::Text("k-123"),
+            limit: 5
+        }
+    );
+    assert_eq!(
+        compiled.evaluate(&Request::default(), &Data::default()),
+        Outcome::Unkeyed
     );
 }
 

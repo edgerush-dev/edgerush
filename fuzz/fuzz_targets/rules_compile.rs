@@ -49,6 +49,7 @@ fuzz_target!(|bytes: &[u8]| {
     let limit = parts.next().unwrap_or("1");
     let schema = Schema {
         tables: vec![("accounts".to_owned(), vec!["rps".to_owned()])],
+        said_keys: false,
     };
     match Rule::compile("fuzzed", when, key, limit, &schema) {
         Ok(rule) => {

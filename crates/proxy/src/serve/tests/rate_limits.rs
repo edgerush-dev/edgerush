@@ -137,6 +137,7 @@ fn limited(mut config: Config, service: &[String]) -> Config {
     config.rate_limiting = Some(edgerush_config::RateLimiting {
         mode: edgerush_config::RateLimitMode::Asynchronous,
         max_key_bytes: None,
+        experimental_header_keys: None,
         service: Some(edgerush_config::RateLimitService {
             pods: service.to_vec(),
             cycle_ms: Some(10),

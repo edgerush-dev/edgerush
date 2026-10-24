@@ -4,8 +4,7 @@
 //! (`edgerush_ratelimit::local`); a thread of the process's sweeps the keys once a second,
 //! forgetting those full and quiet and, past the cap, evicting.
 
-use super::{Failed, Limited, Refusal, with_keys};
-use crate::forwarding::Requester;
+use super::{Failed, KeyedBy, Limited, Refusal, with_keys};
 use edgerush_config::CompiledLimit;
 use edgerush_ratelimit::local::{Decision, Handles, Local};
 use edgerush_ratelimit::service::{Contract, Keyed, longest};
@@ -150,11 +149,11 @@ impl LocalLimiter {
     /// Decides a request from `client` under those of `limits` that `limited` marks, all at
     /// once: admitted under all, or refused and charged under none. Never later: nothing is
     /// waited for.
-    pub(crate) fn decide_all(
+    pub(crate) fn decide_all<'f>(
         &self,
         limits: &[Arc<CompiledLimit>],
         limited: u64,
-        client: Requester,
+        client: impl Into<KeyedBy<'f>>,
     ) -> Limited {
         let now = self.process.now();
         with_keys(
@@ -162,7 +161,7 @@ impl LocalLimiter {
             &self.contracts,
             limits,
             limited,
-            client,
+            client.into(),
             |keys| {
                 if keys.is_empty() {
                     return Limited::Admit;
@@ -181,11 +180,11 @@ impl LocalLimiter {
 
     /// Which of `limits` refused a request from `client` under those `limited` marks, and
     /// how long it should wait to be admitted under all of them, as the keys have it now.
-    pub(crate) fn refusal<'a>(
+    pub(crate) fn refusal<'a, 'f>(
         &self,
         limits: &'a [Arc<CompiledLimit>],
         limited: u64,
-        client: Requester,
+        client: impl Into<KeyedBy<'f>>,
     ) -> Refusal<'a> {
         let now = self.process.now();
         with_keys(
@@ -193,7 +192,7 @@ impl LocalLimiter {
             &self.contracts,
             limits,
             limited,
-            client,
+            client.into(),
             |keys| {
                 // A key begins with its limit's name and a zero.
                 let at = |part: usize| {

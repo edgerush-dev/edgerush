@@ -21,6 +21,7 @@ fn local_mode() -> Option<edgerush_config::RateLimiting> {
     Some(edgerush_config::RateLimiting {
         mode: edgerush_config::RateLimitMode::Local,
         max_key_bytes: None,
+        experimental_header_keys: None,
         service: None,
     })
 }
@@ -134,6 +135,7 @@ async fn with_rate_limiting_off_every_request_goes_on() {
     let off = Some(edgerush_config::RateLimiting {
         mode: edgerush_config::RateLimitMode::Off,
         max_key_bytes: None,
+        experimental_header_keys: None,
         service: None,
     });
     for section in [None, off] {
@@ -170,6 +172,128 @@ async fn a_reload_in_local_mode_keeps_the_keys() {
             proxy.reload(compile(&bigger).unwrap()).unwrap();
             let (statuses, _) = send_round(&mut sends, 1).await;
             assert_eq!(statuses, [429]);
+        })
+        .await;
+}
+
+/// `config` with its first route's first rule under `limits` (each `name: key` with ten an
+/// hour and a bucket of `burst`), in local mode with header keys allowed.
+fn keyed_by(mut config: Config, limits: &[(&str, &str, u64)]) -> Config {
+    config.routes[0].rules[0].rate_limits = limits
+        .iter()
+        .map(|(name, _, _)| (*name).to_owned())
+        .collect();
+    let written: String = limits
+        .iter()
+        .map(|(name, key, burst)| {
+            format!("  - {{ name: {name}, key: '{key}', model: {{ bucket: {{ rate: 10/h, burst: {burst} }} }} }}\n")
+        })
+        .collect();
+    config.limits = Some(serde_saphyr::from_str(&format!("limits:\n{written}")).unwrap());
+    config.rate_limiting = Some(edgerush_config::RateLimiting {
+        mode: edgerush_config::RateLimitMode::Local,
+        max_key_bytes: None,
+        service: None,
+        experimental_header_keys: Some(true),
+    });
+    config
+}
+
+/// One request over `send`, with `x-api-key: key` if there is one: its status, and the
+/// limit its `RateLimit` field names if it was refused.
+async fn as_key(
+    send: ::h2::client::SendRequest<Bytes>,
+    key: Option<&str>,
+) -> (::h2::client::SendRequest<Bytes>, u16, Option<String>) {
+    let mut send = within(send.ready()).await.unwrap();
+    let mut request = Request::get("http://example.test/").version(Version::HTTP_2);
+    if let Some(key) = key {
+        request = request.header("x-api-key", key);
+    }
+    let (response, _) = send.send_request(request.body(()).unwrap(), true).unwrap();
+    let response = within(response).await.unwrap();
+    let named = response.headers().get("ratelimit").map(|field| {
+        field
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    });
+    (send, response.status().as_u16(), named)
+}
+
+/// A limit keyed by a header counts each value apart, the same client sending them all: two
+/// keys each held to their bucket of two, and a request without the header let through.
+#[tokio::test]
+async fn a_limit_keyed_by_a_header_counts_each_value_apart() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let config = keyed_by(
+                everything_config(upstream),
+                &[("per-key", r#"headers["x-api-key"]"#, 2)],
+            );
+            let (_proxy, mut sends) = serving_workers(&config, 1).await;
+            let mut send = sends.remove(0);
+            let mut statuses = Vec::new();
+            for key in [
+                Some("a"),
+                Some("a"),
+                Some("a"),
+                Some("b"),
+                Some("b"),
+                None,
+                None,
+                None,
+            ] {
+                let (next, status, _) = as_key(send, key).await;
+                send = next;
+                statuses.push(status);
+            }
+            assert_eq!(statuses, [200, 200, 429, 200, 200, 200, 200, 200]);
+        })
+        .await;
+}
+
+/// A request under a limit by client and one by header is decided under both at once: the
+/// client's bucket runs out across keys, and its refusal names the limit that refused.
+#[tokio::test]
+async fn limits_by_client_and_by_header_decide_a_request_together() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let config = keyed_by(
+                everything_config(upstream),
+                &[
+                    ("per-client", "client", 3),
+                    ("per-key", r#"headers["x-api-key"]"#, 2),
+                ],
+            );
+            let (_proxy, mut sends) = serving_workers(&config, 1).await;
+            let mut send = sends.remove(0);
+            let mut seen = Vec::new();
+            for key in ["a", "a", "a", "b", "b"] {
+                let (next, status, named) = as_key(send, Some(key)).await;
+                send = next;
+                seen.push((status, named));
+            }
+            let quoted = |name: &str| Some(format!(r#""{name}""#));
+            assert_eq!(
+                seen,
+                [
+                    (200, None),
+                    (200, None),
+                    // Its own key spent, the client's bucket still has one.
+                    (429, quoted("per-key")),
+                    (200, None),
+                    // The client's three spent: refused by it, though `b` has one left.
+                    (429, quoted("per-client")),
+                ]
+            );
         })
         .await;
 }
