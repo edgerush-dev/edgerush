@@ -80,16 +80,28 @@ impl Context for ByKey {
     }
 }
 
+/// The longest text a key holds as it is. A client may send a value as long as its
+/// headers may be, 64 KiB, and a key is carried in every message about it and held on
+/// every pod it reaches (06 §4): bounded here, it costs no more than an address does, and
+/// the longest texts limits are commonly keyed by, API keys and account names, fit.
+const LONGEST_TEXT: usize = 128;
+
 /// Puts together in `buffer` the key a request is counted by under the limit `name`
 /// defined as `definition` says: the name, a zero, the definition's digest, and the key's
 /// value — an IPv6 client by its /64, not its whole address, which one client holds 2^64
-/// of (06 §2). A limit changed has keys of its own, which start afresh.
+/// of (06 §2), and a text longer than [`LONGEST_TEXT`] by its SHA-256, after a 0xFF, which
+/// begins no UTF-8 character, so that no text is taken for a digest. A limit changed has
+/// keys of its own, which start afresh.
 fn key_into(buffer: &mut Vec<u8>, name: &str, definition: [u8; 8], key: KeyValue<'_>) {
     buffer.clear();
     buffer.extend_from_slice(name.as_bytes());
     buffer.push(0);
     buffer.extend_from_slice(&definition);
     match key {
+        KeyValue::Text(text) if text.len() > LONGEST_TEXT => {
+            buffer.push(0xFF);
+            buffer.extend_from_slice(&boring::sha::sha256(text.as_bytes()));
+        }
         KeyValue::Text(text) => buffer.extend_from_slice(text.as_bytes()),
         KeyValue::Address(IpAddr::V4(v4)) => buffer.extend_from_slice(&v4.octets()),
         KeyValue::Address(IpAddr::V6(v6)) => buffer.extend_from_slice(&v6.octets()[..8]),
@@ -1062,5 +1074,29 @@ mod tests {
             key("per-client", address("2001:db8:1:2:ffff:ffff:ffff:ffff"))
         );
         assert_ne!(one, key("per-client", address("2001:db8:1:3::1")));
+    }
+
+    /// A text of up to 128 bytes is the key's value as it is; a longer one is counted by
+    /// its SHA-256, after a byte no text holds: one value, one key, on every data plane,
+    /// never longer than a digest, and never another text's.
+    #[test]
+    fn a_long_text_is_counted_by_its_digest() {
+        let front = "acct".len() + 1 + DEFINED.len();
+        let longest = "a".repeat(128);
+        let kept = key("acct", KeyValue::Text(&longest));
+        assert_eq!(&kept[front..], longest.as_bytes());
+
+        let long = "a".repeat(129);
+        let counted = key("acct", KeyValue::Text(&long));
+        let mut expected = b"acct\0".to_vec();
+        expected.extend_from_slice(&DEFINED);
+        expected.push(0xFF);
+        expected.extend_from_slice(&boring::sha::sha256(long.as_bytes()));
+        assert_eq!(counted, expected);
+        assert_ne!(counted, key("acct", KeyValue::Text(&"a".repeat(130))));
+        let huge = "b".repeat(64 * 1024);
+        assert_eq!(key("acct", KeyValue::Text(&huge)).len(), front + 1 + 32);
+        // No text is a digest: 0xFF begins no UTF-8 character.
+        assert!(std::str::from_utf8(&counted[front..]).is_err());
     }
 }
