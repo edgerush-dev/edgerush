@@ -29,5 +29,9 @@ harness = false
 name = "cycle"
 harness = false
 
+[[bench]]
+name = "local"
+harness = false
+
 [lints]
 workspace = true
