@@ -368,3 +368,51 @@ async fn a_request_under_no_key_ends_its_stream() {
     let refused = plane.end().await.expect("refused");
     assert_eq!(refused.code(), tonic::Code::InvalidArgument);
 }
+
+/// A stream that met a key and went quiet lets go of it once the pod forgets it, as every
+/// stream sweeps its handles once a second, busy or quiet: a forgotten key's memory is not
+/// held past the pod's cap for as long as the stream is open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quiet_stream_lets_go_of_a_key_the_pod_forgot() {
+    let service = start().await;
+    let (mut plane, _) = Plane::open(&service.addresses[0]).await;
+    // A thousand a second, a bucket of one: full again a millisecond after its request, so
+    // that the pod's sweep forgets it once it has gone a second unused.
+    let brief = Key {
+        key: b"brief".to_vec(),
+        contract: Some(Contract {
+            limit: 1_000,
+            window_ns: 1_000_000_000,
+            burst: 1,
+        }),
+    };
+    assert!(plane.decide_keys(vec![brief]).await.admitted);
+    let pod = &service.pods[0];
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        assert!(Instant::now() < deadline, "{what}");
+        !done()
+    };
+    while wait("the stream never said it held it", &|| {
+        pod.handles_held() == 1
+    }) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    while wait("the pod never forgot it", &|| pod.key_count() == 0) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    while wait("the quiet stream kept it", &|| pod.handles_held() == 0) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // A stream that ends takes what it said it held with it.
+    assert!(plane.decide(&[b"kept"]).await.admitted);
+    while wait("the stream never said it held it", &|| {
+        pod.handles_held() == 1
+    }) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(plane);
+    while wait("an ended stream still counted", &|| pod.handles_held() == 0) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
