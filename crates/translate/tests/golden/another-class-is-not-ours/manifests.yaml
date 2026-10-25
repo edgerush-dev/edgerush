@@ -1,5 +1,6 @@
-# An Ingress of another class, and one of no class, belong to other controllers: they
-# are neither translated nor reported.
+# An Ingress of another class, by name or by the old annotation, and one of no class,
+# belong to other controllers: they are neither translated nor reported. A name wins over
+# the annotation.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: theirs, namespace: shop }
@@ -15,6 +16,33 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: classless, namespace: shop }
 spec:
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: theirs-by-annotation
+  namespace: shop
+  annotations: { kubernetes.io/ingress.class: other }
+spec:
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: theirs-by-name
+  namespace: shop
+  annotations: { kubernetes.io/ingress.class: edge }
+spec:
+  ingressClassName: other
   rules:
     - host: shop.example.com
       http:

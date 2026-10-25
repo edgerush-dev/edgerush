@@ -2,7 +2,8 @@
 //!
 //! Each directory under `tests/golden/` is a case: `manifests.yaml`, the objects as
 //! `kubectl apply` would take them; `config.yaml`, the config expected, written as the
-//! development harness's file is; and `report.txt`, the report expected, a finding a line.
+//! development harness's file is; `report.txt`, the report expected, a finding a line; and,
+//! where the case says, `passed-over.txt`, how many Ingresses were another data plane's.
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own.
 //! Every config translated must also pass the data plane's own `compile`.
 
@@ -57,6 +58,12 @@ fn every_case_translates_to_its_config_and_report() {
             shared.clone()
         };
         let translation = translate(&plane, &cluster(&read(&case.join("manifests.yaml"))));
+        // How many Ingresses were another data plane's, where the case says.
+        let passed_over = case.join("passed-over.txt");
+        if passed_over.exists() {
+            let expected: usize = read(&passed_over).trim().parse().unwrap();
+            assert_eq!(translation.passed_over, expected, "{name}: passed over");
+        }
         let expected: Config = serde_saphyr::from_str(&read(&case.join("config.yaml")))
             .unwrap_or_else(|error| panic!("{name}: config.yaml: {error}"));
         assert_eq!(translation.config, expected, "{name}: config");

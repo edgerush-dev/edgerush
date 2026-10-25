@@ -55,6 +55,9 @@ pub struct Translation {
     pub config: Config,
     /// What was left out, and why, object by object.
     pub report: Vec<Finding>,
+    /// How many Ingresses were passed over as another data plane's: of another class, or of
+    /// none.
+    pub passed_over: usize,
 }
 
 /// Something about one object.
@@ -118,11 +121,10 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut report = Vec::new();
     // Oldest first, then by namespace and name, as Gateway API ranks routes: the order is
     // precedence's last tie-breaker (07 §1).
-    let mut ingresses: Vec<&Ingress> = cluster
+    let (mut ingresses, others): (Vec<&Ingress>, Vec<&Ingress>) = cluster
         .ingresses
         .iter()
-        .filter(|ingress| class_of(ingress) == Some(plane.ingress_class.as_str()))
-        .collect();
+        .partition(|ingress| class_of(ingress) == Some(plane.ingress_class.as_str()));
     ingresses.sort_by(|a, b| {
         let key = |ingress: &Ingress| {
             let metadata = &ingress.metadata;
@@ -159,6 +161,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             limits: None,
         },
         report,
+        passed_over: others.len(),
     }
 }
 
@@ -167,8 +170,24 @@ fn namespace(metadata: &ObjectMeta) -> &str {
     metadata.namespace.as_deref().unwrap_or("default")
 }
 
+/// The annotation that named an Ingress's class before `ingressClassName`, and still does
+/// where that is left out.
+const CLASS_ANNOTATION: &str = "kubernetes.io/ingress.class";
+
+/// An Ingress's class: its `ingressClassName`, or, without one, the annotation.
 fn class_of(ingress: &Ingress) -> Option<&str> {
-    ingress.spec.as_ref()?.ingress_class_name.as_deref()
+    let named = ingress
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.ingress_class_name.as_deref());
+    named.or_else(|| {
+        ingress
+            .metadata
+            .annotations
+            .as_ref()?
+            .get(CLASS_ANNOTATION)
+            .map(String::as_str)
+    })
 }
 
 /// An Ingress's routes, one a host, and the upstreams they lead to; or why none.
@@ -177,6 +196,17 @@ fn ingress_routes(
     cluster: &Cluster,
     ingress: &Ingress,
 ) -> Result<(Vec<Route>, BTreeMap<String, Upstream>), Problem> {
+    // Ours by the old annotation: said apart from other annotations, as the class it names
+    // is the only reason it was taken for this data plane.
+    if ingress
+        .spec
+        .as_ref()
+        .is_none_or(|spec| spec.ingress_class_name.is_none())
+    {
+        return Err(Problem::NotSupportedYet(
+            "the `kubernetes.io/ingress.class` annotation",
+        ));
+    }
     // Annotations change what an Ingress does (a rewrite, a redirect, a limit), so one that
     // has any is not translated until they are read; all but kubectl's own record of what it
     // applied, which says nothing of routing and is on whatever `kubectl apply` made.
