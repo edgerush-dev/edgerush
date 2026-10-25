@@ -1,0 +1,1 @@
+IngressClass absent: not among the objects, so no Ingress of the class is translated

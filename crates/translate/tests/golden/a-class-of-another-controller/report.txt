@@ -1,0 +1,1 @@
+IngressClass theirs: names controller `k8s.io/ingress-nginx`, not `edgerush.dev/ingress-controller`, so no Ingress of the class is translated

@@ -5,7 +5,7 @@
 use edgerush_config::compile;
 use edgerush_translate::{Cluster, Plane, translate};
 use k8s_openapi::api::core::v1::Service;
-use k8s_openapi::api::networking::v1::Ingress;
+use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use serde::Deserialize;
 use std::fmt::Write as _;
 use std::io::Write;
@@ -27,7 +27,9 @@ Options:
       --from-manifests <PATH>  Manifests in YAML: a file, or a directory read for every
                                .yaml and .yml file in it and below. A `List`, as
                                `kubectl get -o yaml` writes one, is read for its items;
-                               kinds that are not translated are passed over
+                               kinds that are not translated are passed over. The data
+                               plane's IngressClass must be among them, naming
+                               `edgerush.dev/ingress-controller`
       --data-plane <FILE>      The data plane's settings, in YAML: `ingress_class`,
                                `listeners`, `cluster_domain` and
                                `ingress_hosts_fall_through`
@@ -119,6 +121,7 @@ enum Failed {
 #[derive(Deserialize)]
 #[serde(tag = "kind")]
 enum Manifest {
+    IngressClass(Box<IngressClass>),
     Ingress(Box<Ingress>),
     Service(Box<Service>),
     List {
@@ -131,6 +134,7 @@ enum Manifest {
 impl Manifest {
     fn into_cluster(self, cluster: &mut Cluster) {
         match self {
+            Self::IngressClass(class) => cluster.ingress_classes.push(*class),
             Self::Ingress(ingress) => cluster.ingresses.push(*ingress),
             Self::Service(service) => cluster.services.push(*service),
             Self::List { items } => {

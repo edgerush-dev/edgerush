@@ -448,7 +448,7 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
     // without the file that is not YAML.
     std::fs::write(
         manifests.join("shop").join("web.yaml"),
-        "apiVersion: v1\nkind: List\nitems:\n  - apiVersion: networking.k8s.io/v1\n    kind: Ingress\n    metadata: { name: web, namespace: shop }\n    spec:\n      ingressClassName: edge\n      rules:\n        - host: shop.example.com\n          http:\n            paths:\n              - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }\n  - { apiVersion: v1, kind: Service, metadata: { name: web, namespace: shop }, spec: { ports: [{ name: http, port: 80 }] } }\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata: { name: web, namespace: shop }\n",
+        "apiVersion: v1\nkind: List\nitems:\n  - { apiVersion: networking.k8s.io/v1, kind: IngressClass, metadata: { name: edge }, spec: { controller: edgerush.dev/ingress-controller } }\n  - apiVersion: networking.k8s.io/v1\n    kind: Ingress\n    metadata: { name: web, namespace: shop }\n    spec:\n      ingressClassName: edge\n      rules:\n        - host: shop.example.com\n          http:\n            paths:\n              - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }\n  - { apiVersion: v1, kind: Service, metadata: { name: web, namespace: shop }, spec: { ports: [{ name: http, port: 80 }] } }\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata: { name: web, namespace: shop }\n",
     )?;
     std::fs::write(manifests.join("README.md"), "not manifests")?;
     // Another data plane's: counted, not translated.
