@@ -21,13 +21,13 @@
 
 use arc_swap::ArcSwap;
 use boring::error::ErrorStack;
-use boring::pkey::PKey;
 use boring::ssl::{
     AlpnError, NameType, SniError, SslAcceptor, SslAlert, SslContext, SslContextBuilder, SslMethod,
     SslSessionCacheMode, SslVerifyMode, SslVersion, select_next_proto,
 };
 use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
+use edgerush_certificates::{CertificateError, Identity};
 use edgerush_config::{ClientValidation, CompiledTls, NamedCertificate};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -451,7 +451,7 @@ fn present(
     certificate: &NamedCertificate,
 ) -> Result<X509, TlsError> {
     let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
-    let identity = Identity::read(certificate)?;
+    let identity = identity(certificate)?;
     builder.set_certificate(&identity.leaf).map_err(setup)?;
     for intermediate in identity.intermediates {
         builder.add_extra_chain_cert(intermediate).map_err(setup)?;
@@ -460,52 +460,22 @@ fn present(
     Ok(identity.leaf)
 }
 
-/// A certificate, the intermediates that lead from it, and its key, read and checked to
-/// belong together.
-pub(crate) struct Identity {
-    pub(crate) leaf: X509,
-    pub(crate) intermediates: Vec<X509>,
-    pub(crate) key: PKey<boring::pkey::Private>,
-}
-
-impl Identity {
-    /// Reads `named`, whose name errors say.
-    ///
-    /// # Errors
-    ///
-    /// A [`TlsError`] for a chain or key that cannot be read, or a key not the
-    /// certificate's.
-    pub(crate) fn read(named: &NamedCertificate) -> Result<Self, TlsError> {
-        let name = || named.name.clone();
-        let certificate = &named.certificate;
-        let chain = X509::stack_from_pem(certificate.chain.as_bytes()).map_err(|error| {
-            TlsError::Chain {
-                name: name(),
-                reason: error.to_string(),
-            }
-        })?;
-        let mut chain = chain.into_iter();
-        let leaf = chain
-            .next()
-            .ok_or_else(|| TlsError::Empty { name: name() })?;
-        let key = PKey::private_key_from_pem(certificate.key.as_bytes()).map_err(|error| {
-            TlsError::Key {
-                name: name(),
-                reason: error.to_string(),
-            }
-        })?;
-        // Compared here, where it can be said which: BoringSSL refuses the pair as well,
-        // but only as a failure to set the key.
-        let matches = leaf.public_key().is_ok_and(|public| public.public_eq(&key));
-        if !matches {
-            return Err(TlsError::Mismatch { name: name() });
+/// Reads `named` as translation read it before it came ([`edgerush_certificates`]), errors
+/// saying which certificate.
+///
+/// # Errors
+///
+/// A [`TlsError`] for a chain or key that cannot be read, or a key not the certificate's.
+pub(crate) fn identity(named: &NamedCertificate) -> Result<Identity, TlsError> {
+    Identity::read(&named.certificate).map_err(|error| {
+        let name = named.name.clone();
+        match error {
+            CertificateError::Chain(reason) => TlsError::Chain { name, reason },
+            CertificateError::Empty => TlsError::Empty { name },
+            CertificateError::Key(reason) => TlsError::Key { name, reason },
+            CertificateError::Mismatch => TlsError::Mismatch { name },
         }
-        Ok(Self {
-            leaf,
-            intermediates: chain.collect(),
-            key,
-        })
-    }
+    })
 }
 
 /// Which certificate answers for which name: by the DNS names in each one's subject
@@ -556,14 +526,7 @@ impl Names {
 pub(crate) mod testing {
     //! Certificates made on the spot, for tests that need a server to present one.
 
-    use boring::asn1::Asn1Time;
-    use boring::bn::BigNum;
-    use boring::ec::{EcGroup, EcKey};
-    use boring::hash::MessageDigest;
-    use boring::nid::Nid;
-    use boring::pkey::PKey;
-    use boring::x509::extension::SubjectAlternativeName;
-    use boring::x509::{X509, X509NameBuilder};
+    pub(crate) use edgerush_certificates::testing::certificate;
     use edgerush_config::{Certificate, NamedCertificate};
 
     /// `certificate`, known by `name` as a listener or an upstream names it.
@@ -571,46 +534,6 @@ pub(crate) mod testing {
         NamedCertificate {
             name: name.to_owned(),
             certificate,
-        }
-    }
-
-    /// A self-signed certificate for `names`, with its key.
-    pub(crate) fn certificate(names: &[&str]) -> Certificate {
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-        let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
-        let mut subject = X509NameBuilder::new().unwrap();
-        subject
-            .append_entry_by_nid(Nid::COMMONNAME, names.first().copied().unwrap_or("none"))
-            .unwrap();
-        let subject = subject.build();
-        let mut builder = X509::builder().unwrap();
-        builder.set_version(2).unwrap();
-        let serial = BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap();
-        builder.set_serial_number(&serial).unwrap();
-        builder.set_subject_name(&subject).unwrap();
-        builder.set_issuer_name(&subject).unwrap();
-        builder.set_pubkey(&key).unwrap();
-        builder
-            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
-            .unwrap();
-        builder
-            .set_not_after(&Asn1Time::days_from_now(30).unwrap())
-            .unwrap();
-        if !names.is_empty() {
-            let mut alternatives = SubjectAlternativeName::new();
-            for name in names {
-                alternatives.dns(name);
-            }
-            let alternatives = alternatives
-                .build(&builder.x509v3_context(None, None))
-                .unwrap();
-            builder.append_extension(&alternatives).unwrap();
-        }
-        builder.sign(&key, MessageDigest::sha256()).unwrap();
-        let chain = builder.build().to_pem().unwrap();
-        Certificate {
-            chain: String::from_utf8(chain).unwrap(),
-            key: String::from_utf8(key.private_key_to_pem_pkcs8().unwrap()).unwrap(),
         }
     }
 }
@@ -875,7 +798,7 @@ mod tests {
             let showing = |shown: Option<&Certificate>| {
                 let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
                 if let Some(shown) = shown {
-                    let identity = Identity::read(&named("client", shown.clone())).unwrap();
+                    let identity = identity(&named("client", shown.clone())).unwrap();
                     builder.set_certificate(&identity.leaf).unwrap();
                     builder.set_private_key(&identity.key).unwrap();
                 }

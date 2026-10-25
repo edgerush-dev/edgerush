@@ -213,6 +213,10 @@ crates/edgerush    the binary (operator, control plane and data plane will be su
                    `edgerush proxy --config file.yaml`, a data plane run from a file for development,
                    `edgerush explain`, where a request would go and why, `edgerush test`, and
                    `edgerush validate`, which translates Kubernetes manifests
+crates/certificates
+                   a certificate and its key read and checked to belong together
+                   (`edgerush-certificates`), by BoringSSL: what the data plane presents and what
+                   translation admits are read by the same code; no I/O
 crates/config      the config model and its compilation (`edgerush-config`): pure, format-free
 crates/explain     where a request would go and why (`edgerush-explain`): what `edgerush explain`
                    prints and `edgerush test` checks, worked out by the request core without a

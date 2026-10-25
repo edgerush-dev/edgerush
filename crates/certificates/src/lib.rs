@@ -1,0 +1,122 @@
+//! A certificate and its key, read and checked to belong together
+//! ([03 §3](../../../docs/03-data-plane.md)): by BoringSSL, as the data plane presents them.
+//!
+//! The data plane reads every certificate a listener or an upstream names when a config
+//! comes, and refuses the config over one it cannot use. Translation reads a Secret's with
+//! the same code before it puts it in a config, so that what it admits is exactly what the
+//! data plane can present, and one bad Secret never costs a listener every other
+//! certificate.
+//!
+//! Reading does no I/O and asks no clock: an expired certificate is read as any other.
+
+use boring::pkey::{PKey, Private};
+use boring::x509::X509;
+use edgerush_config::Certificate;
+
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
+/// A certificate, the intermediates that lead from it, and its key, read and checked to
+/// belong together.
+pub struct Identity {
+    /// The certificate.
+    pub leaf: X509,
+    /// The intermediates, in the order the chain gave them.
+    pub intermediates: Vec<X509>,
+    /// Its private key.
+    pub key: PKey<Private>,
+}
+
+/// Why a certificate cannot be used.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CertificateError {
+    /// The chain is not certificates in PEM.
+    #[error("the chain is not PEM certificates: {0}")]
+    Chain(String),
+    /// The chain has no certificate in it.
+    #[error("the chain is empty")]
+    Empty,
+    /// The key is not a private key in PEM.
+    #[error("the key is not a PEM private key: {0}")]
+    Key(String),
+    /// The key is not the one the certificate was issued for.
+    #[error("the key is not the certificate's")]
+    Mismatch,
+}
+
+impl Identity {
+    /// Reads `certificate`.
+    ///
+    /// # Errors
+    ///
+    /// A [`CertificateError`] for a chain or key that cannot be read, or a key not the
+    /// certificate's.
+    pub fn read(certificate: &Certificate) -> Result<Self, CertificateError> {
+        let chain = X509::stack_from_pem(certificate.chain.as_bytes())
+            .map_err(|error| CertificateError::Chain(error.to_string()))?;
+        let mut chain = chain.into_iter();
+        let leaf = chain.next().ok_or(CertificateError::Empty)?;
+        let key = PKey::private_key_from_pem(certificate.key.as_bytes())
+            .map_err(|error| CertificateError::Key(error.to_string()))?;
+        // Compared here, where it can be said what is wrong: BoringSSL refuses the pair as
+        // well, but only as a failure to set the key.
+        let matches = leaf.public_key().is_ok_and(|public| public.public_eq(&key));
+        if !matches {
+            return Err(CertificateError::Mismatch);
+        }
+        Ok(Self {
+            leaf,
+            intermediates: chain.collect(),
+            key,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::certificate;
+    use super::*;
+
+    #[test]
+    fn a_certificate_and_its_key_are_read() {
+        let identity = Identity::read(&certificate(&["a.test"])).unwrap();
+        assert!(identity.intermediates.is_empty());
+        let names: Vec<String> = identity
+            .leaf
+            .subject_alt_names()
+            .unwrap()
+            .iter()
+            .filter_map(|name| name.dnsname().map(str::to_owned))
+            .collect();
+        assert_eq!(names, ["a.test"]);
+    }
+
+    #[test]
+    fn a_certificate_that_cannot_be_used_is_said_why() {
+        let good = certificate(&["a.test"]);
+        let error = |certificate: Certificate| Identity::read(&certificate).err();
+        // Text with no PEM in it is no certificates; a PEM block that is not one is an error.
+        let nothing = Certificate {
+            chain: "not a certificate".to_owned(),
+            ..good.clone()
+        };
+        assert_eq!(error(nothing), Some(CertificateError::Empty));
+        let broken = Certificate {
+            chain: "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n"
+                .to_owned(),
+            ..good.clone()
+        };
+        assert!(matches!(error(broken), Some(CertificateError::Chain(_))));
+        let key = Certificate {
+            key: "not a key".to_owned(),
+            ..good.clone()
+        };
+        assert!(matches!(error(key), Some(CertificateError::Key(_))));
+        let mismatched = Certificate {
+            key: certificate(&["b.test"]).key,
+            ..good.clone()
+        };
+        assert_eq!(error(mismatched), Some(CertificateError::Mismatch));
+        assert!(error(good).is_none());
+    }
+}

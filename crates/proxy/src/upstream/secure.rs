@@ -67,7 +67,7 @@ impl Secure {
             .set_verify_cert_store(trusted.build())
             .map_err(setup)?;
         if let Some(certificate) = &source.client_certificate {
-            let identity = crate::tls::Identity::read(certificate)?;
+            let identity = crate::tls::identity(certificate)?;
             builder.set_certificate(&identity.leaf).map_err(setup)?;
             for intermediate in identity.intermediates {
                 builder.add_extra_chain_cert(intermediate).map_err(setup)?;

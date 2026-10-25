@@ -194,6 +194,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9377eb110cece2e9431deb8d7d2ec8c116510b896741f9f2bf02b352147aa2a6"
 
 [[package]]
+name = "edgerush-certificates"
+version = "0.0.0"
+dependencies = [
+ "boring",
+ "edgerush-config",
+ "thiserror",
+]
+
+[[package]]
 name = "edgerush-config"
 version = "0.0.0"
 dependencies = [
@@ -256,6 +265,7 @@ dependencies = [
  "arc-swap",
  "boring",
  "bytes",
+ "edgerush-certificates",
  "edgerush-config",
  "edgerush-filters",
  "edgerush-ratelimit",
