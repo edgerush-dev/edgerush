@@ -10,6 +10,7 @@
 
 mod hub;
 pub(crate) mod local;
+pub(crate) mod synchronous;
 
 #[cfg(test)]
 pub(crate) use hub::REFUSE_START;
@@ -259,10 +260,18 @@ pub(crate) enum Limited {
     Undecided(Undecided),
 }
 
-/// A request's decision to come, and how long it may be waited for.
-pub(crate) struct Later {
-    decided: oneshot::Receiver<Result<Decided, Undecided>>,
-    until: tokio::time::Instant,
+/// A request's decision to come.
+pub(crate) struct Later(Awaited);
+
+/// What a request waits on for its decision.
+pub(crate) enum Awaited {
+    /// The process's thread, in the asynchronous mode, until `until`.
+    Hub {
+        decided: oneshot::Receiver<Result<Decided, Undecided>>,
+        until: tokio::time::Instant,
+    },
+    /// Its keys' owners, in the synchronous mode.
+    Owners(synchronous::Asked),
 }
 
 impl Later {
@@ -271,9 +280,14 @@ impl Later {
     /// ready its decision: one taken up after its time, its worker held up meanwhile, is out
     /// of time too, though it may have been charged; or, with its sender dropped unanswered,
     /// the limiter gone: [`Undecided::Unavailable`].
+    ///
+    /// In the synchronous mode, as its owners answer ([`synchronous::Asked::decided`]).
     pub(crate) async fn decided(self) -> Result<Decided, Undecided> {
-        let until = self.until;
-        match tokio::time::timeout_at(until, self.decided).await {
+        let (decided, until) = match self.0 {
+            Awaited::Hub { decided, until } => (decided, until),
+            Awaited::Owners(asked) => return asked.decided().await,
+        };
+        match tokio::time::timeout_at(until, decided).await {
             Ok(_) if tokio::time::Instant::now() >= until => Err(Undecided::Timeout),
             Ok(Ok(decided)) => decided,
             Ok(Err(_)) => Err(Undecided::Unavailable),
@@ -783,10 +797,10 @@ impl Limiter {
         let (at, until) = self.deadline(now);
         let (decided, later) = oneshot::channel();
         if self.send_ask(parts, at, (decided, place)) {
-            Limited::Later(Later {
+            Limited::Later(Later(Awaited::Hub {
                 decided: later,
                 until,
-            })
+            }))
         } else {
             Limited::Undecided(Undecided::Unavailable)
         }
@@ -831,10 +845,10 @@ impl Limiter {
             .collect();
         let (decided, later) = oneshot::channel();
         tokio::task::spawn_local(Rc::clone(self).deferred(keys, (decided, place), (at, until)));
-        Limited::Later(Later {
+        Limited::Later(Later(Awaited::Hub {
             decided: later,
             until,
-        })
+        }))
     }
 
     /// A deferred request under `keys`, decided again whenever a hold settles or a count

@@ -25,10 +25,10 @@ mod route;
 pub use backends::{Destination, UpstreamId, WeightedBackends};
 pub use compile::{
     Compiled, CompiledDataPlane, CompiledForwarding, CompiledListener, CompiledMirror,
-    CompiledRateLimitService, CompiledRateLimiting, CompiledRetry, CompiledRule, CompiledTimeouts,
-    CompiledTls, CompiledUpstream, CompiledUpstreamTls, ConfigError, L4, L4Route, MatchId, Matches,
-    NamedCertificate, Object, Outcome, Place, Problem, RuleId, SniRouter, Step, Timeout, compile,
-    compile_with_matches,
+    CompiledRateLimitService, CompiledRateLimiting, CompiledRetry, CompiledRule,
+    CompiledSynchronous, CompiledTimeouts, CompiledTls, CompiledUpstream, CompiledUpstreamTls,
+    ConfigError, L4, L4Route, MatchId, Matches, NamedCertificate, Object, Outcome, Place, Problem,
+    RuleId, SniRouter, Step, Timeout, compile, compile_with_matches,
 };
 pub use config::{
     AccessLog, Certificate, ClientValidation, Config, DataPlane, Endpoints, Forwarding,

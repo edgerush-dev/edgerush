@@ -408,6 +408,9 @@ struct RateLimits {
     hub: Option<Arc<crate::ratelimit::Hub>>,
     /// The keys, for a running config in local mode, once started.
     local: Option<Arc<crate::ratelimit::local::Process>>,
+    /// The synchronous mode's side of the process, for a running config in it, once
+    /// started.
+    synchronous: Option<Arc<crate::ratelimit::synchronous::Process>>,
 }
 
 /// One worker's share of the data plane: the connections it holds to the upstreams, which
@@ -448,6 +451,8 @@ pub struct Worker {
     limiter: RefCell<Option<(u64, Rc<crate::ratelimit::Limiter>)>>,
     /// Its limiter in local mode, as `limiter` is in the asynchronous one.
     local_limiter: RefCell<Option<(u64, Rc<crate::ratelimit::local::LocalLimiter>)>>,
+    /// Its limiter in the synchronous mode, with its streams to the service's pods.
+    sync_limiter: RefCell<Option<(u64, Rc<crate::ratelimit::synchronous::SyncLimiter>)>>,
     /// Connections accepted since everything else last had a turn.
     accepted: Cell<usize>,
     /// Its limits again, for the bodies of answers to share rather than copy.
