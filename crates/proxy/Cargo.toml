@@ -23,6 +23,7 @@ interop = []
 arc-swap.workspace = true
 boring.workspace = true
 bytes.workspace = true
+edgerush-certificates.workspace = true
 edgerush-config.workspace = true
 edgerush-filters.workspace = true
 # Rules' rate limits (experimental): each worker a data plane of the rate-limiting
@@ -54,6 +55,8 @@ socket2.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+# Certificates made on the spot, for listeners and upstreams under test.
+edgerush-certificates = { workspace = true, features = ["testing"] }
 # The engine's clients and its either-version server, for tests only: what talks to the
 # proxy as a client would, upstreams that speak both versions, and a second oracle for
 # EdgeRush's own HTTP/1 client (`upstream::h1::differential`).

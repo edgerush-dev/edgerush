@@ -23,11 +23,13 @@ portable-atomic = { version = "1.15.0", default-features = false, features = ["f
 arc-swap = "1.9"
 # TLS on the client hop, over BoringSSL (03 §3), the same library quiche will use for
 # HTTP/3. Its build needs cmake, and on Windows NASM and libclang (12). Only the proxy
-# crate may depend on these two.
+# crate may depend on these two, and `edgerush-certificates` on this one: translation
+# reads a certificate with it, as the proxy will.
 boring = "5.2"
 # The buffers an answer is read into, and the frames cut from them without a copy. Already
 # in the tree through hyper and http, at the same version.
 bytes = "1.12"
+edgerush-certificates = { path = "crates/certificates" }
 edgerush-config = { path = "crates/config" }
 edgerush-explain = { path = "crates/explain" }
 edgerush-filters = { path = "crates/filters" }

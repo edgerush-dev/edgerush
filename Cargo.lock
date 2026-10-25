@@ -279,6 +279,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-certificates"
+version = "0.0.0"
+dependencies = [
+ "boring",
+ "edgerush-config",
+ "thiserror",
+]
+
+[[package]]
 name = "edgerush-config"
 version = "0.0.0"
 dependencies = [
@@ -325,6 +334,7 @@ dependencies = [
  "arc-swap",
  "boring",
  "bytes",
+ "edgerush-certificates",
  "edgerush-config",
  "edgerush-filters",
  "edgerush-ratelimit",

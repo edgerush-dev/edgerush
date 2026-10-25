@@ -1,0 +1,21 @@
+[package]
+name = "edgerush-certificates"
+description = "EdgeRush certificates: a certificate and its key, read and checked to belong together by BoringSSL, alike for the data plane that presents them and the translation that admits them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Certificates made on the spot, for other crates' tests. Nothing outside a test turns it
+# on.
+testing = []
+
+[dependencies]
+boring.workspace = true
+edgerush-config.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
