@@ -142,6 +142,19 @@ async fn serving(
     config: &Config,
     workers: usize,
 ) -> (Arc<Proxy>, Vec<::h2::client::SendRequest<Bytes>>) {
+    let (proxy, sends, _) = serving_at(config, workers).await;
+    (proxy, sends)
+}
+
+/// The same, and where each worker listens, for a client to connect again.
+async fn serving_at(
+    config: &Config,
+    workers: usize,
+) -> (
+    Arc<Proxy>,
+    Vec<::h2::client::SendRequest<Bytes>>,
+    Vec<SocketAddr>,
+) {
     let proxy = Proxy::new(
         compile(config).unwrap(),
         NonZeroUsize::new(workers).unwrap(),
@@ -150,6 +163,7 @@ async fn serving(
     proxy.start_rate_limits(|| {}).unwrap();
     let proxy = Arc::new(proxy);
     let mut sends = Vec::new();
+    let mut fronts = Vec::new();
     for position in 0..u16::try_from(workers).unwrap() {
         let worker = Worker::made(
             Arc::clone(&proxy),
@@ -163,8 +177,9 @@ async fn serving(
         let _maintained = tokio::task::spawn_local(Rc::clone(&worker).maintain());
         let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
         sends.push(h2_library_client(front, &::h2::client::Builder::new()).await);
+        fronts.push(front);
     }
-    (proxy, sends)
+    (proxy, sends, fronts)
 }
 
 /// `count` requests, alternating between the workers that `sends` reach, one at a time:
@@ -1224,6 +1239,64 @@ async fn a_stream_let_go_of_while_opening_does_not_replace_the_one_after_it() {
             assert!(!relay.has_ended(2), "connection 2 let go of");
             assert_eq!(statuses(&send_round(&mut sends, 2).await), [200, 200]);
             assert_eq!(relay.accepted(), 3);
+        })
+        .await;
+}
+
+/// A reload that changes the synchronous section, or leaves the mode, has each worker let
+/// go of its old limiter at its next sweep, with no request needed: its streams to the pods
+/// close, and with them its hold on the old process.
+#[tokio::test]
+async fn a_reload_lets_go_of_the_old_limiter_and_its_streams() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let owner = listener.local_addr().unwrap();
+            let _pod = lone_pod(listener);
+            let relay = GatedRelay::to(owner).await;
+            let (upstream, _) = counting_upstream().await;
+            let in_mode = |timeout_ms| {
+                with_breaker(
+                    synchronous_in(
+                        everything_config(upstream),
+                        &[("per-client", 100)],
+                        std::slice::from_ref(&relay.address),
+                        timeout_ms,
+                        "deny",
+                    ),
+                    5,
+                    60_000,
+                )
+            };
+            let (proxy, mut sends, fronts) = serving_at(&in_mode(200), 1).await;
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            assert_eq!(relay.accepted(), 1);
+            // The section changed: the old limiter's stream ends, though nothing asks.
+            proxy.reload(compile(&in_mode(300)).unwrap()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !relay.has_ended(0) {
+                assert!(Instant::now() < deadline, "the old limiter was kept");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // The client's connection went idle meanwhile: another.
+            let mut sends = vec![h2_library_client(fronts[0], &::h2::client::Builder::new()).await];
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            assert_eq!(relay.accepted(), 2, "the new limiter's stream");
+            // The mode left: the limiter goes, and its stream with it.
+            let mut local_mode = in_mode(300);
+            local_mode.rate_limiting = Some(edgerush_config::RateLimiting {
+                mode: edgerush_config::RateLimitMode::Local,
+                max_key_bytes: None,
+                service: None,
+                synchronous: None,
+                experimental_header_keys: None,
+            });
+            proxy.reload(compile(&local_mode).unwrap()).unwrap();
+            while !relay.has_ended(1) {
+                assert!(Instant::now() < deadline, "the limiter outlived its mode");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         })
         .await;
 }
