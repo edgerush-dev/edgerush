@@ -56,6 +56,23 @@ fn loom_the_last_room_goes_to_one_of_two() {
     });
 }
 
+/// Two workers asking at once for the one request of room of a key gone idle, its bucket
+/// full again: exactly one gets it. Neither may take the key for idle from its last use
+/// while the other's charge is already in its word.
+#[test]
+fn loom_an_idle_keys_one_room_goes_to_one_of_two() {
+    model(|| {
+        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let c = contract(1, 1);
+        let mut handles = Handles::new(FixedState::default());
+        assert_eq!(local.decide(&mut handles, &[(b"k", c)], 0), Decision::Admit);
+        let one = request(&local, &[b"k"], c, 2_000 * MS);
+        let other = request(&local, &[b"k"], c, 2_000 * MS);
+        let admitted = [one.join().unwrap(), other.join().unwrap()];
+        assert_eq!(admitted.iter().filter(|a| **a).count(), 1, "{admitted:?}");
+    });
+}
+
 /// Two requests under the same two limits, each with room for one, decided in opposite
 /// orders: one admitted, or both, a request too many — never neither, which would refuse one
 /// within its limits, as charging each limit in turn and giving back on a refusal could.

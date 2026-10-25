@@ -111,7 +111,7 @@ pub struct Key {
     rate: Rate,
     /// The arrival time in units, the top bit set once the key is closed.
     word: AtomicU64,
-    /// The latest time a request was decided under it.
+    /// The latest time a request was charged under it, moved before the charge lands.
     last: AtomicU64,
     /// Changed since its state was last copied: set by a decision that changed it, where
     /// the registry tracks changes ([`Local::tracking`]), and cleared as it is copied.
@@ -215,15 +215,20 @@ impl Key {
         self.word.load(Ordering::Acquire) & CLOSED != 0
     }
 
+    /// Whether, at `now`, the key went unused for longer than its bucket takes to refill:
+    /// full, whatever its word says once its clock has come round. Sound because a charge
+    /// moves the last use before it lands ([`charge_from`]): a word read is never older than
+    /// the last use read after it.
+    ///
+    /// [`charge_from`]: Self::charge_from
+    fn idle(&self, now: u64) -> bool {
+        now.saturating_sub(self.last.load(Ordering::Relaxed)) > self.rate.refill
+    }
+
     /// The arrival time as of `now` (units `now_units`) from `word`: as it is, unless the key
-    /// went unused for longer than its bucket takes to refill, when it is full.
+    /// is idle, when it is full.
     fn arrival(&self, word: u64, now: u64, now_units: u64) -> u64 {
-        let last = self.last.load(Ordering::Relaxed);
-        if now.saturating_sub(last) > self.rate.refill {
-            now_units
-        } else {
-            word
-        }
+        if self.idle(now) { now_units } else { word }
     }
 
     /// Whether a request at `now` fits.
@@ -233,7 +238,11 @@ impl Key {
             return Look::Closed;
         }
         let now_units = self.rate.units(now);
-        let arrival = self.arrival(word, now, now_units);
+        self.fits(word, self.arrival(word, now, now_units), now_units)
+    }
+
+    /// Whether a request at `now_units` fits, the bucket's arrival time `arrival` as of then.
+    fn fits(&self, word: u64, arrival: u64, now_units: u64) -> Look {
         let ahead = Rate::ahead(arrival, now_units);
         if ahead > self.rate.tolerance {
             return Look::Full {
@@ -244,18 +253,55 @@ impl Key {
         Look::Fits { word, from }
     }
 
+    /// The word a charge at `now` (units `now_units`) is to replace, `None` if the key was
+    /// closed. An idle key's word is first made to say what the key is, full at `now`,
+    /// before a charge moves its last use: a word from before the idle spell, its clock
+    /// perhaps come round, is never read beside a recent last use, which would take it as
+    /// it is.
+    fn word_to_charge(&self, now: u64, now_units: u64) -> Option<u64> {
+        loop {
+            let word = self.word.load(Ordering::Acquire);
+            if word & CLOSED != 0 {
+                return None;
+            }
+            if !self.idle(now) {
+                return Some(word);
+            }
+            if self
+                .word
+                .compare_exchange(word, now_units, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(now_units);
+            }
+        }
+    }
+
+    /// Replaces `word` with a request charged from `from` at `now`, false if the word
+    /// changed. The last use moves first, so that a worker reading the charge reads a last
+    /// use at least as recent, and never takes the key for idle and charges over it.
+    fn charge_from(&self, word: u64, from: u64, now: u64) -> bool {
+        self.last.fetch_max(now, Ordering::Relaxed);
+        self.word
+            .compare_exchange(
+                word,
+                from.wrapping_add(UNITS) & MASK,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     /// One request at `now`, admitted if it fits.
     fn take(&self, now: u64) -> Look {
+        let now_units = self.rate.units(now);
         loop {
-            match self.look(now) {
+            let Some(word) = self.word_to_charge(now, now_units) else {
+                return Look::Closed;
+            };
+            match self.fits(word, word, now_units) {
                 Look::Fits { word, from } => {
-                    let charged = from.wrapping_add(UNITS) & MASK;
-                    if self
-                        .word
-                        .compare_exchange_weak(word, charged, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        self.last.fetch_max(now, Ordering::Relaxed);
+                    if self.charge_from(word, from, now) {
                         return Look::Fits { word, from };
                     }
                 }
@@ -268,23 +314,15 @@ impl Key {
     fn charge(&self, now: u64) -> bool {
         let now_units = self.rate.units(now);
         loop {
-            let word = self.word.load(Ordering::Acquire);
-            if word & CLOSED != 0 {
+            let Some(word) = self.word_to_charge(now, now_units) else {
                 return false;
-            }
-            let arrival = self.arrival(word, now, now_units);
-            let from = if Rate::ahead(arrival, now_units) > 0 {
-                arrival
+            };
+            let from = if Rate::ahead(word, now_units) > 0 {
+                word
             } else {
                 now_units
             };
-            let charged = from.wrapping_add(UNITS) & MASK;
-            if self
-                .word
-                .compare_exchange_weak(word, charged, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                self.last.fetch_max(now, Ordering::Relaxed);
+            if self.charge_from(word, from, now) {
                 return true;
             }
         }
