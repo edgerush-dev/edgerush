@@ -427,6 +427,88 @@ fn test_runs_a_file_of_tests_and_exits_0_or_1() -> io::Result<()> {
     Ok(())
 }
 
+#[test]
+fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Result<()> {
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("validate");
+    let manifests = root.join("manifests");
+    // Afresh: a run that failed half way leaves its files behind.
+    if root.exists() {
+        std::fs::remove_dir_all(&root)?;
+    }
+    std::fs::create_dir_all(manifests.join("shop"))?;
+    let plane = |listeners: &str| {
+        format!(
+            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\nlisteners:\n{listeners}"
+        )
+    };
+    let http = "  http: { address: \"[::]:8080\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n";
+    let data_plane = root.join("data-plane.yaml");
+    std::fs::write(&data_plane, plane(http))?;
+    // Read from a directory below, from a `List`, beside a kind that is not translated, and
+    // without the file that is not YAML.
+    std::fs::write(
+        manifests.join("shop").join("web.yaml"),
+        "apiVersion: v1\nkind: List\nitems:\n  - apiVersion: networking.k8s.io/v1\n    kind: Ingress\n    metadata: { name: web, namespace: shop }\n    spec:\n      ingressClassName: edge\n      rules:\n        - host: shop.example.com\n          http:\n            paths:\n              - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }\n  - { apiVersion: v1, kind: Service, metadata: { name: web, namespace: shop }, spec: { ports: [{ name: http, port: 80 }] } }\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata: { name: web, namespace: shop }\n",
+    )?;
+    std::fs::write(manifests.join("README.md"), "not manifests")?;
+    // Another data plane's: counted, not translated.
+    std::fs::write(
+        manifests.join("theirs.yaml"),
+        "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: { name: theirs, namespace: shop }\nspec:\n  ingressClassName: other\n",
+    )?;
+    let validate = |manifests: &std::path::Path| {
+        edgerush(&[
+            "validate",
+            "--from-manifests",
+            manifests.to_str().expect("a path that is text"),
+            "--data-plane",
+            data_plane.to_str().expect("a path that is text"),
+        ])
+    };
+
+    let output = validate(&manifests)?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "1 routes and 1 upstreams translated; 0 left out; 1 Ingresses of other classes or none passed over\n"
+    );
+
+    // An Ingress that asks for what is not translated yet is left out, and said.
+    std::fs::write(
+        manifests.join("tls.yml"),
+        "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: { name: secure, namespace: shop }\nspec:\n  ingressClassName: edge\n  tls: [{ hosts: [shop.example.com], secretName: shop }]\n",
+    )?;
+    let output = validate(&manifests)?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Ingress shop/secure: not supported yet: TLS\n1 routes and 1 upstreams translated; 1 left out; 1 Ingresses of other classes or none passed over\n"
+    );
+    std::fs::remove_file(manifests.join("tls.yml"))?;
+
+    // A config the data plane would refuse: a `tcp` listener with no route of its own.
+    let tcp = "  db: { address: \"[::]:5432\", protocol: tcp, proxy_protocol: off }\n";
+    std::fs::write(&data_plane, plane(&format!("{http}{tcp}")))?;
+    let output = validate(&manifests)?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.ends_with(
+            "0 left out; 1 Ingresses of other classes or none passed over\nthe data plane would refuse the config:\n  listener `db`: a `tcp` listener needs exactly one TCP route; it has 0\n"
+        ),
+        "{stdout}"
+    );
+
+    // Files that cannot be read are not validated at all.
+    let output = validate(&root.join("nowhere"))?;
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).starts_with("error: "),
+        "{output:?}"
+    );
+    Ok(())
+}
+
 /// The config of [`config`] with no upstream to reach: for the commands that only read it.
 fn config_text() -> String {
     config("127.0.0.1:1", "up", None)

@@ -52,8 +52,12 @@ without dropping a request.
   and a thread of its own reports to the service. A refusal is a 429 with `Retry-After` and
   the `RateLimit` field.
 
-Not yet: anything Kubernetes (the control plane, the operator, translating Ingress and
-Gateway API), authentication. The request path comes first, then rate limiting, then the
+Begun: translating Ingress into a data plane's config, the control plane's first part, so
+far for Ingresses that route `Prefix` paths of named hosts to Services, and checked from
+manifests with `edgerush validate`.
+
+Not yet: the rest of Kubernetes (the control plane running, the operator, the rest of
+Ingress, Gateway API), authentication. The request path comes first, then rate limiting, then the
 control plane and the operator.
 
 ## Trying it
@@ -114,6 +118,20 @@ it, from the same file and without running anything:
 `edgerush test --config edgerush.yaml tests.yaml` checks a file of such requests and where
 each is expected to go, and, given what its upstream answers, the answer its client gets;
 it exits 1 when one goes elsewhere or is answered otherwise: a config's tests for CI.
+
+`edgerush validate --from-manifests manifests/ --data-plane data-plane.yaml` translates
+Kubernetes manifests (a file or a directory of them, `kubectl get -o yaml` output included)
+as the control plane would for one data plane, compiles the config as the data plane would,
+and lists each object left out and why; it exits 1 when one was. The data plane's settings
+stand in for its `DataPlane` resource, which comes with the operator:
+
+```yaml
+ingress_class: edge
+cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+listeners:
+  http: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+```
 
 ## Building
 
@@ -189,7 +207,8 @@ outside the workspace, the package is formatted on its own:
 ```
 crates/edgerush    the binary (operator, control plane and data plane will be subcommands); so far
                    `edgerush proxy --config file.yaml`, a data plane run from a file for development,
-                   `edgerush explain`, where a request would go and why, and `edgerush test`
+                   `edgerush explain`, where a request would go and why, `edgerush test`, and
+                   `edgerush validate`, which translates Kubernetes manifests
 crates/config      the config model and its compilation (`edgerush-config`): pure, format-free
 crates/explain     where a request would go and why (`edgerush-explain`): what `edgerush explain`
                    prints and `edgerush test` checks, worked out by the request core without a
