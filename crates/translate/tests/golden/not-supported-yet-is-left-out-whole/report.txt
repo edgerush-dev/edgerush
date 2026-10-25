@@ -8,3 +8,4 @@ Ingress shop/g-missing-port: not supported yet: a backend Service or port that d
 Ingress shop/h-external-name: not supported yet: an ExternalName Service
 Ingress shop/i-resource: not supported yet: a resource backend
 Ingress shop/i2-annotated: not supported yet: annotations
+Ingress shop/k-class-by-annotation: not supported yet: the `kubernetes.io/ingress.class` annotation

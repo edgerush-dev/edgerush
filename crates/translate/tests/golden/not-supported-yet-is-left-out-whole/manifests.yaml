@@ -133,6 +133,19 @@ spec:
         paths:
           - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
 ---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: k-class-by-annotation
+  namespace: shop
+  annotations: { kubernetes.io/ingress.class: edge }
+spec:
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
 apiVersion: v1
 kind: Service
 metadata: { name: web, namespace: shop }
