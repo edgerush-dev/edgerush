@@ -556,3 +556,27 @@ async fn a_pod_taken_in_again_is_handed_the_keys_it_missed() {
         "the bucket as it was spent"
     );
 }
+
+/// A pod the view has not taken in is not ready for data planes: alone of three, with no
+/// majority to take it in, it refuses a stream as not serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_not_taken_in_refuses_data_planes_as_not_serving() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let pod = SyncPod::spawn(0, vec![0, 1, 2], 1, timing(), BTreeMap::new());
+    let server = SyncServer::new(pod.clone());
+    tokio::spawn(async move {
+        let _ended = tonic::transport::Server::builder()
+            .serve_with_incoming(server, TcpIncoming::from(listener))
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!pod.view().1);
+    match decide_stream(&address).await {
+        Err(edgerush_ratelimit_service::grpc::Error::Status(status)) => assert!(
+            edgerush_ratelimit_service::synchronous::is_not_serving(&status),
+            "{status:?}"
+        ),
+        other => panic!("not refused as not serving: {:?}", other.map(|_| ())),
+    }
+}

@@ -19,8 +19,8 @@ fn pod_timing() -> Timing {
     }
 }
 
-/// A synchronous service pod alone, serving on `listener`.
-fn lone_pod(listener: TcpListener) -> SyncPod {
+/// A synchronous service pod alone, serving on `listener`, once it is ready.
+async fn lone_pod(listener: TcpListener) -> SyncPod {
     let pod = SyncPod::spawn(0, vec![0], 1, pod_timing(), BTreeMap::new());
     let server = SyncServer::new(pod.clone());
     tokio::spawn(async move {
@@ -28,6 +28,12 @@ fn lone_pod(listener: TcpListener) -> SyncPod {
             .serve_with_incoming(server, TcpIncoming::from(listener))
             .await;
     });
+    // Ready for data planes once its view takes it in.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !pod.view().1 {
+        assert!(Instant::now() < deadline, "the pod never served");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     pod
 }
 
@@ -534,7 +540,7 @@ async fn an_open_breaker_closes_once_a_probe_hears_from_its_owner() {
             // again could be taken in between, as the system hands it out.)
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let owner = listener.local_addr().unwrap();
-            let _pod = lone_pod(listener);
+            let _pod = lone_pod(listener).await;
             let relay = GatedRelay::shut(owner).await;
             let (upstream, _) = counting_upstream().await;
             let config = with_breaker(
@@ -653,7 +659,7 @@ async fn local_buckets_carry_over_from_one_outage_to_the_next() {
             // Says nothing until its gates open, the owner back.
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let owner = listener.local_addr().unwrap();
-            let pod = lone_pod(listener);
+            let pod = lone_pod(listener).await;
             let relay = GatedRelay::shut(owner).await;
             let (upstream, _) = counting_upstream().await;
             let config = with_breaker(
@@ -909,7 +915,7 @@ async fn an_admission_that_comes_too_late_is_given_back_if_the_request_was_refus
             for (when, status, left) in [("deny", 503, 5), ("allow", 200, 4)] {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let owner = listener.local_addr().unwrap();
-                let _pod = lone_pod(listener);
+                let _pod = lone_pod(listener).await;
                 let relay = slow_relay(owner, Duration::from_millis(300)).await;
                 let (upstream, _) = counting_upstream().await;
                 let config = with_breaker(
@@ -1130,7 +1136,7 @@ async fn a_stream_let_go_of_ends_without_touching_the_one_that_replaced_it() {
         .run_until(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let owner = listener.local_addr().unwrap();
-            let _pod = lone_pod(listener);
+            let _pod = lone_pod(listener).await;
             let relay = GatedRelay::to(owner).await;
             let (upstream, _) = counting_upstream().await;
             let config = with_breaker(
@@ -1189,7 +1195,7 @@ async fn a_stream_let_go_of_while_opening_does_not_replace_the_one_after_it() {
         .run_until(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let owner = listener.local_addr().unwrap();
-            let _pod = lone_pod(listener);
+            let _pod = lone_pod(listener).await;
             let relay = GatedRelay::to(owner).await;
             let (upstream, _) = counting_upstream().await;
             let config = with_breaker(
@@ -1255,7 +1261,7 @@ async fn a_reload_lets_go_of_the_old_limiter_and_its_streams() {
         .run_until(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let owner = listener.local_addr().unwrap();
-            let _pod = lone_pod(listener);
+            let _pod = lone_pod(listener).await;
             let relay = GatedRelay::to(owner).await;
             let (upstream, _) = counting_upstream().await;
             let in_mode = |timeout_ms| {
@@ -1299,6 +1305,146 @@ async fn a_reload_lets_go_of_the_old_limiter_and_its_streams() {
                 assert!(Instant::now() < deadline, "the limiter outlived its mode");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+        })
+        .await;
+}
+
+/// A relay to whichever address it is pointed at, cutting what it relays when pointed
+/// elsewhere: a pod's address that stays the same across the pod's lives.
+struct Switch {
+    address: String,
+    to: tokio::sync::watch::Sender<SocketAddr>,
+}
+
+impl Switch {
+    async fn to(to: SocketAddr) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (to, target) = tokio::sync::watch::channel(to);
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                let mut pointed = target.clone();
+                let at = *pointed.borrow_and_update();
+                tokio::spawn(async move {
+                    if let Ok(mut server) = TcpStream::connect(at).await {
+                        tokio::select! {
+                            _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {}
+                            _ = pointed.changed() => {}
+                        }
+                    }
+                });
+            }
+        });
+        Self { address, to }
+    }
+
+    fn point(&self, to: SocketAddr) {
+        self.to.send_replace(to);
+    }
+}
+
+/// An owner that comes back in a new life before the other pods have taken it out refuses
+/// data planes as not serving until the view takes it in again: its keys are asked of
+/// their next owner meanwhile, which holds their copies — not decided from nothing, nor
+/// left to `when_unreachable`.
+#[tokio::test]
+async fn the_keys_of_an_owner_not_serving_go_to_the_next() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Slow to suspect a pod, so that the view still names one that went.
+            let timing = Timing {
+                silence: Duration::from_secs(5),
+                ..pod_timing()
+            };
+            let placeholder: SocketAddr = "127.0.0.1:9".parse().unwrap();
+            let mut switches = Vec::new();
+            for _ in 0..3 {
+                switches.push(Switch::to(placeholder).await);
+            }
+            let addresses: Vec<String> = switches.iter().map(|s| s.address.clone()).collect();
+            let serve = |id: u32, incarnation: u64, peers: BTreeMap<u32, Client>| {
+                async move {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let at = listener.local_addr().unwrap();
+                    let pod = SyncPod::spawn(id, vec![0, 1, 2], incarnation, timing, peers);
+                    let server = SyncServer::new(pod.clone());
+                    tokio::spawn(async move {
+                        let _ended = tonic::transport::Server::builder()
+                            .serve_with_incoming(server, TcpIncoming::from(listener))
+                            .await;
+                    });
+                    (pod, at)
+                }
+            };
+            let peers_of = |id: u32| -> BTreeMap<u32, Client> {
+                (0..3)
+                    .filter(|pod| *pod != id)
+                    .map(|pod| (pod, Client::new(&addresses[pod as usize]).unwrap()))
+                    .collect()
+            };
+            let mut pods = Vec::new();
+            for id in 0..3 {
+                let (pod, at) = serve(id, 1, peers_of(id)).await;
+                switches[id as usize].point(at);
+                pods.push(pod);
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !pods
+                .iter()
+                .all(|pod| matches!(pod.view(), (view, true) if view.pods == [0, 1, 2]))
+            {
+                assert!(Instant::now() < deadline, "the pods never agreed");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let (upstream, _) = counting_upstream().await;
+            let config = synchronous_in(
+                everything_config(upstream),
+                &[("per-client", 1)],
+                &addresses,
+                500,
+                "deny",
+            );
+            let (_, key) = keys_of(&config).remove(0);
+            let view = View {
+                epoch: 1,
+                pods: vec![0, 1, 2],
+            };
+            let (owner, next) = view.owners(&key);
+            let (owner, next) = (owner.unwrap() as usize, next.unwrap() as usize);
+            let (proxy, mut sends) = serving(&config, 1).await;
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            while pods[next].key_count() == 0 {
+                assert!(Instant::now() < deadline, "the next owner never had the copy");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // The owner goes, and a new life of it comes up at its address, unheard by the
+            // others: never taken in, it refuses data planes as not serving.
+            pods[owner].stop();
+            let (back, at) = serve(owner as u32, 2, BTreeMap::new()).await;
+            switches[owner].point(at);
+            assert!(!back.view().1);
+            // The worker sees its old connection end first, as when a pod restarts: a
+            // request sent on it meanwhile is lost with it, as any is on a broken stream.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                statuses(&send_round(&mut sends, 1).await),
+                [429],
+                "decided by the next owner, from its copy"
+            );
+            // Marked not serving, it is not asked again: the next request goes to the next
+            // owner at once.
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [429]);
+            assert_eq!(
+                metric(
+                    &proxy.metrics(),
+                    &format!(
+                        r#"edgerush_rate_limit_owner_asks_total{{pod="{owner}",outcome="not_serving"}}"#
+                    )
+                ),
+                Some(1),
+                "asked once"
+            );
         })
         .await;
 }
