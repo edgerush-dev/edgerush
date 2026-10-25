@@ -3,8 +3,13 @@
 //! ```text
 //! edgerush-ratelimit-service --id 0 --listen 0.0.0.0:7000 \
 //!     --pod 0=rl-0:7000 --pod 1=rl-1:7000 --pod 2=rl-2:7000 [--cycle-ms 10] \
-//!     [--max-key-bytes 268435456] [--metrics 0.0.0.0:9090]
+//!     [--max-key-bytes 268435456] [--metrics 0.0.0.0:9090] [--mode asynchronous]
 //! ```
+//!
+//! `--mode` is the rate-limiting mode the pod serves, `asynchronous` unless said, or
+//! `synchronous`: a pod serves one. `--cycle-ms` is the data planes' cycle in the
+//! asynchronous mode, and in the synchronous mode the pod's own, between its copies of
+//! what changed.
 //!
 //! `--pod` names every service pod, this one too: the members among which a majority agrees
 //! which of them serve (`edgerush_ratelimit::service::membership`). `--max-key-bytes` is
@@ -15,6 +20,7 @@ use edgerush_ratelimit::service::PodId;
 use edgerush_ratelimit_service::grpc::{Client, Server};
 use edgerush_ratelimit_service::pod::{Pod, Timing};
 use edgerush_ratelimit_service::scrape;
+use edgerush_ratelimit_service::synchronous::{self, SyncPod, SyncServer};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -23,8 +29,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// What `--max-key-bytes` is when left out: 256 MiB.
 const MAX_KEY_BYTES: u64 = 256 << 20;
 
+/// The rate-limiting mode a pod serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Asynchronous,
+    Synchronous,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
+    mode: Mode,
     id: PodId,
     listen: SocketAddr,
     pods: BTreeMap<PodId, String>,
@@ -35,7 +49,7 @@ struct Args {
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let (mut id, mut listen, mut pods, mut cycle) = (None, None, BTreeMap::new(), 10);
-    let (mut max_key_bytes, mut metrics) = (MAX_KEY_BYTES, None);
+    let (mut max_key_bytes, mut metrics, mut mode) = (MAX_KEY_BYTES, None, Mode::Asynchronous);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -49,13 +63,27 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     address.to_owned(),
                 );
             }
-            "--cycle-ms" => cycle = value()?.parse().map_err(|_| "--cycle-ms: a number")?,
+            // A cycle of nothing would tick without end.
+            "--cycle-ms" => {
+                cycle = value()?
+                    .parse()
+                    .ok()
+                    .filter(|ms| *ms > 0)
+                    .ok_or("--cycle-ms: a number of milliseconds, at least 1")?;
+            }
             "--max-key-bytes" => {
                 max_key_bytes = value()?
                     .parse()
                     .ok()
                     .filter(|bytes| *bytes > 0)
                     .ok_or("--max-key-bytes: a number of bytes, at least 1")?;
+            }
+            "--mode" => {
+                mode = match value()?.as_str() {
+                    "asynchronous" => Mode::Asynchronous,
+                    "synchronous" => Mode::Synchronous,
+                    _ => return Err("--mode: asynchronous or synchronous".to_owned()),
+                };
             }
             "--metrics" => {
                 metrics = Some(value()?.parse().map_err(|_| "--metrics: host:port")?);
@@ -67,7 +95,11 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     if !pods.contains_key(&id) {
         return Err("--pod must name this pod too".to_owned());
     }
+    if mode == Mode::Synchronous && metrics.is_some() {
+        return Err("--metrics is for the asynchronous mode, for now".to_owned());
+    }
     Ok(Args {
+        mode,
         id,
         listen: listen.ok_or("--listen is required")?,
         pods,
@@ -114,6 +146,24 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         if *id != args.id {
             peers.insert(*id, Client::new(address)?);
         }
+    }
+    if args.mode == Mode::Synchronous {
+        let pod = SyncPod::spawn(
+            args.id,
+            members,
+            incarnation,
+            synchronous::Timing::with_copy(args.cycle),
+            peers,
+        );
+        pod.set_capacity(args.max_key_bytes);
+        eprintln!(
+            "edgerush-ratelimit-service: synchronous pod {} on {}",
+            args.id, args.listen
+        );
+        tonic::transport::Server::builder()
+            .serve_with_shutdown(args.listen, SyncServer::new(pod), stopped())
+            .await?;
+        return Ok(());
     }
     let pod = Pod::spawn(
         args.id,
@@ -171,6 +221,45 @@ mod tests {
         "--pod",
         "0=rl-0:7000",
     ];
+
+    #[test]
+    fn the_mode_is_asynchronous_unless_said() {
+        assert_eq!(parsed(&POD).unwrap().mode, Mode::Asynchronous);
+        let with = |more: &[&'static str]| -> Vec<&str> {
+            POD.iter().copied().chain(more.iter().copied()).collect()
+        };
+        assert_eq!(
+            parsed(&with(&["--mode", "synchronous"])).unwrap().mode,
+            Mode::Synchronous
+        );
+        assert_eq!(
+            parsed(&with(&["--mode", "eventual"])),
+            Err("--mode: asynchronous or synchronous".to_owned())
+        );
+        assert_eq!(
+            parsed(&with(&[
+                "--mode",
+                "synchronous",
+                "--metrics",
+                "127.0.0.1:9090"
+            ])),
+            Err("--metrics is for the asynchronous mode, for now".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_a_millisecond_at_least() {
+        let with = |ms: &'static str| -> Vec<&str> {
+            POD.iter().copied().chain(["--cycle-ms", ms]).collect()
+        };
+        assert_eq!(parsed(&with("1")).unwrap().cycle, Duration::from_millis(1));
+        for ms in ["0", "soon"] {
+            assert_eq!(
+                parsed(&with(ms)),
+                Err("--cycle-ms: a number of milliseconds, at least 1".to_owned())
+            );
+        }
+    }
 
     #[test]
     fn what_keys_may_hold_and_where_metrics_go_are_said_or_left_out() {

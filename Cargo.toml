@@ -103,6 +103,9 @@ thiserror = "2.0"
 prost = "0.14"
 tonic = { version = "0.14", default-features = false, features = ["transport"] }
 tower-service = "0.3"
+# The `Stream` trait alone, for the synchronous service's long-lived streams; already in the
+# tree under tonic, hyper and tokio-stream.
+futures-core = { version = "0.3", default-features = false }
 # A BoringSSL connection as a tokio stream: the handshake and the records, nothing more.
 tokio-boring = "5.2"
 # QUIC and HTTP/3 to clients (16 §2), driven by a worker of ours: it does no I/O and keeps

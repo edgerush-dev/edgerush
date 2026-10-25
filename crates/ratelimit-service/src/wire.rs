@@ -410,7 +410,7 @@ impl From<service::Contract> for Contract {
 }
 
 /// The protocol's contract from the wire's, which must be there and hold no zero.
-fn contract(contract: Option<Contract>) -> Result<service::Contract, Invalid> {
+pub(crate) fn contract(contract: Option<Contract>) -> Result<service::Contract, Invalid> {
     let contract = contract.ok_or(Invalid::NoContract)?;
     let n = |n| NonZeroU64::new(n).ok_or(Invalid::ZeroContract);
     Ok(service::Contract {

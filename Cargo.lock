@@ -369,6 +369,7 @@ dependencies = [
  "bytes",
  "edgerush-ratelimit",
  "edgerush-telemetry",
+ "futures-core",
  "http",
  "http-body-util",
  "hyper",
