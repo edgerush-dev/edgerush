@@ -22,7 +22,7 @@ mod kubernetes;
 mod limits;
 mod route;
 
-pub use backends::{UpstreamId, WeightedBackends};
+pub use backends::{Destination, UpstreamId, WeightedBackends};
 pub use compile::{
     Compiled, CompiledDataPlane, CompiledForwarding, CompiledListener, CompiledMirror,
     CompiledRateLimitService, CompiledRateLimiting, CompiledRetry, CompiledRule, CompiledTimeouts,

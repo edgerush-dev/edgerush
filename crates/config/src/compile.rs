@@ -2,6 +2,8 @@
 //! names are resolved to positions, and every problem is reported with its place, not only
 //! the first.
 
+#[cfg(test)]
+use crate::backends::Destination;
 use crate::backends::{UpstreamId, WeightedBackends};
 use crate::limits::{CompiledLimit, compile_limits};
 use crate::route::{
@@ -1349,12 +1351,14 @@ fn proxy_protocol_upstreams(config: &Config, errors: &mut Vec<ConfigError>) {
             };
             let backends = rule.forward.iter().flat_map(|forward| &forward.backends);
             for (at, backend) in backends.enumerate() {
-                if sends(&backend.upstream) {
+                if let Some(upstream) = &backend.upstream
+                    && sends(upstream)
+                {
                     let place = Place {
                         backend: Some(at),
                         ..place.clone()
                     };
-                    let problem = Problem::ProxyProtocolToHttp(backend.upstream.clone());
+                    let problem = Problem::ProxyProtocolToHttp(upstream.clone());
                     errors.push(place.problem(problem));
                 }
             }
@@ -1380,19 +1384,43 @@ fn proxy_protocol_upstreams(config: &Config, errors: &mut Vec<ConfigError>) {
 fn tls_route_probes(config: &Config, errors: &mut Vec<ConfigError>) {
     for route in &config.tls_routes {
         for (at, backend) in route.backends.iter().enumerate() {
+            let Some(name) = &backend.upstream else {
+                continue;
+            };
             let probed = config
                 .upstreams
-                .get(&backend.upstream)
+                .get(name)
                 .and_then(|upstream| upstream.health_check.as_ref());
             if probed.is_some_and(|check| matches!(check.probe, Probe::Http { .. })) {
                 let place = Place {
                     backend: Some(at),
                     ..Place::route(&route.name)
                 };
-                let problem = Problem::HttpProbeBehindTls(backend.upstream.clone());
+                let problem = Problem::HttpProbeBehindTls(name.clone());
                 errors.push(place.problem(problem));
             }
         }
+    }
+}
+
+/// The upstream a backend names, if it names one and is not also invalid; why not, in
+/// `errors`, but for an invalid backend's own case, which is its rule's to judge.
+fn upstream_of<'a>(
+    backend: &'a Backend,
+    place: &Place,
+    errors: &mut Vec<ConfigError>,
+) -> Option<&'a str> {
+    match (&backend.upstream, &backend.invalid) {
+        (Some(upstream), None) => Some(upstream),
+        (Some(_), Some(_)) => {
+            errors.push(place.problem(Problem::UpstreamAndInvalid));
+            None
+        }
+        (None, None) => {
+            errors.push(place.problem(Problem::NoUpstream));
+            None
+        }
+        (None, Some(_)) => None,
     }
 }
 
@@ -1559,18 +1587,24 @@ fn l4_backends(
             backend: Some(at),
             ..place.clone()
         };
-        let Some(&id) = upstream_ids.get(backend.upstream.as_str()) else {
-            errors.push(place.problem(Problem::UnknownUpstream(backend.upstream.clone())));
+        // A connection has no status to be answered with: an invalid backend is an HTTP
+        // rule's.
+        if backend.invalid.is_some() {
+            errors.push(place.problem(Problem::InvalidBackendOfTunnel));
+            continue;
+        }
+        let Some(name) = upstream_of(backend, &place, errors) else {
             continue;
         };
-        let speaks_more = config
-            .upstreams
-            .get(&backend.upstream)
-            .is_some_and(|upstream| {
-                upstream.protocol != UpstreamProtocol::Http1 || upstream.tls.is_some()
-            });
+        let Some(&id) = upstream_ids.get(name) else {
+            errors.push(place.problem(Problem::UnknownUpstream(name.to_owned())));
+            continue;
+        };
+        let speaks_more = config.upstreams.get(name).is_some_and(|upstream| {
+            upstream.protocol != UpstreamProtocol::Http1 || upstream.tls.is_some()
+        });
         if speaks_more {
-            errors.push(place.problem(Problem::PassthroughUpstream(backend.upstream.clone())));
+            errors.push(place.problem(Problem::PassthroughUpstream(name.to_owned())));
         }
         resolved.push((id, backend.weight));
     }
@@ -2088,17 +2122,30 @@ fn backends(
         .iter()
         .enumerate()
         .filter_map(|(at, backend)| {
-            let id = upstream_ids.get(backend.upstream.as_str()).copied();
-            if id.is_none() {
-                let place = Place {
-                    backend: Some(at),
-                    ..place.clone()
-                };
-                errors.push(place.problem(Problem::UnknownUpstream(backend.upstream.clone())));
+            let place = Place {
+                backend: Some(at),
+                ..place.clone()
+            };
+            if let Some(reason) = &backend.invalid {
+                // Neither both nor neither: said once, by `upstream_of`.
+                if backend.upstream.is_some() {
+                    let _ = upstream_of(backend, &place, errors);
+                    return None;
+                }
+                if reason.is_empty() {
+                    errors.push(place.problem(Problem::InvalidBackendWithoutReason));
+                    return None;
+                }
+                return Some((Err(reason.clone()), backend.weight));
             }
-            Some((id?, backend.weight))
+            let name = upstream_of(backend, &place, errors)?;
+            let id = upstream_ids.get(name).copied();
+            if id.is_none() {
+                errors.push(place.problem(Problem::UnknownUpstream(name.to_owned())));
+            }
+            Some((Ok(id?), backend.weight))
         });
-    WeightedBackends::new(resolved.collect::<Vec<_>>())
+    WeightedBackends::with_invalid(resolved.collect::<Vec<_>>())
 }
 
 /// A problem in a config, and where it is.
@@ -2488,6 +2535,19 @@ pub enum Problem {
     /// The match says both.
     #[error("a match has `path` or `grpc`, not both")]
     PathAndGrpc,
+    /// A backend that names no upstream and is not invalid.
+    #[error("a backend names an `upstream` or is `invalid`")]
+    NoUpstream,
+    /// A backend that names an upstream and is invalid too.
+    #[error("a backend names an `upstream` or is `invalid`, not both")]
+    UpstreamAndInvalid,
+    /// An invalid backend that does not say why.
+    #[error("an `invalid` backend says why it is invalid")]
+    InvalidBackendWithoutReason,
+    /// An invalid backend of a TCP or TLS route, whose connections have no status to be
+    /// answered with.
+    #[error("an `invalid` backend is for HTTP rules only")]
+    InvalidBackendOfTunnel,
     /// The gRPC method match names no service or method, or not in their form.
     #[error("gRPC service `{service}` and method `{method}` are not names a call could have")]
     GrpcMethod {
@@ -2821,7 +2881,9 @@ upstreams:
                 let Outcome::Forward { backends, .. } = &rule.outcome else {
                     panic!("the rule forwards");
                 };
-                let upstream = backends.pick(point).unwrap();
+                let Some(Destination::Upstream(upstream)) = backends.pick(point) else {
+                    panic!("an upstream at {point}");
+                };
                 compiled.upstream(upstream).unwrap().name.as_str()
             })
             .collect();
@@ -3820,7 +3882,10 @@ upstreams:
             panic!("db is a tcp listener");
         };
         assert_eq!(db.name, "db");
-        assert_eq!(db.backends.pick(0), Some(UpstreamId(1)));
+        assert_eq!(
+            db.backends.pick(0),
+            Some(Destination::Upstream(UpstreamId(1)))
+        );
         let Some(L4::Tls(sni)) = &listener(&compiled, "sni").l4 else {
             panic!("sni is a tls listener");
         };
@@ -4831,6 +4896,59 @@ upstreams: {{ u: {upstream} }}
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert!(
             refused[0].contains("`endpoints.kubernetes`: not a Service's name"),
+            "{refused:?}"
+        );
+    }
+
+    /// A backend names an upstream or is invalid, saying why, one and not both; an invalid
+    /// one is an HTTP rule's alone, a connection having no status to be answered with.
+    #[test]
+    fn a_backend_is_an_upstream_or_invalid() {
+        let with = |backends: &str| {
+            let yaml = format!(
+                "listeners: {{ web: {{ address: \"[::]:8080\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }} }}
+routes:
+  - {{ name: r, listeners: [web], hostnames: [{{ name: \"*\", falls_through: true }}], rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: {backends} }} }}] }}
+upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
+"
+            );
+            compile(&config(&yaml))
+                .map(|_| ())
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            with(
+                r#"[{ upstream: up, weight: 1 }, { invalid: "Service shop/gone does not exist", weight: 1 }]"#
+            ),
+            Ok(())
+        );
+        let refused = |backends: &str| with(backends).unwrap_err().join("; ");
+        assert!(
+            refused("[{ weight: 1 }]").ends_with("a backend names an `upstream` or is `invalid`")
+        );
+        assert!(
+            refused(r#"[{ upstream: up, invalid: "gone", weight: 1 }]"#)
+                .ends_with("a backend names an `upstream` or is `invalid`, not both")
+        );
+        assert!(
+            refused(r#"[{ invalid: "", weight: 1 }]"#)
+                .ends_with("an `invalid` backend says why it is invalid")
+        );
+        let tunnel =
+            "listeners: { db: { address: \"[::]:5432\", protocol: tcp, proxy_protocol: off } }
+routes: []
+tcp_routes: [{ name: t, listeners: [db], backends: [{ invalid: gone, weight: 1 }] }]
+upstreams: {}
+";
+        let refused: Vec<String> = compile(&config(tunnel))
+            .unwrap_err()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            refused
+                .iter()
+                .any(|problem| problem.ends_with("an `invalid` backend is for HTTP rules only")),
             "{refused:?}"
         );
     }

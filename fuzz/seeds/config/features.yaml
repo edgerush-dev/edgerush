@@ -14,7 +14,7 @@ routes:
         filters:
           - { type: request_mirror, upstream: shadow, fraction: { numerator: 1, denominator: 10 } }
         forward:
-          backends: [{ upstream: orders, weight: 1 }]
+          backends: [{ upstream: orders, weight: 9 }, { invalid: "Service shop/gone does not exist", weight: 1 }]
           retry: { attempts: 2, http_statuses: [502, 503], grpc_statuses: [UNAVAILABLE], on_timeout: false, backoff_base_ms: 25, backoff_max_ms: 250 }
           timeouts: { request_ms: 1500, backend_request_ms: 500 }
       - matches: [{ grpc: { service: pkg.Svc } }]

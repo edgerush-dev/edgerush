@@ -21,7 +21,8 @@ use crate::head::Head;
 use crate::hop_by_hop::ConnectionError;
 use crate::host::{HostError, bare_host};
 use edgerush_config::{
-    Compiled, CompiledListener, CompiledRule, Outcome, Protocol, RuleId, Step, UpstreamId,
+    Compiled, CompiledListener, CompiledRule, Destination, Outcome, Protocol, RuleId, Step,
+    UpstreamId,
 };
 use edgerush_filters::{Requested, Scheme, UrlRewrite};
 use edgerush_router::{
@@ -193,6 +194,10 @@ pub enum Rejection {
     /// The rule has no backend with a share of its requests.
     #[error("no backend")]
     NoBackend,
+    /// The backend picked for it is invalid: the control plane could not follow its
+    /// reference (07 §1), and Gateway API answers its share with a 500.
+    #[error("invalid backend")]
+    InvalidBackend,
     /// The head could not take the changes asked of it: more fields added than its edits
     /// hold. Not reachable from a config the gateway accepts (14 §6).
     #[error("request head cannot take its changes")]
@@ -229,7 +234,9 @@ impl Rejection {
                 StatusCode::BAD_REQUEST
             }
             Self::NoRoute => StatusCode::NOT_FOUND,
-            Self::NoBackend | Self::Edits => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::NoBackend | Self::InvalidBackend | Self::Edits => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             Self::Protocol => StatusCode::NOT_IMPLEMENTED,
             Self::MaxForwards { options: true } => StatusCode::OK,
             Self::MaxForwards { options: false } => StatusCode::METHOD_NOT_ALLOWED,
@@ -496,7 +503,11 @@ fn decide_with<'a, H: Head>(
             }));
         }
     };
-    let upstream = backends.pick(random()).ok_or(Rejection::NoBackend)?;
+    let upstream = match backends.pick(random()) {
+        Some(Destination::Upstream(upstream)) => upstream,
+        Some(Destination::Invalid(_)) => return Err(Rejection::InvalidBackend),
+        None => return Err(Rejection::NoBackend),
+    };
     let limited = if rule.limits.is_empty()
         || (marking == Marking::Enforced && !snapshot.rate_limiting().enforces())
     {
@@ -937,6 +948,7 @@ upstreams:
             (Rejection::Path(NormaliseError::Backslash), "bad_path"),
             (Rejection::NoRoute, "no_route"),
             (Rejection::NoBackend, "no_backend"),
+            (Rejection::InvalidBackend, "invalid_backend"),
             (Rejection::Protocol, "unknown_protocol"),
         ];
         for (rejection, name) in named {
@@ -2445,6 +2457,48 @@ upstreams:
         assert_eq!(Rejection::Target.status(), 400);
         assert_eq!(Rejection::NoRoute.status(), 404);
         assert_eq!(Rejection::NoBackend.status(), 500);
+        assert_eq!(Rejection::InvalidBackend.status(), 500);
+    }
+
+    /// An invalid backend's share of a rule's requests is refused, the others going to
+    /// the rule's upstreams as ever, in proportion to the weights.
+    #[test]
+    fn an_invalid_backends_share_is_refused() {
+        let config: Config = serde_saphyr::from_str(
+            r#"
+listeners: { web: { address: "127.0.0.1:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
+routes:
+  - name: half
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: up, weight: 1 }, { invalid: "Service shop/gone does not exist", weight: 1 }] }
+upstreams:
+  up: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000"] } }
+"#,
+        )
+        .unwrap();
+        let compiled = compile(&config).unwrap();
+        let listener = &compiled.listeners()[0];
+        let decided = |random: u64| {
+            let mut head = head("/cart", &[("host", "shop.example.com")]);
+            decide(
+                &compiled,
+                listener,
+                &mut head,
+                &peer(),
+                &mut || random,
+                None,
+            )
+            .map(|decision| {
+                let forward = forwarding(decision);
+                compiled.upstream(forward.upstream).unwrap().name.clone()
+            })
+        };
+        assert_eq!(decided(0).as_deref(), Ok("up"));
+        assert_eq!(decided(1), Err(Rejection::InvalidBackend));
+        assert_eq!(decided(2).as_deref(), Ok("up"));
     }
 
     /// Targets the `http` crate takes, with paths that often need normalising.

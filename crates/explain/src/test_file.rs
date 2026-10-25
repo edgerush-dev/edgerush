@@ -161,15 +161,9 @@ pub struct Forward {
     pub rate_limits: Option<Vec<String>>,
 }
 
-/// A backend and its weight.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Backend {
-    /// The upstream.
-    pub upstream: String,
-    /// Its weight.
-    pub weight: u32,
-}
+/// A backend and its weight, spelled as a config spells it: an upstream, or an invalid one
+/// and why.
+pub use edgerush_config::Backend;
 
 /// A mirror and the share of requests it is sent.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

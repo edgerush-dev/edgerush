@@ -7,7 +7,7 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_config::{UpstreamId, WeightedBackends};
+use edgerush_config::{Destination, UpstreamId, WeightedBackends};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
 
@@ -21,7 +21,7 @@ fn backends(count: usize) -> WeightedBackends {
 #[bench::canary_split(backends(2), 0x9E37_79B9_7F4A_7C15)]
 #[bench::sixteen_backends(backends(16), 0x9E37_79B9_7F4A_7C15)]
 #[bench::nowhere_to_go(backends(0), 0x9E37_79B9_7F4A_7C15)]
-fn pick(backends: WeightedBackends, random: u64) -> (WeightedBackends, Option<UpstreamId>) {
+fn pick(backends: WeightedBackends, random: u64) -> (WeightedBackends, Option<Destination>) {
     let picked = black_box(&backends).pick(black_box(random));
     (backends, picked)
 }

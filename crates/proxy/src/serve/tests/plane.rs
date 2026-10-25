@@ -227,6 +227,41 @@ fn the_target_keeps_its_path_and_query_at_the_endpoint() {
     }
 }
 
+/// A request a rule sends to an invalid backend is answered 500 by the data plane, and
+/// counted under `invalid_backend`: Gateway API's answer for a reference the control plane
+/// could not follow.
+#[tokio::test]
+async fn an_invalid_backend_is_answered_500_and_counted() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let config: Config = serde_saphyr::from_str(
+                r#"
+listeners: { web: { address: "127.0.0.1:0", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
+routes:
+  - name: gone
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ invalid: "Service shop/gone does not exist", weight: 1 }] }
+upstreams: {}
+"#,
+            )
+            .unwrap();
+            let (front, worker) = serving_config(&config).await;
+            let answer = h1_answer(
+                front,
+                b"GET / HTTP/1.1\r\nhost: shop.example.com\r\nconnection: close\r\n\r\n",
+            )
+            .await;
+            assert!(answer.starts_with("HTTP/1.1 500"), "{answer}");
+            let counted = "edgerush_listener_local_answers_total{listener=\"web\",reason=\"invalid_backend\"} 1\n";
+            assert!(worker.proxy.metrics().contains(counted));
+        })
+        .await;
+}
+
 #[test]
 fn an_answer_of_our_own_is_a_status_and_nothing_else_and_is_counted() {
     let proxy = Proxy::new(config_with(&["web"]), NonZeroUsize::MIN).unwrap();
