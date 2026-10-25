@@ -680,6 +680,36 @@ async fn a_certificate_answers_for_the_names_stated_for_it_alone() {
         .await;
 }
 
+/// An `https` listener with no certificate refuses every client in the handshake, one that
+/// asks for a name and one that asks for none, as NGINX's `ssl_reject_handshake`; given
+/// one by a reload, it serves (03 §3).
+#[tokio::test]
+async fn a_listener_with_no_certificate_refuses_every_handshake_until_it_has_one() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let mut config = everything_config(upstream);
+            secured(&mut config, Vec::new(), None);
+            let (front, worker) = serving_compiled(compile(&config).unwrap()).await;
+            for name in ["a.test", "127.0.0.1"] {
+                let Err(refused) = tls_client(front, name, None, |_| {}).await else {
+                    panic!("{name} was served");
+                };
+                assert!(refused.contains("UNRECOGNIZED_NAME"), "{name}: {refused}");
+            }
+            worker
+                .proxy()
+                .reload(everything_secured_to(
+                    upstream,
+                    vec![crate::tls::testing::certificate(&["a.test"])],
+                ))
+                .unwrap();
+            assert!(tls_client(front, "a.test", None, |_| {}).await.is_ok());
+        })
+        .await;
+}
+
 /// TLS 1.2 is the oldest spoken, and a client that can exchange keys post-quantum
 /// does.
 #[tokio::test]

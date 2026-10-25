@@ -1089,17 +1089,17 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             };
             errors.push(Place::listener(name).problem(problem));
         }
-        let certificates = listener.tls.as_ref().map(|tls| tls.certificates.len());
-        match (listener.protocol, certificates) {
-            (Protocol::Https, None | Some(0)) => {
-                errors.push(Place::listener(name).problem(Problem::NoCertificate));
+        // An `https` listener with no certificate refuses every handshake, and serves once
+        // one is given it: translated, it waits so for its first Ingress with TLS.
+        match (listener.protocol, listener.tls.is_some()) {
+            (Protocol::Https, false) => {
+                errors.push(Place::listener(name).problem(Problem::NoTls));
             }
             // A passthrough listener presents nothing: the backend terminates TLS.
-            (Protocol::Http | Protocol::Tcp | Protocol::Tls, Some(_)) => {
+            (Protocol::Http | Protocol::Tcp | Protocol::Tls, true) => {
                 errors.push(Place::listener(name).problem(Problem::TlsUnwanted));
             }
-            (Protocol::Https, Some(_)) | (Protocol::Http | Protocol::Tcp | Protocol::Tls, None) => {
-            }
+            (Protocol::Https, true) | (Protocol::Http | Protocol::Tcp | Protocol::Tls, false) => {}
         }
         if let (Protocol::Https, Some(tls)) = (listener.protocol, &listener.tls) {
             let mut seen = HashSet::new();
@@ -2371,9 +2371,9 @@ pub enum Problem {
         /// The listener that has it.
         other: String,
     },
-    /// An `https` listener with nothing to present.
-    #[error("protocol `https` needs `tls` with a certificate")]
-    NoCertificate,
+    /// An `https` listener without `tls`.
+    #[error("protocol `https` needs `tls`")]
+    NoTls,
     /// A certificate named that the config's certificates do not have.
     #[error("there is no certificate `{0}`")]
     UnknownCertificate(String),
@@ -3732,8 +3732,9 @@ upstreams: {}
         config
     }
 
-    /// An `https` listener names its certificates, at least one; nothing else has any. What
-    /// is in them is for the data plane to read: the model carries them as they came.
+    /// An `https` listener has `tls` and names its certificates, if any; nothing else has
+    /// any. What is in them is for the data plane to read: the model carries them as they
+    /// came.
     #[test]
     fn tls_is_for_https_listeners_and_every_one_has_it() {
         let with = |listener: &str| {
@@ -3786,13 +3787,22 @@ upstreams: {}
         };
         assert_eq!(
             problems(r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#.to_owned()),
-            ["listener `l`: protocol `https` needs `tls` with a certificate"]
+            ["listener `l`: protocol `https` needs `tls`"]
         );
+        // No certificate at all: every client is refused in the handshake, the one that
+        // asks for no name with them, so `without_sni` can only be `none`.
+        let refusing = compile(&with(
+            r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [], without_sni: none } }"#,
+        ))
+        .unwrap();
+        let tls = refusing.listeners[0].tls.as_ref().unwrap();
+        assert!(tls.certificates.is_empty());
+        assert_eq!(tls.without_sni, None);
         assert_eq!(
             problems(
-                r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [], without_sni: none } }"#.to_owned()
+                r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [], without_sni: one } }"#.to_owned()
             ),
-            ["listener `l`: protocol `https` needs `tls` with a certificate"]
+            ["listener `l`: `without_sni` names `one`, which is not one of the listener's certificates"]
         );
         assert_eq!(
             problems(format!(
