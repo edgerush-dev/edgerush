@@ -43,24 +43,6 @@ pub(super) fn runs_rate_limits(config: &Compiled, supported: bool) -> Result<(),
     Ok(())
 }
 
-/// The synchronous mode's side of the process for `config`: none in another mode;
-/// `running`, if it asks as `config` says, so that its workers keep their streams; else a
-/// new one.
-fn sync_for(
-    config: &Compiled,
-    running: Option<&Arc<crate::ratelimit::synchronous::Process>>,
-) -> Option<Arc<crate::ratelimit::synchronous::Process>> {
-    let CompiledRateLimiting::Synchronous(synchronous) = config.rate_limiting() else {
-        return None;
-    };
-    match running {
-        Some(running) if running.is_for(synchronous) => Some(Arc::clone(running)),
-        _ => Some(crate::ratelimit::synchronous::Process::start(
-            synchronous.clone(),
-        )),
-    }
-}
-
 /// Refuses a config with an upstream whose endpoints come from Kubernetes: the data plane
 /// does not watch EndpointSlices yet, and such an upstream would never have an endpoint.
 pub(super) fn discovers_nothing(config: &Compiled) -> Result<(), ProxyError> {
@@ -322,7 +304,9 @@ impl Proxy {
             None => None,
         };
         let synchronous = match &rate_limits.failed {
-            Some(_) => sync_for(&snapshot.config, rate_limits.synchronous.as_ref()),
+            Some(failed) => {
+                self.sync_for(&snapshot.config, rate_limits.synchronous.as_ref(), failed)?
+            }
             None => None,
         };
         // Only now that all of it is accepted: a config refused for one listener must not
@@ -421,6 +405,10 @@ impl Proxy {
             if let Some(hub) = hub {
                 scrape.push_str(&hub.render_stats());
             }
+            let (_, synchronous) = self.sync_limits();
+            if let Some(synchronous) = synchronous {
+                scrape.push_str(&synchronous.render_stats());
+            }
         }
         scrape
     }
@@ -502,6 +490,33 @@ impl Proxy {
         .map_err(|error| ProxyError::RateLimitThread(format!("no thread: {error}")))
     }
 
+    /// The synchronous mode's side of the process for `config`: none in another mode;
+    /// `running`, if it asks as `config` says, so that its workers keep their streams and
+    /// its breakers what they know; else a new one, its probe thread calling `failed` if it
+    /// fails.
+    fn sync_for(
+        &self,
+        config: &Compiled,
+        running: Option<&Arc<crate::ratelimit::synchronous::Process>>,
+        failed: &crate::ratelimit::Failed,
+    ) -> Result<Option<Arc<crate::ratelimit::synchronous::Process>>, ProxyError> {
+        let CompiledRateLimiting::Synchronous(synchronous) = config.rate_limiting() else {
+            return Ok(None);
+        };
+        if let Some(running) = running
+            && running.is_for(synchronous)
+        {
+            return Ok(Some(Arc::clone(running)));
+        }
+        crate::ratelimit::synchronous::Process::start(
+            synchronous.clone(),
+            self.workers,
+            Some(failed.clone()),
+        )
+        .map(Some)
+        .map_err(|error| ProxyError::RateLimitThread(format!("no thread: {error}")))
+    }
+
     /// The running config and the keys its limits are decided with in local mode, taken in
     /// together, as [`hub`](Self::hub) takes the thread.
     pub(super) fn local_limits(
@@ -574,7 +589,7 @@ impl Proxy {
         let failed = crate::ratelimit::Failed(Arc::new(failed));
         rate_limits.hub = self.hub_for(&self.current.load().config, None, &failed)?;
         rate_limits.local = self.local_for(&self.current.load().config, None, &failed)?;
-        rate_limits.synchronous = sync_for(&self.current.load().config, None);
+        rate_limits.synchronous = self.sync_for(&self.current.load().config, None, &failed)?;
         rate_limits.failed = Some(failed);
         Ok(())
     }
