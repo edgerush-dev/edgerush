@@ -1,0 +1,7 @@
+# Objects every case's cluster has: the data plane's IngressClass, which names this
+# controller.
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata: { name: edge }
+spec:
+  controller: edgerush.dev/ingress-controller

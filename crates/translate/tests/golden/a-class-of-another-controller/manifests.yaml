@@ -1,0 +1,23 @@
+# The data plane's IngressClass names another controller: the class is not EdgeRush's to
+# serve, so none of its Ingresses is translated.
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata: { name: theirs }
+spec: { controller: k8s.io/ingress-nginx }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: theirs
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

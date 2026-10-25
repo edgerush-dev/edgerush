@@ -5,13 +5,14 @@
 //! development harness's file is; `report.txt`, the report expected, a finding a line, what
 //! was left out first and then the paths shadowed; and,
 //! where the case says, `passed-over.txt`, how many Ingresses were another data plane's.
-//! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own.
+//! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
+//! the objects of `tests/golden/shared.yaml` go with every case's.
 //! Every config translated must also pass the data plane's own `compile`.
 
 use edgerush_config::{Config, compile};
 use edgerush_translate::{Cluster, Plane, translate};
 use k8s_openapi::api::core::v1::Service;
-use k8s_openapi::api::networking::v1::Ingress;
+use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -20,6 +21,7 @@ use std::path::Path;
 #[derive(Deserialize)]
 #[serde(tag = "kind")]
 enum Manifest {
+    IngressClass(Box<IngressClass>),
     Ingress(Box<Ingress>),
     Service(Box<Service>),
 }
@@ -35,6 +37,7 @@ fn every_case_translates_to_its_config_and_report() {
         let mut cluster = Cluster::default();
         for manifest in serde_saphyr::from_multiple::<Manifest>(manifests).unwrap() {
             match manifest {
+                Manifest::IngressClass(class) => cluster.ingress_classes.push(*class),
                 Manifest::Ingress(ingress) => cluster.ingresses.push(*ingress),
                 Manifest::Service(service) => cluster.services.push(*service),
             }
@@ -58,7 +61,15 @@ fn every_case_translates_to_its_config_and_report() {
         } else {
             shared.clone()
         };
-        let translation = translate(&plane, &cluster(&read(&case.join("manifests.yaml"))));
+        // Every case has the objects every cluster of the tests has: an IngressClass `edge`
+        // that names this controller.
+        let manifests = format!(
+            "{}---
+{}",
+            read(&root.join("shared.yaml")),
+            read(&case.join("manifests.yaml"))
+        );
+        let translation = translate(&plane, &cluster(&manifests));
         // How many Ingresses were another data plane's, where the case says.
         let passed_over = case.join("passed-over.txt");
         if passed_over.exists() {

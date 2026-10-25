@@ -16,12 +16,17 @@ use edgerush_config::{
     PathMatch, Protocol, Route, Rule, Upstream, UpstreamProtocol, Wildcard, compile,
 };
 use k8s_openapi::api::core::v1::Service;
-use k8s_openapi::api::networking::v1::{HTTPIngressPath, Ingress, IngressServiceBackend};
+use k8s_openapi::api::networking::v1::{
+    HTTPIngressPath, Ingress, IngressClass, IngressServiceBackend,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fmt;
+
+/// The controller an IngressClass names to be served by EdgeRush (02 §2).
+pub const CONTROLLER: &str = "edgerush.dev/ingress-controller";
 
 /// The data plane's own settings, which in a cluster are its `DataPlane` resource's
 /// ([05 §1](../../../docs/05-operator.md)).
@@ -43,6 +48,8 @@ pub struct Plane {
 /// The objects translated.
 #[derive(Debug, Clone, Default)]
 pub struct Cluster {
+    /// Every IngressClass seen.
+    pub ingress_classes: Vec<IngressClass>,
     /// Every Ingress seen, whatever its class.
     pub ingresses: Vec<Ingress>,
     /// Every Service seen.
@@ -146,7 +153,12 @@ impl Object {
 
 impl fmt::Display for Object {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}/{}", self.kind, self.namespace, self.name)
+        // An object of no namespace, such as an IngressClass, is the cluster's.
+        if self.namespace.is_empty() {
+            write!(f, "{} {}", self.kind, self.name)
+        } else {
+            write!(f, "{} {}/{}", self.kind, self.namespace, self.name)
+        }
     }
 }
 
@@ -166,6 +178,15 @@ pub enum Problem {
     /// The data plane has no listener to serve it on.
     #[error("the data plane has no `http` listener to serve it on")]
     NoListener,
+    /// The data plane's IngressClass is not there, so no Ingress is its.
+    #[error("not among the objects, so no Ingress of the class is translated")]
+    ClassMissing,
+    /// The data plane's IngressClass is another controller's, so no Ingress is its.
+    #[error(
+        "names controller `{0}`, not `edgerush.dev/ingress-controller`, so no Ingress of the \
+         class is translated"
+    )]
+    ClassNotOurs(String),
 }
 
 /// Translates `cluster`'s objects into the config of the data plane `plane` describes.
@@ -174,12 +195,19 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut routes = Vec::new();
     let mut upstreams = BTreeMap::new();
     let mut report = Vec::new();
+    // An Ingress is the data plane's when its class is, and its class is when the
+    // IngressClass of that name names this controller; one of no class is when that class
+    // is the cluster's default.
+    let claim = class_claim(plane, cluster, &mut report);
+    let ours = |ingress: &&Ingress| match (claim, class_of(ingress)) {
+        (None, _) => false,
+        (Some(_), Some(class)) => class == plane.ingress_class,
+        (Some(default), None) => default,
+    };
     // Oldest first, then by namespace and name, as Gateway API ranks routes: the order is
     // precedence's last tie-breaker (07 §1).
-    let (mut ingresses, others): (Vec<&Ingress>, Vec<&Ingress>) = cluster
-        .ingresses
-        .iter()
-        .partition(|ingress| class_of(ingress) == Some(plane.ingress_class.as_str()));
+    let (mut ingresses, others): (Vec<&Ingress>, Vec<&Ingress>) =
+        cluster.ingresses.iter().partition(ours);
     ingresses.sort_by(|a, b| {
         let key = |ingress: &Ingress| {
             let metadata = &ingress.metadata;
@@ -302,6 +330,49 @@ fn namespace(metadata: &ObjectMeta) -> &str {
     metadata.namespace.as_deref().unwrap_or("default")
 }
 
+/// Whether the data plane's class is this controller's, and if so whether it is the
+/// cluster's default; why not, in the report.
+fn class_claim(plane: &Plane, cluster: &Cluster, report: &mut Vec<Finding>) -> Option<bool> {
+    let object = Object {
+        kind: "IngressClass",
+        namespace: String::new(),
+        name: plane.ingress_class.clone(),
+    };
+    let Some(class) = cluster
+        .ingress_classes
+        .iter()
+        .find(|class| class.metadata.name.as_deref() == Some(plane.ingress_class.as_str()))
+    else {
+        report.push(Finding {
+            object,
+            problem: Problem::ClassMissing,
+        });
+        return None;
+    };
+    let controller = class
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.controller.as_deref())
+        .unwrap_or_default();
+    if controller != CONTROLLER {
+        report.push(Finding {
+            object,
+            problem: Problem::ClassNotOurs(controller.to_owned()),
+        });
+        return None;
+    }
+    let default = class
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(DEFAULT_CLASS_ANNOTATION))
+        .is_some_and(|value| value == "true");
+    Some(default)
+}
+
+/// The annotation an IngressClass is made the cluster's default with.
+const DEFAULT_CLASS_ANNOTATION: &str = "ingressclass.kubernetes.io/is-default-class";
+
 /// The annotation that named an Ingress's class before `ingressClassName`, and still does
 /// where that is left out.
 const CLASS_ANNOTATION: &str = "kubernetes.io/ingress.class";
@@ -328,13 +399,19 @@ fn ingress_routes(
     cluster: &Cluster,
     ingress: &Ingress,
 ) -> Result<(Vec<Route>, BTreeMap<String, Upstream>), Problem> {
-    // Ours by the old annotation: said apart from other annotations, as the class it names
-    // is the only reason it was taken for this data plane.
-    if ingress
+    // Ours by the old annotation, with no `ingressClassName`: said apart from other
+    // annotations, as the class it names is the only reason it was taken for this data
+    // plane. One of no class at all is the default class's, and comes on.
+    let named = ingress
         .spec
         .as_ref()
-        .is_none_or(|spec| spec.ingress_class_name.is_none())
-    {
+        .is_some_and(|spec| spec.ingress_class_name.is_some());
+    let annotated = ingress
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|annotations| annotations.contains_key(CLASS_ANNOTATION));
+    if !named && annotated {
         return Err(Problem::NotSupportedYet(
             "the `kubernetes.io/ingress.class` annotation",
         ));
@@ -535,6 +612,14 @@ mod tests {
         translate(
             &plane,
             &Cluster {
+                ingress_classes: vec![
+                    serde_saphyr::from_str(
+                        "metadata: { name: edge }
+spec: { controller: edgerush.dev/ingress-controller }
+",
+                    )
+                    .unwrap(),
+                ],
                 ingresses: vec![ingress("good", "/"), ingress("bad", "/a/../admin")],
                 services: vec![service],
             },

@@ -1,0 +1,10 @@
+ingress_class: absent
+cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
