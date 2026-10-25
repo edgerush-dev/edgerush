@@ -59,6 +59,19 @@ jobs:
             cargo install --locked cargo-deny@0.20.2
           fi
 
+      # Temporary, for a diagnostic pull request: the service tests 30 times over.
+      - name: Hand-back flake
+        run: |
+          cargo test -p edgerush-ratelimit-service --test service --no-run
+          fails=0
+          for i in $(seq 1 30); do
+            if ! cargo test -q -p edgerush-ratelimit-service --test service > run.log 2>&1; then
+              fails=$((fails+1)); echo "::group::run $i failed"; cat run.log; echo "::endgroup::"
+            fi
+          done
+          echo "fails=$fails of 30"
+          [ "$fails" -eq 0 ]
+
       - name: Checks
         run: ./check.sh
 

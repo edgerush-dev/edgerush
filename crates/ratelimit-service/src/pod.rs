@@ -228,6 +228,7 @@ impl Running {
     /// The view changed: the node follows it, and serves if it took this pod in.
     fn follow(&mut self, view: Option<View>) {
         if let Some(view) = view {
+            eprintln!("DIAG pod {} takes view {view:?}", self.me);
             let now = self.now();
             self.node.on_view(view, now);
         }
@@ -359,7 +360,14 @@ impl Sender {
                     // over from a copy that missed some is what the data planes' `seen`
                     // marks are for.
                     for piece in replicas.into_pieces() {
-                        if let Err(Error::TooLong(_)) = sending.replicate(piece).await {
+                        let (h, n, e) = (piece.handover, piece.entries.len(), piece.epoch);
+                        let sent = sending.replicate(piece).await;
+                        if let Err(error) = &sent {
+                            eprintln!(
+                                "DIAG from {from} piece handover={h} entries={n} epoch={e} failed: {error:?}"
+                            );
+                        }
+                        if let Err(Error::TooLong(_)) = sent {
                             too_long.fetch_add(1, Ordering::Relaxed);
                         }
                     }

@@ -506,6 +506,16 @@ async fn keys_handed_back_past_a_message_go_in_pieces() {
         assert!(Instant::now() < deadline, "never handed back");
         tokio::time::sleep(CYCLE).await;
     }
+    let mut missing = BTreeMap::<u32, usize>::new();
+    for key in &mine {
+        if counted(&service.pods[0], key, 1).await != Some(1) {
+            *missing.entry(meanwhile.owners(key).0.unwrap()).or_default() += 1;
+        }
+    }
+    eprintln!(
+        "DIAG first key from pod {:?}; missing by pod that owned them meanwhile: {missing:?}",
+        meanwhile.owners(first).0
+    );
     for key in &mine {
         assert_eq!(
             counted(&service.pods[0], key, 1).await,
