@@ -1,0 +1,12 @@
+# The shared data plane, trusting one authority for TLS to backends.
+ingress_class: edge
+cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+backend_authorities: ["CA"]
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate

@@ -1,0 +1,32 @@
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: ingress/shop/web/shop.example.com
+    listeners: [http]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/plain, weight: 1 }] }
+      - matches: [{ path: { prefix: /grpc } }]
+        forward: { backends: [{ upstream: shop/web/grpc, weight: 1 }] }
+      - matches: [{ path: { prefix: /chat } }]
+        forward: { backends: [{ upstream: shop/web/chat, weight: 1 }] }
+      - matches: [{ path: { prefix: /secure-chat } }]
+        forward: { backends: [{ upstream: shop/web/secure-chat, weight: 1 }] }
+      - matches: [{ path: { prefix: /http } }]
+        forward: { backends: [{ invalid: "Service shop/web port http has appProtocol http, which the gateway does not speak", weight: 1 }] }
+      - matches: [{ path: { prefix: /custom } }]
+        forward: { backends: [{ invalid: "Service shop/web port custom has appProtocol example.com/custom, which the gateway does not speak", weight: 1 }] }
+upstreams:
+  shop/web/plain: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:plain" } }
+  shop/web/grpc: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:grpc" }, protocol: http2 }
+  shop/web/chat: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:chat" } }
+  shop/web/secure-chat:
+    load_balancer: p2c
+    endpoints: { kubernetes: "web.shop.svc.cluster.local:secure-chat" }
+    tls: { server_name: web.shop.svc.cluster.local, authorities: ["CA"] }

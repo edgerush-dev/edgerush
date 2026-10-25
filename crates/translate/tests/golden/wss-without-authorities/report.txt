@@ -1,0 +1,1 @@
+Ingress shop/chat: path / (Prefix) on chat.example.com is answered 500: Service shop/chat port wss is kubernetes.io/wss, and the data plane trusts no authorities for TLS to backends

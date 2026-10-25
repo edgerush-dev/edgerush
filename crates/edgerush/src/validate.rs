@@ -31,8 +31,9 @@ Options:
                                plane's IngressClass must be among them, naming
                                `edgerush.dev/ingress-controller`
       --data-plane <FILE>      The data plane's settings, in YAML: `ingress_class`,
-                               `listeners`, `cluster_domain` and
-                               `ingress_hosts_fall_through`
+                               `listeners`, `cluster_domain`,
+                               `ingress_hosts_fall_through` and, optionally,
+                               `backend_authorities`
   -h, --help                   Print help
 ";
 

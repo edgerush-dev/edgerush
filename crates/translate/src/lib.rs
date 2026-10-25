@@ -10,12 +10,13 @@
 //! path type and on any host, and whose default backend takes the rest, to a Service's
 //! port, and that carry no annotations; an Ingress
 //! that asks for anything more is left out whole, reported as not supported yet, rather
-//! than translated in part. A path whose Service, or port, is not there is translated with
-//! an invalid backend, answered 500, and reported too.
+//! than translated in part. A path whose Service, or port, is not there, or whose port's
+//! `appProtocol` the gateway does not speak, is translated with an invalid backend, answered
+//! 500, and reported too.
 
 use edgerush_config::{
     Backend, Config, DataPlane, Endpoints, Forward, Hostname, Listener, LoadBalancer, Match,
-    PathMatch, Protocol, Route, Rule, Upstream, UpstreamProtocol, Wildcard, compile,
+    PathMatch, Protocol, Route, Rule, Upstream, UpstreamProtocol, UpstreamTls, Wildcard, compile,
 };
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::networking::v1::{
@@ -45,6 +46,11 @@ pub struct Plane {
     /// Whether an Ingress host stays a candidate on hosts a more specific claim also covers:
     /// false is nginx's way ([04 §5](../../../docs/04-control-plane.md)).
     pub ingress_hosts_fall_through: bool,
+    /// The certificates, in PEM, of the authorities trusted to vouch for a backend reached
+    /// over TLS: a Service port whose `appProtocol` is `kubernetes.io/wss`. None, and such
+    /// a backend is answered 500.
+    #[serde(default)]
+    pub backend_authorities: Vec<String>,
 }
 
 /// The objects translated.
@@ -75,9 +81,10 @@ pub struct Translation {
     pub shadowed: Vec<Shadowed>,
 }
 
-/// A path whose backend is not there: its Service does not exist, or has no such port. The
-/// path is translated all the same, with an invalid backend in its place, and is answered
-/// 500 until the Service is there (04 §2).
+/// A path whose backend is not there: its Service does not exist, has no such port, or the
+/// port's `appProtocol` is one the gateway cannot speak. The path is translated all the
+/// same, with an invalid backend in its place, and is answered 500 until the Service is
+/// there (04 §2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unresolved {
     /// The Ingress whose path it is.
@@ -647,19 +654,45 @@ fn backend_upstream(
     let Some(backend) = &backend.service else {
         return Err(Problem::NotSupportedYet("a resource backend"));
     };
-    let port = match service_port(cluster, namespace, backend)? {
+    let (port, app_protocol) = match service_port(cluster, namespace, backend)? {
         Ok(port) => port,
         Err(missing) => return Ok(Err(missing)),
     };
     let service = &backend.name;
+    let host = format!("{service}.{namespace}.svc.{}", plane.cluster_domain);
+    let (protocol, tls) = match app_protocol {
+        None | Some("kubernetes.io/ws") => (UpstreamProtocol::Http1, None),
+        Some("kubernetes.io/h2c") => (UpstreamProtocol::Http2, None),
+        Some("kubernetes.io/wss") if plane.backend_authorities.is_empty() => {
+            return Ok(Err(format!(
+                "Service {namespace}/{service} port {port} is kubernetes.io/wss, and the data \
+                 plane trusts no authorities for TLS to backends"
+            )));
+        }
+        // The certificate must carry the Service's own name, as a client inside the
+        // cluster would ask for it.
+        Some("kubernetes.io/wss") => (
+            UpstreamProtocol::Http1,
+            Some(UpstreamTls {
+                server_name: host.clone(),
+                authorities: plane.backend_authorities.clone(),
+                client_certificate: None,
+            }),
+        ),
+        // A protocol the gateway cannot speak makes the backend invalid, as Gateway API has
+        // it (`UnsupportedProtocol`), rather than spoken to in HTTP/1.1 regardless.
+        Some(other) => {
+            return Ok(Err(format!(
+                "Service {namespace}/{service} port {port} has appProtocol {other}, which \
+                 the gateway does not speak"
+            )));
+        }
+    };
     let name = format!("{namespace}/{service}/{port}");
     let upstream = Upstream {
-        endpoints: Endpoints::Kubernetes(format!(
-            "{service}.{namespace}.svc.{}:{port}",
-            plane.cluster_domain
-        )),
-        protocol: UpstreamProtocol::default(),
-        tls: None,
+        endpoints: Endpoints::Kubernetes(format!("{host}:{port}")),
+        protocol,
+        tls,
         keepalive: None,
         health_check: None,
         load_balancer: LoadBalancer::P2c,
@@ -670,13 +703,13 @@ fn backend_upstream(
 }
 
 /// The Service port a backend names, as EndpointSlices know it: its name, or, for a
-/// Service's only port left unnamed, its number (03 §6). Or what is not there; or why the
-/// Ingress is left out.
-fn service_port(
-    cluster: &Cluster,
+/// Service's only port left unnamed, its number (03 §6); and its `appProtocol`. Or what is
+/// not there; or why the Ingress is left out.
+fn service_port<'a>(
+    cluster: &'a Cluster,
     namespace: &str,
     backend: &IngressServiceBackend,
-) -> Result<Result<String, String>, Problem> {
+) -> Result<Result<(String, Option<&'a str>), String>, Problem> {
     // Kubernetes requires a port, by name or by number, of a Service backend.
     let wanted = match &backend.port {
         Some(wanted) if wanted.name.is_some() || wanted.number.is_some() => wanted,
@@ -714,14 +747,17 @@ fn service_port(
             "Service {namespace}/{service_name} has no port {wanted}"
         )));
     };
-    match port.name.as_deref() {
-        Some(name) if !name.is_empty() => Ok(Ok(name.to_owned())),
+    let name = match port.name.as_deref() {
+        Some(name) if !name.is_empty() => name.to_owned(),
         // Kubernetes names every port of a Service with more than one.
-        _ if ports.len() == 1 => Ok(Ok(port.port.to_string())),
-        _ => Err(Problem::NotSupportedYet(
-            "an unnamed port of a Service with several",
-        )),
-    }
+        _ if ports.len() == 1 => port.port.to_string(),
+        _ => {
+            return Err(Problem::NotSupportedYet(
+                "an unnamed port of a Service with several",
+            ));
+        }
+    };
+    Ok(Ok((name, port.app_protocol.as_deref())))
 }
 
 #[cfg(test)]
