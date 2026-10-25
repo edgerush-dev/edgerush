@@ -1001,3 +1001,208 @@ async fn a_reload_mid_outage_keeps_the_breakers_and_the_local_buckets() {
         })
         .await;
 }
+
+/// A relay to `to` whose connections each have a gate on what `to` sends: open, it passes;
+/// shut, it is held until the gate opens again. Says how many connections it accepted and
+/// which have ended.
+struct GatedRelay {
+    address: String,
+    gates: Arc<std::sync::Mutex<Vec<tokio::sync::watch::Sender<bool>>>>,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+    /// The connections that have ended, by the order they were accepted in.
+    ended: Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+impl GatedRelay {
+    async fn to(to: SocketAddr) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let gates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ended = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (held_gates, held_accepted, held_ended) = (
+            Arc::clone(&gates),
+            Arc::clone(&accepted),
+            Arc::clone(&ended),
+        );
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(server) = TcpStream::connect(to).await else {
+                    continue;
+                };
+                let (gate, mut open) = tokio::sync::watch::channel(true);
+                held_gates.lock().unwrap().push(gate);
+                let nth = held_accepted.fetch_add(1, Ordering::Relaxed);
+                let (mut from_client, mut to_client) = client.into_split();
+                let (mut from_server, mut to_server) = server.into_split();
+                tokio::spawn(async move {
+                    let _ended = tokio::io::copy(&mut from_client, &mut to_server).await;
+                });
+                let ended = Arc::clone(&held_ended);
+                tokio::spawn(async move {
+                    let mut buffer = vec![0; 16_384];
+                    while let Ok(read) = from_server.read(&mut buffer).await
+                        && read > 0
+                    {
+                        if open.wait_for(|open| *open).await.is_err()
+                            || to_client.write_all(&buffer[..read]).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    ended.lock().unwrap().push(nth);
+                });
+            }
+        });
+        Self {
+            address,
+            gates,
+            accepted,
+            ended,
+        }
+    }
+
+    /// Opens or shuts the gate of the `nth` connection accepted, from 0.
+    fn gate(&self, nth: usize, open: bool) {
+        self.gates.lock().unwrap()[nth].send_replace(open);
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::Relaxed)
+    }
+
+    fn ended(&self) -> usize {
+        self.ended.lock().unwrap().len()
+    }
+
+    /// Whether the `nth` connection accepted has ended.
+    fn has_ended(&self, nth: usize) -> bool {
+        self.ended.lock().unwrap().contains(&nth)
+    }
+}
+
+/// A stream let go of while its owner's breaker was open ends only later, after the worker
+/// has opened another to the same owner: its end is its own, and leaves the stream that
+/// replaced it as it is — no request fails on it, and none has to open yet another.
+#[tokio::test]
+async fn a_stream_let_go_of_ends_without_touching_the_one_that_replaced_it() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let owner = listener.local_addr().unwrap();
+            let _pod = lone_pod(listener);
+            let relay = GatedRelay::to(owner).await;
+            let (upstream, _) = counting_upstream().await;
+            let config = with_breaker(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 100)],
+                    std::slice::from_ref(&relay.address),
+                    300,
+                    "deny",
+                ),
+                1,
+                200,
+            );
+            let (proxy, mut sends) = serving(&config, 1).await;
+            // Connection 0, opened with the limiter, answers.
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            // Then holds its answers: an ask times out and opens the breaker.
+            relay.gate(0, false);
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            // The worker lets go of connection 0, whose end the gate holds.
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            // The probe (connection 1) closes the breaker; a request opens connection 2.
+            let open = r#"edgerush_rate_limit_owner_breaker_open{pod="0"}"#;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while metric(&proxy.metrics(), open) != Some(0) {
+                assert!(Instant::now() < deadline, "the breaker never closed");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            assert_eq!(
+                relay.accepted(),
+                3,
+                "the first, the probe's, and the new one"
+            );
+            // Connection 0's end reaches its reader now.
+            let ended = relay.ended();
+            relay.gate(0, true);
+            while relay.ended() == ended {
+                assert!(Instant::now() < deadline, "connection 0 never ended");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(statuses(&send_round(&mut sends, 3).await), [200, 200, 200]);
+            assert_eq!(relay.accepted(), 3, "connection 2 carried on");
+        })
+        .await;
+}
+
+/// A connection the worker let go of while it was still being opened, opened only later,
+/// after the worker had opened another to the same owner: it is closed, and the one that
+/// replaced it carries on.
+#[tokio::test]
+async fn a_stream_let_go_of_while_opening_does_not_replace_the_one_after_it() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let owner = listener.local_addr().unwrap();
+            let _pod = lone_pod(listener);
+            let relay = GatedRelay::to(owner).await;
+            let (upstream, _) = counting_upstream().await;
+            let config = with_breaker(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 100)],
+                    std::slice::from_ref(&relay.address),
+                    300,
+                    "deny",
+                ),
+                1,
+                200,
+            );
+            let (proxy, mut sends) = serving(&config, 1).await;
+            // The limiter is made, and connection 0 opened, at the first request; its gate
+            // is shut as soon as it is accepted, so its opening hangs and the ask times out.
+            let first = send_round(&mut sends, 1);
+            let shut_early = async {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while relay.accepted() == 0 {
+                    assert!(Instant::now() < deadline, "connection 0 never came");
+                    tokio::task::yield_now().await;
+                }
+                relay.gate(0, false);
+            };
+            let (first, ()) = tokio::join!(first, shut_early);
+            assert_eq!(statuses(&first), [503]);
+            // The worker lets go of connection 0 while it is still opening.
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            let open = r#"edgerush_rate_limit_owner_breaker_open{pod="0"}"#;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while metric(&proxy.metrics(), open) != Some(0) {
+                assert!(Instant::now() < deadline, "the breaker never closed");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            assert_eq!(
+                relay.accepted(),
+                3,
+                "the first, the probe's, and the new one"
+            );
+            // Connection 0 opens now: it is closed, and connection 2 kept.
+            relay.gate(0, true);
+            while !relay.has_ended(0) {
+                assert!(Instant::now() < deadline, "connection 0 was kept");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!relay.has_ended(2), "connection 2 let go of");
+            assert_eq!(statuses(&send_round(&mut sends, 2).await), [200, 200]);
+            assert_eq!(relay.accepted(), 3);
+        })
+        .await;
+}

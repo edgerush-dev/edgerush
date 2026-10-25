@@ -345,14 +345,16 @@ type Kept = Vec<(Vec<u8>, Contract)>;
 /// An owner's answer, or why there is none: its stream broke, or could not be opened.
 type Answer = Result<wire::Decided, ()>;
 
-/// What is sent up a stream while it is being opened.
+/// A worker's connection to a pod, as it stands: each one opened has a number of its own,
+/// its generation, so that an old connection let go of, whose end comes later, touches
+/// only what is its own and never the one that replaced it.
 enum Link {
     /// Not open: the next message opens it.
     Down,
     /// Being opened, with what is to go up once it is.
-    Opening(Vec<wire::Upstream>),
+    Opening(u64, Vec<wire::Upstream>),
     /// Open.
-    Up(mpsc::Sender<wire::Upstream>),
+    Up(u64, mpsc::Sender<wire::Upstream>),
 }
 
 /// What waits on an owner's answer, by the number of the ask.
@@ -364,68 +366,109 @@ enum Waiter {
     GivenUp(Kept),
 }
 
-/// A worker's stream to one service pod, and what waits on its answers.
+/// A worker's stream to one service pod, and what waits on its answers, each with the
+/// generation of the connection it was sent on.
 struct Stream {
     address: String,
     link: RefCell<Link>,
-    waiting: RefCell<HashMap<u64, Waiter>>,
+    /// The generation the next connection opened gets.
+    next: Cell<u64>,
+    waiting: RefCell<HashMap<u64, (u64, Waiter)>>,
 }
 
 impl Stream {
-    /// Sends `message` up, opening the stream first if it is not open; false if it cannot
-    /// go: the stream broke, or too much waits for it.
-    fn send(self: &Rc<Self>, message: wire::Upstream, view: &Rc<RefCell<View>>) -> bool {
+    /// Sends `message` up, opening the stream first if it is not open: the generation of
+    /// the connection it went on, or none if it cannot go — the stream broke, or too much
+    /// waits for it.
+    fn send(self: &Rc<Self>, message: wire::Upstream, view: &Rc<RefCell<View>>) -> Option<u64> {
         let mut link = self.link.borrow_mut();
         match &mut *link {
-            Link::Up(up) => match up.try_send(message) {
-                Ok(()) => true,
-                Err(mpsc::error::TrySendError::Full(_)) => false,
+            Link::Up(generation, up) => match up.try_send(message) {
+                Ok(()) => Some(*generation),
+                Err(mpsc::error::TrySendError::Full(_)) => None,
                 Err(mpsc::error::TrySendError::Closed(_)) => {
+                    let generation = *generation;
                     *link = Link::Down;
                     drop(link);
-                    self.broke();
-                    false
+                    self.broke(generation);
+                    None
                 }
             },
-            Link::Opening(queued) => {
+            Link::Opening(generation, queued) => {
                 if queued.len() >= QUEUED {
-                    return false;
+                    return None;
                 }
                 queued.push(message);
-                true
+                Some(*generation)
             }
             Link::Down => {
-                *link = Link::Opening(vec![message]);
-                tokio::task::spawn_local(open(Rc::downgrade(self), Rc::downgrade(view)));
-                true
+                let generation = self.opening();
+                *link = Link::Opening(generation, vec![message]);
+                tokio::task::spawn_local(open(
+                    Rc::downgrade(self),
+                    Rc::downgrade(view),
+                    generation,
+                ));
+                Some(generation)
             }
         }
+    }
+
+    /// The generation of a connection about to be opened.
+    fn opening(&self) -> u64 {
+        let generation = self.next.get();
+        self.next.set(generation.wrapping_add(1));
+        generation
     }
 
     /// Lets go of the stream, if it is open or opening, and of what waits on it: its owner's
     /// breaker is open.
     fn shut(&self) {
         let was = std::mem::replace(&mut *self.link.borrow_mut(), Link::Down);
-        if !matches!(was, Link::Down) {
-            self.broke();
+        if let Link::Opening(generation, _) | Link::Up(generation, _) = was {
+            self.broke(generation);
         }
     }
 
-    /// Hands every request waiting on it the news that its owner will not answer; those
-    /// that gave up on it hear no more.
-    fn broke(&self) {
-        let waiting = std::mem::take(&mut *self.waiting.borrow_mut());
-        for (_, waiter) in waiting {
+    /// Hands every request waiting on the connection of `generation` the news that its
+    /// owner will not answer on it; those that gave up on it hear no more.
+    fn broke(&self, generation: u64) {
+        let mut waiting = self.waiting.borrow_mut();
+        let gone: Vec<u64> = waiting
+            .iter()
+            .filter(|(_, (on, _))| *on == generation)
+            .map(|(id, _)| *id)
+            .collect();
+        let broken: Vec<Waiter> = gone
+            .iter()
+            .filter_map(|id| waiting.remove(id).map(|(_, waiter)| waiter))
+            .collect();
+        drop(waiting);
+        for waiter in broken {
             if let Waiter::Asked(asked) = waiter {
                 let _gone = asked.send(Err(()));
             }
         }
     }
+
+    /// Lets go of the connection of `generation`, which ended: the stream is down if it is
+    /// still the one it has, and what waited on it is told.
+    fn ended(&self, generation: u64) {
+        let mut link = self.link.borrow_mut();
+        if let Link::Opening(current, _) | Link::Up(current, _) = &*link
+            && *current == generation
+        {
+            *link = Link::Down;
+        }
+        drop(link);
+        self.broke(generation);
+    }
 }
 
-/// Opens `stream`, sends what waited for it, and hands out its answers and the pods' view
-/// until it ends, or the worker lets go of it.
-async fn open(stream: Weak<Stream>, view: Weak<RefCell<View>>) {
+/// Opens the connection of `generation` for `stream`, sends what waited for it, and hands
+/// out its answers and the pods' view until it ends, or the worker lets go of it. A
+/// connection the worker let go of while it was being opened is closed at once.
+async fn open(stream: Weak<Stream>, view: Weak<RefCell<View>>, generation: u64) {
     let Some(address) = stream.upgrade().map(|stream| stream.address.clone()) else {
         return;
     };
@@ -435,13 +478,19 @@ async fn open(stream: Weak<Stream>, view: Weak<RefCell<View>>) {
     };
     let mut down = match opened {
         Ok(opened) => {
-            let queued = match std::mem::replace(
-                &mut *held.link.borrow_mut(),
-                Link::Up(opened.up.clone()),
-            ) {
-                Link::Opening(queued) => queued,
-                Link::Down | Link::Up(_) => Vec::new(),
+            let mut link = held.link.borrow_mut();
+            let Link::Opening(current, _) = &*link else {
+                return;
             };
+            if *current != generation {
+                return;
+            }
+            let Link::Opening(_, queued) =
+                std::mem::replace(&mut *link, Link::Up(generation, opened.up.clone()))
+            else {
+                return;
+            };
+            drop(link);
             for message in queued {
                 if opened.up.try_send(message).is_err() {
                     break;
@@ -450,8 +499,7 @@ async fn open(stream: Weak<Stream>, view: Weak<RefCell<View>>) {
             opened.down
         }
         Err(_) => {
-            *held.link.borrow_mut() = Link::Down;
-            held.broke();
+            held.ended(generation);
             return;
         }
     };
@@ -465,7 +513,11 @@ async fn open(stream: Weak<Stream>, view: Weak<RefCell<View>>) {
             Ok(Some(wire::Downstream {
                 message: Some(wire::FromOwner::Decided(decided)),
             })) => {
-                let waiter = held.waiting.borrow_mut().remove(&decided.id);
+                let waiter = held
+                    .waiting
+                    .borrow_mut()
+                    .remove(&decided.id)
+                    .map(|(_, waiter)| waiter);
                 match waiter {
                     Some(Waiter::Asked(asked)) => {
                         let _gone = asked.send(Ok(decided));
@@ -493,8 +545,7 @@ async fn open(stream: Weak<Stream>, view: Weak<RefCell<View>>) {
             }
             Ok(Some(wire::Downstream { message: None })) => {}
             Ok(None) | Err(_) => {
-                *held.link.borrow_mut() = Link::Down;
-                held.broke();
+                held.ended(generation);
                 return;
             }
         }
@@ -533,7 +584,8 @@ impl SyncLimiter {
             .map(|address| {
                 Rc::new(Stream {
                     address: address.clone(),
-                    link: RefCell::new(Link::Opening(Vec::new())),
+                    link: RefCell::new(Link::Opening(0, Vec::new())),
+                    next: Cell::new(1),
                     waiting: RefCell::new(HashMap::new()),
                 })
             })
@@ -543,7 +595,7 @@ impl SyncLimiter {
             .collect();
         let view = Rc::new(RefCell::new(View { epoch: 0, pods }));
         for stream in &streams {
-            tokio::task::spawn_local(open(Rc::downgrade(stream), Rc::downgrade(&view)));
+            tokio::task::spawn_local(open(Rc::downgrade(stream), Rc::downgrade(&view), 0));
         }
         let local = process
             .local
@@ -653,18 +705,20 @@ impl SyncLimiter {
                 .collect();
             let (answered, answer) = oneshot::channel();
             let stream = &self.streams[pod];
-            stream
-                .waiting
-                .borrow_mut()
-                .insert(id, Waiter::Asked(answered));
             let decide = wire::Upstream {
                 message: Some(wire::ToOwner::Decide(wire::Decide { id, keys: sent })),
             };
-            if stream.send(decide, &self.view) {
-                part.answer = Some((id, answer));
-            } else {
-                stream.waiting.borrow_mut().remove(&id);
-                self.process.asked(pod, Ended::Broken);
+            // Registered once sent, on the connection it went on: nothing else runs on the
+            // worker in between, so its answer cannot come first.
+            match stream.send(decide, &self.view) {
+                Some(generation) => {
+                    stream
+                        .waiting
+                        .borrow_mut()
+                        .insert(id, (generation, Waiter::Asked(answered)));
+                    part.answer = Some((id, generation, answer));
+                }
+                None => self.process.asked(pod, Ended::Broken),
             }
         }
         Asked {
@@ -742,7 +796,8 @@ struct Part {
     pod: Option<usize>,
     positions: Vec<usize>,
     kept: Kept,
-    answer: Option<(u64, oneshot::Receiver<Answer>)>,
+    /// The ask's number, the generation of the connection it went on, and its answer.
+    answer: Option<(u64, u64, oneshot::Receiver<Answer>)>,
 }
 
 /// A request asked of its owners, waiting on their answers.
@@ -766,7 +821,7 @@ impl Asked {
         let mut given_up = Vec::new();
         let process = &self.limiter.process;
         for part in std::mem::take(&mut self.parts) {
-            let (Some(pod), Some((id, mut answer))) = (part.pod, part.answer) else {
+            let (Some(pod), Some((id, generation, mut answer))) = (part.pod, part.answer) else {
                 unreached = Some(Undecided::Unavailable);
                 out_of_reach.push((part.positions, part.kept));
                 continue;
@@ -791,7 +846,7 @@ impl Asked {
                 Err(_) => {
                     process.asked(pod, Ended::TimedOut);
                     unreached = Some(Undecided::Timeout);
-                    given_up.push((pod, id, answer, part.kept.clone()));
+                    given_up.push((pod, id, generation, answer, part.kept.clone()));
                     out_of_reach.push((part.positions, part.kept));
                 }
             }
@@ -802,7 +857,7 @@ impl Asked {
         // the last of them giving up and this, so an answer already in is found here and
         // any later one by the stream.
         let refused = !matches!(&decision, Ok(decided) if decided.admitted);
-        for (pod, id, mut answer, keys) in given_up {
+        for (pod, id, generation, mut answer, keys) in given_up {
             let Some(stream) = self.limiter.streams.get(pod) else {
                 continue;
             };
@@ -817,7 +872,7 @@ impl Asked {
                 Err(oneshot::error::TryRecvError::Empty) => {
                     let mut waiting = stream.waiting.borrow_mut();
                     if refused {
-                        waiting.insert(id, Waiter::GivenUp(keys));
+                        waiting.insert(id, (generation, Waiter::GivenUp(keys)));
                     } else {
                         waiting.remove(&id);
                     }
