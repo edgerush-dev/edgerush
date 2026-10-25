@@ -123,11 +123,13 @@ it exits 1 when one goes elsewhere or is answered otherwise: a config's tests fo
 Kubernetes manifests (a file or a directory of them, `kubectl get -o yaml` output included,
 with an IngressClass whose controller is `edgerush.dev/ingress-controller`) as the control
 plane would for one data plane, compiles the config as the data plane would,
-and lists each object left out and why, each path whose backend is not there and each
-path another Ingress already has; it exits 1 when there is one. The data plane's settings
+and lists each object left out and why, each path whose backend is not there, each host
+`tls` lists that is not served over HTTPS and each path another Ingress already has; it
+exits 1 when there is one. The data plane's settings
 stand in for its `DataPlane` resource, which comes with the operator; `backend_authorities`,
 the certificates in PEM trusted for a Service port spoken to over TLS
-(`appProtocol: kubernetes.io/wss`), may be added:
+(`appProtocol: kubernetes.io/wss`), may be added, and an `https` listener, written with
+`tls: { certificates: [], without_sni: none }`, presents the Ingresses' TLS Secrets:
 
 ```yaml
 ingress_class: edge

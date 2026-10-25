@@ -1,0 +1,36 @@
+# A host whose Secret is not there, has no key, holds a key not its certificate's, or
+# does not cover it is served on `http` alone, and the report says why; the Ingress's
+# other hosts are secured as ever.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [a.example.com], secretName: gone }, { hosts: [b.example.com], secretName: keyless }, { hosts: [c.example.com], secretName: mismatched }, { hosts: [d.example.com], secretName: shop-tls }, { hosts: [e.example.com], secretName: wild }]
+  rules:
+    - host: "a.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "b.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "c.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "d.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "e.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

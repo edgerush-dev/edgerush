@@ -8,6 +8,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# A Secret's certificate is read as the data plane will read it, by the same code.
+edgerush-certificates.workspace = true
 edgerush-config.workspace = true
 k8s-openapi.workspace = true
 serde.workspace = true

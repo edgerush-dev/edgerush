@@ -70,6 +70,31 @@ impl Identity {
             key,
         })
     }
+
+    /// Whether the certificate carries `host`, as a client checking it would find it: among
+    /// the DNS names of its subject alternative names, in any letter case, a wildcard
+    /// standing for one whole leftmost label (RFC 6125 §6.4.3), as the data plane matches a
+    /// name. A wildcard `host` is carried only by the same wildcard. The subject's common
+    /// name is not looked at: clients have long stopped reading it (RFC 6125 §6.4.4).
+    #[must_use]
+    pub fn covers(&self, host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        let Some(alternatives) = self.leaf.subject_alt_names() else {
+            return false;
+        };
+        alternatives
+            .iter()
+            .filter_map(|name| name.dnsname())
+            .map(str::to_ascii_lowercase)
+            .any(|name| {
+                name == host
+                    || name.strip_prefix("*.").is_some_and(|parent| {
+                        host.split_once('.').is_some_and(|(label, rest)| {
+                            !label.is_empty() && label != "*" && rest == parent
+                        })
+                    })
+            })
+    }
 }
 
 #[cfg(test)]
@@ -89,6 +114,34 @@ mod tests {
             .filter_map(|name| name.dnsname().map(str::to_owned))
             .collect();
         assert_eq!(names, ["a.test"]);
+    }
+
+    #[test]
+    fn a_certificate_covers_the_names_it_carries_a_wildcard_one_label() {
+        let identity =
+            Identity::read(&certificate(&["shop.example.com", "*.Blog.example.com"])).unwrap();
+        for covered in [
+            "shop.example.com",
+            "SHOP.example.com",
+            "a.blog.example.com",
+            "*.blog.example.com",
+        ] {
+            assert!(identity.covers(covered), "{covered}");
+        }
+        for uncovered in [
+            "example.com",
+            "other.example.com",
+            "blog.example.com",
+            "a.b.blog.example.com",
+            ".blog.example.com",
+            "*.example.com",
+            "*.shop.example.com",
+        ] {
+            assert!(!identity.covers(uncovered), "{uncovered}");
+        }
+        // The common name alone carries nothing.
+        let unnamed = Identity::read(&certificate(&[])).unwrap();
+        assert!(!unnamed.covers("none"));
     }
 
     #[test]

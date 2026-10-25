@@ -1,0 +1,12 @@
+# A data plane with an `https` listener alone.
+ingress_class: edge
+cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+listeners:
+  https:
+    address: "[::]:8443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls: { certificates: [], without_sni: none }

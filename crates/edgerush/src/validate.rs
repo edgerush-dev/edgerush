@@ -4,7 +4,7 @@
 
 use edgerush_config::compile;
 use edgerush_translate::{Cluster, Plane, translate};
-use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -20,8 +20,9 @@ config as the data plane would, and says what was left out and why, without a cl
 Ingresses of another class, or of none, are another data plane's: they are counted, not
 translated.
 Exits 0 when everything was translated and the config compiles, 1 when something was left
-out, a path's backend is not there, a path is shadowed by another Ingress's or the config
-would be refused, and 2 when the files could not be read.
+out, a path's backend is not there, a host `tls` lists is not served over HTTPS, a path is
+shadowed by another Ingress's or the config would be refused, and 2 when the files could
+not be read.
 
 Options:
       --from-manifests <PATH>  Manifests in YAML: a file, or a directory read for every
@@ -29,7 +30,8 @@ Options:
                                `kubectl get -o yaml` writes one, is read for its items;
                                kinds that are not translated are passed over. The data
                                plane's IngressClass must be among them, naming
-                               `edgerush.dev/ingress-controller`
+                               `edgerush.dev/ingress-controller`, and so must the
+                               Secrets the Ingresses' `tls` names
       --data-plane <FILE>      The data plane's settings, in YAML: `ingress_class`,
                                `listeners`, `cluster_domain`,
                                `ingress_hosts_fall_through` and, optionally,
@@ -125,6 +127,7 @@ enum Manifest {
     IngressClass(Box<IngressClass>),
     Ingress(Box<Ingress>),
     Service(Box<Service>),
+    Secret(Box<Secret>),
     List {
         items: Vec<Manifest>,
     },
@@ -138,6 +141,7 @@ impl Manifest {
             Self::IngressClass(class) => cluster.ingress_classes.push(*class),
             Self::Ingress(ingress) => cluster.ingresses.push(*ingress),
             Self::Service(service) => cluster.services.push(*service),
+            Self::Secret(secret) => cluster.secrets.push(*secret),
             Self::List { items } => {
                 for item in items {
                     item.into_cluster(cluster);
@@ -149,7 +153,7 @@ impl Manifest {
 }
 
 /// Translates and compiles. The text, and whether nothing was left out, without its
-/// backend or shadowed, and the config compiles.
+/// backend, unsecured or shadowed, and the config compiles.
 fn run(options: &Options) -> Result<(String, bool), Failed> {
     let plane: Plane = read(&options.data_plane)?;
     let mut cluster = Cluster::default();
@@ -167,6 +171,9 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
     for unresolved in &translation.unresolved {
         let _ = writeln!(text, "{unresolved}");
     }
+    for unsecured in &translation.unsecured {
+        let _ = writeln!(text, "{unsecured}");
+    }
     for shadowed in &translation.shadowed {
         let _ = writeln!(text, "{shadowed}");
     }
@@ -174,11 +181,13 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
     let _ = writeln!(
         text,
         "{} routes and {} upstreams translated; {} left out; {} paths without their backend; \
-         {} paths shadowed; {} Ingresses of other classes or none passed over",
+         {} TLS hosts not served over HTTPS; {} paths shadowed; {} Ingresses of other classes \
+         or none passed over",
         config.routes.len(),
         config.upstreams.len(),
         translation.report.len(),
         translation.unresolved.len(),
+        translation.unsecured.len(),
         translation.shadowed.len(),
         translation.passed_over
     );
@@ -194,6 +203,7 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
     };
     let clean = translation.report.is_empty()
         && translation.unresolved.is_empty()
+        && translation.unsecured.is_empty()
         && translation.shadowed.is_empty();
     Ok((text, clean && !refused))
 }

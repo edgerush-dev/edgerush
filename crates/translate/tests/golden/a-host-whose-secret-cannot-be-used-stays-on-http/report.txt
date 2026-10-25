@@ -1,0 +1,4 @@
+Ingress shop/web: a.example.com is served over HTTP only: Secret shop/gone does not exist
+Ingress shop/web: b.example.com is served over HTTP only: Secret shop/keyless has no tls.key
+Ingress shop/web: c.example.com is served over HTTP only: Secret shop/mismatched cannot be used: the key is not the certificate's
+Ingress shop/web: d.example.com is served over HTTP only: Secret shop/shop-tls does not cover d.example.com

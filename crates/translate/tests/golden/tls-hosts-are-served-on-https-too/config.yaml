@@ -1,0 +1,51 @@
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  https:
+    address: "[::]:8443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: shop/wild, names: [api.example.com, "*.apps.example.com", blog.example.com] }
+        - { certificate: shop/shop-tls, names: [shop.example.com] }
+      without_sni: none
+routes:
+  - name: ingress/shop/web/api.example.com
+    listeners: [http, https]
+    hostnames: [{ name: "api.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/web/plain.example.com
+    listeners: [http]
+    hostnames: [{ name: "plain.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/web/shop.example.com
+    listeners: [http, https]
+    hostnames: [{ name: "shop.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/blog/*.apps.example.com
+    listeners: [http, https]
+    hostnames: [{ name: "*.apps.example.com", wildcard: one_label, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/blog/blog.example.com
+    listeners: [http, https]
+    hostnames: [{ name: "blog.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+upstreams:
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }
