@@ -97,6 +97,12 @@ impl Membership {
         &self.agreed.view
     }
 
+    /// The pods the view it holds took in, each with the life it took it in.
+    #[must_use]
+    pub fn lives(&self) -> &[(PodId, u64)] {
+        &self.agreed.incarnations
+    }
+
     /// Whether the view it holds took it in, in this life: until then it serves nothing.
     #[must_use]
     pub fn serving(&self) -> bool {

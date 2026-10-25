@@ -80,6 +80,12 @@ impl<S: BuildHasher + Clone> Owner<S> {
         self.keys.copies(changed, now)
     }
 
+    /// The state at `now` of every key it holds whose name `keep` takes, changed or not:
+    /// what it hands a pod the view takes in.
+    pub fn copies_of(&self, now: u64, keep: impl Fn(&[u8]) -> bool) -> Vec<Copy> {
+        self.keys.copies_of(now, keep)
+    }
+
     /// Takes in another pod's `copies` at `now`, to carry on from if it goes.
     pub fn install(&self, copies: &[Copy], now: u64) {
         self.keys.install(copies, now);

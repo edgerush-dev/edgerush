@@ -427,3 +427,20 @@ fn most_over((limit, window, burst): (NonZeroU64, NonZeroU64, NonZeroU64), times
     }
     i64::try_from((widest + window - burst * window).div_euclid(window)).unwrap()
 }
+
+/// A hand-back copies every key the filter takes, changed or not, as it stands: a key spent
+/// two of five, at ten a second, is full again in two tenths of a second.
+#[test]
+fn every_key_a_filter_takes_is_copied_as_it_stands() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let c = contract(10, SECOND, 5);
+    for key in [&b"a"[..], b"a", b"b"] {
+        assert!(one(&local, &mut handles, key, c, 0));
+    }
+    let copies = local.copies_of(0, |key| key == b"a");
+    assert_eq!(copies.len(), 1);
+    assert_eq!(&*copies[0].key, b"a");
+    assert_eq!(copies[0].full_in, 2 * SECOND / 10);
+    assert_eq!(local.copies_of(0, |_| true).len(), 2, "both");
+}

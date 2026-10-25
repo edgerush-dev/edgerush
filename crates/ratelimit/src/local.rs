@@ -505,6 +505,26 @@ impl<S: BuildHasher + Clone> Local<S> {
             .collect()
     }
 
+    /// The state at `now` of every key held whose name `keep` takes, closed keys left out
+    /// and change marks left as they are: what a pod hands another taken into the view,
+    /// apart from the cycle's copies of what changed.
+    pub fn copies_of(&self, now: u64, keep: impl Fn(&[u8]) -> bool) -> Vec<Copy> {
+        let mut copies = Vec::new();
+        for shard in &self.shards {
+            for handle in read(shard).iter() {
+                let key = &handle.0;
+                if !key.closed() && keep(&key.key) {
+                    copies.push(Copy {
+                        key: key.key.clone(),
+                        contract: key.contract,
+                        full_in: key.full_in(now),
+                    });
+                }
+            }
+        }
+        copies
+    }
+
     /// Takes in an owner's `copies` at `now`: each key made if it is not held, and set to
     /// the owner's state, so that this registry carries on from it if it becomes the owner.
     pub fn install(&self, copies: &[Copy], now: u64) {
