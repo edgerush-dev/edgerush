@@ -231,6 +231,7 @@ where
         Tls::new(&edgerush_config::CompiledTls {
             certificates: vec![presented("a", certificate(&["a.test"]))],
             without_sni: Some(0),
+            refused: Vec::new(),
             client_validation: None,
         })
         .unwrap(),

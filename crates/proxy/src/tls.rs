@@ -29,7 +29,7 @@ use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
 use edgerush_certificates::{CertificateError, Identity};
 use edgerush_config::{ClientValidation, CompiledTls, NamedCertificate, PresentedCertificate};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// What is offered to a client that asks for protocols (ALPN), in the order preferred:
@@ -317,7 +317,14 @@ impl Certificates {
         transport: Transport,
     ) -> Result<Self, TlsError> {
         let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
-        let mut names = Names::default();
+        let mut names = Names {
+            refused: source
+                .refused
+                .iter()
+                .map(|name| name.to_ascii_lowercase())
+                .collect(),
+            ..Names::default()
+        };
         let mut contexts = Vec::with_capacity(source.certificates.len());
         for (index, presented) in source.certificates.iter().enumerate() {
             let certificate = &presented.certificate;
@@ -474,10 +481,12 @@ pub(crate) fn identity(named: &NamedCertificate) -> Result<Identity, TlsError> {
 
 /// Which certificate answers for which name: by the names the listener states for it, or,
 /// where it states none, the DNS names in its subject alternative names; exact names before
-/// wildcards, and among certificates that answer for the same name, the first. A name no
-/// certificate answers for is answered by none.
+/// wildcards, and among certificates that answer for the same name, the first. A name the
+/// listener refuses, or that no certificate answers for, is answered by none.
 #[derive(Debug, Default)]
 struct Names {
+    /// The names refused before any certificate is looked at, in lower case.
+    refused: HashSet<String>,
     /// By the name, in lower case.
     exact: HashMap<String, usize>,
     /// By what follows the `*.`, in lower case: a wildcard stands for one label, whole
@@ -510,10 +519,14 @@ impl Names {
         };
     }
 
-    /// The certificate for a client that asked for `name`, if one carries it.
+    /// The certificate for a client that asked for `name`, if one carries it and the
+    /// listener does not refuse it.
     fn choose(&self, name: &str) -> Option<usize> {
         // Once for a handshake, which does far more than this.
         let name = name.to_ascii_lowercase();
+        if self.refused.contains(&name) {
+            return None;
+        }
         if let Some(&index) = self.exact.get(&name) {
             return Some(index);
         }
@@ -590,6 +603,16 @@ mod tests {
         assert_eq!(names.choose("b.x.test"), Some(0));
     }
 
+    #[test]
+    fn a_refused_name_is_answered_by_none_whatever_carries_it() {
+        let mut names = names(&[&["*.x.test"], &["b.x.test"]]);
+        names.refused = ["a.x.test".to_owned(), "b.x.test".to_owned()].into();
+        // Refused before the wildcard, and before an exact name alike, in any letter case.
+        assert_eq!(names.choose("a.x.test"), None);
+        assert_eq!(names.choose("B.X.test"), None);
+        assert_eq!(names.choose("c.x.test"), Some(0));
+    }
+
     proptest! {
         /// Against a naive reading of the rules: every certificate's names in order, an
         /// exact match anywhere first, then the first wildcard that covers the name.
@@ -630,6 +653,7 @@ mod tests {
                 presented("b", certificate(&["b.test"])),
             ],
             without_sni: Some(0),
+            refused: Vec::new(),
             client_validation: None,
         };
         let tls = Tls::new(&source).unwrap();
@@ -637,6 +661,7 @@ mod tests {
         let other = CompiledTls {
             certificates: vec![presented("a", certificate(&["a.test"]))],
             without_sni: Some(0),
+            refused: Vec::new(),
             client_validation: None,
         };
         assert!(!tls.is_for(&other));
@@ -654,6 +679,7 @@ mod tests {
                     .map(|(certificate, name)| presented(name, certificate))
                     .collect(),
                 without_sni: Some(0),
+                refused: Vec::new(),
                 client_validation: None,
             })
             .map(|_| ())
@@ -700,6 +726,7 @@ mod tests {
             Tls::new(&CompiledTls {
                 certificates: vec![presented("a", certificate(&["a.test"]))],
                 without_sni: Some(0),
+                refused: Vec::new(),
                 client_validation: Some(edgerush_config::ClientValidation { authorities }),
             })
             .map(|_| ())
@@ -756,6 +783,7 @@ mod tests {
                 Tls::new(&CompiledTls {
                     certificates: vec![presented("a", a.clone()), presented("b", b.clone())],
                     without_sni,
+                    refused: Vec::new(),
                     client_validation: None,
                 })
                 .unwrap()
@@ -803,6 +831,7 @@ mod tests {
                     presented("b", b.clone()),
                 ],
                 without_sni: None,
+                refused: Vec::new(),
                 client_validation: None,
             })
             .unwrap();
@@ -828,6 +857,7 @@ mod tests {
             let tls = Tls::new(&CompiledTls {
                 certificates: Vec::new(),
                 without_sni: None,
+                refused: Vec::new(),
                 client_validation: None,
             })
             .unwrap();
@@ -862,6 +892,7 @@ mod tests {
                     presented("b", certificate(&["b.test"])),
                 ],
                 without_sni: Some(0),
+                refused: Vec::new(),
                 client_validation: Some(edgerush_config::ClientValidation {
                     authorities: vec![trusted.chain.clone()],
                 }),
@@ -900,6 +931,7 @@ mod tests {
             let source = CompiledTls {
                 certificates: vec![presented("a", certificate(&["a.test"]))],
                 without_sni: Some(0),
+                refused: Vec::new(),
                 client_validation: None,
             };
             let tls = Tls::new(&source).unwrap();
@@ -913,6 +945,7 @@ mod tests {
                 &CompiledTls {
                     certificates: vec![presented("a", certificate(&["a.test"]))],
                     without_sni: Some(0),
+                    refused: Vec::new(),
                     client_validation: None,
                 },
             )

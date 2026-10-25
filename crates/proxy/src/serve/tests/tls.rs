@@ -680,6 +680,44 @@ async fn a_certificate_answers_for_the_names_stated_for_it_alone() {
         .await;
 }
 
+/// A name the listener refuses is refused in the handshake before any certificate is looked
+/// at, though a wildcard covers it; the wildcard still answers for the others (03 §3). A
+/// host an Ingress serves without TLS so never reaches another's wildcard route.
+#[tokio::test]
+async fn a_refused_name_is_refused_though_a_wildcard_covers_it() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let mut config = everything_config(upstream);
+            secured(
+                &mut config,
+                vec![crate::tls::testing::certificate(&["*.example.test"])],
+                None,
+            );
+            let tls = config
+                .listeners
+                .get_mut("web")
+                .unwrap()
+                .tls
+                .as_mut()
+                .unwrap();
+            // Written in any letter case, as a client may ask in any.
+            tls.refused = vec!["Plain.Example.test".to_owned()];
+            let (front, _worker) = serving_compiled(compile(&config).unwrap()).await;
+            let Err(refused) = tls_client(front, "plain.example.test", None, |_| {}).await else {
+                panic!("a refused name was served");
+            };
+            assert!(refused.contains("UNRECOGNIZED_NAME"), "{refused}");
+            assert!(
+                tls_client(front, "other.example.test", None, |_| {})
+                    .await
+                    .is_ok()
+            );
+        })
+        .await;
+}
+
 /// An `https` listener with no certificate refuses every client in the handshake, one that
 /// asks for a name and one that asks for none, as NGINX's `ssl_reject_handshake`; given
 /// one by a reload, it serves (03 §3).
