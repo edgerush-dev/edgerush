@@ -1,44 +1,273 @@
 //! The synchronous mode's rate limits (06 §4): every request decided by the owners of its
 //! keys in the rate-limiting service. Each worker holds its own stream to each service pod
-//! (`edgerush_ratelimit_service::synchronous`), opened when first needed: a request's keys
-//! go to their owners as the pods' view has them, those of different owners asked in
-//! parallel, and the answers come back to the worker that asked, with no thread between.
-//! Admitted under all, or refused, the owners that admitted given their charges back; an
-//! owner that does not answer in time, or whose stream breaks, leaves the request to
-//! `when_unreachable`.
+//! (`edgerush_ratelimit_service::synchronous`): a request's keys go to their owners as the
+//! pods' view has them, those of different owners asked in parallel, and the answers come
+//! back to the worker that asked, with no thread between. Admitted under all, or refused,
+//! the owners that admitted given their charges back; an owner that does not answer in
+//! time, or whose stream breaks, leaves the request to `when_unreachable`.
+//!
+//! The process keeps a breaker for each owner, which its workers share: after `failures`
+//! in a row it opens, and every worker decides that owner's keys by `when_unreachable` at
+//! once, asking nothing. A thread of the process's own probes it after `probe_after`,
+//! opening a stream of its own: the pod's view, sent first on every stream, closes it.
 
-use super::{Awaited, KeyedBy, Later, Limited, Refusal, Undecided, with_keys};
+use super::{Awaited, Failed, KeyedBy, Later, Limited, Refusal, Undecided, with_keys};
 use edgerush_config::{CompiledLimit, CompiledSynchronous, WhenUnreachable};
 use edgerush_ratelimit::service::{Contract, Decided, PodId, View, longest};
 use edgerush_ratelimit_service::synchronous::decide_stream;
 use edgerush_ratelimit_service::synchronous::wire;
+use edgerush_telemetry::{Counter, Sharded};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 /// How many messages may wait for a stream while it is opened: past them, a request is
 /// left to `when_unreachable`, as if the owner did not answer.
 const QUEUED: usize = 1_024;
 
-/// The process's side of the synchronous mode: the config its workers ask by.
+/// How long a probe waits for an owner's view: to connect and to hear from it.
+const PROBE_WAIT: Duration = Duration::from_secs(1);
+
+/// How often the probe thread looks for breakers due a probe, at most: probes come no
+/// later than this after their time.
+const PROBE_LOOK: Duration = Duration::from_millis(50);
+
+/// The process's side of the synchronous mode: the config its workers ask by, a breaker
+/// for each owner, and what is counted of them.
 #[derive(Debug)]
 pub(crate) struct Process {
     config: CompiledSynchronous,
+    breakers: Box<[Breaker]>,
+    /// What each worker's asks of each owner came to: answered, timed out, stream broken.
+    asks: Box<[Sharded<[Counter; 3]>]>,
+    /// Requests left to `when_unreachable`: let on, and refused.
+    unreachable: Sharded<[Counter; 2]>,
+    start: Instant,
+}
+
+/// How an ask of an owner ended.
+#[derive(Clone, Copy)]
+enum Ended {
+    Answered = 0,
+    TimedOut = 1,
+    Broken = 2,
 }
 
 impl Process {
-    /// The process's synchronous mode for `config`.
-    pub(crate) fn start(config: CompiledSynchronous) -> Arc<Self> {
-        Arc::new(Self { config })
+    /// The process's synchronous mode for `config`, with `workers` workers, and the thread
+    /// that probes its owners' open breakers, which calls `failed` if it panics.
+    pub(crate) fn start(
+        config: CompiledSynchronous,
+        workers: NonZeroUsize,
+        failed: Option<Failed>,
+    ) -> std::io::Result<Arc<Self>> {
+        let owners = config.addresses.len();
+        let process = Arc::new(Self {
+            breakers: (0..owners).map(|_| Breaker::default()).collect(),
+            asks: (0..owners).map(|_| Sharded::new(workers)).collect(),
+            unreachable: Sharded::new(workers),
+            start: Instant::now(),
+            config,
+        });
+        let probed = Arc::downgrade(&process);
+        std::thread::Builder::new()
+            .name("edgerush-rate-limit-probe".to_owned())
+            .spawn(move || probe(&probed, failed))?;
+        Ok(process)
     }
 
     /// Whether it asks as `config` says, so that a reload saying the same keeps it.
     pub(crate) fn is_for(&self, config: &CompiledSynchronous) -> bool {
         self.config == *config
     }
+
+    fn now(&self) -> u64 {
+        u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Counts an ask of the owner at `pod` that ended as `how`, and tells its breaker.
+    fn asked(&self, pod: usize, how: Ended) {
+        if let Some(asks) = self.asks.get(pod) {
+            asks.local()[how as usize].inc();
+        }
+        if let Some(breaker) = self.breakers.get(pod) {
+            match how {
+                Ended::Answered => breaker.answered(),
+                Ended::TimedOut | Ended::Broken => {
+                    breaker.failed(self.now(), self.config.breaker_failures);
+                }
+            }
+        }
+    }
+
+    /// Whether the owner at `pod` is not to be asked: its breaker open.
+    fn shut_out(&self, pod: usize) -> bool {
+        self.breakers.get(pod).is_some_and(Breaker::is_open)
+    }
+
+    /// What its owners' asks came to, their breakers, and what was left to
+    /// `when_unreachable`, as metrics.
+    pub(crate) fn render_stats(&self) -> String {
+        let mut out = String::from("# TYPE edgerush_rate_limit_owner_asks_total counter\n");
+        let outcomes = ["answered", "timed_out", "broken"];
+        for (pod, asks) in self.asks.iter().enumerate() {
+            for (at, outcome) in outcomes.iter().enumerate() {
+                let count: u64 = asks.sum(|counters| counters[at].get());
+                let _ = writeln!(
+                    out,
+                    "edgerush_rate_limit_owner_asks_total{{pod=\"{pod}\",outcome=\"{outcome}\"}} {count}"
+                );
+            }
+        }
+        out.push_str("# TYPE edgerush_rate_limit_owner_breaker_open gauge\n");
+        for (pod, breaker) in self.breakers.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "edgerush_rate_limit_owner_breaker_open{{pod=\"{pod}\"}} {}",
+                u8::from(breaker.is_open())
+            );
+        }
+        out.push_str("# TYPE edgerush_rate_limit_owner_breaker_trips_total counter\n");
+        for (pod, breaker) in self.breakers.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "edgerush_rate_limit_owner_breaker_trips_total{{pod=\"{pod}\"}} {}",
+                breaker.trips.load(Ordering::Relaxed)
+            );
+        }
+        out.push_str("# TYPE edgerush_rate_limit_unreachable_total counter\n");
+        for (at, action) in ["allow", "deny"].iter().enumerate() {
+            let count: u64 = self.unreachable.sum(|counters| counters[at].get());
+            let _ = writeln!(
+                out,
+                "edgerush_rate_limit_unreachable_total{{action=\"{action}\"}} {count}"
+            );
+        }
+        out
+    }
+}
+
+/// An owner's breaker, which a process's workers share: a few atomics, read on every ask
+/// and written only on failures and on the first answer after them.
+#[derive(Debug, Default)]
+struct Breaker {
+    /// Failures in a row.
+    failures: AtomicU32,
+    /// Closed, 0; open, when it opened or was last probed, in the process's nanoseconds, one
+    /// more, so that a time of 0 is not taken for closed.
+    opened: AtomicU64,
+    /// How many times it opened.
+    trips: AtomicU64,
+}
+
+impl Breaker {
+    fn is_open(&self) -> bool {
+        self.opened.load(Ordering::Relaxed) != 0
+    }
+
+    /// An answer: the count of failures starts again. Read first, so that a healthy owner's
+    /// answers write nothing every worker would share.
+    fn answered(&self) {
+        if self.failures.load(Ordering::Relaxed) != 0 {
+            self.failures.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// A failure at `now`: the `threshold`th in a row opens it, once.
+    fn failed(&self, now: u64, threshold: u32) {
+        let failures = self
+            .failures
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if failures >= threshold
+            && self
+                .opened
+                .compare_exchange(
+                    0,
+                    now.saturating_add(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            self.trips.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The owner heard from: closed.
+    fn close(&self) {
+        self.failures.store(0, Ordering::Relaxed);
+        self.opened.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Probes the open breakers of `process`'s owners, each `probe_after` after it opened or
+/// was last probed, for as long as the process is kept; tells `failed` if it panics, as
+/// the other rate-limiting threads do (03 §2). A probe opens a stream to the owner and
+/// waits for its view: heard, the breaker closes; not, it waits another `probe_after`.
+fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
+    struct Watch(Option<Failed>);
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            if std::thread::panicking()
+                && let Some(Failed(failed)) = &self.0
+            {
+                failed();
+            }
+        }
+    }
+    let _watch = Watch(failed);
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    runtime.block_on(async {
+        let mut look = tokio::time::interval(PROBE_LOOK);
+        look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            look.tick().await;
+            let Some(held) = process.upgrade() else {
+                return;
+            };
+            let probe_after = u64::try_from(held.config.probe_after.as_nanos()).unwrap_or(u64::MAX);
+            let now = held.now();
+            for (pod, breaker) in held.breakers.iter().enumerate() {
+                let opened = breaker.opened.load(Ordering::Relaxed);
+                if opened == 0 || now.saturating_sub(opened - 1) < probe_after {
+                    continue;
+                }
+                // Due again only after another period, heard from or not.
+                breaker
+                    .opened
+                    .store(now.saturating_add(1), Ordering::Relaxed);
+                let Some(address) = held.config.addresses.get(pod).cloned() else {
+                    continue;
+                };
+                let probed = std::sync::Arc::downgrade(&held);
+                tokio::spawn(async move {
+                    let heard = tokio::time::timeout(PROBE_WAIT, async {
+                        let mut stream = decide_stream(&address).await.ok()?;
+                        let first = stream.down.message().await.ok()??;
+                        matches!(first.message, Some(wire::FromOwner::View(_))).then_some(())
+                    })
+                    .await;
+                    if let (Ok(Some(())), Some(process)) = (heard, probed.upgrade())
+                        && let Some(breaker) = process.breakers.get(pod)
+                    {
+                        breaker.close();
+                    }
+                });
+            }
+        }
+    });
 }
 
 /// An owner's answer, or why there is none: its stream broke, or could not be opened.
@@ -89,6 +318,15 @@ impl Stream {
                 tokio::task::spawn_local(open(Rc::downgrade(self), Rc::downgrade(view)));
                 true
             }
+        }
+    }
+
+    /// Lets go of the stream, if it is open or opening, and of what waits on it: its owner's
+    /// breaker is open.
+    fn shut(&self) {
+        let was = std::mem::replace(&mut *self.link.borrow_mut(), Link::Down);
+        if !matches!(was, Link::Down) {
+            self.broke();
         }
     }
 
@@ -282,6 +520,12 @@ impl SyncLimiter {
             let Some(pod) = part.pod else {
                 continue;
             };
+            // Its breaker open, its keys are decided at once by `when_unreachable`, and the
+            // worker lets go of its stream, which may be hung: the next is opened afresh.
+            if self.process.shut_out(pod) {
+                self.streams[pod].shut();
+                continue;
+            }
             let id = self.next.get();
             self.next.set(id.wrapping_add(1));
             let sent: Vec<wire::Key> = part
@@ -308,6 +552,7 @@ impl SyncLimiter {
                 part.answer = Some((id, answer));
             } else {
                 stream.waiting.borrow_mut().remove(&id);
+                self.process.asked(pod, Ended::Broken);
             }
         }
         Asked {
@@ -392,24 +637,31 @@ impl Asked {
         let mut admitted = Vec::new();
         let mut refused_by = Vec::new();
         let mut unreached = None;
+        let process = &self.limiter.process;
         for part in self.parts {
-            let Some((id, answer)) = part.answer else {
+            let (Some(pod), Some((id, answer))) = (part.pod, part.answer) else {
                 unreached = Some(Undecided::Unavailable);
                 continue;
             };
             match tokio::time::timeout_at(self.until, answer).await {
                 Ok(Ok(Ok(decided))) if decided.admitted => {
+                    process.asked(pod, Ended::Answered);
                     admitted.push((part.pod, part.keys));
                 }
                 Ok(Ok(Ok(decided))) => {
+                    process.asked(pod, Ended::Answered);
                     let at = usize::try_from(decided.position).unwrap_or(usize::MAX);
                     if let Some(&position) = part.positions.get(at) {
                         refused_by.push((position, decided.wait_ns));
                     }
                 }
-                Ok(Ok(Err(()))) | Ok(Err(_)) => unreached = Some(Undecided::Unavailable),
+                Ok(Ok(Err(()))) | Ok(Err(_)) => {
+                    process.asked(pod, Ended::Broken);
+                    unreached = Some(Undecided::Unavailable);
+                }
                 Err(_) => {
-                    if let Some(stream) = part.pod.and_then(|pod| self.limiter.streams.get(pod)) {
+                    process.asked(pod, Ended::TimedOut);
+                    if let Some(stream) = self.limiter.streams.get(pod) {
                         stream.waiting.borrow_mut().remove(&id);
                     }
                     unreached = Some(Undecided::Timeout);
@@ -440,17 +692,55 @@ impl Asked {
                 refused_by: Box::default(),
             });
         };
-        match self.limiter.process.config.when_unreachable {
-            WhenUnreachable::Allow => Ok(Decided {
-                ticket: 0,
-                admitted: true,
-                refused_by: Box::default(),
-            }),
+        match process.config.when_unreachable {
+            WhenUnreachable::Allow => {
+                process.unreachable.local()[0].inc();
+                Ok(Decided {
+                    ticket: 0,
+                    admitted: true,
+                    refused_by: Box::default(),
+                })
+            }
             // `local` is refused by the config until it is built: refused as `deny` is.
             WhenUnreachable::Deny | WhenUnreachable::Local => {
+                process.unreachable.local()[1].inc();
                 give_back(admitted);
                 Err(why)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Breaker;
+
+    /// Failures in a row open it, once however many follow; an answer between them starts
+    /// the count again; closing it starts it again too.
+    #[test]
+    fn a_breaker_opens_on_failures_in_a_row_only() {
+        let breaker = Breaker::default();
+        breaker.failed(10, 3);
+        breaker.failed(20, 3);
+        breaker.answered();
+        breaker.failed(30, 3);
+        breaker.failed(40, 3);
+        assert!(!breaker.is_open(), "an answer between");
+        breaker.failed(50, 3);
+        assert!(breaker.is_open());
+        breaker.failed(60, 3);
+        assert_eq!(breaker.trips.load(std::sync::atomic::Ordering::Relaxed), 1);
+        breaker.close();
+        assert!(!breaker.is_open());
+        breaker.failed(70, 3);
+        assert!(!breaker.is_open(), "counted afresh");
+    }
+
+    /// A failure at time 0 still opens it: a time of 0 is not taken for closed.
+    #[test]
+    fn a_breaker_opened_at_the_start_is_open() {
+        let breaker = Breaker::default();
+        breaker.failed(0, 1);
+        assert!(breaker.is_open());
     }
 }
