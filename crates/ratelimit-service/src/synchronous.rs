@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::hash::RandomState;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -47,9 +48,6 @@ const COPIES_WAITING: usize = 1_024;
 /// How often the keys are swept, and how long a full key goes unused before it is
 /// forgotten, as local mode's are.
 const SWEEP: Duration = Duration::from_secs(1);
-
-/// How often a stream lets go of its handles to keys forgotten, in requests.
-const PRUNE_EVERY: u64 = 1_024;
 
 /// How the pods copy and watch each other.
 #[derive(Clone, Copy, Debug)]
@@ -96,6 +94,8 @@ struct Pod {
     cycle: Duration,
     /// Set once it is stopped, as a pod gone.
     stopped: watch::Sender<bool>,
+    /// The handles its streams hold to keys, as each last said: once a [`SWEEP`].
+    handles: AtomicUsize,
 }
 
 impl Pod {
@@ -152,6 +152,7 @@ impl SyncPod {
             view,
             heartbeats,
             cycle: timing.copy,
+            handles: AtomicUsize::new(0),
             stopped,
         });
         let senders: Vec<CopySender> = peers.values().cloned().map(CopySender::spawn).collect();
@@ -253,6 +254,13 @@ impl SyncPod {
         self.pod.owner.keys().key_count()
     }
 
+    /// How many handles its streams hold to keys, as each said at its last sweep: a key
+    /// forgotten or evicted is not let go of while a stream holds one.
+    #[must_use]
+    pub fn handles_held(&self) -> usize {
+        self.pod.handles.load(Ordering::Relaxed)
+    }
+
     /// Stops it, as a pod gone: it beats, copies and answers no more, and its streams end.
     pub fn stop(&self) {
         self.pod.stopped.send_replace(true);
@@ -269,15 +277,35 @@ impl SyncPod {
     /// The keys its decisions change are handed to the pod's cycle once a cycle of the
     /// stream's own, and as it ends, never request by request: what every stream shares
     /// stays off the request's path. A change waits up to two cycles to be copied.
+    ///
+    /// Once a [`SWEEP`], busy or quiet, it lets go of its handles to keys the pod forgot or
+    /// evicted, which would otherwise keep them, past the pod's cap, for as long as the
+    /// stream is open; and says how many it holds.
     async fn serve(
         self,
         requests: Streaming<wire::Upstream>,
         answers: mpsc::Sender<Result<wire::Downstream, Status>>,
     ) {
         let mut handles = Handles::new(self.pod.hasher.clone());
-        self.decide_all(&mut handles, requests, answers).await;
+        let mut said = 0;
+        self.decide_all(&mut handles, &mut said, requests, answers)
+            .await;
         // A key marked changed and handed to no cycle would never be copied again.
         self.hand_over(&mut handles);
+        self.pod.handles.fetch_sub(said, Ordering::Relaxed);
+    }
+
+    /// Lets go of `handles` to keys forgotten, and says how many are left, `said` being
+    /// what it said last.
+    fn tidy(&self, handles: &mut Handles<RandomState>, said: &mut usize) {
+        handles.prune();
+        let held = handles.len();
+        if held > *said {
+            self.pod.handles.fetch_add(held - *said, Ordering::Relaxed);
+        } else {
+            self.pod.handles.fetch_sub(*said - held, Ordering::Relaxed);
+        }
+        *said = held;
     }
 
     fn hand_over(&self, handles: &mut Handles<RandomState>) {
@@ -294,6 +322,7 @@ impl SyncPod {
     async fn decide_all(
         &self,
         handles: &mut Handles<RandomState>,
+        said: &mut usize,
         mut requests: Streaming<wire::Upstream>,
         answers: mpsc::Sender<Result<wire::Downstream, Status>>,
     ) {
@@ -304,7 +333,8 @@ impl SyncPod {
         view.mark_unchanged();
         let mut cycle = tokio::time::interval(pod.cycle);
         cycle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut served = 0_u64;
+        let mut sweep = tokio::time::interval(SWEEP);
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Seen as it is sent, so that only a change sends it again.
         let send_view = |view: &mut watch::Receiver<(View, bool)>| wire::Downstream {
             message: Some(wire::FromOwner::View(
@@ -318,6 +348,10 @@ impl SyncPod {
             let message = tokio::select! {
                 _ = cycle.tick() => {
                     self.hand_over(handles);
+                    continue;
+                }
+                _ = sweep.tick() => {
+                    self.tidy(handles, said);
                     continue;
                 }
                 message = requests.message() => message,
@@ -361,10 +395,6 @@ impl SyncPod {
                 },
                 None => None,
             };
-            served += 1;
-            if served.is_multiple_of(PRUNE_EVERY) {
-                handles.prune();
-            }
             if let Some(answer) = answer {
                 let down = wire::Downstream {
                     message: Some(wire::FromOwner::Decided(answer.into())),
