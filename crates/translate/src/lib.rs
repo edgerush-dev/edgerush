@@ -7,7 +7,7 @@
 //!
 //! **It never fails as a whole.** What it cannot translate is left out, object by object,
 //! and said in its report. So far it translates Ingresses whose rules each name a host and
-//! route paths by `Prefix` to a Service's port, and that carry no annotations; an Ingress
+//! route paths, of any path type, to a Service's port, and that carry no annotations; an Ingress
 //! that asks for anything more is left out whole, reported as not supported yet, rather
 //! than translated in part.
 
@@ -108,6 +108,9 @@ pub enum Problem {
     /// It asks for something translation does not do yet.
     #[error("not supported yet: {0}")]
     NotSupportedYet(&'static str),
+    /// It is not what Kubernetes allows, which its API server would have refused.
+    #[error("invalid: {0}")]
+    Invalid(&'static str),
     /// The data plane has no listener to serve it on.
     #[error("the data plane has no `http` listener to serve it on")]
     NoListener,
@@ -248,17 +251,23 @@ fn ingress_routes(
             return Err(Problem::NotSupportedYet("a rule without paths"));
         };
         for path in &http.paths {
-            let prefix = match (path.path_type.as_str(), &path.path) {
-                ("Prefix", Some(prefix)) => prefix.clone(),
-                ("Prefix", None) => {
-                    return Err(Problem::NotSupportedYet("a Prefix path without a path"));
+            let matched = match (path.path_type.as_str(), &path.path) {
+                ("Prefix", Some(prefix)) => PathMatch::Prefix(prefix.clone()),
+                ("Exact", Some(exact)) => PathMatch::Exact(exact.clone()),
+                // The implementation's to define, and defined as `Prefix`, by whole segments,
+                // as ingress-nginx takes it; left out, it is every path (04 §5).
+                ("ImplementationSpecific", prefix) => {
+                    PathMatch::Prefix(prefix.clone().unwrap_or_else(|| "/".to_owned()))
                 }
-                _ => return Err(Problem::NotSupportedYet("a path type other than Prefix")),
+                ("Prefix" | "Exact", None) => {
+                    return Err(Problem::Invalid("a Prefix or Exact path without a path"));
+                }
+                _ => return Err(Problem::Invalid("a path type Kubernetes does not have")),
             };
             let (name, upstream) = path_upstream(plane, cluster, namespace, path)?;
             by_host.entry(host.clone()).or_default().push(Rule {
                 matches: vec![Match {
-                    path: Some(PathMatch::Prefix(prefix)),
+                    path: Some(matched),
                     grpc: None,
                     method: None,
                     headers: Vec::new(),

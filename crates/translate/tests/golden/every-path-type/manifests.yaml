@@ -1,0 +1,25 @@
+# Every path type: `Exact` is that path alone; `Prefix` and `ImplementationSpecific` match
+# by whole segments, the latter defined so here, as ingress-nginx defines it; and an
+# `ImplementationSpecific` path left out is every path.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: paths, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /cart, pathType: Exact, backend: { service: { name: web, port: { number: 80 } } } }
+          - { path: /api, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+          - { path: /static, pathType: ImplementationSpecific, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: other.example.com
+      http:
+        paths:
+          - { pathType: ImplementationSpecific, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
