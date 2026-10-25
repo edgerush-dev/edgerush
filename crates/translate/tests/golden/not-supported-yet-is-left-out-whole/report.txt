@@ -2,8 +2,7 @@ Ingress shop/a-tls: not supported yet: TLS
 Ingress shop/b-default-backend: not supported yet: a default backend
 Ingress shop/c-prefix-without-path: invalid: a Prefix or Exact path without a path
 Ingress shop/c2-unknown-path-type: invalid: a path type Kubernetes does not have
-Ingress shop/f-missing-service: not supported yet: a backend Service or port that does not exist
-Ingress shop/g-missing-port: not supported yet: a backend Service or port that does not exist
+Ingress shop/f-backend-without-port: invalid: a Service backend without a port
 Ingress shop/h-external-name: not supported yet: an ExternalName Service
 Ingress shop/i-resource: not supported yet: a resource backend
 Ingress shop/i2-annotated: not supported yet: annotations

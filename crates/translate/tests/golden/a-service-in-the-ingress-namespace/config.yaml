@@ -6,6 +6,12 @@ listeners:
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
 routes:
+  - name: ingress/shop/lonely/solo.example.com
+    listeners: [http]
+    hostnames: [{ name: solo.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ invalid: "Service shop/solo does not exist", weight: 1 }] }
   - name: ingress/shop/web/shop.example.com
     listeners: [http]
     hostnames: [{ name: shop.example.com, falls_through: false }]

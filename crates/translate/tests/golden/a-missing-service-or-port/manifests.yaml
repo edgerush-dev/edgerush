@@ -1,0 +1,22 @@
+# A backend whose Service is not there, or whose Service has no such port, stays in its
+# path, which is answered 500 until it is there, and the report says why; the Ingress's
+# other paths are served as ever.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+          - { path: /gone, pathType: Prefix, backend: { service: { name: gone, port: { number: 80 } } } }
+          - { path: /admin, pathType: Exact, backend: { service: { name: web, port: { number: 81 } } } }
+          - { path: /grpc, pathType: Prefix, backend: { service: { name: web, port: { name: grpc } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

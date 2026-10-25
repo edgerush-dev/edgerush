@@ -1,1 +1,1 @@
-Ingress shop/lonely: not supported yet: a backend Service or port that does not exist
+Ingress shop/lonely: path / (Prefix) on solo.example.com is answered 500: Service shop/solo does not exist

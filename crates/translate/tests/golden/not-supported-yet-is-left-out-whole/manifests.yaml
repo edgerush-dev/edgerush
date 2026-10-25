@@ -50,7 +50,7 @@ spec:
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
-metadata: { name: f-missing-service, namespace: shop }
+metadata: { name: f-backend-without-port, namespace: shop }
 spec:
   ingressClassName: edge
   rules:
@@ -58,18 +58,7 @@ spec:
       http:
         paths:
           - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
-          - { path: /gone, pathType: Prefix, backend: { service: { name: gone, port: { number: 80 } } } }
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata: { name: g-missing-port, namespace: shop }
-spec:
-  ingressClassName: edge
-  rules:
-    - host: shop.example.com
-      http:
-        paths:
-          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 81 } } } }
+          - { path: /bare, pathType: Prefix, backend: { service: { name: web } } }
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
