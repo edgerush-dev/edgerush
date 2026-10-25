@@ -1,0 +1,1 @@
+Ingress shop/web: shop.example.com is served over HTTP only: the data plane has no `https` listener

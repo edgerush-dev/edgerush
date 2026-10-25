@@ -1,0 +1,26 @@
+listeners:
+  https:
+    address: "[::]:8443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: shop/secure, names: [secure.example.com, www.secure.example.com] }
+      without_sni: none
+routes:
+  - name: ingress/shop/web/secure.example.com
+    listeners: [https]
+    hostnames: [{ name: "secure.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/web/www.secure.example.com
+    listeners: [https]
+    hostnames: [{ name: "www.secure.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+upstreams:
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

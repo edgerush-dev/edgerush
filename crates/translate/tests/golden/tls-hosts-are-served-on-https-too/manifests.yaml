@@ -1,0 +1,45 @@
+# A host `tls` lists is served on the `https` listener as well as the `http` one, with
+# its Secret's certificate stated for the hosts that use it and no other; a host it does
+# not list stays on `http`. Two Ingresses that name one Secret share its certificate, the
+# older first, and a Secret of any type is read for tls.crt and tls.key.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [shop.example.com], secretName: shop-tls }, { hosts: [api.example.com], secretName: wild }]
+  rules:
+    - host: "shop.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "api.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "plain.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: blog, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [blog.example.com, "*.apps.example.com"], secretName: wild }]
+  rules:
+    - host: "blog.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "*.apps.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

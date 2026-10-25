@@ -12,13 +12,17 @@
 //! that asks for anything more is left out whole, reported as not supported yet, rather
 //! than translated in part. A path whose Service, or port, is not there, or whose port's
 //! `appProtocol` the gateway does not speak, is translated with an invalid backend, answered
-//! 500, and reported too.
+//! 500, and reported too. Hosts its `tls` lists are served on the `https` listeners as well,
+//! with their Secret's certificate, read as the data plane reads one; a host whose Secret
+//! is not there, cannot be used or does not cover it stays on `http`, and is reported.
 
+use edgerush_certificates::Identity;
 use edgerush_config::{
-    Backend, Config, DataPlane, Endpoints, Forward, Hostname, Listener, LoadBalancer, Match,
-    PathMatch, Protocol, Route, Rule, Upstream, UpstreamProtocol, UpstreamTls, Wildcard, compile,
+    Backend, Certificate, Config, DataPlane, Endpoints, Forward, Hostname, Listener,
+    ListenerCertificate, LoadBalancer, Match, PathMatch, Protocol, Route, Rule, StatedNames,
+    Upstream, UpstreamProtocol, UpstreamTls, Wildcard, compile,
 };
-use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::{
     Ingress, IngressBackend, IngressClass, IngressServiceBackend,
 };
@@ -38,7 +42,9 @@ pub const CONTROLLER: &str = "edgerush.dev/ingress-controller";
 pub struct Plane {
     /// The IngressClass whose Ingresses it serves.
     pub ingress_class: String,
-    /// Its listeners, as its config states them. An Ingress is served on every `http` one.
+    /// Its listeners, as its config states them. An Ingress is served on every `http` one,
+    /// and the hosts its `tls` lists on every `https` one too, which names no certificate
+    /// of its own: it presents the Ingresses' Secrets'.
     pub listeners: BTreeMap<String, Listener>,
     /// The cluster's DNS domain, which a Service's name ends in: `cluster.local` unless the
     /// cluster was set up otherwise.
@@ -62,6 +68,8 @@ pub struct Cluster {
     pub ingresses: Vec<Ingress>,
     /// Every Service seen.
     pub services: Vec<Service>,
+    /// Every Secret seen: those Ingresses' `tls` names hold their certificates.
+    pub secrets: Vec<Secret>,
 }
 
 /// A data plane's config, and what could not go into it.
@@ -76,6 +84,8 @@ pub struct Translation {
     pub passed_over: usize,
     /// Paths of Ingresses translated whose backend is not there, answered 500 until it is.
     pub unresolved: Vec<Unresolved>,
+    /// Hosts of Ingresses translated that their `tls` lists but are not served over HTTPS.
+    pub unsecured: Vec<Unsecured>,
     /// Paths of Ingresses translated that never take a request: another rule, older, has
     /// the same path on the same host.
     pub shadowed: Vec<Shadowed>,
@@ -110,6 +120,33 @@ impl fmt::Display for Unresolved {
                 f,
                 "{object}: the default backend on {host} is answered 500: {reason}"
             ),
+        }
+    }
+}
+
+/// A host an Ingress's `tls` lists that is not served over HTTPS: its Secret is not there,
+/// cannot be used or does not cover it, or the data plane has no `https` listener. It is
+/// served over plain HTTP where the data plane has an `http` listener, and nowhere else
+/// otherwise (04 §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unsecured {
+    /// The Ingress whose host it is.
+    pub object: Object,
+    /// The host.
+    pub host: String,
+    /// Why: `Secret shop/tls does not exist`.
+    pub reason: String,
+    /// Whether it is served over plain HTTP.
+    pub over_http: bool,
+}
+
+impl fmt::Display for Unsecured {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (object, host, reason) = (&self.object, &self.host, &self.reason);
+        if self.over_http {
+            write!(f, "{object}: {host} is served over HTTP only: {reason}")
+        } else {
+            write!(f, "{object}: {host} is not served: {reason}")
         }
     }
 }
@@ -269,10 +306,21 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let served_on: BTreeMap<String, Listener> = plane
         .listeners
         .iter()
-        .filter(|(_, listener)| listener.protocol == Protocol::Http)
+        .filter(|(_, listener)| matches!(listener.protocol, Protocol::Http | Protocol::Https))
         .map(|(name, listener)| (name.clone(), listener.clone()))
         .collect();
-    let checked_alone = compile(&config_of(served_on.clone(), Vec::new(), BTreeMap::new())).is_ok();
+    let checked_alone = compile(&config_of(
+        served_on.clone(),
+        Vec::new(),
+        BTreeMap::new(),
+        &[],
+    ))
+    .is_ok();
+    // The certificates every `https` listener presents, each for its hosts alone, in the
+    // order of the Ingresses that use them: a host two Secrets are stated for is the older
+    // Ingress's, as its paths are.
+    let mut presented: Vec<(String, Certificate, Vec<String>)> = Vec::new();
+    let mut unsecured = Vec::new();
     // Each host and path, matched one way, and the Ingress that had it first: oldest first,
     // as the router ranks them.
     let mut claimed: BTreeMap<(String, String), (Object, bool)> = BTreeMap::new();
@@ -286,9 +334,16 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 routes: translated,
                 upstreams: used,
                 missing,
+                certificates,
+                unsecured: insecure,
             }) => {
                 if checked_alone {
-                    let alone = config_of(served_on.clone(), translated.clone(), used.clone());
+                    let alone = config_of(
+                        served_on.clone(),
+                        translated.clone(),
+                        used.clone(),
+                        &certificates,
+                    );
                     if let Err(problems) = compile(&alone) {
                         let problems: Vec<String> =
                             problems.iter().map(ToString::to_string).collect();
@@ -325,6 +380,28 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                     path,
                     reason,
                 }));
+                unsecured.extend(
+                    insecure
+                        .into_iter()
+                        .map(|(host, reason, over_http)| Unsecured {
+                            object: object(),
+                            host,
+                            reason,
+                            over_http,
+                        }),
+                );
+                for (name, certificate, hosts) in certificates {
+                    match presented.iter_mut().find(|(named, ..)| *named == name) {
+                        Some((.., stated)) => {
+                            for host in hosts {
+                                if !stated.contains(&host) {
+                                    stated.push(host);
+                                }
+                            }
+                        }
+                        None => presented.push((name, certificate, hosts)),
+                    }
+                }
                 routes.extend(translated);
                 upstreams.extend(used);
             }
@@ -335,10 +412,11 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         }
     }
     Translation {
-        config: config_of(plane.listeners.clone(), routes, upstreams),
+        config: config_of(plane.listeners.clone(), routes, upstreams, &presented),
         report,
         passed_over: others.len(),
         unresolved,
+        unsecured,
         shadowed,
     }
 }
@@ -363,12 +441,29 @@ fn described(path: &PathMatch) -> String {
     }
 }
 
-/// A config of these listeners, routes and upstreams, and nothing else.
+/// A config of these listeners, routes and upstreams, and nothing else but `presented`:
+/// certificates each `https` listener presents for the hosts stated with them, after any
+/// it names itself.
 fn config_of(
-    listeners: BTreeMap<String, Listener>,
+    mut listeners: BTreeMap<String, Listener>,
     routes: Vec<Route>,
     upstreams: BTreeMap<String, Upstream>,
+    presented: &[(String, Certificate, Vec<String>)],
 ) -> Config {
+    for listener in listeners.values_mut() {
+        let Some(tls) = listener.tls.as_mut() else {
+            continue;
+        };
+        if listener.protocol == Protocol::Https {
+            tls.certificates
+                .extend(presented.iter().map(|(name, _, hosts)| {
+                    ListenerCertificate::Stated(StatedNames {
+                        certificate: name.clone(),
+                        names: hosts.clone(),
+                    })
+                }));
+        }
+    }
     Config {
         listeners,
         routes,
@@ -377,7 +472,10 @@ fn config_of(
         upstreams,
         data_plane: DataPlane::default(),
         rate_limiting: None,
-        certificates: BTreeMap::new(),
+        certificates: presented
+            .iter()
+            .map(|(name, certificate, _)| (name.clone(), certificate.clone()))
+            .collect(),
         limits: None,
     }
 }
@@ -460,10 +558,17 @@ struct IngressRoutes {
     /// Each path whose backend is not there: its host, the path described (none for the
     /// default backend), and why.
     missing: Vec<(String, Option<String>, String)>,
+    /// The certificates its secured hosts are served with: each Secret's, by its config
+    /// name, with the hosts it answers for.
+    certificates: Vec<(String, Certificate, Vec<String>)>,
+    /// Each host `tls` lists that is not served over HTTPS: why, and whether it is served
+    /// over plain HTTP.
+    unsecured: Vec<(String, String, bool)>,
 }
 
-/// An Ingress's routes, the upstreams they lead to and the paths whose backend is not
-/// there; or why none.
+/// An Ingress's routes, the upstreams they lead to, the certificates of its secured hosts,
+/// the paths whose backend is not there and the hosts that could not be secured; or why
+/// none.
 fn ingress_routes(
     plane: &Plane,
     cluster: &Cluster,
@@ -503,15 +608,30 @@ fn ingress_routes(
     }) else {
         return Err(Problem::Invalid("neither rules nor a default backend"));
     };
-    if spec.tls.as_ref().is_some_and(|tls| !tls.is_empty()) {
-        return Err(Problem::NotSupportedYet("TLS"));
+    // The hosts it secures, each with its Secret's name; a host listed twice keeps the
+    // first.
+    let mut tls_hosts: BTreeMap<&str, &str> = BTreeMap::new();
+    for entry in spec.tls.iter().flatten() {
+        let Some(secret) = entry.secret_name.as_deref() else {
+            return Err(Problem::NotSupportedYet("a TLS entry without a Secret"));
+        };
+        let hosts = entry.hosts.as_deref().unwrap_or_default();
+        if hosts.is_empty() {
+            return Err(Problem::NotSupportedYet("a TLS entry without hosts"));
+        }
+        for host in hosts {
+            tls_hosts.entry(host.as_str()).or_insert(secret);
+        }
     }
-    let listeners: Vec<String> = plane
-        .listeners
-        .iter()
-        .filter(|(_, listener)| listener.protocol == Protocol::Http)
-        .map(|(name, _)| name.clone())
-        .collect();
+    let of_protocol = |protocol: Protocol| -> Vec<String> {
+        plane
+            .listeners
+            .iter()
+            .filter(|(_, listener)| listener.protocol == protocol)
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    let (http, https) = (of_protocol(Protocol::Http), of_protocol(Protocol::Https));
     let namespace = namespace(&ingress.metadata);
     let mut by_host: BTreeMap<String, Vec<Rule>> = BTreeMap::new();
     let mut upstreams = BTreeMap::new();
@@ -594,30 +714,122 @@ fn ingress_routes(
     if by_host.is_empty() {
         return Ok(IngressRoutes::default());
     }
-    if listeners.is_empty() {
-        return Err(Problem::NoListener);
+    // Every host is served on the `http` listeners, and one `tls` lists on the `https` ones
+    // too, with its Secret's certificate, when that can be used and covers it (04 §5). One
+    // that cannot be secured stays on `http`, and is said; one asked for over plain HTTP
+    // where the data plane has no `http` listener leaves the Ingress out.
+    let mut certificates: Vec<(String, Certificate, Vec<String>)> = Vec::new();
+    let mut read: BTreeMap<&str, Result<(Certificate, Identity), String>> = BTreeMap::new();
+    let mut unsecured = Vec::new();
+    let mut listeners_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for host in by_host.keys() {
+        let mut listeners = http.clone();
+        match tls_hosts.get(host.as_str()) {
+            None if http.is_empty() => return Err(Problem::NoListener),
+            None => {}
+            Some(&secret) => {
+                let checked = read
+                    .entry(secret)
+                    .or_insert_with(|| secret_certificate(cluster, namespace, secret));
+                let reason = match checked {
+                    Err(reason) => Some(reason.clone()),
+                    Ok((_, identity)) if !identity.covers(host) => {
+                        Some(format!("Secret {namespace}/{secret} does not cover {host}"))
+                    }
+                    Ok(_) if https.is_empty() => {
+                        Some("the data plane has no `https` listener".to_owned())
+                    }
+                    Ok((certificate, _)) => {
+                        let name = format!("{namespace}/{secret}");
+                        match certificates.iter_mut().find(|(named, ..)| *named == name) {
+                            Some((.., hosts)) => hosts.push(host.clone()),
+                            None => {
+                                certificates.push((name, certificate.clone(), vec![host.clone()]))
+                            }
+                        }
+                        listeners.extend(https.iter().cloned());
+                        None
+                    }
+                };
+                if let Some(reason) = reason {
+                    unsecured.push((host.clone(), reason, !http.is_empty()));
+                }
+            }
+        }
+        if !listeners.is_empty() {
+            listeners_of.insert(host.clone(), listeners);
+        }
     }
+    // A host served nowhere is said as such, and nothing else of it.
+    missing.retain(|(host, ..)| listeners_of.contains_key(host));
     let name = ingress.metadata.name.as_deref().unwrap_or_default();
-    let routes = by_host
+    let routes: Vec<Route> = by_host
         .into_iter()
-        .map(|(host, rules)| Route {
-            name: format!("ingress/{namespace}/{name}/{host}"),
-            listeners: listeners.clone(),
-            hostnames: vec![Hostname {
-                // An Ingress's `*` stands for exactly one label (04 §5).
-                wildcard: host.starts_with("*.").then_some(Wildcard::OneLabel),
-                name: host,
-                falls_through: plane.ingress_hosts_fall_through,
-            }],
-            rules,
-            rate_limits: Vec::new(),
+        .filter_map(|(host, rules)| {
+            Some(Route {
+                name: format!("ingress/{namespace}/{name}/{host}"),
+                listeners: listeners_of.remove(&host)?,
+                hostnames: vec![Hostname {
+                    // An Ingress's `*` stands for exactly one label (04 §5).
+                    wildcard: host.starts_with("*.").then_some(Wildcard::OneLabel),
+                    name: host,
+                    falls_through: plane.ingress_hosts_fall_through,
+                }],
+                rules,
+                rate_limits: Vec::new(),
+            })
         })
         .collect();
+    let used: Vec<&str> = routes
+        .iter()
+        .flat_map(|route| &route.rules)
+        .filter_map(|rule| rule.forward.as_ref())
+        .flat_map(|forward| &forward.backends)
+        .filter_map(|backend| backend.upstream.as_deref())
+        .collect();
+    upstreams.retain(|name, _| used.contains(&name.as_str()));
     Ok(IngressRoutes {
         routes,
         upstreams,
         missing,
+        certificates,
+        unsecured,
     })
+}
+
+/// The certificate a Secret holds, in `tls.crt` and `tls.key` whatever its type, read and
+/// checked as the data plane will read it; or why it cannot be used.
+fn secret_certificate(
+    cluster: &Cluster,
+    namespace: &str,
+    name: &str,
+) -> Result<(Certificate, Identity), String> {
+    let Some(secret) = cluster.secrets.iter().find(|secret| {
+        secret.metadata.name.as_deref() == Some(name)
+            && self::namespace(&secret.metadata) == namespace
+    }) else {
+        return Err(format!("Secret {namespace}/{name} does not exist"));
+    };
+    let field = |key: &str| {
+        // `stringData` is written over `data`, as the API server does when it stores one.
+        if let Some(text) = secret.string_data.as_ref().and_then(|data| data.get(key)) {
+            return Ok(text.clone());
+        }
+        let bytes = secret
+            .data
+            .as_ref()
+            .and_then(|data| data.get(key))
+            .ok_or_else(|| format!("Secret {namespace}/{name} has no {key}"))?;
+        String::from_utf8(bytes.0.clone())
+            .map_err(|_| format!("Secret {namespace}/{name}: {key} is not PEM"))
+    };
+    let certificate = Certificate {
+        chain: field("tls.crt")?,
+        key: field("tls.key")?,
+    };
+    let identity = Identity::read(&certificate)
+        .map_err(|error| format!("Secret {namespace}/{name} cannot be used: {error}"))?;
+    Ok((certificate, identity))
 }
 
 /// A rule forwarding what `path` matches to `backend`.
@@ -796,6 +1008,7 @@ spec: { controller: edgerush.dev/ingress-controller }
                 ],
                 ingresses: vec![ingress("good", "/"), ingress("bad", "/a/../admin")],
                 services: vec![service],
+                secrets: Vec::new(),
             },
         )
     }

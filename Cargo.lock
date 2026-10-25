@@ -437,6 +437,7 @@ dependencies = [
 name = "edgerush-translate"
 version = "0.0.0"
 dependencies = [
+ "edgerush-certificates",
  "edgerush-config",
  "k8s-openapi",
  "serde",

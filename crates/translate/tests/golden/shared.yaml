@@ -5,3 +5,107 @@ kind: IngressClass
 metadata: { name: edge }
 spec:
   controller: edgerush.dev/ingress-controller
+# Secrets the TLS cases' Ingresses name, in namespace shop. Test certificates, self-signed,
+# made for these tests alone: shop-tls carries shop.example.com; wild, *.example.com and
+# *.apps.example.com, as an Opaque Secret written in `data`; secure, secure.example.com
+# and www.secure.example.com; keyless has no key; mismatched pairs shop-tls's certificate
+# with another key.
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: shop-tls, namespace: shop }
+type: kubernetes.io/tls
+stringData:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+    DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+    MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+    hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+    /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+    vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+    AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+    RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+    MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgdZaZ6tG6zh0h1cqS
+    23pUIQKMY6JSkLCYIVIsIc7eZ8mhRANCAAT0Y4ToHByUvCc8nl7g3jPjWFbXCx1U
+    xMPpnOJVpR/iSYSwRdqtUkuO4vOaN0GBx4nr7/wUnH5m6xJPwjOZczke
+    -----END PRIVATE KEY-----
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: wild, namespace: shop }
+type: Opaque
+data:
+  tls.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUJwVENDQVVxZ0F3SUJBZ0lVWEsvRDhvdW9SM2htMVhpQ2JVMmN3aVJGbEgwd0NnWUlLb1pJemowRUF3SXcKRHpFTk1Bc0dBMVVFQXd3RWQybHNaREFnRncweU5qRXdNalV4TmpFeU5ESmFHQTh5TVRJMk1UQXdNVEUyTVRJMApNbG93RHpFTk1Bc0dBMVVFQXd3RWQybHNaREJaTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEEwSUFCS1lFCkpLYXNzSk1sUDJDUHRHYXZWWEowUHRuZG9rZm9pa0FKclJMaXJ2K3oxYW1kL3p6Tzd2aHNLL2NRQXlYb2NONkUKTUhmK241OXBmZDZnTjROeW85dWpnWUV3ZnpBZEJnTlZIUTRFRmdRVVFDNDZHcjcvRkU3UGtXVmlDOWQ4eU41VQpkcUF3SHdZRFZSMGpCQmd3Rm9BVVFDNDZHcjcvRkU3UGtXVmlDOWQ4eU41VWRxQXdEd1lEVlIwVEFRSC9CQVV3CkF3RUIvekFzQmdOVkhSRUVKVEFqZ2cwcUxtVjRZVzF3YkdVdVkyOXRnaElxTG1Gd2NITXVaWGhoYlhCc1pTNWoKYjIwd0NnWUlLb1pJemowRUF3SURTUUF3UmdJaEFQa255QmZIZUJNb2VyK1kxRit3aFR2aUUzYnhQYS9DK3lmcgplNlgxWEl4WkFpRUF3d3d3cE02aEhrcVJadXVEd1hGUHVsWUJiVFNkT0o3TFFtV0pDM01mS0IwPQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==
+  tls.key: LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1JR0hBZ0VBTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEJHMHdhd0lCQVFRZ21EM3loblgwM0tYZVdrS1MKUUV2SEExdXJyWCtSQ0NJc2pwUWVoR01iUkhPaFJBTkNBQVNtQkNTbXJMQ1RKVDlnajdSbXIxVnlkRDdaM2FKSAo2SXBBQ2EwUzRxNy9zOVdwbmY4OHp1NzRiQ3YzRUFNbDZIRGVoREIzL3ArZmFYM2VvRGVEY3FQYgotLS0tLUVORCBQUklWQVRFIEtFWS0tLS0tCg==
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: secure, namespace: shop }
+type: kubernetes.io/tls
+stringData:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIBsTCCAVigAwIBAgIUfXfG5PsO09RCdj2xh486kADNHTowCgYIKoZIzj0EAwIw
+    ETEPMA0GA1UEAwwGc2VjdXJlMCAXDTI2MTAyNTE2MTQzNFoYDzIxMjYxMDAxMTYx
+    NDM0WjARMQ8wDQYDVQQDDAZzZWN1cmUwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC
+    AAQbVXXqoEoPaC1rjrX+JtcO1lAlK6i5YIqbol2mEqpF3WKV9TqxKRtWU6cmiNDy
+    +Bg+qUf6Q1Lvr5Pc2eaP8gxbo4GLMIGIMB0GA1UdDgQWBBSY60vDh4Nrjj1lJUbB
+    npjLEnzC9DAfBgNVHSMEGDAWgBSY60vDh4Nrjj1lJUbBnpjLEnzC9DAPBgNVHRMB
+    Af8EBTADAQH/MDUGA1UdEQQuMCyCEnNlY3VyZS5leGFtcGxlLmNvbYIWd3d3LnNl
+    Y3VyZS5leGFtcGxlLmNvbTAKBggqhkjOPQQDAgNHADBEAiAbqkmw/kl7gMmSK0re
+    GZGxl/Dklu8J49s2LCYrW+vjYAIgTdUfE9LvIYYaYjBr1fN4x4asCSbdJXuz+raE
+    t+N4kf8=
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg4WY5qu3swJqgStT4
+    6GtwLmV9kHQ1+/9+JlbzhMFSQMmhRANCAAQbVXXqoEoPaC1rjrX+JtcO1lAlK6i5
+    YIqbol2mEqpF3WKV9TqxKRtWU6cmiNDy+Bg+qUf6Q1Lvr5Pc2eaP8gxb
+    -----END PRIVATE KEY-----
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: keyless, namespace: shop }
+type: Opaque
+stringData:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+    DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+    MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+    hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+    /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+    vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+    AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+    RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+    MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+    -----END CERTIFICATE-----
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: mismatched, namespace: shop }
+type: kubernetes.io/tls
+stringData:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+    DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+    MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+    hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+    /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+    vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+    AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+    RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+    MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg8WSAfm2xP+ksFDC2
+    dGB9PloDMwYYzgfc0O7jWSMgTAehRANCAASTmkK7E/+ctE9hYPZLp2w7TsUszvYq
+    CweI5aAenTwZxKX9ZG1lXRy8gMBqOopIGrL4PJ4le4OYyFDCTDKafTFv
+    -----END PRIVATE KEY-----
