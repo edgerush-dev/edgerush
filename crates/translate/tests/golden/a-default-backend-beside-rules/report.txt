@@ -1,0 +1,1 @@
+Ingress shop/gone: the default backend on d.example.com is answered 500: Service shop/gone does not exist

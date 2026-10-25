@@ -7,7 +7,8 @@
 //!
 //! **It never fails as a whole.** What it cannot translate is left out, object by object,
 //! and said in its report. So far it translates Ingresses whose rules route paths, of any
-//! path type and on any host, to a Service's port, and that carry no annotations; an Ingress
+//! path type and on any host, and whose default backend takes the rest, to a Service's
+//! port, and that carry no annotations; an Ingress
 //! that asks for anything more is left out whole, reported as not supported yet, rather
 //! than translated in part. A path whose Service, or port, is not there is translated with
 //! an invalid backend, answered 500, and reported too.
@@ -18,7 +19,7 @@ use edgerush_config::{
 };
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::networking::v1::{
-    HTTPIngressPath, Ingress, IngressClass, IngressServiceBackend,
+    Ingress, IngressBackend, IngressClass, IngressServiceBackend,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde::Deserialize;
@@ -83,19 +84,26 @@ pub struct Unresolved {
     pub object: Object,
     /// The host, as the Ingress names it (`*` for every host).
     pub host: String,
-    /// The path and how it is matched: `/api (Prefix)`.
-    pub path: String,
+    /// The path and how it is matched, `/api (Prefix)`; none for the Ingress's default
+    /// backend.
+    pub path: Option<String>,
     /// What is not there: `Service shop/web has no port 81`.
     pub reason: String,
 }
 
 impl fmt::Display for Unresolved {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (object, host, path, reason) = (&self.object, &self.host, &self.path, &self.reason);
-        write!(
-            f,
-            "{object}: path {path} on {host} is answered 500: {reason}"
-        )
+        let (object, host, reason) = (&self.object, &self.host, &self.reason);
+        match &self.path {
+            Some(path) => write!(
+                f,
+                "{object}: path {path} on {host} is answered 500: {reason}"
+            ),
+            None => write!(
+                f,
+                "{object}: the default backend on {host} is answered 500: {reason}"
+            ),
+        }
     }
 }
 
@@ -442,8 +450,9 @@ struct IngressRoutes {
     routes: Vec<Route>,
     /// The upstreams they lead to.
     upstreams: BTreeMap<String, Upstream>,
-    /// Each path whose backend is not there: its host, the path described, and why.
-    missing: Vec<(String, String, String)>,
+    /// Each path whose backend is not there: its host, the path described (none for the
+    /// default backend), and why.
+    missing: Vec<(String, Option<String>, String)>,
 }
 
 /// An Ingress's routes, the upstreams they lead to and the paths whose backend is not
@@ -482,14 +491,13 @@ fn ingress_routes(
     {
         return Err(Problem::NotSupportedYet("annotations"));
     }
-    let Some(spec) = &ingress.spec else {
-        return Ok(IngressRoutes::default());
+    let Some(spec) = ingress.spec.as_ref().filter(|spec| {
+        spec.default_backend.is_some() || spec.rules.as_ref().is_some_and(|rules| !rules.is_empty())
+    }) else {
+        return Err(Problem::Invalid("neither rules nor a default backend"));
     };
     if spec.tls.as_ref().is_some_and(|tls| !tls.is_empty()) {
         return Err(Problem::NotSupportedYet("TLS"));
-    }
-    if spec.default_backend.is_some() {
-        return Err(Problem::NotSupportedYet("a default backend"));
     }
     let listeners: Vec<String> = plane
         .listeners
@@ -501,11 +509,40 @@ fn ingress_routes(
     let mut by_host: BTreeMap<String, Vec<Rule>> = BTreeMap::new();
     let mut upstreams = BTreeMap::new();
     let mut missing = Vec::new();
+    // A backend that is not there stays in its path, answered 500 until it is, as Gateway
+    // API has a missing `backendRef` (04 §2).
+    let mut backend_of = |backend: &IngressBackend, host: &str, path: Option<String>| {
+        Ok(
+            match backend_upstream(plane, cluster, namespace, backend)? {
+                Ok((name, upstream)) => {
+                    upstreams.insert(name.clone(), upstream);
+                    Backend {
+                        upstream: Some(name),
+                        invalid: None,
+                        weight: 1,
+                    }
+                }
+                Err(reason) => {
+                    missing.push((host.to_owned(), path, reason.clone()));
+                    Backend {
+                        upstream: None,
+                        invalid: Some(reason),
+                        weight: 1,
+                    }
+                }
+            },
+        )
+    };
     for rule in spec.rules.iter().flatten() {
         // A rule without a host is for every host: the name `*`.
         let host = rule.host.as_deref().unwrap_or("*");
         let Some(http) = &rule.http else {
-            return Err(Problem::NotSupportedYet("a rule without paths"));
+            // A host named without paths is its default backend's alone, below.
+            if spec.default_backend.is_none() {
+                return Err(Problem::NotSupportedYet("a rule without paths"));
+            }
+            by_host.entry(host.to_owned()).or_default();
+            continue;
         };
         for path in &http.paths {
             let matched = match (path.path_type.as_str(), &path.path) {
@@ -521,44 +558,30 @@ fn ingress_routes(
                 }
                 _ => return Err(Problem::Invalid("a path type Kubernetes does not have")),
             };
-            // A backend that is not there stays in its path, answered 500 until it is, as
-            // Gateway API has a missing `backendRef` (04 §2).
-            let backend = match path_upstream(plane, cluster, namespace, path)? {
-                Ok((name, upstream)) => {
-                    upstreams.insert(name.clone(), upstream);
-                    Backend {
-                        upstream: Some(name),
-                        invalid: None,
-                        weight: 1,
-                    }
-                }
-                Err(reason) => {
-                    missing.push((host.to_owned(), described(&matched), reason.clone()));
-                    Backend {
-                        upstream: None,
-                        invalid: Some(reason),
-                        weight: 1,
-                    }
-                }
-            };
-            by_host.entry(host.to_owned()).or_default().push(Rule {
-                matches: vec![Match {
-                    path: Some(matched),
-                    grpc: None,
-                    method: None,
-                    headers: Vec::new(),
-                    query: Vec::new(),
-                }],
-                filters: Vec::new(),
-                forward: Some(Forward {
-                    backends: vec![backend],
-                    timeouts: None,
-                    retry: None,
-                }),
-                redirect: None,
-                paths: None,
-                rate_limits: Vec::new(),
-            });
+            let backend = backend_of(&path.backend, host, Some(described(&matched)))?;
+            by_host
+                .entry(host.to_owned())
+                .or_default()
+                .push(forward(matched, backend));
+        }
+    }
+    // The default backend takes what no rule does (04 §5): without rules, every host no
+    // other Ingress names, as `*`; beside them, the rest of each host they name, as a `/`
+    // that ranks below their own paths. A host whose rules have their own `/` keeps it.
+    if let Some(default) = &spec.default_backend {
+        if by_host.is_empty() {
+            by_host.insert("*".to_owned(), Vec::new());
+        }
+        let every_path = PathMatch::Prefix("/".to_owned());
+        for (host, rules) in &mut by_host {
+            let has_every_path = rules
+                .iter()
+                .flat_map(|rule| &rule.matches)
+                .any(|matched| matched.path.as_ref() == Some(&every_path));
+            if !has_every_path {
+                let backend = backend_of(default, host, None)?;
+                rules.push(forward(every_path.clone(), backend));
+            }
         }
     }
     if by_host.is_empty() {
@@ -590,16 +613,38 @@ fn ingress_routes(
     })
 }
 
-/// The upstream a path's backend leads to, and its name: one a Service's port, whose
-/// endpoints are followed through its EndpointSlices. Or what is not there, when its
-/// Service, or that port of it, is not; or why the Ingress is left out.
-fn path_upstream(
+/// A rule forwarding what `path` matches to `backend`.
+fn forward(path: PathMatch, backend: Backend) -> Rule {
+    Rule {
+        matches: vec![Match {
+            path: Some(path),
+            grpc: None,
+            method: None,
+            headers: Vec::new(),
+            query: Vec::new(),
+        }],
+        filters: Vec::new(),
+        forward: Some(Forward {
+            backends: vec![backend],
+            timeouts: None,
+            retry: None,
+        }),
+        redirect: None,
+        paths: None,
+        rate_limits: Vec::new(),
+    }
+}
+
+/// The upstream a backend leads to, and its name: one a Service's port, whose endpoints are
+/// followed through its EndpointSlices. Or what is not there, when its Service, or that
+/// port of it, is not; or why the Ingress is left out.
+fn backend_upstream(
     plane: &Plane,
     cluster: &Cluster,
     namespace: &str,
-    path: &HTTPIngressPath,
+    backend: &IngressBackend,
 ) -> Result<Result<(String, Upstream), String>, Problem> {
-    let Some(backend) = &path.backend.service else {
+    let Some(backend) = &backend.service else {
         return Err(Problem::NotSupportedYet("a resource backend"));
     };
     let port = match service_port(cluster, namespace, backend)? {
