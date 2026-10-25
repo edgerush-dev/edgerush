@@ -27,6 +27,34 @@ fn local_mode() -> Option<edgerush_config::RateLimiting> {
     })
 }
 
+#[tokio::test]
+async fn review_a_local_refusal_keeps_its_reason_after_eviction() {
+    tokio::task::LocalSet::new().run_until(async {
+        let mut config = limited_in(
+            everything_config("127.0.0.1:9".parse().unwrap()),
+            local_mode(),
+        );
+        config.limits = Some(serde_saphyr::from_str(
+            "limits:\n  - { name: per-client, key: client, model: { bucket: { rate: 1/h, burst: 1 } } }\n",
+        ).unwrap());
+        let compiled = compile(&config).unwrap();
+        let rule = &compiled.rules_of(0)[0];
+        let process = crate::ratelimit::local::Process::unswept(1, 1);
+        let limiter = crate::ratelimit::local::LocalLimiter::new(Arc::clone(&process), 0);
+        let client = crate::forwarding::Requester {
+            address: "203.0.113.7".parse().unwrap(),
+            peer: None,
+        };
+        assert!(matches!(limiter.decide_all(&rule.limits, 1, client), crate::ratelimit::Limited::Admit));
+        assert!(matches!(limiter.decide_all(&rule.limits, 1, client), crate::ratelimit::Limited::Refuse));
+        // Model the background sweep evicting the key before the 429 is built.
+        process.sweep_once();
+        let refusal = limiter.refusal(&rule.limits, 1, client);
+        assert_eq!(refusal.by, 1, "the rejected request must still count as refused");
+        assert!(refusal.longest.is_some(), "the 429 must still identify its limit");
+    }).await;
+}
+
 /// A data plane for `config` on `workers`, its rate limits started as the binary starts
 /// them.
 fn started(config: &Config, workers: NonZeroUsize) -> Proxy {
