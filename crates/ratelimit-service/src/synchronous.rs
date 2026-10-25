@@ -45,6 +45,14 @@ const ANSWERS_WAITING: usize = 1_024;
 /// change forgives it, as it forgives a cycle's.
 const COPIES_WAITING: usize = 1_024;
 
+/// The most bytes of copies one message carries: half what a message may, the rest room
+/// for each copy's framing beyond the estimate.
+const PIECE_BYTES: usize = MAX_MESSAGE / 2;
+
+/// What a copy carries besides its key's bytes, at most: its contract and its time, each
+/// with its tag and length.
+const COPY_OVERHEAD: usize = 64;
+
 /// How often the keys are swept, and how long a full key goes unused before it is
 /// forgotten, as local mode's are.
 const SWEEP: Duration = Duration::from_secs(1);
@@ -155,12 +163,20 @@ impl SyncPod {
             handles: AtomicUsize::new(0),
             stopped,
         });
-        let senders: Vec<CopySender> = peers.values().cloned().map(CopySender::spawn).collect();
+        let senders: Arc<BTreeMap<PodId, CopySender>> = Arc::new(
+            peers
+                .iter()
+                .map(|(pod, client)| (*pod, CopySender::spawn(client.clone())))
+                .collect(),
+        );
         let watched = Arc::downgrade(&pod);
-        // Membership: heartbeats in and out, the view published.
+        let handing = Arc::clone(&senders);
+        // Membership: heartbeats in and out, the view published, and keys handed to a pod the
+        // view takes in.
         tokio::spawn(async move {
             let mut beat = tokio::time::interval(timing.heartbeat);
             beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut before = (membership.view().clone(), membership.lives().to_vec());
             loop {
                 let now = nanos(start.elapsed());
                 let view = tokio::select! {
@@ -189,6 +205,22 @@ impl SyncPod {
                 if view.is_some() || publish.borrow().1 != agreed.1 {
                     let _gone = publish.send(agreed);
                 }
+                if view.is_some() {
+                    let lives = membership.lives().to_vec();
+                    let (view_before, lives_before) =
+                        std::mem::replace(&mut before, (membership.view().clone(), lives.clone()));
+                    if let Some(pod) = watched.upgrade() {
+                        hand_back(
+                            &pod,
+                            me,
+                            incarnation,
+                            &view_before,
+                            &lives_before,
+                            &lives,
+                            &handing,
+                        );
+                    }
+                }
             }
         });
         // The pod's own cycle: what changed copied to every other pod.
@@ -216,7 +248,7 @@ impl SyncPod {
                     .into_iter()
                     .map(wire::Copy::from)
                     .collect();
-                for sender in &senders {
+                for sender in senders.values() {
                     sender.send(me, copies.clone());
                 }
             }
@@ -407,8 +439,51 @@ impl SyncPod {
     }
 }
 
+/// Hands the pods the view took in — those in `lives` and not in `lives_before`, new or
+/// back in a new life — every key `me` owned in `view_before`, changed or not, so that a
+/// key quiet while they were away does not start full again when one of them owns it or
+/// takes over from its owner. Only a pod the view before took in, in this life, hands keys
+/// back: one just come back holds nothing it could hand. Copied off the membership task,
+/// which must keep beating.
+fn hand_back(
+    pod: &Arc<Pod>,
+    me: PodId,
+    incarnation: u64,
+    view_before: &View,
+    lives_before: &[(PodId, u64)],
+    lives: &[(PodId, u64)],
+    senders: &Arc<BTreeMap<PodId, CopySender>>,
+) {
+    if !lives_before.contains(&(me, incarnation)) {
+        return;
+    }
+    let taken_in: Vec<PodId> = lives
+        .iter()
+        .filter(|life| life.0 != me && !lives_before.contains(life))
+        .map(|life| life.0)
+        .collect();
+    if taken_in.is_empty() {
+        return;
+    }
+    let (pod, view_before, senders) = (Arc::clone(pod), view_before.clone(), Arc::clone(senders));
+    tokio::spawn(async move {
+        let copies: Vec<wire::Copy> = pod
+            .owner
+            .copies_of(pod.now(), |key| view_before.owners(key).0 == Some(me))
+            .into_iter()
+            .map(wire::Copy::from)
+            .collect();
+        for to in taken_in {
+            if let Some(sender) = senders.get(&to) {
+                sender.send(me, copies.clone());
+            }
+        }
+    });
+}
+
 /// Sends one other pod its copies, in order, coalescing what waits to the latest of each
-/// key; a copy lost to a failed call is the key's to send again at its next change.
+/// key, in messages within the transport's limit; a copy lost to a failed call is the key's
+/// to send again at its next change.
 struct CopySender {
     queue: mpsc::Sender<(PodId, Vec<wire::Copy>)>,
 }
@@ -427,9 +502,26 @@ impl CopySender {
                         latest.insert(copy.key.clone(), copy);
                     }
                 }
+                // A hand-back holds every key a pod owned: in pieces, each well within what a
+                // message may carry.
+                let mut piece = Vec::new();
+                let mut bytes = 0;
+                for copy in latest.into_values() {
+                    let size = copy.key.len() + COPY_OVERHEAD;
+                    if !piece.is_empty() && bytes + size > PIECE_BYTES {
+                        let copies = wire::Copies {
+                            from,
+                            entries: std::mem::take(&mut piece),
+                        };
+                        let _lost: Result<Empty, Error> = client.call(copies, COPY).await;
+                        bytes = 0;
+                    }
+                    bytes += size;
+                    piece.push(copy);
+                }
                 let copies = wire::Copies {
                     from,
-                    entries: latest.into_values().collect(),
+                    entries: piece,
                 };
                 let _lost: Result<Empty, Error> = client.call(copies, COPY).await;
             }

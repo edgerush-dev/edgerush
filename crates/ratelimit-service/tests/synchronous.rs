@@ -416,3 +416,143 @@ async fn a_quiet_stream_lets_go_of_a_key_the_pod_forgot() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+/// A relay to whichever address it is pointed at: a pod's address that stays the same
+/// across the pod's lives, without binding a port given up (which another socket can take).
+/// Pointed elsewhere, it cuts the connections it relays, so that clients connect again.
+struct Switch {
+    address: String,
+    to: tokio::sync::watch::Sender<std::net::SocketAddr>,
+}
+
+impl Switch {
+    async fn to(to: std::net::SocketAddr) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (to, target) = tokio::sync::watch::channel(to);
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                let mut pointed = target.clone();
+                let at = *pointed.borrow_and_update();
+                tokio::spawn(async move {
+                    if let Ok(mut server) = tokio::net::TcpStream::connect(at).await {
+                        tokio::select! {
+                            _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {}
+                            _ = pointed.changed() => {}
+                        }
+                    }
+                });
+            }
+        });
+        Self { address, to }
+    }
+
+    fn point(&self, to: std::net::SocketAddr) {
+        self.to.send_replace(to);
+    }
+}
+
+/// A pod serving on a port of its own, among the pods at `switches`, in its life
+/// `incarnation`: the pod, and where it serves.
+async fn pod_behind(
+    id: PodId,
+    incarnation: u64,
+    switches: &[Switch],
+) -> (SyncPod, std::net::SocketAddr) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = listener.local_addr().unwrap();
+    let peers = (0..3)
+        .filter(|pod| *pod != id)
+        .map(|pod| (pod, Client::new(&switches[pod as usize].address).unwrap()))
+        .collect();
+    let pod = SyncPod::spawn(id, vec![0, 1, 2], incarnation, timing(), peers);
+    let server = SyncServer::new(pod.clone());
+    tokio::spawn(async move {
+        let _ended = tonic::transport::Server::builder()
+            .serve_with_incoming(server, TcpIncoming::from(listener))
+            .await;
+    });
+    (pod, at)
+}
+
+/// Waits until `done`, or fails with `what` after five seconds.
+async fn until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A pod the view takes in again, in a new life, is handed every key, changed or not: a
+/// client its owner refused all along, whose key no copy carried while it was away, is
+/// refused when it owns the key again, not given a full bucket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_taken_in_again_is_handed_the_keys_it_missed() {
+    // Every pod behind a switch, so that one can come back at the same address.
+    let placeholder: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let mut switches = Vec::new();
+    for _ in 0..3 {
+        switches.push(Switch::to(placeholder).await);
+    }
+    let mut pods = Vec::new();
+    for id in 0..3 {
+        let (pod, at) = pod_behind(id, 1, &switches).await;
+        switches[id as usize].point(at);
+        pods.push(pod);
+    }
+    let all = |pods: &[SyncPod], every: &[PodId]| {
+        pods.iter()
+            .all(|pod| matches!(pod.view(), (view, true) if view.pods == every))
+    };
+    until("the pods never agreed", || all(&pods, &[0, 1, 2])).await;
+    let owner = View {
+        epoch: 1,
+        pods: vec![0, 1, 2],
+    }
+    .owners(b"k")
+    .0
+    .unwrap() as usize;
+    // Its client spends its bucket at its owner, and the others copy it. One an hour, a
+    // bucket of one: the first copy holds the one charge.
+    let one = || Key {
+        key: b"k".to_vec(),
+        contract: Some(Contract {
+            limit: 1,
+            window_ns: 3_600_000_000_000,
+            burst: 1,
+        }),
+    };
+    let (mut plane, _) = Plane::open(&switches[owner].address).await;
+    assert!(plane.decide_keys(vec![one()]).await.admitted);
+    assert!(!plane.decide_keys(vec![one()]).await.admitted);
+    drop(plane);
+    let others: Vec<usize> = (0..3).filter(|pod| *pod != owner).collect();
+    until("the copies never came", || {
+        others.iter().all(|pod| pods[*pod].key_count() == 1)
+    })
+    .await;
+    // The owner goes; the others agree it is gone.
+    pods[owner].stop();
+    let left: Vec<PodId> = others.iter().map(|pod| *pod as PodId).collect();
+    until("the owner never left the view", || {
+        others
+            .iter()
+            .all(|pod| matches!(pods[*pod].view(), (view, true) if view.pods == left))
+    })
+    .await;
+    // It comes back in a new life, holding nothing, and is taken in again.
+    let (back, at) = pod_behind(owner as PodId, 2, &switches).await;
+    switches[owner].point(at);
+    pods[owner] = back;
+    until("it was never taken in again", || all(&pods, &[0, 1, 2])).await;
+    until("it was never handed the key", || {
+        pods[owner].key_count() == 1
+    })
+    .await;
+    let (mut plane, _) = Plane::open(&switches[owner].address).await;
+    assert!(
+        !plane.decide_keys(vec![one()]).await.admitted,
+        "the bucket as it was spent"
+    );
+}
