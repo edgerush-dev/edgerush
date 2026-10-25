@@ -9,7 +9,8 @@
 //! and said in its report. So far it translates Ingresses whose rules route paths, of any
 //! path type and on any host, to a Service's port, and that carry no annotations; an Ingress
 //! that asks for anything more is left out whole, reported as not supported yet, rather
-//! than translated in part.
+//! than translated in part. A path whose Service, or port, is not there is translated with
+//! an invalid backend, answered 500, and reported too.
 
 use edgerush_config::{
     Backend, Config, DataPlane, Endpoints, Forward, Hostname, Listener, LoadBalancer, Match,
@@ -66,9 +67,36 @@ pub struct Translation {
     /// How many Ingresses were passed over as another data plane's: of another class, or of
     /// none.
     pub passed_over: usize,
+    /// Paths of Ingresses translated whose backend is not there, answered 500 until it is.
+    pub unresolved: Vec<Unresolved>,
     /// Paths of Ingresses translated that never take a request: another rule, older, has
     /// the same path on the same host.
     pub shadowed: Vec<Shadowed>,
+}
+
+/// A path whose backend is not there: its Service does not exist, or has no such port. The
+/// path is translated all the same, with an invalid backend in its place, and is answered
+/// 500 until the Service is there (04 §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unresolved {
+    /// The Ingress whose path it is.
+    pub object: Object,
+    /// The host, as the Ingress names it (`*` for every host).
+    pub host: String,
+    /// The path and how it is matched: `/api (Prefix)`.
+    pub path: String,
+    /// What is not there: `Service shop/web has no port 81`.
+    pub reason: String,
+}
+
+impl fmt::Display for Unresolved {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (object, host, path, reason) = (&self.object, &self.host, &self.path, &self.reason);
+        write!(
+            f,
+            "{object}: path {path} on {host} is answered 500: {reason}"
+        )
+    }
 }
 
 /// A path that never takes a request: an older Ingress, or an earlier rule of the same one,
@@ -234,11 +262,16 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     // as the router ranks them.
     let mut claimed: BTreeMap<(String, String), (Object, bool)> = BTreeMap::new();
     let mut shadowed = Vec::new();
+    let mut unresolved = Vec::new();
     for ingress in ingresses {
         let object = || Object::of("Ingress", &ingress.metadata);
         let dated = ingress.metadata.creation_timestamp.is_some();
         match ingress_routes(plane, cluster, ingress) {
-            Ok((translated, used)) => {
+            Ok(IngressRoutes {
+                routes: translated,
+                upstreams: used,
+                missing,
+            }) => {
                 if checked_alone {
                     let alone = config_of(served_on.clone(), translated.clone(), used.clone());
                     if let Err(problems) = compile(&alone) {
@@ -271,6 +304,12 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                         }
                     }
                 }
+                unresolved.extend(missing.into_iter().map(|(host, path, reason)| Unresolved {
+                    object: object(),
+                    host,
+                    path,
+                    reason,
+                }));
                 routes.extend(translated);
                 upstreams.extend(used);
             }
@@ -284,6 +323,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         config: config_of(plane.listeners.clone(), routes, upstreams),
         report,
         passed_over: others.len(),
+        unresolved,
         shadowed,
     }
 }
@@ -295,15 +335,17 @@ fn claims(route: &Route) -> impl Iterator<Item = (String, String)> + '_ {
             .rules
             .iter()
             .flat_map(|rule| &rule.matches)
-            .filter_map(|matched| {
-                let path = match matched.path.as_ref()? {
-                    PathMatch::Prefix(path) => format!("{path} (Prefix)"),
-                    PathMatch::Exact(path) => format!("{path} (Exact)"),
-                    PathMatch::Regex(path) => format!("{path} (regex)"),
-                };
-                Some((hostname.name.clone(), path))
-            })
+            .filter_map(|matched| Some((hostname.name.clone(), described(matched.path.as_ref()?))))
     })
+}
+
+/// A path and how it is matched, as the report says it: `/api (Prefix)`.
+fn described(path: &PathMatch) -> String {
+    match path {
+        PathMatch::Prefix(path) => format!("{path} (Prefix)"),
+        PathMatch::Exact(path) => format!("{path} (Exact)"),
+        PathMatch::Regex(path) => format!("{path} (regex)"),
+    }
 }
 
 /// A config of these listeners, routes and upstreams, and nothing else.
@@ -393,12 +435,24 @@ fn class_of(ingress: &Ingress) -> Option<&str> {
     })
 }
 
-/// An Ingress's routes, one a host, and the upstreams they lead to; or why none.
+/// An Ingress translated.
+#[derive(Default)]
+struct IngressRoutes {
+    /// Its routes, one a host.
+    routes: Vec<Route>,
+    /// The upstreams they lead to.
+    upstreams: BTreeMap<String, Upstream>,
+    /// Each path whose backend is not there: its host, the path described, and why.
+    missing: Vec<(String, String, String)>,
+}
+
+/// An Ingress's routes, the upstreams they lead to and the paths whose backend is not
+/// there; or why none.
 fn ingress_routes(
     plane: &Plane,
     cluster: &Cluster,
     ingress: &Ingress,
-) -> Result<(Vec<Route>, BTreeMap<String, Upstream>), Problem> {
+) -> Result<IngressRoutes, Problem> {
     // Ours by the old annotation, with no `ingressClassName`: said apart from other
     // annotations, as the class it names is the only reason it was taken for this data
     // plane. One of no class at all is the default class's, and comes on.
@@ -429,7 +483,7 @@ fn ingress_routes(
         return Err(Problem::NotSupportedYet("annotations"));
     }
     let Some(spec) = &ingress.spec else {
-        return Ok((Vec::new(), BTreeMap::new()));
+        return Ok(IngressRoutes::default());
     };
     if spec.tls.as_ref().is_some_and(|tls| !tls.is_empty()) {
         return Err(Problem::NotSupportedYet("TLS"));
@@ -446,6 +500,7 @@ fn ingress_routes(
     let namespace = namespace(&ingress.metadata);
     let mut by_host: BTreeMap<String, Vec<Rule>> = BTreeMap::new();
     let mut upstreams = BTreeMap::new();
+    let mut missing = Vec::new();
     for rule in spec.rules.iter().flatten() {
         // A rule without a host is for every host: the name `*`.
         let host = rule.host.as_deref().unwrap_or("*");
@@ -466,7 +521,26 @@ fn ingress_routes(
                 }
                 _ => return Err(Problem::Invalid("a path type Kubernetes does not have")),
             };
-            let (name, upstream) = path_upstream(plane, cluster, namespace, path)?;
+            // A backend that is not there stays in its path, answered 500 until it is, as
+            // Gateway API has a missing `backendRef` (04 §2).
+            let backend = match path_upstream(plane, cluster, namespace, path)? {
+                Ok((name, upstream)) => {
+                    upstreams.insert(name.clone(), upstream);
+                    Backend {
+                        upstream: Some(name),
+                        invalid: None,
+                        weight: 1,
+                    }
+                }
+                Err(reason) => {
+                    missing.push((host.to_owned(), described(&matched), reason.clone()));
+                    Backend {
+                        upstream: None,
+                        invalid: Some(reason),
+                        weight: 1,
+                    }
+                }
+            };
             by_host.entry(host.to_owned()).or_default().push(Rule {
                 matches: vec![Match {
                     path: Some(matched),
@@ -477,11 +551,7 @@ fn ingress_routes(
                 }],
                 filters: Vec::new(),
                 forward: Some(Forward {
-                    backends: vec![Backend {
-                        upstream: Some(name.clone()),
-                        invalid: None,
-                        weight: 1,
-                    }],
+                    backends: vec![backend],
                     timeouts: None,
                     retry: None,
                 }),
@@ -489,11 +559,10 @@ fn ingress_routes(
                 paths: None,
                 rate_limits: Vec::new(),
             });
-            upstreams.insert(name, upstream);
         }
     }
     if by_host.is_empty() {
-        return Ok((Vec::new(), BTreeMap::new()));
+        return Ok(IngressRoutes::default());
     }
     if listeners.is_empty() {
         return Err(Problem::NoListener);
@@ -514,21 +583,29 @@ fn ingress_routes(
             rate_limits: Vec::new(),
         })
         .collect();
-    Ok((routes, upstreams))
+    Ok(IngressRoutes {
+        routes,
+        upstreams,
+        missing,
+    })
 }
 
 /// The upstream a path's backend leads to, and its name: one a Service's port, whose
-/// endpoints are followed through its EndpointSlices.
+/// endpoints are followed through its EndpointSlices. Or what is not there, when its
+/// Service, or that port of it, is not; or why the Ingress is left out.
 fn path_upstream(
     plane: &Plane,
     cluster: &Cluster,
     namespace: &str,
     path: &HTTPIngressPath,
-) -> Result<(String, Upstream), Problem> {
+) -> Result<Result<(String, Upstream), String>, Problem> {
     let Some(backend) = &path.backend.service else {
         return Err(Problem::NotSupportedYet("a resource backend"));
     };
-    let port = service_port(cluster, namespace, backend)?;
+    let port = match service_port(cluster, namespace, backend)? {
+        Ok(port) => port,
+        Err(missing) => return Ok(Err(missing)),
+    };
     let service = &backend.name;
     let name = format!("{namespace}/{service}/{port}");
     let upstream = Upstream {
@@ -544,43 +621,58 @@ fn path_upstream(
         slow_start: None,
         proxy_protocol: None,
     };
-    Ok((name, upstream))
+    Ok(Ok((name, upstream)))
 }
 
 /// The Service port a backend names, as EndpointSlices know it: its name, or, for a
-/// Service's only port left unnamed, its number (03 §6).
+/// Service's only port left unnamed, its number (03 §6). Or what is not there; or why the
+/// Ingress is left out.
 fn service_port(
     cluster: &Cluster,
     namespace: &str,
     backend: &IngressServiceBackend,
-) -> Result<String, Problem> {
-    let missing = Problem::NotSupportedYet("a backend Service or port that does not exist");
-    let service = cluster
-        .services
-        .iter()
-        .find(|service| {
-            service.metadata.name.as_deref() == Some(backend.name.as_str())
-                && self::namespace(&service.metadata) == namespace
-        })
-        .ok_or_else(|| missing.clone())?;
-    let spec = service.spec.as_ref().ok_or_else(|| missing.clone())?;
-    if spec.type_.as_deref() == Some("ExternalName") {
+) -> Result<Result<String, String>, Problem> {
+    // Kubernetes requires a port, by name or by number, of a Service backend.
+    let wanted = match &backend.port {
+        Some(wanted) if wanted.name.is_some() || wanted.number.is_some() => wanted,
+        _ => return Err(Problem::Invalid("a Service backend without a port")),
+    };
+    let service_name = &backend.name;
+    let Some(service) = cluster.services.iter().find(|service| {
+        service.metadata.name.as_deref() == Some(service_name.as_str())
+            && self::namespace(&service.metadata) == namespace
+    }) else {
+        return Ok(Err(format!(
+            "Service {namespace}/{service_name} does not exist"
+        )));
+    };
+    let spec = service.spec.as_ref();
+    if spec.and_then(|spec| spec.type_.as_deref()) == Some("ExternalName") {
         return Err(Problem::NotSupportedYet("an ExternalName Service"));
     }
-    let ports = spec.ports.as_deref().unwrap_or_default();
-    let wanted = backend.port.as_ref().ok_or_else(|| missing.clone())?;
-    let port = ports
+    let ports = spec
+        .and_then(|spec| spec.ports.as_deref())
+        .unwrap_or_default();
+    let found = ports
         .iter()
         .find(|port| match (&wanted.name, wanted.number) {
             (Some(name), _) => port.name.as_ref() == Some(name),
             (None, Some(number)) => port.port == number,
             (None, None) => false,
-        })
-        .ok_or(missing)?;
+        });
+    let Some(port) = found else {
+        let wanted = match (&wanted.name, wanted.number) {
+            (Some(name), _) => format!("named {name}"),
+            (None, number) => number.unwrap_or_default().to_string(),
+        };
+        return Ok(Err(format!(
+            "Service {namespace}/{service_name} has no port {wanted}"
+        )));
+    };
     match port.name.as_deref() {
-        Some(name) if !name.is_empty() => Ok(name.to_owned()),
+        Some(name) if !name.is_empty() => Ok(Ok(name.to_owned())),
         // Kubernetes names every port of a Service with more than one.
-        _ if ports.len() == 1 => Ok(port.port.to_string()),
+        _ if ports.len() == 1 => Ok(Ok(port.port.to_string())),
         _ => Err(Problem::NotSupportedYet(
             "an unnamed port of a Service with several",
         )),

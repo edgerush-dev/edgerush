@@ -1,0 +1,3 @@
+Ingress shop/web: path /gone (Prefix) on shop.example.com is answered 500: Service shop/gone does not exist
+Ingress shop/web: path /admin (Exact) on shop.example.com is answered 500: Service shop/web has no port 81
+Ingress shop/web: path /grpc (Prefix) on shop.example.com is answered 500: Service shop/web has no port named grpc

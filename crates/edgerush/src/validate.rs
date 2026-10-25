@@ -20,8 +20,8 @@ config as the data plane would, and says what was left out and why, without a cl
 Ingresses of another class, or of none, are another data plane's: they are counted, not
 translated.
 Exits 0 when everything was translated and the config compiles, 1 when something was left
-out, a path is shadowed by another Ingress's or the config would be refused, and 2 when
-the files could not be read.
+out, a path's backend is not there, a path is shadowed by another Ingress's or the config
+would be refused, and 2 when the files could not be read.
 
 Options:
       --from-manifests <PATH>  Manifests in YAML: a file, or a directory read for every
@@ -147,8 +147,8 @@ impl Manifest {
     }
 }
 
-/// Translates and compiles. The text, and whether nothing was left out or shadowed and the
-/// config compiles.
+/// Translates and compiles. The text, and whether nothing was left out, without its
+/// backend or shadowed, and the config compiles.
 fn run(options: &Options) -> Result<(String, bool), Failed> {
     let plane: Plane = read(&options.data_plane)?;
     let mut cluster = Cluster::default();
@@ -163,17 +163,21 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
         // Writing to a `String` cannot fail.
         let _ = writeln!(text, "{finding}");
     }
+    for unresolved in &translation.unresolved {
+        let _ = writeln!(text, "{unresolved}");
+    }
     for shadowed in &translation.shadowed {
         let _ = writeln!(text, "{shadowed}");
     }
     let config = &translation.config;
     let _ = writeln!(
         text,
-        "{} routes and {} upstreams translated; {} left out; {} paths shadowed; {} Ingresses \
-         of other classes or none passed over",
+        "{} routes and {} upstreams translated; {} left out; {} paths without their backend; \
+         {} paths shadowed; {} Ingresses of other classes or none passed over",
         config.routes.len(),
         config.upstreams.len(),
         translation.report.len(),
+        translation.unresolved.len(),
         translation.shadowed.len(),
         translation.passed_over
     );
@@ -187,7 +191,9 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
             true
         }
     };
-    let clean = translation.report.is_empty() && translation.shadowed.is_empty();
+    let clean = translation.report.is_empty()
+        && translation.unresolved.is_empty()
+        && translation.shadowed.is_empty();
     Ok((text, clean && !refused))
 }
 
