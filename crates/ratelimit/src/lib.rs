@@ -9,8 +9,10 @@
 //! before any of them is built for the request path; and [`service`](mod@service): the
 //! protocol of the rate-limiting service, a candidate, as two state machines that the
 //! simulator and the prototype both run; and [`local`](mod@local): local mode's limiter, each
-//! process on what it sees alone.
+//! process on what it sees alone; and [`synchronous`](mod@synchronous): the synchronous
+//! mode's owner, deciding every request under the keys it owns.
 
 pub mod local;
 pub mod reference;
 pub mod service;
+pub mod synchronous;
