@@ -25,7 +25,7 @@ use tonic::{Request, Response, Status};
 pub const SERVICE: &str = "edgerush.ratelimit.v1.RateLimit";
 const EXCHANGE: &str = "/edgerush.ratelimit.v1.RateLimit/Exchange";
 const REPLICATE: &str = "/edgerush.ratelimit.v1.RateLimit/Replicate";
-const HEARTBEAT: &str = "/edgerush.ratelimit.v1.RateLimit/Heartbeat";
+pub(crate) const HEARTBEAT: &str = "/edgerush.ratelimit.v1.RateLimit/Heartbeat";
 
 /// How long a call may take before it is given up: the protocol sends again what matters.
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -37,7 +37,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_MESSAGE: usize = 4 << 20;
 
 /// Encodes `E` and decodes `D` as protobuf.
-struct Prost<E, D>(PhantomData<fn(E) -> D>);
+pub(crate) struct Prost<E, D>(PhantomData<fn(E) -> D>);
 
 impl<E, D> Default for Prost<E, D> {
     fn default() -> Self {
@@ -87,7 +87,7 @@ impl<E, D: prost::Message + Default> Decoder for Prost<E, D> {
     }
 }
 
-type Boxed<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+pub(crate) type Boxed<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 /// The service as a gRPC server, in front of a service pod.
 #[derive(Clone)]
@@ -162,7 +162,7 @@ impl tonic::server::UnaryService<wire::Heartbeat> for Beat {
 }
 
 /// A server's side of a call, held to [`MAX_MESSAGE`] both ways.
-fn limited<C: Codec>(codec: C) -> tonic::server::Grpc<C> {
+pub(crate) fn limited<C: Codec>(codec: C) -> tonic::server::Grpc<C> {
     tonic::server::Grpc::new(codec)
         .max_decoding_message_size(MAX_MESSAGE)
         .max_encoding_message_size(MAX_MESSAGE)
@@ -238,7 +238,7 @@ impl Client {
         Ok(Self { channel })
     }
 
-    async fn call<E, D>(&self, message: E, path: &'static str) -> Result<D, Error>
+    pub(crate) async fn call<E, D>(&self, message: E, path: &'static str) -> Result<D, Error>
     where
         E: prost::Message + Send + 'static,
         D: prost::Message + Default + Send + 'static,

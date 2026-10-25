@@ -11,6 +11,7 @@ publish.workspace = true
 bytes.workspace = true
 edgerush-ratelimit.workspace = true
 edgerush-telemetry.workspace = true
+futures-core.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 # `/metrics`, served as tonic serves gRPC: by hyper.
