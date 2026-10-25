@@ -9,6 +9,50 @@ use edgerush_ratelimit_service::synchronous::{SyncPod, SyncServer, Timing, decid
 use std::collections::BTreeMap;
 use tonic::transport::server::TcpIncoming;
 
+/// Faster than a deployment's, so that tests settle quickly.
+fn pod_timing() -> Timing {
+    Timing {
+        copy: Duration::from_millis(10),
+        heartbeat: Duration::from_millis(20),
+        silence: Duration::from_millis(150),
+        settle: Duration::from_millis(60),
+    }
+}
+
+/// A synchronous service pod alone, serving on `listener`.
+fn lone_pod(listener: TcpListener) -> SyncPod {
+    let pod = SyncPod::spawn(0, vec![0], 1, pod_timing(), BTreeMap::new());
+    let server = SyncServer::new(pod.clone());
+    tokio::spawn(async move {
+        let _ended = tonic::transport::Server::builder()
+            .serve_with_incoming(server, TcpIncoming::from(listener))
+            .await;
+    });
+    pod
+}
+
+/// `config` with its owners' breaker opened by `failures` in a row and probed after
+/// `probe_after_ms`.
+fn with_breaker(mut config: Config, failures: u32, probe_after_ms: u64) -> Config {
+    let synchronous = config
+        .rate_limiting
+        .as_mut()
+        .and_then(|limiting| limiting.synchronous.as_mut())
+        .unwrap();
+    synchronous.breaker = edgerush_config::RateLimitBreaker {
+        failures,
+        probe_after_ms,
+    };
+    config
+}
+
+/// The line of `scrape` that begins `name`, and its value.
+fn metric(scrape: &str, name: &str) -> Option<u64> {
+    scrape
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+}
+
 /// Synchronous service pods, `count` of them, each on a port of its own: their addresses.
 /// They decide whatever they are asked from the start; agreeing who serves is theirs.
 async fn sync_pods(count: u32) -> (Vec<SyncPod>, Vec<String>) {
@@ -22,12 +66,7 @@ async fn sync_pods(count: u32) -> (Vec<SyncPod>, Vec<String>) {
     let clients: BTreeMap<u32, Client> = (0..count)
         .map(|pod| (pod, Client::new(&addresses[pod as usize]).unwrap()))
         .collect();
-    let timing = Timing {
-        copy: Duration::from_millis(10),
-        heartbeat: Duration::from_millis(20),
-        silence: Duration::from_millis(150),
-        settle: Duration::from_millis(60),
-    };
+    let timing = pod_timing();
     let mut pods = Vec::new();
     for (id, listener) in (0..count).zip(listeners) {
         let peers = clients
@@ -378,6 +417,121 @@ async fn the_keys_of_an_owner_that_stops_go_to_the_next() {
                 assert!(Instant::now() < deadline, "its keys never moved");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+        })
+        .await;
+}
+
+/// An owner that does not answer opens its breaker after `failures` timeouts in a row: from
+/// then on its requests are decided by `when_unreachable` at once, nothing asked of it, and
+/// the metrics say so.
+#[tokio::test]
+async fn an_owner_that_keeps_timing_out_opens_its_breaker() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Accepts and says nothing.
+            let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = silent.local_addr().unwrap().to_string();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((socket, _)) = silent.accept().await {
+                    held.push(socket);
+                }
+            });
+            let (upstream, _) = counting_upstream().await;
+            let config = with_breaker(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 10)],
+                    std::slice::from_ref(&address),
+                    200,
+                    "deny",
+                ),
+                2,
+                60_000,
+            );
+            let (proxy, mut sends) = serving(&config, 1).await;
+            let began = Instant::now();
+            assert_eq!(statuses(&send_round(&mut sends, 2).await), [503, 503]);
+            assert!(began.elapsed() >= Duration::from_millis(400), "each waited");
+            let began = Instant::now();
+            assert_eq!(
+                statuses(&send_round(&mut sends, 5).await),
+                [503, 503, 503, 503, 503]
+            );
+            assert!(
+                began.elapsed() < Duration::from_millis(400),
+                "none waited: {:?}",
+                began.elapsed()
+            );
+            let scrape = proxy.metrics();
+            let line = |name: &str| metric(&scrape, name);
+            assert_eq!(
+                line(r#"edgerush_rate_limit_owner_asks_total{pod="0",outcome="timed_out"}"#),
+                Some(2),
+                "{scrape}"
+            );
+            assert_eq!(
+                line(r#"edgerush_rate_limit_owner_breaker_trips_total{pod="0"}"#),
+                Some(1)
+            );
+            assert_eq!(
+                line(r#"edgerush_rate_limit_owner_breaker_open{pod="0"}"#),
+                Some(1)
+            );
+            assert_eq!(
+                line(r#"edgerush_rate_limit_unreachable_total{action="deny"}"#),
+                Some(7)
+            );
+        })
+        .await;
+}
+
+/// An open breaker is probed after `probe_after`: once its owner is back and sends its
+/// view on the probe's stream, the breaker closes, and requests are asked of the owner
+/// again.
+#[tokio::test]
+async fn an_open_breaker_closes_once_a_probe_hears_from_its_owner() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let address = {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                listener.local_addr().unwrap()
+            };
+            // Says nothing until the owner comes up on the same address.
+            let silent = TcpListener::bind(address).await.unwrap();
+            let (upstream, _) = counting_upstream().await;
+            let config = with_breaker(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 10)],
+                    &[address.to_string()],
+                    100,
+                    "deny",
+                ),
+                1,
+                200,
+            );
+            let (proxy, mut sends) = serving(&config, 1).await;
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            let open = r#"edgerush_rate_limit_owner_breaker_open{pod="0"}"#;
+            assert_eq!(metric(&proxy.metrics(), open), Some(1));
+            drop(silent);
+            let _pod = lone_pod(TcpListener::bind(address).await.unwrap());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while metric(&proxy.metrics(), open) != Some(0) {
+                assert!(Instant::now() < deadline, "the breaker never closed");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            assert_eq!(
+                metric(
+                    &proxy.metrics(),
+                    r#"edgerush_rate_limit_owner_asks_total{pod="0",outcome="answered"}"#
+                ),
+                Some(1)
+            );
         })
         .await;
 }
