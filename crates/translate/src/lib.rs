@@ -20,6 +20,7 @@ use k8s_openapi::api::networking::v1::{HTTPIngressPath, Ingress, IngressServiceB
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fmt;
 
 /// The data plane's own settings, which in a cluster are its `DataPlane` resource's
@@ -58,6 +59,53 @@ pub struct Translation {
     /// How many Ingresses were passed over as another data plane's: of another class, or of
     /// none.
     pub passed_over: usize,
+    /// Paths of Ingresses translated that never take a request: another rule, older, has
+    /// the same path on the same host.
+    pub shadowed: Vec<Shadowed>,
+}
+
+/// A path that never takes a request: an older Ingress, or an earlier rule of the same one,
+/// has it on the same host, matched the same way, and the router ranks the older first
+/// (07 §1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shadowed {
+    /// The Ingress whose path it is.
+    pub object: Object,
+    /// The host, as the Ingress names it (`*` for every host).
+    pub host: String,
+    /// The path and how it is matched: `/api (Prefix)`.
+    pub path: String,
+    /// The Ingress that has it first: older, or as old and first by namespace and name.
+    pub by: Object,
+    /// Whether both carry their creation times, so that `by` is the one the cluster takes
+    /// first. Manifests written by hand do not, and are ranked by name, which may not be
+    /// the cluster's order: then the two are only known to clash.
+    pub by_age: bool,
+}
+
+impl fmt::Display for Shadowed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (object, host, path) = (&self.object, &self.host, &self.path);
+        if self.by == self.object {
+            write!(
+                f,
+                "{object}: path {path} on {host} is already an earlier rule's of its own"
+            )
+        } else if self.by_age {
+            let by = &self.by;
+            write!(
+                f,
+                "{object}: path {path} on {host} is already {by}'s, which comes first"
+            )
+        } else {
+            let by = &self.by;
+            write!(
+                f,
+                "{object}: path {path} on {host} is also {by}'s; which takes it depends on \
+                 which the cluster made first"
+            )
+        }
+    }
 }
 
 /// Something about one object.
@@ -154,8 +202,13 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         .map(|(name, listener)| (name.clone(), listener.clone()))
         .collect();
     let checked_alone = compile(&config_of(served_on.clone(), Vec::new(), BTreeMap::new())).is_ok();
+    // Each host and path, matched one way, and the Ingress that had it first: oldest first,
+    // as the router ranks them.
+    let mut claimed: BTreeMap<(String, String), (Object, bool)> = BTreeMap::new();
+    let mut shadowed = Vec::new();
     for ingress in ingresses {
         let object = || Object::of("Ingress", &ingress.metadata);
+        let dated = ingress.metadata.creation_timestamp.is_some();
         match ingress_routes(plane, cluster, ingress) {
             Ok((translated, used)) => {
                 if checked_alone {
@@ -168,6 +221,26 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                             problem: Problem::Refused(problems.join("; ")),
                         });
                         continue;
+                    }
+                }
+                for route in &translated {
+                    for (host, path) in claims(route) {
+                        match claimed.entry((host, path)) {
+                            Entry::Vacant(free) => {
+                                free.insert((object(), dated));
+                            }
+                            Entry::Occupied(taken) => {
+                                let (host, path) = taken.key().clone();
+                                let (by, by_dated) = taken.get().clone();
+                                shadowed.push(Shadowed {
+                                    object: object(),
+                                    host,
+                                    path,
+                                    by,
+                                    by_age: dated && by_dated,
+                                });
+                            }
+                        }
                     }
                 }
                 routes.extend(translated);
@@ -183,7 +256,26 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         config: config_of(plane.listeners.clone(), routes, upstreams),
         report,
         passed_over: others.len(),
+        shadowed,
     }
+}
+
+/// The hosts and paths a route claims, each path with how it is matched.
+fn claims(route: &Route) -> impl Iterator<Item = (String, String)> + '_ {
+    route.hostnames.iter().flat_map(move |hostname| {
+        route
+            .rules
+            .iter()
+            .flat_map(|rule| &rule.matches)
+            .filter_map(|matched| {
+                let path = match matched.path.as_ref()? {
+                    PathMatch::Prefix(path) => format!("{path} (Prefix)"),
+                    PathMatch::Exact(path) => format!("{path} (Exact)"),
+                    PathMatch::Regex(path) => format!("{path} (regex)"),
+                };
+                Some((hostname.name.clone(), path))
+            })
+    })
 }
 
 /// A config of these listeners, routes and upstreams, and nothing else.

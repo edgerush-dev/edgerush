@@ -470,7 +470,7 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "1 routes and 1 upstreams translated; 0 left out; 1 Ingresses of other classes or none passed over\n"
+        "1 routes and 1 upstreams translated; 0 left out; 0 paths shadowed; 1 Ingresses of other classes or none passed over\n"
     );
 
     // An Ingress that asks for what is not translated yet is left out, and said.
@@ -482,9 +482,35 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "Ingress shop/secure: not supported yet: TLS\n1 routes and 1 upstreams translated; 1 left out; 1 Ingresses of other classes or none passed over\n"
+        "Ingress shop/secure: not supported yet: TLS\n1 routes and 1 upstreams translated; 1 left out; 0 paths shadowed; 1 Ingresses of other classes or none passed over\n"
     );
     std::fs::remove_file(manifests.join("tls.yml"))?;
+
+    // A path another Ingress already has, the same way on the same host, is translated and
+    // said, as it never takes a request.
+    std::fs::write(
+        manifests.join("shadow.yml"),
+        "apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web2, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+",
+    )?;
+    let output = validate(&manifests)?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Ingress shop/web2: path / (Prefix) on shop.example.com is also Ingress shop/web's; which takes it depends on which the cluster made first
+2 routes and 1 upstreams translated; 0 left out; 1 paths shadowed; 1 Ingresses of other classes or none passed over
+"
+    );
+    std::fs::remove_file(manifests.join("shadow.yml"))?;
 
     // A config the data plane would refuse: a `tcp` listener with no route of its own.
     let tcp = "  db: { address: \"[::]:5432\", protocol: tcp, proxy_protocol: off }\n";
@@ -494,7 +520,7 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.ends_with(
-            "0 left out; 1 Ingresses of other classes or none passed over\nthe data plane would refuse the config:\n  listener `db`: a `tcp` listener needs exactly one TCP route; it has 0\n"
+            "0 left out; 0 paths shadowed; 1 Ingresses of other classes or none passed over\nthe data plane would refuse the config:\n  listener `db`: a `tcp` listener needs exactly one TCP route; it has 0\n"
         ),
         "{stdout}"
     );
