@@ -371,12 +371,12 @@ pub enum Protocol {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Tls {
-    /// The names of the certificates it can present. A client is given the one whose
-    /// names cover the name it asked for (SNI); a client that asked for a name none of them
-    /// carries is refused in the handshake with an `unrecognized_name` alert. No name
-    /// twice.
+    /// The certificates it can present. A client is given the one that answers for the
+    /// name it asked for (SNI): by the names it carries, or by the names stated for it
+    /// alone; a client that asked for a name none answers for is refused in the handshake
+    /// with an `unrecognized_name` alert. No certificate twice.
     #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
-    pub certificates: Vec<String>,
+    pub certificates: Vec<ListenerCertificate>,
     /// The certificate for a client that asks for no name (no SNI): one of
     /// `certificates`, or `none` to refuse such a client in the handshake. Said on every
     /// listener with TLS, so that which one is never left to their order. It holds for the
@@ -386,6 +386,53 @@ pub struct Tls {
     /// client is served.
     #[serde(default)]
     pub client_validation: Option<ClientValidation>,
+}
+
+/// A certificate a listener presents, by its name: for every DNS name it carries, or for
+/// the names stated for it alone.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum ListenerCertificate {
+    /// Its name: it answers for every DNS name in its subject alternative names.
+    Carried(String),
+    /// Its name, and the only names it answers for, whatever else it carries: a
+    /// translated Ingress's certificate answers for the hosts that Ingress lists and no
+    /// other, so one team's certificate never answers for another team's host.
+    Stated(StatedNames),
+}
+
+impl ListenerCertificate {
+    /// The certificate's name, among the config's.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Carried(name) => name,
+            Self::Stated(stated) => &stated.certificate,
+        }
+    }
+
+    /// The names stated for it, if any are.
+    #[must_use]
+    pub fn stated(&self) -> Option<&[String]> {
+        match self {
+            Self::Carried(_) => None,
+            Self::Stated(stated) => Some(&stated.names),
+        }
+    }
+}
+
+/// A certificate and the names it answers for.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct StatedNames {
+    /// The certificate's name, among the config's.
+    pub certificate: String,
+    /// Host names, or `*.` and a host name for every name one label longer, as a
+    /// certificate's own wildcard stands for one whole label.
+    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
+    pub names: Vec<String>,
 }
 
 /// Whom a listener trusts to vouch for its clients (Gateway API's frontend validation, in

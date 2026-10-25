@@ -26,7 +26,7 @@ use crate::request_body::{RequestBody, RequestBodyError};
 use crate::storage::{LIMIT, Storage};
 use crate::timers::Timers;
 use crate::tls::Tls;
-use crate::tls::testing::{certificate, named};
+use crate::tls::testing::{certificate, presented};
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body::{Body, Frame};
@@ -229,7 +229,7 @@ where
 {
     let tls = Arc::new(
         Tls::new(&edgerush_config::CompiledTls {
-            certificates: vec![named("a", certificate(&["a.test"]))],
+            certificates: vec![presented("a", certificate(&["a.test"]))],
             without_sni: Some(0),
             client_validation: None,
         })

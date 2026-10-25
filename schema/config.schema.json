@@ -734,6 +734,19 @@
         "protocol"
       ]
     },
+    "ListenerCertificate": {
+      "description": "A certificate a listener presents, by its name: for every DNS name it carries, or for\nthe names stated for it alone.",
+      "anyOf": [
+        {
+          "description": "Its name: it answers for every DNS name in its subject alternative names.",
+          "type": "string"
+        },
+        {
+          "description": "Its name, and the only names it answers for, whatever else it carries: a\ntranslated Ingress's certificate answers for the hosts that Ingress lists and no\nother, so one team's certificate never answers for another team's host.",
+          "$ref": "#/$defs/StatedNames"
+        }
+      ]
+    },
     "ListenerProxyProtocol": {
       "description": "A listener's PROXY protocol.",
       "oneOf": [
@@ -1499,6 +1512,29 @@
         "window_ms"
       ]
     },
+    "StatedNames": {
+      "description": "A certificate and the names it answers for.",
+      "type": "object",
+      "properties": {
+        "certificate": {
+          "description": "The certificate's name, among the config's.",
+          "type": "string"
+        },
+        "names": {
+          "description": "Host names, or `*.` and a host name for every name one label longer, as a\ncertificate's own wildcard stands for one whole label.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "certificate",
+        "names"
+      ]
+    },
     "TcpRoute": {
       "description": "A route for a `tcp` listener: every connection it takes goes to these backends, as\nGateway API's TCPRoute has it.",
       "type": "object",
@@ -1574,10 +1610,10 @@
       "type": "object",
       "properties": {
         "certificates": {
-          "description": "The names of the certificates it can present. A client is given the one whose\nnames cover the name it asked for (SNI); a client that asked for a name none of them\ncarries is refused in the handshake with an `unrecognized_name` alert. No name\ntwice.",
+          "description": "The certificates it can present. A client is given the one that answers for the\nname it asked for (SNI): by the names it carries, or by the names stated for it\nalone; a client that asked for a name none answers for is refused in the handshake\nwith an `unrecognized_name` alert. No certificate twice.",
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/ListenerCertificate"
           },
           "minItems": 1
         },

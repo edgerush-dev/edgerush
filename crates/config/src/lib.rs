@@ -27,15 +27,15 @@ pub use compile::{
     Compiled, CompiledDataPlane, CompiledForwarding, CompiledListener, CompiledMirror,
     CompiledRateLimitService, CompiledRateLimiting, CompiledRetry, CompiledRule,
     CompiledSynchronous, CompiledTimeouts, CompiledTls, CompiledUpstream, CompiledUpstreamTls,
-    ConfigError, L4, L4Route, MatchId, Matches, NamedCertificate, Object, Outcome, Place, Problem,
-    RuleId, SniRouter, Step, Timeout, compile, compile_with_matches,
+    ConfigError, L4, L4Route, MatchId, Matches, NamedCertificate, Object, Outcome, Place,
+    PresentedCertificate, Problem, RuleId, SniRouter, Step, Timeout, compile, compile_with_matches,
 };
 pub use config::{
     AccessLog, Certificate, ClientValidation, Config, DataPlane, Endpoints, Forwarding,
-    HealthCheck, Http3, Keepalive, Listener, ListenerProxyProtocol, LoadBalancer, Probe, Protocol,
-    ProxyProtocolVersion, RateLimitBreaker, RateLimitMode, RateLimitService, RateLimitSynchronous,
-    RateLimiting, RequestId, SlowStart, Tls, Upstream, UpstreamProtocol, UpstreamTls,
-    WhenUnreachable,
+    HealthCheck, Http3, Keepalive, Listener, ListenerCertificate, ListenerProxyProtocol,
+    LoadBalancer, Probe, Protocol, ProxyProtocolVersion, RateLimitBreaker, RateLimitMode,
+    RateLimitService, RateLimitSynchronous, RateLimiting, RequestId, SlowStart, StatedNames, Tls,
+    Upstream, UpstreamProtocol, UpstreamTls, WhenUnreachable,
 };
 pub use harness_file::{CertificateFiles, HarnessFile};
 pub use kubernetes::{KubernetesService, ServiceNameError, ServicePort};

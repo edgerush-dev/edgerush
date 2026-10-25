@@ -629,6 +629,57 @@ async fn the_certificate_is_chosen_by_the_name_asked_for() {
         .await;
 }
 
+/// A certificate whose names the listener states answers for those alone, whatever else
+/// it carries: a name it carries but is not stated goes to the certificate stated or
+/// carrying it after, or is refused when there is none (03 §3). An Ingress's certificate
+/// so answers only for the hosts its Ingress lists.
+#[tokio::test]
+async fn a_certificate_answers_for_the_names_stated_for_it_alone() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let certificates = vec![
+                crate::tls::testing::certificate(&["a.test", "b.test", "*.w.test"]),
+                crate::tls::testing::certificate(&["b.test"]),
+            ];
+            let leaves: Vec<Vec<u8>> = certificates
+                .iter()
+                .map(|certificate| {
+                    boring::x509::X509::from_pem(certificate.chain.as_bytes())
+                        .unwrap()
+                        .to_der()
+                        .unwrap()
+                })
+                .collect();
+            let mut config = everything_config(upstream);
+            secured(&mut config, certificates, None);
+            let tls = config
+                .listeners
+                .get_mut("web")
+                .unwrap()
+                .tls
+                .as_mut()
+                .unwrap();
+            tls.certificates[0] =
+                edgerush_config::ListenerCertificate::Stated(edgerush_config::StatedNames {
+                    certificate: "web0".to_owned(),
+                    names: vec!["a.test".to_owned()],
+                });
+            let (front, _worker) = serving_compiled(compile(&config).unwrap()).await;
+            for (name, expected) in [("a.test", 0), ("b.test", 1)] {
+                let client = tls_client(front, name, None, |_| {}).await.unwrap();
+                let given = client.ssl().peer_certificate().unwrap().to_der().unwrap();
+                assert_eq!(given, leaves[expected], "asked for {name}");
+            }
+            let Err(refused) = tls_client(front, "x.w.test", None, |_| {}).await else {
+                panic!("a name carried but not stated was served");
+            };
+            assert!(refused.contains("UNRECOGNIZED_NAME"), "{refused}");
+        })
+        .await;
+}
+
 /// TLS 1.2 is the oldest spoken, and a client that can exchange keys post-quantum
 /// does.
 #[tokio::test]
