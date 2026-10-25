@@ -1,0 +1,33 @@
+# An Ingress the data plane would refuse (a path that climbs) is left out alone, with the
+# data plane's own reason; another team's Ingress beside it is translated as ever.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: good, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: bad, namespace: other }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: other.example.com
+      http:
+        paths:
+          - { path: /a/../admin, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec: { ports: [{ name: http, port: 80 }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: other }
+spec: { ports: [{ name: http, port: 80 }] }

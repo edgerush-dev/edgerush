@@ -13,7 +13,7 @@
 
 use edgerush_config::{
     Backend, Config, DataPlane, Endpoints, Forward, Hostname, Listener, LoadBalancer, Match,
-    PathMatch, Protocol, Route, Rule, Upstream, UpstreamProtocol, Wildcard,
+    PathMatch, Protocol, Route, Rule, Upstream, UpstreamProtocol, Wildcard, compile,
 };
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::networking::v1::{HTTPIngressPath, Ingress, IngressServiceBackend};
@@ -111,6 +111,10 @@ pub enum Problem {
     /// It is not what Kubernetes allows, which its API server would have refused.
     #[error("invalid: {0}")]
     Invalid(&'static str),
+    /// Translated, it is what the data plane would refuse: its problems, as compiling it
+    /// says them.
+    #[error("the data plane would refuse it: {0}")]
+    Refused(String),
     /// The data plane has no listener to serve it on.
     #[error("the data plane has no `http` listener to serve it on")]
     NoListener,
@@ -139,32 +143,65 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         };
         key(a).cmp(&key(b))
     });
+    // Each Ingress is compiled alone, with the listeners it is served on, so that one the
+    // data plane would refuse is left out by itself rather than refusing every other's
+    // (04 §2). Unless those listeners are refused with no routes at all: then the fault is
+    // the data plane's settings, not any Ingress's, and the whole config says so.
+    let served_on: BTreeMap<String, Listener> = plane
+        .listeners
+        .iter()
+        .filter(|(_, listener)| listener.protocol == Protocol::Http)
+        .map(|(name, listener)| (name.clone(), listener.clone()))
+        .collect();
+    let checked_alone = compile(&config_of(served_on.clone(), Vec::new(), BTreeMap::new())).is_ok();
     for ingress in ingresses {
+        let object = || Object::of("Ingress", &ingress.metadata);
         match ingress_routes(plane, cluster, ingress) {
             Ok((translated, used)) => {
+                if checked_alone {
+                    let alone = config_of(served_on.clone(), translated.clone(), used.clone());
+                    if let Err(problems) = compile(&alone) {
+                        let problems: Vec<String> =
+                            problems.iter().map(ToString::to_string).collect();
+                        report.push(Finding {
+                            object: object(),
+                            problem: Problem::Refused(problems.join("; ")),
+                        });
+                        continue;
+                    }
+                }
                 routes.extend(translated);
                 upstreams.extend(used);
             }
             Err(problem) => report.push(Finding {
-                object: Object::of("Ingress", &ingress.metadata),
+                object: object(),
                 problem,
             }),
         }
     }
     Translation {
-        config: Config {
-            listeners: plane.listeners.clone(),
-            routes,
-            tcp_routes: Vec::new(),
-            tls_routes: Vec::new(),
-            upstreams,
-            data_plane: DataPlane::default(),
-            rate_limiting: None,
-            certificates: BTreeMap::new(),
-            limits: None,
-        },
+        config: config_of(plane.listeners.clone(), routes, upstreams),
         report,
         passed_over: others.len(),
+    }
+}
+
+/// A config of these listeners, routes and upstreams, and nothing else.
+fn config_of(
+    listeners: BTreeMap<String, Listener>,
+    routes: Vec<Route>,
+    upstreams: BTreeMap<String, Upstream>,
+) -> Config {
+    Config {
+        listeners,
+        routes,
+        tcp_routes: Vec::new(),
+        tls_routes: Vec::new(),
+        upstreams,
+        data_plane: DataPlane::default(),
+        rate_limiting: None,
+        certificates: BTreeMap::new(),
+        limits: None,
     }
 }
 
@@ -377,5 +414,86 @@ fn service_port(
         _ => Err(Problem::NotSupportedYet(
             "an unnamed port of a Service with several",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HTTP: &str = "  http: { address: \"[::]:8080\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n";
+
+    /// Ingresses `good`, routing `/`, and `bad`, routing a path that climbs, which the data
+    /// plane refuses, translated for a data plane with these listeners.
+    fn good_and_bad(listeners: &str) -> Translation {
+        let plane: Plane = serde_saphyr::from_str(&format!(
+            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\nlisteners:\n{listeners}"
+        ))
+        .unwrap();
+        let ingress = |name: &str, path: &str| -> Ingress {
+            serde_saphyr::from_str(&format!(
+                "metadata: {{ name: {name}, namespace: shop }}\nspec:\n  ingressClassName: edge\n  rules:\n    - host: {name}.example.com\n      http:\n        paths:\n          - {{ path: \"{path}\", pathType: Prefix, backend: {{ service: {{ name: web, port: {{ number: 80 }} }} }} }}\n"
+            ))
+            .unwrap()
+        };
+        let service: Service = serde_saphyr::from_str(
+            "metadata: { name: web, namespace: shop }\nspec: { ports: [{ name: http, port: 80 }] }\n",
+        )
+        .unwrap();
+        translate(
+            &plane,
+            &Cluster {
+                ingresses: vec![ingress("good", "/"), ingress("bad", "/a/../admin")],
+                services: vec![service],
+            },
+        )
+    }
+
+    fn reported(translation: &Translation) -> Vec<String> {
+        translation.report.iter().map(ToString::to_string).collect()
+    }
+
+    /// An Ingress is compiled alone with the listeners it is served on: a `tcp` listener of
+    /// the data plane's, which wants a TCP route no Ingress gives it, neither stops that
+    /// check nor is blamed on any Ingress.
+    #[test]
+    fn an_ingress_is_checked_with_its_own_listeners_only() {
+        let tcp = "  db: { address: \"[::]:5432\", protocol: tcp, proxy_protocol: off }\n";
+        let translation = good_and_bad(&format!("{HTTP}{tcp}"));
+        assert_eq!(
+            reported(&translation),
+            [
+                "Ingress shop/bad: the data plane would refuse it: route `ingress/shop/bad/bad.example.com`, rules[0], matches[0]: path: path contains a `.` or `..` segment"
+            ]
+        );
+        let routes: Vec<&str> = translation
+            .config
+            .routes
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(routes, ["ingress/shop/good/good.example.com"]);
+    }
+
+    /// Where the data plane's own listeners are what it would refuse, compiling an Ingress
+    /// alone would refuse every one for a fault none of them has: each is translated, and
+    /// the whole config's problems are the listener's and the Ingresses' together.
+    #[test]
+    fn a_fault_of_the_data_planes_own_is_not_any_ingresses() {
+        let refused = HTTP.replace("trusted_proxies: []", "trusted_proxies: [\"10.1.2.3/8\"]");
+        let translation = good_and_bad(&refused);
+        assert_eq!(reported(&translation), Vec::<String>::new());
+        assert_eq!(translation.config.routes.len(), 2);
+        let problems: Vec<String> = compile(&translation.config)
+            .unwrap_err()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.starts_with("listener `http`")),
+            "{problems:?}"
+        );
     }
 }
