@@ -1,0 +1,26 @@
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: ingress/shop/paths/other.example.com
+    listeners: [http]
+    hostnames: [{ name: other.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/paths/shop.example.com
+    listeners: [http]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { exact: /cart } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+      - matches: [{ path: { prefix: /api } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+      - matches: [{ path: { prefix: /static } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+upstreams:
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

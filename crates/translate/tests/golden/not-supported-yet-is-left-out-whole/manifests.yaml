@@ -1,5 +1,6 @@
-# Each Ingress asks for one thing not translated yet, and is left out whole, even the parts
-# it could have had; the one that asks for nothing more is translated beside them.
+# Each Ingress asks for one thing not translated yet, or one Kubernetes would not have
+# taken, and is left out whole, even the parts it could have had; the one that asks for
+# nothing more is translated beside them.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: a-tls, namespace: shop }
@@ -26,7 +27,7 @@ spec:
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
-metadata: { name: c-exact, namespace: shop }
+metadata: { name: c-prefix-without-path, namespace: shop }
 spec:
   ingressClassName: edge
   rules:
@@ -34,7 +35,18 @@ spec:
       http:
         paths:
           - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
-          - { path: /exact, pathType: Exact, backend: { service: { name: web, port: { number: 80 } } } }
+          - { pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: c2-unknown-path-type, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Regex, backend: { service: { name: web, port: { number: 80 } } } }
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
