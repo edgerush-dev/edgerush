@@ -140,6 +140,7 @@ impl Worker {
             balancing: RefCell::default(),
             limiter: RefCell::new(None),
             local_limiter: RefCell::new(None),
+            sync_limiter: RefCell::new(None),
             accepted: Cell::new(0),
             body_limits,
             me: Weak::clone(me),

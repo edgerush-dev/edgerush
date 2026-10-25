@@ -121,8 +121,27 @@ pub enum CompiledRateLimiting {
         /// The bytes the keys may hold on the data plane, held once by its process.
         max_key_bytes: u64,
     },
+    /// The key's owner in the service decides every request.
+    Synchronous(CompiledSynchronous),
     /// Each process from its copies, sharing through the service (experimental).
     Asynchronous(CompiledRateLimitService),
+}
+
+/// The synchronous mode, checked: its owners, and how a request waits for them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledSynchronous {
+    /// The address of each of the service's pods, the first being pod 0.
+    pub addresses: Vec<String>,
+    /// How long a request waits for its owners' answers.
+    pub timeout: Duration,
+    /// What decides a request whose owner does not answer in time.
+    pub when_unreachable: crate::WhenUnreachable,
+    /// Failures in a row that open an owner's breaker.
+    pub breaker_failures: u32,
+    /// How long an owner's breaker stays open before the owner is tried again.
+    pub probe_after: Duration,
+    /// The bytes the keys may hold on the data plane, held once by its process.
+    pub max_key_bytes: u64,
 }
 
 impl CompiledRateLimiting {
@@ -199,7 +218,9 @@ impl Compiled {
     pub fn rate_limit_service(&self) -> Option<&CompiledRateLimitService> {
         match &self.rate_limiting {
             CompiledRateLimiting::Asynchronous(service) => Some(service),
-            CompiledRateLimiting::Off | CompiledRateLimiting::Local { .. } => None,
+            CompiledRateLimiting::Off
+            | CompiledRateLimiting::Local { .. }
+            | CompiledRateLimiting::Synchronous(_) => None,
         }
     }
 
@@ -676,16 +697,28 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
                     errors.push(place.problem(Problem::RateLimitingSynchronousZero(field)));
                 }
             }
+            if waiting.when_unreachable == crate::WhenUnreachable::Local {
+                errors.push(place.problem(Problem::RateLimitingUnreachableLocalNotBuilt));
+            }
         }
         (None, false) => {}
     }
     match mode {
         RateLimitMode::Off => CompiledRateLimiting::Off,
         RateLimitMode::Local => CompiledRateLimiting::Local { max_key_bytes },
-        RateLimitMode::Synchronous => {
-            errors.push(place.problem(Problem::RateLimitingSynchronousNotBuilt));
-            CompiledRateLimiting::Off
-        }
+        RateLimitMode::Synchronous => match (service, &limiting.synchronous) {
+            (Some(service), Some(waiting)) => {
+                CompiledRateLimiting::Synchronous(CompiledSynchronous {
+                    addresses: service.addresses.clone(),
+                    timeout: Duration::from_millis(waiting.timeout_ms),
+                    when_unreachable: waiting.when_unreachable,
+                    breaker_failures: waiting.breaker.failures,
+                    probe_after: Duration::from_millis(waiting.breaker.probe_after_ms),
+                    max_key_bytes,
+                })
+            }
+            _ => CompiledRateLimiting::Off,
+        },
         RateLimitMode::Asynchronous => match service {
             Some(service) => CompiledRateLimiting::Asynchronous(CompiledRateLimitService {
                 pods: service.addresses.clone(),
@@ -2462,9 +2495,9 @@ pub enum Problem {
     /// A cap on keys where none are kept.
     #[error("`rate_limiting.max_key_bytes` is for a mode that keeps keys, not `off`")]
     RateLimitingKeyBytesOff,
-    /// The synchronous mode, which is not built.
-    #[error("`rate_limiting`: mode `synchronous` is not built yet")]
-    RateLimitingSynchronousNotBuilt,
+    /// An owner out of reach decided by the data plane's own buckets, which is not built.
+    #[error("`rate_limiting.synchronous`: `when_unreachable: local` is not built yet")]
+    RateLimitingUnreachableLocalNotBuilt,
     /// The synchronous mode without how a request waits for its owner.
     #[error("`rate_limiting`: mode `synchronous` needs `synchronous`")]
     RateLimitingSynchronousMissing,
@@ -4942,7 +4975,7 @@ upstreams: {{ u: {upstream} }}
 
     /// The section left out, or its mode `off`, enforces nothing; `local` keeps keys within
     /// a cap, 256 MiB when left out, and takes no service; the modes that share counts need
-    /// one, and `synchronous` is not built yet.
+    /// one, and `synchronous` how a request waits for its owner too.
     #[test]
     fn the_mode_takes_what_it_needs_and_nothing_else() {
         let with = |section: &str| {
@@ -4991,10 +5024,16 @@ upstreams: {{ u: {upstream} }}
         );
         assert_eq!(
             with(&format!(
-                r#"rate_limiting: {{ mode: synchronous, service: {{ addresses: ["rl-0:7000"] }}, {WAITS} }}"#
-            ))
-            .unwrap_err(),
-            ["the data plane: `rate_limiting`: mode `synchronous` is not built yet"]
+                r#"rate_limiting: {{ mode: synchronous, max_key_bytes: 1000, service: {{ addresses: ["rl-0:7000", "rl-1:7000"] }}, {WAITS} }}"#
+            )),
+            Ok(CompiledRateLimiting::Synchronous(CompiledSynchronous {
+                addresses: vec!["rl-0:7000".to_owned(), "rl-1:7000".to_owned()],
+                timeout: Duration::from_millis(20),
+                when_unreachable: crate::WhenUnreachable::Allow,
+                breaker_failures: 5,
+                probe_after: Duration::from_secs(1),
+                max_key_bytes: 1000,
+            }))
         );
         // The mode is always written: a section saying nothing would leave it implied.
         let unsaid: Result<Config, _> =
@@ -5019,13 +5058,13 @@ upstreams: {{ u: {upstream} }}
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
         let service = r#"service: { addresses: ["rl-0:7000"] }"#;
-        let not_built = "the data plane: `rate_limiting`: mode `synchronous` is not built yet";
+        assert_eq!(
+            with(&format!("mode: synchronous, {service}, {WAITS}")),
+            Ok(())
+        );
         assert_eq!(
             with(&format!("mode: synchronous, {service}")).unwrap_err(),
-            [
-                "the data plane: `rate_limiting`: mode `synchronous` needs `synchronous`",
-                not_built
-            ]
+            ["the data plane: `rate_limiting`: mode `synchronous` needs `synchronous`"]
         );
         for (mode, more) in [("off", ""), ("local", ""), ("asynchronous", service)] {
             let more = if more.is_empty() {
@@ -5052,12 +5091,9 @@ upstreams: {{ u: {upstream} }}
             let zero = WAITS.replace(said, zero);
             assert_eq!(
                 with(&format!("mode: synchronous, {service}, {zero}")).unwrap_err(),
-                [
-                    format!(
-                        "the data plane: `rate_limiting.synchronous`: `{field}` is 0: at least 1"
-                    ),
-                    not_built.to_owned()
-                ]
+                [format!(
+                    "the data plane: `rate_limiting.synchronous`: `{field}` is 0: at least 1"
+                )]
             );
         }
         for (field, value) in [
@@ -5069,15 +5105,29 @@ upstreams: {{ u: {upstream} }}
             let service = format!(r#"service: {{ addresses: ["rl-0:7000"], {field}: {value} }}"#);
             assert_eq!(
                 with(&format!("mode: synchronous, {service}, {WAITS}")).unwrap_err(),
-                [
-                    format!(
-                        "the data plane: `rate_limiting.service.{field}` is for mode `asynchronous`"
-                    ),
-                    not_built.to_owned()
-                ],
+                [format!(
+                    "the data plane: `rate_limiting.service.{field}` is for mode `asynchronous`"
+                )],
                 "said, even as its default"
             );
         }
+        assert_eq!(
+            with(&format!(
+                "mode: synchronous, {service}, {}",
+                WAITS.replace("allow", "deny")
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            with(&format!(
+                "mode: synchronous, {service}, {}",
+                WAITS.replace("allow", "local")
+            ))
+            .unwrap_err(),
+            [
+                "the data plane: `rate_limiting.synchronous`: `when_unreachable: local` is not built yet"
+            ]
+        );
         // Every field is required, and an owner out of reach is decided by one of three.
         let parses = |waits: &str| {
             let yaml = format!(

@@ -43,6 +43,24 @@ pub(super) fn runs_rate_limits(config: &Compiled, supported: bool) -> Result<(),
     Ok(())
 }
 
+/// The synchronous mode's side of the process for `config`: none in another mode;
+/// `running`, if it asks as `config` says, so that its workers keep their streams; else a
+/// new one.
+fn sync_for(
+    config: &Compiled,
+    running: Option<&Arc<crate::ratelimit::synchronous::Process>>,
+) -> Option<Arc<crate::ratelimit::synchronous::Process>> {
+    let CompiledRateLimiting::Synchronous(synchronous) = config.rate_limiting() else {
+        return None;
+    };
+    match running {
+        Some(running) if running.is_for(synchronous) => Some(Arc::clone(running)),
+        _ => Some(crate::ratelimit::synchronous::Process::start(
+            synchronous.clone(),
+        )),
+    }
+}
+
 /// Refuses a config with an upstream whose endpoints come from Kubernetes: the data plane
 /// does not watch EndpointSlices yet, and such an upstream would never have an endpoint.
 pub(super) fn discovers_nothing(config: &Compiled) -> Result<(), ProxyError> {
@@ -303,6 +321,10 @@ impl Proxy {
             Some(failed) => self.local_for(&snapshot.config, rate_limits.local.as_ref(), failed)?,
             None => None,
         };
+        let synchronous = match &rate_limits.failed {
+            Some(_) => sync_for(&snapshot.config, rate_limits.synchronous.as_ref()),
+            None => None,
+        };
         // Only now that all of it is accepted: a config refused for one listener must not
         // have changed the certificates of another, nor opened a file it logs to, nor let
         // go of the running config's connections.
@@ -319,6 +341,7 @@ impl Proxy {
         self.current.store(Arc::new(snapshot));
         rate_limits.hub = hub;
         rate_limits.local = local;
+        rate_limits.synchronous = synchronous;
         drop(rate_limits);
         self.metrics.reloads.inc();
         let now = SystemTime::now().duration_since(UNIX_EPOCH);
@@ -386,6 +409,7 @@ impl Proxy {
         let max_key_bytes = match snapshot.config.rate_limiting() {
             CompiledRateLimiting::Local { max_key_bytes } => Some(*max_key_bytes),
             CompiledRateLimiting::Asynchronous(service) => Some(service.max_key_bytes),
+            CompiledRateLimiting::Synchronous(synchronous) => Some(synchronous.max_key_bytes),
             CompiledRateLimiting::Off => None,
         };
         if let Some(max_key_bytes) = max_key_bytes
@@ -490,6 +514,21 @@ impl Proxy {
         (self.current.load_full(), rate_limits.local.clone())
     }
 
+    /// The running config and the synchronous mode's side of the process, taken in
+    /// together, as [`hub`](Self::hub) takes the thread.
+    pub(super) fn sync_limits(
+        &self,
+    ) -> (
+        Arc<Snapshot>,
+        Option<Arc<crate::ratelimit::synchronous::Process>>,
+    ) {
+        let rate_limits = self
+            .rate_limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (self.current.load_full(), rate_limits.synchronous.clone())
+    }
+
     /// The running config and the rate-limiting thread its limits are decided with, which
     /// are always taken in together; no thread for a config with limits if they were not
     /// started ([`Proxy::start_rate_limits`]). For a worker making its limiter: it takes a
@@ -535,6 +574,7 @@ impl Proxy {
         let failed = crate::ratelimit::Failed(Arc::new(failed));
         rate_limits.hub = self.hub_for(&self.current.load().config, None, &failed)?;
         rate_limits.local = self.local_for(&self.current.load().config, None, &failed)?;
+        rate_limits.synchronous = sync_for(&self.current.load().config, None);
         rate_limits.failed = Some(failed);
         Ok(())
     }

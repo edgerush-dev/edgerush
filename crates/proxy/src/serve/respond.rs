@@ -17,6 +17,7 @@ use crate::map_head::MapHead;
 use crate::metrics::{Answer, LimitCounters};
 use crate::random::{random, unguessable};
 use crate::ratelimit::local::LocalLimiter;
+use crate::ratelimit::synchronous::SyncLimiter;
 use crate::ratelimit::{KeyedBy, Limited, Limiter, LookUp, RATELIMIT, Undecided};
 use crate::request::{Decision, Opening, Rejection, decide};
 use crate::request_body::{Counts, RequestBody};
@@ -64,6 +65,8 @@ enum Limiting {
     Asynchronous(Rc<Limiter>),
     /// The process's own.
     Local(Rc<LocalLimiter>),
+    /// Each request asked of its keys' owners.
+    Synchronous(Rc<SyncLimiter>),
 }
 
 impl Worker {
@@ -166,6 +169,9 @@ impl Worker {
                 limiter.decide_all(&rule.limits, limited, client)
             }
             Some(Limiting::Local(limiter)) => limiter.decide_all(&rule.limits, limited, client),
+            Some(Limiting::Synchronous(limiter)) => {
+                limiter.decide_all(&rule.limits, limited, client)
+            }
             None => Limited::Undecided(Undecided::Unavailable),
         }
     }
@@ -227,6 +233,10 @@ impl Worker {
                 Some(Limiting::Local(limiter)) => {
                     limiter.decide_all(&under.rule.limits, one, client)
                 }
+                // Asked of its owner alone, as any request is.
+                Some(Limiting::Synchronous(limiter)) => {
+                    limiter.decide_all(&under.rule.limits, one, client)
+                }
                 None => Limited::Undecided(Undecided::Unavailable),
             };
             match limited {
@@ -282,6 +292,9 @@ impl Worker {
             Some(Limiting::Local(limiter)) => {
                 limiter.refusal(&under.rule.limits, under.marked, client)
             }
+            Some(Limiting::Synchronous(limiter)) => {
+                limiter.refusal(&under.rule.limits, under.marked, client, told)
+            }
             None => return response,
         };
         self.count_limits(under.rule, refusal.by, under.slots, |counters| {
@@ -312,8 +325,37 @@ impl Worker {
         match self.proxy.current.load().config.rate_limiting() {
             CompiledRateLimiting::Asynchronous(_) => self.limiter().map(Limiting::Asynchronous),
             CompiledRateLimiting::Local { .. } => self.local_limiter().map(Limiting::Local),
+            CompiledRateLimiting::Synchronous(_) => self.sync_limiter().map(Limiting::Synchronous),
             CompiledRateLimiting::Off => None,
         }
+    }
+
+    /// The worker's limiter in the synchronous mode, made when first needed and again when
+    /// the process's side of it is replaced; `None` before rate limits are started.
+    fn sync_limiter(&self) -> Option<Rc<SyncLimiter>> {
+        let generation = self.proxy.current.load().generation;
+        let mut held = self.sync_limiter.borrow_mut();
+        if let Some((made_for, limiter)) = held.as_ref()
+            && *made_for == generation
+        {
+            return Some(Rc::clone(limiter));
+        }
+        let (snapshot, process) = self.proxy.sync_limits();
+        let Some(process) = process else {
+            *held = None;
+            return None;
+        };
+        // A reload that asks as before keeps the worker's streams.
+        if let Some((_, limiter)) = held.as_ref()
+            && limiter.is_on(&process)
+        {
+            let limiter = Rc::clone(limiter);
+            *held = Some((snapshot.generation, Rc::clone(&limiter)));
+            return Some(limiter);
+        }
+        let limiter = SyncLimiter::new(process);
+        *held = Some((snapshot.generation, Rc::clone(&limiter)));
+        Some(limiter)
     }
 
     /// The worker's limiter in local mode, made when first needed and again when the
