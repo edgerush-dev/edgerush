@@ -491,9 +491,9 @@ impl Proxy {
     }
 
     /// The synchronous mode's side of the process for `config`: none in another mode;
-    /// `running`, if it asks as `config` says, so that its workers keep their streams and
-    /// its breakers what they know; else a new one, its probe thread calling `failed` if it
-    /// fails.
+    /// `running`, if it asks as `config` says, so that its workers keep their streams; else
+    /// a new one, carrying across what `running` knows of an outage, its probe thread
+    /// calling `failed` if it fails.
     fn sync_for(
         &self,
         config: &Compiled,
@@ -512,6 +512,7 @@ impl Proxy {
             synchronous.clone(),
             self.workers,
             Some(failed.clone()),
+            running.map(|running| &**running),
         )
         .map(Some)
         .map_err(|error| ProxyError::RateLimitThread(format!("no thread: {error}")))
