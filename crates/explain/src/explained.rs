@@ -339,9 +339,7 @@ fn text(
             }
             if let Some((_, rule)) = rule {
                 let backends = rule.forward.iter().flat_map(|forward| &forward.backends);
-                let backends: Vec<String> = backends
-                    .map(|backend| format!("{} (weight {})", backend.upstream, backend.weight))
-                    .collect();
+                let backends: Vec<String> = backends.map(ToString::to_string).collect();
                 field(&mut lines, "backends", vec![backends.join(", ")]);
                 let mirrors: Vec<String> = rule
                     .filters
@@ -813,6 +811,41 @@ upstream  GET /cart?id=7
 backends  cart (weight 9), cart-canary (weight 1)
 mirrors   shadow (1/10)
 "
+        );
+    }
+
+    /// An invalid backend is shown with why it is, for its share of the rule's requests is
+    /// answered 500.
+    #[test]
+    fn an_invalid_backend_is_shown_with_why() {
+        let config = r#"
+listeners: { web: { address: "127.0.0.1:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
+routes:
+  - name: half
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: up, weight: 1 }, { invalid: "Service shop/gone does not exist", weight: 1 }] }
+upstreams:
+  up: { load_balancer: p2c, endpoints: { listed: [] } }
+"#;
+        let snapshot = Snapshot::new(serde_saphyr::from_str(config).unwrap()).unwrap();
+        let listener = snapshot.listener("web").unwrap();
+        let text = snapshot
+            .explain(
+                listener,
+                &asked("1.1", "GET", "http://shop.example.com/", &[]),
+            )
+            .unwrap()
+            .text();
+        assert!(
+            text.contains(
+                "
+backends  up (weight 1), invalid: Service shop/gone does not exist (weight 1)
+"
+            ),
+            "{text}"
         );
     }
 

@@ -396,16 +396,37 @@ pub struct Header {
     pub value: String,
 }
 
-/// One destination of a rule.
+/// One destination of a rule: an upstream, or a backend that is invalid, one and not both.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Backend {
     /// The name of an upstream in the same config.
-    pub upstream: String,
+    #[serde(default)]
+    pub upstream: Option<String>,
+    /// Why this backend is invalid, which the control plane writes for a reference it
+    /// cannot follow (a Service that does not exist): its share of the requests is answered
+    /// 500, as Gateway API has an invalid `backendRef`'s, and gRPC calls `UNAVAILABLE`. The
+    /// reason is shown by `explain` and `test`, and acted on by nothing. HTTP rules only.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
+    pub invalid: Option<String>,
     /// This backend's share of the rule's requests, relative to the other weights. Zero
     /// is no share; if all are zero the rule has nowhere to send a request.
     pub weight: u32,
+}
+
+impl std::fmt::Display for Backend {
+    /// As `explain` and `test` show it: `web (weight 3)`, or
+    /// `invalid: Service shop/gone does not exist (weight 1)`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let weight = self.weight;
+        match (&self.upstream, &self.invalid) {
+            (Some(upstream), _) => write!(f, "{upstream} (weight {weight})"),
+            (None, Some(reason)) => write!(f, "invalid: {reason} (weight {weight})"),
+            (None, None) => write!(f, "nothing (weight {weight})"),
+        }
+    }
 }
 
 /// One way for a request to belong to a rule: all of what is stated here must hold.

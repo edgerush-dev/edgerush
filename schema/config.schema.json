@@ -101,12 +101,25 @@
       ]
     },
     "Backend": {
-      "description": "One destination of a rule.",
+      "description": "One destination of a rule: an upstream, or a backend that is invalid, one and not both.",
       "type": "object",
       "properties": {
+        "invalid": {
+          "description": "Why this backend is invalid, which the control plane writes for a reference it\ncannot follow (a Service that does not exist): its share of the requests is answered\n500, as Gateway API has an invalid `backendRef`'s, and gRPC calls `UNAVAILABLE`. The\nreason is shown by `explain` and `test`, and acted on by nothing. HTTP rules only.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "minLength": 1
+        },
         "upstream": {
           "description": "The name of an upstream in the same config.",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "weight": {
           "description": "This backend's share of the rule's requests, relative to the other weights. Zero\nis no share; if all are zero the rule has nowhere to send a request.",
@@ -117,7 +130,6 @@
       },
       "additionalProperties": false,
       "required": [
-        "upstream",
         "weight"
       ]
     },

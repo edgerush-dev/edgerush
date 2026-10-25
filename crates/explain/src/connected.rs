@@ -174,11 +174,8 @@ impl<'s> Connected<'s> {
         match self.refused() {
             Some(reason) => field(&mut lines, "refused", vec![reason.to_owned()]),
             None => {
-                let backends: Vec<String> = self
-                    .backends()
-                    .iter()
-                    .map(|backend| format!("{} (weight {})", backend.upstream, backend.weight))
-                    .collect();
+                let backends: Vec<String> =
+                    self.backends().iter().map(ToString::to_string).collect();
                 field(&mut lines, "backends", vec![backends.join(", ")]);
             }
         }
@@ -317,7 +314,12 @@ refused   no_backend
         let backends: Vec<(&str, u32)> = api
             .backends()
             .iter()
-            .map(|backend| (backend.upstream.as_str(), backend.weight))
+            .map(|backend| {
+                (
+                    backend.upstream.as_deref().unwrap_or_default(),
+                    backend.weight,
+                )
+            })
             .collect();
         assert_eq!(backends, [("api", 3), ("api-canary", 1)]);
         assert_eq!(api.refused(), None);

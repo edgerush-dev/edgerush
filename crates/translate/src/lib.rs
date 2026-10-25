@@ -478,7 +478,8 @@ fn ingress_routes(
                 filters: Vec::new(),
                 forward: Some(Forward {
                     backends: vec![Backend {
-                        upstream: name.clone(),
+                        upstream: Some(name.clone()),
+                        invalid: None,
                         weight: 1,
                     }],
                     timeouts: None,

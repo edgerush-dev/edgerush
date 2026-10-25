@@ -262,14 +262,7 @@ fn connection(
         or_none(expect.route.clone()),
         or_none(connected.route().map(str::to_owned)),
     );
-    let got_backends: Vec<Backend> = connected
-        .backends()
-        .iter()
-        .map(|backend| Backend {
-            upstream: backend.upstream.clone(),
-            weight: backend.weight,
-        })
-        .collect();
+    let got_backends: Vec<Backend> = connected.backends().to_vec();
     match (&expect.forward, &expect.refused, connected.refused()) {
         (Some(forward), _, None) => {
             differences.differ(
@@ -302,10 +295,7 @@ fn rule_backends(rule: &Rule) -> Vec<Backend> {
     rule.forward
         .iter()
         .flat_map(|forward| &forward.backends)
-        .map(|backend| Backend {
-            upstream: backend.upstream.clone(),
-            weight: backend.weight,
-        })
+        .cloned()
         .collect()
 }
 
@@ -327,11 +317,7 @@ fn rule_mirrors(rule: &Rule) -> Vec<Mirror> {
 }
 
 fn backends(backends: &[Backend]) -> String {
-    listed(
-        backends
-            .iter()
-            .map(|backend| format!("{} (weight {})", backend.upstream, backend.weight)),
-    )
+    listed(backends.iter().map(ToString::to_string))
 }
 
 fn mirrors(mirrors: &[Mirror]) -> String {

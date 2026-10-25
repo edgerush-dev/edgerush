@@ -333,6 +333,8 @@ pub(crate) enum Answer {
     BadTarget,
     NoRoute,
     NoBackend,
+    /// The backend picked is invalid: a reference the control plane could not follow.
+    InvalidBackend,
     NoEndpoints,
     /// No connection to the endpoint could be opened: refused, reset or out of time while
     /// connecting, or a TLS handshake that failed. Nothing of the request was sent
@@ -397,13 +399,14 @@ pub(crate) enum Answer {
 }
 
 impl Answer {
-    const ALL: [Self; 28] = [
+    const ALL: [Self; 29] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
         Self::BadTarget,
         Self::NoRoute,
         Self::NoBackend,
+        Self::InvalidBackend,
         Self::NoEndpoints,
         Self::Unreachable,
         Self::UpstreamFailed,
@@ -437,7 +440,9 @@ impl Answer {
             | Self::BadTarget
             | Self::BadBody => StatusCode::BAD_REQUEST,
             Self::NoRoute => StatusCode::NOT_FOUND,
-            Self::NoBackend | Self::Edits => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::NoBackend | Self::InvalidBackend | Self::Edits => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             Self::NoEndpoints
             | Self::TooBusy
             | Self::OverShare
@@ -468,6 +473,7 @@ impl Answer {
             Self::BadTarget => "bad_target",
             Self::NoRoute => "no_route",
             Self::NoBackend => "no_backend",
+            Self::InvalidBackend => "invalid_backend",
             Self::NoEndpoints => "no_endpoints",
             Self::Unreachable => "upstream_unreachable",
             Self::UpstreamFailed => "upstream_failed",
@@ -512,7 +518,7 @@ impl Answer {
                 Code::Unimplemented,
                 "connection-bound credentials are not sent over HTTP/2",
             ),
-            Self::NoBackend | Self::NoEndpoints => {
+            Self::NoBackend | Self::InvalidBackend | Self::NoEndpoints => {
                 (Code::Unavailable, "no upstream can serve the call")
             }
             Self::Unreachable => (Code::Unavailable, "the upstream could not be reached"),
@@ -568,6 +574,7 @@ impl From<Rejection> for Answer {
             Rejection::Target => Self::BadTarget,
             Rejection::NoRoute => Self::NoRoute,
             Rejection::NoBackend => Self::NoBackend,
+            Rejection::InvalidBackend => Self::InvalidBackend,
             Rejection::Edits => Self::Edits,
             Rejection::Protocol => Self::UnknownProtocol,
             Rejection::MaxForwards { .. } => Self::MaxForwards,
@@ -1463,6 +1470,7 @@ mod tests {
             Rejection::Target,
             Rejection::NoRoute,
             Rejection::NoBackend,
+            Rejection::InvalidBackend,
             Rejection::Edits,
         ] {
             assert_eq!(
@@ -1483,6 +1491,15 @@ mod tests {
         assert_eq!(Answer::UpstreamTimedOut.status(), 504);
         assert_eq!(Answer::UpstreamTimedOut.label(), "upstream_timed_out");
         assert_eq!(Answer::UpstreamTimedOut.grpc().0, Code::DeadlineExceeded);
+    }
+
+    /// An invalid backend's share is answered 500, and a call `UNAVAILABLE`, as a rule
+    /// with no backend is.
+    #[test]
+    fn an_invalid_backend_is_a_500_and_unavailable() {
+        assert_eq!(Answer::InvalidBackend.status(), 500);
+        assert_eq!(Answer::InvalidBackend.grpc().0, Code::Unavailable);
+        assert_eq!(Answer::InvalidBackend.label(), "invalid_backend");
     }
 
     #[test]

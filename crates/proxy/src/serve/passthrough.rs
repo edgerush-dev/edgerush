@@ -17,6 +17,7 @@ use crate::upstream::destination::{Aside, ReuseIdentity};
 use crate::upstream::dial;
 use crate::upstream::h1::blocks::Block;
 use crate::upstream::h1::exchange::ExchangeError;
+use edgerush_config::Destination;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -302,7 +303,11 @@ impl Worker {
         };
         // A backend with no endpoint refuses its share of connections, as TLSRoute has
         // it for a backend that cannot be used.
-        let picked = route.backends.pick(random());
+        // A TCP or TLS route has no invalid backend: the config is refused with one.
+        let picked = match route.backends.pick(random()) {
+            Some(Destination::Upstream(upstream)) => Some(upstream),
+            Some(Destination::Invalid(_)) | None => None,
+        };
         if let Some(logging) = logging {
             let upstream = picked.and_then(|upstream| snapshot.config.upstreams().get(upstream.0));
             logging.routed(&route.name, upstream.map(|upstream| upstream.name.as_str()));
