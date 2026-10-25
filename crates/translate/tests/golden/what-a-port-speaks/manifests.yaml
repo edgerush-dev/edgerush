@@ -1,0 +1,30 @@
+# A Service port's appProtocol says what its upstream is spoken to in: the values
+# Kubernetes defines are read, HTTP/1.1 when it says none. Any other value is one the
+# gateway does not speak: its path is answered 500 and the report says why.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { name: plain } } } }
+          - { path: /grpc, pathType: Prefix, backend: { service: { name: web, port: { name: grpc } } } }
+          - { path: /chat, pathType: Prefix, backend: { service: { name: web, port: { name: chat } } } }
+          - { path: /secure-chat, pathType: Prefix, backend: { service: { name: web, port: { name: secure-chat } } } }
+          - { path: /http, pathType: Prefix, backend: { service: { name: web, port: { name: http } } } }
+          - { path: /custom, pathType: Prefix, backend: { service: { name: web, port: { name: custom } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports:
+    - { name: plain, port: 80 }
+    - { name: grpc, port: 81, appProtocol: kubernetes.io/h2c }
+    - { name: chat, port: 82, appProtocol: kubernetes.io/ws }
+    - { name: secure-chat, port: 443, appProtocol: kubernetes.io/wss }
+    - { name: http, port: 83, appProtocol: http }
+    - { name: custom, port: 84, appProtocol: example.com/custom }

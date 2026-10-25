@@ -1,0 +1,2 @@
+Ingress shop/web: path /http (Prefix) on shop.example.com is answered 500: Service shop/web port http has appProtocol http, which the gateway does not speak
+Ingress shop/web: path /custom (Prefix) on shop.example.com is answered 500: Service shop/web port custom has appProtocol example.com/custom, which the gateway does not speak
