@@ -442,7 +442,7 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
             let decided = |limited: Limited| async move {
                 match limited {
                     Limited::Admit => Some(true),
-                    Limited::Refuse => Some(false),
+                    Limited::Refuse(_) => Some(false),
                     Limited::Later(later) => later.decided().await.ok().map(|d| d.admitted),
                     Limited::Undecided(_) => None,
                 }

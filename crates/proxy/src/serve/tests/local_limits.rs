@@ -27,6 +27,53 @@ fn local_mode() -> Option<edgerush_config::RateLimiting> {
     })
 }
 
+/// A refusal says why at its decision, and its answer goes by that: the key swept away
+/// before the 429 is made — evicted here, past a one-byte cap — still leaves it counted
+/// under its limit, with `Retry-After` and `RateLimit` (GitHub issue #80).
+#[tokio::test]
+async fn a_refusal_keeps_its_reason_once_its_key_is_evicted() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut config = limited_in(
+                everything_config("127.0.0.1:9".parse().unwrap()),
+                local_mode(),
+            );
+            config.limits = Some(
+                serde_saphyr::from_str(
+                    "limits:
+  - { name: per-client, key: client, model: { bucket: { rate: 1/h, burst: 1 } } }
+",
+                )
+                .unwrap(),
+            );
+            let compiled = compile(&config).unwrap();
+            let rule = &compiled.rules_of(0)[0];
+            let process = crate::ratelimit::local::Process::unswept(1, 1);
+            let limiter = crate::ratelimit::local::LocalLimiter::new(Arc::clone(&process), 0);
+            let client = crate::forwarding::Requester {
+                address: "203.0.113.7".parse().unwrap(),
+                peer: None,
+            };
+            assert!(matches!(
+                limiter.decide_all(&rule.limits, 1, client),
+                crate::ratelimit::Limited::Admit
+            ));
+            let crate::ratelimit::Limited::Refuse(Some(said)) =
+                limiter.decide_all(&rule.limits, 1, client)
+            else {
+                panic!("refused, saying why");
+            };
+            process.sweep_once();
+            assert_eq!(process.usage().1, 0, "the key is gone");
+            let refusal = said.of(&rule.limits);
+            assert_eq!(refusal.by, 1, "counted under the limit that refused it");
+            let (limit, wait) = refusal.longest.expect("the 429 names its limit");
+            assert_eq!(limit.name, "per-client");
+            assert!(wait > Duration::from_secs(3_590), "{wait:?}");
+        })
+        .await;
+}
+
 /// A data plane for `config` on `workers`, its rate limits started as the binary starts
 /// them.
 fn started(config: &Config, workers: NonZeroUsize) -> Proxy {
