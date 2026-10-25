@@ -388,7 +388,15 @@ impl SyncPod {
                 }
                 message = requests.message() => message,
                 changed = view.changed() => {
-                    if changed.is_err() || answers.send(Ok(send_view(&mut view))).await.is_err() {
+                    if changed.is_err() {
+                        return;
+                    }
+                    // Taken out of the view in this life: no longer ready for data planes.
+                    if !view.borrow().1 {
+                        let _gone = answers.send(Err(not_serving())).await;
+                        return;
+                    }
+                    if answers.send(Ok(send_view(&mut view))).await.is_err() {
                         return;
                     }
                     continue;
@@ -634,6 +642,11 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for SyncServer {
             if pod.pod.stopped() {
                 return Ok(Status::unavailable("stopped").into_http());
             }
+            // Not ready for data planes until the view takes it in, in this life: the other
+            // pods' heartbeats, copies and hand-back still come in, as taking it in needs.
+            if request.uri().path() == DECIDE && !pod.view().1 {
+                return Ok(not_serving().into_http());
+            }
             Ok(match request.uri().path() {
                 DECIDE => {
                     let mut grpc = limited(Prost::<wire::Downstream, wire::Upstream>::default());
@@ -651,6 +664,19 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for SyncServer {
             })
         })
     }
+}
+
+/// How a pod the view has not taken in, in its present life, refuses a data plane's stream:
+/// not ready, rather than gone, its keys for the data plane to ask of their next owner.
+#[must_use]
+pub fn not_serving() -> Status {
+    Status::failed_precondition("not serving: the view has not taken this pod in")
+}
+
+/// Whether `status` is a pod's refusal as [`not_serving`].
+#[must_use]
+pub fn is_not_serving(status: &Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
 }
 
 /// A data plane's stream to one synchronous pod: what it sends up, and what comes down.
