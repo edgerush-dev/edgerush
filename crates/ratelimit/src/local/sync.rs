@@ -3,11 +3,11 @@
 //! (`loom_tests`).
 
 #[cfg(not(loom))]
-pub(super) use std::sync::atomic::{AtomicU64, Ordering};
+pub(super) use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(not(loom))]
 pub(super) use std::sync::{Arc, RwLock};
 
 #[cfg(loom)]
-pub(super) use loom::sync::atomic::{AtomicU64, Ordering};
+pub(super) use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(loom)]
 pub(super) use loom::sync::{Arc, RwLock};

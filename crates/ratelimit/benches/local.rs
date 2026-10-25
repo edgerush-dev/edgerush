@@ -1,7 +1,8 @@
 //! Instruction counts for local mode's decision on the request path (03 §2: at most 150 ns
 //! for an existing key): a worker deciding on a key it holds a handle to, admitted and
 //! refused, among a thousand other keys; under two and three limits; and meeting a key it
-//! holds no handle to, in a registry of a hundred thousand: found, and made.
+//! holds no handle to, in a registry of a hundred thousand: found, and made. And the same
+//! decision by a synchronous owner, which marks the keys it changes.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-ratelimit --bench local`, see the
 //! repository README.
@@ -44,7 +45,30 @@ type Worker = Box<(Local<Keyed>, Handles<Keyed>)>;
 /// A worker holding handles to a thousand keys and `KEY`, `ROUTE` and `GLOBAL`, each asked
 /// about once.
 fn held(burst: u64) -> (Worker, Contract) {
-    let mut worker: Worker = Box::new((Local::new(hasher(), 4), Handles::new(hasher())));
+    held_in(Local::new(hasher(), 4), burst)
+}
+
+/// The same, in a registry tracking changes, as a synchronous owner's is, the keys' changes
+/// already gathered so that the decision measured marks its key.
+fn tracked(burst: u64) -> (Worker, Contract) {
+    let (mut worker, contract) = held_in(Local::tracking(hasher(), 4), burst);
+    let (local, handles) = &mut *worker;
+    let changed = handles.take_changed();
+    let _ = local.copies(&changed, 0);
+    (worker, contract)
+}
+
+/// The same, `KEY` changed once since its copy: already marked, as a busy key is between
+/// copies.
+fn tracked_marked(burst: u64) -> (Worker, Contract) {
+    let (mut worker, contract) = tracked(burst);
+    let (local, handles) = &mut *worker;
+    local.decide(handles, &[(KEY, contract)], 0);
+    (worker, contract)
+}
+
+fn held_in(local: Local<Keyed>, burst: u64) -> (Worker, Contract) {
+    let mut worker: Worker = Box::new((local, Handles::new(hasher())));
     let contract = contract(burst);
     let keys = (0..1_000).map(|k| format!("api/0\0key-{k}").into_bytes());
     for key in keys.chain([KEY, ROUTE, GLOBAL].map(<[u8]>::to_vec)) {
@@ -57,6 +81,8 @@ fn held(burst: u64) -> (Worker, Contract) {
 #[library_benchmark]
 #[bench::admitted(held(100))]
 #[bench::refused_empty(held(1))]
+#[bench::admitted_marked(tracked(100))]
+#[bench::admitted_marked_already(tracked_marked(100))]
 fn decide(setup: (Worker, Contract)) -> (Decision, Worker) {
     let (mut worker, contract) = setup;
     let (local, handles) = &mut *worker;

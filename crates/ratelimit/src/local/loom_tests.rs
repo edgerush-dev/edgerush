@@ -92,3 +92,30 @@ fn loom_a_key_forgotten_under_a_request_admits_it() {
         assert_eq!(local.holding(), held);
     });
 }
+
+/// A connection charging a key while its last change is being copied: the charge is in that
+/// copy, or the key is gathered again for the next — never lost from both.
+#[test]
+fn loom_a_change_racing_its_copy_is_copied_now_or_next() {
+    model(|| {
+        let local = Arc::new(Local::tracking(FixedState::default(), 1));
+        let c = contract(1, 5);
+        let mut handles = Handles::new(FixedState::default());
+        assert_eq!(local.decide(&mut handles, &[(b"k", c)], 0), Decision::Admit);
+        let gathered = handles.take_changed();
+        let connection = {
+            let local = Arc::clone(&local);
+            loom::thread::spawn(move || {
+                assert_eq!(local.decide(&mut handles, &[(b"k", c)], 0), Decision::Admit);
+                handles.take_changed().len()
+            })
+        };
+        let copies = local.copies(&gathered, 0);
+        let again = connection.join().unwrap();
+        let both_in_copy = copies[0].full_in == 2 * 1_000 * MS;
+        assert!(
+            both_in_copy || again == 1,
+            "copied {copies:?}, gathered again {again}"
+        );
+    });
+}

@@ -27,7 +27,7 @@ pub use crate::service::Contract;
 use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::hash::{BuildHasher, Hash, Hasher};
-use sync::{Arc, AtomicU64, Ordering, RwLock};
+use sync::{Arc, AtomicBool, AtomicU64, Ordering, RwLock};
 
 /// Units in a request's interval.
 const UNITS: u64 = 1 << 16;
@@ -113,6 +113,9 @@ pub struct Key {
     word: AtomicU64,
     /// The latest time a request was decided under it.
     last: AtomicU64,
+    /// Changed since its state was last copied: set by a decision that changed it, where
+    /// the registry tracks changes ([`Local::tracking`]), and cleared as it is copied.
+    changed: AtomicBool,
 }
 
 /// What a look at a key found.
@@ -134,6 +137,77 @@ impl Key {
             rate,
             word: AtomicU64::new(rate.units(now)),
             last: AtomicU64::new(now),
+            changed: AtomicBool::new(false),
+        }
+    }
+
+    /// One request's charge at `now` given back: the bucket a request's room fuller, never
+    /// fuller than full. False if the key was closed.
+    fn give_back(&self, now: u64) -> bool {
+        let now_units = self.rate.units(now);
+        loop {
+            let word = self.word.load(Ordering::Acquire);
+            if word & CLOSED != 0 {
+                return false;
+            }
+            let arrival = self.arrival(word, now, now_units);
+            let back = if Rate::ahead(arrival, now_units) > UNITS {
+                arrival.wrapping_sub(UNITS) & MASK
+            } else {
+                now_units
+            };
+            if self
+                .word
+                .compare_exchange_weak(word, back, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// Marks it changed where `tracking`: true if this is its first change since its last
+    /// copy, for the change's connection to gather it. Always a swap, never a look first: a
+    /// look could see the mark a copy has just cleared and gather nothing, while the copy
+    /// read the key from before the change, losing it.
+    fn mark(&self, tracking: bool) -> bool {
+        tracking && !self.changed.swap(true, Ordering::AcqRel)
+    }
+
+    /// Its state as a copy at `now`, marked unchanged first, so that a change made while it
+    /// is read marks it again, for the next copy. A swap, as the change's mark is: whichever
+    /// comes second sees the other, so a change is in this copy or marked for the next.
+    fn copy(&self, now: u64) -> Copy {
+        self.changed.swap(false, Ordering::AcqRel);
+        Copy {
+            key: self.key.clone(),
+            contract: self.contract,
+            full_in: self.full_in(now),
+        }
+    }
+
+    /// Set to be full in `full_in` nanoseconds from `now`: an owner's copy taken in.
+    fn set_full_in(&self, full_in: u64, now: u64) {
+        let now_units = self.rate.units(now);
+        let ahead = self
+            .rate
+            .units(now.saturating_add(full_in))
+            .wrapping_sub(now_units)
+            & MASK;
+        let arrival = now_units.wrapping_add(ahead) & MASK;
+        self.last.fetch_max(now, Ordering::Relaxed);
+        loop {
+            let word = self.word.load(Ordering::Acquire);
+            if word & CLOSED != 0 {
+                return;
+            }
+            if self
+                .word
+                .compare_exchange_weak(word, arrival, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
         }
     }
 
@@ -249,6 +323,9 @@ impl Key {
     }
 }
 
+/// A key as handles share it: what [`Handles::take_changed`] gathers.
+pub type Shared = Arc<Key>;
+
 /// A key in a set, found by its name.
 #[derive(Clone, Debug)]
 pub struct Handle(Arc<Key>);
@@ -288,6 +365,19 @@ pub enum Decision {
     },
 }
 
+/// A key's state as its owner copies it to the pods that would take over from it: its
+/// contract and how long its bucket takes to be full again, which reads the same on any
+/// clock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Copy {
+    /// The key.
+    pub key: Box<[u8]>,
+    /// Its contract.
+    pub contract: Contract,
+    /// Nanoseconds from when the copy was taken until its bucket is full.
+    pub full_in: u64,
+}
+
 /// What a sweep did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Swept {
@@ -307,6 +397,8 @@ pub struct Local<S> {
     holding: AtomicU64,
     capacity: AtomicU64,
     evicted: AtomicU64,
+    /// Whether decisions mark the keys they change, for copying them on.
+    tracking: bool,
 }
 
 /// The bytes a key of `key` is counted as: the key itself, its name, and a slot for its
@@ -333,6 +425,54 @@ impl<S: BuildHasher + Clone> Local<S> {
             holding: AtomicU64::new(0),
             capacity: AtomicU64::new(u64::MAX),
             evicted: AtomicU64::new(0),
+            tracking: false,
+        }
+    }
+
+    /// The same, its decisions marking the keys they change, which each worker's handles
+    /// gather ([`Handles::take_changed`]) for their state to be copied on ([`copies`]): what
+    /// an owner keeps, for the pods that would take over from it.
+    ///
+    /// [`copies`]: Self::copies
+    #[must_use]
+    pub fn tracking(hasher: S, workers: u64) -> Self {
+        Self {
+            tracking: true,
+            ..Self::new(hasher, workers)
+        }
+    }
+
+    /// Gives one request's charge back under each of `keys` at `now`: a request admitted
+    /// under them and then refused under another owner's limit, so charged under none.
+    pub fn give_back<K: AsRef<[u8]>>(
+        &self,
+        handles: &mut Handles<S>,
+        keys: &[(K, Contract)],
+        now: u64,
+    ) {
+        for (key, contract) in keys {
+            charge_one(self, handles, key.as_ref(), *contract, now, Key::give_back);
+        }
+    }
+
+    /// The state at `now` of `changed`, keys workers' decisions changed, closed keys left
+    /// out. A key is gathered by one worker at a time — the first to change it since its
+    /// last copy — so each comes once.
+    #[must_use]
+    pub fn copies(&self, changed: &[Shared], now: u64) -> Vec<Copy> {
+        changed
+            .iter()
+            .filter(|key| !key.closed())
+            .map(|key| key.copy(now))
+            .collect()
+    }
+
+    /// Takes in an owner's `copies` at `now`: each key made if it is not held, and set to
+    /// the owner's state, so that this registry carries on from it if it becomes the owner.
+    pub fn install(&self, copies: &[Copy], now: u64) {
+        for copy in copies {
+            self.find_or_make(&copy.key, copy.contract, now)
+                .set_full_in(copy.full_in, now);
         }
     }
 
@@ -400,28 +540,38 @@ impl<S: BuildHasher + Clone> Local<S> {
     /// Decides a request at `now` under `keys`, each with its contract, through a worker's
     /// `handles`: admitted and charged under all of them, or refused and charged under
     /// none.
-    pub fn decide(
+    pub fn decide<K: AsRef<[u8]>>(
         &self,
         handles: &mut Handles<S>,
-        keys: &[(&[u8], Contract)],
+        keys: &[(K, Contract)],
         now: u64,
     ) -> Decision {
         if let [(key, contract)] = keys {
             return loop {
-                match handles.with_key(self, key, *contract, now, |held| held.take(now)) {
-                    Look::Fits { .. } => break Decision::Admit,
-                    Look::Full { wait } => break Decision::Refuse { position: 0, wait },
-                    Look::Closed => handles.forget(key),
+                let taken = handles.with_key(self, key.as_ref(), *contract, now, |held| {
+                    let look = held.take(now);
+                    let first = matches!(look, Look::Fits { .. }) && held.mark(self.tracking);
+                    (look, first)
+                });
+                match taken {
+                    (Look::Fits { .. }, first) => {
+                        if first {
+                            handles.gather(key.as_ref());
+                        }
+                        break Decision::Admit;
+                    }
+                    (Look::Full { wait }, _) => break Decision::Refuse { position: 0, wait },
+                    (Look::Closed, _) => handles.forget(key.as_ref()),
                 }
             };
         }
         let mut longest: Option<(usize, u64)> = None;
         for (position, (key, contract)) in keys.iter().enumerate() {
             let wait = loop {
-                match handles.with_key(self, key, *contract, now, |held| held.look(now)) {
+                match handles.with_key(self, key.as_ref(), *contract, now, |held| held.look(now)) {
                     Look::Fits { .. } => break None,
                     Look::Full { wait } => break Some(wait),
-                    Look::Closed => handles.forget(key),
+                    Look::Closed => handles.forget(key.as_ref()),
                 }
             };
             if let Some(wait) = wait
@@ -434,28 +584,26 @@ impl<S: BuildHasher + Clone> Local<S> {
             return Decision::Refuse { position, wait };
         }
         for (key, contract) in keys {
-            while !handles.with_key(self, key, *contract, now, |held| held.charge(now)) {
-                handles.forget(key);
-            }
+            charge_one(self, handles, key.as_ref(), *contract, now, Key::charge);
         }
         Decision::Admit
     }
 
     /// Of `keys`, those without room at `now`, by their place in the list, each with how long
     /// until it has room: what a refusal says. Charges nothing.
-    pub fn refused_by(
+    pub fn refused_by<K: AsRef<[u8]>>(
         &self,
         handles: &mut Handles<S>,
-        keys: &[(&[u8], Contract)],
+        keys: &[(K, Contract)],
         now: u64,
     ) -> Vec<(usize, u64)> {
         let mut refused = Vec::new();
         for (position, (key, contract)) in keys.iter().enumerate() {
             let wait = loop {
-                match handles.with_key(self, key, *contract, now, |held| held.look(now)) {
+                match handles.with_key(self, key.as_ref(), *contract, now, |held| held.look(now)) {
                     Look::Fits { .. } => break None,
                     Look::Full { wait } => break Some(wait),
-                    Look::Closed => handles.forget(key),
+                    Look::Closed => handles.forget(key.as_ref()),
                 }
             };
             if let Some(wait) = wait {
@@ -523,6 +671,8 @@ impl<S: BuildHasher + Clone> Local<S> {
 #[derive(Debug)]
 pub struct Handles<S> {
     set: HashSet<Handle, S>,
+    /// Keys its decisions changed since last taken, each once.
+    changed: Vec<Arc<Key>>,
 }
 
 impl<S: BuildHasher + Clone> Handles<S> {
@@ -531,6 +681,20 @@ impl<S: BuildHasher + Clone> Handles<S> {
     pub fn new(hasher: S) -> Self {
         Self {
             set: HashSet::with_hasher(hasher),
+            changed: Vec::new(),
+        }
+    }
+
+    /// The keys its decisions changed since this was last asked, for their state to be
+    /// copied on ([`Local::copies`]).
+    pub fn take_changed(&mut self) -> Vec<Shared> {
+        std::mem::take(&mut self.changed)
+    }
+
+    /// Gathers `key`, just changed for the first time since its last copy.
+    fn gather(&mut self, key: &[u8]) {
+        if let Some(handle) = self.set.get(key) {
+            self.changed.push(Arc::clone(&handle.0));
         }
     }
 
@@ -576,6 +740,31 @@ impl<S: BuildHasher + Clone> Handles<S> {
         let done = act(&made);
         self.set.replace(Handle(made));
         done
+    }
+}
+
+/// `change` applied to `key` at `now` through `handles` until it lands on a live key, and
+/// the key gathered if that was its first change since its last copy.
+fn charge_one<S: BuildHasher + Clone>(
+    local: &Local<S>,
+    handles: &mut Handles<S>,
+    key: &[u8],
+    contract: Contract,
+    now: u64,
+    change: fn(&Key, u64) -> bool,
+) {
+    loop {
+        let (done, first) = handles.with_key(local, key, contract, now, |held| {
+            let done = change(held, now);
+            (done, done && held.mark(local.tracking))
+        });
+        if done {
+            if first {
+                handles.gather(key);
+            }
+            return;
+        }
+        handles.forget(key);
     }
 }
 
