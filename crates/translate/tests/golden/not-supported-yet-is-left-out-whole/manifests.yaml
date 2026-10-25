@@ -50,27 +50,6 @@ spec:
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
-metadata: { name: d-wildcard, namespace: shop }
-spec:
-  ingressClassName: edge
-  rules:
-    - host: "*.example.com"
-      http:
-        paths:
-          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata: { name: e-hostless, namespace: shop }
-spec:
-  ingressClassName: edge
-  rules:
-    - http:
-        paths:
-          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
 metadata: { name: f-missing-service, namespace: shop }
 spec:
   ingressClassName: edge

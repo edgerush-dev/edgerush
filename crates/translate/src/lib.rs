@@ -6,14 +6,14 @@
 //! admission webhook and `validate --from-manifests` all translate alike.
 //!
 //! **It never fails as a whole.** What it cannot translate is left out, object by object,
-//! and said in its report. So far it translates Ingresses whose rules each name a host and
-//! route paths, of any path type, to a Service's port, and that carry no annotations; an Ingress
+//! and said in its report. So far it translates Ingresses whose rules route paths, of any
+//! path type and on any host, to a Service's port, and that carry no annotations; an Ingress
 //! that asks for anything more is left out whole, reported as not supported yet, rather
 //! than translated in part.
 
 use edgerush_config::{
     Backend, Config, DataPlane, Endpoints, Forward, Hostname, Listener, LoadBalancer, Match,
-    PathMatch, Protocol, Route, Rule, Upstream, UpstreamProtocol,
+    PathMatch, Protocol, Route, Rule, Upstream, UpstreamProtocol, Wildcard,
 };
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::networking::v1::{HTTPIngressPath, Ingress, IngressServiceBackend};
@@ -241,12 +241,8 @@ fn ingress_routes(
     let mut by_host: BTreeMap<String, Vec<Rule>> = BTreeMap::new();
     let mut upstreams = BTreeMap::new();
     for rule in spec.rules.iter().flatten() {
-        let Some(host) = &rule.host else {
-            return Err(Problem::NotSupportedYet("a rule without a host"));
-        };
-        if host.starts_with('*') {
-            return Err(Problem::NotSupportedYet("a wildcard host"));
-        }
+        // A rule without a host is for every host: the name `*`.
+        let host = rule.host.as_deref().unwrap_or("*");
         let Some(http) = &rule.http else {
             return Err(Problem::NotSupportedYet("a rule without paths"));
         };
@@ -265,7 +261,7 @@ fn ingress_routes(
                 _ => return Err(Problem::Invalid("a path type Kubernetes does not have")),
             };
             let (name, upstream) = path_upstream(plane, cluster, namespace, path)?;
-            by_host.entry(host.clone()).or_default().push(Rule {
+            by_host.entry(host.to_owned()).or_default().push(Rule {
                 matches: vec![Match {
                     path: Some(matched),
                     grpc: None,
@@ -302,8 +298,9 @@ fn ingress_routes(
             name: format!("ingress/{namespace}/{name}/{host}"),
             listeners: listeners.clone(),
             hostnames: vec![Hostname {
+                // An Ingress's `*` stands for exactly one label (04 §5).
+                wildcard: host.starts_with("*.").then_some(Wildcard::OneLabel),
                 name: host,
-                wildcard: None,
                 falls_through: plane.ingress_hosts_fall_through,
             }],
             rules,
