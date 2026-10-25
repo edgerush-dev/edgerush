@@ -55,6 +55,30 @@ pub(crate) struct Refusal<'a> {
     pub(crate) longest: Option<(&'a CompiledLimit, Duration)>,
 }
 
+/// Why a request was refused, as its decision read the limits, each by its place in the
+/// rule: what its answer says and counts, never read again from keys that may have refilled
+/// or been forgotten since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Refused {
+    /// The limits that refused it, bit `n` for the rule's `n`th.
+    pub(crate) by: u64,
+    /// The limit that waits longest to admit it, the first of those that wait as long, and
+    /// how long.
+    pub(crate) longest: Option<(usize, Duration)>,
+}
+
+impl Refused {
+    /// As a refusal under `limits`, the rule's.
+    pub(crate) fn of(self, limits: &[Arc<CompiledLimit>]) -> Refusal<'_> {
+        Refusal {
+            by: self.by,
+            longest: self
+                .longest
+                .and_then(|(at, wait)| Some((&**limits.get(at)?, wait))),
+        }
+    }
+}
+
 /// The IETF `RateLimit` field (draft-ietf-httpapi-ratelimit-headers): on a refusal, the
 /// limit that refused, none of it left, and for how long.
 pub(crate) const RATELIMIT: HeaderName = HeaderName::from_static("ratelimit");
@@ -252,8 +276,9 @@ pub(crate) const MOST_SIGNALLED: usize = 4_096;
 pub(crate) enum Limited {
     /// Within it.
     Admit,
-    /// Over it.
-    Refuse,
+    /// Over it: why, where its decision says (local mode), or for the worker's entries to
+    /// say (the asynchronous mode).
+    Refuse(Option<Refused>),
     /// Asked about or deferred: its decision comes, or why there is none.
     Later(Later),
     /// Not decided, and not to be: why.
@@ -535,7 +560,7 @@ impl Limiter {
             self.signal(&outcome, parts);
             match outcome.local {
                 PooledLocal::Admit => Limited::Admit,
-                PooledLocal::Refuse => Limited::Refuse,
+                PooledLocal::Refuse => Limited::Refuse(None),
                 PooledLocal::Ask => self.ask(parts, now, places),
                 PooledLocal::Defer => self.defer(parts, now, places),
             }

@@ -4,10 +4,10 @@
 //! (`edgerush_ratelimit::local`); a thread of the process's sweeps the keys once a second,
 //! forgetting those full and quiet and, past the cap, evicting.
 
-use super::{Failed, KeyedBy, Limited, Refusal, with_keys};
+use super::{Failed, KeyedBy, Limited, Refused, with_keys};
 use edgerush_config::CompiledLimit;
 use edgerush_ratelimit::local::{Decision, Handles, Local};
-use edgerush_ratelimit::service::{Contract, Keyed, longest};
+use edgerush_ratelimit::service::{Contract, Keyed};
 use std::cell::RefCell;
 use std::hash::{BuildHasher, RandomState};
 use std::rc::{Rc, Weak as RcWeak};
@@ -159,8 +159,9 @@ impl LocalLimiter {
     }
 
     /// Decides a request from `client` under those of `limits` that `limited` marks, all at
-    /// once: admitted under all, or refused and charged under none. Never later: nothing is
-    /// waited for.
+    /// once: admitted under all, or refused and charged under none, saying which refused it
+    /// and how long it should wait to be admitted under all of them. Never later: nothing
+    /// is waited for.
     pub(crate) fn decide_all<'f>(
         &self,
         limits: &[Arc<CompiledLimit>],
@@ -178,14 +179,35 @@ impl LocalLimiter {
                 if keys.is_empty() {
                     return Limited::Admit;
                 }
-                match self
-                    .process
-                    .local
-                    .decide(&mut self.handles.borrow_mut(), keys, now)
-                {
-                    Decision::Admit => Limited::Admit,
-                    Decision::Refuse { .. } => Limited::Refuse,
+                let decided =
+                    self.process
+                        .local
+                        .decide_saying(&mut self.handles.borrow_mut(), keys, now);
+                let (Decision::Refuse { position, wait }, mut parts) = decided else {
+                    return Limited::Admit;
+                };
+                // A key begins with its limit's name and a zero.
+                let at = |part: usize| {
+                    let (key, _) = keys.get(part)?;
+                    let name = key.split(|&byte| byte == 0).next()?;
+                    limits
+                        .iter()
+                        .position(|limit| limit.name.as_bytes() == name)
+                };
+                let mut by = 0;
+                while parts != 0 {
+                    let part = parts.trailing_zeros() as usize;
+                    parts &= parts - 1;
+                    if let Some(bit) =
+                        at(part).and_then(|at| 1_u64.checked_shl(u32::try_from(at).ok()?))
+                    {
+                        by |= bit;
+                    }
                 }
+                Limited::Refuse(Some(Refused {
+                    by,
+                    longest: at(position).map(|at| (at, Duration::from_nanos(wait))),
+                }))
             },
         )
     }
@@ -198,47 +220,5 @@ impl LocalLimiter {
         self.process
             .local
             .decide(&mut self.handles.borrow_mut(), keys, now)
-    }
-
-    /// Which of `limits` refused a request from `client` under those `limited` marks, and
-    /// how long it should wait to be admitted under all of them, as the keys have it now.
-    pub(crate) fn refusal<'a, 'f>(
-        &self,
-        limits: &'a [Arc<CompiledLimit>],
-        limited: u64,
-        client: impl Into<KeyedBy<'f>>,
-    ) -> Refusal<'a> {
-        let now = self.process.now();
-        with_keys(
-            &self.keys,
-            &self.contracts,
-            limits,
-            limited,
-            client.into(),
-            |keys| {
-                // A key begins with its limit's name and a zero.
-                let at = |part: usize| {
-                    let (key, _) = keys.get(part)?;
-                    let name = key.split(|&byte| byte == 0).next()?;
-                    limits
-                        .iter()
-                        .position(|limit| limit.name.as_bytes() == name)
-                };
-                let refused =
-                    self.process
-                        .local
-                        .refused_by(&mut self.handles.borrow_mut(), keys, now);
-                let by = refused
-                    .iter()
-                    .filter_map(|(part, _)| at(*part))
-                    .filter_map(|at| 1_u64.checked_shl(u32::try_from(at).ok()?))
-                    .fold(0, |by, bit| by | bit);
-                let longest = longest(refused.into_iter()).and_then(|(part, wait)| {
-                    let limit = limits.get(at(part)?)?;
-                    Some((&**limit, Duration::from_nanos(wait)))
-                });
-                Refusal { by, longest }
-            },
-        )
     }
 }

@@ -187,14 +187,41 @@ fn a_refusal_names_each_limit_out_of_room_and_charges_none() {
     let three: [(&[u8], Contract); 3] = [(b"a", tight), (b"b", roomy), (b"c", tight)];
     assert_eq!(local.decide(&mut handles, &three, 0), Decision::Admit);
     assert_eq!(
-        local.refused_by(&mut handles, &three, 0),
-        [(0, 100 * MS), (2, 100 * MS)]
+        local.decide_saying(&mut handles, &three, 0),
+        (
+            Decision::Refuse {
+                position: 0,
+                wait: 100 * MS
+            },
+            0b101
+        )
     );
     // The roomy one still has its four.
     let left = (0..5)
         .filter(|_| one(&local, &mut handles, b"b", roomy, 0))
         .count();
     assert_eq!(left, 4);
+}
+
+#[test]
+fn one_limit_refusing_is_named() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let c = contract(10, SECOND, 1);
+    assert_eq!(
+        local.decide_saying(&mut handles, &[(b"k", c)], 0),
+        (Decision::Admit, 0)
+    );
+    assert_eq!(
+        local.decide_saying(&mut handles, &[(b"k", c)], 0),
+        (
+            Decision::Refuse {
+                position: 0,
+                wait: 100 * MS
+            },
+            1
+        )
+    );
 }
 
 #[test]

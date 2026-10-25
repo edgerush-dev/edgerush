@@ -18,7 +18,7 @@ use crate::metrics::{Answer, LimitCounters};
 use crate::random::{random, unguessable};
 use crate::ratelimit::local::LocalLimiter;
 use crate::ratelimit::synchronous::SyncLimiter;
-use crate::ratelimit::{KeyedBy, Limited, Limiter, LookUp, RATELIMIT, Undecided};
+use crate::ratelimit::{KeyedBy, Limited, Limiter, LookUp, RATELIMIT, Refused, Undecided};
 use crate::request::{Decision, Opening, Rejection, decide};
 use crate::request_body::{Counts, RequestBody};
 use crate::routed::Through;
@@ -241,7 +241,7 @@ impl Worker {
             };
             match limited {
                 Limited::Admit => count(&self.proxy, Some(true)),
-                Limited::Refuse => count(&self.proxy, Some(false)),
+                Limited::Refuse(_) => count(&self.proxy, Some(false)),
                 Limited::Later(decided) => {
                     let proxy = Arc::clone(&self.proxy);
                     let _counted = tokio::task::spawn_local(async move {
@@ -274,28 +274,28 @@ impl Worker {
     /// 429, with `Retry-After` in whole seconds, rounded up and at least one — the longest
     /// any of them waits — and `RateLimit` naming the limit that waits that long, none
     /// left, for as long (06 §2). A gRPC call is answered `RESOURCE_EXHAUSTED`, which says
-    /// no more. Counted under each limit that refused it: as `told`, where the service pod
-    /// that decided it said, by position among its keys; otherwise as the copies have them.
+    /// no more. Counted under each limit that refused it: as its decision `said`, where it
+    /// did (local mode); otherwise as `told`, where the service pod that decided it said,
+    /// by position among its keys, or else as the copies have them.
     fn refused(
         &self,
         listener: usize,
         under: Under<'_>,
         client: KeyedBy<'_>,
         call: Option<Call>,
+        said: Option<Refused>,
         told: &[(usize, u64)],
     ) -> Response<Body> {
         let mut response = self.proxy.answer_to(listener, Answer::RateLimited, call);
-        let refusal = match self.limiting() {
-            Some(Limiting::Asynchronous(limiter)) => {
+        let refusal = match (said, self.limiting()) {
+            (Some(said), _) => said.of(&under.rule.limits),
+            (None, Some(Limiting::Asynchronous(limiter))) => {
                 limiter.refusal(&under.rule.limits, under.marked, client, told)
             }
-            Some(Limiting::Local(limiter)) => {
-                limiter.refusal(&under.rule.limits, under.marked, client)
-            }
-            Some(Limiting::Synchronous(limiter)) => {
+            (None, Some(Limiting::Synchronous(limiter))) => {
                 limiter.refusal(&under.rule.limits, under.marked, client, told)
             }
-            None => return response,
+            (None, _) => return response,
         };
         self.count_limits(under.rule, refusal.by, under.slots, |counters| {
             &counters.refused
@@ -504,7 +504,7 @@ impl Worker {
             let enforced = directed.limited & !dry;
             if enforced != 0 {
                 // With the request's fields, for a limit keyed by a header (07 §2).
-                let (admitted, told) = match self.rate_limits(
+                let (admitted, said, told) = match self.rate_limits(
                     rule,
                     enforced,
                     KeyedBy {
@@ -512,10 +512,10 @@ impl Worker {
                         fields: Some(&LookUp(head.outgoing())),
                     },
                 ) {
-                    Limited::Admit => (true, None),
-                    Limited::Refuse => (false, None),
+                    Limited::Admit => (true, None, None),
+                    Limited::Refuse(said) => (false, said, None),
                     Limited::Later(decided) => match decided.decided().await {
-                        Ok(decided) => (decided.admitted, Some(decided.refused_by)),
+                        Ok(decided) => (decided.admitted, None, Some(decided.refused_by)),
                         Err(why) => return self.undecided(listener, why, call).into(),
                     },
                     Limited::Undecided(why) => return self.undecided(listener, why, call).into(),
@@ -531,7 +531,7 @@ impl Worker {
                         client: requester,
                         fields: Some(&LookUp(head.outgoing())),
                     };
-                    return self.refused(listener, under, by, call, told).into();
+                    return self.refused(listener, under, by, call, said, told).into();
                 }
                 self.count_limits(rule, enforced, slots, |counters| &counters.admitted);
             }

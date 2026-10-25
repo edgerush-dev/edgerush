@@ -584,6 +584,18 @@ impl<S: BuildHasher + Clone> Local<S> {
         keys: &[(K, Contract)],
         now: u64,
     ) -> Decision {
+        self.decide_saying(handles, keys, now).0
+    }
+
+    /// The same, saying with a refusal which of `keys` had no room, bit `n` for the `n`th of
+    /// the first 64: as the decision read them, which the keys need not bear out a moment
+    /// later, refilled or forgotten. Zero with an admission.
+    pub fn decide_saying<K: AsRef<[u8]>>(
+        &self,
+        handles: &mut Handles<S>,
+        keys: &[(K, Contract)],
+        now: u64,
+    ) -> (Decision, u64) {
         if let [(key, contract)] = keys {
             return loop {
                 let taken = handles.with_key(self, key.as_ref(), *contract, now, |held| {
@@ -596,14 +608,15 @@ impl<S: BuildHasher + Clone> Local<S> {
                         if first {
                             handles.gather(key.as_ref());
                         }
-                        break Decision::Admit;
+                        break (Decision::Admit, 0);
                     }
-                    (Look::Full { wait }, _) => break Decision::Refuse { position: 0, wait },
+                    (Look::Full { wait }, _) => break (Decision::Refuse { position: 0, wait }, 1),
                     (Look::Closed, _) => handles.forget(key.as_ref()),
                 }
             };
         }
         let mut longest: Option<(usize, u64)> = None;
+        let mut refused = 0;
         for (position, (key, contract)) in keys.iter().enumerate() {
             let wait = loop {
                 match handles.with_key(self, key.as_ref(), *contract, now, |held| held.look(now)) {
@@ -612,43 +625,24 @@ impl<S: BuildHasher + Clone> Local<S> {
                     Look::Closed => handles.forget(key.as_ref()),
                 }
             };
-            if let Some(wait) = wait
-                && longest.is_none_or(|(_, most)| wait > most)
-            {
+            let Some(wait) = wait else {
+                continue;
+            };
+            refused |= u32::try_from(position)
+                .ok()
+                .and_then(|at| 1_u64.checked_shl(at))
+                .unwrap_or(0);
+            if longest.is_none_or(|(_, most)| wait > most) {
                 longest = Some((position, wait));
             }
         }
         if let Some((position, wait)) = longest {
-            return Decision::Refuse { position, wait };
+            return (Decision::Refuse { position, wait }, refused);
         }
         for (key, contract) in keys {
             charge_one(self, handles, key.as_ref(), *contract, now, Key::charge);
         }
-        Decision::Admit
-    }
-
-    /// Of `keys`, those without room at `now`, by their place in the list, each with how long
-    /// until it has room: what a refusal says. Charges nothing.
-    pub fn refused_by<K: AsRef<[u8]>>(
-        &self,
-        handles: &mut Handles<S>,
-        keys: &[(K, Contract)],
-        now: u64,
-    ) -> Vec<(usize, u64)> {
-        let mut refused = Vec::new();
-        for (position, (key, contract)) in keys.iter().enumerate() {
-            let wait = loop {
-                match handles.with_key(self, key.as_ref(), *contract, now, |held| held.look(now)) {
-                    Look::Fits { .. } => break None,
-                    Look::Full { wait } => break Some(wait),
-                    Look::Closed => handles.forget(key.as_ref()),
-                }
-            };
-            if let Some(wait) = wait {
-                refused.push((position, wait));
-            }
-        }
-        refused
+        (Decision::Admit, 0)
     }
 
     /// Forgets the keys whose buckets are full at `now` and that no request used for
