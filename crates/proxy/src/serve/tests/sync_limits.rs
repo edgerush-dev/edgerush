@@ -935,3 +935,69 @@ async fn an_admission_that_comes_too_late_is_given_back_if_the_request_was_refus
         })
         .await;
 }
+
+/// A reload mid-outage carries its state across: one that changes `timeout_ms` keeps the
+/// owner's breaker open, so requests are not made to wait again, and the process's own
+/// buckets as they were spent, not full; one that leaves `local` lets them go.
+#[tokio::test]
+async fn a_reload_mid_outage_keeps_the_breakers_and_the_local_buckets() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Accepts and says nothing.
+            let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = silent.local_addr().unwrap().to_string();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((socket, _)) = silent.accept().await {
+                    held.push(socket);
+                }
+            });
+            let (upstream, _) = counting_upstream().await;
+            let in_mode = |timeout_ms, when| {
+                with_breaker(
+                    synchronous_in(
+                        everything_config(upstream),
+                        &[("per-client", 10)],
+                        std::slice::from_ref(&address),
+                        timeout_ms,
+                        when,
+                    ),
+                    1,
+                    60_000,
+                )
+            };
+            let (proxy, mut sends) = serving(&in_mode(200, "local"), 1).await;
+            let first = statuses(&send_round(&mut sends, 11).await);
+            assert_eq!(first[..10], [200; 10], "{first:?}");
+            assert_eq!(first[10], 429);
+            proxy
+                .reload(compile(&in_mode(300, "local")).unwrap())
+                .unwrap();
+            let began = Instant::now();
+            assert_eq!(
+                statuses(&send_round(&mut sends, 1).await),
+                [429],
+                "still spent"
+            );
+            assert!(
+                began.elapsed() < Duration::from_millis(300),
+                "the breaker still open: {:?}",
+                began.elapsed()
+            );
+            let scrape = proxy.metrics();
+            assert_eq!(
+                metric(
+                    &scrape,
+                    r#"edgerush_rate_limit_owner_breaker_trips_total{pod="0"}"#
+                ),
+                Some(1),
+                "{scrape}"
+            );
+            proxy
+                .reload(compile(&in_mode(300, "deny")).unwrap())
+                .unwrap();
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+        })
+        .await;
+}

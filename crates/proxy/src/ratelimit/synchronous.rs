@@ -50,15 +50,20 @@ const PROBE_LOOK: Duration = Duration::from_millis(50);
 #[derive(Debug)]
 pub(crate) struct Process {
     config: CompiledSynchronous,
-    breakers: Box<[Breaker]>,
+    /// Each owner's, by its place among the addresses.
+    breakers: Box<[Arc<Breaker>]>,
     /// What each worker's asks of each owner came to: answered, timed out, stream broken.
-    asks: Box<[Sharded<[Counter; 3]>]>,
+    asks: Box<[Arc<OwnerAsks>]>,
     /// Requests left to `when_unreachable`: let on, refused, and decided locally.
-    unreachable: Sharded<[Counter; 3]>,
+    unreachable: Arc<Sharded<[Counter; 3]>>,
     /// The process's own buckets, with `when_unreachable: local`.
     local: Option<Arc<LocalKeys>>,
+    /// The clock its breakers' times are read by, kept across a reload with them.
     start: Instant,
 }
+
+/// What a process's workers' asks of one owner came to.
+type OwnerAsks = Sharded<[Counter; 3]>;
 
 /// How an ask of an owner ended.
 #[derive(Clone, Copy)]
@@ -71,20 +76,55 @@ enum Ended {
 impl Process {
     /// The process's synchronous mode for `config`, with `workers` workers, and the thread
     /// that probes its owners' open breakers, which calls `failed` if it panics.
+    ///
+    /// A reload carries an outage's state across from the `running` one: the breaker of
+    /// each owner whose address is still listed, whatever else changed, and the process's
+    /// own buckets while `when_unreachable` stays `local`, within the new cap; so that
+    /// tuning a setting mid-outage neither closes the breakers nor hands out fresh buckets.
     pub(crate) fn start(
         config: CompiledSynchronous,
         workers: NonZeroUsize,
         failed: Option<Failed>,
+        running: Option<&Self>,
     ) -> std::io::Result<Arc<Self>> {
-        let owners = config.addresses.len();
-        let local = (config.when_unreachable == WhenUnreachable::Local)
-            .then(|| LocalKeys::unswept(workers.get(), config.max_key_bytes));
+        let kept = |address: &String| {
+            let running = running?;
+            let at = running.config.addresses.iter().position(|a| a == address)?;
+            Some((
+                Arc::clone(running.breakers.get(at)?),
+                Arc::clone(running.asks.get(at)?),
+            ))
+        };
+        let (breakers, asks): (Vec<Arc<Breaker>>, Vec<Arc<OwnerAsks>>) = config
+            .addresses
+            .iter()
+            .map(|address| {
+                kept(address).unwrap_or_else(|| {
+                    (
+                        Arc::new(Breaker::default()),
+                        Arc::new(Sharded::new(workers)),
+                    )
+                })
+            })
+            .unzip();
+        let local = (config.when_unreachable == WhenUnreachable::Local).then(|| {
+            match running.and_then(|running| running.local.as_ref()) {
+                Some(local) => {
+                    local.set_capacity(config.max_key_bytes);
+                    Arc::clone(local)
+                }
+                None => LocalKeys::unswept(workers.get(), config.max_key_bytes),
+            }
+        });
         let process = Arc::new(Self {
-            breakers: (0..owners).map(|_| Breaker::default()).collect(),
-            asks: (0..owners).map(|_| Sharded::new(workers)).collect(),
-            unreachable: Sharded::new(workers),
+            breakers: breakers.into_boxed_slice(),
+            asks: asks.into_boxed_slice(),
+            unreachable: running.map_or_else(
+                || Arc::new(Sharded::new(workers)),
+                |running| Arc::clone(&running.unreachable),
+            ),
             local,
-            start: Instant::now(),
+            start: running.map_or_else(Instant::now, |running| running.start),
             config,
         });
         let probed = Arc::downgrade(&process);
@@ -120,7 +160,9 @@ impl Process {
 
     /// Whether the owner at `pod` is not to be asked: its breaker open.
     fn shut_out(&self, pod: usize) -> bool {
-        self.breakers.get(pod).is_some_and(Breaker::is_open)
+        self.breakers
+            .get(pod)
+            .is_some_and(|breaker| breaker.is_open())
     }
 
     /// What its own buckets hold, in bytes, how many there are, and how many were evicted;
@@ -871,7 +913,39 @@ impl Asked {
 
 #[cfg(test)]
 mod tests {
-    use super::Breaker;
+    use super::{Breaker, Process};
+    use edgerush_config::{CompiledSynchronous, WhenUnreachable};
+    use std::num::NonZeroUsize;
+    use std::time::Duration;
+
+    fn config(timeout_ms: u64) -> CompiledSynchronous {
+        CompiledSynchronous {
+            addresses: vec!["127.0.0.1:1".to_owned()],
+            timeout: Duration::from_millis(timeout_ms),
+            when_unreachable: WhenUnreachable::Deny,
+            breaker_failures: 1,
+            probe_after: Duration::from_secs(60),
+            max_key_bytes: 1 << 20,
+        }
+    }
+
+    /// A process that carries another's breakers carries the clock their times were read
+    /// by: a breaker opened before the reload is probed when it is due, not as late again
+    /// as the old process had run.
+    #[test]
+    fn breakers_carried_across_keep_their_clock() {
+        let one = NonZeroUsize::MIN;
+        let before = Process::start(config(20), one, None, None).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        before.breakers[0].failed(before.now(), 1);
+        let after = Process::start(config(30), one, None, Some(&before)).unwrap();
+        assert!(after.breakers[0].is_open(), "carried");
+        assert!(
+            after.now() >= 50_000_000,
+            "read by the same clock: {}",
+            after.now()
+        );
+    }
 
     /// Failures in a row open it, once however many follow; an answer between them starts
     /// the count again; closing it starts it again too.
