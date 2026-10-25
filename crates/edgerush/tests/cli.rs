@@ -486,13 +486,36 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
     );
     std::fs::remove_file(manifests.join("rewritten.yml"))?;
 
-    // A host `tls` lists whose Secret is not among the manifests is served over plain HTTP,
-    // and said, as it is not served as asked.
+    // A Secret `tls` names is taken as it will be in the cluster, not looked at, unless
+    // asked: the host is secured as named, and the summary says so. Asked, one not among the
+    // manifests leaves its host over plain HTTP, and is said.
     std::fs::write(
         manifests.join("tls.yml"),
         "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: { name: secure, namespace: shop }\nspec:\n  ingressClassName: edge\n  tls: [{ hosts: [secure.example.com], secretName: secure }]\n  rules:\n    - host: secure.example.com\n      http:\n        paths:\n          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }\n",
     )?;
-    let output = validate(&manifests)?;
+    let secured_plane = root.join("secured-data-plane.yaml");
+    let https = "  https: { address: \"[::]:8443\", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [], without_sni: none } }\n";
+    std::fs::write(&secured_plane, plane(&format!("{http}{https}")))?;
+    let secured = |checked: bool| {
+        let mut args = vec![
+            "validate",
+            "--from-manifests",
+            manifests.to_str().expect("a path that is text"),
+            "--data-plane",
+            secured_plane.to_str().expect("a path that is text"),
+        ];
+        if checked {
+            args.push("--check-secrets");
+        }
+        edgerush(&args)
+    };
+    let output = secured(false)?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "2 routes and 1 upstreams translated; 0 left out; 0 paths without their backend; 0 TLS hosts or entries not served as listed; 0 paths shadowed; 1 Ingresses of other classes or none passed over\nTLS Secrets were taken as they will be in the cluster, not checked: --check-secrets checks them\n"
+    );
+    let output = secured(true)?;
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
