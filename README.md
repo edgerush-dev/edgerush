@@ -125,7 +125,8 @@ with an IngressClass whose controller is `edgerush.dev/ingress-controller`) as t
 plane would for one data plane, compiles the config as the data plane would,
 and lists each object left out and why, each path whose backend is not there, what of a
 `tls` is not served as it lists it and each path another Ingress already has; it
-exits 1 when there is one. The data plane's settings
+exits 1 when there is one. TLS Secrets, seldom in a repository, are taken as they will be
+in the cluster unless `--check-secrets` asks for them to be checked. The data plane's settings
 stand in for its `DataPlane` resource, which comes with the operator; `backend_authorities`,
 the certificates in PEM trusted for a Service port spoken to over TLS
 (`appProtocol: kubernetes.io/wss`), may be added, and an `https` listener, written with

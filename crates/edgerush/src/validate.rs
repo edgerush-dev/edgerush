@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 pub(crate) const USAGE: &str = "\
-Usage: edgerush validate --from-manifests <PATH> --data-plane <FILE>
+Usage: edgerush validate --from-manifests <PATH> --data-plane <FILE> [--check-secrets]
 
 Translates Kubernetes manifests as the control plane would for one data plane, compiles the
 config as the data plane would, and says what was left out and why, without a cluster.
@@ -30,12 +30,16 @@ Options:
                                `kubectl get -o yaml` writes one, is read for its items;
                                kinds that are not translated are passed over. The data
                                plane's IngressClass must be among them, naming
-                               `edgerush.dev/ingress-controller`, and so must the
-                               Secrets the Ingresses' `tls` names
+                               `edgerush.dev/ingress-controller`
       --data-plane <FILE>      The data plane's settings, in YAML: `ingress_class`,
                                `listeners`, `cluster_domain`,
                                `ingress_hosts_fall_through` and, optionally,
                                `backend_authorities`
+      --check-secrets          Check the Secrets the Ingresses' `tls` names: each must
+                               be among the manifests, its certificate and key usable
+                               and covering the host, as the control plane checks them.
+                               Without it they are taken as they will be in the
+                               cluster, secure the hosts as named, and are not looked at
   -h, --help                   Print help
 ";
 
@@ -71,6 +75,7 @@ enum Parsed {
 struct Options {
     manifests: PathBuf,
     data_plane: PathBuf,
+    check_secrets: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -88,9 +93,15 @@ enum UsageError {
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut manifests = None;
     let mut data_plane = None;
+    let mut check_secrets = false;
     while let Some(arg) = args.next() {
         let (option, slot) = match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
+            "--check-secrets" if check_secrets => return Err(UsageError::Twice("--check-secrets")),
+            "--check-secrets" => {
+                check_secrets = true;
+                continue;
+            }
             "--from-manifests" => ("--from-manifests", &mut manifests),
             "--data-plane" => ("--data-plane", &mut data_plane),
             _ => return Err(UsageError::Unexpected(arg)),
@@ -103,6 +114,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     Ok(Parsed::Validate(Options {
         manifests: manifests.ok_or(UsageError::Required("--from-manifests <PATH>"))?,
         data_plane: data_plane.ok_or(UsageError::Required("--data-plane <FILE>"))?,
+        check_secrets,
     }))
 }
 
@@ -156,7 +168,10 @@ impl Manifest {
 /// backend, nothing of a `tls` left unserved and no path shadowed, and the config compiles.
 fn run(options: &Options) -> Result<(String, bool), Failed> {
     let plane: Plane = read(&options.data_plane)?;
-    let mut cluster = Cluster::default();
+    let mut cluster = Cluster {
+        secrets_assumed: !options.check_secrets,
+        ..Cluster::default()
+    };
     for file in files(&options.manifests)? {
         for manifest in read_all::<Manifest>(&file)? {
             manifest.into_cluster(&mut cluster);
@@ -191,6 +206,13 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
         translation.shadowed.len(),
         translation.passed_over
     );
+    if cluster.secrets_assumed && !config.certificates.is_empty() {
+        let _ = writeln!(
+            text,
+            "TLS Secrets were taken as they will be in the cluster, not checked: \
+             --check-secrets checks them"
+        );
+    }
     let refused = match compile(config) {
         Ok(_) => false,
         Err(problems) => {
@@ -288,7 +310,26 @@ mod tests {
             Ok(Parsed::Validate(Options {
                 manifests: PathBuf::from("m"),
                 data_plane: PathBuf::from("p"),
+                check_secrets: false,
             }))
+        );
+        assert_eq!(
+            parsed(&[
+                "--check-secrets",
+                "--from-manifests",
+                "m",
+                "--data-plane",
+                "p"
+            ]),
+            Ok(Parsed::Validate(Options {
+                manifests: PathBuf::from("m"),
+                data_plane: PathBuf::from("p"),
+                check_secrets: true,
+            }))
+        );
+        assert_eq!(
+            parsed(&["--check-secrets", "--check-secrets"]),
+            Err(UsageError::Twice("--check-secrets"))
         );
         assert_eq!(parsed(&["--help"]), Ok(Parsed::Help));
         assert_eq!(

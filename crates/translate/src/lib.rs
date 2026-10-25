@@ -70,6 +70,11 @@ pub struct Cluster {
     pub services: Vec<Service>,
     /// Every Secret seen: those Ingresses' `tls` names hold their certificates.
     pub secrets: Vec<Secret>,
+    /// Whether the Secrets Ingresses' `tls` names are taken as they will be in the
+    /// cluster, securing their hosts as named and not looked at: `edgerush validate` unless
+    /// asked to check them, as repositories seldom hold them (04 §3). The control plane
+    /// always looks.
+    pub secrets_assumed: bool,
 }
 
 /// A data plane's config, and what could not go into it.
@@ -907,7 +912,7 @@ fn ingress_routes(
     // that cannot be secured stays on `http`, and is said; one asked for over plain HTTP
     // where the data plane has no `http` listener leaves the Ingress out.
     let mut certificates: Vec<(String, Certificate, Vec<String>)> = Vec::new();
-    let mut read: BTreeMap<&str, Result<(Certificate, Identity), String>> = BTreeMap::new();
+    let mut read: BTreeMap<&str, Result<(Certificate, Option<Identity>), String>> = BTreeMap::new();
     let mut unsecured = Vec::new();
     let mut listeners_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for host in by_host.keys() {
@@ -919,12 +924,22 @@ fn ingress_routes(
                 unsecured.push((host.clone(), "its TLS entry names no Secret".to_owned()))
             }
             Some(&Some(secret)) => {
-                let checked = read
-                    .entry(secret)
-                    .or_insert_with(|| secret_certificate(cluster, namespace, secret));
+                let checked = read.entry(secret).or_insert_with(|| {
+                    if cluster.secrets_assumed {
+                        // Named, and not looked at: what it holds is the cluster's.
+                        let unread = Certificate {
+                            chain: String::new(),
+                            key: String::new(),
+                        };
+                        Ok((unread, None))
+                    } else {
+                        secret_certificate(cluster, namespace, secret)
+                            .map(|(certificate, identity)| (certificate, Some(identity)))
+                    }
+                });
                 let reason = match checked {
                     Err(reason) => Some(reason.clone()),
-                    Ok((_, identity)) if !identity.covers(host) => {
+                    Ok((_, Some(identity))) if !identity.covers(host) => {
                         Some(format!("Secret {namespace}/{secret} does not cover {host}"))
                     }
                     Ok(_) if https.is_empty() => {
@@ -1187,6 +1202,7 @@ spec: { controller: edgerush.dev/ingress-controller }
                 ingresses: vec![ingress("good", "/"), ingress("bad", "/a/../admin")],
                 services: vec![service],
                 secrets: Vec::new(),
+                secrets_assumed: false,
             },
         )
     }
@@ -1215,6 +1231,67 @@ spec: { controller: edgerush.dev/ingress-controller }
             .map(|r| r.name.as_str())
             .collect();
         assert_eq!(routes, ["ingress/shop/good/good.example.com"]);
+    }
+
+    /// Secrets taken as they will be in the cluster secure their hosts as named, unread,
+    /// though none is among the objects; looked at, the same Secret is not there.
+    #[test]
+    fn assumed_secrets_secure_their_hosts_unread() {
+        let plane: Plane = serde_saphyr::from_str(&format!(
+            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\nlisteners:\n{HTTP}  https: {{ address: \"[::]:8443\", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [], without_sni: none }} }}\n"
+        ))
+        .unwrap();
+        let cluster = |secrets_assumed| {
+            Cluster {
+            ingress_classes: vec![
+                serde_saphyr::from_str(
+                    "metadata: { name: edge }\nspec: { controller: edgerush.dev/ingress-controller }\n",
+                )
+                .unwrap(),
+            ],
+            ingresses: vec![
+                serde_saphyr::from_str(
+                    "metadata: { name: web, namespace: shop }\nspec:\n  ingressClassName: edge\n  tls: [{ hosts: [shop.example.com], secretName: shop-tls }]\n  rules:\n    - host: shop.example.com\n      http:\n        paths:\n          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }\n",
+                )
+                .unwrap(),
+            ],
+            services: vec![
+                serde_saphyr::from_str(
+                    "metadata: { name: web, namespace: shop }\nspec: { ports: [{ name: http, port: 80 }] }\n",
+                )
+                .unwrap(),
+            ],
+            secrets: Vec::new(),
+            secrets_assumed,
+        }
+        };
+
+        let assumed = translate(&plane, &cluster(true));
+        assert!(assumed.tls.is_empty(), "{:?}", assumed.tls);
+        assert_eq!(assumed.config.routes[0].listeners, ["http", "https"]);
+        let unread = Certificate {
+            chain: String::new(),
+            key: String::new(),
+        };
+        assert_eq!(
+            assumed.config.certificates.get("shop/shop-tls"),
+            Some(&unread)
+        );
+        let https = &assumed.config.listeners["https"];
+        let stated = https.tls.as_ref().unwrap().certificates[0].stated();
+        assert_eq!(stated, Some(&["shop.example.com".to_owned()][..]));
+        assert!(compile(&assumed.config).is_ok());
+
+        let checked = translate(&plane, &cluster(false));
+        let said: Vec<String> = checked.tls.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            said,
+            [
+                "Ingress shop/web: shop.example.com is served over HTTP only: Secret shop/shop-tls does not exist"
+            ]
+        );
+        assert_eq!(checked.config.routes[0].listeners, ["http"]);
+        assert!(checked.config.certificates.is_empty());
     }
 
     /// Where the data plane's own listeners are what it would refuse, compiling an Ingress
