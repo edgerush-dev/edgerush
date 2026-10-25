@@ -383,6 +383,12 @@ pub struct Tls {
     /// listener with TLS, so that which one is never left to their order. It holds for the
     /// listener's HTTP/3 socket too.
     pub without_sni: String,
+    /// Host names refused in the handshake with an `unrecognized_name` alert before any
+    /// certificate is looked at: translated, those an Ingress serves without TLS, so that
+    /// another's wildcard never answers for them over HTTPS when that Ingress's own route
+    /// is not there to take them.
+    #[serde(default)]
+    pub refused: Vec<String>,
     /// Clients must show a certificate these authorities vouch for (mTLS); none, and any
     /// client is served.
     #[serde(default)]

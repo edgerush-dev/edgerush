@@ -889,6 +889,8 @@ pub struct CompiledTls {
     /// Which of them a client that asks for no name is given; none, and such a client is
     /// refused.
     pub without_sni: Option<usize>,
+    /// Host names refused in the handshake before any certificate is looked at.
+    pub refused: Vec<String>,
     /// Clients must show a certificate these authorities vouch for (mTLS); none, and any
     /// client is served.
     pub client_validation: Option<ClientValidation>,
@@ -1135,6 +1137,13 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                     }
                 }
             }
+            // Names a client asks for, so host names alone: a wildcard is a certificate's.
+            for refused in &tls.refused {
+                if !is_host_name(refused) {
+                    let problem = Problem::RefusedName(refused.clone());
+                    errors.push(Place::listener(name).problem(problem));
+                }
+            }
             if tls.without_sni != WITHOUT_SNI_REFUSED
                 && !tls
                     .certificates
@@ -1352,6 +1361,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                                     .position(|presented| presented.name() == tls.without_sni)
                             })
                             .flatten(),
+                        refused: tls.refused.clone(),
                         client_validation: tls.client_validation.clone(),
                     }),
                     http3: listener.http3,
@@ -2394,6 +2404,9 @@ pub enum Problem {
     /// A certificate for clients without SNI that is not one of the listener's.
     #[error("`without_sni` names `{0}`, which is not one of the listener's certificates")]
     WithoutSniUnknown(String),
+    /// A name a listener refuses that is not a host name.
+    #[error("`refused` names `{0}`, which is not a host name")]
+    RefusedName(String),
     /// TLS on a listener that does not speak it.
     #[error("`tls` is for protocol `https`")]
     TlsUnwanted,
@@ -3889,6 +3902,44 @@ routes: []
 upstreams: {}
 ";
         assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
+    }
+
+    /// A listener may refuse host names before any certificate is looked at; none unless
+    /// said. A name it refuses is a host name, as a client asks for one: no wildcard, no
+    /// address.
+    #[test]
+    fn a_listener_refuses_the_host_names_it_says() {
+        let with = |tls: &str| {
+            with_certificates(
+                config(&format!(
+                    "listeners: {{ l: {{ address: \"[::]:443\", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {tls} }} }}\nroutes: []\nupstreams: {{}}\n"
+                )),
+                &["a"],
+            )
+        };
+        let compiled = compile(&with(
+            "{ certificates: [a], without_sni: none, refused: [b.example.com, C.Example.com] }",
+        ))
+        .unwrap();
+        let tls = compiled.listeners[0].tls.as_ref().unwrap();
+        assert_eq!(tls.refused, ["b.example.com", "C.Example.com"]);
+        let unsaid = compile(&with("{ certificates: [a], without_sni: none }")).unwrap();
+        assert!(unsaid.listeners[0].tls.as_ref().unwrap().refused.is_empty());
+
+        let problems: Vec<String> = compile(&with(
+            "{ certificates: [a], without_sni: none, refused: [\"*.example.com\", 192.0.2.1, ok.example.com] }",
+        ))
+        .unwrap_err()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            problems,
+            [
+                "listener `l`: `refused` names `*.example.com`, which is not a host name",
+                "listener `l`: `refused` names `192.0.2.1`, which is not a host name",
+            ]
+        );
     }
 
     /// A certificate named by a listener or an upstream is found among the config's

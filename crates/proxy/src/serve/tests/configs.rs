@@ -123,6 +123,7 @@ pub(super) fn secured(
             .into_iter()
             .map(edgerush_config::ListenerCertificate::Carried)
             .collect(),
+        refused: Vec::new(),
         client_validation,
     });
 }

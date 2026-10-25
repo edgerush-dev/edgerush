@@ -1627,6 +1627,14 @@
             }
           ]
         },
+        "refused": {
+          "description": "Host names refused in the handshake with an `unrecognized_name` alert before any\ncertificate is looked at: translated, those an Ingress serves without TLS, so that\nanother's wildcard never answers for them over HTTPS when that Ingress's own route\nis not there to take them.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "without_sni": {
           "description": "The certificate for a client that asks for no name (no SNI): one of\n`certificates`, or `none` to refuse such a client in the handshake. Said on every\nlistener with TLS, so that which one is never left to their order. It holds for the\nlistener's HTTP/3 socket too.",
           "type": "string"
