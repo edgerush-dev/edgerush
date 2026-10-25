@@ -470,21 +470,21 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "1 routes and 1 upstreams translated; 0 left out; 0 paths without their backend; 0 TLS hosts not served over HTTPS; 0 paths shadowed; 1 Ingresses of other classes or none passed over\n"
+        "1 routes and 1 upstreams translated; 0 left out; 0 paths without their backend; 0 TLS hosts or entries not served as listed; 0 paths shadowed; 1 Ingresses of other classes or none passed over\n"
     );
 
     // An Ingress that asks for what is not translated yet is left out, and said.
     std::fs::write(
-        manifests.join("tls.yml"),
-        "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: { name: secure, namespace: shop }\nspec:\n  ingressClassName: edge\n  tls: [{ secretName: shop }]\n  rules:\n    - host: shop.example.com\n      http:\n        paths:\n          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }\n",
+        manifests.join("rewritten.yml"),
+        "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: { name: rewritten, namespace: shop, annotations: { nginx.ingress.kubernetes.io/rewrite-target: / } }\nspec:\n  ingressClassName: edge\n  rules:\n    - host: shop.example.com\n      http:\n        paths:\n          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }\n",
     )?;
     let output = validate(&manifests)?;
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "Ingress shop/secure: not supported yet: a TLS entry without hosts\n1 routes and 1 upstreams translated; 1 left out; 0 paths without their backend; 0 TLS hosts not served over HTTPS; 0 paths shadowed; 1 Ingresses of other classes or none passed over\n"
+        "Ingress shop/rewritten: not supported yet: annotations\n1 routes and 1 upstreams translated; 1 left out; 0 paths without their backend; 0 TLS hosts or entries not served as listed; 0 paths shadowed; 1 Ingresses of other classes or none passed over\n"
     );
-    std::fs::remove_file(manifests.join("tls.yml"))?;
+    std::fs::remove_file(manifests.join("rewritten.yml"))?;
 
     // A host `tls` lists whose Secret is not among the manifests is served over plain HTTP,
     // and said, as it is not served as asked.
@@ -496,7 +496,7 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "Ingress shop/secure: secure.example.com is served over HTTP only: Secret shop/secure does not exist\n2 routes and 1 upstreams translated; 0 left out; 0 paths without their backend; 1 TLS hosts not served over HTTPS; 0 paths shadowed; 1 Ingresses of other classes or none passed over\n"
+        "Ingress shop/secure: secure.example.com is served over HTTP only: Secret shop/secure does not exist\n2 routes and 1 upstreams translated; 0 left out; 0 paths without their backend; 1 TLS hosts or entries not served as listed; 0 paths shadowed; 1 Ingresses of other classes or none passed over\n"
     );
     std::fs::remove_file(manifests.join("tls.yml"))?;
 
@@ -521,7 +521,7 @@ spec:
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "Ingress shop/web2: path / (Prefix) on shop.example.com is also Ingress shop/web's; which takes it depends on which the cluster made first
-2 routes and 1 upstreams translated; 0 left out; 0 paths without their backend; 0 TLS hosts not served over HTTPS; 1 paths shadowed; 1 Ingresses of other classes or none passed over
+2 routes and 1 upstreams translated; 0 left out; 0 paths without their backend; 0 TLS hosts or entries not served as listed; 1 paths shadowed; 1 Ingresses of other classes or none passed over
 "
     );
     std::fs::remove_file(manifests.join("shadow.yml"))?;
@@ -546,7 +546,7 @@ spec:
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "Ingress shop/gone: path / (Prefix) on gone.example.com is answered 500: Service shop/gone does not exist
-2 routes and 1 upstreams translated; 0 left out; 1 paths without their backend; 0 TLS hosts not served over HTTPS; 0 paths shadowed; 1 Ingresses of other classes or none passed over
+2 routes and 1 upstreams translated; 0 left out; 1 paths without their backend; 0 TLS hosts or entries not served as listed; 0 paths shadowed; 1 Ingresses of other classes or none passed over
 "
     );
     std::fs::remove_file(manifests.join("gone.yml"))?;
@@ -559,7 +559,7 @@ spec:
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.ends_with(
-            "0 left out; 0 paths without their backend; 0 TLS hosts not served over HTTPS; 0 paths shadowed; 1 Ingresses of other classes or none passed over\nthe data plane would refuse the config:\n  listener `db`: a `tcp` listener needs exactly one TCP route; it has 0\n"
+            "0 left out; 0 paths without their backend; 0 TLS hosts or entries not served as listed; 0 paths shadowed; 1 Ingresses of other classes or none passed over\nthe data plane would refuse the config:\n  listener `db`: a `tcp` listener needs exactly one TCP route; it has 0\n"
         ),
         "{stdout}"
     );

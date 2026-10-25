@@ -15,6 +15,7 @@ listeners:
       certificates:
         - { certificate: shop/wild, names: [e.example.com] }
       without_sni: none
+      refused: [a.example.com, b.example.com, c.example.com, d.example.com]
 routes:
   - name: ingress/shop/web/a.example.com
     listeners: [http]

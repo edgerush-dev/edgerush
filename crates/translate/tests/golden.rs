@@ -4,8 +4,8 @@
 //! `kubectl apply` would take them; `config.yaml`, the config expected, written as the
 //! development harness's file is, without the certificates' contents, which a config file
 //! does not hold; `report.txt`, the report expected, a finding a line, what was left out
-//! first, then the paths whose backend is not there, then the hosts not served over HTTPS,
-//! then the paths shadowed; where the case says, `certificates.txt`, the names of the
+//! first, then the paths whose backend is not there, then what of a `tls` is not served as
+//! it lists it, then the paths shadowed; where the case says, `certificates.txt`, the names of the
 //! certificates the config carries, a line each (none otherwise); and, where the case says,
 //! `passed-over.txt`, how many Ingresses were another data plane's.
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
@@ -100,7 +100,7 @@ fn every_case_translates_to_its_config_and_report() {
             .iter()
             .map(ToString::to_string)
             .chain(translation.unresolved.iter().map(ToString::to_string))
-            .chain(translation.unsecured.iter().map(ToString::to_string))
+            .chain(translation.tls.iter().map(ToString::to_string))
             .chain(translation.shadowed.iter().map(ToString::to_string))
             .collect();
         let expected: Vec<String> = read(&case.join("report.txt"))

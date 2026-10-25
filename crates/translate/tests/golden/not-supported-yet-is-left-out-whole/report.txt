@@ -1,9 +1,8 @@
-Ingress shop/a-tls-without-hosts: not supported yet: a TLS entry without hosts
-Ingress shop/a2-tls-without-secret: not supported yet: a TLS entry without a Secret
 Ingress shop/b-neither-rules-nor-default-backend: invalid: neither rules nor a default backend
 Ingress shop/c-prefix-without-path: invalid: a Prefix or Exact path without a path
 Ingress shop/c2-unknown-path-type: invalid: a path type Kubernetes does not have
 Ingress shop/c3-rule-without-paths: not supported yet: a rule without paths
+Ingress shop/c4-host-an-address: invalid: a host that is an IP address
 Ingress shop/f-backend-without-port: invalid: a Service backend without a port
 Ingress shop/h-external-name: not supported yet: an ExternalName Service
 Ingress shop/i-resource: not supported yet: a resource backend

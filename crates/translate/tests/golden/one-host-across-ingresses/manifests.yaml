@@ -1,0 +1,110 @@
+# A host one Ingress secures is served over HTTPS whichever Ingress's route it is, so
+# that both listeners rank the same paths for it, with the older Ingress's Secret: one
+# that states another Secret for it is said, as one whose own Secret cannot be used is.
+# Without creation times the two are only known to clash. A host no Ingress secures is
+# refused over HTTPS, so that another's wildcard route never takes it there; a wildcard
+# host is not, as a client asks for no wildcard.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: u1, namespace: shop }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [secure.example.com], secretName: secure }]
+  rules:
+    - host: "secure.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: u2, namespace: shop }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [secure.example.com], secretName: wild }]
+  rules:
+    - host: "secure.example.com"
+      http:
+        paths:
+          - { path: /u2, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: a, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [shop.example.com], secretName: shop-tls }]
+  rules:
+    - host: "shop.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: b, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [shop.example.com], secretName: wild }]
+  rules:
+    - host: "shop.example.com"
+      http:
+        paths:
+          - { path: /b, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: c, namespace: shop, creationTimestamp: "2026-03-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: "shop.example.com"
+      http:
+        paths:
+          - { path: /c, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: d, namespace: shop, creationTimestamp: "2026-04-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [shop.example.com], secretName: gone }]
+  rules:
+    - host: "shop.example.com"
+      http:
+        paths:
+          - { path: /d, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: w, namespace: shop, creationTimestamp: "2026-05-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: ["*.example.com"], secretName: wild }]
+  rules:
+    - host: "*.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: p, namespace: shop, creationTimestamp: "2026-06-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: "*.p.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "test.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

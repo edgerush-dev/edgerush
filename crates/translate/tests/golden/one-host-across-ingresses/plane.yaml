@@ -1,0 +1,18 @@
+# A data plane with an `http` and an `https` listener, the latter naming no certificate of its own.
+ingress_class: edge
+cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  https:
+    address: "[::]:8443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls: { certificates: [], without_sni: none }

@@ -1,0 +1,26 @@
+# An entry without hosts is ignored, its certificate put on no host though it carries
+# one: nothing names them. An entry without a Secret secures nothing, its hosts served
+# over HTTP alone. A host listed again keeps its first entry's Secret, and is said where
+# the later entry names another; each of the others is said too.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  tls: [{ secretName: shop-tls }, { hosts: [nosecret.example.com] }, { hosts: [shop.example.com], secretName: shop-tls }, { hosts: [shop.example.com], secretName: shop-tls }, { hosts: [shop.example.com], secretName: wild }]
+  rules:
+    - host: "nosecret.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "shop.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
