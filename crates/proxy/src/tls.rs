@@ -149,10 +149,6 @@ pub enum TlsError {
         /// What was wrong with it.
         reason: String,
     },
-    /// A listener with no certificate to present. Not known to happen: the config model
-    /// refuses an `https` listener without one.
-    #[error("no certificate to present")]
-    NoCertificate,
     /// BoringSSL would not set up what every certificate is served with. Not known to
     /// happen: the settings are fixed.
     #[error("TLS cannot be set up: {0}")]
@@ -350,9 +346,6 @@ impl Certificates {
                 }
             };
             contexts.push(context);
-        }
-        if contexts.is_empty() {
-            return Err(TlsError::NoCertificate);
         }
         Ok(Self {
             names,
@@ -825,6 +818,36 @@ mod tests {
                 let pipe = handshake(client, &mut worker_config(&tls));
                 assert!(pipe.server.is_established(), "{name}");
                 assert_eq!(pipe.client.peer_cert(), Some(&der(shown)[..]), "{name}");
+            }
+        }
+
+        /// Over QUIC as over TCP, a listener with no certificate refuses every client,
+        /// one that asks for a name and one that asks for none.
+        #[test]
+        fn a_listener_with_no_certificate_refuses_every_client_over_quic() {
+            let tls = Tls::new(&CompiledTls {
+                certificates: Vec::new(),
+                without_sni: None,
+                client_validation: None,
+            })
+            .unwrap();
+            const UNRECOGNIZED_NAME: u64 = 0x100 + 112;
+            for name in [Some("a.test"), None] {
+                let client = quiche::connect(
+                    name,
+                    &id(0xc1, 16),
+                    client_addr(),
+                    server_addr(),
+                    &mut client_config(),
+                )
+                .unwrap();
+                let pipe = handshake(client, &mut worker_config(&tls));
+                assert!(!pipe.server.is_established(), "{name:?}");
+                assert_eq!(
+                    pipe.client.peer_error().map(|error| error.error_code),
+                    Some(UNRECOGNIZED_NAME),
+                    "{name:?}"
+                );
             }
         }
 

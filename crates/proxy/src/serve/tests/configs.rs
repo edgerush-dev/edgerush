@@ -102,7 +102,8 @@ pub(super) fn everything_secured_to(
 }
 
 /// `config`'s `web` listener made `https`, presenting `certificates`, each named for its
-/// place (`web0`, `web1`, ...), and validating clients as `client_validation` says.
+/// place (`web0`, `web1`, ...), the first for a client that asks for no name (none, with
+/// none), and validating clients as `client_validation` says.
 pub(super) fn secured(
     config: &mut Config,
     certificates: Vec<edgerush_config::Certificate>,
@@ -117,7 +118,7 @@ pub(super) fn secured(
     let web = config.listeners.get_mut("web").unwrap();
     web.protocol = edgerush_config::Protocol::Https;
     web.tls = Some(edgerush_config::Tls {
-        without_sni: names[0].clone(),
+        without_sni: names.first().cloned().unwrap_or_else(|| "none".to_owned()),
         certificates: names
             .into_iter()
             .map(edgerush_config::ListenerCertificate::Carried)

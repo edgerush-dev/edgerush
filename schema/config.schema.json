@@ -1610,12 +1610,11 @@
       "type": "object",
       "properties": {
         "certificates": {
-          "description": "The certificates it can present. A client is given the one that answers for the\nname it asked for (SNI): by the names it carries, or by the names stated for it\nalone; a client that asked for a name none answers for is refused in the handshake\nwith an `unrecognized_name` alert. No certificate twice.",
+          "description": "The certificates it can present. A client is given the one that answers for the\nname it asked for (SNI): by the names it carries, or by the names stated for it\nalone; a client that asked for a name none answers for is refused in the handshake\nwith an `unrecognized_name` alert. No certificate twice. None at all, and every\nclient is refused so, as NGINX's `ssl_reject_handshake`: a translated listener\nwaits so for its first Ingress with TLS.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/ListenerCertificate"
-          },
-          "minItems": 1
+          }
         },
         "client_validation": {
           "description": "Clients must show a certificate these authorities vouch for (mTLS); none, and any\nclient is served.",

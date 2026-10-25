@@ -374,8 +374,9 @@ pub struct Tls {
     /// The certificates it can present. A client is given the one that answers for the
     /// name it asked for (SNI): by the names it carries, or by the names stated for it
     /// alone; a client that asked for a name none answers for is refused in the handshake
-    /// with an `unrecognized_name` alert. No certificate twice.
-    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
+    /// with an `unrecognized_name` alert. No certificate twice. None at all, and every
+    /// client is refused so, as NGINX's `ssl_reject_handshake`: a translated listener
+    /// waits so for its first Ingress with TLS.
     pub certificates: Vec<ListenerCertificate>,
     /// The certificate for a client that asks for no name (no SNI): one of
     /// `certificates`, or `none` to refuse such a client in the handshake. Said on every
