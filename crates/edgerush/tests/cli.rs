@@ -476,7 +476,7 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
     // An Ingress that asks for what is not translated yet is left out, and said.
     std::fs::write(
         manifests.join("tls.yml"),
-        "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: { name: secure, namespace: shop }\nspec:\n  ingressClassName: edge\n  tls: [{ hosts: [shop.example.com], secretName: shop }]\n",
+        "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: { name: secure, namespace: shop }\nspec:\n  ingressClassName: edge\n  tls: [{ hosts: [shop.example.com], secretName: shop }]\n  rules:\n    - host: shop.example.com\n      http:\n        paths:\n          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }\n",
     )?;
     let output = validate(&manifests)?;
     assert_eq!(output.status.code(), Some(1), "{output:?}");
