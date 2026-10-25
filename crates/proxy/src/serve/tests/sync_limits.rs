@@ -515,18 +515,18 @@ async fn an_open_breaker_closes_once_a_probe_hears_from_its_owner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let address = {
-                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                listener.local_addr().unwrap()
-            };
-            // Says nothing until the owner comes up on the same address.
-            let silent = TcpListener::bind(address).await.unwrap();
+            // Says nothing until its gates open, the owner back. (A port given up and bound
+            // again could be taken in between, as the system hands it out.)
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let owner = listener.local_addr().unwrap();
+            let _pod = lone_pod(listener);
+            let relay = GatedRelay::shut(owner).await;
             let (upstream, _) = counting_upstream().await;
             let config = with_breaker(
                 synchronous_in(
                     everything_config(upstream),
                     &[("per-client", 10)],
-                    &[address.to_string()],
+                    std::slice::from_ref(&relay.address),
                     100,
                     "deny",
                 ),
@@ -537,8 +537,7 @@ async fn an_open_breaker_closes_once_a_probe_hears_from_its_owner() {
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
             let open = r#"edgerush_rate_limit_owner_breaker_open{pod="0"}"#;
             assert_eq!(metric(&proxy.metrics(), open), Some(1));
-            drop(silent);
-            let _pod = lone_pod(TcpListener::bind(address).await.unwrap());
+            relay.open_all();
             let deadline = Instant::now() + Duration::from_secs(5);
             while metric(&proxy.metrics(), open) != Some(0) {
                 assert!(Instant::now() < deadline, "the breaker never closed");
@@ -636,18 +635,17 @@ async fn local_buckets_carry_over_from_one_outage_to_the_next() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let address = {
-                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                listener.local_addr().unwrap()
-            };
-            // Says nothing until the owner comes up on the same address.
-            let silent = TcpListener::bind(address).await.unwrap();
+            // Says nothing until its gates open, the owner back.
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let owner = listener.local_addr().unwrap();
+            let pod = lone_pod(listener);
+            let relay = GatedRelay::shut(owner).await;
             let (upstream, _) = counting_upstream().await;
             let config = with_breaker(
                 synchronous_in(
                     everything_config(upstream),
                     &[("per-client", 10)],
-                    &[address.to_string()],
+                    std::slice::from_ref(&relay.address),
                     100,
                     "local",
                 ),
@@ -658,8 +656,7 @@ async fn local_buckets_carry_over_from_one_outage_to_the_next() {
             let first = statuses(&send_round(&mut sends, 11).await);
             assert_eq!(first[..10], [200; 10], "{first:?}");
             assert_eq!(first[10], 429, "the local bucket spent");
-            drop(silent);
-            let pod = lone_pod(TcpListener::bind(address).await.unwrap());
+            relay.open_all();
             let open = r#"edgerush_rate_limit_owner_breaker_open{pod="0"}"#;
             let deadline = Instant::now() + Duration::from_secs(5);
             while metric(&proxy.metrics(), open) != Some(0) {
@@ -1008,6 +1005,8 @@ async fn a_reload_mid_outage_keeps_the_breakers_and_the_local_buckets() {
 struct GatedRelay {
     address: String,
     gates: Arc<std::sync::Mutex<Vec<tokio::sync::watch::Sender<bool>>>>,
+    /// Whether a connection's gate is open when it is accepted.
+    open_at_first: Arc<std::sync::atomic::AtomicBool>,
     accepted: Arc<std::sync::atomic::AtomicUsize>,
     /// The connections that have ended, by the order they were accepted in.
     ended: Arc<std::sync::Mutex<Vec<usize>>>,
@@ -1015,10 +1014,22 @@ struct GatedRelay {
 
 impl GatedRelay {
     async fn to(to: SocketAddr) -> Self {
+        Self::opening(to, true).await
+    }
+
+    /// One whose gates are all shut until [`open_all`](Self::open_all): `to` as an owner
+    /// that accepts and says nothing, until it is back.
+    async fn shut(to: SocketAddr) -> Self {
+        Self::opening(to, false).await
+    }
+
+    async fn opening(to: SocketAddr, open_at_first: bool) -> Self {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let gates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let open_at_first = Arc::new(std::sync::atomic::AtomicBool::new(open_at_first));
+        let held_open_at_first = Arc::clone(&open_at_first);
         let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let ended = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (held_gates, held_accepted, held_ended) = (
@@ -1031,7 +1042,8 @@ impl GatedRelay {
                 let Ok(server) = TcpStream::connect(to).await else {
                     continue;
                 };
-                let (gate, mut open) = tokio::sync::watch::channel(true);
+                let (gate, mut open) =
+                    tokio::sync::watch::channel(held_open_at_first.load(Ordering::Relaxed));
                 held_gates.lock().unwrap().push(gate);
                 let nth = held_accepted.fetch_add(1, Ordering::Relaxed);
                 let (mut from_client, mut to_client) = client.into_split();
@@ -1058,8 +1070,17 @@ impl GatedRelay {
         Self {
             address,
             gates,
+            open_at_first,
             accepted,
             ended,
+        }
+    }
+
+    /// Opens every gate, and those of connections accepted from now on.
+    fn open_all(&self) {
+        self.open_at_first.store(true, Ordering::Relaxed);
+        for gate in self.gates.lock().unwrap().iter() {
+            gate.send_replace(true);
         }
     }
 
