@@ -697,9 +697,6 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
                     errors.push(place.problem(Problem::RateLimitingSynchronousZero(field)));
                 }
             }
-            if waiting.when_unreachable == crate::WhenUnreachable::Local {
-                errors.push(place.problem(Problem::RateLimitingUnreachableLocalNotBuilt));
-            }
         }
         (None, false) => {}
     }
@@ -2495,9 +2492,6 @@ pub enum Problem {
     /// A cap on keys where none are kept.
     #[error("`rate_limiting.max_key_bytes` is for a mode that keeps keys, not `off`")]
     RateLimitingKeyBytesOff,
-    /// An owner out of reach decided by the data plane's own buckets, which is not built.
-    #[error("`rate_limiting.synchronous`: `when_unreachable: local` is not built yet")]
-    RateLimitingUnreachableLocalNotBuilt,
     /// The synchronous mode without how a request waits for its owner.
     #[error("`rate_limiting`: mode `synchronous` needs `synchronous`")]
     RateLimitingSynchronousMissing,
@@ -5111,23 +5105,16 @@ upstreams: {{ u: {upstream} }}
                 "said, even as its default"
             );
         }
-        assert_eq!(
-            with(&format!(
-                "mode: synchronous, {service}, {}",
-                WAITS.replace("allow", "deny")
-            )),
-            Ok(())
-        );
-        assert_eq!(
-            with(&format!(
-                "mode: synchronous, {service}, {}",
-                WAITS.replace("allow", "local")
-            ))
-            .unwrap_err(),
-            [
-                "the data plane: `rate_limiting.synchronous`: `when_unreachable: local` is not built yet"
-            ]
-        );
+        for when in ["deny", "local"] {
+            assert_eq!(
+                with(&format!(
+                    "mode: synchronous, {service}, {}",
+                    WAITS.replace("allow", when)
+                )),
+                Ok(()),
+                "{when}"
+            );
+        }
         // Every field is required, and an owner out of reach is decided by one of three.
         let parses = |waits: &str| {
             let yaml = format!(
