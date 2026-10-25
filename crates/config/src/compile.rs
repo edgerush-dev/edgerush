@@ -631,17 +631,55 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
         (_, false) => None,
     };
     if let Some(service) = service {
-        if service.pods.is_empty() {
-            errors.push(place.problem(Problem::RateLimitServiceNoPods));
+        if service.addresses.is_empty() {
+            errors.push(place.problem(Problem::RateLimitServiceNoAddresses));
         }
-        for pod in &service.pods {
-            if !is_host_and_port(pod) {
-                errors.push(place.problem(Problem::RateLimitServicePod(pod.clone())));
+        for address in &service.addresses {
+            if !is_host_and_port(address) {
+                errors.push(place.problem(Problem::RateLimitServiceAddress(address.clone())));
             }
         }
         if service.cycle_ms == Some(0) {
             errors.push(place.problem(Problem::RateLimitServiceCycleNever));
         }
+        if mode == RateLimitMode::Synchronous {
+            // The synchronous mode has no cycle of the data plane's and no levers: each
+            // would be ignored, as if it did something.
+            let asynchronous = [
+                ("cycle_ms", service.cycle_ms.is_some()),
+                ("poll_quiet_keys", service.poll_quiet_keys.is_some()),
+                ("ask_cold_keys", service.ask_cold_keys.is_some()),
+                ("schedule_keys", service.schedule_keys.is_some()),
+            ];
+            for (field, said) in asynchronous {
+                if said {
+                    errors.push(place.problem(Problem::RateLimitServiceAsynchronousOnly(field)));
+                }
+            }
+        }
+    }
+    let synchronous = mode == RateLimitMode::Synchronous;
+    match (&limiting.synchronous, synchronous) {
+        (Some(_), false) => {
+            errors.push(place.problem(Problem::RateLimitingSynchronousUnused(mode_name(mode))));
+        }
+        (None, true) => errors.push(place.problem(Problem::RateLimitingSynchronousMissing)),
+        (Some(waiting), true) => {
+            let never = [
+                ("timeout_ms", waiting.timeout_ms == 0),
+                ("breaker.failures", waiting.breaker.failures == 0),
+                (
+                    "breaker.probe_after_ms",
+                    waiting.breaker.probe_after_ms == 0,
+                ),
+            ];
+            for (field, zero) in never {
+                if zero {
+                    errors.push(place.problem(Problem::RateLimitingSynchronousZero(field)));
+                }
+            }
+        }
+        (None, false) => {}
     }
     match mode {
         RateLimitMode::Off => CompiledRateLimiting::Off,
@@ -652,7 +690,7 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
         }
         RateLimitMode::Asynchronous => match service {
             Some(service) => CompiledRateLimiting::Asynchronous(CompiledRateLimitService {
-                pods: service.pods.clone(),
+                pods: service.addresses.clone(),
                 cycle: service
                     .cycle_ms
                     .map_or(CompiledRateLimitService::CYCLE, Duration::from_millis),
@@ -2454,11 +2492,11 @@ pub enum Problem {
         message: String,
     },
     /// A rate-limiting service with no pods.
-    #[error("`rate_limiting.service` names no pods")]
-    RateLimitServiceNoPods,
-    /// A rate-limiting service pod whose address is not one to connect to.
-    #[error("`rate_limiting.service`: pod `{0}` is no `host:port`")]
-    RateLimitServicePod(String),
+    #[error("`rate_limiting.service` names no `addresses`")]
+    RateLimitServiceNoAddresses,
+    /// A rate-limiting service pod's address that is not one to connect to.
+    #[error("`rate_limiting.service`: address `{0}` is no `host:port`")]
+    RateLimitServiceAddress(String),
     /// A rate-limiting service whose cycle never comes.
     #[error("`rate_limiting.service`: `cycle_ms` is 0: at least 1")]
     RateLimitServiceCycleNever,
@@ -2474,6 +2512,18 @@ pub enum Problem {
     /// The synchronous mode, which is not built.
     #[error("`rate_limiting`: mode `synchronous` is not built yet")]
     RateLimitingSynchronousNotBuilt,
+    /// The synchronous mode without how a request waits for its owner.
+    #[error("`rate_limiting`: mode `synchronous` needs `synchronous`")]
+    RateLimitingSynchronousMissing,
+    /// How a request waits for its owner, in a mode that asks no owner.
+    #[error("`rate_limiting.synchronous` is for mode `synchronous`, not `{0}`")]
+    RateLimitingSynchronousUnused(&'static str),
+    /// A wait, a count or a pause of nothing.
+    #[error("`rate_limiting.synchronous`: `{0}` is 0: at least 1")]
+    RateLimitingSynchronousZero(&'static str),
+    /// A field of the service only the asynchronous mode has.
+    #[error("`rate_limiting.service.{0}` is for mode `asynchronous`")]
+    RateLimitServiceAsynchronousOnly(&'static str),
     /// A WebSocket's idle bound of nothing, which would never close one whose peer has gone.
     #[error("`tunnel_idle_ms` is 0: at least 1")]
     TunnelIdleNever,
@@ -5045,7 +5095,7 @@ upstreams: {}
         for mode in ["off", "local"] {
             assert_eq!(
                 with(&format!(
-                    r#"rate_limiting: {{ mode: {mode}, service: {{ pods: ["rl-0:7000"] }} }}"#
+                    r#"rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"] }} }}"#
                 ))
                 .unwrap_err(),
                 [format!(
@@ -5058,14 +5108,115 @@ upstreams: {}
             ["the data plane: `rate_limiting`: mode `asynchronous` needs `service`"]
         );
         assert_eq!(
-            with(r#"rate_limiting: { mode: synchronous, service: { pods: ["rl-0:7000"] } }"#)
-                .unwrap_err(),
+            with(&format!(
+                r#"rate_limiting: {{ mode: synchronous, service: {{ addresses: ["rl-0:7000"] }}, {WAITS} }}"#
+            ))
+            .unwrap_err(),
             ["the data plane: `rate_limiting`: mode `synchronous` is not built yet"]
         );
         // The mode is always written: a section saying nothing would leave it implied.
         let unsaid: Result<Config, _> =
             serde_saphyr::from_str("listeners: {}\nroutes: []\nupstreams: {}\nrate_limiting: {}\n");
         assert!(unsaid.is_err());
+    }
+
+    /// How a request waits for its owner, as a synchronous data plane is to say it.
+    const WAITS: &str = "synchronous: { timeout_ms: 20, when_unreachable: allow, breaker: { failures: 5, probe_after_ms: 1000 } }";
+
+    /// The synchronous mode needs how a request waits for its owner, every field of it
+    /// said and none of them nothing, and no other mode takes it; it takes none of the
+    /// service's asynchronous fields.
+    #[test]
+    fn the_synchronous_mode_says_how_a_request_waits() {
+        let with = |section: &str| {
+            let yaml = format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{}}\nrate_limiting: {{ {section} }}\n"
+            );
+            compile(&config(&yaml))
+                .map(|_| ())
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let service = r#"service: { addresses: ["rl-0:7000"] }"#;
+        let not_built = "the data plane: `rate_limiting`: mode `synchronous` is not built yet";
+        assert_eq!(
+            with(&format!("mode: synchronous, {service}")).unwrap_err(),
+            [
+                "the data plane: `rate_limiting`: mode `synchronous` needs `synchronous`",
+                not_built
+            ]
+        );
+        for (mode, more) in [("off", ""), ("local", ""), ("asynchronous", service)] {
+            let more = if more.is_empty() {
+                String::new()
+            } else {
+                format!(", {more}")
+            };
+            assert_eq!(
+                with(&format!("mode: {mode}{more}, {WAITS}")).unwrap_err(),
+                [format!(
+                    "the data plane: `rate_limiting.synchronous` is for mode `synchronous`, not `{mode}`"
+                )]
+            );
+        }
+        for (field, said, zero) in [
+            ("timeout_ms", "timeout_ms: 20", "timeout_ms: 0"),
+            ("breaker.failures", "failures: 5", "failures: 0"),
+            (
+                "breaker.probe_after_ms",
+                "probe_after_ms: 1000",
+                "probe_after_ms: 0",
+            ),
+        ] {
+            let zero = WAITS.replace(said, zero);
+            assert_eq!(
+                with(&format!("mode: synchronous, {service}, {zero}")).unwrap_err(),
+                [
+                    format!(
+                        "the data plane: `rate_limiting.synchronous`: `{field}` is 0: at least 1"
+                    ),
+                    not_built.to_owned()
+                ]
+            );
+        }
+        for (field, value) in [
+            ("cycle_ms", "10"),
+            ("poll_quiet_keys", "false"),
+            ("ask_cold_keys", "false"),
+            ("schedule_keys", "true"),
+        ] {
+            let service = format!(r#"service: {{ addresses: ["rl-0:7000"], {field}: {value} }}"#);
+            assert_eq!(
+                with(&format!("mode: synchronous, {service}, {WAITS}")).unwrap_err(),
+                [
+                    format!(
+                        "the data plane: `rate_limiting.service.{field}` is for mode `asynchronous`"
+                    ),
+                    not_built.to_owned()
+                ],
+                "said, even as its default"
+            );
+        }
+        // Every field is required, and an owner out of reach is decided by one of three.
+        let parses = |waits: &str| {
+            let yaml = format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{}}\nrate_limiting: {{ mode: synchronous, {service}, {waits} }}\n"
+            );
+            serde_saphyr::from_str::<Config>(&yaml).is_ok()
+        };
+        assert!(parses(WAITS));
+        for value in ["deny", "local"] {
+            assert!(parses(&WAITS.replace("allow", value)), "{value}");
+        }
+        for unsaid in [
+            "timeout_ms: 20, ",
+            "when_unreachable: allow, ",
+            ", breaker: { failures: 5, probe_after_ms: 1000 }",
+            "failures: 5, ",
+            ", probe_after_ms: 1000",
+        ] {
+            assert!(!parses(&WAITS.replace(unsaid, "")), "{unsaid}");
+        }
+        assert!(!parses(&WAITS.replace("allow", "wait")));
     }
 
     /// The rate-limiting service: its pods, a cycle of at least 1 ms, 10 when left out, and
@@ -5080,18 +5231,18 @@ upstreams: {}
                 .map(|compiled| compiled.rate_limit_service().cloned())
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
-        let service = with(r#"{ pods: ["rl-0:7000", "rl-1:7000"] }"#)
+        let service = with(r#"{ addresses: ["rl-0:7000", "rl-1:7000"] }"#)
             .unwrap()
             .unwrap();
         assert_eq!(service.pods, ["rl-0:7000", "rl-1:7000"]);
         assert_eq!(service.cycle, Duration::from_millis(10));
         assert_eq!(service.max_key_bytes, 256 << 20);
         assert_eq!(
-            with("{ pods: [] }").unwrap_err(),
-            ["the data plane: `rate_limiting.service` names no pods"]
+            with("{ addresses: [] }").unwrap_err(),
+            ["the data plane: `rate_limiting.service` names no `addresses`"]
         );
         assert_eq!(
-            with(r#"{ pods: ["a:1"], cycle_ms: 0 }"#).unwrap_err(),
+            with(r#"{ addresses: ["a:1"], cycle_ms: 0 }"#).unwrap_err(),
             ["the data plane: `rate_limiting.service`: `cycle_ms` is 0: at least 1"]
         );
         // A pod is a host and a port, as the process connects to it; anything else would
@@ -5105,17 +5256,17 @@ upstreams: {}
             ":7000",
         ] {
             assert_eq!(
-                with(&format!(r#"{{ pods: ["a:1", "{pod}"] }}"#)).unwrap_err(),
+                with(&format!(r#"{{ addresses: ["a:1", "{pod}"] }}"#)).unwrap_err(),
                 [format!(
-                    "the data plane: `rate_limiting.service`: pod `{pod}` is no `host:port`"
+                    "the data plane: `rate_limiting.service`: address `{pod}` is no `host:port`"
                 )],
                 "{pod}"
             );
         }
-        let addresses = with(r#"{ pods: ["10.0.0.1:7000", "[::1]:7000"] }"#);
+        let addresses = with(r#"{ addresses: ["10.0.0.1:7000", "[::1]:7000"] }"#);
         assert_eq!(addresses.unwrap().unwrap().pods.len(), 2);
         let levers = with(
-            r#"{ pods: ["a:1"], poll_quiet_keys: true, ask_cold_keys: true, schedule_keys: false }"#,
+            r#"{ addresses: ["a:1"], poll_quiet_keys: true, ask_cold_keys: true, schedule_keys: false }"#,
         )
         .unwrap()
         .unwrap();
@@ -5126,7 +5277,7 @@ upstreams: {}
              keys scheduled"
         );
         let capped = compile(&config(
-            "listeners: {}\nroutes: []\nupstreams: {}\nrate_limiting: { mode: asynchronous, max_key_bytes: 1000, service: { pods: [\"a:1\"] } }\n",
+            "listeners: {}\nroutes: []\nupstreams: {}\nrate_limiting: { mode: asynchronous, max_key_bytes: 1000, service: { addresses: [\"a:1\"] } }\n",
         ))
         .unwrap();
         assert_eq!(capped.rate_limit_service().unwrap().max_key_bytes, 1000);
@@ -5151,7 +5302,7 @@ upstreams: {}
         let with = |service: &str, bucket: &str| {
             with_section(
                 &format!(
-                    "rate_limiting: {{ mode: asynchronous, service: {{ pods: [\"rl-0:7000\"]{service} }} }}"
+                    "rate_limiting: {{ mode: asynchronous, service: {{ addresses: [\"rl-0:7000\"]{service} }} }}"
                 ),
                 bucket,
             )
@@ -5215,7 +5366,7 @@ limits:
         service: bool,
     ) -> Result<(Vec<String>, Vec<String>, Compiled), Vec<String>> {
         let service = if service {
-            "rate_limiting: { mode: asynchronous, service: { pods: [\"rl-0:7000\"] } }"
+            "rate_limiting: { mode: asynchronous, service: { addresses: [\"rl-0:7000\"] } }"
         } else {
             ""
         };

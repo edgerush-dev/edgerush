@@ -594,7 +594,7 @@ PY
             "${RL_MAX_KEY_BYTES:+, max_key_bytes: $RL_MAX_KEY_BYTES}" "$run-limits.yaml" >>"$config.rl"
         return
     fi
-    printf 'rate_limiting: { mode: asynchronous%s, service: { pods: ["127.0.0.1:7000"], cycle_ms: %s%s } }\nlimits_file: %s\n' \
+    printf 'rate_limiting: { mode: asynchronous%s, service: { addresses: ["127.0.0.1:7000"], cycle_ms: %s%s } }\nlimits_file: %s\n' \
         "${RL_MAX_KEY_BYTES:+, max_key_bytes: $RL_MAX_KEY_BYTES}" "$RL_CYCLE_MS" "$sharing" \
         "$run-limits.yaml" >>"$config.rl"
 }

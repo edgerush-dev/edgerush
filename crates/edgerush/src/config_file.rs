@@ -551,7 +551,7 @@ routes:
     hostnames: [{{ name: "*", falls_through: true }}]
     rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}] }}, rate_limits: [per-client] }}]
 upstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
-rate_limiting: {{ mode: asynchronous, service: {{ pods: ["rl-0:7000"] }} }}
+rate_limiting: {{ mode: asynchronous, service: {{ addresses: ["rl-0:7000"] }} }}
 limits_file: '{limits_file}'
 "#
         )
