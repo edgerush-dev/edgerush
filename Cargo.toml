@@ -134,6 +134,13 @@ serde_json = "1.0"
 lto = "fat"
 codegen-units = 1
 
+# Debug builds and tests without debug information: writing and linking it was most of
+# what building the tests cost, and over half the target directory. check.sh from
+# nothing took 18 minutes instead of 26 on Windows. A panic still names its file and
+# line; `CARGO_PROFILE_DEV_DEBUG=2` brings the information back for a debugger.
+[profile.dev]
+debug = 0
+
 # quiche 0.30.0 as published, but for changes of ours (16 §2): to how it fills a packet and
 # acknowledges one, how it follows a client that moves, what it bounds and accounts for of
 # what a peer makes it hold, and when it lets a stream go. `vendor/quiche/VENDORED.md` lists
