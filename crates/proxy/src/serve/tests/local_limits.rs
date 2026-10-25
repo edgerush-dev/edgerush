@@ -21,6 +21,7 @@ fn local_mode() -> Option<edgerush_config::RateLimiting> {
     Some(edgerush_config::RateLimiting {
         mode: edgerush_config::RateLimitMode::Local,
         max_key_bytes: None,
+        synchronous: None,
         experimental_header_keys: None,
         service: None,
     })
@@ -135,6 +136,7 @@ async fn with_rate_limiting_off_every_request_goes_on() {
     let off = Some(edgerush_config::RateLimiting {
         mode: edgerush_config::RateLimitMode::Off,
         max_key_bytes: None,
+        synchronous: None,
         experimental_header_keys: None,
         service: None,
     });
@@ -194,6 +196,7 @@ fn keyed_by(mut config: Config, limits: &[(&str, &str, u64)]) -> Config {
         mode: edgerush_config::RateLimitMode::Local,
         max_key_bytes: None,
         service: None,
+        synchronous: None,
         experimental_header_keys: Some(true),
     });
     config

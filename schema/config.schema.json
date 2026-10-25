@@ -1006,6 +1006,29 @@
         }
       ]
     },
+    "RateLimitBreaker": {
+      "description": "A data plane's breaker for each owner, which its workers share: open, nothing is asked\nof the owner and `when_unreachable` decides at once.",
+      "type": "object",
+      "properties": {
+        "failures": {
+          "description": "Timeouts and broken streams in a row, on any worker, that open it; any answer\nstarts the count again.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "probe_after_ms": {
+          "description": "Milliseconds open before a stream is opened to the owner again, without a request:\nthe owner's first word on it closes the breaker, and none leaves it open as long\nagain.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "failures",
+        "probe_after_ms"
+      ]
+    },
     "RateLimitMode": {
       "description": "How a data plane enforces its rate limits.",
       "oneOf": [
@@ -1032,9 +1055,17 @@
       ]
     },
     "RateLimitService": {
-      "description": "The rate-limiting service: its pods, and how often each process sends them what it\nadmitted.",
+      "description": "The rate-limiting service: its pods, and in the asynchronous mode how often each process\nsends them what it admitted and its levers, which the synchronous mode does not take.",
       "type": "object",
       "properties": {
+        "addresses": {
+          "description": "The address (`host:port`) of each of its pods, the first being pod 0.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
         "ask_cold_keys": {
           "description": "Whether a request for a key whose copy is cold waits for its owner's word. Off, it is\ndecided from the copy as it is — a new key's a full bucket — and the copy put right\nafter: no request waits on the service, at the price of a burst on a new key\nadmitted by every process that meets it. Off when left out, the faster.",
           "type": [
@@ -1052,14 +1083,6 @@
           "format": "uint64",
           "default": null,
           "minimum": 1
-        },
-        "pods": {
-          "description": "The address (`host:port`) of each of its pods, the first being pod 0.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "minItems": 1
         },
         "poll_quiet_keys": {
           "description": "Whether a key with nothing to report is polled every cycle while in use, to keep its\ncopy fresh. Off, a quiet key's copy goes cold after a refill time and its next\nrequest asks: messages grow with the keys admitting, not with all those in use. On,\na key counts as in use for its refill time after its last request, so under a limit\nrefilling over an hour or a day every key of every client seen in that time is polled\nevery cycle: each cycle's messages and work grow with them, millions of keys every\n10 ms. Off when left out, the faster.",
@@ -1080,7 +1103,33 @@
       },
       "additionalProperties": false,
       "required": [
-        "pods"
+        "addresses"
+      ]
+    },
+    "RateLimitSynchronous": {
+      "description": "How a request waits for its key's owner in the synchronous mode, and what decides it\nwhen the owner does not answer. Every\nfield is required: how a data plane behaves when its owners are out of reach is the\noperator's to say.",
+      "type": "object",
+      "properties": {
+        "breaker": {
+          "description": "When the data plane stops asking an owner that does not answer, and when it tries\nit again.",
+          "$ref": "#/$defs/RateLimitBreaker"
+        },
+        "timeout_ms": {
+          "description": "Milliseconds a request waits for its owner's answer before `when_unreachable`\ndecides it.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "when_unreachable": {
+          "description": "What decides a request whose owner does not answer in time, or whose breaker is\nopen.",
+          "$ref": "#/$defs/WhenUnreachable"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "timeout_ms",
+        "when_unreachable",
+        "breaker"
       ]
     },
     "RateLimiting": {
@@ -1114,6 +1163,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/RateLimitService"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "synchronous": {
+          "description": "How a request waits for its owner, which `synchronous` needs and no other mode\ntakes.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateLimitSynchronous"
             },
             {
               "type": "null"
@@ -1745,6 +1805,26 @@
       "required": [
         "name",
         "value"
+      ]
+    },
+    "WhenUnreachable": {
+      "description": "What decides a request whose owner does not answer.",
+      "oneOf": [
+        {
+          "description": "It goes on, as under no limit.",
+          "type": "string",
+          "const": "allow"
+        },
+        {
+          "description": "It is refused, 503 with `Retry-After: 1`: the service failed, not the client.",
+          "type": "string",
+          "const": "deny"
+        },
+        {
+          "description": "The data plane's own buckets, as in the local mode, until the owner answers again.",
+          "type": "string",
+          "const": "local"
+        }
       ]
     },
     "Wildcard": {

@@ -773,7 +773,7 @@ routes:
         forward: { backends: [{ upstream: u, weight: 1 }] }
         rate_limits: [writes]
 upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
-rate_limiting: { mode: asynchronous, service: { pods: ["rl-0:7000"] } }
+rate_limiting: { mode: asynchronous, service: { addresses: ["rl-0:7000"] } }
 "#;
         let limits = "limits:
   - { name: per-client, key: client, model: { bucket: { rate: 100/s, burst: 100 } } }

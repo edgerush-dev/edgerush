@@ -137,9 +137,10 @@ fn limited(mut config: Config, service: &[String]) -> Config {
     config.rate_limiting = Some(edgerush_config::RateLimiting {
         mode: edgerush_config::RateLimitMode::Asynchronous,
         max_key_bytes: None,
+        synchronous: None,
         experimental_header_keys: None,
         service: Some(edgerush_config::RateLimitService {
-            pods: service.to_vec(),
+            addresses: service.to_vec(),
             cycle_ms: Some(10),
             poll_quiet_keys: None,
             ask_cold_keys: None,
@@ -775,7 +776,7 @@ async fn a_changed_service_starts_the_process_afresh() {
         |service| service.poll_quiet_keys = Some(true),
         |service| service.schedule_keys = Some(false),
         |service| service.cycle_ms = Some(20),
-        |service| service.pods.push("127.0.0.1:2".to_owned()),
+        |service| service.addresses.push("127.0.0.1:2".to_owned()),
     ];
     for (at, change) in changes.into_iter().enumerate() {
         let current = hub_of(&proxy);

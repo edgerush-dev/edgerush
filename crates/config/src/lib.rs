@@ -33,8 +33,9 @@ pub use compile::{
 pub use config::{
     AccessLog, Certificate, ClientValidation, Config, DataPlane, Endpoints, Forwarding,
     HealthCheck, Http3, Keepalive, Listener, ListenerProxyProtocol, LoadBalancer, Probe, Protocol,
-    ProxyProtocolVersion, RateLimitMode, RateLimitService, RateLimiting, RequestId, SlowStart, Tls,
-    Upstream, UpstreamProtocol, UpstreamTls,
+    ProxyProtocolVersion, RateLimitBreaker, RateLimitMode, RateLimitService, RateLimitSynchronous,
+    RateLimiting, RequestId, SlowStart, Tls, Upstream, UpstreamProtocol, UpstreamTls,
+    WhenUnreachable,
 };
 pub use harness_file::{CertificateFiles, HarnessFile};
 pub use kubernetes::{KubernetesService, ServiceNameError, ServicePort};
