@@ -260,6 +260,20 @@ impl Breaker {
         }
     }
 
+    /// Probed at `now`, if it is still as `seen`, opened at that time: due again after
+    /// another period. False if it changed meanwhile — closed, or probed by another thread
+    /// sharing it across a reload — so that a stale look never opens it again.
+    fn rearm(&self, seen: u64, now: u64) -> bool {
+        self.opened
+            .compare_exchange(
+                seen,
+                now.saturating_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
     /// The owner heard from: closed.
     fn close(&self) {
         self.failures.store(0, Ordering::Relaxed);
@@ -313,10 +327,11 @@ fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
                 if opened == 0 || now.saturating_sub(opened - 1) < probe_after {
                     continue;
                 }
-                // Due again only after another period, heard from or not.
-                breaker
-                    .opened
-                    .store(now.saturating_add(1), Ordering::Relaxed);
+                // Due again only after another period, heard from or not; not this thread's to
+                // probe if another closed or probed it meanwhile.
+                if !breaker.rearm(opened, now) {
+                    continue;
+                }
                 let Some(address) = held.config.addresses.get(pod).cloned() else {
                     continue;
                 };
@@ -1021,6 +1036,21 @@ mod tests {
         assert!(!breaker.is_open());
         breaker.failed(70, 3);
         assert!(!breaker.is_open(), "counted afresh");
+    }
+
+    /// A probe that looked before the breaker was closed does not open it again.
+    #[test]
+    fn a_stale_probe_does_not_open_a_closed_breaker() {
+        let breaker = Breaker::default();
+        breaker.failed(10, 1);
+        let seen = breaker.opened.load(std::sync::atomic::Ordering::Relaxed);
+        breaker.close();
+        assert!(!breaker.rearm(seen, 20));
+        assert!(!breaker.is_open());
+        breaker.failed(30, 1);
+        let seen = breaker.opened.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(breaker.rearm(seen, 40), "as it was seen");
+        assert!(breaker.is_open());
     }
 
     /// A failure at time 0 still opens it: a time of 0 is not taken for closed.

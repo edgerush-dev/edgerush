@@ -363,6 +363,7 @@ impl Worker {
                 self.idle_connections(),
                 storage,
             );
+            self.let_go_of_old_limits();
             // And its rate limiter's keys, none when it has none (06 §8).
             let usage = match (&*self.limiter.borrow(), &*self.local_limiter.borrow()) {
                 (Some((_, limiter)), _) => limiter.usage(),
