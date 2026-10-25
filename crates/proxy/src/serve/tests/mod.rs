@@ -58,6 +58,7 @@ mod proxy_headers;
 mod rate_limits;
 mod resources;
 mod retries;
+mod sync_limits;
 mod timeouts;
 mod tls;
 mod upstream_h2;
