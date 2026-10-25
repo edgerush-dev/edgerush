@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 /// How often the keys are swept, and how long a full key goes unused before it is
 /// forgotten: a second, so that a key in steady use is not made again and again.
-const SWEEP: Duration = Duration::from_secs(1);
+pub(crate) const SWEEP: Duration = Duration::from_secs(1);
 
 /// The process's keys and the clock every worker decides them by.
 #[derive(Debug)]
@@ -34,20 +34,33 @@ impl Process {
         max_key_bytes: u64,
         failed: Option<Failed>,
     ) -> std::io::Result<Arc<Self>> {
-        let entropy = RandomState::new();
-        let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
-        let local = Local::new(hasher, u64::try_from(workers).unwrap_or(u64::MAX));
-        local.set_capacity(max_key_bytes);
-        let process = Arc::new(Self {
-            local,
-            hasher,
-            start: Instant::now(),
-        });
+        let process = Self::unswept(workers, max_key_bytes);
         let swept = Arc::downgrade(&process);
         std::thread::Builder::new()
             .name("edgerush-rate-limit-sweep".to_owned())
             .spawn(move || sweep(&swept, failed))?;
         Ok(process)
+    }
+
+    /// The keys of a process of `workers` workers, within `max_key_bytes`, with no thread of
+    /// their own: whoever keeps them sweeps them ([`sweep_once`](Self::sweep_once)) every
+    /// [`SWEEP`].
+    pub(crate) fn unswept(workers: usize, max_key_bytes: u64) -> Arc<Self> {
+        let entropy = RandomState::new();
+        let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
+        let local = Local::new(hasher, u64::try_from(workers).unwrap_or(u64::MAX));
+        local.set_capacity(max_key_bytes);
+        Arc::new(Self {
+            local,
+            hasher,
+            start: Instant::now(),
+        })
+    }
+
+    /// Forgets the keys full and unused for a [`SWEEP`] and, past the cap, evicts.
+    pub(crate) fn sweep_once(&self) {
+        let quiet = u64::try_from(SWEEP.as_nanos()).unwrap_or(u64::MAX);
+        self.local.sweep(self.now(), quiet);
     }
 
     /// The bytes its keys may hold, from now on: a reload that changes it keeps the keys.
@@ -88,8 +101,7 @@ fn sweep(process: &Weak<Process>, failed: Option<Failed>) {
         let Some(process) = process.upgrade() else {
             return;
         };
-        let quiet = u64::try_from(SWEEP.as_nanos()).unwrap_or(u64::MAX);
-        process.local.sweep(process.now(), quiet);
+        process.sweep_once();
     }
 }
 
@@ -176,6 +188,16 @@ impl LocalLimiter {
                 }
             },
         )
+    }
+
+    /// Decides a request under `keys`, each with its contract, all at once: admitted under
+    /// all, or refused by the key that waits longest, by its place among them, and charged
+    /// under none.
+    pub(crate) fn decide_keys(&self, keys: &[(Vec<u8>, Contract)]) -> Decision {
+        let now = self.process.now();
+        self.process
+            .local
+            .decide(&mut self.handles.borrow_mut(), keys, now)
     }
 
     /// Which of `limits` refused a request from `client` under those `limited` marks, and

@@ -353,7 +353,7 @@ impl Worker {
             *held = Some((snapshot.generation, Rc::clone(&limiter)));
             return Some(limiter);
         }
-        let limiter = SyncLimiter::new(process);
+        let limiter = SyncLimiter::new(process, usize::from(self.position));
         *held = Some((snapshot.generation, Rc::clone(&limiter)));
         Some(limiter)
     }

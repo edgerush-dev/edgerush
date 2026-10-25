@@ -367,7 +367,11 @@ impl Worker {
             let usage = match (&*self.limiter.borrow(), &*self.local_limiter.borrow()) {
                 (Some((_, limiter)), _) => limiter.usage(),
                 (None, Some((_, local))) => local.usage(),
-                (None, None) => (0, 0, 0),
+                // The synchronous mode's own buckets, said by the first worker alone.
+                (None, None) => match &*self.sync_limiter.borrow() {
+                    Some((_, limiter)) if self.position == 0 => limiter.usage(),
+                    _ => (0, 0, 0),
+                },
             };
             metrics.limiter().holding(&self.limiter_said, usage);
             // What its listeners logged since the last sweep goes to be written, so that a
