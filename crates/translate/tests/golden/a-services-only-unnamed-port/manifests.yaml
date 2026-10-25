@@ -1,0 +1,18 @@
+# A Service with one port, left unnamed: the upstream names it by its number, which
+# stands for the Service's only port.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: api, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - { path: /v1, pathType: Prefix, backend: { service: { name: api, port: { number: 8080 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api, namespace: shop }
+spec:
+  ports: [{ port: 8080 }]

@@ -1,0 +1,74 @@
+//! Golden tests: manifests in, the config and report expected out.
+//!
+//! Each directory under `tests/golden/` is a case: `manifests.yaml`, the objects as
+//! `kubectl apply` would take them; `config.yaml`, the config expected, written as the
+//! development harness's file is; and `report.txt`, the report expected, a finding a line.
+//! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own.
+//! Every config translated must also pass the data plane's own `compile`.
+
+use edgerush_config::{Config, compile};
+use edgerush_translate::{Cluster, Plane, translate};
+use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::networking::v1::Ingress;
+use serde::Deserialize;
+use std::fs;
+use std::path::Path;
+
+/// A manifest of a kind translation reads.
+#[derive(Deserialize)]
+#[serde(tag = "kind")]
+enum Manifest {
+    Ingress(Box<Ingress>),
+    Service(Box<Service>),
+}
+
+#[test]
+fn every_case_translates_to_its_config_and_report() {
+    let read = |path: &Path| {
+        fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            .replace("\r\n", "\n")
+    };
+    let cluster = |manifests: &str| {
+        let mut cluster = Cluster::default();
+        for manifest in serde_saphyr::from_multiple::<Manifest>(manifests).unwrap() {
+            match manifest {
+                Manifest::Ingress(ingress) => cluster.ingresses.push(*ingress),
+                Manifest::Service(service) => cluster.services.push(*service),
+            }
+        }
+        cluster
+    };
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let shared: Plane = serde_saphyr::from_str(&read(&root.join("plane.yaml"))).unwrap();
+    let mut cases: Vec<_> = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect();
+    cases.sort();
+    assert!(!cases.is_empty(), "no cases under {}", root.display());
+    for case in cases {
+        let name = case.file_name().unwrap().to_string_lossy().into_owned();
+        let own = case.join("plane.yaml");
+        let plane = if own.exists() {
+            serde_saphyr::from_str(&read(&own)).unwrap()
+        } else {
+            shared.clone()
+        };
+        let translation = translate(&plane, &cluster(&read(&case.join("manifests.yaml"))));
+        let expected: Config = serde_saphyr::from_str(&read(&case.join("config.yaml")))
+            .unwrap_or_else(|error| panic!("{name}: config.yaml: {error}"));
+        assert_eq!(translation.config, expected, "{name}: config");
+        let report: Vec<String> = translation.report.iter().map(ToString::to_string).collect();
+        let expected: Vec<String> = read(&case.join("report.txt"))
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(report, expected, "{name}: report");
+        if let Err(problems) = compile(&translation.config) {
+            let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
+            panic!("{name}: the data plane refuses its config: {problems:?}");
+        }
+    }
+}

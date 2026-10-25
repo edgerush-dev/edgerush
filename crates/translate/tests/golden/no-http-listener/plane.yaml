@@ -1,0 +1,4 @@
+ingress_class: edge
+cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+listeners: {}
