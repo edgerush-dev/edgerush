@@ -1,0 +1,1 @@
+Ingress shop/a: path / (Prefix) on shop.example.com is also Ingress shop/b's; which takes it depends on which the cluster made first

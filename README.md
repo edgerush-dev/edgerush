@@ -122,8 +122,9 @@ it exits 1 when one goes elsewhere or is answered otherwise: a config's tests fo
 `edgerush validate --from-manifests manifests/ --data-plane data-plane.yaml` translates
 Kubernetes manifests (a file or a directory of them, `kubectl get -o yaml` output included)
 as the control plane would for one data plane, compiles the config as the data plane would,
-and lists each object left out and why; it exits 1 when one was. The data plane's settings
-stand in for its `DataPlane` resource, which comes with the operator:
+and lists each object left out and why, and each path another Ingress already has; it
+exits 1 when there is one. The data plane's settings stand in for its `DataPlane`
+resource, which comes with the operator:
 
 ```yaml
 ingress_class: edge

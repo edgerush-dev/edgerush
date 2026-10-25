@@ -1,0 +1,2 @@
+Ingress shop/newer: path /api (Prefix) on shop.example.com is already Ingress shop/older's, which comes first
+Ingress shop/newer: path /static (Prefix) on shop.example.com is already an earlier rule's of its own
