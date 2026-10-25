@@ -79,6 +79,10 @@ pub struct RateLimiting {
     /// mode takes.
     #[serde(default)]
     pub service: Option<RateLimitService>,
+    /// How a request waits for its owner, which `synchronous` needs and no other mode
+    /// takes.
+    #[serde(default)]
+    pub synchronous: Option<RateLimitSynchronous>,
     /// Experimental: whether a limit may be keyed by a request header,
     /// `key: 'headers["x-api-key"]'` — what the client says rather than what the gateway
     /// established — so that limits keyed by something besides the client can be tried
@@ -105,15 +109,65 @@ pub enum RateLimitMode {
     Asynchronous,
 }
 
-/// The rate-limiting service: its pods, and how often each process sends them what it
-/// admitted.
+/// How a request waits for its key's owner in the synchronous mode, and what decides it
+/// when the owner does not answer ([06 §4](../../../docs/06-rate-limiting.md)). Every
+/// field is required: how a data plane behaves when its owners are out of reach is the
+/// operator's to say.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitSynchronous {
+    /// Milliseconds a request waits for its owner's answer before `when_unreachable`
+    /// decides it.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub timeout_ms: u64,
+    /// What decides a request whose owner does not answer in time, or whose breaker is
+    /// open.
+    pub when_unreachable: WhenUnreachable,
+    /// When the data plane stops asking an owner that does not answer, and when it tries
+    /// it again.
+    pub breaker: RateLimitBreaker,
+}
+
+/// What decides a request whose owner does not answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WhenUnreachable {
+    /// It goes on, as under no limit.
+    Allow,
+    /// It is refused, 503 with `Retry-After: 1`: the service failed, not the client.
+    Deny,
+    /// The data plane's own buckets, as in the local mode, until the owner answers again.
+    Local,
+}
+
+/// A data plane's breaker for each owner, which its workers share: open, nothing is asked
+/// of the owner and `when_unreachable` decides at once.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitBreaker {
+    /// Timeouts and broken streams in a row, on any worker, that open it; any answer
+    /// starts the count again.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub failures: u32,
+    /// Milliseconds open before a stream is opened to the owner again, without a request:
+    /// the owner's first word on it closes the breaker, and none leaves it open as long
+    /// again.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub probe_after_ms: u64,
+}
+
+/// The rate-limiting service: its pods, and in the asynchronous mode how often each process
+/// sends them what it admitted and its levers, which the synchronous mode does not take.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitService {
     /// The address (`host:port`) of each of its pods, the first being pod 0.
     #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
-    pub pods: Vec<String>,
+    pub addresses: Vec<String>,
     /// Milliseconds between the process's messages to the service; 10 when left out. Every
     /// limit's bucket holds at least two cycles of its rate, so a longer cycle asks for
     /// larger buckets: at 20 ms, a burst of 40 at `1000/s`.
