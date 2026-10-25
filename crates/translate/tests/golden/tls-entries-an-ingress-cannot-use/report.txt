@@ -1,0 +1,3 @@
+Ingress shop/web: a TLS entry without hosts is ignored
+Ingress shop/web: shop.example.com is listed again in a later TLS entry, which is ignored for it
+Ingress shop/web: nosecret.example.com is served over HTTP only: its TLS entry names no Secret

@@ -9,6 +9,7 @@ listeners:
       certificates:
         - { certificate: shop/secure, names: [secure.example.com, www.secure.example.com] }
       without_sni: none
+      refused: [gone.example.com]
 routes:
   - name: ingress/shop/web/secure.example.com
     listeners: [https]

@@ -1,0 +1,77 @@
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  https:
+    address: "[::]:8443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: shop/secure, names: [secure.example.com] }
+        - { certificate: shop/shop-tls, names: [shop.example.com] }
+        - { certificate: shop/wild, names: ["*.example.com"] }
+      without_sni: none
+      refused: [test.example.com]
+routes:
+  - name: ingress/shop/u1/secure.example.com
+    listeners: [http, https]
+    hostnames: [{ name: "secure.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/u2/secure.example.com
+    listeners: [http, https]
+    hostnames: [{ name: "secure.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /u2 } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/a/shop.example.com
+    listeners: [http, https]
+    hostnames: [{ name: "shop.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/b/shop.example.com
+    listeners: [http, https]
+    hostnames: [{ name: "shop.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /b } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/c/shop.example.com
+    listeners: [http, https]
+    hostnames: [{ name: "shop.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /c } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/d/shop.example.com
+    listeners: [http, https]
+    hostnames: [{ name: "shop.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /d } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/w/*.example.com
+    listeners: [http, https]
+    hostnames: [{ name: "*.example.com", wildcard: one_label, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/p/*.p.example.com
+    listeners: [http]
+    hostnames: [{ name: "*.p.example.com", wildcard: one_label, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/p/test.example.com
+    listeners: [http]
+    hostnames: [{ name: "test.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+upstreams:
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

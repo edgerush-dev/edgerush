@@ -1,0 +1,3 @@
+Ingress shop/u2: secure.example.com is also Ingress shop/u1's, with Secret shop/secure; which Secret is served depends on which the cluster made first
+Ingress shop/b: shop.example.com is served with Ingress shop/a's Secret shop/shop-tls, which comes first, not Secret shop/wild
+Ingress shop/d: shop.example.com is served over HTTPS with Ingress shop/a's Secret shop/shop-tls: Secret shop/gone does not exist
