@@ -53,6 +53,8 @@
 #                                             -local, -both, -sched, -local-sched and
 #                                             -both-sched, ours-local (local mode: the
 #                                             process alone, no service),
+#                                             nginx-rl and haproxy-rl (theirs, as local:
+#                                             limit_req; a stick table's request rate),
 #                                             envoy-rl (Envoy's global rate limit:
 #                                             envoyproxy/ratelimit on Redis), beside ours
 #                                             with no limit
@@ -398,9 +400,10 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
         taskset -c "$PROXY_CPUS" nginx -p "$run-direct/" -c "$run-direct/nginx.conf" \
             -e "$run-direct/error.log" 2>>"$OUT/proxy.log" &
         ;;
-    nginx)
+    nginx | nginx-rl)
         # NGINX's proxy speaks HTTP/1.1 to its upstreams; its gRPC proxy speaks HTTP/2, and
-        # the grpc mode gives the gRPC service to that.
+        # the grpc mode gives the gRPC service to that. nginx-rl is it under a per-client
+        # limit, as ours-local is.
         if [ "$UPSTREAM_H2" = 1 ] && [ "$grpc_pass" != 1 ]; then
             echo "NGINX cannot proxy to an HTTP/2 upstream: leave it out of UPSTREAM_H2 runs" >&2
             exit 2
@@ -456,10 +459,20 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
                 "$run-proxy/nginx.conf"
             grep -q 'quic reuseport' "$run-proxy/nginx.conf"
         fi
+        if [ "$1" = nginx-rl ]; then
+            local per_second
+            per_second=$(rl_per_second) || exit 2
+            # limit_req: a leaky bucket a client address, in the workers' shared memory,
+            # refusing at once past its burst, as a bucket does.
+            sed -i "s#^http {#http {\n    limit_req_zone \$binary_remote_addr zone=per_client:256m rate=${per_second}r/s;\n    limit_req_status 429;#;
+                s#^        location / {#&\n            limit_req zone=per_client burst=${RL_BURST:-100000000} nodelay;#" \
+                "$run-proxy/nginx.conf"
+            grep -q 'limit_req zone=per_client' "$run-proxy/nginx.conf"
+        fi
         taskset -c "$PROXY_CPUS" nginx -p "$run-proxy/" -c "$run-proxy/nginx.conf" \
             -e "$run-proxy/error.log" 2>>"$OUT/proxy.log" &
         ;;
-    haproxy)
+    haproxy | haproxy-rl)
         # A thread for every CPU it may run on: WORKERS of them, if PROXY_CPUS is as many.
         local haproxy_cfg=$run-haproxy.cfg
         if [ "$PASSTHROUGH" = 1 ]; then
@@ -503,6 +516,15 @@ CFG
         fi
         if [ "$UPSTREAM_H2" = 1 ]; then
             sed -i "s#server nginx 127.0.0.1:9000#server nginx 127.0.0.1:9000 proto h2#" "$haproxy_cfg"
+        fi
+        if [ "$1" = haproxy-rl ]; then
+            local per_second
+            per_second=$(rl_per_second) || exit 2
+            # A stick table of client addresses counting requests over the last second,
+            # HAProxy's way: a sliding window, not a bucket, so its burst is its rate.
+            sed -i "s#^    default_backend backend#    stick-table type ip size 2m expire 60s store http_req_rate(1s)\n    http-request track-sc0 src\n    http-request deny deny_status 429 if { sc_http_req_rate(0) gt ${per_second} }\n&#" \
+                "$haproxy_cfg"
+            grep -q 'track-sc0 src' "$haproxy_cfg"
         fi
         taskset -c "$PROXY_CPUS" haproxy -db -f "$haproxy_cfg" 2>>"$OUT/proxy.log" &
         ;;
@@ -549,6 +571,18 @@ CFG
     esac
     proxy_pid=${daemon:-$!}
     await "$scheme://$proxy_at/"
+}
+
+# RL_RATE as requests a second, for nginx-rl and haproxy-rl, which take it no other way.
+rl_per_second() {
+    local rate=${RL_RATE:-100000000/s}
+    case "$rate" in
+    */s) echo "${rate%/s}" ;;
+    *)
+        echo "RL_RATE $rate: nginx-rl and haproxy-rl take a rate a second" >&2
+        return 2
+        ;;
+    esac
 }
 
 # The config under a per-client limit, RL_RATE with a bucket of RL_BURST — unless set,
