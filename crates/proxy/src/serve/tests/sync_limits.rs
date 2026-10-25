@@ -818,7 +818,8 @@ async fn with_local_only_the_keys_out_of_reach_are_decided_locally() {
 }
 
 /// The process's own buckets are swept, on the probe thread: a key full and unused for a
-/// second is forgotten.
+/// second is forgotten. Read from the process itself, not from the metrics a worker writes
+/// once a sweep: the key could come and go between two of those.
 #[tokio::test]
 async fn the_local_buckets_are_swept() {
     let local = tokio::task::LocalSet::new();
@@ -850,12 +851,13 @@ async fn the_local_buckets_are_swept() {
             );
             let (proxy, mut sends) = serving(&config, 1).await;
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
-            let keys = |proxy: &Proxy| metric(&proxy.metrics(), "edgerush_rate_limit_keys");
+            let keys = |proxy: &Proxy| {
+                let (_, process) = proxy.sync_limits();
+                process.map(|process| process.usage().1)
+            };
+            // Nothing forgets a key before it has gone a second unused.
+            assert_eq!(keys(&proxy), Some(1), "the key made");
             let deadline = Instant::now() + Duration::from_secs(5);
-            while keys(&proxy) != Some(1) {
-                assert!(Instant::now() < deadline, "the key never counted");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
             while keys(&proxy) != Some(0) {
                 assert!(Instant::now() < deadline, "the key never forgotten");
                 tokio::time::sleep(Duration::from_millis(10)).await;
