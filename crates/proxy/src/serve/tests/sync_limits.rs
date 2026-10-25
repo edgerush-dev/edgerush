@@ -851,3 +851,87 @@ async fn the_local_buckets_are_swept() {
         })
         .await;
 }
+
+/// A relay to `to` that holds up everything `to` sends by `delay`: an owner whose answers
+/// come late.
+async fn slow_relay(to: SocketAddr, delay: Duration) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let Ok(server) = TcpStream::connect(to).await else {
+                continue;
+            };
+            let (mut from_client, mut to_client) = client.into_split();
+            let (mut from_server, mut to_server) = server.into_split();
+            tokio::spawn(async move {
+                let _ended = tokio::io::copy(&mut from_client, &mut to_server).await;
+            });
+            tokio::spawn(async move {
+                let mut buffer = vec![0; 16_384];
+                while let Ok(read) = from_server.read(&mut buffer).await
+                    && read > 0
+                {
+                    tokio::time::sleep(delay).await;
+                    if to_client.write_all(&buffer[..read]).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    address
+}
+
+/// An owner whose answers come after the data plane gave up: its admission of a request
+/// the data plane then refused is given back when it comes, and its admission of one the
+/// data plane let on is kept, the charge counting a request that went on.
+#[tokio::test]
+async fn an_admission_that_comes_too_late_is_given_back_if_the_request_was_refused() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for (when, status, left) in [("deny", 503, 5), ("allow", 200, 4)] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let owner = listener.local_addr().unwrap();
+                let _pod = lone_pod(listener);
+                let relay = slow_relay(owner, Duration::from_millis(300)).await;
+                let (upstream, _) = counting_upstream().await;
+                let config = with_breaker(
+                    synchronous_in(
+                        everything_config(upstream),
+                        &[("per-client", 5)],
+                        &[relay],
+                        100,
+                        when,
+                    ),
+                    100,
+                    60_000,
+                );
+                let (_, key) = keys_of(&config).remove(0);
+                let (proxy, mut sends) = serving(&config, 1).await;
+                assert_eq!(
+                    statuses(&send_round(&mut sends, 1).await),
+                    [status],
+                    "{when}"
+                );
+                assert_eq!(
+                    metric(
+                        &proxy.metrics(),
+                        r#"edgerush_rate_limit_owner_asks_total{pod="0",outcome="timed_out"}"#
+                    ),
+                    Some(1),
+                    "given up on, not broken: {when}"
+                );
+                // Its late answer in, and anything given back with it.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                assert_eq!(
+                    ask_directly(&owner.to_string(), &key, 5).await,
+                    left,
+                    "{when}"
+                );
+            }
+        })
+        .await;
+}

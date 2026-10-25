@@ -313,11 +313,20 @@ enum Link {
     Up(mpsc::Sender<wire::Upstream>),
 }
 
-/// A worker's stream to one service pod, and the requests waiting on its answers.
+/// What waits on an owner's answer, by the number of the ask.
+enum Waiter {
+    /// A request.
+    Asked(oneshot::Sender<Answer>),
+    /// A request that gave up on it and was refused: an admission that comes late is
+    /// given back, under these keys.
+    GivenUp(Kept),
+}
+
+/// A worker's stream to one service pod, and what waits on its answers.
 struct Stream {
     address: String,
     link: RefCell<Link>,
-    waiting: RefCell<HashMap<u64, oneshot::Sender<Answer>>>,
+    waiting: RefCell<HashMap<u64, Waiter>>,
 }
 
 impl Stream {
@@ -360,11 +369,14 @@ impl Stream {
         }
     }
 
-    /// Hands every request waiting on it the news that its owner will not answer.
+    /// Hands every request waiting on it the news that its owner will not answer; those
+    /// that gave up on it hear no more.
     fn broke(&self) {
         let waiting = std::mem::take(&mut *self.waiting.borrow_mut());
         for (_, waiter) in waiting {
-            let _gone = waiter.send(Err(()));
+            if let Waiter::Asked(asked) = waiter {
+                let _gone = asked.send(Err(()));
+            }
         }
     }
 }
@@ -411,8 +423,18 @@ async fn open(stream: Weak<Stream>, view: Weak<RefCell<View>>) {
             Ok(Some(wire::Downstream {
                 message: Some(wire::FromOwner::Decided(decided)),
             })) => {
-                if let Some(waiter) = held.waiting.borrow_mut().remove(&decided.id) {
-                    let _gone = waiter.send(Ok(decided));
+                let waiter = held.waiting.borrow_mut().remove(&decided.id);
+                match waiter {
+                    Some(Waiter::Asked(asked)) => {
+                        let _gone = asked.send(Ok(decided));
+                    }
+                    // Admitted after its request gave up and was refused: given back.
+                    Some(Waiter::GivenUp(keys)) if decided.admitted => {
+                        if let Some(view) = view.upgrade() {
+                            let _lost = held.send(give_back_of(keys), &view);
+                        }
+                    }
+                    Some(Waiter::GivenUp(_)) | None => {}
                 }
             }
             Ok(Some(wire::Downstream {
@@ -557,18 +579,16 @@ impl SyncLimiter {
                 }),
             }
         }
-        // Kept only where they may be needed again: given back to an owner when another
-        // refuses, or decided locally when their owner is out of reach.
-        let keep = parts.len() > 1 || self.local.is_some();
         for part in &mut parts {
-            if keep {
-                part.kept = part
-                    .positions
-                    .iter()
-                    .filter_map(|at| keys.get(*at))
-                    .map(|(key, contract)| (key.to_vec(), *contract))
-                    .collect();
-            }
+            // Kept for as long as they may be needed again: given back to an owner when
+            // another refuses, or when it admits too late; decided locally when it is out
+            // of reach.
+            part.kept = part
+                .positions
+                .iter()
+                .filter_map(|at| keys.get(*at))
+                .map(|(key, contract)| (key.to_vec(), *contract))
+                .collect();
             let Some(pod) = part.pod else {
                 continue;
             };
@@ -591,7 +611,10 @@ impl SyncLimiter {
                 .collect();
             let (answered, answer) = oneshot::channel();
             let stream = &self.streams[pod];
-            stream.waiting.borrow_mut().insert(id, answered);
+            stream
+                .waiting
+                .borrow_mut()
+                .insert(id, Waiter::Asked(answered));
             let decide = wire::Upstream {
                 message: Some(wire::ToOwner::Decide(wire::Decide { id, keys: sent })),
             };
@@ -651,18 +674,22 @@ impl SyncLimiter {
     /// Gives one request's charge under `keys` back to the owner at `pod`.
     fn give_back(&self, pod: usize, keys: Kept) {
         if let Some(stream) = self.streams.get(pod) {
-            let keys = keys
-                .into_iter()
-                .map(|(key, contract)| wire::Key {
-                    key,
-                    contract: Some(contract.into()),
-                })
-                .collect();
-            let back = wire::Upstream {
-                message: Some(wire::ToOwner::GiveBack(wire::GiveBack { keys })),
-            };
-            let _lost = stream.send(back, &self.view);
+            let _lost = stream.send(give_back_of(keys), &self.view);
         }
+    }
+}
+
+/// The message that gives one request's charge under `keys` back.
+fn give_back_of(keys: Kept) -> wire::Upstream {
+    let keys = keys
+        .into_iter()
+        .map(|(key, contract)| wire::Key {
+            key,
+            contract: Some(contract.into()),
+        })
+        .collect();
+    wire::Upstream {
+        message: Some(wire::ToOwner::GiveBack(wire::GiveBack { keys })),
     }
 }
 
@@ -687,20 +714,22 @@ impl Asked {
     /// The decision: refused if any owner refused, the others' charges given back;
     /// admitted if all admitted; otherwise, some owner out of reach, as `when_unreachable`
     /// says.
-    pub(crate) async fn decided(self) -> Result<Decided, Undecided> {
+    pub(crate) async fn decided(mut self) -> Result<Decided, Undecided> {
         let mut admitted = Vec::new();
         let mut refused_by = Vec::new();
         let mut unreached = None;
         // The keys of the owners out of reach, with their places among the request's.
         let mut out_of_reach: Vec<(Vec<usize>, Kept)> = Vec::new();
+        // The asks given up on: their answers may come yet.
+        let mut given_up = Vec::new();
         let process = &self.limiter.process;
-        for part in self.parts {
-            let (Some(pod), Some((id, answer))) = (part.pod, part.answer) else {
+        for part in std::mem::take(&mut self.parts) {
+            let (Some(pod), Some((id, mut answer))) = (part.pod, part.answer) else {
                 unreached = Some(Undecided::Unavailable);
                 out_of_reach.push((part.positions, part.kept));
                 continue;
             };
-            match tokio::time::timeout_at(self.until, answer).await {
+            match tokio::time::timeout_at(self.until, &mut answer).await {
                 Ok(Ok(Ok(decided))) if decided.admitted => {
                     process.asked(pod, Ended::Answered);
                     admitted.push((part.pod, part.kept));
@@ -719,14 +748,54 @@ impl Asked {
                 }
                 Err(_) => {
                     process.asked(pod, Ended::TimedOut);
-                    if let Some(stream) = self.limiter.streams.get(pod) {
-                        stream.waiting.borrow_mut().remove(&id);
-                    }
                     unreached = Some(Undecided::Timeout);
+                    given_up.push((pod, id, answer, part.kept.clone()));
                     out_of_reach.push((part.positions, part.kept));
                 }
             }
         }
+        let decision = self.decide(admitted, refused_by, unreached, out_of_reach);
+        // What its owners admit too late is given back if the request was refused; if it
+        // went on, the owner's charge counts it. Nothing else runs on the worker between
+        // the last of them giving up and this, so an answer already in is found here and
+        // any later one by the stream.
+        let refused = !matches!(&decision, Ok(decided) if decided.admitted);
+        for (pod, id, mut answer, keys) in given_up {
+            let Some(stream) = self.limiter.streams.get(pod) else {
+                continue;
+            };
+            match answer.try_recv() {
+                Ok(Ok(decided)) => {
+                    stream.waiting.borrow_mut().remove(&id);
+                    if refused && decided.admitted {
+                        self.limiter.give_back(pod, keys);
+                    }
+                }
+                Ok(Err(())) | Err(oneshot::error::TryRecvError::Closed) => {}
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    let mut waiting = stream.waiting.borrow_mut();
+                    if refused {
+                        waiting.insert(id, Waiter::GivenUp(keys));
+                    } else {
+                        waiting.remove(&id);
+                    }
+                }
+            }
+        }
+        decision
+    }
+
+    /// The decision from what the owners said: `admitted` by those that admitted, with
+    /// their keys; `refused_by`, the refusals; and `unreached`, why some did not answer, the
+    /// keys of those `out_of_reach`.
+    fn decide(
+        &self,
+        admitted: Vec<(Option<usize>, Kept)>,
+        refused_by: Vec<(usize, u64)>,
+        unreached: Option<Undecided>,
+        out_of_reach: Vec<(Vec<usize>, Kept)>,
+    ) -> Result<Decided, Undecided> {
+        let process = &self.limiter.process;
         let give_back = |admitted: Vec<(Option<usize>, Kept)>| {
             for (pod, keys) in admitted {
                 if let Some(pod) = pod
