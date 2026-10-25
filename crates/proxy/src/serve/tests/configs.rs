@@ -118,7 +118,10 @@ pub(super) fn secured(
     web.protocol = edgerush_config::Protocol::Https;
     web.tls = Some(edgerush_config::Tls {
         without_sni: names[0].clone(),
-        certificates: names,
+        certificates: names
+            .into_iter()
+            .map(edgerush_config::ListenerCertificate::Carried)
+            .collect(),
         client_validation,
     });
 }

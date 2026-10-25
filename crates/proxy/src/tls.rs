@@ -28,7 +28,7 @@ use boring::ssl::{
 use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
 use edgerush_certificates::{CertificateError, Identity};
-use edgerush_config::{ClientValidation, CompiledTls, NamedCertificate};
+use edgerush_config::{ClientValidation, CompiledTls, NamedCertificate, PresentedCertificate};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -323,7 +323,8 @@ impl Certificates {
         let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
         let mut names = Names::default();
         let mut contexts = Vec::with_capacity(source.certificates.len());
-        for (index, certificate) in source.certificates.iter().enumerate() {
+        for (index, presented) in source.certificates.iter().enumerate() {
+            let certificate = &presented.certificate;
             let context = match transport {
                 Transport::Tcp => {
                     let mut builder =
@@ -335,7 +336,7 @@ impl Certificates {
                     if let Some(authorities) = authorities {
                         validate_clients(&mut builder, authorities)?;
                     }
-                    names.add(&leaf, index);
+                    names.add(presented, &leaf, index);
                     builder.build().into_context()
                 }
                 Transport::Quic => {
@@ -344,7 +345,7 @@ impl Certificates {
                     if let Some(authorities) = authorities {
                         validate_clients(&mut builder, authorities)?;
                     }
-                    names.add(&leaf, index);
+                    names.add(presented, &leaf, index);
                     builder.build()
                 }
             };
@@ -478,9 +479,10 @@ pub(crate) fn identity(named: &NamedCertificate) -> Result<Identity, TlsError> {
     })
 }
 
-/// Which certificate answers for which name: by the DNS names in each one's subject
-/// alternative names, exact names before wildcards, and among certificates that carry the
-/// same name, the first. A name no certificate carries is answered by none.
+/// Which certificate answers for which name: by the names the listener states for it, or,
+/// where it states none, the DNS names in its subject alternative names; exact names before
+/// wildcards, and among certificates that answer for the same name, the first. A name no
+/// certificate answers for is answered by none.
 #[derive(Debug, Default)]
 struct Names {
     /// By the name, in lower case.
@@ -491,8 +493,15 @@ struct Names {
 }
 
 impl Names {
-    fn add(&mut self, certificate: &X509, index: usize) {
-        let Some(alternatives) = certificate.subject_alt_names() else {
+    fn add(&mut self, presented: &PresentedCertificate, leaf: &X509, index: usize) {
+        // Stated, they are the only ones: whatever else it carries is another's to answer.
+        if let Some(stated) = &presented.names {
+            for name in stated {
+                self.add_name(name, index);
+            }
+            return;
+        }
+        let Some(alternatives) = leaf.subject_alt_names() else {
             return;
         };
         for name in alternatives.iter().filter_map(|name| name.dnsname()) {
@@ -527,7 +536,7 @@ pub(crate) mod testing {
     //! Certificates made on the spot, for tests that need a server to present one.
 
     pub(crate) use edgerush_certificates::testing::certificate;
-    use edgerush_config::{Certificate, NamedCertificate};
+    use edgerush_config::{Certificate, NamedCertificate, PresentedCertificate};
 
     /// `certificate`, known by `name` as a listener or an upstream names it.
     pub(crate) fn named(name: &str, certificate: Certificate) -> NamedCertificate {
@@ -536,11 +545,19 @@ pub(crate) mod testing {
             certificate,
         }
     }
+
+    /// `certificate`, known by `name`, as a listener presents it: for the names it carries.
+    pub(crate) fn presented(name: &str, certificate: Certificate) -> PresentedCertificate {
+        PresentedCertificate {
+            certificate: named(name, certificate),
+            names: None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{certificate, named};
+    use super::testing::{certificate, named, presented};
     use super::*;
     use edgerush_config::Certificate;
     use proptest::prelude::*;
@@ -616,8 +633,8 @@ mod tests {
     fn a_listener_with_usable_certificates_is_set_up() {
         let source = CompiledTls {
             certificates: vec![
-                named("a", certificate(&["a.test"])),
-                named("b", certificate(&["b.test"])),
+                presented("a", certificate(&["a.test"])),
+                presented("b", certificate(&["b.test"])),
             ],
             without_sni: Some(0),
             client_validation: None,
@@ -625,7 +642,7 @@ mod tests {
         let tls = Tls::new(&source).unwrap();
         assert!(tls.is_for(&source));
         let other = CompiledTls {
-            certificates: vec![named("a", certificate(&["a.test"]))],
+            certificates: vec![presented("a", certificate(&["a.test"]))],
             without_sni: Some(0),
             client_validation: None,
         };
@@ -641,7 +658,7 @@ mod tests {
                 certificates: certificates
                     .into_iter()
                     .zip(["good", "bad"])
-                    .map(|(certificate, name)| named(name, certificate))
+                    .map(|(certificate, name)| presented(name, certificate))
                     .collect(),
                 without_sni: Some(0),
                 client_validation: None,
@@ -688,7 +705,7 @@ mod tests {
         );
         let validated = |authorities: Vec<String>| {
             Tls::new(&CompiledTls {
-                certificates: vec![named("a", certificate(&["a.test"]))],
+                certificates: vec![presented("a", certificate(&["a.test"]))],
                 without_sni: Some(0),
                 client_validation: Some(edgerush_config::ClientValidation { authorities }),
             })
@@ -744,7 +761,7 @@ mod tests {
             let (a, b) = (certificate(&["a.test"]), certificate(&["b.test"]));
             let listener = |without_sni| {
                 Tls::new(&CompiledTls {
-                    certificates: vec![named("a", a.clone()), named("b", b.clone())],
+                    certificates: vec![presented("a", a.clone()), presented("b", b.clone())],
                     without_sni,
                     client_validation: None,
                 })
@@ -779,6 +796,38 @@ mod tests {
             }
         }
 
+        /// Over QUIC as over TCP, a certificate whose names the listener states answers
+        /// for those alone, whatever else it carries.
+        #[test]
+        fn a_certificate_answers_over_quic_for_the_names_stated_for_it_alone() {
+            let (wide, b) = (certificate(&["a.test", "b.test"]), certificate(&["b.test"]));
+            let tls = Tls::new(&CompiledTls {
+                certificates: vec![
+                    PresentedCertificate {
+                        certificate: named("wide", wide.clone()),
+                        names: Some(vec!["a.test".to_owned()]),
+                    },
+                    presented("b", b.clone()),
+                ],
+                without_sni: None,
+                client_validation: None,
+            })
+            .unwrap();
+            for (name, shown) in [("a.test", &wide), ("b.test", &b)] {
+                let client = quiche::connect(
+                    Some(name),
+                    &id(0xc1, 16),
+                    client_addr(),
+                    server_addr(),
+                    &mut client_config(),
+                )
+                .unwrap();
+                let pipe = handshake(client, &mut worker_config(&tls));
+                assert!(pipe.server.is_established(), "{name}");
+                assert_eq!(pipe.client.peer_cert(), Some(&der(shown)[..]), "{name}");
+            }
+        }
+
         /// A listener that validates clients serves over QUIC only one that shows a
         /// certificate its authorities vouch for, as over TCP.
         #[test]
@@ -786,8 +835,8 @@ mod tests {
             let (trusted, stranger) = (certificate(&["client"]), certificate(&["client"]));
             let tls = Tls::new(&CompiledTls {
                 certificates: vec![
-                    named("a", certificate(&["a.test"])),
-                    named("b", certificate(&["b.test"])),
+                    presented("a", certificate(&["a.test"])),
+                    presented("b", certificate(&["b.test"])),
                 ],
                 without_sni: Some(0),
                 client_validation: Some(edgerush_config::ClientValidation {
@@ -826,7 +875,7 @@ mod tests {
         #[test]
         fn a_session_resumes_on_any_worker_and_across_a_rotation() {
             let source = CompiledTls {
-                certificates: vec![named("a", certificate(&["a.test"]))],
+                certificates: vec![presented("a", certificate(&["a.test"]))],
                 without_sni: Some(0),
                 client_validation: None,
             };
@@ -839,7 +888,7 @@ mod tests {
             let rotated = Tls::after(
                 &tls,
                 &CompiledTls {
-                    certificates: vec![named("a", certificate(&["a.test"]))],
+                    certificates: vec![presented("a", certificate(&["a.test"]))],
                     without_sni: Some(0),
                     client_validation: None,
                 },

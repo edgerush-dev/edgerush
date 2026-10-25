@@ -46,6 +46,8 @@ listeners:
   #   request_id: generate
   #   access_log: stdout
   #   tls:
+  #     # Each answers for the names it carries, or, written { certificate: server, names:
+  #     # [localhost] }, for those names alone.
   #     certificates: [server]
   #     # The certificate for a client that asks for no name (no SNI), or `none` to refuse it.
   #     without_sni: server

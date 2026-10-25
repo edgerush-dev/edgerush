@@ -870,12 +870,22 @@ pub struct NamedCertificate {
     pub certificate: Certificate,
 }
 
+/// A certificate an `https` listener presents, and the names it answers for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentedCertificate {
+    /// The certificate.
+    pub certificate: NamedCertificate,
+    /// The only names it answers for, as the listener states them; none stated, every DNS
+    /// name it carries.
+    pub names: Option<Vec<String>>,
+}
+
 /// What an `https` listener presents, its certificates found by their names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledTls {
-    /// Its certificates, in the order it names them. A client is given the one whose names
-    /// cover the name it asked for (SNI), and is refused when none does.
-    pub certificates: Vec<NamedCertificate>,
+    /// Its certificates, in the order it names them. A client is given the one that
+    /// answers for the name it asked for (SNI), and is refused when none does.
+    pub certificates: Vec<PresentedCertificate>,
     /// Which of them a client that asks for no name is given; none, and such a client is
     /// refused.
     pub without_sni: Option<usize>,
@@ -1093,18 +1103,43 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         }
         if let (Protocol::Https, Some(tls)) = (listener.protocol, &listener.tls) {
             let mut seen = HashSet::new();
-            for certificate in &tls.certificates {
-                let problem = if !seen.insert(certificate.as_str()) {
-                    Problem::CertificateTwice(certificate.clone())
+            for presented in &tls.certificates {
+                let certificate = presented.name();
+                let problem = if !seen.insert(certificate) {
+                    Problem::CertificateTwice(certificate.to_owned())
                 } else if !config.certificates.contains_key(certificate) {
-                    Problem::UnknownCertificate(certificate.clone())
+                    Problem::UnknownCertificate(certificate.to_owned())
                 } else {
                     continue;
                 };
                 errors.push(Place::listener(name).problem(problem));
             }
+            for presented in &tls.certificates {
+                let Some(stated) = presented.stated() else {
+                    continue;
+                };
+                let certificate = presented.name();
+                if stated.is_empty() {
+                    let problem = Problem::NoNamesStated(certificate.to_owned());
+                    errors.push(Place::listener(name).problem(problem));
+                }
+                // As a certificate's own names are written: a wildcard stands for one whole
+                // label, leftmost.
+                for stated in stated {
+                    if !is_host_name(stated.strip_prefix("*.").unwrap_or(stated)) {
+                        let problem = Problem::StatedName {
+                            certificate: certificate.to_owned(),
+                            name: stated.clone(),
+                        };
+                        errors.push(Place::listener(name).problem(problem));
+                    }
+                }
+            }
             if tls.without_sni != WITHOUT_SNI_REFUSED
-                && !tls.certificates.contains(&tls.without_sni)
+                && !tls
+                    .certificates
+                    .iter()
+                    .any(|presented| presented.name() == tls.without_sni)
             {
                 errors.push(
                     Place::listener(name)
@@ -1302,14 +1337,19 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                         certificates: tls
                             .certificates
                             .iter()
-                            .filter_map(|name| named(config, name))
+                            .filter_map(|presented| {
+                                Some(PresentedCertificate {
+                                    certificate: named(config, presented.name())?,
+                                    names: presented.stated().map(<[String]>::to_vec),
+                                })
+                            })
                             .collect(),
                         // `none` refuses, even beside a certificate that has that name.
                         without_sni: (tls.without_sni != WITHOUT_SNI_REFUSED)
                             .then(|| {
                                 tls.certificates
                                     .iter()
-                                    .position(|named| *named == tls.without_sni)
+                                    .position(|presented| presented.name() == tls.without_sni)
                             })
                             .flatten(),
                         client_validation: tls.client_validation.clone(),
@@ -2340,6 +2380,17 @@ pub enum Problem {
     /// A certificate a listener names more than once.
     #[error("certificate `{0}` is named twice")]
     CertificateTwice(String),
+    /// A certificate a listener states no names for: it would answer for none.
+    #[error("certificate `{0}` is stated no names to answer for")]
+    NoNamesStated(String),
+    /// A name stated for a certificate that is neither a host name nor `*.` and one.
+    #[error("certificate `{certificate}`: `{name}` is not a host name, or `*.` and one")]
+    StatedName {
+        /// The certificate's name.
+        certificate: String,
+        /// The name stated.
+        name: String,
+    },
     /// A certificate for clients without SNI that is not one of the listener's.
     #[error("`without_sni` names `{0}`, which is not one of the listener's certificates")]
     WithoutSniUnknown(String),
@@ -3702,9 +3753,11 @@ upstreams: {}
         assert_eq!(compiled.listeners[0].protocol, Protocol::Https);
         let tls = compiled.listeners[0].tls.as_ref().unwrap();
         assert_eq!(tls.certificates.len(), 1);
-        assert_eq!(tls.certificates[0].name, "one");
-        assert_eq!(tls.certificates[0].certificate.chain, "chain of one");
-        assert_eq!(tls.certificates[0].certificate.key, "key of one");
+        let presented = &tls.certificates[0];
+        assert_eq!(presented.certificate.name, "one");
+        assert_eq!(presented.certificate.certificate.chain, "chain of one");
+        assert_eq!(presented.certificate.certificate.key, "key of one");
+        assert_eq!(presented.names, None);
         assert_eq!(tls.client_validation, None);
         let validated = compile(&with(
             r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [one], without_sni: one, client_validation: { authorities: ["CA"] } } }"#,
@@ -3755,6 +3808,79 @@ upstreams: {}
         assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
     }
 
+    /// A listener may state the names a certificate answers for, beside certificates that
+    /// answer for what they carry: host names, or `*.` and one. A certificate stated no
+    /// names, or a name that is neither, is refused where it is stated.
+    #[test]
+    fn the_names_a_certificate_answers_for_may_be_stated() {
+        let with = |tls: &str| {
+            with_certificates(
+                config(&format!(
+                    "listeners: {{ l: {{ address: \"[::]:443\", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {tls} }} }}
+routes: []
+upstreams: {{}}
+"
+                )),
+                &["a", "b"],
+            )
+        };
+        let compiled = compile(&with(
+            "{ certificates: [a, { certificate: b, names: [b.example.com, \"*.b.example.com\"] }], without_sni: b }",
+        ))
+        .unwrap();
+        let tls = compiled.listeners[0].tls.as_ref().unwrap();
+        let presented: Vec<(&str, Option<&[String]>)> = tls
+            .certificates
+            .iter()
+            .map(|presented| {
+                (
+                    presented.certificate.name.as_str(),
+                    presented.names.as_deref(),
+                )
+            })
+            .collect();
+        let stated = ["b.example.com".to_owned(), "*.b.example.com".to_owned()];
+        assert_eq!(presented, [("a", None), ("b", Some(&stated[..]))]);
+        // `without_sni` names a certificate whose names are stated as any other.
+        assert_eq!(tls.without_sni, Some(1));
+
+        let problems = |tls: &str| -> Vec<String> {
+            compile(&with(tls))
+                .unwrap_err()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(
+            problems("{ certificates: [{ certificate: a, names: [] }], without_sni: none }"),
+            ["listener `l`: certificate `a` is stated no names to answer for"]
+        );
+        assert_eq!(
+            problems(
+                "{ certificates: [{ certificate: a, names: [\"*\", \"a.*.example.com\", \"*.*.example.com\", 192.0.2.1, a.example.com] }], without_sni: none }"
+            ),
+            [
+                "listener `l`: certificate `a`: `*` is not a host name, or `*.` and one",
+                "listener `l`: certificate `a`: `a.*.example.com` is not a host name, or `*.` and one",
+                "listener `l`: certificate `a`: `*.*.example.com` is not a host name, or `*.` and one",
+                "listener `l`: certificate `a`: `192.0.2.1` is not a host name, or `*.` and one",
+            ]
+        );
+        // Named twice, stated or not, is twice.
+        assert_eq!(
+            problems(
+                "{ certificates: [a, { certificate: a, names: [a.example.com] }], without_sni: none }"
+            ),
+            ["listener `l`: certificate `a` is named twice"]
+        );
+        // A stated certificate is a name and its names, nothing else.
+        let yaml = "listeners: { l: { address: \"[::]:443\", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ certificate: a, names: [a.test], hosts: [a.test] }], without_sni: none } } }
+routes: []
+upstreams: {}
+";
+        assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
+    }
+
     /// A certificate named by a listener or an upstream is found among the config's
     /// certificates, in the order the listener names them; one that is not there is
     /// refused where it is named, and so is a listener that names one twice. Certificates
@@ -3776,7 +3902,7 @@ upstreams:
             .unwrap()
             .certificates
             .iter()
-            .map(|named| named.name.as_str())
+            .map(|presented| presented.certificate.name.as_str())
             .collect();
         assert_eq!(names, ["b", "a"]);
         let shown = compiled.upstreams[0].tls.as_ref().unwrap();
