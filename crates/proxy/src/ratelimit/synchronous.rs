@@ -848,8 +848,12 @@ impl Asked {
                 }
                 Ok(Ok(Ok(decided))) => {
                     process.asked(pod, Ended::Answered);
+                    // A refusal stays one: a place outside the keys asked, as only a faulty
+                    // pod sends, is taken for the first of them.
                     let at = usize::try_from(decided.position).unwrap_or(usize::MAX);
-                    if let Some(&position) = part.positions.get(at) {
+                    if let Some(&position) =
+                        part.positions.get(at).or_else(|| part.positions.first())
+                    {
                         refused_by.push((position, decided.wait_ns));
                     }
                 }
@@ -997,6 +1001,40 @@ mod tests {
             probe_after: Duration::from_secs(60),
             max_key_bytes: 1 << 20,
         }
+    }
+
+    /// A refusal is never taken for an admission: one naming a place outside the keys its
+    /// owner was asked about, as only a faulty pod sends, refuses by the first of them.
+    #[tokio::test]
+    async fn a_refusal_at_a_place_out_of_range_still_refuses() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let process = Process::start(config(100), NonZeroUsize::MIN, None, None).unwrap();
+                let limiter = super::SyncLimiter::new(process, 0);
+                let (answered, answer) = tokio::sync::oneshot::channel();
+                let asked = super::Asked {
+                    limiter,
+                    parts: vec![super::Part {
+                        pod: Some(0),
+                        positions: vec![3],
+                        kept: Vec::new(),
+                        answer: Some((1, 0, answer)),
+                    }],
+                    until: tokio::time::Instant::now() + Duration::from_secs(5),
+                };
+                let decided = edgerush_ratelimit_service::synchronous::wire::Decided {
+                    id: 1,
+                    admitted: false,
+                    position: 9,
+                    wait_ns: 7,
+                };
+                answered.send(Ok(decided)).unwrap();
+                let decided = asked.decided().await.unwrap();
+                assert!(!decided.admitted);
+                assert_eq!(&*decided.refused_by, [(3, 7)]);
+            })
+            .await;
     }
 
     /// A process that carries another's breakers carries the clock their times were read
