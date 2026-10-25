@@ -330,6 +330,23 @@ impl Worker {
         }
     }
 
+    /// Lets go of a limiter in the synchronous mode that the running config no longer asks
+    /// with — the mode left, or its section changed — and with it its streams to every pod
+    /// and its hold on the old process, whose probe thread then ends. Only a request in the
+    /// synchronous mode looks at the limiter otherwise, so the worker's sweep does it.
+    pub(super) fn let_go_of_old_limits(&self) {
+        let old = match &*self.sync_limiter.borrow() {
+            Some((_, limiter)) => match self.proxy.sync_limits().1 {
+                Some(process) => !limiter.is_on(&process),
+                None => true,
+            },
+            None => false,
+        };
+        if old {
+            drop(self.sync_limiter.borrow_mut().take());
+        }
+    }
+
     /// The worker's limiter in the synchronous mode, made when first needed and again when
     /// the process's side of it is replaced; `None` before rate limits are started.
     fn sync_limiter(&self) -> Option<Rc<SyncLimiter>> {
