@@ -216,6 +216,8 @@ crates/rules       limit rules (`edgerush-rules`), a spike of the DSL question: 
                    fields, checked when compiled and decided without allocating; pure, no I/O
 crates/telemetry   metrics and access logs (`edgerush-telemetry`): counters sharded by thread, the
                    Prometheus text format, an access-log record as a line of JSON
+crates/translate   translation (`edgerush-translate`): Kubernetes objects into the config one data
+                   plane runs, what the control plane will do on every change; pure, no I/O
 bench              the macro benchmark: load generator, proxy and backend on one Linux machine
                    (bench/README.md)
 fuzz               fuzz targets (cargo-fuzz; not part of the workspace)

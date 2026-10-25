@@ -1,0 +1,10 @@
+Ingress shop/a-tls: not supported yet: TLS
+Ingress shop/b-default-backend: not supported yet: a default backend
+Ingress shop/c-exact: not supported yet: a path type other than Prefix
+Ingress shop/d-wildcard: not supported yet: a wildcard host
+Ingress shop/e-hostless: not supported yet: a rule without a host
+Ingress shop/f-missing-service: not supported yet: a backend Service or port that does not exist
+Ingress shop/g-missing-port: not supported yet: a backend Service or port that does not exist
+Ingress shop/h-external-name: not supported yet: an ExternalName Service
+Ingress shop/i-resource: not supported yet: a resource backend
+Ingress shop/i2-annotated: not supported yet: annotations

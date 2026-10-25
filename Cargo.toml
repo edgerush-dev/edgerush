@@ -37,6 +37,7 @@ edgerush-ratelimit-service = { path = "crates/ratelimit-service" }
 edgerush-router = { path = "crates/router" }
 edgerush-rules = { path = "crates/rules" }
 edgerush-telemetry = { path = "crates/telemetry" }
+edgerush-translate = { path = "crates/translate" }
 # HTTP/2 on both hops, used directly rather than through hyper (15 §3). The version is the
 # one already locked under hyper; its behaviour is pinned by the probes in
 # `crates/proxy/tests/h2_library.rs`, so moving it is a deliberate change of its own.
@@ -46,6 +47,10 @@ http = "1.5"
 # The body trait the request core and the upstream exchange work on, whichever engine read
 # the body. Already in the tree through hyper, at the same version.
 http-body = "1.1"
+# Kubernetes' own types, generated from each release's OpenAPI spec; kube-rs is built on
+# them. Built against the newest Kubernetes it has: an older cluster's missing fields read
+# as absent (02 §7). Moving the version feature is a deliberate change of its own.
+k8s-openapi = { version = "0.28", features = ["v1_36"] }
 # Body helpers (an empty body, either of two bodies) for the proxy crate's answers.
 http-body-util = "0.1.5"
 # Tokenises the head of an upstream's response. It is already under hyper, and is what

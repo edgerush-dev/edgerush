@@ -1,0 +1,16 @@
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: ingress/shop/j-good/good.example.com
+    listeners: [http]
+    hostnames: [{ name: good.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+upstreams:
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }
