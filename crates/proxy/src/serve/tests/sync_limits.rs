@@ -53,8 +53,8 @@ fn metric(scrape: &str, name: &str) -> Option<u64> {
         .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
 }
 
-/// Synchronous service pods, `count` of them, each on a port of its own: their addresses.
-/// They decide whatever they are asked from the start; agreeing who serves is theirs.
+/// Synchronous service pods, `count` of them, each on a port of its own, once they agree
+/// all serve: their addresses.
 async fn sync_pods(count: u32) -> (Vec<SyncPod>, Vec<String>) {
     let mut listeners = Vec::new();
     let mut addresses = Vec::new();
@@ -83,7 +83,27 @@ async fn sync_pods(count: u32) -> (Vec<SyncPod>, Vec<String>) {
         });
         pods.push(pod);
     }
-    (pods, addresses)
+    // Agreed and settled, so that no view changes under a test: a pod just started may say
+    // a view without the others for a moment, which would move their keys to it.
+    let every: Vec<u32> = (0..count).collect();
+    let agreed = |pods: &[SyncPod]| {
+        let (first, _) = pods[0].view();
+        pods.iter()
+            .all(|pod| matches!(pod.view(), (view, true) if view == first && view.pods == every))
+            .then_some(first.epoch)
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < deadline, "the pods never agreed");
+        if let Some(epoch) = agreed(&pods) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if agreed(&pods) == Some(epoch) {
+                return (pods, addresses);
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 /// `config` with its first route's first rule under `limits`, each `(name, burst)` keyed by
@@ -532,6 +552,302 @@ async fn an_open_breaker_closes_once_a_probe_hears_from_its_owner() {
                 ),
                 Some(1)
             );
+        })
+        .await;
+}
+
+/// With `when_unreachable: local`, an owner out of reach leaves its keys to the process's
+/// own buckets, which its workers share: a client is held to one bucket of ten across two
+/// workers, refusals say when to come back, and the metrics count the requests decided
+/// there and the process's one key.
+#[tokio::test]
+async fn with_local_an_owner_out_of_reach_is_decided_by_the_process_buckets() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let closed = {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                listener.local_addr().unwrap().to_string()
+            };
+            let (upstream, _) = counting_upstream().await;
+            let config = with_breaker(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 10)],
+                    &[closed],
+                    100,
+                    "local",
+                ),
+                2,
+                60_000,
+            );
+            let (proxy, mut sends) = serving(&config, 2).await;
+            let answers = send_round(&mut sends, 16).await;
+            let statuses = statuses(&answers);
+            assert_eq!(
+                statuses.iter().filter(|s| **s == 200).count(),
+                10,
+                "{statuses:?}"
+            );
+            assert_eq!(
+                statuses.iter().filter(|s| **s == 429).count(),
+                6,
+                "{statuses:?}"
+            );
+            for refused in answers.iter().filter(|a| a.status() == 429) {
+                let after = refused.headers()["retry-after"].to_str().unwrap();
+                assert!(after == "360" || after == "361", "retry-after {after}");
+                assert_eq!(
+                    refused.headers()["ratelimit"],
+                    format!(r#""per-client";r=0;t={after}"#).as_str()
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let scrape = loop {
+                let scrape = proxy.metrics();
+                if metric(&scrape, "edgerush_rate_limit_keys") == Some(1)
+                    || Instant::now() > deadline
+                {
+                    break scrape;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert_eq!(
+                metric(&scrape, "edgerush_rate_limit_keys"),
+                Some(1),
+                "{scrape}"
+            );
+            assert_eq!(
+                metric(
+                    &scrape,
+                    r#"edgerush_rate_limit_unreachable_total{action="local"}"#
+                ),
+                Some(16)
+            );
+        })
+        .await;
+}
+
+/// The process's own buckets are kept from one outage to the next: a client that spent its
+/// bucket while its owner was out of reach, then was decided by the owner once it was back,
+/// finds the bucket still spent when the owner goes again — not a fresh one.
+#[tokio::test]
+async fn local_buckets_carry_over_from_one_outage_to_the_next() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let address = {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                listener.local_addr().unwrap()
+            };
+            // Says nothing until the owner comes up on the same address.
+            let silent = TcpListener::bind(address).await.unwrap();
+            let (upstream, _) = counting_upstream().await;
+            let config = with_breaker(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 10)],
+                    &[address.to_string()],
+                    100,
+                    "local",
+                ),
+                1,
+                200,
+            );
+            let (proxy, mut sends) = serving(&config, 1).await;
+            let first = statuses(&send_round(&mut sends, 11).await);
+            assert_eq!(first[..10], [200; 10], "{first:?}");
+            assert_eq!(first[10], 429, "the local bucket spent");
+            drop(silent);
+            let pod = lone_pod(TcpListener::bind(address).await.unwrap());
+            let open = r#"edgerush_rate_limit_owner_breaker_open{pod="0"}"#;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while metric(&proxy.metrics(), open) != Some(0) {
+                assert!(Instant::now() < deadline, "the breaker never closed");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                statuses(&send_round(&mut sends, 1).await),
+                [200],
+                "the owner's own bucket"
+            );
+            pod.stop();
+            assert_eq!(
+                statuses(&send_round(&mut sends, 2).await),
+                [429, 429],
+                "the local bucket as the last outage left it"
+            );
+        })
+        .await;
+}
+
+/// Gives `count` charges under `key` back to the pod at `address`, directly.
+async fn give_back_directly(address: &str, key: &[u8], count: usize) {
+    let stream = decide_stream(address).await.unwrap();
+    for _ in 0..count {
+        let back = edgerush_ratelimit_service::synchronous::wire::GiveBack {
+            keys: vec![Key {
+                key: key.to_vec(),
+                contract: Some(edgerush_ratelimit_service::wire::Contract {
+                    limit: 10,
+                    window_ns: 3_600_000_000_000,
+                    burst: 5,
+                }),
+            }],
+        };
+        stream
+            .up
+            .send(Upstream {
+                message: Some(ToOwner::GiveBack(back)),
+            })
+            .await
+            .unwrap();
+    }
+    // Asked after them on the same stream, so answered once they are given.
+    let mut stream = stream;
+    let decide = Decide {
+        id: 0,
+        keys: vec![Key {
+            key: b"settled".to_vec(),
+            contract: Some(edgerush_ratelimit_service::wire::Contract {
+                limit: 10,
+                window_ns: 3_600_000_000_000,
+                burst: 5,
+            }),
+        }],
+    };
+    stream
+        .up
+        .send(Upstream {
+            message: Some(ToOwner::Decide(decide)),
+        })
+        .await
+        .unwrap();
+    loop {
+        let down = within(stream.down.message()).await.unwrap().unwrap();
+        if matches!(down.message, Some(FromOwner::Decided(_))) {
+            return;
+        }
+    }
+}
+
+/// With `when_unreachable: local` and one owner out of reach, only its keys are decided
+/// locally, the others asked of their owners: refused locally, the refusal names the limit
+/// whose key that was, by its place among the request's, and the owner that admitted is
+/// given its charge back.
+#[tokio::test]
+async fn with_local_only_the_keys_out_of_reach_are_decided_locally() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_pods, live) = sync_pods(2).await;
+            let closed = {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                listener.local_addr().unwrap().to_string()
+            };
+            let (upstream, _) = counting_upstream().await;
+            let view = View {
+                epoch: 1,
+                pods: vec![0, 1],
+            };
+            // Two limits of equal buckets whose keys have different owners: the first's
+            // owner answers, the second's is out of reach.
+            let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+            let mut addresses = live.clone();
+            let (config, keys) = names
+                .iter()
+                .flat_map(|first| names.iter().map(move |second| (*first, *second)))
+                .filter(|(first, second)| first != second)
+                .find_map(|(first, second)| {
+                    let config = synchronous_in(
+                        everything_config(upstream),
+                        &[(first, 5), (second, 5)],
+                        &live,
+                        200,
+                        "local",
+                    );
+                    let keys = keys_of(&config);
+                    (view.owners(&keys[0].1).0 != view.owners(&keys[1].1).0)
+                        .then_some((config, keys))
+                })
+                .expect("two limits with different owners");
+            let ((_, answered_key), (out_of_reach, _)) = (&keys[0], &keys[1]);
+            let answering = view.owners(answered_key).0.unwrap() as usize;
+            addresses[1 - answering] = closed;
+            let config = synchronous_in(
+                Config {
+                    rate_limiting: None,
+                    ..config
+                },
+                &[(&keys[0].0, 5), (out_of_reach, 5)],
+                &addresses,
+                200,
+                "local",
+            );
+            let config = with_breaker(config, 1, 60_000);
+            let (_proxy, mut sends) = serving(&config, 1).await;
+            assert_eq!(statuses(&send_round(&mut sends, 5).await), [200; 5]);
+            // The answering owner's bucket full again; the local one spent.
+            give_back_directly(&addresses[answering], answered_key, 5).await;
+            let answers = send_round(&mut sends, 1).await;
+            assert_eq!(statuses(&answers), [429]);
+            let named = answers[0].headers()["ratelimit"].to_str().unwrap();
+            assert!(
+                named.starts_with(&format!(r#""{out_of_reach}";"#)),
+                "{named}"
+            );
+            assert_eq!(
+                ask_directly(&addresses[answering], answered_key, 5).await,
+                5,
+                "its charge given back"
+            );
+        })
+        .await;
+}
+
+/// The process's own buckets are swept, on the probe thread: a key full and unused for a
+/// second is forgotten.
+#[tokio::test]
+async fn the_local_buckets_are_swept() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let closed = {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                listener.local_addr().unwrap().to_string()
+            };
+            let (upstream, _) = counting_upstream().await;
+            let mut config = with_breaker(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 10)],
+                    &[closed],
+                    100,
+                    "local",
+                ),
+                1,
+                60_000,
+            );
+            // A thousand a second, a bucket of one: full again a millisecond after its
+            // request.
+            config.limits = Some(
+                serde_saphyr::from_str(
+                    "limits:\n  - { name: per-client, key: client, model: { bucket: { rate: 1000/s, burst: 1 } } }\n",
+                )
+                .unwrap(),
+            );
+            let (proxy, mut sends) = serving(&config, 1).await;
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            let keys = |proxy: &Proxy| metric(&proxy.metrics(), "edgerush_rate_limit_keys");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while keys(&proxy) != Some(1) {
+                assert!(Instant::now() < deadline, "the key never counted");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            while keys(&proxy) != Some(0) {
+                assert!(Instant::now() < deadline, "the key never forgotten");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         })
         .await;
 }

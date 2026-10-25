@@ -10,9 +10,16 @@
 //! in a row it opens, and every worker decides that owner's keys by `when_unreachable` at
 //! once, asking nothing. A thread of the process's own probes it after `probe_after`,
 //! opening a stream of its own: the pod's view, sent first on every stream, closes it.
+//!
+//! With `when_unreachable: local`, the keys of the owners out of reach are decided from the
+//! process's own buckets, as local mode decides (`super::local`): each made full when first
+//! met without its owner and kept from one outage to the next until the sweep, on the probe
+//! thread, forgets it full and idle. Nothing is charged there while the owners answer.
 
+use super::local::{LocalLimiter, Process as LocalKeys, SWEEP};
 use super::{Awaited, Failed, KeyedBy, Later, Limited, Refusal, Undecided, with_keys};
 use edgerush_config::{CompiledLimit, CompiledSynchronous, WhenUnreachable};
+use edgerush_ratelimit::local::Decision;
 use edgerush_ratelimit::service::{Contract, Decided, PodId, View, longest};
 use edgerush_ratelimit_service::synchronous::decide_stream;
 use edgerush_ratelimit_service::synchronous::wire;
@@ -46,8 +53,10 @@ pub(crate) struct Process {
     breakers: Box<[Breaker]>,
     /// What each worker's asks of each owner came to: answered, timed out, stream broken.
     asks: Box<[Sharded<[Counter; 3]>]>,
-    /// Requests left to `when_unreachable`: let on, and refused.
-    unreachable: Sharded<[Counter; 2]>,
+    /// Requests left to `when_unreachable`: let on, refused, and decided locally.
+    unreachable: Sharded<[Counter; 3]>,
+    /// The process's own buckets, with `when_unreachable: local`.
+    local: Option<Arc<LocalKeys>>,
     start: Instant,
 }
 
@@ -68,10 +77,13 @@ impl Process {
         failed: Option<Failed>,
     ) -> std::io::Result<Arc<Self>> {
         let owners = config.addresses.len();
+        let local = (config.when_unreachable == WhenUnreachable::Local)
+            .then(|| LocalKeys::unswept(workers.get(), config.max_key_bytes));
         let process = Arc::new(Self {
             breakers: (0..owners).map(|_| Breaker::default()).collect(),
             asks: (0..owners).map(|_| Sharded::new(workers)).collect(),
             unreachable: Sharded::new(workers),
+            local,
             start: Instant::now(),
             config,
         });
@@ -111,6 +123,12 @@ impl Process {
         self.breakers.get(pod).is_some_and(Breaker::is_open)
     }
 
+    /// What its own buckets hold, in bytes, how many there are, and how many were evicted;
+    /// nothing without `when_unreachable: local`.
+    pub(crate) fn usage(&self) -> (u64, usize, u64) {
+        self.local.as_ref().map_or((0, 0, 0), |local| local.usage())
+    }
+
     /// What its owners' asks came to, their breakers, and what was left to
     /// `when_unreachable`, as metrics.
     pub(crate) fn render_stats(&self) -> String {
@@ -142,7 +160,7 @@ impl Process {
             );
         }
         out.push_str("# TYPE edgerush_rate_limit_unreachable_total counter\n");
-        for (at, action) in ["allow", "deny"].iter().enumerate() {
+        for (at, action) in ["allow", "deny", "local"].iter().enumerate() {
             let count: u64 = self.unreachable.sum(|counters| counters[at].get());
             let _ = writeln!(
                 out,
@@ -211,6 +229,8 @@ impl Breaker {
 /// was last probed, for as long as the process is kept; tells `failed` if it panics, as
 /// the other rate-limiting threads do (03 §2). A probe opens a stream to the owner and
 /// waits for its view: heard, the breaker closes; not, it waits another `probe_after`.
+/// With `when_unreachable: local`, it sweeps the process's own buckets every [`SWEEP`]
+/// too, as local mode's thread does.
 fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
     struct Watch(Option<Failed>);
     impl Drop for Watch {
@@ -232,11 +252,18 @@ fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
     runtime.block_on(async {
         let mut look = tokio::time::interval(PROBE_LOOK);
         look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut swept = Instant::now();
         loop {
             look.tick().await;
             let Some(held) = process.upgrade() else {
                 return;
             };
+            if let Some(local) = &held.local
+                && swept.elapsed() >= SWEEP
+            {
+                local.sweep_once();
+                swept = Instant::now();
+            }
             let probe_after = u64::try_from(held.config.probe_after.as_nanos()).unwrap_or(u64::MAX);
             let now = held.now();
             for (pod, breaker) in held.breakers.iter().enumerate() {
@@ -269,6 +296,9 @@ fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
         }
     });
 }
+
+/// Keys with their contracts, kept where they may be needed again.
+type Kept = Vec<(Vec<u8>, Contract)>;
 
 /// An owner's answer, or why there is none: its stream broke, or could not be opened.
 type Answer = Result<wire::Decided, ()>;
@@ -416,6 +446,8 @@ pub(crate) struct SyncLimiter {
     next: Cell<u64>,
     keys: RefCell<Vec<Vec<u8>>>,
     contracts: RefCell<Vec<Contract>>,
+    /// Its handles on the process's own buckets, with `when_unreachable: local`.
+    local: Option<Rc<LocalLimiter>>,
 }
 
 impl std::fmt::Debug for SyncLimiter {
@@ -429,7 +461,7 @@ impl SyncLimiter {
     /// every pod taken to serve until the pods say otherwise. Every pod's, not only those a
     /// key has needed: the pods' view comes down each, so that a worker whose owners go
     /// still hears from the rest where their keys went.
-    pub(crate) fn new(process: Arc<Process>) -> Rc<Self> {
+    pub(crate) fn new(process: Arc<Process>, index: usize) -> Rc<Self> {
         let streams: Vec<Rc<Stream>> = process
             .config
             .addresses
@@ -449,6 +481,10 @@ impl SyncLimiter {
         for stream in &streams {
             tokio::task::spawn_local(open(Rc::downgrade(stream), Rc::downgrade(&view)));
         }
+        let local = process
+            .local
+            .as_ref()
+            .map(|local| LocalLimiter::new(Arc::clone(local), index));
         Rc::new(Self {
             process,
             streams,
@@ -456,7 +492,13 @@ impl SyncLimiter {
             next: Cell::new(0),
             keys: RefCell::new(Vec::new()),
             contracts: RefCell::new(Vec::new()),
+            local,
         })
+    }
+
+    /// What its process's own buckets hold, as [`Process::usage`] says.
+    pub(crate) fn usage(&self) -> (u64, usize, u64) {
+        self.process.usage()
     }
 
     /// Whether it asks for `process`.
@@ -510,13 +552,23 @@ impl SyncLimiter {
                 None => parts.push(Part {
                     pod: *owner,
                     positions: vec![at],
-                    keys: Vec::new(),
+                    kept: Vec::new(),
                     answer: None,
                 }),
             }
         }
-        let several = parts.len() > 1;
+        // Kept only where they may be needed again: given back to an owner when another
+        // refuses, or decided locally when their owner is out of reach.
+        let keep = parts.len() > 1 || self.local.is_some();
         for part in &mut parts {
+            if keep {
+                part.kept = part
+                    .positions
+                    .iter()
+                    .filter_map(|at| keys.get(*at))
+                    .map(|(key, contract)| (key.to_vec(), *contract))
+                    .collect();
+            }
             let Some(pod) = part.pod else {
                 continue;
             };
@@ -537,11 +589,6 @@ impl SyncLimiter {
                     contract: Some((*contract).into()),
                 })
                 .collect();
-            // Kept only where a give-back may need them: a request asked of one owner has
-            // nothing to give back to another.
-            if several {
-                part.keys.clone_from(&sent);
-            }
             let (answered, answer) = oneshot::channel();
             let stream = &self.streams[pod];
             stream.waiting.borrow_mut().insert(id, answered);
@@ -602,8 +649,15 @@ impl SyncLimiter {
     }
 
     /// Gives one request's charge under `keys` back to the owner at `pod`.
-    fn give_back(&self, pod: usize, keys: Vec<wire::Key>) {
+    fn give_back(&self, pod: usize, keys: Kept) {
         if let Some(stream) = self.streams.get(pod) {
+            let keys = keys
+                .into_iter()
+                .map(|(key, contract)| wire::Key {
+                    key,
+                    contract: Some(contract.into()),
+                })
+                .collect();
             let back = wire::Upstream {
                 message: Some(wire::ToOwner::GiveBack(wire::GiveBack { keys })),
             };
@@ -612,13 +666,13 @@ impl SyncLimiter {
     }
 }
 
-/// One owner's part of a request: its keys' places among the request's, the keys as sent
-/// where they may be given back, and its answer to come; no pod, or no answer, for a part
-/// that could not be asked.
+/// One owner's part of a request: its keys' places among the request's, the keys with
+/// their contracts where they may be needed again, and its answer to come; no pod, or no
+/// answer, for a part that could not be asked.
 struct Part {
     pod: Option<usize>,
     positions: Vec<usize>,
-    keys: Vec<wire::Key>,
+    kept: Kept,
     answer: Option<(u64, oneshot::Receiver<Answer>)>,
 }
 
@@ -637,16 +691,19 @@ impl Asked {
         let mut admitted = Vec::new();
         let mut refused_by = Vec::new();
         let mut unreached = None;
+        // The keys of the owners out of reach, with their places among the request's.
+        let mut out_of_reach: Vec<(Vec<usize>, Kept)> = Vec::new();
         let process = &self.limiter.process;
         for part in self.parts {
             let (Some(pod), Some((id, answer))) = (part.pod, part.answer) else {
                 unreached = Some(Undecided::Unavailable);
+                out_of_reach.push((part.positions, part.kept));
                 continue;
             };
             match tokio::time::timeout_at(self.until, answer).await {
                 Ok(Ok(Ok(decided))) if decided.admitted => {
                     process.asked(pod, Ended::Answered);
-                    admitted.push((part.pod, part.keys));
+                    admitted.push((part.pod, part.kept));
                 }
                 Ok(Ok(Ok(decided))) => {
                     process.asked(pod, Ended::Answered);
@@ -658,6 +715,7 @@ impl Asked {
                 Ok(Ok(Err(()))) | Ok(Err(_)) => {
                     process.asked(pod, Ended::Broken);
                     unreached = Some(Undecided::Unavailable);
+                    out_of_reach.push((part.positions, part.kept));
                 }
                 Err(_) => {
                     process.asked(pod, Ended::TimedOut);
@@ -665,10 +723,11 @@ impl Asked {
                         stream.waiting.borrow_mut().remove(&id);
                     }
                     unreached = Some(Undecided::Timeout);
+                    out_of_reach.push((part.positions, part.kept));
                 }
             }
         }
-        let give_back = |admitted: Vec<(Option<usize>, Vec<wire::Key>)>| {
+        let give_back = |admitted: Vec<(Option<usize>, Kept)>| {
             for (pod, keys) in admitted {
                 if let Some(pod) = pod
                     && !keys.is_empty()
@@ -701,7 +760,37 @@ impl Asked {
                     refused_by: Box::default(),
                 })
             }
-            // `local` is refused by the config until it is built: refused as `deny` is.
+            WhenUnreachable::Local if let Some(local) = &self.limiter.local => {
+                process.unreachable.local()[2].inc();
+                let (positions, keys): (Vec<usize>, Kept) = out_of_reach.into_iter().fold(
+                    (Vec::new(), Vec::new()),
+                    |(mut positions, mut keys), (more_positions, more_keys)| {
+                        positions.extend(more_positions);
+                        keys.extend(more_keys);
+                        (positions, keys)
+                    },
+                );
+                match local.decide_keys(&keys) {
+                    Decision::Admit => Ok(Decided {
+                        ticket: 0,
+                        admitted: true,
+                        refused_by: Box::default(),
+                    }),
+                    Decision::Refuse { position, wait } => {
+                        give_back(admitted);
+                        Ok(Decided {
+                            ticket: 0,
+                            admitted: false,
+                            refused_by: positions
+                                .get(position)
+                                .map(|at| (*at, wait))
+                                .into_iter()
+                                .collect(),
+                        })
+                    }
+                }
+            }
+            // `local` with no buckets of its own is not made: refused as `deny` is.
             WhenUnreachable::Deny | WhenUnreachable::Local => {
                 process.unreachable.local()[1].inc();
                 give_back(admitted);
