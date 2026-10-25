@@ -236,9 +236,16 @@ impl Membership {
         if incarnations.is_empty() {
             return None;
         }
+        // Numbered to keep rising across the service's lives, not only within one: data
+        // planes take only a higher epoch than they hold, so a service restarted whole and
+        // counting from 1 again would go unheard. At least the leader's life, its start on
+        // the wall clock, in milliseconds: the new service's leader started after every pod
+        // of the old one, which made fewer views than it lived milliseconds, a view waiting
+        // out `settle` at the least.
+        let started_ms = self.incarnation / 1_000_000;
         self.agreed = Agreed {
             view: View {
-                epoch: self.agreed.view.epoch + 1,
+                epoch: (self.agreed.view.epoch + 1).max(started_ms),
                 pods: incarnations.iter().map(|(pod, _)| *pod).collect(),
             },
             incarnations,
@@ -264,9 +271,14 @@ mod tests {
 
     impl Cluster {
         fn new() -> Self {
+            Self::living(1)
+        }
+
+        /// Three pods started together, each in its life `incarnation`.
+        fn living(incarnation: u64) -> Self {
             Self {
                 pods: (0..3)
-                    .map(|p| Membership::new(p, 1, vec![0, 1, 2], SILENCE, SETTLE, 0))
+                    .map(|p| Membership::new(p, incarnation, vec![0, 1, 2], SILENCE, SETTLE, 0))
                     .collect(),
                 up: vec![true; 3],
                 cut: Vec::new(),
@@ -322,6 +334,34 @@ mod tests {
                 now,
             );
         }
+    }
+
+    /// A service restarted whole numbers its views above anything the old one made: a
+    /// data plane, which takes only a higher epoch than it holds, takes the new service's
+    /// views at once, and never the old service's again. Lives are start times, in
+    /// nanoseconds of the wall clock, as the service pods give them.
+    #[test]
+    fn a_service_restarted_whole_numbers_its_views_above_the_old_one() {
+        let started = 1_790_000_000_000_000_000; // some day in 2026
+        let mut old = Cluster::living(started);
+        old.run(0, 600 * MS);
+        // Some views later: a pod goes and comes back.
+        old.up[2] = false;
+        old.run(700 * MS, 2_000 * MS);
+        old.up[2] = true;
+        old.restart(2, started + 2_000 * MS, 2_000 * MS);
+        old.run(2_100 * MS, 4_000 * MS);
+        let (last, pods) = old.view(0);
+        assert_eq!(pods, [0, 1, 2]);
+        // The whole service again, ten seconds later, every pod new.
+        let mut new = Cluster::living(started + 14_000 * MS);
+        new.run(0, 600 * MS);
+        let (first, pods) = new.view(0);
+        assert_eq!(pods, [0, 1, 2]);
+        assert!(
+            first > last,
+            "the new service's first view {first} after the old one's last {last}"
+        );
     }
 
     #[test]
