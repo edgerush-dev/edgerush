@@ -1388,6 +1388,8 @@ instructions)
     # HTTP/3 (4 connections × 100 streams) as well with H3=1.
     loads="h1 h2"
     [ "$H3" = 1 ] && loads="h1 h2 h3"
+    # The service's pods, for a variant that asks them.
+    case " $VARIANTS " in *" ours-rl-"* | *" ours-sync "*) start_rl_service ;; esac
     for variant in $VARIANTS; do
         start_proxy "$variant"
         for load in $loads; do
