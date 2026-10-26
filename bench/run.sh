@@ -61,14 +61,16 @@
 #                                             bucket per client address) and envoy-rl
 #                                             (its global one: envoyproxy/ratelimit on
 #                                             Redis, asked every request, like ours-sync),
-#                                             beside ours with no limit
+#                                             kong-local and kong-rl (Kong's rate-limiting
+#                                             plugin: a node's shared memory; Redis, read
+#                                             every request), beside ours with no limit
 #   bench/run.sh summary DIR                  the table of a finished run
 #
 # UPSTREAM_H2=1 has the proxy speak HTTP/2 to the backend, by prior knowledge, many
 # requests on each connection: EdgeRush and HAProxy; NGINX by its gRPC proxy, in grpc.
 #
-# TLS=1 has clients reach the proxy over TLS — EdgeRush, NGINX and HAProxy (and Envoy, in
-# `ratelimit`), with one self-signed ECDSA P-256 certificate — for saturation, latency and
+# TLS=1 has clients reach the proxy over TLS — EdgeRush, NGINX and HAProxy (and Envoy and
+# Kong, in `ratelimit`), with one self-signed ECDSA P-256 certificate — for saturation, latency and
 # h2. Its churn is a full handshake for every request.
 #
 # H3=1 (which is TLS=1 as well) has EdgeRush, NGINX and HAProxy serve HTTP/3 on the same
@@ -408,6 +410,36 @@ open(out, "w").write(s)
 PY
 }
 
+# Kong's config made ready to run, as $run-kong.yml: kong.yml, and for kong-local and
+# kong-rl its rate-limiting plugin on the measured route, like for like with ours-local and
+# ours-sync: RL_RATE a second for each client address, in windows of a second (Kong has no
+# bucket, so RL_BURST has no counterpart). kong-local counts in each node's shared memory;
+# kong-rl reads each request's count from Redis before it goes on (`sync_rate` -1), waiting
+# RL_SYNC_TIMEOUT_MS, and refuses it unread with a 500 when RL_SYNC_UNREACHABLE is deny.
+# No rate-limit headers on an answer let through, as EdgeRush sends none.
+kong_config() { # variant
+    local rate deny=false
+    rate=$(rl_per_second) || exit 2
+    [ "$RL_SYNC_UNREACHABLE" = deny ] && deny=true
+    python3 - "$here/kong.yml" "$run-kong.yml" "$1" "$rate" "$RL_SYNC_TIMEOUT_MS" "$deny" <<'PY'
+import sys
+template, out, variant, rate, timeout_ms, deny = sys.argv[1:]
+s = open(template).read()
+if variant != "kong":
+    common = f"second: {rate}, limit_by: ip, hide_client_headers: true"
+    if variant == "kong-local":
+        config = f"{{ {common}, policy: local }}"
+    else:
+        fault_tolerant = "false" if deny == "true" else "true"
+        config = (f"{{ {common}, policy: redis, sync_rate: -1, fault_tolerant: {fault_tolerant}, "
+                  f"redis: {{ host: 127.0.0.1, port: 6379, timeout: {timeout_ms} }} }}")
+    plugins = "        preserve_host: true\n        plugins:\n"
+    assert s.count(plugins) == 1, "the measured route moved"
+    s = s.replace(plugins, plugins + f"          - name: rate-limiting\n            config: {config}\n")
+open(out, "w").write(s)
+PY
+}
+
 start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an idle policy
     set -- "${1%%@*}"
     local daemon=
@@ -415,7 +447,7 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
     # long argument. Only the variants that are EdgeRush are given it.
     local idle="--idle-per-destination $IDLE_PER_DESTINATION --idle-total $IDLE_TOTAL"
     case "$ACCESS_LOG.$1" in
-    1.envoy | 1.envoy-local | 1.envoy-rl | 1.kong | 1.nginx-direct)
+    1.envoy | 1.envoy-local | 1.envoy-rl | 1.kong | 1.kong-local | 1.kong-rl | 1.nginx-direct)
         echo "$1 is not set up to log: leave it out of ACCESS_LOG runs" >&2
         exit 2
         ;;
@@ -426,11 +458,18 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
         taskset -c "$PROXY_CPUS" envoy -c "$run-envoy.yaml" --concurrency "$WORKERS" \
             --disable-hot-restart -l warn 2>>"$OUT/proxy.log" &
         ;;
-    kong)
+    kong | kong-local | kong-rl)
+        kong_config "$1"
+        local kong_listen="127.0.0.1:8080 http2 reuseport backlog=4096"
+        if [ "$TLS" = 1 ]; then
+            certificate
+            kong_listen="127.0.0.1:8080 http2 ssl reuseport backlog=4096"
+        fi
         # Kong goes into the background by itself and leaves the pid of its master.
         (
-            export KONG_PREFIX="$run-kong" KONG_DATABASE=off KONG_DECLARATIVE_CONFIG="$here/kong.yml"
-            export KONG_PROXY_LISTEN="127.0.0.1:8080 http2 reuseport backlog=4096" KONG_ADMIN_LISTEN=off
+            export KONG_PREFIX="$run-kong" KONG_DATABASE=off KONG_DECLARATIVE_CONFIG="$run-kong.yml"
+            export KONG_PROXY_LISTEN="$kong_listen" KONG_ADMIN_LISTEN=off
+            [ "$TLS" = 1 ] && export KONG_SSL_CERT="$tls/cert.pem" KONG_SSL_CERT_KEY="$tls/key.pem"
             export KONG_NGINX_WORKER_PROCESSES="$WORKERS" KONG_PROXY_ACCESS_LOG=off KONG_HEADERS=off
             export KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=1024 KONG_UPSTREAM_KEEPALIVE_MAX_REQUESTS=0
             export KONG_UPSTREAM_KEEPALIVE_IDLE_TIMEOUT=3600 KONG_ANONYMOUS_REPORTS=off
@@ -723,18 +762,22 @@ stop_rl_service() {
     rl_pid= rl_sync_pid=
 }
 
-# The envoy-rl variant's service and its Redis, for `ratelimit`, if it is to run.
+# Redis, for `ratelimit`, if envoy-rl or kong-rl is to run, and envoy-rl's service in front
+# of it.
 rls_up=
 start_rls() {
-    case " $VARIANTS " in *" envoy-rl "*) ;; *) return 0 ;; esac
+    case " $VARIANTS " in *" envoy-rl "* | *" kong-rl "*) ;; *) return 0 ;; esac
     stop_rls
+    docker run -d --rm --name bench-redis --network host --cpuset-cpus "$BACKEND_CPUS" \
+        "$REDIS_IMAGE" redis-server --port 6379 --bind 127.0.0.1 --save "" --appendonly no \
+        --io-threads "$REDIS_IO_THREADS" --maxmemory 0 >/dev/null
+    rls_up=1
+    echo "redis $REDIS_IMAGE io-threads $REDIS_IO_THREADS" >>"$OUT/rls.settings"
+    case " $VARIANTS " in *" envoy-rl "*) ;; *) sleep 2; return 0 ;; esac
     local procs=${RLS_PROCS:-$(echo "$BACKEND_CPUS" | tr ',' '\n' | wc -l)}
     local rate
     rate=$(rl_per_second) || exit 2
     sed "s/@RATE@/$rate/" "$here/rls-config.yaml" >"$run-rls-config.yaml"
-    docker run -d --rm --name bench-redis --network host --cpuset-cpus "$BACKEND_CPUS" \
-        "$REDIS_IMAGE" redis-server --port 6379 --bind 127.0.0.1 --save "" --appendonly no \
-        --io-threads "$REDIS_IO_THREADS" --maxmemory 0 >/dev/null
     local pipeline=()
     [ -n "$RLS_PIPELINE_WINDOW" ] && pipeline+=(-e "REDIS_PIPELINE_WINDOW=$RLS_PIPELINE_WINDOW")
     docker run -d --rm --name bench-rls --network host --cpuset-cpus "$BACKEND_CPUS" \
@@ -745,12 +788,9 @@ start_rls() {
         -e RUNTIME_ROOT=/data -e RUNTIME_SUBDIRECTORY=ratelimit -e RUNTIME_WATCH_ROOT=false \
         -v "$run-rls-config.yaml:/data/ratelimit/config/config.yaml:ro" \
         "$RLS_IMAGE" /bin/ratelimit >/dev/null
-    rls_up=1
     sleep 3
-    {
-        echo "redis $REDIS_IMAGE io-threads $REDIS_IO_THREADS"
-        echo "rls $RLS_IMAGE pool $RLS_POOL pipeline window '${RLS_PIPELINE_WINDOW}' limit $RLS_PIPELINE_LIMIT procs $procs"
-    } >>"$OUT/rls.settings"
+    echo "rls $RLS_IMAGE pool $RLS_POOL pipeline window '${RLS_PIPELINE_WINDOW}' limit $RLS_PIPELINE_LIMIT procs $procs" \
+        >>"$OUT/rls.settings"
 }
 
 stop_rls() {
@@ -801,7 +841,7 @@ ratelimit_runs() {
         curl -s "http://127.0.0.1:9901/stats?filter=rate" >"$OUT/$1.envoy-stats" || true
         ;;
     esac
-    if [ "${1%%.*}" = envoy-rl ]; then
+    if [ "${1%%.*}" = envoy-rl ] || [ "${1%%.*}" = kong-rl ]; then
         docker exec bench-redis redis-cli info memory >"$OUT/$1.redis-memory" 2>&1 || true
         docker exec bench-redis redis-cli dbsize >"$OUT/$1.redis-keys" 2>&1 || true
     fi
