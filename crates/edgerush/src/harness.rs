@@ -237,6 +237,8 @@ enum Failure {
     Config { path: PathBuf, rejected: Rejected },
     #[error("config {} cannot be run:\n{error}", path.display())]
     Proxy { path: PathBuf, error: ProxyError },
+    #[error("config {} cannot be run:\nupstream `{upstream}`: {NOT_FOLLOWED}", path.display())]
+    NotFollowed { path: PathBuf, upstream: String },
     #[error("cannot listen on {address} for {what}: {error}")]
     Listen {
         what: String,
@@ -251,6 +253,19 @@ enum Failure {
     Ended(Ended),
     #[error("{0} while the data plane drained")]
     PanickedDraining(Ended),
+}
+
+/// Why a config with an upstream whose endpoints come from Kubernetes is refused: the
+/// harness follows no EndpointSlices yet, and such an upstream would never have an endpoint.
+const NOT_FOLLOWED: &str = "endpoints from Kubernetes are not served yet";
+
+/// The first upstream of `config` whose endpoints come from Kubernetes, if there is one.
+fn not_followed(config: &Compiled) -> Option<&str> {
+    config
+        .upstreams()
+        .iter()
+        .find(|upstream| upstream.discovery.is_some())
+        .map(|upstream| upstream.name.as_str())
 }
 
 fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
@@ -283,6 +298,12 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         Ok(opened) => opened,
         Err(rejected) => return Err(Failure::Config { path, rejected }),
     };
+    if let Some(upstream) = not_followed(&config) {
+        return Err(Failure::NotFollowed {
+            path,
+            upstream: upstream.to_owned(),
+        });
+    }
     let mut bound: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
     // Limits checked but enforced in none is said once, so that a mode left out is seen.
     let unenforced = (!config.rate_limiting().enforces()).then_some(config.limits().len());
@@ -400,6 +421,15 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
                 continue;
             }
         };
+        if let Some(upstream) = not_followed(&config) {
+            say(
+                stderr,
+                format_args!(
+                    "config rejected, the one before it runs on:\nupstream `{upstream}`: {NOT_FOLLOWED}"
+                ),
+            );
+            continue;
+        }
         let warnings = restart_needed(&bound, &config);
         // Published once, for every worker at once: none of them sees the old config after
         // another has seen the new one.

@@ -323,16 +323,23 @@ impl Destinations {
         keys: &Keys,
         secure: &[Option<Arc<Secure>>],
     ) -> Self {
-        let (destinations, retiring) = Self::prepare(config, previous, keys, secure);
+        let listed: Vec<Vec<SocketAddr>> = config
+            .upstreams()
+            .iter()
+            .map(|upstream| upstream.endpoints.clone())
+            .collect();
+        let (destinations, retiring) = Self::prepare(config, &listed, previous, keys, secure);
         retiring.retire();
         destinations
     }
 
     /// [`Destinations::reconcile`] with those of `previous` that `config` does not have
     /// handed back to be retired, not retired yet: for a config that may still be refused,
-    /// which must leave the running one's connections as they are.
+    /// which must leave the running one's connections as they are. `endpoints` are each
+    /// upstream's, by position: those the config lists, or those discovered for it.
     pub(crate) fn prepare(
         config: &Compiled,
+        endpoints: &[Vec<SocketAddr>],
         previous: &Self,
         keys: &Keys,
         secure: &[Option<Arc<Secure>>],
@@ -372,9 +379,10 @@ impl Destinations {
             .map(|(position, upstream)| {
                 let mut kept_any = false;
                 let mut added = Vec::new();
-                let destinations: Vec<Arc<ReuseIdentity>> = upstream
-                    .endpoints
-                    .iter()
+                let destinations: Vec<Arc<ReuseIdentity>> = endpoints
+                    .get(position)
+                    .into_iter()
+                    .flatten()
                     .map(|address| {
                         // Taken out as it is used, so that whatever is left over at the
                         // end is exactly what this config no longer has.

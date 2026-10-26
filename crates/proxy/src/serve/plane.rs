@@ -12,10 +12,14 @@ use crate::upstream::destination::{Aside, Destinations, Keys, Retiring, ReuseIde
 use crate::upstream::secure::Secure;
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRateLimiting};
+use edgerush_discovery::Endpoints;
+use k8s_openapi::api::discovery::v1::EndpointSlice;
+use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Refuses a config with a rate-limiting service on a machine without the native 128-bit
@@ -43,26 +47,40 @@ pub(super) fn runs_rate_limits(config: &Compiled, supported: bool) -> Result<(),
     Ok(())
 }
 
-/// Refuses a config with an upstream whose endpoints come from Kubernetes: the data plane
-/// does not watch EndpointSlices yet, and such an upstream would never have an endpoint.
-pub(super) fn discovers_nothing(config: &Compiled) -> Result<(), ProxyError> {
-    match config
+/// The EndpointSlices of each namespace followed, as last told, by namespace.
+pub(crate) type Discovered = HashMap<String, Arc<[EndpointSlice]>>;
+
+/// Each upstream's endpoints, by position: those the config lists, or those its Service's
+/// slices say take requests (03 §6), none while its namespace is not followed. Worked out
+/// whenever a snapshot is made, so that a config that names another Service of a namespace
+/// followed has its endpoints at once.
+fn resolved(config: &Compiled, discovered: &Discovered) -> Vec<Vec<SocketAddr>> {
+    config
         .upstreams()
         .iter()
-        .find(|upstream| upstream.discovery.is_some())
-    {
-        Some(upstream) => Err(ProxyError::KubernetesDiscoveryNotBuilt(
-            upstream.name.clone(),
-        )),
-        None => Ok(()),
-    }
+        .map(|upstream| match &upstream.discovery {
+            Some(service) => discovered
+                .get(&service.namespace)
+                .map(|slices| {
+                    Endpoints::of(service, slices)
+                        .in_use()
+                        .iter()
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => upstream.endpoints.clone(),
+        })
+        .collect()
 }
 
 impl Snapshot {
-    /// The snapshot of `config`, after `previous` if there is one, and the destinations of
-    /// `previous` it does not have, retired only once it is taken in.
+    /// The snapshot of `config` with the endpoints `discovered` has for its discovered
+    /// upstreams, after `previous` if there is one, and the destinations of `previous` it
+    /// does not have, retired only once it is taken in.
     pub(super) fn new(
-        config: Compiled,
+        config: Arc<Compiled>,
+        discovered: &Discovered,
         listeners: &[String],
         metrics: &Metrics,
         previous: Option<&Snapshot>,
@@ -70,11 +88,10 @@ impl Snapshot {
         logs: Vec<Option<Sink>>,
     ) -> Result<(Self, Retiring), ProxyError> {
         runs_rate_limits(&config, edgerush_ratelimit::service::pooled::supported())?;
-        discovers_nothing(&config)?;
-        let endpoints = config
-            .upstreams()
+        let resolved = resolved(&config, discovered);
+        let endpoints = resolved
             .iter()
-            .map(|upstream| upstream.endpoints.iter().map(authority).collect())
+            .map(|endpoints| endpoints.iter().map(authority).collect())
             .collect::<Result<_, _>>()?;
         let nothing_routed = Routed::default();
         let previous_routed = previous.map_or(&nothing_routed, |previous| &previous.routed);
@@ -166,7 +183,7 @@ impl Snapshot {
         let previous_destinations =
             previous.map_or(&nothing_yet, |previous| &previous.destinations);
         let (destinations, retiring) =
-            Destinations::prepare(&config, previous_destinations, keys, &secure);
+            Destinations::prepare(&config, &resolved, previous_destinations, keys, &secure);
         let carried = previous.map_or_else(
             || vec![Carry::New; config.upstreams().len()],
             |previous| {
@@ -223,9 +240,10 @@ impl Proxy {
         let keys = Keys::default();
         let logs = Logs::new(workers.get(), Arc::clone(&metrics.logs_dropped));
         let prepared = logs.prepare(&config, &listeners)?;
-        // After none, nothing to retire.
+        // After none, nothing to retire; and nothing discovered yet.
         let (snapshot, _none) = Snapshot::new(
-            config,
+            Arc::new(config),
+            &Discovered::new(),
             &listeners,
             &metrics,
             None,
@@ -245,6 +263,8 @@ impl Proxy {
             draining: AtomicBool::new(false),
             quic,
             logs,
+            discovered: Mutex::default(),
+            making: Mutex::default(),
         })
     }
 
@@ -275,18 +295,25 @@ impl Proxy {
     /// Returns a [`ProxyError`] as [`Proxy::new`] does; the data plane then runs on as it
     /// was.
     pub fn reload(&self, config: Compiled) -> Result<(), ProxyError> {
+        let _making = self.making.lock().unwrap_or_else(PoisonError::into_inner);
         // Against the config on its way out, so that a destination which has not changed
         // keeps what its connections are filed under and one that has gone is retired.
         let previous = self.current.load();
         let prepared = self.logs.prepare(&config, &self.listeners)?;
+        let discovered = self
+            .discovered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let (snapshot, retiring) = Snapshot::new(
-            config,
+            Arc::new(config),
+            &discovered,
             &self.listeners,
             &self.metrics,
             Some(&previous),
             &self.keys,
             prepared.by_listener(),
         )?;
+        drop(discovered);
         drop(previous);
         // Held until the config is in, so that no worker pairs either config with the
         // other's thread.
@@ -332,6 +359,62 @@ impl Proxy {
         let now = now.map_or(0, |since_epoch| since_epoch.as_secs());
         self.metrics.last_reload.store(now, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Takes in the EndpointSlices of namespaces followed: for each, every slice it now
+    /// has, or none when it is no longer followed. An upstream whose Service is in one is
+    /// served with the endpoints they give it from now on, published as a reload publishes
+    /// a config, the config itself as it was: an endpoint kept keeps its connections and
+    /// what is known of it, one added slow-starts beside them, and one gone is retired, an
+    /// exchange under way finishing (03 §6). The slices are kept, so that a config that
+    /// comes to name another Service of the namespace has its endpoints at once. Whether
+    /// the running config's endpoints changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProxyError`] as [`Proxy::new`] does; nothing is taken in then.
+    pub fn rediscover(
+        &self,
+        changes: impl IntoIterator<Item = (String, Option<Arc<[EndpointSlice]>>)>,
+    ) -> Result<bool, ProxyError> {
+        let _making = self.making.lock().unwrap_or_else(PoisonError::into_inner);
+        let previous = self.current.load();
+        let mut discovered = self
+            .discovered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut next = discovered.clone();
+        for (namespace, slices) in changes {
+            match slices {
+                Some(slices) => next.insert(namespace, slices),
+                None => next.remove(&namespace),
+            };
+        }
+        if resolved(&previous.config, &next) == resolved(&previous.config, &discovered) {
+            *discovered = next;
+            return Ok(false);
+        }
+        // The running config's listeners, logs and TLS are as they were, and are kept.
+        let (snapshot, retiring) = Snapshot::new(
+            Arc::clone(&previous.config),
+            &next,
+            &self.listeners,
+            &self.metrics,
+            Some(&previous),
+            &self.keys,
+            previous.logs.clone(),
+        )?;
+        *discovered = next;
+        drop(previous);
+        // As a reload holds it, so that no worker makes its limiter between the two.
+        let rate_limits = self
+            .rate_limits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        retiring.retire();
+        self.current.store(Arc::new(snapshot));
+        drop(rate_limits);
+        Ok(true)
     }
 
     /// Has the access logs' files opened again by their paths, for whoever moved them
