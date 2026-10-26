@@ -14,7 +14,7 @@ use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRateLimiting};
 use edgerush_discovery::Endpoints;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -45,6 +45,15 @@ pub(super) fn runs_rate_limits(config: &Compiled, supported: bool) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// The namespaces `config`'s discovered upstreams are in.
+fn namespaces_of(config: &Compiled) -> BTreeSet<String> {
+    config
+        .upstreams()
+        .iter()
+        .filter_map(|upstream| Some(upstream.discovery.as_ref()?.namespace.clone()))
+        .collect()
 }
 
 /// The EndpointSlices of each namespace followed, as last told, by namespace.
@@ -240,6 +249,7 @@ impl Proxy {
         let keys = Keys::default();
         let logs = Logs::new(workers.get(), Arc::clone(&metrics.logs_dropped));
         let prepared = logs.prepare(&config, &listeners)?;
+        let (namespaces, _) = tokio::sync::watch::channel(namespaces_of(&config));
         // After none, nothing to retire; and nothing discovered yet.
         let (snapshot, _none) = Snapshot::new(
             Arc::new(config),
@@ -265,6 +275,7 @@ impl Proxy {
             logs,
             discovered: Mutex::default(),
             making: Mutex::default(),
+            namespaces,
         })
     }
 
@@ -349,7 +360,14 @@ impl Proxy {
         }
         // Before any request of it can make a record.
         self.logs.commit(prepared);
+        let namespaces = namespaces_of(&snapshot.config);
         self.current.store(Arc::new(snapshot));
+        // Followed from now on, and those it no longer names forgotten.
+        self.namespaces.send_if_modified(|followed| {
+            let changed = *followed != namespaces;
+            *followed = namespaces;
+            changed
+        });
         rate_limits.hub = hub;
         rate_limits.local = local;
         rate_limits.synchronous = synchronous;

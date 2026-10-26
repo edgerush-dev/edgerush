@@ -305,6 +305,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-kubernetes"
+version = "0.0.0"
+dependencies = [
+ "boring",
+ "bytes",
+ "edgerush-discovery",
+ "h2",
+ "http",
+ "k8s-openapi",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-boring",
+]
+
+[[package]]
 name = "edgerush-proxy"
 version = "0.0.0"
 dependencies = [
@@ -315,6 +331,7 @@ dependencies = [
  "edgerush-config",
  "edgerush-discovery",
  "edgerush-filters",
+ "edgerush-kubernetes",
  "edgerush-ratelimit",
  "edgerush-ratelimit-service",
  "edgerush-router",
