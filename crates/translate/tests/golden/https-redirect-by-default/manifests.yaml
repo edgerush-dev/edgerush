@@ -1,0 +1,86 @@
+# Over plain HTTP, a host served over HTTPS is redirected there, path by path, in place of
+# its own routes: those of the Ingress that secures it and of one that does not but shares
+# the host. A host not secured is served over plain HTTP still. An Ingress that turns the
+# redirect off is served over both; one whose annotation is neither "true" nor "false" is
+# left out, and one with an annotation not read yet beside it is left out as before.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [shop.example.com], secretName: shop-tls }]
+  rules:
+    - host: "shop.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+          - { path: /api, pathType: Exact, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "plain.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: extra, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: "shop.example.com"
+      http:
+        paths:
+          - { path: /extra, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kept
+  namespace: shop
+  creationTimestamp: "2026-03-01T00:00:00Z"
+  annotations: { gateway.edgerush.dev/https-redirect: "false" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [secure.example.com], secretName: secure }]
+  rules:
+    - host: "secure.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: odd
+  namespace: shop
+  creationTimestamp: "2026-04-01T00:00:00Z"
+  annotations: { gateway.edgerush.dev/https-redirect: "yes" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: "odd.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mixed
+  namespace: shop
+  creationTimestamp: "2026-05-01T00:00:00Z"
+  annotations:
+    gateway.edgerush.dev/https-redirect: "false"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: edge
+  rules:
+    - host: "mixed.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

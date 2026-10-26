@@ -130,12 +130,16 @@ in the cluster unless `--check-secrets` asks for them to be checked. The data pl
 stand in for its `DataPlane` resource, which comes with the operator; `backend_authorities`,
 the certificates in PEM trusted for a Service port spoken to over TLS
 (`appProtocol: kubernetes.io/wss`), may be added, and an `https` listener, written with
-`tls: { certificates: [], without_sni: none }`, presents the Ingresses' TLS Secrets:
+`tls: { certificates: [], without_sni: none }`, presents the Ingresses' TLS Secrets.
+`ingress_https_redirect: true` redirects plain HTTP to HTTPS for the hosts served over it,
+as a `DataPlane` does by default; an Ingress's `gateway.edgerush.dev/https-redirect: "false"`
+or `"true"` overrides it for its own routes:
 
 ```yaml
 ingress_class: edge
 cluster_domain: cluster.local
 ingress_hosts_fall_through: false
+ingress_https_redirect: true
 listeners:
   http: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 ```
