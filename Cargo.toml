@@ -32,6 +32,7 @@ bytes = "1.12"
 edgerush-certificates = { path = "crates/certificates" }
 edgerush-config = { path = "crates/config" }
 edgerush-discovery = { path = "crates/discovery" }
+edgerush-kubernetes = { path = "crates/kubernetes" }
 edgerush-explain = { path = "crates/explain" }
 edgerush-filters = { path = "crates/filters" }
 edgerush-proxy = { path = "crates/proxy" }

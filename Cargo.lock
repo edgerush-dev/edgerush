@@ -366,6 +366,7 @@ dependencies = [
  "edgerush-config",
  "edgerush-discovery",
  "edgerush-filters",
+ "edgerush-kubernetes",
  "edgerush-ratelimit",
  "edgerush-ratelimit-service",
  "edgerush-router",

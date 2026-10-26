@@ -1,5 +1,5 @@
 use super::*;
-use crate::fake::*;
+use crate::testing::*;
 use std::sync::atomic::Ordering;
 
 #[tokio::test]

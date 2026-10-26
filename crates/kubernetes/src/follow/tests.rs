@@ -1,6 +1,6 @@
 use super::*;
 use crate::Timing;
-use crate::fake::*;
+use crate::testing::*;
 use bytes::Bytes;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};

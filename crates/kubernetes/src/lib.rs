@@ -523,7 +523,7 @@ mod follow;
 
 pub use follow::{Failure, Retry, Slices, follow};
 
-#[cfg(test)]
-mod fake;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 #[cfg(test)]
 mod tests;

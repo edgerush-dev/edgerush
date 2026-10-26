@@ -1,22 +1,39 @@
-//! A fake API server, for the tests: HTTP/2 over TLS, answering as each test scripts it.
+//! A fake API server, for tests here and in the crates that follow namespaces with this
+//! one: HTTP/2 over TLS, answering as each test scripts it.
 
-use super::*;
+#![allow(
+    clippy::unwrap_used,
+    reason = "test set-up: a fake that cannot be made is a broken test"
+)]
+
+use crate::{ApiServer, Timing};
 use boring::pkey::PKey;
-use boring::ssl::{AlpnError, SslAcceptor, select_next_proto};
+use boring::ssl::{AlpnError, SslAcceptor, SslMethod, select_next_proto};
+use boring::x509::X509;
+use bytes::Bytes;
+use http::header::AUTHORIZATION;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::net::TcpListener;
 
 /// What the fake API server answers a request with: a status, its body in these chunks,
 /// and a pause before each.
-pub(crate) struct Answer {
-    pub(crate) status: u16,
-    pub(crate) chunks: Vec<Bytes>,
-    pub(crate) pause: Duration,
+#[derive(Debug, Clone)]
+pub struct Answer {
+    /// The status.
+    pub status: u16,
+    /// The body, a chunk at a time.
+    pub chunks: Vec<Bytes>,
+    /// The pause before each chunk.
+    pub pause: Duration,
 }
 
-pub(crate) fn answer(status: u16, body: &str) -> Answer {
+/// `status`, with `body` at once.
+#[must_use]
+pub fn answer(status: u16, body: &str) -> Answer {
     Answer {
         status,
         chunks: vec![Bytes::copy_from_slice(body.as_bytes())],
@@ -26,22 +43,31 @@ pub(crate) fn answer(status: u16, body: &str) -> Answer {
 
 /// A request as the fake API server saw it.
 #[derive(Debug, Clone)]
-pub(crate) struct Seen {
-    pub(crate) path: String,
-    pub(crate) authorization: Option<String>,
+pub struct Seen {
+    /// Its path and query.
+    pub path: String,
+    /// Its `Authorization`, if it had one.
+    pub authorization: Option<String>,
 }
 
-/// A fake API server over HTTP/2 and TLS, its certificate made for `names`.
-pub(crate) struct Fake {
-    pub(crate) address: SocketAddr,
-    /// Its certificate, which the client is given as its authority.
-    pub(crate) authority: String,
-    pub(crate) seen: Arc<std::sync::Mutex<Vec<Seen>>>,
-    pub(crate) connections: Arc<AtomicUsize>,
+/// A fake API server over HTTP/2 and TLS.
+#[derive(Debug)]
+pub struct Fake {
+    /// Where it listens.
+    pub address: SocketAddr,
+    /// Its certificate, which a client is given as its authority.
+    pub authority: String,
+    /// The requests it has seen, in order.
+    pub seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+    /// The connections it has accepted.
+    pub connections: Arc<AtomicUsize>,
 }
 
 impl Fake {
-    pub(crate) async fn start(
+    /// A fake whose certificate is made for `names`, answering each request as `answers`
+    /// says for its path and query. On the runtime it is started on, which must be a
+    /// multi-threaded one or be driven while the client waits.
+    pub async fn start(
         names: &[&str],
         answers: impl Fn(&str) -> Answer + Send + Sync + 'static,
     ) -> Self {
@@ -114,12 +140,15 @@ impl Fake {
         }
     }
 
-    pub(crate) fn seen(&self) -> Vec<Seen> {
+    /// The requests it has seen so far.
+    #[must_use]
+    pub fn seen(&self) -> Vec<Seen> {
         self.seen.lock().unwrap().clone()
     }
 
     /// A client of it, at `127.0.0.1`, trusting its certificate, with the token in `token`.
-    pub(crate) fn client(&self, token: &Path, timing: Timing) -> ApiServer {
+    #[must_use]
+    pub fn client(&self, token: &Path, timing: Timing) -> ApiServer {
         ApiServer::new(
             "127.0.0.1",
             self.address.port(),
@@ -131,8 +160,8 @@ impl Fake {
     }
 }
 
-/// A token file of the test's own, holding `token`.
-pub(crate) fn token(name: &str, token: &str) -> PathBuf {
+/// A token file of the test's own, `name` in a directory of these tests', holding `token`.
+pub fn token(name: &str, token: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("edgerush-kubernetes-tests");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
@@ -140,9 +169,12 @@ pub(crate) fn token(name: &str, token: &str) -> PathBuf {
     path
 }
 
-pub(crate) const SLICE: &str = r#"{"metadata":{"name":"web-1","namespace":"shop","resourceVersion":"4"},"addressType":"IPv4","endpoints":[{"addresses":["10.0.0.1"]}]}"#;
+/// A slice of Service `web` in `shop`, at version 4, of one endpoint.
+pub const SLICE: &str = r#"{"metadata":{"name":"web-1","namespace":"shop","resourceVersion":"4"},"addressType":"IPv4","endpoints":[{"addresses":["10.0.0.1"]}]}"#;
 
-pub(crate) fn list(version: &str, next: Option<&str>) -> String {
+/// A list's page of [`SLICE`] as of `version`, continuing to `next` if it is not the last.
+#[must_use]
+pub fn list(version: &str, next: Option<&str>) -> String {
     let next = next
         .map(|next| format!(r#","continue":"{next}""#))
         .unwrap_or_default();

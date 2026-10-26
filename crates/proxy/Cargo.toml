@@ -27,6 +27,8 @@ edgerush-certificates.workspace = true
 edgerush-config.workspace = true
 # Which of a Service's EndpointSlices' endpoints take requests.
 edgerush-discovery.workspace = true
+# The list and watch of the namespaces discovered upstreams are in.
+edgerush-kubernetes.workspace = true
 edgerush-filters.workspace = true
 # Rules' rate limits (experimental): each worker a data plane of the rate-limiting
 # service's protocol, reaching the service through that crate's gRPC client.
@@ -61,6 +63,8 @@ nix.workspace = true
 [dev-dependencies]
 # Certificates made on the spot, for listeners and upstreams under test.
 edgerush-certificates = { workspace = true, features = ["testing"] }
+# A fake API server, for the namespaces followed.
+edgerush-kubernetes = { workspace = true, features = ["testing"] }
 # The engine's clients and its either-version server, for tests only: what talks to the
 # proxy as a client would, upstreams that speak both versions, and a second oracle for
 # EdgeRush's own HTTP/1 client (`upstream::h1::differential`).

@@ -17,6 +17,7 @@
 
 mod connection;
 mod exchange;
+mod kubernetes;
 mod logged;
 mod passthrough;
 mod plane;
@@ -402,6 +403,9 @@ pub struct Proxy {
     /// Held while a snapshot is made and taken in, by a reload or by endpoints discovered,
     /// so that the two never start from one snapshot and the later undo the other.
     making: std::sync::Mutex<()>,
+    /// The namespaces the running config's discovered upstreams are in, which
+    /// [`Proxy::follow_kubernetes`] follows.
+    namespaces: tokio::sync::watch::Sender<std::collections::BTreeSet<String>>,
 }
 
 /// The data plane's rate limits: whether they were started, and the thread the running

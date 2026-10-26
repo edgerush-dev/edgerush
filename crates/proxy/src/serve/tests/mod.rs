@@ -50,6 +50,7 @@ mod headers;
 mod health;
 mod http2;
 mod http3;
+mod kubernetes;
 mod local_limits;
 mod mirrors;
 mod passthrough;

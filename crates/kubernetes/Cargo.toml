@@ -7,9 +7,16 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# The fake API server (`testing`), for the tests of crates that follow namespaces with this
+# one. Never for the binary.
+testing = ["dep:edgerush-certificates", "edgerush-certificates/testing"]
+
 [dependencies]
 boring.workspace = true
 bytes.workspace = true
+# The fake API server's certificate, under `testing` alone.
+edgerush-certificates = { workspace = true, optional = true }
 # What to ask for next, and the slices the answers leave.
 edgerush-discovery.workspace = true
 # HTTP/2, which the data plane already speaks to upstreams: one connection to the API
