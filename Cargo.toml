@@ -19,6 +19,9 @@ publish = false
 # feature at compile time (x86-64 Linux): it finds the instruction at run time, and where it
 # finds none the proxy refuses a pooled service rather than run the fallback's lock.
 portable-atomic = { version = "1.15.0", default-features = false, features = ["fallback"] }
+# A set of rate-limit keys that keeps each key's hash beside it (`HashTable`), so that
+# growing never reads a key again (GitHub issue #111). Already in the tree through indexmap.
+hashbrown = { version = "0.17.1", default-features = false }
 # Publishing a config to the request path without a lock: readers never wait.
 arc-swap = "1.9"
 # TLS on the client hop, over BoringSSL (03 §3), the same library quiche will use for

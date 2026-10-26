@@ -7,6 +7,7 @@ use super::*;
 use crate::reference::{Model, TokenBucket};
 use crate::service::FixedState;
 use proptest::prelude::*;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 
 const MS: u64 = 1_000_000;
@@ -443,4 +444,50 @@ fn every_key_a_filter_takes_is_copied_as_it_stands() {
     assert_eq!(&*copies[0].key, b"a");
     assert_eq!(copies[0].full_in, 2 * SECOND / 10);
     assert_eq!(local.copies_of(0, |_| true).len(), 2, "both");
+}
+
+/// A key for the set a worker's handles and the registry's shards keep their keys in
+/// (`key_set`, #111).
+fn held_key(name: &[u8]) -> Arc<Key> {
+    Arc::new(Key::new(name.into(), contract(10, SECOND, 10), 0))
+}
+
+proptest! {
+    /// Whatever is held, replaced, removed or kept, and however often the set grows on
+    /// the way, it finds each name's latest key, as a map of names does.
+    #[test]
+    fn holds_what_a_map_of_names_holds(
+        ops in proptest::collection::vec((0_u8..4, 0_u16..400), 0..3_000),
+    ) {
+        let mut set = key_set::KeySet::with_hasher(FixedState::default());
+        let mut map: HashMap<Vec<u8>, Arc<Key>> = HashMap::new();
+        for (op, at) in ops {
+            let name = format!("k{at}").into_bytes();
+            match op {
+                0 | 1 => {
+                    let made = held_key(&name);
+                    let hash = set.hash(&name);
+                    set.replace_hashed(hash, Arc::clone(&made));
+                    map.insert(name.clone(), made);
+                }
+                2 => {
+                    set.remove(&name);
+                    map.remove(&name);
+                }
+                _ => {
+                    // Keeps the names of an odd number.
+                    set.retain(|key| key.key.last().is_some_and(|last| last % 2 == 1));
+                    map.retain(|name, _| name.last().is_some_and(|last| last % 2 == 1));
+                }
+            }
+            prop_assert_eq!(set.len(), map.len());
+            prop_assert_eq!(set.is_empty(), map.is_empty());
+            let found = set.get(&name).map(Arc::as_ptr);
+            prop_assert_eq!(found, map.get(&name).map(Arc::as_ptr));
+        }
+        for (name, held) in &map {
+            prop_assert!(set.get(name).is_some_and(|key| Arc::ptr_eq(key, held)));
+        }
+        prop_assert_eq!(set.iter().count(), map.len());
+    }
 }

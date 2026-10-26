@@ -15,6 +15,7 @@
 //! A bucket's arrival time is kept in units of 1/65,536 of a request's interval, modulo
 //! 2^63; the top bit of the word marks a key forgotten.
 
+mod key_set;
 mod sync;
 
 #[cfg(all(test, loom))]
@@ -24,9 +25,8 @@ mod tests;
 
 pub use crate::service::Contract;
 
-use std::borrow::Borrow;
-use std::collections::HashSet;
-use std::hash::{BuildHasher, Hash, Hasher};
+use key_set::{KeySet, SLOT_BYTES};
+use std::hash::BuildHasher;
 use sync::{Arc, AtomicBool, AtomicU64, Ordering, RwLock};
 
 /// Units in a request's interval.
@@ -364,30 +364,6 @@ impl Key {
 /// A key as handles share it: what [`Handles::take_changed`] gathers.
 pub type Shared = Arc<Key>;
 
-/// A key in a set, found by its name.
-#[derive(Clone, Debug)]
-pub struct Handle(Arc<Key>);
-
-impl PartialEq for Handle {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.key == other.0.key
-    }
-}
-
-impl Eq for Handle {}
-
-impl Hash for Handle {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.key.hash(state);
-    }
-}
-
-impl Borrow<[u8]> for Handle {
-    fn borrow(&self) -> &[u8] {
-        &self.0.key
-    }
-}
-
 /// What a decision is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -428,7 +404,7 @@ pub struct Swept {
 /// The keys one process's workers share.
 #[derive(Debug)]
 pub struct Local<S> {
-    shards: Box<[RwLock<HashSet<Handle, S>>]>,
+    shards: Box<[RwLock<KeySet<S>>]>,
     hasher: S,
     /// Workers holding handles to the keys, which a key's bytes count.
     workers: u64,
@@ -446,8 +422,7 @@ pub struct Local<S> {
 pub fn key_bytes(key: &[u8], workers: u64) -> u64 {
     // An `Arc`'s two counts beside the key.
     let entry = 2 * size_of::<usize>() + size_of::<Key>() + key.len();
-    let slot = (size_of::<Handle>() + 1) as u64;
-    entry as u64 + slot * (1 + workers)
+    entry as u64 + SLOT_BYTES * (1 + workers)
 }
 
 impl<S: BuildHasher + Clone> Local<S> {
@@ -456,7 +431,7 @@ impl<S: BuildHasher + Clone> Local<S> {
     pub fn new(hasher: S, workers: u64) -> Self {
         Self {
             shards: (0..SHARDS)
-                .map(|_| RwLock::new(HashSet::with_hasher(hasher.clone())))
+                .map(|_| RwLock::new(KeySet::with_hasher(hasher.clone())))
                 .collect(),
             hasher,
             workers: workers.max(1),
@@ -511,8 +486,7 @@ impl<S: BuildHasher + Clone> Local<S> {
     pub fn copies_of(&self, now: u64, keep: impl Fn(&[u8]) -> bool) -> Vec<Copy> {
         let mut copies = Vec::new();
         for shard in &self.shards {
-            for handle in read(shard).iter() {
-                let key = &handle.0;
+            for key in read(shard).iter() {
                 if !key.closed() && keep(&key.key) {
                     copies.push(Copy {
                         key: key.key.clone(),
@@ -560,11 +534,14 @@ impl<S: BuildHasher + Clone> Local<S> {
     /// Whether it holds `key`.
     #[must_use]
     pub fn contains(&self, key: &[u8]) -> bool {
-        read(self.shard(key)).contains(key)
+        let hash = self.hasher.hash_one(key);
+        read(self.shard(hash)).get_hashed(hash, key).is_some()
     }
 
-    fn shard(&self, key: &[u8]) -> &RwLock<HashSet<Handle, S>> {
-        let at = usize::try_from(self.hasher.hash_one(key)).unwrap_or(0) % self.shards.len();
+    /// The shard of a key whose name's hash is `hash`: chosen by bits of the hash its set
+    /// does not place by, so that the keys of one shard spread over its set.
+    fn shard(&self, hash: u64) -> &RwLock<KeySet<S>> {
+        let at = usize::try_from(hash >> 32).unwrap_or(0) % self.shards.len();
         // `at` is below the length.
         &self.shards[at]
     }
@@ -572,24 +549,25 @@ impl<S: BuildHasher + Clone> Local<S> {
     /// The live key of `key` under `contract`, made at `now`, full, if there is none; one
     /// closed or under another contract is replaced.
     fn find_or_make(&self, key: &[u8], contract: Contract, now: u64) -> Arc<Key> {
-        let shard = self.shard(key);
-        if let Some(found) = read(shard).get(key)
-            && found.0.contract == contract
-            && !found.0.closed()
+        let hash = self.hasher.hash_one(key);
+        let shard = self.shard(hash);
+        if let Some(found) = read(shard).get_hashed(hash, key)
+            && found.contract == contract
+            && !found.closed()
         {
-            return Arc::clone(&found.0);
+            return Arc::clone(found);
         }
         let mut set = write(shard);
-        if let Some(found) = set.get(key) {
-            if found.0.contract == contract && !found.0.closed() {
-                return Arc::clone(&found.0);
+        if let Some(found) = set.get_hashed(hash, key) {
+            if found.contract == contract && !found.closed() {
+                return Arc::clone(found);
             }
-            found.0.close();
+            found.close();
             self.holding
                 .fetch_sub(key_bytes(key, self.workers), Ordering::Relaxed);
         }
         let made = Arc::new(Key::new(key.into(), contract, now));
-        set.replace(Handle(Arc::clone(&made)));
+        set.replace_hashed(hash, Arc::clone(&made));
         self.holding
             .fetch_add(key_bytes(key, self.workers), Ordering::Relaxed);
         made
@@ -672,11 +650,11 @@ impl<S: BuildHasher + Clone> Local<S> {
         let mut swept = Swept::default();
         let mut freed = 0;
         for shard in &self.shards {
-            write(shard).retain(|handle| {
-                let forget = handle.0.close_if_forgettable(now, quiet);
+            write(shard).retain(|key| {
+                let forget = key.close_if_forgettable(now, quiet);
                 if forget {
                     swept.forgotten += 1;
-                    freed += key_bytes(&handle.0.key, self.workers);
+                    freed += key_bytes(&key.key, self.workers);
                 }
                 !forget
             });
@@ -692,7 +670,7 @@ impl<S: BuildHasher + Clone> Local<S> {
             .flat_map(|shard| {
                 read(shard)
                     .iter()
-                    .map(|handle| (handle.0.full_in(now), Arc::clone(&handle.0)))
+                    .map(|key| (key.full_in(now), Arc::clone(key)))
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -702,13 +680,14 @@ impl<S: BuildHasher + Clone> Local<S> {
             if self.holding() <= target {
                 break;
             }
-            let mut set = write(self.shard(&key.key));
+            let hash = self.hasher.hash_one(&*key.key);
+            let mut set = write(self.shard(hash));
             if set
-                .get(&*key.key)
-                .is_some_and(|held| Arc::ptr_eq(&held.0, &key))
+                .get_hashed(hash, &key.key)
+                .is_some_and(|held| Arc::ptr_eq(held, &key))
             {
                 key.close();
-                set.remove(&*key.key);
+                set.remove(&key.key);
                 self.holding
                     .fetch_sub(key_bytes(&key.key, self.workers), Ordering::Relaxed);
                 self.evicted.fetch_add(1, Ordering::Relaxed);
@@ -722,7 +701,7 @@ impl<S: BuildHasher + Clone> Local<S> {
 /// A worker's handles to the keys it has met: found without a lock, by the key's name.
 #[derive(Debug)]
 pub struct Handles<S> {
-    set: HashSet<Handle, S>,
+    set: KeySet<S>,
     /// Keys its decisions changed since last taken, each once.
     changed: Vec<Arc<Key>>,
 }
@@ -732,7 +711,7 @@ impl<S: BuildHasher + Clone> Handles<S> {
     #[must_use]
     pub fn new(hasher: S) -> Self {
         Self {
-            set: HashSet::with_hasher(hasher),
+            set: KeySet::with_hasher(hasher),
             changed: Vec::new(),
         }
     }
@@ -745,8 +724,8 @@ impl<S: BuildHasher + Clone> Handles<S> {
 
     /// Gathers `key`, just changed for the first time since its last copy.
     fn gather(&mut self, key: &[u8]) {
-        if let Some(handle) = self.set.get(key) {
-            self.changed.push(Arc::clone(&handle.0));
+        if let Some(found) = self.set.get(key) {
+            self.changed.push(Arc::clone(found));
         }
     }
 
@@ -765,7 +744,7 @@ impl<S: BuildHasher + Clone> Handles<S> {
     /// Lets go of the keys forgotten or evicted: taken now and then, as a worker's handles
     /// to keys it never meets again hold them.
     pub fn prune(&mut self) {
-        self.set.retain(|handle| !handle.0.closed());
+        self.set.retain(|key| !key.closed());
     }
 
     fn forget(&mut self, key: &[u8]) {
@@ -783,14 +762,15 @@ impl<S: BuildHasher + Clone> Handles<S> {
         now: u64,
         act: impl Fn(&Key) -> R,
     ) -> R {
-        if let Some(handle) = self.set.get(key)
-            && handle.0.contract == contract
+        let hash = self.set.hash(key);
+        if let Some(found) = self.set.get_hashed(hash, key)
+            && found.contract == contract
         {
-            return act(&handle.0);
+            return act(found);
         }
         let made = local.find_or_make(key, contract, now);
         let done = act(&made);
-        self.set.replace(Handle(made));
+        self.set.replace_hashed(hash, made);
         done
     }
 }
