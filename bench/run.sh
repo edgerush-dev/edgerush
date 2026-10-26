@@ -57,19 +57,22 @@
 #                                             decides every request),
 #                                             nginx-rl and haproxy-rl (theirs, as local:
 #                                             limit_req; a stick table's request rate),
-#                                             envoy-rl (Envoy's global rate limit:
-#                                             envoyproxy/ratelimit on Redis), beside ours
-#                                             with no limit
+#                                             envoy-local (Envoy's local rate limit: a
+#                                             bucket per client address) and envoy-rl
+#                                             (its global one: envoyproxy/ratelimit on
+#                                             Redis, asked every request, like ours-sync),
+#                                             beside ours with no limit
 #   bench/run.sh summary DIR                  the table of a finished run
 #
 # UPSTREAM_H2=1 has the proxy speak HTTP/2 to the backend, by prior knowledge, many
 # requests on each connection: EdgeRush and HAProxy; NGINX by its gRPC proxy, in grpc.
 #
-# TLS=1 has clients reach the proxy over TLS — EdgeRush, NGINX and HAProxy, with one
-# self-signed ECDSA P-256 certificate — for saturation, latency and h2. Its churn is a
-# full handshake for every request.
+# TLS=1 has clients reach the proxy over TLS — EdgeRush, NGINX and HAProxy (and Envoy, in
+# `ratelimit`), with one self-signed ECDSA P-256 certificate — for saturation, latency and
+# h2. Its churn is a full handshake for every request.
 #
-# H3=1 (which is TLS=1 as well) has those three serve HTTP/3 on the same port, over UDP;
+# H3=1 (which is TLS=1 as well) has EdgeRush, NGINX and HAProxy serve HTTP/3 on the same
+# port, over UDP;
 # the `h3` scenario sets it itself. Its generator is h2load built with HTTP/3 (H2LOAD3).
 #
 # ACCESS_LOG=1 has EdgeRush, NGINX and HAProxy log every request they serve to a file, the
@@ -366,6 +369,43 @@ stop_backend() {
     fi
 }
 
+# An Envoy config made ready to run, as $run-envoy.yaml: its @...@ values filled in from
+# the limit EdgeRush is given (RL_RATE, RL_BURST) and its synchronous mode's wait and
+# fallback (RL_SYNC_TIMEOUT_MS, RL_SYNC_UNREACHABLE); with TLS=1, the listener given the
+# bench's certificate, offering HTTP/2 and HTTP/1.1 by ALPN as EdgeRush does.
+envoy_config() { # template
+    local rate deny=false
+    rate=$(rl_per_second) || exit 2
+    [ "$RL_SYNC_UNREACHABLE" = deny ] && deny=true
+    [ "$TLS" = 1 ] && certificate
+    python3 - "$1" "$run-envoy.yaml" "$rate" "${RL_BURST:-100000000}" "$RL_SYNC_TIMEOUT_MS" \
+        "$deny" "$TLS" "$tls" <<'PY'
+import re, sys
+template, out, rate, burst, timeout_ms, deny, tls, tls_dir = sys.argv[1:]
+s = open(template).read()
+for name, value in (("RATE", rate), ("BURST", burst), ("TIMEOUT_MS", timeout_ms), ("DENY", deny)):
+    s = s.replace(f"@{name}@", value)
+left = re.findall(r"@[A-Z_]+@", s)
+assert not left, f"not filled in: {left}"
+if tls == "1":
+    chain = "      filter_chains:\n        - filters:\n"
+    assert s.count(chain) == 1, "the listener's filter chain moved"
+    s = s.replace(chain, f"""      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                alpn_protocols: [h2, http/1.1]
+                tls_certificates:
+                  - certificate_chain: {{ filename: {tls_dir}/cert.pem }}
+                    private_key: {{ filename: {tls_dir}/key.pem }}
+          filters:
+""")
+open(out, "w").write(s)
+PY
+}
+
 start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an idle policy
     set -- "${1%%@*}"
     local daemon=
@@ -373,18 +413,15 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
     # long argument. Only the variants that are EdgeRush are given it.
     local idle="--idle-per-destination $IDLE_PER_DESTINATION --idle-total $IDLE_TOTAL"
     case "$ACCESS_LOG.$1" in
-    1.envoy | 1.kong | 1.nginx-direct)
+    1.envoy | 1.envoy-local | 1.envoy-rl | 1.kong | 1.nginx-direct)
         echo "$1 is not set up to log: leave it out of ACCESS_LOG runs" >&2
         exit 2
         ;;
     esac
     case "$1" in
-    envoy)
-        taskset -c "$PROXY_CPUS" envoy -c "$here/envoy.yaml" --concurrency "$WORKERS" \
-            --disable-hot-restart -l warn 2>>"$OUT/proxy.log" &
-        ;;
-    envoy-rl)
-        taskset -c "$PROXY_CPUS" envoy -c "$here/envoy-rl.yaml" --concurrency "$WORKERS" \
+    envoy | envoy-local | envoy-rl)
+        envoy_config "$here/$1.yaml"
+        taskset -c "$PROXY_CPUS" envoy -c "$run-envoy.yaml" --concurrency "$WORKERS" \
             --disable-hot-restart -l warn 2>>"$OUT/proxy.log" &
         ;;
     kong)
@@ -690,6 +727,9 @@ start_rls() {
     case " $VARIANTS " in *" envoy-rl "*) ;; *) return 0 ;; esac
     stop_rls
     local procs=${RLS_PROCS:-$(echo "$BACKEND_CPUS" | tr ',' '\n' | wc -l)}
+    local rate
+    rate=$(rl_per_second) || exit 2
+    sed "s/@RATE@/$rate/" "$here/rls-config.yaml" >"$run-rls-config.yaml"
     docker run -d --rm --name bench-redis --network host --cpuset-cpus "$BACKEND_CPUS" \
         "$REDIS_IMAGE" redis-server --port 6379 --bind 127.0.0.1 --save "" --appendonly no \
         --io-threads "$REDIS_IO_THREADS" --maxmemory 0 >/dev/null
@@ -701,7 +741,7 @@ start_rls() {
         -e REDIS_PIPELINE_LIMIT="$RLS_PIPELINE_LIMIT" "${pipeline[@]}" \
         -e GOMAXPROCS="$procs" -e PORT=8082 -e GRPC_PORT=8081 -e DEBUG_PORT=6070 \
         -e RUNTIME_ROOT=/data -e RUNTIME_SUBDIRECTORY=ratelimit -e RUNTIME_WATCH_ROOT=false \
-        -v "$here/rls-config.yaml:/data/ratelimit/config/config.yaml:ro" \
+        -v "$run-rls-config.yaml:/data/ratelimit/config/config.yaml:ro" \
         "$RLS_IMAGE" /bin/ratelimit >/dev/null
     rls_up=1
     sleep 3
@@ -752,9 +792,14 @@ ratelimit_runs() {
         printf '%s %s\n' "$(cat "$task/comm")" "$(awk '{print $14 + $15}' "$task/stat")"
     done >"$OUT/$1.threads" 2>/dev/null || true
     service_cpu >"$OUT/$1.service-cpu-after"
-    # Envoy's own count of asks answered, failed and refused, and what Redis holds.
-    if [ -n "$rls_up" ]; then
-        curl -s "http://127.0.0.1:9901/stats?filter=ratelimit" >"$OUT/$1.envoy-stats" || true
+    # Envoy's own count of requests let through and refused, its asks answered and failed,
+    # and what Redis holds.
+    case "${1%%.*}" in
+    envoy-local | envoy-rl)
+        curl -s "http://127.0.0.1:9901/stats?filter=rate" >"$OUT/$1.envoy-stats" || true
+        ;;
+    esac
+    if [ "${1%%.*}" = envoy-rl ]; then
         docker exec bench-redis redis-cli info memory >"$OUT/$1.redis-memory" 2>&1 || true
         docker exec bench-redis redis-cli dbsize >"$OUT/$1.redis-keys" 2>&1 || true
     fi

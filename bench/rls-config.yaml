@@ -1,9 +1,9 @@
 # envoyproxy/ratelimit's limits for bench/envoy-rl.yaml: each client address its own key,
-# a fixed window of a second that no request reaches, so that every request is counted in
-# Redis and none refused.
+# RL_RATE in a fixed window of a second (bench/run.sh fills in @RATE@), every request
+# counted in Redis.
 domain: edgerush-bench
 descriptors:
   - key: remote_address
     rate_limit:
       unit: second
-      requests_per_unit: 1000000
+      requests_per_unit: @RATE@

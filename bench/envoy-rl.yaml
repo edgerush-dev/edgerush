@@ -1,13 +1,16 @@
 # Envoy as bench/envoy.yaml has it, with its global rate limit: every request forwarded is
 # first asked of envoyproxy/ratelimit over gRPC, which counts in Redis, keyed by the
 # client's address as EdgeRush's per-client limit is (bench/run.sh `ratelimit`, variant
-# envoy-rl). The limit (bench/rls-config.yaml) is one no request reaches, so that every
-# request is decided and none refused, as EdgeRush's is in that scenario.
+# envoy-rl). Like for like with EdgeRush's synchronous mode (ours-sync): the ask waits
+# RL_SYNC_TIMEOUT_MS and, unanswered, is let through or refused with a 503 as
+# RL_SYNC_UNREACHABLE says; the limit is RL_RATE, counted in windows of a second
+# (bench/rls-config.yaml: the service has no bucket, so RL_BURST has no counterpart).
+# bench/run.sh fills in the @...@ values and, with TLS=1, the listener's certificate.
 #
-# Tuned for its best: the rate limit cluster's circuit breakers raised from their 1024, and
-# a timeout of a second on the ask rather than 20 ms, so that a slow answer is waited for
-# rather than let through unchecked (`failure_mode_deny` off counts it as an error and
-# admits it); the admin interface on 127.0.0.1:9901 for its ratelimit counters.
+# The generators send no X-Forwarded-For, so `remote_address` is the peer's address without
+# `use_remote_address`, which bench/envoy.yaml leaves off as well. The rate limit cluster's
+# circuit breakers are raised from their 1024; the admin interface on 127.0.0.1:9901 gives
+# its ratelimit counters.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9901 }
@@ -25,15 +28,14 @@ static_resources:
                 codec_type: AUTO
                 generate_request_id: false
                 server_header_transformation: PASS_THROUGH
-                # The peer's address is the client's: the `remote_address` the limit keys by.
-                use_remote_address: true
                 http_filters:
                   - name: envoy.filters.http.ratelimit
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
                       domain: edgerush-bench
-                      timeout: 1s
-                      failure_mode_deny: false
+                      timeout: @TIMEOUT_MS@ms
+                      failure_mode_deny: @DENY@
+                      status_on_error: { code: ServiceUnavailable }
                       rate_limit_service:
                         transport_api_version: V3
                         grpc_service:
