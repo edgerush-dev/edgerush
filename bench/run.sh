@@ -52,7 +52,9 @@
 #                                             asked about, every key visited), -nopoll,
 #                                             -local, -both, -sched, -local-sched and
 #                                             -both-sched, ours-local (local mode: the
-#                                             process alone, no service),
+#                                             process alone, no service), ours-sync
+#                                             (the synchronous mode: a pod of its own
+#                                             decides every request),
 #                                             nginx-rl and haproxy-rl (theirs, as local:
 #                                             limit_req; a stick table's request rate),
 #                                             envoy-rl (Envoy's global rate limit:
@@ -145,8 +147,14 @@ repo=$(dirname "$here")
 : "${WSBENCH:=$here/wsbench/target/release/wsbench}"
 # The `ratelimit` scenario's service pod, on the backend's CPUs.
 : "${RL_SERVICE:=$repo/target/release/edgerush-ratelimit-service}"
-# The rate-limiting service's cycle, in milliseconds: the data planes' and the pod's alike.
+# The rate-limiting service's cycle, in milliseconds: the data planes' and the pod's alike
+# (the synchronous pod's between its copies of what changed).
 : "${RL_CYCLE_MS:=10}"
+# The ours-sync variant's wait for its owner, in milliseconds, and what a request does when
+# the owner does not answer in time: deny, so that it shows among the answers that are not
+# 2xx rather than passing as served; allow or local otherwise.
+: "${RL_SYNC_TIMEOUT_MS:=20}"
+: "${RL_SYNC_UNREACHABLE:=deny}"
 # The `ratelimit` scenario's keys beyond its busy ones: RL_RESIDENT more client addresses
 # met once each before the run (wsbench --resident), quiet keys the limits then hold; and
 # RL_MAX_KEY_BYTES, the bytes their keys may hold, the proxy's and the service pod's alike
@@ -552,6 +560,13 @@ CFG
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config.rl" \
             --workers "$WORKERS" $idle ${METRICS:+--metrics "$METRICS"} 2>>"$OUT/proxy.log" &
         ;;
+    ours-sync)
+        # EdgeRush under a per-client limit in the synchronous mode: the service's pod
+        # decides every request.
+        rl_config sync-mode
+        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config.rl" \
+            --workers "$WORKERS" $idle ${METRICS:+--metrics "$METRICS"} 2>>"$OUT/proxy.log" &
+        ;;
     ours-rl-*)
         # EdgeRush under a per-client limit, its levers as the name says.
         rl_config "${1#ours-rl-}"
@@ -607,8 +622,8 @@ rl_config() { # levers
     sched) sharing=$(levers true true true) ;;
     local-sched) sharing=$(levers true false true) ;;
     both-sched) sharing=$(levers false false true) ;;
-    # Local mode: no service, no levers.
-    local-mode) sharing= ;;
+    # Local mode: no service, no levers; the synchronous mode has none either.
+    local-mode | sync-mode) sharing= ;;
     *) echo "no levers $1" >&2; exit 2 ;;
     esac
     cat >"$run-limits.yaml" <<LIMITS
@@ -628,27 +643,45 @@ PY
             "${RL_MAX_KEY_BYTES:+, max_key_bytes: $RL_MAX_KEY_BYTES}" "$run-limits.yaml" >>"$config.rl"
         return
     fi
+    if [ "$1" = sync-mode ]; then
+        printf 'rate_limiting: { mode: synchronous%s, service: { addresses: ["127.0.0.1:7001"] }, synchronous: { timeout_ms: %s, when_unreachable: %s, breaker: { failures: 5, probe_after_ms: 1000 } } }\nlimits_file: %s\n' \
+            "${RL_MAX_KEY_BYTES:+, max_key_bytes: $RL_MAX_KEY_BYTES}" "$RL_SYNC_TIMEOUT_MS" \
+            "$RL_SYNC_UNREACHABLE" "$run-limits.yaml" >>"$config.rl"
+        return
+    fi
     printf 'rate_limiting: { mode: asynchronous%s, service: { addresses: ["127.0.0.1:7000"], cycle_ms: %s%s } }\nlimits_file: %s\n' \
         "${RL_MAX_KEY_BYTES:+, max_key_bytes: $RL_MAX_KEY_BYTES}" "$RL_CYCLE_MS" "$sharing" \
         "$run-limits.yaml" >>"$config.rl"
 }
 
-# The service's one pod, for `ratelimit`.
+# The service's one pod, for `ratelimit`; and, when an ours-sync variant is to run, a
+# second pod of its own serving the synchronous mode, since a pod serves one mode.
 rl_pid=
+rl_sync_pid=
 start_rl_service() {
     [ -x "$RL_SERVICE" ] || { echo "no service at $RL_SERVICE: build it first" >&2; exit 2; }
     taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --id 0 --listen 127.0.0.1:7000 --cycle-ms "$RL_CYCLE_MS" \
         --pod 0=127.0.0.1:7000 ${RL_MAX_KEY_BYTES:+--max-key-bytes "$RL_MAX_KEY_BYTES"} \
         2>>"$OUT/rl-service.log" &
     rl_pid=$!
+    case " $VARIANTS " in
+    *" ours-sync "*)
+        taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --mode synchronous --id 0 --listen 127.0.0.1:7001 \
+            --cycle-ms "$RL_CYCLE_MS" --pod 0=127.0.0.1:7001 \
+            ${RL_MAX_KEY_BYTES:+--max-key-bytes "$RL_MAX_KEY_BYTES"} 2>>"$OUT/rl-sync-service.log" &
+        rl_sync_pid=$!
+        ;;
+    esac
     sleep 2
 }
 
 stop_rl_service() {
-    [ -n "$rl_pid" ] || return 0
-    kill "$rl_pid" 2>/dev/null || true
-    wait "$rl_pid" 2>/dev/null || true
-    rl_pid=
+    local pid
+    for pid in $rl_pid $rl_sync_pid; do
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+    rl_pid= rl_sync_pid=
 }
 
 # The envoy-rl variant's service and its Redis, for `ratelimit`, if it is to run.
@@ -689,6 +722,10 @@ service_cpu() {
     local ticks=0 container id usage
     [ -n "$rl_pid" ] && ticks=$(awk '{print $14 + $15}' "/proc/$rl_pid/stat" 2>/dev/null || echo 0)
     printf 'edgerush-service %s\n' "$((ticks * 1000000 / $(getconf CLK_TCK)))"
+    if [ -n "$rl_sync_pid" ]; then
+        ticks=$(awk '{print $14 + $15}' "/proc/$rl_sync_pid/stat" 2>/dev/null || echo 0)
+        printf 'edgerush-sync-service %s\n' "$((ticks * 1000000 / $(getconf CLK_TCK)))"
+    fi
     for container in bench-rls bench-redis; do
         id=$(docker inspect -f '{{.Id}}' "$container" 2>/dev/null) || continue
         usage=$(awk '/usage_usec/ {print $2}' "/sys/fs/cgroup/system.slice/docker-$id.scope/cpu.stat" 2>/dev/null || echo 0)
