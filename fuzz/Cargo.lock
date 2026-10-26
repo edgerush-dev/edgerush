@@ -358,6 +358,7 @@ dependencies = [
 name = "edgerush-ratelimit"
 version = "0.0.0"
 dependencies = [
+ "hashbrown",
  "portable-atomic",
 ]
 
