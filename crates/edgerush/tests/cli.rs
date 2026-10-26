@@ -438,7 +438,7 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
     std::fs::create_dir_all(manifests.join("shop"))?;
     let plane = |listeners: &str| {
         format!(
-            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\nlisteners:\n{listeners}"
+            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\nlisteners:\n{listeners}"
         )
     };
     let http = "  http: { address: \"[::]:8080\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n";
@@ -487,8 +487,9 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
     std::fs::remove_file(manifests.join("rewritten.yml"))?;
 
     // A Secret `tls` names is taken as it will be in the cluster, not looked at, unless
-    // asked: the host is secured as named, and the summary says so. Asked, one not among the
-    // manifests leaves its host over plain HTTP, and is said.
+    // asked: the host is secured as named, a route over HTTPS and one redirecting plain
+    // HTTP there, and the summary says so. Asked, one not among the manifests leaves its
+    // host over plain HTTP, and is said.
     std::fs::write(
         manifests.join("tls.yml"),
         "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: { name: secure, namespace: shop }\nspec:\n  ingressClassName: edge\n  tls: [{ hosts: [secure.example.com], secretName: secure }]\n  rules:\n    - host: secure.example.com\n      http:\n        paths:\n          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }\n",
@@ -513,7 +514,7 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "2 routes and 1 upstreams translated; 0 left out; 0 paths without their backend; 0 TLS hosts or entries not served as listed; 0 paths shadowed; 1 Ingresses of other classes or none passed over\nTLS Secrets were taken as they will be in the cluster, not checked: --check-secrets checks them\n"
+        "3 routes and 1 upstreams translated; 0 left out; 0 paths without their backend; 0 TLS hosts or entries not served as listed; 0 paths shadowed; 1 Ingresses of other classes or none passed over\nTLS Secrets were taken as they will be in the cluster, not checked: --check-secrets checks them\n"
     );
     let output = secured(true)?;
     assert_eq!(output.status.code(), Some(1), "{output:?}");

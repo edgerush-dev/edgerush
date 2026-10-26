@@ -1,6 +1,7 @@
 ingress_class: theirs
 cluster_domain: cluster.local
 ingress_hosts_fall_through: false
+ingress_https_redirect: true
 listeners:
   http:
     address: "[::]:8080"

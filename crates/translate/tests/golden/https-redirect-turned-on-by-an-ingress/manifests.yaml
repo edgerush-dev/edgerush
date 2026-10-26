@@ -1,0 +1,40 @@
+# Where the data plane does not redirect, an Ingress that asks for it is redirected on the
+# hosts it has over HTTPS, and only there: its host without TLS is served over plain HTTP.
+# One that does not ask is served over both.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: asks
+  namespace: shop
+  creationTimestamp: "2026-01-01T00:00:00Z"
+  annotations: { gateway.edgerush.dev/https-redirect: "true" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [shop.example.com], secretName: shop-tls }]
+  rules:
+    - host: "shop.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "plain.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: other, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [secure.example.com], secretName: secure }]
+  rules:
+    - host: "secure.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

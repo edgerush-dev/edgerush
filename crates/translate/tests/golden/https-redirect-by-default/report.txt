@@ -1,0 +1,2 @@
+Ingress shop/odd: annotation `gateway.edgerush.dev/https-redirect` is neither "true" nor "false"
+Ingress shop/mixed: not supported yet: annotations

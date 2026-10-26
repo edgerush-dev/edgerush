@@ -8,19 +8,21 @@
 //! **It never fails as a whole.** What it cannot translate is left out, object by object,
 //! and said in its report. So far it translates Ingresses whose rules route paths, of any
 //! path type and on any host, and whose default backend takes the rest, to a Service's
-//! port, and that carry no annotations; an Ingress
+//! port, and that carry no annotations but the redirect's below; an Ingress
 //! that asks for anything more is left out whole, reported as not supported yet, rather
 //! than translated in part. A path whose Service, or port, is not there, or whose port's
 //! `appProtocol` the gateway does not speak, is translated with an invalid backend, answered
 //! 500, and reported too. Hosts its `tls` lists are served on the `https` listeners as well,
 //! with their Secret's certificate, read as the data plane reads one; a host whose Secret
-//! is not there, cannot be used or does not cover it stays on `http`, and is reported.
+//! is not there, cannot be used or does not cover it stays on `http`, and is reported. Over
+//! plain HTTP, a host served over HTTPS is redirected there, unless the data plane's
+//! settings or the Ingress's `gateway.edgerush.dev/https-redirect` annotation say not.
 
 use edgerush_certificates::Identity;
 use edgerush_config::{
     Backend, Certificate, Config, DataPlane, Endpoints, Forward, Hostname, Listener,
-    ListenerCertificate, LoadBalancer, Match, PathMatch, Protocol, Route, Rule, StatedNames,
-    Upstream, UpstreamProtocol, UpstreamTls, Wildcard, compile,
+    ListenerCertificate, LoadBalancer, Match, PathMatch, Protocol, Query, Redirect, Route, Rule,
+    Scheme, StatedNames, Upstream, UpstreamProtocol, UpstreamTls, Wildcard, compile,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::{
@@ -52,6 +54,10 @@ pub struct Plane {
     /// Whether an Ingress host stays a candidate on hosts a more specific claim also covers:
     /// false is nginx's way ([04 §5](../../../docs/04-control-plane.md)).
     pub ingress_hosts_fall_through: bool,
+    /// Whether a request over plain HTTP to a host an Ingress secures is redirected to
+    /// HTTPS, as ingress-nginx's `ssl-redirect` has it; an Ingress may say otherwise for its
+    /// own routes ([04 §5](../../../docs/04-control-plane.md)).
+    pub ingress_https_redirect: bool,
     /// The certificates, in PEM, of the authorities trusted to vouch for a backend reached
     /// over TLS: a Service port whose `appProtocol` is `kubernetes.io/wss`. None, and such
     /// a backend is answered 500.
@@ -341,6 +347,9 @@ pub enum Problem {
     /// It is not what Kubernetes allows, which its API server would have refused.
     #[error("invalid: {0}")]
     Invalid(&'static str),
+    /// An annotation that takes `"true"` or `"false"` has another value.
+    #[error("annotation `{0}` is neither \"true\" nor \"false\"")]
+    NotBoolean(&'static str),
     /// Translated, it is what the data plane would refuse: its problems, as compiling it
     /// says them.
     #[error("the data plane would refuse it: {0}")]
@@ -477,6 +486,8 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     // Every Ingress in, a host some Ingress secures is served over HTTPS whichever Ingress's
     // route it is, so that both kinds of listener rank the same paths for it; a host none
     // secures is refused over HTTPS by name, so that no wildcard's route takes it there.
+    // Over plain HTTP, a route on a secured host redirects to HTTPS unless its Ingress says
+    // not, as ingress-nginx redirects a path of a host it has a certificate for (04 §5).
     // A host served on no listener at all is said as such, and nothing else of it.
     let https: Vec<String> = plane
         .listeners
@@ -501,7 +512,18 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 .first()
                 .map(|hostname| hostname.name.clone());
             let host = host.unwrap_or_default();
+            let mut redirect = None;
             if stated.contains_key(&host) {
+                if translated.https_redirect {
+                    let (http, own): (Vec<String>, Vec<String>) = route
+                        .listeners
+                        .drain(..)
+                        .partition(|listener| !https.contains(listener));
+                    route.listeners = own;
+                    if !http.is_empty() {
+                        redirect = Some(https_redirect(&route, http));
+                    }
+                }
                 for listener in &https {
                     if !route.listeners.contains(listener) {
                         route.listeners.push(listener.clone());
@@ -533,6 +555,9 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             }
             served.push(host);
             routes.push(route);
+            // In the route's place on the `http` listeners, so that they rank its paths as
+            // they would its own; its claims are the route's, said once.
+            routes.extend(redirect);
         }
         tls.extend(
             translated
@@ -707,6 +732,10 @@ fn class_claim(plane: &Plane, cluster: &Cluster, report: &mut Vec<Finding>) -> O
 /// The annotation an IngressClass is made the cluster's default with.
 const DEFAULT_CLASS_ANNOTATION: &str = "ingressclass.kubernetes.io/is-default-class";
 
+/// The annotation an Ingress turns the redirect from plain HTTP to HTTPS on or off with, for
+/// its own routes, whatever the data plane's setting: `"true"` or `"false"`.
+pub const HTTPS_REDIRECT_ANNOTATION: &str = "gateway.edgerush.dev/https-redirect";
+
 /// The annotation that named an Ingress's class before `ingressClassName`, and still does
 /// where that is left out.
 const CLASS_ANNOTATION: &str = "kubernetes.io/ingress.class";
@@ -745,6 +774,8 @@ struct IngressRoutes {
     notes: Vec<TlsProblem>,
     /// Each host `tls` lists that its own Secret does not secure, and why.
     unsecured: Vec<(String, String)>,
+    /// Whether its routes on a host served over HTTPS redirect there over plain HTTP.
+    https_redirect: bool,
 }
 
 /// An Ingress's routes, the upstreams they lead to, the certificates of its secured hosts,
@@ -773,17 +804,29 @@ fn ingress_routes(
         ));
     }
     // Annotations change what an Ingress does (a rewrite, a redirect, a limit), so one that
-    // has any is not translated until they are read; all but kubectl's own record of what it
-    // applied, which says nothing of routing and is on whatever `kubectl apply` made.
-    if ingress
-        .metadata
-        .annotations
+    // has any is not translated until they are read; all but those read already and
+    // kubectl's own record of what it applied, which says nothing of routing and is on
+    // whatever `kubectl apply` made.
+    let annotations = ingress.metadata.annotations.as_ref();
+    if annotations
         .iter()
-        .flatten()
-        .any(|(name, _)| name != "kubectl.kubernetes.io/last-applied-configuration")
+        .flat_map(|annotations| annotations.keys())
+        .any(|name| {
+            name != "kubectl.kubernetes.io/last-applied-configuration"
+                && name != HTTPS_REDIRECT_ANNOTATION
+        })
     {
         return Err(Problem::NotSupportedYet("annotations"));
     }
+    let https_redirect = match annotations
+        .and_then(|annotations| annotations.get(HTTPS_REDIRECT_ANNOTATION))
+        .map(String::as_str)
+    {
+        None => plane.ingress_https_redirect,
+        Some("true") => true,
+        Some("false") => false,
+        Some(_) => return Err(Problem::NotBoolean(HTTPS_REDIRECT_ANNOTATION)),
+    };
     let Some(spec) = ingress.spec.as_ref().filter(|spec| {
         spec.default_backend.is_some() || spec.rules.as_ref().is_some_and(|rules| !rules.is_empty())
     }) else {
@@ -987,6 +1030,7 @@ fn ingress_routes(
         certificates,
         notes,
         unsecured,
+        https_redirect,
     })
 }
 
@@ -1023,6 +1067,39 @@ fn secret_certificate(
     let identity = Identity::read(&certificate)
         .map_err(|error| format!("Secret {namespace}/{name} cannot be used: {error}"))?;
     Ok((certificate, identity))
+}
+
+/// The route that answers on `listeners` what `route` takes, each of its paths, with a
+/// redirect to the same URL over HTTPS: on its default port, the one a data plane's Service
+/// serves HTTPS on (05 §1); 308, so that a client keeps its method and body, as ingress-nginx
+/// answers; and the query kept.
+fn https_redirect(route: &Route, listeners: Vec<String>) -> Route {
+    let rules = route
+        .rules
+        .iter()
+        .map(|rule| Rule {
+            matches: rule.matches.clone(),
+            filters: Vec::new(),
+            forward: None,
+            redirect: Some(Redirect {
+                status: 308,
+                scheme: Some(Scheme::Https),
+                host: None,
+                port: None,
+                path: None,
+                query: Query::Keep,
+            }),
+            paths: rule.paths.clone(),
+            rate_limits: Vec::new(),
+        })
+        .collect();
+    Route {
+        name: format!("{}/https-redirect", route.name),
+        listeners,
+        hostnames: route.hostnames.clone(),
+        rules,
+        rate_limits: Vec::new(),
+    }
 }
 
 /// A rule forwarding what `path` matches to `backend`.
@@ -1175,7 +1252,7 @@ mod tests {
     /// plane refuses, translated for a data plane with these listeners.
     fn good_and_bad(listeners: &str) -> Translation {
         let plane: Plane = serde_saphyr::from_str(&format!(
-            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\nlisteners:\n{listeners}"
+            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\nlisteners:\n{listeners}"
         ))
         .unwrap();
         let ingress = |name: &str, path: &str| -> Ingress {
@@ -1238,7 +1315,7 @@ spec: { controller: edgerush.dev/ingress-controller }
     #[test]
     fn assumed_secrets_secure_their_hosts_unread() {
         let plane: Plane = serde_saphyr::from_str(&format!(
-            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\nlisteners:\n{HTTP}  https: {{ address: \"[::]:8443\", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [], without_sni: none }} }}\n"
+            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\nlisteners:\n{HTTP}  https: {{ address: \"[::]:8443\", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [], without_sni: none }} }}\n"
         ))
         .unwrap();
         let cluster = |secrets_assumed| {
@@ -1268,7 +1345,9 @@ spec: { controller: edgerush.dev/ingress-controller }
 
         let assumed = translate(&plane, &cluster(true));
         assert!(assumed.tls.is_empty(), "{:?}", assumed.tls);
-        assert_eq!(assumed.config.routes[0].listeners, ["http", "https"]);
+        assert_eq!(assumed.config.routes[0].listeners, ["https"]);
+        assert_eq!(assumed.config.routes[1].listeners, ["http"]);
+        assert!(assumed.config.routes[1].rules[0].redirect.is_some());
         let unread = Certificate {
             chain: String::new(),
             key: String::new(),
