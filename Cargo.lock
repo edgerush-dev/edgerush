@@ -304,6 +304,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-discovery"
+version = "0.0.0"
+dependencies = [
+ "edgerush-config",
+ "k8s-openapi",
+ "proptest",
+ "serde-saphyr",
+]
+
+[[package]]
 name = "edgerush-explain"
 version = "0.0.0"
 dependencies = [
