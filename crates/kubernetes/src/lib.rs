@@ -519,5 +519,11 @@ async fn read_whole(
     Ok(whole.freeze())
 }
 
+mod follow;
+
+pub use follow::{Failure, Retry, Slices, follow};
+
+#[cfg(test)]
+mod fake;
 #[cfg(test)]
 mod tests;

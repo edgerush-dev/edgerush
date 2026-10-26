@@ -345,6 +345,7 @@ dependencies = [
  "boring",
  "bytes",
  "edgerush-certificates",
+ "edgerush-discovery",
  "h2",
  "http",
  "k8s-openapi",
