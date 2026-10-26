@@ -16,7 +16,8 @@ use boring::x509::extension::SubjectAlternativeName;
 use boring::x509::{X509, X509NameBuilder};
 use edgerush_config::Certificate;
 
-/// A self-signed certificate for `names`, with its key.
+/// A self-signed certificate for `names`, with its key: each an IP address, or else a DNS
+/// name.
 #[must_use]
 pub fn certificate(names: &[&str]) -> Certificate {
     let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
@@ -42,7 +43,11 @@ pub fn certificate(names: &[&str]) -> Certificate {
     if !names.is_empty() {
         let mut alternatives = SubjectAlternativeName::new();
         for name in names {
-            alternatives.dns(name);
+            if name.parse::<std::net::IpAddr>().is_ok() {
+                alternatives.ip(name);
+            } else {
+                alternatives.dns(name);
+            }
         }
         let alternatives = alternatives
             .build(&builder.x509v3_context(None, None))
