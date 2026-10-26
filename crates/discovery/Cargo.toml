@@ -1,0 +1,20 @@
+[package]
+name = "edgerush-discovery"
+description = "EdgeRush discovery: a Service's endpoints from its EndpointSlices, pure, no I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+edgerush-config.workspace = true
+k8s-openapi.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# Tests write EndpointSlices as the cluster sends them. The crate knows no format.
+serde-saphyr.workspace = true
+
+[lints]
+workspace = true
