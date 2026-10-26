@@ -396,6 +396,12 @@ pub struct Proxy {
     /// What the listeners' access logs are written to, and the thread that writes them
     /// ([21 §4](../../docs/21-access-logs.md)).
     logs: Logs,
+    /// The endpoints discovered of the Kubernetes Services upstreams name
+    /// ([`Proxy::rediscover`]): every snapshot takes its discovered upstreams' from here.
+    discovered: std::sync::Mutex<plane::Discovered>,
+    /// Held while a snapshot is made and taken in, by a reload or by endpoints discovered,
+    /// so that the two never start from one snapshot and the later undo the other.
+    making: std::sync::Mutex<()>,
 }
 
 /// The data plane's rate limits: whether they were started, and the thread the running
@@ -726,7 +732,8 @@ impl Admitted {
 /// A compiled config and what the data plane works out from it, once, when it arrives.
 #[derive(Debug)]
 struct Snapshot {
-    config: Compiled,
+    /// Shared with the snapshots made of it for endpoints discovered.
+    config: Arc<Compiled>,
     /// Which config this is, counting from the first: what tells a worker its balancing
     /// state is for an earlier one.
     generation: u64,
@@ -1196,10 +1203,6 @@ pub enum ProxyError {
     /// BoringSSL could not give the keys the data plane makes at start.
     #[error("no random keys to be had: {0}")]
     Random(String),
-    /// An upstream whose endpoints come from Kubernetes, which the data plane cannot
-    /// follow yet: it does not watch EndpointSlices.
-    #[error("upstream `{0}`: endpoints from Kubernetes are not served yet")]
-    KubernetesDiscoveryNotBuilt(String),
     /// A rate-limiting service on a machine without native 128-bit atomics.
     #[error(
         "`rate_limiting`: this machine has no native 128-bit compare-and-swap, which rate \

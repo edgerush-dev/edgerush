@@ -1,6 +1,9 @@
 //! The data plane: what a reload keeps, its listeners, and its own answers.
 
 use super::*;
+use k8s_openapi::api::discovery::v1::EndpointSlice;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 
 /// A config with the named upstreams, each at the address given.
 fn upstreams(named: &[(&str, &str)]) -> Compiled {
@@ -47,40 +50,172 @@ fn a_reload_keeps_what_has_not_changed_and_retires_what_has() {
     assert!(zed.is_retired(), "an upstream that is gone was left live");
 }
 
-/// An upstream whose endpoints come from Kubernetes would never have one while the data
-/// plane does not watch EndpointSlices: such a config is refused at start, and on a reload,
-/// which leaves the running config as it was.
-#[test]
-fn endpoints_from_kubernetes_are_refused_until_they_can_be_followed() {
-    let discovered = |name: &str| {
-        let yaml = format!(
-            "listeners: {{}}
+/// A config whose upstream `web` follows `service`'s endpoints, and `listed` one at
+/// `127.0.0.1:1`.
+fn discovering(service: &str) -> Compiled {
+    let yaml = format!(
+        "listeners: {{}}
 routes: []
 upstreams:
-  {name}: {{ load_balancer: p2c, endpoints: {{ kubernetes: \"web.shop.svc.cluster.local:http\" }} }}
+  listed: {{ load_balancer: p2c, endpoints: {{ listed: [\"127.0.0.1:1\"] }} }}
+  web: {{ load_balancer: p2c, endpoints: {{ kubernetes: \"{service}\" }} }}
 "
-        );
-        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
-        compile(&config).unwrap()
-    };
-    assert!(matches!(
-        Proxy::new(discovered("shop"), NonZeroUsize::MIN),
-        Err(ProxyError::KubernetesDiscoveryNotBuilt(name)) if name == "shop"
-    ));
-
-    let proxy = Proxy::new(upstreams(&[("web", "127.0.0.1:1")]), NonZeroUsize::MIN).unwrap();
-    let web = filed_under(&proxy, 0);
-    assert_eq!(
-        proxy.reload(discovered("web")).unwrap_err().to_string(),
-        "upstream `web`: endpoints from Kubernetes are not served yet"
     );
-    assert_eq!(
-        filed_under(&proxy, 0),
-        web,
-        "a refused reload changed the config"
-    );
+    let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+    compile(&config).unwrap()
 }
 
+/// A slice of Service `service` in `shop`, its port `port` (unnamed if empty) on 8080, of
+/// these ready endpoints.
+fn slice(service: &str, port: &str, addresses: &[&str]) -> EndpointSlice {
+    let addresses: Vec<String> = addresses
+        .iter()
+        .map(|address| format!("{{ addresses: [\"{address}\"] }}"))
+        .collect();
+    serde_saphyr::from_str(&format!(
+        "metadata: {{ name: {service}-1, namespace: shop, labels: {{ kubernetes.io/service-name: {service} }} }}\naddressType: IPv4\nports: [{{ name: \"{port}\", port: 8080 }}]\nendpoints: [{}]\n",
+        addresses.join(", ")
+    ))
+    .unwrap()
+}
+
+fn shop(slices: Vec<EndpointSlice>) -> (String, Option<Arc<[EndpointSlice]>>) {
+    ("shop".to_owned(), Some(slices.into()))
+}
+
+/// The destinations of the running config's upstream at `upstream`: address and key.
+fn destinations_of(proxy: &Proxy, upstream: usize) -> Vec<(SocketAddr, u64)> {
+    let snapshot = proxy.current.load();
+    (0..)
+        .map_while(|at| snapshot.destinations.at(upstream, at))
+        .map(|identity| (identity.address(), identity.key()))
+        .collect()
+}
+
+fn addresses_of(proxy: &Proxy, upstream: usize) -> Vec<String> {
+    destinations_of(proxy, upstream)
+        .into_iter()
+        .map(|(address, _)| address.to_string())
+        .collect()
+}
+
+/// An upstream that follows a Service has no endpoint until its namespace's slices are
+/// told, and is then served with them as a reload serves a config: an endpoint kept keeps
+/// what its connections are filed under, one gone is retired, and the config itself is the
+/// same.
+#[test]
+fn discovered_endpoints_are_served_and_changed_as_a_reload_changes_them() {
+    let proxy = Proxy::new(
+        discovering("web.shop.svc.cluster.local:http"),
+        NonZeroUsize::MIN,
+    )
+    .unwrap();
+    assert!(destinations_of(&proxy, 1).is_empty());
+    let listed = filed_under(&proxy, 0);
+
+    let both = vec![slice("web", "http", &["10.0.0.1", "10.0.0.2"])];
+    assert!(proxy.rediscover([shop(both.clone())]).unwrap());
+    assert_eq!(addresses_of(&proxy, 1), ["10.0.0.1:8080", "10.0.0.2:8080"]);
+    let first = destinations_of(&proxy, 1);
+    let generation = proxy.current.load().generation;
+
+    // The same again, or another Service's slices beside them, changes nothing running:
+    // no snapshot is made.
+    assert!(!proxy.rediscover([shop(both)]).unwrap());
+    let beside = vec![
+        slice("web", "http", &["10.0.0.1", "10.0.0.2"]),
+        slice("api", "http", &["10.0.1.1"]),
+    ];
+    assert!(!proxy.rediscover([shop(beside)]).unwrap());
+    assert_eq!(proxy.current.load().generation, generation);
+
+    let gone = Arc::clone(proxy.current.load().destinations.at(1, 0).unwrap());
+    let moved = vec![slice("web", "http", &["10.0.0.2", "10.0.0.3"])];
+    assert!(proxy.rediscover([shop(moved)]).unwrap());
+    let second = destinations_of(&proxy, 1);
+    assert_eq!(second[0], first[1], "an endpoint kept changed hands");
+    assert_ne!(second[1].1, first[0].1);
+    assert!(gone.is_retired(), "an endpoint gone was left live");
+    assert_eq!(
+        filed_under(&proxy, 0),
+        listed,
+        "a listed upstream changed hands"
+    );
+
+    // A reload of a config that still names the Service keeps what was discovered of it.
+    proxy
+        .reload(discovering("web.shop.svc.cluster.local:http"))
+        .unwrap();
+    assert_eq!(destinations_of(&proxy, 1), second);
+
+    // The namespace no longer followed: none served, and those there were retired.
+    let last = Arc::clone(proxy.current.load().destinations.at(1, 0).unwrap());
+    assert!(proxy.rediscover([("shop".to_owned(), None)]).unwrap());
+    assert!(destinations_of(&proxy, 1).is_empty());
+    assert!(last.is_retired());
+}
+
+/// A config that comes to name another Service of a namespace followed has its endpoints
+/// in the very snapshot that takes it in, the Service's only port unnamed as much as named.
+#[test]
+fn an_upstream_a_reload_adds_has_its_endpoints_at_once() {
+    let proxy = Proxy::new(
+        discovering("web.shop.svc.cluster.local:http"),
+        NonZeroUsize::MIN,
+    )
+    .unwrap();
+    let slices = vec![
+        slice("web", "http", &["10.0.0.1"]),
+        slice("api", "http", &["10.0.1.1"]),
+        slice("only", "", &["10.0.2.1"]),
+    ];
+    assert!(proxy.rediscover([shop(slices)]).unwrap());
+
+    proxy
+        .reload(discovering("api.shop.svc.cluster.local:http"))
+        .unwrap();
+    assert_eq!(addresses_of(&proxy, 1), ["10.0.1.1:8080"]);
+    proxy
+        .reload(discovering("only.shop.svc.cluster.local:80"))
+        .unwrap();
+    assert_eq!(addresses_of(&proxy, 1), ["10.0.2.1:8080"]);
+}
+
+/// A reload and slices discovered, taken in at once from two threads, never undo each
+/// other: the last of each is what runs.
+#[test]
+fn reloads_and_discoveries_at_once_lose_neither() {
+    let proxy = Arc::new(
+        Proxy::new(
+            discovering("web.shop.svc.cluster.local:http"),
+            NonZeroUsize::MIN,
+        )
+        .unwrap(),
+    );
+    let rounds = 200u16;
+    let reloading = {
+        let proxy = Arc::clone(&proxy);
+        std::thread::spawn(move || {
+            for _ in 0..rounds {
+                proxy
+                    .reload(discovering("web.shop.svc.cluster.local:http"))
+                    .unwrap();
+            }
+        })
+    };
+    for round in 1..=rounds {
+        let address = format!("10.0.{}.{}", round / 256, round % 256);
+        proxy
+            .rediscover([shop(vec![slice("web", "http", &[&address])])])
+            .unwrap();
+    }
+    reloading.join().unwrap();
+    assert_eq!(
+        addresses_of(&proxy, 1),
+        [format!("10.0.{}.{}:8080", rounds / 256, rounds % 256)],
+        "a reload undid the last slices discovered"
+    );
+}
 /// Reads a body to its end and says whether its connection went back.
 async fn drain(
     mut body: H1Body<UpstreamSocket, http_body_util::Empty<Bytes>>,
@@ -176,7 +311,8 @@ fn a_snapshot_knows_where_it_has_the_listeners_that_have_sockets() {
     let metrics = Metrics::new(NonZeroUsize::MIN, sockets.len());
     let listeners = |names: &[&str]| {
         Snapshot::new(
-            config_with(names),
+            Arc::new(config_with(names)),
+            &HashMap::new(),
             &sockets,
             &metrics,
             None,

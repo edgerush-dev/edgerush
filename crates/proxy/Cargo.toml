@@ -25,6 +25,8 @@ boring.workspace = true
 bytes.workspace = true
 edgerush-certificates.workspace = true
 edgerush-config.workspace = true
+# Which of a Service's EndpointSlices' endpoints take requests.
+edgerush-discovery.workspace = true
 edgerush-filters.workspace = true
 # Rules' rate limits (experimental): each worker a data plane of the rate-limiting
 # service's protocol, reaching the service through that crate's gRPC client.
@@ -39,6 +41,8 @@ http-body.workspace = true
 http-body-util.workspace = true
 httparse.workspace = true
 hyper = { workspace = true, optional = true }
+# The EndpointSlices of namespaces followed, as the API gives them.
+k8s-openapi.workspace = true
 hyper-util = { workspace = true, optional = true }
 memchr.workspace = true
 quiche.workspace = true
