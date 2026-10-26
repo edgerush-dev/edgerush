@@ -311,6 +311,7 @@ dependencies = [
  "k8s-openapi",
  "proptest",
  "serde-saphyr",
+ "thiserror",
 ]
 
 [[package]]
