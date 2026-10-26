@@ -383,7 +383,9 @@ envoy_config() { # template
 import re, sys
 template, out, rate, burst, timeout_ms, deny, tls, tls_dir = sys.argv[1:]
 s = open(template).read()
-for name, value in (("RATE", rate), ("BURST", burst), ("TIMEOUT_MS", timeout_ms), ("DENY", deny)):
+# A protobuf Duration in JSON is seconds: 20 ms is 0.02s.
+timeout = f"{int(timeout_ms) / 1000:g}s"
+for name, value in (("RATE", rate), ("BURST", burst), ("TIMEOUT", timeout), ("DENY", deny)):
     s = s.replace(f"@{name}@", value)
 left = re.findall(r"@[A-Z_]+@", s)
 assert not left, f"not filled in: {left}"
