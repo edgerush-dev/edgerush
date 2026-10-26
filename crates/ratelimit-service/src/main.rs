@@ -109,6 +109,19 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     })
 }
 
+/// A synchronous pod runs on one thread: a stream's decisions and its connection's writes
+/// share it, so that the asks one read brings in are answered in one write, where a
+/// connection on another thread would take the answers a few at a time as they are decided.
+/// The asynchronous pod keeps a thread a core.
+fn runtime(mode: Mode) -> std::io::Result<tokio::runtime::Runtime> {
+    match mode {
+        Mode::Synchronous => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build(),
+        Mode::Asynchronous => tokio::runtime::Runtime::new(),
+    }
+}
+
 fn main() -> ExitCode {
     let args = match parse(std::env::args().skip(1)) {
         Ok(args) => args,
@@ -117,7 +130,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let runtime = match tokio::runtime::Runtime::new() {
+    let runtime = match runtime(args.mode) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("edgerush-ratelimit-service: no runtime: {error}");
@@ -221,6 +234,14 @@ mod tests {
         "--pod",
         "0=rl-0:7000",
     ];
+
+    #[test]
+    fn a_synchronous_pod_runs_on_one_thread() {
+        use tokio::runtime::RuntimeFlavor;
+        let flavor = |mode| runtime(mode).unwrap().handle().runtime_flavor();
+        assert_eq!(flavor(Mode::Synchronous), RuntimeFlavor::CurrentThread);
+        assert_eq!(flavor(Mode::Asynchronous), RuntimeFlavor::MultiThread);
+    }
 
     #[test]
     fn the_mode_is_asynchronous_unless_said() {
