@@ -131,14 +131,17 @@ impl std::fmt::Debug for SyncPod {
 impl SyncPod {
     /// Starts pod `me` among `members` (itself too), in its life `incarnation`, copying to
     /// and beating at the others through `peers`.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// When its sweep's thread cannot be started.
     pub fn spawn(
         me: PodId,
         members: Vec<PodId>,
         incarnation: u64,
         timing: Timing,
         peers: BTreeMap<PodId, Client>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let start = Instant::now();
         let mut membership = Membership::new(
             me,
@@ -253,20 +256,22 @@ impl SyncPod {
                 }
             }
         });
-        // The sweep, as local mode's.
+        // The sweep, as local mode's, on a thread of its own: over millions of keys it takes
+        // a tenth of a second and more, which on the pod's one thread would hold up every
+        // stream's answers.
         let swept = Arc::downgrade(&pod);
-        tokio::spawn(async move {
-            let mut every = tokio::time::interval(SWEEP);
-            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                every.tick().await;
-                let Some(pod) = swept.upgrade() else {
-                    return;
-                };
-                pod.owner.keys().sweep(pod.now(), nanos(SWEEP));
-            }
-        });
-        Self { pod }
+        std::thread::Builder::new()
+            .name("edgerush-sync-pod-sweep".to_owned())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(SWEEP);
+                    let Some(pod) = swept.upgrade() else {
+                        return;
+                    };
+                    pod.owner.keys().sweep(pod.now(), nanos(SWEEP));
+                }
+            })?;
+        Ok(Self { pod })
     }
 
     /// The view as the pods agree on it, and whether it takes this pod in.

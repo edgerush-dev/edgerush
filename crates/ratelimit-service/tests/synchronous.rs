@@ -74,7 +74,7 @@ async fn start_with(timing: Timing) -> Service {
             .filter(|(pod, _)| **pod != id)
             .map(|(pod, client)| (*pod, client.clone()))
             .collect();
-        let pod = SyncPod::spawn(id, vec![0, 1, 2], 1, timing, peers);
+        let pod = SyncPod::spawn(id, vec![0, 1, 2], 1, timing, peers).unwrap();
         let server = SyncServer::new(pod.clone());
         tokio::spawn(async move {
             tonic::transport::Server::builder()
@@ -465,7 +465,7 @@ async fn pod_behind(
         .filter(|pod| *pod != id)
         .map(|pod| (pod, Client::new(&switches[pod as usize].address).unwrap()))
         .collect();
-    let pod = SyncPod::spawn(id, vec![0, 1, 2], incarnation, timing(), peers);
+    let pod = SyncPod::spawn(id, vec![0, 1, 2], incarnation, timing(), peers).unwrap();
     let server = SyncServer::new(pod.clone());
     tokio::spawn(async move {
         let _ended = tonic::transport::Server::builder()
@@ -563,7 +563,7 @@ async fn a_pod_taken_in_again_is_handed_the_keys_it_missed() {
 async fn a_pod_not_taken_in_refuses_data_planes_as_not_serving() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
-    let pod = SyncPod::spawn(0, vec![0, 1, 2], 1, timing(), BTreeMap::new());
+    let pod = SyncPod::spawn(0, vec![0, 1, 2], 1, timing(), BTreeMap::new()).unwrap();
     let server = SyncServer::new(pod.clone());
     tokio::spawn(async move {
         let _ended = tonic::transport::Server::builder()
@@ -579,4 +579,45 @@ async fn a_pod_not_taken_in_refuses_data_planes_as_not_serving() {
         ),
         other => panic!("not refused as not serving: {:?}", other.map(|_| ())),
     }
+}
+
+/// A pod's sweep runs on a thread of its own, not on the runtime that answers: a pod whose
+/// runtime is held up still forgets the keys gone full and quiet, and a sweep over many
+/// keys never holds the pod's answers up.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pod_sweeps_while_its_runtime_is_held_up() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let pod = SyncPod::spawn(0, vec![0], 1, timing(), BTreeMap::new()).unwrap();
+    let server = SyncServer::new(pod.clone());
+    tokio::spawn(async move {
+        let _ended = tonic::transport::Server::builder()
+            .serve_with_incoming(server, TcpIncoming::from(listener))
+            .await;
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !pod.view().1 {
+        assert!(Instant::now() < deadline, "the lone pod was never taken in");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (mut plane, _) = Plane::open(&address).await;
+    // A thousand a second, a bucket of one: full again a millisecond after its request.
+    let brief = Key {
+        key: b"brief".to_vec(),
+        contract: Some(Contract {
+            limit: 1_000,
+            window_ns: 1_000_000_000,
+            burst: 1,
+        }),
+    };
+    assert!(plane.decide_keys(vec![brief]).await.admitted);
+    assert_eq!(pod.key_count(), 1);
+    // The runtime's one thread held up for three sweeps' time: only a sweep on a thread of
+    // its own forgets the key meanwhile.
+    std::thread::sleep(Duration::from_millis(3_500));
+    assert_eq!(
+        pod.key_count(),
+        0,
+        "not swept while the runtime was held up"
+    );
 }
