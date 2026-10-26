@@ -109,10 +109,10 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     })
 }
 
-/// A synchronous pod runs on one thread: a stream's decisions and its connection's writes
+/// A synchronous pod answers on one thread: a stream's decisions and its connection's writes
 /// share it, so that the asks one read brings in are answered in one write, where a
 /// connection on another thread would take the answers a few at a time as they are decided.
-/// The asynchronous pod keeps a thread a core.
+/// Its sweep has a thread of its own. The asynchronous pod keeps a thread a core.
 fn runtime(mode: Mode) -> std::io::Result<tokio::runtime::Runtime> {
     match mode {
         Mode::Synchronous => tokio::runtime::Builder::new_current_thread()
@@ -167,7 +167,7 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             incarnation,
             synchronous::Timing::with_copy(args.cycle),
             peers,
-        );
+        )?;
         pod.set_capacity(args.max_key_bytes);
         eprintln!(
             "edgerush-ratelimit-service: synchronous pod {} on {}",

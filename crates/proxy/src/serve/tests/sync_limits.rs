@@ -21,7 +21,7 @@ fn pod_timing() -> Timing {
 
 /// A synchronous service pod alone, serving on `listener`, once it is ready.
 async fn lone_pod(listener: TcpListener) -> SyncPod {
-    let pod = SyncPod::spawn(0, vec![0], 1, pod_timing(), BTreeMap::new());
+    let pod = SyncPod::spawn(0, vec![0], 1, pod_timing(), BTreeMap::new()).unwrap();
     let server = SyncServer::new(pod.clone());
     tokio::spawn(async move {
         let _ended = tonic::transport::Server::builder()
@@ -80,7 +80,7 @@ async fn sync_pods(count: u32) -> (Vec<SyncPod>, Vec<String>) {
             .filter(|(pod, _)| **pod != id)
             .map(|(pod, client)| (*pod, client.clone()))
             .collect();
-        let pod = SyncPod::spawn(id, (0..count).collect(), 1, timing, peers);
+        let pod = SyncPod::spawn(id, (0..count).collect(), 1, timing, peers).unwrap();
         let server = SyncServer::new(pod.clone());
         tokio::spawn(async move {
             let _ended = tonic::transport::Server::builder()
@@ -1367,7 +1367,7 @@ async fn the_keys_of_an_owner_not_serving_go_to_the_next() {
                 async move {
                     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let at = listener.local_addr().unwrap();
-                    let pod = SyncPod::spawn(id, vec![0, 1, 2], incarnation, timing, peers);
+                    let pod = SyncPod::spawn(id, vec![0, 1, 2], incarnation, timing, peers).unwrap();
                     let server = SyncServer::new(pod.clone());
                     tokio::spawn(async move {
                         let _ended = tonic::transport::Server::builder()
