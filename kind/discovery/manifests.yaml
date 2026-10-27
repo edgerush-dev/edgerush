@@ -1,0 +1,96 @@
+# What kind/discovery.sh runs: a backend Service in `shop`, and in `edge` a data plane whose
+# one upstream follows that Service's EndpointSlices, allowed nothing but to list and watch
+# them in `shop` (09 §1).
+apiVersion: v1
+kind: Namespace
+metadata: { name: shop }
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: edge }
+---
+# The backend: agnhost's netexec, which answers /hostname with the name of its pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web, namespace: shop }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: web } }
+  template:
+    metadata: { labels: { app: web } }
+    spec:
+      containers:
+        - name: web
+          image: AGNHOST
+          args: ["netexec", "--http-port=8080"]
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 1 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  selector: { app: web }
+  ports: [{ name: http, port: 80, targetPort: http }]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: edgerush, namespace: edge }
+---
+# The data plane's one permission: list and watch EndpointSlices, here in `shop` alone.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: endpointslices, namespace: shop }
+rules:
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: edgerush, namespace: shop }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: endpointslices }
+subjects: [{ kind: ServiceAccount, name: edgerush, namespace: edge }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: edgerush, namespace: edge }
+data:
+  config.yaml: |
+    listeners:
+      http:
+        address: "0.0.0.0:8080"
+        protocol: http
+        proxy_protocol: off
+        forwarding: { trusted_proxies: [], trusted_only_headers: [] }
+        request_id: generate
+    routes:
+      - name: web
+        listeners: [http]
+        hostnames: [{ name: "*", falls_through: true }]
+        rules:
+          - matches: [{ path: { prefix: / } }]
+            forward: { backends: [{ upstream: web, weight: 1 }] }
+    upstreams:
+      web: { load_balancer: round_robin, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: edgerush, namespace: edge }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: edgerush } }
+  template:
+    metadata: { labels: { app: edgerush } }
+    spec:
+      serviceAccountName: edgerush
+      containers:
+        - name: edgerush
+          image: edgerush:kind
+          imagePullPolicy: Never
+          args: ["proxy", "--config", "/etc/edgerush/config.yaml", "--workers", "1"]
+          ports: [{ name: http, containerPort: 8080 }]
+          volumeMounts: [{ name: config, mountPath: /etc/edgerush }]
+      volumes:
+        - name: config
+          configMap: { name: edgerush }
