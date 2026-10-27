@@ -1,0 +1,30 @@
+[package]
+name = "edgerush-controller"
+description = "EdgeRush's control plane: the cluster's objects followed, translated and compiled for a data plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+edgerush-config.workspace = true
+edgerush-kubernetes.workspace = true
+edgerush-translate.workspace = true
+k8s-openapi.workspace = true
+# "sync": each follow's objects, and the word that one has changed; with the workspace's
+# "rt", the follows' tasks, ended with the control plane, and "time", the debounce.
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+bytes.workspace = true
+edgerush-certificates = { workspace = true, features = ["testing"] }
+edgerush-kubernetes = { workspace = true, features = ["testing"] }
+serde.workspace = true
+serde-saphyr.workspace = true
+serde_json.workspace = true
+# The fake API server answers on a runtime with threads of its own.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

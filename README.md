@@ -225,6 +225,9 @@ crates/certificates
                    (`edgerush-certificates`), by BoringSSL: what the data plane presents and what
                    translation admits are read by the same code; no I/O
 crates/config      the config model and its compilation (`edgerush-config`): pure, format-free
+crates/controller  the control plane (`edgerush-controller`): the objects a data plane's config is
+                   made of, followed, translated once every kind is listed and again on each
+                   change, a moment's changes at once, and each config that compiles handed on
 crates/explain     where a request would go and why (`edgerush-explain`): what `edgerush explain`
                    prints and `edgerush test` checks, worked out by the request core without a
                    data plane; no I/O
