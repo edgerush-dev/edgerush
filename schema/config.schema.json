@@ -1092,7 +1092,7 @@
           "const": "local"
         },
         {
-          "description": "The key's owner in the rate-limiting service decides every request. Not built yet.",
+          "description": "The key's owner in the rate-limiting service decides every request.",
           "type": "string",
           "const": "synchronous"
         },

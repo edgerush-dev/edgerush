@@ -108,7 +108,7 @@ pub enum RateLimitMode {
     /// Each process on what it sees alone, with no service: a client spread over several
     /// processes gets each one's limit.
     Local,
-    /// The key's owner in the rate-limiting service decides every request. Not built yet.
+    /// The key's owner in the rate-limiting service decides every request.
     Synchronous,
     /// Each process decides from its copies of the keys and shares what it admitted through
     /// the rate-limiting service every cycle (experimental).
