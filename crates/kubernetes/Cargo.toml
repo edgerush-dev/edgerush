@@ -1,6 +1,6 @@
 [package]
 name = "edgerush-kubernetes"
-description = "EdgeRush's client of the Kubernetes API: the data plane's list and watch of EndpointSlices"
+description = "EdgeRush's client of the Kubernetes API: the list and watch of the kinds it reads"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,13 +17,12 @@ boring.workspace = true
 bytes.workspace = true
 # The fake API server's certificate, under `testing` alone.
 edgerush-certificates = { workspace = true, optional = true }
-# What to ask for next, and the slices the answers leave.
-edgerush-discovery.workspace = true
 # HTTP/2, which the data plane already speaks to upstreams: one connection to the API
 # server carries every namespace's list and watch, as Kubernetes' own clients do.
 h2.workspace = true
 http.workspace = true
 k8s-openapi.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
@@ -32,6 +31,7 @@ tokio-boring.workspace = true
 [dev-dependencies]
 # Certificates made on the spot, for the fake API server.
 edgerush-certificates = { workspace = true, features = ["testing"] }
+proptest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

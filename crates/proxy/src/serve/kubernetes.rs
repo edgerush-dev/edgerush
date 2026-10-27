@@ -3,7 +3,8 @@
 //! ([03 §6](../../docs/03-data-plane.md)).
 
 use super::Proxy;
-use edgerush_kubernetes::{ApiServer, Retry, Slices, follow};
+use edgerush_kubernetes::{ApiServer, Listed, Retry, Scope, follow};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::rc::Rc;
@@ -72,10 +73,11 @@ impl Proxy {
                 if followed.contains_key(&namespace) {
                     continue;
                 }
-                let (out, slices) = watch::channel(Arc::new(Slices::default()));
+                let (out, slices) = watch::channel(Arc::new(Listed::default()));
                 let (api, failed, name) = (Rc::clone(&api), Rc::clone(&said), namespace.clone());
                 tokio::task::spawn_local(async move {
-                    follow(&api, &name, Retry::default(), out, |failure| {
+                    let scope = Scope::Namespace(name.clone());
+                    follow(&api, &scope, Retry::default(), out, |failure| {
                         failed(&name, failure);
                     })
                     .await;
@@ -100,7 +102,7 @@ impl Proxy {
 async fn take_in(
     proxy: Arc<Proxy>,
     namespace: String,
-    mut slices: watch::Receiver<Arc<Slices>>,
+    mut slices: watch::Receiver<Arc<Listed<EndpointSlice>>>,
     said: Said,
 ) {
     while slices.changed().await.is_ok() {
@@ -109,7 +111,8 @@ async fn take_in(
         if !now.listed {
             continue;
         }
-        if let Err(error) = proxy.rediscover([(namespace.clone(), Some(now.slices.clone().into()))])
+        if let Err(error) =
+            proxy.rediscover([(namespace.clone(), Some(now.objects.clone().into()))])
         {
             said(&namespace, &error);
         }

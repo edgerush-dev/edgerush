@@ -1,4 +1,5 @@
 use super::*;
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ListMeta, ObjectMeta, Status};
 use proptest::prelude::*;
 
@@ -32,9 +33,9 @@ fn page(
     }
 }
 
-fn names(watch: &Watch) -> Vec<String> {
+fn names(watch: &Watch<EndpointSlice>) -> Vec<String> {
     watch
-        .slices()
+        .objects()
         .map(|slice| slice.metadata.name.clone().unwrap_or_default())
         .collect()
 }
@@ -48,7 +49,7 @@ fn status(code: i32) -> WatchEvent<EndpointSlice> {
 }
 
 /// A watch that has listed `a` and `b` as of version 2.
-fn listed() -> Watch {
+fn listed() -> Watch<EndpointSlice> {
     let mut watch = Watch::new();
     watch
         .page(page(
@@ -82,7 +83,7 @@ fn a_list_is_read_a_page_at_a_time_then_watched_from_its_version() {
         }
     );
     // A part read is not the slices yet.
-    assert_eq!(watch.slices().count(), 0);
+    assert_eq!(watch.objects().count(), 0);
     assert!(!watch.listed());
 
     assert_eq!(
@@ -289,7 +290,23 @@ fn a_change_before_any_list_is_passed_over() {
         watch.event(WatchEvent::Added(slice("a", 1, 0))),
         Err(WatchError::NotWatching)
     );
-    assert_eq!(watch.slices().count(), 0);
+    assert_eq!(watch.objects().count(), 0);
+}
+
+#[test]
+fn objects_are_told_apart_by_namespace_and_name() {
+    let mut elsewhere = slice("a", 3, 1);
+    elsewhere.metadata.namespace = Some("cart".to_owned());
+    let mut watch = listed();
+    assert_eq!(watch.event(WatchEvent::Added(elsewhere.clone())), Ok(true));
+    // By namespace, then name.
+    assert_eq!(names(&watch), ["a", "a", "b"]);
+    assert_eq!(watch.objects().next(), Some(&elsewhere));
+    assert_eq!(watch.event(WatchEvent::Deleted(slice("a", 4, 0))), Ok(true));
+    assert_eq!(
+        watch.objects().collect::<Vec<_>>(),
+        [&elsewhere, &slice("b", 2, 0)]
+    );
 }
 
 #[test]
@@ -385,7 +402,7 @@ proptest! {
                     prop_assert_eq!(watch.event(bookmark), Ok(false));
                 }
                 Step::GoneWhile(name, content, size) => {
-                    let before: Vec<EndpointSlice> = watch.slices().cloned().collect();
+                    let before: Vec<EndpointSlice> = watch.objects().cloned().collect();
                     prop_assert_eq!(watch.event(status(410)), Err(WatchError::Gone));
                     let name = format!("s{name}");
                     cluster.insert(name.clone(), slice(&name, version, content));
@@ -396,7 +413,7 @@ proptest! {
                         let next = (!last).then(|| format!("page{}", at + 1));
                         watch.page(page(part.to_vec(), next.as_deref(), last.then(|| version.to_string()).as_deref())).unwrap();
                         if !last {
-                            let now: Vec<EndpointSlice> = watch.slices().cloned().collect();
+                            let now: Vec<EndpointSlice> = watch.objects().cloned().collect();
                             prop_assert_eq!(&now, &before);
                         }
                     }
@@ -405,7 +422,7 @@ proptest! {
                     }
                 }
             }
-            let now: Vec<&EndpointSlice> = watch.slices().collect();
+            let now: Vec<&EndpointSlice> = watch.objects().collect();
             let expected: Vec<&EndpointSlice> = cluster.values().collect();
             prop_assert_eq!(now, expected);
             prop_assert_eq!(watch.request(), Request::Watch { from: version.to_string() });

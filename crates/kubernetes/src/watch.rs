@@ -1,36 +1,49 @@
-//! A namespace's EndpointSlices as a list and a watch keep them: what to ask the API server
-//! next, and the slices its answers leave.
+//! A kind's objects as a list and a watch keep them: what to ask the API server next, and
+//! the objects its answers leave. Pure: no I/O, no clocks.
 //!
-//! The protocol is Kubernetes' own. A list, read a page at a time, gives every slice and
+//! The protocol is Kubernetes' own. A list, read a page at a time, gives every object and
 //! the version it is as of; a watch from that version gives each change after it, and
 //! bookmarks that move the version on without one. A watch that ends is begun again from
 //! the last version. A version the server no longer has (410 Gone) means the changes since
-//! are lost, so the slices are listed afresh. Until such a list has been read whole, the
-//! slices it replaces are kept, so that the endpoints in use stay in use while it lasts.
+//! are lost, so the objects are listed afresh. Until such a list has been read whole, the
+//! objects it replaces are kept, so that what is in use stays in use while it lasts.
 
-use k8s_openapi::List;
-use k8s_openapi::api::discovery::v1::EndpointSlice;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::WatchEvent;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, WatchEvent};
+use k8s_openapi::{List, ListableResource, Metadata};
 use std::collections::BTreeMap;
 
-/// A namespace's EndpointSlices, kept by a list and a watch.
-#[derive(Debug, Clone, Default)]
-pub struct Watch {
-    /// The slices, by name, as of `version`.
-    slices: BTreeMap<String, EndpointSlice>,
-    /// The version the slices are as of, which a watch resumes from: none until a list has
+/// An object's key: its namespace, empty for a kind of the cluster's, and its name.
+type Key = (String, String);
+
+/// A kind's objects, kept by a list and a watch.
+#[derive(Debug, Clone)]
+pub struct Watch<K> {
+    /// The objects, by namespace and name, as of `version`.
+    objects: BTreeMap<Key, K>,
+    /// The version the objects are as of, which a watch resumes from: none until a list has
     /// been read whole, and none again while one is needed.
     version: Option<String>,
-    /// A list being read: the slices of its pages so far, and the token of the next.
-    listing: Option<Listing>,
+    /// A list being read: the objects of its pages so far, and the token of the next.
+    listing: Option<Listing<K>>,
     /// Whether a list has been read whole.
     listed: bool,
 }
 
+impl<K> Default for Watch<K> {
+    fn default() -> Self {
+        Self {
+            objects: BTreeMap::new(),
+            version: None,
+            listing: None,
+            listed: false,
+        }
+    }
+}
+
 /// A list part read.
 #[derive(Debug, Clone)]
-struct Listing {
-    slices: BTreeMap<String, EndpointSlice>,
+struct Listing<K> {
+    objects: BTreeMap<Key, K>,
     next: String,
 }
 
@@ -44,7 +57,7 @@ pub enum Request {
     },
     /// A watch from this version.
     Watch {
-        /// The version the slices are as of.
+        /// The version the objects are as of.
         from: String,
     },
 }
@@ -52,23 +65,27 @@ pub enum Request {
 /// An answer the watch cannot take.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WatchError {
-    /// The server no longer has the version or the list asked from (410 Gone): the slices
+    /// The server no longer has the version or the list asked from (410 Gone): the objects
     /// are listed afresh, those kept until the list is read whole.
     #[error("the version asked from is gone: listing afresh")]
     Gone,
-    /// A list's last page, or a change, that says no version: the slices are listed afresh.
+    /// A list's last page, or a change, that says no version: the objects are listed
+    /// afresh.
     #[error("no resource version: listing afresh")]
     NoVersion,
     /// A watch event while no watch is open, which a client never asks for: passed over.
     #[error("a change while not watching")]
     NotWatching,
     /// An error the server sent in the watch: the watch is begun again from the version
-    /// the slices are as of.
+    /// the objects are as of.
     #[error("the watch failed: {0}")]
     Failed(String),
 }
 
-impl Watch {
+impl<K> Watch<K>
+where
+    K: ListableResource + Metadata<Ty = ObjectMeta> + Clone + PartialEq,
+{
     /// A watch that has listed nothing yet.
     #[must_use]
     pub fn new() -> Self {
@@ -91,40 +108,40 @@ impl Watch {
         }
     }
 
-    /// Whether a list has been read whole: the slices are the namespace's, as of some
+    /// Whether a list has been read whole: the objects are all there are, as of some
     /// version, rather than none yet.
     #[must_use]
     pub fn listed(&self) -> bool {
         self.listed
     }
 
-    /// The slices.
-    pub fn slices(&self) -> impl Iterator<Item = &EndpointSlice> {
-        self.slices.values()
+    /// The objects, by namespace, then name.
+    pub fn objects(&self) -> impl Iterator<Item = &K> {
+        self.objects.values()
     }
 
-    /// A page of the list asked for. Whether the slices changed: only at the last page,
+    /// A page of the list asked for. Whether the objects changed: only at the last page,
     /// when the list replaces them whole.
     ///
     /// # Errors
     ///
     /// [`WatchError::NoVersion`] for a last page that says no version, and the list begins
     /// again.
-    pub fn page(&mut self, page: List<EndpointSlice>) -> Result<bool, WatchError> {
-        let mut slices = self
+    pub fn page(&mut self, page: List<K>) -> Result<bool, WatchError> {
+        let mut objects = self
             .listing
             .take()
-            .map(|listing| listing.slices)
+            .map(|listing| listing.objects)
             .unwrap_or_default();
-        // A slice without a name, which Kubernetes never sends, is passed over.
-        slices.extend(
+        // An object without a name, which Kubernetes never sends, is passed over.
+        objects.extend(
             page.items
                 .into_iter()
-                .filter_map(|slice| Some((slice.metadata.name.clone()?, slice))),
+                .filter_map(|object| Some((key(&object)?, object))),
         );
         let metadata = page.metadata;
         if let Some(next) = metadata.continue_.filter(|next| !next.is_empty()) {
-            self.listing = Some(Listing { slices, next });
+            self.listing = Some(Listing { objects, next });
             return Ok(false);
         }
         let Some(version) = metadata.resource_version.filter(|v| !v.is_empty()) else {
@@ -133,33 +150,33 @@ impl Watch {
         };
         self.version = Some(version);
         self.listed = true;
-        let changed = slices != self.slices;
-        self.slices = slices;
+        let changed = objects != self.objects;
+        self.objects = objects;
         Ok(changed)
     }
 
     /// A list or a watch the server answered 410 Gone: the version, or the list's token,
-    /// is too old. The slices are listed afresh, and kept until that list is read whole.
+    /// is too old. The objects are listed afresh, and kept until that list is read whole.
     pub fn gone(&mut self) {
         self.listing = None;
         self.version = None;
     }
 
-    /// An event of the watch. Whether the slices changed.
+    /// An event of the watch. Whether the objects changed.
     ///
     /// # Errors
     ///
-    /// [`WatchError::Gone`] and [`WatchError::NoVersion`] when the slices must be listed
+    /// [`WatchError::Gone`] and [`WatchError::NoVersion`] when the objects must be listed
     /// afresh, which [`Watch::request`] then asks for; [`WatchError::Failed`] for an error
     /// the server sent, the watch to be begun again from where it was;
     /// [`WatchError::NotWatching`] for an event while no watch is open, passed over.
-    pub fn event(&mut self, event: WatchEvent<EndpointSlice>) -> Result<bool, WatchError> {
+    pub fn event(&mut self, event: WatchEvent<K>) -> Result<bool, WatchError> {
         if self.listing.is_some() || self.version.is_none() {
             return Err(WatchError::NotWatching);
         }
-        let (slice, deleted) = match event {
-            WatchEvent::Added(slice) | WatchEvent::Modified(slice) => (slice, false),
-            WatchEvent::Deleted(slice) => (slice, true),
+        let (object, deleted) = match event {
+            WatchEvent::Added(object) | WatchEvent::Modified(object) => (object, false),
+            WatchEvent::Deleted(object) => (object, true),
             WatchEvent::Bookmark {
                 resource_version, ..
             } => {
@@ -183,8 +200,8 @@ impl Watch {
                 return Err(WatchError::Failed("an error of no known kind".to_owned()));
             }
         };
-        let Some(version) = slice
-            .metadata
+        let Some(version) = object
+            .metadata()
             .resource_version
             .clone()
             .filter(|v| !v.is_empty())
@@ -193,17 +210,26 @@ impl Watch {
             return Err(WatchError::NoVersion);
         };
         self.version = Some(version);
-        // A slice without a name, which Kubernetes never sends, is passed over.
-        let Some(name) = slice.metadata.name.clone() else {
+        // An object without a name, which Kubernetes never sends, is passed over.
+        let Some(key) = key(&object) else {
             return Ok(false);
         };
         let changed = if deleted {
-            self.slices.remove(&name).is_some()
+            self.objects.remove(&key).is_some()
         } else {
-            self.slices.insert(name, slice.clone()).as_ref() != Some(&slice)
+            self.objects.insert(key, object.clone()).as_ref() != Some(&object)
         };
         Ok(changed)
     }
+}
+
+/// An object's key, if it has a name.
+fn key<K: Metadata<Ty = ObjectMeta>>(object: &K) -> Option<Key> {
+    let metadata = object.metadata();
+    Some((
+        metadata.namespace.clone().unwrap_or_default(),
+        metadata.name.clone()?,
+    ))
 }
 
 #[cfg(test)]

@@ -257,7 +257,6 @@ version = "0.0.0"
 dependencies = [
  "edgerush-config",
  "k8s-openapi",
- "thiserror",
 ]
 
 [[package]]
@@ -310,10 +309,10 @@ version = "0.0.0"
 dependencies = [
  "boring",
  "bytes",
- "edgerush-discovery",
  "h2",
  "http",
  "k8s-openapi",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
