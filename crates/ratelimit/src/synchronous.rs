@@ -86,7 +86,8 @@ impl<S: BuildHasher + Clone> Owner<S> {
         self.keys.copies_of(now, keep)
     }
 
-    /// Takes in another pod's `copies` at `now`, to carry on from if it goes.
+    /// Takes in another pod's `copies` at `now`, to carry on from if it goes; a copy never
+    /// makes a key emptier than this pod holds it.
     pub fn install(&self, copies: &[Copy], now: u64) {
         self.keys.install(copies, now);
     }

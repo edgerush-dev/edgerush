@@ -168,6 +168,50 @@ fn a_pod_taking_over_carries_on_from_the_last_copy() {
     assert_eq!(admitted(&standby, &mut at_standby, b"k", c, 5, 0), 2);
 }
 
+/// A copy never makes a bucket emptier (#88): one from an owner the view has moved on from,
+/// arriving late, leaves what the new owner charged since, and the fuller of the two holds.
+#[test]
+fn a_late_copy_leaves_what_was_charged_since() {
+    let (old, new) = (self::owner(), self::owner());
+    let (mut at_old, mut at_new) = (handles(), handles());
+    let c = contract(1, 5);
+    assert_eq!(admitted(&old, &mut at_old, b"k", c, 1, 0), 1);
+    let late = old.copies(&at_old.take_changed(), 0);
+    assert_eq!(admitted(&new, &mut at_new, b"k", c, 3, 0), 3);
+    new.install(&late, 0);
+    assert_eq!(admitted(&new, &mut at_new, b"k", c, 5, 0), 2);
+    // A copy fuller than the bucket is still taken in.
+    assert_eq!(admitted(&old, &mut at_old, b"k", c, 4, 0), 4);
+    new.install(&old.copies(&at_old.take_changed(), 0), 0);
+    assert_eq!(admitted(&new, &mut at_new, b"k", c, 5, 0), 0);
+}
+
+/// A key quiet for longer than its clock takes to come round is full, whatever its word
+/// says: a copy of a full bucket taken in leaves it full, rather than keeping the word as
+/// the fuller of the two.
+#[test]
+fn a_copy_of_a_full_bucket_leaves_a_quiet_key_full() {
+    let standby = owner();
+    let mut at_standby = handles();
+    // One a nanosecond: the 63-bit clock comes round every 2^47 ns, when the word reads a
+    // request's interval ahead.
+    let one = NonZeroU64::new(1).unwrap();
+    let c = Contract {
+        limit: one,
+        window: one,
+        burst: one,
+    };
+    let round = 1 << 47;
+    assert_eq!(admitted(&standby, &mut at_standby, b"k", c, 1, 0), 1);
+    let full = vec![Copy {
+        key: b"k"[..].into(),
+        contract: c,
+        full_in: 0,
+    }];
+    standby.install(&full, round);
+    assert_eq!(admitted(&standby, &mut at_standby, b"k", c, 1, round), 1);
+}
+
 /// A copy says how long until full, not when: taken in on a clock far from the owner's, the
 /// bucket is where it was.
 #[test]
