@@ -281,6 +281,8 @@ async fn drive<S, R, F, B, D>(
     // The connection's streams, run by this task, so many a turn (15 §3, `queue`).
     let mut queue = Queue::new();
     let mut turn = Turn::WHOLE;
+    // Whether a stream was just taken up, and so others h2 decoded with it may be waiting.
+    let mut taking = false;
     // A stream is charged its head as it is handed over and its task as that is made, on
     // its first turn: its future's size is its type's, known without making one, and a
     // stream the worker cannot pay for is answered then, with no task (15 §3).
@@ -354,6 +356,21 @@ async fn drive<S, R, F, B, D>(
             } else {
                 idle_from_now = true;
             }
+            // The streams h2 decoded with the one just taken up are taken up too, before any
+            // is run: polling the connection for each would flush the answer of the one
+            // before, one write an answer, where answers made at once to streams that came
+            // together go out together once the queue has run them (15 §3). Each head's
+            // charge is handed over as it is taken, as below.
+            if taking
+                && turn.accepts > 0
+                && let Some(stream) = connection.accept_decoded()
+            {
+                handed = account.split(::h2::server::head_held(&stream.0));
+                account.settle(connection.received_unreleased() + connection.held());
+                turn.accepts -= 1;
+                return Poll::Ready(Next::Accepted(Some(Ok(stream))));
+            }
+            taking = false;
             *streams.driver.borrow_mut() = Some(cx.waker().clone());
             turn.polls -= queue.run(cx.waker(), turn.polls, &mut made);
             // Its allowance spent, with streams perhaps still in line, the turn is given back.
@@ -406,6 +423,7 @@ async fn drive<S, R, F, B, D>(
             match accepted {
                 Poll::Ready(accepted) => {
                     turn.accepts -= 1;
+                    taking = true;
                     Poll::Ready(Next::Accepted(accepted))
                 }
                 Poll::Pending => {
@@ -1915,6 +1933,152 @@ mod tests {
         });
     }
 
+    /// A socket that counts the writes that took bytes and the reads asked of it.
+    struct Counted {
+        io: tokio::io::DuplexStream,
+        writes: Rc<Cell<usize>>,
+        reads: Rc<Cell<usize>>,
+    }
+
+    impl AsyncRead for Counted {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.reads.set(self.reads.get() + 1);
+            std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Counted {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let written = std::pin::Pin::new(&mut self.io).poll_write(cx, buf);
+            if matches!(written, Poll::Ready(Ok(bytes)) if bytes > 0) {
+                self.writes.set(self.writes.get() + 1);
+            }
+            written
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+
+    /// Streams sent together and answered at once have their answers written together: h2
+    /// decodes them in one read, and the driver takes up all it has decoded before it runs
+    /// any, so a turn's worth goes out in one write, where taking them up one poll of the
+    /// connection at a time flushed each answer made before the next poll. Taking up what
+    /// h2 has decoded reads nothing more (15 §3).
+    #[test]
+    fn answers_made_at_once_to_streams_sent_together_go_out_in_one_write() {
+        use crate::h2_peer::{self, Peer, kind};
+        locally(async {
+            let (writes, reads) = (Rc::new(Cell::new(0usize)), Rc::new(Cell::new(0usize)));
+            let (near, far) = wire();
+            let near = Counted {
+                io: near,
+                writes: Rc::clone(&writes),
+                reads: Rc::clone(&reads),
+            };
+            served(near, Settings::default(), |_, _| async {
+                Answered::Map(Response::new(Full::new(Bytes::new())))
+            });
+            let mut peer = Peer::open_as_client(far, &[]).await;
+            peer.send(&h2_peer::settings_ack()).await;
+            // What the connection writes as it starts, out of the way.
+            peer.settled().await;
+            let (written, read) = (writes.get(), reads.get());
+            let mut burst = Vec::new();
+            for n in 0..ACCEPTS {
+                let id = u32::try_from(2 * n + 1).unwrap();
+                burst.extend(h2_peer::headers(id, h2_peer::request("GET", "/"), true).encode());
+            }
+            // All of it in the socket before the connection's task is next polled.
+            peer.write_raw(&burst).await;
+            let mut answered = 0;
+            while answered < ACCEPTS {
+                if peer.next().await.kind == kind::HEADERS {
+                    answered += 1;
+                }
+            }
+            let writes = writes.get() - written;
+            assert_eq!(
+                writes, 1,
+                "{ACCEPTS} answers made at once went out in {writes} writes"
+            );
+            let reads = reads.get() - read;
+            assert!(
+                reads < ACCEPTS / 2,
+                "{reads} reads to take up {ACCEPTS} streams sent together"
+            );
+        });
+    }
+
+    /// Streams taken up together, decoded in one read, are each charged the head h2 hands
+    /// over with it, as a stream taken up alone is, and give it back as they go.
+    #[test]
+    fn streams_taken_up_together_are_each_charged_their_head() {
+        const STREAMS: usize = 4;
+        locally(async {
+            let storage = Storage::new(crate::storage::LIMIT);
+            let asked = Rc::new(Cell::new(0));
+            let (mut send, _told) = charged(&storage, never(&asked)).await;
+            let large = || {
+                let mut request = get();
+                request
+                    .headers_mut()
+                    .insert("x-large", HeaderValue::from_str(&"v".repeat(8000)).unwrap());
+                request
+            };
+            // What `count` streams sent together hold while they wait on the core, and what
+            // their connection holds once they are reset: h2's client writes them in one go,
+            // as the test's task gives its turn up only once all are sent.
+            let mut charged_for = async |count: usize| {
+                let made = asked.get();
+                let mut streams = Vec::new();
+                for _ in 0..count {
+                    send = within(send.clone().ready()).await.unwrap();
+                    streams.push(send.send_request(large(), false).unwrap());
+                }
+                until_held(&storage, |_| asked.get() == made + count).await;
+                let held = settled(&storage).await;
+                for (_answer, mut stream) in streams {
+                    stream.send_reset(::h2::Reason::CANCEL);
+                }
+                (held, settled(&storage).await)
+            };
+            // Places for as many streams, and the decoder's buffer grown to a large head,
+            // before anything is measured: neither ever shrinks.
+            let (_, base) = charged_for(STREAMS).await;
+            let (alone, after) = charged_for(1).await;
+            assert_eq!(after, base);
+            let (together, after) = charged_for(STREAMS).await;
+            assert_eq!(after, base);
+            assert_eq!(
+                together - base,
+                STREAMS * (alone - base),
+                "{} charged for a stream alone, {} for {STREAMS} together",
+                alone - base,
+                together - base
+            );
+        });
+    }
+
     /// The most bytes a client reads between two turns of another task of the worker's while
     /// the connection, served with `settings`, answers `pings` PINGs that wait whole in its
     /// socket — with a request before every nine if `asking`, which the core never answers —
@@ -2048,8 +2212,9 @@ mod tests {
     }
 
     /// Serves `near` as `serve` does, `respond` answering, on a worker with room to spare.
-    fn served<R, F>(near: tokio::io::DuplexStream, settings: Settings, respond: R)
+    fn served<S, R, F>(near: S, settings: Settings, respond: R)
     where
+        S: AsyncRead + AsyncWrite + Unpin + 'static,
         R: Fn(Request<RequestBody>, Interim) -> F + 'static,
         F: Future<Output = Answered<Full<Bytes>>> + 'static,
     {

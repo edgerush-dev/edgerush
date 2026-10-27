@@ -448,6 +448,20 @@ where
         Poll::Pending
     }
 
+    /// The next request whose head the connection has decoded already, as
+    /// [`poll_accept`](Connection::poll_accept) hands it over, but without
+    /// driving the connection: nothing is read, decoded or written. `None`
+    /// when no decoded head waits. For an owner that takes up together the
+    /// streams one poll decoded, before it answers any of them.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn accept_decoded(&mut self) -> Option<(Request<RecvStream>, SendResponse<B>)> {
+        let inner = self.connection.next_incoming()?;
+        let (head, _) = inner.take_request().into_parts();
+        let body = RecvStream::new(FlowControl::new(inner.clone_to_opaque()));
+        Some((Request::from_parts(head, body), SendResponse { inner }))
+    }
+
     /// Sets the target window size for the whole connection.
     ///
     /// If `size` is greater than the current value, then a `WINDOW_UPDATE`
