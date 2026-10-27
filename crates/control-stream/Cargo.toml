@@ -1,0 +1,23 @@
+[package]
+name = "edgerush-control-stream"
+description = "EdgeRush's config stream: its messages, what a control plane sends each data plane, and what a data plane makes of it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+edgerush-config.workspace = true
+prost.workspace = true
+# A config travels as the model's own JSON (02 §4).
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# The example configs, read as the development harness reads them.
+serde-saphyr.workspace = true
+
+[lints]
+workspace = true
