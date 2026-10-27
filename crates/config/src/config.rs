@@ -1,14 +1,14 @@
 //! The whole of what a data plane is given to run.
 
 use crate::{Route, TcpRoute, TlsRoute};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// A data plane's configuration. Filters are to come.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -49,7 +49,7 @@ pub struct Config {
 /// The whole data plane's own settings ([07 §1](../../../docs/07-config-and-dsl.md)):
 /// bounds rather than behaviour, each with its value when left out. The control plane fills
 /// them from the `DataPlane` resource; they reload with the rest of the config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct DataPlane {
@@ -62,7 +62,7 @@ pub struct DataPlane {
 }
 
 /// How the data plane enforces its rate limits: the mode, and what that mode needs.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RateLimiting {
@@ -92,7 +92,7 @@ pub struct RateLimiting {
 }
 
 /// How a data plane enforces its rate limits ([06 §4](../../../docs/06-rate-limiting.md)).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RateLimitMode {
@@ -113,7 +113,7 @@ pub enum RateLimitMode {
 /// when the owner does not answer ([06 §4](../../../docs/06-rate-limiting.md)). Every
 /// field is required: how a data plane behaves when its owners are out of reach is the
 /// operator's to say.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitSynchronous {
@@ -130,7 +130,7 @@ pub struct RateLimitSynchronous {
 }
 
 /// What decides a request whose owner does not answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WhenUnreachable {
@@ -144,7 +144,7 @@ pub enum WhenUnreachable {
 
 /// A data plane's breaker for each owner, which its workers share: open, nothing is asked
 /// of the owner and `when_unreachable` decides at once.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitBreaker {
@@ -161,7 +161,7 @@ pub struct RateLimitBreaker {
 
 /// The rate-limiting service: its pods, and in the asynchronous mode how often each process
 /// sends them what it admitted and its levers, which the synchronous mode does not take.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitService {
@@ -202,7 +202,7 @@ pub struct RateLimitService {
 
 /// A place where requests come in. Hostnames are to come; until a listener can be told
 /// from another by hostname, each needs an address of its own.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
@@ -247,7 +247,7 @@ pub struct Listener {
 }
 
 /// A listener's PROXY protocol ([20 §2](../../../docs/20-proxy-protocol.md)).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ListenerProxyProtocol {
@@ -264,7 +264,7 @@ pub enum ListenerProxyProtocol {
 }
 
 /// The PROXY protocol version an upstream is sent ([20 §4](../../../docs/20-proxy-protocol.md)).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyProtocolVersion {
@@ -275,7 +275,7 @@ pub enum ProxyProtocolVersion {
 }
 
 /// What an HTTP listener does with `X-Request-ID` (08 §3 in the docs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RequestId {
@@ -288,7 +288,7 @@ pub enum RequestId {
 
 /// Where a listener's access log goes ([08 §2](../../../docs/08-observability.md)): one JSON
 /// line a record.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AccessLog {
@@ -305,7 +305,7 @@ pub enum AccessLog {
 /// who it trusts to say who their clients are, and which headers only they may send. Both
 /// are always written out, an empty list included, since both decide who a request is
 /// taken to come from.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Forwarding {
@@ -327,7 +327,7 @@ pub struct Forwarding {
 }
 
 /// An `https` listener's HTTP/3 (16 in the docs): the same routes and TLS, over QUIC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Http3 {
@@ -351,7 +351,7 @@ impl Http3 {
 }
 
 /// What a listener speaks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
@@ -367,7 +367,7 @@ pub enum Protocol {
 }
 
 /// The TLS a listener terminates.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Tls {
@@ -397,7 +397,7 @@ pub struct Tls {
 
 /// A certificate a listener presents, by its name: for every DNS name it carries, or for
 /// the names stated for it alone.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum ListenerCertificate {
@@ -430,7 +430,7 @@ impl ListenerCertificate {
 }
 
 /// A certificate and the names it answers for.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct StatedNames {
@@ -444,7 +444,7 @@ pub struct StatedNames {
 
 /// Whom a listener trusts to vouch for its clients (Gateway API's frontend validation, in
 /// its default mode: a client without a valid certificate is refused in the handshake).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ClientValidation {
@@ -475,7 +475,7 @@ impl fmt::Debug for Certificate {
 }
 
 /// A set of endpoints that serve the same thing.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
@@ -511,7 +511,7 @@ pub struct Upstream {
 
 /// Where an upstream's endpoints come from, one way and stated
 /// ([03 §6](../../../docs/03-data-plane.md)).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Endpoints {
@@ -526,7 +526,7 @@ pub enum Endpoints {
 }
 
 /// How an upstream's endpoint is chosen for an exchange ([03 §6](../../../docs/03-data-plane.md)).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LoadBalancer {
@@ -540,7 +540,7 @@ pub enum LoadBalancer {
 /// Slow start ([03 §6](../../../docs/03-data-plane.md)): an endpoint added to an upstream
 /// that keeps an endpoint it had, or passing its checks again after failing them, takes a
 /// share rising linearly from a tenth of a full one to all of it over the window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct SlowStart {
@@ -552,7 +552,7 @@ pub struct SlowStart {
 /// An active check of an upstream's endpoints. Everything is stated: how often, how long a
 /// probe may take, and how many results in a row change an endpoint's state (HAProxy's
 /// `rise` and `fall`; Envoy's thresholds).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct HealthCheck {
@@ -580,7 +580,7 @@ pub struct HealthCheck {
 }
 
 /// What a health check asks an endpoint.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Probe {
@@ -607,7 +607,7 @@ pub enum Probe {
 /// A gRPC server takes a PING more often than every five minutes as abuse, and says so
 /// with GOAWAY(ENHANCE_YOUR_CALM), so nothing shorter is allowed unless the backend is
 /// said to take it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Keepalive {
@@ -633,7 +633,7 @@ pub struct Keepalive {
 
 /// TLS to an upstream's endpoints: whom they are expected to be, and whom to trust to say
 /// so (Gateway API's BackendTLSPolicy: a hostname and CA certificates).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamTls {
@@ -651,7 +651,7 @@ pub struct UpstreamTls {
 
 /// What an upstream is spoken to in. Unsaid, it is HTTP/1.1, as for a Kubernetes Service
 /// port that names no application protocol.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamProtocol {
