@@ -1,5 +1,6 @@
 //! The data plane's side of the stream: what it was sent, held until it can run.
 
+use crate::encode::{CONFIG_VERSION, OLDEST_CONFIG_VERSION};
 use crate::{Held, Malformed, Refusal, Report, Versioned, wire};
 use edgerush_config::{Certificate, Config};
 use std::collections::BTreeMap;
@@ -86,7 +87,7 @@ impl Staging {
     }
 
     /// What it holds, to open a stream with: the version of the latest config sent, and
-    /// of each certificate offered.
+    /// of each certificate offered; and the config versions this build reads.
     pub fn hello(&self) -> wire::FromDataPlane {
         let held = Held {
             config: self.latest.as_ref().map(|latest| latest.version.clone()),
@@ -97,7 +98,11 @@ impl Staging {
                 .collect(),
         };
         wire::FromDataPlane {
-            said: Some(wire::Said::Hello((&held).into())),
+            said: Some(wire::Said::Hello(wire::Hello {
+                held: Some((&held).into()),
+                config_version: CONFIG_VERSION,
+                oldest_config_version: OLDEST_CONFIG_VERSION,
+            })),
         }
     }
 

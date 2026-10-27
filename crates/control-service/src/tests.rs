@@ -5,7 +5,7 @@ use boring::x509::store::X509StoreBuilder;
 use edgerush_certificates::Identity;
 use edgerush_certificates::testing::Authority;
 use edgerush_config::{Certificate, Config};
-use edgerush_control_stream::{Malformed, Offer, Report, Staging, Versions, wire};
+use edgerush_control_stream::{CONFIG_VERSION, Malformed, Offer, Report, Staging, Versions, wire};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -187,7 +187,12 @@ async fn a_data_plane_runs_each_offer_and_says_so() {
             .values()
             .any(|listener| listener.address.port() == 82)
     });
-    assert_eq!(plane.next().await, Heard::Opened(Default::default()));
+    let opened = Heard::Opened {
+        held: Default::default(),
+        version: CONFIG_VERSION,
+        written: CONFIG_VERSION,
+    };
+    assert_eq!(plane.next().await, opened);
     assert_eq!(ran(&mut running).await, config(80));
     let Heard::Reported(report) = plane.next().await else {
         panic!("no report")
@@ -290,7 +295,7 @@ async fn certificates_replaced_serve_the_next_connection() {
     let tls = connector(&credentials(&authority, &["data-plane"])).unwrap();
     let (mut running, first) = follower(&plane.address, "control.test", tls.clone(), |_| false);
     assert_eq!(ran(&mut running).await, config(80));
-    assert!(matches!(plane.next().await, Heard::Opened(_)));
+    assert!(matches!(plane.next().await, Heard::Opened { .. }));
     assert!(matches!(plane.next().await, Heard::Reported(_)));
     plane.tls.send_replace(Arc::new(
         acceptor(&credentials(&authority, &["renamed.test"])).unwrap(),
@@ -337,7 +342,7 @@ async fn a_data_plane_that_dials_again_is_sent_only_what_it_lacks() {
         let following = follow(&address, "control.test", &tls, &mut staging, run);
         tokio::pin!(following);
         let heard = hear(&mut plane, following.as_mut()).await;
-        assert!(matches!(heard, Heard::Opened(_)), "{heard:?}");
+        assert!(matches!(heard, Heard::Opened { .. }), "{heard:?}");
         let heard = hear(&mut plane, following.as_mut()).await;
         assert!(matches!(heard, Heard::Reported(_)), "{heard:?}");
     }
@@ -346,7 +351,7 @@ async fn a_data_plane_that_dials_again_is_sent_only_what_it_lacks() {
         let following = follow(&address, "control.test", &tls, &mut staging, run);
         tokio::pin!(following);
         let heard = hear(&mut plane, following.as_mut()).await;
-        let Heard::Opened(held) = heard else {
+        let Heard::Opened { held, .. } = heard else {
             panic!("{heard:?}")
         };
         assert_eq!(held.config.as_deref(), Some(offer.version()));
@@ -362,22 +367,18 @@ async fn a_data_plane_that_dials_again_is_sent_only_what_it_lacks() {
     plane.join().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_stream_that_does_not_open_with_what_the_data_plane_holds_is_refused() {
-    let authority = Authority::new("stream");
-    let mut plane = Plane::start(&credentials(&authority, &["control.test"]), None).await;
-    let tls = connector(&credentials(&authority, &["data-plane"])).unwrap();
+/// A stream to `plane` that opens with `first`, as no data plane of this build's would: how
+/// the control plane refuses it.
+async fn refused(plane: &Plane, tls: &SslConnector, first: wire::FromDataPlane) -> tonic::Status {
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", plane.address))
         .unwrap()
-        .connect_with_connector(client::Dialler::new(&plane.address, "control.test", &tls))
+        .connect_with_connector(client::Dialler::new(&plane.address, "control.test", tls))
         .await
         .unwrap();
     let mut grpc = tonic::client::Grpc::new(channel);
     grpc.ready().await.unwrap();
     let (up, sending) = mpsc::channel(1);
-    up.send(wire::FromDataPlane::from(&Report::default()))
-        .await
-        .unwrap();
+    up.send(first).await.unwrap();
     let response = grpc
         .streaming(
             tonic::Request::new(Received(sending)),
@@ -386,12 +387,51 @@ async fn a_stream_that_does_not_open_with_what_the_data_plane_holds_is_refused()
         )
         .await;
     // Refused as the stream opens, or with its first message down.
-    let status = match response {
-        Err(status) => status,
-        Ok(response) => response.into_inner().message().await.unwrap_err(),
+    let refused = async {
+        match response {
+            Err(status) => status,
+            Ok(response) => response.into_inner().message().await.unwrap_err(),
+        }
     };
+    tokio::time::timeout(Duration::from_secs(5), refused)
+        .await
+        .expect("not refused")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_that_does_not_open_with_what_the_data_plane_holds_is_refused() {
+    let authority = Authority::new("stream");
+    let mut plane = Plane::start(&credentials(&authority, &["control.test"]), None).await;
+    let tls = connector(&credentials(&authority, &["data-plane"])).unwrap();
+    let status = refused(&plane, &tls, wire::FromDataPlane::from(&Report::default())).await;
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     let why = Malformed::NoHello.to_string();
+    assert_eq!(status.message(), why);
+    assert_eq!(plane.next().await, Heard::Closed(Some(why)));
+    plane.signal();
+    plane.join().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_data_plane_this_control_plane_is_too_old_for_is_refused() {
+    let authority = Authority::new("stream");
+    let offer = Offer::new(&config(80), None, &mut Versions::new(7)).unwrap();
+    let mut plane = Plane::start(&credentials(&authority, &["control.test"]), Some(offer)).await;
+    let tls = connector(&credentials(&authority, &["data-plane"])).unwrap();
+    let newer = wire::FromDataPlane {
+        said: Some(wire::Said::Hello(wire::Hello {
+            held: None,
+            config_version: CONFIG_VERSION + 2,
+            oldest_config_version: CONFIG_VERSION + 1,
+        })),
+    };
+    let status = refused(&plane, &tls, newer).await;
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    let why = format!(
+        "the data plane reads config version {} and after, and this control plane writes {} at most",
+        CONFIG_VERSION + 1,
+        CONFIG_VERSION
+    );
     assert_eq!(status.message(), why);
     assert_eq!(plane.next().await, Heard::Closed(Some(why)));
     plane.signal();

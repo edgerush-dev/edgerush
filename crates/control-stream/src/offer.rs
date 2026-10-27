@@ -1,5 +1,6 @@
 //! What the control plane offers, and the versions it names it by.
 
+use crate::encode::{ConfigVersion, encode};
 use crate::wire;
 use edgerush_config::{Certificate, Config};
 use prost::Message;
@@ -45,8 +46,8 @@ pub struct Versioned<T> {
 pub struct Offer {
     /// The config, without its certificates.
     pub(crate) config: Versioned<Config>,
-    /// The config as sent.
-    pub(crate) json: Vec<u8>,
+    /// The config as sent to each config version served, oldest first.
+    pub(crate) json: Vec<Vec<u8>>,
     /// Its certificates, by name.
     pub(crate) certificates: BTreeMap<String, Versioned<Certificate>>,
 }
@@ -112,7 +113,9 @@ impl Offer {
                 (last.config.clone(), last.json.clone())
             }
             _ => {
-                let json = serde_json::to_vec(&bare)?;
+                let json = ConfigVersion::all()
+                    .map(|version| encode(&bare, version))
+                    .collect::<Result<_, _>>()?;
                 let config = Versioned {
                     version: versions.next(),
                     value: bare,
@@ -127,15 +130,17 @@ impl Offer {
         };
         // Refused here, where it can be said, rather than by the stream as it is sent.
         let too_large = |what: String, bytes: usize| OfferError::TooLarge { what, bytes, limit };
-        for message in crate::Session::holding_nothing().send(&offer) {
-            let bytes = message.encoded_len();
-            if bytes > limit {
-                return Err(match message.resource {
-                    Some(wire::Resource::Certificate(certificate)) => {
-                        too_large(format!("the certificate {}", certificate.name), bytes)
-                    }
-                    _ => too_large("the config".to_owned(), bytes),
-                });
+        for version in ConfigVersion::all() {
+            for message in crate::Session::holding_nothing(version).send(&offer) {
+                let bytes = message.encoded_len();
+                if bytes > limit {
+                    return Err(match message.resource {
+                        Some(wire::Resource::Certificate(certificate)) => {
+                            too_large(format!("the certificate {}", certificate.name), bytes)
+                        }
+                        _ => too_large("the config".to_owned(), bytes),
+                    });
+                }
             }
         }
         Ok(offer)

@@ -2,7 +2,7 @@
 
 use crate::{Prost, Received, SERVICE, SUBSCRIBE};
 use boring::ssl::SslAcceptor;
-use edgerush_control_stream::{Held, MAX_MESSAGE, Offer, Report, Session, wire};
+use edgerush_control_stream::{Held, MAX_MESSAGE, Offer, OpenError, Report, Session, wire};
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
@@ -37,8 +37,15 @@ pub enum Heard {
     /// A connection refused in the handshake: no certificate the authorities vouch for, or
     /// not TLS 1.3, or not in time.
     Refused(String),
-    /// A stream opened, the data plane holding this.
-    Opened(Held),
+    /// A stream opened.
+    Opened {
+        /// What the data plane holds.
+        held: Held,
+        /// Its config version.
+        version: u32,
+        /// The config version it is written, older than its own if this control plane is.
+        written: u32,
+    },
     /// What the data plane runs, and what it refused.
     Reported(Report),
     /// The stream ended, and why, if not by the data plane closing it.
@@ -261,9 +268,21 @@ async fn subscribed(
     };
     let mut session = match Session::open(first) {
         Ok(session) => session,
-        Err(malformed) => return Some(refuse(&sent, malformed.to_string()).await),
+        Err(error @ (OpenError::DataPlaneTooOld { .. } | OpenError::ControlPlaneTooOld { .. })) => {
+            return Some(refuse(&sent, Status::failed_precondition(error.to_string())).await);
+        }
+        Err(error) => {
+            return Some(refuse(&sent, Status::invalid_argument(error.to_string())).await);
+        }
     };
-    heard(peer, Heard::Opened(session.held().clone()));
+    heard(
+        peer,
+        Heard::Opened {
+            held: session.held().clone(),
+            version: session.reads(),
+            written: session.version().get(),
+        },
+    );
     loop {
         // The latest offer, as far as the data plane does not hold it already.
         let offer = offers.borrow_and_update().clone();
@@ -290,7 +309,10 @@ async fn subscribed(
                 Ok(Some(message)) => match session.heard(message) {
                     Ok(Some(report)) => heard(peer, Heard::Reported(report)),
                     Ok(None) => {}
-                    Err(malformed) => return Some(refuse(&sent, malformed.to_string()).await),
+                    Err(malformed) => {
+                        let why = Status::invalid_argument(malformed.to_string());
+                        return Some(refuse(&sent, why).await);
+                    }
                 },
                 Ok(None) => return None,
                 Err(status) => return Some(status.message().to_owned()),
@@ -299,9 +321,10 @@ async fn subscribed(
     }
 }
 
-/// Ends a stream over a message the protocol does not allow: says why to the data plane,
-/// and returns it.
-async fn refuse(sent: &mpsc::Sender<Result<wire::ToDataPlane, Status>>, why: String) -> String {
-    let _gone = sent.send(Err(Status::invalid_argument(why.clone()))).await;
-    why
+/// Ends a stream the control plane does not serve: says why to the data plane, and returns
+/// it.
+async fn refuse(sent: &mpsc::Sender<Result<wire::ToDataPlane, Status>>, why: Status) -> String {
+    let said = why.message().to_owned();
+    let _gone = sent.send(Err(why)).await;
+    said
 }

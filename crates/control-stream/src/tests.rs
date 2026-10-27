@@ -50,6 +50,77 @@ fn hello(staging: &Staging) -> Session {
     Session::open(wire::FromDataPlane::decode(hello.encode_to_vec().as_slice()).unwrap()).unwrap()
 }
 
+/// A stream's first message: what is held, at a config version.
+fn opening(
+    held: Option<wire::Held>,
+    config_version: u32,
+    oldest_config_version: u32,
+) -> wire::FromDataPlane {
+    wire::FromDataPlane {
+        said: Some(wire::Said::Hello(wire::Hello {
+            held,
+            config_version,
+            oldest_config_version,
+        })),
+    }
+}
+
+fn served() -> ConfigVersion {
+    ConfigVersion::served(CONFIG_VERSION).unwrap()
+}
+
+#[test]
+fn a_config_is_written_at_the_older_end_and_refused_outside_either_window() {
+    let open = |version, oldest| Session::open(opening(None, version, oldest));
+    // At this control plane's own, and at each older one it still writes.
+    for version in OLDEST_CONFIG_VERSION..=CONFIG_VERSION {
+        let session = open(version, OLDEST_CONFIG_VERSION).unwrap();
+        assert_eq!(session.version().get(), version);
+        assert_eq!(session.reads(), version);
+    }
+    // A newer data plane that still reads this control plane's is written that.
+    let session = open(CONFIG_VERSION + 2, CONFIG_VERSION).unwrap();
+    assert_eq!(session.version(), served());
+    assert_eq!(session.reads(), CONFIG_VERSION + 2);
+    // One that no longer does is refused: this control plane is too old for it.
+    assert_eq!(
+        open(CONFIG_VERSION + 2, CONFIG_VERSION + 1).unwrap_err(),
+        OpenError::ControlPlaneTooOld {
+            oldest: CONFIG_VERSION + 1,
+            newest: CONFIG_VERSION,
+        }
+    );
+    // One older than this control plane writes for, or that does not say, is refused.
+    for version in [0, OLDEST_CONFIG_VERSION - 1] {
+        assert_eq!(
+            open(version, 0).unwrap_err(),
+            OpenError::DataPlaneTooOld {
+                version,
+                oldest: OLDEST_CONFIG_VERSION,
+                newest: CONFIG_VERSION,
+            }
+        );
+        assert_eq!(ConfigVersion::served(version), None);
+    }
+    // A data plane of this build opens at its own.
+    let session = hello(&Staging::new());
+    assert_eq!(session.version(), served());
+    assert_eq!(session.reads(), CONFIG_VERSION);
+}
+
+#[test]
+fn an_offer_is_written_for_every_config_version_served() {
+    let offer = Offer::new(&config(80, &[]), None, &mut Versions::new(7)).unwrap();
+    assert_eq!(offer.json.len(), ConfigVersion::all().count());
+    for version in ConfigVersion::all() {
+        let sent = Session::holding_nothing(version).send(&offer);
+        let Some(wire::Resource::Config(config)) = &sent[0].resource else {
+            panic!("no config")
+        };
+        assert_eq!(config.json, offer.json[version.index()]);
+    }
+}
+
 fn running(offer: &Offer) -> Held {
     Held {
         config: Some(offer.version().to_owned()),
@@ -291,11 +362,11 @@ fn a_message_the_protocol_does_not_allow_ends_the_stream() {
     let report = wire::FromDataPlane::from(&Report::default());
     assert_eq!(
         Session::open(report.clone()).unwrap_err(),
-        Malformed::NoHello
+        Malformed::NoHello.into()
     );
     assert_eq!(
         Session::open(wire::FromDataPlane::default()).unwrap_err(),
-        Malformed::NoHello
+        Malformed::NoHello.into()
     );
     let session = Session::open(Staging::new().hello()).unwrap();
     assert_eq!(
@@ -314,10 +385,10 @@ fn a_message_the_protocol_does_not_allow_ends_the_stream() {
         (unversioned, Malformed::Unversioned),
         (unnamed, Malformed::Unnamed),
     ] {
-        let hello = wire::FromDataPlane {
-            said: Some(wire::Said::Hello(held)),
-        };
-        assert_eq!(Session::open(hello).unwrap_err(), expected);
+        assert_eq!(
+            Session::open(opening(Some(held), CONFIG_VERSION, OLDEST_CONFIG_VERSION)).unwrap_err(),
+            expected.into()
+        );
     }
     let refused = wire::FromDataPlane {
         said: Some(wire::Said::Report(wire::Report {
@@ -376,7 +447,7 @@ fn a_config_with_limits_is_not_offered() {
 fn a_resource_longer_than_a_message_is_not_offered() {
     let whole = config(80, &[("a", "1")]);
     let mut versions = Versions::new(7);
-    let lengths: Vec<usize> = Session::holding_nothing()
+    let lengths: Vec<usize> = Session::holding_nothing(served())
         .send(&Offer::new(&whole, None, &mut versions).unwrap())
         .iter()
         .map(Message::encoded_len)

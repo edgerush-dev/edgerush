@@ -93,12 +93,27 @@ pub struct FromDataPlane {
 /// What a data plane says.
 #[derive(Clone, PartialEq, prost::Oneof)]
 pub enum Said {
-    /// What it holds: the stream's first message, and only that.
+    /// What it holds, and the config version it reads: the stream's first message, and
+    /// only that.
     #[prost(message, tag = "1")]
-    Hello(Held),
+    Hello(Hello),
     /// What it runs, after a config it was sent.
     #[prost(message, tag = "2")]
     Report(Report),
+}
+
+/// What a data plane holds as it opens a stream, and the config version it reads.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Hello {
+    /// What it holds.
+    #[prost(message, optional, tag = "1")]
+    pub held: Option<Held>,
+    /// Its config version; 0, from one that does not say, is none written.
+    #[prost(uint32, tag = "2")]
+    pub config_version: u32,
+    /// The oldest config version it still reads.
+    #[prost(uint32, tag = "3")]
+    pub oldest_config_version: u32,
 }
 
 /// Resources' versions: a config's and certificates'.

@@ -4,7 +4,10 @@
 //!
 //! A pure crate: no I/O, no clocks. The stream itself, gRPC over mTLS, is its callers'.
 //!
-//! A data plane opens the stream by saying what it holds ([`Held`]). The control plane
+//! A data plane opens the stream by saying what it holds ([`Held`]), and the config versions
+//! it reads: the control plane writes the one model at the older of its version and the
+//! data plane's ([`CONFIG_VERSION`]), and refuses a stream at a version either end no
+//! longer has. The control plane
 //! sends it what it lacks of the latest [`Offer`], a resource a message: each certificate
 //! at a version it does not hold, then the config, which names each certificate it needs at
 //! its version, then the names of certificates no longer offered ([`Session`]). The stream is ordered and lasts until it breaks, so what is sent
@@ -17,13 +20,15 @@
 
 use std::collections::BTreeMap;
 
+mod encode;
 mod offer;
 mod session;
 mod staging;
 pub mod wire;
 
+pub use encode::{CONFIG_VERSION, ConfigVersion, OLDEST_CONFIG_VERSION};
 pub use offer::{MAX_MESSAGE, Offer, OfferError, Versioned, Versions};
-pub use session::Session;
+pub use session::{OpenError, Session};
 pub use staging::{Staging, Taken};
 
 /// What a data plane holds, or runs: a config's version and each certificate's.
