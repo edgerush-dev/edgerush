@@ -12,7 +12,7 @@ use crate::upstream::destination::{Aside, Destinations, Keys, Retiring, ReuseIde
 use crate::upstream::secure::Secure;
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRateLimiting};
-use edgerush_discovery::Endpoints;
+use edgerush_discovery::{Endpoints, SERVICE_NAME_LABEL};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
@@ -57,7 +57,35 @@ fn namespaces_of(config: &Compiled) -> BTreeSet<String> {
 }
 
 /// The EndpointSlices of each namespace followed, as last told, by namespace.
-pub(crate) type Discovered = HashMap<String, Arc<[EndpointSlice]>>;
+pub(crate) type Discovered = HashMap<String, ByService>;
+
+/// A namespace's EndpointSlices by the Service each is labelled with, so that an upstream's
+/// endpoints are worked out from its own Service's slices, not from every slice of the
+/// namespace for every upstream in it.
+pub(crate) type ByService = HashMap<String, Arc<[EndpointSlice]>>;
+
+/// `slices`, by the Service each is labelled with; one of none is no Service's.
+fn by_service(slices: &[EndpointSlice]) -> ByService {
+    let mut grouped: HashMap<String, Vec<EndpointSlice>> = HashMap::new();
+    for slice in slices {
+        let Some(service) = slice
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(SERVICE_NAME_LABEL))
+        else {
+            continue;
+        };
+        grouped
+            .entry(service.clone())
+            .or_default()
+            .push(slice.clone());
+    }
+    grouped
+        .into_iter()
+        .map(|(service, slices)| (service, slices.into()))
+        .collect()
+}
 
 /// Each upstream's endpoints, by position: those the config lists, or those its Service's
 /// slices say take requests (03 §6), none while its namespace is not followed. Worked out
@@ -70,6 +98,7 @@ fn resolved(config: &Compiled, discovered: &Discovered) -> Vec<Vec<SocketAddr>> 
         .map(|upstream| match &upstream.discovery {
             Some(service) => discovered
                 .get(&service.namespace)
+                .and_then(|services| services.get(&service.service))
                 .map(|slices| {
                     Endpoints::of(service, slices)
                         .in_use()
@@ -404,7 +433,7 @@ impl Proxy {
         let mut next = discovered.clone();
         for (namespace, slices) in changes {
             match slices {
-                Some(slices) => next.insert(namespace, slices),
+                Some(slices) => next.insert(namespace, by_service(&slices)),
                 None => next.remove(&namespace),
             };
         }
