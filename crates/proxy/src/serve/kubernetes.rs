@@ -20,6 +20,23 @@ const GATHERED: Duration = Duration::from_millis(100);
 type Said = Rc<dyn Fn(&str, &dyn Display)>;
 
 impl Proxy {
+    /// The namespaces the running config's discovered upstreams are in that have not been
+    /// listed whole yet, in order: what a data plane that has just started waits for before
+    /// it serves (03 §6).
+    #[must_use]
+    pub fn unlisted(&self) -> Vec<String> {
+        let discovered = self
+            .discovered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.namespaces
+            .borrow()
+            .iter()
+            .filter(|namespace| !discovered.contains_key(*namespace))
+            .cloned()
+            .collect()
+    }
+
     /// Follows the namespaces the running config's discovered upstreams are in, through
     /// `api`, for as long as the data plane runs: a namespace a reload comes to name is
     /// followed from then on, and one it no longer names is no longer followed, its slices

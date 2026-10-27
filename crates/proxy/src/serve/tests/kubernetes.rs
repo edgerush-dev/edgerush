@@ -78,6 +78,11 @@ async fn the_namespaces_a_config_names_are_followed_and_served() {
         )
         .unwrap(),
     );
+    assert_eq!(
+        proxy.unlisted(),
+        ["shop"],
+        "a namespace listed before it was"
+    );
     let said: Rc<RefCell<Vec<String>>> = Rc::default();
     let heard = Rc::clone(&said);
     let local = tokio::task::LocalSet::new();
@@ -93,6 +98,7 @@ async fn the_namespaces_a_config_names_are_followed_and_served() {
                 served(&proxy) == ["10.0.0.1:8080"]
             })
             .await;
+            assert!(proxy.unlisted().is_empty());
 
             proxy
                 .reload(discovering("api.blog.svc.cluster.local:http"))

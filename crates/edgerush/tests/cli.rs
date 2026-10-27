@@ -19,7 +19,44 @@ use std::time::Duration;
 fn edgerush(args: &[&str]) -> io::Result<Output> {
     Command::new(env!("CARGO_BIN_EXE_edgerush"))
         .args(args)
+        // Outside a cluster, wherever the tests run.
+        .env_remove("KUBERNETES_SERVICE_HOST")
+        .env_remove("KUBERNETES_SERVICE_PORT")
         .output()
+}
+
+/// An upstream whose endpoints come from Kubernetes cannot be followed outside a cluster:
+/// a config with one is refused at the start, and on a reload, the one before it running
+/// on. Followed within one, it is tested in kind.
+#[test]
+fn proxy_refuses_discovered_upstreams_outside_a_cluster() -> io::Result<()> {
+    let listed = config("127.0.0.1:0", "up", None);
+    let discovered = listed.replace(
+        "endpoints: { listed: [] }",
+        "endpoints: { kubernetes: \"web.shop.svc.cluster.local:http\" }",
+    );
+    assert_ne!(discovered, listed, "{listed}");
+    let outside = "upstream `up`: its endpoints come from Kubernetes, and the environment names no API server";
+    let file = scratch("outside-a-cluster.yaml");
+    std::fs::write(&file, &discovered)?;
+    let output = edgerush(&["proxy", "--config", &file])?;
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(outside), "{stderr}");
+
+    let one = upstream("one")?;
+    std::fs::write(&file, config("127.0.0.1:0", "up", Some(one)))?;
+    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
+    let web = harness.address_after("listener \"web\" is on ");
+    harness.wait_for("1 worker, thread-per-core");
+    std::fs::write(&file, &discovered)?;
+    assert_eq!(
+        harness.wait_for("config rejected"),
+        "config rejected, the one before it runs on:"
+    );
+    assert!(harness.wait_for("upstream `up`").contains(outside));
+    assert!(get(web, "/")?.contains("x-upstream: one"));
+    Ok(())
 }
 
 #[test]
@@ -708,6 +745,9 @@ impl Harness {
         let mut process = Command::new(env!("CARGO_BIN_EXE_edgerush"))
             .arg("proxy")
             .args(args)
+            // Outside a cluster, wherever the tests run.
+            .env_remove("KUBERNETES_SERVICE_HOST")
+            .env_remove("KUBERNETES_SERVICE_PORT")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;
