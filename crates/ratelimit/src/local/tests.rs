@@ -328,6 +328,31 @@ fn a_workers_handles_drop_keys_forgotten() {
     assert_eq!(handles.len(), 0);
 }
 
+/// A worker lets go of the keys forgotten a part of its handles at a time, so that no one
+/// pass reads them all: one pass reads one part, and as many passes as there are parts read
+/// every one.
+#[test]
+fn a_workers_handles_drop_keys_forgotten_a_part_at_a_time() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let c = contract(10, SECOND, 1);
+    let keys = 64 * 100;
+    for k in 0..keys {
+        assert!(one(&local, &mut handles, format!("k{k}").as_bytes(), c, 0));
+    }
+    local.sweep(10 * SECOND, 0);
+    handles.prune_next();
+    let left = handles.len();
+    assert!(
+        left < keys && left > keys - keys / 32,
+        "one part, of about a 64th, let go: {left} of {keys} left"
+    );
+    for _ in 1..HANDLE_PARTS {
+        handles.prune_next();
+    }
+    assert_eq!(handles.len(), 0);
+}
+
 /// Times at which a contract's units are whole: there the limiter's arithmetic is exact,
 /// and its decisions are the reference bucket's, one for one.
 fn exact_times(c: &Contract, steps: &[u64]) -> Vec<u64> {
@@ -461,7 +486,7 @@ proptest! {
         ops in proptest::collection::vec((0_u8..4, 0_u16..400), 0..3_000),
     ) {
         holds_what_a_map_holds::<1>(&ops)?;
-        holds_what_a_map_holds::<{ key_set::HANDLE_PARTS }>(&ops)?;
+        holds_what_a_map_holds::<{ HANDLE_PARTS }>(&ops)?;
     }
 }
 
@@ -506,8 +531,7 @@ fn holds_what_a_map_holds<const PARTS: usize>(
 /// doubles moves about a 64th of them.
 #[test]
 fn handles_spread_over_their_parts() {
-    let mut set =
-        key_set::KeySet::<_, { key_set::HANDLE_PARTS }>::with_hasher(FixedState::default());
+    let mut set = key_set::KeySet::<_, { HANDLE_PARTS }>::with_hasher(FixedState::default());
     let keys = 64_000;
     for at in 0..keys {
         let name = format!("client-{at}").into_bytes();
@@ -515,9 +539,9 @@ fn handles_spread_over_their_parts() {
         set.replace_hashed(hash, held_key(&name));
     }
     let lens = set.part_lens();
-    assert_eq!(lens.len(), key_set::HANDLE_PARTS);
+    assert_eq!(lens.len(), HANDLE_PARTS);
     assert_eq!(lens.iter().sum::<usize>(), keys);
-    let share = keys / key_set::HANDLE_PARTS;
+    let share = keys / HANDLE_PARTS;
     assert!(
         lens.iter().all(|&len| len > share / 2 && len < share * 2),
         "{lens:?}"

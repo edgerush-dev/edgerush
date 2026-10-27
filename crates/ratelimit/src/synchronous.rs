@@ -12,7 +12,7 @@
 #[cfg(test)]
 mod tests;
 
-pub use crate::local::{Copy, Decision, Handles, Key, Shared};
+pub use crate::local::{Copy, Decision, HANDLE_PARTS, Handles, Key, Shared};
 
 use crate::local::Local;
 use crate::service::Contract;

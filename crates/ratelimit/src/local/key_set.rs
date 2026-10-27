@@ -14,9 +14,6 @@ use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use std::hash::BuildHasher;
 
-/// The parts a worker's handles are split into.
-pub(super) const HANDLE_PARTS: usize = 64;
-
 /// The bits of a hash below a part's: a table places a key by the hash's low bits and tags
 /// it with its top seven, and a registry chooses its shard by bits 32 to 39 (`Local`).
 const PART_SHIFT: u32 = 40;
@@ -122,6 +119,14 @@ impl<S: BuildHasher, const PARTS: usize> KeySet<S, PARTS> {
             part.retain(|held| keep(&held.key));
         }
         self.len = self.parts.iter().map(HashTable::len).sum();
+    }
+
+    /// Keeps only the keys `keep` takes in part `part` (of `PARTS`, wrapping).
+    pub(super) fn retain_part(&mut self, part: usize, mut keep: impl FnMut(&Arc<Key>) -> bool) {
+        let table = &mut self.parts[part % PARTS];
+        let before = table.len();
+        table.retain(|held| keep(&held.key));
+        self.len -= before - table.len();
     }
 
     /// How many it holds.
