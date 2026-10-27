@@ -21,8 +21,8 @@ prost.workspace = true
 thiserror.workspace = true
 # "macros": a stream waits on the offers, the data plane and the control plane's stopping
 # at once; "sync": the offers and the stopping; "net" and "time": sockets and handshakes'
-# deadlines.
-tokio = { workspace = true, features = ["macros", "net", "sync", "time"] }
+# deadlines; "fs": the certificate files, read again every second.
+tokio = { workspace = true, features = ["fs", "macros", "net", "sync", "time"] }
 tokio-boring.workspace = true
 tonic.workspace = true
 tower-service.workspace = true

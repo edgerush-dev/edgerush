@@ -1,5 +1,7 @@
 use super::*;
+use edgerush_certificates::testing::Authority;
 use edgerush_config::{Config, HarnessFile};
+use edgerush_control_stream::Staging;
 use edgerush_kubernetes::Timing;
 use edgerush_kubernetes::testing::{Answer, Fake, answer, token};
 use std::cell::RefCell;
@@ -19,6 +21,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             data_plane: PathBuf::from("p"),
             scope: vec![Scope::Cluster],
             write_config: None,
+            stream: None,
         }))
     );
     assert_eq!(
@@ -39,6 +42,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
                 Scope::Namespace("blog".to_owned())
             ],
             write_config: Some(PathBuf::from("c")),
+            stream: None,
         }))
     );
     assert_eq!(parsed(&["--help"]), Ok(Parsed::Help));
@@ -194,6 +198,7 @@ async fn run_until(
     name: &str,
     plane: &str,
     write_config: Option<PathBuf>,
+    serving: Option<Serving>,
     done: impl Fn(&[String]) -> bool,
 ) -> Vec<String> {
     let api = fake.client(&token(name, "secret"), Timing::default());
@@ -204,6 +209,7 @@ async fn run_until(
         data_plane: PathBuf::new(),
         scope: vec![Scope::Cluster],
         write_config,
+        stream: None,
     };
     let stop = {
         let lines = Rc::clone(&lines);
@@ -219,11 +225,18 @@ async fn run_until(
         }
     };
     tokio::task::LocalSet::new()
-        .run_until(control_until(api, options, plane, stop, move |line| {
-            heard
-                .borrow_mut()
-                .extend(line.lines().map(ToOwned::to_owned));
-        }))
+        .run_until(control_until(
+            api,
+            options,
+            plane,
+            serving,
+            stop,
+            move |line| {
+                heard
+                    .borrow_mut()
+                    .extend(line.lines().map(ToOwned::to_owned));
+            },
+        ))
         .await
         .unwrap();
     lines.take()
@@ -243,6 +256,7 @@ async fn each_translation_is_said_and_written_as_a_harness_file() {
         "controller-writes",
         &plane_at("[::]:8080", "[::]:8443"),
         Some(written.clone()),
+        None,
         |lines| lines.iter().any(|line| line.starts_with("written to ")),
     )
     .await;
@@ -285,6 +299,7 @@ async fn a_config_the_data_plane_would_refuse_is_said_and_not_written() {
         "controller-refuses",
         &plane_at("[::]:8080", "[::]:8080"),
         Some(written.clone()),
+        None,
         |lines| lines.iter().any(|line| line.contains("already taken")),
     )
     .await;
@@ -295,4 +310,249 @@ async fn a_config_the_data_plane_would_refuse_is_said_and_not_written() {
         "{lines:?}"
     );
     assert!(!written.exists(), "a refused config written");
+}
+
+#[test]
+fn the_stream_is_given_whole_or_not_at_all() {
+    let stream = [
+        "--listen",
+        "[::]:9443",
+        "--certificate",
+        "c",
+        "--key",
+        "k",
+        "--authorities",
+        "a",
+    ];
+    let mut args = vec!["--data-plane", "p"];
+    args.extend(stream);
+    assert_eq!(
+        parsed(&args),
+        Ok(Parsed::Control(Options {
+            data_plane: PathBuf::from("p"),
+            scope: vec![Scope::Cluster],
+            write_config: None,
+            stream: Some(Box::new(Stream {
+                listen: "[::]:9443".parse().unwrap(),
+                files: Files {
+                    certificate: PathBuf::from("c"),
+                    key: PathBuf::from("k"),
+                    authorities: PathBuf::from("a"),
+                },
+            })),
+        }))
+    );
+    // Each of the four left out.
+    for left_out in [0, 2, 4, 6] {
+        let mut args = vec!["--data-plane", "p"];
+        for (i, pair) in stream.chunks(2).enumerate() {
+            if i * 2 != left_out {
+                args.extend(pair);
+            }
+        }
+        assert_eq!(parsed(&args), Err(UsageError::Together), "{args:?}");
+    }
+    assert_eq!(
+        parsed(&["--listen", "9443"]),
+        Err(UsageError::Listen("9443".to_owned()))
+    );
+    assert_eq!(
+        parsed(&["--listen", "[::]:1", "--listen", "[::]:2"]),
+        Err(UsageError::Twice("--listen"))
+    );
+}
+
+#[test]
+fn certificates_that_cannot_be_read_stop_it_before_it_looks_for_a_cluster() {
+    let plane = file("stream-plane.yaml", &plane_at("[::]:8080", "[::]:8443"));
+    let missing = std::env::temp_dir()
+        .join("edgerush-controller-tests")
+        .join("missing.crt");
+    let missing = missing.to_str().unwrap();
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let status = command(
+        [
+            "--data-plane",
+            plane.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--certificate",
+            missing,
+            "--key",
+            missing,
+            "--authorities",
+            missing,
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned),
+        &mut stdout,
+        &mut stderr,
+    );
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert_eq!(status, crate::EXIT_USAGE, "{stderr}");
+    assert!(
+        stderr.starts_with("error: the stream's certificates: ") && stderr.contains("missing.crt"),
+        "{stderr}"
+    );
+    // Files that can be read, but not used.
+    let junk = file("junk.crt", "not a certificate");
+    let junk = junk.to_str().unwrap();
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let status = command(
+        [
+            "--data-plane",
+            plane.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--certificate",
+            junk,
+            "--key",
+            junk,
+            "--authorities",
+            junk,
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned),
+        &mut stdout,
+        &mut stderr,
+    );
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert_eq!(status, crate::EXIT_USAGE, "{stderr}");
+    assert!(
+        stderr.starts_with("error: the stream's certificates: the certificate: "),
+        "{stderr}"
+    );
+}
+
+/// The stream's files, of `authority`'s certificate for `name`, in `dir`.
+fn stream_files(dir: &str, authority: &Authority, name: &str) -> Files {
+    let dir = std::env::temp_dir()
+        .join("edgerush-controller-tests")
+        .join(dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let files = Files {
+        certificate: dir.join("tls.crt"),
+        key: dir.join("tls.key"),
+        authorities: dir.join("ca.crt"),
+    };
+    let issued = authority.issue(&[name]);
+    std::fs::write(&files.certificate, issued.chain).unwrap();
+    std::fs::write(&files.key, issued.key).unwrap();
+    std::fs::write(&files.authorities, authority.pem()).unwrap();
+    files
+}
+
+/// A data plane that dials the control plane is sent each config translated, and what it
+/// says of it is said; certificate files replaced are put to use, or said not to be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said() {
+    let fake = cluster().await;
+    let authority = Authority::new("stream");
+    let files = stream_files("served", &authority, "control.test");
+    let credentials = files.read().await.unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let serving = Serving {
+        listener,
+        files: files.clone(),
+        credentials,
+        reread: Duration::from_millis(20),
+        versions: Versions::new(7),
+    };
+    // The data plane, dialling as one does.
+    let (ran, mut running) = tokio::sync::mpsc::unbounded_channel();
+    let tls = edgerush_control_service::connector(&Credentials {
+        certificate: authority.issue(&["data-plane"]),
+        authorities: authority.pem(),
+    })
+    .unwrap();
+    let following = tokio::spawn(async move {
+        let mut staging = Staging::new();
+        edgerush_control_service::follow(&address, "control.test", &tls, &mut staging, |config| {
+            let _ = ran.send(*config);
+            Ok(())
+        })
+        .await
+    });
+    // Files that cannot be used, then another authority's, once the data plane runs its
+    // config; and then a data plane that trusts that authority alone, which is served.
+    let replacing = files.clone();
+    let address = serving.listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        let config = running.recv().await.unwrap();
+        let routes: Vec<String> = config
+            .routes
+            .iter()
+            .map(|route| route.name.clone())
+            .collect();
+        assert_eq!(routes, ["ingress/shop/web/shop.example"]);
+        std::fs::write(&replacing.key, "not a key").unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let renamed = Authority::new("renamed");
+        let issued = renamed.issue(&["control.test"]);
+        std::fs::write(&replacing.certificate, issued.chain).unwrap();
+        std::fs::write(&replacing.key, issued.key).unwrap();
+        std::fs::write(&replacing.authorities, renamed.pem()).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let tls = edgerush_control_service::connector(&Credentials {
+            certificate: renamed.issue(&["data-plane"]),
+            authorities: renamed.pem(),
+        })
+        .unwrap();
+        let mut staging = Staging::new();
+        edgerush_control_service::follow(&address, "control.test", &tls, &mut staging, |_| Ok(()))
+            .await
+    });
+    let runs = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|line| {
+                line.starts_with("data plane 127.0.0.1:") && line.contains(": runs config 7.")
+            })
+            .count()
+    };
+    let lines = run_until(
+        &fake,
+        "controller-serves",
+        &plane_at("[::]:8080", "[::]:8443"),
+        None,
+        Some(serving),
+        |lines| runs(lines) == 2,
+    )
+    .await;
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "the stream's certificates are replaced"),
+        "{lines:?}"
+    );
+    let said = |start: &str| lines.iter().any(|line| line.starts_with(start));
+    assert!(said("offered as config 7."), "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("data plane 127.0.0.1:")
+                && line.ends_with(": opened at config version 1, holding no config")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("data plane 127.0.0.1:")
+                && line.contains(": runs config 7.")),
+        "{lines:?}"
+    );
+    assert!(
+        said("the stream's certificates cannot be used, and the last are kept: "),
+        "{lines:?}"
+    );
+    // Stopping ends the data plane's stream.
+    let ended = tokio::time::timeout(Duration::from_secs(5), following)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ended,
+        edgerush_control_service::Ended::Ended("the control plane is stopping".to_owned())
+    );
 }

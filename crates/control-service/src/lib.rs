@@ -6,7 +6,8 @@
 //! report after each config; down come the resources of each offer it lacks. TLS is 1.3
 //! alone, and each end checks the other's certificate against the stream's own
 //! authorities; the data plane checks the control plane's name too, as it dials it. Any
-//! data plane the authorities vouch for is served: none is told apart by its name yet.
+//! data plane the authorities vouch for is served: none is told apart by its name yet. Each
+//! end's certificate files are read again as they change ([`reread`]).
 
 use bytes::Buf;
 use std::marker::PhantomData;
@@ -17,10 +18,13 @@ use tonic::Status;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 
 mod client;
+mod files;
 mod server;
 mod tls;
 
+pub use boring::ssl::{SslAcceptor, SslConnector};
 pub use client::{Ended, follow};
+pub use files::{Files, FilesError, reread};
 pub use server::{Heard, ServeError, serve};
 pub use tls::{Credentials, TlsError, acceptor, connector};
 

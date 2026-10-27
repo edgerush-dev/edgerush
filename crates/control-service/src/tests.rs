@@ -437,3 +437,63 @@ async fn a_data_plane_this_control_plane_is_too_old_for_is_refused() {
     plane.signal();
     plane.join().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn certificate_files_are_read_again_and_each_change_handed_on_once() {
+    let dir = std::env::temp_dir().join("edgerush-control-service-files");
+    std::fs::create_dir_all(&dir).unwrap();
+    let files = Files {
+        certificate: dir.join("tls.crt"),
+        key: dir.join("tls.key"),
+        authorities: dir.join("ca.crt"),
+    };
+    // Each file put in place whole, as Kubernetes swaps a mounted Secret's: one written in
+    // place could be read half written.
+    let put = |path: &std::path::Path, contents: &str| {
+        let beside = path.with_extension("partial");
+        std::fs::write(&beside, contents).unwrap();
+        std::fs::rename(&beside, path).unwrap();
+    };
+    let write = |chain: &str| {
+        put(&files.certificate, chain);
+        put(&files.key, "key");
+        put(&files.authorities, "authorities");
+    };
+    write("first");
+    let first = files.read().await.unwrap();
+    assert_eq!(first.certificate.chain, "first");
+    let (seen, mut changes) = mpsc::unbounded_channel();
+    let rereading = tokio::spawn(reread(
+        files.clone(),
+        first,
+        Duration::from_millis(20),
+        move |changed| {
+            let _ = seen.send(
+                changed
+                    .map(|now| now.certificate.chain.clone())
+                    .map_err(Clone::clone),
+            );
+        },
+    ));
+    let next = async |changes: &mut mpsc::UnboundedReceiver<_>| {
+        tokio::time::timeout(Duration::from_secs(5), changes.recv())
+            .await
+            .expect("no change handed on")
+            .unwrap()
+    };
+    write("second");
+    assert_eq!(next(&mut changes).await, Ok("second".to_owned()));
+    std::fs::remove_file(&files.key).unwrap();
+    let Err(failed) = next(&mut changes).await else {
+        panic!("no failure handed on")
+    };
+    assert!(failed.path.ends_with("tls.key"), "{failed}");
+    // Said once, not on every read; and put back as it was, nothing has changed.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    put(&files.key, "key");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(changes.try_recv().is_err());
+    write("third");
+    assert_eq!(next(&mut changes).await, Ok("third".to_owned()));
+    rereading.abort();
+}
