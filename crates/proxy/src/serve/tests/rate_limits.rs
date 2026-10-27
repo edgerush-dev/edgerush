@@ -139,6 +139,7 @@ fn limited(mut config: Config, service: &[String]) -> Config {
         max_key_bytes: None,
         synchronous: None,
         experimental_header_keys: None,
+        experimental_fewer_pods: None,
         service: Some(edgerush_config::RateLimitService {
             addresses: service.to_vec(),
             cycle_ms: Some(10),
