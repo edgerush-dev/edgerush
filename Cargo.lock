@@ -264,6 +264,7 @@ version = "0.0.0"
 dependencies = [
  "edgerush-config",
  "edgerush-explain",
+ "edgerush-kubernetes",
  "edgerush-proxy",
  "edgerush-translate",
  "k8s-openapi",

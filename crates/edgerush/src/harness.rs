@@ -26,6 +26,7 @@ use crate::config_file::{ConfigFile, Rejected};
 use crate::essential::{Ended, Essential, Told};
 use crate::per_core::{self, Accept};
 use edgerush_config::Compiled;
+use edgerush_kubernetes::{ApiError, ApiServer};
 use edgerush_proxy::{H1Limits, Proxy, ProxyError};
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -237,8 +238,15 @@ enum Failure {
     Config { path: PathBuf, rejected: Rejected },
     #[error("config {} cannot be run:\n{error}", path.display())]
     Proxy { path: PathBuf, error: ProxyError },
-    #[error("config {} cannot be run:\nupstream `{upstream}`: {NOT_FOLLOWED}", path.display())]
-    NotFollowed { path: PathBuf, upstream: String },
+    #[error(
+        "config {} cannot be run:\nupstream `{upstream}`: its endpoints come from Kubernetes, and {why}",
+        path.display()
+    )]
+    Unfollowable {
+        path: PathBuf,
+        upstream: String,
+        why: ApiError,
+    },
     #[error("cannot listen on {address} for {what}: {error}")]
     Listen {
         what: String,
@@ -255,12 +263,18 @@ enum Failure {
     PanickedDraining(Ended),
 }
 
-/// Why a config with an upstream whose endpoints come from Kubernetes is refused: the
-/// harness follows no EndpointSlices yet, and such an upstream would never have an endpoint.
-const NOT_FOLLOWED: &str = "endpoints from Kubernetes are not served yet";
+/// How long a data plane with discovered upstreams waits for the first list of every
+/// namespace it follows before it serves anyway, as Envoy waits for its clusters (03 §6).
+const FIRST_LISTS: Duration = Duration::from_secs(15);
 
-/// The first upstream of `config` whose endpoints come from Kubernetes, if there is one.
-fn not_followed(config: &Compiled) -> Option<&str> {
+/// How often that wait looks.
+const FIRST_LISTS_POLL: Duration = Duration::from_millis(20);
+
+/// The first upstream of `config` whose endpoints come from Kubernetes, if `outside` says
+/// why there is no cluster's API server to follow them through: such an upstream would
+/// never have an endpoint.
+fn unfollowable<'a>(config: &'a Compiled, outside: Option<&ApiError>) -> Option<&'a str> {
+    outside?;
     config
         .upstreams()
         .iter()
@@ -298,10 +312,15 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         Ok(opened) => opened,
         Err(rejected) => return Err(Failure::Config { path, rejected }),
     };
-    if let Some(upstream) = not_followed(&config) {
-        return Err(Failure::NotFollowed {
+    // The cluster's API server, if the data plane is in one: what discovered upstreams are
+    // followed through, a config with one refused without it.
+    let cluster = ApiServer::in_cluster();
+    let outside = cluster.as_ref().err().cloned();
+    if let Some(upstream) = unfollowable(&config, outside.as_ref()) {
+        return Err(Failure::Unfollowable {
             path,
             upstream: upstream.to_owned(),
+            why: outside.unwrap_or(ApiError::NoServer),
         });
     }
     let mut bound: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
@@ -372,6 +391,26 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     proxy
         .start_rate_limits(rate_limits_failed(&stopping))
         .map_err(|error| Failure::Proxy { path, error })?;
+    if let Ok(api) = cluster {
+        kubernetes(Arc::clone(&proxy), api, &stopping).map_err(Failure::Runtime)?;
+        // Nothing accepted until every namespace followed has been listed once, so that a
+        // client waits rather than be answered 503 for want of a list; for so long at most.
+        match first_lists(&proxy, &stop) {
+            Next::Look => {}
+            Next::Stop => return Ok(()),
+            Next::Failed(ended) => return Err(Failure::Ended(ended)),
+        }
+        let unlisted = proxy.unlisted();
+        if !unlisted.is_empty() {
+            say(
+                stderr,
+                format_args!(
+                    "serving before the first EndpointSlices of {}: their upstreams answer 503 until they come",
+                    unlisted.join(", ")
+                ),
+            );
+        }
+    }
     // Every worker runs on a thread of its own, which stays for as long as the process.
     let loads = per_core::start(&proxy, sockets, accept, limits, connections, &stopping)?;
     health_checks(Arc::clone(&proxy), &stopping).map_err(Failure::Runtime)?;
@@ -421,11 +460,11 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
                 continue;
             }
         };
-        if let Some(upstream) = not_followed(&config) {
+        if let (Some(upstream), Some(why)) = (unfollowable(&config, outside.as_ref()), &outside) {
             say(
                 stderr,
                 format_args!(
-                    "config rejected, the one before it runs on:\nupstream `{upstream}`: {NOT_FOLLOWED}"
+                    "config rejected, the one before it runs on:\nupstream `{upstream}`: its endpoints come from Kubernetes, and {why}"
                 ),
             );
             continue;
@@ -699,6 +738,41 @@ fn health_checks(proxy: Arc<Proxy>, tell: &Sender<Told>) -> io::Result<()> {
             essential.finished();
         })?;
     Ok(())
+}
+
+/// Follows the namespaces the running config's discovered upstreams are in, through `api`,
+/// on a thread and runtime of its own, as the health checks are (03 §6); what fails is said
+/// on stderr with its namespace.
+fn kubernetes(proxy: Arc<Proxy>, api: ApiServer, tell: &Sender<Told>) -> io::Result<()> {
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let tell = tell.clone();
+    thread::Builder::new()
+        .name("kubernetes".to_owned())
+        .spawn(move || {
+            let mut essential = Essential::new("the EndpointSlice watch".to_owned(), &tell);
+            let follows = proxy.follow_kubernetes(api, |namespace, failure| {
+                say(
+                    &mut io::stderr(),
+                    format_args!("EndpointSlices of namespace {namespace}: {failure}"),
+                );
+            });
+            tokio::task::LocalSet::new().block_on(&runtime, follows);
+            essential.finished();
+        })?;
+    Ok(())
+}
+
+/// Waits until every namespace the running config follows has been listed once, or for
+/// [`FIRST_LISTS`] at most: [`Next::Look`] then, or what the main loop was told meanwhile.
+fn first_lists(proxy: &Proxy, told: &Receiver<Told>) -> Next {
+    let until = Instant::now() + FIRST_LISTS;
+    while !proxy.unlisted().is_empty() && Instant::now() < until {
+        match next(told, FIRST_LISTS_POLL) {
+            Next::Look => {}
+            other => return other,
+        }
+    }
+    Next::Look
 }
 
 /// What the proxy calls if its rate-limiting thread fails, a thread it starts itself when a

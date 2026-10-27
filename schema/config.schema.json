@@ -223,7 +223,7 @@
           ]
         },
         {
-          "description": "A Kubernetes Service's endpoints, followed through its EndpointSlices:\n`<service>.<namespace>.svc.<cluster domain>:<port>`, the port named, or a number for\nthe Service's only, unnamed port. Not served yet: a data plane refuses it until it\nwatches EndpointSlices.",
+          "description": "A Kubernetes Service's endpoints, followed through its EndpointSlices:\n`<service>.<namespace>.svc.<cluster domain>:<port>`, the port named, or a number for\nthe Service's only, unnamed port. A data plane follows them from the API server of\nthe cluster it is in, and refuses it outside one.",
           "type": "object",
           "properties": {
             "kubernetes": {

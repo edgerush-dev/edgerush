@@ -520,8 +520,8 @@ pub enum Endpoints {
     Listed(#[cfg_attr(feature = "schema", schemars(extend("uniqueItems" = true)))] Vec<SocketAddr>),
     /// A Kubernetes Service's endpoints, followed through its EndpointSlices:
     /// `<service>.<namespace>.svc.<cluster domain>:<port>`, the port named, or a number for
-    /// the Service's only, unnamed port. Not served yet: a data plane refuses it until it
-    /// watches EndpointSlices.
+    /// the Service's only, unnamed port. A data plane follows them from the API server of
+    /// the cluster it is in, and refuses it outside one.
     Kubernetes(String),
 }
 
