@@ -306,6 +306,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-control-service"
+version = "0.0.0"
+dependencies = [
+ "boring",
+ "bytes",
+ "edgerush-certificates",
+ "edgerush-config",
+ "edgerush-control-stream",
+ "futures-core",
+ "http",
+ "hyper-util",
+ "prost",
+ "serde-saphyr",
+ "thiserror",
+ "tokio",
+ "tokio-boring",
+ "tonic",
+ "tower-service",
+]
+
+[[package]]
 name = "edgerush-control-stream"
 version = "0.0.0"
 dependencies = [

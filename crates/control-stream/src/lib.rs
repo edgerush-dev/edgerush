@@ -22,7 +22,7 @@ mod session;
 mod staging;
 pub mod wire;
 
-pub use offer::{Offer, OfferError, Versioned, Versions};
+pub use offer::{MAX_MESSAGE, Offer, OfferError, Versioned, Versions};
 pub use session::Session;
 pub use staging::{Staging, Taken};
 

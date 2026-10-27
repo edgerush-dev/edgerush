@@ -34,6 +34,7 @@ boring = "5.2"
 bytes = "1.12"
 edgerush-certificates = { path = "crates/certificates" }
 edgerush-config = { path = "crates/config" }
+edgerush-control-service = { path = "crates/control-service" }
 edgerush-control-stream = { path = "crates/control-stream" }
 edgerush-controller = { path = "crates/controller" }
 edgerush-discovery = { path = "crates/discovery" }
@@ -107,9 +108,10 @@ thiserror = "2.0"
 # between control plane and data planes (02 §4): tonic was in the tree already for the
 # proxy's gRPC tests; prost encodes its messages, derived from Rust structs so the build
 # needs no protoc. Version skew between the two ends is what protobuf is for. Only the
-# rate-limiting service crate and the config stream's (`edgerush-control-stream`) may
-# depend on these three (the proxy and the control plane reach them through those crates);
-# tower-service is the trait tonic serves through.
+# rate-limiting service crate and the config stream's two (`edgerush-control-stream`,
+# whose messages are prost's, and `edgerush-control-service`) may depend on these three
+# (the proxy and the control plane reach them through those crates); tower-service is the
+# trait tonic serves through.
 prost = "0.14"
 tonic = { version = "0.14", default-features = false, features = ["transport"] }
 tower-service = "0.3"

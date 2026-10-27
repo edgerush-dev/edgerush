@@ -1,0 +1,37 @@
+[package]
+name = "edgerush-control-service"
+description = "EdgeRush's config stream over gRPC and mutual TLS: the control plane's server and the data plane's client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+boring.workspace = true
+bytes.workspace = true
+edgerush-certificates.workspace = true
+edgerush-config.workspace = true
+edgerush-control-stream.workspace = true
+futures-core.workspace = true
+http.workspace = true
+# The data plane's connection, made by our own connector, as tonic's client takes one.
+hyper-util.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+# "macros": a stream waits on the offers, the data plane and the control plane's stopping
+# at once; "sync": the offers and the stopping; "net" and "time": sockets and handshakes'
+# deadlines.
+tokio = { workspace = true, features = ["macros", "net", "sync", "time"] }
+tokio-boring.workspace = true
+tonic.workspace = true
+tower-service.workspace = true
+
+[dev-dependencies]
+edgerush-certificates = { workspace = true, features = ["testing"] }
+# The configs sent, read as the development harness reads one.
+serde-saphyr.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

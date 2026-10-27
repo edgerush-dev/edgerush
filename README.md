@@ -257,6 +257,10 @@ crates/certificates
                    (`edgerush-certificates`), by BoringSSL: what the data plane presents and what
                    translation admits are read by the same code; no I/O
 crates/config      the config model and its compilation (`edgerush-config`): pure, format-free
+crates/control-service
+                   the config stream over gRPC and mutual TLS (`edgerush-control-service`):
+                   the control plane's server and the data plane's client, TLS 1.3 alone and
+                   each end checked against the stream's own authorities
 crates/control-stream
                    the config stream between control plane and data planes
                    (`edgerush-control-stream`): pure, no I/O; its messages, what a control plane

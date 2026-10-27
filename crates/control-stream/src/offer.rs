@@ -1,7 +1,13 @@
 //! What the control plane offers, and the versions it names it by.
 
+use crate::wire;
 use edgerush_config::{Certificate, Config};
+use prost::Message;
 use std::collections::BTreeMap;
+
+/// The longest message either end of the stream sends or takes: 64 MiB, for a config is
+/// sent whole, in one.
+pub const MAX_MESSAGE: usize = 64 << 20;
 
 /// Names resources' versions: a count from the control plane's start, marked with when
 /// it started, so that two of its runs never name two resources alike (02 §4).
@@ -55,6 +61,16 @@ pub enum OfferError {
     /// The config could not be written as JSON.
     #[error("the config cannot be written: {0}")]
     Written(#[from] serde_json::Error),
+    /// A resource, written, is longer than a message may be.
+    #[error("{what} is {bytes} bytes written, more than the {limit} a message may hold")]
+    TooLarge {
+        /// What: the config, or a certificate by name.
+        what: String,
+        /// How long its message is.
+        bytes: usize,
+        /// How long one may be.
+        limit: usize,
+    },
 }
 
 impl Offer {
@@ -64,6 +80,16 @@ impl Offer {
         config: &Config,
         last: Option<&Offer>,
         versions: &mut Versions,
+    ) -> Result<Self, OfferError> {
+        Self::within(config, last, versions, MAX_MESSAGE)
+    }
+
+    /// As [`Offer::new`], each message at most `limit` long.
+    pub(crate) fn within(
+        config: &Config,
+        last: Option<&Offer>,
+        versions: &mut Versions,
+        limit: usize,
     ) -> Result<Self, OfferError> {
         if config.limits.is_some() {
             return Err(OfferError::Limits);
@@ -94,11 +120,25 @@ impl Offer {
                 (config, json)
             }
         };
-        Ok(Self {
+        let offer = Self {
             config,
             json,
             certificates,
-        })
+        };
+        // Refused here, where it can be said, rather than by the stream as it is sent.
+        let too_large = |what: String, bytes: usize| OfferError::TooLarge { what, bytes, limit };
+        for message in crate::Session::holding_nothing().send(&offer) {
+            let bytes = message.encoded_len();
+            if bytes > limit {
+                return Err(match message.resource {
+                    Some(wire::Resource::Certificate(certificate)) => {
+                        too_large(format!("the certificate {}", certificate.name), bytes)
+                    }
+                    _ => too_large("the config".to_owned(), bytes),
+                });
+            }
+        }
+        Ok(offer)
     }
 
     /// The config's version.

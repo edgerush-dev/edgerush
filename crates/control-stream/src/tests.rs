@@ -373,6 +373,38 @@ fn a_config_with_limits_is_not_offered() {
 }
 
 #[test]
+fn a_resource_longer_than_a_message_is_not_offered() {
+    let whole = config(80, &[("a", "1")]);
+    let mut versions = Versions::new(7);
+    let lengths: Vec<usize> = Session::holding_nothing()
+        .send(&Offer::new(&whole, None, &mut versions).unwrap())
+        .iter()
+        .map(Message::encoded_len)
+        .collect();
+    let (certificate, config) = (lengths[0], lengths[1]);
+    let fits = certificate.max(config);
+    assert!(Offer::within(&whole, None, &mut versions, fits).is_ok());
+    let too_large = |limit| match Offer::within(&whole, None, &mut versions.clone(), limit) {
+        Err(OfferError::TooLarge { what, bytes, .. }) => (what, bytes),
+        other => panic!("{other:?}"),
+    };
+    let smaller = certificate.min(config);
+    let (what, bytes) = too_large(fits - 1);
+    assert_eq!(bytes, fits);
+    let expected = if config > certificate {
+        "the config"
+    } else {
+        "the certificate a"
+    };
+    assert_eq!(what, expected);
+    // The certificate is sent first, so it is the one said.
+    assert_eq!(
+        too_large(smaller - 1),
+        ("the certificate a".to_owned(), certificate)
+    );
+}
+
+#[test]
 fn two_runs_of_a_control_plane_never_name_two_resources_alike() {
     let whole = config(80, &[("a", "1"), ("b", "2")]);
     let names = |start| {

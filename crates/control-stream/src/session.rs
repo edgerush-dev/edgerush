@@ -20,6 +20,13 @@ impl Session {
         }
     }
 
+    /// A stream to a data plane that holds nothing.
+    pub(crate) fn holding_nothing() -> Self {
+        Self {
+            held: Held::default(),
+        }
+    }
+
     /// What the data plane is taken to hold.
     pub fn held(&self) -> &Held {
         &self.held
