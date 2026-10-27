@@ -1,17 +1,34 @@
 use super::*;
 use crate::testing::*;
+use k8s_openapi::ByteString;
+use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
+
+/// A namespace's scope.
+fn namespace(name: &str) -> Scope {
+    Scope::Namespace(name.to_owned())
+}
 
 #[tokio::test]
 async fn a_list_is_asked_for_with_the_token_and_read() {
     let fake = Fake::start(&["127.0.0.1"], |_| answer(200, &list("5", Some("a/b=")))).await;
     let client = fake.client(&token("list", "secret\n"), Timing::default());
-    let page = client.list("shop", None).await.unwrap();
+    let page = client
+        .list::<EndpointSlice>(&namespace("shop"), None)
+        .await
+        .unwrap();
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].metadata.name.as_deref(), Some("web-1"));
     assert_eq!(page.metadata.resource_version.as_deref(), Some("5"));
     assert_eq!(page.metadata.continue_.as_deref(), Some("a/b="));
-    client.list("shop", Some("a/b=")).await.unwrap();
+    client
+        .list::<EndpointSlice>(&namespace("shop"), Some("a/b="))
+        .await
+        .unwrap();
 
     let seen = fake.seen();
     assert_eq!(
@@ -47,7 +64,10 @@ async fn a_watch_is_asked_from_its_version_and_read_an_event_a_line() {
     })
     .await;
     let client = fake.client(&token("watch", "secret"), Timing::default());
-    let mut events = client.watch("shop", "7+x").await.unwrap();
+    let mut events = client
+        .watch::<EndpointSlice>(&namespace("shop"), "7+x")
+        .await
+        .unwrap();
     match events.next().await {
         Some(Ok(WatchEvent::Added(slice))) => {
             assert_eq!(slice.metadata.name.as_deref(), Some("web-1"));
@@ -79,7 +99,10 @@ async fn another_status_is_said_with_its_message_and_410_is_gone() {
     })
     .await;
     let client = fake.client(&token("status", "secret"), Timing::default());
-    let gone = client.watch("shop", "7").await.unwrap_err();
+    let gone = client
+        .watch::<EndpointSlice>(&namespace("shop"), "7")
+        .await
+        .unwrap_err();
     assert_eq!(
         gone,
         ApiError::Answered {
@@ -88,7 +111,10 @@ async fn another_status_is_said_with_its_message_and_410_is_gone() {
         }
     );
     assert!(gone.is_gone());
-    let refused = client.list("shop", None).await.unwrap_err();
+    let refused = client
+        .list::<EndpointSlice>(&namespace("shop"), None)
+        .await
+        .unwrap_err();
     assert_eq!(
         refused,
         ApiError::Answered {
@@ -107,7 +133,10 @@ async fn a_certificate_not_for_the_address_or_not_trusted_is_refused() {
     .await;
     let client = elsewhere.client(&token("elsewhere", "secret"), Timing::default());
     assert!(
-        matches!(client.list("shop", None).await, Err(ApiError::Connect(_))),
+        matches!(
+            client.list::<EndpointSlice>(&namespace("shop"), None).await,
+            Err(ApiError::Connect(_))
+        ),
         "a certificate for another address"
     );
 
@@ -123,7 +152,9 @@ async fn a_certificate_not_for_the_address_or_not_trusted_is_refused() {
     .unwrap();
     assert!(
         matches!(
-            untrusting.list("shop", None).await,
+            untrusting
+                .list::<EndpointSlice>(&namespace("shop"), None)
+                .await,
             Err(ApiError::Connect(_))
         ),
         "a certificate no trusted authority signed"
@@ -140,16 +171,29 @@ async fn the_token_is_read_again_once_it_is_old_and_kept_if_it_cannot_be() {
         ..Timing::default()
     };
     let client = fake.client(&path, every_time);
-    client.list("shop", None).await.unwrap();
+    client
+        .list::<EndpointSlice>(&namespace("shop"), None)
+        .await
+        .unwrap();
     std::fs::write(&path, "second").unwrap();
-    client.list("shop", None).await.unwrap();
+    client
+        .list::<EndpointSlice>(&namespace("shop"), None)
+        .await
+        .unwrap();
     std::fs::remove_file(&path).unwrap();
-    client.list("shop", None).await.unwrap();
+    client
+        .list::<EndpointSlice>(&namespace("shop"), None)
+        .await
+        .unwrap();
 
     let held = fake.client(&token("held", "first"), Timing::default());
-    held.list("shop", None).await.unwrap();
+    held.list::<EndpointSlice>(&namespace("shop"), None)
+        .await
+        .unwrap();
     token("held", "second");
-    held.list("shop", None).await.unwrap();
+    held.list::<EndpointSlice>(&namespace("shop"), None)
+        .await
+        .unwrap();
 
     let tokens: Vec<Option<String>> = fake.seen().into_iter().map(|s| s.authorization).collect();
     let bearer = |token: &str| Some(format!("Bearer {token}"));
@@ -166,7 +210,7 @@ async fn the_token_is_read_again_once_it_is_old_and_kept_if_it_cannot_be() {
 
     let none = fake.client(&token("none", "  \n"), Timing::default());
     assert!(matches!(
-        none.list("shop", None).await,
+        none.list::<EndpointSlice>(&namespace("shop"), None).await,
         Err(ApiError::Token(_))
     ));
 }
@@ -205,19 +249,31 @@ async fn answers_are_bounded_in_size_and_time() {
     };
     let client = fake.client(&token("bounded", "secret"), quick);
     assert_eq!(
-        client.list("large", None).await.unwrap_err(),
+        client
+            .list::<EndpointSlice>(&namespace("large"), None)
+            .await
+            .unwrap_err(),
         ApiError::TooLarge("a list's page", MOST_PAGE_BYTES)
     );
-    let mut events = client.watch("large", "1").await.unwrap();
+    let mut events = client
+        .watch::<EndpointSlice>(&namespace("large"), "1")
+        .await
+        .unwrap();
     assert!(matches!(
         events.next().await,
         Some(Err(ApiError::TooLarge("a watch's event", MOST_EVENT_BYTES)))
     ));
     assert_eq!(
-        client.list("slow", None).await.unwrap_err(),
+        client
+            .list::<EndpointSlice>(&namespace("slow"), None)
+            .await
+            .unwrap_err(),
         ApiError::TimedOut
     );
-    let mut quiet = client.watch("slow", "1").await.unwrap();
+    let mut quiet = client
+        .watch::<EndpointSlice>(&namespace("slow"), "1")
+        .await
+        .unwrap();
     assert_eq!(quiet.next().await.unwrap().unwrap_err(), ApiError::TimedOut);
 }
 
@@ -272,11 +328,132 @@ fn a_namespace_is_a_label_and_nothing_else() {
         &"a".repeat(64),
     ] {
         assert_eq!(
-            slices_of(namespace),
+            kind::collection::<EndpointSlice>(&Scope::Namespace(namespace.to_owned())),
             Err(ApiError::Namespace(namespace.to_owned()))
         );
     }
-    assert!(slices_of("shop-2").is_ok());
+    assert!(kind::collection::<EndpointSlice>(&self::namespace("shop-2")).is_ok());
+}
+
+#[test]
+fn each_kind_is_asked_for_at_its_own_path_in_the_cluster_or_a_namespace() {
+    let shop = namespace("shop");
+    for (path, expected) in [
+        (
+            kind::collection::<Ingress>(&Scope::Cluster),
+            "/apis/networking.k8s.io/v1/ingresses",
+        ),
+        (
+            kind::collection::<Ingress>(&shop),
+            "/apis/networking.k8s.io/v1/namespaces/shop/ingresses",
+        ),
+        (
+            kind::collection::<IngressClass>(&Scope::Cluster),
+            "/apis/networking.k8s.io/v1/ingressclasses",
+        ),
+        // The core group has a path of its own.
+        (
+            kind::collection::<Service>(&Scope::Cluster),
+            "/api/v1/services",
+        ),
+        (
+            kind::collection::<Secret>(&shop),
+            "/api/v1/namespaces/shop/secrets",
+        ),
+        (
+            kind::collection::<EndpointSlice>(&Scope::Cluster),
+            "/apis/discovery.k8s.io/v1/endpointslices",
+        ),
+    ] {
+        assert_eq!(path.as_deref(), Ok(expected));
+    }
+    assert_eq!(
+        kind::collection::<IngressClass>(&shop),
+        Err(ApiError::NotNamespaced("IngressClass"))
+    );
+}
+
+/// A Secret as `kubectl apply` leaves it: a certificate, its key, a key besides, and the
+/// whole again in kubectl's annotation.
+const SECRET: &str = r#"{"metadata":{"name":"tls","namespace":"shop","resourceVersion":"3","labels":{"app":"web"},"annotations":{"kubectl.kubernetes.io/last-applied-configuration":"{\"data\":{\"password\":\"aHVudGVyMg==\"}}"},"managedFields":[{"manager":"kubectl"}]},"type":"kubernetes.io/tls","data":{"tls.crt":"Y2VydA==","tls.key":"a2V5","password":"aHVudGVyMg=="}}"#;
+
+/// [`SECRET`] as it is kept.
+fn trimmed_secret() -> Secret {
+    Secret {
+        metadata: ObjectMeta {
+            name: Some("tls".to_owned()),
+            namespace: Some("shop".to_owned()),
+            resource_version: Some("3".to_owned()),
+            ..ObjectMeta::default()
+        },
+        type_: Some("kubernetes.io/tls".to_owned()),
+        data: Some(BTreeMap::from([
+            ("tls.crt".to_owned(), ByteString(b"cert".to_vec())),
+            ("tls.key".to_owned(), ByteString(b"key".to_vec())),
+        ])),
+        ..Secret::default()
+    }
+}
+
+#[tokio::test]
+async fn secrets_are_asked_for_without_helms_and_tokens_and_kept_as_certificates_alone() {
+    let fake = Fake::start(&["127.0.0.1"], |path| {
+        if path.contains("watch=true") {
+            answer(
+                200,
+                &format!("{{\"type\":\"MODIFIED\",\"object\":{SECRET}}}\n"),
+            )
+        } else {
+            answer(
+                200,
+                &format!(r#"{{"metadata":{{"resourceVersion":"3"}},"items":[{SECRET}]}}"#),
+            )
+        }
+    })
+    .await;
+    let client = fake.client(&token("secrets", "secret"), Timing::default());
+    let page = client.list::<Secret>(&Scope::Cluster, None).await.unwrap();
+    assert_eq!(page.items, [trimmed_secret()]);
+    let mut events = client.watch::<Secret>(&Scope::Cluster, "3").await.unwrap();
+    assert_eq!(
+        events.next().await.unwrap().unwrap(),
+        WatchEvent::Modified(trimmed_secret())
+    );
+
+    let seen = fake.seen();
+    let selector = "fieldSelector=type%21%3Dhelm.sh%2Frelease.v1%2Ctype%21%3Dkubernetes.io%2Fservice-account-token";
+    assert_eq!(seen[0].path, format!("/api/v1/secrets?limit=12&{selector}"));
+    assert_eq!(
+        seen[1].path,
+        format!(
+            "/api/v1/secrets?watch=true&allowWatchBookmarks=true&timeoutSeconds=300&{selector}&resourceVersion=3"
+        )
+    );
+}
+
+#[tokio::test]
+async fn every_kind_is_kept_without_its_managed_fields() {
+    let ingress = r#"{"metadata":{"name":"web","namespace":"shop","resourceVersion":"2","annotations":{"a":"b"},"managedFields":[{"manager":"kubectl"}]},"spec":{}}"#;
+    let fake = Fake::start(&["127.0.0.1"], move |_| {
+        answer(
+            200,
+            &format!(r#"{{"metadata":{{"resourceVersion":"2"}},"items":[{ingress}]}}"#),
+        )
+    })
+    .await;
+    let client = fake.client(&token("managed", "secret"), Timing::default());
+    let page = client.list::<Ingress>(&Scope::Cluster, None).await.unwrap();
+    let metadata = &page.items[0].metadata;
+    assert_eq!(metadata.managed_fields, None);
+    // An Ingress's annotations are read: they stay.
+    assert_eq!(
+        metadata.annotations,
+        Some(BTreeMap::from([("a".to_owned(), "b".to_owned())]))
+    );
+    assert_eq!(
+        fake.seen()[0].path,
+        "/apis/networking.k8s.io/v1/ingresses?limit=500"
+    );
 }
 
 #[test]

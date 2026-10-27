@@ -1,6 +1,9 @@
-//! EdgeRush's client of the Kubernetes API, for the data plane: it lists and watches a
-//! namespace's EndpointSlices, and does nothing else ([02 §4](../../../docs/02-architecture.md),
-//! [03 §6](../../../docs/03-data-plane.md)).
+//! EdgeRush's client of the Kubernetes API: it lists and watches the kinds EdgeRush reads,
+//! and does nothing else. The data plane follows the EndpointSlices of the namespaces its
+//! upstreams name ([02 §4](../../../docs/02-architecture.md),
+//! [03 §6](../../../docs/03-data-plane.md)); the control plane, Ingresses, IngressClasses,
+//! Services and Secrets ([04 §1](../../../docs/04-control-plane.md)). [`Kind`] says what is
+//! asked of each, [`Watch`] what to ask next, and [`follow`] keeps asking.
 //!
 //! In a cluster it is [`ApiServer::in_cluster`]: the API server the pod's environment names,
 //! as Kubernetes' own clients find it, its certificate checked against the address it is
@@ -19,11 +22,11 @@ use boring::x509::store::X509StoreBuilder;
 use bytes::{Bytes, BytesMut};
 use h2::RecvStream;
 use h2::client::SendRequest;
+use http::StatusCode;
 use http::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
-use http::{Request, StatusCode};
 use k8s_openapi::List;
-use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Status, WatchEvent};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -33,13 +36,11 @@ use tokio::time::{Instant, timeout};
 /// Where a pod's service account is mounted: its token and its cluster's authority.
 pub const SERVICE_ACCOUNT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 
-/// The most slices a list's page asks for.
-const PAGE: u32 = 500;
-
 /// The most a list's page may be.
 pub const MOST_PAGE_BYTES: usize = 32 << 20;
 
-/// The most one event of a watch may be: a slice holds at most 1,000 endpoints.
+/// The most one event of a watch may be: etcd keeps an object of at most 1.5 MiB, some
+/// 2 MiB as JSON.
 pub const MOST_EVENT_BYTES: usize = 4 << 20;
 
 /// The most of an error's body that is read for its message.
@@ -94,6 +95,9 @@ pub enum ApiError {
     /// A namespace that is not a namespace's name, which would not make a path.
     #[error("`{0}` is not a namespace's name")]
     Namespace(String),
+    /// A namespace's objects asked for of a kind whose objects are the cluster's.
+    #[error("a {0} is the cluster's, not a namespace's")]
+    NotNamespaced(&'static str),
     /// The API server could not be connected to, or its certificate is not trusted.
     #[error("connecting to the API server: {0}")]
     Connect(String),
@@ -121,7 +125,7 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    /// Whether the API server no longer has what was asked from (410 Gone), and the slices
+    /// Whether the API server no longer has what was asked from (410 Gone), and the objects
     /// must be listed afresh.
     #[must_use]
     pub fn is_gone(&self) -> bool {
@@ -234,18 +238,19 @@ impl ApiServer {
         })
     }
 
-    /// A page of `namespace`'s EndpointSlices: the first, or the one `continue_from`
-    /// continues to.
+    /// A page of `K`'s objects in `scope`: the first, or the one `continue_from` continues
+    /// to, each object trimmed as [`Kind::trim`] keeps it.
     ///
     /// # Errors
     ///
     /// An [`ApiError`]: [`ApiError::is_gone`] when the token is too old.
-    pub async fn list(
+    pub async fn list<K: Kind>(
         &self,
-        namespace: &str,
+        scope: &Scope,
         continue_from: Option<&str>,
-    ) -> Result<List<EndpointSlice>, ApiError> {
-        let mut path = format!("{}?limit={PAGE}", slices_of(namespace)?);
+    ) -> Result<List<K>, ApiError> {
+        let mut path = format!("{}?limit={}", kind::collection::<K>(scope)?, K::PAGE);
+        fields_into::<K>(&mut path);
         if let Some(token) = continue_from {
             path.push_str("&continue=");
             encode_into(&mut path, token);
@@ -253,25 +258,31 @@ impl ApiServer {
         let deadline = Instant::now() + self.timing.answer;
         let body = self.get(&path, deadline).await?;
         let page = read_whole(body, MOST_PAGE_BYTES, "a list's page", deadline).await?;
-        serde_json::from_slice(&page).map_err(|error| ApiError::Unreadable(error.to_string()))
+        let mut page: List<K> = serde_json::from_slice(&page)
+            .map_err(|error| ApiError::Unreadable(error.to_string()))?;
+        page.items.iter_mut().for_each(K::trim);
+        Ok(page)
     }
 
-    /// A watch of `namespace`'s EndpointSlices from version `from`, with bookmarks.
+    /// A watch of `K`'s objects in `scope` from version `from`, with bookmarks.
     ///
     /// # Errors
     ///
     /// An [`ApiError`]: [`ApiError::is_gone`] when the version is too old.
-    pub async fn watch(&self, namespace: &str, from: &str) -> Result<Events, ApiError> {
+    pub async fn watch<K: Kind>(&self, scope: &Scope, from: &str) -> Result<Events<K>, ApiError> {
         let mut path = format!(
-            "{}?watch=true&allowWatchBookmarks=true&timeoutSeconds={WATCH_SECONDS}&resourceVersion=",
-            slices_of(namespace)?
+            "{}?watch=true&allowWatchBookmarks=true&timeoutSeconds={WATCH_SECONDS}",
+            kind::collection::<K>(scope)?
         );
+        fields_into::<K>(&mut path);
+        path.push_str("&resourceVersion=");
         encode_into(&mut path, from);
         let body = self.get(&path, Instant::now() + self.timing.answer).await?;
         Ok(Events {
             body,
             pending: BytesMut::new(),
             quiet: self.timing.quiet,
+            kind: PhantomData,
         })
     }
 
@@ -279,7 +290,7 @@ impl ApiServer {
     /// answered instead.
     async fn get(&self, path: &str, deadline: Instant) -> Result<RecvStream, ApiError> {
         let token = self.token.read(self.timing.token_reread).await?;
-        let request = Request::get(format!("https://{}{path}", self.authority))
+        let request = http::Request::get(format!("https://{}{path}", self.authority))
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header(ACCEPT, "application/json")
             .header(USER_AGENT, "edgerush")
@@ -375,21 +386,23 @@ impl ApiServer {
 
 /// A watch's events, as the API server sends them.
 #[derive(Debug)]
-pub struct Events {
+pub struct Events<K> {
     body: RecvStream,
     /// What has come of an event not yet whole.
     pending: BytesMut,
     quiet: Duration,
+    kind: PhantomData<fn() -> K>,
 }
 
-impl Events {
-    /// The next event, or none when the API server has ended the watch.
+impl<K: Kind> Events<K> {
+    /// The next event, its object trimmed as [`Kind::trim`] keeps it, or none when the API
+    /// server has ended the watch.
     ///
     /// # Errors
     ///
     /// An [`ApiError`] for an event too large or unreadable, a watch quiet too long, or one
     /// that failed; the watch is begun again then.
-    pub async fn next(&mut self) -> Option<Result<WatchEvent<EndpointSlice>, ApiError>> {
+    pub async fn next(&mut self) -> Option<Result<WatchEvent<K>, ApiError>> {
         loop {
             // One event a line.
             while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
@@ -398,7 +411,16 @@ impl Events {
                     continue;
                 }
                 return Some(
-                    serde_json::from_slice(&line)
+                    serde_json::from_slice::<WatchEvent<K>>(&line)
+                        .map(|mut event| {
+                            if let WatchEvent::Added(object)
+                            | WatchEvent::Modified(object)
+                            | WatchEvent::Deleted(object) = &mut event
+                            {
+                                object.trim();
+                            }
+                            event
+                        })
                         .map_err(|error| ApiError::Unreadable(error.to_string())),
                 );
             }
@@ -466,20 +488,12 @@ fn server(host: Option<&str>, port: Option<&str>) -> Result<(String, u16), ApiEr
     Ok((host.to_owned(), number))
 }
 
-/// The path of a namespace's EndpointSlices.
-fn slices_of(namespace: &str) -> Result<String, ApiError> {
-    let is_label = (1..=63).contains(&namespace.len())
-        && namespace
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && !namespace.starts_with('-')
-        && !namespace.ends_with('-');
-    if !is_label {
-        return Err(ApiError::Namespace(namespace.to_owned()));
+/// `K`'s field selector, if it has one, written into a query.
+fn fields_into<K: Kind>(query: &mut String) {
+    if let Some(fields) = K::FIELDS {
+        query.push_str("&fieldSelector=");
+        encode_into(query, fields);
     }
-    Ok(format!(
-        "/apis/discovery.k8s.io/v1/namespaces/{namespace}/endpointslices"
-    ))
 }
 
 /// `value` written into a query, every byte but RFC 3986's unreserved percent-encoded:
@@ -520,8 +534,12 @@ async fn read_whole(
 }
 
 mod follow;
+mod kind;
+mod watch;
 
-pub use follow::{Failure, Retry, Slices, follow};
+pub use follow::{Failure, Listed, Retry, follow};
+pub use kind::{Kind, Scope};
+pub use watch::{Request, Watch, WatchError};
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

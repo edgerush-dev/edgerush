@@ -312,7 +312,6 @@ dependencies = [
  "k8s-openapi",
  "proptest",
  "serde-saphyr",
- "thiserror",
 ]
 
 [[package]]
@@ -346,10 +345,11 @@ dependencies = [
  "boring",
  "bytes",
  "edgerush-certificates",
- "edgerush-discovery",
  "h2",
  "http",
  "k8s-openapi",
+ "proptest",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

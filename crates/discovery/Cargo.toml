@@ -10,7 +10,6 @@ publish.workspace = true
 [dependencies]
 edgerush-config.workspace = true
 k8s-openapi.workspace = true
-thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

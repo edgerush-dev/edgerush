@@ -2,9 +2,7 @@
 //! ([03 §6](../../../docs/03-data-plane.md)).
 //!
 //! A pure crate: the slices are passed in, as the data plane's watch has them, and
-//! [`Endpoints::of`] says which addresses take requests; [`Watch`] keeps a namespace's
-//! slices from what a list and a watch answer, and says what to ask next. No I/O, no
-//! clocks.
+//! [`Endpoints::of`] says which addresses take requests. No I/O, no clocks.
 //!
 //! An endpoint's conditions are read as the API asks: `ready` unknown is ready, `serving`
 //! unknown is `ready`'s value, `terminating` unknown is not terminating. A ready endpoint
@@ -165,10 +163,6 @@ fn fit_of(conditions: Option<&EndpointConditions>) -> Option<Fit> {
         None
     }
 }
-
-mod watch;
-
-pub use watch::{Request, Watch, WatchError};
 
 #[cfg(test)]
 mod tests;

@@ -2,6 +2,7 @@ use super::*;
 use crate::Timing;
 use crate::testing::*;
 use bytes::Bytes;
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::time::timeout;
@@ -58,9 +59,9 @@ fn status(code: u16) -> Answer {
 }
 
 /// The names of the slices published.
-fn names(slices: &Slices) -> Vec<String> {
+fn names(slices: &Listed<EndpointSlice>) -> Vec<String> {
     slices
-        .slices
+        .objects
         .iter()
         .map(|slice| slice.metadata.name.clone().unwrap_or_default())
         .collect()
@@ -80,25 +81,33 @@ fn followed(
     fake: &Fake,
     token_name: &str,
 ) -> (
-    watch::Receiver<Arc<Slices>>,
+    watch::Receiver<Arc<Listed<EndpointSlice>>>,
     Said,
     tokio::task::JoinHandle<()>,
 ) {
     let api = fake.client(&token(token_name, "secret"), Timing::default());
-    let (out, published) = watch::channel(Arc::new(Slices::default()));
+    let (out, published) = watch::channel(Arc::new(Listed::default()));
     let failures = Arc::new(Mutex::new(Vec::new()));
     let said = Arc::clone(&failures);
     let task = tokio::spawn(async move {
-        follow(&api, "shop", QUICK, out, |failure| {
-            said.lock().unwrap().push(failure.clone());
-        })
+        follow(
+            &api,
+            &Scope::Namespace("shop".to_owned()),
+            QUICK,
+            out,
+            |failure| {
+                said.lock().unwrap().push(failure.clone());
+            },
+        )
         .await;
     });
     (published, failures, task)
 }
 
 /// The next slices published.
-async fn next(published: &mut watch::Receiver<Arc<Slices>>) -> Arc<Slices> {
+async fn next(
+    published: &mut watch::Receiver<Arc<Listed<EndpointSlice>>>,
+) -> Arc<Listed<EndpointSlice>> {
     timeout(Duration::from_secs(10), published.changed())
         .await
         .expect("nothing published in time")
@@ -166,7 +175,7 @@ async fn a_namespace_without_slices_is_published_as_listed() {
     let (mut published, _, _task) = followed(&fake, "follow-empty");
     let first = next(&mut published).await;
     assert!(first.listed);
-    assert!(first.slices.is_empty());
+    assert!(first.objects.is_empty());
 }
 
 #[tokio::test]

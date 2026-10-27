@@ -1,17 +1,16 @@
-//! A namespace's EndpointSlices followed: a list and a watch kept going for as long as
-//! anyone looks at what they give ([03 §6](../../../docs/03-data-plane.md)).
+//! A kind's objects followed: a list and a watch kept going for as long as anyone looks at
+//! what they give ([03 §6](../../../docs/03-data-plane.md),
+//! [04 §1](../../../docs/04-control-plane.md)).
 //!
 //! What to ask for and what the answers leave is [`Watch`]'s; this asks, and publishes the
-//! slices each time they change, and once when the first list is read whole, so that a
-//! namespace with none is known to have none. A version the API server no longer has is
+//! objects each time they change, and once when the first list is read whole, so that a
+//! scope with none is known to have none. A version the API server no longer has is
 //! listed afresh at once, and a watch it ended is begun again at once. Any other failure is
 //! said, and waited out before asking again: from [`Retry::first`], doubling each time to
 //! [`Retry::most`], each wait between half and all of that, so that data planes started
 //! together do not ask together; back to the first once an answer is read.
 
-use crate::{ApiError, ApiServer};
-use edgerush_discovery::{Request, Watch, WatchError};
-use k8s_openapi::api::discovery::v1::EndpointSlice;
+use crate::{ApiError, ApiServer, Kind, Request, Scope, Watch, WatchError};
 use std::future::{Future, poll_fn};
 use std::hash::{BuildHasher, RandomState};
 use std::pin::pin;
@@ -20,14 +19,23 @@ use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::watch;
 
-/// A namespace's slices, as last read.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Slices {
+/// A kind's objects in a scope, as last read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listed<K> {
     /// Whether a list has been read whole: until one has, there are none, and what the
-    /// namespace holds is not known yet.
+    /// scope holds is not known yet.
     pub listed: bool,
-    /// The slices.
-    pub slices: Vec<EndpointSlice>,
+    /// The objects, by namespace, then name.
+    pub objects: Vec<K>,
+}
+
+impl<K> Default for Listed<K> {
+    fn default() -> Self {
+        Self {
+            listed: false,
+            objects: Vec::new(),
+        }
+    }
 }
 
 /// How long failures are waited out before asking again.
@@ -60,33 +68,33 @@ pub enum Failure {
     Watch(#[from] WatchError),
 }
 
-/// Follows `namespace`'s EndpointSlices on `api`, publishing them on `out` each time they
+/// Follows `K`'s objects in `scope` on `api`, publishing them on `out` each time they
 /// change, and saying each failure to `failed`, until no one holds a receiver of `out`.
-pub async fn follow(
+pub async fn follow<K: Kind>(
     api: &ApiServer,
-    namespace: &str,
+    scope: &Scope,
     retry: Retry,
-    out: watch::Sender<Arc<Slices>>,
+    out: watch::Sender<Arc<Listed<K>>>,
     mut failed: impl FnMut(&Failure),
 ) {
-    let mut watch = Watch::new();
+    let mut watch = Watch::<K>::new();
     let mut waits = Waits {
         retry,
         failed: 0,
         random: RandomState::new(),
     };
     let mut published = false;
-    let publish = |watch: &Watch| {
-        out.send_replace(Arc::new(Slices {
+    let publish = |watch: &Watch<K>| {
+        out.send_replace(Arc::new(Listed {
             listed: watch.listed(),
-            slices: watch.slices().cloned().collect(),
+            objects: watch.objects().cloned().collect(),
         }));
     };
     loop {
         let failure: Option<Failure> = match watch.request() {
             Request::List { continue_from } => {
                 let Some(answer) =
-                    unless_closed(&out, api.list(namespace, continue_from.as_deref())).await
+                    unless_closed(&out, api.list(scope, continue_from.as_deref())).await
                 else {
                     return;
                 };
@@ -106,7 +114,7 @@ pub async fn follow(
                 }
             }
             Request::Watch { from } => {
-                let Some(answer) = unless_closed(&out, api.watch(namespace, &from)).await else {
+                let Some(answer) = unless_closed(&out, api.watch(scope, &from)).await else {
                     return;
                 };
                 match answer {
@@ -180,8 +188,8 @@ impl Waits {
 }
 
 /// `work` done, or nothing once no one holds a receiver of `out`.
-async fn unless_closed<T>(
-    out: &watch::Sender<Arc<Slices>>,
+async fn unless_closed<T, K>(
+    out: &watch::Sender<Arc<Listed<K>>>,
     work: impl Future<Output = T>,
 ) -> Option<T> {
     let mut work = pin!(work);
