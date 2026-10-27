@@ -63,7 +63,9 @@
 #                                             Redis, asked every request, like ours-sync),
 #                                             kong-local and kong-rl (Kong's rate-limiting
 #                                             plugin: a node's shared memory; Redis, read
-#                                             every request), beside ours with no limit
+#                                             every request), apisix-local and apisix-rl
+#                                             (APISIX's limit-count, the same two ways),
+#                                             beside ours with no limit
 #   bench/run.sh summary DIR                  the table of a finished run
 #
 # UPSTREAM_H2=1 has the proxy speak HTTP/2 to the backend, by prior knowledge, many
@@ -203,7 +205,10 @@ repo=$(dirname "$here")
 # (RESIDENCY=1), what the OS asked for and, where perf counts it, what the hardware did.
 : "${IDLE:=normal}"
 : "${RESIDENCY:=1}"
-: "${VARIANTS:=ours}" # and: ours-kernel nginx haproxy envoy kong
+: "${VARIANTS:=ours}" # and: ours-kernel nginx haproxy envoy kong apisix
+# APISIX's image, for the apisix variants: in Docker on the proxy's CPUs, with host
+# networking.
+: "${APISIX_IMAGE:=apache/apisix:3.19.0-debian}"
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
 
 # Hundreds of connections on either side of the proxy, and more when they churn.
@@ -440,6 +445,24 @@ open(out, "w").write(s)
 PY
 }
 
+# APISIX's config and routes made ready to run, in $run-apisix: apisix.yaml, and for
+# apisix-local and apisix-rl its limit-count plugin on the measured route, like for like
+# with kong-local and kong-rl: RL_RATE a second for each client address, in windows of a
+# second (no bucket, so RL_BURST has no counterpart). apisix-local counts in each node's
+# shared memory; apisix-rl counts in Redis on every request (`sync_interval` -1, its
+# default), waiting RL_SYNC_TIMEOUT_MS, and refuses the request when RL_SYNC_UNREACHABLE
+# is deny. No rate-limit headers on an answer let through, as EdgeRush sends none. Over
+# TLS it listens with the certificate on 8080, its plain listener moved to 18080.
+apisix_config() { # variant
+    local rate deny=false
+    rate=$(rl_per_second) || exit 2
+    [ "$RL_SYNC_UNREACHABLE" = deny ] && deny=true
+    mkdir -p "$run-apisix"
+    [ "$TLS" = 1 ] && certificate
+    python3 "$here/apisix_config.py" "$here/apisix.yaml" "$run-apisix" "$1" "$rate" \
+        "$RL_SYNC_TIMEOUT_MS" "$deny" "$WORKERS" "${TLS:-0}" "$tls"
+}
+
 start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an idle policy
     set -- "${1%%@*}"
     local daemon=
@@ -447,7 +470,8 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
     # long argument. Only the variants that are EdgeRush are given it.
     local idle="--idle-per-destination $IDLE_PER_DESTINATION --idle-total $IDLE_TOTAL"
     case "$ACCESS_LOG.$1" in
-    1.envoy | 1.envoy-local | 1.envoy-rl | 1.kong | 1.kong-local | 1.kong-rl | 1.nginx-direct)
+    1.envoy | 1.envoy-local | 1.envoy-rl | 1.kong | 1.kong-local | 1.kong-rl | 1.apisix | \
+        1.apisix-local | 1.apisix-rl | 1.nginx-direct)
         echo "$1 is not set up to log: leave it out of ACCESS_LOG runs" >&2
         exit 2
         ;;
@@ -477,6 +501,25 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
             taskset -c "$PROXY_CPUS" kong start
         ) >>"$OUT/proxy.log" 2>&1
         daemon=$(cat "$run-kong/pids/nginx.pid")
+        ;;
+    apisix | apisix-local | apisix-rl)
+        apisix_config "$1"
+        docker rm -f bench-apisix >/dev/null 2>&1 || true
+        docker run -d --name bench-apisix --network host --cpuset-cpus "$PROXY_CPUS" \
+            --ulimit nofile=200000:200000 -e APISIX_STAND_ALONE=true \
+            -v "$run-apisix/config.yaml:/usr/local/apisix/conf/config.yaml" \
+            -v "$run-apisix/apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro" \
+            "$APISIX_IMAGE" >>"$OUT/proxy.log" 2>&1
+        # Its NGINX master, whose workers are its children: below the container's first
+        # process, if that is the shell that started it.
+        daemon=$(docker inspect -f '{{.State.Pid}}' bench-apisix)
+        local below
+        for _ in $(seq 100); do
+            [ -n "$(pgrep -P "$daemon" -f 'nginx: worker')" ] && break
+            below=$(pgrep -P "$daemon" -f 'nginx: master' | head -1 || true)
+            [ -n "$below" ] && daemon=$below
+            sleep 0.1
+        done
         ;;
     nginx-direct)
         # NGINX answering every request itself: the counterpart of EdgeRush's own answer to
@@ -766,7 +809,7 @@ stop_rl_service() {
 # of it.
 rls_up=
 start_rls() {
-    case " $VARIANTS " in *" envoy-rl "* | *" kong-rl "*) ;; *) return 0 ;; esac
+    case " $VARIANTS " in *" envoy-rl "* | *" kong-rl "* | *" apisix-rl "*) ;; *) return 0 ;; esac
     stop_rls
     docker run -d --rm --name bench-redis --network host --cpuset-cpus "$BACKEND_CPUS" \
         "$REDIS_IMAGE" redis-server --port 6379 --bind 127.0.0.1 --save "" --appendonly no \
@@ -841,13 +884,16 @@ ratelimit_runs() {
         curl -s "http://127.0.0.1:9901/stats?filter=rate" >"$OUT/$1.envoy-stats" || true
         ;;
     esac
-    if [ "${1%%.*}" = envoy-rl ] || [ "${1%%.*}" = kong-rl ]; then
+    if [ "${1%%.*}" = envoy-rl ] || [ "${1%%.*}" = kong-rl ] || [ "${1%%.*}" = apisix-rl ]; then
         docker exec bench-redis redis-cli info memory >"$OUT/$1.redis-memory" 2>&1 || true
         docker exec bench-redis redis-cli dbsize >"$OUT/$1.redis-keys" 2>&1 || true
     fi
 }
 
 stop_proxy() {
+    # APISIX runs as root in its container: stopped by Docker, not by a signal from here,
+    # and whether or not it got as far as answering.
+    docker rm -f bench-apisix >/dev/null 2>&1 || true
     [ -n "$proxy_pid" ] || return 0
     kill "$proxy_pid" 2>/dev/null || true
     wait "$proxy_pid" 2>/dev/null || true
@@ -1353,6 +1399,7 @@ environment() {
         { command -v haproxy >/dev/null && haproxy -v | head -1; } || true
         { command -v envoy >/dev/null && envoy --version | grep -o "version: [^/]*/[0-9.]*"; } || true
         { command -v kong >/dev/null && kong version; } || true
+        case " $VARIANTS " in *" apisix"*) echo "APISIX $APISIX_IMAGE" ;; esac
     } >"$OUT/environment.txt"
 }
 
