@@ -1,12 +1,17 @@
 # The shared data plane has no `https` listener: a host `tls` lists is served over plain
-# HTTP, and the report says why.
+# HTTP, and the report says why; not redirected, with nowhere to redirect it to, whether its
+# entry names a Secret or not.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: web, namespace: shop }
 spec:
   ingressClassName: edge
-  tls: [{ hosts: [shop.example.com], secretName: shop-tls }]
+  tls: [{ hosts: [shop.example.com], secretName: shop-tls }, { hosts: [bare.example.com] }]
   rules:
+    - host: "bare.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
     - host: "shop.example.com"
       http:
         paths:

@@ -38,8 +38,10 @@ routes:
     rules:
       - matches: [{ path: { prefix: / } }]
         redirect: { status: 308, scheme: https, query: keep }
+        filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
       - matches: [{ path: { exact: /api } }]
         redirect: { status: 308, scheme: https, query: keep }
+        filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
   - name: ingress/shop/extra/shop.example.com
     listeners: [https]
     hostnames: [{ name: "shop.example.com", falls_through: false }]
@@ -52,6 +54,7 @@ routes:
     rules:
       - matches: [{ path: { prefix: /extra } }]
         redirect: { status: 308, scheme: https, query: keep }
+        filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
   - name: ingress/shop/kept/secure.example.com
     listeners: [http, https]
     hostnames: [{ name: "secure.example.com", falls_through: false }]

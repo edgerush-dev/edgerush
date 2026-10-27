@@ -34,8 +34,9 @@ Options:
       --data-plane <FILE>      The data plane's settings, in YAML: `ingress_class`,
                                `listeners`, `cluster_domain`,
                                `ingress_hosts_fall_through`,
-                               `ingress_https_redirect` and, optionally,
-                               `backend_authorities`
+                               `ingress_https_redirect`,
+                               `ingress_https_redirect_max_age` and,
+                               optionally, `backend_authorities`
       --check-secrets          Check the Secrets the Ingresses' `tls` names: each must
                                be among the manifests, its certificate and key usable
                                and covering the host, as the control plane checks them.

@@ -475,7 +475,7 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
     std::fs::create_dir_all(manifests.join("shop"))?;
     let plane = |listeners: &str| {
         format!(
-            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\nlisteners:\n{listeners}"
+            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\ningress_https_redirect_max_age: 30\nlisteners:\n{listeners}"
         )
     };
     let http = "  http: { address: \"[::]:8080\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n";
@@ -557,7 +557,7 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "Ingress shop/secure: secure.example.com is served over HTTP only: Secret shop/secure does not exist\n2 routes and 1 upstreams translated; 0 left out; 0 paths without their backend; 1 TLS hosts or entries not served as listed; 0 paths shadowed; 1 Ingresses of other classes or none passed over\n"
+        "Ingress shop/secure: secure.example.com is refused over HTTPS and redirected there over plain HTTP: Secret shop/secure does not exist\n2 routes and 1 upstreams translated; 0 left out; 0 paths without their backend; 1 TLS hosts or entries not served as listed; 0 paths shadowed; 1 Ingresses of other classes or none passed over\n"
     );
     std::fs::remove_file(manifests.join("tls.yml"))?;
 

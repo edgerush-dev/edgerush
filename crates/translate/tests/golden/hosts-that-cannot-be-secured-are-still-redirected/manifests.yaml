@@ -1,0 +1,61 @@
+# A host an Ingress lists under `tls` that cannot be secured — its Secret is not there, its
+# entry names none, or its Secret does not cover it — is refused over HTTPS by name and,
+# its redirect on, still redirected there over plain HTTP, never served unencrypted; so is
+# another Ingress's path on the same host. A host that can be secured is redirected as ever.
+# An Ingress that turns the redirect off is served over plain HTTP alone on such a host.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [a.example.com], secretName: gone }, { hosts: [b.example.com] }, { hosts: [c.example.com], secretName: shop-tls }, { hosts: [e.example.com], secretName: wild }]
+  rules:
+    - host: "a.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "b.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "c.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: "e.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: extra, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: "a.example.com"
+      http:
+        paths:
+          - { path: /extra, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kept
+  namespace: shop
+  creationTimestamp: "2026-03-01T00:00:00Z"
+  annotations: { gateway.edgerush.dev/https-redirect: "false" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [d.example.com], secretName: gone }]
+  rules:
+    - host: "d.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

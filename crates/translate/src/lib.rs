@@ -14,15 +14,17 @@
 //! `appProtocol` the gateway does not speak, is translated with an invalid backend, answered
 //! 500, and reported too. Hosts its `tls` lists are served on the `https` listeners as well,
 //! with their Secret's certificate, read as the data plane reads one; a host whose Secret
-//! is not there, cannot be used or does not cover it stays on `http`, and is reported. Over
-//! plain HTTP, a host served over HTTPS is redirected there, unless the data plane's
-//! settings or the Ingress's `gateway.edgerush.dev/https-redirect` annotation say not.
+//! is not there, cannot be used or does not cover it is refused over HTTPS, and reported.
+//! Over plain HTTP, a host its `tls` lists is redirected there, secured or not, unless the
+//! data plane's settings or the Ingress's `gateway.edgerush.dev/https-redirect` annotation
+//! say not, and is served over plain HTTP only where they do.
 
 use edgerush_certificates::Identity;
 use edgerush_config::{
-    Backend, Certificate, Config, DataPlane, Endpoints, Forward, Hostname, Listener,
-    ListenerCertificate, LoadBalancer, Match, PathMatch, Protocol, Query, Redirect, Route, Rule,
-    Scheme, StatedNames, Upstream, UpstreamProtocol, UpstreamTls, Wildcard, compile,
+    Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, Header, HeaderChanges,
+    Hostname, Listener, ListenerCertificate, LoadBalancer, Match, PathMatch, Protocol, Query,
+    Redirect, Route, Rule, Scheme, StatedNames, Upstream, UpstreamProtocol, UpstreamTls, Wildcard,
+    compile,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::{
@@ -31,6 +33,7 @@ use k8s_openapi::api::networking::v1::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::btree_map::Entry;
 use std::fmt;
 
@@ -58,6 +61,10 @@ pub struct Plane {
     /// HTTPS, as ingress-nginx's `ssl-redirect` has it; an Ingress may say otherwise for its
     /// own routes ([04 §5](../../../docs/04-control-plane.md)).
     pub ingress_https_redirect: bool,
+    /// How long, in seconds, a client may keep that redirect: stated, as a browser may
+    /// otherwise keep a permanent one for ever, and go on to a host no longer served over
+    /// HTTPS ([04 §5](../../../docs/04-control-plane.md)).
+    pub ingress_https_redirect_max_age: u32,
     /// The certificates, in PEM, of the authorities trusted to vouch for a backend reached
     /// over TLS: a Service port whose `appProtocol` is `kubernetes.io/wss`. None, and such
     /// a backend is answered 500.
@@ -186,6 +193,9 @@ pub enum TlsProblem {
 pub enum Served {
     /// Over plain HTTP alone.
     OverHttpOnly,
+    /// Not at all: refused over HTTPS, and redirected there over plain HTTP, as its Ingress
+    /// asked for it secured.
+    Redirected,
     /// Not at all: the data plane has no `http` listener.
     Nowhere,
     /// Over HTTPS too, with another Ingress's Secret, which secures the same host.
@@ -216,6 +226,11 @@ impl fmt::Display for TlsFinding {
                 Served::OverHttpOnly => {
                     write!(f, "{object}: {host} is served over HTTP only: {reason}")
                 }
+                Served::Redirected => write!(
+                    f,
+                    "{object}: {host} is refused over HTTPS and redirected there over plain \
+                     HTTP: {reason}"
+                ),
                 Served::Nowhere => write!(f, "{object}: {host} is not served: {reason}"),
                 Served::With { by, secret } => write!(
                     f,
@@ -487,8 +502,14 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     // route it is, so that both kinds of listener rank the same paths for it; a host none
     // secures is refused over HTTPS by name, so that no wildcard's route takes it there.
     // Over plain HTTP, a route on a secured host redirects to HTTPS unless its Ingress says
-    // not, as ingress-nginx redirects a path of a host it has a certificate for (04 §5).
-    // A host served on no listener at all is said as such, and nothing else of it.
+    // not, as ingress-nginx redirects a path of a host it has a certificate for (04 §5); so
+    // does one on a host an Ingress lists under `tls` but cannot secure, refused over HTTPS
+    // all the same, as it was asked for secured and is never served unencrypted. A host
+    // served on no listener at all is said as such, and nothing else of it.
+    let unsecurable: BTreeSet<String> = accepted
+        .iter()
+        .flat_map(|(_, _, translated, _)| translated.unsecurable.iter().cloned())
+        .collect();
     let https: Vec<String> = plane
         .listeners
         .iter()
@@ -506,33 +527,44 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut shadowed = Vec::new();
     for (object, dated, translated, taken) in accepted {
         let mut served = Vec::new();
+        let mut redirected = Vec::new();
         for mut route in translated.routes {
             let host = route
                 .hostnames
                 .first()
                 .map(|hostname| hostname.name.clone());
             let host = host.unwrap_or_default();
+            let secured = stated.contains_key(&host);
             let mut redirect = None;
-            if stated.contains_key(&host) {
-                if translated.https_redirect {
-                    let (http, own): (Vec<String>, Vec<String>) = route
-                        .listeners
-                        .drain(..)
-                        .partition(|listener| !https.contains(listener));
-                    route.listeners = own;
-                    if !http.is_empty() {
-                        redirect = Some(https_redirect(&route, http));
-                    }
+            if (secured || unsecurable.contains(&host)) && translated.https_redirect {
+                let (http, own): (Vec<String>, Vec<String>) = route
+                    .listeners
+                    .drain(..)
+                    .partition(|listener| !https.contains(listener));
+                route.listeners = own;
+                if !http.is_empty() {
+                    redirect = Some(https_redirect(
+                        &route,
+                        http,
+                        plane.ingress_https_redirect_max_age,
+                    ));
                 }
+            }
+            if secured {
                 for listener in &https {
                     if !route.listeners.contains(listener) {
                         route.listeners.push(listener.clone());
                     }
                 }
-            } else if !host.starts_with('*') && !refused.contains(&host) {
-                refused.push(host.clone());
+            } else {
+                if redirect.is_some() {
+                    redirected.push(host.clone());
+                }
+                if !host.starts_with('*') && !refused.contains(&host) {
+                    refused.push(host.clone());
+                }
             }
-            if route.listeners.is_empty() {
+            if route.listeners.is_empty() && redirect.is_none() {
                 continue;
             }
             for (host, path) in claims(&route) {
@@ -554,7 +586,10 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 }
             }
             served.push(host);
-            routes.push(route);
+            // A route whose host cannot be secured has nothing left but its redirect.
+            if !route.listeners.is_empty() {
+                routes.push(route);
+            }
             // In the route's place on the `http` listeners, so that they rank its paths as
             // they would its own; its claims are the route's, said once.
             routes.extend(redirect);
@@ -569,6 +604,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                             by: by.clone(),
                             secret: secret.clone(),
                         },
+                        None if redirected.contains(&host) => Served::Redirected,
                         None if served.contains(&host) => Served::OverHttpOnly,
                         None => Served::Nowhere,
                     };
@@ -774,6 +810,9 @@ struct IngressRoutes {
     notes: Vec<TlsProblem>,
     /// Each host `tls` lists that its own Secret does not secure, and why.
     unsecured: Vec<(String, String)>,
+    /// Of those, the hosts asked for over HTTPS where the data plane serves it, which are
+    /// redirected there all the same, never served unencrypted (04 §5).
+    unsecurable: Vec<String>,
     /// Whether its routes on a host served over HTTPS redirect there over plain HTTP.
     https_redirect: bool,
 }
@@ -957,6 +996,7 @@ fn ingress_routes(
     let mut certificates: Vec<(String, Certificate, Vec<String>)> = Vec::new();
     let mut read: BTreeMap<&str, Result<(Certificate, Option<Identity>), String>> = BTreeMap::new();
     let mut unsecured = Vec::new();
+    let mut unsecurable = Vec::new();
     let mut listeners_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for host in by_host.keys() {
         let mut listeners = http.clone();
@@ -964,7 +1004,10 @@ fn ingress_routes(
             None if http.is_empty() => return Err(Problem::NoListener),
             None => {}
             Some(None) => {
-                unsecured.push((host.clone(), "its TLS entry names no Secret".to_owned()))
+                unsecured.push((host.clone(), "its TLS entry names no Secret".to_owned()));
+                if !https.is_empty() {
+                    unsecurable.push(host.clone());
+                }
             }
             Some(&Some(secret)) => {
                 let checked = read.entry(secret).or_insert_with(|| {
@@ -1002,6 +1045,9 @@ fn ingress_routes(
                 };
                 if let Some(reason) = reason {
                     unsecured.push((host.clone(), reason));
+                    if !https.is_empty() {
+                        unsecurable.push(host.clone());
+                    }
                 }
             }
         }
@@ -1030,6 +1076,7 @@ fn ingress_routes(
         certificates,
         notes,
         unsecured,
+        unsecurable,
         https_redirect,
     })
 }
@@ -1072,14 +1119,23 @@ fn secret_certificate(
 /// The route that answers on `listeners` what `route` takes, each of its paths, with a
 /// redirect to the same URL over HTTPS: on its default port, the one a data plane's Service
 /// serves HTTPS on (05 §1); 308, so that a client keeps its method and body, as ingress-nginx
-/// answers; and the query kept.
-fn https_redirect(route: &Route, listeners: Vec<String>) -> Route {
+/// answers; the query kept; and to be kept `max_age` seconds, as a browser may otherwise keep
+/// a permanent redirect for ever (04 §5).
+fn https_redirect(route: &Route, listeners: Vec<String>, max_age: u32) -> Route {
+    let kept = Filter::ResponseHeaderModifier(HeaderChanges {
+        set: vec![Header {
+            name: "cache-control".to_owned(),
+            value: format!("max-age={max_age}"),
+        }],
+        add: Vec::new(),
+        remove: Vec::new(),
+    });
     let rules = route
         .rules
         .iter()
         .map(|rule| Rule {
             matches: rule.matches.clone(),
-            filters: Vec::new(),
+            filters: vec![kept.clone()],
             forward: None,
             redirect: Some(Redirect {
                 status: 308,
@@ -1252,7 +1308,7 @@ mod tests {
     /// plane refuses, translated for a data plane with these listeners.
     fn good_and_bad(listeners: &str) -> Translation {
         let plane: Plane = serde_saphyr::from_str(&format!(
-            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\nlisteners:\n{listeners}"
+            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\ningress_https_redirect_max_age: 30\nlisteners:\n{listeners}"
         ))
         .unwrap();
         let ingress = |name: &str, path: &str| -> Ingress {
@@ -1315,7 +1371,7 @@ spec: { controller: edgerush.dev/ingress-controller }
     #[test]
     fn assumed_secrets_secure_their_hosts_unread() {
         let plane: Plane = serde_saphyr::from_str(&format!(
-            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\nlisteners:\n{HTTP}  https: {{ address: \"[::]:8443\", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [], without_sni: none }} }}\n"
+            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\ningress_https_redirect_max_age: 30\nlisteners:\n{HTTP}  https: {{ address: \"[::]:8443\", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [], without_sni: none }} }}\n"
         ))
         .unwrap();
         let cluster = |secrets_assumed| {
@@ -1366,10 +1422,13 @@ spec: { controller: edgerush.dev/ingress-controller }
         assert_eq!(
             said,
             [
-                "Ingress shop/web: shop.example.com is served over HTTP only: Secret shop/shop-tls does not exist"
+                "Ingress shop/web: shop.example.com is refused over HTTPS and redirected there over plain HTTP: Secret shop/shop-tls does not exist"
             ]
         );
+        // Its redirect alone, on `http`: the host is asked for secured, never served unencrypted.
+        assert_eq!(checked.config.routes.len(), 1);
         assert_eq!(checked.config.routes[0].listeners, ["http"]);
+        assert!(checked.config.routes[0].rules[0].redirect.is_some());
         assert!(checked.config.certificates.is_empty());
     }
 
