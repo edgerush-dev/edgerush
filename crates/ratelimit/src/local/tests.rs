@@ -454,40 +454,72 @@ fn held_key(name: &[u8]) -> Arc<Key> {
 
 proptest! {
     /// Whatever is held, replaced, removed or kept, and however often the set grows on
-    /// the way, it finds each name's latest key, as a map of names does.
+    /// the way, in one part or in a worker's many, it finds each name's latest key, as a
+    /// map of names does.
     #[test]
     fn holds_what_a_map_of_names_holds(
         ops in proptest::collection::vec((0_u8..4, 0_u16..400), 0..3_000),
     ) {
-        let mut set = key_set::KeySet::with_hasher(FixedState::default());
-        let mut map: HashMap<Vec<u8>, Arc<Key>> = HashMap::new();
-        for (op, at) in ops {
-            let name = format!("k{at}").into_bytes();
-            match op {
-                0 | 1 => {
-                    let made = held_key(&name);
-                    let hash = set.hash(&name);
-                    set.replace_hashed(hash, Arc::clone(&made));
-                    map.insert(name.clone(), made);
-                }
-                2 => {
-                    set.remove(&name);
-                    map.remove(&name);
-                }
-                _ => {
-                    // Keeps the names of an odd number.
-                    set.retain(|key| key.key.last().is_some_and(|last| last % 2 == 1));
-                    map.retain(|name, _| name.last().is_some_and(|last| last % 2 == 1));
-                }
-            }
-            prop_assert_eq!(set.len(), map.len());
-            prop_assert_eq!(set.is_empty(), map.is_empty());
-            let found = set.get(&name).map(Arc::as_ptr);
-            prop_assert_eq!(found, map.get(&name).map(Arc::as_ptr));
-        }
-        for (name, held) in &map {
-            prop_assert!(set.get(name).is_some_and(|key| Arc::ptr_eq(key, held)));
-        }
-        prop_assert_eq!(set.iter().count(), map.len());
+        holds_what_a_map_holds::<1>(&ops)?;
+        holds_what_a_map_holds::<{ key_set::HANDLE_PARTS }>(&ops)?;
     }
+}
+
+/// `ops` on a set of `PARTS` parts and on a map of names alike, compared after each.
+fn holds_what_a_map_holds<const PARTS: usize>(
+    ops: &[(u8, u16)],
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut set = key_set::KeySet::<_, PARTS>::with_hasher(FixedState::default());
+    let mut map: HashMap<Vec<u8>, Arc<Key>> = HashMap::new();
+    for &(op, at) in ops {
+        let name = format!("k{at}").into_bytes();
+        match op {
+            0 | 1 => {
+                let made = held_key(&name);
+                let hash = set.hash(&name);
+                set.replace_hashed(hash, Arc::clone(&made));
+                map.insert(name.clone(), made);
+            }
+            2 => {
+                set.remove(&name);
+                map.remove(&name);
+            }
+            _ => {
+                // Keeps the names of an odd number.
+                set.retain(|key| key.key.last().is_some_and(|last| last % 2 == 1));
+                map.retain(|name, _| name.last().is_some_and(|last| last % 2 == 1));
+            }
+        }
+        prop_assert_eq!(set.len(), map.len());
+        prop_assert_eq!(set.is_empty(), map.is_empty());
+        let found = set.get(&name).map(Arc::as_ptr);
+        prop_assert_eq!(found, map.get(&name).map(Arc::as_ptr));
+    }
+    for (name, held) in &map {
+        prop_assert!(set.get(name).is_some_and(|key| Arc::ptr_eq(key, held)));
+    }
+    prop_assert_eq!(set.iter().count(), map.len());
+    Ok(())
+}
+
+/// A worker's handles spread over all their parts, each a fair share, so that a part that
+/// doubles moves about a 64th of them.
+#[test]
+fn handles_spread_over_their_parts() {
+    let mut set =
+        key_set::KeySet::<_, { key_set::HANDLE_PARTS }>::with_hasher(FixedState::default());
+    let keys = 64_000;
+    for at in 0..keys {
+        let name = format!("client-{at}").into_bytes();
+        let hash = set.hash(&name);
+        set.replace_hashed(hash, held_key(&name));
+    }
+    let lens = set.part_lens();
+    assert_eq!(lens.len(), key_set::HANDLE_PARTS);
+    assert_eq!(lens.iter().sum::<usize>(), keys);
+    let share = keys / key_set::HANDLE_PARTS;
+    assert!(
+        lens.iter().all(|&len| len > share / 2 && len < share * 2),
+        "{lens:?}"
+    );
 }

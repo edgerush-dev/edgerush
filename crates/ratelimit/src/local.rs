@@ -25,7 +25,7 @@ mod tests;
 
 pub use crate::service::Contract;
 
-use key_set::{KeySet, SLOT_BYTES};
+use key_set::{HANDLE_PARTS, KeySet, SLOT_BYTES};
 use std::hash::BuildHasher;
 use sync::{Arc, AtomicBool, AtomicU64, Ordering, RwLock};
 
@@ -404,7 +404,7 @@ pub struct Swept {
 /// The keys one process's workers share.
 #[derive(Debug)]
 pub struct Local<S> {
-    shards: Box<[RwLock<KeySet<S>>]>,
+    shards: Box<[RwLock<KeySet<S, 1>>]>,
     hasher: S,
     /// Workers holding handles to the keys, which a key's bytes count.
     workers: u64,
@@ -540,7 +540,7 @@ impl<S: BuildHasher + Clone> Local<S> {
 
     /// The shard of a key whose name's hash is `hash`: chosen by bits of the hash its set
     /// does not place by, so that the keys of one shard spread over its set.
-    fn shard(&self, hash: u64) -> &RwLock<KeySet<S>> {
+    fn shard(&self, hash: u64) -> &RwLock<KeySet<S, 1>> {
         let at = usize::try_from(hash >> 32).unwrap_or(0) % self.shards.len();
         // `at` is below the length.
         &self.shards[at]
@@ -701,7 +701,7 @@ impl<S: BuildHasher + Clone> Local<S> {
 /// A worker's handles to the keys it has met: found without a lock, by the key's name.
 #[derive(Debug)]
 pub struct Handles<S> {
-    set: KeySet<S>,
+    set: KeySet<S, HANDLE_PARTS>,
     /// Keys its decisions changed since last taken, each once.
     changed: Vec<Arc<Key>>,
 }
