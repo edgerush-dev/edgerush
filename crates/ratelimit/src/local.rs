@@ -235,14 +235,19 @@ impl Key {
         if self.idle(now) { now_units } else { word }
     }
 
-    /// Whether a request at `now` fits.
+    /// Whether a request at `now` fits: as of the key's last charge if `now` is behind it,
+    /// as [`word_to_charge`](Self::word_to_charge) decides.
     fn look(&self, now: u64) -> Look {
         let word = self.word.load(Ordering::Acquire);
         if word & CLOSED != 0 {
             return Look::Closed;
         }
-        let now_units = self.rate.units(now);
-        self.fits(word, self.arrival(word, now, now_units), now_units)
+        let last = self.last.load(Ordering::Relaxed);
+        if now.saturating_sub(last) > self.rate.refill {
+            let now_units = self.rate.units(now);
+            return self.fits(word, now_units, now_units);
+        }
+        self.fits(word, word, self.rate.units(now.max(last)))
     }
 
     /// Whether a request at `now_units` fits, the bucket's arrival time `arrival` as of then.
@@ -257,26 +262,34 @@ impl Key {
         Look::Fits { word, from }
     }
 
-    /// The word a charge at `now` (units `now_units`) is to replace, `None` if the key was
-    /// closed. An idle key's word is first made to say what the key is, full at `now`,
-    /// before a charge moves its last use: a word from before the idle spell, its clock
-    /// perhaps come round, is never read beside a recent last use, which would take it as
-    /// it is.
-    fn word_to_charge(&self, now: u64, now_units: u64) -> Option<u64> {
+    /// The word a charge at `now` (units `now_units`) is to replace, and the time in units it
+    /// is decided at; `None` if the key was closed. An idle key's word is first made to say
+    /// what the key is, full at `now`, before a charge moves its last use: a word from
+    /// before the idle spell, its clock perhaps come round, is never read beside a recent
+    /// last use, which would take it as it is.
+    ///
+    /// A request whose clock is behind the key's last charge, as one worker's can be behind
+    /// another's, is decided as of that charge (#108): taken at its own time, it would see
+    /// the charge as still to come, the bucket emptier than it is by the refill between.
+    fn word_to_charge(&self, now: u64, now_units: u64) -> Option<(u64, u64)> {
         loop {
             let word = self.word.load(Ordering::Acquire);
             if word & CLOSED != 0 {
                 return None;
             }
-            if !self.idle(now) {
-                return Some(word);
+            let last = self.last.load(Ordering::Relaxed);
+            if last > now {
+                return Some((word, self.rate.units(last)));
+            }
+            if now - last <= self.rate.refill {
+                return Some((word, now_units));
             }
             if self
                 .word
                 .compare_exchange(word, now_units, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Some(now_units);
+                return Some((now_units, now_units));
             }
         }
     }
@@ -296,14 +309,16 @@ impl Key {
             .is_ok()
     }
 
-    /// One request at `now`, admitted if it fits.
+    /// One request at `now`, admitted if it fits. Inlined: called, it costs a decision under
+    /// one key a tenth more instructions (Callgrind).
+    #[inline]
     fn take(&self, now: u64) -> Look {
         let now_units = self.rate.units(now);
         loop {
-            let Some(word) = self.word_to_charge(now, now_units) else {
+            let Some((word, at)) = self.word_to_charge(now, now_units) else {
                 return Look::Closed;
             };
-            match self.fits(word, word, now_units) {
+            match self.fits(word, word, at) {
                 Look::Fits { word, from } => {
                     if self.charge_from(word, from, now) {
                         return Look::Fits { word, from };
@@ -318,14 +333,10 @@ impl Key {
     fn charge(&self, now: u64) -> bool {
         let now_units = self.rate.units(now);
         loop {
-            let Some(word) = self.word_to_charge(now, now_units) else {
+            let Some((word, at)) = self.word_to_charge(now, now_units) else {
                 return false;
             };
-            let from = if Rate::ahead(word, now_units) > 0 {
-                word
-            } else {
-                now_units
-            };
+            let from = if Rate::ahead(word, at) > 0 { word } else { at };
             if self.charge_from(word, from, now) {
                 return true;
             }
