@@ -422,18 +422,24 @@ async fn a_quiet_stream_lets_go_of_a_key_the_pod_forgot() {
 /// Pointed elsewhere, it cuts the connections it relays, so that clients connect again.
 struct Switch {
     address: String,
-    to: tokio::sync::watch::Sender<std::net::SocketAddr>,
+    to: tokio::sync::watch::Sender<Option<std::net::SocketAddr>>,
 }
 
 impl Switch {
-    async fn to(to: std::net::SocketAddr) -> Self {
+    /// Pointed nowhere yet: until it is, it closes every connection at once, as a port
+    /// with nothing behind it refuses one. Such an address cannot stand in for that
+    /// everywhere: WSL's mirrored loopback leaves a connection to a closed port hanging
+    /// until it times out, minutes later, and a client's calls with it (#123).
+    async fn unpointed() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
-        let (to, target) = tokio::sync::watch::channel(to);
+        let (to, target) = tokio::sync::watch::channel(None);
         tokio::spawn(async move {
             while let Ok((mut client, _)) = listener.accept().await {
                 let mut pointed = target.clone();
-                let at = *pointed.borrow_and_update();
+                let Some(at) = *pointed.borrow_and_update() else {
+                    continue;
+                };
                 tokio::spawn(async move {
                     if let Ok(mut server) = tokio::net::TcpStream::connect(at).await {
                         tokio::select! {
@@ -448,7 +454,7 @@ impl Switch {
     }
 
     fn point(&self, to: std::net::SocketAddr) {
-        self.to.send_replace(to);
+        self.to.send_replace(Some(to));
     }
 }
 
@@ -490,10 +496,9 @@ async fn until(what: &str, done: impl Fn() -> bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pod_taken_in_again_is_handed_the_keys_it_missed() {
     // Every pod behind a switch, so that one can come back at the same address.
-    let placeholder: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
     let mut switches = Vec::new();
     for _ in 0..3 {
-        switches.push(Switch::to(placeholder).await);
+        switches.push(Switch::unpointed().await);
     }
     let mut pods = Vec::new();
     for id in 0..3 {
