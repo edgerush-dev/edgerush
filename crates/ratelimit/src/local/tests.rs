@@ -547,3 +547,43 @@ fn handles_spread_over_their_parts() {
         "{lens:?}"
     );
 }
+
+/// A request whose clock is behind the key's last charge, as one worker's can be behind
+/// another's, is decided as of that charge (#108): at its own time it would see the charge as
+/// still to come, and the bucket emptier than it is by the refill between.
+#[test]
+fn a_request_with_a_clock_behind_the_keys_is_decided_as_of_its_last_charge() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let c = contract(100, SECOND, 10);
+    assert!(one(&local, &mut handles, b"k", c, 100 * MS));
+    let admitted = (0..12)
+        .filter(|_| one(&local, &mut handles, b"k", c, 0))
+        .count();
+    assert_eq!(admitted, 9);
+}
+
+/// The same through a request under several keys, which looks at each before charging any.
+#[test]
+fn a_request_under_several_keys_with_a_clock_behind_is_decided_as_of_the_last_charge() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let c = contract(100, SECOND, 10);
+    assert!(one(&local, &mut handles, b"a", c, 100 * MS));
+    let both = [(&b"a"[..], c), (&b"b"[..], c)];
+    let admitted = (0..12)
+        .filter(|_| local.decide(&mut handles, &both, 0) == Decision::Admit)
+        .count();
+    assert_eq!(admitted, 9);
+}
+
+/// A limit no request could reach refuses none, even with a clock behind: the burst kept is
+/// capped, the rate is not, so a microsecond's refill is more than the whole bucket (#108).
+#[test]
+fn an_enormous_limit_refuses_none_with_a_clock_behind() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let c = contract(u64::MAX / 4, SECOND, u64::MAX / 4);
+    assert!(one(&local, &mut handles, b"k", c, 1_000));
+    assert!((0..100).all(|_| one(&local, &mut handles, b"k", c, 0)));
+}
