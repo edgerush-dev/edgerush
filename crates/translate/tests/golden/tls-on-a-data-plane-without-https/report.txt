@@ -1,1 +1,2 @@
+Ingress shop/web: bare.example.com is served over HTTP only: its TLS entry names no Secret
 Ingress shop/web: shop.example.com is served over HTTP only: the data plane has no `https` listener

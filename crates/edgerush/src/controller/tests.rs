@@ -90,6 +90,7 @@ ingress_class: edge
 cluster_domain: cluster.local
 ingress_hosts_fall_through: false
 ingress_https_redirect: false
+ingress_https_redirect_max_age: 30
 listeners:
   http:
     address: "{http}"
