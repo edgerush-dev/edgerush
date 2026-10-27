@@ -7,6 +7,7 @@
     reason = "test set-up: the helpers around the tests fail them the way the tests would"
 )]
 
+use edgerush_ratelimit::service::membership::{Agreed, Heartbeat};
 use edgerush_ratelimit::service::{Contract, DataPlane, Decision, PodId, View};
 use edgerush_ratelimit_service::grpc::{Client, Error, Server};
 use edgerush_ratelimit_service::pod::{Pod, Timing};
@@ -539,5 +540,56 @@ async fn a_copy_too_long_to_send_is_counted() {
         }
         assert!(Instant::now() < deadline, "never counted: {usage:?}");
         tokio::time::sleep(CYCLE).await;
+    }
+}
+
+/// A connection to a pod that is open but never answers is let go of, and the next call
+/// connects afresh (#127): the client pings each connection and drops one whose ping goes
+/// unanswered, rather than keeping it, and every call on it timing out, until it fails of
+/// itself — which an open connection need never do.
+#[tokio::test]
+async fn a_client_lets_go_of_a_connection_that_never_answers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = listener.local_addr().unwrap();
+    let pod = Pod::spawn(0, vec![0], 1, timing(), BTreeMap::new());
+    let server = Server::new(pod);
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .serve_with_incoming(server, TcpIncoming::from(listener))
+            .await
+            .unwrap();
+    });
+    // In front of it, a relay that holds the first connection open, read by nothing, for
+    // as long as the test runs, and relays every later one.
+    let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = relay.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        let (_held, _) = relay.accept().await.unwrap();
+        while let Ok((mut client, _)) = relay.accept().await {
+            tokio::spawn(async move {
+                let mut server = tokio::net::TcpStream::connect(at).await.unwrap();
+                let _ended = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+            });
+        }
+    });
+    let client = Client::new(&address).unwrap();
+    let beat = || Heartbeat {
+        from: 1,
+        incarnation: 1,
+        agreed: Agreed {
+            view: View {
+                epoch: 0,
+                pods: Vec::new(),
+            },
+            incarnations: Vec::new(),
+        },
+        hears: Vec::new(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while client.heartbeat(beat()).await.is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "every call went on the connection that never answers"
+        );
     }
 }

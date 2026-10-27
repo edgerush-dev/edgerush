@@ -30,6 +30,13 @@ pub(crate) const HEARTBEAT: &str = "/edgerush.ratelimit.v1.RateLimit/Heartbeat";
 /// How long a call may take before it is given up: the protocol sends again what matters.
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How often a client pings its connection, idle or not, and how long it waits for the
+/// answer before letting the connection go (#127): a call that times out leaves its
+/// connection in place, so one that is open but never answers — a wedged peer whose
+/// kernel still acknowledges, a middlebox — would otherwise take every later call with
+/// it, for as long as it stays open.
+const KEEP_ALIVE: Duration = Duration::from_secs(1);
+
 /// The longest message either side sends or takes, set rather than left to tonic's
 /// defaults: 4 MiB. What the protocol sends is cut to a quarter of it (06 §4), so that
 /// a piece made by an estimate of its size, or an answer to it, always fits; a message
@@ -233,6 +240,9 @@ impl Client {
         let channel = Endpoint::from_shared(format!("http://{address}"))?
             .timeout(CALL_TIMEOUT)
             .connect_timeout(CALL_TIMEOUT)
+            .http2_keep_alive_interval(KEEP_ALIVE)
+            .keep_alive_timeout(KEEP_ALIVE)
+            .keep_alive_while_idle(true)
             .tcp_nodelay(true)
             .connect_lazy();
         Ok(Self { channel })
