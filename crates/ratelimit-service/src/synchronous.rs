@@ -18,7 +18,7 @@ use crate::grpc::{Boxed, Client, Error, HEARTBEAT, MAX_MESSAGE, Prost, limited};
 use crate::wire::{Empty, Heartbeat as WireHeartbeat};
 use edgerush_ratelimit::service::membership::{Heartbeat, Membership};
 use edgerush_ratelimit::service::{PodId, View};
-use edgerush_ratelimit::synchronous::{self as owner, Handles, Owner, Shared};
+use edgerush_ratelimit::synchronous::{self as owner, HANDLE_PARTS, Handles, Owner, Shared};
 use futures_core::Stream;
 use http::uri::PathAndQuery;
 use std::collections::BTreeMap;
@@ -102,7 +102,8 @@ struct Pod {
     cycle: Duration,
     /// Set once it is stopped, as a pod gone.
     stopped: watch::Sender<bool>,
-    /// The handles its streams hold to keys, as each last said: once a [`SWEEP`].
+    /// The handles its streams hold to keys, as each last said, a part of a [`SWEEP`] ago at
+    /// most.
     handles: AtomicUsize,
 }
 
@@ -315,9 +316,10 @@ impl SyncPod {
     /// stream's own, and as it ends, never request by request: what every stream shares
     /// stays off the request's path. A change waits up to two cycles to be copied.
     ///
-    /// Once a [`SWEEP`], busy or quiet, it lets go of its handles to keys the pod forgot or
-    /// evicted, which would otherwise keep them, past the pod's cap, for as long as the
-    /// stream is open; and says how many it holds.
+    /// Busy or quiet, it lets go of its handles to keys the pod forgot or evicted, which
+    /// would otherwise keep them, past the pod's cap, for as long as the stream is open: a
+    /// part of them at a time, every part once a [`SWEEP`], so that no one pass holds the
+    /// pod's thread up reading every handle; and says how many it holds.
     async fn serve(
         self,
         requests: Streaming<wire::Upstream>,
@@ -332,10 +334,10 @@ impl SyncPod {
         self.pod.handles.fetch_sub(said, Ordering::Relaxed);
     }
 
-    /// Lets go of `handles` to keys forgotten, and says how many are left, `said` being
-    /// what it said last.
+    /// Lets go of `handles` to keys forgotten, in the next of their parts, and says how many
+    /// are left, `said` being what it said last.
     fn tidy(&self, handles: &mut Handles<RandomState>, said: &mut usize) {
-        handles.prune();
+        handles.prune_next();
         let held = handles.len();
         if held > *said {
             self.pod.handles.fetch_add(held - *said, Ordering::Relaxed);
@@ -370,7 +372,7 @@ impl SyncPod {
         view.mark_unchanged();
         let mut cycle = tokio::time::interval(pod.cycle);
         cycle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut sweep = tokio::time::interval(SWEEP);
+        let mut sweep = tokio::time::interval(SWEEP / HANDLE_PARTS as u32);
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Seen as it is sent, so that only a change sends it again.
         let send_view = |view: &mut watch::Receiver<(View, bool)>| wire::Downstream {

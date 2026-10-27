@@ -6,7 +6,7 @@
 
 use super::{Failed, KeyedBy, Limited, Refused, with_keys};
 use edgerush_config::CompiledLimit;
-use edgerush_ratelimit::local::{Decision, Handles, Local};
+use edgerush_ratelimit::local::{Decision, HANDLE_PARTS, Handles, Local};
 use edgerush_ratelimit::service::{Contract, Keyed};
 use std::cell::RefCell;
 use std::hash::{BuildHasher, RandomState};
@@ -118,7 +118,8 @@ pub(crate) struct LocalLimiter {
 
 impl LocalLimiter {
     /// Worker `index`'s limiter on `process`'s keys, letting go of its handles to keys
-    /// forgotten once a second, for as long as the worker keeps it.
+    /// forgotten a part at a time, every part once a second, for as long as the worker keeps
+    /// it: no one pass holds the worker up reading every handle.
     pub(crate) fn new(process: Arc<Process>, index: usize) -> Rc<Self> {
         let handles = RefCell::new(Handles::new(process.hasher));
         let limiter = Rc::new(Self {
@@ -130,14 +131,14 @@ impl LocalLimiter {
         });
         let held: RcWeak<Self> = Rc::downgrade(&limiter);
         tokio::task::spawn_local(async move {
-            let mut every = tokio::time::interval(SWEEP);
+            let mut every = tokio::time::interval(SWEEP / HANDLE_PARTS as u32);
             every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 every.tick().await;
                 let Some(limiter) = held.upgrade() else {
                     return;
                 };
-                limiter.handles.borrow_mut().prune();
+                limiter.handles.borrow_mut().prune_next();
             }
         });
         limiter

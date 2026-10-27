@@ -25,9 +25,13 @@ mod tests;
 
 pub use crate::service::Contract;
 
-use key_set::{HANDLE_PARTS, KeySet, SLOT_BYTES};
+use key_set::{KeySet, SLOT_BYTES};
 use std::hash::BuildHasher;
 use sync::{Arc, AtomicBool, AtomicU64, Ordering, RwLock};
+
+/// The tables a worker's handles are split into, by bits of each key's hash: each doubles
+/// on its own, and [`Handles::prune_next`] reads one at a time.
+pub const HANDLE_PARTS: usize = 64;
 
 /// Units in a request's interval.
 const UNITS: u64 = 1 << 16;
@@ -704,6 +708,8 @@ pub struct Handles<S> {
     set: KeySet<S, HANDLE_PARTS>,
     /// Keys its decisions changed since last taken, each once.
     changed: Vec<Arc<Key>>,
+    /// The part [`prune_next`](Self::prune_next) reads next.
+    next_part: usize,
 }
 
 impl<S: BuildHasher + Clone> Handles<S> {
@@ -713,6 +719,7 @@ impl<S: BuildHasher + Clone> Handles<S> {
         Self {
             set: KeySet::with_hasher(hasher),
             changed: Vec::new(),
+            next_part: 0,
         }
     }
 
@@ -745,6 +752,14 @@ impl<S: BuildHasher + Clone> Handles<S> {
     /// to keys it never meets again hold them.
     pub fn prune(&mut self) {
         self.set.retain(|key| !key.closed());
+    }
+
+    /// The same for one of its [`HANDLE_PARTS`] parts, the next in turn: taken that many
+    /// times as often as a whole prune would be, so that no one pass reads every handle —
+    /// over a million handles, a whole pass reads them for tens of milliseconds.
+    pub fn prune_next(&mut self) {
+        self.set.retain_part(self.next_part, |key| !key.closed());
+        self.next_part = (self.next_part + 1) % HANDLE_PARTS;
     }
 
     fn forget(&mut self, key: &[u8]) {
