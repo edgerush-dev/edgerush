@@ -10,7 +10,8 @@
 //! `passed-over.txt`, how many Ingresses were another data plane's.
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
 //! the objects of `tests/golden/shared.yaml` go with every case's.
-//! Every config translated must also pass the data plane's own `compile`.
+//! Every config translated must also pass the data plane's own `compile`, and, written as
+//! YAML as the control plane writes it, read back the same.
 
 use edgerush_config::{Config, compile};
 use edgerush_translate::{Cluster, Plane, translate};
@@ -88,6 +89,10 @@ fn every_case_translates_to_its_config_and_report() {
             .into_keys()
             .collect();
         assert_eq!(config, expected, "{name}: config");
+        let written = serde_saphyr::to_string(&config).unwrap();
+        let read_back: Config = serde_saphyr::from_str(&written)
+            .unwrap_or_else(|error| panic!("{name}: the config written: {error}\n{written}"));
+        assert_eq!(read_back, config, "{name}: the config written, read back");
         let listed = case.join("certificates.txt");
         let expected: Vec<String> = if listed.exists() {
             read(&listed).lines().map(str::to_owned).collect()

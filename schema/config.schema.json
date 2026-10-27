@@ -13,7 +13,10 @@
     },
     "data_plane": {
       "description": "The data plane's own settings; left out, each has its value.",
-      "$ref": "#/$defs/DataPlane"
+      "$ref": "#/$defs/DataPlane",
+      "default": {
+        "set_aside_ms": null
+      }
     },
     "limits_file": {
       "description": "The file of the rate-limiting engine's limits, which routes and route rules name,\nrelative to the config file's directory unless it is absolute: read and looked at\nagain with the config file. Left out, rate limiting is off and no limit can be named.",
@@ -39,7 +42,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "default": null
     },
     "routes": {
       "description": "The routes of `http` and `https` listeners, in order of precedence among otherwise\nequal matches; empty for none.",
@@ -51,6 +55,7 @@
     "tcp_routes": {
       "description": "The routes of `tcp` listeners: one for each.",
       "type": "array",
+      "default": [],
       "items": {
         "$ref": "#/$defs/TcpRoute"
       }
@@ -58,6 +63,7 @@
     "tls_routes": {
       "description": "The routes of `tls` listeners, in order of precedence among equally specific\nhostnames.",
       "type": "array",
+      "default": [],
       "items": {
         "$ref": "#/$defs/TlsRoute"
       }
@@ -247,6 +253,7 @@
             "add": {
               "description": "Values to append to whatever the headers had: a field line more, but for `Cookie`,\nwhose one string the value joins after `\"; \"`.",
               "type": "array",
+              "default": [],
               "items": {
                 "$ref": "#/$defs/Header"
               },
@@ -264,6 +271,7 @@
             "set": {
               "description": "Headers to give one value, whatever they had. A header is named once in the three\nlists.",
               "type": "array",
+              "default": [],
               "items": {
                 "$ref": "#/$defs/Header"
               },
@@ -286,6 +294,7 @@
             "add": {
               "description": "Values to append to whatever the headers had: a field line more, but for `Cookie`,\nwhose one string the value joins after `\"; \"`.",
               "type": "array",
+              "default": [],
               "items": {
                 "$ref": "#/$defs/Header"
               },
@@ -303,6 +312,7 @@
             "set": {
               "description": "Headers to give one value, whatever they had. A header is named once in the three\nlists.",
               "type": "array",
+              "default": [],
               "items": {
                 "$ref": "#/$defs/Header"
               },
@@ -363,7 +373,8 @@
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "default": null
             },
             "type": {
               "type": "string",
@@ -398,7 +409,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "timeouts": {
           "description": "How long its requests may take; none leaves them to the data plane's fixed clocks.",
@@ -409,7 +421,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,
@@ -575,7 +588,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,
@@ -651,7 +665,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "address": {
           "description": "The address to listen on; `[::]:8080` is every address, IPv4 included. No two\nlisteners have the same one.",
@@ -666,7 +681,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "http3": {
           "description": "HTTP/3 as well, on the same port over UDP: for an `https` listener only.",
@@ -677,7 +693,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "protocol": {
           "description": "What is spoken there.",
@@ -692,7 +709,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "request_id": {
           "description": "Whether an `http` or `https` listener, which must say, gives each request an ID of\nits own; no other may.",
@@ -703,7 +721,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "tls": {
           "description": "What an `https` listener presents, which it must have; no other may.",
@@ -714,7 +733,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "tunnel_idle_seconds": {
           "description": "How long, in seconds, a `tcp` or `tls` listener's tunnel may carry nothing either\nway before both its ends are closed. An hour unless said otherwise,\nas HAProxy's `timeout tunnel` is set in practice: what a tunnel carries (a database's\nconnection, a long poll) can be quiet for long. For those listeners only.",
@@ -803,11 +823,13 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "headers": {
           "description": "Conditions on headers; names are case-insensitive. A repeated header is judged by its\nfields joined.",
           "type": "array",
+          "default": [],
           "items": {
             "$ref": "#/$defs/ValuePredicate"
           }
@@ -829,11 +851,13 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "query": {
           "description": "Conditions on decoded query parameters; names are case-sensitive. A repeated\nparameter is judged by its first occurrence.",
           "type": "array",
+          "default": [],
           "items": {
             "$ref": "#/$defs/ValuePredicate"
           }
@@ -1192,7 +1216,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "synchronous": {
           "description": "How a request waits for its owner, which `synchronous` needs and no other mode\ntakes.",
@@ -1203,7 +1228,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,
@@ -1232,7 +1258,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "port": {
           "description": "The port to send the client to; written only if it is not its scheme's default.",
@@ -1258,7 +1285,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "status": {
           "description": "The answer's status.",
@@ -1408,6 +1436,7 @@
         "filters": {
           "description": "What is done to a request and its response. Each kind of filter at most once.",
           "type": "array",
+          "default": [],
           "items": {
             "$ref": "#/$defs/Filter"
           }
@@ -1421,7 +1450,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "matches": {
           "description": "The rule is for a request that satisfies any one of these.",
@@ -1440,7 +1470,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "rate_limits": {
           "description": "The rate-limiting engine's limits the rule's requests are under, by name, beside its\nroute's and those over the whole data plane: each request admitted under all of them\nor none, and charged to all or none. Only with `forward`.",
@@ -1459,7 +1490,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,
@@ -1625,7 +1657,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "refused": {
           "description": "Host names refused in the handshake with an `unrecognized_name` alert before any\ncertificate is looked at: translated, those an Ingress serves without TLS, so that\nanother's wildcard never answers for them over HTTPS when that Ingress's own route\nis not there to take them.",
@@ -1705,7 +1738,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "keepalive": {
           "description": "HTTP/2 PINGs to find a dead connection before a request does; none is no PINGs. For\nan upstream spoken to in HTTP/2 only.",
@@ -1716,7 +1750,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "load_balancer": {
           "description": "Which endpoint takes each exchange. Always stated: it chooses behaviour.",
@@ -1724,7 +1759,8 @@
         },
         "protocol": {
           "description": "What its endpoints are spoken to in, whatever the client spoke. An upstream of TCP\nand TLS routes is sent their bytes as they come: neither `http2` nor `tls`.",
-          "$ref": "#/$defs/UpstreamProtocol"
+          "$ref": "#/$defs/UpstreamProtocol",
+          "default": "http1"
         },
         "proxy_protocol": {
           "description": "A PROXY protocol header ahead of each tunnel's bytes, telling the backend who the\nclient is; none is no header. For an upstream of TCP and TLS routes only: an HTTP\nroute's connections carry many clients' requests.",
@@ -1735,7 +1771,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "slow_start": {
           "description": "A new or recovered endpoint's ramp to its full share; none is every endpoint at its\nfull share from the start.",
@@ -1746,7 +1783,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "tls": {
           "description": "TLS to its endpoints; none is plain TCP.",
@@ -1757,7 +1795,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,

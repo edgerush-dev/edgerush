@@ -1,13 +1,13 @@
 //! Routes as the model states them. These types say what was written; whether it makes
 //! sense is for [`compile_routes`](crate::compile_routes) to find out.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A route: the hosts it serves and its rules.
 ///
 /// Routes come as an ordered list, and the order matters: it is the last tie-breaker of
 /// precedence. The control plane emits them oldest first, then by name.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Route {
@@ -30,7 +30,7 @@ pub struct Route {
 
 /// A route for a `tcp` listener: every connection it takes goes to these backends, as
 /// Gateway API's TCPRoute has it (17 in the docs).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct TcpRoute {
@@ -46,7 +46,7 @@ pub struct TcpRoute {
 
 /// A route for a `tls` listener: the connections whose ClientHello asks for a name its
 /// hostnames cover, as Gateway API's TLSRoute has it in passthrough mode.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct TlsRoute {
@@ -65,7 +65,7 @@ pub struct TlsRoute {
 }
 
 /// A claim on hosts.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Hostname {
@@ -82,7 +82,7 @@ pub struct Hostname {
 
 /// What the `*` of a wildcard hostname stands for. Neither covers the bare suffix:
 /// `*.example.com` is not `example.com`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Wildcard {
@@ -94,7 +94,7 @@ pub enum Wildcard {
 
 /// A rule: the requests it is for, what is done to them on the way, and what becomes of
 /// them.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
@@ -123,7 +123,7 @@ pub struct Rule {
 }
 
 /// How a rule takes request paths.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RulePaths {
@@ -144,7 +144,7 @@ pub struct RulePaths {
 }
 
 /// What a rule does with an encoded slash inside a path segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum EncodedSlash {
@@ -158,7 +158,7 @@ pub enum EncodedSlash {
 /// goes upstream. The `Location` holds what is said here and only what it needs besides:
 /// relative when none of scheme, host and port is said, and otherwise absolute, the scheme
 /// unsaid taken from the listener and the host from the request.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Redirect {
@@ -183,7 +183,7 @@ pub struct Redirect {
 }
 
 /// A scheme a redirect sends a client to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Scheme {
@@ -194,7 +194,7 @@ pub enum Scheme {
 }
 
 /// What becomes of a request's query when it is redirected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Query {
@@ -206,7 +206,7 @@ pub enum Query {
 
 /// A change to a request's path. Either replacement is a path in normal form, without `?` or
 /// `#`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PathChange {
@@ -224,7 +224,7 @@ pub enum PathChange {
 }
 
 /// A rule's requests sent on to its backends.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Forward {
@@ -242,7 +242,7 @@ pub struct Forward {
 /// How long a rule's requests may take (Gateway API's HTTPRoute `timeouts`). A timeout
 /// stated takes the place of the data plane's fixed clocks for an answer's head; the idle
 /// clocks, which find data that stopped flowing, run whatever is stated. At least one.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Timeouts {
@@ -270,7 +270,7 @@ pub struct Timeouts {
 /// named, as Gateway API asks: nothing of it reached the endpoint. Otherwise decided on an
 /// answer's head alone: once a head has gone to the client, the request is not sent again.
 /// Within a budget of the upstream's, and only for a body small enough to be kept.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Retry {
@@ -306,7 +306,7 @@ pub struct Retry {
 }
 
 /// Something done to a request or its response.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Filter {
@@ -325,7 +325,7 @@ pub enum Filter {
 
 /// A rewrite (Gateway API's `URLRewrite`): what the upstream is sent in place of what the
 /// request was routed on. At least one of the two.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct UrlRewrite {
@@ -340,7 +340,7 @@ pub struct UrlRewrite {
 /// A copy of some share of a rule's requests, sent to another upstream (Gateway API's
 /// `RequestMirror`). The copy never holds the request up: one that falls behind is given
 /// up on.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Mirror {
@@ -352,7 +352,7 @@ pub struct Mirror {
 }
 
 /// A share: `numerator` out of every `denominator`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Fraction {
@@ -364,7 +364,7 @@ pub struct Fraction {
 }
 
 /// Changes to headers. A header may be named once, in one of the three.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct HeaderChanges {
@@ -385,7 +385,7 @@ pub struct HeaderChanges {
 }
 
 /// A header with a value.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Header {
@@ -397,7 +397,7 @@ pub struct Header {
 }
 
 /// One destination of a rule: an upstream, or a backend that is invalid, one and not both.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Backend {
@@ -430,7 +430,7 @@ impl std::fmt::Display for Backend {
 }
 
 /// One way for a request to belong to a rule: all of what is stated here must hold.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Match {
@@ -458,7 +458,7 @@ pub struct Match {
 /// service, its method, or both; at least one. A gRPC call's path is `/service/method`,
 /// and this is matched as that path would be: both as the exact path, a service alone as
 /// the prefix `/service`, a method alone in any service.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GrpcMethod {
@@ -472,7 +472,7 @@ pub struct GrpcMethod {
 }
 
 /// How a path is matched.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PathMatch {
@@ -488,7 +488,7 @@ pub enum PathMatch {
 }
 
 /// A condition on a named value: a header or a query parameter.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ValuePredicate {
@@ -499,7 +499,7 @@ pub struct ValuePredicate {
 }
 
 /// How a value is matched.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ValueMatch {

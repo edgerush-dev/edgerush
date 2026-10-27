@@ -16,9 +16,9 @@ serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-# Golden tests read manifests and configs the way files hold them. The crate knows no
-# format.
-serde-saphyr.workspace = true
+# Golden tests read manifests and configs the way files hold them, and write each config
+# translated as the control plane does. The crate knows no format.
+serde-saphyr = { workspace = true, features = ["serialize"] }
 
 [lints]
 workspace = true
