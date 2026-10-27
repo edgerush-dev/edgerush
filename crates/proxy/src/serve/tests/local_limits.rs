@@ -23,6 +23,7 @@ fn local_mode() -> Option<edgerush_config::RateLimiting> {
         max_key_bytes: None,
         synchronous: None,
         experimental_header_keys: None,
+        experimental_fewer_pods: None,
         service: None,
     })
 }
@@ -185,6 +186,7 @@ async fn with_rate_limiting_off_every_request_goes_on() {
         max_key_bytes: None,
         synchronous: None,
         experimental_header_keys: None,
+        experimental_fewer_pods: None,
         service: None,
     });
     for section in [None, off] {
@@ -245,6 +247,7 @@ fn keyed_by(mut config: Config, limits: &[(&str, &str, u64)]) -> Config {
         service: None,
         synchronous: None,
         experimental_header_keys: Some(true),
+        experimental_fewer_pods: None,
     });
     config
 }

@@ -1161,6 +1161,14 @@
       "description": "How the data plane enforces its rate limits: the mode, and what that mode needs.",
       "type": "object",
       "properties": {
+        "experimental_fewer_pods": {
+          "description": "Experimental: whether the synchronous mode may run with fewer than three service\npods, which cannot fail over — for\ndevelopment and tests on one pod. Off when left out; only the synchronous mode\ntakes it.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
         "experimental_header_keys": {
           "description": "Experimental: whether a limit may be keyed by a request header,\n`key: 'headers[\"x-api-key\"]'` — what the client says rather than what the gateway\nestablished — so that limits keyed by something besides the client can be tried. Off when left out.",
           "type": [

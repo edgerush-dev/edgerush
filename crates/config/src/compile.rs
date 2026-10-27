@@ -663,6 +663,16 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
         if service.cycle_ms == Some(0) {
             errors.push(place.problem(Problem::RateLimitServiceCycleNever));
         }
+        // Fewer than three cannot fail over: of two, the one left is no majority and cannot
+        // take the other out of the view.
+        if mode == RateLimitMode::Synchronous
+            && !service.addresses.is_empty()
+            && service.addresses.len() < 3
+            && limiting.experimental_fewer_pods != Some(true)
+        {
+            errors
+                .push(place.problem(Problem::RateLimitServiceTooFewPods(service.addresses.len())));
+        }
         if mode == RateLimitMode::Synchronous {
             // The synchronous mode has no cycle of the data plane's and no levers: each
             // would be ignored, as if it did something.
@@ -680,6 +690,9 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
         }
     }
     let synchronous = mode == RateLimitMode::Synchronous;
+    if !synchronous && limiting.experimental_fewer_pods.is_some() {
+        errors.push(place.problem(Problem::RateLimitingFewerPodsUnused(mode_name(mode))));
+    }
     match (&limiting.synchronous, synchronous) {
         (Some(_), false) => {
             errors.push(place.problem(Problem::RateLimitingSynchronousUnused(mode_name(mode))));
@@ -2588,6 +2601,14 @@ pub enum Problem {
     /// A rate-limiting service with no pods.
     #[error("`rate_limiting.service` names no `addresses`")]
     RateLimitServiceNoAddresses,
+    /// A synchronous rate-limiting service of fewer pods than can fail over.
+    #[error(
+        "`rate_limiting.service`: {0} of `addresses`, where the synchronous mode needs three to fail over, or `rate_limiting.experimental_fewer_pods`"
+    )]
+    RateLimitServiceTooFewPods(usize),
+    /// Fewer pods allowed in a mode that does not care how many there are.
+    #[error("`rate_limiting.experimental_fewer_pods` is for mode `synchronous`, not `{0}`")]
+    RateLimitingFewerPodsUnused(&'static str),
     /// A rate-limiting service pod's address that is not one to connect to.
     #[error("`rate_limiting.service`: address `{0}` is no `host:port`")]
     RateLimitServiceAddress(String),
@@ -5323,10 +5344,14 @@ upstreams: {}
         );
         assert_eq!(
             with(&format!(
-                r#"rate_limiting: {{ mode: synchronous, max_key_bytes: 1000, service: {{ addresses: ["rl-0:7000", "rl-1:7000"] }}, {WAITS} }}"#
+                r#"rate_limiting: {{ mode: synchronous, max_key_bytes: 1000, service: {{ addresses: ["rl-0:7000", "rl-1:7000", "rl-2:7000"] }}, {WAITS} }}"#
             )),
             Ok(CompiledRateLimiting::Synchronous(CompiledSynchronous {
-                addresses: vec!["rl-0:7000".to_owned(), "rl-1:7000".to_owned()],
+                addresses: vec![
+                    "rl-0:7000".to_owned(),
+                    "rl-1:7000".to_owned(),
+                    "rl-2:7000".to_owned(),
+                ],
                 timeout: Duration::from_millis(20),
                 when_unreachable: crate::WhenUnreachable::Allow,
                 breaker_failures: 5,
@@ -5338,6 +5363,73 @@ upstreams: {}
         let unsaid: Result<Config, _> =
             serde_saphyr::from_str("listeners: {}\nroutes: []\nupstreams: {}\nrate_limiting: {}\n");
         assert!(unsaid.is_err());
+    }
+
+    /// The synchronous mode needs three service pods, as fewer cannot fail over, unless told
+    /// it may run on fewer (for development and tests); no other mode takes the switch.
+    #[test]
+    fn the_synchronous_mode_needs_three_pods_unless_told() {
+        let with = |section: &str| {
+            let yaml = format!(
+                "listeners: {{}}
+routes: []
+upstreams: {{}}
+rate_limiting: {{ {section} }}
+"
+            );
+            compile(&config(&yaml))
+                .map(|_| ())
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let pods = |count: usize| {
+            let addresses: Vec<String> = (0..count)
+                .map(|pod| format!(r#""rl-{pod}:7000""#))
+                .collect();
+            format!("service: {{ addresses: [{}] }}", addresses.join(", "))
+        };
+        for count in [1, 2] {
+            assert_eq!(
+                with(&format!("mode: synchronous, {}, {WAITS}", pods(count))).unwrap_err(),
+                [format!(
+                    "the data plane: `rate_limiting.service`: {count} of `addresses`, where the synchronous mode needs three to fail over, or `rate_limiting.experimental_fewer_pods`"
+                )]
+            );
+            assert_eq!(
+                with(&format!(
+                    "mode: synchronous, {}, {WAITS}, experimental_fewer_pods: true",
+                    pods(count)
+                )),
+                Ok(())
+            );
+            assert!(
+                with(&format!(
+                    "mode: synchronous, {}, {WAITS}, experimental_fewer_pods: false",
+                    pods(count)
+                ))
+                .is_err()
+            );
+        }
+        for count in [3, 4, 5] {
+            assert_eq!(
+                with(&format!("mode: synchronous, {}, {WAITS}", pods(count))),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            with(&format!(
+                "mode: asynchronous, {}, experimental_fewer_pods: true",
+                pods(1)
+            ))
+            .unwrap_err(),
+            [
+                "the data plane: `rate_limiting.experimental_fewer_pods` is for mode `synchronous`, not `asynchronous`"
+            ]
+        );
+        assert_eq!(
+            with(&format!("mode: asynchronous, {}", pods(1))),
+            Ok(()),
+            "the asynchronous mode takes any number"
+        );
     }
 
     /// How a request waits for its owner, as a synchronous data plane is to say it.
@@ -5356,7 +5448,7 @@ upstreams: {}
                 .map(|_| ())
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
-        let service = r#"service: { addresses: ["rl-0:7000"] }"#;
+        let service = r#"service: { addresses: ["rl-0:7000", "rl-1:7000", "rl-2:7000"] }"#;
         assert_eq!(
             with(&format!("mode: synchronous, {service}, {WAITS}")),
             Ok(())
@@ -5401,7 +5493,9 @@ upstreams: {}
             ("ask_cold_keys", "false"),
             ("schedule_keys", "true"),
         ] {
-            let service = format!(r#"service: {{ addresses: ["rl-0:7000"], {field}: {value} }}"#);
+            let service = format!(
+                r#"service: {{ addresses: ["rl-0:7000", "rl-1:7000", "rl-2:7000"], {field}: {value} }}"#
+            );
             assert_eq!(
                 with(&format!("mode: synchronous, {service}, {WAITS}")).unwrap_err(),
                 [format!(

@@ -89,6 +89,12 @@ pub struct RateLimiting {
     /// ([07 §2](../../../docs/07-config-and-dsl.md)). Off when left out.
     #[serde(default)]
     pub experimental_header_keys: Option<bool>,
+    /// Experimental: whether the synchronous mode may run with fewer than three service
+    /// pods, which cannot fail over ([06 §4](../../../docs/06-rate-limiting.md)) — for
+    /// development and tests on one pod. Off when left out; only the synchronous mode
+    /// takes it.
+    #[serde(default)]
+    pub experimental_fewer_pods: Option<bool>,
 }
 
 /// How a data plane enforces its rate limits ([06 §4](../../../docs/06-rate-limiting.md)).
