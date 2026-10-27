@@ -1,8 +1,8 @@
 # Examples
 
 Start with [Docker Compose](docker-compose/README.md) for a complete local demo with
-two HTTP backends. The configs below use the current file-driven data plane; Kubernetes
-and rate limiting are not implemented yet.
+two HTTP backends. The configs below use the file-driven data plane, the development
+harness; none of them limits requests.
 
 | Example | Shows |
 |---|---|

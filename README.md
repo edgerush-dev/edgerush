@@ -4,10 +4,11 @@ A Kubernetes-native API gateway written in Rust: an operator, control planes and
 planes in one binary; Ingress and Gateway API served from the same data plane; cluster-wide
 rate limiting with no external store to run.
 
-**Status: the data plane runs; Kubernetes does not yet.** The proxy serves traffic from a
-YAML file, the development harness; rate limiting runs, experimentally; the control plane
-and the operator are still to be built. Not for production. A hobby project with no
-timelines.
+**Status: the data plane runs; Kubernetes is arriving.** The proxy serves traffic from a
+YAML file, the development harness, and in a cluster follows Services' endpoints itself;
+rate limiting runs, each pod on its own or through EdgeRush's rate-limiting service; the
+control plane translates Ingresses but does not yet hand its config to data planes, and the
+operator is still to be built. Not for production. A hobby project with no timelines.
 
 ## What it is for
 
@@ -15,10 +16,10 @@ timelines.
   objects. Ingress stays a first-class API.
 - **Operator-driven.** `ControlPlane` and `DataPlane` resources become Deployments and
   Services; one control plane can drive many data planes, each its own failure domain.
-- **Cluster-wide rate limiting with no external store to run.** Counts live in memory in
-  EdgeRush's own rate-limiting service, packaged with it; each data-plane pod decides from
-  its own copy, off the request path, and limits keep working when the control plane is
-  down.
+- **Rate limiting per pod or across the cluster, with no external store to run.** One mode
+  for each data plane: each pod limiting on what it sees, or counts kept in memory in
+  EdgeRush's own rate-limiting service, packaged with it. Limits keep working when the
+  control plane is down.
 - **Low added latency, measured.** Thread-per-core on Tokio, our own HTTP/1 server and
   client, compiled filter chains. `bench/` compares EdgeRush with NGINX, HAProxy, Envoy and
   Kong doing the same work on the same machine.
@@ -44,22 +45,42 @@ without dropping a request.
   every upstream; a drain on SIGTERM; Prometheus metrics; access logs, a line of JSON for
   each request, WebSocket and passthrough connection, to stdout or a file reopened on
   SIGUSR1.
-- **Rate limiting, experimental:** token-bucket limits on route rules, keyed by the
-  client's address, a request under several decided under all of them at once, and dry
-  runs that count without refusing; shared across pods through the rate-limiting service
-  (`edgerush-ratelimit-service`), whose pods own the keys. Each proxy process is one
-  participant of it: its workers decide from per-key state they share by compare-and-swap,
-  and a thread of its own reports to the service. A refusal is a 429 with `Retry-After` and
-  the `RateLimit` field.
+- **Rate limiting:** token-bucket limits on route rules, keyed by the client's address (or,
+  experimentally, by a request header), a request under several decided under all of them
+  at once, and dry runs that count without refusing. A refusal is a 429 with `Retry-After`
+  and the `RateLimit` field. A data plane runs one mode, `off` unless it says otherwise,
+  which checks its limits and enforces none:
+  - `local`: each proxy process limits on what it sees, with no service to run; its
+    workers share each key's bucket, one atomic word decided by compare-and-swap.
+  - `synchronous`: the key's owner in the rate-limiting service
+    (`edgerush-ratelimit-service --mode synchronous`, three pods or more) decides every
+    request, over a stream each worker keeps to each pod. A request waits for its owner at
+    most a stated time; an owner that keeps failing is cut off by a breaker and tried again
+    later; and what happens while an owner is out of reach is stated too: allow, deny, or
+    the data plane's own buckets until it answers. The pods copy their keys to one another
+    every cycle, so that a pod's keys carry on when it leaves.
+  - `asynchronous`, experimental and parked: each process decides from its own copy of
+    each key and reports to the service every cycle.
 
-Begun: the control plane, `edgerush controller`, translating Ingresses into a data plane's
-config as the cluster changes, so far for Ingresses that route `Prefix` paths of named
-hosts to Services, and checked from manifests with `edgerush validate`; it does not reach
-data planes yet.
+Kubernetes, begun:
 
-Not yet: the rest of Kubernetes (the config reaching data planes, the operator, the rest of
-Ingress, Gateway API), authentication. The request path comes first, then rate limiting, then the
-control plane and the operator.
+- **`edgerush controller`**, the control plane for one data plane: it follows
+  IngressClasses, Ingresses, Services and Secrets through the API server and translates
+  them each time they change. Translated so far: Ingresses' rules and default backends,
+  with paths of every type, to Services' ports, spoken to as their `appProtocol` says; TLS
+  from Secrets, each certificate served for the hosts that name it alone; and plain HTTP
+  redirected to HTTPS for the hosts an Ingress secures. Its config does not reach data
+  planes yet: it is reported on stderr, or written as a file that `edgerush proxy` reads.
+- **Endpoints from EndpointSlices:** an upstream that names a Service takes its endpoints
+  from the data plane's own list and watch of EndpointSlices, so that they are followed
+  with the control plane down; tested end to end in kind.
+- **`edgerush validate`** translates manifests as the controller would, without a cluster,
+  and reports what it left out and why.
+
+Not yet: the rest of Kubernetes (the config reaching data planes, the operator,
+ingress-nginx's annotations, Ingress status, Gateway API), authentication. The request
+path came first; rate limiting and the control plane are now built side by side, and the
+operator follows.
 
 ## Trying it
 
@@ -237,25 +258,30 @@ crates/config      the config model and its compilation (`edgerush-config`): pur
 crates/controller  the control plane (`edgerush-controller`): the objects a data plane's config is
                    made of, followed, translated once every kind is listed and again on each
                    change, a moment's changes at once, and each config that compiles handed on
+crates/discovery   a Kubernetes Service's endpoints, from its EndpointSlices (`edgerush-discovery`):
+                   which addresses take requests; pure, no I/O
 crates/explain     where a request would go and why (`edgerush-explain`): what `edgerush explain`
                    prints and `edgerush test` checks, worked out by the request core without a
                    data plane; no I/O
 crates/filters     built-in filters (`edgerush-filters`): pure, on plain `http` types
+crates/kubernetes  EdgeRush's client of the Kubernetes API (`edgerush-kubernetes`): it lists and
+                   watches the kinds EdgeRush reads and does nothing else, over h2 and BoringSSL
 crates/ratelimit   rate limiting (`edgerush-ratelimit`): pure, no I/O; the admission models as
                    reference implementations behind one interface, an example that runs the same
                    clients through each (`cargo run -p edgerush-ratelimit --example timelines`),
-                   the rate-limiting service's protocol as two state machines, and a
-                   process's one participant of it, its workers sharing each key's state
+                   local mode's limiter, the synchronous mode's owner, and the asynchronous
+                   mode's protocol as two state machines
 crates/ratelimit-sim
                    the rate-limit simulator (`edgerush-ratelimit-sim`): ways of limiting one key
                    across pods run against the contract, deterministic, no I/O; side by side
                    with `cargo run --release -p edgerush-ratelimit-sim --example compare`
 crates/ratelimit-service
-                   the rate-limiting service, a prototype (`edgerush-ratelimit-service`): service
-                   pods running the protocol of `edgerush-ratelimit` over gRPC, the client data
-                   planes reach them with, and the `edgerush-ratelimit-service` binary
+                   the rate-limiting service (`edgerush-ratelimit-service`): service pods, in the
+                   synchronous or the asynchronous mode, over gRPC, the asynchronous mode's client,
+                   and the `edgerush-ratelimit-service` binary
 crates/proxy       the data plane (`edgerush-proxy`): listeners, TLS, our HTTP/1 server and client,
-                   HTTP/2 on h2, HTTP/3 on quiche, upstream pools and the request core between them
+                   HTTP/2 on h2, HTTP/3 on quiche, upstream pools and the request core between them,
+                   and each rate-limiting mode's side of the data plane
 crates/router      request matching (`edgerush-router`): pure logic, no I/O
 crates/rules       limit rules (`edgerush-rules`), a spike of the DSL question: expressions over the
                    request context in CEL's syntax for the part rules need, and rules as plain
@@ -263,7 +289,7 @@ crates/rules       limit rules (`edgerush-rules`), a spike of the DSL question: 
 crates/telemetry   metrics and access logs (`edgerush-telemetry`): counters sharded by thread, the
                    Prometheus text format, an access-log record as a line of JSON
 crates/translate   translation (`edgerush-translate`): Kubernetes objects into the config one data
-                   plane runs, what the control plane will do on every change; pure, no I/O
+                   plane runs, what the control plane does on every change; pure, no I/O
 bench              the macro benchmark: load generator, proxy and backend on one Linux machine
                    (bench/README.md)
 fuzz               fuzz targets (cargo-fuzz; not part of the workspace)
