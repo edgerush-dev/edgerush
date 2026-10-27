@@ -2,12 +2,14 @@
 //!
 //! One executable will carry every role (operator, control plane, data plane) as
 //! subcommands. So far: `proxy`, a data plane run from a config file — the development
-//! harness — `explain`, which says where a request would go and why, `test`, which
-//! checks a file of such requests and what is expected of them, and `validate`, which
-//! translates Kubernetes manifests as the control plane would.
+//! harness — `controller`, a control plane for one data plane, `explain`, which says where
+//! a request would go and why, `test`, which checks a file of such requests and what is
+//! expected of them, and `validate`, which translates Kubernetes manifests as the control
+//! plane would.
 
 mod bind;
 mod config_file;
+mod controller;
 mod essential;
 mod explain;
 mod harness;
@@ -26,10 +28,11 @@ const USAGE: &str = "\
 Usage: edgerush [OPTIONS] [COMMAND]
 
 Commands:
-  proxy    Run a data plane from a config file, without Kubernetes (development harness)
-  explain  Say where a request to a listener goes, and why no other match took it
-  test     Check where requests go against a file of tests, without running a data plane
-  validate Translate Kubernetes manifests as the control plane would, and say what was left out
+  proxy       Run a data plane from a config file, without Kubernetes (development harness)
+  controller  Run a control plane for one data plane, in a cluster
+  explain     Say where a request to a listener goes, and why no other match took it
+  test        Check where requests go against a file of tests, without running a data plane
+  validate    Translate Kubernetes manifests as the control plane would, and say what was left out
 
 Options:
   -V, --version  Print version
@@ -58,6 +61,7 @@ fn run(
         None | Some("-h" | "--help") => write!(stdout, "{USAGE}").map(|()| 0),
         Some("-V" | "--version") => writeln!(stdout, "{VERSION}").map(|()| 0),
         Some("proxy") => return harness::command(args, stdout, stderr),
+        Some("controller") => return controller::command(args, stdout, stderr),
         Some("explain") => return explain::command(args, stdout, stderr),
         Some("test") => return testing::command(args, stdout, stderr),
         Some("validate") => return validate::command(args, stdout, stderr),

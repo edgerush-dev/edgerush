@@ -3,7 +3,7 @@
 //! the data plane's settings, and saying what translating them came to, with no cluster.
 
 use edgerush_config::compile;
-use edgerush_translate::{Cluster, Plane, translate};
+use edgerush_translate::{Cluster, Plane, Translation, translate};
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use serde::Deserialize;
@@ -119,9 +119,9 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     }))
 }
 
-/// Why the manifests could not be validated.
+/// Why the manifests could not be validated, or a file read.
 #[derive(Debug, thiserror::Error)]
-enum Failed {
+pub(crate) enum Failed {
     #[error("{} cannot be read: {error}", path.display())]
     Unreadable { path: PathBuf, error: io::Error },
     #[error("{} is not what was expected: {error}", path.display())]
@@ -179,6 +179,36 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
         }
     }
     let translation = translate(&plane, &cluster);
+    let mut text = described(&translation);
+    let config = &translation.config;
+    if cluster.secrets_assumed && !config.certificates.is_empty() {
+        let _ = writeln!(
+            text,
+            "TLS Secrets were taken as they will be in the cluster, not checked: \
+             --check-secrets checks them"
+        );
+    }
+    let refused = match compile(config) {
+        Ok(_) => false,
+        Err(problems) => {
+            let _ = writeln!(text, "the data plane would refuse the config:");
+            for problem in problems {
+                let _ = writeln!(text, "  {problem}");
+            }
+            true
+        }
+    };
+    let clean = translation.report.is_empty()
+        && translation.unresolved.is_empty()
+        && translation.tls.is_empty()
+        && translation.shadowed.is_empty();
+    Ok((text, clean && !refused))
+}
+
+/// What a translation came to, a line each: what was left out, the paths without their
+/// backend, what of a `tls` is not served as listed and the paths shadowed, then how many
+/// of each. As `validate` prints it and the control plane logs it.
+pub(crate) fn described(translation: &Translation) -> String {
     let mut text = String::new();
     for finding in &translation.report {
         // Writing to a `String` cannot fail.
@@ -207,28 +237,7 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
         translation.shadowed.len(),
         translation.passed_over
     );
-    if cluster.secrets_assumed && !config.certificates.is_empty() {
-        let _ = writeln!(
-            text,
-            "TLS Secrets were taken as they will be in the cluster, not checked: \
-             --check-secrets checks them"
-        );
-    }
-    let refused = match compile(config) {
-        Ok(_) => false,
-        Err(problems) => {
-            let _ = writeln!(text, "the data plane would refuse the config:");
-            for problem in problems {
-                let _ = writeln!(text, "  {problem}");
-            }
-            true
-        }
-    };
-    let clean = translation.report.is_empty()
-        && translation.unresolved.is_empty()
-        && translation.tls.is_empty()
-        && translation.shadowed.is_empty();
-    Ok((text, clean && !refused))
+    text
 }
 
 /// The files of manifests at `path`: itself, or every `.yaml` and `.yml` file in it and
@@ -271,7 +280,8 @@ fn files(path: &Path) -> Result<Vec<PathBuf>, Failed> {
     Ok(found)
 }
 
-fn read<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, Failed> {
+/// The file at `path`, in YAML, as a config file is read.
+pub(crate) fn read<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, Failed> {
     let bytes = fs::read(path).map_err(|error| Failed::Unreadable {
         path: path.to_owned(),
         error,
