@@ -89,6 +89,31 @@ pub enum Scope {
     Namespace(String),
 }
 
+impl Scope {
+    /// The objects of namespace `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Namespace`] for a name no namespace can have, which would not make a
+    /// path.
+    pub fn namespace(name: &str) -> Result<Self, ApiError> {
+        if !is_namespace(name) {
+            return Err(ApiError::Namespace(name.to_owned()));
+        }
+        Ok(Self::Namespace(name.to_owned()))
+    }
+}
+
+/// Whether `name` can be a namespace's: a DNS label.
+fn is_namespace(name: &str) -> bool {
+    (1..=63).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+}
+
 /// The path of `K`'s objects in `scope`.
 pub(crate) fn collection<K: Kind>(scope: &Scope) -> Result<String, ApiError> {
     let group = if K::GROUP.is_empty() {
@@ -102,13 +127,7 @@ pub(crate) fn collection<K: Kind>(scope: &Scope) -> Result<String, ApiError> {
             if !K::NAMESPACED {
                 return Err(ApiError::NotNamespaced(K::KIND));
             }
-            let is_label = (1..=63).contains(&namespace.len())
-                && namespace
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-                && !namespace.starts_with('-')
-                && !namespace.ends_with('-');
-            if !is_label {
+            if !is_namespace(namespace) {
                 return Err(ApiError::Namespace(namespace.clone()));
             }
             Ok(format!(

@@ -13,6 +13,7 @@ interop = ["edgerush-proxy/interop"]
 
 [dependencies]
 edgerush-config.workspace = true
+edgerush-controller.workspace = true
 edgerush-explain.workspace = true
 # The cluster's API server, found as a pod finds it, which discovered upstreams are
 # followed through.
@@ -21,7 +22,8 @@ edgerush-proxy.workspace = true
 edgerush-translate.workspace = true
 k8s-openapi.workspace = true
 serde.workspace = true
-serde-saphyr.workspace = true
+# "serialize": the config the control plane writes with `--write-config`.
+serde-saphyr = { workspace = true, features = ["serialize"] }
 socket2.workspace = true
 thiserror.workspace = true
 # "sync": the channels by which a worker is handed a connection. "signal": being told to
@@ -36,9 +38,13 @@ rustix.workspace = true
 [dev-dependencies]
 # Its `schema` feature: `tests/schema.rs` keeps `schema/config.schema.json` as the types say.
 edgerush-config = { workspace = true, features = ["schema"] }
+# The fake API server `edgerush controller` is run against.
+edgerush-kubernetes = { workspace = true, features = ["testing"] }
 proptest.workspace = true
 schemars.workspace = true
 serde_json.workspace = true
+# The fake API server answers on a runtime with threads of its own.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

@@ -34,6 +34,7 @@ boring = "5.2"
 bytes = "1.12"
 edgerush-certificates = { path = "crates/certificates" }
 edgerush-config = { path = "crates/config" }
+edgerush-controller = { path = "crates/controller" }
 edgerush-discovery = { path = "crates/discovery" }
 edgerush-kubernetes = { path = "crates/kubernetes" }
 edgerush-explain = { path = "crates/explain" }

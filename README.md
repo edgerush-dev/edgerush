@@ -52,11 +52,12 @@ without dropping a request.
   and a thread of its own reports to the service. A refusal is a 429 with `Retry-After` and
   the `RateLimit` field.
 
-Begun: translating Ingress into a data plane's config, the control plane's first part, so
-far for Ingresses that route `Prefix` paths of named hosts to Services, and checked from
-manifests with `edgerush validate`.
+Begun: the control plane, `edgerush controller`, translating Ingresses into a data plane's
+config as the cluster changes, so far for Ingresses that route `Prefix` paths of named
+hosts to Services, and checked from manifests with `edgerush validate`; it does not reach
+data planes yet.
 
-Not yet: the rest of Kubernetes (the control plane running, the operator, the rest of
+Not yet: the rest of Kubernetes (the config reaching data planes, the operator, the rest of
 Ingress, Gateway API), authentication. The request path comes first, then rate limiting, then the
 control plane and the operator.
 
@@ -144,6 +145,13 @@ listeners:
   http: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 ```
 
+`edgerush controller --data-plane data-plane.yaml`, run in a cluster, follows the
+IngressClasses, Ingresses, Services and Secrets there (or in each `--namespace` given)
+through the API server and translates them for that data plane each time they change, once
+all have been listed. Until the config reaches data planes, each translation is said on
+stderr as `validate` says it, and `--write-config config.yaml` writes the config as a file
+`edgerush proxy` reads, without the certificates it names.
+
 ## Building
 
 The Rust toolchain is pinned in `rust-toolchain.toml`; `rustup` installs it on first use.
@@ -218,8 +226,9 @@ outside the workspace, the package is formatted on its own:
 ```
 crates/edgerush    the binary (operator, control plane and data plane will be subcommands); so far
                    `edgerush proxy --config file.yaml`, a data plane run from a file for development,
-                   `edgerush explain`, where a request would go and why, `edgerush test`, and
-                   `edgerush validate`, which translates Kubernetes manifests
+                   `edgerush controller`, a control plane for one data plane, `edgerush explain`,
+                   where a request would go and why, `edgerush test`, and `edgerush validate`,
+                   which translates Kubernetes manifests
 crates/certificates
                    a certificate and its key read and checked to belong together
                    (`edgerush-certificates`), by BoringSSL: what the data plane presents and what

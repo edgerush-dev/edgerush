@@ -331,8 +331,16 @@ fn a_namespace_is_a_label_and_nothing_else() {
             kind::collection::<EndpointSlice>(&Scope::Namespace(namespace.to_owned())),
             Err(ApiError::Namespace(namespace.to_owned()))
         );
+        assert_eq!(
+            Scope::namespace(namespace),
+            Err(ApiError::Namespace(namespace.to_owned()))
+        );
     }
     assert!(kind::collection::<EndpointSlice>(&self::namespace("shop-2")).is_ok());
+    assert_eq!(
+        Scope::namespace("shop-2"),
+        Ok(Scope::Namespace("shop-2".to_owned()))
+    );
 }
 
 #[test]
