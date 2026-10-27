@@ -81,6 +81,12 @@ allowance, for fuzz builds:
   KiB it carries. Once it is spent no further frame is read: `FramedRead::poll_next` wakes
   the task and returns `Pending`, as Tokio's own budget does, and a header block left part
   way waits for its next frame as it does for a slow peer. `work_left` says what is left.
+- **A stream already decoded can be taken without driving the connection.**
+  `server::Connection::accept_decoded` hands over the next request whose head is decoded,
+  as `poll_accept` does, but reads, decodes and writes nothing: `poll_accept` polls the
+  connection first, and with it flushes whatever answers were queued since. The owner takes
+  up together the streams one poll decoded, so that answers made at once to them go out in
+  one write rather than one each.
 - **What an accepted head held can be asked.** `server::head_held` measures a request's
   head as `held` counted it, so that as `accept` hands it over and the count falls by that
   much, the owner passes that much of its charge on with it.
@@ -165,6 +171,9 @@ The allowance is covered by the probes after "How much a server decodes" there:
 `a_header_block_spent_part_way_is_finished_with_the_next_allowance`; through the proxy by
 `frames_waiting_in_a_connections_socket_are_decoded_a_turn_at_a_time` and
 `frames_sent_to_a_connection_told_to_go_are_decoded_a_turn_at_a_time`.
+Taking a decoded stream is covered through the proxy by
+`answers_made_at_once_to_streams_sent_together_go_out_in_one_write`, which fails with
+`poll_accept` in its place, and `streams_taken_up_together_are_each_charged_their_head`.
 The refusal of whitespace at either end is covered by
 `a_request_field_value_with_whitespace_at_either_end_is_reset`,
 `resets_for_whitespace_at_either_end_are_bounded`,
