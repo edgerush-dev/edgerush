@@ -1320,18 +1320,24 @@ async fn a_reload_lets_go_of_the_old_limiter_and_its_streams() {
 /// elsewhere: a pod's address that stays the same across the pod's lives.
 struct Switch {
     address: String,
-    to: tokio::sync::watch::Sender<SocketAddr>,
+    to: tokio::sync::watch::Sender<Option<SocketAddr>>,
 }
 
 impl Switch {
-    async fn to(to: SocketAddr) -> Self {
+    /// Pointed nowhere yet: until it is, it closes every connection at once, as a port
+    /// with nothing behind it refuses one. Such an address cannot stand in for that
+    /// everywhere: WSL's mirrored loopback leaves a connection to a closed port hanging
+    /// until it times out, minutes later, and a client's calls with it (#123).
+    async fn unpointed() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
-        let (to, target) = tokio::sync::watch::channel(to);
+        let (to, target) = tokio::sync::watch::channel(None);
         tokio::spawn(async move {
             while let Ok((mut client, _)) = listener.accept().await {
                 let mut pointed = target.clone();
-                let at = *pointed.borrow_and_update();
+                let Some(at) = *pointed.borrow_and_update() else {
+                    continue;
+                };
                 tokio::spawn(async move {
                     if let Ok(mut server) = TcpStream::connect(at).await {
                         tokio::select! {
@@ -1346,7 +1352,7 @@ impl Switch {
     }
 
     fn point(&self, to: SocketAddr) {
-        self.to.send_replace(to);
+        self.to.send_replace(Some(to));
     }
 }
 
@@ -1364,10 +1370,9 @@ async fn the_keys_of_an_owner_not_serving_go_to_the_next() {
                 silence: Duration::from_secs(5),
                 ..pod_timing()
             };
-            let placeholder: SocketAddr = "127.0.0.1:9".parse().unwrap();
             let mut switches = Vec::new();
             for _ in 0..3 {
-                switches.push(Switch::to(placeholder).await);
+                switches.push(Switch::unpointed().await);
             }
             let addresses: Vec<String> = switches.iter().map(|s| s.address.clone()).collect();
             let serve = |id: u32, incarnation: u64, peers: BTreeMap<u32, Client>| {
