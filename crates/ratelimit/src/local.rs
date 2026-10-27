@@ -190,21 +190,27 @@ impl Key {
         }
     }
 
-    /// Set to be full in `full_in` nanoseconds from `now`: an owner's copy taken in.
+    /// At least as full as one full in `full_in` nanoseconds from `now`: an owner's copy
+    /// taken in. Never emptier (#88): a copy from an owner the view has moved on from can
+    /// arrive after this pod has charged the key as its new owner, and would erase those
+    /// charges; of the two, the fuller holds.
     fn set_full_in(&self, full_in: u64, now: u64) {
         let now_units = self.rate.units(now);
-        let ahead = self
+        let copied = self
             .rate
             .units(now.saturating_add(full_in))
             .wrapping_sub(now_units)
             & MASK;
-        let arrival = now_units.wrapping_add(ahead) & MASK;
-        self.last.fetch_max(now, Ordering::Relaxed);
         loop {
             let word = self.word.load(Ordering::Acquire);
             if word & CLOSED != 0 {
                 return;
             }
+            // Read before the last use moves, as a charge's is: a key quiet past its refill
+            // is full, whatever its word says.
+            let held = Rate::ahead(self.arrival(word, now, now_units), now_units);
+            let arrival = now_units.wrapping_add(held.max(copied)) & MASK;
+            self.last.fetch_max(now, Ordering::Relaxed);
             if self
                 .word
                 .compare_exchange_weak(word, arrival, Ordering::AcqRel, Ordering::Acquire)
@@ -503,8 +509,9 @@ impl<S: BuildHasher + Clone> Local<S> {
         copies
     }
 
-    /// Takes in an owner's `copies` at `now`: each key made if it is not held, and set to
-    /// the owner's state, so that this registry carries on from it if it becomes the owner.
+    /// Takes in an owner's `copies` at `now`: each key made if it is not held, and made at
+    /// least as full as the owner's, so that this registry carries on from it if it becomes
+    /// the owner. A copy never makes a key emptier: the fuller of the two holds.
     pub fn install(&self, copies: &[Copy], now: u64) {
         for copy in copies {
             self.find_or_make(&copy.key, copy.contract, now)
