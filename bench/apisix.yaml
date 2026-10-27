@@ -1,0 +1,40 @@
+# APISIX (standalone: routes from this file, no etcd) as the proxy under test, doing what
+# proxy.yaml asks of EdgeRush: the same routes, the same header changes — through its
+# proxy-rewrite and response-rewrite plugins — and keep-alive connections to the same
+# backend. Run by bench/run.sh, which writes its config.yaml (WORKERS worker processes, no
+# access log, no admin API) and, for apisix-local and apisix-rl, adds the rate limit to the
+# measured route.
+upstreams:
+  - id: backend
+    type: roundrobin
+    pass_host: pass
+    nodes:
+      "127.0.0.1:9000": 1
+    keepalive_pool: { size: 1024, idle_timeout: 3600, requests: 1000000000 }
+routes:
+  - id: bench
+    hosts: [bench.example.com]
+    uri: /*
+    upstream_id: backend
+    plugins:
+      proxy-rewrite:
+        headers:
+          add: { x-request-source: edge }
+          remove: [x-internal-debug]
+      response-rewrite:
+        headers:
+          set: { x-served-by: edgerush }
+          remove: [server]
+  - id: bench-unavailable
+    hosts: [bench.example.com]
+    uris: [/health, /health/*, /static, /static/*]
+    plugins: { fault-injection: { abort: { http_status: 503 } } }
+  - id: bench-api-post
+    hosts: [bench.example.com]
+    uris: [/api/v1, /api/v1/*]
+    methods: [POST]
+    plugins: { fault-injection: { abort: { http_status: 503 } } }
+  - id: others
+    hosts: ["*.example.org", www.example.net]
+    uri: /*
+    plugins: { fault-injection: { abort: { http_status: 503 } } }

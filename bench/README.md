@@ -2,8 +2,8 @@
 
 Load generator, proxy under test and backend on **one Linux machine**, each on CPUs of its
 own, over loopback. It compares variants on the same machine in the same hour — EdgeRush
-with itself (first of all its two threading models) and with NGINX, HAProxy, Envoy and
-Kong set up to do the same work — and does not produce numbers that mean anything elsewhere.
+with itself (first of all its two threading models) and with NGINX, HAProxy, Envoy,
+Kong and APISIX set up to do the same work — and does not produce numbers that mean anything elsewhere.
 
 ```
 oha / h2load  ──▶  proxy under test  ──▶  nginx (answers 200 and a few bytes)
@@ -14,7 +14,8 @@ oha / h2load  ──▶  proxy under test  ──▶  nginx (answers 200 and a f
 
 `nginx` (any flavour; it is run as the current user from `nginx.conf`, the system service
 is not used; it is also one of the proxies under test), `haproxy`, `envoy` and `kong` for
-those variants (none of them as a service),
+those variants (none of them as a service), Docker for the `apisix` variants
+(`APISIX_IMAGE`) and for the Redis the shared rate limits of Kong, Envoy and APISIX use,
 `h2load` (`nghttp2-client`), [`oha`](https://github.com/hatoo/oha)
 (`cargo install oha --locked`), `python3`, `curl`, `taskset`, and a release build:
 `cargo build --release -p edgerush`. The `websocket` mode also needs
@@ -250,15 +251,16 @@ That is a hypothesis to isolate, not an explanation established by the macro rer
 — the same without balancing connections at accept —, `ours-pgo` — a profile-guided build
 of it at `EDGERUSH_PGO` ([12](../../docs/12-open-questions.md), item 8) — (EdgeRush,
 `proxy.yaml`); then `nginx`
-(`nginx-proxy.conf`), `haproxy` (`haproxy.cfg`), `envoy` (`envoy.yaml`) and `kong`
-(`kong.yml`, without a database). The configs ask for the same
+(`nginx-proxy.conf`), `haproxy` (`haproxy.cfg`), `envoy` (`envoy.yaml`), `kong`
+(`kong.yml`, without a database) and `apisix` (`apisix.yaml`, standalone, without etcd,
+its `config.yaml` written by `apisix_config.py`). The configs ask for the same
 thing — the same hosts and rules, the same header changes on
 request and response, the same forwarding headers (what a client says of forwarding taken
 off; `X-Forwarded-For`, `-Host`, `-Proto` and a `Via` entry set, as EdgeRush's listener does
-by default; not yet in `envoy.yaml` and `kong.yml`), the same request ID (the client's
+by default; not yet in `envoy.yaml`, `kong.yml` and `apisix.yaml`), the same request ID (the client's
 replaced, the proxy's own on the request and on every answer, the upstream's replaced;
-NGINX's is 32 hexadecimal digits rather than a UUIDv7; not yet in `envoy.yaml` and
-`kong.yml`), HTTP/1.1 and cleartext HTTP/2 on one
+NGINX's is 32 hexadecimal digits rather than a UUIDv7; not yet in `envoy.yaml`,
+`kong.yml` and `apisix.yaml`), HTTP/1.1 and cleartext HTTP/2 on one
 port, keep-alive connections to
 the backend that any client's request may use, no access log — and each proxy gets
 `WORKERS` workers on `PROXY_CPUS`. Where they cannot be the same it is said at the top of
