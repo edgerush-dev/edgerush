@@ -305,6 +305,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-controller"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "edgerush-certificates",
+ "edgerush-config",
+ "edgerush-kubernetes",
+ "edgerush-translate",
+ "k8s-openapi",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "edgerush-discovery"
 version = "0.0.0"
 dependencies = [
