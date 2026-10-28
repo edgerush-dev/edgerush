@@ -65,7 +65,6 @@ fn warm(burst: u64) -> (Plane, Contract) {
         let answers = pod.on_batch(batch, 0);
         plane.on_answers(answers, 0);
     }
-    plane.take_decided();
     plane.on_cycle(MS);
     plane.take_outgoing();
     (plane, contract)
@@ -149,10 +148,7 @@ fn held(burst: u64, admitted: usize) -> Arc<Entry> {
     let hasher = Keyed::new([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
     let mut participant =
         Participant::new(1, 10 * MS, view, hasher).expect("native 128-bit atomics on Linux");
-    participant.set_levers(Levers {
-        poll_quiet: false,
-        ask_cold: false,
-    });
+    participant.set_levers(Levers { poll_quiet: false });
     let contract = contract(burst);
     participant.decide_all(&[(KEY, contract)], 0);
     participant.on_cycle(10 * MS);

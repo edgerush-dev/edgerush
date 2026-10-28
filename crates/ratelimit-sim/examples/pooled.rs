@@ -18,13 +18,13 @@ use std::num::NonZeroU64;
 
 const MS: u64 = 1_000_000;
 const SECOND: u64 = 1_000 * MS;
-/// Pooled's levers: the fourth argument, `no-poll`, `local` or `both`; the protocol's own
-/// unless said.
+/// Pooled's levers: the fourth argument, `no-poll` for quiet keys not polled; the
+/// protocol's own unless said. `both` is taken for `no-poll`, as runs from when cold keys
+/// could be asked about named it.
 fn levers() -> edgerush_ratelimit::service::pooled::Levers {
     let chosen = std::env::args().nth(4).unwrap_or_default();
     edgerush_ratelimit::service::pooled::Levers {
         poll_quiet: !matches!(chosen.as_str(), "no-poll" | "both"),
-        ask_cold: !matches!(chosen.as_str(), "local" | "both"),
     }
 }
 
@@ -482,26 +482,22 @@ fn main() {
             None => (
                 Approach::PooledWith {
                     cycle: cycle(),
-                    ask_timeout: 0,
+                    exchange_timeout: 0,
                     workers: w,
                     levers: levers(),
                     scheduled: scheduled(),
                 },
-                Approach::Nodes {
-                    cycle: cycle(),
-                    ask_timeout: 0,
-                },
+                Approach::Nodes { cycle: cycle() },
             ),
             Some((beside, order)) => {
                 let under = Approach::NodesUnder {
                     cycle: cycle(),
-                    ask_timeout: 0,
                     beside,
                     order,
                 };
                 let pooled = Approach::PooledUnder {
                     cycle: cycle(),
-                    ask_timeout: 0,
+                    exchange_timeout: 0,
                     workers: w,
                     beside,
                     order,

@@ -11,10 +11,10 @@
 #[cfg(not(loom))]
 pub(super) use portable_atomic::AtomicU128;
 #[cfg(not(loom))]
-pub(super) use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
+pub(super) use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 
 #[cfg(loom)]
-pub(super) use loom::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
+pub(super) use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 
 /// Under loom, the word: what the entries use of `AtomicU128`, behind a loom mutex.
 #[cfg(loom)]

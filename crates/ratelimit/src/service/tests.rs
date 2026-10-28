@@ -33,10 +33,6 @@ fn without(pod: PodId) -> View {
     view(&pods, 2)
 }
 
-fn asks(batches: &[(PodId, Batch)]) -> usize {
-    batches.iter().map(|(_, batch)| batch.asks.len()).sum()
-}
-
 fn hits(sequence: u64, count: u64, seen: u64) -> Report {
     Report::Hits {
         sequence,
@@ -179,19 +175,12 @@ impl Net {
     }
 }
 
-/// A data plane asks about its first request and hears back, and a cycle bounds the copy:
-/// warm, it decides at once. What the cycle sends — the request's hit, settling what the
-/// owner held for it — is delivered and answered.
+/// A data plane decides its first request from a full bucket, and a cycle sends its hit to
+/// the owner, whose answer the copy takes.
 fn warmed(net: &mut Net, plane: usize, key: &[u8], now: u64) {
     net.planes[plane].decide(key, contract(), now);
-    net.settle(now);
-    net.planes[plane].take_decided();
     net.planes[plane].on_cycle(now);
     net.settle(now);
-}
-
-fn waits(decision: Decision) -> bool {
-    matches!(decision, Decision::Wait(_))
 }
 
 #[test]
@@ -209,7 +198,7 @@ fn hits_go_to_the_owner_and_a_copy_comes_back() {
     assert_eq!(
         net.pods[Net::owner(b"k")].counted(b"k"),
         Some(6),
-        "two asked about, four reported"
+        "two warmed, four reported"
     );
     assert_eq!(net.copy(1, b"k").bucket.remaining(0), 4);
     assert_eq!(
@@ -481,27 +470,6 @@ fn an_emptied_batch_still_says_what_was_refused() {
     );
 }
 
-/// A key with refused requests of an ask given up still to report is neither evicted for
-/// room nor idle: its owner holds them, and counts them, until it hears.
-#[test]
-fn a_key_with_refusals_to_report_is_kept() {
-    let mut net = Net::new(1);
-    warmed(&mut net, 0, b"k", 0);
-    // Its owner gone, nothing is sent.
-    net.set_view(&view(&[], 2), 0);
-    net.planes[0]
-        .keys
-        .get_mut(&b"k"[..])
-        .unwrap()
-        .unsent_refused = 1;
-    net.planes[0].set_capacity(1);
-    net.planes[0].on_cycle(CYCLE);
-    assert!(net.planes[0].keys.contains_key(&b"k"[..]), "not evicted");
-    net.planes[0].set_capacity(u64::MAX);
-    net.planes[0].on_cycle(1_000 * MS);
-    assert!(net.planes[0].keys.contains_key(&b"k"[..]), "not idle");
-}
-
 /// The owner counts the others admitting as of the latest admission it knows of, not as of
 /// now: data planes that burst together and fell quiet count together.
 #[test]
@@ -663,213 +631,6 @@ fn a_cut_off_data_plane_does_not_build_up_what_it_carries() {
     }
     // A share of a full bucket among eight, one carried, and one held-back cycle's floor.
     assert!(most <= 11 / 8 + 1 + 1, "{most}");
-}
-
-/// Two data planes holding no copy each get six requests at once: they wait, the owner
-/// decides them against its one bucket of ten, and ten are admitted in all.
-#[test]
-fn requests_for_a_cold_key_wait_and_the_owner_decides_them() {
-    let mut net = Net::new(2);
-    let waiting = (0..2)
-        .flat_map(|plane| std::iter::repeat_n(plane, 6))
-        .filter(|&plane| waits(net.planes[plane].decide(b"k", contract(), 0)))
-        .count();
-    assert_eq!(waiting, 12, "all wait");
-    net.settle(0);
-    let decided: Vec<(Ticket, bool)> = net
-        .planes
-        .iter_mut()
-        .flat_map(DataPlane::take_decided)
-        .collect();
-    assert_eq!(decided.len(), 12, "every request decided");
-    assert_eq!(decided.iter().filter(|(_, a)| *a).count(), 10);
-    assert_eq!(net.pods[Net::owner(b"k")].counted(b"k"), Some(10));
-    assert!(
-        waits(net.planes[0].decide(b"k", contract(), 0)),
-        "answered, but not yet bounded by a cycle: still asked about"
-    );
-    net.settle(0);
-    net.planes[0].on_cycle(0);
-    assert!(
-        !waits(net.planes[0].decide(b"k", contract(), 0)),
-        "answered and bounded: decided here"
-    );
-}
-
-/// Requests coming faster than a round trip: the first asks, those during it are asked
-/// about once more, and once a cycle has bounded the copy requests are decided here.
-#[test]
-fn a_busy_data_plane_stops_asking_after_the_cold_burst() {
-    let mut net = Net::new(1);
-    assert!(waits(net.planes[0].decide(b"k", contract(), 0)));
-    net.collect();
-    assert!(waits(net.planes[0].decide(b"k", contract(), MS)));
-    net.hop(2 * MS);
-    assert_eq!(net.planes[0].take_decided().len(), 1, "the first answered");
-    assert!(
-        waits(net.planes[0].decide(b"k", contract(), 3 * MS)),
-        "the second is asked about"
-    );
-    net.planes[0].on_cycle(3 * MS);
-    net.hop(4 * MS);
-    assert_eq!(
-        net.planes[0].take_decided().len(),
-        2,
-        "the second answered, the third decided here"
-    );
-    assert!(
-        !waits(net.planes[0].decide(b"k", contract(), 5 * MS)),
-        "and the next at once"
-    );
-}
-
-#[test]
-fn a_copy_goes_cold_a_refill_time_after_the_last_answer() {
-    let mut net = Net::new(1);
-    warmed(&mut net, 0, b"k", 0);
-    assert!(!waits(net.planes[0].decide(b"k", contract(), 100 * MS)));
-    assert!(waits(net.planes[0].decide(b"k", contract(), 100 * MS + 1)));
-}
-
-/// An ask unanswered for four cycles: the requests waiting are decided from the copy, and
-/// so is every request until the owner is heard from again. Its answer, late, decides
-/// nothing.
-#[test]
-fn an_unanswered_ask_is_given_up_after_four_cycles() {
-    let mut net = Net::new(1);
-    net.planes[0].decide(b"k", contract(), 0);
-    net.planes[0].decide(b"k", contract(), 0);
-    let lost = net.planes[0].take_outgoing();
-    net.planes[0].on_cycle(3 * CYCLE);
-    net.planes[0].take_outgoing();
-    assert!(net.planes[0].take_decided().is_empty(), "still waiting");
-    net.planes[0].on_cycle(4 * CYCLE);
-    assert_eq!(net.planes[0].take_decided(), vec![(0, true), (1, true)]);
-    assert!(net.copy(0, b"k").unreachable);
-    assert_eq!(
-        net.planes[0].decide(b"k", contract(), 4 * CYCLE),
-        Decision::Admit
-    );
-    net.to_pods = lost;
-    net.settle(4 * CYCLE);
-    assert!(
-        net.planes[0].take_decided().is_empty(),
-        "the late answer decides nothing"
-    );
-    assert!(!net.copy(0, b"k").unreachable, "heard from again");
-}
-
-/// An ask whose answer is lost is sent again once, half way to giving it up, and the owner
-/// answers it alike, deciding nothing twice.
-#[test]
-fn an_ask_is_sent_again_once_and_decided_once() {
-    let mut net = Net::new(1);
-    net.planes[0].decide(b"k", contract(), 0);
-    let owner = Net::owner(b"k");
-    for (_, batch) in net.planes[0].take_outgoing() {
-        net.pods[owner].on_batch(batch, 0); // its answer lost
-    }
-    assert_eq!(net.pods[owner].counted(b"k"), Some(1));
-    net.planes[0].on_cycle(CYCLE);
-    assert_eq!(asks(&net.planes[0].take_outgoing()), 0, "not yet");
-    net.planes[0].on_cycle(2 * CYCLE);
-    let again = net.planes[0].take_outgoing();
-    assert_eq!(asks(&again), 1, "sent again");
-    net.to_pods = again;
-    net.settle(2 * CYCLE);
-    assert_eq!(net.pods[owner].counted(b"k"), Some(1), "decided once");
-    assert_eq!(net.planes[0].take_decided(), vec![(0, true)]);
-    net.planes[0].on_cycle(3 * CYCLE);
-    assert_eq!(asks(&net.planes[0].take_outgoing()), 0, "only once");
-}
-
-/// An ask its owner decided, whose answer is lost and whose sending again is lost too, is
-/// given up and its request decided here: the hit it is sent as settles what the owner held
-/// for it, and the request is counted once.
-#[test]
-fn an_ask_given_up_after_its_owner_decided_it_is_counted_once() {
-    let mut net = Net::new(1);
-    let owner = Net::owner(b"k");
-    net.planes[0].decide(b"k", contract(), 0);
-    for (_, batch) in net.planes[0].take_outgoing() {
-        net.pods[owner].on_batch(batch, 0); // its answer lost
-    }
-    net.planes[0].on_cycle(2 * CYCLE);
-    net.planes[0].take_outgoing(); // sent again, lost
-    net.planes[0].on_cycle(4 * CYCLE);
-    assert_eq!(
-        net.planes[0].take_decided(),
-        vec![(0, true)],
-        "given up, decided here"
-    );
-    net.settle(4 * CYCLE);
-    assert_eq!(net.pods[owner].counted(b"k"), Some(1));
-}
-
-/// An ask whose first sending arrives after a later ask was sent is not decided again: the
-/// later one said the data plane was done with it.
-#[test]
-fn an_ask_arriving_after_a_later_one_is_not_decided_again() {
-    let mut net = Net::new(1);
-    let owner = Net::owner(b"k");
-    net.planes[0].decide(b"k", contract(), 0);
-    let late = net.planes[0].take_outgoing(); // held up on the way
-    net.planes[0].on_cycle(2 * CYCLE);
-    net.settle(2 * CYCLE); // sent again, and answered
-    assert_eq!(net.planes[0].take_decided(), vec![(0, true)]);
-    net.planes[0].on_cycle(3 * CYCLE);
-    net.settle(3 * CYCLE);
-    // Quiet for two refill times: forgotten here, made again, and asked about anew.
-    net.planes[0].on_cycle(300 * MS);
-    assert!(net.planes[0].keys.is_empty());
-    net.planes[0].decide(b"k", contract(), 300 * MS);
-    net.settle(300 * MS);
-    assert_eq!(net.planes[0].take_decided(), vec![(1, true)]);
-    net.planes[0].on_cycle(310 * MS);
-    net.settle(310 * MS);
-    assert_eq!(net.pods[owner].counted(b"k"), Some(2));
-    // The first sending arrives, an ask long over.
-    net.to_pods = late;
-    net.settle(310 * MS);
-    assert_eq!(net.pods[owner].counted(b"k"), Some(2), "not decided again");
-    assert!(net.planes[0].take_decided().is_empty());
-    assert_eq!(net.admits(0, b"k", 1, 320 * MS), 1);
-    net.planes[0].on_cycle(320 * MS);
-    net.settle(320 * MS);
-    assert_eq!(
-        net.pods[owner].counted(b"k"),
-        Some(3),
-        "three admitted, each counted once"
-    );
-}
-
-/// An ask says how long its data plane waits for the answer, and every batch the oldest of
-/// its asks still in flight: one sent while another is out leaves that one open, and once
-/// both are given up, the next batch says both are over.
-#[test]
-fn a_batch_says_which_asks_are_over_and_an_ask_how_long_it_waits() {
-    let mut net = Net::new(1);
-    net.planes[0].set_ask_timeout(300 * MS);
-    let sent = |net: &mut Net| -> (Vec<(u64, u64)>, Vec<u64>) {
-        let batches = net.planes[0].take_outgoing();
-        let marks = batches.iter().map(|(_, batch)| batch.oldest_ask).collect();
-        let asks = batches
-            .into_iter()
-            .flat_map(|(_, batch)| batch.asks)
-            .map(|ask| (ask.id, ask.timeout))
-            .collect();
-        (asks, marks)
-    };
-    net.planes[0].decide(b"k", contract(), 0);
-    assert_eq!(sent(&mut net), (vec![(1, 300 * MS)], vec![1]));
-    net.planes[0].decide(b"j", contract(), 0);
-    assert_eq!(sent(&mut net), (vec![(2, 300 * MS)], vec![1]));
-    net.planes[0].on_cycle(300 * MS);
-    let (_, marks) = sent(&mut net);
-    assert!(
-        !marks.is_empty() && marks.iter().all(|mark| *mark == 3),
-        "{marks:?}"
-    );
 }
 
 /// A batch says which of its data plane's asks are over: one before its mark is not decided
@@ -1113,51 +874,6 @@ fn a_hold_lapses_charged_once_its_time_is_over() {
     );
 }
 
-/// What the owner holds for a data plane's hits is copied with the key: the secondary
-/// taking over settles it with those hits, charging each request once.
-#[test]
-fn a_hold_is_settled_by_the_secondary_taking_over() {
-    let (owner, secondary, _) = roles(b"k");
-    let mut net = Net::new(1);
-    net.planes[0].decide(b"k", contract(), 0);
-    net.settle(0);
-    assert_eq!(net.planes[0].take_decided(), vec![(0, true)]);
-    let secondary = secondary as usize;
-    assert_eq!(net.pods[secondary].counted(b"k"), Some(1), "copied, held");
-    net.set_view(&without(owner), 0);
-    net.planes[0].on_cycle(0);
-    net.settle(0);
-    assert_eq!(net.pods[secondary].counted(b"k"), Some(1), "settled");
-    let bucket = net.pods[secondary].keys[&b"k"[..]].bucket();
-    assert_eq!(bucket.remaining(0), 9, "charged once");
-}
-
-/// What the owner holds for an asked request is left out of the bucket it sends the
-/// asking data plane, which carries the request itself until it sees its hit applied: its
-/// copy has the request once, from the ask's answer and from any answer after it.
-#[test]
-fn the_asking_data_plane_has_its_asked_request_once() {
-    let mut net = Net::new(1);
-    net.planes[0].decide(b"k", contract(), 0);
-    net.settle(0);
-    assert_eq!(net.planes[0].take_decided(), vec![(0, true)]);
-    assert_eq!(
-        net.copy(0, b"k").bucket.remaining(0),
-        9,
-        "from the ask's answer"
-    );
-    net.planes[0].on_cycle(0);
-    net.planes[0].take_outgoing(); // the asked request's hit, lost
-    assert_eq!(net.admits(0, b"k", 2, 0), 2);
-    net.planes[0].on_cycle(0);
-    net.settle(0); // the next batch, kept waiting for the lost one, answered
-    assert_eq!(
-        net.copy(0, b"k").bucket.remaining(0),
-        7,
-        "from the next batch's answer"
-    );
-}
-
 /// The owner copies every change to the key's secondary, which takes over from that copy
 /// when the owner leaves: data planes send it again the batches not seen applied, numbered
 /// as before, and it applies only those its copy lacks.
@@ -1331,10 +1047,12 @@ fn a_changed_contract_starts_the_key_afresh() {
     net.admits(0, b"k", 5, 0);
     let mut bigger = contract();
     bigger.burst = NonZeroU64::new(20).unwrap();
-    assert!(
-        waits(net.planes[0].decide(b"k", bigger, 0)),
-        "a new key, so cold"
+    assert_eq!(
+        net.planes[0].decide(b"k", bigger, 0),
+        Decision::Admit,
+        "a new key, from a full bucket"
     );
+    net.planes[0].on_cycle(0);
     net.settle(0);
     assert_eq!(
         net.pods[Net::owner(b"k")].counted(b"k"),
@@ -1366,14 +1084,6 @@ fn quiet_keys_are_forgotten() {
 }
 
 #[test]
-fn a_data_plane_going_away_gives_up_the_requests_waiting() {
-    let mut net = Net::new(1);
-    net.planes[0].decide(b"k", contract(), 0);
-    net.planes[0].decide(b"k", contract(), 0);
-    assert_eq!(net.planes[0].abandon(), vec![0, 1]);
-}
-
-#[test]
 fn a_bucket_set_from_how_far_it_is_from_full_reads_the_same() {
     let mut bucket = contract().bucket();
     for at in [0, 0, 0, 3 * MS, 4 * MS] {
@@ -1387,19 +1097,6 @@ fn a_bucket_set_from_how_far_it_is_from_full_reads_the_same() {
             bucket.remaining(5 * MS + later)
         );
     }
-}
-
-/// An ask sent again whose answer is lost too is not sent a third time: the next step is
-/// giving it up.
-#[test]
-fn an_ask_is_sent_again_no_more_than_once() {
-    let mut net = Net::new(1);
-    net.planes[0].decide(b"k", contract(), 0);
-    net.planes[0].take_outgoing();
-    net.planes[0].on_cycle(2 * CYCLE);
-    assert_eq!(asks(&net.planes[0].take_outgoing()), 1);
-    net.planes[0].on_cycle(3 * CYCLE);
-    assert_eq!(asks(&net.planes[0].take_outgoing()), 0);
 }
 
 /// Only the owner's copies are kept: one from another pod is ignored.
@@ -1753,25 +1450,30 @@ fn a_data_plane_takes_a_later_view_from_an_answer() {
     for pod in &mut net.pods {
         pod.on_view(later.clone(), CYCLE);
     }
-    // The plane hears of it only in an answer about another key.
+    // The plane hears of it only in an answer about another key, to its report.
     let other = (0..100)
         .map(|k| format!("o{k}").into_bytes())
         .find(|k| roles(k).0 == secondary)
         .unwrap();
     net.planes[0].decide(&other, contract(), CYCLE);
+    net.planes[0].on_cycle(CYCLE);
     net.settle(CYCLE);
     assert_eq!(net.planes[0].view, later);
     assert_eq!(net.copy(0, b"k").owner, Some(secondary));
 }
 
-/// Cut off from an owner, a data plane asks the pods in turn for their view.
+/// Cut off from an owner — a key in use it has heard nothing about for four cycles — a data
+/// plane asks the pods in turn for their view: an empty batch to each. The key is pod 2's,
+/// so that the polls, to pods 0 and 1, go alone rather than beside what it sends its owner.
 #[test]
 fn a_data_plane_cut_off_asks_the_pods_for_their_view() {
     let mut net = Net::new(1);
-    net.planes[0].decide(b"k", contract(), 0);
-    net.planes[0].take_outgoing();
+    let key = (0..100)
+        .map(|k| format!("c{k}").into_bytes())
+        .find(|k| roles(k).0 == 2)
+        .unwrap();
+    net.planes[0].decide(&key, contract(), 0);
     net.planes[0].on_cycle(4 * CYCLE);
-    assert!(net.copy(0, b"k").unreachable);
     let first = net.planes[0].take_outgoing();
     net.planes[0].on_cycle(5 * CYCLE);
     let second = net.planes[0].take_outgoing();
@@ -1786,8 +1488,8 @@ fn a_data_plane_cut_off_asks_the_pods_for_their_view() {
     assert_ne!(polled(&first), polled(&second), "in turn");
 }
 
-/// An owner that has stopped answering a key in use, with no ask in flight, cuts the data
-/// plane off as surely as an ask given up: it asks the pods for their view.
+/// An owner that has stopped answering a key the data plane has been hearing about cuts it
+/// off too: it asks the pods for their view.
 #[test]
 fn an_owner_silent_for_four_cycles_sends_the_data_plane_asking_for_the_view() {
     let mut net = Net::new(1);
@@ -1804,47 +1506,6 @@ fn an_owner_silent_for_four_cycles_sends_the_data_plane_asking_for_the_view() {
     }
     net.planes[0].on_cycle(4 * CYCLE);
     assert_eq!(empty(&net.planes[0].take_outgoing()), 1);
-}
-
-/// A burst arrives over a few milliseconds, not at once: the first ask is answered while
-/// the rest is still coming. Until a cycle has shared out the copy among the data planes
-/// admitting the key, every request goes to the owner: two data planes each holding the
-/// copy the first answer brought would each spend it.
-#[test]
-fn a_burst_arriving_after_the_first_answer_is_held_to_one_bucket() {
-    let mut net = Net::new(2);
-    let mut admitted = 0;
-    let mut now = 0;
-    // One request on each, answered before the next arrives; then the rest, one at a time,
-    // each answered before the next. A cycle runs at once, before any answer, as a new
-    // data plane's first does: it bounds nothing.
-    for plane in &mut net.planes {
-        plane.decide(b"k", contract(), now);
-        plane.on_cycle(now);
-    }
-    net.settle(now);
-    admitted += net
-        .planes
-        .iter_mut()
-        .flat_map(DataPlane::take_decided)
-        .filter(|(_, a)| *a)
-        .count();
-    for _ in 0..8 {
-        for plane in 0..2 {
-            if net.planes[plane].decide(b"k", contract(), now) == Decision::Admit {
-                admitted += 1;
-            }
-            net.settle(now);
-        }
-        now += MS / 2;
-    }
-    let waited: usize = net
-        .planes
-        .iter_mut()
-        .flat_map(DataPlane::take_decided)
-        .filter(|(_, admitted)| *admitted)
-        .count();
-    assert_eq!(admitted + waited, 10, "one bucket, not two");
 }
 
 /// A handover can reach a pod joining before the view that takes it in: it is kept, and
@@ -1886,23 +1547,6 @@ fn a_pod_just_joined_waits_before_making_a_key_afresh() {
     assert_eq!(answers.entries.len(), 1, "after it: made afresh");
 }
 
-/// An ask's timeout can be set longer than four cycles: until it passes, what waits waits.
-#[test]
-fn an_ask_waits_as_long_as_its_timeout_says() {
-    let mut net = Net::new(1);
-    net.planes[0].set_ask_timeout(30 * CYCLE);
-    net.planes[0].decide(b"k", contract(), 0);
-    net.planes[0].take_outgoing(); // lost
-    net.planes[0].on_cycle(29 * CYCLE);
-    assert!(net.planes[0].take_decided().is_empty(), "still waiting");
-    net.planes[0].on_cycle(30 * CYCLE);
-    assert_eq!(
-        net.planes[0].take_decided(),
-        vec![(0, true)],
-        "given up, decided here"
-    );
-}
-
 /// Two keys owned by different pods.
 fn apart() -> (Vec<u8>, Vec<u8>) {
     let a = b"limit-a".to_vec();
@@ -1942,99 +1586,6 @@ fn several_limits_decided_here_are_charged_to_all_or_none() {
     assert_eq!(net.copy(0, &b).bucket.remaining(CYCLE), 0, "b charged");
 }
 
-/// A request with one cold limit: the warm one is decided here and held, and the cold
-/// one's owner is asked about it alone; admitted, the held hit goes to its own owner.
-#[test]
-fn a_warm_limit_is_held_while_the_cold_ones_owner_decides() {
-    let (a, b) = apart();
-    let mut net = Net::new(1);
-    warmed(&mut net, 0, &a, 0);
-    let before = net.copy(0, &a).bucket.remaining(0);
-    assert!(waits(net.planes[0].decide_all(&under(&[&a, &b]), 0)));
-    assert_eq!(net.copy(0, &a).bucket.remaining(0), before - 1, "held");
-    let sent = net.planes[0].take_outgoing();
-    assert_eq!(asks(&sent), 1);
-    let (pod, batch) = sent.iter().find(|(_, b)| !b.asks.is_empty()).unwrap();
-    assert_eq!(*pod as usize, Net::owner(&b));
-    assert_eq!(batch.asks[0].keys.len(), 1, "the cold key alone");
-    net.to_pods.extend(sent);
-    net.settle(0);
-    assert_eq!(net.planes[0].take_decided(), vec![(1, true)]);
-    assert_eq!(net.pods[Net::owner(&b)].counted(&b), Some(1));
-    net.planes[0].on_cycle(CYCLE);
-    net.settle(CYCLE);
-    assert_eq!(
-        net.pods[Net::owner(&a)].counted(&a),
-        Some(2),
-        "the first request's ask, and the held hit"
-    );
-    assert_eq!(
-        net.pods[Net::owner(&b)].counted(&b),
-        Some(1),
-        "counted by its owner when it decided: not sent again"
-    );
-}
-
-/// The cold limit's owner refusing gives the held charge back: nothing is sent for it.
-#[test]
-fn a_refusal_from_the_cold_ones_owner_gives_the_held_charge_back() {
-    let (a, b) = apart();
-    let mut net = Net::new(2);
-    warmed(&mut net, 0, &a, 0);
-    for _ in 0..10 {
-        net.planes[1].decide(&b, contract(), 0);
-    }
-    net.settle(0);
-    assert_eq!(net.pods[Net::owner(&b)].counted(&b), Some(10), "b spent");
-    let before = net.copy(0, &a).bucket.remaining(0);
-    assert!(waits(net.planes[0].decide_all(&under(&[&a, &b]), 0)));
-    net.settle(0);
-    assert_eq!(net.planes[0].take_decided(), vec![(1, false)]);
-    assert_eq!(net.copy(0, &a).bucket.remaining(0), before, "given back");
-    net.planes[0].on_cycle(CYCLE);
-    net.settle(CYCLE);
-    assert_eq!(
-        net.pods[Net::owner(&a)].counted(&a),
-        Some(1),
-        "nothing sent"
-    );
-}
-
-/// Cold limits are asked about together, of the owner of the first in their order; it
-/// decides its own key and charges its copy of the other, whose hit the data plane then
-/// sends that key's owner.
-#[test]
-fn cold_limits_are_asked_together_of_the_first_ones_owner() {
-    let (a, b) = apart();
-    let mut net = Net::new(2);
-    for (plane, keys) in [(0, [&a[..], &b[..]]), (1, [&b[..], &a[..]])] {
-        assert!(waits(net.planes[plane].decide_all(&under(&keys), 0)));
-        let sent = net.planes[plane].take_outgoing();
-        assert_eq!(sent.len(), 1, "one pod asked");
-        assert_eq!(sent[0].0 as usize, Net::owner(keys[0]), "the first's owner");
-        assert_eq!(sent[0].1.asks[0].keys.len(), 2);
-        if plane == 0 {
-            net.to_pods.extend(sent);
-        }
-    }
-    net.settle(0);
-    assert_eq!(net.planes[0].take_decided(), vec![(0, true)]);
-    assert_eq!(net.pods[Net::owner(&a)].counted(&a), Some(1));
-    assert_eq!(
-        net.pods[Net::owner(&b)].counted(&b),
-        None,
-        "decided on a's owner's copy"
-    );
-    net.planes[0].on_cycle(CYCLE);
-    net.settle(CYCLE);
-    assert_eq!(
-        net.pods[Net::owner(&b)].counted(&b),
-        Some(1),
-        "sent its owner"
-    );
-    assert_eq!(net.pods[Net::owner(&a)].counted(&a), Some(1), "once");
-}
-
 /// A pod decides an ask's requests each under all its keys or none, charging its copies,
 /// so that the asks it decides after see the requests it admitted.
 #[test]
@@ -2055,52 +1606,6 @@ fn a_pod_decides_an_ask_whole_and_its_copies_see_each_ask() {
         "a charged six only"
     );
     assert_eq!(pod.counted(&a), Some(6));
-}
-
-/// An ask given up: what waits is decided here under every limit, the held ones admitted
-/// with the rest.
-#[test]
-fn an_ask_given_up_decides_its_requests_here_under_every_limit() {
-    let (a, b) = apart();
-    let mut net = Net::new(1);
-    warmed(&mut net, 0, &a, 0);
-    assert!(waits(net.planes[0].decide_all(&under(&[&a, &b]), 0)));
-    net.planes[0].take_outgoing(); // lost
-    net.planes[0].on_cycle(4 * CYCLE);
-    assert_eq!(net.planes[0].take_decided(), vec![(1, true)]);
-    assert_eq!(net.copy(0, &a).held, 0);
-    let sent: Vec<(Vec<u8>, Report)> = net.planes[0]
-        .take_outgoing()
-        .into_iter()
-        .flat_map(|(_, batch)| batch.entries)
-        .map(|entry| (entry.key.to_vec(), entry.report))
-        .collect();
-    // Each after the first batch the data plane numbered, and seen applied: the cold
-    // limit's a request of the ask, which its owner may have decided and holds for it. Both
-    // admitted as the request came, four cycles before.
-    let aged = |report| match report {
-        Report::Hits {
-            sequence,
-            count,
-            asked,
-            refused,
-            seen,
-            ..
-        } => Report::Hits {
-            sequence,
-            count,
-            asked,
-            refused,
-            seen,
-            age: 4 * CYCLE,
-        },
-        report => report,
-    };
-    assert!(
-        sent.contains(&(a.clone(), aged(hits(2, 1, 1))))
-            && sent.contains(&(b.clone(), aged(asked_hits(2, 1, 1)))),
-        "both sent their owners in the same cycle: {sent:?}"
-    );
 }
 
 /// Any number of limits is decided all or none, and the same key named twice — a caller's
@@ -2189,8 +1694,6 @@ fn a_refused_request_waits_for_the_latest_of_its_keys() {
     let mut net = Net::new(1);
     warmed(&mut net, 0, &a, 0);
     net.planes[0].decide(&b, slow, 0);
-    net.settle(0);
-    net.planes[0].take_decided();
     net.planes[0].on_cycle(0);
     net.planes[0].take_outgoing();
     let both = [(&a[..], contract()), (&b[..], slow)];
@@ -2226,8 +1729,6 @@ fn a_key_refused_for_its_share_waits_for_the_next_cycle() {
     let mut net = Net::new(2);
     for plane in 0..2 {
         net.planes[plane].decide(b"k", big, 0);
-        net.settle(0);
-        net.planes[plane].take_decided();
     }
     net.planes[1].decide(b"k", big, 0);
     net.planes[1].on_cycle(CYCLE);
@@ -2253,85 +1754,14 @@ fn a_key_refused_for_its_share_waits_for_the_next_cycle() {
     );
 }
 
-/// A pod that decided an ask but that the data plane no longer takes for the key's owner
-/// refuses it: the copy does not take the pod's state, and still shows room, yet the
-/// decision names the key that refused, with its wait, as the pod held it.
-#[test]
-fn a_refusal_names_its_key_as_the_deciding_pod_held_it() {
-    let mut net = Net::new(2);
-    // Another data plane spends the whole bucket through the owner.
-    for _ in 0..12 {
-        net.planes[1].decide(b"k", contract(), 0);
-    }
-    net.settle(0);
-    net.planes[1].take_decided();
-    assert_eq!(net.pods[Net::owner(b"k")].counted(b"k"), Some(10));
-    // This one, cold, asks the owner; while the answer is on its way, a view comes that
-    // leaves the owner out.
-    let ticket = match net.planes[0].decide(b"k", contract(), 0) {
-        Decision::Wait(ticket) => ticket,
-        other => panic!("{other:?}"),
-    };
-    let owner = Net::owner(b"k");
-    let (pod, batch) = net.planes[0]
-        .take_outgoing()
-        .into_iter()
-        .find(|(pod, batch)| *pod as usize == owner && !batch.asks.is_empty())
-        .unwrap();
-    let answers = net.pods[pod as usize].on_batch(batch, 0);
-    net.planes[0].on_view(without(pod), 0);
-    net.planes[0].on_answers(answers, 0);
-    assert!(net.copy(0, b"k").bucket.admits(0), "the copy took nothing");
-    let decided = net.planes[0].take_decisions();
-    assert_eq!(
-        decided,
-        [Decided {
-            ticket,
-            admitted: false,
-            // A hundred a second: one back in 10 ms.
-            refused_by: [(0, 10 * MS)].into(),
-        }]
-    );
-}
-
-/// Requests whose ask goes unanswered are decided here, from the copy as of when they came,
-/// and those refused name the key that refused them, with its wait as the copy has it now:
-/// none, as it refilled while they waited.
-#[test]
-fn a_refusal_decided_here_names_its_key_as_the_copy_has_it() {
-    let mut net = Net::new(1);
-    for _ in 0..12 {
-        net.planes[0].decide(b"k", contract(), 0);
-    }
-    net.planes[0].take_outgoing();
-    net.planes[0].on_cycle(3 * CYCLE);
-    net.planes[0].take_outgoing();
-    net.planes[0].on_cycle(4 * CYCLE);
-    let decided = net.planes[0].take_decisions();
-    assert_eq!(decided.len(), 12);
-    let refused: Vec<&Decided> = decided.iter().filter(|d| !d.admitted).collect();
-    assert!(!refused.is_empty(), "{decided:?}");
-    for decided in refused {
-        assert_eq!(&*decided.refused_by, [(0, 0)], "{decided:?}");
-    }
-    assert!(
-        decided
-            .iter()
-            .filter(|d| d.admitted)
-            .all(|d| d.refused_by.is_empty())
-    );
-}
-
-/// Keys `k0`… `k{n-1}`, each decided once by `plane`, its ask answered and the cycle's
-/// batch acknowledged, the `n`th a millisecond after the one before.
+/// Keys `k0`… `k{n-1}`, each decided once by `plane` and the cycle's batch acknowledged,
+/// the `n`th a millisecond after the one before.
 fn used_in_turn(net: &mut Net, plane: usize, n: u64) -> Vec<Vec<u8>> {
     (0..n)
         .map(|at| {
             let key = format!("k{at}").into_bytes();
             let now = at * MS;
             net.planes[plane].decide(&key, contract(), now);
-            net.settle(now);
-            net.planes[plane].take_decided();
             net.planes[plane].on_cycle(now);
             net.settle(now);
             key
@@ -2570,14 +2000,14 @@ fn a_batch_ages_what_joined_it_earlier() {
     });
     queued.at(25 * MS);
     queued.at(20 * MS);
-    let batch = queued.batch(100, 1);
+    let batch = queued.batch(100);
     assert_eq!(batch.made, 25 * MS);
     assert!(matches!(batch.entries[0].report, Report::Hits { age, .. } if age == 21 * MS));
 }
 
 /// One data plane and its pod, batches taking `there` to reach the pod and answers `back`
-/// to return, a cycle every `CYCLE`, and asks sent as they are made, as the proxy's hub
-/// sends them: requests at `times`. Whether each was admitted, `None` if never decided.
+/// to return, a cycle every `CYCLE`: requests at `times`, each decided at once from the
+/// copy. Whether each was admitted.
 fn decided_over_round_trips(
     c: Contract,
     times: &[u64],
@@ -2587,7 +2017,6 @@ fn decided_over_round_trips(
     let mut plane: DataPlane = DataPlane::new(100, CYCLE, view(&[0], 1));
     let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
     let mut decided = vec![None; times.len()];
-    let mut waiting: BTreeMap<Ticket, usize> = BTreeMap::new();
     // In order of arrival: answers, and when. Each takes as long, so sent in order, they
     // arrive in order.
     let mut answers: VecDeque<(u64, Answers)> = VecDeque::new();
@@ -2604,12 +2033,7 @@ fn decided_over_round_trips(
             .min()
             .unwrap();
         if request == Some(now) {
-            match plane.decide(b"k", c, now) {
-                Decision::Wait(ticket) => {
-                    waiting.insert(ticket, at);
-                }
-                decision => decided[at] = Some(decision == Decision::Admit),
-            }
+            decided[at] = Some(plane.decide(b"k", c, now) == Decision::Admit);
             at += 1;
         } else if answer == Some(now) {
             let (_, answer) = answers.pop_front().unwrap();
@@ -2620,9 +2044,6 @@ fn decided_over_round_trips(
             }
             plane.on_cycle(now);
             next_cycle += CYCLE;
-        }
-        for (ticket, admitted) in plane.take_decided() {
-            decided[waiting.remove(&ticket).unwrap()] = Some(admitted);
         }
         for (_, batch) in plane.take_outgoing() {
             let answer = pod.on_batch(batch, now + there);
@@ -2830,46 +2251,6 @@ fn an_ask_is_decided_no_earlier_than_what_its_owner_charged() {
     );
 }
 
-/// An ask's ages count back from when its batch was made, as its hits' do.
-#[test]
-fn a_batch_ages_its_asks_with_its_hits() {
-    let mut queued = Queued::default();
-    let arrived = Arrived::and(Some(Arrived::at(4 * MS)), 6 * MS);
-    let made = queued.at(10 * MS).made;
-    queued
-        .asks
-        .push(arrived.ask(made, 1, 2, 4 * CYCLE, vec![(b"k"[..].into(), contract())]));
-    queued.at(25 * MS);
-    let batch = queued.batch(100, 1);
-    assert_eq!((batch.asks[0].age, batch.asks[0].span), (21 * MS, 2 * MS));
-}
-
-/// An ask's batch carries first what the data plane admitted of its keys and has not yet
-/// sent: the owner charges those before it decides the ask, as they came before it.
-#[test]
-fn an_asks_batch_carries_its_keys_unsent_hits_ahead_of_it() {
-    let mut net = Net::new(1);
-    warmed(&mut net, 0, b"k", 0);
-    assert_eq!(
-        net.planes[0].decide(b"k", contract(), 10 * MS),
-        Decision::Admit
-    );
-    // A refill time on, unheard from since, the copy is cold: the next request asks.
-    assert!(waits(net.planes[0].decide(b"k", contract(), 150 * MS)));
-    let owner = Net::owner(b"k") as PodId;
-    let sent = net.planes[0].take_outgoing();
-    let (_, batch) = sent.iter().find(|(pod, _)| *pod == owner).unwrap();
-    assert_eq!(batch.asks.len(), 1);
-    assert!(
-        batch.entries.iter().any(|entry| matches!(
-            entry.report,
-            Report::Hits { count: 1, age, .. } if age == 140 * MS
-        )),
-        "the hit admitted at 10 ms, sent with the ask: {:?}",
-        batch.entries
-    );
-}
-
 /// The issue's case (#49): a bucket of one refilling faster than a round trip, so the copy
 /// is cold for every request and each asks. The requests that come while the first ask is
 /// out go in one ask after it; the owner decides them at one instant, against a bucket of
@@ -2953,10 +2334,10 @@ fn answers_held_up_are_taken_as_of_no_more_than_a_cycle_before() {
     assert_eq!(net.copy(0, b"k").bucket.behind(500 * MS), behind - refill);
 }
 
-/// What is queued for a pod goes a piece at a time: asks first, then entries, in the order
-/// they were queued, each piece no bigger than [`PIECE_BYTES`], and everything once.
+/// What is queued for a pod goes a piece at a time: its entries in the order they were
+/// queued, each piece no bigger than [`PIECE_BYTES`], and everything once.
 #[test]
-fn a_piece_takes_asks_first_and_no_more_than_fits() {
+fn a_piece_takes_no_more_than_fits() {
     let key = |n: usize| -> Box<[u8]> {
         let mut key = vec![b'k'; 1_000];
         key[..8].copy_from_slice(&(n as u64).to_be_bytes());
@@ -2973,135 +2354,18 @@ fn a_piece_takes_asks_first_and_no_more_than_fits() {
     for entry in entries.iter().cloned() {
         queued.at(10 * MS).push_entry(entry);
     }
-    let asks: Vec<Ask> = (1..=3)
-        .map(|id| Ask {
-            id,
-            count: 1,
-            age: 0,
-            span: 0,
-            timeout: 300 * MS,
-            keys: vec![(key(10_000 + id as usize), contract())],
-        })
-        .collect();
-    for ask in asks.iter().cloned() {
-        queued.push_ask(ask);
-    }
     let whole: usize = entries.iter().map(Entry::bytes).sum();
     assert!(whole > 3 * PIECE_BYTES, "{whole}: more than three pieces");
     let mut pieces = Vec::new();
     while !queued.is_empty() {
-        let piece = queued.take_piece(100, 1);
+        let piece = queued.take_piece(100);
         assert!(piece.bytes() <= PIECE_BYTES, "{}", piece.bytes());
-        assert_eq!(
-            (piece.from, piece.oldest_ask, piece.made),
-            (100, 1, 10 * MS)
-        );
+        assert_eq!((piece.from, piece.made), (100, 10 * MS));
         pieces.push(piece);
     }
     assert_eq!(pieces.len(), 4);
-    assert_eq!(pieces[0].asks, asks, "asks first");
     let sent: Vec<Entry> = pieces.into_iter().flat_map(|piece| piece.entries).collect();
     assert_eq!(sent, entries, "every entry once, in order");
-}
-
-/// An ask takes its keys' reports into its piece: its owner charges a batch's entries
-/// before its asks, as the ask's requests came after the hits queued with them (#49), so a
-/// piece cut keeps that order, and the ask does not wait behind the reports queued ahead.
-/// Each key's reports stay in order.
-#[test]
-fn an_ask_takes_its_keys_reports_into_its_piece() {
-    let key = |n: usize| -> Box<[u8]> {
-        let mut key = vec![b'k'; 1_000];
-        key[..8].copy_from_slice(&(n as u64).to_be_bytes());
-        key.into()
-    };
-    let ask = |id: u64, n: usize| Ask {
-        id,
-        count: 1,
-        age: 0,
-        span: 0,
-        timeout: 300 * MS,
-        keys: vec![(key(n), contract())],
-    };
-    let entry = |n: usize, report: Report| Entry {
-        key: key(n),
-        contract: contract(),
-        report,
-    };
-    let mut queued = Queued::default();
-    for n in 0..3_000 {
-        queued.at(10 * MS).push_entry(entry(n, hits(1, 1, 0)));
-    }
-    // Key 2,000 has a second report, queued with the ask about it, last.
-    queued.push_entry(entry(2_000, hits(2, 1, 1)));
-    queued.push_ask(ask(1, 2_000));
-    queued.push_ask(ask(2, 10_000));
-    let mut pieces = Vec::new();
-    while !queued.is_empty() {
-        let piece = queued.take_piece(100, 1);
-        assert!(piece.bytes() <= PIECE_BYTES, "{}", piece.bytes());
-        pieces.push(piece);
-    }
-    assert_eq!(pieces.len(), 4);
-    let ids: Vec<u64> = pieces[0].asks.iter().map(|ask| ask.id).collect();
-    assert_eq!(ids, [1, 2], "the asks first");
-    let reports: Vec<&Report> = pieces[0]
-        .entries
-        .iter()
-        .filter(|entry| entry.key == key(2_000))
-        .map(|entry| &entry.report)
-        .collect();
-    assert_eq!(
-        reports,
-        [&hits(1, 1, 0), &hits(2, 1, 1)],
-        "with them, in order"
-    );
-    let rest: Vec<Box<[u8]>> = pieces
-        .iter()
-        .flat_map(|piece| &piece.entries)
-        .map(|entry| entry.key.clone())
-        .filter(|sent| *sent != key(2_000))
-        .collect();
-    let expected: Vec<Box<[u8]>> = (0..3_000).filter(|n| *n != 2_000).map(key).collect();
-    assert_eq!(rest, expected, "the others once, in order");
-}
-
-/// An ask held back for its key's reports, too big to go beside it, does not leave a piece
-/// empty: the reports go first, each alone and in order, and the ask after them.
-#[test]
-fn an_ask_held_back_leaves_its_piece_to_its_keys_report() {
-    let key: Box<[u8]> = vec![b'a'; 2 * PIECE_BYTES].into();
-    let mut queued = Queued::default();
-    for report in [hits(1, 1, 0), hits(2, 1, 1)] {
-        queued.push_entry(Entry {
-            key: key.clone(),
-            contract: contract(),
-            report,
-        });
-    }
-    queued.push_ask(Ask {
-        id: 1,
-        count: 1,
-        age: 0,
-        span: 0,
-        timeout: 300 * MS,
-        keys: vec![(key.clone(), contract())],
-    });
-    let first = queued.take_piece(100, 1);
-    let reports =
-        |piece: &Batch| -> Vec<Report> { piece.entries.iter().map(|entry| entry.report).collect() };
-    assert_eq!(
-        (reports(&first), first.asks.len()),
-        (vec![hits(1, 1, 0)], 0)
-    );
-    let second = queued.take_piece(100, 1);
-    assert_eq!(
-        (reports(&second), second.asks.len()),
-        (vec![hits(2, 1, 1)], 0)
-    );
-    let third = queued.take_piece(100, 1);
-    assert_eq!((reports(&third), third.asks.len()), (vec![], 1));
-    assert!(queued.is_empty());
 }
 
 /// A piece takes at least one thing, however big: an entry bigger than a piece goes alone,
@@ -3116,10 +2380,10 @@ fn a_piece_takes_an_entry_bigger_than_itself_alone() {
             report: Report::Poll,
         });
     }
-    let first = queued.take_piece(100, 1);
+    let first = queued.take_piece(100);
     assert_eq!(first.entries.len(), 1);
     assert_eq!(first.entries[0].key.len(), 2 * PIECE_BYTES);
-    let second = queued.take_piece(100, 1);
+    let second = queued.take_piece(100);
     assert_eq!(&*second.entries[0].key, b"bbbbbbbbbb");
     assert!(queued.is_empty());
 }

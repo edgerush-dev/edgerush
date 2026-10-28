@@ -56,7 +56,7 @@ fn loom_a_change_to_the_word_wakes_or_reaches_its_waiter() {
 #[test]
 fn loom_a_hold_given_back_wakes_or_admits_its_waiter() {
     loom::model(|| {
-        let entry = Arc::new(Entry::new(b"k"[..].into(), contract(1, 1), CYCLE, false, 0));
+        let entry = Arc::new(Entry::new(b"k"[..].into(), contract(1, 1), CYCLE, 0));
         assert!(entry.take(Op::Hold, 0).0.done(), "the last token held");
         let waiter = {
             let entry = Arc::clone(&entry);
@@ -81,7 +81,6 @@ fn loom_admissions_racing_a_drain_are_counted_once_and_a_count_left_is_signalled
             b"k"[..].into(),
             contract(1_000, 1_000),
             CYCLE,
-            false,
             0,
         ));
         let admit = |entry: &Arc<Entry>| {
@@ -117,7 +116,6 @@ fn loom_a_signal_carried_by_one_on_its_way_reaches_the_transport() {
             b"k"[..].into(),
             contract(1_000, 1_000),
             CYCLE,
-            false,
             0,
         ));
         let queue = Arc::new(loom::sync::Mutex::new(Vec::<Arc<Entry>>::new()));
@@ -162,7 +160,6 @@ fn loom_two_clocks_leave_the_record_with_the_words_cycle() {
             b"k"[..].into(),
             contract(1_000, 1_000),
             CYCLE,
-            false,
             0,
         ));
         let (early, late) = (255 * CYCLE, 256 * CYCLE);

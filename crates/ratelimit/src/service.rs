@@ -44,8 +44,8 @@ pub mod pooled;
 
 pub use keyed::Keyed;
 
-use crate::reference::{BucketState, Charge, Model, TokenBucket};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use crate::reference::{BucketState, Model, TokenBucket};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::num::NonZeroU64;
 
@@ -266,6 +266,10 @@ pub struct Batch {
     /// said back in the answers ([`Answers::made`]).
     pub made: u64,
 }
+
+/// What a data plane says as [`Batch::oldest_ask`]: one past its last ask, as it asks no
+/// one. The pod's side of asks goes with the field.
+pub(crate) const NO_ASKS: u64 = 1;
 
 /// The most a data plane's batch to a pod takes, by [`Batch::bytes`]: 1 MiB, a quarter of
 /// the longest message the transport takes, so that a batch cut by a bound on its size,
@@ -493,17 +497,6 @@ pub enum Decision {
     Admit,
     /// Refused.
     Refuse,
-    /// Waiting for a service pod: its decision comes from [`DataPlane::take_decided`].
-    Wait(Ticket),
-}
-
-/// What `admitting` says the asks decided admitted under `key`.
-fn admitted_under(admitting: &[(Box<[u8]>, u64)], key: &[u8]) -> u64 {
-    admitting
-        .iter()
-        .filter(|(asked, _)| **asked == *key)
-        .map(|(_, admitted)| admitted)
-        .sum()
 }
 
 /// When answers that came at `now` are taken as of, their batch [`made`](Answers::made) at
@@ -559,16 +552,15 @@ impl Unseen {
 }
 
 /// What a data plane has to send one service pod: entries, their hits' ages counting back
-/// from `made`, and asks; and what they take, by [`Entry::bytes`] and [`Ask::bytes`].
+/// from `made`; and what they take, by [`Entry::bytes`].
 #[derive(Debug, Default)]
 pub(crate) struct Queued {
     pub(crate) made: u64,
     pub(crate) entries: Vec<Entry>,
-    pub(crate) asks: Vec<Ask>,
     bytes: usize,
 }
 
-/// The room left in a piece being filled, which takes its first entry or ask however big.
+/// The room left in a piece being filled, which takes its first entry however big.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Room {
     left: usize,
@@ -607,7 +599,7 @@ impl Queued {
 
     /// Whether it holds nothing to send.
     pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.asks.is_empty()
+        self.entries.is_empty()
     }
 
     /// `entry` queued last.
@@ -616,99 +608,30 @@ impl Queued {
         self.entries.push(entry);
     }
 
-    /// `ask` queued last.
-    pub(crate) fn push_ask(&mut self, ask: Ask) {
-        self.bytes = self.bytes.saturating_add(ask.bytes());
-        self.asks.push(ask);
-    }
-
-    /// Its next piece, from data plane `from`: the asks first, then the reports queued for
-    /// their keys, then the other entries, each in the order queued, as many as fit in
-    /// [`PIECE_BYTES`]; the rest kept for the next. Asks go first because requests wait on
-    /// them, and their keys' reports with them because their owner charges a batch's
-    /// entries before its asks, as an ask's requests came after the hits queued with them:
-    /// an ask whose keys' reports do not all fit beside it waits for them. A key's reports
-    /// stay in order, and keys depend on no other. An ask kept back is in flight already,
-    /// so that `oldest_ask` leaves it to be decided, and a key's reports kept back follow
-    /// those sent, as its owner applies them.
-    pub(crate) fn take_piece(&mut self, from: PlaneId, oldest_ask: u64) -> Batch {
-        if self.bytes <= Room::new().left {
-            // All of it, as most often.
-            let batch = Batch {
-                from,
-                entries: std::mem::take(&mut self.entries),
-                asks: std::mem::take(&mut self.asks),
-                oldest_ask,
-                made: self.made,
-            };
-            self.bytes = 0;
-            return batch;
-        }
+    /// Its next piece, from data plane `from`: its entries in the order queued, as many as
+    /// fit in [`PIECE_BYTES`]; the rest kept for the next. A key's reports stay in order,
+    /// and keys depend on no other.
+    pub(crate) fn take_piece(&mut self, from: PlaneId) -> Batch {
         let mut room = Room::new();
         let fit = self
-            .asks
-            .iter()
-            .take_while(|ask| room.take(ask.bytes()))
-            .count();
-        let asked: HashSet<&[u8]> = self.asks[..fit]
-            .iter()
-            .flat_map(|ask| ask.keys.iter().map(|(key, _)| &**key))
-            .collect();
-        let mut taken = vec![false; self.entries.len()];
-        // Keys asked about whose reports do not all fit: none after the first left out.
-        let mut short = HashSet::new();
-        for (at, entry) in self.entries.iter().enumerate() {
-            let key = &*entry.key;
-            if asked.contains(key) && !short.contains(key) {
-                if room.take(entry.bytes()) {
-                    taken[at] = true;
-                } else {
-                    short.insert(key);
-                }
-            }
-        }
-        for (at, entry) in self.entries.iter().enumerate() {
-            if taken[at] || asked.contains(&*entry.key) {
-                continue;
-            }
-            if !room.take(entry.bytes()) {
-                break;
-            }
-            taken[at] = true;
-        }
-        let mut at = 0;
-        let asks: Vec<Ask> = self
-            .asks
-            .extract_if(.., |ask| {
-                at += 1;
-                at <= fit && !ask.keys.iter().any(|(key, _)| short.contains(&**key))
-            })
-            .collect();
-        if asks.is_empty() && !taken.contains(&true) {
-            // Every ask that fitted waits for a report too big to go beside it: that goes
-            // first, as a piece takes its first entry however big.
-            if let Some(first) = taken.first_mut() {
-                *first = true;
-            }
-        }
-        let mut taken = taken.into_iter();
-        let entries = self
             .entries
-            .extract_if(.., |_| taken.next().unwrap_or(false))
-            .collect();
+            .iter()
+            .take_while(|entry| room.take(entry.bytes()))
+            .count();
+        let entries: Vec<Entry> = self.entries.drain(..fit).collect();
         let batch = Batch {
             from,
             entries,
-            asks,
-            oldest_ask,
+            asks: Vec::new(),
+            oldest_ask: NO_ASKS,
             made: self.made,
         };
         self.bytes = self.bytes.saturating_sub(batch.bytes() - MESSAGE_BYTES);
         batch
     }
 
-    /// Made at `now` from here on, if that is later: the ages of the hits and asks it holds
-    /// count back from it, so that every age in a batch counts back from one time, the
+    /// Made at `now` from here on, if that is later: the ages of the hits it holds count
+    /// back from it, so that every age in a batch counts back from one time, the
     /// latest anything was added at.
     pub(crate) fn at(&mut self, now: u64) -> &mut Self {
         if now > self.made {
@@ -718,21 +641,18 @@ impl Queued {
                     *age = age.saturating_add(later);
                 }
             }
-            for ask in &mut self.asks {
-                ask.age = ask.age.saturating_add(later);
-            }
             self.made = now;
         }
         self
     }
 
     /// Its batch, from data plane `from`.
-    pub(crate) fn batch(self, from: PlaneId, oldest_ask: u64) -> Batch {
+    pub(crate) fn batch(self, from: PlaneId) -> Batch {
         Batch {
             from,
             entries: self.entries,
-            asks: self.asks,
-            oldest_ask,
+            asks: Vec::new(),
+            oldest_ask: NO_ASKS,
             made: self.made,
         }
     }
@@ -752,10 +672,6 @@ struct PlaneKey {
     unsent: u64,
     /// When the earliest of them was admitted.
     unsent_since: u64,
-    /// Of them, requests an ask decided.
-    unsent_asked: u64,
-    /// Requests of asks given up refused here, not yet sent.
-    unsent_refused: u64,
     /// Batches sent to the present owner so far.
     sent: u64,
     /// The highest of them the owner has been seen to apply.
@@ -768,23 +684,12 @@ struct PlaneKey {
     allowance: Option<u64>,
     /// When a cycle last shared out what the copy has left.
     shared: Option<u64>,
-    /// Whether a cycle has set the allowance from a copy a pod answered with: until then
-    /// the copy is shared out among no one, and a pod decides.
-    bounded: bool,
     /// How many other data planes the owner last said were admitting the key.
     others: u64,
     /// When a request for the key last came.
     last_request: Option<u64>,
-    /// When a pod last answered about it: the copy is fresh for a refill time after.
+    /// When a pod last answered about it.
     heard: Option<u64>,
-    /// Asks in flight about it.
-    asking: u32,
-    /// Requests charged here and held while an ask about their other keys is in flight: sent
-    /// to the owner if they are admitted, given back if not.
-    held: u64,
-    /// Whether an ask about it went unanswered since a pod was last heard from about it:
-    /// until one is, requests are decided here.
-    unreachable: bool,
 }
 
 impl PlaneKey {
@@ -796,36 +701,16 @@ impl PlaneKey {
             bucket: contract.bucket(),
             unsent: 0,
             unsent_since: 0,
-            unsent_asked: 0,
-            unsent_refused: 0,
             sent: numbered,
             seen: numbered,
             unacknowledged: VecDeque::new(),
             spent: 0,
             allowance: None,
             shared: None,
-            bounded: false,
             others: 0,
             last_request: None,
             heard: None,
-            asking: 0,
-            held: 0,
-            unreachable: false,
         }
-    }
-
-    /// Whether a pod must decide a request for it: no copy fresh enough, none bounded yet,
-    /// or an ask about it in flight. A copy an ask just brought is not bounded until a cycle
-    /// after it shares out what it holds among the data planes admitting the key, as the
-    /// answers say them; until then another data plane may hold the same copy. Requests come
-    /// over a few milliseconds, not all at once: the first ask's answer comes back while the
-    /// rest of a burst is still arriving.
-    fn cold(&self, now: u64) -> bool {
-        self.owner.is_some()
-            && !self.unreachable
-            && (self.asking > 0
-                || !self.bounded
-                || self.heard.is_none_or(|heard| now - heard > self.hold))
     }
 
     /// Whether a request would be admitted here, from the copy and the cycle's allowance.
@@ -858,42 +743,24 @@ impl PlaneKey {
         self.unsent_one(now);
     }
 
-    /// Whether the copy and the cycle's allowance have room for a request that arrived at
-    /// `at` and waited: the copy as of then, refilled no later.
-    fn room_as_of(&self, at: u64) -> bool {
-        self.allowance
-            .is_none_or(|allowance| self.spent < allowance)
-            && self.bucket.remaining_between(at, at, 1) == 1
-    }
-
-    /// Charges, at `now`, a request admitted here that arrived at `at` and waited: as of
-    /// then, and its hit admitted then.
-    fn take_as_of(&mut self, at: u64, now: u64) {
-        self.bucket.charge_within(at, now, 0, 1);
-        self.spent += 1;
-        self.unsent_one(at);
-    }
-
-    /// Its hits not yet sent, and requests of asks given up it refused, as a report numbered
-    /// after the last, sent at `now`: `None` if there are none.
+    /// Its hits not yet sent, as a report numbered after the last, sent at `now`: `None` if
+    /// there are none.
     fn report_unsent(&mut self, key: &[u8], now: u64) -> Option<Entry> {
-        if self.unsent == 0 && self.unsent_refused == 0 {
+        if self.unsent == 0 {
             return None;
         }
         self.sent += 1;
         let unseen = Unseen {
             sequence: self.sent,
             count: self.unsent,
-            asked: self.unsent_asked,
-            refused: self.unsent_refused,
+            asked: 0,
+            refused: 0,
             admitted: self.unsent_since,
             first: now,
             last: now,
         };
         self.unacknowledged.push_back(unseen);
         self.unsent = 0;
-        self.unsent_asked = 0;
-        self.unsent_refused = 0;
         Some(Entry {
             key: key.into(),
             contract: self.contract,
@@ -901,7 +768,7 @@ impl PlaneKey {
         })
     }
 
-    /// One more hit to send, admitted at `at`: no later than any sent with it, if it waited.
+    /// One more hit to send, admitted at `at`.
     fn unsent_one(&mut self, at: u64) {
         self.unsent_since = if self.unsent == 0 {
             at
@@ -921,123 +788,15 @@ impl PlaneKey {
         admitted
     }
 
-    /// Charges a request held while a pod decides its other keys.
-    fn hold(&mut self, now: u64) -> Charge {
-        self.spent += 1;
-        self.held += 1;
-        self.bucket.charge(now)
-    }
-
-    /// A request held, that arrived at `at`: admitted, it goes to the owner as admitted
-    /// then; refused, its charge is given back.
-    fn release(&mut self, charge: Charge, admitted: bool, at: u64) {
-        self.held = self.held.saturating_sub(1);
-        if admitted {
-            self.unsent_one(at);
-        } else {
-            self.spent = self.spent.saturating_sub(1);
-            self.bucket.release(charge);
-        }
-    }
-
-    /// Whether nothing is left to do for the key and its copy would be cold anyway.
+    /// Whether nothing is left to do for the key, and nothing has used it for twice its
+    /// refill time.
     fn idle(&self, now: u64) -> bool {
         self.unsent == 0
-            && self.unsent_refused == 0
-            && self.held == 0
-            && self.asking == 0
             && self.unacknowledged.is_empty()
             && self
                 .last_request
                 .is_none_or(|last| now.saturating_sub(last) > 2 * self.hold)
     }
-}
-
-/// An ask in flight.
-struct InFlight {
-    id: u64,
-    /// The pod it went to.
-    pod: PodId,
-    /// When it was first sent.
-    sent: u64,
-    /// Whether it has been sent again.
-    resent: bool,
-}
-
-/// Requests under one list of keys waiting for a service pod's decision, and the ask
-/// about them.
-struct Group {
-    /// The requests' keys, in their limits' order, with their contracts.
-    keys: Vec<(Box<[u8]>, Contract)>,
-    /// Which of them are asked about, by position; the others are decided here and held.
-    /// Fixed for as long as the group waits.
-    cold: Vec<usize>,
-    asking: Option<InFlight>,
-    /// The requests the ask in flight is about.
-    asked: Vec<Ticket>,
-    /// When they arrived.
-    asked_arrived: Arrived,
-    /// Requests that came while it was in flight.
-    waiting: Vec<Ticket>,
-    /// When they arrived, if any have.
-    waiting_arrived: Option<Arrived>,
-    /// Whether the ask in flight is the follow-up for a cold burst's tail.
-    follow_up: bool,
-}
-
-/// When the requests of an ask arrived: the earliest and the latest, which the owner
-/// decides them between.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Arrived {
-    pub(crate) first: u64,
-    pub(crate) last: u64,
-}
-
-impl Arrived {
-    /// One request, arriving at `now`.
-    pub(crate) fn at(now: u64) -> Self {
-        Self {
-            first: now,
-            last: now,
-        }
-    }
-
-    /// With one more request, arriving at `now`; `None` before the first.
-    pub(crate) fn and(arrived: Option<Self>, now: u64) -> Self {
-        arrived.map_or(Self::at(now), |arrived| Self {
-            first: arrived.first.min(now),
-            last: arrived.last.max(now),
-        })
-    }
-
-    /// The ask about them, its ages counting back from `made`.
-    pub(crate) fn ask(
-        self,
-        made: u64,
-        id: u64,
-        count: u64,
-        timeout: u64,
-        keys: Vec<(Box<[u8]>, Contract)>,
-    ) -> Ask {
-        Ask {
-            id,
-            count,
-            age: made.saturating_sub(self.first),
-            span: self.last.saturating_sub(self.first),
-            timeout,
-            keys,
-        }
-    }
-}
-
-/// A group's name: its keys, each after its length, so that no two lists share one.
-fn group_name<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Box<[u8]> {
-    let mut name = Vec::new();
-    for key in keys {
-        name.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        name.extend_from_slice(key);
-    }
-    name.into_boxed_slice()
 }
 
 /// A data plane's side of the protocol: one worker's copies of the keys it has seen.
@@ -1046,26 +805,13 @@ pub struct DataPlane<S = FixedState> {
     cycle: u64,
     view: View,
     keys: HashMap<Box<[u8]>, PlaneKey, S>,
-    /// Requests waiting for a pod, by their list of keys.
-    groups: HashMap<Box<[u8]>, Group, S>,
-    /// When each request waiting arrived, and the charges held for it, one per key of its
-    /// group not asked about, in the group's order.
-    holds: BTreeMap<Ticket, (u64, Vec<Charge>)>,
-    /// The group of each ask in flight, by its id.
-    in_flight: BTreeMap<u64, Box<[u8]>>,
-    next_ticket: Ticket,
-    asks_sent: u64,
     /// Batches numbered, over every key: a key made again numbers its own from here, past
     /// every number an earlier life of it used.
     numbered: u64,
-    decided: Vec<Decided>,
     /// What is to go to each pod.
     queued: BTreeMap<PodId, Queued>,
     /// Views asked for so far, to ask the pods in turn.
     polls: u64,
-    /// How long an ask may go unanswered before it is given up and what waits is decided
-    /// here; sent again once half way.
-    ask_timeout: u64,
     /// The bytes its keys may hold, as [`plane_key_bytes`] counts them, and what they hold.
     capacity: u64,
     holding: u64,
@@ -1124,28 +870,14 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             id,
             cycle: cycle.max(1),
             view,
-            keys: HashMap::with_hasher(hasher.clone()),
-            groups: HashMap::with_hasher(hasher),
-            holds: BTreeMap::new(),
-            in_flight: BTreeMap::new(),
-            next_ticket: 0,
-            asks_sent: 0,
+            keys: HashMap::with_hasher(hasher),
             numbered: 0,
-            decided: Vec::new(),
             queued: BTreeMap::new(),
             polls: 0,
-            ask_timeout: RESEND_AFTER_CYCLES * cycle.max(1),
             capacity: u64::MAX,
             holding: 0,
             evicted: 0,
         }
-    }
-
-    /// How long an ask may go unanswered before it is given up: four cycles unless said
-    /// otherwise. Over TCP a lost segment is sent again only after some 200 ms, and an ask
-    /// given up sooner leaves its requests to a copy that has heard nothing.
-    pub fn set_ask_timeout(&mut self, timeout: u64) {
-        self.ask_timeout = timeout.max(1);
     }
 
     /// The bytes its keys may hold: past them, each cycle evicts the least recently used
@@ -1184,10 +916,9 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
     ///
     /// [`decide_all`]: Self::decide_all
     pub fn decide(&mut self, key: &[u8], contract: Contract, now: u64) -> Decision {
-        // The common case, with one lookup: a key held under the same contract, warm.
+        // The common case, with one lookup: a key held under the same contract.
         if let Some(at) = self.keys.get_mut(key)
             && at.contract == contract
-            && !at.cold(now)
         {
             return if at.decide(now) {
                 Decision::Admit
@@ -1195,7 +926,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 Decision::Refuse
             };
         }
-        self.decide_held_or_asked(&[(key, contract)], now)
+        self.decide_new(&[(key, contract)], now)
     }
 
     /// Decides a request arriving at `now` under every limit that applies to it, each a key
@@ -1203,10 +934,8 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
     /// bucket first (06 §4): admitted under all of them or none, and charged to all of them
     /// or none (06 §2).
     ///
-    /// Keys it holds fresh copies of are decided here, and any refusing refuses at once.
-    /// If some are cold, it holds the charges of the others and waits while it asks the
-    /// owner of the first cold key to decide the cold ones; the ask is among the messages
-    /// [`take_outgoing`](Self::take_outgoing) gives, to be sent at once.
+    /// Every key is decided here, from its copy — a key it has not heard of from a full
+    /// bucket — and nothing waits on a service pod.
     pub fn decide_all(&mut self, keys: &[(&[u8], Contract)], now: u64) -> Decision {
         // Hashing a key is a third of a decision: the usual few are looked up together,
         // once each.
@@ -1215,37 +944,37 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             [a, b] => self.decide_warm([a, b], now),
             [a, b, c] => self.decide_warm([a, b, c], now),
             [a, b, c, d] => self.decide_warm([a, b, c, d], now),
-            _ => self.decide_held_or_asked(keys, now),
+            _ => self.decide_new(keys, now),
         }
     }
 
     /// The common case for a few limits, with one lookup a key: every key held under the
-    /// same contract, warm, decided here.
+    /// same contract.
     fn decide_warm<const N: usize>(&mut self, keys: [&(&[u8], Contract); N], now: u64) -> Decision {
         // Looking the same key up twice at once is refused by the map; limits each have a
         // key of their own, so it is a caller's mistake, decided the long way.
         for (at, (key, _)) in keys.iter().enumerate() {
             if keys[..at].iter().any(|(other, _)| other == key) {
-                return self.decide_held_or_asked(&keys.map(|key| *key), now);
+                return self.decide_new(&keys.map(|key| *key), now);
             }
         }
         let mut found = self.keys.get_disjoint_mut(keys.map(|(key, _)| *key));
-        let mut warm = true;
+        let mut held = true;
         let mut room = true;
         for (at, (_, contract)) in found.iter_mut().zip(keys) {
             match at {
-                Some(at) if at.contract == *contract && !at.cold(now) => {
+                Some(at) if at.contract == *contract => {
                     at.last_request = Some(now);
                     room &= at.room(now);
                 }
                 _ => {
-                    warm = false;
+                    held = false;
                     break;
                 }
             }
         }
-        if !warm {
-            return self.decide_held_or_asked(&keys.map(|key| *key), now);
+        if !held {
+            return self.decide_new(&keys.map(|key| *key), now);
         }
         if !room {
             return Decision::Refuse;
@@ -1256,12 +985,11 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         Decision::Admit
     }
 
-    /// Decides a request with a key new to it, under a changed contract, or cold: kept out
-    /// of the common case's way.
+    /// Decides a request with a key new to it, or under a changed contract — made from a
+    /// full bucket — or the same key twice: kept out of the common case's way.
     #[cold]
     #[inline(never)]
-    fn decide_held_or_asked(&mut self, keys: &[(&[u8], Contract)], now: u64) -> Decision {
-        let mut cold = false;
+    fn decide_new(&mut self, keys: &[(&[u8], Contract)], now: u64) -> Decision {
         for &(key, contract) in keys {
             // New, or its contract changed: any change starts a key afresh (06 §3).
             if !matches!(self.keys.get(key), Some(at) if at.contract == contract) {
@@ -1278,302 +1006,26 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 return Decision::Refuse;
             };
             at.last_request = Some(now);
-            cold |= at.cold(now);
         }
-        if !cold {
-            let room = keys
-                .iter()
-                .all(|(key, _)| self.keys.get(*key).is_some_and(|at| at.room(now)));
-            if room {
-                for (key, _) in keys {
-                    if let Some(at) = self.keys.get_mut(*key) {
-                        at.take(now);
-                    }
-                }
-                return Decision::Admit;
-            }
-            return Decision::Refuse;
-        }
-        self.wait(keys, now)
-    }
-
-    /// A request with a cold key: the keys its group does not ask about decided and held
-    /// here, then waiting for the ask in flight, or asking.
-    fn wait(&mut self, keys: &[(&[u8], Contract)], now: u64) -> Decision {
-        let name = group_name(keys.iter().map(|(key, _)| *key));
-        if !self.groups.contains_key(&name) {
-            let cold = keys
-                .iter()
-                .enumerate()
-                .filter(|(_, (key, _))| self.keys.get(*key).is_some_and(|at| at.cold(now)))
-                .map(|(at, _)| at)
-                .collect();
-            let group = Group {
-                keys: keys.iter().map(|(key, c)| ((*key).into(), *c)).collect(),
-                cold,
-                asking: None,
-                asked: Vec::new(),
-                asked_arrived: Arrived::at(now),
-                waiting: Vec::new(),
-                waiting_arrived: None,
-                follow_up: false,
-            };
-            self.groups.insert(name.clone(), group);
-        }
-        let Some(group) = self.groups.get_mut(&name) else {
-            return Decision::Refuse;
-        };
-        let held = |at: &usize| !group.cold.contains(at);
-        let room = (0..group.keys.len()).filter(held).all(|at| {
-            self.keys
-                .get(&group.keys[at].0)
-                .is_some_and(|key| key.room(now))
-        });
+        let room = keys
+            .iter()
+            .all(|(key, _)| self.keys.get(*key).is_some_and(|at| at.room(now)));
         if !room {
-            if group.asking.is_none() && group.waiting.is_empty() {
-                self.groups.remove(&name);
-            }
             return Decision::Refuse;
         }
-        let charges = (0..group.keys.len())
-            .filter(held)
-            .filter_map(|at| {
-                self.keys
-                    .get_mut(&group.keys[at].0)
-                    .map(|key| key.hold(now))
-            })
-            .collect();
-        let ticket = self.next_ticket;
-        self.next_ticket += 1;
-        self.holds.insert(ticket, (now, charges));
-        if group.asking.is_some() {
-            group.waiting.push(ticket);
-            group.waiting_arrived = Some(Arrived::and(group.waiting_arrived, now));
-        } else {
-            group.follow_up = false;
-            group.asked.push(ticket);
-            group.asked_arrived = Arrived::at(now);
-            self.ask(&name, None, now);
-        }
-        Decision::Wait(ticket)
-    }
-
-    /// Sends the ask about the requests the group `name` has in `asked` to the owner of its
-    /// first cold key: under a new id, or `again` under the one it had.
-    fn ask(&mut self, name: &[u8], again: Option<u64>, now: u64) {
-        let Some(group) = self.groups.get_mut(name) else {
-            return;
-        };
-        let Some(pod) = group
-            .cold
-            .first()
-            .and_then(|at| self.keys.get(&group.keys[*at].0))
-            .and_then(|key| key.owner)
-        else {
-            return;
-        };
-        let id = match again {
-            Some(id) => id,
-            None => {
-                self.asks_sent += 1;
-                for at in &group.cold {
-                    if let Some(key) = self.keys.get_mut(&group.keys[*at].0) {
-                        key.asking += 1;
-                    }
-                }
-                self.in_flight.insert(self.asks_sent, name.into());
-                self.asks_sent
-            }
-        };
-        let resent = group
-            .asking
-            .as_ref()
-            .is_some_and(|f| f.id == id && f.resent);
-        let sent = group
-            .asking
-            .as_ref()
-            .filter(|f| f.id == id)
-            .map_or(now, |f| f.sent);
-        group.asking = Some(InFlight {
-            id,
-            pod,
-            sent,
-            resent,
-        });
-        // What it admitted of the keys and has not yet sent goes first, ahead of the ask in
-        // its pod's batch: decided after them, the ask's requests are charged after them,
-        // as they came after them, not before — which charges leave a bucket further
-        // behind than in order, refusing a client within its rate.
-        for at in &group.cold {
-            let key = &group.keys[*at].0;
-            let Some(held) = self.keys.get_mut(key) else {
-                continue;
-            };
-            let Some(owner) = held.owner else {
-                continue;
-            };
-            let Some(entry) = held.report_unsent(key, now) else {
-                continue;
-            };
-            self.numbered += 1;
-            self.queued
-                .entry(owner)
-                .or_default()
-                .at(now)
-                .push_entry(entry);
-        }
-        let queued = self.queued.entry(pod).or_default().at(now);
-        queued.push_ask(
-            group.asked_arrived.ask(
-                queued.made,
-                id,
-                group.asked.len() as u64,
-                self.ask_timeout,
-                group
-                    .cold
-                    .iter()
-                    .map(|at| group.keys[*at].clone())
-                    .collect(),
-            ),
-        );
-    }
-
-    /// The ask in flight for the group `name` is over — answered, or given up: its keys are
-    /// no longer asked about by it.
-    fn ask_over(&mut self, name: &[u8]) -> Option<InFlight> {
-        let group = self.groups.get_mut(name)?;
-        let flight = group.asking.take()?;
-        self.in_flight.remove(&flight.id);
-        for at in &group.cold {
-            if let Some(key) = self.keys.get_mut(&group.keys[*at].0) {
-                key.asking = key.asking.saturating_sub(1);
+        for (key, _) in keys {
+            if let Some(at) = self.keys.get_mut(*key) {
+                at.take(now);
             }
         }
-        Some(flight)
+        Decision::Admit
     }
 
-    /// Decides here, at `now`, a request of the group `name` that waited: its asked-about
-    /// keys from their copies as of when it arrived — requests that waited together are as
-    /// far apart as they came — its held ones admitted or given back with them.
-    fn settle_here(&mut self, name: &[u8], ticket: Ticket, asked: bool, now: u64) {
-        let Some(group) = self.groups.get(name) else {
-            return;
-        };
-        let arrived = self.arrived(ticket, now);
-        let admitted = group.cold.iter().all(|at| {
-            self.keys
-                .get(&group.keys[*at].0)
-                .is_some_and(|key| key.room_as_of(arrived))
-        });
-        if admitted {
-            for at in &group.cold {
-                if let Some(key) = self.keys.get_mut(&group.keys[*at].0) {
-                    key.take_as_of(arrived, now);
-                    if asked {
-                        key.unsent_asked += 1;
-                    }
-                }
-            }
-        } else if asked {
-            for at in &group.cold {
-                if let Some(key) = self.keys.get_mut(&group.keys[*at].0) {
-                    key.unsent_refused += 1;
-                }
-            }
-        }
-        let refused_by = if admitted {
-            Box::default()
-        } else {
-            // Those that had no room for it when it came, each with how long from now it
-            // waits: none if it has room again by now, refilled while the request waited.
-            group
-                .cold
-                .iter()
-                .filter_map(|at| {
-                    let key = self.keys.get(&group.keys[*at].0)?;
-                    let wait = key.wait(self.cycle, now).unwrap_or(0);
-                    (!key.room_as_of(arrived)).then_some((*at, wait))
-                })
-                .collect()
-        };
-        self.settle_held(name, ticket, admitted, now);
-        self.decided.push(Decided {
-            ticket,
-            admitted,
-            refused_by,
-        });
-    }
-
-    /// The charges held for `ticket`, of the group `name`, as its decision at `now` says.
-    fn settle_held(&mut self, name: &[u8], ticket: Ticket, admitted: bool, now: u64) {
-        let Some(group) = self.groups.get(name) else {
-            return;
-        };
-        let (arrived, charges) = self.holds.remove(&ticket).unwrap_or((now, Vec::new()));
-        let held = (0..group.keys.len()).filter(|at| !group.cold.contains(at));
-        for (at, charge) in held.zip(charges) {
-            if let Some(key) = self.keys.get_mut(&group.keys[at].0) {
-                key.release(charge, admitted, arrived);
-            }
-        }
-    }
-
-    /// When the request `ticket`, waiting, arrived; `now` if it is not waiting.
-    fn arrived(&self, ticket: Ticket, now: u64) -> u64 {
-        self.holds.get(&ticket).map_or(now, |(arrived, _)| *arrived)
-    }
-
-    /// The cycle's work at `now`: allowances set for the next cycle, asks sent again or
-    /// given up, batches and polls for every owner.
+    /// The cycle's work at `now`: allowances set for the next cycle, batches and polls for
+    /// every owner.
     pub fn on_cycle(&mut self, now: u64) {
         let resend_after = RESEND_AFTER_CYCLES * self.cycle;
-        let ask_timeout = self.ask_timeout;
         let cycle = self.cycle;
-        // Asks: one unanswered half its timeout is sent again once, as it was; one
-        // unanswered for all of it is given up — its pod gone or out of reach — and what
-        // waits is decided here, and so is every request for its keys after, without
-        // asking, until a pod is heard from about them again.
-        let mut again = Vec::new();
-        let mut given_up = Vec::new();
-        for (name, group) in &mut self.groups {
-            let Some(flight) = &mut group.asking else {
-                continue;
-            };
-            if now - flight.sent >= ask_timeout {
-                given_up.push(name.clone());
-            } else if now - flight.sent >= ask_timeout / 2 && !flight.resent {
-                flight.resent = true;
-                again.push((name.clone(), flight.id));
-            }
-        }
-        for (name, id) in again {
-            self.ask(&name, Some(id), now);
-        }
-        for name in given_up {
-            self.ask_over(&name);
-            let Some(group) = self.groups.get_mut(&name) else {
-                continue;
-            };
-            let asked = std::mem::take(&mut group.asked);
-            let waited: Vec<(Ticket, bool)> = asked
-                .into_iter()
-                .map(|ticket| (ticket, true))
-                .chain(
-                    std::mem::take(&mut group.waiting)
-                        .into_iter()
-                        .map(|ticket| (ticket, false)),
-                )
-                .collect();
-            for at in group.cold.clone() {
-                if let Some(key) = self.keys.get_mut(&group.keys[at].0) {
-                    key.unreachable = true;
-                }
-            }
-            for (ticket, asked) in waited {
-                self.settle_here(&name, ticket, asked, now);
-            }
-            self.groups.remove(&name);
-        }
         let mut cut_off = false;
         for (key, at) in &mut self.keys {
             let hold = at.contract.refill_time();
@@ -1599,7 +1051,6 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 let sees = at.bucket.remaining_within(now, cycle, u64::MAX);
                 (sees / (at.others + 1)).max(1) + left.min(1)
             });
-            at.bounded |= at.heard.is_some();
             at.spent = 0;
             let Some(owner) = at.owner else {
                 continue;
@@ -1636,10 +1087,9 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                     report: Report::Poll,
                 });
             }
-            // Cut off: an ask given up, or a key in use whose owner has not answered for as
-            // long as an ask is given up after.
-            cut_off |= at.unreachable
-                || (in_use && at.heard.is_none_or(|heard| now - heard >= resend_after));
+            // Cut off: a key in use whose owner has not answered for as long as a report is
+            // sent again after.
+            cut_off |= in_use && at.heard.is_none_or(|heard| now - heard >= resend_after);
             if !entries.is_empty() {
                 let queued = self.queued.entry(owner).or_default().at(now);
                 for entry in entries {
@@ -1667,13 +1117,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             let quiet = self
                 .keys
                 .iter()
-                .filter(|(_, at)| {
-                    at.unsent == 0
-                        && at.unsent_refused == 0
-                        && at.held == 0
-                        && at.asking == 0
-                        && at.unacknowledged.is_empty()
-                })
+                .filter(|(_, at)| at.unsent == 0 && at.unacknowledged.is_empty())
                 .map(|(key, at)| {
                     let used = at.last_request.unwrap_or(0);
                     (used, key.clone(), plane_key_bytes(key))
@@ -1689,176 +1133,34 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         }
     }
 
-    /// Of the asks `decided`, what each admitted under each of its keys asked about.
-    fn admitting(&self, decided: &[(u64, u64)]) -> Vec<(Box<[u8]>, u64)> {
-        let mut admitting = Vec::new();
-        for (id, admitted) in decided {
-            let Some(group) = self
-                .in_flight
-                .get(id)
-                .and_then(|name| self.groups.get(name))
-            else {
-                continue;
-            };
-            let admitted = (*admitted).min(group.asked.len() as u64);
-            for at in &group.cold {
-                admitting.push((group.keys[*at].0.clone(), admitted));
-            }
-        }
-        admitting
-    }
-
     /// A service pod's answers reach it at `now`: each copy set to the pod's bucket as of
     /// when the batch was made, and charged with what the pod has not seen.
     pub fn on_answers(&mut self, answers: Answers, now: u64) {
         let Answers {
             from,
             entries,
-            decided,
             view,
             made,
             ..
         } = answers;
         let made = taken_as_of(made, self.cycle, now);
-        // Keys the pod decided asks under without owning them: the requests it admitted
-        // are charged on its copy, and still to be sent to their owners.
-        // Keys whose state the pod sent but the copies did not take, for saying which of
-        // them refused the asks it decided.
-        let mut untaken: Vec<(Box<[u8]>, u128)> = Vec::new();
-        // What the asks decided admitted under each of their keys: still to be sent, as
-        // hits, and already charged in the owner's bucket, which holds them for those hits.
-        let admitting = self.admitting(&decided);
         for answer in entries {
             let Some(at) = self.keys.get_mut(&answer.key) else {
                 continue;
             };
-            // Only the owner it sends to, or a pod answering an ask from its copy: an answer
-            // from an owner that has gone is stale.
-            if answer.owned && at.owner != Some(from) {
-                untaken.push((answer.key, answer.behind));
+            // Only the owner it sends to: an answer from an owner that has gone is stale.
+            if !answer.owned || at.owner != Some(from) {
                 continue;
             }
             at.others = answer.others;
-            // Only the owner says which batches it applied: another pod's copy may be fresher
-            // than the owner's own state, which after a failover went on from an older one.
-            if answer.owned {
-                // No more of this data plane's batches can have been applied than it has sent.
-                let seen = answer.applied.min(at.sent);
-                at.seen = at.seen.max(seen);
-                at.unacknowledged.retain(|unseen| unseen.sequence > seen);
-            }
+            // No more of this data plane's batches can have been applied than it has sent.
+            let seen = answer.applied.min(at.sent);
+            at.seen = at.seen.max(seen);
+            at.unacknowledged.retain(|unseen| unseen.sequence > seen);
+            // Charged on top: the hits the owner has yet to apply.
             let unseen: u64 = at.unacknowledged.iter().map(|unseen| unseen.count).sum();
-            let asked = if answer.owned {
-                admitted_under(&admitting, &answer.key)
-            } else {
-                0
-            };
-            // Charged on top: the hits the owner has yet to apply, but for the asked ones it
-            // holds — no more than this data plane knows of, its answer to an ask maybe lost —
-            // and what waits on this data plane's own asks.
-            let known: u64 = at
-                .unacknowledged
-                .iter()
-                .map(|unseen| unseen.asked)
-                .sum::<u64>()
-                + at.unsent_asked
-                + asked;
-            let unapplied = (unseen + at.unsent + asked).saturating_sub(answer.held.min(known));
-            at.bucket.rebase(made, answer.behind, unapplied + at.held);
+            at.bucket.rebase(made, answer.behind, unseen + at.unsent);
             at.heard = Some(now);
-            at.unreachable = false;
-        }
-        for (id, admitted) in decided {
-            let Some(name) = self.in_flight.get(&id).cloned() else {
-                continue;
-            };
-            self.ask_over(&name);
-            let Some(group) = self.groups.get_mut(&name) else {
-                continue;
-            };
-            let asked = std::mem::take(&mut group.asked);
-            // Those of the keys asked about that refused, as the pod held them: from the copy,
-            // which took its state, or from the state the copy did not take.
-            let refused_by: Box<[(usize, u64)]> = if (asked.len() as u64) > admitted {
-                group
-                    .cold
-                    .iter()
-                    .filter_map(|at| {
-                        let key = &group.keys[*at].0;
-                        let copy = self.keys.get(key)?;
-                        let wait = match untaken.iter().find(|(untaken, _)| untaken == key) {
-                            Some((_, behind)) => {
-                                let mut held = copy.bucket.clone();
-                                held.rebase(made, *behind, 0);
-                                held.retry_at(now).map(|retry| retry.saturating_sub(now))
-                            }
-                            None => copy.wait(self.cycle, now),
-                        }?;
-                        Some((*at, wait))
-                    })
-                    .collect()
-            } else {
-                Box::default()
-            };
-            // Every request admitted is reported as a hit under each key asked about: its
-            // owner, deciding the ask, holds what it admitted for those hits; a pod deciding
-            // from its copy leaves them to the owner to count.
-            let charged: Vec<Box<[u8]>> = group
-                .cold
-                .iter()
-                .map(|at| group.keys[*at].0.clone())
-                .collect();
-            for (index, ticket) in asked.into_iter().enumerate() {
-                let admitted = (index as u64) < admitted;
-                if admitted {
-                    let arrived = self.arrived(ticket, now);
-                    for key in &charged {
-                        if let Some(at) = self.keys.get_mut(key) {
-                            at.unsent_one(arrived);
-                            at.unsent_asked += 1;
-                        }
-                    }
-                }
-                self.settle_held(&name, ticket, admitted, now);
-                self.decided.push(Decided {
-                    ticket,
-                    admitted,
-                    refused_by: if admitted {
-                        Box::default()
-                    } else {
-                        refused_by.clone()
-                    },
-                });
-            }
-            // Those that came during the first ask are asked about once more — the tail of
-            // a cold burst — and, once a cycle has bounded the copies, any after that are
-            // decided here: asking again and again would keep a data plane whose requests
-            // come faster than a round trip waiting on every one.
-            let Some(group) = self.groups.get_mut(&name) else {
-                continue;
-            };
-            if group.waiting.is_empty() {
-                self.groups.remove(&name);
-                continue;
-            }
-            let bounded = group.cold.iter().all(|at| {
-                self.keys
-                    .get(&group.keys[*at].0)
-                    .is_some_and(|key| key.bounded)
-            });
-            if group.follow_up && bounded {
-                let waiting = std::mem::take(&mut group.waiting);
-                for ticket in waiting {
-                    self.settle_here(&name, ticket, false, now);
-                }
-                self.groups.remove(&name);
-            } else {
-                group.follow_up = true;
-                group.asked = std::mem::take(&mut group.waiting);
-                // Never `None` with requests waiting: they set it as they came.
-                group.asked_arrived = group.waiting_arrived.take().unwrap_or(Arrived::at(now));
-                self.ask(&name, None, now);
-            }
         }
         if let Some(view) = view {
             self.on_view(view, now);
@@ -1866,9 +1168,8 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
     }
 
     /// The service's pods change at `now`. Keys whose owner moved send it again every
-    /// batch not seen applied, numbered as before — a pod taking over from its copy knows
-    /// what the old owner applied — and asks whose pod no longer owns their first key are
-    /// sent again to the one that does.
+    /// batch not seen applied, numbered as before: a pod taking over from its copy knows
+    /// what the old owner applied.
     pub fn on_view(&mut self, view: View, now: u64) {
         if view.epoch <= self.view.epoch {
             return;
@@ -1880,7 +1181,6 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 continue;
             }
             at.owner = owner;
-            at.unreachable = false;
             let Some(owner) = owner else {
                 continue;
             };
@@ -1894,19 +1194,6 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                     report,
                 });
             }
-        }
-        let moved: Vec<(Box<[u8]>, u64)> = self
-            .groups
-            .iter()
-            .filter_map(|(name, group)| {
-                let flight = group.asking.as_ref()?;
-                let first = group.cold.first()?;
-                let owner = self.keys.get(&group.keys[*first].0)?.owner;
-                (owner != Some(flight.pod)).then(|| (name.clone(), flight.id))
-            })
-            .collect();
-        for (name, id) in moved {
-            self.ask(&name, Some(id), now);
         }
     }
 
@@ -1937,46 +1224,13 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         longest(self.waits(keys, now))
     }
 
-    /// The oldest of its asks still in flight, or one past its last ([`Batch::oldest_ask`]).
-    fn oldest_ask(&self) -> u64 {
-        self.in_flight
-            .keys()
-            .next()
-            .copied()
-            .unwrap_or(self.asks_sent + 1)
-    }
-
     /// Messages to send: one batch per service pod; an empty one asks only for the view.
     /// Whole, not cut to [`PIECE_BYTES`] as the pooled participant's are: as the reference,
     /// it is compared with that over batches that fit.
     pub fn take_outgoing(&mut self) -> Vec<(PodId, Batch)> {
-        let oldest_ask = self.oldest_ask();
         std::mem::take(&mut self.queued)
             .into_iter()
-            .map(|(pod, queued)| (pod, queued.batch(self.id, oldest_ask)))
-            .collect()
-    }
-
-    /// Requests that waited, decided since last asked: `(ticket, admitted)`.
-    pub fn take_decided(&mut self) -> Vec<(Ticket, bool)> {
-        self.take_decisions()
-            .into_iter()
-            .map(|decided| (decided.ticket, decided.admitted))
-            .collect()
-    }
-
-    /// The same, with which keys refused those refused.
-    pub fn take_decisions(&mut self) -> Vec<Decided> {
-        std::mem::take(&mut self.decided)
-    }
-
-    /// The requests waiting, refused: the data plane is going away.
-    pub fn abandon(&mut self) -> Vec<Ticket> {
-        self.holds.clear();
-        self.in_flight.clear();
-        self.groups
-            .drain()
-            .flat_map(|(_, group)| group.asked.into_iter().chain(group.waiting))
+            .map(|(pod, queued)| (pod, queued.batch(self.id)))
             .collect()
     }
 }

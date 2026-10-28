@@ -105,10 +105,10 @@ impl Pooled {
     }
 
     /// The `at`th answer held back (counting round), delivered, and kept to deliver again
-    /// if `twice`: the decisions it brought, and the requests handed back to decide again.
-    fn deliver(&mut self, at: usize, twice: bool, now: u64) -> Settled {
+    /// if `twice`.
+    fn deliver(&mut self, at: usize, twice: bool, now: u64) {
         if self.pending.is_empty() {
-            return Settled::default();
+            return;
         }
         let at = at % self.pending.len();
         let (exchange, place, answers) = if twice {
@@ -117,19 +117,6 @@ impl Pooled {
             self.pending.remove(at)
         };
         self.take(exchange, place, answers, now);
-        self.settled()
-    }
-
-    fn settled(&mut self) -> Settled {
-        Settled {
-            decided: self
-                .participant
-                .take_decisions()
-                .into_iter()
-                .map(|decided| (decided.ticket, decided.admitted))
-                .collect(),
-            retries: self.participant.take_retries(),
-        }
     }
 
     /// A worker's decision: from its handles if it holds them all and they decide it;
@@ -172,7 +159,7 @@ impl Pooled {
         decision
     }
 
-    fn exchange(&mut self, now: u64) -> Settled {
+    fn exchange(&mut self, now: u64) {
         for _ in 0..10 {
             let outgoing = self.participant.take_exchanges();
             if outgoing.is_empty() {
@@ -183,32 +170,18 @@ impl Pooled {
                 self.take(exchange, place, answers, now);
             }
         }
-        self.settled()
     }
 }
 
-/// What came of requests that waited: decided, by ticket, or handed back to decide again.
-#[derive(Debug, Default)]
-struct Settled {
-    decided: Vec<(Ticket, bool)>,
-    retries: Vec<Ticket>,
-}
-
-/// `batch` with its asks in the order of their numbers, as both sides' pods are given them.
-/// A pod remembers only the last ask a data plane made about a key, so two asks about one
-/// key sent again count once more or twice more as their order has it (an inherited defect
-/// of the service pod, apart's alike; results note): the order a side happens to list its
-/// waiting groups in, which is not what this comparison is about.
-///
-/// Every report in it is numbered as the wire takes it: from 1, and seeing only earlier
-/// reports applied, whatever was resent, answered late or answered twice before it.
-fn in_order(mut batch: Batch) -> Batch {
+/// `batch` as the pod is given it, its reports numbered as the wire takes them: from 1, and
+/// seeing only earlier reports applied, whatever was resent, answered late or answered
+/// twice before it.
+fn in_order(batch: Batch) -> Batch {
     for entry in &batch.entries {
         if let Report::Hits { sequence, seen, .. } = entry.report {
             assert!(seen < sequence, "report {sequence} seeing {seen} applied");
         }
     }
-    batch.asks.sort_by_key(|ask| ask.id);
     batch
 }
 
@@ -234,9 +207,9 @@ impl Reference {
         }
     }
 
-    fn deliver(&mut self, at: usize, twice: bool, now: u64) -> Vec<(Ticket, bool)> {
+    fn deliver(&mut self, at: usize, twice: bool, now: u64) {
         if self.pending.is_empty() {
-            return Vec::new();
+            return;
         }
         let at = at % self.pending.len();
         let answers = if twice {
@@ -245,10 +218,9 @@ impl Reference {
             self.pending.remove(at)
         };
         self.plane.on_answers(answers, now);
-        self.plane.take_decided()
     }
 
-    fn exchange(&mut self, now: u64) -> Vec<(Ticket, bool)> {
+    fn exchange(&mut self, now: u64) {
         for _ in 0..10 {
             let outgoing = self.plane.take_outgoing();
             if outgoing.is_empty() {
@@ -259,7 +231,6 @@ impl Reference {
                 self.plane.on_answers(answers, now);
             }
         }
-        self.plane.take_decided()
     }
 }
 
@@ -297,15 +268,15 @@ proptest! {
     ))]
 
     /// One participant decides every request — under one limit or two, all or none — as one
-    /// `DataPlane` does, the cycle, the answers — late, out of order, twice — and the asks
-    /// included: the per-key state moved into shared words changes no decision. Requests
-    /// come a unit apart or more, cycles on their boundary.
+    /// `DataPlane` does, the cycle and the answers — late, out of order, twice — included:
+    /// the per-key state moved into shared words changes no decision. Requests come a unit
+    /// apart or more, cycles on their boundary.
     ///
     /// But one: where `DataPlane` refuses a request because another's hold is outstanding,
-    /// pooled defers it, or hands a waited one back, rather than refuse what the hold may yet
-    /// give back. Such a request is set aside — the reference's refusal of it, which changed
-    /// nothing, put aside too — and given to both again after every event, compared when
-    /// pooled decides it. Pooled defers only where the reference refuses.
+    /// pooled defers it, rather than refuse what the hold may yet give back. Such a request
+    /// is set aside — the reference's refusal of it, which changed nothing, put aside too —
+    /// and given to both again after every event, compared when pooled decides it. Pooled
+    /// defers only where the reference refuses.
     #[test]
     fn a_participant_decides_as_a_data_plane(
         events in prop::collection::vec((event(), 0u64..4), 1..300),
@@ -356,17 +327,13 @@ proptest! {
     /// flight or more:
     /// over a schedule of requests, cycles and answers — late, out
     /// of order, twice — and then everything delivered and settled, each key's count at its
-    /// owner is what was admitted under it, cold keys decided locally or asked about: what an
-    /// ask admits the owner holds for the hits it is reported as, an ask given up and decided
-    /// here is counted once whether admitted or refused, and an ask sent again, or arriving
-    /// after its data plane is done with it, is not decided twice. Now
+    /// owner is what was admitted under it. Now
     /// and then the next cycle runs with no room for any key, evicting every
     /// key it may, to be made again by its next request: its reports then number on past
     /// those of its earlier life, which the pod, never forgetting the key, still holds.
     #[test]
     fn no_admission_goes_uncounted_scheduled_or_not(
         events in prop::collection::vec((event(), 0u64..4, prop::bool::weighted(0.1)), 1..300),
-        ask_cold: bool,
         poll_quiet: bool,
         one_in_flight: bool,
     ) {
@@ -377,28 +344,9 @@ proptest! {
         ];
         for scheduled in [false, true] {
             let mut pooled = Pooled::numbered(scheduled);
-            pooled.participant.set_levers(Levers {
-                ask_cold,
-                poll_quiet,
-            });
+            pooled.participant.set_levers(Levers { poll_quiet });
             pooled.participant.set_one_in_flight(one_in_flight);
             let mut admitted = [0u64; 3];
-            let mut waiting: HashMap<Ticket, Vec<usize>> = HashMap::new();
-            let settle = |settled: Settled,
-                          admitted: &mut [u64; 3],
-                          waiting: &mut HashMap<Ticket, Vec<usize>>| {
-                for (ticket, ok) in settled.decided {
-                    let places = waiting.remove(&ticket).unwrap_or_default();
-                    if ok {
-                        for place in places {
-                            admitted[place] += 1;
-                        }
-                    }
-                }
-                for ticket in settled.retries {
-                    waiting.remove(&ticket);
-                }
-            };
             let mut now = 0;
             let mut next_cycle = CYCLE;
             let mut evicting = false;
@@ -421,7 +369,7 @@ proptest! {
                     Event::Pair(first, second) => vec![*first, *second],
                     Event::Cycle => continue,
                     Event::Exchange => {
-                        settle(pooled.exchange(now), &mut admitted, &mut waiting);
+                        pooled.exchange(now);
                         continue;
                     }
                     Event::Send => {
@@ -429,22 +377,16 @@ proptest! {
                         continue;
                     }
                     Event::Deliver(index, twice) => {
-                        settle(pooled.deliver(*index, *twice, now), &mut admitted, &mut waiting);
+                        pooled.deliver(*index, *twice, now);
                         continue;
                     }
                 };
                 let request: Vec<(&[u8], Contract)> =
                     places.iter().map(|place| keys[*place]).collect();
-                match pooled.decide(&request, now) {
-                    Decision::Admit => {
-                        for place in &places {
-                            admitted[*place] += 1;
-                        }
+                if pooled.decide(&request, now) == Decision::Admit {
+                    for place in &places {
+                        admitted[*place] += 1;
                     }
-                    Decision::Wait(ticket) => {
-                        waiting.insert(ticket, places);
-                    }
-                    Decision::Refuse | Decision::Defer => {}
                 }
             }
             for _ in 0..50 {
@@ -452,19 +394,17 @@ proptest! {
                 pooled.participant.on_cycle(now);
                 next_cycle += CYCLE;
                 while !pooled.pending.is_empty() {
-                    settle(pooled.deliver(0, false, now), &mut admitted, &mut waiting);
+                    pooled.deliver(0, false, now);
                 }
-                settle(pooled.exchange(now), &mut admitted, &mut waiting);
+                pooled.exchange(now);
             }
-            prop_assert!(waiting.is_empty(), "never decided: {:?}", waiting);
             for (place, (key, _)) in keys.iter().enumerate() {
                 let counted = pooled.pod.counted(key).unwrap_or(0);
                 prop_assert_eq!(
                     counted,
                     admitted[place],
-                    "scheduled {}, asked {}, key {}",
+                    "scheduled {}, key {}",
                     scheduled,
-                    ask_cold,
                     place
                 );
             }
@@ -477,11 +417,8 @@ struct Comparison {
     keys: [(&'static [u8], Contract); 3],
     pooled: Pooled,
     reference: Reference,
-    /// Requests deferred or handed back, by their keys' places.
+    /// Requests deferred, by their keys' places.
     aside: Vec<Vec<usize>>,
-    /// The keys of requests waiting on both sides, by ticket: the same ticket on both, as
-    /// each numbers its waiting requests in turn.
-    waiting: HashMap<Ticket, Vec<usize>>,
 }
 
 impl Comparison {
@@ -491,7 +428,6 @@ impl Comparison {
             pooled: Pooled::new(),
             reference: Reference::new(),
             aside: Vec::new(),
-            waiting: HashMap::new(),
         }
     }
 
@@ -519,10 +455,6 @@ impl Comparison {
             got,
             want
         );
-        if let (Decision::Wait(ours), crate::service::Decision::Wait(theirs)) = (got, want) {
-            prop_assert_eq!(ours, theirs, "event {}: tickets", at);
-            self.waiting.insert(ours, places.to_vec());
-        }
         Ok(true)
     }
 
@@ -540,9 +472,8 @@ impl Comparison {
             }
             Event::Cycle => {}
             Event::Exchange => {
-                let got = self.pooled.exchange(now);
-                let want = self.reference.exchange(now);
-                self.waited(at, now, got, want)?;
+                self.pooled.exchange(now);
+                self.reference.exchange(now);
             }
             Event::Send => {
                 self.pooled.send(now);
@@ -555,9 +486,8 @@ impl Comparison {
                 );
             }
             Event::Deliver(index, twice) => {
-                let got = self.pooled.deliver(*index, *twice, now);
-                let want = self.reference.deliver(*index, *twice, now);
-                self.waited(at, now, got, want)?;
+                self.pooled.deliver(*index, *twice, now);
+                self.reference.deliver(*index, *twice, now);
             }
         }
         Ok(())
@@ -579,48 +509,6 @@ impl Comparison {
         Ok(())
     }
 
-    /// Requests that waited, decided alike by ticket; those pooled handed back the
-    /// reference refused, and are set aside.
-    fn waited(
-        &mut self,
-        at: usize,
-        now: u64,
-        got: Settled,
-        want: Vec<(Ticket, bool)>,
-    ) -> Result<(), TestCaseError> {
-        let got_decided: HashMap<Ticket, bool> = got.decided.iter().copied().collect();
-        prop_assert_eq!(
-            got.decided.len() + got.retries.len(),
-            want.len(),
-            "event {} at {}: waited decisions {:?} against {:?}",
-            at,
-            now,
-            got,
-            want
-        );
-        for (ticket, admitted) in want {
-            let places = self.waiting.remove(&ticket).unwrap_or_default();
-            if got.retries.contains(&ticket) {
-                prop_assert!(
-                    !admitted,
-                    "event {}: handed back where the reference admits",
-                    at
-                );
-                self.aside.push(places);
-            } else {
-                prop_assert_eq!(
-                    got_decided.get(&ticket),
-                    Some(&admitted),
-                    "event {} at {}: ticket {}",
-                    at,
-                    now,
-                    ticket
-                );
-            }
-        }
-        Ok(())
-    }
-
     /// Every request set aside, decided again on both sides.
     fn again(&mut self, at: usize, now: u64) -> Result<(), TestCaseError> {
         for places in std::mem::take(&mut self.aside) {
@@ -632,7 +520,7 @@ impl Comparison {
     }
 }
 
-/// Which decision, its ticket aside: pooled's and the reference's compared.
+/// Which decision: pooled's and the reference's compared.
 fn discriminant(decision: impl Into<Kind>) -> Kind {
     decision.into()
 }
@@ -641,7 +529,6 @@ fn discriminant(decision: impl Into<Kind>) -> Kind {
 enum Kind {
     Admit,
     Refuse,
-    Wait,
     Defer,
 }
 
@@ -650,7 +537,6 @@ impl From<Decision> for Kind {
         match decision {
             Decision::Admit => Self::Admit,
             Decision::Refuse => Self::Refuse,
-            Decision::Wait(_) => Self::Wait,
             Decision::Defer => Self::Defer,
         }
     }
@@ -661,7 +547,6 @@ impl From<crate::service::Decision> for Kind {
         match decision {
             crate::service::Decision::Admit => Self::Admit,
             crate::service::Decision::Refuse => Self::Refuse,
-            crate::service::Decision::Wait(_) => Self::Wait,
         }
     }
 }
@@ -671,7 +556,7 @@ impl From<crate::service::Decision> for Kind {
 /// key may hold unreported, as nothing drains it here.
 #[test]
 fn threads_racing_for_the_last_tokens_admit_the_bucket_exactly() {
-    let entry = Entry::new(b"k"[..].into(), contract(1, 16_000), CYCLE, false, 0);
+    let entry = Entry::new(b"k"[..].into(), contract(1, 16_000), CYCLE, 0);
     let start = std::sync::Barrier::new(8);
     let admitted: u64 = std::thread::scope(|scope| {
         let threads: Vec<_> = (0..8)
@@ -699,7 +584,7 @@ fn threads_racing_for_the_last_tokens_admit_the_bucket_exactly() {
 fn threads_spend_a_cycles_allowance_once_and_advance_it_once() {
     // A bucket deep enough that only the allowance bounds: the share is what the copy has
     // left plus the refill, among `others + 1`, and `others` is set so that it is 50.
-    let entry = Entry::new(b"k"[..].into(), contract(1_000, 2_000), CYCLE, false, 0);
+    let entry = Entry::new(b"k"[..].into(), contract(1_000, 2_000), CYCLE, 0);
     entry.others.store(39, Ordering::Release);
     for cycle in 1..=3u64 {
         let now = cycle * CYCLE;
@@ -804,13 +689,7 @@ fn set_most_reserved(participant: &mut Participant<FixedState>, key: &[u8], most
         None => {
             // Shared with the registry: made again with the most set, and registered.
             let old = &tracked.entry;
-            let mut fresh = Entry::new(
-                old.key.clone(),
-                old.terms.contract,
-                old.terms.cycle,
-                true,
-                0,
-            );
+            let mut fresh = Entry::new(old.key.clone(), old.terms.contract, old.terms.cycle, 0);
             fresh.most_reserved = most;
             participant.registry.remove(&tracked.entry);
             tracked.entry = Arc::new(fresh);
@@ -823,7 +702,7 @@ fn set_most_reserved(participant: &mut Participant<FixedState>, key: &[u8], most
 /// way, and a request more defers rather than counts past its most; drained, it is taken.
 #[test]
 fn a_full_count_defers_and_holds_still_settle() {
-    let mut entry = Entry::new(b"k"[..].into(), contract(100, 100), CYCLE, false, 0);
+    let mut entry = Entry::new(b"k"[..].into(), contract(100, 100), CYCLE, 0);
     entry.most_reserved = 4;
     for _ in 0..2 {
         assert!(entry.take(Op::Hold, 0).0.done());
@@ -851,7 +730,7 @@ fn a_full_count_defers_and_holds_still_settle() {
 /// say so again.
 #[test]
 fn a_key_asks_for_a_drain_once_at_half_its_count() {
-    let mut entry = Entry::new(b"k"[..].into(), contract(100, 100), CYCLE, false, 0);
+    let mut entry = Entry::new(b"k"[..].into(), contract(100, 100), CYCLE, 0);
     entry.most_reserved = 8;
     let drains: Vec<bool> = (0..6).map(|_| decide(&[&entry], 0).drain).collect();
     assert_eq!(drains, [false, false, false, true, false, false]);
@@ -865,7 +744,7 @@ fn a_key_asks_for_a_drain_once_at_half_its_count() {
 /// not to one that has spent nothing, which would raise it past its allowance.
 #[test]
 fn a_refused_hold_gives_back_to_a_cycle_only_what_it_spent() {
-    let entry = Entry::new(b"k"[..].into(), contract(1_000, 1_000), CYCLE, false, 0);
+    let entry = Entry::new(b"k"[..].into(), contract(1_000, 1_000), CYCLE, 0);
     // Its own cycle: held, refused, all back.
     assert!(entry.take(Op::Hold, CYCLE).0.done());
     let held = entry.snapshot();
@@ -903,7 +782,7 @@ fn a_refused_hold_gives_back_to_a_cycle_only_what_it_spent() {
 /// last token on X, B needs X, A fails on Y and gives X back.
 #[test]
 fn a_request_short_only_by_anothers_hold_waits_for_it() {
-    let x = Entry::new(b"x"[..].into(), contract(100, 1), CYCLE, false, 0);
+    let x = Entry::new(b"x"[..].into(), contract(100, 1), CYCLE, 0);
     assert!(x.take(Op::Hold, 0).0.done(), "A holds X's last token");
     let b = decide(&[&x], 0);
     assert_eq!(b.local, Local::Defer, "B is not refused");
@@ -920,8 +799,8 @@ fn a_request_short_only_by_anothers_hold_waits_for_it() {
 /// given back; one settled, it is admitted.
 #[test]
 fn holds_at_their_most_defer_a_request_rather_than_refuse_it() {
-    let x = Entry::new(b"x"[..].into(), contract(1_000, 1_000), CYCLE, false, 0);
-    let y = Entry::new(b"y"[..].into(), contract(1_000, 1_000), CYCLE, false, 0);
+    let x = Entry::new(b"x"[..].into(), contract(1_000, 1_000), CYCLE, 0);
+    let y = Entry::new(b"y"[..].into(), contract(1_000, 1_000), CYCLE, 0);
     for _ in 0..word::MOST_HELD {
         assert!(x.take(Op::Hold, 0).0.done());
     }
@@ -935,7 +814,7 @@ fn holds_at_their_most_defer_a_request_rather_than_refuse_it() {
 /// Settling or draining wakes only where requests wait: none waiting, nothing to wake.
 #[test]
 fn only_a_key_with_waiters_wants_waking() {
-    let x = Entry::new(b"x"[..].into(), contract(100, 10), CYCLE, false, 0);
+    let x = Entry::new(b"x"[..].into(), contract(100, 10), CYCLE, 0);
     assert!(x.take(Op::Hold, 0).0.done());
     assert!(!x.settle(false, 0).0);
     assert!(x.take(Op::Admit, 0).0.done());
@@ -1232,13 +1111,13 @@ fn given_back_as_it_was(entry: &Entry, before: Fields) {
 /// the first back as it was.
 #[test]
 fn a_two_key_request_is_charged_on_both_or_neither() {
-    let roomy = Entry::new(b"a"[..].into(), contract(100, 10), CYCLE, false, 0);
-    let empty = Entry::new(b"b"[..].into(), contract(100, 1), CYCLE, false, 0);
+    let roomy = Entry::new(b"a"[..].into(), contract(100, 10), CYCLE, 0);
+    let empty = Entry::new(b"b"[..].into(), contract(100, 1), CYCLE, 0);
     assert_eq!(decide(&[&empty], 0).local, Local::Admit);
     let before = roomy.snapshot();
     assert_eq!(decide(&[&roomy, &empty], 0).local, Local::Refuse);
     given_back_as_it_was(&roomy, before);
-    let fresh = Entry::new(b"c"[..].into(), contract(100, 1), CYCLE, false, 0);
+    let fresh = Entry::new(b"c"[..].into(), contract(100, 1), CYCLE, 0);
     assert_eq!(decide(&[&roomy, &fresh], 0).local, Local::Admit);
     let after = roomy.snapshot();
     assert_eq!((after.held, after.unreported), (0, 1));
@@ -1284,7 +1163,7 @@ fn an_evicted_entry_sends_its_holders_to_the_new_one() {
 /// cycle themselves, once, with one cycle's refill: a long pause adds no burst.
 #[test]
 fn a_stalled_transport_leaves_workers_advancing_cycles_with_one_refill() {
-    let entry = Entry::new(b"k"[..].into(), contract(1_000, 20), CYCLE, false, 0);
+    let entry = Entry::new(b"k"[..].into(), contract(1_000, 20), CYCLE, 0);
     entry.others.store(1, Ordering::Release);
     while decide(&[&entry], 0).local == Local::Admit {}
     // Five cycles later: one advance, sharing out what the bucket refilled (capped at the
@@ -1310,47 +1189,6 @@ fn a_stalled_transport_leaves_workers_advancing_cycles_with_one_refill() {
         .bucket
         .remaining(fields.arrival, entry.terms.bucket.units(now));
     assert_eq!(admitted, fields.left.min(remaining));
-}
-
-/// Cold requests under the same keys wait on one ask; under different lists that share a
-/// key, on one ask each; and an owner admitting one of two admits only the first.
-#[test]
-fn cold_requests_are_coalesced_by_their_list_of_keys() {
-    let mut participant = participant();
-    let a: (&[u8], Contract) = (b"a", contract(100, 1));
-    let b: (&[u8], Contract) = (b"b", contract(100, 10));
-    let first = participant.decide_all(&[a], 0);
-    let second = participant.decide_all(&[a], 0);
-    let other = participant.decide_all(&[a, b], 0);
-    assert!(matches!(
-        (first, second, other),
-        (Decision::Wait(_), Decision::Wait(_), Decision::Wait(_))
-    ));
-    let batches = participant.take_outgoing();
-    let asks: Vec<(u64, usize)> = batches
-        .iter()
-        .flat_map(|(_, batch)| batch.asks.iter().map(|ask| (ask.count, ask.keys.len())))
-        .collect();
-    assert_eq!(
-        asks,
-        [(1, 1), (1, 2)],
-        "the second waits behind the first's ask"
-    );
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
-    for (_, batch) in batches {
-        let answers = pod.on_batch(batch, 0);
-        participant.on_answers(answers, 0);
-    }
-    let decided: Vec<bool> = participant
-        .take_decisions()
-        .iter()
-        .map(|decided| decided.admitted)
-        .collect();
-    assert_eq!(
-        decided.iter().filter(|admitted| **admitted).count(),
-        1,
-        "a bucket of one: {decided:?}"
-    );
 }
 
 /// A worker meeting a key the pod already holds finds its entry in the registry, the
@@ -1421,13 +1259,7 @@ fn a_keys_bytes_count_every_workers_handle() {
     assert_eq!(holding(8) - holding(1), 7 * handle);
     assert_eq!(size_of::<Handle>(), size_of::<usize>(), "a pointer, no key");
     let mut set = HashSet::new();
-    let made = Arc::new(Entry::new(
-        b"key"[..].into(),
-        contract(100, 10),
-        CYCLE,
-        false,
-        0,
-    ));
+    let made = Arc::new(Entry::new(b"key"[..].into(), contract(100, 10), CYCLE, 0));
     set.insert(Handle::new(Arc::clone(&made)));
     assert!(Arc::ptr_eq(set.get(&b"key"[..]).unwrap().entry(), &made));
     assert!(!set.contains(&b"kez"[..]));
@@ -1436,21 +1268,15 @@ fn a_keys_bytes_count_every_workers_handle() {
 /// With one exchange in flight to a pod, nothing more goes to it until that one is
 /// answered: what is admitted meanwhile gathers in the ledger and goes as one report, and
 /// the key is not polled while it waits. An exchange never answered is taken as failed once
-/// an ask's time has passed.
+/// its time has passed.
 #[test]
 fn one_exchange_in_flight_gathers_what_comes_meanwhile() {
     let mut participant = participant();
     participant.set_one_in_flight(true);
     let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 100));
-    // Cold: asked, and answered, which leaves the pod free.
-    assert!(matches!(
-        participant.decide_all(&[(key, c)], 0),
-        Decision::Wait(_)
-    ));
-    for (_, batch) in participant.take_outgoing() {
-        participant.on_answers(pod.on_batch(batch, 0), 0);
-    }
+    // A new key, made and decided here.
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     let entry = participant.entries(&[(key, c)]).remove(0);
     // One admitted, sent with a cycle, and not answered.
     assert!(entry.take(Op::Admit, CYCLE).0.done());
@@ -1478,7 +1304,7 @@ fn one_exchange_in_flight_gathers_what_comes_meanwhile() {
         })
         .collect();
     assert_eq!(hits, [3]);
-    // Never answered: after an ask's time, taken as failed, and the next goes.
+    // Never answered: after the exchange's time, taken as failed, and the next goes.
     assert!(entry.take(Op::Admit, 6 * CYCLE).0.done());
     let later = 5 * CYCLE + RESEND_AFTER_CYCLES * CYCLE;
     participant.on_cycle(later);
@@ -1497,14 +1323,11 @@ fn slow() -> Contract {
     }
 }
 
-/// A participant with one exchange in flight, cold keys decided locally.
+/// A participant with one exchange in flight, quiet keys not polled.
 fn one_in_flight() -> Participant<FixedState> {
     let mut participant = participant();
     participant.set_one_in_flight(true);
-    participant.set_levers(Levers {
-        ask_cold: false,
-        poll_quiet: false,
-    });
+    participant.set_levers(Levers { poll_quiet: false });
     participant
 }
 
@@ -1537,85 +1360,12 @@ fn pod(life: u64) -> ServicePod {
     pod
 }
 
-/// An ask's batch carries first what workers admitted of its keys and the participant had
-/// not yet drained or sent: the owner charges those before it decides the ask, as they came
-/// before it.
-#[test]
-fn an_asks_batch_carries_its_keys_unsent_hits_ahead_of_it() {
-    let mut pooled = Pooled::new();
-    let a: (&[u8], Contract) = (b"a", contract(100, 10));
-    assert!(matches!(pooled.decide(&[a], 0), Decision::Wait(_)));
-    pooled.exchange(0);
-    pooled.participant.on_cycle(CYCLE);
-    pooled.exchange(CYCLE);
-    assert_eq!(
-        pooled.decide(&[a], CYCLE + 1),
-        Decision::Admit,
-        "from the warm copy"
-    );
-    // A refill time on, unheard from since, the copy is cold: the next request asks.
-    let cold = CYCLE + 11 * INTERVAL;
-    assert!(matches!(pooled.decide(&[a], cold), Decision::Wait(_)));
-    let (_, batch) = only_exchange(&mut pooled.participant);
-    assert_eq!(batch.asks.len(), 1);
-    let hits: Vec<u64> = batch
-        .entries
-        .iter()
-        .filter_map(|entry| match entry.report {
-            Report::Hits { count, .. } if &*entry.key == b"a" => Some(count),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        hits,
-        [1],
-        "the worker's admission, drained and sent with the ask"
-    );
-}
-
 /// The one exchange `participant` starts: its number and batch.
 fn only_exchange(participant: &mut Participant<FixedState>) -> (u64, Batch) {
     let mut started = participant.take_exchanges();
     assert_eq!(started.len(), 1, "one exchange");
     let (_, exchange, batch) = started.remove(0);
     (exchange, batch)
-}
-
-/// An ask its owner decided, whose exchange then failed, and failed again when sent again,
-/// is given up and its request decided here: the hit it is sent as settles what the owner
-/// held for it, and the request is counted once.
-#[test]
-fn an_ask_given_up_after_its_owner_decided_it_is_counted_once() {
-    let mut participant = participant();
-    participant.set_one_in_flight(true);
-    let mut pod = pod(1);
-    let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
-    let Decision::Wait(ticket) = participant.decide_all(&[(key, c)], 0) else {
-        panic!("a new key is asked about");
-    };
-    participant.on_cycle(CYCLE);
-    let (first, batch) = only_exchange(&mut participant);
-    assert_eq!(batch.asks.len(), 1);
-    let _lost = pod.on_batch(batch, CYCLE);
-    participant.exchanged(0, first);
-    // Out of reach until the ask is given up, its sending again failing too.
-    let mut decided = Vec::new();
-    for cycle in 2..20 {
-        let now = cycle * CYCLE;
-        participant.on_cycle(now);
-        decided.extend(participant.take_decisions());
-        for (to, exchange, batch) in participant.take_exchanges() {
-            if decided.is_empty() {
-                participant.exchanged(to, exchange);
-            } else {
-                let answers = pod.on_batch(batch, now);
-                participant.on_answers_to(exchange, answers, now);
-            }
-        }
-    }
-    let decided: Vec<(Ticket, bool)> = decided.iter().map(|d| (d.ticket, d.admitted)).collect();
-    assert_eq!(decided, [(ticket, true)], "given up, decided here");
-    assert_eq!(pod.counted(key), Some(1));
 }
 
 /// An exchange given up and its pod's answer to it arriving after the next one's: the
@@ -1631,7 +1381,7 @@ fn a_late_answer_does_not_put_back_an_older_bucket() {
     participant.on_cycle(CYCLE);
     let (first, batch) = only_exchange(&mut participant);
     let older = pod.on_batch(batch, CYCLE);
-    // Unanswered for an ask's time: given up, its report sent again in the next.
+    // Unanswered for the exchange's time: given up, its report sent again in the next.
     participant.on_cycle(5 * CYCLE);
     let (next, batch) = only_exchange(&mut participant);
     assert!(next > first);
@@ -1881,10 +1631,7 @@ fn an_earlier_lifes_answer_to_a_later_exchange_is_not_taken() {
 #[test]
 fn an_earlier_lifes_late_answer_acknowledges_nothing() {
     let mut participant = one_in_flight();
-    participant.set_levers(Levers {
-        ask_cold: false,
-        poll_quiet: true,
-    });
+    participant.set_levers(Levers { poll_quiet: true });
     let mut before = pod(1);
     let mut after = pod(2);
     let (key, c): (&[u8], Contract) = (b"k", slow());
@@ -1924,15 +1671,11 @@ fn later_holds_across_the_wrap() {
     assert!(!later(5, 5));
 }
 
-/// With cold keys not asked about, a new key's request is decided at once from a full
-/// bucket and nothing is asked; its admissions are reported with the cycle, as any key's.
+/// A new key's request is decided at once from a full bucket and nothing is asked; its
+/// admissions are reported with the cycle, as any key's.
 #[test]
 fn a_cold_key_decided_locally_asks_nothing() {
     let mut participant = participant();
-    participant.set_levers(Levers {
-        ask_cold: false,
-        ..Levers::default()
-    });
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 3));
     for _ in 0..3 {
         assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
@@ -1957,15 +1700,11 @@ fn a_cold_key_decided_locally_asks_nothing() {
     assert_eq!(reported, 3);
 }
 
-/// Cold keys decided locally, a worker makes a key's entry itself, once however many meet
-/// it; the participant adopts it, reports what it admitted, and keeps it as the key's.
+/// A worker makes a key's entry itself, once however many meet it; the participant adopts
+/// it, reports what it admitted, and keeps it as the key's.
 #[test]
 fn a_worker_makes_a_local_key_and_the_participant_adopts_it() {
     let mut participant = participant();
-    participant.set_levers(Levers {
-        ask_cold: false,
-        ..Levers::default()
-    });
     let registry = participant.registry();
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
     let (made, fresh) = registry.find_or_make(key, c, CYCLE, 0).unwrap();
@@ -2005,19 +1744,10 @@ fn a_worker_makes_a_local_key_and_the_participant_adopts_it() {
 fn quiet_keys_are_polled_only_when_asked_to_be() {
     for poll_quiet in [true, false] {
         let mut participant = participant();
-        participant.set_levers(Levers {
-            poll_quiet,
-            ..Levers::default()
-        });
+        participant.set_levers(Levers { poll_quiet });
         let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
         let (key, c): (&[u8], Contract) = (b"k", contract(100, 100));
-        assert!(matches!(
-            participant.decide_all(&[(key, c)], 0),
-            Decision::Wait(_)
-        ));
-        for (_, batch) in participant.take_outgoing() {
-            participant.on_answers(pod.on_batch(batch, 0), 0);
-        }
+        assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
         // Its admission reported and answered; then a cycle with nothing to report.
         participant.on_cycle(CYCLE);
         for (_, batch) in participant.take_outgoing() {
@@ -2166,13 +1896,13 @@ fn keys_chosen_to_share_a_shard_spread_under_another_processs_hash() {
     assert!(shards.len() > 180, "{} shards", shards.len());
 }
 
-/// A key's slot in the participant's table takes 88 bytes, the table holding up to twice
+/// A key's slot in the participant's table takes 80 bytes, the table holding up to twice
 /// the room its keys take: the batches it has not seen acknowledged, which between cycles
 /// it almost never has, kept apart behind a pointer, and when its copy was last heard of
 /// in eight bytes.
 #[test]
 fn a_keys_slot_is_small() {
-    assert_eq!(size_of::<(Handle, Tracked)>(), 88);
+    assert_eq!(size_of::<(Handle, Tracked)>(), 80);
 }
 
 /// When a key's copy was last heard of, kept in eight bytes, reads back as it was set:
@@ -2333,13 +2063,13 @@ fn replay(schedule: &[(Event, u64)]) {
         let rooms: Vec<String> = keys
             .iter()
             .map(|(key, contract)| {
-                // What the reference's copy would admit: none while cold, otherwise what is
-                // left of its bucket and of its share of the cycle.
+                // What the reference's copy would admit: what is left of its bucket and of
+                // its share of the cycle.
                 let want = reference
                     .plane
                     .keys
                     .get(*key)
-                    .filter(|at| at.contract == *contract && !at.cold(now))
+                    .filter(|at| at.contract == *contract)
                     .map(|at| {
                         let left = at.bucket.remaining(now);
                         at.allowance.map_or(left, |allowance| {
@@ -2354,15 +2084,7 @@ fn replay(schedule: &[(Event, u64)]) {
                         .terms
                         .bucket
                         .remaining(fields.arrival, entry.terms.bucket.units(now));
-                    (
-                        fields.left,
-                        left,
-                        fields.held,
-                        entry.cold(now),
-                        tracked.asking,
-                        tracked.bounded,
-                        tracked.heard.get(),
-                    )
+                    (fields.left, left, fields.held, tracked.heard.get())
                 });
                 format!("{want:?}/{got:?}")
             })
@@ -2436,8 +2158,7 @@ fn replay_a_failure() {
     ]);
 }
 
-/// A scheduled participant deciding cold keys locally, nothing polled: what each test of
-/// scheduling starts from, with `keys` keys made at 0 and their first cycle's visit done.
+/// A scheduled participant, nothing polled: what each test of scheduling starts from, with `keys` keys made at 0 and their first cycle's visit done.
 fn scheduled(keys: u64) -> (Participant<FixedState>, Vec<Arc<Entry>>) {
     scheduled_under(keys, contract(100, 10))
 }
@@ -2446,10 +2167,7 @@ fn scheduled(keys: u64) -> (Participant<FixedState>, Vec<Arc<Entry>>) {
 fn scheduled_under(keys: u64, c: Contract) -> (Participant<FixedState>, Vec<Arc<Entry>>) {
     let mut participant = participant();
     participant.set_scheduled(true);
-    participant.set_levers(Levers {
-        poll_quiet: false,
-        ask_cold: false,
-    });
+    participant.set_levers(Levers { poll_quiet: false });
     let names: Vec<Vec<u8>> = (0..keys).map(|n| format!("k{n}").into_bytes()).collect();
     for name in &names {
         participant.ensure(name, c, 0);
@@ -2541,13 +2259,7 @@ fn a_signal_on_its_way_carries_the_others_until_the_transport_takes_it() {
     assert!(key.claim_signal(), "taken, claimed afresh");
     participant.on_signals([Arc::clone(key)]);
     assert!(key.claim_signal(), "taken with the key queued already");
-    let stale = Arc::new(Entry::new(
-        b"gone"[..].into(),
-        contract(100, 10),
-        CYCLE,
-        false,
-        0,
-    ));
+    let stale = Arc::new(Entry::new(b"gone"[..].into(), contract(100, 10), CYCLE, 0));
     assert!(stale.claim_signal());
     participant.on_signals([Arc::clone(&stale)]);
     assert!(stale.claim_signal(), "taken, though no longer kept");
@@ -2654,60 +2366,6 @@ fn hourly() -> Contract {
         window: n(3_600_000 * MS),
         burst: n(10),
     }
-}
-
-/// A key with refused requests of an ask given up still to report is neither evicted for
-/// room nor idle, as a data plane's is not.
-#[test]
-fn a_key_with_refusals_to_report_is_kept() {
-    let mut participant = one_in_flight();
-    participant.ensure(b"k", contract(100, 10), 0);
-    // Its owner gone, nothing is sent.
-    participant.on_view(
-        View {
-            epoch: 2,
-            pods: Vec::new(),
-        },
-        0,
-    );
-    participant.keys.get_mut(&b"k"[..]).unwrap().unsent_refused = 1;
-    participant.set_capacity(1);
-    participant.on_cycle(CYCLE);
-    assert_eq!(participant.key_count(), 1, "not evicted");
-    participant.set_capacity(u64::MAX);
-    participant.on_cycle(1_000 * MS);
-    assert_eq!(participant.key_count(), 1, "not idle");
-}
-
-/// An ask says how long its participant waits for the answer, and its batch the oldest of
-/// its asks still in flight, as a data plane's do.
-#[test]
-fn a_batch_says_which_asks_are_over_and_an_ask_how_long_it_waits() {
-    let mut participant = participant();
-    participant.set_ask_timeout(300 * MS);
-    let c = contract(100, 10);
-    assert!(matches!(
-        participant.decide_all(&[(b"k", c)], 0),
-        Decision::Wait(_)
-    ));
-    assert!(matches!(
-        participant.decide_all(&[(b"j", c)], 0),
-        Decision::Wait(_)
-    ));
-    participant.on_cycle(CYCLE);
-    let batches: Vec<Batch> = participant
-        .take_exchanges()
-        .into_iter()
-        .map(|(_, _, batch)| batch)
-        .collect();
-    let mut asks: Vec<(u64, u64)> = batches
-        .iter()
-        .flat_map(|batch| &batch.asks)
-        .map(|ask| (ask.id, ask.timeout))
-        .collect();
-    asks.sort_unstable();
-    assert_eq!(asks, [(1, 300 * MS), (2, 300 * MS)]);
-    assert!(batches.iter().all(|batch| batch.oldest_ask == 1));
 }
 
 /// Scheduled, a key evicted for capacity frees its entry then, not when its eviction time
@@ -2902,10 +2560,7 @@ fn a_backlog_goes_a_piece_an_exchange_and_none_starves(scheduled: bool) {
     let c = contract(100, 1_000);
     let mut participant = one_in_flight();
     participant.set_scheduled(scheduled);
-    participant.set_levers(Levers {
-        poll_quiet: false,
-        ask_cold: false,
-    });
+    participant.set_levers(Levers { poll_quiet: false });
     let mut pod = pod(1);
     // 300 bytes a key: some 2,400 to a piece, two and a half pieces for every key.
     let names: Vec<Vec<u8>> = (0..KEYS)

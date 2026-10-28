@@ -38,11 +38,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-/// How long the process waits for an owner's answer to an ask before deciding what waits
-/// from its entries: long enough for TCP to send a lost segment again (some 200 ms on
+/// How long the process waits for a pod's answer to an exchange before taking it as failed
+/// and sending the next: long enough for TCP to send a lost segment again (some 200 ms on
 /// Linux), as the comparison harness found that the protocol's own four cycles, 40 ms, were
 /// not.
-const ASK_TIMEOUT: u64 = 300_000_000;
+const EXCHANGE_TIMEOUT: u64 = 300_000_000;
 
 /// Why a request was refused, as the worker's entries have it.
 pub(crate) struct Refusal<'a> {

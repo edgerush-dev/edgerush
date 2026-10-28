@@ -79,10 +79,7 @@ fn admitted() -> (Plane, ServicePod, u64) {
     let mut plane: Plane = Box::new(
         Participant::new(1, CYCLE, view, hasher).expect("native 128-bit atomics on Linux"),
     );
-    plane.set_levers(Levers {
-        poll_quiet: false,
-        ask_cold: false,
-    });
+    plane.set_levers(Levers { poll_quiet: false });
     plane.set_scheduled(true);
     admit(&mut plane, 0..HELD, 0);
     let mut now = CYCLE;

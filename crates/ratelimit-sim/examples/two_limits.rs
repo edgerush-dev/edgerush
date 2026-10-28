@@ -252,18 +252,11 @@ fn main() {
         for (name, shape, conforming) in workloads {
             let under = |order| Approach::NodesUnder {
                 cycle: CYCLE,
-                ask_timeout: 0,
                 beside,
                 order,
             };
             for (rows, approach) in [
-                (
-                    "alone",
-                    Approach::Nodes {
-                        cycle: CYCLE,
-                        ask_timeout: 0,
-                    },
-                ),
+                ("alone", Approach::Nodes { cycle: CYCLE }),
                 ("both, smallest first", under(Order::SmallestFirst)),
                 ("both, data plane's first", under(Order::SharedFirst)),
             ] {
