@@ -38,11 +38,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-/// How long the process waits for an owner's answer to an ask before deciding what waits
-/// from its entries: long enough for TCP to send a lost segment again (some 200 ms on
+/// How long the process waits for a pod's answer to an exchange before taking it as failed
+/// and sending the next: long enough for TCP to send a lost segment again (some 200 ms on
 /// Linux), as the comparison harness found that the protocol's own four cycles, 40 ms, were
 /// not.
-const ASK_TIMEOUT: u64 = 300_000_000;
+const EXCHANGE_TIMEOUT: u64 = 300_000_000;
 
 /// Why a request was refused, as the worker's entries have it.
 pub(crate) struct Refusal<'a> {
@@ -177,8 +177,7 @@ fn key_into(buffer: &mut Vec<u8>, name: &str, definition: [u8; 8], key: KeyValue
 }
 
 /// How long a request may wait on its rate limits in all, from when its worker's limiter
-/// first meets it, wherever it waits — deferred, queued for the process, asked about, handed
-/// back: an ask's own time, which a hold it waits on may take to settle, and a little more.
+/// first meets it, wherever it waits — deferred, queued for the process, handed back.
 /// Fixed, until measuring shows that setting it would be worth what it costs.
 pub(crate) const WAIT: Duration = Duration::from_millis(400);
 
@@ -670,7 +669,6 @@ impl Limiter {
                             let decided = match undecided {
                                 Some(why) => Err(why),
                                 None => Ok(Decided {
-                                    ticket: id,
                                     admitted,
                                     refused_by,
                                 }),
@@ -696,12 +694,12 @@ impl Limiter {
 
 /// A worker's own decision of a request under `parts` at `now`, from its handles to the
 /// entries of its keys: those it holds none of under their contracts looked for in its
-/// process's `registry` first — or, with cold keys decided locally, made there while there
-/// is room for it — and asked about if not there.
+/// process's `registry` first — or made there while there is room for it — and asked about
+/// if not there.
 fn decide(
     handles: &RefCell<Handles>,
     registry: &Registry<Keyed>,
-    making: Option<(&Hub, u64, &Arc<Room>)>,
+    (hub, cycle, room): (&Hub, u64, &Arc<Room>),
     parts: &[(&[u8], Contract)],
     now: u64,
 ) -> Pooled {
@@ -722,22 +720,22 @@ fn decide(
             if held(&handles, key, *contract) {
                 continue;
             }
-            // Cold keys decided locally, a key the process has not met is made here, at
-            // once, and handed to the process to keep, holding room until it is taken in;
-            // with no room, only one there already is found, and the request is asked
-            // about otherwise.
-            let found =
-                match making.and_then(|(hub, cycle, room)| Some((hub, cycle, room.take(key)?))) {
-                    None => registry.find(key, *contract),
-                    Some((hub, cycle, room)) => registry
+            // A key the process has not met is made here, at once, and handed to the
+            // process to keep, holding room until it is taken in; with no room, only one
+            // there already is found, and the request is asked about otherwise.
+            let found = match room.take(key) {
+                None => registry.find(key, *contract),
+                Some(room) => {
+                    registry
                         .find_or_make(key, *contract, cycle, now)
                         .map(|(entry, made)| {
                             if made {
                                 let _gone = hub.to.send(ToHub::Adopt(Arc::clone(&entry), room));
                             }
                             entry
-                        }),
-                };
+                        })
+                }
+            };
             let Some(entry) = found else {
                 return ask;
             };
@@ -768,11 +766,11 @@ fn decide(
 }
 
 impl Limiter {
-    /// With cold keys decided locally, where a worker makes a key's entry: its process, the
-    /// cycle, in nanoseconds, and its room for keys made.
-    fn making(&self) -> Option<(&Hub, u64, &Arc<Room>)> {
+    /// Where a worker makes a key's entry: its process, the cycle, in nanoseconds, and its
+    /// room for keys made.
+    fn making(&self) -> (&Hub, u64, &Arc<Room>) {
         let cycle = u64::try_from(self.service.cycle.as_nanos()).unwrap_or(u64::MAX);
-        (!self.service.ask_cold_keys).then_some((&*self.hub, cycle, &self.room))
+        (&*self.hub, cycle, &self.room)
     }
 
     /// What a decision asks of others: a key's count drained, waiters woken, and with keys
@@ -892,7 +890,6 @@ impl Limiter {
             .collect();
         let decision = |admitted| {
             Ok(Decided {
-                ticket: 0,
                 admitted,
                 refused_by: Box::default(),
             })

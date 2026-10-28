@@ -181,7 +181,6 @@ fn warm(keys: &[Vec<u8>]) -> DataPlane<Keyed> {
         let answers = pod.on_batch(batch, 0);
         plane.on_answers(answers, 0);
     }
-    plane.take_decided();
     plane.on_cycle(MS);
     plane.take_outgoing();
     plane

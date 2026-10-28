@@ -98,8 +98,6 @@ pub enum Approach {
     Nodes {
         /// The time between a data plane's batches.
         cycle: u64,
-        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
-        ask_timeout: u64,
     },
     /// [`Nodes`](Self::Nodes) pooled, as the proxy runs it (06 §4): each data plane of the
     /// protocol is one process's participant, its `workers` deciding warm requests
@@ -108,8 +106,9 @@ pub enum Approach {
     Pooled {
         /// The time between a process's batches to the service.
         cycle: u64,
-        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
-        ask_timeout: u64,
+        /// How long a process's exchange may go unanswered before it is taken as failed;
+        /// 0 for four cycles.
+        exchange_timeout: u64,
         /// The workers of a process.
         workers: usize,
     },
@@ -118,8 +117,9 @@ pub enum Approach {
     PooledWith {
         /// The time between a process's batches to the service.
         cycle: u64,
-        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
-        ask_timeout: u64,
+        /// How long a process's exchange may go unanswered before it is taken as failed;
+        /// 0 for four cycles.
+        exchange_timeout: u64,
         /// The workers of a process.
         workers: usize,
         /// The levers.
@@ -133,14 +133,13 @@ pub enum Approach {
     PooledUnder {
         /// The time between a process's batches to the service.
         cycle: u64,
-        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
-        ask_timeout: u64,
+        /// How long a process's exchange may go unanswered before it is taken as failed;
+        /// 0 for four cycles.
+        exchange_timeout: u64,
         /// The workers of a process.
         workers: usize,
         /// The limits beside the run's.
         beside: Beside,
-        /// The order a request's limits are decided in.
-        order: Order,
         /// The levers.
         levers: edgerush_ratelimit::service::pooled::Levers,
         /// Whether each participant visits only the keys that need it each cycle.
@@ -151,30 +150,13 @@ pub enum Approach {
     NodesUnder {
         /// The time between a data plane's batches.
         cycle: u64,
-        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
-        ask_timeout: u64,
         /// The limits beside the run's.
         beside: Beside,
-        /// Which of a request's limits goes first.
-        order: Order,
     },
 }
 
-/// Which of a request's limits goes first: a cold request's ask goes to its key's owner,
-/// which decides that key exactly and the others from its copies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Order {
-    /// The smallest bucket first, ties to the most specific (06 §4): the limit most likely
-    /// at its edge decided exactly.
-    SmallestFirst,
-    /// The limit over the whole data plane first: shared by every route, it brings all of
-    /// a client's cold asks to one pod.
-    SharedFirst,
-}
-
 /// Limits a request is under beside the run's contract, each counted by a key owned by
-/// another service pod than the run's key, so that one pod cannot decide them all exactly;
-/// in the order an [`Order`] says.
+/// another service pod than the run's key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Beside {
     /// Every request under one more limit, over the whole data plane.
@@ -347,37 +329,34 @@ impl Approach {
             Self::Ownership(sharing) => Box::new(Ownership::new(contract, pods, *sharing)),
             Self::Counters(counting) => Box::new(Counters::new(contract, pods, *counting)),
             Self::Service(serving) => Box::new(Service::new(contract, pods, *serving)),
-            Self::Nodes { cycle, ask_timeout } => {
-                Box::new(Nodes::new(contract, pods, *cycle, *ask_timeout, None))
-            }
+            Self::Nodes { cycle } => Box::new(Nodes::new(contract, pods, *cycle, 0, None)),
             Self::Pooled {
                 cycle,
-                ask_timeout,
+                exchange_timeout,
                 workers,
             } => {
                 let workers = (*workers).max(1);
                 let processes = pods.div_ceil(workers);
-                let nodes = Nodes::new(contract, processes, *cycle, *ask_timeout, None);
+                let nodes = Nodes::new(contract, processes, *cycle, *exchange_timeout, None);
                 Box::new(nodes.pooled(workers))
             }
             Self::PooledWith {
                 cycle,
-                ask_timeout,
+                exchange_timeout,
                 workers,
                 levers,
                 scheduled,
             } => {
                 let workers = (*workers).max(1);
                 let processes = pods.div_ceil(workers);
-                let nodes = Nodes::new(contract, processes, *cycle, *ask_timeout, None);
+                let nodes = Nodes::new(contract, processes, *cycle, *exchange_timeout, None);
                 Box::new(nodes.pooled_with(workers, *levers, *scheduled))
             }
             Self::PooledUnder {
                 cycle,
-                ask_timeout,
+                exchange_timeout,
                 workers,
                 beside,
-                order,
                 levers,
                 scheduled,
             } => {
@@ -387,23 +366,14 @@ impl Approach {
                     contract,
                     processes,
                     *cycle,
-                    *ask_timeout,
-                    Some((*beside, *order)),
+                    *exchange_timeout,
+                    Some(*beside),
                 );
                 Box::new(nodes.pooled_with(workers, *levers, *scheduled))
             }
-            Self::NodesUnder {
-                cycle,
-                ask_timeout,
-                beside,
-                order,
-            } => Box::new(Nodes::new(
-                contract,
-                pods,
-                *cycle,
-                *ask_timeout,
-                Some((*beside, *order)),
-            )),
+            Self::NodesUnder { cycle, beside } => {
+                Box::new(Nodes::new(contract, pods, *cycle, 0, Some(*beside)))
+            }
         }
     }
 }

@@ -125,36 +125,26 @@ async fn counted(pod: &Pod, key: &[u8], expected: u64) -> Option<u64> {
     }
 }
 
-/// Two data planes holding no copy each get six requests at once: they ask, the owner
-/// decides against its one bucket of ten, and copies every change to every other pod.
+/// Two data planes holding no copy each get six requests at once: each decides them from a
+/// full bucket of ten and admits all six, asking no one — a cold burst's overshoot, accepted
+/// — and the owner counts all twelve and copies every change to every other pod.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cold_burst_on_two_data_planes_is_held_to_one_bucket() {
+async fn a_cold_burst_on_two_data_planes_is_counted_whole() {
     let service = start().await;
     let start = Instant::now();
     let cycle = u64::try_from(CYCLE.as_nanos()).unwrap();
     let mut planes: Vec<DataPlane> = (0..2).map(|id| DataPlane::new(id, cycle, view())).collect();
     for plane in &mut planes {
         for _ in 0..6 {
-            assert!(matches!(
-                plane.decide(b"k", contract(), now(start)),
-                Decision::Wait(_)
-            ));
+            assert_eq!(plane.decide(b"k", contract(), now(start)), Decision::Admit);
         }
+        plane.on_cycle(now(start));
     }
     for plane in &mut planes {
         exchange(plane, &service, start).await;
     }
-    for plane in &mut planes {
-        exchange(plane, &service, start).await;
-    }
-    let decided: Vec<(u64, bool)> = planes
-        .iter_mut()
-        .flat_map(DataPlane::take_decided)
-        .collect();
-    assert_eq!(decided.len(), 12);
-    assert_eq!(decided.iter().filter(|(_, admitted)| *admitted).count(), 10);
     for pod in &service.pods {
-        assert_eq!(counted(pod, b"k", 10).await, Some(10), "owned or copied");
+        assert_eq!(counted(pod, b"k", 12).await, Some(12), "owned or copied");
     }
 }
 
@@ -167,9 +157,6 @@ async fn hits_admitted_locally_reach_the_owner_each_cycle() {
     let cycle = u64::try_from(CYCLE.as_nanos()).unwrap();
     let mut plane: DataPlane = DataPlane::new(7, cycle, view());
     plane.decide(b"k", contract(), now(start));
-    exchange(&mut plane, &service, start).await;
-    plane.take_decided();
-    // A cycle after the owner's answer bounds the copy: from then on, decided here.
     plane.on_cycle(now(start));
     exchange(&mut plane, &service, start).await;
     let admitted = (0..5)
@@ -197,6 +184,7 @@ async fn keys_are_counted_by_their_owners_only() {
     for key in &keys {
         plane.decide(key, contract(), now(start));
     }
+    plane.on_cycle(now(start));
     let sent = plane.take_outgoing();
     for (pod, batch) in &sent {
         for entry in &batch.entries {
@@ -237,9 +225,6 @@ async fn the_secondary_takes_over_when_the_owner_stops() {
     let cycle = u64::try_from(CYCLE.as_nanos()).unwrap();
     let mut plane: DataPlane = DataPlane::new(11, cycle, view());
     plane.decide(b"k", contract(), now(start));
-    exchange(&mut plane, &service, start).await;
-    plane.take_decided();
-    // A cycle after the owner's answer bounds the copy: from then on, decided here.
     plane.on_cycle(now(start));
     exchange(&mut plane, &service, start).await;
     for _ in 0..3 {
@@ -294,8 +279,6 @@ async fn a_restarted_owner_is_handed_its_keys_back_when_it_rejoins() {
     let cycle = u64::try_from(CYCLE.as_nanos()).unwrap();
     let mut plane: DataPlane = DataPlane::new(13, cycle, view());
     plane.decide(b"k", contract(), now(start));
-    exchange(&mut plane, &service, start).await;
-    plane.take_decided();
     plane.on_cycle(now(start));
     exchange(&mut plane, &service, start).await;
     for _ in 0..3 {
@@ -321,7 +304,6 @@ async fn a_restarted_owner_is_handed_its_keys_back_when_it_rejoins() {
         if plane.decide(b"k", contract(), now(start)) == Decision::Admit {
             admitted += 1;
         }
-        admitted += plane.take_decided().iter().filter(|(_, a)| *a).count() as u64;
         plane.on_cycle(now(start));
         send(&mut plane, &service, start).await;
         let serving = service.pods[owner]
@@ -364,6 +346,7 @@ async fn a_pod_shows_what_its_keys_hold_and_keeps_them_within_their_bound() {
     }
     let mut plane: DataPlane = DataPlane::new(7, cycle, view());
     plane.decide(b"k", contract(), now(start));
+    plane.on_cycle(now(start));
     exchange(&mut plane, &service, start).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -405,6 +388,7 @@ async fn a_pod_shows_what_its_keys_hold_and_keeps_them_within_their_bound() {
     }
     tokio::time::sleep(Duration::from_millis(80)).await;
     plane.decide(b"k2", contract(), now(start));
+    plane.on_cycle(now(start));
     exchange(&mut plane, &service, start).await;
     let deadline = Instant::now() + Duration::from_secs(5);
     let scrape = loop {
@@ -530,6 +514,7 @@ async fn a_copy_too_long_to_send_is_counted() {
     for plane in 0..12 {
         let mut plane: DataPlane = DataPlane::new(100 + plane, cycle, view());
         plane.decide(&key, contract(), now(start));
+        plane.on_cycle(now(start));
         exchange(&mut plane, &service, start).await;
     }
     let deadline = Instant::now() + Duration::from_secs(5);

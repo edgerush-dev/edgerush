@@ -144,7 +144,6 @@ fn limited(mut config: Config, service: &[String]) -> Config {
             addresses: service.to_vec(),
             cycle_ms: Some(10),
             poll_quiet_keys: None,
-            ask_cold_keys: None,
             schedule_keys: None,
         }),
     });
@@ -322,216 +321,53 @@ async fn statuses_from(version: Version, trusted: &[&str], forwarded_for: &[&str
 /// Two workers of one data plane share a client's bucket through each key's one entry: a
 /// client with a connection to each is held to the one bucket, refusals say when to come
 /// back, and the process's keys are counted once — with the levers left out, and with the
-/// protocol's (quiet keys polled, cold keys asked about, every key visited).
+/// protocol's (quiet keys polled, every key visited).
 #[tokio::test]
 async fn workers_share_a_clients_bucket() {
     two_workers_share_a_clients_bucket(|_| {}).await;
     two_workers_share_a_clients_bucket(|service| {
         service.poll_quiet_keys = Some(true);
-        service.ask_cold_keys = Some(true);
         service.schedule_keys = Some(false);
     })
     .await;
 }
 
-/// Asks that reach the process together go to the service together: a burst of workers'
-/// asks about cold keys is sent in a few exchanges, not one for each ask, which under many
-/// cold keys would hold an exchange in flight for every one.
-#[tokio::test]
-async fn asks_that_come_together_are_sent_together() {
-    use crate::ratelimit::{FromHub, Hub, ToHub};
-    use edgerush_ratelimit::service::Contract;
-    use std::num::NonZeroU64;
-
-    let exchanges = Arc::new(AtomicUsize::new(0));
-    let service = counted_service(&exchanges).await;
-    let contract = Contract {
-        limit: NonZeroU64::new(10).unwrap(),
-        window: NonZeroU64::new(3_600_000_000_000).unwrap(),
-        burst: NonZeroU64::new(10).unwrap(),
-    };
-    let compiled = edgerush_config::CompiledRateLimitService {
-        pods: service,
-        // A cycle longer than the test, so that every exchange is an ask's.
-        cycle: Duration::from_secs(60),
-        max_key_bytes: 1 << 20,
-        poll_quiet_keys: true,
-        ask_cold_keys: true,
-        schedule_keys: false,
-    };
-    let hub = Hub::start(&compiled, 1, 1 << 20, None).unwrap();
-    let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
-    hub.to.send(ToHub::Join { worker: 0, answers }).unwrap();
-    let before = exchanges.load(Ordering::Relaxed);
-    const ASKS: u64 = 500;
-    // Each decision waited for, as a request there still waits for its own.
-    let mut waiting = Vec::new();
-    for id in 0..ASKS {
-        let key: Box<[u8]> = format!("cold-{id}").into_bytes().into();
-        let (decided, waits) = tokio::sync::oneshot::channel();
-        waiting.push(waits);
-        hub.to
-            .send(ToHub::Ask {
-                worker: 0,
-                id,
-                keys: vec![(key, contract)],
-                until: u64::MAX,
-                decided,
-            })
-            .unwrap();
-    }
-    for _ in 0..ASKS {
-        assert!(matches!(
-            within(answered.recv()).await.unwrap(),
-            FromHub { admitted: true, .. }
-        ));
-    }
-    let sent = exchanges.load(Ordering::Relaxed) - before;
-    assert!(sent < 50, "{sent} exchanges for {ASKS} asks");
-    // The process thread counts what it took and answered.
-    let stats = hub.render_stats();
-    assert!(
-        stats.contains(
-            "edgerush_rate_limit_hub_asks_total 500
-"
-        ),
-        "{stats}"
-    );
-    assert!(
-        stats.contains(
-            "edgerush_rate_limit_hub_asks_answered_total 500
-"
-        ),
-        "{stats}"
-    );
-}
-
-/// Pooled, a request short only by another request's hold on its key is deferred rather
-/// than refused, and decided once the hold settles; with no place left to wait in, it is
-/// answered full at once. No service pod answers: asks are given up after their time
-/// and keys decided from their copies.
-#[tokio::test]
-async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
-    use crate::ratelimit::{Hub, Limited, Limiter, MOST_WAITING, Undecided};
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let mut config = limited(
-                everything_config("127.0.0.1:9".parse().unwrap()),
-                &["127.0.0.1:9".to_owned()],
-            );
-            config.routes[0].rules[0].rate_limits = vec!["x".to_owned(), "y".to_owned()];
-            config.limits = Some(
-                serde_saphyr::from_str(
-                    "limits:
-  - { name: x, key: client, model: { bucket: { rate: 1/h, burst: 2 } } }
-  - { name: y, key: client, model: { bucket: { rate: 100/h, burst: 100 } } }
-",
-                )
-                .unwrap(),
-            );
-            if let Some(service) = service_of(&mut config) {
-                // Cold keys asked about: a hold waits on an ask.
-                service.ask_cold_keys = Some(true);
-            }
-            let compiled = compile(&config).unwrap();
-            let service = compiled.rate_limit_service().unwrap().clone();
-            let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
-            let limiter = Limiter::new(&service, hub, 0);
-            let rule = Arc::clone(&compiled.rules_of(0)[0]);
-            let client = requester("203.0.113.7");
-            let decided = |limited: Limited| async move {
-                match limited {
-                    Limited::Admit => Some(true),
-                    Limited::Refuse(_) => Some(false),
-                    Limited::Later(later) => later.decided().await.ok().map(|d| d.admitted),
-                    Limited::Undecided(_) => None,
-                }
-            };
-            // X alone, asked about and given up: decided from its copy, one of its two taken.
-            let first = limiter.decide_all(&rule.limits, 0b01, client);
-            assert_eq!(within(decided(first)).await, Some(true));
-            // X and Y: X's last token held while Y, cold, is asked about.
-            let both = limiter.decide_all(&rule.limits, 0b11, client);
-            assert!(matches!(both, Limited::Later(_)));
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            // X alone again, short only by that hold: with one place, which the waiting ask
-            // holds, none to be deferred in: full.
-            limiter.set_most_waiting(1);
-            assert!(matches!(
-                limiter.decide_all(&rule.limits, 0b01, client),
-                Limited::Undecided(Undecided::Full)
-            ));
-            limiter.set_most_waiting(MOST_WAITING);
-            // Deferred, and decided once the hold settles: X and Y admitted, X is spent.
-            let Limited::Later(alone) = limiter.decide_all(&rule.limits, 0b01, client) else {
-                panic!("not deferred");
-            };
-            assert_eq!(within(decided(both)).await, Some(true));
-            let alone = within(alone.decided()).await;
-            assert_eq!(
-                alone.map(|d| d.admitted),
-                Ok(false),
-                "decided, not undecided"
-            );
-            limiter.stop();
-        })
-        .await;
-}
-
-/// Pooled with cold keys not asked about: a new key is decided at once, by the worker,
-/// from an entry it makes with a full bucket, no service pod being there to answer; with
-/// them asked about, the first waits on the ask.
+/// Pooled, a new key is decided at once, by the worker, from an entry it makes with a full
+/// bucket, no service pod being there to answer: no request waits on the service.
 #[tokio::test]
 async fn a_cold_key_decided_locally_does_not_wait_for_the_service() {
     use crate::ratelimit::{Hub, Limited, Limiter};
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            for ask_cold in [false, true] {
-                let mut config = limited(
-                    everything_config("127.0.0.1:9".parse().unwrap()),
-                    &["127.0.0.1:9".to_owned()],
-                );
-                if let Some(service) = service_of(&mut config) {
-                    service.ask_cold_keys = Some(ask_cold);
-                }
-                let compiled = compile(&config).unwrap();
-                let service = compiled.rate_limit_service().unwrap().clone();
-                let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
-                let limiter = Limiter::new(&service, hub, 0);
-                let rule = Arc::clone(&compiled.rules_of(0)[0]);
-                let client = requester("203.0.113.9");
-                let started = Instant::now();
-                let first = limiter.decide_all(&rule.limits, 0b1, client);
-                if ask_cold {
-                    let Limited::Later(first) = first else {
-                        panic!("the first goes to the process");
-                    };
-                    assert!(within(first.decided()).await.unwrap().admitted);
-                    let took = started.elapsed();
-                    assert!(
-                        took >= Duration::from_millis(200),
-                        "waited on the ask: {took:?}"
-                    );
-                } else {
-                    assert!(
-                        matches!(first, Limited::Admit),
-                        "decided by the worker at once"
-                    );
-                    assert!(matches!(
-                        limiter.decide_all(&rule.limits, 0b1, client),
-                        Limited::Admit
-                    ));
-                    // The process keeps the worker's entry, to report what it admitted.
-                    let deadline = Instant::now() + Duration::from_secs(2);
-                    while limiter.usage().1 != 1 {
-                        assert!(Instant::now() < deadline, "the process never kept the key");
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-                limiter.stop();
+            let config = limited(
+                everything_config("127.0.0.1:9".parse().unwrap()),
+                &["127.0.0.1:9".to_owned()],
+            );
+            let compiled = compile(&config).unwrap();
+            let service = compiled.rate_limit_service().unwrap().clone();
+            let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
+            let limiter = Limiter::new(&service, hub, 0);
+            let rule = Arc::clone(&compiled.rules_of(0)[0]);
+            let client = requester("203.0.113.9");
+            assert!(
+                matches!(
+                    limiter.decide_all(&rule.limits, 0b1, client),
+                    Limited::Admit
+                ),
+                "decided by the worker at once"
+            );
+            assert!(matches!(
+                limiter.decide_all(&rule.limits, 0b1, client),
+                Limited::Admit
+            ));
+            // The process keeps the worker's entry, to report what it admitted.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while limiter.usage().1 != 1 {
+                assert!(Instant::now() < deadline, "the process never kept the key");
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            limiter.stop();
         })
         .await;
 }
@@ -550,7 +386,6 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
             let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
             if let Some(service) = service_of(&mut config) {
                 service.poll_quiet_keys = Some(false);
-                service.ask_cold_keys = Some(false);
                 service.schedule_keys = Some(true);
             }
             let compiled = compile(&config).unwrap();
@@ -613,7 +448,6 @@ async fn scheduled_a_signal_with_no_room_leaves_the_next_free_to_go() {
             let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
             if let Some(service) = service_of(&mut config) {
                 service.poll_quiet_keys = Some(false);
-                service.ask_cold_keys = Some(false);
                 service.schedule_keys = Some(true);
             }
             let compiled = compile(&config).unwrap();
@@ -772,8 +606,7 @@ async fn a_changed_service_starts_the_process_afresh() {
     }
     proxy.reload(compile(&bigger).unwrap()).unwrap();
     assert!(Arc::ptr_eq(&first, &hub_of(&proxy)), "only its keys' bytes");
-    let changes: [fn(&mut edgerush_config::RateLimitService); 5] = [
-        |service| service.ask_cold_keys = Some(true),
+    let changes: [fn(&mut edgerush_config::RateLimitService); 4] = [
         |service| service.poll_quiet_keys = Some(true),
         |service| service.schedule_keys = Some(false),
         |service| service.cycle_ms = Some(20),
@@ -943,58 +776,10 @@ async fn a_limit_not_started_refuses_rather_than_admits() {
         .await;
 }
 
-/// A request that would ask once the rate-limiting thread is gone — its channel closed —
-/// is answered 503 `rate_limit_unavailable`, the gateway's own trouble, never 429 as if
-/// over its limit.
-#[tokio::test]
-async fn a_rate_limiting_thread_gone_is_unavailable_not_a_refusal() {
-    use crate::ratelimit::ToHub;
-
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (upstream, _) = counting_upstream().await;
-            let mut config = limited(everything_config(upstream), &["127.0.0.1:9".to_owned()]);
-            if let Some(service) = service_of(&mut config) {
-                // Every new client asked about.
-                service.ask_cold_keys = Some(true);
-            }
-            let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
-            let (failed, failures) = told_failures();
-            proxy.start_rate_limits(failed).unwrap();
-            hub_of(&proxy)
-                .to
-                .send(ToHub::Panic { in_exchange: false })
-                .unwrap();
-            until(|| failures() > 0).await;
-            let worker = Worker::with_deadlines(Arc::clone(&proxy), H1Limits::default(), SHORT);
-            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let front = socket.local_addr().unwrap();
-            let _serving = serving(&worker, socket);
-            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
-            let mut statuses = Vec::new();
-            for _ in 0..3 {
-                send = within(send.ready()).await.unwrap();
-                let request = Request::get("http://example.test/")
-                    .version(Version::HTTP_2)
-                    .body(())
-                    .unwrap();
-                let (response, _) = send.send_request(request, true).unwrap();
-                let response = within(response).await.unwrap();
-                statuses.push(response.status().as_u16());
-            }
-            assert_eq!(statuses, [503; 3]);
-            let scrape = worker.proxy().metrics();
-            assert!(
-                scrape.contains(r#"reason="rate_limit_unavailable"} 3"#),
-                "{scrape}"
-            );
-        })
-        .await;
-}
-
-/// An ask still waiting when the rate-limiting thread goes is told it is unavailable, at
-/// once, rather than left waiting for an answer that cannot come; one made after is too.
+/// A request still waiting on its process when the rate-limiting thread goes is told it is
+/// unavailable, at once, rather than left waiting for an answer that cannot come; one made
+/// after is too. Here the worker has no room to make keys, so it asks its process, held up
+/// meanwhile, and the thread panics before it takes the ask.
 #[tokio::test]
 async fn an_ask_waiting_when_the_thread_goes_is_told_it_is_unavailable() {
     use crate::ratelimit::{Hub, Limited, Limiter, ToHub, Undecided};
@@ -1002,28 +787,27 @@ async fn an_ask_waiting_when_the_thread_goes_is_told_it_is_unavailable() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let exchanges = Arc::new(AtomicUsize::new(0));
-            // Every answer held back past the end of the test.
-            let hold = Arc::new(Mutex::new(Some(Instant::now() + Duration::from_secs(60))));
-            let pods = held_service(&exchanges, &hold).await;
-            let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &pods);
-            if let Some(service) = service_of(&mut config) {
-                service.ask_cold_keys = Some(true);
-            }
+            let config = limited(
+                everything_config("127.0.0.1:9".parse().unwrap()),
+                &["127.0.0.1:9".to_owned()],
+            );
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
             let (failed, failures) = told_failures();
             let failed = crate::ratelimit::Failed(Arc::new(failed));
             let hub = Hub::start(&service, 1, 1 << 20, Some(failed)).unwrap();
             let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
+            limiter.set_most_made(0, 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
+            let (release, stalled) = std::sync::mpsc::channel();
+            hub.to.send(ToHub::Stall(stalled)).unwrap();
+            hub.to.send(ToHub::Panic { in_exchange: false }).unwrap();
             let Limited::Later(waiting) =
                 limiter.decide_all(&rule.limits, 0b1, requester("203.0.113.7"))
             else {
                 panic!("not asked about");
             };
-            until(|| exchanges.load(Ordering::Relaxed) > 0).await;
-            hub.to.send(ToHub::Panic { in_exchange: false }).unwrap();
+            release.send(()).unwrap();
             until(|| failures() > 0).await;
             assert_eq!(within(waiting.decided()).await, Err(Undecided::Unavailable));
             assert!(matches!(
@@ -1055,9 +839,6 @@ async fn one_token_limiter() -> (
         )
         .unwrap(),
     );
-    if let Some(service) = service_of(&mut config) {
-        service.ask_cold_keys = Some(false);
-    }
     let compiled = compile(&config).unwrap();
     let service = compiled.rate_limit_service().unwrap().clone();
     let hub = crate::ratelimit::Hub::start(&service, 1, 1 << 20, None).unwrap();
@@ -1086,7 +867,7 @@ async fn a_worker_makes_new_keys_only_with_room_and_asks_without() {
                 panic!("made with no room");
             };
             release.send(()).unwrap();
-            // Its ask given up, the process makes the key itself, from a full bucket.
+            // The process released, it makes the key itself, from a full bucket.
             assert!(within(asked.decided()).await.unwrap().admitted);
             // The first key taken in: room again.
             within(async {
@@ -1170,32 +951,34 @@ async fn a_decision_taken_up_after_its_time_is_out_of_time() {
         .await;
 }
 
-/// A limiter of one worker whose every new client is asked about, of three service pods
-/// that hold back every answer for longer than an ask may wait — so that each ask is given
-/// up after its 300 ms and decided from the copy — with the rule it limits, and the
-/// exchanges the pods were sent.
+/// A limiter of one worker with no room to make keys, so that it asks its process about
+/// every new client, and its process held up until the sender returned is told to go on —
+/// so that each ask waits there until then, and is decided from a full bucket after —
+/// with the rule it limits.
 async fn asking_limiter() -> (
     Rc<crate::ratelimit::Limiter>,
     Arc<edgerush_config::CompiledRule>,
-    Arc<AtomicUsize>,
+    std::sync::mpsc::Sender<()>,
 ) {
-    let exchanges = Arc::new(AtomicUsize::new(0));
-    let hold = Arc::new(Mutex::new(Some(Instant::now() + Duration::from_secs(60))));
-    let pods = held_service(&exchanges, &hold).await;
-    let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &pods);
-    if let Some(service) = service_of(&mut config) {
-        service.ask_cold_keys = Some(true);
-    }
+    let config = limited(
+        everything_config("127.0.0.1:9".parse().unwrap()),
+        &["127.0.0.1:9".to_owned()],
+    );
     let compiled = compile(&config).unwrap();
     let service = compiled.rate_limit_service().unwrap().clone();
     let hub = crate::ratelimit::Hub::start(&service, 1, 1 << 20, None).unwrap();
-    let limiter = crate::ratelimit::Limiter::new(&service, hub, 0);
-    (limiter, Arc::clone(&compiled.rules_of(0)[0]), exchanges)
+    let limiter = crate::ratelimit::Limiter::new(&service, Arc::clone(&hub), 0);
+    limiter.set_most_made(0, 0);
+    let (release, stalled) = std::sync::mpsc::channel();
+    hub.to
+        .send(crate::ratelimit::ToHub::Stall(stalled))
+        .unwrap();
+    (limiter, Arc::clone(&compiled.rules_of(0)[0]), release)
 }
 
 /// A worker has so many places for requests waiting on its rate limits, asks and deferred
 /// alike: past them a request is answered full at once, never queued; a place is given back
-/// once its ask is answered.
+/// once its ask is answered. Asks here wait on their process, held up.
 #[tokio::test]
 async fn a_worker_holds_no_more_requests_waiting_than_it_has_places() {
     use crate::ratelimit::{Limited, Undecided};
@@ -1203,7 +986,7 @@ async fn a_worker_holds_no_more_requests_waiting_than_it_has_places() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (limiter, rule, _) = asking_limiter().await;
+            let (limiter, rule, release) = asking_limiter().await;
             limiter.set_most_waiting(2);
             let ask = |client: &str| limiter.decide_all(&rule.limits, 0b1, requester(client));
             let Limited::Later(first) = ask("203.0.113.1") else {
@@ -1216,8 +999,8 @@ async fn a_worker_holds_no_more_requests_waiting_than_it_has_places() {
                 ask("203.0.113.3"),
                 Limited::Undecided(Undecided::Full)
             ));
-            // Given up after their time, and decided from their copies: admitted, and their
-            // places given back.
+            // The process goes on and decides them: admitted, and their places given back.
+            release.send(()).unwrap();
             assert!(within(first.decided()).await.unwrap().admitted);
             assert!(within(second.decided()).await.unwrap().admitted);
             assert!(matches!(ask("203.0.113.4"), Limited::Later(_)));
@@ -1236,7 +1019,7 @@ async fn a_place_holds_its_requests_bytes_too() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (limiter, rule, _) = asking_limiter().await;
+            let (limiter, rule, release) = asking_limiter().await;
             let ask = |client: &str| limiter.decide_all(&rule.limits, 0b1, requester(client));
             let Limited::Later(first) = ask("203.0.113.1") else {
                 panic!("not asked about");
@@ -1252,7 +1035,8 @@ async fn a_place_holds_its_requests_bytes_too() {
                 limiter.decide_dry_run(&rule.limits, 0b1, requester("203.0.113.3")),
                 Limited::Undecided(Undecided::Full)
             ));
-            // Its ask given up and answered: its bytes given back.
+            // Its ask answered: its bytes given back.
+            release.send(()).unwrap();
             assert!(within(first.decided()).await.unwrap().admitted);
             assert!(matches!(ask("203.0.113.4"), Limited::Later(_)));
             limiter.set_most_waiting_bytes(MOST_WAITING_BYTES);
@@ -1270,7 +1054,7 @@ async fn dry_runs_wait_in_places_of_their_own() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (limiter, rule, _) = asking_limiter().await;
+            let (limiter, rule, release) = asking_limiter().await;
             limiter.set_most_waiting(1);
             limiter.set_most_dry_runs_waiting(1);
             let ask = |client: &str| limiter.decide_all(&rule.limits, 0b1, requester(client));
@@ -1294,6 +1078,7 @@ async fn dry_runs_wait_in_places_of_their_own() {
                 dry_run("203.0.113.5"),
                 Limited::Undecided(Undecided::Full)
             ));
+            release.send(()).unwrap();
             assert!(within(dry.decided()).await.unwrap().admitted);
             assert!(within(enforced.decided()).await.unwrap().admitted);
             limiter.stop();
@@ -1302,9 +1087,9 @@ async fn dry_runs_wait_in_places_of_their_own() {
 }
 
 /// A request waits on its rate limits no longer than its time, wherever it waits — here on
-/// an ask its process has out — and is then answered as out of time; its place is kept until
-/// the ask is answered, though nothing waits for it any more, so that what is still queued
-/// or asking is within the places too.
+/// its process, held up — and is then answered as out of time; its place is kept until the
+/// ask is answered, though nothing waits for it any more, so that what is still queued is
+/// within the places too.
 #[tokio::test]
 async fn a_request_out_of_time_is_answered_and_its_place_kept_until_its_ask_is() {
     use crate::ratelimit::{Limited, Undecided};
@@ -1312,7 +1097,7 @@ async fn a_request_out_of_time_is_answered_and_its_place_kept_until_its_ask_is()
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (limiter, rule, _) = asking_limiter().await;
+            let (limiter, rule, release) = asking_limiter().await;
             limiter.set_most_waiting(1);
             limiter.set_wait(Duration::from_millis(50));
             let ask = |client: &str| limiter.decide_all(&rule.limits, 0b1, requester(client));
@@ -1326,12 +1111,13 @@ async fn a_request_out_of_time_is_answered_and_its_place_kept_until_its_ask_is()
                 waited < Duration::from_millis(250),
                 "waited {waited:?}, as long as its ask"
             );
-            // Its ask still out: no place for another.
+            // Its ask not yet answered: no place for another.
             assert!(matches!(
                 ask("203.0.113.2"),
                 Limited::Undecided(Undecided::Full)
             ));
-            // Its ask given up and answered: its place given back.
+            // Its ask answered: its place given back.
+            release.send(()).unwrap();
             within(async {
                 while matches!(ask("203.0.113.3"), Limited::Undecided(Undecided::Full)) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1343,9 +1129,9 @@ async fn a_request_out_of_time_is_answered_and_its_place_kept_until_its_ask_is()
         .await;
 }
 
-/// A request that goes while its process's participant has its ask out is left to settle,
-/// not taken back: its place is held until the ask is answered, though nothing waits for
-/// it any more, so that work the participant still has is within the places too.
+/// A request that goes while its ask waits on its process is left to settle, not taken
+/// back: its place is held until the ask is answered, though nothing waits for it any
+/// more, so that work its process still has is within the places too.
 #[tokio::test]
 async fn a_request_gone_keeps_its_place_while_its_ask_is_out() {
     use crate::ratelimit::{Limited, Undecided};
@@ -1353,20 +1139,20 @@ async fn a_request_gone_keeps_its_place_while_its_ask_is_out() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (limiter, rule, exchanges) = asking_limiter().await;
+            let (limiter, rule, release) = asking_limiter().await;
             limiter.set_most_waiting(1);
             let ask = |client: &str| limiter.decide_all(&rule.limits, 0b1, requester(client));
             let Limited::Later(first) = ask("203.0.113.1") else {
                 panic!("not asked about");
             };
-            until(|| exchanges.load(Ordering::Relaxed) > 0).await;
-            // The request goes; its ask is out.
+            // The request goes; its ask waits on its process.
             drop(first);
             assert!(matches!(
                 ask("203.0.113.2"),
                 Limited::Undecided(Undecided::Full)
             ));
-            // Its ask given up and answered: its place given back.
+            // Its ask answered: its place given back.
+            release.send(()).unwrap();
             within(async {
                 while matches!(ask("203.0.113.3"), Limited::Undecided(Undecided::Full)) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1380,7 +1166,7 @@ async fn a_request_gone_keeps_its_place_while_its_ask_is_out() {
 
 /// An ask its process takes once its time is up is answered as out of time, undecided; one
 /// whose request has gone is let go, its place given back and nothing told, and counted:
-/// neither is asked of a service pod, or charged.
+/// neither is decided, or charged, so neither is reported to a service pod.
 #[tokio::test]
 async fn an_ask_gone_or_out_of_time_when_taken_is_not_asked_of_the_service() {
     use crate::ratelimit::{FromHub, Hub, ToHub, Undecided};
@@ -1391,11 +1177,10 @@ async fn an_ask_gone_or_out_of_time_when_taken_is_not_asked_of_the_service() {
     let service = counted_service(&exchanges).await;
     let compiled = edgerush_config::CompiledRateLimitService {
         pods: service,
-        // A cycle longer than the test, so that every exchange is an ask's.
+        // A cycle longer than the test: nothing is reported in it.
         cycle: Duration::from_secs(60),
         max_key_bytes: 1 << 20,
         poll_quiet_keys: true,
-        ask_cold_keys: true,
         schedule_keys: false,
     };
     let hub = Hub::start(&compiled, 1, 1 << 20, None).unwrap();
@@ -1442,7 +1227,7 @@ async fn an_ask_gone_or_out_of_time_when_taken_is_not_asked_of_the_service() {
     assert_eq!(
         exchanges.load(Ordering::Relaxed),
         before,
-        "asked all the same"
+        "decided and reported all the same"
     );
 }
 
@@ -1485,10 +1270,7 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
     let hold = Arc::new(Mutex::new(Some(Instant::now() + Duration::from_secs(60))));
     let pods = held_service(&exchanges, &hold).await;
     let mut config = limited(everything_config("127.0.0.1:1".parse().unwrap()), &pods);
-    if let Some(service) = service_of(&mut config) {
-        // A new key is asked about: an exchange.
-        service.ask_cold_keys = Some(true);
-    }
+    // A new key asked about, decided by the process and reported next cycle: an exchange.
     let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
     let (failed, failures) = told_failures();
     proxy.start_rate_limits(failed).unwrap();
@@ -1546,8 +1328,6 @@ async fn a_failed_rate_limiting_thread_tells_once() {
             cycle: Duration::from_millis(10),
             max_key_bytes: 1 << 20,
             poll_quiet_keys: true,
-            // A new key is asked about: an exchange.
-            ask_cold_keys: true,
             schedule_keys: false,
         };
         let (failed, failures) = told_failures();
@@ -1574,8 +1354,11 @@ async fn a_failed_rate_limiting_thread_tells_once() {
                 decided,
             }
         };
+        // A new key asked about, decided by the process and reported next cycle: an
+        // exchange.
         hub.to.send(ask(0)).unwrap();
         assert!(within(answered.recv()).await.unwrap().admitted);
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(failures(), 0, "an exchange answered");
 
         hub.to.send(ToHub::Panic { in_exchange }).unwrap();

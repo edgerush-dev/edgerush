@@ -329,10 +329,7 @@ fn main() {
         ),
         (
             "service as the prototype's nodes, 10 ms",
-            Approach::Nodes {
-                cycle: 10 * MS,
-                ask_timeout: 0,
-            },
+            Approach::Nodes { cycle: 10 * MS },
         ),
         (
             "service, debt up to 1 s, 10 ms, every pod granted by the owner, the owner asked when cold, copied to a secondary with every change",
@@ -361,15 +358,10 @@ fn main() {
     // The service's cycle instead of the rows' own, if given, in ms.
     let service_cycle: Option<u64> = std::env::args().nth(8).and_then(|arg| arg.parse().ok());
     for (_, approach) in &mut approaches {
-        if let Approach::Nodes { cycle, ask_timeout } = approach {
-            if let Some(service_cycle) = service_cycle {
-                *cycle = service_cycle * MS;
-            }
-            // `ASK_TIMEOUT_MS=300`: how long the prototype's data planes wait for an ask.
-            *ask_timeout = std::env::var("ASK_TIMEOUT_MS")
-                .ok()
-                .and_then(|ms| ms.parse::<u64>().ok())
-                .map_or(0, |ms| ms * MS);
+        if let Approach::Nodes { cycle } = approach
+            && let Some(service_cycle) = service_cycle
+        {
+            *cycle = service_cycle * MS;
         }
         if let Approach::Service(serving) = approach {
             serving.skew = skew_us * 1_000;

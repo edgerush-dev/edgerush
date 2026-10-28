@@ -111,10 +111,6 @@ limits:
   - { name: everything, key: client, model: { bucket: { rate: 20/h, burst: 20 } } }
 ";
 
-/// The lever that has a data plane ask the owner about a key it has not heard of, rather
-/// than decide it from a full bucket.
-const ASKING: &str = ", ask_cold_keys: true";
-
 /// A data plane of one worker under [`LIMITS`], reaching the service pods at `service` with
 /// `levers` besides the defaults (`, name: value` each), and where it listens.
 async fn proxy(upstream: SocketAddr, service: &[String], levers: &str) -> SocketAddr {
@@ -292,10 +288,11 @@ async fn a_request_is_charged_to_all_its_limits_or_none() {
     .await;
 }
 
-/// Two data planes share a client's bucket through the service: what one admitted counts
-/// against the other, exactly, when the other asks the owner about a key it has not heard of
-/// and the first no longer counts as admitting it, so that neither is held to a share of
-/// what is left.
+/// Two data planes share a client's bucket through the service: once the other has heard
+/// from the owner, what one admitted counts against it, exactly, and the first no longer
+/// counting as admitting the key, neither is held to a share of what is left. The other's
+/// first request, before it has heard, is decided from a full bucket (as the next test
+/// shows), and its answer brings the owner's count.
 #[tokio::test]
 async fn two_data_planes_share_a_key_through_the_service() {
     let local = tokio::task::LocalSet::new();
@@ -303,17 +300,21 @@ async fn two_data_planes_share_a_key_through_the_service() {
         .run_until(async {
             let service = service().await;
             let upstream = upstream().await;
-            let first = proxy(upstream, &service, ASKING).await;
-            let second = proxy(upstream, &service, ASKING).await;
+            let first = proxy(upstream, &service, "").await;
+            let second = proxy(upstream, &service, "").await;
             let client = [127, 0, 0, 5];
             let one = statuses(first, client, "GET", "/by-client", 6).await;
             // Longer than a data plane counts as admitting a key after its last admission,
             // 300 ms (`ACTIVE_CYCLES`): the first's reports have reached the owner, and it
             // no longer shares the bucket with the second.
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let other = statuses(second, client, "GET", "/by-client", 8).await;
+            let heard = statuses(second, client, "GET", "/by-client", 1).await;
+            // Its report and the owner's answer, a cycle or two.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let other = statuses(second, client, "GET", "/by-client", 5).await;
             assert_eq!(one, [200; 6]);
-            assert_eq!(other, [200, 200, 200, 200, 429, 429, 429, 429]);
+            assert_eq!(heard, [200]);
+            assert_eq!(other, [200, 200, 200, 429, 429], "three left of ten");
         })
         .await;
 }

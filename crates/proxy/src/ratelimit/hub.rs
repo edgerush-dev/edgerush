@@ -5,16 +5,15 @@
 //! workers' messages, the service's answers and its cycle; nothing of it is shared with a
 //! worker but the entries, a channel, and the clock they read its times by.
 
-use super::{ASK_TIMEOUT, Decision, Made, Undecided};
+use super::{Decision, EXCHANGE_TIMEOUT, Made, Undecided};
 use crate::ProxyError;
 use edgerush_config::CompiledRateLimitService;
 use edgerush_ratelimit::service::pooled::{
     Decision as Pooled, Entry, Levers, Participant, Registry,
 };
-use edgerush_ratelimit::service::{Contract, Keyed, Ticket, View};
+use edgerush_ratelimit::service::{Contract, Keyed, View};
 use edgerush_ratelimit_service::grpc::{Client, Error};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -64,8 +63,8 @@ pub(crate) enum ToHub {
     Capacity(u64),
     /// A key whose unreported count passed half its most: to drain now.
     Drain(Box<[u8]>),
-    /// Cold keys decided locally: an entry a worker made, for the process to keep, with
-    /// the room it holds among its worker's until the process takes it in.
+    /// An entry a worker made, for the process to keep, with the room it holds among its
+    /// worker's until the process takes it in.
     Adopt(Arc<Entry>, Made),
     /// Keys visited only when they need it: those its decisions signalled since its last
     /// such message, for the next cycle to visit.
@@ -271,7 +270,6 @@ impl Hub {
         self.service.pods == service.pods
             && self.service.cycle == service.cycle
             && self.service.poll_quiet_keys == service.poll_quiet_keys
-            && self.service.ask_cold_keys == service.ask_cold_keys
             && self.service.schedule_keys == service.schedule_keys
     }
 
@@ -426,7 +424,7 @@ fn run(
         let _gone = made.send(Err("no native 128-bit compare-and-swap".to_owned()));
         return;
     };
-    participant.set_ask_timeout(ASK_TIMEOUT);
+    participant.set_exchange_timeout(EXCHANGE_TIMEOUT);
     participant.set_capacity(max_key_bytes);
     participant.set_workers(workers as u64);
     // One exchange in flight to each service pod, what comes meanwhile gathered for the
@@ -434,7 +432,6 @@ fn run(
     participant.set_one_in_flight(true);
     participant.set_levers(Levers {
         poll_quiet: service.poll_quiet_keys,
-        ask_cold: service.ask_cold_keys,
     });
     participant.set_scheduled(service.schedule_keys);
     if made.send(Ok(participant.registry())).is_err() {
@@ -448,7 +445,6 @@ fn run(
     let mut thread = Guard::new(&watch);
     let state = Rc::new(State {
         participant: RefCell::new(participant),
-        waiting: RefCell::new(HashMap::new()),
         deferred: RefCell::new(Vec::new()),
         clients,
         answers: RefCell::new(vec![None; workers]),
@@ -505,8 +501,6 @@ impl Asked {
 /// The process thread's state.
 struct State {
     participant: RefCell<Participant<Keyed>>,
-    /// Requests that wait on the service, by ticket.
-    waiting: RefCell<HashMap<Ticket, Asked>>,
     /// Requests deferred here, decided again at every turn of the loop until their time is
     /// up: no more than their workers have places for.
     deferred: RefCell<Vec<Asked>>,
@@ -563,7 +557,6 @@ impl State {
                     Ok(over) => Some(over),
                     Err(asked) => decided(
                         &mut self.participant.borrow_mut(),
-                        &mut self.waiting.borrow_mut(),
                         &mut self.deferred.borrow_mut(),
                         asked,
                         now,
@@ -590,52 +583,13 @@ impl State {
         }
     }
 
-    /// Hands the requests the service decided their answers, decides again what is
-    /// deferred here, and wakes what waits on a settled hold or a drained count.
+    /// Decides again what is deferred here, and wakes what waits on a settled hold or a
+    /// drained count.
     fn answer(&self) {
         let now = self.now();
         let mut participant = self.participant.borrow_mut();
-        let mut waiting = self.waiting.borrow_mut();
         let mut deferred = self.deferred.borrow_mut();
-        let mut told: Vec<(usize, FromHub)> = participant
-            .take_decisions()
-            .into_iter()
-            .filter_map(|decided| {
-                // Gone or not, settled as the participant had it, its place given back.
-                let Asked {
-                    worker,
-                    id,
-                    keys,
-                    since,
-                    decided: to,
-                    ..
-                } = waiting.remove(&decided.ticket)?;
-                self.shared.stats.answered(now.saturating_sub(since));
-                let keys: Vec<(&[u8], Contract)> = keys
-                    .iter()
-                    .map(|(key, contract)| (&**key, *contract))
-                    .collect();
-                Some((
-                    worker,
-                    FromHub {
-                        id,
-                        to: Some(to),
-                        admitted: decided.admitted,
-                        undecided: None,
-                        refused_by: decided.refused_by,
-                        entries: participant.entries(&keys),
-                    },
-                ))
-            })
-            .collect();
-        // Handed back at their settling: deferred here, as one deferred when asked, within
-        // the time it had from the first — or, its request gone, let go rather than tried
-        // again.
-        for ticket in participant.take_retries() {
-            if let Some(asked) = waiting.remove(&ticket) {
-                deferred.push(asked);
-            }
-        }
+        let mut told: Vec<(usize, FromHub)> = Vec::new();
         // Every request deferred here, decided again while its time lasts and it is there.
         for asked in std::mem::take(&mut *deferred) {
             let (worker, since) = (asked.worker, asked.since);
@@ -647,8 +601,7 @@ impl State {
                 }
                 Err(asked) => asked,
             };
-            if let Some(answer) = decided(&mut participant, &mut waiting, &mut deferred, asked, now)
-            {
+            if let Some(answer) = decided(&mut participant, &mut deferred, asked, now) {
                 self.shared.stats.answered(now.saturating_sub(since));
                 told.push((worker, answer));
             }
@@ -656,7 +609,7 @@ impl State {
         if participant.take_wake() {
             self.settled.notify_waiters();
         }
-        drop((participant, waiting, deferred));
+        drop((participant, deferred));
         for (worker, message) in told {
             self.tell(worker, message);
         }
@@ -688,7 +641,7 @@ impl State {
                 continue;
             };
             let me = Rc::clone(self);
-            let entries = (batch.entries.len() + batch.asks.len()) as u64;
+            let entries = batch.entries.len() as u64;
             let stats = &self.shared.stats;
             let flying = stats.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
             stats.in_flight_most.fetch_max(flying, Ordering::Relaxed);
@@ -737,12 +690,11 @@ impl State {
     }
 }
 
-/// What comes of request `asked` at `now`: told its decision now; kept waiting on the
-/// service, by ticket; or deferred, to be decided again while its time lasts. What is kept
-/// needs no bound of its own: each holds one of its worker's places until it is answered.
+/// What comes of request `asked` at `now`: told its decision now, or deferred, to be
+/// decided again while its time lasts. What is kept needs no bound of its own: each holds
+/// one of its worker's places until it is answered.
 fn decided(
     participant: &mut Participant<Keyed>,
-    waiting: &mut HashMap<Ticket, Asked>,
     deferred: &mut Vec<Asked>,
     asked: Asked,
     now: u64,
@@ -754,10 +706,6 @@ fn decided(
         .collect();
     let id = asked.id;
     match participant.decide_all(&keys, now) {
-        Pooled::Wait(ticket) => {
-            waiting.insert(ticket, asked);
-            None
-        }
         Pooled::Defer => {
             deferred.push(asked);
             None
