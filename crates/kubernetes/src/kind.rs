@@ -1,8 +1,10 @@
 //! The kinds EdgeRush lists and watches, and what it asks of each: the data plane's
 //! EndpointSlices; the control plane's Ingresses, IngressClasses, Services and Secrets
-//! ([04 §1](../../../docs/04-control-plane.md)).
+//! ([04 §1](../../../docs/04-control-plane.md)), and the Lease its replicas elect a leader
+//! by ([02 §3](../../../docs/02-architecture.md)).
 
 use crate::ApiError;
+use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
@@ -34,6 +36,10 @@ pub trait Kind:
 }
 
 impl Kind for EndpointSlice {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for Lease {
     const NAMESPACED: bool = true;
 }
 

@@ -22,8 +22,8 @@ use boring::x509::store::X509StoreBuilder;
 use bytes::{Bytes, BytesMut};
 use h2::RecvStream;
 use h2::client::SendRequest;
-use http::StatusCode;
-use http::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
+use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use http::{Method, StatusCode};
 use k8s_openapi::List;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Status, WatchEvent};
 use std::marker::PhantomData;
@@ -130,6 +130,13 @@ impl ApiError {
     #[must_use]
     pub fn is_gone(&self) -> bool {
         matches!(self, Self::Answered { code: 410, .. })
+    }
+
+    /// Whether this is the API server's 409: an object written as of a version it has
+    /// moved past, or created where there is one already.
+    #[must_use]
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::Answered { code: 409, .. })
     }
 }
 
@@ -286,21 +293,155 @@ impl ApiServer {
         })
     }
 
+    /// Merges `patch`, JSON, into the status of `K`'s object `name` in `namespace`, as
+    /// `kubectl patch --subresource status --type merge` does (RFC 7386): a field it states
+    /// takes the place of the one there, a list whole, and one it leaves out is left as it
+    /// is. Nothing but the status is changed, whatever the patch says of the rest.
+    ///
+    /// # Errors
+    ///
+    /// An [`ApiError`]: what the API server answered if not 200, such as 403 without the
+    /// permission to update the status, or 404 for an object gone.
+    pub async fn patch_status<K: Kind>(
+        &self,
+        namespace: &str,
+        name: &str,
+        patch: &serde_json::Value,
+    ) -> Result<(), ApiError> {
+        let mut path = object_path::<K>(namespace, name)?;
+        path.push_str("/status");
+        let body = serde_json::to_vec(patch).map_err(|error| ApiError::Http(error.to_string()))?;
+        let deadline = Instant::now() + self.timing.answer;
+        let merge = ("application/merge-patch+json", Bytes::from(body));
+        // What it answers, the object as it now is, is not needed.
+        let _object = self
+            .send(Method::PATCH, &path, Some(merge), deadline)
+            .await?;
+        Ok(())
+    }
+
+    /// `K`'s object `name` in `namespace`, as it is now; none if there is none.
+    ///
+    /// # Errors
+    ///
+    /// An [`ApiError`] for anything the API server answers but the object or 404.
+    pub async fn object<K: Kind>(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<K>, ApiError> {
+        let path = object_path::<K>(namespace, name)?;
+        let deadline = Instant::now() + self.timing.answer;
+        match self.get(&path, deadline).await {
+            Ok(body) => self.read_object(body, deadline).await.map(Some),
+            Err(ApiError::Answered { code: 404, .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Creates `object`, `K`'s, in `namespace`: the object as the API server has made it.
+    ///
+    /// # Errors
+    ///
+    /// An [`ApiError`]: [`ApiError::is_conflict`] when there is one of its name already.
+    pub async fn create<K: Kind + serde::Serialize>(
+        &self,
+        namespace: &str,
+        object: &K,
+    ) -> Result<K, ApiError> {
+        let path = kind::collection::<K>(&Scope::namespace(namespace)?)?;
+        self.write(Method::POST, &path, object).await
+    }
+
+    /// Replaces `K`'s object `name` in `namespace` with `object`, as of the version its
+    /// metadata says it was read at: the object as the API server now has it.
+    ///
+    /// # Errors
+    ///
+    /// An [`ApiError`]: [`ApiError::is_conflict`] when it has changed since that version.
+    pub async fn replace<K: Kind + serde::Serialize>(
+        &self,
+        namespace: &str,
+        name: &str,
+        object: &K,
+    ) -> Result<K, ApiError> {
+        let path = object_path::<K>(namespace, name)?;
+        self.write(Method::PUT, &path, object).await
+    }
+
+    /// Sends `object` with `method` to `path`, and reads back what the API server made of
+    /// it.
+    async fn write<K: Kind + serde::Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        object: &K,
+    ) -> Result<K, ApiError> {
+        let body = serde_json::to_vec(object).map_err(|error| ApiError::Http(error.to_string()))?;
+        let deadline = Instant::now() + self.timing.answer;
+        // The API server answers a create with 201: a success as 200 is.
+        let answered = self
+            .send(
+                method,
+                path,
+                Some(("application/json", Bytes::from(body))),
+                deadline,
+            )
+            .await?;
+        self.read_object(answered, deadline).await
+    }
+
+    /// The object `body` holds, trimmed as [`Kind::trim`] keeps it.
+    async fn read_object<K: Kind>(
+        &self,
+        body: RecvStream,
+        deadline: Instant,
+    ) -> Result<K, ApiError> {
+        let read = read_whole(body, MOST_PAGE_BYTES, "an object", deadline).await?;
+        let mut object: K = serde_json::from_slice(&read)
+            .map_err(|error| ApiError::Unreadable(error.to_string()))?;
+        object.trim();
+        Ok(object)
+    }
+
     /// The body of what `path` answers with 200, its head by `deadline`; or what it
     /// answered instead.
     async fn get(&self, path: &str, deadline: Instant) -> Result<RecvStream, ApiError> {
+        self.send(Method::GET, path, None, deadline).await
+    }
+
+    /// The body of what `path` answers `method` with, with `body` of its content type if
+    /// any, with 200, its head by `deadline`; or what it answered instead.
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<(&'static str, Bytes)>,
+        deadline: Instant,
+    ) -> Result<RecvStream, ApiError> {
         let token = self.token.read(self.timing.token_reread).await?;
-        let request = http::Request::get(format!("https://{}{path}", self.authority))
+        let mut request = http::Request::builder()
+            .method(method)
+            .uri(format!("https://{}{path}", self.authority))
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header(ACCEPT, "application/json")
-            .header(USER_AGENT, "edgerush")
+            .header(USER_AGENT, "edgerush");
+        if let Some((content_type, _)) = &body {
+            request = request.header(CONTENT_TYPE, *content_type);
+        }
+        let request = request
             .body(())
             .map_err(|error| ApiError::Http(error.to_string()))?;
         let answered = async {
             let mut send = self.sender().await?;
-            let (answer, _) = send
-                .send_request(request, true)
+            let (answer, mut stream) = send
+                .send_request(request, body.is_none())
                 .map_err(|error| ApiError::Http(error.to_string()))?;
+            if let Some((_, body)) = body {
+                stream
+                    .send_data(body, true)
+                    .map_err(|error| ApiError::Http(error.to_string()))?;
+            }
             answer
                 .await
                 .map_err(|error| ApiError::Http(error.to_string()))
@@ -309,7 +450,7 @@ impl ApiServer {
             .await
             .map_err(|_| ApiError::TimedOut)??;
         let (head, body) = answer.into_parts();
-        if head.status == StatusCode::OK {
+        if head.status == StatusCode::OK || head.status == StatusCode::CREATED {
             return Ok(body);
         }
         let said = read_whole(body, MOST_ERROR_BYTES, "an error", deadline)
@@ -382,6 +523,14 @@ impl ApiServer {
             .await
             .map_err(|error| ApiError::Http(error.to_string()))
     }
+}
+
+/// The path of `K`'s object `name` in `namespace`.
+fn object_path<K: Kind>(namespace: &str, name: &str) -> Result<String, ApiError> {
+    let mut path = kind::collection::<K>(&Scope::namespace(namespace)?)?;
+    path.push('/');
+    encode_into(&mut path, name);
+    Ok(path)
 }
 
 /// A watch's events, as the API server sends them.

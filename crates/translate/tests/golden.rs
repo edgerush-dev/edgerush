@@ -11,7 +11,8 @@
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
 //! the objects of `tests/golden/shared.yaml` go with every case's.
 //! Every config translated must also pass the data plane's own `compile`, and, written as
-//! YAML as the control plane writes it, read back the same.
+//! YAML as the control plane writes it, read back the same; and the Ingresses it says it
+//! served must be those its config's routes are of.
 
 use edgerush_config::{Config, compile};
 use edgerush_translate::{Cluster, Plane, translate};
@@ -113,6 +114,46 @@ fn every_case_translates_to_its_config_and_report() {
             .map(str::to_owned)
             .collect();
         assert_eq!(report, expected, "{name}: report");
+        // The Ingresses served are those the config's routes are of, each route named
+        // `ingress/<namespace>/<name>/...`.
+        let mut of_routes: Vec<String> = translation
+            .config
+            .routes
+            .iter()
+            .filter_map(|route| {
+                let mut parts = route.name.strip_prefix("ingress/")?.splitn(3, '/');
+                Some(format!("{}/{}", parts.next()?, parts.next()?))
+            })
+            .collect();
+        of_routes.sort();
+        of_routes.dedup();
+        let mut served: Vec<String> = translation
+            .served
+            .iter()
+            .map(|object| {
+                assert_eq!(object.kind, "Ingress", "{name}: served");
+                format!("{}/{}", object.namespace, object.name)
+            })
+            .collect();
+        served.sort();
+        assert_eq!(served, of_routes, "{name}: the Ingresses served");
+        // Every Ingress is claimed or passed over, and every one served is claimed.
+        let ingresses = serde_saphyr::from_multiple::<Manifest>(&manifests)
+            .unwrap()
+            .into_iter()
+            .filter(|manifest| matches!(manifest, Manifest::Ingress(_)))
+            .count();
+        assert_eq!(
+            translation.claimed.len() + translation.passed_over,
+            ingresses,
+            "{name}: the Ingresses claimed and passed over"
+        );
+        for object in &translation.served {
+            assert!(
+                translation.claimed.contains(object),
+                "{name}: {object} served, not claimed"
+            );
+        }
         if let Err(problems) = compile(&translation.config) {
             let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
             panic!("{name}: the data plane refuses its config: {problems:?}");

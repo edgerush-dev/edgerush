@@ -479,3 +479,166 @@ fn authorities_that_are_not_certificates_are_refused() {
         ));
     }
 }
+
+#[tokio::test]
+async fn a_status_is_merged_into_its_objects_and_a_refusal_said() {
+    let fake = Fake::start(&["127.0.0.1"], |path| {
+        if path.contains("/gone/") {
+            answer(
+                404,
+                r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"ingresses.networking.k8s.io \"gone\" not found","code":404}"#,
+            )
+        } else {
+            answer(200, "{}")
+        }
+    })
+    .await;
+    let client = fake.client(&token("patch", "secret"), Timing::default());
+    let patch = serde_json::json!({
+        "status": { "loadBalancer": { "ingress": [{ "ip": "203.0.113.7" }] } }
+    });
+    client
+        .patch_status::<Ingress>("shop", "web", &patch)
+        .await
+        .unwrap();
+    let seen = fake.seen();
+    assert_eq!(seen[0].method, "PATCH");
+    assert_eq!(
+        seen[0].path,
+        "/apis/networking.k8s.io/v1/namespaces/shop/ingresses/web/status"
+    );
+    assert_eq!(
+        seen[0].content_type.as_deref(),
+        Some("application/merge-patch+json")
+    );
+    assert_eq!(seen[0].authorization.as_deref(), Some("Bearer secret"));
+    let sent: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
+    assert_eq!(sent, patch);
+    assert_eq!(
+        client
+            .patch_status::<Ingress>("shop", "gone", &patch)
+            .await
+            .unwrap_err(),
+        ApiError::Answered {
+            code: 404,
+            message: "ingresses.networking.k8s.io \"gone\" not found".to_owned()
+        }
+    );
+    // A namespace that cannot be one, or a kind that is in none, is refused unasked.
+    assert_eq!(
+        client
+            .patch_status::<Ingress>("Shop", "web", &patch)
+            .await
+            .unwrap_err(),
+        ApiError::Namespace("Shop".to_owned())
+    );
+    assert_eq!(
+        client
+            .patch_status::<IngressClass>("shop", "edge", &patch)
+            .await
+            .unwrap_err(),
+        ApiError::NotNamespaced("IngressClass")
+    );
+    assert_eq!(fake.seen().len(), 2);
+}
+
+/// Lease `edgerush` in `edge`, held by `holder`, at `version`.
+fn lease(holder: &str, version: &str) -> k8s_openapi::api::coordination::v1::Lease {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "coordination.k8s.io/v1",
+        "kind": "Lease",
+        "metadata": { "name": "edgerush", "namespace": "edge", "resourceVersion": version },
+        "spec": { "holderIdentity": holder, "leaseDurationSeconds": 15 },
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn an_object_is_read_created_and_replaced_as_of_its_version() {
+    use k8s_openapi::api::coordination::v1::Lease;
+    let fake = Fake::start_by_method(&["127.0.0.1"], |method, path| {
+        let object = |holder: &str, version: &str| {
+            answer(200, &serde_json::to_string(&lease(holder, version)).unwrap())
+        };
+        match (method, path) {
+            ("GET", "/apis/coordination.k8s.io/v1/namespaces/edge/leases/edgerush") => {
+                object("one", "7")
+            }
+            ("GET", _) => answer(
+                404,
+                r#"{"kind":"Status","code":404,"message":"leases.coordination.k8s.io \"gone\" not found"}"#,
+            ),
+            ("POST", "/apis/coordination.k8s.io/v1/namespaces/edge/leases") => Answer {
+                status: 201,
+                ..object("two", "8")
+            },
+            ("PUT", "/apis/coordination.k8s.io/v1/namespaces/edge/leases/edgerush") => {
+                object("three", "9")
+            }
+            _ => answer(
+                409,
+                r#"{"kind":"Status","code":409,"message":"the object has been modified"}"#,
+            ),
+        }
+    })
+    .await;
+    let client = fake.client(&token("objects", "secret"), Timing::default());
+    let read: Lease = client.object("edge", "edgerush").await.unwrap().unwrap();
+    assert_eq!(read, lease("one", "7"));
+    assert_eq!(client.object::<Lease>("edge", "gone").await.unwrap(), None);
+    let created = client.create("edge", &lease("two", "")).await.unwrap();
+    assert_eq!(created, lease("two", "8"));
+    let replaced = client
+        .replace("edge", "edgerush", &lease("three", "8"))
+        .await
+        .unwrap();
+    assert_eq!(replaced, lease("three", "9"));
+    let conflict = client
+        .replace("edge", "other", &lease("four", "8"))
+        .await
+        .unwrap_err();
+    assert!(conflict.is_conflict(), "{conflict:?}");
+    assert!(
+        !ApiError::Answered {
+            code: 404,
+            message: String::new()
+        }
+        .is_conflict()
+    );
+    let seen = fake.seen();
+    let writes: Vec<(&str, &str, Option<&str>)> = seen
+        .iter()
+        .filter(|seen| seen.method != "GET")
+        .map(|seen| {
+            (
+                seen.method.as_str(),
+                seen.path.as_str(),
+                seen.content_type.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        writes,
+        [
+            (
+                "POST",
+                "/apis/coordination.k8s.io/v1/namespaces/edge/leases",
+                Some("application/json")
+            ),
+            (
+                "PUT",
+                "/apis/coordination.k8s.io/v1/namespaces/edge/leases/edgerush",
+                Some("application/json")
+            ),
+            (
+                "PUT",
+                "/apis/coordination.k8s.io/v1/namespaces/edge/leases/other",
+                Some("application/json")
+            ),
+        ]
+    );
+    // What is written is the object whole, its version among it.
+    let put: Lease =
+        serde_json::from_str(&seen.iter().find(|seen| seen.method == "PUT").unwrap().body).unwrap();
+    assert_eq!(put, lease("three", "8"));
+}

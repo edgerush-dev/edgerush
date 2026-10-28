@@ -107,6 +107,12 @@ pub struct Translation {
     /// Paths of Ingresses translated that never take a request: another rule, older, has
     /// the same path on the same host.
     pub shadowed: Vec<Shadowed>,
+    /// The Ingresses a route of which is in the config, in the order they rank: those whose
+    /// status carries the data plane's addresses (04 §6).
+    pub served: Vec<Object>,
+    /// Every Ingress of the data plane's class, served or not, in the order they rank:
+    /// those whose status is this data plane's to write.
+    pub claimed: Vec<Object>,
 }
 
 /// A path whose backend is not there: its Service does not exist, has no such port, or the
@@ -435,6 +441,10 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut presented: Vec<(String, Certificate, Vec<String>)> = Vec::new();
     let mut stated: BTreeMap<String, (Object, bool, String)> = BTreeMap::new();
     let mut accepted = Vec::new();
+    let of_the_class: Vec<Object> = ingresses
+        .iter()
+        .map(|ingress| Object::of("Ingress", &ingress.metadata))
+        .collect();
     for ingress in ingresses {
         let object = || Object::of("Ingress", &ingress.metadata);
         let dated = ingress.metadata.creation_timestamp.is_some();
@@ -525,6 +535,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     // as the router ranks them.
     let mut claimed: BTreeMap<(String, String), (Object, bool)> = BTreeMap::new();
     let mut shadowed = Vec::new();
+    let mut served_ingresses = Vec::new();
     for (object, dated, translated, taken) in accepted {
         let mut served = Vec::new();
         let mut redirected = Vec::new();
@@ -633,6 +644,9 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 }),
         );
         upstreams.extend(translated.upstreams);
+        if !served.is_empty() {
+            served_ingresses.push(object);
+        }
     }
     // An upstream only routes served on no listener led to is left out with them.
     let used: Vec<String> = routes
@@ -656,6 +670,8 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         unresolved,
         tls,
         shadowed,
+        served: served_ingresses,
+        claimed: of_the_class,
     }
 }
 

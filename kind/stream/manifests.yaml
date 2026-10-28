@@ -3,7 +3,10 @@
 # plane that dials it. Each holds a certificate of the stream's own authority, from the
 # Secrets the script makes. The data plane may only list and watch EndpointSlices in `shop`
 # (09 §1); the control plane reads the cluster's IngressClasses and `shop`'s Ingresses,
-# Services and Secrets.
+# Services and Secrets, writes the status of `shop`'s Ingresses, and reads the data plane's
+# Service in `edge` for the address they say: an external IP, as kind has no load balancer.
+# The control plane runs as two replicas, which elect the one that writes status by a Lease
+# in `edge`; both serve the stream.
 apiVersion: v1
 kind: Namespace
 metadata: { name: shop }
@@ -82,11 +85,31 @@ rules:
   - apiGroups: [""]
     resources: [services, secrets]
     verbs: [list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses/status]
+    verbs: [patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata: { name: edgerush-control, namespace: shop }
 roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: edgerush-control }
+subjects: [{ kind: ServiceAccount, name: edgerush-control, namespace: edge }]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: edgerush-control-status, namespace: edge }
+rules:
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [list, watch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: edgerush-control-status, namespace: edge }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: edgerush-control-status }
 subjects: [{ kind: ServiceAccount, name: edgerush-control, namespace: edge }]
 ---
 # The data plane's settings, as the control plane translates for it.
@@ -112,7 +135,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata: { name: edgerush-control, namespace: edge }
 spec:
-  replicas: 1
+  replicas: 2
   selector: { matchLabels: { app: edgerush-control } }
   template:
     metadata: { labels: { app: edgerush-control } }
@@ -136,6 +159,10 @@ spec:
             - /etc/edgerush/stream/tls.key
             - --authorities
             - /etc/edgerush/stream/ca.crt
+            - --status-service
+            - edge/edgerush
+            - --leader-lease
+            - edge/edgerush-control
           ports: [{ name: stream, containerPort: 9443 }]
           volumeMounts:
             - { name: plane, mountPath: /etc/edgerush }
@@ -152,6 +179,15 @@ metadata: { name: edgerush-control, namespace: edge }
 spec:
   selector: { app: edgerush-control }
   ports: [{ name: stream, port: 9443, targetPort: stream }]
+---
+# The data plane's Service, its address an external IP of the documentation's range.
+apiVersion: v1
+kind: Service
+metadata: { name: edgerush, namespace: edge }
+spec:
+  selector: { app: edgerush }
+  ports: [{ name: http, port: 80, targetPort: http }]
+  externalIPs: [192.0.2.10]
 ---
 apiVersion: v1
 kind: ServiceAccount
