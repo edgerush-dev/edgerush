@@ -13,8 +13,9 @@
 # an Ingress of class `edge`, for host shop.example; the control plane in `edge` follows
 # `shop`, and the data plane in `edge` dials it at edgerush-control.edge.svc:9443 and is
 # reached by `kubectl port-forward`. Then:
-#   - the Ingress is served;
-#   - an Ingress changed is served as it now says;
+#   - the Ingress is served, and its status says the data plane's Service's address;
+#   - an Ingress changed is served as it now says; left out, it says no address, and
+#     taken back, the address again;
 #   - with the control plane gone, the data plane serves on;
 #   - a data plane started while it is gone waits for its first config, serving nothing,
 #     and serves once the control plane is back.
@@ -134,11 +135,32 @@ said deploy/edgerush-control "runs config" 10 ||
     fail "the control plane never heard the data plane run its config"
 pass "the Ingress is served, by $(curl -s -H 'host: shop.example' "http://127.0.0.1:$port/hostname")"
 
+# What the Ingress's status says, its first address.
+says() { k -n shop get ingress web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }
+# Waits up to $2 seconds for the Ingress's status to say $1.
+saying() {
+    for _ in $(seq 1 $(($2 * 5))); do
+        [ "$(says)" = "$1" ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+saying 192.0.2.10 30 || fail "the Ingress's status says '$(says)', not the data plane's address"
+pass "the Ingress's status says the data plane's address"
+
 k -n shop patch ingress web --type=json \
     -p='[{"op": "replace", "path": "/spec/rules/0/host", "value": "other.example"}]' >/dev/null
 answers other.example 200 30 || fail "the Ingress changed is not served: $(status other.example)"
 answers shop.example 404 10 || fail "the host taken away still answers $(status shop.example)"
 pass "the Ingress changed is served as it now says"
+
+# An annotation translation does not support leaves the Ingress out whole.
+k -n shop annotate ingress web nginx.ingress.kubernetes.io/rewrite-target=/ >/dev/null
+saying "" 30 || fail "left out, the Ingress's status still says '$(says)'"
+k -n shop annotate ingress web nginx.ingress.kubernetes.io/rewrite-target- >/dev/null
+saying 192.0.2.10 30 || fail "taken back, the Ingress's status says '$(says)'"
+answers other.example 200 30 || fail "taken back, the Ingress is not served: $(status other.example)"
+pass "left out, the Ingress says no address, and taken back, the address again"
 
 echo "== the control plane gone"
 k -n edge scale deploy/edgerush-control --replicas=0 >/dev/null

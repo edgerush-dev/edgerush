@@ -22,6 +22,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             scope: vec![Scope::Cluster],
             write_config: None,
             stream: None,
+            status: None,
         }))
     );
     assert_eq!(
@@ -43,6 +44,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             ],
             write_config: Some(PathBuf::from("c")),
             stream: None,
+            status: None,
         }))
     );
     assert_eq!(parsed(&["--help"]), Ok(Parsed::Help));
@@ -210,6 +212,7 @@ async fn run_until(
         scope: vec![Scope::Cluster],
         write_config,
         stream: None,
+        status: None,
     };
     let stop = {
         let lines = Rc::clone(&lines);
@@ -340,6 +343,7 @@ fn the_stream_is_given_whole_or_not_at_all() {
                     authorities: PathBuf::from("a"),
                 },
             })),
+            status: None,
         }))
     );
     // Each of the four left out.
@@ -556,5 +560,91 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
     assert_eq!(
         ended,
         edgerush_control_service::Ended::Ended("the control plane is stopping".to_owned())
+    );
+}
+
+#[test]
+fn ingress_statuses_say_the_data_planes_service_or_addresses_stated_never_both() {
+    let status = |args: &[&str]| {
+        let mut all = vec!["--data-plane", "p"];
+        all.extend(args);
+        parsed(&all).map(|parsed| match parsed {
+            Parsed::Control(options) => options.status,
+            Parsed::Help => panic!("help"),
+        })
+    };
+    assert_eq!(status(&[]), Ok(None));
+    assert_eq!(
+        status(&["--status-service", "edge/edgerush"]),
+        Ok(Some(Addresses::Service {
+            namespace: "edge".to_owned(),
+            name: "edgerush".to_owned(),
+        }))
+    );
+    assert_eq!(
+        status(&[
+            "--status-address",
+            "203.0.113.7",
+            "--status-address",
+            "lb.example"
+        ]),
+        Ok(Some(Addresses::Stated(vec![
+            address("203.0.113.7"),
+            address("lb.example")
+        ])))
+    );
+    assert_eq!(
+        status(&[
+            "--status-service",
+            "edge/edgerush",
+            "--status-address",
+            "203.0.113.7"
+        ]),
+        Err(UsageError::Status)
+    );
+    for named in ["edgerush", "Edge/edgerush", "edge/", "edge/a/b"] {
+        assert_eq!(
+            status(&["--status-service", named]),
+            Err(UsageError::StatusService(named.to_owned())),
+            "{named}"
+        );
+    }
+    assert_eq!(
+        status(&["--status-service", "edge/a", "--status-service", "edge/b"]),
+        Err(UsageError::Twice("--status-service"))
+    );
+}
+
+#[test]
+fn what_is_said_of_a_status_names_the_ingress_and_its_addresses() {
+    let ingress = edgerush_translate::Object {
+        kind: "Ingress",
+        namespace: "shop".to_owned(),
+        name: "web".to_owned(),
+    };
+    let addresses = [address("203.0.113.7"), address("lb.example")];
+    let said = |addresses: &[_], written| {
+        told(
+            &Said::Status {
+                ingress: &ingress,
+                addresses,
+                written,
+            },
+            None,
+        )
+    };
+    assert_eq!(
+        said(&addresses, Ok(())),
+        "status of Ingress shop/web: 203.0.113.7, lb.example"
+    );
+    assert_eq!(said(&[], Ok(())), "status of Ingress shop/web: no address");
+    let refused = edgerush_kubernetes::ApiError::Answered {
+        code: 403,
+        message: "forbidden".to_owned(),
+    };
+    let not = said(&addresses[..1], Err(&refused));
+    assert!(
+        not.starts_with("status of Ingress shop/web cannot be written (203.0.113.7): "),
+        "{not}"
     );
 }

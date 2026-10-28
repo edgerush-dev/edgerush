@@ -7,6 +7,7 @@
 use crate::validate::{described, read};
 use edgerush_control_service::{Credentials, Files, Heard, SslAcceptor, acceptor, reread, serve};
 use edgerush_control_stream::{Offer, OfferError, Versions};
+use edgerush_controller::status::{Addresses, address};
 use edgerush_controller::{Debounce, Said, control};
 use edgerush_kubernetes::{ApiError, ApiServer, Scope};
 use edgerush_translate::{Plane, Translation};
@@ -26,6 +27,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 pub(crate) const USAGE: &str = "\
 Usage: edgerush controller --data-plane <FILE> [--namespace <NAME>]... [--write-config <FILE>]
          [--listen <ADDRESS> --certificate <FILE> --key <FILE> --authorities <FILE>]
+         [--status-service <NAMESPACE>/<NAME> | --status-address <ADDRESS>...]
 
 Runs a control plane for one data plane, in a cluster: follows the IngressClasses,
 Ingresses, Services and Secrets of its scope through the API server, found as a pod finds
@@ -35,6 +37,8 @@ With --listen, it serves the config stream there, gRPC over mutual TLS that data
 dial: each config translated is offered to every data plane, and what each says of it is
 said on stderr. The certificate, key and authorities are PEM files, read again every
 second, so that ones replaced serve the next connection.
+With --status-service or --status-address, each Ingress served says the data plane's
+addresses in its status, and each of the class that is not says none.
 Runs until Ctrl-C, or SIGTERM on Unix, and then exits 0; exits 2 when the command line, the
 data plane's settings or the stream's certificates cannot be used, or it is not in a
 cluster.
@@ -57,6 +61,14 @@ Options:
       --key <FILE>           Its private key
       --authorities <FILE>   The stream's authorities, which every data plane's
                              certificate must be signed by
+      --status-service <NAMESPACE>/<NAME>
+                             The data plane's Service, followed: its load balancer's
+                             addresses, else its external IPs, are what each Ingress
+                             served says in its status
+      --status-address <ADDRESS>
+                             An address each Ingress served says in its status, an IP or a
+                             host name, given once for each; for a cluster with no load
+                             balancer, instead of --status-service
   -h, --help                 Print help
 ";
 
@@ -160,19 +172,21 @@ fn outside(error: &ApiError) -> String {
     format!("the API server cannot be reached as a pod reaches it: {error}")
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 enum Parsed {
     Help,
     Control(Options),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 struct Options {
     data_plane: PathBuf,
     /// The scope: its namespaces, or the cluster.
     scope: Vec<Scope>,
     write_config: Option<PathBuf>,
     stream: Option<Box<Stream>>,
+    /// Where the addresses Ingress statuses say come from, if they are written.
+    status: Option<Addresses>,
 }
 
 /// The config stream, as the command line gives it.
@@ -200,6 +214,10 @@ enum UsageError {
     Listen(String),
     #[error("'--listen', '--certificate', '--key' and '--authorities' are given together")]
     Together,
+    #[error("'--status-service {0}' is not a namespace and a name, as edge/edgerush")]
+    StatusService(String),
+    #[error("'--status-service' and '--status-address' are not given together")]
+    Status,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
@@ -209,6 +227,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut certificate = None;
     let mut key = None;
     let mut authorities = None;
+    let mut status_service = None;
+    let mut status_addresses = Vec::new();
     let mut scope = Vec::new();
     while let Some(arg) = args.next() {
         let option = match arg.as_str() {
@@ -220,6 +240,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             "--certificate" => "--certificate",
             "--key" => "--key",
             "--authorities" => "--authorities",
+            "--status-service" => "--status-service",
+            "--status-address" => "--status-address",
             _ => return Err(UsageError::Unexpected(arg)),
         };
         let value = args.next().ok_or(UsageError::NoValue(option))?;
@@ -231,6 +253,28 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                     return Err(UsageError::NamespaceTwice(value));
                 }
                 scope.push(namespace);
+                continue;
+            }
+            "--status-service" => {
+                let named = value
+                    .split_once('/')
+                    .filter(|(namespace, name)| {
+                        Scope::namespace(namespace).is_ok()
+                            && !name.is_empty()
+                            && !name.contains('/')
+                    })
+                    .map(|(namespace, name)| Addresses::Service {
+                        namespace: namespace.to_owned(),
+                        name: name.to_owned(),
+                    })
+                    .ok_or_else(|| UsageError::StatusService(value.clone()))?;
+                if status_service.replace(named).is_some() {
+                    return Err(UsageError::Twice(option));
+                }
+                continue;
+            }
+            "--status-address" => {
+                status_addresses.push(address(&value));
                 continue;
             }
             "--listen" => {
@@ -265,11 +309,18 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         (None, None, None, None) => None,
         _ => return Err(UsageError::Together),
     };
+    let status = match (status_service, status_addresses.is_empty()) {
+        (Some(_), false) => return Err(UsageError::Status),
+        (Some(service), true) => Some(service),
+        (None, false) => Some(Addresses::Stated(status_addresses)),
+        (None, true) => None,
+    };
     Ok(Parsed::Control(Options {
         data_plane: data_plane.ok_or(UsageError::Required("--data-plane <FILE>"))?,
         scope,
         write_config,
         stream,
+        status,
     }))
 }
 
@@ -296,6 +347,7 @@ async fn control_until(
 ) -> io::Result<()> {
     let say: Rc<dyn Fn(&str)> = Rc::new(say);
     let write_config = options.write_config;
+    let status = options.status;
     let scope = options.scope;
     let mut tasks = Vec::new();
     let mut served = None;
@@ -351,7 +403,7 @@ async fn control_until(
             &scope,
             &plane,
             Debounce::default(),
-            None,
+            status,
             move |said| {
                 let mut text = told(&said, write_config.as_deref());
                 if let (Said::Translated(translation), Some(offering)) = (&said, &offering) {
