@@ -157,6 +157,17 @@ fn hear(heard: &Rc<RefCell<Heard>>) -> impl Fn(Said<'_>) + 'static {
                 "translated".to_owned()
             }
             Said::Refused { problems, .. } => format!("refused: {problems:?}"),
+            Said::Status {
+                ingress,
+                addresses,
+                written,
+            } => {
+                let ips: Vec<String> = addresses.iter().filter_map(|a| a.ip.clone()).collect();
+                match written {
+                    Ok(()) => format!("status of {ingress}: [{}]", ips.join(", ")),
+                    Err(error) => format!("status of {ingress} not written: {error}"),
+                }
+            }
         };
         heard.lines.push(line);
     }
@@ -216,6 +227,7 @@ fn every_follows_objects_are_translated_and_its_secrets_looked_at() {
             true,
             vec![secret("shop", &[])],
         )],
+        status_service: Vec::new(),
     };
     assert_eq!(
         followed.unlisted(),
@@ -390,7 +402,7 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
                         quiet: Duration::from_secs(1),
                         most: Duration::from_secs(5),
                     };
-                    control(api, &[Scope::Cluster], &plane, debounce, said).await;
+                    control(api, &[Scope::Cluster], &plane, debounce, None, said).await;
                 }
             });
             until("the Secrets' failure said", || {
@@ -496,7 +508,7 @@ async fn each_namespace_of_the_scope_is_followed_and_all_are_translated_together
             let controlling = tokio::task::spawn_local({
                 let said = hear(&heard);
                 async move {
-                    control(api, &scope, &plane, Debounce::default(), said).await;
+                    control(api, &scope, &plane, Debounce::default(), None, said).await;
                 }
             });
             until("translated", || !heard.borrow().translations.is_empty()).await;
@@ -533,5 +545,311 @@ async fn each_namespace_of_the_scope_is_followed_and_all_are_translated_together
             "/apis/networking.k8s.io/v1/namespaces/blog/ingresses",
             "/apis/networking.k8s.io/v1/namespaces/shop/ingresses",
         ]
+    );
+}
+
+/// Ingress `name` in `shop` of [`ingress`]'s making, of class `class`, with `annotations`,
+/// its status saying `addresses`.
+fn ingress_saying(
+    name: &str,
+    class: &str,
+    addresses: &[&str],
+    annotations: &[(&str, &str)],
+) -> Ingress {
+    let mut made = ingress("shop", name, "shop.example");
+    if let Some(spec) = made.spec.as_mut() {
+        spec.ingress_class_name = Some(class.to_owned());
+    }
+    if !annotations.is_empty() {
+        made.metadata.annotations = Some(
+            annotations
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+        );
+    }
+    if !addresses.is_empty() {
+        made.status = Some(saying(
+            addresses.iter().map(|ip| status::address(ip)).collect(),
+        ));
+    }
+    made
+}
+
+/// A status saying `addresses`.
+fn saying(
+    addresses: Vec<IngressLoadBalancerIngress>,
+) -> k8s_openapi::api::networking::v1::IngressStatus {
+    k8s_openapi::api::networking::v1::IngressStatus {
+        load_balancer: Some(
+            k8s_openapi::api::networking::v1::IngressLoadBalancerStatus {
+                ingress: Some(addresses),
+            },
+        ),
+    }
+}
+
+fn object(name: &str) -> Object {
+    Object {
+        kind: "Ingress",
+        namespace: "shop".to_owned(),
+        name: name.to_owned(),
+    }
+}
+
+#[test]
+fn a_status_is_written_where_it_says_other_than_what_is_served() {
+    let addresses = vec![
+        status::address("203.0.113.7"),
+        status::address("edge.example"),
+    ];
+    let mut ingresses = vec![
+        // Served, saying nothing yet.
+        ingress_saying("web", "edge", &[], &[]),
+        // Served, saying the same, in another order.
+        ingress_saying("same", "edge", &[], &[]),
+        // Of the class, not served, saying an address of before.
+        ingress_saying("old", "edge", &["192.0.2.1"], &[]),
+        // Of the class, not served, saying nothing.
+        ingress_saying("quiet", "edge", &[], &[]),
+        // Another's.
+        ingress_saying("theirs", "other", &["198.51.100.1"], &[]),
+    ];
+    ingresses[1].status = Some(saying(vec![addresses[1].clone(), addresses[0].clone()]));
+    let claimed = [
+        object("web"),
+        object("same"),
+        object("old"),
+        object("quiet"),
+        object("gone"),
+    ];
+    let served = [object("web"), object("same")];
+    let changes = status::changes(&claimed, &served, &ingresses, &addresses);
+    assert_eq!(
+        changes,
+        [
+            status::Change {
+                ingress: object("web"),
+                addresses: vec![addresses[0].clone(), addresses[1].clone()],
+            },
+            status::Change {
+                ingress: object("old"),
+                addresses: Vec::new(),
+            },
+        ]
+    );
+    assert_eq!(
+        status::patch(&addresses[..1]).unwrap(),
+        serde_json::json!({ "status": { "loadBalancer": { "ingress": [{ "ip": "203.0.113.7" }] } } })
+    );
+    assert_eq!(
+        status::patch(&[]).unwrap(),
+        serde_json::json!({ "status": { "loadBalancer": { "ingress": null } } })
+    );
+}
+
+#[test]
+fn a_services_addresses_are_its_load_balancers_else_its_external_ips() {
+    let service: Service = serde_saphyr::from_str(
+        "{ metadata: { name: edgerush, namespace: edge },
+           spec: { externalIPs: [192.0.2.9] },
+           status: { loadBalancer: { ingress: [{ ip: 203.0.113.7 }, { hostname: lb.example }] } } }",
+    )
+    .unwrap();
+    assert_eq!(
+        status::of_service(Some(&service)),
+        [
+            status::address("203.0.113.7"),
+            status::address("lb.example")
+        ]
+    );
+    let mut pending = service.clone();
+    pending.status = None;
+    assert_eq!(
+        status::of_service(Some(&pending)),
+        [status::address("192.0.2.9")]
+    );
+    pending.spec = None;
+    assert!(status::of_service(Some(&pending)).is_empty());
+    assert!(status::of_service(None).is_empty());
+    assert_eq!(
+        status::address("2001:db8::1").ip.as_deref(),
+        Some("2001:db8::1")
+    );
+    assert_eq!(
+        status::address("lb.example").hostname.as_deref(),
+        Some("lb.example")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        if path.ends_with("/status") {
+            return answer(200, "{}");
+        }
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[
+                ingress_saying("web", "edge", &[], &[]),
+                ingress_saying(
+                    "old",
+                    "edge",
+                    &["192.0.2.1"],
+                    &[("nginx.ingress.kubernetes.io/rewrite-target", "/")],
+                ),
+                ingress_saying("theirs", "other", &["198.51.100.1"], &[]),
+            ])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/namespaces/edge/services?") {
+            let data_plane: Service = serde_saphyr::from_str(
+                "{ metadata: { name: edgerush, namespace: edge }, spec: { externalIPs: [203.0.113.7] } }",
+            )
+            .unwrap();
+            page(&[data_plane])
+        } else if path.starts_with("/api/v1/secrets?") {
+            page(&[secret("shop", &["shop.example"])])
+        } else {
+            answer(500, "")
+        }
+    })
+    .await;
+    let api = fake.client(&token("controller-status", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let plane = plane();
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    let source = Addresses::Service {
+                        namespace: "edge".to_owned(),
+                        name: "edgerush".to_owned(),
+                    };
+                    control(
+                        api,
+                        &[Scope::Cluster],
+                        &plane,
+                        Debounce::default(),
+                        Some(source),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            let said = |line: &str| heard.borrow().lines.iter().any(|said| said == line);
+            until("both statuses written", || {
+                said("status of Ingress shop/web: [203.0.113.7]")
+                    && said("status of Ingress shop/old: []")
+            })
+            .await;
+            controlling.abort();
+        })
+        .await;
+    let patched: std::collections::BTreeSet<(String, String)> = fake
+        .seen()
+        .into_iter()
+        .filter(|seen| seen.method == "PATCH")
+        .map(|seen| (seen.path, seen.body))
+        .collect();
+    let path =
+        |name: &str| format!("/apis/networking.k8s.io/v1/namespaces/shop/ingresses/{name}/status");
+    let expected: std::collections::BTreeSet<(String, String)> = [
+        (
+            path("old"),
+            r#"{"status":{"loadBalancer":{"ingress":null}}}"#.to_owned(),
+        ),
+        (
+            path("web"),
+            r#"{"status":{"loadBalancer":{"ingress":[{"ip":"203.0.113.7"}]}}}"#.to_owned(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(patched, expected);
+}
+
+/// The data plane's Service not to be read: translation goes on all the same, and no status
+/// is written until it is listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_config_is_not_held_up_by_its_status() {
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            // Saying an address already, which a status written with no Service to give
+            // one would take away.
+            page(&[ingress_saying("web", "edge", &["203.0.113.7"], &[])])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/namespaces/edge/services?") {
+            answer(403, r#"{"kind":"Status","code":403,"message":"forbidden"}"#)
+        } else if path.starts_with("/api/v1/secrets?") {
+            page(&[secret("shop", &["shop.example"])])
+        } else {
+            answer(500, "")
+        }
+    })
+    .await;
+    let api = fake.client(
+        &token("controller-status-held", "secret"),
+        Timing::default(),
+    );
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let plane = plane();
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    let source = Addresses::Service {
+                        namespace: "edge".to_owned(),
+                        name: "edgerush".to_owned(),
+                    };
+                    control(
+                        api,
+                        &[Scope::Cluster],
+                        &plane,
+                        Debounce::default(),
+                        Some(source),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("translated, and the Service's refusal said", || {
+                let heard = heard.borrow();
+                !heard.translations.is_empty()
+                    && heard
+                        .lines
+                        .iter()
+                        .any(|line| line.starts_with("services in edge: "))
+            })
+            .await;
+            controlling.abort();
+        })
+        .await;
+    assert!(
+        heard
+            .borrow()
+            .lines
+            .iter()
+            .all(|line| !line.starts_with("waiting on services in edge")),
+        "the translation waited on the status's Service: {:?}",
+        heard.borrow().lines
+    );
+    assert!(
+        fake.seen().iter().all(|seen| seen.method != "PATCH"),
+        "a status written with no Service listed"
     );
 }

@@ -110,6 +110,9 @@ pub struct Translation {
     /// The Ingresses a route of which is in the config, in the order they rank: those whose
     /// status carries the data plane's addresses (04 §6).
     pub served: Vec<Object>,
+    /// Every Ingress of the data plane's class, served or not, in the order they rank:
+    /// those whose status is this data plane's to write.
+    pub claimed: Vec<Object>,
 }
 
 /// A path whose backend is not there: its Service does not exist, has no such port, or the
@@ -438,6 +441,10 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut presented: Vec<(String, Certificate, Vec<String>)> = Vec::new();
     let mut stated: BTreeMap<String, (Object, bool, String)> = BTreeMap::new();
     let mut accepted = Vec::new();
+    let of_the_class: Vec<Object> = ingresses
+        .iter()
+        .map(|ingress| Object::of("Ingress", &ingress.metadata))
+        .collect();
     for ingress in ingresses {
         let object = || Object::of("Ingress", &ingress.metadata);
         let dated = ingress.metadata.creation_timestamp.is_some();
@@ -664,6 +671,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         tls,
         shadowed,
         served: served_ingresses,
+        claimed: of_the_class,
     }
 }
 

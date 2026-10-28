@@ -346,17 +346,24 @@ async fn control_until(
     };
     let telling = Rc::clone(&say);
     tasks.push(tokio::task::spawn_local(async move {
-        control(api, &scope, &plane, Debounce::default(), move |said| {
-            let mut text = told(&said, write_config.as_deref());
-            if let (Said::Translated(translation), Some(offering)) = (&said, &offering) {
-                // Writing to a `String` cannot fail.
-                let _ = match offering.offer(translation) {
-                    Ok(version) => write!(text, "\noffered as config {version}"),
-                    Err(error) => write!(text, "\nnot offered: {error}"),
-                };
-            }
-            telling(&text);
-        })
+        control(
+            api,
+            &scope,
+            &plane,
+            Debounce::default(),
+            None,
+            move |said| {
+                let mut text = told(&said, write_config.as_deref());
+                if let (Said::Translated(translation), Some(offering)) = (&said, &offering) {
+                    // Writing to a `String` cannot fail.
+                    let _ = match offering.offer(translation) {
+                        Ok(version) => write!(text, "\noffered as config {version}"),
+                        Err(error) => write!(text, "\nnot offered: {error}"),
+                    };
+                }
+                telling(&text);
+            },
+        )
         .await;
     }));
     let stopped = stop.await;
@@ -449,6 +456,25 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
             format!("waiting to have listed {}", unlisted.join(", "))
         }
         Said::Failed { followed, failure } => format!("{followed}: {failure}"),
+        Said::Status {
+            ingress,
+            addresses,
+            written,
+        } => {
+            let said: Vec<String> = addresses
+                .iter()
+                .filter_map(|address| address.ip.clone().or_else(|| address.hostname.clone()))
+                .collect();
+            let said = if said.is_empty() {
+                "no address".to_owned()
+            } else {
+                said.join(", ")
+            };
+            match written {
+                Ok(()) => format!("status of {ingress}: {said}"),
+                Err(error) => format!("status of {ingress} cannot be written ({said}): {error}"),
+            }
+        }
         Said::Translated(translation) => {
             let mut text = described(translation);
             if let Some(path) = write_config {

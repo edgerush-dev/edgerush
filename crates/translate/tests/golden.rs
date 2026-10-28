@@ -137,6 +137,23 @@ fn every_case_translates_to_its_config_and_report() {
             .collect();
         served.sort();
         assert_eq!(served, of_routes, "{name}: the Ingresses served");
+        // Every Ingress is claimed or passed over, and every one served is claimed.
+        let ingresses = serde_saphyr::from_multiple::<Manifest>(&manifests)
+            .unwrap()
+            .into_iter()
+            .filter(|manifest| matches!(manifest, Manifest::Ingress(_)))
+            .count();
+        assert_eq!(
+            translation.claimed.len() + translation.passed_over,
+            ingresses,
+            "{name}: the Ingresses claimed and passed over"
+        );
+        for object in &translation.served {
+            assert!(
+                translation.claimed.contains(object),
+                "{name}: {object} served, not claimed"
+            );
+        }
         if let Err(problems) = compile(&translation.config) {
             let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
             panic!("{name}: the data plane refuses its config: {problems:?}");

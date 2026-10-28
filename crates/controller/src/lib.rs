@@ -6,12 +6,15 @@
 //! The changes of a moment make one translation: it waits until no change has come for
 //! [`Debounce::quiet`], and never more than [`Debounce::most`] after the first it waits on
 //! (04 §2). Each translation is whole, of everything followed, and pure
-//! ([`edgerush_translate`]); the follows and the waiting are all that is not.
+//! ([`edgerush_translate`]); the follows and the waiting are all that is not. Where it is
+//! asked to, it writes each Ingress's status as the config handed on serves it (04 §6),
+//! [`status`].
 
 use edgerush_config::{ConfigError, compile};
-use edgerush_kubernetes::{ApiServer, Failure, Kind, Listed, Retry, Scope, follow};
-use edgerush_translate::{Cluster, Plane, Translation, translate};
+use edgerush_kubernetes::{ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow};
+use edgerush_translate::{Cluster, Object, Plane, Translation, translate};
 use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,6 +22,10 @@ use std::time::Duration;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+
+pub mod status;
+
+use status::Addresses;
 
 /// How long changes are gathered before they are translated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,18 +70,30 @@ pub enum Said<'a> {
         /// Why the data plane would refuse it.
         problems: &'a [ConfigError],
     },
+    /// An Ingress's status written to say these addresses, none taking them away; or why it
+    /// could not be, to be written again at the next change.
+    Status {
+        /// The Ingress.
+        ingress: &'a Object,
+        /// What it is to say.
+        addresses: &'a [IngressLoadBalancerIngress],
+        /// Whether it says it now.
+        written: Result<(), &'a ApiError>,
+    },
 }
 
 /// Follows, through `api`, the kinds `plane`'s config is made of in each of `scope`'s
 /// parts, IngressClasses in the cluster, and translates them for it each time they
-/// change, once every one has been listed whole; says how it goes to `said`. Runs for as
-/// long as it is polled, its follows ended with it. For a thread and runtime of its own,
-/// in a `LocalSet`.
+/// change, once every one has been listed whole; says how it goes to `said`. With
+/// `status`, it writes each Ingress's status to say the addresses it gives as the config
+/// handed on serves the Ingress, where it says otherwise. Runs for as long as it is polled,
+/// its follows ended with it. For a thread and runtime of its own, in a `LocalSet`.
 pub async fn control(
     api: ApiServer,
     scope: &[Scope],
     plane: &Plane,
     debounce: Debounce,
+    status: Option<Addresses>,
     said: impl Fn(Said<'_>) + 'static,
 ) {
     let api = Rc::new(api);
@@ -92,14 +111,25 @@ pub async fn control(
         ingresses: start.follows(scope),
         services: start.follows(scope),
         secrets: start.follows(scope),
+        status_service: match &status {
+            Some(Addresses::Service { namespace, .. }) => {
+                start.follows(&[Scope::Namespace(namespace.clone())])
+            }
+            _ => Vec::new(),
+        },
     };
     let mut waiting = Waiting::default();
     let mut translator = Translator::default();
+    // What the config handed on serves: the Ingresses claimed, and those served.
+    let mut handed: Option<(Vec<Object>, Vec<Object>)> = None;
     loop {
         match translator.step(plane, followed.unlisted(), || followed.cluster()) {
             Step::Nothing => {}
             Step::Waiting(unlisted) => said(Said::Waiting(unlisted)),
-            Step::Translated(translation) => said(Said::Translated(translation)),
+            Step::Translated(translation) => {
+                handed = Some((translation.claimed.clone(), translation.served.clone()));
+                said(Said::Translated(translation));
+            }
             Step::Refused {
                 translation,
                 problems,
@@ -107,6 +137,39 @@ pub async fn control(
                 translation,
                 problems: &problems,
             }),
+        }
+        // Every round, so that a status changed by another, or written in vain, is written
+        // again; one at a time, which is all the pace there is. A status written is a change
+        // to its Ingress, and the round it brings finds nothing more to write.
+        if let (Some(source), Some((claimed, served))) = (&status, &handed)
+            && followed.status_listed()
+        {
+            let addresses = match source {
+                Addresses::Stated(addresses) => addresses.clone(),
+                Addresses::Service { name, .. } => {
+                    let services = followed.status_services();
+                    let named = services
+                        .iter()
+                        .find(|service| service.metadata.name.as_deref() == Some(name.as_str()));
+                    status::of_service(named)
+                }
+            };
+            let ingresses = followed.ingresses();
+            for change in status::changes(claimed, served, &ingresses, &addresses) {
+                let written = match status::patch(&change.addresses) {
+                    Ok(patch) => {
+                        let object = &change.ingress;
+                        api.patch_status::<Ingress>(&object.namespace, &object.name, &patch)
+                            .await
+                    }
+                    Err(error) => Err(ApiError::Unreadable(error.to_string())),
+                };
+                said(Said::Status {
+                    ingress: &change.ingress,
+                    addresses: &change.addresses,
+                    written: written.as_ref().map(|_| ()),
+                });
+            }
         }
         // Until a change comes, and then until its moment is over.
         changed.notified().await;
@@ -188,10 +251,12 @@ struct Followed {
     ingresses: Vec<Follow<Ingress>>,
     services: Vec<Follow<Service>>,
     secrets: Vec<Follow<Secret>>,
+    /// The namespace of the data plane's Service, followed for its addresses.
+    status_service: Vec<Follow<Service>>,
 }
 
 impl Followed {
-    /// The follows that have not been listed whole, by name.
+    /// The follows translation waits on that have not been listed whole, by name.
     fn unlisted(&self) -> Vec<String> {
         fn of<K>(follows: &[Follow<K>]) -> impl Iterator<Item = String> {
             follows
@@ -206,22 +271,42 @@ impl Followed {
             .collect()
     }
 
+    /// Whether the data plane's Service's namespace has been listed whole: what statuses
+    /// wait for, and translation does not, so that a config is never held up by its status.
+    fn status_listed(&self) -> bool {
+        self.status_service
+            .iter()
+            .all(|follow| follow.objects.borrow().listed)
+    }
+
+    /// The Ingresses followed, as they are now.
+    fn ingresses(&self) -> Vec<Ingress> {
+        objects(&self.ingresses)
+    }
+
+    /// The Services of the data plane's Service's namespace, as they are now.
+    fn status_services(&self) -> Vec<Service> {
+        objects(&self.status_service)
+    }
+
     /// Every object followed, as translation takes them.
     fn cluster(&self) -> Cluster {
-        fn of<K: Clone>(follows: &[Follow<K>]) -> Vec<K> {
-            follows
-                .iter()
-                .flat_map(|follow| follow.objects.borrow().objects.clone())
-                .collect()
-        }
         Cluster {
-            ingress_classes: of(&self.ingress_classes),
-            ingresses: of(&self.ingresses),
-            services: of(&self.services),
-            secrets: of(&self.secrets),
+            ingress_classes: objects(&self.ingress_classes),
+            ingresses: objects(&self.ingresses),
+            services: objects(&self.services),
+            secrets: objects(&self.secrets),
             secrets_assumed: false,
         }
     }
+}
+
+/// The objects of `follows`, as they last published them.
+fn objects<K: Clone>(follows: &[Follow<K>]) -> Vec<K> {
+    follows
+        .iter()
+        .flat_map(|follow| follow.objects.borrow().objects.clone())
+        .collect()
 }
 
 /// The changes waited on: when the first and the last came.
