@@ -165,8 +165,6 @@ pub struct CompiledRateLimitService {
     pub max_key_bytes: u64,
     /// Whether quiet keys are polled every cycle while in use.
     pub poll_quiet_keys: bool,
-    /// Whether a request for a cold key waits for its owner's word.
-    pub ask_cold_keys: bool,
     /// Whether each cycle visits only the keys that need it.
     pub schedule_keys: bool,
 }
@@ -679,7 +677,6 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
             let asynchronous = [
                 ("cycle_ms", service.cycle_ms.is_some()),
                 ("poll_quiet_keys", service.poll_quiet_keys.is_some()),
-                ("ask_cold_keys", service.ask_cold_keys.is_some()),
                 ("schedule_keys", service.schedule_keys.is_some()),
             ];
             for (field, said) in asynchronous {
@@ -739,7 +736,6 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
                     .map_or(CompiledRateLimitService::CYCLE, Duration::from_millis),
                 max_key_bytes,
                 poll_quiet_keys: service.poll_quiet_keys.unwrap_or(false),
-                ask_cold_keys: service.ask_cold_keys.unwrap_or(false),
                 schedule_keys: service.schedule_keys.unwrap_or(true),
             }),
             None => CompiledRateLimiting::Off,
@@ -5490,7 +5486,6 @@ rate_limiting: {{ {section} }}
         for (field, value) in [
             ("cycle_ms", "10"),
             ("poll_quiet_keys", "false"),
-            ("ask_cold_keys", "false"),
             ("schedule_keys", "true"),
         ] {
             let service = format!(
@@ -5583,16 +5578,13 @@ rate_limiting: {{ {section} }}
         }
         let addresses = with(r#"{ addresses: ["10.0.0.1:7000", "[::1]:7000"] }"#);
         assert_eq!(addresses.unwrap().unwrap().pods.len(), 2);
-        let levers = with(
-            r#"{ addresses: ["a:1"], poll_quiet_keys: true, ask_cold_keys: true, schedule_keys: false }"#,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(levers.poll_quiet_keys && levers.ask_cold_keys && !levers.schedule_keys);
+        let levers = with(r#"{ addresses: ["a:1"], poll_quiet_keys: true, schedule_keys: false }"#)
+            .unwrap()
+            .unwrap();
+        assert!(levers.poll_quiet_keys && !levers.schedule_keys);
         assert!(
-            !service.poll_quiet_keys && !service.ask_cold_keys && service.schedule_keys,
-            "when left out, the fastest: quiet keys not polled, cold keys decided locally, \
-             keys scheduled"
+            !service.poll_quiet_keys && service.schedule_keys,
+            "when left out, the fastest: quiet keys not polled, keys scheduled"
         );
         let capped = compile(&config(
             "listeners: {}\nroutes: []\nupstreams: {}\nrate_limiting: { mode: asynchronous, max_key_bytes: 1000, service: { addresses: [\"a:1\"] } }\n",

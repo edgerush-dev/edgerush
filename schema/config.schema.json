@@ -1115,14 +1115,6 @@
           },
           "minItems": 1
         },
-        "ask_cold_keys": {
-          "description": "Whether a request for a key whose copy is cold waits for its owner's word. Off, it is\ndecided from the copy as it is — a new key's a full bucket — and the copy put right\nafter: no request waits on the service, at the price of a burst on a new key\nadmitted by every process that meets it. Off when left out, the faster.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
-        },
         "cycle_ms": {
           "description": "Milliseconds between the process's messages to the service; 10 when left out. Every\nlimit's bucket holds at least two cycles of its rate, so a longer cycle asks for\nlarger buckets: at 20 ms, a burst of 40 at `1000/s`.",
           "type": [
@@ -1134,7 +1126,7 @@
           "minimum": 1
         },
         "poll_quiet_keys": {
-          "description": "Whether a key with nothing to report is polled every cycle while in use, to keep its\ncopy fresh. Off, a quiet key's copy goes cold after a refill time and its next\nrequest asks: messages grow with the keys admitting, not with all those in use. On,\na key counts as in use for its refill time after its last request, so under a limit\nrefilling over an hour or a day every key of every client seen in that time is polled\nevery cycle: each cycle's messages and work grow with them, millions of keys every\n10 ms. Off when left out, the faster.",
+          "description": "Whether a key with nothing to report is polled every cycle while in use, to keep its\ncopy fresh. Off, a quiet key's copy is as fresh as its last answer until it has\nsomething to report again: messages grow with the keys admitting, not with all those\nin use. On,\na key counts as in use for its refill time after its last request, so under a limit\nrefilling over an hour or a day every key of every client seen in that time is polled\nevery cycle: each cycle's messages and work grow with them, millions of keys every\n10 ms. Off when left out, the faster.",
           "type": [
             "boolean",
             "null"

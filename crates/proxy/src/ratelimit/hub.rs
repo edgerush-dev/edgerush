@@ -271,7 +271,6 @@ impl Hub {
         self.service.pods == service.pods
             && self.service.cycle == service.cycle
             && self.service.poll_quiet_keys == service.poll_quiet_keys
-            && self.service.ask_cold_keys == service.ask_cold_keys
             && self.service.schedule_keys == service.schedule_keys
     }
 
@@ -434,7 +433,7 @@ fn run(
     participant.set_one_in_flight(true);
     participant.set_levers(Levers {
         poll_quiet: service.poll_quiet_keys,
-        ask_cold: service.ask_cold_keys,
+        ask_cold: false,
     });
     participant.set_scheduled(service.schedule_keys);
     if made.send(Ok(participant.registry())).is_err() {

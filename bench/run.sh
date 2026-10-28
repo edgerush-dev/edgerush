@@ -48,10 +48,9 @@
 #                                             client addresses (1000 unless said), each a
 #                                             quiet key of its own; by the levers:
 #                                             VARIANTS ours-rl-default (left out),
-#                                             ours-rl-protocol (quiet keys polled, cold keys
-#                                             asked about, every key visited), -nopoll,
-#                                             -local, -both, -sched, -local-sched and
-#                                             -both-sched, ours-local (local mode: the
+#                                             ours-rl-protocol (quiet keys polled, every key
+#                                             visited), -nopoll and -sched, ours-local
+#                                             (local mode: the
 #                                             process alone, no service), ours-sync
 #                                             (the synchronous mode: a pod of its own
 #                                             decides every request),
@@ -726,23 +725,18 @@ rl_per_second() {
 # refusing — its levers as `$1` says.
 rl_config() { # levers
     local sharing
-    levers() { # poll_quiet_keys ask_cold_keys schedule_keys
-        printf ', poll_quiet_keys: %s, ask_cold_keys: %s, schedule_keys: %s' "$1" "$2" "$3"
+    levers() { # poll_quiet_keys schedule_keys
+        printf ', poll_quiet_keys: %s, schedule_keys: %s' "$1" "$2"
     }
     case "$1" in
     # As configured with its levers left out: the fastest.
     default) sharing= ;;
     # Every lever said, so that a name keeps its meaning whatever the defaults: the
-    # protocol's (quiet keys polled, cold keys asked about, every key visited); quiet keys
-    # not polled; cold keys decided locally; both; and each visiting only the keys that need
-    # it.
-    protocol) sharing=$(levers true true false) ;;
-    nopoll) sharing=$(levers false true false) ;;
-    local) sharing=$(levers true false false) ;;
-    both) sharing=$(levers false false false) ;;
-    sched) sharing=$(levers true true true) ;;
-    local-sched) sharing=$(levers true false true) ;;
-    both-sched) sharing=$(levers false false true) ;;
+    # protocol's (quiet keys polled, every key visited); quiet keys not polled; and quiet
+    # keys polled, visiting only the keys that need it.
+    protocol) sharing=$(levers true false) ;;
+    nopoll) sharing=$(levers false false) ;;
+    sched) sharing=$(levers true true) ;;
     # Local mode: no service, no levers; the synchronous mode has none either.
     local-mode | sync-mode) sharing= ;;
     *) echo "no levers $1" >&2; exit 2 ;;

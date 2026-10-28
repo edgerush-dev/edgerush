@@ -696,12 +696,12 @@ impl Limiter {
 
 /// A worker's own decision of a request under `parts` at `now`, from its handles to the
 /// entries of its keys: those it holds none of under their contracts looked for in its
-/// process's `registry` first — or, with cold keys decided locally, made there while there
-/// is room for it — and asked about if not there.
+/// process's `registry` first — or made there while there is room for it — and asked about
+/// if not there.
 fn decide(
     handles: &RefCell<Handles>,
     registry: &Registry<Keyed>,
-    making: Option<(&Hub, u64, &Arc<Room>)>,
+    (hub, cycle, room): (&Hub, u64, &Arc<Room>),
     parts: &[(&[u8], Contract)],
     now: u64,
 ) -> Pooled {
@@ -722,22 +722,22 @@ fn decide(
             if held(&handles, key, *contract) {
                 continue;
             }
-            // Cold keys decided locally, a key the process has not met is made here, at
-            // once, and handed to the process to keep, holding room until it is taken in;
-            // with no room, only one there already is found, and the request is asked
-            // about otherwise.
-            let found =
-                match making.and_then(|(hub, cycle, room)| Some((hub, cycle, room.take(key)?))) {
-                    None => registry.find(key, *contract),
-                    Some((hub, cycle, room)) => registry
+            // A key the process has not met is made here, at once, and handed to the
+            // process to keep, holding room until it is taken in; with no room, only one
+            // there already is found, and the request is asked about otherwise.
+            let found = match room.take(key) {
+                None => registry.find(key, *contract),
+                Some(room) => {
+                    registry
                         .find_or_make(key, *contract, cycle, now)
                         .map(|(entry, made)| {
                             if made {
                                 let _gone = hub.to.send(ToHub::Adopt(Arc::clone(&entry), room));
                             }
                             entry
-                        }),
-                };
+                        })
+                }
+            };
             let Some(entry) = found else {
                 return ask;
             };
@@ -768,11 +768,11 @@ fn decide(
 }
 
 impl Limiter {
-    /// With cold keys decided locally, where a worker makes a key's entry: its process, the
-    /// cycle, in nanoseconds, and its room for keys made.
-    fn making(&self) -> Option<(&Hub, u64, &Arc<Room>)> {
+    /// Where a worker makes a key's entry: its process, the cycle, in nanoseconds, and its
+    /// room for keys made.
+    fn making(&self) -> (&Hub, u64, &Arc<Room>) {
         let cycle = u64::try_from(self.service.cycle.as_nanos()).unwrap_or(u64::MAX);
-        (!self.service.ask_cold_keys).then_some((&*self.hub, cycle, &self.room))
+        (&*self.hub, cycle, &self.room)
     }
 
     /// What a decision asks of others: a key's count drained, waiters woken, and with keys
