@@ -131,6 +131,13 @@ impl ApiError {
     pub fn is_gone(&self) -> bool {
         matches!(self, Self::Answered { code: 410, .. })
     }
+
+    /// Whether this is the API server's 409: an object written as of a version it has
+    /// moved past, or created where there is one already.
+    #[must_use]
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::Answered { code: 409, .. })
+    }
 }
 
 /// The API server, and what it is asked with.
@@ -301,9 +308,7 @@ impl ApiServer {
         name: &str,
         patch: &serde_json::Value,
     ) -> Result<(), ApiError> {
-        let mut path = kind::collection::<K>(&Scope::namespace(namespace)?)?;
-        path.push('/');
-        encode_into(&mut path, name);
+        let mut path = object_path::<K>(namespace, name)?;
         path.push_str("/status");
         let body = serde_json::to_vec(patch).map_err(|error| ApiError::Http(error.to_string()))?;
         let deadline = Instant::now() + self.timing.answer;
@@ -313,6 +318,90 @@ impl ApiServer {
             .send(Method::PATCH, &path, Some(merge), deadline)
             .await?;
         Ok(())
+    }
+
+    /// `K`'s object `name` in `namespace`, as it is now; none if there is none.
+    ///
+    /// # Errors
+    ///
+    /// An [`ApiError`] for anything the API server answers but the object or 404.
+    pub async fn object<K: Kind>(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<K>, ApiError> {
+        let path = object_path::<K>(namespace, name)?;
+        let deadline = Instant::now() + self.timing.answer;
+        match self.get(&path, deadline).await {
+            Ok(body) => self.read_object(body, deadline).await.map(Some),
+            Err(ApiError::Answered { code: 404, .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Creates `object`, `K`'s, in `namespace`: the object as the API server has made it.
+    ///
+    /// # Errors
+    ///
+    /// An [`ApiError`]: [`ApiError::is_conflict`] when there is one of its name already.
+    pub async fn create<K: Kind + serde::Serialize>(
+        &self,
+        namespace: &str,
+        object: &K,
+    ) -> Result<K, ApiError> {
+        let path = kind::collection::<K>(&Scope::namespace(namespace)?)?;
+        self.write(Method::POST, &path, object).await
+    }
+
+    /// Replaces `K`'s object `name` in `namespace` with `object`, as of the version its
+    /// metadata says it was read at: the object as the API server now has it.
+    ///
+    /// # Errors
+    ///
+    /// An [`ApiError`]: [`ApiError::is_conflict`] when it has changed since that version.
+    pub async fn replace<K: Kind + serde::Serialize>(
+        &self,
+        namespace: &str,
+        name: &str,
+        object: &K,
+    ) -> Result<K, ApiError> {
+        let path = object_path::<K>(namespace, name)?;
+        self.write(Method::PUT, &path, object).await
+    }
+
+    /// Sends `object` with `method` to `path`, and reads back what the API server made of
+    /// it.
+    async fn write<K: Kind + serde::Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        object: &K,
+    ) -> Result<K, ApiError> {
+        let body = serde_json::to_vec(object).map_err(|error| ApiError::Http(error.to_string()))?;
+        let deadline = Instant::now() + self.timing.answer;
+        // The API server answers a create with 201: a success as 200 is.
+        let answered = self
+            .send(
+                method,
+                path,
+                Some(("application/json", Bytes::from(body))),
+                deadline,
+            )
+            .await?;
+        self.read_object(answered, deadline).await
+    }
+
+    /// The object `body` holds, trimmed as [`Kind::trim`] keeps it.
+    async fn read_object<K: Kind>(
+        &self,
+        body: RecvStream,
+        deadline: Instant,
+    ) -> Result<K, ApiError> {
+        let read = read_whole(body, MOST_PAGE_BYTES, "an object", deadline).await?;
+        let mut object: K = serde_json::from_slice(&read)
+            .map_err(|error| ApiError::Unreadable(error.to_string()))?;
+        object.trim();
+        Ok(object)
     }
 
     /// The body of what `path` answers with 200, its head by `deadline`; or what it
@@ -361,7 +450,7 @@ impl ApiServer {
             .await
             .map_err(|_| ApiError::TimedOut)??;
         let (head, body) = answer.into_parts();
-        if head.status == StatusCode::OK {
+        if head.status == StatusCode::OK || head.status == StatusCode::CREATED {
             return Ok(body);
         }
         let said = read_whole(body, MOST_ERROR_BYTES, "an error", deadline)
@@ -434,6 +523,14 @@ impl ApiServer {
             .await
             .map_err(|error| ApiError::Http(error.to_string()))
     }
+}
+
+/// The path of `K`'s object `name` in `namespace`.
+fn object_path<K: Kind>(namespace: &str, name: &str) -> Result<String, ApiError> {
+    let mut path = kind::collection::<K>(&Scope::namespace(namespace)?)?;
+    path.push('/');
+    encode_into(&mut path, name);
+    Ok(path)
 }
 
 /// A watch's events, as the API server sends them.

@@ -23,6 +23,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             write_config: None,
             stream: None,
             status: None,
+            leader: None,
         }))
     );
     assert_eq!(
@@ -45,6 +46,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             write_config: Some(PathBuf::from("c")),
             stream: None,
             status: None,
+            leader: None,
         }))
     );
     assert_eq!(parsed(&["--help"]), Ok(Parsed::Help));
@@ -213,6 +215,7 @@ async fn run_until(
         write_config,
         stream: None,
         status: None,
+        leader: None,
     };
     let stop = {
         let lines = Rc::clone(&lines);
@@ -233,6 +236,7 @@ async fn run_until(
             options,
             plane,
             serving,
+            None,
             stop,
             move |line| {
                 heard
@@ -344,6 +348,7 @@ fn the_stream_is_given_whole_or_not_at_all() {
                 },
             })),
             status: None,
+            leader: None,
         }))
     );
     // Each of the four left out.
@@ -601,6 +606,27 @@ fn ingress_statuses_say_the_data_planes_service_or_addresses_stated_never_both()
             "203.0.113.7"
         ]),
         Err(UsageError::Status)
+    );
+    let leader = |args: &[&str]| {
+        let mut all = vec!["--data-plane", "p"];
+        all.extend(args);
+        parsed(&all).map(|parsed| match parsed {
+            Parsed::Control(options) => options.leader,
+            Parsed::Help => panic!("help"),
+        })
+    };
+    assert_eq!(leader(&[]), Ok(None));
+    assert_eq!(
+        leader(&["--leader-lease", "edge/edgerush-control"]),
+        Ok(Some(("edge".to_owned(), "edgerush-control".to_owned())))
+    );
+    assert_eq!(
+        leader(&["--leader-lease", "edge"]),
+        Err(UsageError::LeaderLease("edge".to_owned()))
+    );
+    assert_eq!(
+        leader(&["--leader-lease", "edge/a", "--leader-lease", "edge/b"]),
+        Err(UsageError::Twice("--leader-lease"))
     );
     for named in ["edgerush", "Edge/edgerush", "edge/", "edge/a/b"] {
         assert_eq!(

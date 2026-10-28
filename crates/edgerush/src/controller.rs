@@ -7,6 +7,7 @@
 use crate::validate::{described, read};
 use edgerush_control_service::{Credentials, Files, Heard, SslAcceptor, acceptor, reread, serve};
 use edgerush_control_stream::{Offer, OfferError, Versions};
+use edgerush_controller::lease::{self, elect};
 use edgerush_controller::status::{Addresses, address};
 use edgerush_controller::{Debounce, Said, control};
 use edgerush_kubernetes::{ApiError, ApiServer, Scope};
@@ -28,6 +29,7 @@ pub(crate) const USAGE: &str = "\
 Usage: edgerush controller --data-plane <FILE> [--namespace <NAME>]... [--write-config <FILE>]
          [--listen <ADDRESS> --certificate <FILE> --key <FILE> --authorities <FILE>]
          [--status-service <NAMESPACE>/<NAME> | --status-address <ADDRESS>...]
+         [--leader-lease <NAMESPACE>/<NAME>]
 
 Runs a control plane for one data plane, in a cluster: follows the IngressClasses,
 Ingresses, Services and Secrets of its scope through the API server, found as a pod finds
@@ -38,7 +40,8 @@ dial: each config translated is offered to every data plane, and what each says 
 said on stderr. The certificate, key and authorities are PEM files, read again every
 second, so that ones replaced serve the next connection.
 With --status-service or --status-address, each Ingress served says the data plane's
-addresses in its status, and each of the class that is not says none.
+addresses in its status, and each of the class that is not says none. With --leader-lease,
+the replicas elect one by that Lease, which alone writes status; every one serves.
 Runs until Ctrl-C, or SIGTERM on Unix, and then exits 0; exits 2 when the command line, the
 data plane's settings or the stream's certificates cannot be used, or it is not in a
 cluster.
@@ -69,6 +72,9 @@ Options:
                              An address each Ingress served says in its status, an IP or a
                              host name, given once for each; for a cluster with no load
                              balancer, instead of --status-service
+      --leader-lease <NAMESPACE>/<NAME>
+                             The Lease the controller's replicas elect a leader by, which
+                             alone writes status; left out, there is no election
   -h, --help                 Print help
 ";
 
@@ -108,6 +114,21 @@ pub(crate) fn command(
             return writeln!(stderr, "error: {failure}").map_or(1, |()| crate::EXIT_USAGE);
         }
     };
+    // The election's own client, so that its writes never wait behind the follows'.
+    let elector = match &options.leader {
+        Some(_) => match ApiServer::in_cluster() {
+            Ok(api) => Some(Elector {
+                api,
+                identity: identity(),
+                timing: lease::Timing::default(),
+            }),
+            Err(error) => {
+                return writeln!(stderr, "error: {}", outside(&error))
+                    .map_or(1, |()| crate::EXIT_USAGE);
+            }
+        },
+        None => None,
+    };
     let serving = match (&options.stream, credentials) {
         (Some(stream), Some(credentials)) => {
             let listener = match std::net::TcpListener::bind(stream.listen) {
@@ -133,6 +154,7 @@ pub(crate) fn command(
             options,
             plane,
             serving,
+            elector,
             told_to_stop(),
             |line: &str| {
                 let _nobody_reads = writeln!(io::stderr(), "{line}");
@@ -187,6 +209,8 @@ struct Options {
     stream: Option<Box<Stream>>,
     /// Where the addresses Ingress statuses say come from, if they are written.
     status: Option<Addresses>,
+    /// The Lease a leader is elected by, as its namespace and name, if one is.
+    leader: Option<(String, String)>,
 }
 
 /// The config stream, as the command line gives it.
@@ -218,6 +242,8 @@ enum UsageError {
     StatusService(String),
     #[error("'--status-service' and '--status-address' are not given together")]
     Status,
+    #[error("'--leader-lease {0}' is not a namespace and a name, as edge/edgerush-control")]
+    LeaderLease(String),
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
@@ -228,6 +254,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut key = None;
     let mut authorities = None;
     let mut status_service = None;
+    let mut leader = None;
     let mut status_addresses = Vec::new();
     let mut scope = Vec::new();
     while let Some(arg) = args.next() {
@@ -242,6 +269,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             "--authorities" => "--authorities",
             "--status-service" => "--status-service",
             "--status-address" => "--status-address",
+            "--leader-lease" => "--leader-lease",
             _ => return Err(UsageError::Unexpected(arg)),
         };
         let value = args.next().ok_or(UsageError::NoValue(option))?;
@@ -256,17 +284,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                 continue;
             }
             "--status-service" => {
-                let named = value
-                    .split_once('/')
-                    .filter(|(namespace, name)| {
-                        Scope::namespace(namespace).is_ok()
-                            && !name.is_empty()
-                            && !name.contains('/')
-                    })
-                    .map(|(namespace, name)| Addresses::Service {
-                        namespace: namespace.to_owned(),
-                        name: name.to_owned(),
-                    })
+                let named = named(&value)
+                    .map(|(namespace, name)| Addresses::Service { namespace, name })
                     .ok_or_else(|| UsageError::StatusService(value.clone()))?;
                 if status_service.replace(named).is_some() {
                     return Err(UsageError::Twice(option));
@@ -275,6 +294,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             }
             "--status-address" => {
                 status_addresses.push(address(&value));
+                continue;
+            }
+            "--leader-lease" => {
+                let named = named(&value).ok_or_else(|| UsageError::LeaderLease(value.clone()))?;
+                if leader.replace(named).is_some() {
+                    return Err(UsageError::Twice(option));
+                }
                 continue;
             }
             "--listen" => {
@@ -321,7 +347,34 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         write_config,
         stream,
         status,
+        leader,
     }))
+}
+
+/// A namespace and a name, as `<namespace>/<name>` says them.
+fn named(value: &str) -> Option<(String, String)> {
+    value
+        .split_once('/')
+        .filter(|(namespace, name)| {
+            Scope::namespace(namespace).is_ok() && !name.is_empty() && !name.contains('/')
+        })
+        .map(|(namespace, name)| (namespace.to_owned(), name.to_owned()))
+}
+
+/// The election, ready to be run.
+struct Elector {
+    /// A client of its own, so that its writes never wait behind the follows'.
+    api: ApiServer,
+    /// This replica, as the Lease names its holder.
+    identity: String,
+    timing: lease::Timing,
+}
+
+/// This replica, as a Lease names its holder: its pod's name, which the environment gives
+/// as its host name, and when it started, so that a pod started again is another.
+fn identity() -> String {
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "edgerush".to_owned());
+    format!("{host}_{}", started_at())
 }
 
 /// The config stream, ready to be served.
@@ -342,12 +395,47 @@ async fn control_until(
     options: Options,
     plane: Plane,
     serving: Option<Serving>,
+    elector: Option<Elector>,
     stop: impl Future<Output = io::Result<()>>,
     say: impl Fn(&str) + 'static,
 ) -> io::Result<()> {
     let say: Rc<dyn Fn(&str)> = Rc::new(say);
     let write_config = options.write_config;
     let status = options.status;
+    let mut electing = Vec::new();
+    let leading = match (options.leader, elector) {
+        (Some((namespace, name)), Some(elector)) => {
+            let (leads, leading) = watch::channel(false);
+            let lease = format!("Lease {namespace}/{name}");
+            let telling = Rc::clone(&say);
+            let failed = lease.clone();
+            electing.push(tokio::task::spawn_local(async move {
+                elect(
+                    &elector.api,
+                    &namespace,
+                    &name,
+                    &elector.identity,
+                    elector.timing,
+                    &leads,
+                    |error| telling(&format!("{failed}: {error}")),
+                )
+                .await;
+            }));
+            let (mut told, telling) = (leading.clone(), Rc::clone(&say));
+            electing.push(tokio::task::spawn_local(async move {
+                while told.changed().await.is_ok() {
+                    let leads = *told.borrow_and_update();
+                    telling(&if leads {
+                        format!("leading, by {lease}")
+                    } else {
+                        "no longer leading".to_owned()
+                    });
+                }
+            }));
+            Some(leading)
+        }
+        _ => None,
+    };
     let scope = options.scope;
     let mut tasks = Vec::new();
     let mut served = None;
@@ -404,6 +492,7 @@ async fn control_until(
             &plane,
             Debounce::default(),
             status,
+            leading,
             move |said| {
                 let mut text = told(&said, write_config.as_deref());
                 if let (Said::Translated(translation), Some(offering)) = (&said, &offering) {
@@ -425,7 +514,7 @@ async fn control_until(
             say(&format!("error: {error}"));
         }
     }
-    for task in tasks {
+    for task in tasks.into_iter().chain(electing) {
         task.abort();
     }
     stopped

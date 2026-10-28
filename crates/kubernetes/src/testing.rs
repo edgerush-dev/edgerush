@@ -77,6 +77,15 @@ impl Fake {
         names: &[&str],
         answers: impl Fn(&str) -> Answer + Send + Sync + 'static,
     ) -> Self {
+        Self::start_by_method(names, move |_method, path| answers(path)).await
+    }
+
+    /// As [`Fake::start`], each request answered as `answers` says for its method and its
+    /// path and query.
+    pub async fn start_by_method(
+        names: &[&str],
+        answers: impl Fn(&str, &str) -> Answer + Send + Sync + 'static,
+    ) -> Self {
         let certificate = edgerush_certificates::testing::certificate(names);
         let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
         acceptor
@@ -133,7 +142,7 @@ impl Fake {
                         if read {
                             recorded.lock().unwrap().push(seen.clone());
                         }
-                        let answer = answers(&path);
+                        let answer = answers(&seen.method, &path);
                         let recorded = Arc::clone(&recorded);
                         tokio::spawn(async move {
                             if !read {

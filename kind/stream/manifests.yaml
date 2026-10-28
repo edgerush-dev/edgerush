@@ -5,6 +5,8 @@
 # (09 §1); the control plane reads the cluster's IngressClasses and `shop`'s Ingresses,
 # Services and Secrets, writes the status of `shop`'s Ingresses, and reads the data plane's
 # Service in `edge` for the address they say: an external IP, as kind has no load balancer.
+# The control plane runs as two replicas, which elect the one that writes status by a Lease
+# in `edge`; both serve the stream.
 apiVersion: v1
 kind: Namespace
 metadata: { name: shop }
@@ -100,6 +102,9 @@ rules:
   - apiGroups: [""]
     resources: [services]
     verbs: [list, watch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -130,7 +135,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata: { name: edgerush-control, namespace: edge }
 spec:
-  replicas: 1
+  replicas: 2
   selector: { matchLabels: { app: edgerush-control } }
   template:
     metadata: { labels: { app: edgerush-control } }
@@ -156,6 +161,8 @@ spec:
             - /etc/edgerush/stream/ca.crt
             - --status-service
             - edge/edgerush
+            - --leader-lease
+            - edge/edgerush-control
           ports: [{ name: stream, containerPort: 9443 }]
           volumeMounts:
             - { name: plane, mountPath: /etc/edgerush }

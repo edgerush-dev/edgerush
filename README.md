@@ -182,7 +182,8 @@ certificates it names. With `--listen [::]:9443 --certificate tls.crt --key tls.
 --authorities ca.crt` it serves the config stream there, gRPC over mutual TLS: each config is
 offered to every data plane that dials it with a certificate those authorities signed, and
 what each says of it is said too. With `--status-service edge/edgerush`, each Ingress served
-says that Service's addresses in its status, and each of the class not served says none.
+says that Service's addresses in its status, and each of the class not served says none;
+with `--leader-lease edge/edgerush-control`, replicas elect the one that writes it.
 
 ## Building
 

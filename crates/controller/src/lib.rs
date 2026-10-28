@@ -23,6 +23,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
+pub mod lease;
 pub mod status;
 
 use status::Addresses;
@@ -86,14 +87,17 @@ pub enum Said<'a> {
 /// parts, IngressClasses in the cluster, and translates them for it each time they
 /// change, once every one has been listed whole; says how it goes to `said`. With
 /// `status`, it writes each Ingress's status to say the addresses it gives as the config
-/// handed on serves the Ingress, where it says otherwise. Runs for as long as it is polled,
-/// its follows ended with it. For a thread and runtime of its own, in a `LocalSet`.
+/// handed on serves the Ingress, where it says otherwise; with `leading` too, only while it
+/// says this replica leads, every status that says otherwise written as it comes to (02 §3).
+/// Runs for as long as it is polled, its follows ended with it. For a thread and runtime of
+/// its own, in a `LocalSet`.
 pub async fn control(
     api: ApiServer,
     scope: &[Scope],
     plane: &Plane,
     debounce: Debounce,
     status: Option<Addresses>,
+    leading: Option<watch::Receiver<bool>>,
     said: impl Fn(Said<'_>) + 'static,
 ) {
     let api = Rc::new(api);
@@ -118,6 +122,16 @@ pub async fn control(
             _ => Vec::new(),
         },
     };
+    // Coming to lead is a change: every status is looked at, as the last leader may have
+    // left some stale.
+    if let Some(leading) = &leading {
+        let (mut told, changed) = (leading.clone(), Rc::clone(&changed));
+        tasks.spawn_local(async move {
+            while told.changed().await.is_ok() {
+                changed.notify_one();
+            }
+        });
+    }
     let mut waiting = Waiting::default();
     let mut translator = Translator::default();
     // What the config handed on serves: the Ingresses claimed, and those served.
@@ -143,6 +157,7 @@ pub async fn control(
         // to its Ingress, and the round it brings finds nothing more to write.
         if let (Some(source), Some((claimed, served))) = (&status, &handed)
             && followed.status_listed()
+            && leading.as_ref().is_none_or(|leads| *leads.borrow())
         {
             let addresses = match source {
                 Addresses::Stated(addresses) => addresses.clone(),

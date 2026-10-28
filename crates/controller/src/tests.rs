@@ -402,7 +402,7 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
                         quiet: Duration::from_secs(1),
                         most: Duration::from_secs(5),
                     };
-                    control(api, &[Scope::Cluster], &plane, debounce, None, said).await;
+                    control(api, &[Scope::Cluster], &plane, debounce, None, None, said).await;
                 }
             });
             until("the Secrets' failure said", || {
@@ -508,7 +508,7 @@ async fn each_namespace_of_the_scope_is_followed_and_all_are_translated_together
             let controlling = tokio::task::spawn_local({
                 let said = hear(&heard);
                 async move {
-                    control(api, &scope, &plane, Debounce::default(), None, said).await;
+                    control(api, &scope, &plane, Debounce::default(), None, None, said).await;
                 }
             });
             until("translated", || !heard.borrow().translations.is_empty()).await;
@@ -738,6 +738,7 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
                         &plane,
                         Debounce::default(),
                         Some(source),
+                        None,
                         said,
                     )
                     .await;
@@ -822,6 +823,7 @@ async fn a_config_is_not_held_up_by_its_status() {
                         &plane,
                         Debounce::default(),
                         Some(source),
+                        None,
                         said,
                     )
                     .await;
@@ -852,4 +854,156 @@ async fn a_config_is_not_held_up_by_its_status() {
         fake.seen().iter().all(|seen| seen.method != "PATCH"),
         "a status written with no Service listed"
     );
+}
+
+/// No Lease: one is made and held, and renewed; renewals refused, leading stops within the
+/// renew deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_makes_the_lease_leads_renews_and_stops_when_it_cannot() {
+    use k8s_openapi::api::coordination::v1::Lease;
+    let made = Arc::new(AtomicBool::new(false));
+    let refusing = Arc::new(AtomicBool::new(false));
+    let (was_made, refused) = (Arc::clone(&made), Arc::clone(&refusing));
+    let fake =
+        edgerush_kubernetes::testing::Fake::start_by_method(&["127.0.0.1"], move |method, path| {
+            let held: Lease = serde_json::from_value(serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": "edgerush", "namespace": "edge", "resourceVersion": "2" },
+                "spec": { "holderIdentity": "me", "leaseDurationSeconds": 1 },
+            }))
+            .unwrap();
+            let body = serde_json::to_string(&held).unwrap();
+            assert!(
+                path.starts_with("/apis/coordination.k8s.io/v1/namespaces/edge/leases"),
+                "{path}"
+            );
+            match method {
+                "GET" if !was_made.load(Ordering::SeqCst) => {
+                    answer(404, r#"{"kind":"Status","code":404}"#)
+                }
+                "GET" => answer(200, &body),
+                "POST" => {
+                    was_made.store(true, Ordering::SeqCst);
+                    Answer {
+                        status: 201,
+                        ..answer(200, &body)
+                    }
+                }
+                "PUT" if refused.load(Ordering::SeqCst) => {
+                    answer(409, r#"{"kind":"Status","code":409,"message":"modified"}"#)
+                }
+                _ => answer(200, &body),
+            }
+        })
+        .await;
+    let api = fake.client(&token("controller-lease", "secret"), Timing::default());
+    let timing = lease::Timing {
+        duration: Duration::from_millis(600),
+        renew_deadline: Duration::from_millis(400),
+        retry: Duration::from_millis(50),
+    };
+    let (leading, mut leads) = watch::channel(false);
+    let electing = tokio::spawn(async move {
+        lease::elect(&api, "edge", "edgerush", "me", timing, &leading, |_| {}).await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), leads.wait_for(|leads| *leads))
+        .await
+        .expect("never led")
+        .unwrap();
+    until("renewed", || {
+        fake.seen()
+            .iter()
+            .filter(|seen| seen.method == "PUT")
+            .count()
+            >= 2
+    })
+    .await;
+    refusing.store(true, Ordering::SeqCst);
+    let refused_at = Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), leads.wait_for(|leads| !*leads))
+        .await
+        .expect("led on, its renewals refused")
+        .unwrap();
+    // Not before its last renewal's deadline.
+    assert!(
+        refused_at.elapsed() >= Duration::from_millis(300),
+        "stopped after {:?}",
+        refused_at.elapsed()
+    );
+    electing.abort();
+    let created = fake
+        .seen()
+        .into_iter()
+        .find(|seen| seen.method == "POST")
+        .unwrap();
+    let created: Lease = serde_json::from_str(&created.body).unwrap();
+    assert_eq!(created.spec.unwrap().holder_identity.as_deref(), Some("me"));
+}
+
+/// A replica that does not lead writes no status; as it comes to, it writes each that says
+/// otherwise, nothing else having changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        if path.ends_with("/status") {
+            return answer(200, "{}");
+        }
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[ingress_saying("web", "edge", &[], &[])])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/secrets?") {
+            page(&[secret("shop", &["shop.example"])])
+        } else {
+            answer(500, "")
+        }
+    })
+    .await;
+    let api = fake.client(&token("controller-leading", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let (leads, leading) = watch::channel(false);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let plane = plane();
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    let source = Addresses::Stated(vec![status::address("203.0.113.7")]);
+                    control(
+                        api,
+                        &[Scope::Cluster],
+                        &plane,
+                        Debounce::default(),
+                        Some(source),
+                        Some(leading),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("translated", || !heard.borrow().translations.is_empty()).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                fake.seen().iter().all(|seen| seen.method != "PATCH"),
+                "a status written by a replica that does not lead"
+            );
+            leads.send_replace(true);
+            until("the status written once it leads", || {
+                heard
+                    .borrow()
+                    .lines
+                    .iter()
+                    .any(|line| line == "status of Ingress shop/web: [203.0.113.7]")
+            })
+            .await;
+            controlling.abort();
+        })
+        .await;
 }
