@@ -107,6 +107,9 @@ pub struct Translation {
     /// Paths of Ingresses translated that never take a request: another rule, older, has
     /// the same path on the same host.
     pub shadowed: Vec<Shadowed>,
+    /// The Ingresses a route of which is in the config, in the order they rank: those whose
+    /// status carries the data plane's addresses (04 §6).
+    pub served: Vec<Object>,
 }
 
 /// A path whose backend is not there: its Service does not exist, has no such port, or the
@@ -525,6 +528,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     // as the router ranks them.
     let mut claimed: BTreeMap<(String, String), (Object, bool)> = BTreeMap::new();
     let mut shadowed = Vec::new();
+    let mut served_ingresses = Vec::new();
     for (object, dated, translated, taken) in accepted {
         let mut served = Vec::new();
         let mut redirected = Vec::new();
@@ -633,6 +637,9 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 }),
         );
         upstreams.extend(translated.upstreams);
+        if !served.is_empty() {
+            served_ingresses.push(object);
+        }
     }
     // An upstream only routes served on no listener led to is left out with them.
     let used: Vec<String> = routes
@@ -656,6 +663,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         unresolved,
         tls,
         shadowed,
+        served: served_ingresses,
     }
 }
 
