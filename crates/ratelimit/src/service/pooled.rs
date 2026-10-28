@@ -404,9 +404,8 @@ enum Op {
     Hold,
 }
 
-/// Whether an operation advances the cycle first if it is due: always, but for the
-/// transport's work before a cycle's advance, which `DataPlane::on_cycle` does first —
-/// asks given up and what waited on them decided in the cycle that is ending.
+/// Whether an operation advances the cycle first if it is due: always, but for a drain at
+/// a worker's word ([`Participant::drain`]), which leaves the cycle to the transport.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cycle {
     Advance,
@@ -840,8 +839,6 @@ impl Tracked {
         let unseen = Unseen {
             sequence: self.sent,
             count: unsent,
-            asked: 0,
-            refused: 0,
             admitted: self.unsent_since,
             first: now,
             last: now,
@@ -1834,7 +1831,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 continue;
             };
             // Only the owner it sends to: an answer from an owner that has gone is stale.
-            if !answer.owned || tracked.owner != Some(from) {
+            if tracked.owner != Some(from) {
                 continue;
             }
             if acknowledges {

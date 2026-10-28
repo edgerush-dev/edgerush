@@ -145,7 +145,7 @@ impl TryFrom<Decide> for owner::Decide {
     fn try_from(decide: Decide) -> Result<Self, Invalid> {
         let keys = keys_of(decide.keys)?;
         if keys.is_empty() {
-            return Err(Invalid::AskWithoutKeys);
+            return Err(Invalid::NoKeys);
         }
         for (at, (key, _)) in keys.iter().enumerate() {
             if keys[..at].iter().any(|(earlier, _)| earlier == key) {
@@ -301,7 +301,7 @@ mod tests {
             id: 1,
             keys: vec![],
         };
-        assert_eq!(owner::Decide::try_from(none), Err(Invalid::AskWithoutKeys));
+        assert_eq!(owner::Decide::try_from(none), Err(Invalid::NoKeys));
         let twice = Decide {
             id: 1,
             keys: vec![key(b"a"), key(b"b"), key(b"a")],

@@ -469,25 +469,6 @@ impl TokenBucket {
         u64::try_from((allowed - ahead) / self.window + 1).map_or(most, |all| all.min(most))
     }
 
-    /// Of at most `most` requests that arrived between `first` and `last`, how many the
-    /// bucket admits, each as early as it would: one after another from the later of `first`
-    /// and when it next admits, counting its refill no later than `last`. Charged within no
-    /// wait as of `first`, they leave the bucket as admitted so. The times may be earlier
-    /// than those the bucket was given before: what it was charged since stands, and it
-    /// admits fewer, never more. A `first` after `last` is taken as `last`. In one step,
-    /// whatever the count.
-    #[must_use]
-    pub fn remaining_between(&self, first: u64, last: u64, most: u64) -> u64 {
-        let last = u128::from(last) * self.limit;
-        let first = (u128::from(first) * self.limit).min(last);
-        let from = self.arrival.map_or(first, |arrival| arrival.max(first));
-        let furthest = last.saturating_add(self.tolerance);
-        if most == 0 || from > furthest {
-            return 0;
-        }
-        u64::try_from((furthest - from) / self.window + 1).map_or(most, |all| all.min(most))
-    }
-
     /// Charges `count` requests arriving at `now`, whether or not there was room for them:
     /// as many [`charge`](Model::charge)s, in one step.
     pub fn charge_many(&mut self, now: u64, count: u64) {
@@ -544,7 +525,6 @@ impl TokenBucket {
         BucketState {
             arrival: self.arrival.unwrap_or(0),
             last: self.last,
-            as_of: 0,
         }
     }
 
@@ -571,24 +551,6 @@ impl TokenBucket {
 pub struct BucketState {
     arrival: u128,
     last: u64,
-    /// Its holder's, which the bucket neither sets nor reads ([`as_of`](Self::as_of)): in
-    /// what would otherwise be the state's padding.
-    as_of: u64,
-}
-
-impl BucketState {
-    /// A time its holder keeps with it, 0 until set: a service pod, the latest time it has
-    /// charged the bucket as of.
-    #[must_use]
-    pub fn as_of(&self) -> u64 {
-        self.as_of
-    }
-
-    /// The state, with `as_of` its holder's time.
-    #[must_use]
-    pub fn with_as_of(self, as_of: u64) -> Self {
-        Self { as_of, ..self }
-    }
 }
 
 impl Model for TokenBucket {

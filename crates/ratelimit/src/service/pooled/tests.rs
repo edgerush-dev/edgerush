@@ -852,12 +852,9 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
             entries: vec![crate::service::Answer {
                 key: key.into(),
                 behind: 0,
-                held: 0,
                 applied: 0,
                 others: 0,
-                owned: true,
             }],
-            decided: Vec::new(),
             view: None,
             life: 0,
             number: 0,
@@ -878,12 +875,9 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
             entries: vec![crate::service::Answer {
                 key: key.into(),
                 behind: 3 * u128::from(c.window.get()),
-                held: 0,
                 applied: 1,
                 others: 0,
-                owned: true,
             }],
-            decided: Vec::new(),
             view: None,
             life: 0,
             number: 0,
@@ -915,12 +909,9 @@ fn answers_that_do_not_say_when_are_taken_as_they_come() {
             entries: vec![crate::service::Answer {
                 key: key.into(),
                 behind: 5 * u128::from(c.window.get()),
-                held: 0,
                 applied: 0,
                 others: 0,
-                owned: true,
             }],
-            decided: Vec::new(),
             view: None,
             life: 0,
             number: 0,
@@ -952,12 +943,9 @@ fn answers_held_up_are_taken_as_of_no_more_than_a_cycle_before() {
             entries: vec![crate::service::Answer {
                 key: key.into(),
                 behind: 5 * u128::from(c.window.get()),
-                held: 0,
                 applied: 0,
                 others: 0,
-                owned: true,
             }],
-            decided: Vec::new(),
             view: None,
             life: 0,
             number: 0,
@@ -1335,20 +1323,16 @@ fn one_in_flight() -> Participant<FixedState> {
 fn others_hits(key: &[u8], c: Contract, count: u64) -> Batch {
     Batch {
         from: 8,
-        oldest_ask: 0,
         entries: vec![BatchEntry {
             key: key.into(),
             contract: c,
             report: Report::Hits {
                 sequence: 1,
                 count,
-                asked: 0,
-                refused: 0,
                 seen: 0,
                 age: 0,
             },
         }],
-        asks: Vec::new(),
         made: 0,
     }
 }
@@ -1451,7 +1435,6 @@ fn a_late_answer_still_acknowledges() {
         Answers {
             from: 0,
             entries: Vec::new(),
-            decided: Vec::new(),
             view: None,
             life: 1,
             number: late.number + 1,
@@ -1671,22 +1654,17 @@ fn later_holds_across_the_wrap() {
     assert!(!later(5, 5));
 }
 
-/// A new key's request is decided at once from a full bucket and nothing is asked; its
-/// admissions are reported with the cycle, as any key's.
+/// A new key's request is decided at once from a full bucket and nothing is sent for it
+/// until the cycle, which reports its admissions as any key's.
 #[test]
-fn a_cold_key_decided_locally_asks_nothing() {
+fn a_cold_key_is_decided_locally_and_reported_with_the_cycle() {
     let mut participant = participant();
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 3));
     for _ in 0..3 {
         assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     }
     assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Refuse);
-    let asked: usize = participant
-        .take_outgoing()
-        .iter()
-        .map(|(_, batch)| batch.asks.len())
-        .sum();
-    assert_eq!(asked, 0);
+    assert!(participant.take_outgoing().is_empty());
     participant.on_cycle(CYCLE);
     let reported: u64 = participant
         .take_outgoing()
@@ -1920,8 +1898,6 @@ fn unseen(sequence: u64) -> Unseen {
     Unseen {
         sequence,
         count: sequence,
-        asked: 0,
-        refused: 0,
         admitted: sequence,
         first: sequence,
         last: sequence,
@@ -2331,12 +2307,9 @@ fn idle_keys_are_evicted_at_their_time_without_a_scan() {
             entries: vec![Answer {
                 key: entries[3].key().into(),
                 behind: 0,
-                held: 0,
                 applied: 1,
                 others: 0,
-                owned: true,
             }],
-            decided: Vec::new(),
             view: None,
             life: 0,
             number: 0,

@@ -470,13 +470,13 @@ proptest! {
         }
     }
 
-    /// What remains between two times is the most of so many requests arriving between them
-    /// that a bucket admits one by one, each as early as it would admit it; and charged
-    /// within no wait as of the first, they leave it as they would. One request a window, so
-    /// that a time to admit again is a whole nanosecond: otherwise each wait one by one is
-    /// rounded up to one, and leaves the bucket that much further behind.
+    /// Of so many requests arriving between two times, charged within no wait as of the
+    /// first, as many are charged as a bucket admits one by one, each as early as it would
+    /// admit it, and they leave it as those would. One request a window, so that a time to
+    /// admit again is a whole nanosecond: otherwise each wait one by one is rounded up to
+    /// one, and leaves the bucket that much further behind.
     #[test]
-    fn remaining_between_is_the_most_admitted_arriving_between(
+    fn charged_within_no_wait_as_many_as_admitted_one_by_one(
         (bucket, last) in owing_with(1..2), from in 0u64..5000, span in 0u64..5000, most in 0u64..30
     ) {
         let (first, end) = (last + from, last + from + span);
@@ -492,42 +492,12 @@ proptest! {
                 }
             }
         }
-        prop_assert_eq!(bucket.remaining_between(first, end, most), admitted);
         let mut charged = bucket;
-        prop_assert_eq!(charged.charge_within(first, end, 0, admitted), admitted);
+        prop_assert_eq!(charged.charge_within(first, end, 0, most), admitted);
         for t in [end, end + 1, end + 500, end + 5000] {
             prop_assert_eq!(charged.behind(t), one_by_one.behind(t));
         }
     }
-
-    /// Requests arriving at one instant are decided as remaining then; earlier, before the
-    /// bucket's last charge too, never more of them, as it has refilled less.
-    #[test]
-    fn remaining_between_is_no_more_for_earlier_times(
-        (bucket, last) in owing(), from in 0u64..5000, span in 0u64..5000,
-        earlier in 0u64..10_000, most in 0u64..30
-    ) {
-        let now = last + from;
-        prop_assert_eq!(bucket.remaining_between(now, now, most), bucket.remaining_within(now, 0, most));
-        let (first, end) = (now, now + span);
-        let (back_first, back_end) = (first.saturating_sub(earlier), end.saturating_sub(earlier));
-        prop_assert!(
-            bucket.remaining_between(back_first, back_end, most)
-                <= bucket.remaining_between(first, end, most)
-        );
-    }
-}
-
-/// Times out of order, the last before the first, are taken as requests at the last.
-#[test]
-fn remaining_between_takes_a_first_after_the_last_as_the_last() {
-    let mut bucket = TokenBucket::new(nz(1), nz(10), nz(2));
-    bucket.charge_many(100, 2);
-    assert_eq!(
-        bucket.remaining_between(130, 115, 5),
-        bucket.remaining_between(115, 115, 5)
-    );
-    assert_eq!(bucket.remaining_between(115, 115, 5), 1);
 }
 
 /// Counts of any size are taken in one step, and terms of any size without overflowing.

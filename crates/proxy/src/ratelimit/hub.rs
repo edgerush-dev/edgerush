@@ -641,7 +641,7 @@ impl State {
                 continue;
             };
             let me = Rc::clone(self);
-            let entries = (batch.entries.len() + batch.asks.len()) as u64;
+            let entries = batch.entries.len() as u64;
             let stats = &self.shared.stats;
             let flying = stats.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
             stats.in_flight_most.fetch_max(flying, Ordering::Relaxed);

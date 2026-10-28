@@ -49,8 +49,6 @@ fn batch(from: PlaneId, sequence: u64, keys: impl Iterator<Item = u32>) -> Batch
             report: Report::Hits {
                 sequence,
                 count: 1,
-                asked: 0,
-                refused: 0,
                 seen: sequence - 1,
                 age: 0,
             },
@@ -59,8 +57,6 @@ fn batch(from: PlaneId, sequence: u64, keys: impl Iterator<Item = u32>) -> Batch
     Batch {
         from,
         entries,
-        asks: Vec::new(),
-        oldest_ask: 0,
         made: 0,
     }
 }

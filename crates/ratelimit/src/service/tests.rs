@@ -37,20 +37,6 @@ fn hits(sequence: u64, count: u64, seen: u64) -> Report {
     Report::Hits {
         sequence,
         count,
-        asked: 0,
-        refused: 0,
-        seen,
-        age: 0,
-    }
-}
-
-/// Hits that are all requests an ask decided.
-fn asked_hits(sequence: u64, count: u64, seen: u64) -> Report {
-    Report::Hits {
-        sequence,
-        count,
-        asked: count,
-        refused: 0,
         seen,
         age: 0,
     }
@@ -64,27 +50,6 @@ fn batch(from: PlaneId, report: Report) -> Batch {
             contract: contract(),
             report,
         }],
-        asks: Vec::new(),
-        oldest_ask: 0,
-        made: 0,
-    }
-}
-
-/// An ask from `from` about `count` requests under `keys`, the oldest its data plane has
-/// in flight.
-fn ask(from: PlaneId, id: u64, count: u64, keys: &[&[u8]]) -> Batch {
-    Batch {
-        from,
-        entries: Vec::new(),
-        asks: vec![Ask {
-            id,
-            count,
-            age: 0,
-            span: 0,
-            timeout: 4 * CYCLE,
-            keys: keys.iter().map(|key| ((*key).into(), contract())).collect(),
-        }],
-        oldest_ask: id,
         made: 0,
     }
 }
@@ -336,17 +301,6 @@ fn reports_that_waited_are_taken_in_with_no_overflow() {
     assert_eq!(pod.keys[&b"k"[..]].bucket().retry_at(0), Some(110 * MS));
 }
 
-/// An ask about any number of requests is decided in one step: as many admitted as every
-/// key has room for.
-#[test]
-fn an_ask_about_any_number_of_requests_is_decided_at_once() {
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-    let answers = pod.on_batch(ask(1, 1, u64::MAX, &[b"a", b"b"]), 0);
-    assert_eq!(answers.decided, [(1, 10)]);
-    assert_eq!(pod.counted(b"a"), Some(10));
-    assert_eq!(pod.keys[&b"b"[..]].bucket().remaining(0), 0);
-}
-
 proptest::proptest! {
     /// Hits charged at once are charged as one by one: each owed while the bucket would
     /// admit again within a refill time, the rest forgiven.
@@ -375,34 +329,6 @@ proptest::proptest! {
         }
     }
 
-    /// Requests asked about are decided at once as one by one: each admitted while every
-    /// one of its keys has room, and charged to all of them.
-    #[test]
-    fn asks_decided_at_once_are_decided_as_one_by_one(
-        asks in proptest::collection::vec((0u64..50, 0u64..30, 1usize..8), 1..20),
-    ) {
-        const KEYS: [&[u8]; 3] = [b"a", b"b", b"c"];
-        let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-        let mut one_by_one: Vec<TokenBucket> = KEYS.iter().map(|_| contract().bucket()).collect();
-        let mut now = 0;
-        for (id, (gap, count, which)) in (1..).zip(asks) {
-            now += gap * MS;
-            let under: Vec<usize> = (0..KEYS.len()).filter(|at| which & (1 << at) != 0).collect();
-            let keys: Vec<&[u8]> = under.iter().map(|&at| KEYS[at]).collect();
-            let mut admitted = 0;
-            while admitted < count && under.iter().all(|&at| one_by_one[at].admits(now)) {
-                for &at in &under {
-                    one_by_one[at].charge(now);
-                }
-                admitted += 1;
-            }
-            let answers = pod.on_batch(ask(1, id, count, &keys), now);
-            proptest::prop_assert_eq!(answers.decided, vec![(id, admitted)]);
-            for &at in &under {
-                proptest::prop_assert_eq!(pod.keys[KEYS[at]].bucket(), one_by_one[at].clone());
-            }
-        }
-    }
 }
 
 #[test]
@@ -427,47 +353,6 @@ fn a_batch_unseen_for_a_refill_time_is_emptied_and_holds_nothing_back() {
         "the empty one, then the two"
     );
     assert!(net.copy(0, b"k").unacknowledged.is_empty());
-}
-
-/// A batch emptied unseen still says what it did of requests refused: that charges nothing,
-/// and frees what the owner holds for them.
-#[test]
-fn an_emptied_batch_still_says_what_was_refused() {
-    let mut unseen = Unseen {
-        sequence: 1,
-        count: 3,
-        asked: 2,
-        refused: 1,
-        first: 0,
-        last: 0,
-        admitted: 0,
-    };
-    let said = |unseen: &Unseen| unseen.report(0, 0);
-    unseen.empty_if_stale(100 * MS, 100 * MS);
-    assert_eq!(
-        said(&unseen),
-        Report::Hits {
-            sequence: 1,
-            count: 3,
-            asked: 2,
-            refused: 1,
-            seen: 0,
-            age: 0,
-        },
-        "not yet"
-    );
-    unseen.empty_if_stale(100 * MS, 100 * MS + 1);
-    assert_eq!(
-        said(&unseen),
-        Report::Hits {
-            sequence: 1,
-            count: 0,
-            asked: 0,
-            refused: 1,
-            seen: 0,
-            age: 0,
-        }
-    );
 }
 
 /// The owner counts the others admitting as of the latest admission it knows of, not as of
@@ -633,247 +518,6 @@ fn a_cut_off_data_plane_does_not_build_up_what_it_carries() {
     assert!(most <= 11 / 8 + 1 + 1, "{most}");
 }
 
-/// A batch says which of its data plane's asks are over: one before its mark is not decided
-/// again however late it comes — queued behind an exchange, even in that very batch, after
-/// the hit it was given up and decided as. A pod forgets what it knows of a data plane's
-/// asks a minute after it last heard from it.
-#[test]
-fn an_ask_over_is_not_decided_and_is_forgotten_a_minute_on() {
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-    let mut late = ask(100, 1, 1, &[b"k"]);
-    late.oldest_ask = 2;
-    late.entries = vec![Entry {
-        key: b"k"[..].into(),
-        contract: contract(),
-        report: asked_hits(1, 1, 0),
-    }];
-    assert!(pod.on_batch(late, 0).decided.is_empty(), "over");
-    assert_eq!(pod.counted(b"k"), Some(1), "once");
-    // Decided, then over: what was decided of it is let go. A batch that went the long
-    // way round, its mark older, moves nothing back.
-    assert_eq!(pod.on_batch(ask(100, 2, 1, &[b"k"]), 0).decided, [(2, 1)]);
-    let mut on = batch(100, Report::Poll);
-    on.oldest_ask = 3;
-    pod.on_batch(on, 0);
-    assert!(pod.asks[&100].decided.is_empty());
-    let mut behind = ask(100, 2, 1, &[b"k"]);
-    behind.oldest_ask = 1;
-    assert!(pod.on_batch(behind, 0).decided.is_empty(), "still over");
-    assert_eq!(pod.counted(b"k"), Some(2));
-    // Heard from half way through the minute: kept a minute from then.
-    let kept = ASKS_KEPT_CYCLES * CYCLE;
-    pod.on_batch(batch(100, Report::Poll), kept / 2);
-    pod.on_timer(kept + 1);
-    assert!(pod.asks.contains_key(&100));
-    pod.on_timer(kept / 2 + kept + 1);
-    assert!(pod.asks.is_empty());
-}
-
-/// A later ask holds what is held for its data plane as long as its own: the hits of both
-/// may come together.
-#[test]
-fn a_later_ask_holds_what_is_held_as_long_as_its_own() {
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-    pod.set_least_hold(0);
-    // Refilling in 100 ms, asks waiting 40: each held 140 ms.
-    pod.on_batch(ask(100, 1, 1, &[b"k"]), 0);
-    pod.on_batch(ask(100, 2, 1, &[b"k"]), 100 * MS);
-    pod.on_batch(batch(100, asked_hits(1, 2, 0)), 200 * MS);
-    assert_eq!(pod.counted(b"k"), Some(2));
-}
-
-/// An asked request's hit whose batch went unseen for a refill time comes emptied: what is
-/// held for it is left to lapse, and an admission after it, its batch waiting behind that
-/// one, is charged and counted rather than settling it.
-#[test]
-fn an_admission_after_an_asked_hit_emptied_is_counted() {
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-    assert_eq!(pod.on_batch(ask(100, 1, 1, &[b"k"]), 0).decided, [(1, 1)]);
-    // The asked request's batch lost; one admitted after it reported, kept waiting. Charged
-    // as of when it was admitted, under an interval before the check below, where it shows.
-    pod.on_batch(batch(100, hits(2, 1, 0)), 105 * MS);
-    pod.on_batch(batch(100, asked_hits(1, 0, 0)), 110 * MS);
-    assert_eq!(pod.counted(b"k"), Some(2), "two admitted");
-    assert_eq!(pod.keys[&b"k"[..]].bucket().remaining(110 * MS), 9);
-}
-
-/// An ask sent after another is over says so: a copy of the first arriving late, behind it,
-/// is not decided again, and each request is counted once.
-#[test]
-fn a_late_copy_of_an_ask_over_is_not_decided_again() {
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-    assert_eq!(pod.on_batch(ask(100, 1, 1, &[b"k"]), 0).decided, [(1, 1)]);
-    assert_eq!(
-        pod.on_batch(ask(100, 2, 1, &[b"k"]), CYCLE).decided,
-        [(2, 1)]
-    );
-    assert!(
-        pod.on_batch(ask(100, 1, 1, &[b"k"]), 2 * CYCLE)
-            .decided
-            .is_empty(),
-        "over"
-    );
-    pod.on_batch(batch(100, asked_hits(1, 2, 0)), 3 * CYCLE);
-    assert_eq!(pod.counted(b"k"), Some(2), "two admitted");
-}
-
-/// The hits of an ask its data plane gave up come as long after it was decided as the data
-/// plane waited, and a refill time more as it sends them: they still find its hold.
-#[test]
-fn the_hits_of_an_ask_given_up_find_its_hold() {
-    let n = |n| NonZeroU64::new(n).unwrap();
-    // Refilling in a second, the data plane waiting 300 ms: held for 1.3 s.
-    let slow = Contract {
-        limit: n(10),
-        window: n(1_000 * MS),
-        burst: n(10),
-    };
-    let ask = |id| Batch {
-        from: 100,
-        oldest_ask: id,
-        entries: Vec::new(),
-        asks: vec![Ask {
-            id,
-            count: 1,
-            age: 0,
-            span: 0,
-            timeout: 300 * MS,
-            keys: vec![(b"k"[..].into(), slow)],
-        }],
-        made: 0,
-    };
-    let hits = |sequence| Batch {
-        from: 100,
-        oldest_ask: 0,
-        entries: vec![Entry {
-            key: b"k"[..].into(),
-            contract: slow,
-            report: asked_hits(sequence, 1, sequence - 1),
-        }],
-        asks: Vec::new(),
-        made: 0,
-    };
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-    pod.set_least_hold(0);
-    pod.on_batch(ask(1), 0);
-    pod.on_batch(hits(1), 1_299 * MS);
-    assert_eq!(pod.counted(b"k"), Some(1), "settled");
-    pod.on_batch(ask(2), 1_299 * MS);
-    pod.on_batch(hits(2), 2_599 * MS);
-    assert_eq!(pod.counted(b"k"), Some(3), "lapsed, charged");
-}
-
-/// An ask its owner decided, given up by its data plane, which then refused its request
-/// itself: told so, the owner drops it from what it holds and counts, and leaves its bucket
-/// charged. Told of one it holds nothing for, it changes nothing.
-#[test]
-fn a_request_of_an_ask_given_up_and_refused_is_not_counted() {
-    let refused = |sequence| Report::Hits {
-        sequence,
-        count: 0,
-        asked: 0,
-        refused: 1,
-        seen: sequence - 1,
-        age: 0,
-    };
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-    assert_eq!(pod.on_batch(ask(100, 1, 1, &[b"k"]), 0).decided, [(1, 1)]);
-    pod.on_batch(batch(100, refused(1)), 0);
-    assert_eq!(pod.counted(b"k"), Some(0), "none admitted");
-    assert_eq!(
-        pod.keys[&b"k"[..]].bucket().remaining(0),
-        9,
-        "still charged"
-    );
-    pod.on_batch(batch(100, refused(2)), 0);
-    assert_eq!(pod.counted(b"k"), Some(0));
-}
-
-/// What an ask admits is held for its data plane's asked hits, which settle it rather than
-/// being charged again — other hits are charged as ever — for the key's refill time, or the
-/// pod's least hold if that is longer, and the time the data plane waits for an answer
-/// beside: then it lapses, still charged and counted, and asked hits after it are charged.
-#[test]
-fn a_hold_lapses_charged_once_its_time_is_over() {
-    let n = |n| NonZeroU64::new(n).unwrap();
-    // Counted after each step, for a key under `contract`, the pod holding at least
-    // `least_hold`, the data plane waiting four cycles for an answer.
-    let steps = |contract: Contract, least_hold: u64| -> Vec<u64> {
-        let hits = |sequence, count, asked| Batch {
-            from: 100,
-            oldest_ask: 0,
-            entries: vec![Entry {
-                key: b"k"[..].into(),
-                contract,
-                report: Report::Hits {
-                    sequence,
-                    count,
-                    asked,
-                    refused: 0,
-                    seen: sequence - 1,
-                    age: 0,
-                },
-            }],
-            asks: Vec::new(),
-            made: 0,
-        };
-        let ask = |id, count| Batch {
-            from: 100,
-            oldest_ask: id,
-            entries: Vec::new(),
-            asks: vec![Ask {
-                id,
-                count,
-                age: 0,
-                span: 0,
-                timeout: 4 * CYCLE,
-                keys: vec![(b"k"[..].into(), contract)],
-            }],
-            made: 0,
-        };
-        let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-        pod.set_least_hold(least_hold);
-        let mut counted = Vec::new();
-        let mut step = |pod: &ServicePod| counted.push(pod.counted(b"k").unwrap_or(0));
-        // Held for 90 ms: 50 and the 40 the data plane waits.
-        assert_eq!(pod.on_batch(ask(1, 3), 0).decided, [(1, 3)]);
-        step(&pod);
-        pod.on_batch(hits(1, 1, 1), 4 * CYCLE);
-        step(&pod);
-        // A hit no ask decided: charged, the hold left as it is.
-        pod.on_batch(hits(2, 1, 0), 5 * CYCLE);
-        step(&pod);
-        pod.on_batch(hits(3, 1, 1), 8 * CYCLE);
-        step(&pod);
-        // The hold's time over: what is left of it lapses, still charged.
-        pod.on_batch(hits(4, 1, 1), 9 * CYCLE);
-        step(&pod);
-        assert_eq!(pod.on_batch(ask(2, 2), 9 * CYCLE).decided, [(2, 2)]);
-        step(&pod);
-        pod.on_batch(hits(5, 2, 2), 10 * CYCLE);
-        step(&pod);
-        counted
-    };
-    let want = [3, 3, 4, 4, 5, 7, 7];
-    // Refilling in 50 ms, longer than the least hold: held as long as that.
-    let refilling_in = |time: u64| Contract {
-        limit: n(10),
-        window: n(time),
-        burst: n(10),
-    };
-    assert_eq!(
-        steps(refilling_in(5 * CYCLE), CYCLE),
-        want,
-        "its refill time"
-    );
-    // Refilling in 10 ms, shorter than the least hold of 50 ms: held as long as that.
-    assert_eq!(
-        steps(refilling_in(CYCLE), 5 * CYCLE),
-        want,
-        "the least hold"
-    );
-}
-
 /// The owner copies every change to the key's secondary, which takes over from that copy
 /// when the owner leaves: data planes send it again the batches not seen applied, numbered
 /// as before, and it applies only those its copy lacks.
@@ -1024,12 +668,9 @@ fn an_answer_from_a_pod_that_is_not_the_owner_is_ignored() {
             entries: vec![Answer {
                 key: b"k"[..].into(),
                 behind: 0,
-                held: 0,
                 applied: 0,
                 others: 5,
-                owned: true,
             }],
-            decided: Vec::new(),
             view: None,
             life: 0,
             number: 0,
@@ -1204,9 +845,6 @@ fn a_handover_arriving_late_keeps_what_the_new_owner_applied() {
             plane: 9,
             applied: 0,
             admitted_ago: Some(0),
-            last_ask: (0, 0),
-            held: 0,
-            held_for: 0,
         }],
     };
     pod.on_replicas(
@@ -1225,94 +863,6 @@ fn a_handover_arriving_late_keeps_what_the_new_owner_applied() {
         "ten less five less two"
     );
     assert_eq!(pod.keys[&b"k"[..]].planes.get(9).unwrap().applied, 1);
-}
-
-/// What the new owner holds for asks it decided before the handover reached it stays held,
-/// on top of what it is handed: the hits that come after settle it, each request counted
-/// and charged once.
-#[test]
-fn a_handover_arriving_late_keeps_what_the_new_owner_held() {
-    let (owner, secondary, _) = roles(b"k");
-    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 3));
-    assert_eq!(pod.on_batch(ask(9, 1, 2, &[b"k"]), 0).decided, [(1, 2)]);
-    let handed = Replica {
-        key: b"k"[..].into(),
-        contract: contract(),
-        behind: contract().bucket().behind(0) + 5 * u128::from(1_000 * MS),
-        counted: 5,
-        planes: Vec::new(),
-    };
-    pod.on_replicas(
-        Replicas {
-            from: secondary,
-            entries: vec![handed],
-            handover: true,
-            epoch: 0,
-        },
-        0,
-    );
-    assert_eq!(pod.counted(b"k"), Some(7));
-    pod.on_batch(batch(9, asked_hits(1, 2, 0)), 0);
-    assert_eq!(pod.counted(b"k"), Some(7), "settled, not counted again");
-    assert_eq!(
-        pod.keys[&b"k"[..]].bucket().remaining(0),
-        3,
-        "ten less five less two"
-    );
-}
-
-/// A key handed over holds what its data plane's asks admitted as long as the longer of
-/// the two holds: the old owner's, copied with it, and the new owner's own.
-#[test]
-fn a_handover_holds_for_the_longer_of_the_two() {
-    let (owner, secondary, _) = roles(b"k");
-    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 3));
-    pod.set_least_hold(0);
-    // Held 140 ms here; 250 more by the old owner as it hands the key over.
-    assert_eq!(pod.on_batch(ask(9, 2, 1, &[b"k"]), 0).decided, [(2, 1)]);
-    let handed = Replica {
-        key: b"k"[..].into(),
-        contract: contract(),
-        behind: contract().bucket().behind(0) + u128::from(100 * MS),
-        counted: 1,
-        planes: vec![PlaneRecord {
-            plane: 9,
-            applied: 0,
-            admitted_ago: Some(0),
-            last_ask: (1, 1),
-            held: 1,
-            held_for: 250 * MS,
-        }],
-    };
-    pod.on_replicas(
-        Replicas {
-            from: secondary,
-            entries: vec![handed],
-            handover: true,
-            epoch: 0,
-        },
-        0,
-    );
-    assert_eq!(pod.counted(b"k"), Some(2));
-    pod.on_batch(batch(9, asked_hits(1, 2, 0)), 200 * MS);
-    assert_eq!(pod.counted(b"k"), Some(2), "settled");
-}
-
-/// Two asks out on one key at once — two groups of limits sharing it — both answers lost,
-/// both sent again: each copy is answered as its ask was, and each request counted once.
-#[test]
-fn two_asks_out_on_one_key_sent_again_are_each_decided_once() {
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-    let with_oldest = |id, oldest| {
-        let mut batch = ask(100, id, 1, &[b"k"]);
-        batch.oldest_ask = oldest;
-        batch
-    };
-    assert_eq!(pod.on_batch(with_oldest(8, 8), 0).decided, [(8, 1)]);
-    assert_eq!(pod.on_batch(with_oldest(9, 8), 0).decided, [(9, 1)]);
-    assert_eq!(pod.on_batch(with_oldest(8, 8), 2 * CYCLE).decided, [(8, 1)]);
-    assert_eq!(pod.on_batch(with_oldest(9, 8), 2 * CYCLE).decided, [(9, 1)]);
-    assert_eq!(pod.counted(b"k"), Some(2), "each once");
 }
 
 /// A handover reaching a pod that does not own the key is ignored.
@@ -1430,14 +980,14 @@ fn a_pod_not_serving_answers_with_its_view_alone() {
     let (owner, _, _) = roles(b"k");
     let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 4));
     pod.set_serving(false);
-    let answers = pod.on_batch(ask(1, 1, 3, &[b"k"]), 0);
+    let answers = pod.on_batch(batch(1, hits(1, 3, 0)), 0);
     assert!(answers.entries.is_empty());
-    assert!(answers.decided.is_empty());
     assert_eq!(answers.view, Some(view(&[0, 1, 2], 4)));
     assert_eq!(pod.counted(b"k"), None);
     pod.set_serving(true);
-    let answers = pod.on_batch(ask(1, 1, 3, &[b"k"]), 0);
-    assert_eq!(answers.decided, vec![(1, 3)]);
+    let answers = pod.on_batch(batch(1, hits(1, 3, 0)), 0);
+    assert_eq!(answers.entries.len(), 1);
+    assert_eq!(pod.counted(b"k"), Some(3));
 }
 
 /// A data plane takes over a later view from any answer, and moves its keys with it.
@@ -1586,28 +1136,6 @@ fn several_limits_decided_here_are_charged_to_all_or_none() {
     assert_eq!(net.copy(0, &b).bucket.remaining(CYCLE), 0, "b charged");
 }
 
-/// A pod decides an ask's requests each under all its keys or none, charging its copies,
-/// so that the asks it decides after see the requests it admitted.
-#[test]
-fn a_pod_decides_an_ask_whole_and_its_copies_see_each_ask() {
-    let (a, b) = apart();
-    let mut pod: ServicePod = ServicePod::new(roles(&a).0, CYCLE, view(&[0, 1, 2], 1));
-    let answers = pod.on_batch(ask(1, 1, 6, &[&a, &b]), 0);
-    assert_eq!(answers.decided, vec![(1, 6)]);
-    let owned: Vec<bool> = answers.entries.iter().map(|answer| answer.owned).collect();
-    assert_eq!(owned, vec![true, false]);
-    let answers = pod.on_batch(ask(2, 1, 6, &[&b]), 0);
-    assert_eq!(answers.decided, vec![(1, 4)], "b's copy holds the six");
-    let answers = pod.on_batch(ask(3, 1, 3, &[&a, &b]), 0);
-    assert_eq!(answers.decided, vec![(1, 0)], "b's copy empty");
-    assert_eq!(
-        pod.keys[&a[..]].bucket().remaining(0),
-        4,
-        "a charged six only"
-    );
-    assert_eq!(pod.counted(&a), Some(6));
-}
-
 /// Any number of limits is decided all or none, and the same key named twice — a caller's
 /// mistake — is decided rather than refused by the map.
 #[test]
@@ -1633,51 +1161,6 @@ fn any_number_of_limits_is_decided_and_a_key_named_twice_is_no_panic() {
     assert_eq!(net.copy(0, &keys[0]).bucket.remaining(0), 5, "none charged");
     let twice = [&keys[1][..], &keys[1][..]];
     assert_eq!(net.planes[0].decide_all(&under(&twice), 0), Decision::Admit);
-}
-
-/// A pod answering an ask from its copy of a key it does not own may hold a copy fresher
-/// than the owner's own state — after a failover, the new owner took over from an older
-/// one — so what it says was applied is not taken: only the owner's word lets a batch go.
-#[test]
-fn a_copy_answering_an_ask_does_not_say_which_batches_were_applied() {
-    let (a, b) = apart();
-    let mut net = Net::new(1);
-    warmed(&mut net, 0, &b, 0);
-    net.admits(0, &b, 2, 0);
-    net.planes[0].on_cycle(CYCLE);
-    net.planes[0].take_outgoing(); // the batch's answer never comes
-    assert_eq!(net.copy(0, &b).unacknowledged.len(), 1);
-    // The first batch, the asked request's hit, the owner said it applied; the second's
-    // answer never came.
-    assert_eq!(net.copy(0, &b).seen, 1);
-    let copy = Answer {
-        key: b.clone().into_boxed_slice(),
-        behind: 0,
-        held: 0,
-        applied: 2,
-        others: 0,
-        owned: false,
-    };
-    let not_owner = roles(&a).0;
-    assert_ne!(Some(not_owner), roles(&b).0.into());
-    net.planes[0].on_answers(
-        Answers {
-            from: not_owner,
-            entries: vec![copy],
-            decided: Vec::new(),
-            view: None,
-            life: 0,
-            number: 0,
-            made: CYCLE,
-        },
-        CYCLE,
-    );
-    assert_eq!(
-        net.copy(0, &b).unacknowledged.len(),
-        1,
-        "still waiting for the owner to say it applied it"
-    );
-    assert_eq!(net.copy(0, &b).seen, 1);
 }
 
 /// A refused request waits as long as the longest of its keys: its bucket's refill to one,
@@ -1834,7 +1317,9 @@ fn a_service_pod_past_its_capacity_evicts_the_least_recently_changed() {
     let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
     let keys: Vec<Vec<u8>> = (0..5_u64).map(|at| format!("k{at}").into_bytes()).collect();
     for (at, key) in (0_u64..).zip(&keys) {
-        pod.on_batch(ask(100, at, 1, &[key]), at * MS);
+        let mut hit = batch(100, hits(1, 1, 0));
+        hit.entries[0].key = key[..].into();
+        pod.on_batch(hit, at * MS);
     }
     let now = 5 * MS;
     pod.on_timer(now);
@@ -1871,13 +1356,13 @@ fn a_service_pod_counts_room_for_the_records_a_key_has() {
 }
 
 /// A service pod's key takes 128 bytes in its table, which holds up to twice the room its
-/// keys take, and its record of a data plane 56: its bucket kept as the bucket's state, its
+/// keys take, and its record of a data plane 32: its bucket kept as the bucket's state, its
 /// terms the key's contract, batches waiting, which rarely do, kept apart, and the data
-/// plane's last admission in eight bytes, room for what is held for it.
+/// plane's last admission in eight bytes.
 #[test]
 fn a_service_pods_key_is_small() {
     assert_eq!(size_of::<(Box<[u8]>, Owned)>(), 128);
-    assert_eq!(size_of::<(PlaneId, Record)>(), 56);
+    assert_eq!(size_of::<(PlaneId, Record)>(), 32);
 }
 
 /// A data plane's last admission, kept in eight bytes, reads back as it was set and orders
@@ -1990,8 +1475,6 @@ fn a_batch_ages_what_joined_it_earlier() {
         report: Unseen {
             sequence: 1,
             count: 1,
-            asked: 0,
-            refused: 0,
             admitted: 4 * MS,
             first: 10 * MS,
             last: 10 * MS,
@@ -2165,92 +1648,6 @@ fn a_client_at_exactly_its_rate_is_admitted_with_exchanges_overlapping() {
     assert_eq!(decided, [Some(true); 7]);
 }
 
-/// An owner decides an ask's requests as of when they came, by the ask's ages: two that came
-/// an interval apart fit a bucket of one; two at one instant do not; and an ask that does
-/// not say when is decided as it arrives.
-#[test]
-fn an_ask_is_decided_between_its_requests_arrivals() {
-    let n = |n| NonZeroU64::new(n).unwrap();
-    let interval = 10 * MS;
-    let c = Contract {
-        limit: n(1),
-        window: n(interval),
-        burst: n(1),
-    };
-    let decided = |age, span| {
-        let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-        let batch = Batch {
-            from: 100,
-            entries: Vec::new(),
-            asks: vec![Ask {
-                id: 1,
-                count: 2,
-                age,
-                span,
-                timeout: 4 * CYCLE,
-                keys: vec![(b"k"[..].into(), c)],
-            }],
-            oldest_ask: 1,
-            made: 50 * MS,
-        };
-        pod.on_batch(batch, 100 * MS).decided
-    };
-    assert_eq!(
-        decided(3 * interval, interval),
-        [(1, 2)],
-        "an interval apart"
-    );
-    assert_eq!(decided(3 * interval, 0), [(1, 1)], "at one instant");
-    assert_eq!(decided(0, 0), [(1, 1)], "as it arrives");
-}
-
-/// An ask that, by its ages, came before requests its owner has already charged is decided
-/// as if it came no earlier than them: two data planes' batches arrive offset differently —
-/// a batch waiting to be sent counts its wait as trip — and decided as of before them, it
-/// would find their charges ahead of it, as if out of order, and lose room. A bucket of ten
-/// refilling ten an hour admits ten of twelve, in any order.
-#[test]
-fn an_ask_is_decided_no_earlier_than_what_its_owner_charged() {
-    let n = |n| NonZeroU64::new(n).unwrap();
-    let c = Contract {
-        limit: n(10),
-        window: n(3_600_000 * MS),
-        burst: n(10),
-    };
-    let ask = |from, count, age| Batch {
-        from,
-        entries: Vec::new(),
-        asks: vec![Ask {
-            id: 1,
-            count,
-            age,
-            span: 0,
-            timeout: 4 * CYCLE,
-            keys: vec![(b"k"[..].into(), c)],
-        }],
-        oldest_ask: 1,
-        made: 50 * MS,
-    };
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-    assert_eq!(pod.on_batch(ask(100, 6, 0), 50 * MS).decided, [(1, 6)]);
-    assert_eq!(
-        pod.on_batch(ask(101, 6, 10 * MS), 51 * MS).decided,
-        [(1, 4)],
-        "as of 41 ms, before the six charged as of 50"
-    );
-    // So too after another data plane's hits, charged as of when they were admitted.
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-    let mut hits = batch(102, hits(1, 6, 0));
-    hits.entries[0].contract = c;
-    hits.made = 50 * MS;
-    pod.on_batch(hits, 50 * MS);
-    assert_eq!(
-        pod.on_batch(ask(101, 6, 10 * MS), 51 * MS).decided,
-        [(1, 4)],
-        "as of 41 ms, before the six hits admitted at 50"
-    );
-}
-
 /// The issue's case (#49): a bucket of one refilling faster than a round trip, so the copy
 /// is cold for every request and each asks. The requests that come while the first ask is
 /// out go in one ask after it; the owner decides them at one instant, against a bucket of
@@ -2284,12 +1681,9 @@ fn answers_that_do_not_say_when_are_taken_as_they_come() {
             entries: vec![Answer {
                 key: b"k"[..].into(),
                 behind: 5 * u128::from(1_000 * MS),
-                held: 0,
                 applied: seen,
                 others: 0,
-                owned: true,
             }],
-            decided: Vec::new(),
             view: None,
             life: 0,
             number: 0,
@@ -2316,12 +1710,9 @@ fn answers_held_up_are_taken_as_of_no_more_than_a_cycle_before() {
             entries: vec![Answer {
                 key: b"k"[..].into(),
                 behind,
-                held: 0,
                 applied: seen,
                 others: 0,
-                owned: true,
             }],
-            decided: Vec::new(),
             view: None,
             life: 0,
             number: 0,
@@ -2407,9 +1798,6 @@ fn copies_go_a_piece_at_a_time() {
                 plane,
                 applied: 1,
                 admitted_ago: Some(0),
-                last_ask: (0, 0),
-                held: 0,
-                held_for: 0,
             })
             .collect(),
     };
