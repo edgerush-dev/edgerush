@@ -11,7 +11,7 @@ use boring::pkey::PKey;
 use boring::ssl::{AlpnError, SslAcceptor, SslMethod, select_next_proto};
 use boring::x509::X509;
 use bytes::Bytes;
-use http::header::AUTHORIZATION;
+use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,10 +44,16 @@ pub fn answer(status: u16, body: &str) -> Answer {
 /// A request as the fake API server saw it.
 #[derive(Debug, Clone)]
 pub struct Seen {
+    /// Its method.
+    pub method: String,
     /// Its path and query.
     pub path: String,
     /// Its `Authorization`, if it had one.
     pub authorization: Option<String>,
+    /// Its `Content-Type`, if it had one.
+    pub content_type: Option<String>,
+    /// Its body, as text.
+    pub body: String,
 }
 
 /// A fake API server over HTTP/2 and TLS.
@@ -106,15 +112,39 @@ impl Fake {
                     let mut connection = h2::server::handshake(secured).await.unwrap();
                     while let Some(Ok((request, mut respond))) = connection.accept().await {
                         let path = request.uri().path_and_query().unwrap().to_string();
-                        recorded.lock().unwrap().push(Seen {
-                            path: path.clone(),
-                            authorization: request
+                        let header = |name| {
+                            request
                                 .headers()
-                                .get(AUTHORIZATION)
-                                .map(|value| value.to_str().unwrap().to_owned()),
-                        });
+                                .get(name)
+                                .map(|value: &http::HeaderValue| value.to_str().unwrap().to_owned())
+                        };
+                        let mut seen = Seen {
+                            method: request.method().to_string(),
+                            path: path.clone(),
+                            authorization: header(AUTHORIZATION),
+                            content_type: header(CONTENT_TYPE),
+                            body: String::new(),
+                        };
+                        // A read has no body, and is recorded at once, in the order the
+                        // requests came; a write once its body is read, before it is
+                        // answered, so that a client answered finds it recorded.
+                        let mut body = request.into_body();
+                        let read = body.is_end_stream();
+                        if read {
+                            recorded.lock().unwrap().push(seen.clone());
+                        }
                         let answer = answers(&path);
+                        let recorded = Arc::clone(&recorded);
                         tokio::spawn(async move {
+                            if !read {
+                                let mut written = Vec::new();
+                                while let Some(Ok(chunk)) = body.data().await {
+                                    let _ = body.flow_control().release_capacity(chunk.len());
+                                    written.extend_from_slice(&chunk);
+                                }
+                                seen.body = String::from_utf8(written).unwrap();
+                                recorded.lock().unwrap().push(seen);
+                            }
                             let head = http::Response::builder()
                                 .status(answer.status)
                                 .body(())

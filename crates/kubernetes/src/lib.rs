@@ -22,8 +22,8 @@ use boring::x509::store::X509StoreBuilder;
 use bytes::{Bytes, BytesMut};
 use h2::RecvStream;
 use h2::client::SendRequest;
-use http::StatusCode;
-use http::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
+use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use http::{Method, StatusCode};
 use k8s_openapi::List;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Status, WatchEvent};
 use std::marker::PhantomData;
@@ -286,21 +286,73 @@ impl ApiServer {
         })
     }
 
+    /// Merges `patch`, JSON, into the status of `K`'s object `name` in `namespace`, as
+    /// `kubectl patch --subresource status --type merge` does (RFC 7386): a field it states
+    /// takes the place of the one there, a list whole, and one it leaves out is left as it
+    /// is. Nothing but the status is changed, whatever the patch says of the rest.
+    ///
+    /// # Errors
+    ///
+    /// An [`ApiError`]: what the API server answered if not 200, such as 403 without the
+    /// permission to update the status, or 404 for an object gone.
+    pub async fn patch_status<K: Kind>(
+        &self,
+        namespace: &str,
+        name: &str,
+        patch: &serde_json::Value,
+    ) -> Result<(), ApiError> {
+        let mut path = kind::collection::<K>(&Scope::namespace(namespace)?)?;
+        path.push('/');
+        encode_into(&mut path, name);
+        path.push_str("/status");
+        let body = serde_json::to_vec(patch).map_err(|error| ApiError::Http(error.to_string()))?;
+        let deadline = Instant::now() + self.timing.answer;
+        let merge = ("application/merge-patch+json", Bytes::from(body));
+        // What it answers, the object as it now is, is not needed.
+        let _object = self
+            .send(Method::PATCH, &path, Some(merge), deadline)
+            .await?;
+        Ok(())
+    }
+
     /// The body of what `path` answers with 200, its head by `deadline`; or what it
     /// answered instead.
     async fn get(&self, path: &str, deadline: Instant) -> Result<RecvStream, ApiError> {
+        self.send(Method::GET, path, None, deadline).await
+    }
+
+    /// The body of what `path` answers `method` with, with `body` of its content type if
+    /// any, with 200, its head by `deadline`; or what it answered instead.
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<(&'static str, Bytes)>,
+        deadline: Instant,
+    ) -> Result<RecvStream, ApiError> {
         let token = self.token.read(self.timing.token_reread).await?;
-        let request = http::Request::get(format!("https://{}{path}", self.authority))
+        let mut request = http::Request::builder()
+            .method(method)
+            .uri(format!("https://{}{path}", self.authority))
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header(ACCEPT, "application/json")
-            .header(USER_AGENT, "edgerush")
+            .header(USER_AGENT, "edgerush");
+        if let Some((content_type, _)) = &body {
+            request = request.header(CONTENT_TYPE, *content_type);
+        }
+        let request = request
             .body(())
             .map_err(|error| ApiError::Http(error.to_string()))?;
         let answered = async {
             let mut send = self.sender().await?;
-            let (answer, _) = send
-                .send_request(request, true)
+            let (answer, mut stream) = send
+                .send_request(request, body.is_none())
                 .map_err(|error| ApiError::Http(error.to_string()))?;
+            if let Some((_, body)) = body {
+                stream
+                    .send_data(body, true)
+                    .map_err(|error| ApiError::Http(error.to_string()))?;
+            }
             answer
                 .await
                 .map_err(|error| ApiError::Http(error.to_string()))

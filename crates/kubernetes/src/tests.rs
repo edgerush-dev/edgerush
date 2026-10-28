@@ -479,3 +479,65 @@ fn authorities_that_are_not_certificates_are_refused() {
         ));
     }
 }
+
+#[tokio::test]
+async fn a_status_is_merged_into_its_objects_and_a_refusal_said() {
+    let fake = Fake::start(&["127.0.0.1"], |path| {
+        if path.contains("/gone/") {
+            answer(
+                404,
+                r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"ingresses.networking.k8s.io \"gone\" not found","code":404}"#,
+            )
+        } else {
+            answer(200, "{}")
+        }
+    })
+    .await;
+    let client = fake.client(&token("patch", "secret"), Timing::default());
+    let patch = serde_json::json!({
+        "status": { "loadBalancer": { "ingress": [{ "ip": "203.0.113.7" }] } }
+    });
+    client
+        .patch_status::<Ingress>("shop", "web", &patch)
+        .await
+        .unwrap();
+    let seen = fake.seen();
+    assert_eq!(seen[0].method, "PATCH");
+    assert_eq!(
+        seen[0].path,
+        "/apis/networking.k8s.io/v1/namespaces/shop/ingresses/web/status"
+    );
+    assert_eq!(
+        seen[0].content_type.as_deref(),
+        Some("application/merge-patch+json")
+    );
+    assert_eq!(seen[0].authorization.as_deref(), Some("Bearer secret"));
+    let sent: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
+    assert_eq!(sent, patch);
+    assert_eq!(
+        client
+            .patch_status::<Ingress>("shop", "gone", &patch)
+            .await
+            .unwrap_err(),
+        ApiError::Answered {
+            code: 404,
+            message: "ingresses.networking.k8s.io \"gone\" not found".to_owned()
+        }
+    );
+    // A namespace that cannot be one, or a kind that is in none, is refused unasked.
+    assert_eq!(
+        client
+            .patch_status::<Ingress>("Shop", "web", &patch)
+            .await
+            .unwrap_err(),
+        ApiError::Namespace("Shop".to_owned())
+    );
+    assert_eq!(
+        client
+            .patch_status::<IngressClass>("shop", "edge", &patch)
+            .await
+            .unwrap_err(),
+        ApiError::NotNamespaced("IngressClass")
+    );
+    assert_eq!(fake.seen().len(), 2);
+}
