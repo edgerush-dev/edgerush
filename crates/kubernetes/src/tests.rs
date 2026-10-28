@@ -242,12 +242,14 @@ async fn answers_are_bounded_in_size_and_time() {
         }
     })
     .await;
-    let quick = Timing {
-        answer: Duration::from_millis(500),
-        quiet: Duration::from_millis(300),
+    // The sizes are bounded under deadlines far longer than reading past them takes, even on
+    // a loaded machine: it is not the deadlines being tested there.
+    let roomy = Timing {
+        answer: Duration::from_secs(30),
+        quiet: Duration::from_secs(30),
         ..Timing::default()
     };
-    let client = fake.client(&token("bounded", "secret"), quick);
+    let client = fake.client(&token("bounded", "secret"), roomy);
     assert_eq!(
         client
             .list::<EndpointSlice>(&namespace("large"), None)
@@ -263,6 +265,12 @@ async fn answers_are_bounded_in_size_and_time() {
         events.next().await,
         Some(Err(ApiError::TooLarge("a watch's event", MOST_EVENT_BYTES)))
     ));
+    let quick = Timing {
+        answer: Duration::from_millis(500),
+        quiet: Duration::from_millis(300),
+        ..Timing::default()
+    };
+    let client = fake.client(&token("bounded", "secret"), quick);
     assert_eq!(
         client
             .list::<EndpointSlice>(&namespace("slow"), None)
