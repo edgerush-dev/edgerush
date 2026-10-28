@@ -121,13 +121,20 @@ where
 }
 
 /// An error and what caused it, as one line: tonic's own say little more than "transport
-/// error".
+/// error". A cause that says only what the error before it said is left out: a wrapper
+/// that shows its cause's message as its own, and then has it for its cause, as the
+/// connector's error does, would have it said twice.
 fn error_chain(error: &dyn std::error::Error) -> String {
     let mut said = error.to_string();
+    let mut last = said.clone();
     let mut cause = error.source();
     while let Some(error) = cause {
-        said.push_str(": ");
-        said.push_str(&error.to_string());
+        let this = error.to_string();
+        if this != last {
+            said.push_str(": ");
+            said.push_str(&this);
+        }
+        last = this;
         cause = error.source();
     }
     said
@@ -184,5 +191,40 @@ impl tower_service::Service<Uri> for Dialler {
                 .await
                 .map_err(|_| failed("dialling took too long".to_owned()))?
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_chain;
+
+    /// An error of its own, with a cause.
+    #[derive(Debug)]
+    struct Caused(&'static str, Option<Box<Caused>>);
+
+    impl std::fmt::Display for Caused {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Caused {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|cause| cause as _)
+        }
+    }
+
+    #[test]
+    fn each_cause_is_said_once() {
+        let failed = Caused("dialling took too long", None);
+        // A wrapper that says what its cause says.
+        let wrapped = Caused("dialling took too long", Some(Box::new(failed)));
+        assert_eq!(
+            error_chain(&Caused("transport error", Some(Box::new(wrapped)))),
+            "transport error: dialling took too long"
+        );
+        let different = Caused("refused", Some(Box::new(Caused("no route", None))));
+        assert_eq!(error_chain(&different), "refused: no route");
+        assert_eq!(error_chain(&Caused("alone", None)), "alone");
     }
 }
