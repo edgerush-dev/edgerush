@@ -74,8 +74,8 @@ Kubernetes, begun:
   stream it serves, gRPC over mutual TLS.
 - **`edgerush proxy --control-plane`**, a data plane taking its config from that stream:
   nothing is served until the first config runs, each later one takes over as a file's
-  does, and the stream is dialled again after a jittered wait when it ends. Not yet tested
-  end to end in kind.
+  does, and the stream is dialled again after a jittered wait when it ends; tested end
+  to end in kind, the control plane gone and back among it.
 - **Endpoints from EndpointSlices:** an upstream that names a Service takes its endpoints
   from the data plane's own list and watch of EndpointSlices, so that they are followed
   with the control plane down; tested end to end in kind.
