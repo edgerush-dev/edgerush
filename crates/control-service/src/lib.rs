@@ -20,12 +20,14 @@ use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 mod client;
 mod files;
 mod server;
+mod subscribe;
 mod tls;
 
 pub use boring::ssl::{SslAcceptor, SslConnector};
 pub use client::{Ended, follow};
 pub use files::{Files, FilesError, reread};
 pub use server::{Heard, ServeError, serve};
+pub use subscribe::{Backoff, Following, Subscription, subscribe};
 pub use tls::{Credentials, TlsError, acceptor, connector};
 
 /// The service's name, as gRPC calls it.
