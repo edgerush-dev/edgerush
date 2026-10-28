@@ -12,8 +12,12 @@ edgerush-config.workspace = true
 edgerush-kubernetes.workspace = true
 edgerush-translate.workspace = true
 k8s-openapi.workspace = true
-# Ingress status, written as a JSON merge patch (04 §6).
+# The admission webhook's reviews, read (04 §3).
+serde.workspace = true
+# Ingress status, written as a JSON merge patch (04 §6), and the webhook's reviews, read
+# and answered.
 serde_json.workspace = true
+thiserror.workspace = true
 # "sync": each follow's objects, and the word that one has changed; with the workspace's
 # "rt", the follows' tasks, ended with the control plane, and "time", the debounce.
 tokio = { workspace = true, features = ["sync"] }
@@ -22,7 +26,7 @@ tokio = { workspace = true, features = ["sync"] }
 bytes.workspace = true
 edgerush-certificates = { workspace = true, features = ["testing"] }
 edgerush-kubernetes = { workspace = true, features = ["testing"] }
-serde.workspace = true
+proptest.workspace = true
 serde-saphyr.workspace = true
 # The fake API server answers on a runtime with threads of its own.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

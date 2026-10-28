@@ -249,7 +249,9 @@ compares with the `http` crate's reading instead, and `quic_header` with quiche'
 compiles to being whole; `test_file` reads, checks and runs a file of `edgerush test`'s
 tests against a fixed config, holding all three to not failing; `rules_compile` compiles
 a limit rule's three parts and decides a request with what compiles, holding an error to
-its place in the part it is about. An input that fails is saved under `fuzz/artifacts/`; fix the bug
+its place in the part it is about; `admission_review` reads any bytes as the admission
+webhook's review, which anyone in the cluster can send it, and answers what it reads,
+holding reading to not failing and the answer to carrying the review's uid. An input that fails is saved under `fuzz/artifacts/`; fix the bug
 and add the input to the unit tests. Run a target after changing the code it covers. Being
 outside the workspace, the package is formatted on its own:
 `cargo fmt --manifest-path fuzz/Cargo.toml`.

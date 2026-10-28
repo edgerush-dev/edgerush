@@ -351,9 +351,11 @@ dependencies = [
  "edgerush-kubernetes",
  "edgerush-translate",
  "k8s-openapi",
+ "proptest",
  "serde",
  "serde-saphyr",
  "serde_json",
+ "thiserror",
  "tokio",
 ]
 
