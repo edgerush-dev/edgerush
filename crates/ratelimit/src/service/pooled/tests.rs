@@ -5,7 +5,9 @@
 #![cfg(not(loom))]
 
 use super::*;
-use crate::service::{Answer, DataPlane, ENTRY_BYTES, FixedState, Keyed, PIECE_BYTES, ServicePod};
+use crate::service::{
+    Answer, DataPlane, ENTRY_BYTES, FixedState, Keyed, MOST_UNACKNOWLEDGED, PIECE_BYTES, ServicePod,
+};
 use proptest::prelude::*;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
@@ -2498,6 +2500,34 @@ fn a_key_evicted_with_hits_outstanding_is_forgiven_and_counted_afresh() {
     let (exchange, batch) = only_exchange(&mut participant);
     participant.on_answers_to(exchange, pod.on_batch(batch, 4 * CYCLE), 4 * CYCLE);
     assert_eq!(pod.counted(a), Some(1), "the lost batch not waited for");
+}
+
+/// Cut off from its owner, a participant keeps at most `MOST_UNACKNOWLEDGED` reports out for
+/// a key, as `DataPlane` does, and later hits wait in its ledger; once the owner is back,
+/// every hit is counted, once.
+#[test]
+fn a_participant_keeps_a_bounded_number_of_reports_out() {
+    let mut participant = participant();
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
+    let (key, c): (&[u8], Contract) = (b"k", contract(100, 100));
+    for cycle in 1..=50 {
+        let now = cycle * CYCLE;
+        assert_eq!(participant.decide_all(&[(key, c)], now), Decision::Admit);
+        participant.on_cycle(now);
+        let _lost = participant.take_outgoing();
+    }
+    let tracked = &participant.keys[key];
+    assert_eq!(tracked.unacknowledged.as_slice().len(), MOST_UNACKNOWLEDGED);
+    assert_eq!(tracked.unsent, 50 - MOST_UNACKNOWLEDGED as u64, "waiting");
+    for cycle in 51..=60 {
+        let now = cycle * CYCLE;
+        participant.on_cycle(now);
+        for (_, batch) in participant.take_outgoing() {
+            participant.on_answers(pod.on_batch(batch, now), now);
+        }
+    }
+    assert_eq!(pod.counted(key), Some(50));
+    assert!(participant.keys[key].unacknowledged.is_empty());
 }
 
 /// Scheduled, an entry replaced by a changed contract is kept by its eviction time until

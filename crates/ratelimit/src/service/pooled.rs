@@ -28,8 +28,8 @@ mod tests;
 pub use word::fits;
 
 use super::{
-    Answers, Batch, Contract, Entry as BatchEntry, PlaneId, PodId, Queued, RESEND_AFTER_CYCLES,
-    Report, Room, Unseen, View, encoded_entry_bytes, longest,
+    Answers, Batch, Contract, Entry as BatchEntry, MOST_UNACKNOWLEDGED, PlaneId, PodId, Queued,
+    RESEND_AFTER_CYCLES, Report, Room, Unseen, View, encoded_entry_bytes, longest,
 };
 use chunked::MinHeap;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -816,10 +816,10 @@ struct Tracked {
 
 impl Tracked {
     /// Its ledger's hits, as a report numbered after the last, sent at `now`: `None` if
-    /// there are none.
+    /// there are none, or [`MOST_UNACKNOWLEDGED`] are out already and they wait.
     fn report_unsent(&mut self, now: u64, spare: &mut Spare) -> Option<BatchEntry> {
         let unsent = self.unsent;
-        if unsent == 0 {
+        if unsent == 0 || self.unacknowledged.as_slice().len() >= MOST_UNACKNOWLEDGED {
             return None;
         }
         self.unsent = 0;

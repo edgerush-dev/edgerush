@@ -1332,6 +1332,36 @@ fn a_key_made_again_is_counted_from_its_first_report() {
     assert_eq!(net.pods[owner].counted(b"k"), Some(6), "reported");
 }
 
+/// Cut off from its owner, a data plane keeps at most `MOST_UNACKNOWLEDGED` reports out for
+/// a key, and later hits wait in its ledger; once the owner is back, every hit is counted,
+/// once.
+#[test]
+fn a_data_plane_keeps_a_bounded_number_of_reports_out() {
+    // A refill time of a second: no report grows older than it within the test.
+    let roomy = Contract {
+        limit: NonZeroU64::new(1_000).unwrap(),
+        burst: NonZeroU64::new(1_000).unwrap(),
+        ..contract()
+    };
+    let mut net = Net::new(1);
+    let owner = Net::owner(b"k");
+    for cycle in 1..=50 {
+        let now = cycle * CYCLE;
+        assert_eq!(net.planes[0].decide(b"k", roomy, now), Decision::Admit);
+        net.planes[0].on_cycle(now);
+        let _lost = net.planes[0].take_outgoing();
+    }
+    let copy = net.copy(0, b"k");
+    assert_eq!(copy.unacknowledged.len(), MOST_UNACKNOWLEDGED);
+    assert_eq!(copy.unsent, 50 - MOST_UNACKNOWLEDGED as u64, "waiting");
+    for cycle in 51..=60 {
+        net.planes[0].on_cycle(cycle * CYCLE);
+        net.settle(cycle * CYCLE);
+    }
+    assert_eq!(net.pods[owner].counted(b"k"), Some(50));
+    assert!(net.copy(0, b"k").unacknowledged.is_empty());
+}
+
 /// Past its capacity, a service pod evicts the keys that changed least recently down to
 /// nine tenths of it.
 #[test]

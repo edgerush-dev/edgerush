@@ -54,6 +54,13 @@ pub const RESEND_AFTER_CYCLES: u64 = 4;
 /// through at 1.44 times the contract with one packet in ten lost (simulator, TCP-like loss).
 pub const ACTIVE_CYCLES: u64 = 30;
 
+/// The most reports a data plane has out for one key, sent and not yet seen applied: past
+/// it, new hits wait in the key's ledger, one running count, until one is. Above what a
+/// healthy link has out — a report a cycle through the [`ACTIVE_CYCLES`] a lost segment takes
+/// TCP to send again — so that only an outage meets it, and it bounds what a busy key holds
+/// through one, which eviction at the cap does not reach.
+pub const MOST_UNACKNOWLEDGED: usize = 32;
+
 /// A data plane: one worker of one EdgeRush pod, in one life of it. A restarted worker is a
 /// new data plane, with a new id.
 pub type PlaneId = u64;
@@ -646,9 +653,9 @@ impl PlaneKey {
     }
 
     /// Its hits not yet sent, as a report numbered after the last, sent at `now`: `None` if
-    /// there are none.
+    /// there are none, or [`MOST_UNACKNOWLEDGED`] are out already and they wait.
     fn report_unsent(&mut self, key: &[u8], now: u64) -> Option<Entry> {
-        if self.unsent == 0 {
+        if self.unsent == 0 || self.unacknowledged.len() >= MOST_UNACKNOWLEDGED {
             return None;
         }
         self.sent += 1;
