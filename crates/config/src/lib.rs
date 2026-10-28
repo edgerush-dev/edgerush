@@ -17,6 +17,7 @@
 mod backends;
 mod compile;
 mod config;
+mod dns;
 mod harness_file;
 mod kubernetes;
 mod limits;
@@ -37,6 +38,7 @@ pub use config::{
     RateLimitService, RateLimitSynchronous, RateLimiting, RequestId, SlowStart, StatedNames, Tls,
     Upstream, UpstreamProtocol, UpstreamTls, WhenUnreachable,
 };
+pub use dns::{DnsName, DnsNameError};
 pub use harness_file::{CertificateFiles, HarnessFile};
 pub use kubernetes::{KubernetesService, ServiceNameError, ServicePort};
 pub use limits::{Bucket, CompiledLimit, Global, Limit, LimitMatch, Limits, Model};

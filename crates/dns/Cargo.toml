@@ -1,0 +1,21 @@
+[package]
+name = "edgerush-dns"
+description = "EdgeRush's DNS wire: A and AAAA queries written, their answers read, pure, no I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Answers written as a nameserver writes them, for tests that stand in for one.
+testing = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

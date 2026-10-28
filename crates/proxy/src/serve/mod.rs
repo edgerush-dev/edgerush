@@ -400,12 +400,18 @@ pub struct Proxy {
     /// The endpoints discovered of the Kubernetes Services upstreams name
     /// ([`Proxy::rediscover`]): every snapshot takes its discovered upstreams' from here.
     discovered: std::sync::Mutex<plane::Discovered>,
-    /// Held while a snapshot is made and taken in, by a reload or by endpoints discovered,
-    /// so that the two never start from one snapshot and the later undo the other.
+    /// The addresses of the names upstreams resolve ([`Proxy::reresolve`]): every snapshot
+    /// takes its upstreams' that resolve a name from here.
+    named: std::sync::Mutex<plane::Named>,
+    /// Held while a snapshot is made and taken in, by a reload or by endpoints discovered
+    /// or resolved, so that two never start from one snapshot and the later undo the other.
     making: std::sync::Mutex<()>,
     /// The namespaces the running config's discovered upstreams are in, which
     /// [`Proxy::follow_kubernetes`] follows.
     namespaces: tokio::sync::watch::Sender<std::collections::BTreeSet<String>>,
+    /// The names the running config's upstreams resolve, which [`Proxy::names`] hands
+    /// whoever resolves them.
+    names: tokio::sync::watch::Sender<std::collections::BTreeSet<String>>,
 }
 
 /// The data plane's rate limits: whether they were started, and the thread the running

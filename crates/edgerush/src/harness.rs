@@ -344,8 +344,9 @@ enum Failure {
     PanickedDraining(Ended),
 }
 
-/// How long a data plane with discovered upstreams waits for the first list of every
-/// namespace it follows before it serves anyway, as Envoy waits for its clusters (03 §6).
+/// How long a data plane with discovered upstreams, or upstreams that resolve a name, waits
+/// for the first list of every namespace it follows and the first answer for every name
+/// before it serves anyway, as Envoy waits for its clusters (03 §6).
 const FIRST_LISTS: Duration = Duration::from_secs(15);
 
 /// How often that wait looks.
@@ -509,23 +510,35 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         })?;
     if let Ok(api) = cluster {
         kubernetes(Arc::clone(&proxy), api, &stopping).map_err(Failure::Runtime)?;
-        // Nothing accepted until every namespace followed has been listed once, so that a
-        // client waits rather than be answered 503 for want of a list; for so long at most.
-        match first_lists(&proxy, &stop) {
-            Next::Look => {}
-            Next::Stop => return Ok(()),
-            Next::Failed(ended) => return Err(Failure::Ended(ended)),
-        }
-        let unlisted = proxy.unlisted();
-        if !unlisted.is_empty() {
-            say(
-                stderr,
-                format_args!(
-                    "serving before the first EndpointSlices of {}: their upstreams answer 503 until they come",
-                    unlisted.join(", ")
-                ),
-            );
-        }
+    }
+    resolver(Arc::clone(&proxy), &stopping).map_err(Failure::Runtime)?;
+    // Nothing accepted until every namespace followed has been listed once and every name
+    // looked up once, so that a client waits rather than be answered 503 for want of a
+    // list or an answer; for so long at most.
+    match first_lists(&proxy, &stop, FIRST_LISTS) {
+        Next::Look => {}
+        Next::Stop => return Ok(()),
+        Next::Failed(ended) => return Err(Failure::Ended(ended)),
+    }
+    let unlisted = proxy.unlisted();
+    if !unlisted.is_empty() {
+        say(
+            stderr,
+            format_args!(
+                "serving before the first EndpointSlices of {}: their upstreams answer 503 until they come",
+                unlisted.join(", ")
+            ),
+        );
+    }
+    let unresolved = proxy.unresolved();
+    if !unresolved.is_empty() {
+        say(
+            stderr,
+            format_args!(
+                "serving before the first answers for {}: their upstreams answer 503 until they come",
+                unresolved.join(", ")
+            ),
+        );
     }
     // Every worker runs on a thread of its own, which stays for as long as the process.
     let loads = per_core::start(&proxy, sockets, accept, limits, connections, &stopping)?;
@@ -1000,11 +1013,37 @@ fn kubernetes(proxy: Arc<Proxy>, api: ApiServer, tell: &Sender<Told>) -> io::Res
     Ok(())
 }
 
-/// Waits until every namespace the running config follows has been listed once, or for
-/// [`FIRST_LISTS`] at most: [`Next::Look`] then, or what the main loop was told meanwhile.
-fn first_lists(proxy: &Proxy, told: &Receiver<Told>) -> Next {
-    let until = Instant::now() + FIRST_LISTS;
-    while !proxy.unlisted().is_empty() && Instant::now() < until {
+/// Resolves the names the running config's upstreams resolve, of the nameservers
+/// `/etc/resolv.conf` lists, on a thread and runtime of its own, as EndpointSlices are
+/// followed (03 §6); what fails is said on stderr with its name.
+fn resolver(proxy: Arc<Proxy>, tell: &Sender<Told>) -> io::Result<()> {
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let tell = tell.clone();
+    thread::Builder::new()
+        .name("resolver".to_owned())
+        .spawn(move || {
+            let mut essential = Essential::new("the resolver".to_owned(), &tell);
+            let resolving = crate::resolver::resolve_names(
+                proxy,
+                crate::resolver::system_nameservers(),
+                crate::resolver::Pace::default(),
+                |name, failure| {
+                    say(&mut io::stderr(), format_args!("name {name}: {failure}"));
+                },
+            );
+            tokio::task::LocalSet::new().block_on(&runtime, resolving);
+            essential.finished();
+        })?;
+    Ok(())
+}
+
+/// Waits until every namespace the running config follows has been listed once, and every
+/// name it resolves looked up once, or for `most` at most, [`FIRST_LISTS`] when it runs:
+/// [`Next::Look`] then, or what the main loop was told meanwhile.
+fn first_lists(proxy: &Proxy, told: &Receiver<Told>, most: Duration) -> Next {
+    let until = Instant::now() + most;
+    while (!proxy.unlisted().is_empty() || !proxy.unresolved().is_empty()) && Instant::now() < until
+    {
         match next(told, FIRST_LISTS_POLL) {
             Next::Look => {}
             other => return other,
@@ -1106,6 +1145,36 @@ mod tests {
 
     fn parsed(args: &[&str]) -> Result<Parsed, UsageError> {
         parse(args.iter().map(ToString::to_string))
+    }
+
+    /// A data plane holds until each name it resolves has been looked up, for so long at
+    /// most, and then holds no more.
+    #[test]
+    fn it_holds_for_the_first_answer_for_each_name_for_so_long_at_most() {
+        let config: Config = serde_saphyr::from_str(
+            "listeners: {}\nroutes: []\nupstreams:\n  web: { load_balancer: p2c, endpoints: { dns: \"web.shop.svc.cluster.local:8080\" } }\n",
+        )
+        .unwrap();
+        let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+        let (_tell, told) = mpsc::channel();
+        let held = Instant::now();
+        assert!(matches!(
+            first_lists(&proxy, &told, Duration::from_millis(300)),
+            Next::Look
+        ));
+        assert!(
+            held.elapsed() >= Duration::from_millis(300),
+            "it did not hold"
+        );
+        proxy
+            .reresolve([("web.shop.svc.cluster.local".to_owned(), Some(Vec::new()))])
+            .unwrap();
+        let held = Instant::now();
+        assert!(matches!(
+            first_lists(&proxy, &told, Duration::from_secs(10)),
+            Next::Look
+        ));
+        assert!(held.elapsed() < Duration::from_secs(1), "it held on");
     }
 
     #[test]
