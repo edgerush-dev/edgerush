@@ -69,18 +69,19 @@ Kubernetes, begun:
   them each time they change. Translated so far: Ingresses' rules and default backends,
   with paths of every type, to Services' ports, spoken to as their `appProtocol` says; TLS
   from Secrets, each certificate served for the hosts that name it alone; and plain HTTP
-  redirected to HTTPS for the hosts an Ingress secures. Its config does not reach data
-  planes yet: it is reported on stderr, or written as a file that `edgerush proxy` reads.
+  redirected to HTTPS for the hosts an Ingress secures. Each config is reported on stderr,
+  can be written as a file that `edgerush proxy` reads, and is offered on the config
+  stream it serves, gRPC over mutual TLS, which data planes do not dial yet.
 - **Endpoints from EndpointSlices:** an upstream that names a Service takes its endpoints
   from the data plane's own list and watch of EndpointSlices, so that they are followed
   with the control plane down; tested end to end in kind.
 - **`edgerush validate`** translates manifests as the controller would, without a cluster,
   and reports what it left out and why.
 
-Not yet: the rest of Kubernetes (the config reaching data planes, the operator,
-ingress-nginx's annotations, Ingress status, Gateway API), authentication. The request
-path came first; rate limiting and the control plane are now built side by side, and the
-operator follows.
+Not yet: the rest of Kubernetes (data planes taking their config from the stream, the
+operator, ingress-nginx's annotations, Ingress status, Gateway API), authentication. The
+request path came first; rate limiting and the control plane are now built side by side,
+and the operator follows.
 
 ## Trying it
 
@@ -171,9 +172,12 @@ listeners:
 `edgerush controller --data-plane data-plane.yaml`, run in a cluster, follows the
 IngressClasses, Ingresses, Services and Secrets there (or in each `--namespace` given)
 through the API server and translates them for that data plane each time they change, once
-all have been listed. Until the config reaches data planes, each translation is said on
-stderr as `validate` says it, and `--write-config config.yaml` writes the config as a file
-`edgerush proxy` reads, without the certificates it names.
+all have been listed. Each translation is said on stderr as `validate` says it, and
+`--write-config config.yaml` writes the config as a file `edgerush proxy` reads, without the
+certificates it names. With `--listen [::]:9443 --certificate tls.crt --key tls.key
+--authorities ca.crt` it serves the config stream there, gRPC over mutual TLS: each config is
+offered to every data plane that dials it with a certificate those authorities signed, and
+what each says of it is said too.
 
 ## Building
 
@@ -257,6 +261,15 @@ crates/certificates
                    (`edgerush-certificates`), by BoringSSL: what the data plane presents and what
                    translation admits are read by the same code; no I/O
 crates/config      the config model and its compilation (`edgerush-config`): pure, format-free
+crates/control-service
+                   the config stream over gRPC and mutual TLS (`edgerush-control-service`):
+                   the control plane's server and the data plane's client, TLS 1.3 alone and
+                   each end checked against the stream's own authorities
+crates/control-stream
+                   the config stream between control plane and data planes
+                   (`edgerush-control-stream`): pure, no I/O; its messages, what a control plane
+                   sends each data plane, and how a data plane holds a config until it has its
+                   certificates, then runs the two whole
 crates/controller  the control plane (`edgerush-controller`): the objects a data plane's config is
                    made of, followed, translated once every kind is listed and again on each
                    change, a moment's changes at once, and each config that compiles handed on

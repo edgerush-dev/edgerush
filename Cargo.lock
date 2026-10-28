@@ -262,7 +262,10 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 name = "edgerush"
 version = "0.0.0"
 dependencies = [
+ "edgerush-certificates",
  "edgerush-config",
+ "edgerush-control-service",
+ "edgerush-control-stream",
  "edgerush-controller",
  "edgerush-explain",
  "edgerush-kubernetes",
@@ -302,6 +305,39 @@ dependencies = [
  "schemars",
  "serde",
  "serde-saphyr",
+ "thiserror",
+]
+
+[[package]]
+name = "edgerush-control-service"
+version = "0.0.0"
+dependencies = [
+ "boring",
+ "bytes",
+ "edgerush-certificates",
+ "edgerush-config",
+ "edgerush-control-stream",
+ "futures-core",
+ "http",
+ "hyper-util",
+ "prost",
+ "serde-saphyr",
+ "thiserror",
+ "tokio",
+ "tokio-boring",
+ "tonic",
+ "tower-service",
+]
+
+[[package]]
+name = "edgerush-control-stream"
+version = "0.0.0"
+dependencies = [
+ "edgerush-config",
+ "proptest",
+ "prost",
+ "serde-saphyr",
+ "serde_json",
  "thiserror",
 ]
 

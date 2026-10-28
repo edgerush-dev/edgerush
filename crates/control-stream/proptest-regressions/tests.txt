@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 39123c1885d619ac7206f39fa0b52e9a48fd24c8dc10fd6db30020c86bd8a8cd # shrinks to steps = [Offer(80, []), Offer(80, [(0, 0)]), Offer(80, [])], failures = [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]
+cc 1c57584e1446bfbcff7d5a9585461e7f0a13fac28bf52ff832b682afb23f9740 # shrinks to steps = [Offer(80, [(0, 0)]), Offer(80, [(0, 1)]), Offer(80, [])], failures = [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]
+cc 0c613738a5a4d39ca230f67f961c6e19afefd04a0ad6a17831f3e31538c10fa3 # shrinks to steps = [Offer(80, []), Offer(81, []), Offer(80, []), Deliver, Break(0)], failures = [false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]
+cc 9d0e5ce78a7889a098dedc29691a6ff2b3abb70c935ea91bf9a144aae01098db # shrinks to steps = [Offer(81, []), Offer(80, []), Offer(80, [(0, 0)]), Deliver], failures = [false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]

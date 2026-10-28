@@ -13,6 +13,9 @@ interop = ["edgerush-proxy/interop"]
 
 [dependencies]
 edgerush-config.workspace = true
+# The config stream `edgerush controller` serves, and the offers it sends.
+edgerush-control-service.workspace = true
+edgerush-control-stream.workspace = true
 edgerush-controller.workspace = true
 edgerush-explain.workspace = true
 # The cluster's API server, found as a pod finds it, which discovered upstreams are
@@ -36,6 +39,8 @@ tokio = { workspace = true, features = ["signal", "sync"] }
 rustix.workspace = true
 
 [dev-dependencies]
+# The stream's certificates, issued by an authority of the tests' own.
+edgerush-certificates = { workspace = true, features = ["testing"] }
 # Its `schema` feature: `tests/schema.rs` keeps `schema/config.schema.json` as the types say.
 edgerush-config = { workspace = true, features = ["schema"] }
 # The fake API server `edgerush controller` is run against.
