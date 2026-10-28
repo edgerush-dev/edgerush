@@ -13,6 +13,7 @@
 use crate::downstream::h1::codec::RequestError;
 use crate::forwarding::Cut;
 use crate::grpc::status::{Code, NAMES};
+use crate::ratelimit::Usage;
 use crate::request::Rejection;
 use edgerush_telemetry::{Counter, Exposition, Gauge, Histogram, Kind, Sharded};
 use http::StatusCode;
@@ -801,31 +802,36 @@ impl WorkerGauges {
 }
 
 /// What one worker's rate limiter holds, as the worker last looked (06 §8): its keys'
-/// bytes, how many there are, and those it has evicted to stay within its share.
+/// bytes, how many there are, those it has evicted to stay within its share, and the hits
+/// forgiven with them.
 #[derive(Debug, Default)]
 pub(crate) struct LimiterGauges {
     key_bytes: Gauge,
     keys: Gauge,
     evicted: Counter,
+    forgiven: Counter,
 }
 
 impl LimiterGauges {
-    /// What this worker's limiter holds now — bytes, keys and evictions all told, as
-    /// [`crate::ratelimit::Limiter::usage`] says — `said` being what it last said. A
-    /// limiter made afresh counts its evictions from nothing again.
-    pub(crate) fn holding(&self, said: &LimiterSaid, (bytes, keys, evicted): (u64, usize, u64)) {
+    /// What this worker's limiter holds now, as [`crate::ratelimit::Limiter::usage`] says,
+    /// `said` being what it last said. A limiter made afresh counts its evictions and hits
+    /// forgiven from nothing again.
+    pub(crate) fn holding(&self, said: &LimiterSaid, usage: Usage) {
         said.bytes.move_to(
             &self.key_bytes,
-            usize::try_from(bytes).unwrap_or(usize::MAX),
+            usize::try_from(usage.bytes).unwrap_or(usize::MAX),
         );
-        said.keys.move_to(&self.keys, keys);
-        let before = said.evicted.replace(evicted);
-        self.evicted.add(if evicted >= before {
-            evicted - before
-        } else {
-            evicted
-        });
+        said.keys.move_to(&self.keys, usage.keys);
+        add_since(&self.evicted, &said.evicted, usage.evicted);
+        add_since(&self.forgiven, &said.forgiven, usage.forgiven);
     }
+}
+
+/// Adds to `counter` what a count all told, `now`, grew by since `said`, and remembers it:
+/// all of it if it went back, counted from nothing again.
+fn add_since(counter: &Counter, said: &Cell<u64>, now: u64) {
+    let before = said.replace(now);
+    counter.add(if now >= before { now - before } else { now });
 }
 
 /// What one worker last said its rate limiter holds, kept by the worker.
@@ -834,6 +840,7 @@ pub(crate) struct LimiterSaid {
     bytes: SaidOne,
     keys: SaidOne,
     evicted: Cell<u64>,
+    forgiven: Cell<u64>,
 }
 
 /// What one worker last said it holds, kept by the worker.
@@ -983,6 +990,12 @@ impl Metrics {
                     may hold; each starts again full.";
         scrape.family(name, Kind::Counter, help);
         scrape.sample(name, &[], self.limiters.sum(|shard| shard.evicted.get()));
+        let name = "edgerush_rate_limit_hits_forgiven_total";
+        let help = "Hits the rate-limiting service had not been seen to apply, forgiven with \
+                    the keys evicted to keep within the bytes they may hold: at most what was \
+                    lost, as a lost answer may leave one applied unseen.";
+        scrape.family(name, Kind::Counter, help);
+        scrape.sample(name, &[], self.limiters.sum(|shard| shard.forgiven.get()));
         // Limits that share a series are shown once, under a name of its own.
         let mut shown: Vec<(&str, usize, bool)> = Vec::new();
         for (limit, slot, dry_run) in limits {
@@ -1590,16 +1603,23 @@ mod tests {
     fn the_rate_limits_keys_are_shown_against_their_bound() {
         let metrics = metrics();
         let said = LimiterSaid::default();
-        metrics.limiter().holding(&said, (7_000, 20, 3));
-        metrics.limiter().holding(&said, (5_000, 14, 5));
-        // Made afresh: its count starts again.
-        metrics.limiter().holding(&said, (1_000, 3, 1));
+        let usage = |bytes, keys, evicted, forgiven| Usage {
+            bytes,
+            keys,
+            evicted,
+            forgiven,
+        };
+        metrics.limiter().holding(&said, usage(7_000, 20, 3, 10));
+        metrics.limiter().holding(&said, usage(5_000, 14, 5, 12));
+        // Made afresh: its counts start again.
+        metrics.limiter().holding(&said, usage(1_000, 3, 1, 4));
         let scrape = metrics.render_limits(&[], 1 << 20);
         for line in [
             "edgerush_rate_limit_key_bytes 1000\n",
             "edgerush_rate_limit_max_key_bytes 1048576\n",
             "edgerush_rate_limit_keys 3\n",
             "edgerush_rate_limit_keys_evicted_total 6\n",
+            "edgerush_rate_limit_hits_forgiven_total 16\n",
         ] {
             assert!(scrape.contains(line), "{line}{scrape}");
         }

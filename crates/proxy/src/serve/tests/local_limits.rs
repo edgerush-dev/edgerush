@@ -65,7 +65,7 @@ async fn a_refusal_keeps_its_reason_once_its_key_is_evicted() {
                 panic!("refused, saying why");
             };
             process.sweep_once();
-            assert_eq!(process.usage().1, 0, "the key is gone");
+            assert_eq!(process.usage().keys, 0, "the key is gone");
             let refusal = said.of(&rule.limits);
             assert_eq!(refusal.by, 1, "counted under the limit that refused it");
             let (limit, wait) = refusal.longest.expect("the 429 names its limit");

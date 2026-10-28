@@ -4,7 +4,7 @@
 //! (`edgerush_ratelimit::local`); a thread of the process's sweeps the keys once a second,
 //! forgetting those full and quiet and, past the cap, evicting.
 
-use super::{Failed, KeyedBy, Limited, Refused, with_keys};
+use super::{Failed, KeyedBy, Limited, Refused, Usage, with_keys};
 use edgerush_config::CompiledLimit;
 use edgerush_ratelimit::local::{Decision, HANDLE_PARTS, Handles, Local};
 use edgerush_ratelimit::service::{Contract, Keyed};
@@ -68,13 +68,14 @@ impl Process {
         self.local.set_capacity(max_key_bytes);
     }
 
-    /// What its keys hold, in bytes, how many there are, and how many were evicted.
-    pub(crate) fn usage(&self) -> (u64, usize, u64) {
-        (
-            self.local.holding(),
-            self.local.key_count(),
-            self.local.evicted(),
-        )
+    /// What its keys hold: nothing is forgiven, as nothing is reported.
+    pub(crate) fn usage(&self) -> Usage {
+        Usage {
+            bytes: self.local.holding(),
+            keys: self.local.key_count(),
+            evicted: self.local.evicted(),
+            forgiven: 0,
+        }
     }
 
     fn now(&self) -> u64 {
@@ -151,11 +152,11 @@ impl LocalLimiter {
 
     /// What its process's keys hold, said by its first worker alone, so that the workers'
     /// sum is the process's.
-    pub(crate) fn usage(&self) -> (u64, usize, u64) {
+    pub(crate) fn usage(&self) -> Usage {
         if self.index == 0 {
             self.process.usage()
         } else {
-            (0, 0, 0)
+            Usage::default()
         }
     }
 

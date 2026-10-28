@@ -10,6 +10,7 @@ use crate::downstream::h1::deadlines::Bounds;
 use crate::drain::Drain;
 use crate::metrics::{Answer, LimiterSaid, Said, Socket};
 use crate::places::{Places, Refused};
+use crate::ratelimit::Usage;
 use crate::received::Received;
 use crate::slots::WorkerSlots;
 use crate::storage::Storage;
@@ -371,7 +372,7 @@ impl Worker {
                 // The synchronous mode's own buckets, said by the first worker alone.
                 (None, None) => match &*self.sync_limiter.borrow() {
                     Some((_, limiter)) if self.position == 0 => limiter.usage(),
-                    _ => (0, 0, 0),
+                    _ => Usage::default(),
                 },
             };
             metrics.limiter().holding(&self.limiter_said, usage);

@@ -17,7 +17,7 @@
 //! thread, forgets it full and idle. Nothing is charged there while the owners answer.
 
 use super::local::{LocalLimiter, Process as LocalKeys, SWEEP};
-use super::{Awaited, Failed, KeyedBy, Later, Limited, Refusal, Undecided, with_keys};
+use super::{Awaited, Failed, KeyedBy, Later, Limited, Refusal, Undecided, Usage, with_keys};
 use edgerush_config::{CompiledLimit, CompiledSynchronous, WhenUnreachable};
 use edgerush_ratelimit::local::Decision;
 use edgerush_ratelimit::service::{Contract, Decided, PodId, View, longest};
@@ -171,8 +171,10 @@ impl Process {
 
     /// What its own buckets hold, in bytes, how many there are, and how many were evicted;
     /// nothing without `when_unreachable: local`.
-    pub(crate) fn usage(&self) -> (u64, usize, u64) {
-        self.local.as_ref().map_or((0, 0, 0), |local| local.usage())
+    pub(crate) fn usage(&self) -> Usage {
+        self.local
+            .as_ref()
+            .map_or_else(Usage::default, |local| local.usage())
     }
 
     /// What its owners' asks came to, their breakers, and what was left to
@@ -681,7 +683,7 @@ impl SyncLimiter {
     }
 
     /// What its process's own buckets hold, as [`Process::usage`] says.
-    pub(crate) fn usage(&self) -> (u64, usize, u64) {
+    pub(crate) fn usage(&self) -> Usage {
         self.process.usage()
     }
 

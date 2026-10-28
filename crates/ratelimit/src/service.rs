@@ -717,6 +717,8 @@ pub struct DataPlane<S = FixedState> {
     holding: u64,
     /// Keys it has evicted to stay within its capacity, all told.
     evicted: u64,
+    /// Hits not seen applied that keys evicted for capacity held, all told.
+    forgiven: u64,
 }
 
 /// What a data plane counts a key as holding: its entry in the table, the table's control
@@ -777,12 +779,14 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             capacity: u64::MAX,
             holding: 0,
             evicted: 0,
+            forgiven: 0,
         }
     }
 
     /// The bytes its keys may hold: past them, each cycle evicts the least recently used
-    /// keys with nothing in flight, down to nine tenths of it. A key evicted starts again
-    /// full, as one forgotten does. No bound unless set.
+    /// keys, down to nine tenths of it, forgiving any hits they have not had applied
+    /// ([`Self::forgiven`]). A key evicted starts again full, as one forgotten does, and
+    /// numbers its reports past every one sent before. No bound unless set.
     pub fn set_capacity(&mut self, bytes: u64) {
         self.capacity = bytes;
     }
@@ -797,6 +801,14 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
     #[must_use]
     pub fn evicted(&self) -> u64 {
         self.evicted
+    }
+
+    /// Hits forgiven by evicting for capacity keys that had them unsent or not seen
+    /// applied, all told: at most what was lost, since a report not seen applied may have
+    /// been applied with its answer lost.
+    #[must_use]
+    pub fn forgiven(&self) -> u64 {
+        self.forgiven
     }
 
     /// How many keys it holds.
@@ -1014,18 +1026,21 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         });
         self.holding = self.holding.saturating_sub(freed);
         if self.holding > self.capacity {
-            let quiet = self
+            // Every key, whatever it has outstanding: memory stays within the cap however
+            // long the service is out of reach.
+            let used = self
                 .keys
                 .iter()
-                .filter(|(_, at)| at.unsent == 0 && at.unacknowledged.is_empty())
                 .map(|(key, at)| {
                     let used = at.last_request.unwrap_or(0);
                     (used, key.clone(), plane_key_bytes(key))
                 })
                 .collect();
             let target = self.capacity - self.capacity / 10;
-            for key in least_recently_used(quiet, self.holding, target) {
-                if self.keys.remove(&key).is_some() {
+            for key in least_recently_used(used, self.holding, target) {
+                if let Some(at) = self.keys.remove(&key) {
+                    let unseen: u64 = at.unacknowledged.iter().map(|u| u.count).sum();
+                    self.forgiven += at.unsent + unseen;
                     self.holding = self.holding.saturating_sub(plane_key_bytes(&key));
                     self.evicted += 1;
                 }

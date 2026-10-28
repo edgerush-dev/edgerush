@@ -1253,7 +1253,7 @@ fn used_in_turn(net: &mut Net, plane: usize, n: u64) -> Vec<Vec<u8>> {
 }
 
 /// Past its capacity, a data plane evicts the keys it used least recently down to nine
-/// tenths of it, never one with hits still to be acknowledged.
+/// tenths of it, even one with hits still to be acknowledged, which are forgiven.
 #[test]
 fn a_data_plane_past_its_capacity_evicts_the_least_recently_used() {
     let mut net = Net::new(1);
@@ -1271,18 +1271,41 @@ fn a_data_plane_past_its_capacity_evicts_the_least_recently_used() {
     assert_eq!(kept(&net.planes[0]), [false, false, false, true, true]);
     assert_eq!(net.planes[0].holding(), 2 * each);
     assert_eq!(net.planes[0].evicted(), 3);
-    // The newest has a hit not yet acknowledged: room for less than one, and it stays.
-    net.planes[0].decide(&keys[4], contract(), 6 * MS);
+    assert_eq!(net.planes[0].forgiven(), 0, "nothing outstanding");
+    // The newest has two hits not yet acknowledged: room for less than one, and it goes,
+    // its hits forgiven.
+    net.admits(0, &keys[4], 2, 6 * MS);
     net.planes[0].set_capacity(each / 2);
     net.planes[0].on_cycle(6 * MS);
-    assert_eq!(kept(&net.planes[0]), [false, false, false, false, true]);
-    assert_eq!(net.planes[0].evicted(), 4);
-    // Acknowledged and quiet past twice its refill time, it is forgotten, and gives its
-    // bytes back.
-    net.settle(6 * MS);
-    net.planes[0].on_cycle(10_000 * MS);
     assert_eq!(kept(&net.planes[0]), [false; 5]);
+    assert_eq!(net.planes[0].evicted(), 5);
+    assert_eq!(net.planes[0].forgiven(), 2);
     assert_eq!(net.planes[0].holding(), 0);
+}
+
+/// A key evicted for capacity with a batch lost on its way is counted afresh by its owner
+/// when made again: its first report says every earlier batch was seen, so the owner does
+/// not hold it back waiting for the one that will never come.
+#[test]
+fn a_key_evicted_with_hits_outstanding_is_counted_afresh() {
+    let mut net = Net::new(1);
+    let owner = Net::owner(b"k");
+    warmed(&mut net, 0, b"k", 0);
+    assert_eq!(net.admits(0, b"k", 2, MS), 2);
+    net.planes[0].on_cycle(MS);
+    let lost = net.planes[0].take_outgoing();
+    assert_eq!(lost.len(), 1);
+    net.planes[0].set_capacity(1);
+    net.planes[0].on_cycle(2 * MS);
+    assert!(net.planes[0].keys.is_empty(), "evicted");
+    assert_eq!(net.planes[0].forgiven(), 2);
+    net.planes[0].set_capacity(u64::MAX);
+    warmed(&mut net, 0, b"k", 3 * MS);
+    assert_eq!(
+        net.pods[owner].counted(b"k"),
+        Some(2),
+        "the first life's warming hit and the new one; the lost two forgiven"
+    );
 }
 
 /// A key evicted and made again numbers its reports past those its earlier life sent: its

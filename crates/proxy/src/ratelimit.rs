@@ -44,6 +44,19 @@ use tokio::sync::{Notify, mpsc, oneshot};
 /// not.
 const EXCHANGE_TIMEOUT: u64 = 300_000_000;
 
+/// What a worker's rate limiter holds, as its sweep says it (06 §8), counts all told since
+/// the limiter was made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Usage {
+    /// The bytes its keys hold.
+    pub(crate) bytes: u64,
+    /// How many keys it holds.
+    pub(crate) keys: usize,
+    /// Keys evicted to stay within the bytes they may hold.
+    pub(crate) evicted: u64,
+    /// Hits not seen applied that the keys evicted held, forgiven with them.
+    pub(crate) forgiven: u64,
+}
 /// Why a request was refused, as the worker's entries have it.
 pub(crate) struct Refusal<'a> {
     /// The limits that refused it, bit `n` for the rule's `n`th: those out of room. None
@@ -486,14 +499,13 @@ impl Limiter {
         Arc::ptr_eq(&self.hub, hub)
     }
 
-    /// What its process's keys hold, in bytes, how many there are, and how many it has
-    /// evicted, all told: for the worker's sweep to say, by its first worker alone, so that
-    /// the workers' sum is the process's.
-    pub(crate) fn usage(&self) -> (u64, usize, u64) {
+    /// What its process's keys hold: for the worker's sweep to say, by its first worker
+    /// alone, so that the workers' sum is the process's.
+    pub(crate) fn usage(&self) -> Usage {
         if self.index == 0 {
             self.hub.usage()
         } else {
-            (0, 0, 0)
+            Usage::default()
         }
     }
 
