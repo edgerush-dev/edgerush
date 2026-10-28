@@ -451,6 +451,17 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             error,
         })?;
     let _first = logged.set(Arc::clone(&proxy));
+    // Before anything is discovered or resolved, so that nothing is sent to these first.
+    let denied = denied(
+        std::env::var("POD_IPS").ok().as_deref(),
+        std::env::var("KUBERNETES_SERVICE_HOST").ok().as_deref(),
+    );
+    proxy.deny(denied, |upstream, address, why| {
+        say(
+            &mut io::stderr(),
+            format_args!("upstream {upstream}: {address} is not sent to, as {why}"),
+        );
+    });
 
     // Every socket is open before a request is served on any, so that a port that is
     // taken stops a harness that has done nothing yet.
@@ -1013,6 +1024,21 @@ fn kubernetes(proxy: Arc<Proxy>, api: ApiServer, tell: &Sender<Told>) -> io::Res
     Ok(())
 }
 
+/// What the data plane refuses to send to beside the ranges none sends to (03 §6): the pod's
+/// own addresses, `pod_ips` as the Downward API gives `status.podIPs`, comma-separated; and
+/// the API server's, `api_server` as a pod is given it. What is not an address is passed
+/// over: outside a cluster there are none.
+fn denied(pod_ips: Option<&str>, api_server: Option<&str>) -> edgerush_proxy::egress::Denied {
+    edgerush_proxy::egress::Denied {
+        own: pod_ips
+            .into_iter()
+            .flat_map(|ips| ips.split(','))
+            .filter_map(|ip| ip.trim().parse().ok())
+            .collect(),
+        api_server: api_server.and_then(|host| host.trim().parse().ok()),
+    }
+}
+
 /// Resolves the names the running config's upstreams resolve, of the nameservers
 /// `/etc/resolv.conf` lists, on a thread and runtime of its own, as EndpointSlices are
 /// followed (03 §6); what fails is said on stderr with its name.
@@ -1145,6 +1171,30 @@ mod tests {
 
     fn parsed(args: &[&str]) -> Result<Parsed, UsageError> {
         parse(args.iter().map(ToString::to_string))
+    }
+
+    #[test]
+    fn the_pods_own_and_the_api_servers_addresses_are_read_from_the_environment() {
+        let both = denied(Some("10.244.0.5,fd00:10:244::5"), Some("10.96.0.1"));
+        assert_eq!(
+            both.own,
+            [
+                "10.244.0.5".parse::<std::net::IpAddr>().unwrap(),
+                "fd00:10:244::5".parse().unwrap()
+            ]
+        );
+        assert_eq!(both.api_server, Some("10.96.0.1".parse().unwrap()));
+        let one = denied(Some("10.244.0.5"), Some("fd00::1"));
+        assert_eq!(one.own.len(), 1);
+        assert_eq!(one.api_server, Some("fd00::1".parse().unwrap()));
+        assert_eq!(
+            denied(None, None),
+            edgerush_proxy::egress::Denied::default()
+        );
+        assert_eq!(
+            denied(Some(" , not-an-address,"), Some("kubernetes.default")),
+            edgerush_proxy::egress::Denied::default()
+        );
     }
 
     /// A data plane holds until each name it resolves has been looked up, for so long at

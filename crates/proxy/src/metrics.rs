@@ -957,6 +957,21 @@ impl Metrics {
         slot
     }
 
+    /// The scrape's refused endpoints: for each upstream of the current config with any, how
+    /// many of its addresses discovered or resolved are not sent to, by why (03 §6).
+    pub(crate) fn render_refused(refused: &[(&str, &'static str, usize)]) -> String {
+        let mut scrape = Exposition::new();
+        let name = "edgerush_upstream_refused_endpoints";
+        let help = "Addresses discovered or resolved that are not sent to: unspecified, \
+                    loopback, link-local, multicast, the data plane's own or the API server's.";
+        scrape.family(name, Kind::Gauge, help);
+        for (upstream, reason, count) in refused {
+            let labels = [("upstream", *upstream), ("reason", *reason)];
+            scrape.sample(name, &labels, *count as u64);
+        }
+        scrape.finish()
+    }
+
     /// The scrape's rate limits: those of the current config by their names, each with the
     /// slot it has and whether it is a dry run, which alone shows `dry_run_refused` and
     /// `dry_run_uncounted`; and

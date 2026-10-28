@@ -19,6 +19,8 @@
 #     taken back, the address again;
 #   - asked to reach its Service by the Service's own address, it is served through the
 #     cluster's DNS and kube-proxy, and served again once it no longer asks;
+#   - an EndpointSlice written by hand to point at the data plane's own pod is not sent
+#     to, and that is said;
 #   - the control plane's leader gone, the other replica takes its Lease and writes status;
 #   - with the control plane gone, the data plane serves on;
 #   - a data plane started while it is gone waits for its first config, serving nothing,
@@ -193,6 +195,46 @@ done
 k -n shop annotate ingress web gateway.edgerush.dev/service-upstream- >/dev/null
 answers other.example 200 30 || fail "back on its endpoints, $(status other.example)"
 pass "reached by its Service's own address, the Ingress is served through the cluster's DNS"
+
+# A Service of no selector, and its one EndpointSlice written by hand: the data plane's own
+# address, which would loop a request back into it.
+own=$(k -n edge get pod -l app=edgerush -o jsonpath='{.items[0].status.podIP}')
+[ -n "$own" ] || fail "the data plane has no pod address"
+k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata: { name: loop, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80, targetPort: 8080 }]
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: loop-1
+  namespace: shop
+  labels: { kubernetes.io/service-name: loop }
+addressType: IPv4
+ports: [{ name: http, port: 8080 }]
+endpoints: [{ addresses: ["$own"] }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: loop, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: loop.example
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: loop, port: { name: http } } } }
+EOF
+said deploy/edgerush "upstream shop/loop/http: $own:8080 is not sent to, as one of the data plane's own" 30 ||
+    fail "the data plane never said it refuses its own address"
+answers loop.example 503 10 || fail "an Ingress led to the data plane's own address answers $(status loop.example)"
+k -n shop delete ingress loop >/dev/null
+k -n shop delete service loop >/dev/null
+k -n shop delete endpointslice loop-1 >/dev/null
+pass "an EndpointSlice pointed at the data plane's own pod is not sent to, and that is said"
 
 echo "== the leader gone"
 # Who holds the Lease: a pod's name, and when it started.

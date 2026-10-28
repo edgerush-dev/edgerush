@@ -249,6 +249,10 @@ spec:
             - /etc/edgerush/stream/ca.crt
             - --workers
             - "1"
+          # The pod's own addresses, which it never sends a request to (03 §6).
+          env:
+            - name: POD_IPS
+              valueFrom: { fieldRef: { fieldPath: status.podIPs } }
           ports: [{ name: http, containerPort: 8080 }]
           volumeMounts: [{ name: stream, mountPath: /etc/edgerush/stream }]
       volumes:
