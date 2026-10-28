@@ -61,9 +61,6 @@ pub type PlaneId = u64;
 /// A service pod: its ordinal among the service's pods.
 pub type PodId = u32;
 
-/// A request waiting for the owner's decision.
-pub type Ticket = u64;
-
 /// A limit's contract: `limit` requests per `window` nanoseconds on average, at most
 /// `burst` at once (the whole bucket, 06 §3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -385,16 +382,14 @@ impl Replicas {
     }
 }
 
-/// The decision on a request that waited.
+/// The decision on a request told to the worker waiting on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decided {
-    /// The request.
-    pub ticket: Ticket,
     /// Whether it was admitted.
     pub admitted: bool,
     /// Refused, those of its keys that refused it, by position in its list, each with how
-    /// long from the decision it waits to admit one: as the service pod that decided held
-    /// them, or, decided here, as the copies have them. Empty when admitted.
+    /// long from the decision it waits to admit one, as whatever decided held them. Empty
+    /// when admitted.
     pub refused_by: Box<[(usize, u64)]>,
 }
 
@@ -513,6 +508,16 @@ impl Queued {
     /// fit in [`PIECE_BYTES`]; the rest kept for the next. A key's reports stay in order,
     /// and keys depend on no other.
     pub(crate) fn take_piece(&mut self, from: PlaneId) -> Batch {
+        if self.bytes <= Room::new().left {
+            // All of it, as most often.
+            let batch = Batch {
+                from,
+                entries: std::mem::take(&mut self.entries),
+                made: self.made,
+            };
+            self.bytes = 0;
+            return batch;
+        }
         let mut room = Room::new();
         let fit = self
             .entries
@@ -558,12 +563,12 @@ impl Queued {
 /// What a data plane holds of one key.
 struct PlaneKey {
     contract: Contract,
-    /// Its contract's refill time, worked out once: how long a copy stays fresh.
+    /// Its contract's refill time, worked out once.
     hold: u64,
     /// The service pod it sends to.
     owner: Option<PodId>,
     /// The owner's bucket as last heard, charged with its own hits not yet seen applied,
-    /// with what it has admitted since, and with what it holds.
+    /// and with what it has admitted since.
     bucket: TokenBucket,
     /// Hits admitted and not yet sent.
     unsent: u64,

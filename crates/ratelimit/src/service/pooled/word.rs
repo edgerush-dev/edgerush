@@ -9,7 +9,7 @@
 //! | shared | 1 | whether that advance shared out the copy |
 //! | closed | 1 | evicted: nothing more is taken |
 //! | unreported | 14 | admitted here and not yet drained by the transport into its ledger |
-//! | held | 7 | charged and held for requests waiting on an ask, each reserving a place in `unreported` |
+//! | held | 7 | charged and held for requests under several keys until all are decided, each reserving a place in `unreported` |
 //! | set | 1 | a cycle has set the allowance: until then there is none, as a new key has none |
 //!
 //! Invariants, kept by every compare-and-swap: `left + spent <= MOST_LEFT`, and
@@ -249,9 +249,8 @@ impl Bucket {
         from.wrapping_add(count.saturating_mul(UNITS)) & ARRIVAL_MASK
     }
 
-    /// The arrival of a bucket full at `now` (units) and at any earlier time a request that
-    /// waited is decided as of, as the reference's bucket with no arrival time is: charged
-    /// as of then, from then.
+    /// The arrival of a bucket full at `now` (units) and at any time before it, as the
+    /// reference's bucket with no arrival time is: charged as of then, from then.
     pub(super) fn full(now: u64) -> u64 {
         now.wrapping_sub(FULL_FOR) & ARRIVAL_MASK
     }

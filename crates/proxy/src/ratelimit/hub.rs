@@ -63,8 +63,8 @@ pub(crate) enum ToHub {
     Capacity(u64),
     /// A key whose unreported count passed half its most: to drain now.
     Drain(Box<[u8]>),
-    /// Cold keys decided locally: an entry a worker made, for the process to keep, with
-    /// the room it holds among its worker's until the process takes it in.
+    /// An entry a worker made, for the process to keep, with the room it holds among its
+    /// worker's until the process takes it in.
     Adopt(Arc<Entry>, Made),
     /// Keys visited only when they need it: those its decisions signalled since its last
     /// such message, for the next cycle to visit.

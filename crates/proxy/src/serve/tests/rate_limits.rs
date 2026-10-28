@@ -867,7 +867,7 @@ async fn a_worker_makes_new_keys_only_with_room_and_asks_without() {
                 panic!("made with no room");
             };
             release.send(()).unwrap();
-            // Its ask given up, the process makes the key itself, from a full bucket.
+            // The process released, it makes the key itself, from a full bucket.
             assert!(within(asked.decided()).await.unwrap().admitted);
             // The first key taken in: room again.
             within(async {

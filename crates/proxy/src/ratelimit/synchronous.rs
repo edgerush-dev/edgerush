@@ -1024,14 +1024,12 @@ impl Asked {
         if !refused_by.is_empty() {
             give_back(admitted);
             return Ok(Decided {
-                ticket: 0,
                 admitted: false,
                 refused_by: refused_by.into_boxed_slice(),
             });
         }
         let Some(why) = unreached else {
             return Ok(Decided {
-                ticket: 0,
                 admitted: true,
                 refused_by: Box::default(),
             });
@@ -1040,7 +1038,6 @@ impl Asked {
             WhenUnreachable::Allow => {
                 process.unreachable.local()[0].inc();
                 Ok(Decided {
-                    ticket: 0,
                     admitted: true,
                     refused_by: Box::default(),
                 })
@@ -1057,14 +1054,12 @@ impl Asked {
                 );
                 match local.decide_keys(&keys) {
                     Decision::Admit => Ok(Decided {
-                        ticket: 0,
                         admitted: true,
                         refused_by: Box::default(),
                     }),
                     Decision::Refuse { position, wait } => {
                         give_back(admitted);
                         Ok(Decided {
-                            ticket: 0,
                             admitted: false,
                             refused_by: positions
                                 .get(position)

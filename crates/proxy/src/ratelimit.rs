@@ -177,8 +177,7 @@ fn key_into(buffer: &mut Vec<u8>, name: &str, definition: [u8; 8], key: KeyValue
 }
 
 /// How long a request may wait on its rate limits in all, from when its worker's limiter
-/// first meets it, wherever it waits — deferred, queued for the process, asked about, handed
-/// back: an ask's own time, which a hold it waits on may take to settle, and a little more.
+/// first meets it, wherever it waits — deferred, queued for the process, handed back.
 /// Fixed, until measuring shows that setting it would be worth what it costs.
 pub(crate) const WAIT: Duration = Duration::from_millis(400);
 
@@ -670,7 +669,6 @@ impl Limiter {
                             let decided = match undecided {
                                 Some(why) => Err(why),
                                 None => Ok(Decided {
-                                    ticket: id,
                                     admitted,
                                     refused_by,
                                 }),
@@ -892,7 +890,6 @@ impl Limiter {
             .collect();
         let decision = |admitted| {
             Ok(Decided {
-                ticket: 0,
                 admitted,
                 refused_by: Box::default(),
             })

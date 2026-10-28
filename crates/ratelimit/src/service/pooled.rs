@@ -208,9 +208,8 @@ impl<S: BuildHasher> Registry<S> {
             .cloned()
     }
 
-    /// The live entry of `key` under `contract`, or, if there is none, one made at `now`
-    /// for a participant whose cold keys are decided locally — its bucket full, its cycle
-    /// `cycle` — and kept: with whether it was made here, for whoever made it to have the
+    /// The live entry of `key` under `contract`, or, if there is none, one made at `now` —
+    /// its bucket full, its cycle `cycle` — and kept: with whether it was made here, for whoever made it to have the
     /// participant adopt it ([`Participant::adopt`]). `None` if a live entry of the key is
     /// under another contract: the participant replaces it. Taken by a worker meeting a key
     /// its process has not, once; under the shard's lock, so that two workers meeting it at
@@ -565,22 +564,16 @@ impl Entry {
         }
     }
 
-    /// Takes one request's worth at `now`: admitted, or held for a request waiting on an
-    /// ask about its other keys.
+    /// Takes one request's worth at `now`: admitted, or held for a request under several
+    /// keys until all of them are decided. Taking does not count as the key's use: a
+    /// request's arrival does ([`decide`] marks it). With whether it started the key's
+    /// count: an admission counted where none was, read from the compare-and-swap that took
+    /// it, never from an attempt.
     fn take(&self, op: Op, now: u64) -> (Taken, bool) {
-        self.take_in(op, now, now, Cycle::Advance)
-    }
-
-    /// Taking does not count as the key's use: a request's arrival does, which the
-    /// transport's own takes, settling what waited, are not ([`decide`] marks it). With
-    /// whether it started the key's count: an admission counted where none was, read from
-    /// the compare-and-swap that took it, never from an attempt. Taken at `now` for a
-    /// request that arrived at `at`: the bucket as of then, the cycle as of now.
-    fn take_in(&self, op: Op, at: u64, now: u64, cycle: Cycle) -> (Taken, bool) {
-        let units = self.terms.bucket.units(at);
+        let units = self.terms.bucket.units(now);
         let mut why = Taken::Refused;
         let mut was = 0;
-        let taken = self.update(now, cycle, |fields| {
+        let taken = self.update(now, Cycle::Advance, |fields| {
             was = fields.unreported;
             why = if fields.closed {
                 Taken::Closed
@@ -597,7 +590,7 @@ impl Entry {
                 }
             } else {
                 if op == Op::Admit && fields.unreported == 0 {
-                    self.started.store(at, Ordering::Relaxed);
+                    self.started.store(now, Ordering::Relaxed);
                 }
                 return Some(Fields {
                     arrival: Bucket::charge(fields.arrival, units, 1),
@@ -626,20 +619,15 @@ impl Entry {
     /// A request held, decided: admitted, its hold becomes an admission to report, the
     /// place it reserved kept; refused, its charge is given back, and one of the cycle's
     /// allowance if the cycle under way has spent any, as `DataPlane`'s `spent − 1` does —
-    /// all read from the one word. Whether requests wait on it.
+    /// all read from the one word. Whether requests wait on it, and whether it started the
+    /// key's count, as [`Self::take`].
     fn settle(&self, admitted: bool, now: u64) -> (bool, bool) {
-        self.settle_in(admitted, now, now, Cycle::Advance)
-    }
-
-    /// As [`Self::settle`], with whether it started the key's count, as [`Self::take_in`],
-    /// for a request that arrived at `at`.
-    fn settle_in(&self, admitted: bool, at: u64, now: u64, cycle: Cycle) -> (bool, bool) {
         let mut was = 0;
-        let settled = self.update(now, cycle, |fields| {
+        let settled = self.update(now, Cycle::Advance, |fields| {
             was = fields.unreported;
             Some(if admitted {
                 if fields.unreported == 0 {
-                    self.started.store(at, Ordering::Relaxed);
+                    self.started.store(now, Ordering::Relaxed);
                 }
                 Fields {
                     held: fields.held.saturating_sub(1),
