@@ -1,4 +1,5 @@
-//! The stream's TLS: 1.3 alone, each end checked against the stream's own authorities.
+//! The stream's TLS: 1.3 alone, each end checked against the stream's own authorities. And
+//! the admission webhook's: 1.3 alone too, its client not asked for a certificate.
 
 use boring::error::ErrorStack;
 use boring::ssl::{
@@ -36,6 +37,9 @@ pub enum TlsError {
 /// HTTP/2, as gRPC is spoken, in ALPN's form.
 const H2: &[u8] = b"\x02h2";
 
+/// HTTP/2, then HTTP/1.1, in ALPN's form: what the webhook speaks, as its client offers.
+const H2_OR_H1: &[u8] = b"\x02h2\x08http/1.1";
+
 /// The control plane's TLS: it refuses a data plane without a certificate its authorities
 /// vouch for.
 ///
@@ -72,22 +76,30 @@ pub fn connector(credentials: &Credentials) -> Result<SslConnector, TlsError> {
     Ok(builder.build())
 }
 
+/// The admission webhook's TLS: it asks its client for no certificate, as the API server
+/// presents none unless it is set up to (04 §3), and speaks HTTP/2 or HTTP/1.1, as it is
+/// offered.
+///
+/// # Errors
+///
+/// A [`TlsError`] for a certificate that cannot be used.
+pub fn webhook_acceptor(certificate: &Certificate) -> Result<SslAcceptor, TlsError> {
+    let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(setup)?;
+    presenting(&mut builder, certificate)?;
+    builder.set_verify(SslVerifyMode::NONE);
+    // A client that offers neither is spoken HTTP/1.1 to, as one that offers nothing is.
+    builder.set_alpn_select_callback(|_ssl, offered| {
+        select_next_proto(H2_OR_H1, offered).ok_or(AlpnError::NOACK)
+    });
+    Ok(builder.build())
+}
+
 /// What both ends are set up with: TLS 1.3 alone, their own certificate, and the stream's
 /// authorities, alone: the machine's own store is not consulted.
 fn common(builder: &mut SslContextBuilder, credentials: &Credentials) -> Result<(), TlsError> {
     let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
-    builder
-        .set_min_proto_version(Some(SslVersion::TLS1_3))
-        .map_err(setup)?;
-    builder
-        .set_max_proto_version(Some(SslVersion::TLS1_3))
-        .map_err(setup)?;
-    let identity = Identity::read(&credentials.certificate)?;
-    builder.set_certificate(&identity.leaf).map_err(setup)?;
-    for intermediate in identity.intermediates {
-        builder.add_extra_chain_cert(intermediate).map_err(setup)?;
-    }
-    builder.set_private_key(&identity.key).map_err(setup)?;
+    presenting(builder, &credentials.certificate)?;
     let mut trusted = X509StoreBuilder::new().map_err(setup)?;
     for authority in authorities(&credentials.authorities)? {
         trusted.add_cert(authority).map_err(setup)?;
@@ -95,6 +107,24 @@ fn common(builder: &mut SslContextBuilder, credentials: &Credentials) -> Result<
     builder
         .set_verify_cert_store(trusted.build())
         .map_err(setup)?;
+    Ok(())
+}
+
+/// TLS 1.3 alone, presenting `certificate`.
+fn presenting(builder: &mut SslContextBuilder, certificate: &Certificate) -> Result<(), TlsError> {
+    let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .map_err(setup)?;
+    builder
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .map_err(setup)?;
+    let identity = Identity::read(certificate)?;
+    builder.set_certificate(&identity.leaf).map_err(setup)?;
+    for intermediate in identity.intermediates {
+        builder.add_extra_chain_cert(intermediate).map_err(setup)?;
+    }
+    builder.set_private_key(&identity.key).map_err(setup)?;
     Ok(())
 }
 

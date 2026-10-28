@@ -8,6 +8,8 @@
 //! authorities; the data plane checks the control plane's name too, as it dials it. Any
 //! data plane the authorities vouch for is served: none is told apart by its name yet. Each
 //! end's certificate files are read again as they change ([`reread`]).
+//!
+//! Beside it, the control plane serves the admission webhook's listener, [`webhook`].
 
 use bytes::Buf;
 use std::marker::PhantomData;
@@ -22,13 +24,14 @@ mod files;
 mod server;
 mod subscribe;
 mod tls;
+pub mod webhook;
 
 pub use boring::ssl::{SslAcceptor, SslConnector};
 pub use client::{Ended, follow};
-pub use files::{Files, FilesError, reread};
+pub use files::{CertificateFiles, Files, FilesError, Reread, reread};
 pub use server::{Heard, ServeError, serve};
 pub use subscribe::{Backoff, Following, Subscription, subscribe};
-pub use tls::{Credentials, TlsError, acceptor, connector};
+pub use tls::{Credentials, TlsError, acceptor, connector, webhook_acceptor};
 
 /// The service's name, as gRPC calls it.
 pub const SERVICE: &str = "edgerush.control.v1.Control";

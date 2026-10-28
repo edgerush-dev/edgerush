@@ -8,7 +8,8 @@
 //! (04 §2). Each translation is whole, of everything followed, and pure
 //! ([`edgerush_translate`]); the follows and the waiting are all that is not. Where it is
 //! asked to, it writes each Ingress's status as the config handed on serves it (04 §6),
-//! [`status`].
+//! [`status`]. The admission webhook's reviews are read, the Ingress each asks
+//! about judged alone, and answered by [`admission`] (04 §3).
 
 use edgerush_config::{ConfigError, compile};
 use edgerush_kubernetes::{ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow};
@@ -23,6 +24,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
+pub mod admission;
 pub mod lease;
 pub mod status;
 

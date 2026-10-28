@@ -6,7 +6,9 @@
 # Services and Secrets, writes the status of `shop`'s Ingresses, and reads the data plane's
 # Service in `edge` for the address they say: an external IP, as kind has no load balancer.
 # The control plane runs as two replicas, which elect the one that writes status by a Lease
-# in `edge`; both serve the stream.
+# in `edge`; both serve the stream, and the admission webhook, with a certificate of the same
+# authority for edgerush-control.edge.svc. The webhook's registration is the script's, made
+# once the checks that leave the Ingress out are done, as it would refuse them.
 apiVersion: v1
 kind: Namespace
 metadata: { name: shop }
@@ -163,22 +165,35 @@ spec:
             - edge/edgerush
             - --leader-lease
             - edge/edgerush-control
-          ports: [{ name: stream, containerPort: 9443 }]
+            - --webhook-listen
+            - "0.0.0.0:8443"
+            - --webhook-certificate
+            - /etc/edgerush/webhook/tls.crt
+            - --webhook-key
+            - /etc/edgerush/webhook/tls.key
+          ports:
+            - { name: stream, containerPort: 9443 }
+            - { name: webhook, containerPort: 8443 }
           volumeMounts:
             - { name: plane, mountPath: /etc/edgerush }
             - { name: stream, mountPath: /etc/edgerush/stream }
+            - { name: webhook, mountPath: /etc/edgerush/webhook }
       volumes:
         - name: plane
           configMap: { name: edgerush-plane }
         - name: stream
           secret: { secretName: edgerush-control-stream }
+        - name: webhook
+          secret: { secretName: edgerush-control-webhook }
 ---
 apiVersion: v1
 kind: Service
 metadata: { name: edgerush-control, namespace: edge }
 spec:
   selector: { app: edgerush-control }
-  ports: [{ name: stream, port: 9443, targetPort: stream }]
+  ports:
+    - { name: stream, port: 9443, targetPort: stream }
+    - { name: webhook, port: 443, targetPort: webhook }
 ---
 # The data plane's Service, its address an external IP of the documentation's range.
 apiVersion: v1

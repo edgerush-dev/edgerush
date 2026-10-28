@@ -16,6 +16,9 @@ edgerush-control-stream.workspace = true
 futures-core.workspace = true
 http.workspace = true
 # The data plane's connection, made by our own connector, as tonic's client takes one.
+# The admission webhook's listener, HTTP/2 or HTTP/1.1, its bodies held to a bound.
+http-body-util.workspace = true
+hyper.workspace = true
 hyper-util.workspace = true
 prost.workspace = true
 thiserror.workspace = true
@@ -29,6 +32,8 @@ tower-service.workspace = true
 
 [dev-dependencies]
 edgerush-certificates = { workspace = true, features = ["testing"] }
+# The webhook asked over HTTP/2, as the API server asks it.
+h2.workspace = true
 # The configs sent, read as the development harness reads one.
 serde-saphyr.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

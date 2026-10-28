@@ -1,17 +1,25 @@
 //! `edgerush controller`: the command line around `edgerush_controller`
 //! ([04](../../../docs/04-control-plane.md)) — its arguments, the data plane's settings,
-//! the API server found as a pod finds it, the config stream it serves, and what is said of
-//! each translation and each data plane. A translation is said as `validate` says it, and
-//! with `--write-config` written to a file.
+//! the API server found as a pod finds it, the config stream and the admission webhook it
+//! serves, and what is said of each translation and each data plane. A translation is said
+//! as `validate` says it, and with `--write-config` written to a file.
 
 use crate::validate::{described, read};
-use edgerush_control_service::{Credentials, Files, Heard, SslAcceptor, acceptor, reread, serve};
+use edgerush_config::Certificate;
+use edgerush_control_service::webhook::{self, Bounds};
+use edgerush_control_service::{
+    CertificateFiles, Credentials, Files, FilesError, Heard, SslAcceptor, acceptor, reread, serve,
+    webhook_acceptor,
+};
 use edgerush_control_stream::{Offer, OfferError, Versions};
+use edgerush_controller::admission::{self, Asked};
 use edgerush_controller::lease::{self, elect};
 use edgerush_controller::status::{Addresses, address};
 use edgerush_controller::{Debounce, Said, control};
-use edgerush_kubernetes::{ApiError, ApiServer, Scope};
+use edgerush_kubernetes::{ApiError, ApiServer, Listed, Retry, Scope, follow};
 use edgerush_translate::{Plane, Translation};
+use http::StatusCode;
+use k8s_openapi::api::networking::v1::IngressClass;
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::future::{Future, poll_fn};
@@ -30,6 +38,7 @@ Usage: edgerush controller --data-plane <FILE> [--namespace <NAME>]... [--write-
          [--listen <ADDRESS> --certificate <FILE> --key <FILE> --authorities <FILE>]
          [--status-service <NAMESPACE>/<NAME> | --status-address <ADDRESS>...]
          [--leader-lease <NAMESPACE>/<NAME>]
+         [--webhook-listen <ADDRESS> --webhook-certificate <FILE> --webhook-key <FILE>]
 
 Runs a control plane for one data plane, in a cluster: follows the IngressClasses,
 Ingresses, Services and Secrets of its scope through the API server, found as a pod finds
@@ -42,9 +51,14 @@ second, so that ones replaced serve the next connection.
 With --status-service or --status-address, each Ingress served says the data plane's
 addresses in its status, and each of the class that is not says none. With --leader-lease,
 the replicas elect one by that Lease, which alone writes status; every one serves.
+With --webhook-listen, it serves the admission webhook there, HTTPS, reviews POSTed to
+/validate: an Ingress of the data plane's class is refused where, alone, it does not
+translate into something the data plane accepts. Its certificate and key are read again
+every second; until the IngressClasses are listed it answers 503, which the API server
+takes as an outage, admitting the Ingress where the webhook fails open.
 Runs until Ctrl-C, or SIGTERM on Unix, and then exits 0; exits 2 when the command line, the
-data plane's settings or the stream's certificates cannot be used, or it is not in a
-cluster.
+data plane's settings or the stream's or the webhook's certificates cannot be used, or it is
+not in a cluster.
 
 Options:
       --data-plane <FILE>    The data plane's settings, in YAML, as `edgerush validate`
@@ -75,10 +89,16 @@ Options:
       --leader-lease <NAMESPACE>/<NAME>
                              The Lease the controller's replicas elect a leader by, which
                              alone writes status; left out, there is no election
+      --webhook-listen <ADDRESS>
+                             Serve the admission webhook on ADDRESS, such as [::]:8443;
+                             given with the two below
+      --webhook-certificate <FILE>
+                             The webhook's certificate, then its intermediates
+      --webhook-key <FILE>   Its private key
   -h, --help                 Print help
 ";
 
-/// How often the stream's certificate files are read again.
+/// How often the stream's and the webhook's certificate files are read again.
 const REREAD: Duration = Duration::from_secs(1);
 
 /// Runs `edgerush controller` with the arguments after its name. Returns the exit status.
@@ -105,10 +125,14 @@ pub(crate) fn command(
                 Some(stream) => Some(runtime.block_on(credentials(stream))?),
                 None => None,
             };
+            let webhook = match &options.webhook {
+                Some(webhook) => Some(runtime.block_on(webhook_certificate(&webhook.files))?),
+                None => None,
+            };
             let api = ApiServer::in_cluster().map_err(|error| outside(&error))?;
-            Ok((plane, stream, api))
+            Ok((plane, stream, webhook, api))
         });
-    let (plane, credentials, api) = match started {
+    let (plane, credentials, webhook_certificate, api) = match started {
         Ok(started) => started,
         Err(failure) => {
             return writeln!(stderr, "error: {failure}").map_or(1, |()| crate::EXIT_USAGE);
@@ -147,13 +171,43 @@ pub(crate) fn command(
         }
         _ => None,
     };
+    let hooking = match (&options.webhook, webhook_certificate) {
+        (Some(webhook), Some(certificate)) => {
+            let listener = match std::net::TcpListener::bind(webhook.listen) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    return writeln!(stderr, "error: {}: {error}", webhook.listen)
+                        .map_or(1, |()| 1);
+                }
+            };
+            // The webhook's own client, so that its follow waits behind no other.
+            let api = match ApiServer::in_cluster() {
+                Ok(api) => api,
+                Err(error) => {
+                    return writeln!(stderr, "error: {}", outside(&error))
+                        .map_or(1, |()| crate::EXIT_USAGE);
+                }
+            };
+            Some(Hooking {
+                api,
+                listener,
+                files: webhook.files.clone(),
+                certificate,
+                reread: REREAD,
+            })
+        }
+        _ => None,
+    };
     let stopped = tokio::task::LocalSet::new().block_on(
         &runtime,
         control_until(
             api,
             options,
             plane,
-            serving,
+            Listeners {
+                stream: serving,
+                webhook: hooking,
+            },
             elector,
             told_to_stop(),
             |line: &str| {
@@ -189,6 +243,17 @@ async fn credentials(stream: &Stream) -> Result<Credentials, String> {
     Ok(credentials)
 }
 
+/// The webhook's certificate, read and checked to be usable.
+async fn webhook_certificate(files: &CertificateFiles) -> Result<Certificate, String> {
+    let failed = |error: String| format!("the webhook's certificate: {error}");
+    let certificate = files
+        .read()
+        .await
+        .map_err(|error| failed(error.to_string()))?;
+    webhook_acceptor(&certificate).map_err(|error| failed(error.to_string()))?;
+    Ok(certificate)
+}
+
 /// Why a control plane cannot run here.
 fn outside(error: &ApiError) -> String {
     format!("the API server cannot be reached as a pod reaches it: {error}")
@@ -211,6 +276,7 @@ struct Options {
     status: Option<Addresses>,
     /// The Lease a leader is elected by, as its namespace and name, if one is.
     leader: Option<(String, String)>,
+    webhook: Option<Box<Webhook>>,
 }
 
 /// The config stream, as the command line gives it.
@@ -218,6 +284,13 @@ struct Options {
 struct Stream {
     listen: SocketAddr,
     files: Files,
+}
+
+/// The admission webhook, as the command line gives it.
+#[derive(Debug, PartialEq, Eq)]
+struct Webhook {
+    listen: SocketAddr,
+    files: CertificateFiles,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -244,6 +317,10 @@ enum UsageError {
     Status,
     #[error("'--leader-lease {0}' is not a namespace and a name, as edge/edgerush-control")]
     LeaderLease(String),
+    #[error("'--webhook-listen {0}' is not an address and a port, such as [::]:8443")]
+    WebhookListen(String),
+    #[error("'--webhook-listen', '--webhook-certificate' and '--webhook-key' are given together")]
+    WebhookTogether,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
@@ -255,6 +332,9 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut authorities = None;
     let mut status_service = None;
     let mut leader = None;
+    let mut webhook_listen = None;
+    let mut webhook_certificate = None;
+    let mut webhook_key = None;
     let mut status_addresses = Vec::new();
     let mut scope = Vec::new();
     while let Some(arg) = args.next() {
@@ -270,6 +350,9 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             "--status-service" => "--status-service",
             "--status-address" => "--status-address",
             "--leader-lease" => "--leader-lease",
+            "--webhook-listen" => "--webhook-listen",
+            "--webhook-certificate" => "--webhook-certificate",
+            "--webhook-key" => "--webhook-key",
             _ => return Err(UsageError::Unexpected(arg)),
         };
         let value = args.next().ok_or(UsageError::NoValue(option))?;
@@ -310,10 +393,21 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                 }
                 continue;
             }
+            "--webhook-listen" => {
+                let address = value
+                    .parse()
+                    .map_err(|_| UsageError::WebhookListen(value))?;
+                if webhook_listen.replace(address).is_some() {
+                    return Err(UsageError::Twice(option));
+                }
+                continue;
+            }
             "--data-plane" => &mut data_plane,
             "--certificate" => &mut certificate,
             "--key" => &mut key,
             "--authorities" => &mut authorities,
+            "--webhook-certificate" => &mut webhook_certificate,
+            "--webhook-key" => &mut webhook_key,
             _ => &mut write_config,
         };
         if slot.replace(PathBuf::from(value)).is_some() {
@@ -335,6 +429,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         (None, None, None, None) => None,
         _ => return Err(UsageError::Together),
     };
+    let webhook = match (webhook_listen, webhook_certificate, webhook_key) {
+        (Some(listen), Some(certificate), Some(key)) => Some(Box::new(Webhook {
+            listen,
+            files: CertificateFiles { certificate, key },
+        })),
+        (None, None, None) => None,
+        _ => return Err(UsageError::WebhookTogether),
+    };
     let status = match (status_service, status_addresses.is_empty()) {
         (Some(_), false) => return Err(UsageError::Status),
         (Some(service), true) => Some(service),
@@ -348,6 +450,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         stream,
         status,
         leader,
+        webhook,
     }))
 }
 
@@ -377,6 +480,18 @@ fn identity() -> String {
     format!("{host}_{}", started_at())
 }
 
+/// The admission webhook, ready to be served.
+struct Hooking {
+    /// A client of its own, for the IngressClasses it follows.
+    api: ApiServer,
+    listener: std::net::TcpListener,
+    files: CertificateFiles,
+    /// What the files held as it started.
+    certificate: Certificate,
+    /// How often the files are read again.
+    reread: Duration,
+}
+
 /// The config stream, ready to be served.
 struct Serving {
     listener: std::net::TcpListener,
@@ -388,13 +503,21 @@ struct Serving {
     versions: Versions,
 }
 
-/// Runs the control plane through `api` until `stop` is done, serving the config stream
-/// too if `serving`, each line of what it says given to `say`.
+/// What the control plane serves, besides writing status.
+struct Listeners {
+    /// The config stream, if it is served.
+    stream: Option<Serving>,
+    /// The admission webhook, if it is served.
+    webhook: Option<Hooking>,
+}
+
+/// Runs the control plane through `api` until `stop` is done, serving what `listeners`
+/// holds too, each line of what it says given to `say`.
 async fn control_until(
     api: ApiServer,
     options: Options,
     plane: Plane,
-    serving: Option<Serving>,
+    listeners: Listeners,
     elector: Option<Elector>,
     stop: impl Future<Output = io::Result<()>>,
     say: impl Fn(&str) + 'static,
@@ -439,7 +562,7 @@ async fn control_until(
     let scope = options.scope;
     let mut tasks = Vec::new();
     let mut served = None;
-    let offering = match serving {
+    let offering = match listeners.stream {
         Some(serving) => {
             let (offers, offered) = watch::channel(None);
             let (stopping, stopped) = oneshot::channel::<()>();
@@ -484,6 +607,21 @@ async fn control_until(
         }
         None => None,
     };
+    // The webhook, on a thread of its own: what it says is said here, where `say` lives.
+    let mut hooked = None;
+    if let Some(hooking) = listeners.webhook {
+        let (said, mut hearing) = mpsc::unbounded_channel();
+        let (stopping, stopped) = oneshot::channel::<()>();
+        let (ending, ended) = oneshot::channel::<()>();
+        hooked = Some((stopping, ended));
+        hook(hooking, plane.clone(), said, stopped, ending)?;
+        let telling = Rc::clone(&say);
+        tasks.push(tokio::task::spawn_local(async move {
+            while let Some(line) = hearing.recv().await {
+                telling(&line);
+            }
+        }));
+    }
     let telling = Rc::clone(&say);
     tasks.push(tokio::task::spawn_local(async move {
         control(
@@ -514,6 +652,10 @@ async fn control_until(
             say(&format!("error: {error}"));
         }
     }
+    if let Some((stopping, ended)) = hooked {
+        let _ = stopping.send(());
+        let _ended = ended.await;
+    }
     for task in tasks.into_iter().chain(electing) {
         task.abort();
     }
@@ -541,10 +683,123 @@ impl Offering {
     }
 }
 
+/// Serves the webhook `hooking` holds on a thread and runtime of its own (04 §3), so that a
+/// flood of reviews, which anyone in the cluster can send, costs only its answers: the
+/// IngressClasses followed on its own client, each review judged for the data plane `plane`
+/// describes, and its certificate files read again. What it says goes to `said`, a line each;
+/// it stops once `stop` is done, or dropped, and tells `ended` as it ends.
+///
+/// # Errors
+///
+/// If its certificate cannot be used, its listener cannot be made, or the thread or its
+/// runtime cannot be started.
+fn hook(
+    hooking: Hooking,
+    plane: Plane,
+    said: mpsc::UnboundedSender<String>,
+    stop: oneshot::Receiver<()>,
+    ended: oneshot::Sender<()>,
+) -> io::Result<()> {
+    let acceptor = webhook_acceptor(&hooking.certificate).map_err(io::Error::other)?;
+    hooking.listener.set_nonblocking(true)?;
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    std::thread::Builder::new()
+        .name("webhook".to_owned())
+        .spawn(move || {
+            let serving = async move {
+                let (listed, classes) = watch::channel(Arc::new(Listed::<IngressClass>::default()));
+                let failed = said.clone();
+                let api = hooking.api;
+                let following = tokio::task::spawn_local(async move {
+                    follow(&api, &Scope::Cluster, Retry::default(), listed, |failure| {
+                        let _gone = failed.send(format!(
+                            "ingressclasses in the cluster, for the webhook: {failure}"
+                        ));
+                    })
+                    .await;
+                });
+                let tls = watch::Sender::new(Arc::new(acceptor));
+                let replacing = said.clone();
+                let accepting = tls.subscribe();
+                let rereading = tokio::task::spawn_local(reread(
+                    hooking.files,
+                    hooking.certificate,
+                    hooking.reread,
+                    move |changed| {
+                        let _gone = replacing.send(webhook_replaced(changed, &tls));
+                    },
+                ));
+                match tokio::net::TcpListener::from_std(hooking.listener) {
+                    Ok(listener) => {
+                        webhook::serve(
+                            listener,
+                            accepting,
+                            Bounds::default(),
+                            move |body| review(&plane, &classes.borrow(), body),
+                            async move {
+                                let _ = stop.await;
+                            },
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        let _gone = said.send(format!("error: the webhook's listener: {error}"));
+                    }
+                }
+                following.abort();
+                rereading.abort();
+            };
+            tokio::task::LocalSet::new().block_on(&runtime, serving);
+            let _ = ended.send(());
+        })?;
+    Ok(())
+}
+
+/// The webhook's answer to the review `body`, an Ingress of the data plane `plane`
+/// describes judged alone, as `classes` say which is its: 503 until they are listed, as
+/// there is nothing to say which is; 400 for what is not a review.
+fn review(plane: &Plane, classes: &Listed<IngressClass>, body: &[u8]) -> webhook::Answer {
+    let answer = |status, body: Vec<u8>| webhook::Answer { status, body };
+    if !classes.listed {
+        let why = "the IngressClasses are not listed yet";
+        return answer(StatusCode::SERVICE_UNAVAILABLE, why.as_bytes().to_vec());
+    }
+    match admission::read(body) {
+        Ok(review) => {
+            let refused = match &review.asked {
+                Asked::Ingress(ingress) => admission::judge(plane, &classes.objects, ingress),
+                Asked::Other => None,
+            };
+            answer(
+                StatusCode::OK,
+                admission::answer(&review.uid, refused.as_deref()),
+            )
+        }
+        Err(error) => answer(StatusCode::BAD_REQUEST, error.to_string().into_bytes()),
+    }
+}
+
+/// What is said of the webhook's certificate files changing: the new ones put to use for
+/// the next connection, or kept from it if they cannot be used.
+fn webhook_replaced(
+    changed: Result<&Certificate, &FilesError>,
+    tls: &watch::Sender<Arc<SslAcceptor>>,
+) -> String {
+    let kept = "and the last is kept";
+    match changed.map(webhook_acceptor) {
+        Ok(Ok(replaced)) => {
+            tls.send_replace(Arc::new(replaced));
+            "the webhook's certificate is replaced".to_owned()
+        }
+        Ok(Err(error)) => format!("the webhook's certificate cannot be used, {kept}: {error}"),
+        Err(error) => format!("the webhook's certificate cannot be read, {kept}: {error}"),
+    }
+}
+
 /// What is said of the stream's certificate files changing: the new ones put to use for the
 /// next connection, or kept from it if they cannot be used.
 fn replaced(
-    changed: Result<&Credentials, &edgerush_control_service::FilesError>,
+    changed: Result<&Credentials, &FilesError>,
     tls: &watch::Sender<Arc<SslAcceptor>>,
 ) -> String {
     let kept = "and the last are kept";

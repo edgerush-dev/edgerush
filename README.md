@@ -183,7 +183,11 @@ certificates it names. With `--listen [::]:9443 --certificate tls.crt --key tls.
 offered to every data plane that dials it with a certificate those authorities signed, and
 what each says of it is said too. With `--status-service edge/edgerush`, each Ingress served
 says that Service's addresses in its status, and each of the class not served says none;
-with `--leader-lease edge/edgerush-control`, replicas elect the one that writes it.
+with `--leader-lease edge/edgerush-control`, replicas elect the one that writes it. With
+`--webhook-listen [::]:8443 --webhook-certificate tls.crt --webhook-key tls.key` it serves
+the admission webhook there, HTTPS, reviews `POST`ed to `/validate`: an Ingress of the
+class is refused, with why, where alone it does not translate into something the data plane
+accepts.
 
 ## Building
 
@@ -249,7 +253,9 @@ compares with the `http` crate's reading instead, and `quic_header` with quiche'
 compiles to being whole; `test_file` reads, checks and runs a file of `edgerush test`'s
 tests against a fixed config, holding all three to not failing; `rules_compile` compiles
 a limit rule's three parts and decides a request with what compiles, holding an error to
-its place in the part it is about. An input that fails is saved under `fuzz/artifacts/`; fix the bug
+its place in the part it is about; `admission_review` reads any bytes as the admission
+webhook's review, which anyone in the cluster can send it, and answers what it reads,
+holding reading to not failing and the answer to carrying the review's uid. An input that fails is saved under `fuzz/artifacts/`; fix the bug
 and add the input to the unit tests. Run a target after changing the code it covers. Being
 outside the workspace, the package is formatted on its own:
 `cargo fmt --manifest-path fuzz/Cargo.toml`.

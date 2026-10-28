@@ -252,6 +252,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-controller"
+version = "0.0.0"
+dependencies = [
+ "edgerush-config",
+ "edgerush-kubernetes",
+ "edgerush-translate",
+ "k8s-openapi",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "edgerush-discovery"
 version = "0.0.0"
 dependencies = [
@@ -288,6 +302,7 @@ dependencies = [
  "boring",
  "bytes",
  "edgerush-config",
+ "edgerush-controller",
  "edgerush-explain",
  "edgerush-filters",
  "edgerush-proxy",
@@ -301,6 +316,7 @@ dependencies = [
  "prost",
  "quiche",
  "serde-saphyr",
+ "serde_json",
 ]
 
 [[package]]
@@ -399,6 +415,17 @@ dependencies = [
 [[package]]
 name = "edgerush-telemetry"
 version = "0.0.0"
+
+[[package]]
+name = "edgerush-translate"
+version = "0.0.0"
+dependencies = [
+ "edgerush-certificates",
+ "edgerush-config",
+ "k8s-openapi",
+ "serde",
+ "thiserror",
+]
 
 [[package]]
 name = "either"
