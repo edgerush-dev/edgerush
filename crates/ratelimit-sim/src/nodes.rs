@@ -4,7 +4,7 @@
 //! with the same choices, which it was taken from; where they differ, the nodes are what is
 //! built. Requests can be under other limits beside the run's ([`Beside`]).
 
-use crate::{Beside, Cluster, Contract, FaultEvent, Message, Order, Outbox};
+use crate::{Beside, Cluster, Contract, FaultEvent, Message, Outbox};
 use edgerush_ratelimit::service::pooled::{
     self, Decision as Pooled, Entry, Levers, Local, Participant, Registry,
 };
@@ -258,7 +258,7 @@ impl Nodes {
         planes: usize,
         cycle: u64,
         exchange_timeout: u64,
-        beside: Option<(Beside, Order)>,
+        beside: Option<Beside>,
     ) -> Self {
         let view = View {
             epoch: 1,
@@ -274,26 +274,18 @@ impl Nodes {
         };
         let run = contract_of(contract);
         let mut keys = vec![(Box::from(KEY), run)];
-        // The limits of a request, `specific` and the one over the data plane, `shared`.
-        let ordered = |keys: &[(Box<[u8]>, service::Contract)], specific, shared, order| {
-            let (a, b): (usize, usize) = (specific, shared);
-            let first = match order {
-                Order::SharedFirst => b,
-                Order::SmallestFirst if keys[a].1.burst <= keys[b].1.burst => a,
-                Order::SmallestFirst => b,
-            };
-            if first == a { vec![a, b] } else { vec![b, a] }
-        };
+        // The limits of each kind of request, its own first: every limit is decided from
+        // the data plane's copy, so the order changes nothing.
         let kinds = match beside {
             None => vec![vec![0]],
-            Some((Beside::Global(global), order)) => {
+            Some(Beside::Global(global)) => {
                 keys.push((apart("global"), contract_of(&global)));
-                vec![ordered(&keys, 0, 1, order)]
+                vec![vec![0, 1]]
             }
-            Some((Beside::Routes(each), order)) => {
+            Some(Beside::Routes(each)) => {
                 keys.push((apart("route-a"), contract_of(&each)));
                 keys.push((apart("route-b"), contract_of(&each)));
-                vec![ordered(&keys, 1, 0, order), ordered(&keys, 2, 0, order)]
+                vec![vec![1, 0], vec![2, 0]]
             }
         };
         Self {
@@ -781,7 +773,7 @@ impl Cluster for Nodes {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Approach, Beside, Fault, Network, Order, Run, Shape, Workload, run};
+    use crate::{Approach, Beside, Fault, Network, Run, Shape, Workload, run};
     use edgerush_ratelimit::service::pooled::Levers;
     use std::num::NonZeroU64;
 
@@ -1145,7 +1137,6 @@ mod tests {
                     approach: Approach::NodesUnder {
                         cycle: 10_000_000,
                         beside: Beside::Global(global),
-                        order: Order::SmallestFirst,
                     },
                     ..base
                 })
@@ -1167,11 +1158,11 @@ mod tests {
     }
 
     /// Two routes under one limit over the data plane, their own limits smaller, bursts on
-    /// every pod at once, cold each time. Every limit is decided from the data plane's
-    /// copies, so the order they are decided in changes nothing: either way the shared
-    /// limit is held as it would be alone. Every admission is counted once under each limit.
+    /// every pod at once, cold each time: every limit decided from the data plane's copies,
+    /// the shared limit is held as it would be alone. Every admission is counted once under
+    /// each limit.
     #[test]
-    fn routes_sharing_a_limit_hold_it_as_alone_in_either_order() {
+    fn routes_sharing_a_limit_hold_it_as_alone() {
         let route = crate::Contract {
             limit: NonZeroU64::new(80).unwrap(),
             window: NonZeroU64::new(SECOND).unwrap(),
@@ -1183,27 +1174,15 @@ mod tests {
                 ..bursts(Fault::None, seed)
             };
             let alone = run(&base);
-            let under = |order| {
-                run(&Run {
-                    approach: Approach::NodesUnder {
-                        cycle: 10_000_000,
-                        beside: Beside::Routes(route),
-                        order,
-                    },
-                    ..base
-                })
-            };
-            let smallest = under(Order::SmallestFirst);
-            let shared = under(Order::SharedFirst);
-            assert_eq!(smallest.worst_excess, alone.worst_excess, "{seed}");
-            assert_eq!(
-                (smallest.admitted, smallest.worst_excess),
-                (shared.admitted, shared.worst_excess),
-                "{seed}"
-            );
-            for outcome in [smallest, shared] {
-                assert_eq!((outcome.lost, outcome.counted_twice), (0, 0));
-            }
+            let under = run(&Run {
+                approach: Approach::NodesUnder {
+                    cycle: 10_000_000,
+                    beside: Beside::Routes(route),
+                },
+                ..base
+            });
+            assert_eq!(under.worst_excess, alone.worst_excess, "{seed}");
+            assert_eq!((under.lost, under.counted_twice), (0, 0));
         }
     }
 

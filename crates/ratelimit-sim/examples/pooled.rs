@@ -12,7 +12,7 @@
 //! background apart from deciding, and go on. Restarts and pauses strike a whole pod.
 
 use edgerush_ratelimit_sim::{
-    Approach, Beside, Contract, Fault, Network, Order, Run, Shape, Workload, run,
+    Approach, Beside, Contract, Fault, Network, Run, Shape, Workload, run,
 };
 use std::num::NonZeroU64;
 
@@ -69,7 +69,7 @@ struct Case {
     faults: fn(u64, usize) -> (Fault, Fault),
     network: Network,
     /// Limits beside the run's on every request, decided all or none.
-    beside: Option<(Beside, Order)>,
+    beside: Option<Beside>,
 }
 
 fn contract(limit: u64, burst: u64) -> Contract {
@@ -440,7 +440,7 @@ fn main() {
             },
             faults: none,
             network: reliable,
-            beside: Some((Beside::Routes(contract(80, 80)), Order::SmallestFirst)),
+            beside: Some(Beside::Routes(contract(80, 80))),
         },
         Case {
             name: "two routes under their own limits and one shared, spread at the shared limit",
@@ -454,7 +454,7 @@ fn main() {
             },
             faults: none,
             network: reliable,
-            beside: Some((Beside::Routes(contract(200, 200)), Order::SmallestFirst)),
+            beside: Some(Beside::Routes(contract(200, 200))),
         },
     ];
 
@@ -489,18 +489,16 @@ fn main() {
                 },
                 Approach::Nodes { cycle: cycle() },
             ),
-            Some((beside, order)) => {
+            Some(beside) => {
                 let under = Approach::NodesUnder {
                     cycle: cycle(),
                     beside,
-                    order,
                 };
                 let pooled = Approach::PooledUnder {
                     cycle: cycle(),
                     exchange_timeout: 0,
                     workers: w,
                     beside,
-                    order,
                     levers: levers(),
                     scheduled: scheduled(),
                 };

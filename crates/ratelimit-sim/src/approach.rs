@@ -140,8 +140,6 @@ pub enum Approach {
         workers: usize,
         /// The limits beside the run's.
         beside: Beside,
-        /// The order a request's limits are decided in.
-        order: Order,
         /// The levers.
         levers: edgerush_ratelimit::service::pooled::Levers,
         /// Whether each participant visits only the keys that need it each cycle.
@@ -154,26 +152,11 @@ pub enum Approach {
         cycle: u64,
         /// The limits beside the run's.
         beside: Beside,
-        /// Which of a request's limits goes first.
-        order: Order,
     },
 }
 
-/// Which of a request's limits goes first: a cold request's ask goes to its key's owner,
-/// which decides that key exactly and the others from its copies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Order {
-    /// The smallest bucket first, ties to the most specific (06 §4): the limit most likely
-    /// at its edge decided exactly.
-    SmallestFirst,
-    /// The limit over the whole data plane first: shared by every route, it brings all of
-    /// a client's cold asks to one pod.
-    SharedFirst,
-}
-
 /// Limits a request is under beside the run's contract, each counted by a key owned by
-/// another service pod than the run's key, so that one pod cannot decide them all exactly;
-/// in the order an [`Order`] says.
+/// another service pod than the run's key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Beside {
     /// Every request under one more limit, over the whole data plane.
@@ -374,7 +357,6 @@ impl Approach {
                 exchange_timeout,
                 workers,
                 beside,
-                order,
                 levers,
                 scheduled,
             } => {
@@ -385,21 +367,13 @@ impl Approach {
                     processes,
                     *cycle,
                     *exchange_timeout,
-                    Some((*beside, *order)),
+                    Some(*beside),
                 );
                 Box::new(nodes.pooled_with(workers, *levers, *scheduled))
             }
-            Self::NodesUnder {
-                cycle,
-                beside,
-                order,
-            } => Box::new(Nodes::new(
-                contract,
-                pods,
-                *cycle,
-                0,
-                Some((*beside, *order)),
-            )),
+            Self::NodesUnder { cycle, beside } => {
+                Box::new(Nodes::new(contract, pods, *cycle, 0, Some(*beside)))
+            }
         }
     }
 }

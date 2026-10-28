@@ -1,8 +1,6 @@
-//! Requests under two limits through the prototype's nodes, decided all or none (06 §4),
-//! against the run's limit alone, over many seeds, printed as Markdown, with a request's
-//! limits in either order — smallest bucket first, or the limit over the whole data plane
-//! first. A cold request's ask goes to the first limit's owner, which decides that limit
-//! exactly and the other from its copy:
+//! Requests under two limits through the prototype's nodes, decided all or none from the
+//! data plane's copies (06 §4), against the run's limit alone, over many seeds, printed as
+//! Markdown:
 //!
 //! - **a limit over the data plane beside**: every request under the run's limit, 20 a
 //!   second with a bucket of 20, and one over the whole data plane, 200 a second;
@@ -21,8 +19,8 @@
 //! client alone.
 
 use edgerush_ratelimit_sim::{
-    Approach, Arrival, Beside, Contract, Fault, Network, Order, Run, Shape, Workload, decisions,
-    run, worst_excess,
+    Approach, Arrival, Beside, Contract, Fault, Network, Run, Shape, Workload, decisions, run,
+    worst_excess,
 };
 use std::num::NonZeroU64;
 
@@ -250,15 +248,15 @@ fn main() {
         println!();
         println!("|---|---|{}", "---|".repeat(pods.len()));
         for (name, shape, conforming) in workloads {
-            let under = |order| Approach::NodesUnder {
-                cycle: CYCLE,
-                beside,
-                order,
-            };
             for (rows, approach) in [
                 ("alone", Approach::Nodes { cycle: CYCLE }),
-                ("both, smallest first", under(Order::SmallestFirst)),
-                ("both, data plane's first", under(Order::SharedFirst)),
+                (
+                    "both",
+                    Approach::NodesUnder {
+                        cycle: CYCLE,
+                        beside,
+                    },
+                ),
             ] {
                 print!("| {name} | {rows} |");
                 for &p in &pods {
