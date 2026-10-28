@@ -71,15 +71,19 @@ Kubernetes, begun:
   from Secrets, each certificate served for the hosts that name it alone; and plain HTTP
   redirected to HTTPS for the hosts an Ingress secures. Each config is reported on stderr,
   can be written as a file that `edgerush proxy` reads, and is offered on the config
-  stream it serves, gRPC over mutual TLS, which data planes do not dial yet.
+  stream it serves, gRPC over mutual TLS.
+- **`edgerush proxy --control-plane`**, a data plane taking its config from that stream:
+  nothing is served until the first config runs, each later one takes over as a file's
+  does, and the stream is dialled again after a jittered wait when it ends. Not yet tested
+  end to end in kind.
 - **Endpoints from EndpointSlices:** an upstream that names a Service takes its endpoints
   from the data plane's own list and watch of EndpointSlices, so that they are followed
   with the control plane down; tested end to end in kind.
 - **`edgerush validate`** translates manifests as the controller would, without a cluster,
   and reports what it left out and why.
 
-Not yet: the rest of Kubernetes (data planes taking their config from the stream, the
-operator, ingress-nginx's annotations, Ingress status, Gateway API), authentication. The
+Not yet: the rest of Kubernetes (the operator, ingress-nginx's annotations, Ingress
+status, Gateway API), authentication. The
 request path came first; rate limiting and the control plane are now built side by side,
 and the operator follows.
 
@@ -252,7 +256,8 @@ outside the workspace, the package is formatted on its own:
 
 ```
 crates/edgerush    the binary (operator, control plane and data plane will be subcommands); so far
-                   `edgerush proxy --config file.yaml`, a data plane run from a file for development,
+                   `edgerush proxy`, a data plane, its config from a file for development
+                   (`--config file.yaml`) or from a control plane (`--control-plane`),
                    `edgerush controller`, a control plane for one data plane, `edgerush explain`,
                    where a request would go and why, `edgerush test`, and `edgerush validate`,
                    which translates Kubernetes manifests

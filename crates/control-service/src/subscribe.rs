@@ -5,6 +5,7 @@ use crate::{Credentials, Ended, Files, TlsError, connector, follow, reread};
 use edgerush_config::Config;
 use edgerush_control_stream::Staging;
 use std::convert::Infallible;
+use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -97,12 +98,15 @@ pub struct Subscription {
 /// # Errors
 ///
 /// A [`TlsError`], at once, if the credentials it starts with cannot be used.
-pub async fn subscribe(
+pub async fn subscribe<R>(
     subscription: Subscription,
     staging: &mut Staging,
-    mut run: impl FnMut(Box<Config>) -> Result<(), String>,
+    mut run: impl FnMut(Box<Config>) -> R,
     told: impl Fn(Following),
-) -> Result<Infallible, TlsError> {
+) -> Result<Infallible, TlsError>
+where
+    R: Future<Output = Result<(), String>>,
+{
     let Subscription {
         address,
         files,

@@ -1,11 +1,13 @@
-//! `edgerush proxy`: a data plane run from a config file, without Kubernetes. A harness for
-//! development and tests — in a cluster the config comes from the control plane.
+//! `edgerush proxy`: a data plane, its config from a file, a harness for development and
+//! tests, or from the control plane's config stream ([`crate::stream`]).
 //!
 //! The file is the config model as it is, nothing added; what is about the process and not
 //! about routing (where `/metrics` is served, how many workers there are, whose a new
-//! connection is) is on the command line. Listeners are bound once, at the start. After
-//! that the file is read again every [`POLL`] and a config that has changed takes over
-//! without dropping a request, while one that cannot be run is told and changes nothing.
+//! connection is) is on the command line. Listeners are bound once, at the start: from the
+//! file, or from the stream's first config, which is waited for. After that the file is
+//! read again every [`POLL`], or the stream looked at every [`STREAM_POLL`], and a config
+//! that has changed takes over without dropping a request, while one that cannot be run is
+//! told and changes nothing.
 //!
 //! Requests are served thread-per-core ([`crate::per_core`]), the model that was chosen
 //! from the benchmark ([03 §2] in the docs): one data plane for the process, whose config
@@ -22,18 +24,21 @@
 //! that is the shape the harness runs in on Windows.
 
 use crate::bind::{Port, datagrams, listen};
+use crate::config_file::Problems;
 use crate::config_file::{ConfigFile, Rejected};
 use crate::essential::{Ended, Essential, Told};
 use crate::per_core::{self, Accept};
-use edgerush_config::Compiled;
+use crate::stream::{FromStream, Stream, StreamError};
+use edgerush_config::{Compiled, Config, compile};
+use edgerush_control_service::Files;
 use edgerush_kubernetes::{ApiError, ApiServer};
 use edgerush_proxy::{H1Limits, Proxy, ProxyError};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -41,16 +46,29 @@ use tokio::runtime::Builder;
 
 pub(crate) const USAGE: &str = "\
 Usage: edgerush proxy --config <FILE> [OPTIONS]
+       edgerush proxy --control-plane <ADDRESS> --certificate <FILE> --key <FILE>
+                      --authorities <FILE> [OPTIONS]
 
-Runs a data plane from a config file, without Kubernetes: a harness for development.
-The file, and the certificate files it names, are read again every second, and a change
-takes over without dropping a request. Listeners are bound once: one that is new or has
-moved takes a restart.
+Runs a data plane. With --config, from a config file, without Kubernetes: a harness for
+development. The file, and the certificate files it names, are read again every second,
+and a change takes over without dropping a request. With --control-plane, from the config
+stream that control plane serves: nothing is bound or served until its first config runs,
+which is waited for, and each config after it takes over as a file's does; the certificate,
+key and authorities are PEM files, read again every second. Listeners are bound once: one
+that is new or has moved takes a restart.
 Ctrl-C or SIGTERM drains it: what is under way is finished, for up to 29 seconds; a
 second one stops it at once. SIGUSR1 opens the access logs' files again, for rotation.
 
 Options:
       --config <FILE>      The config, in YAML
+      --control-plane <ADDRESS>
+                           The control plane's config stream, as host:port; its
+                           certificate must name the host
+      --certificate <FILE> The data plane's certificate on the stream, then its
+                           intermediates
+      --key <FILE>         Its private key
+      --authorities <FILE> The stream's authorities, which the control plane's
+                           certificate must be signed by
       --metrics <ADDRESS>  Serve /metrics there, as in 127.0.0.1:9090 [default: nowhere]
       --accept <BY>        Whose a new connection is. balanced: the worker that holds the
                            fewest; kernel: the one the kernel gave it to, by its hash of
@@ -71,6 +89,10 @@ Options:
 /// How often the file is looked at. It is a small file, read by the thread that has
 /// nothing else to do.
 const POLL: Duration = Duration::from_secs(1);
+
+/// How often the config stream is looked at for a config to run: what it hands over waits
+/// in a channel, so looking costs nothing.
+const STREAM_POLL: Duration = Duration::from_millis(50);
 
 /// How long a draining process waits for its connections before it exits anyway: inside
 /// Kubernetes' default 30 s grace, and past the 25 s a worker gives its connections, the
@@ -113,7 +135,7 @@ enum Parsed {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
-    config: PathBuf,
+    source: Source,
     metrics: Option<SocketAddr>,
     /// `None` is one for every CPU the process may use.
     workers: Option<NonZeroUsize>,
@@ -124,6 +146,13 @@ struct Options {
     limits: H1Limits,
 }
 
+/// Where the config comes from.
+#[derive(Debug, PartialEq, Eq)]
+enum Source {
+    File(PathBuf),
+    ControlPlane(Stream),
+}
+
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 enum UsageError {
     #[error("unexpected argument '{0}'")]
@@ -132,8 +161,16 @@ enum UsageError {
     NoValue(&'static str),
     #[error("'{0}' is given twice")]
     Twice(&'static str),
-    #[error("'--config <FILE>' is required")]
+    #[error("'--config <FILE>' or '--control-plane <ADDRESS>' is required")]
     NoConfig,
+    #[error("'--config' and '--control-plane' are not given together")]
+    Both,
+    #[error("'{0}' is not a control plane's address and port, such as edgerush-control:9443")]
+    ControlPlane(String),
+    #[error(
+        "'--control-plane' needs '--certificate', '--key' and '--authorities', and they need it"
+    )]
+    Stream,
     #[error("'{0}' is not an address to listen on, such as 127.0.0.1:9090")]
     Address(String),
     #[error("'{0}' is not a number of workers: 1 or more")]
@@ -148,6 +185,8 @@ enum UsageError {
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut config = None;
+    let mut control_plane = None;
+    let (mut certificate, mut key, mut authorities) = (None, None, None);
     let mut metrics: Option<SocketAddr> = None;
     let mut workers = None;
     let mut accept = None;
@@ -160,6 +199,29 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                 let file = args.next().ok_or(UsageError::NoValue("--config"))?;
                 if config.replace(PathBuf::from(file)).is_some() {
                     return Err(UsageError::Twice("--config"));
+                }
+            }
+            "--control-plane" => {
+                let address = args.next().ok_or(UsageError::NoValue("--control-plane"))?;
+                let port = address
+                    .rsplit_once(':')
+                    .map(|(_, port)| port.parse::<u16>());
+                if !matches!(port, Some(Ok(_))) {
+                    return Err(UsageError::ControlPlane(address));
+                }
+                if control_plane.replace(address).is_some() {
+                    return Err(UsageError::Twice("--control-plane"));
+                }
+            }
+            option @ ("--certificate" | "--key" | "--authorities") => {
+                let (slot, option) = match option {
+                    "--certificate" => (&mut certificate, "--certificate"),
+                    "--key" => (&mut key, "--key"),
+                    _ => (&mut authorities, "--authorities"),
+                };
+                let file = args.next().ok_or(UsageError::NoValue(option))?;
+                if slot.replace(PathBuf::from(file)).is_some() {
+                    return Err(UsageError::Twice(option));
                 }
             }
             "--metrics" => {
@@ -221,9 +283,26 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             _ => return Err(UsageError::Unexpected(arg)),
         }
     }
-    let config = config.ok_or(UsageError::NoConfig)?;
+    let stream = match (control_plane, certificate, key, authorities) {
+        (Some(address), Some(certificate), Some(key), Some(authorities)) => Some(Stream {
+            address,
+            files: Files {
+                certificate,
+                key,
+                authorities,
+            },
+        }),
+        (None, None, None, None) => None,
+        _ => return Err(UsageError::Stream),
+    };
+    let source = match (config, stream) {
+        (Some(file), None) => Source::File(file),
+        (None, Some(stream)) => Source::ControlPlane(stream),
+        (Some(_), Some(_)) => return Err(UsageError::Both),
+        (None, None) => return Err(UsageError::NoConfig),
+    };
     Ok(Parsed::Run(Box::new(Options {
-        config,
+        source,
         metrics,
         workers,
         accept: accept.unwrap_or(Accept::Balanced),
@@ -236,8 +315,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
 enum Failure {
     #[error("config {} cannot be run:\n{rejected}", path.display())]
     Config { path: PathBuf, rejected: Rejected },
-    #[error("config {} cannot be run:\n{error}", path.display())]
-    Proxy { path: PathBuf, error: ProxyError },
+    #[error("{config} cannot be run:\n{error}")]
+    Proxy { config: String, error: ProxyError },
     #[error(
         "config {} cannot be run:\nupstream `{upstream}`: its endpoints come from Kubernetes, and {why}",
         path.display()
@@ -247,6 +326,8 @@ enum Failure {
         upstream: String,
         why: ApiError,
     },
+    #[error(transparent)]
+    Stream(#[from] StreamError),
     #[error("cannot listen on {address} for {what}: {error}")]
     Listen {
         what: String,
@@ -284,7 +365,7 @@ fn unfollowable<'a>(config: &'a Compiled, outside: Option<&ApiError>) -> Option<
 
 fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     let Options {
-        config: path,
+        source,
         metrics,
         workers,
         accept,
@@ -308,30 +389,67 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         Port::Shared
     };
 
-    let (mut file, config) = match ConfigFile::open(path.clone()) {
-        Ok(opened) => opened,
-        Err(rejected) => return Err(Failure::Config { path, rejected }),
-    };
     // The cluster's API server, if the data plane is in one: what discovered upstreams are
     // followed through, a config with one refused without it.
     let cluster = ApiServer::in_cluster();
     let outside = cluster.as_ref().err().cloned();
-    if let Some(upstream) = unfollowable(&config, outside.as_ref()) {
-        return Err(Failure::Unfollowable {
-            path,
-            upstream: upstream.to_owned(),
-            why: outside.unwrap_or(ApiError::NoServer),
-        });
-    }
+    // Listened for before anything else, so that no signal finds the default action, which
+    // is to die on the spot, a data plane waiting for its first config among them. The
+    // access logs are opened again once there is a proxy to have them.
+    let (stopping, stop) = mpsc::channel();
+    let logged: Arc<OnceLock<Arc<Proxy>>> = Arc::default();
+    let logs = Arc::clone(&logged);
+    signals(stopping.clone(), move || {
+        if let Some(proxy) = logs.get() {
+            proxy.reopen_logs();
+        }
+    })
+    .map_err(Failure::Runtime)?;
+    let (mut configs, config, named, first_ran) = match source {
+        Source::File(path) => {
+            let (file, config) = match ConfigFile::open(path.clone()) {
+                Ok(opened) => opened,
+                Err(rejected) => return Err(Failure::Config { path, rejected }),
+            };
+            if let Some(upstream) = unfollowable(&config, outside.as_ref()) {
+                return Err(Failure::Unfollowable {
+                    path,
+                    upstream: upstream.to_owned(),
+                    why: outside.unwrap_or(ApiError::NoServer),
+                });
+            }
+            let named = format!("config {}", path.display());
+            (Configs::File(file), config, named, None)
+        }
+        Source::ControlPlane(stream) => {
+            let handing = crate::stream::start(&stream, &stopping)?;
+            say(
+                stderr,
+                format_args!(
+                    "waiting for the first config from the control plane at {}",
+                    stream.address
+                ),
+            );
+            match first(&handing, &stop, outside.as_ref(), stderr) {
+                First::Config(config, ran) => {
+                    let named = "the control plane's config".to_owned();
+                    (Configs::Stream(handing), *config, named, Some(ran))
+                }
+                First::Stop => return Ok(()),
+                First::Failed(ended) => return Err(Failure::Ended(ended)),
+            }
+        }
+    };
     let mut bound: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
     // Limits checked but enforced in none is said once, so that a mode left out is seen.
     let unenforced = (!config.rate_limiting().enforces()).then_some(config.limits().len());
     let proxy = Proxy::new(config, workers)
         .map(Arc::new)
         .map_err(|error| Failure::Proxy {
-            path: path.clone(),
+            config: named.clone(),
             error,
         })?;
+    let _first = logged.set(Arc::clone(&proxy));
 
     // Every socket is open before a request is served on any, so that a port that is
     // taken stops a harness that has done nothing yet.
@@ -383,14 +501,12 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             ),
         );
     }
-    // Listened for before a request is served, so that no signal finds the default
-    // action, which is to die on the spot.
-    let (stopping, stop) = mpsc::channel();
-    let logs = Arc::clone(&proxy);
-    signals(stopping.clone(), move || logs.reopen_logs()).map_err(Failure::Runtime)?;
     proxy
         .start_rate_limits(rate_limits_failed(&stopping))
-        .map_err(|error| Failure::Proxy { path, error })?;
+        .map_err(|error| Failure::Proxy {
+            config: named,
+            error,
+        })?;
     if let Ok(api) = cluster {
         kubernetes(Arc::clone(&proxy), api, &stopping).map_err(Failure::Runtime)?;
         // Nothing accepted until every namespace followed has been listed once, so that a
@@ -440,52 +556,82 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         ),
     );
 
+    if let Some(ran) = first_ran {
+        let _gone = ran.send(Ok(()));
+        say(stderr, format_args!("config from the control plane runs"));
+    }
+
     // Until told to stop; `stopping` is still held here, so the channel cannot close.
     loop {
-        match next(&stop, POLL) {
+        match next(&stop, configs.poll()) {
             Next::Look => {}
             Next::Stop => break,
             Next::Failed(ended) => return Err(Failure::Ended(ended)),
         }
-        let Some(changed) = file.changed() else {
-            continue;
-        };
-        let config = match changed {
-            Ok(config) => config,
-            Err(rejected) => {
-                say(
-                    stderr,
-                    format_args!("config rejected, the one before it runs on:\n{rejected}"),
-                );
-                continue;
+        match &mut configs {
+            Configs::File(file) => {
+                let Some(changed) = file.changed() else {
+                    continue;
+                };
+                let config = match changed {
+                    Ok(config) => config,
+                    Err(rejected) => {
+                        say(
+                            stderr,
+                            format_args!("config rejected, the one before it runs on:\n{rejected}"),
+                        );
+                        continue;
+                    }
+                };
+                let reloaded = runnable(&config, outside.as_ref())
+                    .and_then(|()| reloaded(&proxy, &bound, config));
+                match reloaded {
+                    Ok(warnings) => {
+                        say(stderr, format_args!("config reloaded"));
+                        for warning in warnings {
+                            say(stderr, format_args!("warning: {warning}"));
+                        }
+                    }
+                    Err(why) => say(
+                        stderr,
+                        format_args!("config rejected, the one before it runs on:\n{why}"),
+                    ),
+                }
             }
-        };
-        if let (Some(upstream), Some(why)) = (unfollowable(&config, outside.as_ref()), &outside) {
-            say(
-                stderr,
-                format_args!(
-                    "config rejected, the one before it runs on:\nupstream `{upstream}`: its endpoints come from Kubernetes, and {why}"
-                ),
-            );
-            continue;
-        }
-        let warnings = restart_needed(&bound, &config);
-        // Published once, for every worker at once: none of them sees the old config after
-        // another has seen the new one.
-        match proxy.reload(config) {
-            Ok(()) => say(stderr, format_args!("config reloaded")),
-            Err(error) => {
-                say(
-                    stderr,
-                    format_args!("config rejected, the one before it runs on:\n{error}"),
-                );
-                continue;
+            Configs::Stream(handing) => {
+                while let Ok(from) = handing.try_recv() {
+                    let (config, ran) = match from {
+                        FromStream::Said(line) => {
+                            say(stderr, format_args!("{line}"));
+                            continue;
+                        }
+                        FromStream::Run { config, ran } => (config, ran),
+                    };
+                    let reloaded = compiled(&config).and_then(|config| {
+                        runnable(&config, outside.as_ref())?;
+                        reloaded(&proxy, &bound, config)
+                    });
+                    match &reloaded {
+                        Ok(warnings) => {
+                            say(stderr, format_args!("config from the control plane runs"));
+                            for warning in warnings {
+                                say(stderr, format_args!("warning: {warning}"));
+                            }
+                        }
+                        Err(why) => say(
+                            stderr,
+                            format_args!(
+                                "config from the control plane refused, the one before it runs on:\n{why}"
+                            ),
+                        ),
+                    }
+                    let _gone = ran.send(reloaded.map(|_| ()));
+                }
             }
-        }
-        for warning in warnings {
-            say(stderr, format_args!("warning: {warning}"));
         }
     }
+    // A config handed over from here on is refused as the data plane stops.
+    drop(configs);
     drop(stopping);
     say(stderr, format_args!("draining"));
     proxy.drain();
@@ -530,6 +676,98 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         Some(ended) => Err(Failure::PanickedDraining(ended)),
         None => Ok(()),
     }
+}
+
+/// Where the configs after the first come from.
+enum Configs {
+    File(ConfigFile),
+    Stream(Receiver<FromStream>),
+}
+
+impl Configs {
+    /// How often the main loop looks for one.
+    fn poll(&self) -> Duration {
+        match self {
+            Self::File(_) => POLL,
+            Self::Stream(_) => STREAM_POLL,
+        }
+    }
+}
+
+/// How the wait for the stream's first config ended.
+enum First {
+    /// With it, compiled, and where to say whether it runs.
+    Config(
+        Box<Compiled>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    Stop,
+    Failed(Ended),
+}
+
+/// Waits for the stream's first config that can be run, saying what the stream says
+/// meanwhile, and each config refused, here and on the stream.
+fn first(
+    handing: &Receiver<FromStream>,
+    told: &Receiver<Told>,
+    outside: Option<&ApiError>,
+    stderr: &mut impl Write,
+) -> First {
+    loop {
+        match next(told, STREAM_POLL) {
+            Next::Look => {}
+            Next::Stop => return First::Stop,
+            Next::Failed(ended) => return First::Failed(ended),
+        }
+        while let Ok(from) = handing.try_recv() {
+            let (config, ran) = match from {
+                FromStream::Said(line) => {
+                    say(stderr, format_args!("{line}"));
+                    continue;
+                }
+                FromStream::Run { config, ran } => (config, ran),
+            };
+            let runs = compiled(&config).and_then(|config| {
+                runnable(&config, outside)?;
+                Ok(config)
+            });
+            match runs {
+                Ok(config) => return First::Config(Box::new(config), ran),
+                Err(why) => {
+                    say(
+                        stderr,
+                        format_args!("config from the control plane refused:\n{why}"),
+                    );
+                    let _gone = ran.send(Err(why));
+                }
+            }
+        }
+    }
+}
+
+/// A config from the stream, compiled as a file's is.
+fn compiled(config: &Config) -> Result<Compiled, String> {
+    compile(config).map_err(|problems| Problems(problems).to_string())
+}
+
+/// Whether `config` can be run here: not with an upstream whose endpoints come from
+/// Kubernetes, where `outside` says why there is no cluster to follow them through.
+fn runnable(config: &Compiled, outside: Option<&ApiError>) -> Result<(), String> {
+    match (unfollowable(config, outside), outside) {
+        (Some(upstream), Some(why)) => Err(format!(
+            "upstream `{upstream}`: its endpoints come from Kubernetes, and {why}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Has `proxy` run `config`, published once, for every worker at once, so that none of
+/// them sees the old config after another has seen the new one: what takes a restart, its
+/// listeners being bound once, or why it was refused.
+fn reloaded(proxy: &Proxy, bound: &[Bound], config: Compiled) -> Result<Vec<String>, String> {
+    let warnings = restart_needed(bound, &config);
+    proxy.reload(config).map_err(|error| error.to_string())?;
+    Ok(warnings)
 }
 
 /// How a drain ended.
@@ -873,7 +1111,7 @@ mod tests {
     #[test]
     fn a_config_is_all_that_is_needed() {
         let options = Options {
-            config: PathBuf::from("dev.yaml"),
+            source: Source::File(PathBuf::from("dev.yaml")),
             metrics: None,
             workers: None,
             accept: Accept::Balanced,
@@ -890,7 +1128,7 @@ mod tests {
         // There is no configuration for these; what a benchmark needs is to hold both
         // clients to the same ones, and to be able to say which they were.
         let options = Options {
-            config: PathBuf::from("dev.yaml"),
+            source: Source::File(PathBuf::from("dev.yaml")),
             metrics: None,
             workers: None,
             accept: Accept::Balanced,
@@ -936,7 +1174,7 @@ mod tests {
     #[test]
     fn the_workers_are_as_the_command_line_says() {
         let options = Options {
-            config: PathBuf::from("dev.yaml"),
+            source: Source::File(PathBuf::from("dev.yaml")),
             metrics: None,
             workers: NonZeroUsize::new(4),
             accept: Accept::Balanced,
@@ -951,7 +1189,7 @@ mod tests {
     #[test]
     fn metrics_are_served_where_the_command_line_says() {
         let options = Options {
-            config: PathBuf::from("dev.yaml"),
+            source: Source::File(PathBuf::from("dev.yaml")),
             metrics: Some("[::]:9090".parse().unwrap()),
             workers: None,
             accept: Accept::Balanced,
@@ -987,6 +1225,57 @@ mod tests {
         assert_eq!(
             parsed(&["--config", "dev.yaml", "--metrics", "localhost:9090"]),
             Err(UsageError::Address("localhost:9090".to_owned()))
+        );
+    }
+
+    #[test]
+    fn the_config_comes_from_a_file_or_a_control_plane_never_both() {
+        let stream = [
+            "--control-plane",
+            "edgerush-control.edgerush.svc:9443",
+            "--certificate",
+            "c",
+            "--key",
+            "k",
+            "--authorities",
+            "a",
+        ];
+        let Ok(Parsed::Run(options)) = parsed(&stream) else {
+            panic!("not run")
+        };
+        assert_eq!(
+            options.source,
+            Source::ControlPlane(Stream {
+                address: "edgerush-control.edgerush.svc:9443".to_owned(),
+                files: Files {
+                    certificate: PathBuf::from("c"),
+                    key: PathBuf::from("k"),
+                    authorities: PathBuf::from("a"),
+                },
+            })
+        );
+        let mut both = vec!["--config", "a.yaml"];
+        both.extend(stream);
+        assert_eq!(parsed(&both), Err(UsageError::Both));
+        // Each of the stream's four left out.
+        for left_out in 0..4 {
+            let args: Vec<&str> = stream
+                .chunks(2)
+                .enumerate()
+                .filter(|(i, _)| *i != left_out)
+                .flat_map(|(_, pair)| pair.iter().copied())
+                .collect();
+            assert_eq!(parsed(&args), Err(UsageError::Stream), "{args:?}");
+        }
+        for address in ["edgerush-control", "edgerush-control:port", "[::1]:99999"] {
+            assert_eq!(
+                parsed(&["--control-plane", address]),
+                Err(UsageError::ControlPlane(address.to_owned()))
+            );
+        }
+        assert_eq!(
+            parsed(&["--key", "k", "--key", "l"]),
+            Err(UsageError::Twice("--key"))
         );
     }
 

@@ -48,13 +48,16 @@ pub enum Ended {
 /// checked against `name`, and follows the stream until it ends: from what `staging`
 /// holds, each config given to run handed to `run`, which runs it, or says why it cannot,
 /// and each outcome reported.
-pub async fn follow(
+pub async fn follow<R>(
     address: &str,
     name: &str,
     tls: &SslConnector,
     staging: &mut Staging,
-    mut run: impl FnMut(Box<Config>) -> Result<(), String>,
-) -> Ended {
+    mut run: impl FnMut(Box<Config>) -> R,
+) -> Ended
+where
+    R: Future<Output = Result<(), String>>,
+{
     let unreachable = |why: String| Ended::Unreachable(why);
     let endpoint = match Endpoint::from_shared(format!("http://{address}")) {
         Ok(endpoint) => endpoint,
@@ -103,7 +106,8 @@ pub async fn follow(
             Err(malformed) => return malformed.into(),
             Ok(Taken::Nothing) => continue,
             Ok(Taken::Say(report)) => Some(report),
-            Ok(Taken::Run(config)) => match run(config) {
+            // Awaited, not waited on: the connection, its pings answered, goes on meanwhile.
+            Ok(Taken::Run(config)) => match run(config).await {
                 Ok(()) => staging.ran(),
                 Err(why) => staging.failed(why),
             },

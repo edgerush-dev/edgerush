@@ -132,11 +132,13 @@ fn follower(
     let following = tokio::spawn(async move {
         let mut staging = Staging::new();
         follow(&address, &name, &tls, &mut staging, |config| {
-            if fail(&config) {
-                return Err("the port is taken".to_owned());
-            }
-            let _ = ran.send(*config);
-            Ok(())
+            let ran = if fail(&config) {
+                Err("the port is taken".to_owned())
+            } else {
+                let _ = ran.send(*config);
+                Ok(())
+            };
+            std::future::ready(ran)
         })
         .await
     });
@@ -338,7 +340,7 @@ async fn a_data_plane_that_dials_again_is_sent_only_what_it_lacks() {
     let runs = std::cell::Cell::new(0);
     let run = |_| {
         runs.set(runs.get() + 1);
-        Ok(())
+        std::future::ready(Ok(()))
     };
     // What the control plane hears next, the stream followed meanwhile.
     async fn hear(plane: &mut Plane, following: Pin<&mut impl Future<Output = Ended>>) -> Heard {
@@ -566,7 +568,7 @@ fn subscriber(
             &mut staging,
             |config| {
                 let _ = ran.send(*config);
-                Ok(())
+                std::future::ready(Ok(()))
             },
             |following| {
                 let _ = said.send(following);
@@ -718,6 +720,66 @@ async fn certificate_files_replaced_are_presented_on_the_next_dial() {
         .await
         .expect("not said to be replaced");
     assert_eq!(within(&mut running).await, config(80));
+    subscribing.abort();
+    plane.signal();
+    plane.join().await;
+}
+
+/// While a config waits to run — a data plane starting, say, its first EndpointSlices
+/// listed — the stream goes on: here, its certificate files are read again meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stream_goes_on_while_a_config_waits_to_run() {
+    let authority = Authority::new("stream");
+    let offer = Offer::new(&config(80), None, &mut Versions::new(7)).unwrap();
+    let mut plane = Plane::start(&credentials(&authority, &["127.0.0.1"]), Some(offer)).await;
+    let files = data_plane_files("waits", &authority, &authority);
+    let presented = files.read().await.unwrap();
+    let subscription = Subscription {
+        address: plane.address.clone(),
+        files: files.clone(),
+        credentials: presented,
+        reread: Duration::from_millis(20),
+        backoff: quick(),
+    };
+    let (started, mut starting) = mpsc::unbounded_channel();
+    let (said, mut told) = mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let released = Arc::clone(&release);
+    let subscribing = tokio::spawn(async move {
+        let mut staging = Staging::new();
+        let _never = subscribe(
+            subscription,
+            &mut staging,
+            |_config| {
+                let _ = started.send(());
+                let released = Arc::clone(&released);
+                async move {
+                    released.notified().await;
+                    Ok(())
+                }
+            },
+            |following| {
+                let _ = said.send(following);
+            },
+        )
+        .await;
+    });
+    within(&mut starting).await;
+    put_files(&files, &authority, &authority);
+    let replaced = async {
+        loop {
+            if within(&mut told).await == Following::Replaced {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), replaced)
+        .await
+        .expect("not read again while the config waited");
+    // Let go, it runs, and is reported.
+    release.notify_one();
+    assert!(matches!(plane.next().await, Heard::Opened { .. }));
+    assert!(matches!(plane.next().await, Heard::Reported(_)));
     subscribing.abort();
     plane.signal();
     plane.join().await;
