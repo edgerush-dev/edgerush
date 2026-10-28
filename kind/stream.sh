@@ -17,6 +17,8 @@
 #   - the Ingress is served, and its status says the data plane's Service's address;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
+#   - asked to reach its Service by the Service's own address, it is served through the
+#     cluster's DNS and kube-proxy, and served again once it no longer asks;
 #   - the control plane's leader gone, the other replica takes its Lease and writes status;
 #   - with the control plane gone, the data plane serves on;
 #   - a data plane started while it is gone waits for its first config, serving nothing,
@@ -171,6 +173,26 @@ k -n shop annotate ingress web nginx.ingress.kubernetes.io/rewrite-target- >/dev
 saying 192.0.2.10 30 || fail "taken back, the Ingress's status says '$(says)'"
 answers other.example 200 30 || fail "taken back, the Ingress is not served: $(status other.example)"
 pass "left out, the Ingress says no address, and taken back, the address again"
+
+# The data plane resolves the Service's name through the cluster's DNS, as its pod's
+# resolv.conf names it, and kube-proxy chooses the pod; a data plane that could not would
+# answer 503 for want of an endpoint.
+# How many configs the data plane has run from the control plane.
+ran() { k -n edge logs deploy/edgerush | grep -c "config from the control plane runs"; }
+before=$(ran)
+k -n shop annotate ingress web gateway.edgerush.dev/service-upstream=true >/dev/null
+for _ in $(seq 1 150); do
+    [ "$(ran)" -gt "$before" ] && break
+    sleep 0.2
+done
+[ "$(ran)" -gt "$before" ] || fail "the data plane never ran the config that reaches the Service's address"
+answers other.example 200 30 || fail "reached by its Service's address, $(status other.example)"
+for _ in $(seq 1 20); do
+    [ "$(status other.example)" = 200 ] || fail "reached by its Service's address, $(status other.example)"
+done
+k -n shop annotate ingress web gateway.edgerush.dev/service-upstream- >/dev/null
+answers other.example 200 30 || fail "back on its endpoints, $(status other.example)"
+pass "reached by its Service's own address, the Ingress is served through the cluster's DNS"
 
 echo "== the leader gone"
 # Who holds the Lease: a pod's name, and when it started.
