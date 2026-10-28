@@ -607,47 +607,20 @@ async fn control_until(
         }
         None => None,
     };
-    // The webhook: the IngressClasses followed on its own client, the reviews answered on
-    // the server's tasks, and its certificate files read again.
+    // The webhook, on a thread of its own: what it says is said here, where `say` lives.
     let mut hooked = None;
     if let Some(hooking) = listeners.webhook {
-        let (listed, classes) = watch::channel(Arc::new(Listed::<IngressClass>::default()));
-        let telling = Rc::clone(&say);
-        let api = hooking.api;
-        tasks.push(tokio::task::spawn_local(async move {
-            follow(&api, &Scope::Cluster, Retry::default(), listed, |failure| {
-                telling(&format!(
-                    "ingressclasses in the cluster, for the webhook: {failure}"
-                ));
-            })
-            .await;
-        }));
-        let tls = watch::Sender::new(Arc::new(
-            webhook_acceptor(&hooking.certificate).map_err(io::Error::other)?,
-        ));
-        hooking.listener.set_nonblocking(true)?;
-        let listener = tokio::net::TcpListener::from_std(hooking.listener)?;
+        let (said, mut hearing) = mpsc::unbounded_channel();
         let (stopping, stopped) = oneshot::channel::<()>();
-        let judged = Arc::new(plane.clone());
-        hooked = Some((
-            stopping,
-            tokio::spawn(webhook::serve(
-                listener,
-                tls.subscribe(),
-                Bounds::default(),
-                move |body| review(&judged, &classes.borrow(), body),
-                async move {
-                    let _ = stopped.await;
-                },
-            )),
-        ));
+        let (ending, ended) = oneshot::channel::<()>();
+        hooked = Some((stopping, ended));
+        hook(hooking, plane.clone(), said, stopped, ending)?;
         let telling = Rc::clone(&say);
-        tasks.push(tokio::task::spawn_local(reread(
-            hooking.files,
-            hooking.certificate,
-            hooking.reread,
-            move |changed| telling(&webhook_replaced(changed, &tls)),
-        )));
+        tasks.push(tokio::task::spawn_local(async move {
+            while let Some(line) = hearing.recv().await {
+                telling(&line);
+            }
+        }));
     }
     let telling = Rc::clone(&say);
     tasks.push(tokio::task::spawn_local(async move {
@@ -679,9 +652,9 @@ async fn control_until(
             say(&format!("error: {error}"));
         }
     }
-    if let Some((stopping, server)) = hooked {
+    if let Some((stopping, ended)) = hooked {
         let _ = stopping.send(());
-        let _ended = server.await;
+        let _ended = ended.await;
     }
     for task in tasks.into_iter().chain(electing) {
         task.abort();
@@ -708,6 +681,78 @@ impl Offering {
         self.offers.send_replace(Some(Arc::new(offer)));
         Ok(version)
     }
+}
+
+/// Serves the webhook `hooking` holds on a thread and runtime of its own (04 §3), so that a
+/// flood of reviews, which anyone in the cluster can send, costs only its answers: the
+/// IngressClasses followed on its own client, each review judged for the data plane `plane`
+/// describes, and its certificate files read again. What it says goes to `said`, a line each;
+/// it stops once `stop` is done, or dropped, and tells `ended` as it ends.
+///
+/// # Errors
+///
+/// If its certificate cannot be used, its listener cannot be made, or the thread or its
+/// runtime cannot be started.
+fn hook(
+    hooking: Hooking,
+    plane: Plane,
+    said: mpsc::UnboundedSender<String>,
+    stop: oneshot::Receiver<()>,
+    ended: oneshot::Sender<()>,
+) -> io::Result<()> {
+    let acceptor = webhook_acceptor(&hooking.certificate).map_err(io::Error::other)?;
+    hooking.listener.set_nonblocking(true)?;
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    std::thread::Builder::new()
+        .name("webhook".to_owned())
+        .spawn(move || {
+            let serving = async move {
+                let (listed, classes) = watch::channel(Arc::new(Listed::<IngressClass>::default()));
+                let failed = said.clone();
+                let api = hooking.api;
+                let following = tokio::task::spawn_local(async move {
+                    follow(&api, &Scope::Cluster, Retry::default(), listed, |failure| {
+                        let _gone = failed.send(format!(
+                            "ingressclasses in the cluster, for the webhook: {failure}"
+                        ));
+                    })
+                    .await;
+                });
+                let tls = watch::Sender::new(Arc::new(acceptor));
+                let replacing = said.clone();
+                let accepting = tls.subscribe();
+                let rereading = tokio::task::spawn_local(reread(
+                    hooking.files,
+                    hooking.certificate,
+                    hooking.reread,
+                    move |changed| {
+                        let _gone = replacing.send(webhook_replaced(changed, &tls));
+                    },
+                ));
+                match tokio::net::TcpListener::from_std(hooking.listener) {
+                    Ok(listener) => {
+                        webhook::serve(
+                            listener,
+                            accepting,
+                            Bounds::default(),
+                            move |body| review(&plane, &classes.borrow(), body),
+                            async move {
+                                let _ = stop.await;
+                            },
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        let _gone = said.send(format!("error: the webhook's listener: {error}"));
+                    }
+                }
+                following.abort();
+                rereading.abort();
+            };
+            tokio::task::LocalSet::new().block_on(&runtime, serving);
+            let _ = ended.send(());
+        })?;
+    Ok(())
 }
 
 /// The webhook's answer to the review `body`, an Ingress of the data plane `plane`

@@ -583,9 +583,11 @@ async fn posted(address: &str, authority: &Authority, name: &str, body: &[u8]) -
 }
 
 /// The webhook answers each review as the IngressClasses it follows say, refusing an
-/// Ingress of the class that does not translate; its certificate files replaced are put to
-/// use for the next connection.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// Ingress of the class that does not translate, on a thread of its own: a review is
+/// answered while the control plane's own thread is held up. Its certificate files
+/// replaced are put to use for the next connection. On one thread, as `edgerush controller`
+/// runs, the reviews asked from another.
+#[tokio::test(flavor = "current_thread")]
 async fn the_webhook_answers_reviews_and_its_certificate_replaced_serves_the_next() {
     let fake = cluster().await;
     let authority = Authority::new("webhook");
@@ -603,63 +605,92 @@ async fn the_webhook_answers_reviews_and_its_certificate_replaced_serves_the_nex
         certificate,
         reread: Duration::from_millis(20),
     };
-    // The control plane runs until the test is done with it.
+    // The control plane runs until the test is done with it, and holds up its own thread
+    // once when asked.
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let finished = Arc::clone(&done);
-    let reviewing = tokio::spawn(async move {
-        // Until its IngressClasses are listed, it has nothing to judge by.
-        let admitted = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let (status, body) = posted(
-                    &address,
-                    &authority,
-                    "webhook.test",
-                    &review_of("u-1", "{}"),
-                )
-                .await;
-                if status != "HTTP/1.1 503 Service Unavailable" {
-                    return (status, body);
+    let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let holding = Arc::clone(&hold);
+    let reviewer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let reviewing = std::thread::spawn(move || {
+        reviewer.block_on(async move {
+            // Until its IngressClasses are listed, it has nothing to judge by.
+            let admitted = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let (status, body) = posted(
+                        &address,
+                        &authority,
+                        "webhook.test",
+                        &review_of("u-1", "{}"),
+                    )
+                    .await;
+                    if status != "HTTP/1.1 503 Service Unavailable" {
+                        return (status, body);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("never answered but 503");
-        let refused = posted(
-            &address,
-            &authority,
-            "webhook.test",
-            &review_of("u-2", r#"{"x":"y"}"#),
-        )
-        .await;
-        put_webhook_files(&files, &authority, "renamed.test");
-        let renamed = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let socket = tokio::net::TcpStream::connect(&address).await.unwrap();
-                let mut builder =
-                    boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
-                let mut trusted = boring::x509::store::X509StoreBuilder::new().unwrap();
-                for certificate in
-                    boring::x509::X509::stack_from_pem(authority.pem().as_bytes()).unwrap()
-                {
-                    trusted.add_cert(certificate).unwrap();
-                }
-                builder.set_verify_cert_store(trusted.build()).unwrap();
-                let connector = builder.build();
-                let connected =
-                    tokio_boring::connect(connector.configure().unwrap(), "renamed.test", socket)
-                        .await;
-                if connected.is_ok() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        });
-        renamed
+            })
             .await
-            .expect("the certificate replaced never served");
-        finished.store(true, std::sync::atomic::Ordering::SeqCst);
-        (admitted, refused)
+            .expect("never answered but 503");
+            let refused = posted(
+                &address,
+                &authority,
+                "webhook.test",
+                &review_of("u-2", r#"{"x":"y"}"#),
+            )
+            .await;
+            // The control plane's thread held up for 1.5 s: a review is answered all the same.
+            holding.store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let asked = std::time::Instant::now();
+            let (status, _) = posted(
+                &address,
+                &authority,
+                "webhook.test",
+                &review_of("u-3", "{}"),
+            )
+            .await;
+            let answered_in = asked.elapsed();
+            assert_eq!(status, "HTTP/1.1 200 OK");
+            assert!(
+                answered_in < Duration::from_millis(800),
+                "answered in {answered_in:?}, the control plane's thread held up"
+            );
+            put_webhook_files(&files, &authority, "renamed.test");
+            let renamed = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let socket = tokio::net::TcpStream::connect(&address).await.unwrap();
+                    let mut builder =
+                        boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
+                    let mut trusted = boring::x509::store::X509StoreBuilder::new().unwrap();
+                    for certificate in
+                        boring::x509::X509::stack_from_pem(authority.pem().as_bytes()).unwrap()
+                    {
+                        trusted.add_cert(certificate).unwrap();
+                    }
+                    builder.set_verify_cert_store(trusted.build()).unwrap();
+                    let connector = builder.build();
+                    let connected = tokio_boring::connect(
+                        connector.configure().unwrap(),
+                        "renamed.test",
+                        socket,
+                    )
+                    .await;
+                    if connected.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
+            renamed
+                .await
+                .expect("the certificate replaced never served");
+            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            (admitted, refused)
+        })
     });
     let lines = run_until(
         &fake,
@@ -670,10 +701,15 @@ async fn the_webhook_answers_reviews_and_its_certificate_replaced_serves_the_nex
             stream: None,
             webhook: Some(hooking),
         },
-        move |_| done.load(std::sync::atomic::Ordering::SeqCst),
+        move |_| {
+            if hold.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+            done.load(std::sync::atomic::Ordering::SeqCst)
+        },
     )
     .await;
-    let (admitted, refused) = reviewing.await.unwrap();
+    let (admitted, refused) = reviewing.join().unwrap();
     assert_eq!(admitted.0, "HTTP/1.1 200 OK");
     let admitted: serde_json::Value = serde_json::from_str(&admitted.1).unwrap();
     assert_eq!(admitted["response"]["allowed"], true, "{admitted}");
