@@ -368,6 +368,9 @@ pub enum Problem {
     /// It is not what Kubernetes allows, which its API server would have refused.
     #[error("invalid: {0}")]
     Invalid(&'static str),
+    /// It asks for what is never served, for what it could be made to do.
+    #[error("never served: {0}")]
+    NeverServed(&'static str),
     /// An annotation that takes `"true"` or `"false"` has another value.
     #[error("annotation `{0}` is neither \"true\" nor \"false\"")]
     NotBoolean(&'static str),
@@ -1279,8 +1282,12 @@ fn service_port<'a>(
         )));
     };
     let spec = service.spec.as_ref();
+    // Its name can be anything, another namespace's Service or the node itself among it,
+    // which would let an Ingress reach what its namespace cannot (CVE-2021-25740).
     if spec.and_then(|spec| spec.type_.as_deref()) == Some("ExternalName") {
-        return Err(Problem::NotSupportedYet("an ExternalName Service"));
+        return Err(Problem::NeverServed(
+            "an ExternalName Service, whose name can lead anywhere",
+        ));
     }
     let ports = spec
         .and_then(|spec| spec.ports.as_deref())
