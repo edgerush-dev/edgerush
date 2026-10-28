@@ -793,7 +793,7 @@ pub const HTTPS_REDIRECT_ANNOTATION: &str = "gateway.edgerush.dev/https-redirect
 
 /// The annotation an Ingress has its backends reached by their Services' own addresses
 /// with, `"true"`, rather than by their endpoints: the cluster IP, which kube-proxy or a
-/// mesh then chooses a pod behind (12 item 12).
+/// mesh then chooses a pod behind ([03 §6](../../../docs/03-data-plane.md)).
 pub const SERVICE_UPSTREAM_ANNOTATION: &str = "gateway.edgerush.dev/service-upstream";
 
 /// The annotation that named an Ingress's class before `ingressClassName`, and still does
