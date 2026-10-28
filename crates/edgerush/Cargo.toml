@@ -23,6 +23,8 @@ edgerush-explain.workspace = true
 edgerush-kubernetes.workspace = true
 edgerush-proxy.workspace = true
 edgerush-translate.workspace = true
+# The webhook's answers, by status.
+http.workspace = true
 k8s-openapi.workspace = true
 serde.workspace = true
 # "serialize": the config the control plane writes with `--write-config`.
@@ -39,6 +41,9 @@ tokio = { workspace = true, features = ["signal", "sync"] }
 rustix.workspace = true
 
 [dev-dependencies]
+# The webhook asked over TLS, as the API server asks it.
+boring.workspace = true
+tokio-boring.workspace = true
 # The stream's certificates, issued by an authority of the tests' own.
 edgerush-certificates = { workspace = true, features = ["testing"] }
 # Its `schema` feature: `tests/schema.rs` keeps `schema/config.schema.json` as the types say.

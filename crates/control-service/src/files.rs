@@ -1,10 +1,19 @@
-//! The stream's certificate files, read again as they change: Kubernetes replaces a
-//! mounted Secret's files in place when the Secret changes.
+//! Certificate files, read again as they change: Kubernetes replaces a mounted Secret's
+//! files in place when the Secret changes. The stream's, and the admission webhook's.
 
 use crate::Credentials;
 use edgerush_config::Certificate;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Files [`reread`] reads again as they change.
+pub trait Reread {
+    /// What they hold.
+    type Held: PartialEq;
+
+    /// What they hold now.
+    fn held(&self) -> impl Future<Output = Result<Self::Held, FilesError>> + Send;
+}
 
 /// Where an end's credentials are: each a PEM file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +54,47 @@ impl Files {
     }
 }
 
+impl Reread for Files {
+    type Held = Credentials;
+
+    fn held(&self) -> impl Future<Output = Result<Credentials, FilesError>> + Send {
+        self.read()
+    }
+}
+
+/// Where a server's certificate is, for one that asks for none of its clients': each a PEM
+/// file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertificateFiles {
+    /// The certificate it presents, then the intermediates.
+    pub certificate: PathBuf,
+    /// Its private key.
+    pub key: PathBuf,
+}
+
+impl CertificateFiles {
+    /// What they hold now.
+    ///
+    /// # Errors
+    ///
+    /// A [`FilesError`] for a file that cannot be read. Whether what they hold can be used
+    /// is for [`webhook_acceptor`](crate::webhook_acceptor) to say.
+    pub async fn read(&self) -> Result<Certificate, FilesError> {
+        Ok(Certificate {
+            chain: read(&self.certificate).await?,
+            key: read(&self.key).await?,
+        })
+    }
+}
+
+impl Reread for CertificateFiles {
+    type Held = Certificate;
+
+    fn held(&self) -> impl Future<Output = Result<Certificate, FilesError>> + Send {
+        self.read()
+    }
+}
+
 async fn read(path: &Path) -> Result<String, FilesError> {
     tokio::fs::read_to_string(path)
         .await
@@ -55,13 +105,13 @@ async fn read(path: &Path) -> Result<String, FilesError> {
 }
 
 /// Reads `files` again every `every`, for as long as it is polled, `last` being what they
-/// held, and hands `changed` each change: credentials that differ from the last, or a
+/// held, and hands `changed` each change: what they hold differing from the last, or a
 /// failure to read them other than the last said.
-pub async fn reread(
-    files: Files,
-    mut last: Credentials,
+pub async fn reread<F: Reread>(
+    files: F,
+    mut last: F::Held,
     every: Duration,
-    mut changed: impl FnMut(Result<&Credentials, &FilesError>),
+    mut changed: impl FnMut(Result<&F::Held, &FilesError>),
 ) {
     let mut ticks = tokio::time::interval(every);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -70,7 +120,7 @@ pub async fn reread(
     let mut failed: Option<FilesError> = None;
     loop {
         ticks.tick().await;
-        match files.read().await {
+        match files.held().await {
             Ok(now) => {
                 failed = None;
                 if now != last {

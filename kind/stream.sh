@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The config stream, end to end in a kind cluster (02 §4, 03 §10): an Ingress applied is
-# translated by the control plane and served by a data plane that takes its config from it.
+# translated by the control plane and served by a data plane that takes its config from it;
+# and the admission webhook, which the cluster's API server asks (04 §3).
 #
 #   kind/stream.sh 1.37          make the cluster, run every check, delete the cluster
 #   KEEP=1 kind/stream.sh 1.37   the same, the cluster left for a look
@@ -19,7 +20,9 @@
 #   - the control plane's leader gone, the other replica takes its Lease and writes status;
 #   - with the control plane gone, the data plane serves on;
 #   - a data plane started while it is gone waits for its first config, serving nothing,
-#     and serves once the control plane is back.
+#     and serves once the control plane is back;
+#   - the webhook registered, an Ingress of the class that would be left out is refused,
+#     with why, one that would not is admitted, and one of another class, however it is.
 # Each check says PASS or FAIL; the first FAIL ends the run with status 1. Nothing here
 # reads or writes the user's own kubeconfig: every kubectl is given the cluster's.
 set -euo pipefail
@@ -75,6 +78,8 @@ issue() {
 }
 issue control edgerush-control.edge.svc
 issue data-plane edgerush.edge
+# The name the API server asks the webhook by.
+issue webhook edgerush-control.edge.svc
 
 echo "== deploying"
 k create namespace edge --dry-run=client -o yaml | k apply -f - >/dev/null
@@ -83,6 +88,9 @@ for end in control data-plane; do
         --from-file=tls.crt="$pki/$end.crt" --from-file=tls.key="$pki/$end.key" \
         --from-file=ca.crt="$pki/ca.crt" --dry-run=client -o yaml | k apply -f - >/dev/null
 done
+k -n edge create secret tls edgerush-control-webhook \
+    --cert="$pki/webhook.crt" --key="$pki/webhook.key" --dry-run=client -o yaml |
+    k apply -f - >/dev/null
 sed "s|AGNHOST|$AGNHOST|" kind/stream/manifests.yaml | k apply -f - >/dev/null
 k -n shop rollout status deploy/web --timeout=120s >/dev/null
 k -n edge rollout status deploy/edgerush-control --timeout=120s >/dev/null
@@ -216,3 +224,53 @@ said "$pod" "config from the control plane runs" 45 ||
 forward
 answers other.example 200 30 || fail "once the control plane is back, $(status other.example)"
 pass "once the control plane is back, it serves"
+
+echo "== the admission webhook"
+k apply -f - >/dev/null <<EOF
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata: { name: edgerush }
+webhooks:
+  - name: ingresses.edgerush.dev
+    rules:
+      - apiGroups: [networking.k8s.io]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [ingresses]
+    clientConfig:
+      service: { namespace: edge, name: edgerush-control, path: /validate, port: 443 }
+      caBundle: $(base64 -w0 "$pki/ca.crt")
+    failurePolicy: Ignore
+    sideEffects: None
+    admissionReviewVersions: [v1]
+    timeoutSeconds: 5
+EOF
+# The API server takes up a registration within moments; until then it admits all.
+refused=
+for _ in $(seq 1 150); do
+    if ! refused=$(k -n shop annotate ingress web nginx.ingress.kubernetes.io/rewrite-target=/ 2>&1); then
+        break
+    fi
+    k -n shop annotate ingress web nginx.ingress.kubernetes.io/rewrite-target- >/dev/null
+    refused=
+    sleep 0.2
+done
+[ -n "$refused" ] || fail "an Ingress the data plane would leave out was never refused"
+echo "$refused" | grep -q 'denied the request: not supported yet: annotations' ||
+    fail "refused, but not for why: $refused"
+pass "an Ingress of the class that would be left out is refused, with why"
+
+k -n shop annotate ingress web gateway.edgerush.dev/https-redirect=false >/dev/null ||
+    fail "an Ingress that translates was refused"
+k -n shop apply --dry-run=server -f - >/dev/null <<EOF ||
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: theirs
+  annotations: { nginx.ingress.kubernetes.io/rewrite-target: / }
+spec:
+  ingressClassName: nginx
+  rules: [{ host: theirs.example }]
+EOF
+    fail "an Ingress of another class was refused"
+pass "an Ingress that translates is admitted, and one of another class, however it is"

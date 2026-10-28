@@ -20,7 +20,7 @@ use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status, Streaming};
 
 /// How long a data plane has to finish its handshake.
-const HANDSHAKE: Duration = Duration::from_secs(10);
+pub(crate) const HANDSHAKE: Duration = Duration::from_secs(10);
 
 /// How often a quiet connection is pinged, and how long an answer may take before the data
 /// plane is taken as gone.

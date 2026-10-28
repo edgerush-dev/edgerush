@@ -24,6 +24,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             stream: None,
             status: None,
             leader: None,
+            webhook: None,
         }))
     );
     assert_eq!(
@@ -47,6 +48,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             stream: None,
             status: None,
             leader: None,
+            webhook: None,
         }))
     );
     assert_eq!(parsed(&["--help"]), Ok(Parsed::Help));
@@ -202,7 +204,7 @@ async fn run_until(
     name: &str,
     plane: &str,
     write_config: Option<PathBuf>,
-    serving: Option<Serving>,
+    listeners: Listeners,
     done: impl Fn(&[String]) -> bool,
 ) -> Vec<String> {
     let api = fake.client(&token(name, "secret"), Timing::default());
@@ -216,6 +218,7 @@ async fn run_until(
         stream: None,
         status: None,
         leader: None,
+        webhook: None,
     };
     let stop = {
         let lines = Rc::clone(&lines);
@@ -235,7 +238,7 @@ async fn run_until(
             api,
             options,
             plane,
-            serving,
+            listeners,
             None,
             stop,
             move |line| {
@@ -263,7 +266,10 @@ async fn each_translation_is_said_and_written_as_a_harness_file() {
         "controller-writes",
         &plane_at("[::]:8080", "[::]:8443"),
         Some(written.clone()),
-        None,
+        Listeners {
+            stream: None,
+            webhook: None,
+        },
         |lines| lines.iter().any(|line| line.starts_with("written to ")),
     )
     .await;
@@ -306,7 +312,10 @@ async fn a_config_the_data_plane_would_refuse_is_said_and_not_written() {
         "controller-refuses",
         &plane_at("[::]:8080", "[::]:8080"),
         Some(written.clone()),
-        None,
+        Listeners {
+            stream: None,
+            webhook: None,
+        },
         |lines| lines.iter().any(|line| line.contains("already taken")),
     )
     .await;
@@ -349,6 +358,7 @@ fn the_stream_is_given_whole_or_not_at_all() {
             })),
             status: None,
             leader: None,
+            webhook: None,
         }))
     );
     // Each of the four left out.
@@ -368,6 +378,322 @@ fn the_stream_is_given_whole_or_not_at_all() {
     assert_eq!(
         parsed(&["--listen", "[::]:1", "--listen", "[::]:2"]),
         Err(UsageError::Twice("--listen"))
+    );
+}
+
+#[test]
+fn the_webhook_is_given_whole_or_not_at_all() {
+    let webhook = [
+        "--webhook-listen",
+        "[::]:8443",
+        "--webhook-certificate",
+        "c",
+        "--webhook-key",
+        "k",
+    ];
+    let mut args = vec!["--data-plane", "p"];
+    args.extend(webhook);
+    assert_eq!(
+        parsed(&args),
+        Ok(Parsed::Control(Options {
+            data_plane: PathBuf::from("p"),
+            scope: vec![Scope::Cluster],
+            write_config: None,
+            stream: None,
+            status: None,
+            leader: None,
+            webhook: Some(Box::new(Webhook {
+                listen: "[::]:8443".parse().unwrap(),
+                files: CertificateFiles {
+                    certificate: PathBuf::from("c"),
+                    key: PathBuf::from("k"),
+                },
+            })),
+        }))
+    );
+    // Each of the three left out.
+    for left_out in [0, 2, 4] {
+        let mut args = vec!["--data-plane", "p"];
+        for (i, pair) in webhook.chunks(2).enumerate() {
+            if i * 2 != left_out {
+                args.extend(pair);
+            }
+        }
+        assert_eq!(parsed(&args), Err(UsageError::WebhookTogether), "{args:?}");
+    }
+    assert_eq!(
+        parsed(&["--webhook-listen", "8443"]),
+        Err(UsageError::WebhookListen("8443".to_owned()))
+    );
+    for twice in [
+        ["--webhook-listen", "[::]:1", "--webhook-listen", "[::]:2"],
+        ["--webhook-certificate", "a", "--webhook-certificate", "b"],
+        ["--webhook-key", "a", "--webhook-key", "b"],
+    ] {
+        assert_eq!(
+            parsed(&twice),
+            Err(UsageError::Twice(twice[0])),
+            "{twice:?}"
+        );
+    }
+}
+
+#[test]
+fn a_webhook_certificate_that_cannot_be_used_stops_it_before_it_looks_for_a_cluster() {
+    let plane = file("webhook-plane.yaml", &plane_at("[::]:8080", "[::]:8443"));
+    let missing = std::env::temp_dir()
+        .join("edgerush-controller-tests")
+        .join("missing-webhook.crt");
+    let junk = file("junk-webhook.crt", "not a certificate");
+    for (path, said) in [
+        (missing.as_path(), "missing-webhook.crt"),
+        (junk.as_path(), "the certificate: "),
+    ] {
+        let path = path.to_str().unwrap();
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let status = command(
+            [
+                "--data-plane",
+                plane.to_str().unwrap(),
+                "--webhook-listen",
+                "127.0.0.1:0",
+                "--webhook-certificate",
+                path,
+                "--webhook-key",
+                path,
+            ]
+            .into_iter()
+            .map(ToOwned::to_owned),
+            &mut stdout,
+            &mut stderr,
+        );
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert_eq!(status, crate::EXIT_USAGE, "{stderr}");
+        assert!(
+            stderr.starts_with("error: the webhook's certificate: ") && stderr.contains(said),
+            "{stderr}"
+        );
+    }
+}
+
+/// A review of an Ingress, of class `edge` and annotated as `annotations` says.
+fn review_of(uid: &str, annotations: &str) -> Vec<u8> {
+    format!(
+        r#"{{"apiVersion":"admission.k8s.io/v1","kind":"AdmissionReview","request":{{"uid":"{uid}","kind":{{"group":"networking.k8s.io","version":"v1","kind":"Ingress"}},"operation":"CREATE","object":{{"metadata":{{"name":"web","namespace":"shop","annotations":{annotations}}},"spec":{{"ingressClassName":"edge","rules":[{{"host":"shop.example","http":{{"paths":[{{"path":"/","pathType":"Prefix","backend":{{"service":{{"name":"web","port":{{"number":80}}}}}}}}]}}}}]}}}}}}}}"#
+    )
+    .into_bytes()
+}
+
+fn classes(listed: bool) -> Listed<IngressClass> {
+    Listed {
+        listed,
+        objects: vec![
+            serde_json::from_str(
+                r#"{"metadata":{"name":"edge"},"spec":{"controller":"edgerush.dev/ingress-controller"}}"#,
+            )
+            .unwrap(),
+        ],
+    }
+}
+
+#[test]
+fn a_review_is_answered_once_the_classes_are_listed_and_what_is_none_is_a_bad_request() {
+    let plane: Plane = serde_saphyr::from_str(&plane_at("[::]:8080", "[::]:8443")).unwrap();
+    let answered = |listed: bool, body: &[u8]| {
+        let answer = review(&plane, &classes(listed), body);
+        (answer.status, String::from_utf8(answer.body).unwrap())
+    };
+    let (status, body) = answered(false, &review_of("u-1", "{}"));
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, "the IngressClasses are not listed yet");
+    let (status, body) = answered(true, &review_of("u-2", "{}"));
+    assert_eq!(status, StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["response"]["uid"], "u-2");
+    assert_eq!(body["response"]["allowed"], true);
+    let (status, body) = answered(true, &review_of("u-3", r#"{"x":"y"}"#));
+    assert_eq!(status, StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["response"]["allowed"], false);
+    assert_eq!(
+        body["response"]["status"]["message"],
+        "not supported yet: annotations"
+    );
+    let (status, body) = answered(true, b"not a review");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.starts_with("not an AdmissionReview"), "{body}");
+}
+
+/// The webhook's files, of `authority`'s certificate for `name`, in `dir`, each put in
+/// place whole, as Kubernetes swaps a mounted Secret's.
+fn webhook_files(dir: &str, authority: &Authority, name: &str) -> CertificateFiles {
+    let dir = std::env::temp_dir()
+        .join("edgerush-controller-tests")
+        .join(dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let files = CertificateFiles {
+        certificate: dir.join("tls.crt"),
+        key: dir.join("tls.key"),
+    };
+    put_webhook_files(&files, authority, name);
+    files
+}
+
+fn put_webhook_files(files: &CertificateFiles, authority: &Authority, name: &str) {
+    let put = |path: &Path, contents: &str| {
+        let beside = path.with_extension("partial");
+        std::fs::write(&beside, contents).unwrap();
+        std::fs::rename(&beside, path).unwrap();
+    };
+    let issued = authority.issue(&[name]);
+    put(&files.key, &issued.key);
+    put(&files.certificate, &issued.chain);
+}
+
+/// What the webhook at `address`, named `name`, answers `body` POSTed to it over HTTP/1.1,
+/// `authority` trusted: its status line and its body.
+async fn posted(address: &str, authority: &Authority, name: &str, body: &[u8]) -> (String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut builder = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
+    let mut trusted = boring::x509::store::X509StoreBuilder::new().unwrap();
+    for certificate in boring::x509::X509::stack_from_pem(authority.pem().as_bytes()).unwrap() {
+        trusted.add_cert(certificate).unwrap();
+    }
+    builder.set_verify_cert_store(trusted.build()).unwrap();
+    let connector = builder.build();
+    let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut stream = tokio_boring::connect(connector.configure().unwrap(), name, socket)
+        .await
+        .unwrap();
+    let mut request = format!(
+        "POST /validate HTTP/1.1\r\nhost: {name}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    stream.write_all(&request).await.unwrap();
+    let mut read = Vec::new();
+    let mut buffer = [0; 4096];
+    while let Ok(count @ 1..) = stream.read(&mut buffer).await {
+        read.extend_from_slice(&buffer[..count]);
+    }
+    let read = String::from_utf8(read).unwrap();
+    let (head, body) = read.split_once("\r\n\r\n").unwrap();
+    (head.lines().next().unwrap().to_owned(), body.to_owned())
+}
+
+/// The webhook answers each review as the IngressClasses it follows say, refusing an
+/// Ingress of the class that does not translate; its certificate files replaced are put to
+/// use for the next connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_webhook_answers_reviews_and_its_certificate_replaced_serves_the_next() {
+    let fake = cluster().await;
+    let authority = Authority::new("webhook");
+    let files = webhook_files("webhook", &authority, "webhook.test");
+    let certificate = files.read().await.unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let hooking = Hooking {
+        api: fake.client(
+            &token("controller-webhook-follows", "secret"),
+            Timing::default(),
+        ),
+        listener,
+        files: files.clone(),
+        certificate,
+        reread: Duration::from_millis(20),
+    };
+    // The control plane runs until the test is done with it.
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = Arc::clone(&done);
+    let reviewing = tokio::spawn(async move {
+        // Until its IngressClasses are listed, it has nothing to judge by.
+        let admitted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (status, body) = posted(
+                    &address,
+                    &authority,
+                    "webhook.test",
+                    &review_of("u-1", "{}"),
+                )
+                .await;
+                if status != "HTTP/1.1 503 Service Unavailable" {
+                    return (status, body);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("never answered but 503");
+        let refused = posted(
+            &address,
+            &authority,
+            "webhook.test",
+            &review_of("u-2", r#"{"x":"y"}"#),
+        )
+        .await;
+        put_webhook_files(&files, &authority, "renamed.test");
+        let renamed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let socket = tokio::net::TcpStream::connect(&address).await.unwrap();
+                let mut builder =
+                    boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
+                let mut trusted = boring::x509::store::X509StoreBuilder::new().unwrap();
+                for certificate in
+                    boring::x509::X509::stack_from_pem(authority.pem().as_bytes()).unwrap()
+                {
+                    trusted.add_cert(certificate).unwrap();
+                }
+                builder.set_verify_cert_store(trusted.build()).unwrap();
+                let connector = builder.build();
+                let connected =
+                    tokio_boring::connect(connector.configure().unwrap(), "renamed.test", socket)
+                        .await;
+                if connected.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        renamed
+            .await
+            .expect("the certificate replaced never served");
+        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        (admitted, refused)
+    });
+    let lines = run_until(
+        &fake,
+        "controller-webhook",
+        &plane_at("[::]:8080", "[::]:8443"),
+        None,
+        Listeners {
+            stream: None,
+            webhook: Some(hooking),
+        },
+        move |_| done.load(std::sync::atomic::Ordering::SeqCst),
+    )
+    .await;
+    let (admitted, refused) = reviewing.await.unwrap();
+    assert_eq!(admitted.0, "HTTP/1.1 200 OK");
+    let admitted: serde_json::Value = serde_json::from_str(&admitted.1).unwrap();
+    assert_eq!(admitted["response"]["allowed"], true, "{admitted}");
+    assert_eq!(refused.0, "HTTP/1.1 200 OK");
+    let refused: serde_json::Value = serde_json::from_str(&refused.1).unwrap();
+    assert_eq!(refused["response"]["uid"], "u-2");
+    assert_eq!(refused["response"]["allowed"], false, "{refused}");
+    assert_eq!(
+        refused["response"]["status"]["message"],
+        "not supported yet: annotations"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "the webhook's certificate is replaced"),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("for the webhook")),
+        "{lines:?}"
     );
 }
 
@@ -527,7 +853,10 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
         "controller-serves",
         &plane_at("[::]:8080", "[::]:8443"),
         None,
-        Some(serving),
+        Listeners {
+            stream: Some(serving),
+            webhook: None,
+        },
         |lines| runs(lines) == 2,
     )
     .await;

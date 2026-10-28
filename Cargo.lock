@@ -262,6 +262,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 name = "edgerush"
 version = "0.0.0"
 dependencies = [
+ "boring",
  "edgerush-certificates",
  "edgerush-config",
  "edgerush-control-service",
@@ -271,6 +272,7 @@ dependencies = [
  "edgerush-kubernetes",
  "edgerush-proxy",
  "edgerush-translate",
+ "http",
  "k8s-openapi",
  "proptest",
  "rustix",
@@ -281,6 +283,7 @@ dependencies = [
  "socket2",
  "thiserror",
  "tokio",
+ "tokio-boring",
 ]
 
 [[package]]
@@ -318,7 +321,10 @@ dependencies = [
  "edgerush-config",
  "edgerush-control-stream",
  "futures-core",
+ "h2",
  "http",
+ "http-body-util",
+ "hyper",
  "hyper-util",
  "prost",
  "serde-saphyr",
