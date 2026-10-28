@@ -9,12 +9,18 @@
     reason = "test set-up: the helpers around the tests fail them the way the tests would"
 )]
 
+use edgerush_certificates::testing::Authority;
+use edgerush_config::HarnessFile;
+use edgerush_control_service::{Credentials, Heard, acceptor, serve};
+use edgerush_control_stream::{Offer, Versions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
+use tokio::sync::watch;
 
 fn edgerush(args: &[&str]) -> io::Result<Output> {
     Command::new(env!("CARGO_BIN_EXE_edgerush"))
@@ -85,7 +91,9 @@ fn proxy_needs_a_config() -> io::Result<()> {
     let output = edgerush(&["proxy"])?;
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.starts_with("error: '--config <FILE>' is required"));
+    assert!(
+        stderr.starts_with("error: '--config <FILE>' or '--control-plane <ADDRESS>' is required")
+    );
     assert!(stderr.contains("Usage: edgerush proxy"));
     Ok(())
 }
@@ -243,6 +251,151 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
     Ok(())
 }
 
+/// The config `config` gives, as the control plane offers it.
+fn offered(yaml: &str, last: Option<&Offer>, versions: &mut Versions) -> Offer {
+    let file: HarnessFile = serde_saphyr::from_str(yaml).expect("a config");
+    let config = file.into_config(std::collections::BTreeMap::new(), None);
+    Offer::new(&config, last, versions).expect("an offer")
+}
+
+/// With `--control-plane`, nothing is served until the first config comes down the stream;
+/// then each config after it takes over, and one that cannot be run is said not to.
+#[test]
+fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> {
+    let (one, two) = (upstream("one")?, upstream("two")?);
+    let authority = Authority::new("stream");
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("stream");
+    std::fs::create_dir_all(&dir)?;
+    let issued = authority.issue(&["data-plane"]);
+    let file = |name: &str, contents: &str| -> io::Result<String> {
+        let path = dir.join(name);
+        std::fs::write(&path, contents)?;
+        Ok(path.to_str().expect("a path that is text").to_owned())
+    };
+    let (certificate, key, authorities) = (
+        file("tls.crt", &issued.chain)?,
+        file("tls.key", &issued.key)?,
+        file("ca.crt", &authority.pem())?,
+    );
+    let mut harness = Harness::start(&[
+        "--control-plane",
+        &address.to_string(),
+        "--certificate",
+        &certificate,
+        "--key",
+        &key,
+        "--authorities",
+        &authorities,
+        "--workers",
+        "1",
+    ])?;
+    harness.wait_for("waiting for the first config from the control plane at 127.0.0.1:");
+    // The control plane, serving no config yet.
+    let runtime = tokio::runtime::Runtime::new()?;
+    let (offers, offered_rx) = watch::channel(None);
+    let presented = Credentials {
+        certificate: authority.issue(&["127.0.0.1"]),
+        authorities: authority.pem(),
+    };
+    let tls = acceptor(&presented).expect("the control plane's TLS");
+    let (_tls, accepting) = watch::channel(Arc::new(tls));
+    listener.set_nonblocking(true)?;
+    // What the data plane reports of each config.
+    let (report, reports) = mpsc::channel();
+    let _serving = runtime.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).expect("a listener");
+        let heard = move |_peer: SocketAddr, heard: Heard| {
+            if let Heard::Reported(reported) = heard {
+                let _gone = report.send(reported);
+            }
+        };
+        serve(
+            listener,
+            accepting,
+            offered_rx,
+            heard,
+            std::future::pending(),
+        )
+        .await
+    });
+    let reported = || reports.recv_timeout(PATIENCE).expect("a report");
+    let mut versions = Versions::new(1);
+    // A first config that cannot be run is refused, and the next waited for.
+    let refused = offered(
+        &config("127.0.0.1:0", "elsewhere", Some(one)),
+        None,
+        &mut versions,
+    );
+    offers.send_replace(Some(Arc::new(refused.clone())));
+    assert_eq!(
+        harness.wait_for("config from the control plane refused"),
+        "config from the control plane refused:"
+    );
+    let report = reported();
+    assert_eq!(report.running.config, None);
+    let refusal = report.refused.expect("refused");
+    assert_eq!(refusal.config, refused.version());
+    assert!(refusal.why.contains("elsewhere"), "{}", refusal.why);
+    let first = offered(
+        &config("127.0.0.1:0", "up", Some(one)),
+        Some(&refused),
+        &mut versions,
+    );
+    offers.send_replace(Some(Arc::new(first.clone())));
+    let web = harness.address_after("listener \"web\" is on ");
+    harness.wait_for("config from the control plane runs");
+    assert!(get(web, "/")?.contains("x-upstream: one"));
+    let report = reported();
+    assert_eq!(report.running.config.as_deref(), Some(first.version()));
+    assert_eq!(report.refused, None);
+
+    // Another config: it takes over without a restart.
+    let second = offered(
+        &config("127.0.0.1:0", "up", Some(two)),
+        Some(&first),
+        &mut versions,
+    );
+    offers.send_replace(Some(Arc::new(second.clone())));
+    harness.wait_for("config from the control plane runs");
+    assert!(get(web, "/")?.contains("x-upstream: two"));
+    assert_eq!(reported().running.config.as_deref(), Some(second.version()));
+
+    // A config that cannot be run: said, and the one before it runs on.
+    let third = offered(
+        &config("127.0.0.1:0", "elsewhere", Some(one)),
+        Some(&second),
+        &mut versions,
+    );
+    offers.send_replace(Some(Arc::new(third.clone())));
+    let report = reported();
+    assert_eq!(report.running.config.as_deref(), Some(second.version()));
+    assert_eq!(
+        report.refused.map(|refusal| refusal.config),
+        Some(third.version().to_owned())
+    );
+    let refused = harness.wait_for("config from the control plane refused");
+    assert_eq!(
+        refused,
+        "config from the control plane refused, the one before it runs on:"
+    );
+    assert!(harness.wait_for("elsewhere").contains("upstream"));
+    assert!(get(web, "/")?.contains("x-upstream: two"));
+
+    // Certificate files replaced are said to be, by what the stream says as it goes.
+    let renewed = authority.issue(&["data-plane"]);
+    let put = |path: &str, contents: &str| -> io::Result<()> {
+        let beside = format!("{path}.partial");
+        std::fs::write(&beside, contents)?;
+        std::fs::rename(&beside, path)
+    };
+    put(&key, &renewed.key)?;
+    put(&certificate, &renewed.chain)?;
+    harness.wait_for("the config stream's certificates are replaced");
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn every_worker_serves_the_file_and_follows_it() -> io::Result<()> {
@@ -315,6 +468,44 @@ fn what_every_worker_counts_is_added_up_in_one_scrape() -> io::Result<()> {
 /// Told to stop, the harness drains (03 §10): a request under way is answered, saying the
 /// connection closes; nothing new is taken; and the process exits once the last
 /// connection has gone.
+/// Told to stop while it waits for its first config, it exits as asked, not as a signal's
+/// default action would have it.
+#[cfg(unix)]
+#[test]
+fn told_to_stop_while_it_waits_for_its_first_config_it_exits() -> io::Result<()> {
+    let authority = Authority::new("stream");
+    // An address nothing listens on.
+    let address = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("stream-waits");
+    std::fs::create_dir_all(&dir)?;
+    let issued = authority.issue(&["data-plane"]);
+    let file = |name: &str, contents: &str| -> io::Result<String> {
+        let path = dir.join(name);
+        std::fs::write(&path, contents)?;
+        Ok(path.to_str().expect("a path that is text").to_owned())
+    };
+    let (certificate, key, authorities) = (
+        file("tls.crt", &issued.chain)?,
+        file("tls.key", &issued.key)?,
+        file("ca.crt", &authority.pem())?,
+    );
+    let mut harness = Harness::start(&[
+        "--control-plane",
+        &address.to_string(),
+        "--certificate",
+        &certificate,
+        "--key",
+        &key,
+        "--authorities",
+        &authorities,
+    ])?;
+    harness.wait_for("waiting for the first config from the control plane");
+    harness.wait_for("dialled again in");
+    harness.signal("TERM")?;
+    assert!(harness.exited()?.success());
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn told_to_stop_it_finishes_what_is_under_way_and_exits() -> io::Result<()> {

@@ -298,7 +298,7 @@ impl Display for Unreadable {
 
 /// Every problem of a config, a line each.
 #[derive(Debug)]
-pub(crate) struct Problems(Vec<ConfigError>);
+pub(crate) struct Problems(pub(crate) Vec<ConfigError>);
 
 impl Display for Problems {
     fn fmt(&self, to: &mut Formatter<'_>) -> fmt::Result {

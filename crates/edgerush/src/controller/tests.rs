@@ -470,7 +470,7 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
         let mut staging = Staging::new();
         edgerush_control_service::follow(&address, "control.test", &tls, &mut staging, |config| {
             let _ = ran.send(*config);
-            Ok(())
+            std::future::ready(Ok(()))
         })
         .await
     });
@@ -500,8 +500,10 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
         })
         .unwrap();
         let mut staging = Staging::new();
-        edgerush_control_service::follow(&address, "control.test", &tls, &mut staging, |_| Ok(()))
-            .await
+        edgerush_control_service::follow(&address, "control.test", &tls, &mut staging, |_| {
+            std::future::ready(Ok(()))
+        })
+        .await
     });
     let runs = |lines: &[String]| {
         lines

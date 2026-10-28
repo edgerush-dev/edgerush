@@ -1,0 +1,205 @@
+# What kind/stream.sh runs: a backend Service in `shop` behind an Ingress of class `edge`;
+# in `edge`, the control plane, which follows `shop` and serves the config stream, and a data
+# plane that dials it. Each holds a certificate of the stream's own authority, from the
+# Secrets the script makes. The data plane may only list and watch EndpointSlices in `shop`
+# (09 §1); the control plane reads the cluster's IngressClasses and `shop`'s Ingresses,
+# Services and Secrets.
+apiVersion: v1
+kind: Namespace
+metadata: { name: shop }
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: edge }
+---
+# The backend: agnhost's netexec, which answers /hostname with the name of its pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web, namespace: shop }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: web } }
+  template:
+    metadata: { labels: { app: web } }
+    spec:
+      containers:
+        - name: web
+          image: AGNHOST
+          args: ["netexec", "--http-port=8080"]
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 1 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  selector: { app: web }
+  ports: [{ name: http, port: 80, targetPort: http }]
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata: { name: edge }
+spec: { controller: edgerush.dev/ingress-controller }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: web, port: { name: http } } }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: edgerush-control, namespace: edge }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: edgerush-control-ingressclasses }
+rules:
+  - apiGroups: [networking.k8s.io]
+    resources: [ingressclasses]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: edgerush-control-ingressclasses }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edgerush-control-ingressclasses }
+subjects: [{ kind: ServiceAccount, name: edgerush-control, namespace: edge }]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: edgerush-control, namespace: shop }
+rules:
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [list, watch]
+  - apiGroups: [""]
+    resources: [services, secrets]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: edgerush-control, namespace: shop }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: edgerush-control }
+subjects: [{ kind: ServiceAccount, name: edgerush-control, namespace: edge }]
+---
+# The data plane's settings, as the control plane translates for it.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: edgerush-plane, namespace: edge }
+data:
+  plane.yaml: |
+    ingress_class: edge
+    cluster_domain: cluster.local
+    ingress_hosts_fall_through: false
+    ingress_https_redirect: false
+    ingress_https_redirect_max_age: 30
+    listeners:
+      http:
+        address: "0.0.0.0:8080"
+        protocol: http
+        proxy_protocol: off
+        forwarding: { trusted_proxies: [], trusted_only_headers: [] }
+        request_id: generate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: edgerush-control, namespace: edge }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: edgerush-control } }
+  template:
+    metadata: { labels: { app: edgerush-control } }
+    spec:
+      serviceAccountName: edgerush-control
+      containers:
+        - name: edgerush
+          image: edgerush:kind
+          imagePullPolicy: Never
+          args:
+            - controller
+            - --data-plane
+            - /etc/edgerush/plane.yaml
+            - --namespace
+            - shop
+            - --listen
+            - "0.0.0.0:9443"
+            - --certificate
+            - /etc/edgerush/stream/tls.crt
+            - --key
+            - /etc/edgerush/stream/tls.key
+            - --authorities
+            - /etc/edgerush/stream/ca.crt
+          ports: [{ name: stream, containerPort: 9443 }]
+          volumeMounts:
+            - { name: plane, mountPath: /etc/edgerush }
+            - { name: stream, mountPath: /etc/edgerush/stream }
+      volumes:
+        - name: plane
+          configMap: { name: edgerush-plane }
+        - name: stream
+          secret: { secretName: edgerush-control-stream }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: edgerush-control, namespace: edge }
+spec:
+  selector: { app: edgerush-control }
+  ports: [{ name: stream, port: 9443, targetPort: stream }]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: edgerush, namespace: edge }
+---
+# The data plane's one permission: list and watch EndpointSlices, here in `shop` alone.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: endpointslices, namespace: shop }
+rules:
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: edgerush, namespace: shop }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: endpointslices }
+subjects: [{ kind: ServiceAccount, name: edgerush, namespace: edge }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: edgerush, namespace: edge }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: edgerush } }
+  template:
+    metadata: { labels: { app: edgerush } }
+    spec:
+      serviceAccountName: edgerush
+      containers:
+        - name: edgerush
+          image: edgerush:kind
+          imagePullPolicy: Never
+          args:
+            - proxy
+            - --control-plane
+            - edgerush-control.edge.svc:9443
+            - --certificate
+            - /etc/edgerush/stream/tls.crt
+            - --key
+            - /etc/edgerush/stream/tls.key
+            - --authorities
+            - /etc/edgerush/stream/ca.crt
+            - --workers
+            - "1"
+          ports: [{ name: http, containerPort: 8080 }]
+          volumeMounts: [{ name: stream, mountPath: /etc/edgerush/stream }]
+      volumes:
+        - name: stream
+          secret: { secretName: edgerush-data-plane-stream }

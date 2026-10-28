@@ -15,6 +15,7 @@ mod explain;
 mod harness;
 mod limits;
 mod per_core;
+mod stream;
 mod testing;
 mod validate;
 
