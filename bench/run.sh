@@ -156,6 +156,12 @@ repo=$(dirname "$here")
 # The rate-limiting service's cycle, in milliseconds: the data planes' and the pod's alike
 # (the synchronous pod's between its copies of what changed).
 : "${RL_CYCLE_MS:=10}"
+# The per-client limit of every rate-limited variant: RL_RATE (`64000/s`) with a bucket of
+# RL_BURST. The asynchronous mode refuses a limit whose burst and two cycles' refill pass
+# 65,535, the most a key's cycle holds; these keep within it up to a cycle of 120 ms. A
+# load from one client address past RL_RATE is refused in part.
+: "${RL_RATE:=64000/s}"
+: "${RL_BURST:=50000}"
 # The ours-sync variant's wait for its owner, in milliseconds, and what a request does when
 # the owner does not answer in time: deny, so that it shows among the answers that are not
 # 2xx rather than passing as served; allow or local otherwise.
@@ -384,7 +390,7 @@ envoy_config() { # template
     rate=$(rl_per_second) || exit 2
     [ "$RL_SYNC_UNREACHABLE" = deny ] && deny=true
     [ "$TLS" = 1 ] && certificate
-    python3 - "$1" "$run-envoy.yaml" "$rate" "${RL_BURST:-100000000}" "$RL_SYNC_TIMEOUT_MS" \
+    python3 - "$1" "$run-envoy.yaml" "$rate" "$RL_BURST" "$RL_SYNC_TIMEOUT_MS" \
         "$deny" "$TLS" "$tls" <<'PY'
 import re, sys
 template, out, rate, burst, timeout_ms, deny, tls, tls_dir = sys.argv[1:]
@@ -593,7 +599,7 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
             # limit_req: a leaky bucket a client address, in the workers' shared memory,
             # refusing at once past its burst, as a bucket does.
             sed -i "s#^http {#http {\n    limit_req_zone \$binary_remote_addr zone=per_client:256m rate=${per_second}r/s;\n    limit_req_status 429;#;
-                s#^        location / {#&\n            limit_req zone=per_client burst=${RL_BURST:-100000000} nodelay;#" \
+                s#^        location / {#&\n            limit_req zone=per_client burst=$RL_BURST nodelay;#" \
                 "$run-proxy/nginx.conf"
             grep -q 'limit_req zone=per_client' "$run-proxy/nginx.conf"
         fi
@@ -710,7 +716,7 @@ CFG
 
 # RL_RATE as requests a second, for nginx-rl and haproxy-rl, which take it no other way.
 rl_per_second() {
-    local rate=${RL_RATE:-100000000/s}
+    local rate=$RL_RATE
     case "$rate" in
     */s) echo "${rate%/s}" ;;
     *)
@@ -720,9 +726,8 @@ rl_per_second() {
     esac
 }
 
-# The config under a per-client limit, RL_RATE with a bucket of RL_BURST — unless set,
-# room for everything the load sends, so that what is measured is deciding rather than
-# refusing — its levers as `$1` says.
+# The config under a per-client limit, RL_RATE with a bucket of RL_BURST, its levers as
+# `$1` says.
 rl_config() { # levers
     local sharing
     levers() { # poll_quiet_keys schedule_keys
@@ -743,7 +748,7 @@ rl_config() { # levers
     esac
     cat >"$run-limits.yaml" <<LIMITS
 limits:
-  - { name: per-client, key: client, model: { bucket: { rate: ${RL_RATE:-100000000/s}, burst: ${RL_BURST:-100000000} } } }
+  - { name: per-client, key: client, model: { bucket: { rate: $RL_RATE, burst: $RL_BURST } } }
 LIMITS
     python3 - "$config" "$config.rl" <<'PY'
 import sys
@@ -861,7 +866,7 @@ ratelimit_runs() {
         ${RL_RESIDENT:+--resident "$RL_RESIDENT"}
     # The proxy's own counts after it, where it serves them: its answers by kind, its keys
     # and its background thread's work.
-    if [ -n "$METRICS" ]; then
+    if [ -n "${METRICS:-}" ]; then
         curl -s "http://$METRICS/metrics" >"$OUT/$1.keys-h1.metrics" || true
     fi
     # The CPU each of the proxy's threads spent over the three, in clock ticks: the
