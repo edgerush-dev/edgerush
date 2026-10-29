@@ -482,7 +482,11 @@ dependencies = [
 name = "edgerush-ratelimit-service"
 version = "0.0.0"
 dependencies = [
+ "boring",
  "bytes",
+ "edgerush-certificates",
+ "edgerush-config",
+ "edgerush-control-service",
  "edgerush-ratelimit",
  "edgerush-telemetry",
  "futures-core",
@@ -494,6 +498,7 @@ dependencies = [
  "prost",
  "thiserror",
  "tokio",
+ "tokio-boring",
  "tonic",
  "tower-service",
 ]

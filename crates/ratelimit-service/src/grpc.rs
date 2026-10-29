@@ -6,7 +6,9 @@
 //! - `Heartbeat`: a pod's heartbeat, for every other.
 
 use crate::pod::Pod;
+use crate::secure::{self, Caller, Dialler, refused};
 use crate::wire;
+use boring::ssl::SslConnector;
 use bytes::Buf;
 use edgerush_ratelimit::service::{self, membership};
 use http::uri::PathAndQuery;
@@ -16,6 +18,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::sync::watch;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::server::NamedService;
 use tonic::transport::{Channel, Endpoint};
@@ -187,6 +190,13 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for Server {
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let pod = self.pod.clone();
         Box::pin(async move {
+            let allowed = match request.uri().path() {
+                EXCHANGE => Caller::DataPlane,
+                _ => Caller::Pod,
+            };
+            if let Some(status) = refused(&request, allowed) {
+                return Ok(status.into_http());
+            }
             Ok(match request.uri().path() {
                 EXCHANGE => {
                     let mut grpc = limited(Prost::<wire::Answers, wire::Batch>::default());
@@ -218,9 +228,21 @@ pub enum Error {
     /// The answer cannot be used.
     #[error("an answer that cannot be used: {0}")]
     Invalid(#[from] wire::Invalid),
+    /// The address names no host to check a certificate against.
+    #[error("an address with no host")]
+    NoHost,
     /// The message is longer than [`MAX_MESSAGE`]: not sent.
     #[error("a message of {0} bytes, longer than the {MAX_MESSAGE} a call takes")]
     TooLong(usize),
+}
+
+/// Where a client connects, and how its calls are timed and its connection watched.
+fn endpoint(address: &str) -> Result<Endpoint, Error> {
+    Ok(Endpoint::from_shared(format!("http://{address}"))?
+        .timeout(CALL_TIMEOUT)
+        .http2_keep_alive_interval(KEEP_ALIVE)
+        .keep_alive_timeout(KEEP_ALIVE)
+        .keep_alive_while_idle(true))
 }
 
 /// A client of one service pod. Cheap to clone: clones share the connection, made when
@@ -231,20 +253,30 @@ pub struct Client {
 }
 
 impl Client {
-    /// A client of the service pod at `address` (`host:port`).
+    /// A client of the service pod at `address` (`host:port`), spoken to plain.
     ///
     /// # Errors
     ///
     /// When `address` cannot be made into a URI.
     pub fn new(address: &str) -> Result<Self, Error> {
-        let channel = Endpoint::from_shared(format!("http://{address}"))?
-            .timeout(CALL_TIMEOUT)
+        let channel = endpoint(address)?
             .connect_timeout(CALL_TIMEOUT)
-            .http2_keep_alive_interval(KEEP_ALIVE)
-            .keep_alive_timeout(KEEP_ALIVE)
-            .keep_alive_while_idle(true)
             .tcp_nodelay(true)
             .connect_lazy();
+        Ok(Self { channel })
+    }
+
+    /// A client of the service pod at `address` (`host:port`), spoken to with the latest
+    /// of `tls` as each connection is made: its certificate checked against the host.
+    ///
+    /// # Errors
+    ///
+    /// When `address` cannot be made into a URI, or names no host.
+    pub fn secured(address: &str, tls: watch::Receiver<SslConnector>) -> Result<Self, Error> {
+        let endpoint = endpoint(address)?;
+        let name = secure::host(endpoint.uri()).ok_or(Error::NoHost)?;
+        let dialler = Dialler::new(address, name, tls, CALL_TIMEOUT);
+        let channel = endpoint.connect_with_connector_lazy(dialler);
         Ok(Self { channel })
     }
 

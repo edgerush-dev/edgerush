@@ -252,6 +252,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-control-service"
+version = "0.0.0"
+dependencies = [
+ "boring",
+ "bytes",
+ "edgerush-certificates",
+ "edgerush-config",
+ "edgerush-control-stream",
+ "futures-core",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "prost",
+ "thiserror",
+ "tokio",
+ "tokio-boring",
+ "tonic",
+ "tower-service",
+]
+
+[[package]]
+name = "edgerush-control-stream"
+version = "0.0.0"
+dependencies = [
+ "edgerush-config",
+ "prost",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "edgerush-controller"
 version = "0.0.0"
 dependencies = [
@@ -389,7 +421,10 @@ dependencies = [
 name = "edgerush-ratelimit-service"
 version = "0.0.0"
 dependencies = [
+ "boring",
  "bytes",
+ "edgerush-config",
+ "edgerush-control-service",
  "edgerush-ratelimit",
  "edgerush-telemetry",
  "futures-core",
@@ -400,6 +435,7 @@ dependencies = [
  "prost",
  "thiserror",
  "tokio",
+ "tokio-boring",
  "tonic",
  "tower-service",
 ]

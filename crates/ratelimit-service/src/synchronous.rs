@@ -15,6 +15,7 @@
 pub mod wire;
 
 use crate::grpc::{Boxed, Client, Error, HEARTBEAT, MAX_MESSAGE, Prost, limited};
+use crate::secure::{Caller, refused};
 use crate::wire::{Empty, Heartbeat as WireHeartbeat};
 use edgerush_ratelimit::service::membership::{Heartbeat, Membership};
 use edgerush_ratelimit::service::{PodId, View};
@@ -646,6 +647,13 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for SyncServer {
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let pod = self.pod.clone();
         Box::pin(async move {
+            let allowed = match request.uri().path() {
+                DECIDE => Caller::DataPlane,
+                _ => Caller::Pod,
+            };
+            if let Some(status) = refused(&request, allowed) {
+                return Ok(status.into_http());
+            }
             if pod.pod.stopped() {
                 return Ok(Status::unavailable("stopped").into_http());
             }
