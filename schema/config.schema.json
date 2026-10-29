@@ -15,6 +15,7 @@
       "description": "The data plane's own settings; left out, each has its value.",
       "$ref": "#/$defs/DataPlane",
       "default": {
+        "experimental_unrestricted_egress": null,
         "set_aside_ms": null
       }
     },
@@ -180,6 +181,14 @@
       "description": "The whole data plane's own settings:\nbounds rather than behaviour, each with its value when left out. The control plane fills\nthem from the `DataPlane` resource; they reload with the rest of the config.",
       "type": "object",
       "properties": {
+        "experimental_unrestricted_egress": {
+          "description": "Whether addresses discovered or resolved are sent to whatever they are, loopback,\nlink-local, the pod's own and the gateway's other pods among them: experimental, for\ndevelopment, until a development profile takes it over. Off when left out.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
         "set_aside_ms": {
           "description": "Milliseconds an endpoint that could not be connected to is set aside before a\nconnect probe may bring it back; 5,000\nwhen left out.",
           "type": [

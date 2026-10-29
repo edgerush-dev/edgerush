@@ -439,6 +439,39 @@ fn the_gateways_own_pods_are_refused_as_they_are_named() {
     assert_eq!(addresses_of(&proxy, 1), ["10.0.0.3:8080"]);
 }
 
+/// The experimental switch: nothing discovered or resolved is refused.
+#[test]
+fn unrestricted_egress_refuses_nothing() {
+    let config: Config = serde_saphyr::from_str(
+        "listeners: {}
+routes: []
+upstreams:
+  web: { load_balancer: p2c, endpoints: { kubernetes: \"web.shop.svc.cluster.local:http\" } }
+data_plane: { experimental_unrestricted_egress: true }
+",
+    )
+    .unwrap();
+    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+    proxy.deny(
+        crate::egress::Denied {
+            own: vec!["10.0.0.9".parse().unwrap()],
+            api_server: None,
+            gateway: vec!["10.0.0.8".parse().unwrap()],
+        },
+        |_, _, _| panic!("refused, unrestricted"),
+    );
+    let slices = vec![slice(
+        "web",
+        "http",
+        &["10.0.0.8", "10.0.0.9", "169.254.169.254"],
+    )];
+    assert!(proxy.rediscover([shop(slices)]).unwrap());
+    assert_eq!(
+        addresses_of(&proxy, 0),
+        ["10.0.0.8:8080", "10.0.0.9:8080", "169.254.169.254:8080"]
+    );
+}
+
 /// A config that comes to name another Service of a namespace followed has its endpoints
 /// in the very snapshot that takes it in, the Service's only port unnamed as much as named.
 #[test]

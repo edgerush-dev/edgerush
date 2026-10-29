@@ -447,6 +447,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     let mut bound: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
     // Limits checked but enforced in none is said once, so that a mode left out is seen.
     let unenforced = (!config.rate_limiting().enforces()).then_some(config.limits().len());
+    let unrestricted_from_start = unrestricted(&config);
     let proxy = Proxy::new(config, workers)
         .map(Arc::new)
         .map_err(|error| Failure::Proxy {
@@ -462,6 +463,9 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     denied.gateway = gateway;
     if let Some(warning) = own_unknown(&denied, cluster.is_ok()) {
         say(stderr, format_args!("{warning}"));
+    }
+    if let Some(warning) = unrestricted_from_start {
+        say(stderr, format_args!("warning: {warning}"));
     }
     proxy.deny(denied, |upstream, address, why| {
         say(
@@ -807,7 +811,8 @@ fn runnable(config: &Compiled, outside: Option<&ApiError>) -> Result<(), String>
 /// them sees the old config after another has seen the new one: what takes a restart, its
 /// listeners being bound once, or why it was refused.
 fn reloaded(proxy: &Proxy, bound: &[Bound], config: Compiled) -> Result<Vec<String>, String> {
-    let warnings = restart_needed(bound, &config);
+    let mut warnings = restart_needed(bound, &config);
+    warnings.extend(unrestricted(&config).map(ToOwned::to_owned));
     proxy.reload(config).map_err(|error| error.to_string())?;
     Ok(warnings)
 }
@@ -1058,6 +1063,14 @@ fn denied(pod_ips: Option<&str>, api_server: Option<&str>) -> edgerush_proxy::eg
     }
 }
 
+/// What is said of a config that sets the experimental switch off default-deny egress, at
+/// each config that sets it (03 §6).
+fn unrestricted(config: &Compiled) -> Option<&'static str> {
+    config.data_plane().unrestricted_egress.then_some(
+        "data_plane.experimental_unrestricted_egress is set: addresses discovered or resolved          are sent to whatever they are, loopback, link-local and the gateway's own pods among          them; for development alone",
+    )
+}
+
 /// What is said of a data plane in a cluster that was not given its own addresses: that it
 /// sends to them until something else names them (03 §6). Nothing, outside a cluster, where
 /// there is no pod.
@@ -1206,6 +1219,29 @@ mod tests {
 
     fn parsed(args: &[&str]) -> Result<Parsed, UsageError> {
         parse(args.iter().map(ToString::to_string))
+    }
+
+    #[test]
+    fn a_config_that_unrestricts_egress_says_so() {
+        let config = |data_plane: &str| {
+            let config: Config = serde_saphyr::from_str(&format!(
+                "listeners: {{}}
+routes: []
+upstreams: {{}}
+{data_plane}"
+            ))
+            .unwrap();
+            compile(&config).unwrap()
+        };
+        assert_eq!(unrestricted(&config("")), None);
+        assert_eq!(
+            unrestricted(&config(
+                "data_plane: { experimental_unrestricted_egress: false }"
+            )),
+            None
+        );
+        let on = config("data_plane: { experimental_unrestricted_egress: true }");
+        assert!(unrestricted(&on).is_some_and(|said| said.contains("for development alone")));
     }
 
     #[test]

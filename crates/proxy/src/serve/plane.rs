@@ -191,6 +191,8 @@ fn resolved(config: &Compiled, found: Found<'_>) -> Endpointed {
     for (addresses, checked) in all {
         let mut kept = Vec::with_capacity(addresses.len());
         let mut refused = Vec::new();
+        // Unrestricted, by the experimental switch, nothing is checked.
+        let checked = checked && !config.data_plane().unrestricted_egress;
         for address in addresses {
             match denied.refusal(address.ip()).filter(|_| checked) {
                 Some(why) => refused.push((address, why)),
