@@ -40,8 +40,9 @@ pub mod pooled;
 pub use keyed::Keyed;
 
 use crate::reference::{BucketState, Model, TokenBucket};
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+use pooled::chunked::MinHeap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::num::NonZeroU64;
 
 /// How many cycles a data plane waits to see a batch applied before sending it again.
@@ -745,11 +746,45 @@ fn plane_key_bytes(key: &[u8]) -> u64 {
     (size_of::<(Box<[u8]>, PlaneKey)>() + 1 + key.len()) as u64
 }
 
-/// What a service pod counts a key as holding: as a data plane does, and the room for its
-/// records of the data planes admitting it.
+/// What a service pod counts a key as holding: as a data plane does, the room for its
+/// records of the data planes admitting it, and its time to be looked at with its own copy
+/// of the key.
 fn pod_key_bytes(key: &[u8], owned: &Owned) -> u64 {
-    let records = owned.planes.room() * size_of::<(PlaneId, Record)>();
-    (size_of::<(Box<[u8]>, Owned)>() + 1 + key.len() + records) as u64
+    let due = size_of::<KeyDue>() + key.len();
+    (size_of::<(Box<[u8]>, Owned)>() + 1 + key.len() + records_bytes(owned.planes.room()) + due)
+        as u64
+}
+
+/// What room for `room` records of data planes takes.
+const fn records_bytes(room: usize) -> usize {
+    room * size_of::<(PlaneId, Record)>()
+}
+
+/// When a service pod is next to look at a key it holds: to forget it, or to retire the
+/// records of data planes silent on it. One for each key.
+struct KeyDue {
+    at: u64,
+    key: Box<[u8]>,
+}
+
+impl PartialEq for KeyDue {
+    fn eq(&self, other: &Self) -> bool {
+        self.at == other.at
+    }
+}
+
+impl Eq for KeyDue {}
+
+impl PartialOrd for KeyDue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KeyDue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.at.cmp(&other.at)
+    }
 }
 
 /// Of `keys`, those evictable with when each was last used, the least recently used going
@@ -770,6 +805,33 @@ fn least_recently_used(
         })
         .map(|(_, key, _)| key)
         .collect()
+}
+
+/// Of `(time, bytes)` pairs, the time by which the earliest hold `need` bytes: those before
+/// it hold less, those up to it at least. Found by halving the pairs about their middle
+/// time, which takes about twice as many steps as there are pairs, rather than sorting
+/// them all. `u64::MAX` if they all hold less; 0 if nothing is needed.
+fn earliest_holding(mut pairs: &mut [(u64, u64)], mut need: u64) -> u64 {
+    if need == 0 {
+        return 0;
+    }
+    loop {
+        if pairs.is_empty() {
+            return u64::MAX;
+        }
+        let middle = pairs.len() / 2;
+        let (before, &mut (time, bytes), after) =
+            pairs.select_nth_unstable_by_key(middle, |&(time, _)| time);
+        let held: u64 = before.iter().map(|&(_, bytes)| bytes).sum();
+        if held >= need {
+            pairs = before;
+        } else if held.saturating_add(bytes) >= need {
+            return time;
+        } else {
+            need -= held + bytes;
+            pairs = after;
+        }
+    }
 }
 
 impl<S: BuildHasher + Default + Clone> DataPlane<S> {
@@ -1322,8 +1384,9 @@ impl Records {
     }
 
     /// Lets go of the records of data planes that have admitted nothing within `kept` of
-    /// `now`, those that never have among them, and of the room they took.
-    fn retire(&mut self, now: u64, kept: u64) {
+    /// `now`, those that never have among them, and of the room they took: when the next of
+    /// those left is to go, if no data plane admits again meanwhile.
+    fn retire(&mut self, now: u64, kept: u64) -> u64 {
         let before = self.0.len();
         self.0.retain(|(_, record)| {
             record
@@ -1334,6 +1397,11 @@ impl Records {
         if self.0.len() < before {
             self.0.shrink_to_fit();
         }
+        self.0
+            .iter()
+            .filter_map(|(_, record)| record.last_admitted.get())
+            .min()
+            .map_or(u64::MAX, |at| at.saturating_add(kept).saturating_add(1))
     }
 }
 
@@ -1425,9 +1493,9 @@ impl Owned {
     /// Takes in what `mine` applied of the key while this copy was on its way: its count
     /// since its pod took up the view charged on top, and the furthest of each data plane's
     /// marks.
-    fn merge(&mut self, mine: Owned, now: u64) {
+    fn merge(&mut self, mine: &Owned, now: u64) {
         self.apply(mine.counted.saturating_sub(mine.since), now, now);
-        for (plane, record) in mine.planes {
+        for (plane, record) in mine.planes.iter() {
             let ours = self.planes.entry(plane);
             ours.applied = ours.applied.max(record.applied);
             ours.last_admitted = ours.last_admitted.max(record.last_admitted);
@@ -1453,6 +1521,25 @@ impl Owned {
     }
 }
 
+/// A copy waiting to go to another pod, the same as another of the same key: a key changed
+/// again replaces its copy in one step, rather than in a search of those waiting.
+#[derive(Debug)]
+struct ByKey(Replica);
+
+impl PartialEq for ByKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.key == other.0.key
+    }
+}
+
+impl Eq for ByKey {}
+
+impl Hash for ByKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.key.hash(state);
+    }
+}
+
 /// A service pod's side of the protocol: the keys it owns, and a copy of every other key
 /// the service holds.
 pub struct ServicePod<S = FixedState> {
@@ -1460,7 +1547,14 @@ pub struct ServicePod<S = FixedState> {
     cycle: u64,
     view: View,
     keys: HashMap<Box<[u8]>, Owned, S>,
-    replicas: BTreeMap<PodId, Vec<Replica>>,
+    /// When to look at each key next, so that its timer visits only the keys due rather
+    /// than every key it holds. One for each key; a key evicted takes its own out with it.
+    due: MinHeap<KeyDue>,
+    /// Keys its timer has looked at, all told.
+    #[cfg(test)]
+    looked: u64,
+    /// Copies waiting to go, to each pod one a key: the latest.
+    replicas: BTreeMap<PodId, HashSet<ByKey, S>>,
     handovers: BTreeMap<PodId, Vec<Replica>>,
     /// Whether the view it holds took it in: until then it answers with its view alone.
     serving: bool,
@@ -1471,8 +1565,8 @@ pub struct ServicePod<S = FixedState> {
     grace: u64,
     /// Until when it makes no key afresh.
     fresh_from: u64,
-    /// The bytes its keys may hold, as [`pod_key_bytes`] counts them, what they held at the
-    /// last timer, and the keys it has evicted to stay within it, all told.
+    /// The bytes its keys may hold, as [`pod_key_bytes`] counts them, what they hold, and the
+    /// keys it has evicted to stay within it, all told.
     capacity: u64,
     holding: u64,
     evicted: u64,
@@ -1491,6 +1585,9 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             cycle: cycle.max(1),
             view,
             keys: HashMap::default(),
+            due: MinHeap::new(),
+            #[cfg(test)]
+            looked: 0,
             replicas: BTreeMap::new(),
             handovers: BTreeMap::new(),
             serving: true,
@@ -1528,7 +1625,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         self.capacity = bytes;
     }
 
-    /// The bytes its keys held at its last timer, as it counts them.
+    /// The bytes its keys hold, as it counts them.
     #[must_use]
     pub fn holding(&self) -> u64 {
         self.holding
@@ -1582,8 +1679,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 if now < self.fresh_from {
                     continue;
                 }
-                self.keys
-                    .insert(entry.key.clone(), Owned::new(entry.contract, now));
+                self.hold(entry.key.clone(), Owned::new(entry.contract, now), now);
             }
             let Some(owned) = self.keys.get_mut(&entry.key) else {
                 continue;
@@ -1595,6 +1691,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 .map(|(_, record)| record.last_admitted)
                 .max()
                 .unwrap_or_default();
+            let room = owned.planes.room();
             let record = owned.planes.entry(from);
             let mut changed = false;
             if let Report::Hits {
@@ -1632,6 +1729,8 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 );
                 owned.apply(ready.count, ready.at, now);
             }
+            let grown = records_bytes(owned.planes.room().saturating_sub(room));
+            self.holding = self.holding.saturating_add(grown as u64);
             let applied = owned.planes.get(from).map_or(0, |record| record.applied);
             answers.push(Answer {
                 key: entry.key.clone(),
@@ -1664,10 +1763,11 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             if pod == self.me {
                 continue;
             }
-            let copies = self.replicas.entry(pod).or_default();
             // One copy of a key a batch: the last made holds the others.
-            copies.retain(|copy| copy.key != replica.key);
-            copies.push(replica.clone());
+            self.replicas
+                .entry(pod)
+                .or_default()
+                .replace(ByKey(replica.clone()));
         }
     }
 
@@ -1717,12 +1817,12 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 touched: now,
             };
             if replicas.handover
-                && let Some(mine) = self.keys.remove(&replica.key)
+                && let Some(mine) = self.keys.get(&replica.key)
                 && mine.contract == copy.contract
             {
                 copy.merge(mine, now);
             }
-            self.keys.insert(replica.key, copy);
+            self.hold(replica.key, copy, now);
         }
     }
 
@@ -1764,7 +1864,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 self.replicas
                     .entry(pod)
                     .or_default()
-                    .push(owned.replica(key, now));
+                    .replace(ByKey(owned.replica(key, now)));
             }
         }
         if !before.pods.contains(&self.me) && self.view.pods.contains(&self.me) {
@@ -1780,35 +1880,99 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         }
     }
 
-    /// The pod's timer at `now`: keys full again and quiet for a refill time are dropped,
-    /// owned or copies, and the records of data planes silent on a key kept are retired.
+    /// Holds `owned` as `key`, in place of what it held of it, if anything: counted in what
+    /// its keys hold, and a key new to it looked at first at `now`.
+    fn hold(&mut self, key: Box<[u8]>, owned: Owned, now: u64) {
+        let bytes = pod_key_bytes(&key, &owned);
+        if let Some(held) = self.keys.get_mut(&key) {
+            self.holding = self
+                .holding
+                .saturating_sub(pod_key_bytes(&key, held))
+                .saturating_add(bytes);
+            *held = owned;
+        } else {
+            self.holding = self.holding.saturating_add(bytes);
+            self.due.push(KeyDue {
+                at: now,
+                key: key.clone(),
+            });
+            self.keys.insert(key, owned);
+        }
+    }
+
+    /// The pod's timer at `now`: of the keys due, those full again and quiet for a refill
+    /// time are dropped, owned or copies, and the records of data planes silent on those
+    /// kept retired; each kept is looked at again when the first of those may next happen.
+    /// Past its capacity, the least recently changed keys go.
     pub fn on_timer(&mut self, now: u64) {
-        let mut holding = 0;
-        self.keys.retain(|key, owned| {
-            let refill_time = owned.contract.refill_time();
-            let keep = now.saturating_sub(owned.touched) <= refill_time
-                || owned.bucket().forgettable_at() > now;
-            if keep {
-                owned.planes.retire(now, refill_time.max(RECORD_KEPT));
-                holding += pod_key_bytes(key, owned);
+        while self.due.peek().is_some_and(|due| due.at <= now) {
+            let Some(due) = self.due.pop() else {
+                break;
+            };
+            let Some(owned) = self.keys.get_mut(&due.key) else {
+                continue;
+            };
+            #[cfg(test)]
+            {
+                self.looked += 1;
             }
-            keep
-        });
-        self.holding = holding;
+            let refill_time = owned.contract.refill_time();
+            let forget_at = owned
+                .touched
+                .saturating_add(refill_time)
+                .saturating_add(1)
+                .max(owned.bucket().forgettable_at());
+            if forget_at <= now {
+                if let Some(owned) = self.keys.remove(&due.key) {
+                    self.holding = self.holding.saturating_sub(pod_key_bytes(&due.key, &owned));
+                }
+                continue;
+            }
+            let room = owned.planes.room();
+            let retire_at = owned.planes.retire(now, refill_time.max(RECORD_KEPT));
+            let freed = records_bytes(room.saturating_sub(owned.planes.room()));
+            self.holding = self.holding.saturating_sub(freed as u64);
+            // Both later than now: it is forgotten at `forget_at` at the soonest, and none of
+            // its records left was due to go.
+            self.due.push(KeyDue {
+                at: forget_at.min(retire_at),
+                key: due.key,
+            });
+        }
         if self.holding > self.capacity {
-            let all = self
-                .keys
-                .iter()
-                .map(|(key, owned)| (owned.touched, key.clone(), pod_key_bytes(key, owned)))
-                .collect();
-            let target = self.capacity - self.capacity / 10;
-            for key in least_recently_used(all, self.holding, target) {
-                if let Some(owned) = self.keys.remove(&key) {
-                    self.holding = self.holding.saturating_sub(pod_key_bytes(&key, &owned));
+            self.evict();
+        }
+    }
+
+    /// Evicts the least recently changed keys down to nine tenths of its capacity, and
+    /// their times to be looked at with them: the keys found by selection, not by sorting
+    /// every key, and none of them copied.
+    fn evict(&mut self) {
+        let target = self.capacity - self.capacity / 10;
+        let mut used: Vec<(u64, u64)> = self
+            .keys
+            .iter()
+            .map(|(key, owned)| (owned.touched, pod_key_bytes(key, owned)))
+            .collect();
+        let cutoff = earliest_holding(&mut used, self.holding.saturating_sub(target));
+        drop(used);
+        // Those changed before the cutoff hold less than must go, so all go; then those
+        // changed at it, while over.
+        for at_cutoff in [false, true] {
+            self.keys.retain(|key, owned| {
+                let evict = if at_cutoff {
+                    owned.touched == cutoff && self.holding > target
+                } else {
+                    owned.touched < cutoff
+                };
+                if evict {
+                    self.holding = self.holding.saturating_sub(pod_key_bytes(key, owned));
                     self.evicted += 1;
                 }
-            }
+                !evict
+            });
         }
+        self.due.retain(|due| self.keys.contains_key(&due.key));
     }
 
     /// Copies to send: one message per other pod, and one per pod keys are handed over to.
@@ -1833,6 +1997,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             .map(message(true));
         std::mem::take(&mut self.replicas)
             .into_iter()
+            .map(|(pod, copies)| (pod, copies.into_iter().map(|ByKey(copy)| copy).collect()))
             .map(message(false))
             .chain(handovers)
             .collect()

@@ -16,7 +16,7 @@
 //!
 //! No I/O: the time is passed in; the transport's messages are the caller's to carry.
 
-mod chunked;
+pub(super) mod chunked;
 mod sync;
 mod word;
 

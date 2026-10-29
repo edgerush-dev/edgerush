@@ -618,6 +618,41 @@ fn every_change_is_copied_to_every_other_pod() {
     assert_eq!(net.pods[owner as usize].counted(b"k"), Some(4));
 }
 
+/// A key changed again before its copies go is copied once to each pod, as it last stood,
+/// among the copies of the other keys.
+#[test]
+fn a_key_changed_twice_is_copied_once_as_it_last_stood() {
+    let (owner, secondary, third) = roles(b"k");
+    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 1));
+    let other = (0u32..)
+        .map(|n| format!("other{n}").into_bytes())
+        .find(|key| view(&[0, 1, 2], 1).owners(key).0 == Some(owner))
+        .unwrap();
+    pod.on_batch(batch(1, hits(1, 2, 0)), 0);
+    let mut both = batch(1, hits(2, 3, 1));
+    both.entries.push(Entry {
+        key: other[..].into(),
+        contract: contract(),
+        report: hits(1, 1, 0),
+    });
+    pod.on_batch(both, CYCLE);
+    let mut copies = pod.take_replicas();
+    copies.sort_by_key(|(to, _)| *to);
+    let mut expected = [secondary, third];
+    expected.sort_unstable();
+    assert_eq!(copies.len(), 2);
+    for ((to, replicas), pod) in copies.iter().zip(expected) {
+        assert_eq!(*to, pod);
+        let mut entries: Vec<(&[u8], u64)> = replicas
+            .entries
+            .iter()
+            .map(|replica| (&replica.key[..], replica.counted))
+            .collect();
+        entries.sort_unstable();
+        assert_eq!(entries, [(&b"k"[..], 5), (&other[..], 1)], "to pod {pod}");
+    }
+}
+
 /// A pod joining holds no copies: the owners send it one of each key at once.
 #[test]
 fn a_pod_joining_gets_a_copy_of_every_key_at_once() {
@@ -1523,13 +1558,172 @@ fn a_service_pod_past_its_capacity_evicts_the_least_recently_changed() {
     assert_eq!(pod.evicted(), 3);
 }
 
+/// A pod's timer looks only at the keys due: each new key once, then each again only when
+/// it may be forgotten or have a record retired.
+#[test]
+fn a_timer_looks_only_at_keys_due() {
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    let mut many = batch(1, hits(1, 1, 0));
+    many.entries = (0..100)
+        .map(|n| Entry {
+            key: format!("k{n}").into_bytes().into(),
+            contract: contract(),
+            report: hits(1, 1, 0),
+        })
+        .collect();
+    pod.on_batch(many, 0);
+    pod.on_timer(0);
+    assert_eq!(pod.looked, 100, "each new key once");
+    for now in (CYCLE..=100 * MS).step_by(CYCLE as usize) {
+        pod.on_timer(now);
+    }
+    assert_eq!(pod.looked, 100, "none due within a refill time");
+    assert_eq!(pod.key_count(), 100);
+    pod.on_timer(100 * MS + 1);
+    assert_eq!(pod.looked, 200);
+    assert_eq!(pod.key_count(), 0, "each forgotten when due");
+}
+
+/// What happens to a service pod in [`a_pods_timer_keeps_what_a_walk_of_every_key_would`].
+#[derive(Clone, Debug)]
+enum PodEvent {
+    /// A hit from data plane `plane` on key `key`, under the slower contract if `slow`:
+    /// a key whose contract changes starts afresh.
+    Hit { plane: u64, key: u8, slow: bool },
+    /// A poll from data plane `plane` on key `key`.
+    Poll { plane: u64, key: u8 },
+    /// Time passes, and the timer runs.
+    Timer { after: u64 },
+}
+
+fn pod_event() -> impl proptest::strategy::Strategy<Value = PodEvent> {
+    use proptest::prelude::*;
+    prop_oneof![
+        4 => (1_u64..4, 0_u8..6, proptest::bool::weighted(0.1))
+            .prop_map(|(plane, key, slow)| PodEvent::Hit { plane, key, slow }),
+        1 => (1_u64..4, 0_u8..6).prop_map(|(plane, key)| PodEvent::Poll { plane, key }),
+        // In whole cycles, so that times land on a refill time's end, where a key is kept.
+        2 => (0_u64..30).prop_map(|cycles| PodEvent::Timer { after: cycles * CYCLE }),
+    ]
+}
+
+/// What a service pod's keys hold, counted afresh, and whether each key has one time to be
+/// looked at and no other key has any.
+fn counted_afresh(pod: &ServicePod) -> (u64, bool) {
+    let holding = pod
+        .keys
+        .iter()
+        .map(|(key, owned)| pod_key_bytes(key, owned))
+        .sum();
+    let mut due: Vec<&[u8]> = pod.due.iter().map(|due| &due.key[..]).collect();
+    due.sort_unstable();
+    let mut keys: Vec<&[u8]> = pod.keys.keys().map(|key| &key[..]).collect();
+    keys.sort_unstable();
+    (holding, due == keys)
+}
+
+proptest::proptest! {
+    /// A pod's timer, looking only at keys due, drops no key that a walk of every key would
+    /// keep, and every key once quiet long enough; what its keys hold is counted exactly,
+    /// and each has one time to be looked at, through batches, polls, contracts changed,
+    /// records retired and keys evicted past a capacity.
+    #[test]
+    fn a_pods_timer_keeps_what_a_walk_of_every_key_would(
+        events in proptest::collection::vec(pod_event(), 1..120),
+        capacity in proptest::option::of(500_u64..3_000),
+    ) {
+        let slow = Contract {
+            window: NonZeroU64::new(10_000 * MS).unwrap(),
+            ..contract()
+        };
+        let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+        if let Some(capacity) = capacity {
+            pod.set_capacity(capacity);
+        }
+        let mut sequences: HashMap<(u64, u8), u64> = HashMap::new();
+        let mut now = 0;
+        for event in events {
+            match event {
+                PodEvent::Hit { plane, key, slow: is_slow } => {
+                    let sequence = sequences.entry((plane, key)).or_insert(0);
+                    *sequence += 1;
+                    let mut hit = batch(plane, hits(*sequence, 1, *sequence - 1));
+                    hit.entries[0].key = vec![key].into();
+                    hit.entries[0].contract = if is_slow { slow } else { contract() };
+                    pod.on_batch(hit, now);
+                }
+                PodEvent::Poll { plane, key } => {
+                    let mut poll = batch(plane, Report::Poll);
+                    poll.entries[0].key = vec![key].into();
+                    pod.on_batch(poll, now);
+                }
+                PodEvent::Timer { after } => {
+                    now += after;
+                    let walk_keeps: Vec<Box<[u8]>> = pod
+                        .keys
+                        .iter()
+                        .filter(|(_, owned)| {
+                            now.saturating_sub(owned.touched) <= owned.contract.refill_time()
+                                || owned.bucket().forgettable_at() > now
+                        })
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    pod.on_timer(now);
+                    if capacity.is_none() {
+                        for key in &walk_keeps {
+                            proptest::prop_assert!(pod.keys.contains_key(key), "dropped {:?}", key);
+                        }
+                    } else {
+                        proptest::prop_assert!(pod.holding() <= pod.capacity);
+                    }
+                }
+            }
+            let (holding, one_each) = counted_afresh(&pod);
+            proptest::prop_assert_eq!(pod.holding(), holding);
+            proptest::prop_assert!(one_each);
+        }
+        pod.on_timer(now + 30 * 60 * 1_000 * MS);
+        proptest::prop_assert_eq!(pod.key_count(), 0, "every key quiet for half an hour");
+        proptest::prop_assert!(pod.due.is_empty());
+    }
+
+    /// Selection finds the time a sort of every pair would, `need` drawn at, just short of
+    /// and just past what the earliest `pick` of them hold, where an off-by-one shows.
+    #[test]
+    fn the_earliest_holding_are_found_as_a_sort_finds_them(
+        pairs in proptest::collection::vec((0_u64..20, 1_u64..100), 0..60),
+        pick in 0_usize..64,
+        nudge in -1_i64..=1,
+    ) {
+        let mut sorted = pairs.clone();
+        sorted.sort_unstable();
+        let total: u64 = sorted.iter().take(pick).map(|&(_, bytes)| bytes).sum();
+        let need = total.saturating_add_signed(nudge);
+        let mut held = 0;
+        let sort_finds = if need == 0 {
+            0
+        } else {
+            sorted
+                .iter()
+                .find(|&&(_, bytes)| {
+                    held += bytes;
+                    held >= need
+                })
+                .map_or(u64::MAX, |&(time, _)| time)
+        };
+        let mut pairs = pairs;
+        proptest::prop_assert_eq!(earliest_holding(&mut pairs, need), sort_finds);
+    }
+}
+
 /// A service pod counts room for as many records as a key's data planes need, not a
 /// B-tree node's eleven: one for the usual key, admitted by one data plane, and growing
 /// one at a time, then doubling.
 #[test]
 fn a_service_pod_counts_room_for_the_records_a_key_has() {
     let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-    let entry = size_of::<(Box<[u8]>, Owned)>() + 1 + b"k".len();
+    // The key in the table, and again with its time to be looked at.
+    let entry = size_of::<(Box<[u8]>, Owned)>() + 1 + b"k".len() + size_of::<KeyDue>() + b"k".len();
     let record = size_of::<(PlaneId, Record)>();
     for (plane, room) in [(7, 1), (3, 2), (9, 4), (5, 4), (1, 8)] {
         pod.on_batch(batch(plane, hits(1, 1, 0)), 0);
@@ -1539,12 +1733,13 @@ fn a_service_pod_counts_room_for_the_records_a_key_has() {
 }
 
 /// A service pod's key takes 128 bytes in its table, which holds up to twice the room its
-/// keys take, and its record of a data plane 32: its bucket kept as the bucket's state, its
-/// terms the key's contract, batches waiting, which rarely do, kept apart, and the data
-/// plane's last admission in eight bytes.
+/// keys take, its time to be looked at 24 and a copy of the key, and its record of a data
+/// plane 32: its bucket kept as the bucket's state, its terms the key's contract, batches
+/// waiting, which rarely do, kept apart, and the data plane's last admission in eight bytes.
 #[test]
 fn a_service_pods_key_is_small() {
     assert_eq!(size_of::<(Box<[u8]>, Owned)>(), 128);
+    assert_eq!(size_of::<KeyDue>(), 24);
     assert_eq!(size_of::<(PlaneId, Record)>(), 32);
 }
 
