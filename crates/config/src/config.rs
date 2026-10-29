@@ -125,7 +125,7 @@ pub enum RateLimitMode {
     /// The key's owner in the rate-limiting service decides every request.
     Synchronous,
     /// Each process decides from its copies of the keys and shares what it admitted through
-    /// the rate-limiting service every cycle (experimental).
+    /// the rate-limiting service every cycle.
     Asynchronous,
 }
 
