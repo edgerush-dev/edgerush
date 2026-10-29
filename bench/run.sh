@@ -861,7 +861,7 @@ ratelimit_runs() {
         ${RL_RESIDENT:+--resident "$RL_RESIDENT"}
     # The proxy's own counts after it, where it serves them: its answers by kind, its keys
     # and its background thread's work.
-    if [ -n "$METRICS" ]; then
+    if [ -n "${METRICS:-}" ]; then
         curl -s "http://$METRICS/metrics" >"$OUT/$1.keys-h1.metrics" || true
     fi
     # The CPU each of the proxy's threads spent over the three, in clock ticks: the
