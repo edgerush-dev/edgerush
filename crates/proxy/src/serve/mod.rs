@@ -412,6 +412,9 @@ pub struct Proxy {
     /// The names the running config's upstreams resolve, which [`Proxy::names`] hands
     /// whoever resolves them.
     names: tokio::sync::watch::Sender<std::collections::BTreeSet<String>>,
+    /// The addresses discovered or resolved that are not sent to, beside the ranges none
+    /// is, and who is told of each as it comes to be refused ([`Proxy::deny`]).
+    denied: std::sync::Mutex<plane::Egress>,
 }
 
 /// The data plane's rate limits: whether they were started, and the thread the running
@@ -753,6 +756,9 @@ struct Snapshot {
     /// By position of the upstream, then of the endpoint: where to connect, in the form a
     /// request target takes, made once so that no request formats an address.
     endpoints: Vec<Vec<Authority>>,
+    /// By position of the upstream: the addresses discovered or resolved for it that are
+    /// not sent to, and why (03 §6).
+    refused: Vec<Vec<(std::net::SocketAddr, crate::egress::Refusal)>>,
     /// By position of the upstream: the slot of its counters.
     upstream_slots: Vec<usize>,
     /// By position of the rate limit: the slot of its counters.

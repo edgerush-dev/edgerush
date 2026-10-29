@@ -1,16 +1,18 @@
 use super::*;
 use edgerush_config::{Config, compile};
 use edgerush_dns::testing::{Reply, answer};
+use edgerush_proxy::Proxy;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::net::TcpListener;
 
 /// What a stand-in nameserver sends back to a query: the datagrams, or over TCP the
 /// message, for its kind, A or AAAA, and whether it came over TCP.
-type Replies = Arc<dyn Fn(&[u8], Kind, bool) -> Vec<Vec<u8>> + Send + Sync>;
+pub(crate) type Replies = Arc<dyn Fn(&[u8], Kind, bool) -> Vec<Vec<u8>> + Send + Sync>;
 
 /// A nameserver on a port of its own, over UDP and TCP, answering as `replies` says.
-async fn nameserver(replies: Replies) -> SocketAddr {
+pub(crate) async fn nameserver(replies: Replies) -> SocketAddr {
     let (udp, tcp) = loop {
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         if let Ok(tcp) = TcpListener::bind(udp.local_addr().unwrap()).await {
@@ -58,7 +60,9 @@ fn kind_of(query: &[u8]) -> Kind {
     }
 }
 
-fn replying(reply: impl Fn(Kind, bool) -> Option<Reply> + Send + Sync + 'static) -> Replies {
+pub(crate) fn replying(
+    reply: impl Fn(Kind, bool) -> Option<Reply> + Send + Sync + 'static,
+) -> Replies {
     Arc::new(move |query, kind, tcp| {
         reply(kind, tcp)
             .and_then(|reply| answer(query, &reply))
@@ -172,6 +176,19 @@ async fn a_nameserver_that_fails_or_is_silent_is_passed_for_the_next() {
     assert_eq!(looked(&[]).await, Looked::Failed(Failure::NoNameserver));
 }
 
+/// What hands `proxy` what its names resolve to, as the data plane's harness does.
+fn taking(
+    proxy: &Arc<Proxy>,
+) -> impl Fn(&str, Option<Vec<IpAddr>>) -> Result<(), String> + 'static {
+    let proxy = Arc::clone(proxy);
+    move |name, addresses| {
+        proxy
+            .reresolve([(name.to_owned(), addresses)])
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// How many endpoints the proxy serves upstream `web` with, as its metrics say.
 fn endpoints(proxy: &Proxy) -> Option<u64> {
     let scraped = proxy.metrics();
@@ -226,9 +243,10 @@ async fn each_name_is_resolved_again_as_it_runs_out_and_a_failure_keeps_the_last
     local
         .run_until(async {
             let resolving = tokio::task::spawn_local(resolve_names(
-                Arc::clone(&proxy),
+                proxy.names(),
                 vec![server],
                 pace,
+                taking(&proxy),
                 move |name, what| heard.0.borrow_mut().push(format!("{name}: {what}")),
             ));
             until("resolved", || proxy.unresolved().is_empty()).await;
@@ -275,9 +293,10 @@ async fn a_name_whose_first_lookup_fails_is_taken_in_as_none() {
     local
         .run_until(async {
             let resolving = tokio::task::spawn_local(resolve_names(
-                Arc::clone(&proxy),
+                proxy.names(),
                 Vec::new(),
                 Pace::default(),
+                taking(&proxy),
                 |_, _| {},
             ));
             until("taken in", || proxy.unresolved().is_empty()).await;

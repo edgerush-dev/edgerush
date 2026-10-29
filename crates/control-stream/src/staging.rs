@@ -78,6 +78,9 @@ pub enum Taken {
     /// This, to be said: the latest config equals the one running and is kept, or it
     /// could not be read and is refused.
     Say(Report),
+    /// The addresses of the gateway's own pods, to be refused from now on: each time they
+    /// change, whole.
+    Gateway(Vec<std::net::IpAddr>),
 }
 
 impl Staging {
@@ -119,6 +122,12 @@ impl Staging {
         match message.resource {
             // A resource of a kind this data plane does not know.
             None => Ok(Taken::Nothing),
+            Some(wire::Resource::Gateway(gateway)) => gateway
+                .addresses
+                .into_iter()
+                .map(|address| address.parse().map_err(|_| Malformed::Address(address)))
+                .collect::<Result<_, _>>()
+                .map(Taken::Gateway),
             Some(wire::Resource::Certificate(certificate)) => {
                 if certificate.name.is_empty() {
                     return Err(Malformed::Unnamed);

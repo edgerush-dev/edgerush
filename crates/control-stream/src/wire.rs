@@ -12,7 +12,7 @@ use std::fmt;
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ToDataPlane {
     /// The resource; none is one of a kind this data plane does not know.
-    #[prost(oneof = "Resource", tags = "1, 2, 3")]
+    #[prost(oneof = "Resource", tags = "1, 2, 3, 4")]
     pub resource: Option<Resource>,
 }
 
@@ -28,6 +28,18 @@ pub enum Resource {
     /// Certificates no longer offered.
     #[prost(message, tag = "3")]
     Removed(Removed),
+    /// The addresses of the gateway's own pods, which no route may send to.
+    #[prost(message, tag = "4")]
+    Gateway(Gateway),
+}
+
+/// The addresses of the gateway's own pods: the data planes', the control plane's and the
+/// rate-limiting service's, whole, each time they change (03 §6).
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Gateway {
+    /// Each address, IPv4 or IPv6, as text.
+    #[prost(string, repeated, tag = "1")]
+    pub addresses: Vec<String>,
 }
 
 /// A certificate and its key, by the name configs give it.

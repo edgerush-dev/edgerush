@@ -17,6 +17,10 @@
 //! if it refused one ([`Report`], [`Staging`]). A config equal to the one running, with
 //! certificates equal to its own, is kept, and acked under its new version. A certificate
 //! the running config uses stays with it until another config runs.
+//!
+//! Apart from the config, the control plane sends the addresses of the gateway's own pods,
+//! which no route may send to (03 §6): whole, as a stream opens and each time they change.
+//! They are taken in as they come, and neither staged nor acked.
 
 use std::collections::BTreeMap;
 
@@ -74,6 +78,9 @@ pub enum Malformed {
     /// A certificate without its name.
     #[error("a certificate without a name")]
     Unnamed,
+    /// One of the gateway's addresses that is not an address.
+    #[error("a gateway address that is not one: {0:?}")]
+    Address(String),
 }
 
 impl From<&Held> for wire::Held {

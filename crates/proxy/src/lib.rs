@@ -20,6 +20,7 @@ pub mod connections;
 mod cookies;
 mod descriptors;
 mod drain;
+pub mod egress;
 mod forwarding;
 mod gathered;
 mod grpc;

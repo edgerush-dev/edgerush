@@ -8,6 +8,7 @@ use http::Uri;
 use http::uri::PathAndQuery;
 use hyper_util::rt::TokioIo;
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -47,13 +48,15 @@ pub enum Ended {
 /// Dials the control plane at `address` (`host:port`), with `tls`, its certificate
 /// checked against `name`, and follows the stream until it ends: from what `staging`
 /// holds, each config given to run handed to `run`, which runs it, or says why it cannot,
-/// and each outcome reported.
+/// and each outcome reported; and the addresses of the gateway's own pods handed to
+/// `gateway` each time they come.
 pub async fn follow<R>(
     address: &str,
     name: &str,
     tls: &SslConnector,
     staging: &mut Staging,
     mut run: impl FnMut(Box<Config>) -> R,
+    mut gateway: impl FnMut(Vec<IpAddr>),
 ) -> Ended
 where
     R: Future<Output = Result<(), String>>,
@@ -105,6 +108,10 @@ where
         let report = match staging.take(message) {
             Err(malformed) => return malformed.into(),
             Ok(Taken::Nothing) => continue,
+            Ok(Taken::Gateway(addresses)) => {
+                gateway(addresses);
+                continue;
+            }
             Ok(Taken::Say(report)) => Some(report),
             // Awaited, not waited on: the connection, its pings answered, goes on meanwhile.
             Ok(Taken::Run(config)) => match run(config).await {

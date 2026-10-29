@@ -181,6 +181,9 @@ impl CompiledRateLimitService {
 pub struct CompiledDataPlane {
     /// How long an endpoint that could not be connected to waits for its connect probe.
     pub set_aside: Duration,
+    /// Whether addresses discovered or resolved are sent to whatever they are
+    /// (experimental, 03 §6).
+    pub unrestricted_egress: bool,
 }
 
 impl CompiledDataPlane {
@@ -1003,6 +1006,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             .data_plane
             .set_aside_ms
             .map_or(CompiledDataPlane::SET_ASIDE, Duration::from_millis),
+        unrestricted_egress: config.data_plane.experimental_unrestricted_egress == Some(true),
     };
     if config.data_plane.set_aside_ms == Some(0) {
         errors.push(Place::of(Object::DataPlane).problem(Problem::SetAsideNever));

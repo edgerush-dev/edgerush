@@ -59,6 +59,12 @@ pub struct DataPlane {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub set_aside_ms: Option<u64>,
+    /// Whether addresses discovered or resolved are sent to whatever they are, loopback,
+    /// link-local, the pod's own and the gateway's other pods among them: experimental, for
+    /// development, until a development profile takes it over
+    /// ([03 §6](../../../docs/03-data-plane.md)). Off when left out.
+    #[serde(default)]
+    pub experimental_unrestricted_egress: Option<bool>,
 }
 
 /// How the data plane enforces its rate limits: the mode, and what that mode needs.

@@ -37,6 +37,8 @@ pub(crate) enum FromStream {
     },
     /// A line to say.
     Said(String),
+    /// The addresses of the gateway's own pods, to refuse from now on.
+    Gateway(Vec<std::net::IpAddr>),
 }
 
 /// Why the stream cannot be followed at all.
@@ -78,11 +80,15 @@ pub(crate) fn start(
             let mut essential = Essential::new("the config stream".to_owned(), &tell);
             let address = subscription.address.clone();
             let said = handed.clone();
+            let gateway = handed.clone();
             let mut staging = Staging::new();
             let followed = runtime.block_on(subscribe(
                 subscription,
                 &mut staging,
                 |config| ran(&handed, config),
+                |addresses| {
+                    let _gone = gateway.send(FromStream::Gateway(addresses));
+                },
                 |following| {
                     let _gone = said.send(FromStream::Said(told(&address, &following)));
                 },

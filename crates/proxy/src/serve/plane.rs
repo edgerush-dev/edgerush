@@ -4,6 +4,7 @@
 use super::{ACCEPT_PAUSE, Proxy, ProxyError, Snapshot, authority, is_about_one_connection};
 use crate::access_log::{Logs, Sink};
 use crate::downstream::h3::listener as h3_listener;
+use crate::egress::{Denied, Refusal};
 use crate::metrics::{AcceptPause, Metrics};
 use crate::routed::Routed;
 use crate::tls::Tls;
@@ -14,7 +15,7 @@ use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRateLimiting};
 use edgerush_discovery::{Endpoints, SERVICE_NAME_LABEL};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
@@ -73,11 +74,39 @@ pub(crate) type Discovered = HashMap<String, ByService>;
 pub(crate) type Named = HashMap<String, Arc<[IpAddr]>>;
 
 /// Where endpoints not listed come from: the slices of namespaces followed, and what names
-/// resolved to.
+/// resolved to; and which of their addresses are not sent to.
 #[derive(Clone, Copy)]
 pub(crate) struct Found<'a> {
     pub(crate) discovered: &'a Discovered,
     pub(crate) named: &'a Named,
+    pub(crate) denied: &'a Denied,
+}
+
+/// Who is told of an address as it comes to be refused: its upstream's name, the address
+/// and why.
+pub(crate) type Told = Arc<dyn Fn(&str, SocketAddr, Refusal) + Send + Sync>;
+
+/// What is refused beside the ranges no data plane sends to, and who is told.
+#[derive(Clone, Default)]
+pub(crate) struct Egress {
+    denied: Denied,
+    told: Option<Told>,
+}
+
+impl std::fmt::Debug for Egress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Egress")
+            .field("denied", &self.denied)
+            .field("told", &self.told.is_some())
+            .finish()
+    }
+}
+
+/// Each upstream's endpoints, by position, and the addresses refused it, by position.
+#[derive(PartialEq, Eq)]
+struct Endpointed {
+    kept: Vec<Vec<SocketAddr>>,
+    refused: Vec<Vec<(SocketAddr, Refusal)>>,
 }
 
 /// A namespace's EndpointSlices by the Service each is labelled with, so that an upstream's
@@ -113,33 +142,92 @@ fn by_service(slices: &[EndpointSlice]) -> ByService {
 /// name resolved to, on its port, none until it has. Worked out whenever a snapshot is
 /// made, so that a config that names another Service of a namespace followed, or a name
 /// another upstream resolves, has its endpoints at once.
-fn resolved(config: &Compiled, found: Found<'_>) -> Vec<Vec<SocketAddr>> {
-    let Found { discovered, named } = found;
-    config
+///
+/// A discovered or resolved address that is not to be sent to is refused, not kept; one the
+/// config lists is the operator's, and kept whatever it is.
+fn resolved(config: &Compiled, found: Found<'_>) -> Endpointed {
+    let Found {
+        discovered,
+        named,
+        denied,
+    } = found;
+    let all: Vec<(Vec<SocketAddr>, bool)> = config
         .upstreams()
         .iter()
         .map(|upstream| match (&upstream.discovery, &upstream.dns) {
-            (Some(service), _) => discovered
-                .get(&service.namespace)
-                .and_then(|services| services.get(&service.service))
-                .map(|slices| {
-                    Endpoints::of(service, slices)
-                        .in_use()
-                        .iter()
-                        .copied()
-                        .collect()
-                })
-                .unwrap_or_default(),
-            (None, Some(name)) => named
-                .get(&name.host)
-                .map(|addresses| {
-                    addresses
-                        .iter()
-                        .map(|address| SocketAddr::new(*address, name.port.get()))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            (None, None) => upstream.endpoints.clone(),
+            (Some(service), _) => (
+                discovered
+                    .get(&service.namespace)
+                    .and_then(|services| services.get(&service.service))
+                    .map(|slices| {
+                        Endpoints::of(service, slices)
+                            .in_use()
+                            .iter()
+                            .copied()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                true,
+            ),
+            (None, Some(name)) => (
+                named
+                    .get(&name.host)
+                    .map(|addresses| {
+                        addresses
+                            .iter()
+                            .map(|address| SocketAddr::new(*address, name.port.get()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                true,
+            ),
+            (None, None) => (upstream.endpoints.clone(), false),
+        })
+        .collect();
+    let mut endpointed = Endpointed {
+        kept: Vec::with_capacity(all.len()),
+        refused: Vec::with_capacity(all.len()),
+    };
+    for (addresses, checked) in all {
+        let mut kept = Vec::with_capacity(addresses.len());
+        let mut refused = Vec::new();
+        // Unrestricted, by the experimental switch, nothing is checked.
+        let checked = checked && !config.data_plane().unrestricted_egress;
+        for address in addresses {
+            match denied.refusal(address.ip()).filter(|_| checked) {
+                Some(why) => refused.push((address, why)),
+                None => kept.push(address),
+            }
+        }
+        endpointed.kept.push(kept);
+        endpointed.refused.push(refused);
+    }
+    endpointed
+}
+
+/// The addresses `next` refuses that `previous` did not, by upstream name: those to be
+/// told of.
+fn newly_refused(previous: &Snapshot, next: &Snapshot) -> Vec<(String, SocketAddr, Refusal)> {
+    let before: BTreeSet<(&str, SocketAddr)> = previous
+        .config
+        .upstreams()
+        .iter()
+        .zip(&previous.refused)
+        .flat_map(|(upstream, refused)| {
+            refused
+                .iter()
+                .map(|(address, _)| (upstream.name.as_str(), *address))
+        })
+        .collect();
+    next.config
+        .upstreams()
+        .iter()
+        .zip(&next.refused)
+        .flat_map(|(upstream, refused)| {
+            refused
+                .iter()
+                .filter(|(address, _)| !before.contains(&(upstream.name.as_str(), *address)))
+                .map(|(address, why)| (upstream.name.clone(), *address, *why))
         })
         .collect()
 }
@@ -158,7 +246,10 @@ impl Snapshot {
         logs: Vec<Option<Sink>>,
     ) -> Result<(Self, Retiring), ProxyError> {
         runs_rate_limits(&config, edgerush_ratelimit::service::pooled::supported())?;
-        let resolved = resolved(&config, found);
+        let Endpointed {
+            kept: resolved,
+            refused,
+        } = resolved(&config, found);
         let endpoints = resolved
             .iter()
             .map(|endpoints| endpoints.iter().map(authority).collect())
@@ -270,6 +361,7 @@ impl Snapshot {
             generation: previous.map_or(0, |previous| previous.generation + 1),
             listeners,
             endpoints,
+            refused,
             upstream_slots,
             limit_slots,
             carried,
@@ -318,6 +410,7 @@ impl Proxy {
             Found {
                 discovered: &Discovered::new(),
                 named: &Named::new(),
+                denied: &Denied::default(),
             },
             &listeners,
             &metrics,
@@ -343,6 +436,7 @@ impl Proxy {
             making: Mutex::default(),
             namespaces,
             names,
+            denied: Mutex::default(),
         })
     }
 
@@ -383,11 +477,13 @@ impl Proxy {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let named = self.named.lock().unwrap_or_else(PoisonError::into_inner);
+        let (denied, told) = self.denied();
         let (snapshot, retiring) = Snapshot::new(
             Arc::new(config),
             Found {
                 discovered: &discovered,
                 named: &named,
+                denied: &denied,
             },
             &self.listeners,
             &self.metrics,
@@ -395,6 +491,7 @@ impl Proxy {
             &self.keys,
             prepared.by_listener(),
         )?;
+        let refusals = newly_refused(&previous, &snapshot);
         drop(named);
         drop(discovered);
         drop(previous);
@@ -450,6 +547,7 @@ impl Proxy {
         rate_limits.local = local;
         rate_limits.synchronous = synchronous;
         drop(rate_limits);
+        tell(told.as_ref(), refusals);
         self.metrics.reloads.inc();
         let now = SystemTime::now().duration_since(UNIX_EPOCH);
         let now = now.map_or(0, |since_epoch| since_epoch.as_secs());
@@ -487,13 +585,16 @@ impl Proxy {
             };
         }
         let named = self.named.lock().unwrap_or_else(PoisonError::into_inner);
+        let (denied, told) = self.denied();
         let now = Found {
             discovered: &discovered,
             named: &named,
+            denied: &denied,
         };
         let then = Found {
             discovered: &next,
             named: &named,
+            denied: &denied,
         };
         if resolved(&previous.config, then) == resolved(&previous.config, now) {
             *discovered = next;
@@ -510,6 +611,7 @@ impl Proxy {
             previous.logs.clone(),
         )?;
         *discovered = next;
+        let refusals = newly_refused(&previous, &snapshot);
         drop(named);
         drop(previous);
         // As a reload holds it, so that no worker makes its limiter between the two.
@@ -520,6 +622,7 @@ impl Proxy {
         retiring.retire();
         self.current.store(Arc::new(snapshot));
         drop(rate_limits);
+        tell(told.as_ref(), refusals);
         Ok(true)
     }
 
@@ -545,6 +648,7 @@ impl Proxy {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut named = self.named.lock().unwrap_or_else(PoisonError::into_inner);
+        let (denied, told) = self.denied();
         let mut next = named.clone();
         for (name, addresses) in changes {
             match addresses {
@@ -558,10 +662,12 @@ impl Proxy {
         let now = Found {
             discovered: &discovered,
             named: &named,
+            denied: &denied,
         };
         let then = Found {
             discovered: &discovered,
             named: &next,
+            denied: &denied,
         };
         if resolved(&previous.config, then) == resolved(&previous.config, now) {
             *named = next;
@@ -578,6 +684,7 @@ impl Proxy {
             previous.logs.clone(),
         )?;
         *named = next;
+        let refusals = newly_refused(&previous, &snapshot);
         drop(named);
         drop(discovered);
         drop(previous);
@@ -589,7 +696,90 @@ impl Proxy {
         retiring.retire();
         self.current.store(Arc::new(snapshot));
         drop(rate_limits);
+        tell(told.as_ref(), refusals);
         Ok(true)
+    }
+
+    /// Refuses, beside the ranges no data plane sends to, the addresses `denied` names, of
+    /// every address discovered or resolved from now on, and tells `told` of each as it
+    /// comes to be refused: its upstream, the address and why (03 §6). For the start, before
+    /// anything is discovered or resolved: what was is looked at again only as it changes.
+    pub fn deny(
+        &self,
+        denied: Denied,
+        told: impl Fn(&str, SocketAddr, Refusal) + Send + Sync + 'static,
+    ) {
+        let mut held = self.denied.lock().unwrap_or_else(PoisonError::into_inner);
+        *held = Egress {
+            denied,
+            told: Some(Arc::new(told)),
+        };
+    }
+
+    /// Refuses `addresses` from now on, the gateway's other pods', as the control plane names
+    /// them, in place of those it named before: every address discovered or resolved is
+    /// looked at again, an endpoint now refused retired and one no longer refused served,
+    /// as [`Proxy::rediscover`] serves endpoints that change. Whether the running config's
+    /// endpoints changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProxyError`] as [`Proxy::new`] does; nothing is taken in then.
+    pub fn gateway(&self, addresses: Vec<IpAddr>) -> Result<bool, ProxyError> {
+        let _making = self.making.lock().unwrap_or_else(PoisonError::into_inner);
+        let previous = self.current.load();
+        let discovered = self
+            .discovered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let named = self.named.lock().unwrap_or_else(PoisonError::into_inner);
+        let (denied, told) = self.denied();
+        let mut next = denied.clone();
+        next.gateway = addresses;
+        let now = Found {
+            discovered: &discovered,
+            named: &named,
+            denied: &denied,
+        };
+        let then = Found {
+            discovered: &discovered,
+            named: &named,
+            denied: &next,
+        };
+        let changed = resolved(&previous.config, then) != resolved(&previous.config, now);
+        if changed {
+            // The running config's listeners, logs and TLS are as they were, and are kept.
+            let (snapshot, retiring) = Snapshot::new(
+                Arc::clone(&previous.config),
+                then,
+                &self.listeners,
+                &self.metrics,
+                Some(&previous),
+                &self.keys,
+                previous.logs.clone(),
+            )?;
+            let refusals = newly_refused(&previous, &snapshot);
+            // As a reload holds it, so that no worker makes its limiter between the two.
+            let rate_limits = self
+                .rate_limits
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            retiring.retire();
+            self.current.store(Arc::new(snapshot));
+            drop(rate_limits);
+            tell(told.as_ref(), refusals);
+        }
+        self.denied
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .denied = next;
+        Ok(changed)
+    }
+
+    /// What is refused, and who is told.
+    fn denied(&self) -> (Denied, Option<Told>) {
+        let held = self.denied.lock().unwrap_or_else(PoisonError::into_inner);
+        (held.denied.clone(), held.told.clone())
     }
 
     /// The names the running config's upstreams resolve, for whoever resolves them: each
@@ -669,6 +859,17 @@ impl Proxy {
             .map(|(limit, slot)| (limit.name.as_str(), *slot, limit.dry_run))
             .collect();
         let mut scrape = self.metrics.render(&self.listeners, &upstreams, &endpoints);
+        let mut refused: Vec<(&str, &'static str, usize)> = Vec::new();
+        for (upstream, addresses) in snapshot.config.upstreams().iter().zip(&snapshot.refused) {
+            let mut by_why: BTreeMap<Refusal, usize> = BTreeMap::new();
+            for (_, why) in addresses {
+                *by_why.entry(*why).or_default() += 1;
+            }
+            for (why, count) in by_why {
+                refused.push((upstream.name.as_str(), why.label(), count));
+            }
+        }
+        scrape.push_str(&Metrics::render_refused(&refused));
         // Only a config that enforces limits shows them.
         let max_key_bytes = match snapshot.config.rate_limiting() {
             CompiledRateLimiting::Local { max_key_bytes } => Some(*max_key_bytes),
@@ -918,6 +1119,15 @@ impl Proxy {
     pub fn accept_paused(&self, listener: usize, why: AcceptPause) {
         if let Some(counters) = self.metrics.listener(listener) {
             counters.paused(why);
+        }
+    }
+}
+
+/// Tells `told`, if anyone, of each address `refusals` holds.
+fn tell(told: Option<&Told>, refusals: Vec<(String, SocketAddr, Refusal)>) {
+    if let Some(told) = told {
+        for (upstream, address, why) in refusals {
+            told(&upstream, address, why);
         }
     }
 }

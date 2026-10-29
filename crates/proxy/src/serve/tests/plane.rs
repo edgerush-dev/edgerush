@@ -4,6 +4,7 @@ use super::*;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Mutex;
 
 /// A config with the named upstreams, each at the address given.
 fn upstreams(named: &[(&str, &str)]) -> Compiled {
@@ -258,6 +259,219 @@ fn resolved_endpoints_are_served_on_each_upstreams_port_and_changed_as_a_reload_
     assert!(proxy.unresolved().is_empty());
 }
 
+/// What a scrape says of upstream `upstream`'s refused endpoints, by reason.
+fn refused_of(proxy: &Proxy, upstream: &str) -> Vec<String> {
+    let prefix = format!("edgerush_upstream_refused_endpoints{{upstream=\"{upstream}\",");
+    proxy
+        .metrics()
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+        .map(|line| line[prefix.len()..].to_owned())
+        .collect()
+}
+
+/// Of the addresses discovered or resolved, those in the ranges no data plane sends to, the
+/// pod's own and the API server's are left out, the others served; each is told once, as it
+/// comes to be refused, and counted. Addresses the config lists are kept whatever they are.
+#[test]
+fn addresses_discovered_or_resolved_that_are_denied_are_left_out_told_once_and_counted() {
+    let config: Config = serde_saphyr::from_str(
+        "listeners: {}
+routes: []
+upstreams:
+  listed: { load_balancer: p2c, endpoints: { listed: [\"127.0.0.1:1\"] } }
+  named: { load_balancer: p2c, endpoints: { dns: \"web.shop.svc.cluster.local:8080\" } }
+  web: { load_balancer: p2c, endpoints: { kubernetes: \"web.shop.svc.cluster.local:http\" } }
+",
+    )
+    .unwrap();
+    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+    let told: Arc<Mutex<Vec<String>>> = Arc::default();
+    let telling = Arc::clone(&told);
+    proxy.deny(
+        crate::egress::Denied {
+            own: vec!["10.0.0.9".parse().unwrap()],
+            api_server: Some("10.96.0.1".parse().unwrap()),
+            gateway: Vec::new(),
+        },
+        move |upstream, address, why| {
+            telling
+                .lock()
+                .unwrap()
+                .push(format!("{upstream} {address}: {why}"));
+        },
+    );
+    let slices = vec![slice(
+        "web",
+        "http",
+        &["10.0.0.1", "10.0.0.9", "169.254.169.254"],
+    )];
+    assert!(proxy.rediscover([shop(slices.clone())]).unwrap());
+    assert_eq!(addresses_of(&proxy, 2), ["10.0.0.1:8080"]);
+    assert!(
+        proxy
+            .reresolve([(WEB.to_owned(), at(&["10.0.0.2", "10.96.0.1", "::1"]))])
+            .unwrap()
+    );
+    assert_eq!(addresses_of(&proxy, 1), ["10.0.0.2:8080"]);
+    assert_eq!(
+        addresses_of(&proxy, 0),
+        ["127.0.0.1:1"],
+        "a listed address was refused"
+    );
+    assert_eq!(
+        *told.lock().unwrap(),
+        [
+            "web 10.0.0.9:8080: one of the data plane's own",
+            "web 169.254.169.254:8080: link-local",
+            "named 10.96.0.1:8080: the API server's",
+            "named [::1]:8080: loopback",
+        ]
+    );
+    assert_eq!(
+        refused_of(&proxy, "web"),
+        ["reason=\"link_local\"} 1", "reason=\"own\"} 1"]
+    );
+    assert_eq!(
+        refused_of(&proxy, "named"),
+        ["reason=\"loopback\"} 1", "reason=\"api_server\"} 1"]
+    );
+    assert!(refused_of(&proxy, "listed").is_empty());
+    // Told once: not again as the same addresses come again, nor at a reload.
+    told.lock().unwrap().clear();
+    let more = vec![slice(
+        "web",
+        "http",
+        &["10.0.0.1", "10.0.0.3", "10.0.0.9", "169.254.169.254"],
+    )];
+    assert!(proxy.rediscover([shop(more)]).unwrap());
+    proxy.reload(compile(&config).unwrap()).unwrap();
+    assert!(
+        told.lock().unwrap().is_empty(),
+        "{:?}",
+        told.lock().unwrap()
+    );
+    // A reload that brings an upstream resolving the name on another port: its own told.
+    let wider: Config = serde_saphyr::from_str(
+        "listeners: {}
+routes: []
+upstreams:
+  listed: { load_balancer: p2c, endpoints: { listed: [\"127.0.0.1:1\"] } }
+  more: { load_balancer: p2c, endpoints: { dns: \"web.shop.svc.cluster.local:9090\" } }
+  named: { load_balancer: p2c, endpoints: { dns: \"web.shop.svc.cluster.local:8080\" } }
+  web: { load_balancer: p2c, endpoints: { kubernetes: \"web.shop.svc.cluster.local:http\" } }
+",
+    )
+    .unwrap();
+    proxy.reload(compile(&wider).unwrap()).unwrap();
+    assert_eq!(
+        *told.lock().unwrap(),
+        [
+            "more 10.96.0.1:9090: the API server's",
+            "more [::1]:9090: loopback"
+        ]
+    );
+    told.lock().unwrap().clear();
+    proxy.reload(compile(&config).unwrap()).unwrap();
+    // Gone, and back: told again.
+    assert!(
+        proxy
+            .rediscover([shop(vec![slice("web", "http", &["10.0.0.1"])])])
+            .unwrap()
+    );
+    assert!(refused_of(&proxy, "web").is_empty());
+    assert!(proxy.rediscover([shop(slices)]).unwrap());
+    assert_eq!(told.lock().unwrap().len(), 2);
+}
+
+/// The gateway's other pods, as the control plane names them, are refused from then on:
+/// what was discovered is looked at again, an endpoint now refused retired and told, and
+/// one no longer refused served again.
+#[test]
+fn the_gateways_own_pods_are_refused_as_they_are_named() {
+    let proxy = Proxy::new(
+        discovering("web.shop.svc.cluster.local:http"),
+        NonZeroUsize::MIN,
+    )
+    .unwrap();
+    let told: Arc<Mutex<Vec<String>>> = Arc::default();
+    let telling = Arc::clone(&told);
+    proxy.deny(
+        crate::egress::Denied::default(),
+        move |upstream, address, why| {
+            telling
+                .lock()
+                .unwrap()
+                .push(format!("{upstream} {address}: {why}"));
+        },
+    );
+    assert!(
+        proxy
+            .rediscover([shop(vec![slice("web", "http", &["10.0.0.1", "10.0.0.2"])])])
+            .unwrap()
+    );
+    let kept = Arc::clone(proxy.current.load().destinations.at(1, 1).unwrap());
+    let gone = Arc::clone(proxy.current.load().destinations.at(1, 0).unwrap());
+    assert!(proxy.gateway(vec!["10.0.0.1".parse().unwrap()]).unwrap());
+    assert_eq!(addresses_of(&proxy, 1), ["10.0.0.2:8080"]);
+    assert!(gone.is_retired(), "an endpoint now refused was left live");
+    assert_eq!(
+        destinations_of(&proxy, 1)[0].1,
+        kept.key(),
+        "one kept changed hands"
+    );
+    assert_eq!(
+        *told.lock().unwrap(),
+        ["web 10.0.0.1:8080: one of the gateway's own pods"]
+    );
+    assert_eq!(refused_of(&proxy, "web"), ["reason=\"gateway\"} 1"]);
+    // Named again the same: nothing changes. Named no more: served again.
+    assert!(!proxy.gateway(vec!["10.0.0.1".parse().unwrap()]).unwrap());
+    assert!(proxy.gateway(Vec::new()).unwrap());
+    assert_eq!(addresses_of(&proxy, 1), ["10.0.0.1:8080", "10.0.0.2:8080"]);
+    // Still named across a rediscovery: the list is kept.
+    assert!(proxy.gateway(vec!["10.0.0.2".parse().unwrap()]).unwrap());
+    assert!(
+        proxy
+            .rediscover([shop(vec![slice("web", "http", &["10.0.0.2", "10.0.0.3"])])])
+            .unwrap()
+    );
+    assert_eq!(addresses_of(&proxy, 1), ["10.0.0.3:8080"]);
+}
+
+/// The experimental switch: nothing discovered or resolved is refused.
+#[test]
+fn unrestricted_egress_refuses_nothing() {
+    let config: Config = serde_saphyr::from_str(
+        "listeners: {}
+routes: []
+upstreams:
+  web: { load_balancer: p2c, endpoints: { kubernetes: \"web.shop.svc.cluster.local:http\" } }
+data_plane: { experimental_unrestricted_egress: true }
+",
+    )
+    .unwrap();
+    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+    proxy.deny(
+        crate::egress::Denied {
+            own: vec!["10.0.0.9".parse().unwrap()],
+            api_server: None,
+            gateway: vec!["10.0.0.8".parse().unwrap()],
+        },
+        |_, _, _| panic!("refused, unrestricted"),
+    );
+    let slices = vec![slice(
+        "web",
+        "http",
+        &["10.0.0.8", "10.0.0.9", "169.254.169.254"],
+    )];
+    assert!(proxy.rediscover([shop(slices)]).unwrap());
+    assert_eq!(
+        addresses_of(&proxy, 0),
+        ["10.0.0.8:8080", "10.0.0.9:8080", "169.254.169.254:8080"]
+    );
+}
+
 /// A config that comes to name another Service of a namespace followed has its endpoints
 /// in the very snapshot that takes it in, the Service's only port unnamed as much as named.
 #[test]
@@ -418,6 +632,7 @@ fn a_snapshot_knows_where_it_has_the_listeners_that_have_sockets() {
             crate::serve::plane::Found {
                 discovered: &HashMap::new(),
                 named: &HashMap::new(),
+                denied: &crate::egress::Denied::default(),
             },
             &sockets,
             &metrics,

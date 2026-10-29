@@ -406,6 +406,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         }
     })
     .map_err(Failure::Runtime)?;
+    let mut gateway: Vec<std::net::IpAddr> = Vec::new();
     let (mut configs, config, named, first_ran) = match source {
         Source::File(path) => {
             let (file, config) = match ConfigFile::open(path.clone()) {
@@ -424,6 +425,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         }
         Source::ControlPlane(stream) => {
             let handing = crate::stream::start(&stream, &stopping)?;
+            // What the control plane names as the gateway's own before the first config,
+            // which it sends first, for the proxy to refuse from its start.
             say(
                 stderr,
                 format_args!(
@@ -431,7 +434,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
                     stream.address
                 ),
             );
-            match first(&handing, &stop, outside.as_ref(), stderr) {
+            match first(&handing, &stop, outside.as_ref(), &mut gateway, stderr) {
                 First::Config(config, ran) => {
                     let named = "the control plane's config".to_owned();
                     (Configs::Stream(handing), *config, named, Some(ran))
@@ -444,6 +447,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     let mut bound: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
     // Limits checked but enforced in none is said once, so that a mode left out is seen.
     let unenforced = (!config.rate_limiting().enforces()).then_some(config.limits().len());
+    let unrestricted_from_start = unrestricted(&config);
     let proxy = Proxy::new(config, workers)
         .map(Arc::new)
         .map_err(|error| Failure::Proxy {
@@ -451,6 +455,24 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             error,
         })?;
     let _first = logged.set(Arc::clone(&proxy));
+    // Before anything is discovered or resolved, so that nothing is sent to these first.
+    let mut denied = denied(
+        std::env::var("POD_IPS").ok().as_deref(),
+        std::env::var("KUBERNETES_SERVICE_HOST").ok().as_deref(),
+    );
+    denied.gateway = gateway;
+    if let Some(warning) = own_unknown(&denied, cluster.is_ok()) {
+        say(stderr, format_args!("{warning}"));
+    }
+    if let Some(warning) = unrestricted_from_start {
+        say(stderr, format_args!("warning: {warning}"));
+    }
+    proxy.deny(denied, |upstream, address, why| {
+        say(
+            &mut io::stderr(),
+            format_args!("upstream {upstream}: {address} is not sent to, as {why}"),
+        );
+    });
 
     // Every socket is open before a request is served on any, so that a port that is
     // taken stops a harness that has done nothing yet.
@@ -618,6 +640,12 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
                             say(stderr, format_args!("{line}"));
                             continue;
                         }
+                        FromStream::Gateway(addresses) => {
+                            if let Err(error) = proxy.gateway(addresses) {
+                                say(stderr, format_args!("the gateway's own addresses: {error}"));
+                            }
+                            continue;
+                        }
                         FromStream::Run { config, ran } => (config, ran),
                     };
                     let reloaded = compiled(&config).and_then(|config| {
@@ -724,6 +752,7 @@ fn first(
     handing: &Receiver<FromStream>,
     told: &Receiver<Told>,
     outside: Option<&ApiError>,
+    gateway: &mut Vec<std::net::IpAddr>,
     stderr: &mut impl Write,
 ) -> First {
     loop {
@@ -736,6 +765,10 @@ fn first(
             let (config, ran) = match from {
                 FromStream::Said(line) => {
                     say(stderr, format_args!("{line}"));
+                    continue;
+                }
+                FromStream::Gateway(addresses) => {
+                    *gateway = addresses;
                     continue;
                 }
                 FromStream::Run { config, ran } => (config, ran),
@@ -778,7 +811,8 @@ fn runnable(config: &Compiled, outside: Option<&ApiError>) -> Result<(), String>
 /// them sees the old config after another has seen the new one: what takes a restart, its
 /// listeners being bound once, or why it was refused.
 fn reloaded(proxy: &Proxy, bound: &[Bound], config: Compiled) -> Result<Vec<String>, String> {
-    let warnings = restart_needed(bound, &config);
+    let mut warnings = restart_needed(bound, &config);
+    warnings.extend(unrestricted(&config).map(ToOwned::to_owned));
     proxy.reload(config).map_err(|error| error.to_string())?;
     Ok(warnings)
 }
@@ -1013,6 +1047,39 @@ fn kubernetes(proxy: Arc<Proxy>, api: ApiServer, tell: &Sender<Told>) -> io::Res
     Ok(())
 }
 
+/// What the data plane refuses to send to beside the ranges none sends to (03 §6): the pod's
+/// own addresses, `pod_ips` as the Downward API gives `status.podIPs`, comma-separated; and
+/// the API server's, `api_server` as a pod is given it. What is not an address is passed
+/// over: outside a cluster there are none.
+fn denied(pod_ips: Option<&str>, api_server: Option<&str>) -> edgerush_proxy::egress::Denied {
+    edgerush_proxy::egress::Denied {
+        own: pod_ips
+            .into_iter()
+            .flat_map(|ips| ips.split(','))
+            .filter_map(|ip| ip.trim().parse().ok())
+            .collect(),
+        api_server: api_server.and_then(|host| host.trim().parse().ok()),
+        gateway: Vec::new(),
+    }
+}
+
+/// What is said of a config that sets the experimental switch off default-deny egress, at
+/// each config that sets it (03 §6).
+fn unrestricted(config: &Compiled) -> Option<&'static str> {
+    config.data_plane().unrestricted_egress.then_some(
+        "data_plane.experimental_unrestricted_egress is set: addresses discovered or resolved          are sent to whatever they are, loopback, link-local and the gateway's own pods among          them; for development alone",
+    )
+}
+
+/// What is said of a data plane in a cluster that was not given its own addresses: that it
+/// sends to them until something else names them (03 §6). Nothing, outside a cluster, where
+/// there is no pod.
+fn own_unknown(denied: &edgerush_proxy::egress::Denied, in_cluster: bool) -> Option<&'static str> {
+    (in_cluster && denied.own.is_empty()).then_some(
+        "POD_IPS is not set: the pod's own addresses are not refused as upstream endpoints          until the control plane names them; set it from status.podIPs (03 §6)",
+    )
+}
+
 /// Resolves the names the running config's upstreams resolve, of the nameservers
 /// `/etc/resolv.conf` lists, on a thread and runtime of its own, as EndpointSlices are
 /// followed (03 §6); what fails is said on stderr with its name.
@@ -1023,10 +1090,17 @@ fn resolver(proxy: Arc<Proxy>, tell: &Sender<Told>) -> io::Result<()> {
         .name("resolver".to_owned())
         .spawn(move || {
             let mut essential = Essential::new("the resolver".to_owned(), &tell);
+            let wanted = proxy.names();
             let resolving = crate::resolver::resolve_names(
-                proxy,
+                wanted,
                 crate::resolver::system_nameservers(),
                 crate::resolver::Pace::default(),
+                move |name, addresses| {
+                    proxy
+                        .reresolve([(name.to_owned(), addresses)])
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                },
                 |name, failure| {
                     say(&mut io::stderr(), format_args!("name {name}: {failure}"));
                 },
@@ -1145,6 +1219,64 @@ mod tests {
 
     fn parsed(args: &[&str]) -> Result<Parsed, UsageError> {
         parse(args.iter().map(ToString::to_string))
+    }
+
+    #[test]
+    fn a_config_that_unrestricts_egress_says_so() {
+        let config = |data_plane: &str| {
+            let config: Config = serde_saphyr::from_str(&format!(
+                "listeners: {{}}
+routes: []
+upstreams: {{}}
+{data_plane}"
+            ))
+            .unwrap();
+            compile(&config).unwrap()
+        };
+        assert_eq!(unrestricted(&config("")), None);
+        assert_eq!(
+            unrestricted(&config(
+                "data_plane: { experimental_unrestricted_egress: false }"
+            )),
+            None
+        );
+        let on = config("data_plane: { experimental_unrestricted_egress: true }");
+        assert!(unrestricted(&on).is_some_and(|said| said.contains("for development alone")));
+    }
+
+    #[test]
+    fn a_data_plane_in_a_cluster_not_given_its_own_addresses_says_so() {
+        let unset = denied(None, Some("10.96.0.1"));
+        assert!(
+            own_unknown(&unset, true).is_some_and(|said| said.starts_with("POD_IPS is not set"))
+        );
+        assert_eq!(own_unknown(&unset, false), None);
+        let given = denied(Some("10.244.0.5"), Some("10.96.0.1"));
+        assert_eq!(own_unknown(&given, true), None);
+    }
+
+    #[test]
+    fn the_pods_own_and_the_api_servers_addresses_are_read_from_the_environment() {
+        let both = denied(Some("10.244.0.5,fd00:10:244::5"), Some("10.96.0.1"));
+        assert_eq!(
+            both.own,
+            [
+                "10.244.0.5".parse::<std::net::IpAddr>().unwrap(),
+                "fd00:10:244::5".parse().unwrap()
+            ]
+        );
+        assert_eq!(both.api_server, Some("10.96.0.1".parse().unwrap()));
+        let one = denied(Some("10.244.0.5"), Some("fd00::1"));
+        assert_eq!(one.own.len(), 1);
+        assert_eq!(one.api_server, Some("fd00::1".parse().unwrap()));
+        assert_eq!(
+            denied(None, None),
+            edgerush_proxy::egress::Denied::default()
+        );
+        assert_eq!(
+            denied(Some(" , not-an-address,"), Some("kubernetes.default")),
+            edgerush_proxy::egress::Denied::default()
+        );
     }
 
     /// A data plane holds until each name it resolves has been looked up, for so long at

@@ -1,6 +1,8 @@
-//! The names the running config's `dns` upstreams resolve, resolved for as long as the
-//! data plane runs ([03 §6](../../../docs/03-data-plane.md)): each looked up again as its
-//! answer's time to live runs out, and what it resolves to handed to the proxy.
+//! Names resolved for as long as they are wanted ([03 §6](../../../docs/03-data-plane.md)):
+//! each looked up again as its answer's time to live runs out, and what it resolves to
+//! handed on. The data plane's are those its `dns` upstreams name, handed to the proxy; the
+//! control plane's, those of the gateway's own headless Services, whose pods data planes
+//! are not to send to.
 //!
 //! A name is asked for its A and AAAA records, of each nameserver in turn, over UDP and,
 //! for an answer cut short, again over TCP ([`edgerush_dns`] writes and reads them). An
@@ -11,13 +13,11 @@
 //! than [`Pace::floor`], so that a short one cannot make a lookup spin.
 
 use edgerush_dns::{Answer, Kind, Malformed, nameservers, query, read};
-use edgerush_proxy::Proxy;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Display;
 use std::hash::{BuildHasher, RandomState};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -82,20 +82,26 @@ pub(crate) enum Looked {
     Failed(Failure),
 }
 
-/// Resolves the names the running config's upstreams name, asking `servers` at `pace`, for
-/// as long as the data plane runs: a name a reload comes to name is resolved from then on,
-/// and one it no longer names is no longer resolved, what it resolved to forgotten. `said`
-/// is told each failure that differs from the last for its name, with the name. For a
-/// thread and runtime of its own, in a `LocalSet`, as EndpointSlices are followed.
+/// Who is handed what a name resolves to: its addresses, none for a name that resolves to
+/// none or was never answered for, or nothing at all for a name no longer resolved, to be
+/// forgotten; or why it could not take them.
+type Taker = Rc<dyn Fn(&str, Option<Vec<IpAddr>>) -> Result<(), String>>;
+
+/// Resolves the names `wanted` holds, asking `servers` at `pace`, for as long as it is
+/// polled, each answer handed to `take`: a name `wanted` comes to hold is resolved from
+/// then on, and one it no longer holds is no longer resolved, and `take` is told to forget
+/// it. `said` is told each failure that differs from the last for its name, with the name,
+/// and what `take` could not take. In a `LocalSet`, on a thread and runtime of its own.
 pub(crate) async fn resolve_names(
-    proxy: Arc<Proxy>,
+    mut wanted: tokio::sync::watch::Receiver<BTreeSet<String>>,
     servers: Vec<SocketAddr>,
     pace: Pace,
+    take: impl Fn(&str, Option<Vec<IpAddr>>) -> Result<(), String> + 'static,
     said: impl Fn(&str, &dyn Display) + 'static,
 ) {
     let said: Said = Rc::new(said);
+    let take: Taker = Rc::new(take);
     let servers: Rc<[SocketAddr]> = servers.into();
-    let mut wanted = proxy.names();
     let mut resolving: HashMap<String, JoinHandle<()>> = HashMap::new();
     loop {
         let now = wanted.borrow_and_update().clone();
@@ -108,7 +114,7 @@ pub(crate) async fn resolve_names(
             if let Some(task) = resolving.remove(&name) {
                 task.abort();
             }
-            if let Err(error) = proxy.reresolve([(name.clone(), None)]) {
+            if let Err(error) = take(&name, None) {
                 said(&name, &error);
             }
         }
@@ -117,7 +123,7 @@ pub(crate) async fn resolve_names(
                 continue;
             }
             let task = tokio::task::spawn_local(keep_resolved(
-                Arc::clone(&proxy),
+                Rc::clone(&take),
                 Rc::clone(&servers),
                 pace,
                 name.clone(),
@@ -133,7 +139,7 @@ pub(crate) async fn resolve_names(
 
 /// Looks `name` up for as long as it is wanted, as the module says.
 async fn keep_resolved(
-    proxy: Arc<Proxy>,
+    take: Taker,
     servers: Rc<[SocketAddr]>,
     pace: Pace,
     name: String,
@@ -154,7 +160,7 @@ async fn keep_resolved(
             Looked::Answered(addresses, ttl) => {
                 taken_in = true;
                 last_told = None;
-                if let Err(error) = proxy.reresolve([(name.clone(), Some(addresses))]) {
+                if let Err(error) = take(&name, Some(addresses)) {
                     said(&name, &error);
                 }
                 ttl
@@ -162,7 +168,7 @@ async fn keep_resolved(
             Looked::Failed(failure) => {
                 if !taken_in {
                     taken_in = true;
-                    if let Err(error) = proxy.reresolve([(name.clone(), Some(Vec::new()))]) {
+                    if let Err(error) = take(&name, Some(Vec::new())) {
                         said(&name, &error);
                     }
                 }
@@ -333,4 +339,4 @@ impl Exchange<'_> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

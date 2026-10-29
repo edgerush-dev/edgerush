@@ -6,7 +6,7 @@ use edgerush_certificates::Identity;
 use edgerush_certificates::testing::Authority;
 use edgerush_config::{Certificate, Config};
 use edgerush_control_stream::{CONFIG_VERSION, Malformed, Offer, Report, Staging, Versions, wire};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -51,6 +51,7 @@ struct Plane {
     address: String,
     heard: mpsc::UnboundedReceiver<Heard>,
     offers: watch::Sender<Option<Arc<Offer>>>,
+    gateway: watch::Sender<Arc<[IpAddr]>>,
     tls: watch::Sender<Arc<SslAcceptor>>,
     stop: Option<oneshot::Sender<()>>,
     served: JoinHandle<Result<(), ServeError>>,
@@ -73,12 +74,14 @@ impl Plane {
         let address = listener.local_addr().unwrap().to_string();
         let (tls, accepting) = watch::channel(Arc::new(acceptor(credentials).unwrap()));
         let (offers, offered) = watch::channel(offer.map(Arc::new));
+        let (gateway, addresses) = watch::channel::<Arc<[IpAddr]>>(Arc::from([]));
         let (said, heard) = mpsc::unbounded_channel();
         let (stop, stopped) = oneshot::channel::<()>();
         let served = tokio::spawn(serve(
             listener,
             accepting,
             offered,
+            addresses,
             move |_peer: SocketAddr, heard: Heard| {
                 let _ = said.send(heard);
             },
@@ -90,6 +93,7 @@ impl Plane {
             address,
             heard,
             offers,
+            gateway,
             tls,
             stop: Some(stop),
             served,
@@ -131,15 +135,22 @@ fn follower(
     let (address, name) = (address.to_owned(), name.to_owned());
     let following = tokio::spawn(async move {
         let mut staging = Staging::new();
-        follow(&address, &name, &tls, &mut staging, |config| {
-            let ran = if fail(&config) {
-                Err("the port is taken".to_owned())
-            } else {
-                let _ = ran.send(*config);
-                Ok(())
-            };
-            std::future::ready(ran)
-        })
+        follow(
+            &address,
+            &name,
+            &tls,
+            &mut staging,
+            |config| {
+                let ran = if fail(&config) {
+                    Err("the port is taken".to_owned())
+                } else {
+                    let _ = ran.send(*config);
+                    Ok(())
+                };
+                std::future::ready(ran)
+            },
+            |_| {},
+        )
         .await
     });
     (running, following)
@@ -352,7 +363,7 @@ async fn a_data_plane_that_dials_again_is_sent_only_what_it_lacks() {
     {
         // Followed until the config runs and is reported, then dropped, as a connection
         // lost.
-        let following = follow(&address, "control.test", &tls, &mut staging, run);
+        let following = follow(&address, "control.test", &tls, &mut staging, run, |_| {});
         tokio::pin!(following);
         let heard = hear(&mut plane, following.as_mut()).await;
         assert!(matches!(heard, Heard::Opened { .. }), "{heard:?}");
@@ -361,7 +372,7 @@ async fn a_data_plane_that_dials_again_is_sent_only_what_it_lacks() {
     }
     assert!(matches!(plane.next().await, Heard::Closed(_)));
     {
-        let following = follow(&address, "control.test", &tls, &mut staging, run);
+        let following = follow(&address, "control.test", &tls, &mut staging, run, |_| {});
         tokio::pin!(following);
         let heard = hear(&mut plane, following.as_mut()).await;
         let Heard::Opened { held, .. } = heard else {
@@ -570,6 +581,7 @@ fn subscriber(
                 let _ = ran.send(*config);
                 std::future::ready(Ok(()))
             },
+            |_| {},
             |following| {
                 let _ = said.send(following);
             },
@@ -758,6 +770,7 @@ async fn the_stream_goes_on_while_a_config_waits_to_run() {
                     Ok(())
                 }
             },
+            |_| {},
             |following| {
                 let _ = said.send(following);
             },
@@ -782,5 +795,86 @@ async fn the_stream_goes_on_while_a_config_waits_to_run() {
     assert!(matches!(plane.next().await, Heard::Reported(_)));
     subscribing.abort();
     plane.signal();
+    plane.join().await;
+}
+
+/// A control plane with no gateway's addresses to say, its sender of them gone, serves its
+/// stream all the same: the last addresses, none, are all there are.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_goes_on_once_the_gateways_addresses_can_no_longer_change() {
+    let authority = Authority::new("stream");
+    let offer = Offer::new(&config(80), None, &mut Versions::new(7)).unwrap();
+    let mut plane = Plane::start(&credentials(&authority, &["control.test"]), Some(offer)).await;
+    drop(std::mem::replace(
+        &mut plane.gateway,
+        watch::channel::<Arc<[IpAddr]>>(Arc::from([])).0,
+    ));
+    let tls = connector(&credentials(&authority, &["data-plane"])).unwrap();
+    let (mut running, following) = follower(&plane.address, "control.test", tls, |_| false);
+    assert_eq!(ran(&mut running).await, config(80));
+    assert!(matches!(plane.next().await, Heard::Opened { .. }));
+    assert!(matches!(plane.next().await, Heard::Reported(_)));
+    plane.offers.send_replace(Some(Arc::new(
+        Offer::new(&config(81), None, &mut Versions::new(8)).unwrap(),
+    )));
+    assert_eq!(ran(&mut running).await, config(81));
+    assert!(!following.is_finished());
+    plane.signal();
+    ended(following).await;
+    plane.join().await;
+}
+
+/// What a data plane is handed, in the order it is handed it.
+#[derive(Debug, PartialEq)]
+enum Handed {
+    Config,
+    Gateway(Vec<IpAddr>),
+}
+
+/// The gateway's addresses reach a data plane before the config it runs, and again each
+/// time they change, while the config is not sent again.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gateways_addresses_come_before_the_config_and_again_as_they_change() {
+    let authority = Authority::new("stream");
+    let offer = Offer::new(&config(80), None, &mut Versions::new(7)).unwrap();
+    let mut plane = Plane::start(&credentials(&authority, &["control.test"]), Some(offer)).await;
+    let first: Vec<IpAddr> = vec!["10.244.0.5".parse().unwrap()];
+    plane.gateway.send_replace(Arc::from(first.clone()));
+    let tls = connector(&credentials(&authority, &["data-plane"])).unwrap();
+    let (handed, mut handing) = mpsc::unbounded_channel();
+    let address = plane.address.clone();
+    let following = tokio::spawn(async move {
+        let mut staging = Staging::new();
+        let running = handed.clone();
+        follow(
+            &address,
+            "control.test",
+            &tls,
+            &mut staging,
+            move |_config| {
+                let _ = running.send(Handed::Config);
+                std::future::ready(Ok(()))
+            },
+            move |addresses| {
+                let _ = handed.send(Handed::Gateway(addresses));
+            },
+        )
+        .await
+    });
+    assert_eq!(within(&mut handing).await, Handed::Gateway(first));
+    assert_eq!(within(&mut handing).await, Handed::Config);
+    // Once the data plane has reported, so that nothing but the change sends more.
+    assert!(matches!(plane.next().await, Heard::Opened { .. }));
+    assert!(matches!(plane.next().await, Heard::Reported(_)));
+    let more: Vec<IpAddr> = vec!["10.244.0.5".parse().unwrap(), "fd00::6".parse().unwrap()];
+    plane.gateway.send_replace(Arc::from(more.clone()));
+    assert_eq!(within(&mut handing).await, Handed::Gateway(more));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        handing.try_recv().is_err(),
+        "more was sent than the addresses"
+    );
+    plane.signal();
+    ended(following).await;
     plane.join().await;
 }
