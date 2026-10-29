@@ -1,0 +1,23 @@
+[package]
+name = "edgerush-crdgen"
+description = "EdgeRush's generator of Rust types from a CRD's schema, adapted from kopium; pure, no I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+k8s-openapi.workspace = true
+# An enumerated field's values are JSON in the schema.
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# A module written by the tests is compiled by them too.
+serde.workspace = true
+# Tests write schemas and CRDs as YAML, as they are published. The crate knows no format.
+serde-saphyr.workspace = true
+
+[lints]
+workspace = true

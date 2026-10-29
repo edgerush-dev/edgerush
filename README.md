@@ -324,6 +324,9 @@ crates/control-stream
 crates/controller  the control plane (`edgerush-controller`): the objects a data plane's config is
                    made of, followed, translated once every kind is listed and again on each
                    change, a moment's changes at once, and each config that compiles handed on
+crates/crdgen      Rust types written from a CRD's schema (`edgerush-crdgen`), adapted from
+                   kopium (its NOTICE): an enumerated string kept a `String`, a missing field
+                   read empty, so that no object of a newer release fails its list; no I/O
 crates/discovery   a Kubernetes Service's endpoints, from its EndpointSlices (`edgerush-discovery`):
                    which addresses take requests, and which are hinted for a zone; pure, no I/O
 crates/dns         DNS's wire (`edgerush-dns`): A and AAAA queries written and a nameserver's
@@ -332,6 +335,9 @@ crates/explain     where a request would go and why (`edgerush-explain`): what `
                    prints and `edgerush test` checks, worked out by the request core without a
                    data plane; no I/O
 crates/filters     built-in filters (`edgerush-filters`): pure, on plain `http` types
+crates/gateway-api the Gateway API kinds EdgeRush follows (`edgerush-gateway-api`), their types
+                   written by `edgerush-crdgen` from the CRDs in its `crds/`, fetched from a
+                   release by its `fetch.sh`; a test fails when the two differ; no I/O
 crates/kubernetes  EdgeRush's client of the Kubernetes API (`edgerush-kubernetes`): it lists and
                    watches the kinds EdgeRush reads and does nothing else, over h2 and BoringSSL
 crates/ratelimit   rate limiting (`edgerush-ratelimit`): pure, no I/O; the admission models as
@@ -380,4 +386,7 @@ everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 Apache-2.0 — see [LICENSE](LICENSE). `vendor/quiche` is quiche's, under its own BSD 2-Clause
 licence ([vendor/quiche/COPYING](vendor/quiche/COPYING)), and `vendor/h2` is h2's, under its
-own MIT licence ([vendor/h2/LICENSE](vendor/h2/LICENSE)).
+own MIT licence ([vendor/h2/LICENSE](vendor/h2/LICENSE)). `crates/crdgen` is adapted from
+kopium, under the same Apache-2.0 ([crates/crdgen/NOTICE](crates/crdgen/NOTICE)), and
+`crates/gateway-api/crds` holds the Gateway API's CRDs as its releases publish them, under
+the same Apache-2.0, copyright the Kubernetes Authors.

@@ -1,0 +1,16 @@
+edgerush-crdgen is adapted from kopium, the Kubernetes OPenapI UnMangler
+<https://github.com/kube-rs/kopium>, at commit 2d72ccd (2026-10-26).
+
+Copyright the kopium authors (clux <sszynrae@gmail.com> and contributors).
+Licensed under the Apache License, Version 2.0; see LICENSE at the root of this
+repository, which is the same licence.
+
+What is kept: how a schema is walked into structs and their fields (src/analyzer.rs,
+from kopium's analyzer.rs), and how containers are named, deduplicated and their
+fields renamed (src/output.rs, from kopium's output.rs), with kopium's tests of them.
+
+What is changed: an enumerated string is a `String`, not an enum; only CRDs passed in
+are read (no cluster, no command line); the output is plain serde structs with the
+resource traits of k8s-openapi, not kube-rs's derives; case conversion, escaping and
+doc comments are written here instead of using heck, syn and regex; errors are typed;
+there is no logging.
