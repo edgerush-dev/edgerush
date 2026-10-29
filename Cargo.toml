@@ -38,6 +38,7 @@ edgerush-control-service = { path = "crates/control-service" }
 edgerush-control-stream = { path = "crates/control-stream" }
 edgerush-controller = { path = "crates/controller" }
 edgerush-discovery = { path = "crates/discovery" }
+edgerush-dns = { path = "crates/dns" }
 edgerush-kubernetes = { path = "crates/kubernetes" }
 edgerush-explain = { path = "crates/explain" }
 edgerush-filters = { path = "crates/filters" }

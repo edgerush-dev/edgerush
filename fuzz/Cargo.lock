@@ -274,6 +274,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-dns"
+version = "0.0.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "edgerush-explain"
 version = "0.0.0"
 dependencies = [
@@ -303,6 +310,7 @@ dependencies = [
  "bytes",
  "edgerush-config",
  "edgerush-controller",
+ "edgerush-dns",
  "edgerush-explain",
  "edgerush-filters",
  "edgerush-proxy",

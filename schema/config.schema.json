@@ -240,6 +240,19 @@
           "required": [
             "kubernetes"
           ]
+        },
+        {
+          "description": "What a name resolves to, each address on the port given: `<name>:<port>`, looked\nup as an absolute name, again as each answer's time to live runs out. A Service's\nown name, so that kube-proxy or a mesh chooses the pod, or a headless Service's,\nwhose answer is its pods.",
+          "type": "object",
+          "properties": {
+            "dns": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "dns"
+          ]
         }
       ]
     },

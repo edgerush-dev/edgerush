@@ -74,11 +74,15 @@ Kubernetes, begun:
   stream it serves, gRPC over mutual TLS.
 - **`edgerush proxy --control-plane`**, a data plane taking its config from that stream:
   nothing is served until the first config runs, each later one takes over as a file's
-  does, and the stream is dialled again after a jittered wait when it ends. Not yet tested
-  end to end in kind.
+  does, and the stream is dialled again after a jittered wait when it ends; tested end
+  to end in kind, the control plane gone and back among it.
 - **Endpoints from EndpointSlices:** an upstream that names a Service takes its endpoints
   from the data plane's own list and watch of EndpointSlices, so that they are followed
   with the control plane down; tested end to end in kind.
+- **Endpoints a name resolves to:** an upstream may name a host and a port instead,
+  `dns: "web.shop.svc.cluster.local:8080"`, each address the name resolves to an endpoint
+  on that port, looked up again by the data plane's own resolver as each answer's time to
+  live runs out.
 - **`edgerush validate`** translates manifests as the controller would, without a cluster,
   and reports what it left out and why.
 
@@ -255,7 +259,9 @@ tests against a fixed config, holding all three to not failing; `rules_compile` 
 a limit rule's three parts and decides a request with what compiles, holding an error to
 its place in the part it is about; `admission_review` reads any bytes as the admission
 webhook's review, which anyone in the cluster can send it, and answers what it reads,
-holding reading to not failing and the answer to carrying the review's uid. An input that fails is saved under `fuzz/artifacts/`; fix the bug
+holding reading to not failing and the answer to carrying the review's uid; `dns_answer`
+reads any bytes as a nameserver's answer, holding reading to not failing and the addresses
+it finds to being each once, in order. An input that fails is saved under `fuzz/artifacts/`; fix the bug
 and add the input to the unit tests. Run a target after changing the code it covers. Being
 outside the workspace, the package is formatted on its own:
 `cargo fmt --manifest-path fuzz/Cargo.toml`.
@@ -288,6 +294,8 @@ crates/controller  the control plane (`edgerush-controller`): the objects a data
                    change, a moment's changes at once, and each config that compiles handed on
 crates/discovery   a Kubernetes Service's endpoints, from its EndpointSlices (`edgerush-discovery`):
                    which addresses take requests; pure, no I/O
+crates/dns         DNS's wire (`edgerush-dns`): A and AAAA queries written and a nameserver's
+                   answers read, for upstreams that resolve a name; pure, no I/O
 crates/explain     where a request would go and why (`edgerush-explain`): what `edgerush explain`
                    prints and `edgerush test` checks, worked out by the request core without a
                    data plane; no I/O

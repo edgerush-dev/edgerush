@@ -791,6 +791,11 @@ const DEFAULT_CLASS_ANNOTATION: &str = "ingressclass.kubernetes.io/is-default-cl
 /// its own routes, whatever the data plane's setting: `"true"` or `"false"`.
 pub const HTTPS_REDIRECT_ANNOTATION: &str = "gateway.edgerush.dev/https-redirect";
 
+/// The annotation an Ingress has its backends reached by their Services' own addresses
+/// with, `"true"`, rather than by their endpoints: the cluster IP, which kube-proxy or a
+/// mesh then chooses a pod behind ([03 §6](../../../docs/03-data-plane.md)).
+pub const SERVICE_UPSTREAM_ANNOTATION: &str = "gateway.edgerush.dev/service-upstream";
+
 /// The annotation that named an Ingress's class before `ingressClassName`, and still does
 /// where that is left out.
 const CLASS_ANNOTATION: &str = "kubernetes.io/ingress.class";
@@ -872,6 +877,7 @@ fn ingress_routes(
         .any(|name| {
             name != "kubectl.kubernetes.io/last-applied-configuration"
                 && name != HTTPS_REDIRECT_ANNOTATION
+                && name != SERVICE_UPSTREAM_ANNOTATION
         })
     {
         return Err(Problem::NotSupportedYet("annotations"));
@@ -884,6 +890,14 @@ fn ingress_routes(
         Some("true") => true,
         Some("false") => false,
         Some(_) => return Err(Problem::NotBoolean(HTTPS_REDIRECT_ANNOTATION)),
+    };
+    let service_upstream = match annotations
+        .and_then(|annotations| annotations.get(SERVICE_UPSTREAM_ANNOTATION))
+        .map(String::as_str)
+    {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(Problem::NotBoolean(SERVICE_UPSTREAM_ANNOTATION)),
     };
     let Some(spec) = ingress.spec.as_ref().filter(|spec| {
         spec.default_backend.is_some() || spec.rules.as_ref().is_some_and(|rules| !rules.is_empty())
@@ -931,7 +945,7 @@ fn ingress_routes(
     // API has a missing `backendRef` (04 §2).
     let mut backend_of = |backend: &IngressBackend, host: &str, path: Option<String>| {
         Ok(
-            match backend_upstream(plane, cluster, namespace, backend)? {
+            match backend_upstream(plane, cluster, namespace, backend, service_upstream)? {
                 Ok((name, upstream)) => {
                     upstreams.insert(name.clone(), upstream);
                     Backend {
@@ -1200,18 +1214,25 @@ fn forward(path: PathMatch, backend: Backend) -> Rule {
 }
 
 /// The upstream a backend leads to, and its name: one a Service's port, whose endpoints are
-/// followed through its EndpointSlices. Or what is not there, when its Service, or that
-/// port of it, is not; or why the Ingress is left out.
+/// followed through its EndpointSlices, or, `by_address`, reached by the Service's own name,
+/// which resolves to its cluster IP. Or what is not there, when its Service, or that port of
+/// it, is not, or it has no cluster IP to be reached by; or why the Ingress is left out.
 fn backend_upstream(
     plane: &Plane,
     cluster: &Cluster,
     namespace: &str,
     backend: &IngressBackend,
+    by_address: bool,
 ) -> Result<Result<(String, Upstream), String>, Problem> {
     let Some(backend) = &backend.service else {
         return Err(Problem::NotSupportedYet("a resource backend"));
     };
-    let (port, app_protocol) = match service_port(cluster, namespace, backend)? {
+    let ServicePort {
+        label: port,
+        number,
+        app_protocol,
+        headless,
+    } = match service_port(cluster, namespace, backend)? {
         Ok(port) => port,
         Err(missing) => return Ok(Err(missing)),
     };
@@ -1245,9 +1266,27 @@ fn backend_upstream(
             )));
         }
     };
-    let name = format!("{namespace}/{service}/{port}");
+    // A headless Service's name resolves to its pods, which listen on their own ports, not
+    // the Service's.
+    if by_address && headless {
+        return Ok(Err(format!(
+            "Service {namespace}/{service} has no cluster IP for \
+             {SERVICE_UPSTREAM_ANNOTATION} to reach it by"
+        )));
+    }
+    let (name, endpoints) = if by_address {
+        (
+            format!("{namespace}/{service}/{port}/service"),
+            Endpoints::Dns(format!("{host}:{number}")),
+        )
+    } else {
+        (
+            format!("{namespace}/{service}/{port}"),
+            Endpoints::Kubernetes(format!("{host}:{port}")),
+        )
+    };
     let upstream = Upstream {
-        endpoints: Endpoints::Kubernetes(format!("{host}:{port}")),
+        endpoints,
         protocol,
         tls,
         keepalive: None,
@@ -1259,14 +1298,25 @@ fn backend_upstream(
     Ok(Ok((name, upstream)))
 }
 
-/// The Service port a backend names, as EndpointSlices know it: its name, or, for a
-/// Service's only port left unnamed, its number (03 §6); and its `appProtocol`. Or what is
-/// not there; or why the Ingress is left out.
+/// A Service's port, as a backend names it.
+struct ServicePort<'a> {
+    /// As EndpointSlices know it: its name, or, for a Service's only port left unnamed, its
+    /// number (03 §6).
+    label: String,
+    /// Its number, which the Service's cluster IP is reached on.
+    number: i32,
+    /// Its `appProtocol`.
+    app_protocol: Option<&'a str>,
+    /// Whether the Service has no cluster IP.
+    headless: bool,
+}
+
+/// The Service port a backend names. Or what is not there; or why the Ingress is left out.
 fn service_port<'a>(
     cluster: &'a Cluster,
     namespace: &str,
     backend: &IngressServiceBackend,
-) -> Result<Result<(String, Option<&'a str>), String>, Problem> {
+) -> Result<Result<ServicePort<'a>, String>, Problem> {
     // Kubernetes requires a port, by name or by number, of a Service backend.
     let wanted = match &backend.port {
         Some(wanted) if wanted.name.is_some() || wanted.number.is_some() => wanted,
@@ -1318,7 +1368,12 @@ fn service_port<'a>(
             ));
         }
     };
-    Ok(Ok((name, port.app_protocol.as_deref())))
+    Ok(Ok(ServicePort {
+        label: name,
+        number: port.port,
+        app_protocol: port.app_protocol.as_deref(),
+        headless: spec.and_then(|spec| spec.cluster_ip.as_deref()) == Some("None"),
+    }))
 }
 
 #[cfg(test)]

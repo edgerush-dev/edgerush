@@ -155,6 +155,109 @@ fn discovered_endpoints_are_served_and_changed_as_a_reload_changes_them() {
     assert!(last.is_retired());
 }
 
+/// A config whose upstreams `api` and `web` resolve `web.shop.svc.cluster.local`, on 9090
+/// and on 8080, and `listed` one at `127.0.0.1:1`.
+fn resolving() -> Compiled {
+    let config: Config = serde_saphyr::from_str(
+        "listeners: {}
+routes: []
+upstreams:
+  api: { load_balancer: p2c, endpoints: { dns: \"web.shop.svc.cluster.local:9090\" } }
+  listed: { load_balancer: p2c, endpoints: { listed: [\"127.0.0.1:1\"] } }
+  web: { load_balancer: p2c, endpoints: { dns: \"Web.Shop.svc.cluster.local.:8080\" } }
+",
+    )
+    .unwrap();
+    compile(&config).unwrap()
+}
+
+const WEB: &str = "web.shop.svc.cluster.local";
+
+fn at(addresses: &[&str]) -> Option<Vec<std::net::IpAddr>> {
+    Some(
+        addresses
+            .iter()
+            .map(|address| address.parse().unwrap())
+            .collect(),
+    )
+}
+
+/// An upstream that resolves a name has no endpoint until the name's addresses are told,
+/// each upstream then served with them on its own port, as discovered endpoints are: an
+/// address kept keeps what its connections are filed under, one gone is retired, the same
+/// answer in another order changes nothing, and a name forgotten is to be looked up again.
+#[test]
+fn resolved_endpoints_are_served_on_each_upstreams_port_and_changed_as_a_reload_changes_them() {
+    let proxy = Proxy::new(resolving(), NonZeroUsize::MIN).unwrap();
+    let names = proxy.names();
+    assert_eq!(names.borrow().iter().collect::<Vec<_>>(), [WEB]);
+    assert_eq!(proxy.unresolved(), [WEB]);
+    assert!(destinations_of(&proxy, 0).is_empty());
+    assert!(destinations_of(&proxy, 2).is_empty());
+    let listed = filed_under(&proxy, 1);
+
+    assert!(
+        proxy
+            .reresolve([(WEB.to_owned(), at(&["10.0.0.2", "10.0.0.1"]))])
+            .unwrap()
+    );
+    assert!(proxy.unresolved().is_empty());
+    assert_eq!(addresses_of(&proxy, 0), ["10.0.0.1:9090", "10.0.0.2:9090"]);
+    assert_eq!(addresses_of(&proxy, 2), ["10.0.0.1:8080", "10.0.0.2:8080"]);
+    let first = destinations_of(&proxy, 2);
+    let generation = proxy.current.load().generation;
+    // The same answer in another order, or a name no upstream resolves: nothing changes.
+    assert!(
+        !proxy
+            .reresolve([(WEB.to_owned(), at(&["10.0.0.1", "10.0.0.2"]))])
+            .unwrap()
+    );
+    assert!(
+        !proxy
+            .reresolve([("other.example".to_owned(), at(&["10.0.9.9"]))])
+            .unwrap()
+    );
+    assert_eq!(proxy.current.load().generation, generation);
+
+    let gone = Arc::clone(proxy.current.load().destinations.at(2, 0).unwrap());
+    assert!(
+        proxy
+            .reresolve([(WEB.to_owned(), at(&["10.0.0.2", "10.0.0.3"]))])
+            .unwrap()
+    );
+    let second = destinations_of(&proxy, 2);
+    assert_eq!(second[0], first[1], "an address kept changed hands");
+    assert!(gone.is_retired(), "an address gone was left live");
+    assert_eq!(
+        filed_under(&proxy, 1),
+        listed,
+        "a listed upstream changed hands"
+    );
+
+    // A reload of a config that still resolves the name keeps what it resolved to, and so
+    // does an EndpointSlice change.
+    proxy.reload(resolving()).unwrap();
+    assert_eq!(destinations_of(&proxy, 2), second);
+    assert!(!proxy.rediscover([shop(Vec::new())]).unwrap());
+    assert_eq!(destinations_of(&proxy, 2), second);
+
+    // Looked up, it no longer resolves: none served, but it has been looked up.
+    let last = Arc::clone(proxy.current.load().destinations.at(2, 0).unwrap());
+    assert!(proxy.reresolve([(WEB.to_owned(), at(&[]))]).unwrap());
+    assert!(destinations_of(&proxy, 2).is_empty());
+    assert!(last.is_retired());
+    assert!(proxy.unresolved().is_empty());
+    // Forgotten, it is to be looked up again.
+    assert!(!proxy.reresolve([(WEB.to_owned(), None)]).unwrap());
+    assert_eq!(proxy.unresolved(), [WEB]);
+
+    // A config that resolves no name: none to resolve.
+    proxy.reload(upstreams(&[("web", "127.0.0.1:1")])).unwrap();
+    assert!(names.has_changed().unwrap());
+    assert!(proxy.names().borrow().is_empty());
+    assert!(proxy.unresolved().is_empty());
+}
+
 /// A config that comes to name another Service of a namespace followed has its endpoints
 /// in the very snapshot that takes it in, the Service's only port unnamed as much as named.
 #[test]
@@ -312,7 +415,10 @@ fn a_snapshot_knows_where_it_has_the_listeners_that_have_sockets() {
     let listeners = |names: &[&str]| {
         Snapshot::new(
             Arc::new(config_with(names)),
-            &HashMap::new(),
+            crate::serve::plane::Found {
+                discovered: &HashMap::new(),
+                named: &HashMap::new(),
+            },
             &sockets,
             &metrics,
             None,

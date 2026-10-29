@@ -524,6 +524,11 @@ pub enum Endpoints {
     /// the Service's only, unnamed port. A data plane follows them from the API server of
     /// the cluster it is in, and refuses it outside one.
     Kubernetes(String),
+    /// What a name resolves to, each address on the port given: `<name>:<port>`, looked
+    /// up as an absolute name, again as each answer's time to live runs out. A Service's
+    /// own name, so that kube-proxy or a mesh chooses the pod, or a headless Service's,
+    /// whose answer is its pods.
+    Dns(String),
 }
 
 /// How an upstream's endpoint is chosen for an exchange ([03 §6](../../../docs/03-data-plane.md)).

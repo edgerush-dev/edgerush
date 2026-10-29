@@ -1,0 +1,58 @@
+# An Ingress that asks for its Services' own addresses has each backend reached by the
+# Service's name, which resolves to its cluster IP, on the Service's port: an upstream of its
+# own beside the one another Ingress reaches the same port's endpoints by. A headless
+# Service has no cluster IP, and its path is answered 500, the Ingress's others served; an
+# annotation that is neither "true" nor "false" leaves its Ingress out.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: by-address
+  namespace: shop
+  creationTimestamp: "2026-01-01T00:00:00Z"
+  annotations: { gateway.edgerush.dev/service-upstream: "true" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: address.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { name: http } } } }
+          - { path: /pods, pathType: Prefix, backend: { service: { name: pods, port: { number: 8080 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: by-endpoints, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: endpoints.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: garbled
+  namespace: shop
+  annotations: { gateway.edgerush.dev/service-upstream: "yes" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: garbled.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: pods, namespace: shop }
+spec:
+  clusterIP: None
+  ports: [{ name: http, port: 8080 }]

@@ -1,4 +1,4 @@
-# An ExternalName Service is never a backend: its name can lead anywhere (12 item 12).
+# An ExternalName Service is never a backend: its name can lead anywhere (04 §2).
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: away, namespace: shop }

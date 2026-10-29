@@ -22,6 +22,8 @@ boring = "5.2"
 bytes = "1.12"
 # The model and compiler a harness file is read into.
 edgerush-config = { path = "../crates/config" }
+# A nameserver's answers, read as the resolver reads them.
+edgerush-dns = { path = "../crates/dns" }
 # The admission webhook's reviews, read and answered.
 edgerush-controller = { path = "../crates/controller" }
 # edgerush test's file of tests, read, checked and run.
@@ -163,6 +165,13 @@ bench = false
 [[bin]]
 name = "tls_hello"
 path = "fuzz_targets/tls_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_answer"
+path = "fuzz_targets/dns_answer.rs"
 test = false
 doc = false
 bench = false

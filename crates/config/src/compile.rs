@@ -12,10 +12,10 @@ use crate::route::{
     ValuePredicate, Wildcard,
 };
 use crate::{
-    AccessLog, Backend, Certificate, ClientValidation, Config, Endpoints, Forwarding, HealthCheck,
-    Http3, Keepalive, KubernetesService, ListenerProxyProtocol, LoadBalancer, Probe, Protocol,
-    ProxyProtocolVersion, RateLimitMode, RequestId, Rule, ServiceNameError, SlowStart,
-    UpstreamProtocol,
+    AccessLog, Backend, Certificate, ClientValidation, Config, DnsName, DnsNameError, Endpoints,
+    Forwarding, HealthCheck, Http3, Keepalive, KubernetesService, ListenerProxyProtocol,
+    LoadBalancer, Probe, Protocol, ProxyProtocolVersion, RateLimitMode, RequestId, Rule,
+    ServiceNameError, SlowStart, UpstreamProtocol,
 };
 use edgerush_filters::forwarding::{ForwardingError, HeaderNames, TrustedProxies};
 use edgerush_filters::{
@@ -854,6 +854,8 @@ pub struct CompiledUpstream {
     /// The Kubernetes Service whose EndpointSlices its endpoints come from, if they are
     /// discovered rather than listed.
     pub discovery: Option<KubernetesService>,
+    /// The name and port its endpoints are what the name resolves to, if they are.
+    pub dns: Option<DnsName>,
     /// What to speak there.
     pub protocol: UpstreamProtocol,
     /// TLS to its endpoints, if any.
@@ -967,12 +969,17 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             name: name.clone(),
             endpoints: match &upstream.endpoints {
                 Endpoints::Listed(endpoints) => endpoints.clone(),
-                Endpoints::Kubernetes(_) => Vec::new(),
+                Endpoints::Kubernetes(_) | Endpoints::Dns(_) => Vec::new(),
             },
-            // A name that is not a Service's is refused below, and nothing is compiled.
+            // A name that is not a Service's, or not a name, is refused below, and nothing
+            // is compiled.
             discovery: match &upstream.endpoints {
-                Endpoints::Listed(_) => None,
                 Endpoints::Kubernetes(service) => KubernetesService::parse(service).ok(),
+                Endpoints::Listed(_) | Endpoints::Dns(_) => None,
+            },
+            dns: match &upstream.endpoints {
+                Endpoints::Dns(name) => DnsName::parse(name).ok(),
+                Endpoints::Listed(_) | Endpoints::Kubernetes(_) => None,
             },
             protocol: upstream.protocol,
             // A certificate not found is refused below, and nothing is compiled.
@@ -1018,6 +1025,11 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                 if let Err(error) = KubernetesService::parse(service) {
                     let problem = Problem::KubernetesService(error);
                     errors.push(Place::upstream(name).problem(problem));
+                }
+            }
+            Endpoints::Dns(dns) => {
+                if let Err(error) = DnsName::parse(dns) {
+                    errors.push(Place::upstream(name).problem(Problem::DnsName(error)));
                 }
             }
         }
@@ -2516,6 +2528,9 @@ pub enum Problem {
     /// Endpoints from Kubernetes, named by something that is not a Service's name and port.
     #[error("`endpoints.kubernetes`: {0}")]
     KubernetesService(ServiceNameError),
+    /// Endpoints a name resolves to, named by something that is not a name and port.
+    #[error("`endpoints.dns`: {0}")]
+    DnsName(DnsNameError),
     /// A slow start over no time at all, which is none: left out is how none is said.
     #[error("`slow_start.window_ms` is 0: at least 1, or no `slow_start`")]
     SlowStartNever,
@@ -5178,6 +5193,36 @@ upstreams: {{ u: {upstream} }}
         assert!(
             refused[0].contains("`endpoints.kubernetes`: not a Service's name"),
             "{refused:?}"
+        );
+        let resolved = |endpoints: &str| {
+            let yaml = format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: {endpoints} }} }}\n"
+            );
+            compile(&config(&yaml))
+                .map(|compiled| {
+                    let upstream = &compiled.upstreams[0];
+                    (
+                        upstream.endpoints.clone(),
+                        upstream.discovery.clone(),
+                        upstream.dns.clone(),
+                    )
+                })
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            resolved(r#"{ dns: "Web.Shop.svc.cluster.local.:80" }"#),
+            Ok((
+                Vec::new(),
+                None,
+                Some(DnsName::parse("web.shop.svc.cluster.local:80").unwrap())
+            ))
+        );
+        let refused = resolved(r#"{ dns: "192.0.2.1:80" }"#).unwrap_err();
+        assert_eq!(
+            refused,
+            [
+                "upstream `u`: `endpoints.dns`: `192.0.2.1` is an address, which `listed` holds, not a name"
+            ]
         );
     }
 

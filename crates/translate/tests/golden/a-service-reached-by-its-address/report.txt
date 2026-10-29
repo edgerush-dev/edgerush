@@ -1,0 +1,2 @@
+Ingress shop/garbled: annotation `gateway.edgerush.dev/service-upstream` is neither "true" nor "false"
+Ingress shop/by-address: path /pods (Prefix) on address.example.com is answered 500: Service shop/pods has no cluster IP for gateway.edgerush.dev/service-upstream to reach it by
