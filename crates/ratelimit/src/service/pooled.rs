@@ -16,7 +16,7 @@
 //!
 //! No I/O: the time is passed in; the transport's messages are the caller's to carry.
 
-mod chunked;
+pub(super) mod chunked;
 mod sync;
 mod word;
 
@@ -28,8 +28,8 @@ mod tests;
 pub use word::fits;
 
 use super::{
-    Answers, Batch, Contract, Entry as BatchEntry, PlaneId, PodId, Queued, RESEND_AFTER_CYCLES,
-    Report, Room, Unseen, View, encoded_entry_bytes, longest,
+    Answers, Batch, Contract, Entry as BatchEntry, MOST_UNACKNOWLEDGED, PlaneId, PodId, Queued,
+    RESEND_AFTER_CYCLES, Report, Room, Unseen, View, encoded_entry_bytes, longest,
 };
 use chunked::MinHeap;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -816,10 +816,10 @@ struct Tracked {
 
 impl Tracked {
     /// Its ledger's hits, as a report numbered after the last, sent at `now`: `None` if
-    /// there are none.
+    /// there are none, or [`MOST_UNACKNOWLEDGED`] are out already and they wait.
     fn report_unsent(&mut self, now: u64, spare: &mut Spare) -> Option<BatchEntry> {
         let unsent = self.unsent;
-        if unsent == 0 {
+        if unsent == 0 || self.unacknowledged.as_slice().len() >= MOST_UNACKNOWLEDGED {
             return None;
         }
         self.unsent = 0;
@@ -1035,6 +1035,8 @@ pub struct Participant<S> {
     /// `evictions`, keeps until it comes or is dropped ([`Self::drop_stale`]).
     stale: u64,
     evicted: u64,
+    /// Hits given up without being seen applied, all told ([`Self::forgiven`]).
+    forgiven: u64,
     /// Lists of unacknowledged batches given back, for keys to take.
     spare: Spare,
     /// Whether each cycle visits only the keys that need it, rather than every key.
@@ -1094,6 +1096,8 @@ struct Visit<'a> {
     sending: &'a BTreeMap<PodId, u64>,
     queued: &'a mut BTreeMap<PodId, Queued>,
     numbered: &'a mut u64,
+    /// Hits given up without being seen applied, all told ([`Participant::forgiven`]).
+    forgiven: &'a mut u64,
     spare: &'a mut Spare,
     cut_off: bool,
     wake: bool,
@@ -1136,7 +1140,7 @@ impl Visit<'_> {
         let bytes = encoded_entry_bytes(key.len());
         let mut left_out = false;
         for unseen in tracked.unacknowledged.as_mut_slice() {
-            unseen.empty_if_stale(hold, now);
+            *self.forgiven += unseen.empty_if_stale(hold, now);
         }
         let mut reported = false;
         for unseen in tracked.unacknowledged.as_mut_slice() {
@@ -1279,6 +1283,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             holding: 0,
             stale: 0,
             evicted: 0,
+            forgiven: 0,
             spare: Spare::default(),
             scheduled: false,
             runnable: Vec::new(),
@@ -1409,6 +1414,15 @@ impl<S: BuildHasher + Clone> Participant<S> {
     #[must_use]
     pub fn evicted(&self) -> u64 {
         self.evicted
+    }
+
+    /// Hits given up without being seen applied, all told, as `DataPlane::forgiven`: those of
+    /// keys evicted for capacity, and those of reports not acknowledged within their key's
+    /// refill time. At most what was lost, since an unacknowledged report may have been
+    /// applied with its answer lost.
+    #[must_use]
+    pub fn forgiven(&self) -> u64 {
+        self.forgiven
     }
 
     /// How many keys it holds.
@@ -1604,6 +1618,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             sending: &self.sending,
             queued: &mut self.queued,
             numbered: &mut self.numbered,
+            forgiven: &mut self.forgiven,
             spare: &mut self.spare,
             cut_off: false,
             wake: false,
@@ -1687,28 +1702,36 @@ impl<S: BuildHasher + Clone> Participant<S> {
         }
         let target = self.capacity - self.capacity / 10;
         if self.holding > target {
-            let mut quiet: Vec<(u64, Box<[u8]>)> = self
+            // Every key, whatever it has outstanding: what it has not had applied is
+            // forgiven, so that memory stays within the cap however long the service is out
+            // of reach.
+            let mut used: Vec<(u64, Box<[u8]>)> = self
                 .keys
-                .iter()
-                .filter(|(_, t)| t.unacknowledged.is_empty() && t.unsent == 0)
-                .map(|(_, t)| {
+                .values()
+                .map(|t| {
                     let used = t.entry.last_request.load(Ordering::Relaxed);
                     (used, t.entry.key.clone())
                 })
                 .collect();
-            quiet.sort_unstable_by_key(|(used, _)| *used);
-            for (_, key) in quiet {
+            used.sort_unstable_by_key(|(used, _)| *used);
+            for (_, key) in used {
                 if self.holding <= target {
                     break;
                 }
-                let closed = self.keys.get(&*key).is_some_and(close_if_quiet);
-                if let Some(tracked) = self.keys.get(&*key).filter(|_| closed) {
-                    self.registry.remove(&tracked.entry);
-                }
-                if closed && self.keys.remove(&*key).is_some() {
-                    self.forget(&key);
-                    self.evicted += 1;
-                }
+                let Some(tracked) = self.keys.remove(&*key) else {
+                    continue;
+                };
+                let unreported = close(&tracked.entry).unreported;
+                let unseen: u64 = tracked
+                    .unacknowledged
+                    .as_slice()
+                    .iter()
+                    .map(|u| u.count)
+                    .sum();
+                self.forgiven += unreported + tracked.unsent + unseen;
+                self.registry.remove(&tracked.entry);
+                self.forget(&key);
+                self.evicted += 1;
             }
             // Freed now, not when the keys would have gone idle: what was evicted is gone.
             if self.stale > 0 {
@@ -2006,15 +2029,16 @@ fn close_if_quiet(tracked: &Tracked) -> bool {
     }
 }
 
-/// Closes an entry being replaced, whatever it holds: its contract changed, and the key
-/// starts afresh, what the old one had not reported dropped with it, as `DataPlane` drops
-/// a key whose contract changed.
-fn close(entry: &Entry) {
+/// Closes an entry, whatever it holds: replaced, its contract changed, or evicted for
+/// capacity; the key starts afresh, what the old one had not reported dropped with it, as
+/// `DataPlane` drops such a key. What the entry held as it closed.
+fn close(entry: &Entry) -> Fields {
     let mut current = entry.word.load(Ordering::Acquire);
     loop {
+        let fields = Fields::unpack(current);
         let closed = Fields {
             closed: true,
-            ..Fields::unpack(current)
+            ..fields
         };
         match entry.word.compare_exchange_weak(
             current,
@@ -2022,7 +2046,7 @@ fn close(entry: &Entry) {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => return,
+            Ok(_) => return fields,
             Err(seen) => current = seen,
         }
     }

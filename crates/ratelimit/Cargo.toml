@@ -34,5 +34,9 @@ harness = false
 name = "local"
 harness = false
 
+[[bench]]
+name = "timer"
+harness = false
+
 [lints]
 workspace = true

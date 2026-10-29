@@ -865,7 +865,7 @@ async fn the_local_buckets_are_swept() {
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
             let keys = |proxy: &Proxy| {
                 let (_, process) = proxy.sync_limits();
-                process.map(|process| process.usage().1)
+                process.map(|process| process.usage().keys)
             };
             // Nothing forgets a key before it has gone a second unused.
             assert_eq!(keys(&proxy), Some(1), "the key made");

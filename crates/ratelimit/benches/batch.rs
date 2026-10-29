@@ -1,7 +1,8 @@
 //! Instruction counts for a service pod taking in a data plane's batch (06 §4): hits for a
 //! hundred keys, each key looked up among the ten thousand the pod holds and the data
 //! plane's record found among those of the data planes admitting the key — one, as for
-//! most keys, or sixteen, as for a key every pod of a deployment admits.
+//! most keys, or sixteen, as for a key every pod of a deployment admits; and, a pod among
+//! three, a batch for a thousand keys, the changes to those it owns copied to the other two.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-ratelimit --bench batch`, see the
 //! repository README.
@@ -23,6 +24,8 @@ const MS: u64 = 1_000_000;
 /// Keys the pod holds, and how many of them the batch carries hits for.
 const HELD: u32 = 10_000;
 const SENT: u32 = 100;
+/// Keys a batch carries hits for when its pod is one of three.
+const SENT_AMONG_THREE: u32 = 1_000;
 
 fn contract() -> Contract {
     let n = |n| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
@@ -78,9 +81,24 @@ fn holding(planes: PlaneId) -> (Box<ServicePod>, Batch) {
     (pod, batch(0, 2, 0..SENT))
 }
 
+/// One of three pods, so that it owns about a third of the keys and copies each it changes
+/// to the other two, holding `HELD` keys from data plane 0; and its next batch for the first
+/// `SENT_AMONG_THREE`.
+fn among_three() -> (Box<ServicePod>, Batch) {
+    let view = View {
+        epoch: 1,
+        pods: vec![0, 1, 2],
+    };
+    let mut pod: Box<ServicePod> = Box::new(ServicePod::new(0, 10 * MS, view));
+    pod.on_batch(batch(0, 1, 0..HELD), 0);
+    pod.take_replicas();
+    (pod, batch(0, 2, 0..SENT_AMONG_THREE))
+}
+
 #[library_benchmark]
 #[bench::one_plane(holding(1))]
 #[bench::sixteen_planes(holding(16))]
+#[bench::copied_among_three(among_three())]
 fn on_batch(setup: (Box<ServicePod>, Batch)) -> (Answers, Box<ServicePod>) {
     let (mut pod, batch) = setup;
     let answers = pod.on_batch(black_box(batch), black_box(MS));

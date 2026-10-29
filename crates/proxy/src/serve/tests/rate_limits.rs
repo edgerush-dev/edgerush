@@ -363,7 +363,7 @@ async fn a_cold_key_decided_locally_does_not_wait_for_the_service() {
             ));
             // The process keeps the worker's entry, to report what it admitted.
             let deadline = Instant::now() + Duration::from_secs(2);
-            while limiter.usage().1 != 1 {
+            while limiter.usage().keys != 1 {
                 assert!(Instant::now() < deadline, "the process never kept the key");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

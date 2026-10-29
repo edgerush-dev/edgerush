@@ -1,5 +1,5 @@
-//! A binary min-heap held in chunks of a fixed size, for what the participant's thread keeps
-//! one of for every key (06 §4).
+//! A binary min-heap held in chunks of a fixed size, for what the participant's thread and a
+//! service pod keep one of for every key (06 §4).
 //!
 //! A `BinaryHeap` holds its items in one block that doubles as it fills. Grown inside
 //! glibc's arena, a block is copied under the arena's lock, and a large one freed trims the
@@ -17,14 +17,14 @@ mod tests;
 const DEFAULT_CHUNK: usize = 4_096;
 
 /// A min-heap: [`Self::pop`] takes the least item, any one of those equal.
-pub(super) struct MinHeap<T, const CHUNK: usize = DEFAULT_CHUNK> {
+pub(in crate::service) struct MinHeap<T, const CHUNK: usize = DEFAULT_CHUNK> {
     /// All full but the last that holds any items, then at most one empty.
     chunks: Vec<Vec<T>>,
     len: usize,
 }
 
 impl<T: Ord, const CHUNK: usize> MinHeap<T, CHUNK> {
-    pub(super) const fn new() -> Self {
+    pub(in crate::service) const fn new() -> Self {
         Self {
             chunks: Vec::new(),
             len: 0,
@@ -32,16 +32,22 @@ impl<T: Ord, const CHUNK: usize> MinHeap<T, CHUNK> {
     }
 
     #[cfg(test)]
-    pub(super) const fn len(&self) -> usize {
+    pub(in crate::service) const fn len(&self) -> usize {
         self.len
     }
 
     #[cfg(test)]
-    pub(super) const fn is_empty(&self) -> bool {
+    pub(in crate::service) const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    pub(super) fn push(&mut self, item: T) {
+    /// Every item, in no order.
+    #[cfg(test)]
+    pub(in crate::service) fn iter(&self) -> impl Iterator<Item = &T> {
+        self.chunks.iter().flatten()
+    }
+
+    pub(in crate::service) fn push(&mut self, item: T) {
         let chunk = self.len / CHUNK;
         if chunk == self.chunks.len() {
             self.chunks.push(Vec::with_capacity(CHUNK));
@@ -52,12 +58,12 @@ impl<T: Ord, const CHUNK: usize> MinHeap<T, CHUNK> {
     }
 
     /// The least item.
-    pub(super) fn peek(&self) -> Option<&T> {
+    pub(in crate::service) fn peek(&self) -> Option<&T> {
         (self.len > 0).then(|| self.at(0))
     }
 
     /// Takes the least item.
-    pub(super) fn pop(&mut self) -> Option<T> {
+    pub(in crate::service) fn pop(&mut self) -> Option<T> {
         let last = self.len.checked_sub(1)?;
         self.swap(0, last);
         let item = self.chunks[last / CHUNK].pop();
@@ -68,7 +74,7 @@ impl<T: Ord, const CHUNK: usize> MinHeap<T, CHUNK> {
     }
 
     /// Keeps only the items `keep` says to, in one pass over them all.
-    pub(super) fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
+    pub(in crate::service) fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
         let mut kept = 0;
         for i in 0..self.len {
             if keep(self.at(i)) {

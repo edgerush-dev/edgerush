@@ -5,7 +5,7 @@
 //! workers' messages, the service's answers and its cycle; nothing of it is shared with a
 //! worker but the entries, a channel, and the clock they read its times by.
 
-use super::{Decision, EXCHANGE_TIMEOUT, Made, Undecided};
+use super::{Decision, EXCHANGE_TIMEOUT, Made, Undecided, Usage};
 use crate::ProxyError;
 use edgerush_config::CompiledRateLimitService;
 use edgerush_ratelimit::service::pooled::{
@@ -95,8 +95,8 @@ pub(crate) struct FromHub {
 /// what its keys hold.
 struct Shared {
     epoch: Instant,
-    /// Bytes, keys, and evictions all told, as of its last cycle.
-    usage: [AtomicU64; 3],
+    /// Bytes, keys, and evictions and hits forgiven all told, as of its last cycle.
+    usage: [AtomicU64; 4],
     stats: Stats,
 }
 
@@ -286,15 +286,15 @@ impl Hub {
         move || shared.strong_count() == 0
     }
 
-    /// What its keys hold, in bytes, how many there are, and how many it has evicted, all
-    /// told, as of its last cycle.
-    pub(crate) fn usage(&self) -> (u64, usize, u64) {
-        let [bytes, keys, evicted] = &self.shared.usage;
-        (
-            bytes.load(Ordering::Relaxed),
-            usize::try_from(keys.load(Ordering::Relaxed)).unwrap_or(usize::MAX),
-            evicted.load(Ordering::Relaxed),
-        )
+    /// What its keys hold, as of its last cycle.
+    pub(crate) fn usage(&self) -> Usage {
+        let [bytes, keys, evicted, forgiven] = &self.shared.usage;
+        Usage {
+            bytes: bytes.load(Ordering::Relaxed),
+            keys: usize::try_from(keys.load(Ordering::Relaxed)).unwrap_or(usize::MAX),
+            evicted: evicted.load(Ordering::Relaxed),
+            forgiven: forgiven.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -619,10 +619,11 @@ impl State {
     /// batches, for the workers' scrape.
     fn report(&self) {
         let participant = self.participant.borrow();
-        let [bytes, keys, evicted] = &self.shared.usage;
+        let [bytes, keys, evicted, forgiven] = &self.shared.usage;
         bytes.store(participant.holding(), Ordering::Relaxed);
         keys.store(participant.key_count() as u64, Ordering::Relaxed);
         evicted.store(participant.evicted(), Ordering::Relaxed);
+        forgiven.store(participant.forgiven(), Ordering::Relaxed);
         let stats = &self.shared.stats;
         stats
             .answers_late

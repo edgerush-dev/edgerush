@@ -618,6 +618,41 @@ fn every_change_is_copied_to_every_other_pod() {
     assert_eq!(net.pods[owner as usize].counted(b"k"), Some(4));
 }
 
+/// A key changed again before its copies go is copied once to each pod, as it last stood,
+/// among the copies of the other keys.
+#[test]
+fn a_key_changed_twice_is_copied_once_as_it_last_stood() {
+    let (owner, secondary, third) = roles(b"k");
+    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 1));
+    let other = (0u32..)
+        .map(|n| format!("other{n}").into_bytes())
+        .find(|key| view(&[0, 1, 2], 1).owners(key).0 == Some(owner))
+        .unwrap();
+    pod.on_batch(batch(1, hits(1, 2, 0)), 0);
+    let mut both = batch(1, hits(2, 3, 1));
+    both.entries.push(Entry {
+        key: other[..].into(),
+        contract: contract(),
+        report: hits(1, 1, 0),
+    });
+    pod.on_batch(both, CYCLE);
+    let mut copies = pod.take_replicas();
+    copies.sort_by_key(|(to, _)| *to);
+    let mut expected = [secondary, third];
+    expected.sort_unstable();
+    assert_eq!(copies.len(), 2);
+    for ((to, replicas), pod) in copies.iter().zip(expected) {
+        assert_eq!(*to, pod);
+        let mut entries: Vec<(&[u8], u64)> = replicas
+            .entries
+            .iter()
+            .map(|replica| (&replica.key[..], replica.counted))
+            .collect();
+        entries.sort_unstable();
+        assert_eq!(entries, [(&b"k"[..], 5), (&other[..], 1)], "to pod {pod}");
+    }
+}
+
 /// A pod joining holds no copies: the owners send it one of each key at once.
 #[test]
 fn a_pod_joining_gets_a_copy_of_every_key_at_once() {
@@ -799,6 +834,122 @@ fn only_batches_ahead_of_a_missing_one_hold_room() {
     pod.on_batch(batch(1, hits(3, 1, 2)), 3 * CYCLE);
     assert_eq!(pod.counted(b"k"), Some(4));
     assert_eq!(room(&pod), 0, "given back");
+}
+
+/// A pod keeps at most [`MOST_UNACKNOWLEDGED`] of a data plane's batches waiting for a
+/// missing one: one more is answered unapplied, and counted when the data plane sends it
+/// again.
+#[test]
+fn a_pod_keeps_a_bounded_number_of_batches_waiting() {
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    let waiting = |pod: &ServicePod| {
+        pod.keys[&b"k"[..]]
+            .planes
+            .get(1)
+            .unwrap()
+            .waiting
+            .as_ref()
+            .map_or(0, |waiting| waiting.len())
+    };
+    let most = MOST_UNACKNOWLEDGED as u64;
+    let last = most + 8;
+    for sequence in 2..=last {
+        let answer = pod.on_batch(batch(1, hits(sequence, 1, 0)), 0);
+        assert_eq!(answer.entries[0].applied, 0);
+    }
+    assert_eq!(waiting(&pod), MOST_UNACKNOWLEDGED);
+    pod.on_batch(batch(1, hits(2, 1, 0)), CYCLE);
+    assert_eq!(
+        waiting(&pod),
+        MOST_UNACKNOWLEDGED,
+        "one waiting, sent again"
+    );
+    pod.on_batch(batch(1, hits(1, 1, 0)), CYCLE);
+    assert_eq!(pod.counted(b"k"), Some(1 + most));
+    for sequence in most + 2..=last {
+        pod.on_batch(batch(1, hits(sequence, 1, 0)), 2 * CYCLE);
+    }
+    assert_eq!(pod.counted(b"k"), Some(last), "each counted once");
+    assert_eq!(waiting(&pod), 0);
+}
+
+/// The data planes a pod keeps records of for `key`.
+fn recorded(pod: &ServicePod, key: &[u8]) -> Vec<PlaneId> {
+    pod.keys[key]
+        .planes
+        .iter()
+        .map(|(plane, _)| plane)
+        .collect()
+}
+
+/// A data plane's record of a key goes once it has admitted nothing on it for
+/// [`RECORD_KEPT`], though another keeps the key in use, and the room it took with it; one
+/// that has only polled goes at once.
+#[test]
+fn a_record_silent_for_ten_minutes_is_retired() {
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    pod.on_batch(batch(1, hits(1, 1, 0)), 0);
+    pod.on_batch(batch(2, hits(1, 1, 0)), 0);
+    pod.on_batch(batch(2, hits(2, 1, 1)), RECORD_KEPT);
+    pod.on_batch(batch(3, Report::Poll), RECORD_KEPT);
+    pod.on_timer(RECORD_KEPT);
+    assert_eq!(recorded(&pod, b"k"), [1, 2]);
+    pod.on_batch(batch(2, hits(3, 1, 2)), RECORD_KEPT + CYCLE);
+    pod.on_timer(RECORD_KEPT + CYCLE);
+    assert_eq!(recorded(&pod, b"k"), [2]);
+    assert_eq!(pod.keys[&b"k"[..]].planes.room(), 1);
+}
+
+/// A key whose refill time is longer than [`RECORD_KEPT`] keeps a silent data plane's
+/// record for its refill time.
+#[test]
+fn a_long_refill_keeps_a_silent_record_for_its_refill_time() {
+    let n = |n| NonZeroU64::new(n).unwrap();
+    let hourly = Contract {
+        limit: n(1),
+        window: n(1_000 * MS),
+        burst: n(3_600),
+    };
+    let refill_time = hourly.refill_time();
+    assert!(refill_time > RECORD_KEPT);
+    let send = |pod: &mut ServicePod, from, sequence, now| {
+        let entry = Entry {
+            key: b"k"[..].into(),
+            contract: hourly,
+            report: hits(sequence, 1, sequence - 1),
+        };
+        pod.on_batch(
+            Batch {
+                from,
+                entries: vec![entry],
+                made: 0,
+            },
+            now,
+        );
+    };
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    send(&mut pod, 1, 1, 0);
+    send(&mut pod, 2, 1, 0);
+    send(&mut pod, 2, 2, refill_time);
+    pod.on_timer(refill_time);
+    assert_eq!(recorded(&pod, b"k"), [1, 2]);
+    send(&mut pod, 2, 3, refill_time + CYCLE);
+    pod.on_timer(refill_time + CYCLE);
+    assert_eq!(recorded(&pod, b"k"), [2]);
+}
+
+/// A data plane back after its record went starts a fresh one from the batches it saw
+/// applied: none is counted twice.
+#[test]
+fn a_data_plane_back_after_its_record_went_is_counted_once() {
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    pod.on_batch(batch(1, hits(1, 2, 0)), 0);
+    pod.on_batch(batch(2, hits(1, 1, 0)), RECORD_KEPT + CYCLE);
+    pod.on_timer(RECORD_KEPT + CYCLE);
+    assert_eq!(recorded(&pod, b"k"), [2]);
+    let answer = pod.on_batch(batch(1, hits(2, 3, 1)), RECORD_KEPT + 2 * CYCLE);
+    assert_eq!(answer.entries[0].applied, 2);
+    assert_eq!(pod.counted(b"k"), Some(6));
 }
 
 /// A pod that leaves and comes back owns its keys again: the pod that held them meanwhile
@@ -1253,7 +1404,7 @@ fn used_in_turn(net: &mut Net, plane: usize, n: u64) -> Vec<Vec<u8>> {
 }
 
 /// Past its capacity, a data plane evicts the keys it used least recently down to nine
-/// tenths of it, never one with hits still to be acknowledged.
+/// tenths of it, even one with hits still to be acknowledged, which are forgiven.
 #[test]
 fn a_data_plane_past_its_capacity_evicts_the_least_recently_used() {
     let mut net = Net::new(1);
@@ -1271,18 +1422,41 @@ fn a_data_plane_past_its_capacity_evicts_the_least_recently_used() {
     assert_eq!(kept(&net.planes[0]), [false, false, false, true, true]);
     assert_eq!(net.planes[0].holding(), 2 * each);
     assert_eq!(net.planes[0].evicted(), 3);
-    // The newest has a hit not yet acknowledged: room for less than one, and it stays.
-    net.planes[0].decide(&keys[4], contract(), 6 * MS);
+    assert_eq!(net.planes[0].forgiven(), 0, "nothing outstanding");
+    // The newest has two hits not yet acknowledged: room for less than one, and it goes,
+    // its hits forgiven.
+    net.admits(0, &keys[4], 2, 6 * MS);
     net.planes[0].set_capacity(each / 2);
     net.planes[0].on_cycle(6 * MS);
-    assert_eq!(kept(&net.planes[0]), [false, false, false, false, true]);
-    assert_eq!(net.planes[0].evicted(), 4);
-    // Acknowledged and quiet past twice its refill time, it is forgotten, and gives its
-    // bytes back.
-    net.settle(6 * MS);
-    net.planes[0].on_cycle(10_000 * MS);
     assert_eq!(kept(&net.planes[0]), [false; 5]);
+    assert_eq!(net.planes[0].evicted(), 5);
+    assert_eq!(net.planes[0].forgiven(), 2);
     assert_eq!(net.planes[0].holding(), 0);
+}
+
+/// A key evicted for capacity with a batch lost on its way is counted afresh by its owner
+/// when made again: its first report says every earlier batch was seen, so the owner does
+/// not hold it back waiting for the one that will never come.
+#[test]
+fn a_key_evicted_with_hits_outstanding_is_counted_afresh() {
+    let mut net = Net::new(1);
+    let owner = Net::owner(b"k");
+    warmed(&mut net, 0, b"k", 0);
+    assert_eq!(net.admits(0, b"k", 2, MS), 2);
+    net.planes[0].on_cycle(MS);
+    let lost = net.planes[0].take_outgoing();
+    assert_eq!(lost.len(), 1);
+    net.planes[0].set_capacity(1);
+    net.planes[0].on_cycle(2 * MS);
+    assert!(net.planes[0].keys.is_empty(), "evicted");
+    assert_eq!(net.planes[0].forgiven(), 2);
+    net.planes[0].set_capacity(u64::MAX);
+    warmed(&mut net, 0, b"k", 3 * MS);
+    assert_eq!(
+        net.pods[owner].counted(b"k"),
+        Some(2),
+        "the first life's warming hit and the new one; the lost two forgiven"
+    );
 }
 
 /// A key evicted and made again numbers its reports past those its earlier life sent: its
@@ -1307,6 +1481,50 @@ fn a_key_made_again_is_counted_from_its_first_report() {
     net.planes[0].on_cycle(4 * MS);
     net.settle(4 * MS);
     assert_eq!(net.pods[owner].counted(b"k"), Some(6), "reported");
+}
+
+/// A report not seen applied within its key's refill time of first being sent gives up its
+/// hits, counted as forgiven, once.
+#[test]
+fn a_data_plane_counts_the_hits_of_a_stale_report_as_forgiven() {
+    let mut net = Net::new(1);
+    assert_eq!(net.admits(0, b"k", 3, 0), 3);
+    net.planes[0].on_cycle(0);
+    for (now, forgiven) in [(50 * MS, 0), (110 * MS, 3), (200 * MS, 3)] {
+        let _lost = net.planes[0].take_outgoing();
+        net.planes[0].on_cycle(now);
+        assert_eq!(net.planes[0].forgiven(), forgiven, "at {} ms", now / MS);
+    }
+}
+
+/// Cut off from its owner, a data plane keeps at most `MOST_UNACKNOWLEDGED` reports out for
+/// a key, and later hits wait in its ledger; once the owner is back, every hit is counted,
+/// once.
+#[test]
+fn a_data_plane_keeps_a_bounded_number_of_reports_out() {
+    // A refill time of a second: no report grows older than it within the test.
+    let roomy = Contract {
+        limit: NonZeroU64::new(1_000).unwrap(),
+        burst: NonZeroU64::new(1_000).unwrap(),
+        ..contract()
+    };
+    let mut net = Net::new(1);
+    let owner = Net::owner(b"k");
+    for cycle in 1..=50 {
+        let now = cycle * CYCLE;
+        assert_eq!(net.planes[0].decide(b"k", roomy, now), Decision::Admit);
+        net.planes[0].on_cycle(now);
+        let _lost = net.planes[0].take_outgoing();
+    }
+    let copy = net.copy(0, b"k");
+    assert_eq!(copy.unacknowledged.len(), MOST_UNACKNOWLEDGED);
+    assert_eq!(copy.unsent, 50 - MOST_UNACKNOWLEDGED as u64, "waiting");
+    for cycle in 51..=60 {
+        net.planes[0].on_cycle(cycle * CYCLE);
+        net.settle(cycle * CYCLE);
+    }
+    assert_eq!(net.pods[owner].counted(b"k"), Some(50));
+    assert!(net.copy(0, b"k").unacknowledged.is_empty());
 }
 
 /// Past its capacity, a service pod evicts the keys that changed least recently down to
@@ -1340,13 +1558,172 @@ fn a_service_pod_past_its_capacity_evicts_the_least_recently_changed() {
     assert_eq!(pod.evicted(), 3);
 }
 
+/// A pod's timer looks only at the keys due: each new key once, then each again only when
+/// it may be forgotten or have a record retired.
+#[test]
+fn a_timer_looks_only_at_keys_due() {
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    let mut many = batch(1, hits(1, 1, 0));
+    many.entries = (0..100)
+        .map(|n| Entry {
+            key: format!("k{n}").into_bytes().into(),
+            contract: contract(),
+            report: hits(1, 1, 0),
+        })
+        .collect();
+    pod.on_batch(many, 0);
+    pod.on_timer(0);
+    assert_eq!(pod.looked, 100, "each new key once");
+    for now in (CYCLE..=100 * MS).step_by(CYCLE as usize) {
+        pod.on_timer(now);
+    }
+    assert_eq!(pod.looked, 100, "none due within a refill time");
+    assert_eq!(pod.key_count(), 100);
+    pod.on_timer(100 * MS + 1);
+    assert_eq!(pod.looked, 200);
+    assert_eq!(pod.key_count(), 0, "each forgotten when due");
+}
+
+/// What happens to a service pod in [`a_pods_timer_keeps_what_a_walk_of_every_key_would`].
+#[derive(Clone, Debug)]
+enum PodEvent {
+    /// A hit from data plane `plane` on key `key`, under the slower contract if `slow`:
+    /// a key whose contract changes starts afresh.
+    Hit { plane: u64, key: u8, slow: bool },
+    /// A poll from data plane `plane` on key `key`.
+    Poll { plane: u64, key: u8 },
+    /// Time passes, and the timer runs.
+    Timer { after: u64 },
+}
+
+fn pod_event() -> impl proptest::strategy::Strategy<Value = PodEvent> {
+    use proptest::prelude::*;
+    prop_oneof![
+        4 => (1_u64..4, 0_u8..6, proptest::bool::weighted(0.1))
+            .prop_map(|(plane, key, slow)| PodEvent::Hit { plane, key, slow }),
+        1 => (1_u64..4, 0_u8..6).prop_map(|(plane, key)| PodEvent::Poll { plane, key }),
+        // In whole cycles, so that times land on a refill time's end, where a key is kept.
+        2 => (0_u64..30).prop_map(|cycles| PodEvent::Timer { after: cycles * CYCLE }),
+    ]
+}
+
+/// What a service pod's keys hold, counted afresh, and whether each key has one time to be
+/// looked at and no other key has any.
+fn counted_afresh(pod: &ServicePod) -> (u64, bool) {
+    let holding = pod
+        .keys
+        .iter()
+        .map(|(key, owned)| pod_key_bytes(key, owned))
+        .sum();
+    let mut due: Vec<&[u8]> = pod.due.iter().map(|due| &due.key[..]).collect();
+    due.sort_unstable();
+    let mut keys: Vec<&[u8]> = pod.keys.keys().map(|key| &key[..]).collect();
+    keys.sort_unstable();
+    (holding, due == keys)
+}
+
+proptest::proptest! {
+    /// A pod's timer, looking only at keys due, drops no key that a walk of every key would
+    /// keep, and every key once quiet long enough; what its keys hold is counted exactly,
+    /// and each has one time to be looked at, through batches, polls, contracts changed,
+    /// records retired and keys evicted past a capacity.
+    #[test]
+    fn a_pods_timer_keeps_what_a_walk_of_every_key_would(
+        events in proptest::collection::vec(pod_event(), 1..120),
+        capacity in proptest::option::of(500_u64..3_000),
+    ) {
+        let slow = Contract {
+            window: NonZeroU64::new(10_000 * MS).unwrap(),
+            ..contract()
+        };
+        let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+        if let Some(capacity) = capacity {
+            pod.set_capacity(capacity);
+        }
+        let mut sequences: HashMap<(u64, u8), u64> = HashMap::new();
+        let mut now = 0;
+        for event in events {
+            match event {
+                PodEvent::Hit { plane, key, slow: is_slow } => {
+                    let sequence = sequences.entry((plane, key)).or_insert(0);
+                    *sequence += 1;
+                    let mut hit = batch(plane, hits(*sequence, 1, *sequence - 1));
+                    hit.entries[0].key = vec![key].into();
+                    hit.entries[0].contract = if is_slow { slow } else { contract() };
+                    pod.on_batch(hit, now);
+                }
+                PodEvent::Poll { plane, key } => {
+                    let mut poll = batch(plane, Report::Poll);
+                    poll.entries[0].key = vec![key].into();
+                    pod.on_batch(poll, now);
+                }
+                PodEvent::Timer { after } => {
+                    now += after;
+                    let walk_keeps: Vec<Box<[u8]>> = pod
+                        .keys
+                        .iter()
+                        .filter(|(_, owned)| {
+                            now.saturating_sub(owned.touched) <= owned.contract.refill_time()
+                                || owned.bucket().forgettable_at() > now
+                        })
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    pod.on_timer(now);
+                    if capacity.is_none() {
+                        for key in &walk_keeps {
+                            proptest::prop_assert!(pod.keys.contains_key(key), "dropped {:?}", key);
+                        }
+                    } else {
+                        proptest::prop_assert!(pod.holding() <= pod.capacity);
+                    }
+                }
+            }
+            let (holding, one_each) = counted_afresh(&pod);
+            proptest::prop_assert_eq!(pod.holding(), holding);
+            proptest::prop_assert!(one_each);
+        }
+        pod.on_timer(now + 30 * 60 * 1_000 * MS);
+        proptest::prop_assert_eq!(pod.key_count(), 0, "every key quiet for half an hour");
+        proptest::prop_assert!(pod.due.is_empty());
+    }
+
+    /// Selection finds the time a sort of every pair would, `need` drawn at, just short of
+    /// and just past what the earliest `pick` of them hold, where an off-by-one shows.
+    #[test]
+    fn the_earliest_holding_are_found_as_a_sort_finds_them(
+        pairs in proptest::collection::vec((0_u64..20, 1_u64..100), 0..60),
+        pick in 0_usize..64,
+        nudge in -1_i64..=1,
+    ) {
+        let mut sorted = pairs.clone();
+        sorted.sort_unstable();
+        let total: u64 = sorted.iter().take(pick).map(|&(_, bytes)| bytes).sum();
+        let need = total.saturating_add_signed(nudge);
+        let mut held = 0;
+        let sort_finds = if need == 0 {
+            0
+        } else {
+            sorted
+                .iter()
+                .find(|&&(_, bytes)| {
+                    held += bytes;
+                    held >= need
+                })
+                .map_or(u64::MAX, |&(time, _)| time)
+        };
+        let mut pairs = pairs;
+        proptest::prop_assert_eq!(earliest_holding(&mut pairs, need), sort_finds);
+    }
+}
+
 /// A service pod counts room for as many records as a key's data planes need, not a
 /// B-tree node's eleven: one for the usual key, admitted by one data plane, and growing
 /// one at a time, then doubling.
 #[test]
 fn a_service_pod_counts_room_for_the_records_a_key_has() {
     let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
-    let entry = size_of::<(Box<[u8]>, Owned)>() + 1 + b"k".len();
+    // The key in the table, and again with its time to be looked at.
+    let entry = size_of::<(Box<[u8]>, Owned)>() + 1 + b"k".len() + size_of::<KeyDue>() + b"k".len();
     let record = size_of::<(PlaneId, Record)>();
     for (plane, room) in [(7, 1), (3, 2), (9, 4), (5, 4), (1, 8)] {
         pod.on_batch(batch(plane, hits(1, 1, 0)), 0);
@@ -1356,12 +1733,13 @@ fn a_service_pod_counts_room_for_the_records_a_key_has() {
 }
 
 /// A service pod's key takes 128 bytes in its table, which holds up to twice the room its
-/// keys take, and its record of a data plane 32: its bucket kept as the bucket's state, its
-/// terms the key's contract, batches waiting, which rarely do, kept apart, and the data
-/// plane's last admission in eight bytes.
+/// keys take, its time to be looked at 24 and a copy of the key, and its record of a data
+/// plane 32: its bucket kept as the bucket's state, its terms the key's contract, batches
+/// waiting, which rarely do, kept apart, and the data plane's last admission in eight bytes.
 #[test]
 fn a_service_pods_key_is_small() {
     assert_eq!(size_of::<(Box<[u8]>, Owned)>(), 128);
+    assert_eq!(size_of::<KeyDue>(), 24);
     assert_eq!(size_of::<(PlaneId, Record)>(), 32);
 }
 

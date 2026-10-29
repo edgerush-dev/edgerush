@@ -5,7 +5,9 @@
 #![cfg(not(loom))]
 
 use super::*;
-use crate::service::{Answer, DataPlane, ENTRY_BYTES, FixedState, Keyed, PIECE_BYTES, ServicePod};
+use crate::service::{
+    Answer, DataPlane, ENTRY_BYTES, FixedState, Keyed, MOST_UNACKNOWLEDGED, PIECE_BYTES, ServicePod,
+};
 use proptest::prelude::*;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
@@ -94,6 +96,11 @@ impl Pooled {
         pooled.pod.set_life(1);
         pooled.participant.set_scheduled(scheduled);
         pooled
+    }
+
+    /// What it has to send, lost: the participant gives the exchange up after its timeout.
+    fn lose(&mut self) {
+        let _lost = self.participant.take_exchanges();
     }
 
     /// What it has to send, answered by the pod and held back.
@@ -248,6 +255,9 @@ enum Event {
     /// An answer held back delivered — any of them, so late and out of order — and, if
     /// so, kept to come again.
     Deliver(usize, bool),
+    /// What is to be sent, lost on its way: the pod never sees it. Only where the
+    /// accounting is checked ([`event_or_loss`]), not in the comparison.
+    Lose,
 }
 
 fn event() -> impl Strategy<Value = Event> {
@@ -259,6 +269,11 @@ fn event() -> impl Strategy<Value = Event> {
         1 => Just(Event::Send),
         2 => (0usize..8, prop::bool::weighted(0.1)).prop_map(|(at, twice)| Event::Deliver(at, twice)),
     ]
+}
+
+/// As [`event`], and now and then what is to be sent lost.
+fn event_or_loss() -> impl Strategy<Value = Event> {
+    prop_oneof![14 => event(), 1 => Just(Event::Lose)]
 }
 
 proptest! {
@@ -321,19 +336,21 @@ proptest! {
         std::env::var("PROPTEST_CASES").ok().and_then(|n| n.parse().ok()).unwrap_or(2_048)
     ))]
 
-    /// No admission goes uncounted, and no answer's buckets are taken over a later
-    /// answer's ([`Pooled::take`]), whether the participant visits every
+    /// No admission goes uncounted unless forgiven, and no answer's buckets are taken over
+    /// a later answer's ([`Pooled::take`]), whether the participant visits every
     /// key each cycle or only those that need it, quiet keys polled or not, one exchange in
     /// flight or more:
     /// over a schedule of requests, cycles and answers — late, out
-    /// of order, twice — and then everything delivered and settled, each key's count at its
-    /// owner is what was admitted under it. Now
-    /// and then the next cycle runs with no room for any key, evicting every
-    /// key it may, to be made again by its next request: its reports then number on past
-    /// those of its earlier life, which the pod, never forgetting the key, still holds.
+    /// of order, twice — and batches lost, sent again, and then everything delivered and
+    /// settled, each key's count at its owner is what was admitted under it. Now
+    /// and then the next cycle runs with no room for any key, evicting every key, its hits
+    /// not yet applied forgiven, to be made again by its next request: its reports then
+    /// number on past those of its earlier life, which the pod, never forgetting the key,
+    /// still holds. Then no key is counted past what was admitted, and what went uncounted
+    /// is within what was forgiven: a report forgiven may still be applied.
     #[test]
     fn no_admission_goes_uncounted_scheduled_or_not(
-        events in prop::collection::vec((event(), 0u64..4, prop::bool::weighted(0.1)), 1..300),
+        events in prop::collection::vec((event_or_loss(), 0u64..4, prop::bool::weighted(0.1)), 1..300),
         poll_quiet: bool,
         one_in_flight: bool,
     ) {
@@ -380,6 +397,10 @@ proptest! {
                         pooled.deliver(*index, *twice, now);
                         continue;
                     }
+                    Event::Lose => {
+                        pooled.lose();
+                        continue;
+                    }
                 };
                 let request: Vec<(&[u8], Contract)> =
                     places.iter().map(|place| keys[*place]).collect();
@@ -398,16 +419,27 @@ proptest! {
                 }
                 pooled.exchange(now);
             }
+            let mut uncounted = 0;
             for (place, (key, _)) in keys.iter().enumerate() {
                 let counted = pooled.pod.counted(key).unwrap_or(0);
-                prop_assert_eq!(
-                    counted,
-                    admitted[place],
-                    "scheduled {}, key {}",
+                prop_assert!(
+                    counted <= admitted[place],
+                    "scheduled {}, key {}: {} counted of {}",
                     scheduled,
-                    place
+                    place,
+                    counted,
+                    admitted[place]
                 );
+                uncounted += admitted[place] - counted;
             }
+            let forgiven = pooled.participant.forgiven();
+            prop_assert!(
+                uncounted <= forgiven,
+                "scheduled {}: {} uncounted, {} forgiven",
+                scheduled,
+                uncounted,
+                forgiven
+            );
         }
     }
 }
@@ -489,6 +521,7 @@ impl Comparison {
                 self.pooled.deliver(*index, *twice, now);
                 self.reference.deliver(*index, *twice, now);
             }
+            Event::Lose => unreachable!("not generated for the comparison"),
         }
         Ok(())
     }
@@ -2035,6 +2068,7 @@ fn replay(schedule: &[(Event, u64)]) {
                 reference.deliver(*index, *twice, now)
             ),
             Event::Cycle => String::new(),
+            Event::Lose => unreachable!("not generated for the comparison"),
         };
         let rooms: Vec<String> = keys
             .iter()
@@ -2426,6 +2460,92 @@ fn a_key_made_again_is_counted_from_its_first_report() {
             "scheduled: {scheduled}"
         );
     }
+}
+
+/// Past its capacity, a participant evicts the keys used least recently even with hits
+/// outstanding — sent and not acknowledged, or still in its ledger behind an exchange that
+/// is out — and forgives them. Made again, a key is counted afresh by its owner, which does
+/// not wait for the batch that was lost.
+#[test]
+fn a_key_evicted_with_hits_outstanding_is_forgiven_and_counted_afresh() {
+    let mut participant = one_in_flight();
+    let mut pod = pod(1);
+    let c = contract(100, 10);
+    let (a, b): (&[u8], &[u8]) = (b"a", b"b");
+    // Two hits on `a` go out, and their batch is lost.
+    for _ in 0..2 {
+        assert_eq!(participant.decide_all(&[(a, c)], 0), Decision::Admit);
+    }
+    participant.on_cycle(CYCLE);
+    let (exchange, _lost) = only_exchange(&mut participant);
+    // Three on `b` wait in its ledger while that exchange is out.
+    for _ in 0..3 {
+        assert_eq!(participant.decide_all(&[(b, c)], CYCLE), Decision::Admit);
+    }
+    participant.set_capacity(1);
+    participant.on_cycle(2 * CYCLE);
+    assert!(
+        participant.take_exchanges().is_empty(),
+        "the exchange is out"
+    );
+    assert_eq!(participant.key_count(), 0, "both evicted");
+    assert_eq!(participant.forgiven(), 5);
+    participant.exchanged(0, exchange);
+    participant.set_capacity(u64::MAX);
+    assert_eq!(
+        participant.decide_all(&[(a, c)], 3 * CYCLE),
+        Decision::Admit
+    );
+    participant.on_cycle(4 * CYCLE);
+    let (exchange, batch) = only_exchange(&mut participant);
+    participant.on_answers_to(exchange, pod.on_batch(batch, 4 * CYCLE), 4 * CYCLE);
+    assert_eq!(pod.counted(a), Some(1), "the lost batch not waited for");
+}
+
+/// A report not acknowledged within its key's refill time of first being sent gives up its
+/// hits, counted as forgiven, once, as `DataPlane` counts them.
+#[test]
+fn a_participant_counts_the_hits_of_a_stale_report_as_forgiven() {
+    let mut participant = participant();
+    let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
+    for _ in 0..3 {
+        assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    }
+    participant.on_cycle(CYCLE);
+    // A refill time of some 105 ms from the report's first sending.
+    for (now, forgiven) in [(60 * MS, 0), (120 * MS, 3), (200 * MS, 3)] {
+        let _lost = participant.take_outgoing();
+        participant.on_cycle(now);
+        assert_eq!(participant.forgiven(), forgiven, "at {} ms", now / MS);
+    }
+}
+
+/// Cut off from its owner, a participant keeps at most `MOST_UNACKNOWLEDGED` reports out for
+/// a key, as `DataPlane` does, and later hits wait in its ledger; once the owner is back,
+/// every hit is counted, once.
+#[test]
+fn a_participant_keeps_a_bounded_number_of_reports_out() {
+    let mut participant = participant();
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
+    let (key, c): (&[u8], Contract) = (b"k", contract(100, 100));
+    for cycle in 1..=50 {
+        let now = cycle * CYCLE;
+        assert_eq!(participant.decide_all(&[(key, c)], now), Decision::Admit);
+        participant.on_cycle(now);
+        let _lost = participant.take_outgoing();
+    }
+    let tracked = &participant.keys[key];
+    assert_eq!(tracked.unacknowledged.as_slice().len(), MOST_UNACKNOWLEDGED);
+    assert_eq!(tracked.unsent, 50 - MOST_UNACKNOWLEDGED as u64, "waiting");
+    for cycle in 51..=60 {
+        let now = cycle * CYCLE;
+        participant.on_cycle(now);
+        for (_, batch) in participant.take_outgoing() {
+            participant.on_answers(pod.on_batch(batch, now), now);
+        }
+    }
+    assert_eq!(pod.counted(key), Some(50));
+    assert!(participant.keys[key].unacknowledged.is_empty());
 }
 
 /// Scheduled, an entry replaced by a changed contract is kept by its eviction time until
