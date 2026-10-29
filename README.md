@@ -4,11 +4,11 @@ A Kubernetes-native API gateway written in Rust: an operator, control planes and
 planes in one binary; Ingress and Gateway API served from the same data plane; cluster-wide
 rate limiting with no external store to run.
 
-**Status: the data plane runs; Kubernetes is arriving.** The proxy serves traffic from a
-YAML file, the development harness, and in a cluster follows Services' endpoints itself;
-rate limiting runs, each pod on its own or through EdgeRush's rate-limiting service; the
-control plane translates Ingresses but does not yet hand its config to data planes, and the
-operator is still to be built. Not for production. A hobby project with no timelines.
+**Status: the data plane runs, and the control plane runs it in a cluster; the operator is
+next.** The proxy serves traffic from a YAML file, the development harness, or from a
+control plane that translates Ingresses in a cluster and streams the config to it. Rate
+limiting runs, each pod on its own or through EdgeRush's rate-limiting service. Not for
+production. A hobby project with no timelines.
 
 ## What it is for
 
@@ -26,8 +26,10 @@ operator is still to be built. Not for production. A hobby project with no timel
 
 ## What works today
 
-The data plane, run from a file that is read again every second; a change takes over
-without dropping a request.
+### The data plane
+
+Its config is read from a file every second, or taken from a control plane's stream; a
+change takes over without dropping a request.
 
 - **Protocols:** HTTP/1.1, HTTP/2 and HTTP/3 (QUIC, on quiche) from clients; HTTP/1.1 and
   HTTP/2 to backends; gRPC; WebSocket over all three client protocols; TCP and TLS
@@ -46,52 +48,51 @@ without dropping a request.
   each request, WebSocket and passthrough connection, to stdout or a file reopened on
   SIGUSR1.
 - **Rate limiting:** token-bucket limits on route rules, keyed by the client's address (or,
-  experimentally, by a request header), a request under several decided under all of them
-  at once, and dry runs that count without refusing. A refusal is a 429 with `Retry-After`
-  and the `RateLimit` field. A data plane runs one mode, `off` unless it says otherwise,
-  which checks its limits and enforces none:
-  - `local`: each proxy process limits on what it sees, with no service to run; its
-    workers share each key's bucket, one atomic word decided by compare-and-swap.
+  experimentally, by a request header), and dry runs that count without refusing. A
+  refusal is a 429 with `Retry-After` and the `RateLimit` field. A data plane runs one
+  mode, `off` (limits checked, none enforced) unless it says otherwise:
+  - `local`: each proxy process limits on what it sees, with no service to run.
   - `synchronous`: the key's owner in the rate-limiting service
-    (`edgerush-ratelimit-service --mode synchronous`, three pods or more) decides every
-    request, over a stream each worker keeps to each pod. A request waits for its owner at
-    most a stated time; an owner that keeps failing is cut off by a breaker and tried again
-    later; and what happens while an owner is out of reach is stated too: allow, deny, or
-    the data plane's own buckets until it answers. The pods copy their keys to one another
-    every cycle, so that a pod's keys carry on when it leaves.
+    (`edgerush-ratelimit-service --mode synchronous`, three pods or more, optionally over
+    mutual TLS) decides every request. A request waits for its owner at most a stated
+    time, and what happens while an owner is out of reach is stated too: allow, deny, or
+    the data plane's own buckets until it answers. The pods copy their keys to one
+    another, so a pod's keys carry on when it leaves.
   - `asynchronous`, experimental and parked: each process decides from its own copy of
     each key and reports to the service every cycle.
 
-Kubernetes, begun:
+### In Kubernetes
 
-- **`edgerush controller`**, the control plane for one data plane: it follows
-  IngressClasses, Ingresses, Services and Secrets through the API server and translates
-  them each time they change. Translated so far: Ingresses' rules and default backends,
-  with paths of every type, to Services' ports, spoken to as their `appProtocol` says; TLS
-  from Secrets, each certificate served for the hosts that name it alone; and plain HTTP
-  redirected to HTTPS for the hosts an Ingress secures. Each config is reported on stderr,
-  can be written as a file that `edgerush proxy` reads, and is offered on the config
-  stream it serves, gRPC over mutual TLS.
-- **`edgerush proxy --control-plane`**, a data plane taking its config from that stream:
-  nothing is served until the first config runs, each later one takes over as a file's
-  does, and the stream is dialled again after a jittered wait when it ends; tested end
-  to end in kind, the control plane gone and back among it.
-- **Endpoints from EndpointSlices:** an upstream that names a Service takes its endpoints
-  from the data plane's own list and watch of EndpointSlices, so that they are followed
-  with the control plane down; tested end to end in kind.
-- **Endpoints a name resolves to:** an upstream may name a host and a port instead,
-  `dns: "web.shop.svc.cluster.local:8080"`, each address the name resolves to an endpoint
-  on that port, looked up again by the data plane's own resolver as each answer's time to
-  live runs out.
-- **`edgerush validate`** translates manifests as the controller would, without a cluster,
-  and reports what it left out and why.
+- **`edgerush controller`**, the control plane for one data plane. It follows
+  IngressClasses, Ingresses, Services and Secrets and translates them each time they
+  change: Ingresses' rules and default backends, paths of every type, Services' ports
+  spoken to as their `appProtocol` says, TLS from Secrets, and plain HTTP redirected to
+  HTTPS for the hosts an Ingress secures. It streams each config to its data planes over
+  gRPC and mutual TLS, writes each Ingress's status (replicas elect one writer by a
+  Lease), and serves an admission webhook that refuses an Ingress it could not translate.
+- **`edgerush proxy --control-plane`**, a data plane taking its config from that stream.
+  Nothing is served until the first config runs; with the control plane gone, it serves
+  on, and dials again.
+- **Endpoints**, followed by the data plane itself so that they keep changing with the
+  control plane down:
+  - from a Service's EndpointSlices, which the data plane lists and watches;
+  - from a DNS name, `dns: "web.shop.svc.cluster.local:8080"`, looked up again as each
+    answer's time to live runs out; an Ingress annotated
+    `gateway.edgerush.dev/service-upstream: "true"` reaches its backends this way, by the
+    Service's own address, as a mesh may want;
+  - preferring the endpoints EndpointSlices hint for the data plane's zone, for a Service
+    that asks for hints (`trafficDistribution`). Spread the data plane's pods evenly over
+    the zones: a zone's backends take what that zone's data planes receive.
+- **Default-deny egress:** an address discovered or resolved is never sent to if it is
+  loopback, link-local, multicast, the pod's own, the API server's, or one of the gateway's
+  own pods, which the control plane names (`--own-name`).
+- Tested end to end in kind (`kind/stream.sh`), the control plane gone and back among it.
 
-Not yet: the rest of Kubernetes (the operator, ingress-nginx's annotations, Ingress
-status, Gateway API), authentication. The
-request path came first; rate limiting and the control plane are now built side by side,
-and the operator follows.
+**Not yet:** the operator, Gateway API, ingress-nginx's annotations, authentication.
 
 ## Trying it
+
+### A data plane from a file
 
 With a backend on port 9000, save this as `edgerush.yaml`:
 
@@ -125,51 +126,55 @@ python3 -m http.server 9000 --bind 127.0.0.1 &   # a backend, if you have none
 curl -i http://127.0.0.1:8080/
 ```
 
-For a complete local demo with backends, see [Docker Compose](examples/docker-compose/README.md).
-[Examples](examples/README.md) also has runnable HTTP and gRPC configs with routing tests
-and `explain` commands.
-Every field of the config file is described in its JSON Schema,
-[schema/config.schema.json](schema/config.schema.json), made from the code; editors use
-it for completion and checks. [all-features.yaml](examples/all-features.yaml) uses every
-implemented feature once.
+A worker runs on every CPU, sharing each port between them; Windows cannot, so there add
+`--workers 1`. `edgerush proxy --help` lists the options.
 
 The format asks for choices such as `forwarding` and `proxy_protocol` to be stated rather
-than defaulted, as the control plane will state them. `bench/proxy.yaml` and
-`fuzz/seeds/config/` have fuller examples, with TLS, HTTP/3, passthrough and more;
-`edgerush proxy --help` lists the options. A worker runs on every CPU, which shares each
-port between them; Windows cannot, so there add `--workers 1`.
+than defaulted, as the control plane states them. More to start from:
 
-`edgerush explain` says where a request to a listener would go and why no other match took
+- [Docker Compose](examples/docker-compose/README.md): a complete local demo with backends.
+- [Examples](examples/README.md): runnable HTTP and gRPC configs, with routing tests and
+  `explain` commands.
+- [all-features.yaml](examples/all-features.yaml): every implemented feature, once.
+- [schema/config.schema.json](schema/config.schema.json): every field of the config,
+  made from the code; editors use it for completion and checks.
+- `bench/proxy.yaml` and `fuzz/seeds/config/`: fuller configs, with TLS, HTTP/3,
+  passthrough and more.
+
+### Checking a config: `explain` and `test`
+
+`edgerush explain` says where a request to a listener would go, and why no other match took
 it, from the same file and without running anything:
 
 ```sh
-./target/release/edgerush explain --config edgerush.yaml --listener web     --client 203.0.113.7 --protocol 1.1 --method GET --url http://localhost/
+./target/release/edgerush explain --config edgerush.yaml --listener web --client 203.0.113.7 --protocol 1.1 --method GET --url http://localhost/
 ```
 
-`edgerush test --config edgerush.yaml tests.yaml` checks a file of such requests and where
-each is expected to go, and, given what its upstream answers, the answer its client gets;
-it exits 1 when one goes elsewhere or is answered otherwise: a config's tests for CI.
+`edgerush test --config edgerush.yaml tests.yaml` checks a file of such requests: where
+each is expected to go and, given what its upstream answers, what its client gets. It exits
+1 when one goes elsewhere or is answered otherwise, so a config's tests can run in CI.
 
-`edgerush validate --from-manifests manifests/ --data-plane data-plane.yaml` translates
-Kubernetes manifests (a file or a directory of them, `kubectl get -o yaml` output included,
-with an IngressClass whose controller is `edgerush.dev/ingress-controller`) as the control
-plane would for one data plane, compiles the config as the data plane would,
-and lists each object left out and why, each path whose backend is not there, what of a
-`tls` is not served as it lists it and each path another Ingress already has; it
-exits 1 when there is one. TLS Secrets, seldom in a repository, are taken as they will be
-in the cluster unless `--check-secrets` asks for them to be checked. The data plane's settings
-stand in for its `DataPlane` resource, which comes with the operator; `backend_authorities`,
-the certificates in PEM trusted for a Service port spoken to over TLS
-(`appProtocol: kubernetes.io/wss`), may be added, and an `https` listener, written with
-`tls: { certificates: [], without_sni: none }`, presents the Ingresses' TLS Secrets.
-`ingress_https_redirect: true` redirects plain HTTP to HTTPS for the hosts an Ingress's `tls`
-lists, as a `DataPlane` does by default; an Ingress's `gateway.edgerush.dev/https-redirect: "false"`
-or `"true"` overrides it for its own routes. `ingress_https_redirect_max_age` is how long, in
-seconds, a client may keep that redirect (30 for a `DataPlane` by default). `data_plane`,
-the data plane's own settings as its config states them, goes into every config as written:
-`data_plane: { own_service: edgerush.edge.svc.cluster.local }` names the Service of its own
-pods, whose EndpointSlices say its zone, and endpoints EndpointSlices hint for that zone
-are then preferred:
+### Checking manifests: `validate`
+
+```sh
+edgerush validate --from-manifests manifests/ --data-plane data-plane.yaml
+```
+
+translates Kubernetes manifests as the control plane would for one data plane, without a
+cluster, and compiles the config as the data plane would. The manifests are a file or a
+directory (`kubectl get -o yaml` output included), with an IngressClass whose controller is
+`edgerush.dev/ingress-controller`. It reports, and exits 1 for:
+
+- each object left out, and why;
+- each path whose backend is not there;
+- what of an Ingress's `tls` is not served as it lists it;
+- each path another Ingress already has.
+
+TLS Secrets, seldom in a repository, are taken as they will be in the cluster, unless
+`--check-secrets` asks for them to be checked.
+
+`data-plane.yaml` holds the data plane's settings, which stand in for its `DataPlane`
+resource until the operator brings one:
 
 ```yaml
 ingress_class: edge
@@ -181,24 +186,41 @@ listeners:
   http: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 ```
 
-`edgerush controller --data-plane data-plane.yaml`, run in a cluster, follows the
-IngressClasses, Ingresses, Services and Secrets there (or in each `--namespace` given)
-through the API server and translates them for that data plane each time they change, once
-all have been listed. Each translation is said on stderr as `validate` says it, and
-`--write-config config.yaml` writes the config as a file `edgerush proxy` reads, without the
-certificates it names. With `--listen [::]:9443 --certificate tls.crt --key tls.key
---authorities ca.crt` it serves the config stream there, gRPC over mutual TLS: each config is
-offered to every data plane that dials it with a certificate those authorities signed, and
-what each says of it is said too. With `--status-service edge/edgerush`, each Ingress served
-says that Service's addresses in its status, and each of the class not served says none;
-with `--leader-lease edge/edgerush-control`, replicas elect the one that writes it. With
-`--own-name edgerush-peers.edge.svc.cluster.local`, given once for each headless Service
-whose pods are the gateway's own, it sends the addresses those names resolve to on the
-stream, and no data plane sends a request to them. With
-`--webhook-listen [::]:8443 --webhook-certificate tls.crt --webhook-key tls.key` it serves
-the admission webhook there, HTTPS, reviews `POST`ed to `/validate`: an Ingress of the
-class is refused, with why, where alone it does not translate into something the data plane
-accepts.
+| Setting | What it is |
+|---|---|
+| `ingress_class` | The IngressClass whose Ingresses this data plane serves. |
+| `listeners` | As in a config. An Ingress is served on every `http` listener, and the hosts its `tls` lists on every `https` one; written with `tls: { certificates: [], without_sni: none }`, an `https` listener presents the Ingresses' TLS Secrets. |
+| `cluster_domain` | The cluster's DNS domain, which Services' names end in. |
+| `ingress_hosts_fall_through` | Whether an Ingress host stays a candidate on hosts a more specific one also covers; `false` is ingress-nginx's way. |
+| `ingress_https_redirect` | Whether plain HTTP to a host an Ingress's `tls` lists is redirected to HTTPS, as a `DataPlane` does by default. An Ingress's `gateway.edgerush.dev/https-redirect: "false"` or `"true"` overrides it for its own routes. |
+| `ingress_https_redirect_max_age` | How long, in seconds, a client may keep that redirect (30 for a `DataPlane` by default). |
+| `backend_authorities` | Optional: certificates in PEM trusted for a Service port spoken to over TLS (`appProtocol: kubernetes.io/wss`). |
+| `data_plane` | Optional: the data plane's own settings, as a config states them, written into every config. `own_service: edgerush.edge.svc.cluster.local` names the Service of the data plane's own pods, whose EndpointSlices say its zone. |
+
+### In a cluster: `controller`
+
+```sh
+edgerush controller --data-plane data-plane.yaml
+```
+
+run in a cluster, follows the IngressClasses, Ingresses, Services and Secrets there and
+translates them for that data plane each time they change, once all have been listed. Each
+translation is reported on stderr as `validate` reports it. The rest is chosen by flags:
+
+| Flags | What they do |
+|---|---|
+| `--namespace shop`, once for each | Follow these namespaces alone, not the whole cluster. |
+| `--write-config config.yaml` | Write each config as a file `edgerush proxy --config` reads, without the certificates it names. |
+| `--listen [::]:9443 --certificate tls.crt --key tls.key --authorities ca.crt` | Serve the config stream, gRPC over mutual TLS: each config goes to every data plane that dials with a certificate those authorities signed, and what each says of it is reported. |
+| `--own-name edgerush-peers.edge.svc.cluster.local`, once for each | A headless Service whose pods are the gateway's own: the addresses it resolves to go on the stream, and no data plane sends a request to them. |
+| `--status-service edge/edgerush`, or `--status-address 192.0.2.10` once for each | What each Ingress served says in its status: that Service's addresses, or these. Each Ingress of the class not served says none. |
+| `--leader-lease edge/edgerush-control` | Replicas elect the one that writes status by this Lease. |
+| `--webhook-listen [::]:8443 --webhook-certificate tls.crt --webhook-key tls.key` | Serve the admission webhook, HTTPS, reviews `POST`ed to `/validate`: an Ingress of the class that would not translate alone is refused, with why. |
+
+A data plane dials the stream with
+`edgerush proxy --control-plane edgerush-control.edge.svc:9443 --certificate tls.crt --key tls.key --authorities ca.crt`.
+`kind/stream.sh` sets the whole thing up in a kind cluster, and its manifests
+(`kind/stream/manifests.yaml`) are a working example.
 
 ## Building
 
@@ -257,26 +279,28 @@ cargo +nightly fuzz run normalise fuzz/corpus/normalise fuzz/seeds/normalise -- 
 The first directory is the corpus the fuzzer grows (not kept in git); `fuzz/seeds/` holds a
 few hand-written inputs per target that show it the input format.
 
-Targets compare the real code with the slow reference implementations in the router's and
-the filters' `reference` modules, the same ones the property tests use; `request_host`
-compares with the `http` crate's reading instead, and `quic_header` with quiche's parser.
-`config` reads a harness config file and compiles it, holding both to not failing and what
-compiles to being whole; `test_file` reads, checks and runs a file of `edgerush test`'s
-tests against a fixed config, holding all three to not failing; `rules_compile` compiles
-a limit rule's three parts and decides a request with what compiles, holding an error to
-its place in the part it is about; `admission_review` reads any bytes as the admission
-webhook's review, which anyone in the cluster can send it, and answers what it reads,
-holding reading to not failing and the answer to carrying the review's uid; `dns_answer`
-reads any bytes as a nameserver's answer, holding reading to not failing and the addresses
-it finds to being each once, in order. An input that fails is saved under `fuzz/artifacts/`; fix the bug
-and add the input to the unit tests. Run a target after changing the code it covers. Being
+Most targets compare the real code with the slow reference implementations in the router's
+and the filters' `reference` modules, the same ones the property tests use. The others:
+
+| Target | What it holds to |
+|---|---|
+| `request_host` | Agrees with the `http` crate's reading of a host. |
+| `quic_header` | Agrees with quiche's parser. |
+| `config` | Reading and compiling a config file never fail, and what compiles is whole. |
+| `test_file` | Reading, checking and running a file of `edgerush test`'s tests never fail. |
+| `rules_compile` | A limit rule's three parts compile or fail with an error placed in the part it is about, and what compiles decides a request without failing. |
+| `admission_review` | Any bytes read as a webhook review never fail, and the answer carries the review's uid. |
+| `dns_answer` | Any bytes read as a nameserver's answer never fail, and each address found is listed once, in order. |
+
+An input that fails is saved under `fuzz/artifacts/`: fix the bug and add the input to the
+unit tests. Run a target after changing the code it covers. Being
 outside the workspace, the package is formatted on its own:
 `cargo fmt --manifest-path fuzz/Cargo.toml`.
 
 ## Layout
 
 ```
-crates/edgerush    the binary (operator, control plane and data plane will be subcommands); so far
+crates/edgerush    the binary, one subcommand for each part (the operator's to come):
                    `edgerush proxy`, a data plane, its config from a file for development
                    (`--config file.yaml`) or from a control plane (`--control-plane`),
                    `edgerush controller`, a control plane for one data plane, `edgerush explain`,
@@ -300,7 +324,7 @@ crates/controller  the control plane (`edgerush-controller`): the objects a data
                    made of, followed, translated once every kind is listed and again on each
                    change, a moment's changes at once, and each config that compiles handed on
 crates/discovery   a Kubernetes Service's endpoints, from its EndpointSlices (`edgerush-discovery`):
-                   which addresses take requests; pure, no I/O
+                   which addresses take requests, and which are hinted for a zone; pure, no I/O
 crates/dns         DNS's wire (`edgerush-dns`): A and AAAA queries written and a nameserver's
                    answers read, for upstreams that resolve a name; pure, no I/O
 crates/explain     where a request would go and why (`edgerush-explain`): what `edgerush explain`
