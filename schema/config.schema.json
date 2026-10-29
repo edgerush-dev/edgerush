@@ -16,6 +16,7 @@
       "$ref": "#/$defs/DataPlane",
       "default": {
         "experimental_unrestricted_egress": null,
+        "own_service": null,
         "set_aside_ms": null
       }
     },
@@ -185,6 +186,14 @@
           "description": "Whether addresses discovered or resolved are sent to whatever they are, loopback,\nlink-local, the pod's own and the gateway's other pods among them: experimental, for\ndevelopment, until a development profile takes it over. Off when left out.",
           "type": [
             "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "own_service": {
+          "description": "A Service that selects the data plane's own pods,\n`<service>.<namespace>.svc.<cluster domain>`: the data plane's zone is that of the\nendpoint at one of its own addresses in the Service's EndpointSlices, and an\nupstream's endpoints hinted for that zone are preferred. Left out, or until the data plane is\nfound in them, no zone is preferred.",
+          "type": [
+            "string",
             "null"
           ],
           "default": null

@@ -439,6 +439,134 @@ fn the_gateways_own_pods_are_refused_as_they_are_named() {
     assert_eq!(addresses_of(&proxy, 1), ["10.0.0.3:8080"]);
 }
 
+/// A slice of Service `service` in `namespace`, its port `http` on 8080, of these
+/// endpoints, each written as YAML is.
+fn written(namespace: &str, service: &str, endpoints: &str) -> EndpointSlice {
+    serde_saphyr::from_str(&format!(
+        "metadata: {{ name: {service}-1, namespace: {namespace}, labels: {{ kubernetes.io/service-name: {service} }} }}\naddressType: IPv4\nports: [{{ name: http, port: 8080 }}]\nendpoints: [{endpoints}]\n"
+    ))
+    .unwrap()
+}
+
+/// The running config's upstream at `upstream`: its endpoints, and how many of them, first,
+/// are the zone's.
+fn zoned_of(proxy: &Proxy, upstream: usize) -> (Vec<String>, usize) {
+    (
+        addresses_of(proxy, upstream),
+        proxy.current.load().zoned[upstream],
+    )
+}
+
+/// The data plane's zone is that of its own pod in its own Service's slices, whose
+/// namespace is followed for it; an upstream's endpoints hinted for that zone come first,
+/// to be preferred, until one in use carries no hint, or the zone's are all refused.
+#[test]
+fn endpoints_hinted_for_the_data_planes_zone_come_first() {
+    let config: Config = serde_saphyr::from_str(
+        "listeners: {}
+routes: []
+upstreams:
+  listed: { load_balancer: p2c, endpoints: { listed: [\"127.0.0.1:1\", \"127.0.0.1:2\"] } }
+  web: { load_balancer: p2c, endpoints: { kubernetes: \"web.shop.svc.cluster.local:http\" } }
+data_plane: { own_service: edgerush.edge.svc.cluster.local }
+",
+    )
+    .unwrap();
+    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+    assert!(proxy.namespaces.borrow().contains("edge"));
+    proxy.deny(
+        crate::egress::Denied {
+            own: vec!["10.9.0.1".parse().unwrap()],
+            ..crate::egress::Denied::default()
+        },
+        |_, _, _| {},
+    );
+    let hinted = |address: &str, zone: &str| {
+        format!(
+            "{{ addresses: [{address}], zone: {zone}, hints: {{ forZones: [{{ name: {zone} }}] }} }}"
+        )
+    };
+    let web = written(
+        "shop",
+        "web",
+        &[
+            hinted("10.0.0.1", "b"),
+            hinted("10.0.0.2", "a"),
+            hinted("10.0.0.3", "a"),
+        ]
+        .join(", "),
+    );
+    assert!(proxy.rediscover([shop(vec![web.clone()])]).unwrap());
+    // No zone found yet: nothing is preferred.
+    assert_eq!(
+        zoned_of(&proxy, 1),
+        (
+            vec![
+                "10.0.0.1:8080".to_owned(),
+                "10.0.0.2:8080".to_owned(),
+                "10.0.0.3:8080".to_owned()
+            ],
+            3
+        )
+    );
+    // The pod is found in zone `a`, not ready yet and in another Service's namespace.
+    let own = written(
+        "edge",
+        "edgerush",
+        "{ addresses: [10.9.0.2], zone: b }, { addresses: [10.9.0.1], zone: a, conditions: { ready: false } }",
+    );
+    let edge = ("edge".to_owned(), Some(Arc::from(vec![own])));
+    assert!(proxy.rediscover([edge]).unwrap());
+    assert_eq!(
+        zoned_of(&proxy, 1),
+        (
+            vec![
+                "10.0.0.2:8080".to_owned(),
+                "10.0.0.3:8080".to_owned(),
+                "10.0.0.1:8080".to_owned()
+            ],
+            2
+        )
+    );
+    // Listed endpoints are as listed, all alike.
+    assert_eq!(zoned_of(&proxy, 0).1, 2);
+    // The zone's endpoints all refused: none is preferred.
+    assert!(
+        proxy
+            .gateway(vec![
+                "10.0.0.2".parse().unwrap(),
+                "10.0.0.3".parse().unwrap()
+            ])
+            .unwrap()
+    );
+    assert_eq!(zoned_of(&proxy, 1), (vec!["10.0.0.1:8080".to_owned()], 1));
+    assert!(proxy.gateway(Vec::new()).unwrap());
+    assert_eq!(zoned_of(&proxy, 1).1, 2);
+    // One endpoint without a hint: none is preferred, in the order of their addresses.
+    let partly = written(
+        "shop",
+        "web",
+        &[
+            hinted("10.0.0.1", "b"),
+            hinted("10.0.0.2", "a"),
+            "{ addresses: [10.0.0.4], zone: a }".to_owned(),
+        ]
+        .join(", "),
+    );
+    assert!(proxy.rediscover([shop(vec![partly])]).unwrap());
+    assert_eq!(
+        zoned_of(&proxy, 1),
+        (
+            vec![
+                "10.0.0.1:8080".to_owned(),
+                "10.0.0.2:8080".to_owned(),
+                "10.0.0.4:8080".to_owned()
+            ],
+            3
+        )
+    );
+}
+
 /// The experimental switch: nothing discovered or resolved is refused.
 #[test]
 fn unrestricted_egress_refuses_nothing() {

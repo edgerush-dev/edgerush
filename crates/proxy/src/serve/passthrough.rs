@@ -316,8 +316,9 @@ impl Worker {
             return Err(Tunnel::NoBackend);
         };
         let destinations = snapshot.destinations.of(upstream.0);
-        let picked = balance_of(&self.balancing, &snapshot, upstream.0)
-            .and_then(|balance| balance.pick(destinations, &Tried::default()));
+        let picked = balance_of(&self.balancing, &snapshot, upstream.0).and_then(|balance| {
+            balance.pick(destinations, snapshot.zoned(upstream.0), &Tried::default())
+        });
         let Some((identity, counted)) = picked
             .and_then(|(at, counted)| Some((snapshot.destinations.at(upstream.0, at)?, counted)))
         else {

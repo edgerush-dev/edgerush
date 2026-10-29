@@ -13,7 +13,7 @@ use crate::upstream::destination::{Aside, Destinations, Keys, Retiring, ReuseIde
 use crate::upstream::secure::Secure;
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRateLimiting};
-use edgerush_discovery::{Endpoints, SERVICE_NAME_LABEL};
+use edgerush_discovery::{Endpoints, SERVICE_NAME_LABEL, zone_of};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
@@ -48,12 +48,20 @@ pub(super) fn runs_rate_limits(config: &Compiled, supported: bool) -> Result<(),
     Ok(())
 }
 
-/// The namespaces `config`'s discovered upstreams are in.
+/// The namespaces `config`'s discovered upstreams are in, and the data plane's own
+/// Service's, whose slices say its zone.
 fn namespaces_of(config: &Compiled) -> BTreeSet<String> {
     config
         .upstreams()
         .iter()
         .filter_map(|upstream| Some(upstream.discovery.as_ref()?.namespace.clone()))
+        .chain(
+            config
+                .data_plane()
+                .own_service
+                .as_ref()
+                .map(|own| own.namespace.clone()),
+        )
         .collect()
 }
 
@@ -106,6 +114,9 @@ impl std::fmt::Debug for Egress {
 #[derive(PartialEq, Eq)]
 struct Endpointed {
     kept: Vec<Vec<SocketAddr>>,
+    /// How many of each upstream's kept endpoints, first, are its zone's, to be preferred
+    /// (03 §6): as many as it has when none is.
+    zoned: Vec<usize>,
     refused: Vec<Vec<(SocketAddr, Refusal)>>,
 }
 
@@ -145,32 +156,43 @@ fn by_service(slices: &[EndpointSlice]) -> ByService {
 ///
 /// A discovered or resolved address that is not to be sent to is refused, not kept; one the
 /// config lists is the operator's, and kept whatever it is.
+///
+/// A discovered upstream's endpoints hinted for the data plane's zone, if it has found its
+/// zone and they are to be preferred, come first.
 fn resolved(config: &Compiled, found: Found<'_>) -> Endpointed {
     let Found {
         discovered,
         named,
         denied,
     } = found;
-    let all: Vec<(Vec<SocketAddr>, bool)> = config
+    let zone = config.data_plane().own_service.as_ref().and_then(|own| {
+        let slices = discovered.get(&own.namespace)?.get(&own.service)?;
+        zone_of(&own.namespace, &own.service, slices, &denied.own)
+    });
+    // Each upstream's addresses, those preferred first, how many those are, and whether
+    // they are checked.
+    let all: Vec<(Vec<SocketAddr>, usize, bool)> = config
         .upstreams()
         .iter()
         .map(|upstream| match (&upstream.discovery, &upstream.dns) {
-            (Some(service), _) => (
-                discovered
+            (Some(service), _) => {
+                let endpoints = discovered
                     .get(&service.namespace)
                     .and_then(|services| services.get(&service.service))
-                    .map(|slices| {
-                        Endpoints::of(service, slices)
-                            .in_use()
-                            .iter()
-                            .copied()
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                true,
-            ),
-            (None, Some(name)) => (
-                named
+                    .map(|slices| Endpoints::of(service, slices))
+                    .unwrap_or_default();
+                let preferred = zone
+                    .and_then(|zone| endpoints.for_zone(zone))
+                    .unwrap_or_default();
+                let rest = endpoints
+                    .in_use()
+                    .iter()
+                    .filter(|address| !preferred.contains(address));
+                let addresses: Vec<SocketAddr> = preferred.iter().chain(rest).copied().collect();
+                (addresses, preferred.len(), true)
+            }
+            (None, Some(name)) => {
+                let addresses: Vec<SocketAddr> = named
                     .get(&name.host)
                     .map(|addresses| {
                         addresses
@@ -178,27 +200,36 @@ fn resolved(config: &Compiled, found: Found<'_>) -> Endpointed {
                             .map(|address| SocketAddr::new(*address, name.port.get()))
                             .collect()
                     })
-                    .unwrap_or_default(),
-                true,
-            ),
-            (None, None) => (upstream.endpoints.clone(), false),
+                    .unwrap_or_default();
+                (addresses, 0, true)
+            }
+            (None, None) => (upstream.endpoints.clone(), 0, false),
         })
         .collect();
     let mut endpointed = Endpointed {
         kept: Vec::with_capacity(all.len()),
+        zoned: Vec::with_capacity(all.len()),
         refused: Vec::with_capacity(all.len()),
     };
-    for (addresses, checked) in all {
+    for (addresses, preferred, checked) in all {
         let mut kept = Vec::with_capacity(addresses.len());
         let mut refused = Vec::new();
+        let mut zoned = 0;
         // Unrestricted, by the experimental switch, nothing is checked.
         let checked = checked && !config.data_plane().unrestricted_egress;
-        for address in addresses {
+        for (at, address) in addresses.into_iter().enumerate() {
             match denied.refusal(address.ip()).filter(|_| checked) {
                 Some(why) => refused.push((address, why)),
-                None => kept.push(address),
+                None => {
+                    zoned += usize::from(at < preferred);
+                    kept.push(address);
+                }
             }
         }
+        // None of the zone's kept, or all of them the zone's: none is preferred.
+        endpointed
+            .zoned
+            .push(if zoned == 0 { kept.len() } else { zoned });
         endpointed.kept.push(kept);
         endpointed.refused.push(refused);
     }
@@ -255,6 +286,7 @@ impl Snapshot {
         };
         let Endpointed {
             kept: resolved,
+            zoned,
             refused,
         } = resolved(&config, found);
         let endpoints = resolved
@@ -368,6 +400,7 @@ impl Snapshot {
             generation: previous.map_or(0, |previous| previous.generation + 1),
             listeners,
             endpoints,
+            zoned,
             refused,
             upstream_slots,
             limit_slots,

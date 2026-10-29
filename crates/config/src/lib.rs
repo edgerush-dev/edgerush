@@ -41,7 +41,7 @@ pub use config::{
 };
 pub use dns::{DnsName, DnsNameError};
 pub use harness_file::{CertificateFiles, HarnessFile};
-pub use kubernetes::{KubernetesService, ServiceNameError, ServicePort};
+pub use kubernetes::{KubernetesService, ServiceName, ServiceNameError, ServicePort};
 pub use limits::{Bucket, CompiledLimit, Global, Limit, LimitMatch, Limits, Model};
 pub use route::{
     Backend, EncodedSlash, Filter, Forward, Fraction, GrpcMethod, Header, HeaderChanges, Hostname,

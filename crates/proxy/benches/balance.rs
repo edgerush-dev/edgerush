@@ -2,7 +2,8 @@
 //! ([03 §6](../../../docs/03-data-plane.md)): `p2c` and `round_robin`, in the common case —
 //! every endpoint serving, none ramping, a first try — and in the cases that cost more: an
 //! endpoint failing its checks drawn, a retry that keeps away from what it tried, and an
-//! endpoint in slow start.
+//! endpoint in slow start; and with a zone kept to, whose rule looks at each of its
+//! endpoints, beside an upstream whose endpoints are all its zone's, which has none.
 //!
 //! Linux only (valgrind):
 //! `cargo bench -p edgerush-proxy --features fuzzing --bench balance`, see the repository
@@ -13,7 +14,7 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_proxy::balance::{Candidates, RoundRobin, Share, Tried, p2c};
+use edgerush_proxy::balance::{Candidates, RoundRobin, Share, Tried, p2c, zone};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
 
@@ -108,6 +109,24 @@ fn pick_round_robin(endpoints: Endpoints, tried: Tried) -> (Endpoints, Option<us
     (endpoints, picked)
 }
 
-library_benchmark_group!(name = balance; benchmarks = pick_p2c, pick_round_robin);
+// The first `zoned` of the endpoints are the zone's: the zone's rule, then the pick.
+#[library_benchmark]
+#[bench::sixteen_zone_of_eight(serving(16), 8, Tried::default())]
+#[bench::sixteen_zone_of_eight_one_failing(one_failing(), 8, Tried::default())]
+#[bench::sixteen_all_the_zones(serving(16), 16, Tried::default())]
+fn pick_p2c_zoned(endpoints: Endpoints, zoned: usize, tried: Tried) -> (Endpoints, Option<usize>) {
+    let mut random = draws();
+    let (endpoints_seen, tried) = (black_box(&endpoints), black_box(&tried));
+    let picked = match zone(endpoints_seen, black_box(zoned), tried) {
+        Some(zone) => p2c(&zone, tried, &mut random),
+        None => p2c(endpoints_seen, tried, &mut random),
+    };
+    (endpoints, picked)
+}
+
+library_benchmark_group!(
+    name = balance;
+    benchmarks = pick_p2c, pick_round_robin, pick_p2c_zoned
+);
 
 main!(library_benchmark_groups = balance);

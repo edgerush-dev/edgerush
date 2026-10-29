@@ -666,7 +666,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     upstreams.retain(|name, _| used.contains(name));
     Translation {
         config: Config {
-            data_plane: plane.data_plane,
+            data_plane: plane.data_plane.clone(),
             ..config_of(
                 plane.listeners.clone(),
                 routes,

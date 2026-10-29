@@ -5,8 +5,19 @@ use super::*;
 /// An HTTP/1 upstream that answers `/healthz` 200 while `serving` says so and 503
 /// otherwise, and every other request 200 with its name in `x-upstream`.
 async fn checked_upstream(name: &'static str, serving: Rc<Cell<bool>>) -> SocketAddr {
+    checked_upstream_at("127.0.0.1:0", name, serving, 200).await
+}
+
+/// [`checked_upstream`], listening at `address`, answering every request but a probe with
+/// `status`.
+async fn checked_upstream_at(
+    address: &str,
+    name: &'static str,
+    serving: Rc<Cell<bool>>,
+    status: u16,
+) -> SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket = TcpListener::bind(address).await.unwrap();
     let address = socket.local_addr().unwrap();
     let _accepting = tokio::task::spawn_local(async move {
         while let Ok((mut stream, _)) = socket.accept().await {
@@ -26,9 +37,13 @@ async fn checked_upstream(name: &'static str, serving: Rc<Cell<bool>>) -> Socket
                     seen.clear();
                     let answer = if probe && !serving.get() {
                         "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".to_owned()
-                    } else {
+                    } else if probe || status == 200 {
                         format!(
                             "HTTP/1.1 200 OK\r\nx-upstream: {name}\r\ncontent-length: 0\r\n\r\n"
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 {status} Said\r\nx-upstream: {name}\r\ncontent-length: 0\r\n\r\n"
                         )
                     };
                     if stream.write_all(answer.as_bytes()).await.is_err() {
@@ -240,6 +255,107 @@ async fn with_most_endpoints_failing_their_health_is_ignored() {
                 unhealthy_answered |= !answer.contains("x-upstream: three\r\n");
             }
             assert!(unhealthy_answered, "health was not ignored below half");
+        })
+        .await;
+}
+
+/// A worker for `config`, its upstream `up` [`discovering_up`] and its endpoints `near` in
+/// the data plane's zone and `far` in another, as [`zoned`] has them on `port`, with the
+/// health checker running.
+async fn zoned_worker(
+    mut config: Config,
+    port: u16,
+    near: &[u8],
+    far: &[u8],
+) -> (SocketAddr, Rc<Worker>) {
+    discovering_up(&mut config);
+    let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+    zoned(&proxy, port, near, far);
+    let _checking = tokio::task::spawn_local(Arc::clone(&proxy).check_health());
+    let worker = Worker::with_deadlines(proxy, H1Limits::default(), SHORT);
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front = socket.local_addr().unwrap();
+    let _serving = serving(&worker, socket);
+    (front, worker)
+}
+
+/// Who answered `count` requests to `front`, each once, by the name each says.
+async fn answered_by(front: SocketAddr, count: usize) -> Vec<String> {
+    let mut by = std::collections::BTreeSet::new();
+    for _ in 0..count {
+        let answer = h1_answer(front, CLOSING_GET).await;
+        let name = answer
+            .split("x-upstream: ")
+            .nth(1)
+            .and_then(|rest| rest.split("\r\n").next())
+            .unwrap_or_else(|| panic!("{answer}"));
+        by.insert(name.to_owned());
+    }
+    by.into_iter().collect()
+}
+
+/// Requests keep to the endpoints hinted for the data plane's zone while at least half of
+/// them serve, and go to every zone's that serve once fewer do (03 §6).
+#[tokio::test]
+async fn requests_keep_to_the_zone_while_half_of_it_serves() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let near_one = Rc::new(Cell::new(true));
+            let near_two = Rc::new(Cell::new(true));
+            let first =
+                checked_upstream_at("127.0.0.1:0", "near-1", Rc::clone(&near_one), 200).await;
+            let port = first.port();
+            let at = |host: u8| format!("127.0.0.{host}:{port}");
+            checked_upstream_at(&at(2), "near-2", Rc::clone(&near_two), 200).await;
+            checked_upstream_at(&at(3), "far-1", Rc::new(Cell::new(true)), 200).await;
+            checked_upstream_at(&at(4), "far-2", Rc::new(Cell::new(true)), 200).await;
+            let mut config = everything_config(first);
+            config.upstreams.get_mut("up").unwrap().health_check = Some(every_second_by(healthz()));
+            let (front, worker) = zoned_worker(config, port, &[1, 2], &[3, 4]).await;
+
+            until_serving(&worker, "4").await;
+            assert_eq!(answered_by(front, 40).await, ["near-1", "near-2"]);
+            // Half the zone serves: still the zone's.
+            near_one.set(false);
+            until_serving(&worker, "3").await;
+            assert_eq!(answered_by(front, 20).await, ["near-2"]);
+            // None of it serves: every zone's that do.
+            near_two.set(false);
+            until_serving(&worker, "2").await;
+            assert_eq!(answered_by(front, 40).await, ["far-1", "far-2"]);
+        })
+        .await;
+}
+
+/// A request sent again keeps to the zone too, to one of its endpoints not yet tried.
+#[tokio::test]
+async fn a_retry_keeps_to_the_zone() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let serving = || Rc::new(Cell::new(true));
+            let first = checked_upstream_at("127.0.0.1:0", "near-1", serving(), 503).await;
+            let port = first.port();
+            let at = |host: u8| format!("127.0.0.{host}:{port}");
+            checked_upstream_at(&at(2), "near-2", serving(), 200).await;
+            checked_upstream_at(&at(3), "far-1", serving(), 200).await;
+            checked_upstream_at(&at(4), "far-2", serving(), 200).await;
+            let mut config = everything_config(first);
+            config.routes[0].rules[0].forward.as_mut().unwrap().retry =
+                Some(retrying(2, &[503], &[], 1));
+            let (front, worker) = zoned_worker(config, port, &[1, 2], &[3, 4]).await;
+            // Every request near-1 answers 503 is sent again, to near-2.
+            assert_eq!(answered_by(front, 40).await, ["near-2"]);
+            let scrape = worker.proxy().metrics();
+            let retries: u64 = scrape
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("edgerush_upstream_retries_total{upstream=\"up\"} ")
+                })
+                .and_then(|count| count.parse().ok())
+                .unwrap_or_else(|| panic!("no retries counted: {scrape}"));
+            assert!(retries > 0, "nothing was sent again: {scrape}");
         })
         .await;
 }

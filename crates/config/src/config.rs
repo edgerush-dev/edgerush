@@ -49,7 +49,7 @@ pub struct Config {
 /// The whole data plane's own settings ([07 §1](../../../docs/07-config-and-dsl.md)):
 /// bounds rather than behaviour, each with its value when left out. The control plane fills
 /// them from the `DataPlane` resource; they reload with the rest of the config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct DataPlane {
@@ -65,6 +65,14 @@ pub struct DataPlane {
     /// ([03 §6](../../../docs/03-data-plane.md)). Off when left out.
     #[serde(default)]
     pub experimental_unrestricted_egress: Option<bool>,
+    /// A Service that selects the data plane's own pods,
+    /// `<service>.<namespace>.svc.<cluster domain>`: the data plane's zone is that of the
+    /// endpoint at one of its own addresses in the Service's EndpointSlices, and an
+    /// upstream's endpoints hinted for that zone are preferred
+    /// ([03 §6](../../../docs/03-data-plane.md)). Left out, or until the data plane is
+    /// found in them, no zone is preferred.
+    #[serde(default)]
+    pub own_service: Option<String>,
 }
 
 /// How the data plane enforces its rate limits: the mode, and what that mode needs.

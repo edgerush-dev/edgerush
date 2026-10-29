@@ -15,7 +15,7 @@ use crate::{
     AccessLog, Backend, Certificate, ClientValidation, Config, DnsName, DnsNameError, Endpoints,
     Forwarding, HealthCheck, Http3, Keepalive, KubernetesService, ListenerProxyProtocol,
     LoadBalancer, Probe, Protocol, ProxyProtocolVersion, RateLimitMode, RequestId, Rule,
-    ServiceNameError, SlowStart, UpstreamProtocol,
+    ServiceName, ServiceNameError, SlowStart, UpstreamProtocol,
 };
 use edgerush_filters::forwarding::{ForwardingError, HeaderNames, TrustedProxies};
 use edgerush_filters::{
@@ -190,13 +190,16 @@ impl CompiledRateLimitService {
 }
 
 /// The data plane's own settings, each at the value it runs with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledDataPlane {
     /// How long an endpoint that could not be connected to waits for its connect probe.
     pub set_aside: Duration,
     /// Whether addresses discovered or resolved are sent to whatever they are
     /// (experimental, 03 §6).
     pub unrestricted_egress: bool,
+    /// The Service that selects the data plane's own pods, whose EndpointSlices say its
+    /// zone (03 §6).
+    pub own_service: Option<ServiceName>,
 }
 
 impl CompiledDataPlane {
@@ -219,8 +222,8 @@ impl Compiled {
 
     /// The data plane's own settings.
     #[must_use]
-    pub fn data_plane(&self) -> CompiledDataPlane {
-        self.data_plane
+    pub fn data_plane(&self) -> &CompiledDataPlane {
+        &self.data_plane
     }
 
     /// How its rate limits are enforced.
@@ -1040,6 +1043,19 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             .set_aside_ms
             .map_or(CompiledDataPlane::SET_ASIDE, Duration::from_millis),
         unrestricted_egress: config.data_plane.experimental_unrestricted_egress == Some(true),
+        own_service: match config
+            .data_plane
+            .own_service
+            .as_deref()
+            .map(ServiceName::parse)
+        {
+            Some(Ok(service)) => Some(service),
+            Some(Err(error)) => {
+                errors.push(Place::of(Object::DataPlane).problem(Problem::OwnService(error)));
+                None
+            }
+            None => None,
+        },
     };
     if config.data_plane.set_aside_ms == Some(0) {
         errors.push(Place::of(Object::DataPlane).problem(Problem::SetAsideNever));
@@ -2568,6 +2584,9 @@ pub enum Problem {
     /// Endpoints a name resolves to, named by something that is not a name and port.
     #[error("`endpoints.dns`: {0}")]
     DnsName(DnsNameError),
+    /// The data plane's own Service, named by something that is not a Service's name.
+    #[error("`own_service`: {0}")]
+    OwnService(ServiceNameError),
     /// A slow start over no time at all, which is none: left out is how none is said.
     #[error("`slow_start.window_ms` is 0: at least 1, or no `slow_start`")]
     SlowStartNever,
@@ -5196,6 +5215,33 @@ upstreams: {{ u: {upstream} }}
 
     /// Endpoints from Kubernetes compile to the Service and port they are followed
     /// through, with none listed; a name that is not a Service's is refused, saying why.
+    #[test]
+    fn the_data_planes_own_service_is_a_services_name_without_a_port() {
+        let with = |data_plane: &str| {
+            compile(&config(&format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{}}\ndata_plane: {data_plane}\n"
+            )))
+            .map(|compiled| compiled.data_plane().own_service.clone())
+            .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert_eq!(with("{}"), Ok(None));
+        assert_eq!(
+            with("{ own_service: edgerush.edge.svc.cluster.local }"),
+            Ok(Some(ServiceName {
+                service: "edgerush".to_owned(),
+                namespace: "edge".to_owned(),
+                cluster_domain: "cluster.local".to_owned(),
+            }))
+        );
+        let refused =
+            with(r#"{ own_service: "edgerush.edge.svc.cluster.local:http" }"#).unwrap_err();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].starts_with("the data plane: `own_service`: not a Service's name"),
+            "{refused:?}"
+        );
+    }
+
     #[test]
     fn endpoints_from_kubernetes_name_a_service_and_its_port() {
         let with = |endpoints: &str| {
