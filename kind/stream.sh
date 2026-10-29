@@ -20,7 +20,9 @@
 #   - asked to reach its Service by the Service's own address, it is served through the
 #     cluster's DNS and kube-proxy, and served again once it no longer asks;
 #   - an EndpointSlice written by hand to point at the data plane's own pod is not sent
-#     to, and that is said;
+#     to, and that is said; nor one pointed at a control-plane pod, whose address the
+#     control plane resolves by its headless Service and sends on the stream, and again
+#     once a replica that took over is a new pod;
 #   - the control plane's leader gone, the other replica takes its Lease and writes status;
 #   - with the control plane gone, the data plane serves on;
 #   - a data plane started while it is gone waits for its first config, serving nothing,
@@ -196,11 +198,10 @@ k -n shop annotate ingress web gateway.edgerush.dev/service-upstream- >/dev/null
 answers other.example 200 30 || fail "back on its endpoints, $(status other.example)"
 pass "reached by its Service's own address, the Ingress is served through the cluster's DNS"
 
-# A Service of no selector, and its one EndpointSlice written by hand: the data plane's own
-# address, which would loop a request back into it.
-own=$(k -n edge get pod -l app=edgerush -o jsonpath='{.items[0].status.podIP}')
-[ -n "$own" ] || fail "the data plane has no pod address"
-k apply -f - >/dev/null <<EOF
+# A Service of no selector, and its one EndpointSlice written by hand, pointed at $1: the
+# data plane must say it is not sent to, as $2, and answer 503 for want of an endpoint.
+refused() {
+    k apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Service
 metadata: { name: loop, namespace: shop }
@@ -215,7 +216,7 @@ metadata:
   labels: { kubernetes.io/service-name: loop }
 addressType: IPv4
 ports: [{ name: http, port: 8080 }]
-endpoints: [{ addresses: ["$own"] }]
+endpoints: [{ addresses: ["$1"] }]
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -228,13 +229,24 @@ spec:
         paths:
           - { path: /, pathType: Prefix, backend: { service: { name: loop, port: { name: http } } } }
 EOF
-said deploy/edgerush "upstream shop/loop/http: $own:8080 is not sent to, as one of the data plane's own" 30 ||
-    fail "the data plane never said it refuses its own address"
-answers loop.example 503 10 || fail "an Ingress led to the data plane's own address answers $(status loop.example)"
-k -n shop delete ingress loop >/dev/null
-k -n shop delete service loop >/dev/null
-k -n shop delete endpointslice loop-1 >/dev/null
+    said deploy/edgerush "upstream shop/loop/http: $1:8080 is not sent to, as $2" 60 ||
+        fail "the data plane never said it refuses $1, as $2"
+    answers loop.example 503 10 || fail "an Ingress led to $1 answers $(status loop.example)"
+    k -n shop delete ingress loop >/dev/null
+    k -n shop delete service loop >/dev/null
+    k -n shop delete endpointslice loop-1 >/dev/null
+}
+# The control-plane pod newest made, and its address.
+control() { k -n edge get pod -l app=edgerush-control --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].status.podIP}'; }
+
+own=$(k -n edge get pod -l app=edgerush -o jsonpath='{.items[0].status.podIP}')
+[ -n "$own" ] || fail "the data plane has no pod address"
+refused "$own" "one of the data plane's own"
 pass "an EndpointSlice pointed at the data plane's own pod is not sent to, and that is said"
+peer=$(control)
+[ -n "$peer" ] || fail "the control plane has no pod address"
+refused "$peer" "one of the gateway's own pods"
+pass "nor one pointed at a control-plane pod, named on the stream"
 
 echo "== the leader gone"
 # Who holds the Lease: a pod's name, and when it started.
@@ -259,6 +271,16 @@ k -n shop annotate ingress web nginx.ingress.kubernetes.io/rewrite-target- >/dev
 saying 192.0.2.10 30 || fail "with $took leading, the status says '$(says)'"
 k -n edge rollout status deploy/edgerush-control --timeout=120s >/dev/null
 pass "the leader gone, $took took the Lease and writes status"
+# The replica that took the deleted one's place is a new pod, at a new address, which the
+# control plane comes to resolve and sends again.
+for _ in $(seq 1 150); do
+    [ "$(k -n edge get pod -l app=edgerush-control --field-selector=status.phase=Running -o name | grep -c .)" = 2 ] && break
+    sleep 0.2
+done
+newest=$(control)
+[ -n "$newest" ] && [ "$newest" != "$peer" ] || fail "no new control-plane pod took the deleted one's place"
+refused "$newest" "one of the gateway's own pods"
+pass "a control-plane pod made since is not sent to either, named on the stream as it changed"
 
 echo "== the control plane gone"
 k -n edge scale deploy/edgerush-control --replicas=0 >/dev/null

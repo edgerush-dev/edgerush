@@ -48,6 +48,23 @@ impl DnsName {
     /// Returns a [`DnsNameError`] saying what is wrong with it.
     pub fn parse(text: &str) -> Result<Self, DnsNameError> {
         let (name, port) = text.rsplit_once(':').ok_or(DnsNameError::NoPort)?;
+        let host = Self::host(name)?;
+        if port.starts_with('0') || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(DnsNameError::Port(port.to_owned()));
+        }
+        let port = port
+            .parse()
+            .map_err(|_| DnsNameError::Port(port.to_owned()))?;
+        Ok(Self { host, port })
+    }
+
+    /// Reads a name alone, without a port, in any case and with a trailing dot or without,
+    /// into the spelling [`DnsName::host`] holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DnsNameError`] saying what is wrong with it.
+    pub fn host(name: &str) -> Result<String, DnsNameError> {
         // An IPv6 address has colons of its own: `[::1]:80`, or bare.
         let unbracketed = name.trim_start_matches('[').trim_end_matches(']');
         if unbracketed.parse::<IpAddr>().is_ok() || name.contains(':') {
@@ -62,13 +79,7 @@ impl DnsName {
                 return Err(DnsNameError::Label(label.to_owned()));
             }
         }
-        if port.starts_with('0') || !port.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(DnsNameError::Port(port.to_owned()));
-        }
-        let port = port
-            .parse()
-            .map_err(|_| DnsNameError::Port(port.to_owned()))?;
-        Ok(Self { host, port })
+        Ok(host)
     }
 }
 
@@ -121,6 +132,18 @@ mod tests {
         assert_eq!(
             name("web.shop.svc.cluster.local", 80).to_string(),
             "web.shop.svc.cluster.local:80"
+        );
+        assert_eq!(
+            DnsName::host("Peers.Edge.svc.cluster.local."),
+            Ok("peers.edge.svc.cluster.local".to_owned())
+        );
+        assert_eq!(
+            DnsName::host("10.0.0.1"),
+            Err(DnsNameError::Address("10.0.0.1".to_owned()))
+        );
+        assert_eq!(
+            DnsName::host("a..b"),
+            Err(DnsNameError::Label(String::new()))
         );
     }
 

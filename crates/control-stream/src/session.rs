@@ -13,6 +13,8 @@ pub struct Session {
     version: ConfigVersion,
     /// The data plane's own config version.
     reads: u32,
+    /// The gateway's addresses last sent, if any have been.
+    gateway: Option<Vec<std::net::IpAddr>>,
 }
 
 /// Why a control plane does not serve a stream a data plane opened.
@@ -69,6 +71,7 @@ impl Session {
             held: hello.held.unwrap_or_default().try_into()?,
             version,
             reads: hello.config_version,
+            gateway: None,
         })
     }
 
@@ -78,6 +81,7 @@ impl Session {
             held: Held::default(),
             version,
             reads: version.get(),
+            gateway: None,
         }
     }
 
@@ -148,6 +152,20 @@ impl Session {
             });
         }
         messages
+    }
+
+    /// What to send of the gateway's `addresses`: all of them, once on a stream and again
+    /// each time they are other than those last sent; none otherwise.
+    pub fn gateway(&mut self, addresses: &[std::net::IpAddr]) -> Option<wire::ToDataPlane> {
+        if self.gateway.as_deref() == Some(addresses) {
+            return None;
+        }
+        self.gateway = Some(addresses.to_vec());
+        Some(wire::ToDataPlane {
+            resource: Some(wire::Resource::Gateway(wire::Gateway {
+                addresses: addresses.iter().map(ToString::to_string).collect(),
+            })),
+        })
     }
 
     /// What a message after the first says: none, from a data plane that says something

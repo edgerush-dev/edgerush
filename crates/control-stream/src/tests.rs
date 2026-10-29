@@ -138,6 +138,7 @@ fn kinds(taken: &[Taken]) -> Vec<&'static str> {
             Taken::Nothing => "nothing",
             Taken::Run(_) => "run",
             Taken::Say(_) => "say",
+            Taken::Gateway(_) => "gateway",
         })
         .collect()
 }
@@ -152,6 +153,9 @@ fn sent(messages: &[wire::ToDataPlane]) -> Vec<String> {
             Some(wire::Resource::Config(_)) => "config".to_owned(),
             Some(wire::Resource::Removed(removed)) => {
                 format!("removed {}", removed.names.join(" "))
+            }
+            Some(wire::Resource::Gateway(gateway)) => {
+                format!("gateway {}", gateway.addresses.join(" "))
             }
             None => "none".to_owned(),
         })
@@ -632,4 +636,49 @@ proptest! {
             prop_assert_eq!(report, Report::default());
         }
     }
+}
+
+fn addresses(addresses: &[&str]) -> Vec<std::net::IpAddr> {
+    addresses
+        .iter()
+        .map(|address| address.parse().unwrap())
+        .collect()
+}
+
+/// The gateway's addresses are sent once on a stream, again only as they change, and whole;
+/// none sent is sent as none, so that a stream that opens says them even if there are none.
+#[test]
+fn the_gateways_addresses_are_sent_once_and_again_as_they_change() {
+    let mut session = hello(&Staging::new());
+    let first = addresses(&["10.244.0.5", "fd00::5"]);
+    let sent_first: Vec<_> = session.gateway(&first).into_iter().collect();
+    assert_eq!(sent(&sent_first), ["gateway 10.244.0.5 fd00::5"]);
+    assert!(session.gateway(&first).is_none(), "the same sent again");
+    let more = addresses(&["10.244.0.5", "10.244.0.6", "fd00::5"]);
+    let sent_more: Vec<_> = session.gateway(&more).into_iter().collect();
+    assert_eq!(sent(&sent_more), ["gateway 10.244.0.5 10.244.0.6 fd00::5"]);
+    // A stream opened afresh says them again, and says none, where there are none.
+    let mut again = hello(&Staging::new());
+    let none: Vec<_> = again.gateway(&[]).into_iter().collect();
+    assert_eq!(sent(&none), ["gateway "]);
+    // Taken through the wire, as they were sent.
+    let mut staging = Staging::new();
+    let taken = take(&mut staging, sent_more);
+    let [Taken::Gateway(taken)] = taken.as_slice() else {
+        panic!("{:?}", kinds(&taken))
+    };
+    assert_eq!(*taken, more);
+}
+
+#[test]
+fn a_gateway_address_that_is_not_one_is_malformed() {
+    let message = wire::ToDataPlane {
+        resource: Some(wire::Resource::Gateway(wire::Gateway {
+            addresses: vec!["10.244.0.5".to_owned(), "pod-5".to_owned()],
+        })),
+    };
+    assert_eq!(
+        Staging::new().take(message).unwrap_err(),
+        Malformed::Address("pod-5".to_owned())
+    );
 }

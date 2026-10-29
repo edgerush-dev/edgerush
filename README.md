@@ -188,6 +188,9 @@ offered to every data plane that dials it with a certificate those authorities s
 what each says of it is said too. With `--status-service edge/edgerush`, each Ingress served
 says that Service's addresses in its status, and each of the class not served says none;
 with `--leader-lease edge/edgerush-control`, replicas elect the one that writes it. With
+`--own-name edgerush-peers.edge.svc.cluster.local`, given once for each headless Service
+whose pods are the gateway's own, it sends the addresses those names resolve to on the
+stream, and no data plane sends a request to them. With
 `--webhook-listen [::]:8443 --webhook-certificate tls.crt --webhook-key tls.key` it serves
 the admission webhook there, HTTPS, reviews `POST`ed to `/validate`: an Ingress of the
 class is refused, with why, where alone it does not translate into something the data plane

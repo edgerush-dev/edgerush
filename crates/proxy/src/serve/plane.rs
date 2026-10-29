@@ -714,6 +714,66 @@ impl Proxy {
         };
     }
 
+    /// Refuses `addresses` from now on, the gateway's other pods', as the control plane names
+    /// them, in place of those it named before: every address discovered or resolved is
+    /// looked at again, an endpoint now refused retired and one no longer refused served,
+    /// as [`Proxy::rediscover`] serves endpoints that change. Whether the running config's
+    /// endpoints changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProxyError`] as [`Proxy::new`] does; nothing is taken in then.
+    pub fn gateway(&self, addresses: Vec<IpAddr>) -> Result<bool, ProxyError> {
+        let _making = self.making.lock().unwrap_or_else(PoisonError::into_inner);
+        let previous = self.current.load();
+        let discovered = self
+            .discovered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let named = self.named.lock().unwrap_or_else(PoisonError::into_inner);
+        let (denied, told) = self.denied();
+        let mut next = denied.clone();
+        next.gateway = addresses;
+        let now = Found {
+            discovered: &discovered,
+            named: &named,
+            denied: &denied,
+        };
+        let then = Found {
+            discovered: &discovered,
+            named: &named,
+            denied: &next,
+        };
+        let changed = resolved(&previous.config, then) != resolved(&previous.config, now);
+        if changed {
+            // The running config's listeners, logs and TLS are as they were, and are kept.
+            let (snapshot, retiring) = Snapshot::new(
+                Arc::clone(&previous.config),
+                then,
+                &self.listeners,
+                &self.metrics,
+                Some(&previous),
+                &self.keys,
+                previous.logs.clone(),
+            )?;
+            let refusals = newly_refused(&previous, &snapshot);
+            // As a reload holds it, so that no worker makes its limiter between the two.
+            let rate_limits = self
+                .rate_limits
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            retiring.retire();
+            self.current.store(Arc::new(snapshot));
+            drop(rate_limits);
+            tell(told.as_ref(), refusals);
+        }
+        self.denied
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .denied = next;
+        Ok(changed)
+    }
+
     /// What is refused, and who is told.
     fn denied(&self) -> (Denied, Option<Told>) {
         let held = self.denied.lock().unwrap_or_else(PoisonError::into_inner);

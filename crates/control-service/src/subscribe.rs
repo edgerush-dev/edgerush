@@ -92,8 +92,9 @@ pub struct Subscription {
 }
 
 /// Follows the control plane for as long as it is polled: each config given to run handed
-/// to `run`, which runs it or says why it cannot, from what `staging` holds, and what
-/// happens along the way to `told`.
+/// to `run`, which runs it or says why it cannot, from what `staging` holds, the addresses
+/// of the gateway's own pods to `gateway` each time they come, and what happens along the
+/// way to `told`.
 ///
 /// # Errors
 ///
@@ -102,6 +103,7 @@ pub async fn subscribe<R>(
     subscription: Subscription,
     staging: &mut Staging,
     mut run: impl FnMut(Box<Config>) -> R,
+    mut gateway: impl FnMut(Vec<std::net::IpAddr>),
     told: impl Fn(Following),
 ) -> Result<Infallible, TlsError>
 where
@@ -133,10 +135,17 @@ where
         loop {
             let tls = dialled.borrow().clone();
             let mut carried = false;
-            let ended = follow(&address, &name, &tls, staging, |config| {
-                carried = true;
-                run(config)
-            })
+            let ended = follow(
+                &address,
+                &name,
+                &tls,
+                staging,
+                |config| {
+                    carried = true;
+                    run(config)
+                },
+                &mut gateway,
+            )
             .await;
             if carried {
                 waiting.reset();

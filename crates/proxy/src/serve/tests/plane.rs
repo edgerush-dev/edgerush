@@ -292,6 +292,7 @@ upstreams:
         crate::egress::Denied {
             own: vec!["10.0.0.9".parse().unwrap()],
             api_server: Some("10.96.0.1".parse().unwrap()),
+            gateway: Vec::new(),
         },
         move |upstream, address, why| {
             telling
@@ -381,6 +382,61 @@ upstreams:
     assert!(refused_of(&proxy, "web").is_empty());
     assert!(proxy.rediscover([shop(slices)]).unwrap());
     assert_eq!(told.lock().unwrap().len(), 2);
+}
+
+/// The gateway's other pods, as the control plane names them, are refused from then on:
+/// what was discovered is looked at again, an endpoint now refused retired and told, and
+/// one no longer refused served again.
+#[test]
+fn the_gateways_own_pods_are_refused_as_they_are_named() {
+    let proxy = Proxy::new(
+        discovering("web.shop.svc.cluster.local:http"),
+        NonZeroUsize::MIN,
+    )
+    .unwrap();
+    let told: Arc<Mutex<Vec<String>>> = Arc::default();
+    let telling = Arc::clone(&told);
+    proxy.deny(
+        crate::egress::Denied::default(),
+        move |upstream, address, why| {
+            telling
+                .lock()
+                .unwrap()
+                .push(format!("{upstream} {address}: {why}"));
+        },
+    );
+    assert!(
+        proxy
+            .rediscover([shop(vec![slice("web", "http", &["10.0.0.1", "10.0.0.2"])])])
+            .unwrap()
+    );
+    let kept = Arc::clone(proxy.current.load().destinations.at(1, 1).unwrap());
+    let gone = Arc::clone(proxy.current.load().destinations.at(1, 0).unwrap());
+    assert!(proxy.gateway(vec!["10.0.0.1".parse().unwrap()]).unwrap());
+    assert_eq!(addresses_of(&proxy, 1), ["10.0.0.2:8080"]);
+    assert!(gone.is_retired(), "an endpoint now refused was left live");
+    assert_eq!(
+        destinations_of(&proxy, 1)[0].1,
+        kept.key(),
+        "one kept changed hands"
+    );
+    assert_eq!(
+        *told.lock().unwrap(),
+        ["web 10.0.0.1:8080: one of the gateway's own pods"]
+    );
+    assert_eq!(refused_of(&proxy, "web"), ["reason=\"gateway\"} 1"]);
+    // Named again the same: nothing changes. Named no more: served again.
+    assert!(!proxy.gateway(vec!["10.0.0.1".parse().unwrap()]).unwrap());
+    assert!(proxy.gateway(Vec::new()).unwrap());
+    assert_eq!(addresses_of(&proxy, 1), ["10.0.0.1:8080", "10.0.0.2:8080"]);
+    // Still named across a rediscovery: the list is kept.
+    assert!(proxy.gateway(vec!["10.0.0.2".parse().unwrap()]).unwrap());
+    assert!(
+        proxy
+            .rediscover([shop(vec![slice("web", "http", &["10.0.0.2", "10.0.0.3"])])])
+            .unwrap()
+    );
+    assert_eq!(addresses_of(&proxy, 1), ["10.0.0.3:8080"]);
 }
 
 /// A config that comes to name another Service of a namespace followed has its endpoints

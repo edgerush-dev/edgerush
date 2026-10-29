@@ -55,6 +55,8 @@ fn every_config_sent_arrives_the_same() {
                 Taken::Run(run) => ran = Some(*run),
                 Taken::Nothing => {}
                 Taken::Say(report) => panic!("{name}: {report:?}"),
+                // No offer sends the gateway's addresses.
+                Taken::Gateway(addresses) => panic!("{name}: {addresses:?}"),
             }
         }
         assert_eq!(ran.as_ref(), Some(&config), "{name}");

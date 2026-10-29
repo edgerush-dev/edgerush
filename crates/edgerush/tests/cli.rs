@@ -311,10 +311,13 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
                 let _gone = report.send(reported);
             }
         };
+        let (_kept, addresses) =
+            tokio::sync::watch::channel::<Arc<[std::net::IpAddr]>>(Arc::from([]));
         serve(
             listener,
             accepting,
             offered_rx,
+            addresses,
             heard,
             std::future::pending(),
         )

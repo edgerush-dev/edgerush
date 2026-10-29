@@ -20,6 +20,9 @@ pub enum Refusal {
     Own,
     /// The API server's.
     ApiServer,
+    /// One of the gateway's other pods: a data plane's, the control plane's or the
+    /// rate-limiting service's.
+    Gateway,
 }
 
 impl fmt::Display for Refusal {
@@ -31,6 +34,7 @@ impl fmt::Display for Refusal {
             Self::Multicast => "multicast",
             Self::Own => "one of the data plane's own",
             Self::ApiServer => "the API server's",
+            Self::Gateway => "one of the gateway's own pods",
         })
     }
 }
@@ -46,6 +50,7 @@ impl Refusal {
             Self::Multicast => "multicast",
             Self::Own => "own",
             Self::ApiServer => "api_server",
+            Self::Gateway => "gateway",
         }
     }
 }
@@ -58,6 +63,8 @@ pub struct Denied {
     pub own: Vec<IpAddr>,
     /// The API server's, as the pod is given it.
     pub api_server: Option<IpAddr>,
+    /// The gateway's other pods', as the control plane names them.
+    pub gateway: Vec<IpAddr>,
 }
 
 impl Denied {
@@ -85,6 +92,12 @@ impl Denied {
                     .as_ref()
                     .is_some_and(canonical)
                     .then_some(Refusal::ApiServer)
+            })
+            .or_else(|| {
+                self.gateway
+                    .iter()
+                    .any(canonical)
+                    .then_some(Refusal::Gateway)
             })
     }
 }
@@ -138,16 +151,23 @@ mod tests {
         let denied = Denied {
             own: vec![ip("10.244.0.5"), ip("fd00:10:244::5")],
             api_server: Some(ip("10.96.0.1")),
+            gateway: vec![ip("10.244.1.7")],
         };
         assert_eq!(denied.refusal(ip("10.244.0.5")), Some(Refusal::Own));
         assert_eq!(denied.refusal(ip("::ffff:10.244.0.5")), Some(Refusal::Own));
         assert_eq!(denied.refusal(ip("fd00:10:244::5")), Some(Refusal::Own));
         assert_eq!(denied.refusal(ip("10.96.0.1")), Some(Refusal::ApiServer));
+        assert_eq!(denied.refusal(ip("10.244.1.7")), Some(Refusal::Gateway));
+        assert_eq!(
+            denied.refusal(ip("::ffff:10.244.1.7")),
+            Some(Refusal::Gateway)
+        );
         assert_eq!(denied.refusal(ip("10.244.0.6")), None);
         // A range is said before whose the address is.
         let looped = Denied {
             own: vec![ip("127.0.0.1")],
             api_server: None,
+            gateway: Vec::new(),
         };
         assert_eq!(looped.refusal(ip("127.0.0.1")), Some(Refusal::Loopback));
     }

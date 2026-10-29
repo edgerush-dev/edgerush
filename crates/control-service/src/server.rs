@@ -6,7 +6,7 @@ use edgerush_control_stream::{Held, MAX_MESSAGE, Offer, OpenError, Report, Sessi
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -61,9 +61,10 @@ pub enum ServeError {
 }
 
 /// Serves the config stream on `listener` until `stop`: each data plane that dials it is
-/// sent the latest of `offers`, and each later one, and what it says goes to `heard`, with
-/// its address. Each connection takes the latest of `tls`, so that certificates replaced
-/// serve the next. Streams end as it stops.
+/// sent the latest of `gateway`, the addresses of the gateway's own pods, and each later
+/// one, then the latest of `offers`, and each later one, and what it says goes to `heard`,
+/// with its address. Each connection takes the latest of `tls`, so that certificates
+/// replaced serve the next. Streams end as it stops.
 ///
 /// # Errors
 ///
@@ -72,6 +73,7 @@ pub async fn serve(
     listener: TcpListener,
     tls: watch::Receiver<Arc<SslAcceptor>>,
     offers: watch::Receiver<Option<Arc<Offer>>>,
+    gateway: watch::Receiver<Arc<[IpAddr]>>,
     heard: impl Fn(SocketAddr, Heard) + Send + Sync + 'static,
     stop: impl Future<Output = ()> + Send,
 ) -> Result<(), ServeError> {
@@ -82,6 +84,7 @@ pub async fn serve(
     let accepting = tokio::spawn(accept(listener, tls, secured, heard.clone()));
     let service = Control {
         offers,
+        gateway,
         stopped,
         heard,
     };
@@ -184,6 +187,7 @@ impl AsyncWrite for Secured {
 #[derive(Clone)]
 struct Control {
     offers: watch::Receiver<Option<Arc<Offer>>>,
+    gateway: watch::Receiver<Arc<[IpAddr]>>,
     stopped: watch::Receiver<()>,
     heard: Arc<dyn Fn(SocketAddr, Heard) + Send + Sync>,
 }
@@ -258,6 +262,7 @@ async fn subscribed(
 ) -> Option<String> {
     let Control {
         mut offers,
+        mut gateway,
         mut stopped,
         heard,
     } = control;
@@ -283,7 +288,17 @@ async fn subscribed(
             written: session.version().get(),
         },
     );
+    // Whether the gateway's addresses can still change: once whoever says them is gone,
+    // the last are all there are, and the stream goes on.
+    let mut saying = true;
     loop {
+        // The gateway's addresses first, so that none is sent to by a config it runs.
+        let addresses = Arc::clone(&gateway.borrow_and_update());
+        if let Some(message) = session.gateway(&addresses)
+            && sent.send(Ok(message)).await.is_err()
+        {
+            return Some("the data plane is gone".to_owned());
+        }
         // The latest offer, as far as the data plane does not hold it already.
         let offer = offers.borrow_and_update().clone();
         if let Some(offer) = offer {
@@ -298,6 +313,9 @@ async fn subscribed(
                 if changed.is_err() {
                     return Some("the control plane stopped offering".to_owned());
                 }
+            }
+            changed = gateway.changed(), if saying => {
+                saying = changed.is_ok();
             }
             // Only ever an error, once the server stops: nothing is sent on it.
             _ = stopped.changed() => {

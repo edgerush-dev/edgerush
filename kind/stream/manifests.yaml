@@ -165,6 +165,11 @@ spec:
             - edge/edgerush
             - --leader-lease
             - edge/edgerush-control
+            # The gateway's own pods, which no data plane may send to (03 §6).
+            - --own-name
+            - edgerush-control-peers.edge.svc.cluster.local
+            - --own-name
+            - edgerush-peers.edge.svc.cluster.local
             - --webhook-listen
             - "0.0.0.0:8443"
             - --webhook-certificate
@@ -194,6 +199,26 @@ spec:
   ports:
     - { name: stream, port: 9443, targetPort: stream }
     - { name: webhook, port: 443, targetPort: webhook }
+---
+# The control plane's pods and the data plane's, by headless Services whose names resolve
+# to every pod's address, ready or not: the gateway's own, which it never sends to.
+apiVersion: v1
+kind: Service
+metadata: { name: edgerush-control-peers, namespace: edge }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: edgerush-control }
+  ports: [{ name: stream, port: 9443, targetPort: stream }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: edgerush-peers, namespace: edge }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: edgerush }
+  ports: [{ name: http, port: 8080, targetPort: http }]
 ---
 # The data plane's Service, its address an external IP of the documentation's range.
 apiVersion: v1

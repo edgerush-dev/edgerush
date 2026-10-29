@@ -406,6 +406,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         }
     })
     .map_err(Failure::Runtime)?;
+    let mut gateway: Vec<std::net::IpAddr> = Vec::new();
     let (mut configs, config, named, first_ran) = match source {
         Source::File(path) => {
             let (file, config) = match ConfigFile::open(path.clone()) {
@@ -424,6 +425,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         }
         Source::ControlPlane(stream) => {
             let handing = crate::stream::start(&stream, &stopping)?;
+            // What the control plane names as the gateway's own before the first config,
+            // which it sends first, for the proxy to refuse from its start.
             say(
                 stderr,
                 format_args!(
@@ -431,7 +434,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
                     stream.address
                 ),
             );
-            match first(&handing, &stop, outside.as_ref(), stderr) {
+            match first(&handing, &stop, outside.as_ref(), &mut gateway, stderr) {
                 First::Config(config, ran) => {
                     let named = "the control plane's config".to_owned();
                     (Configs::Stream(handing), *config, named, Some(ran))
@@ -452,10 +455,11 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         })?;
     let _first = logged.set(Arc::clone(&proxy));
     // Before anything is discovered or resolved, so that nothing is sent to these first.
-    let denied = denied(
+    let mut denied = denied(
         std::env::var("POD_IPS").ok().as_deref(),
         std::env::var("KUBERNETES_SERVICE_HOST").ok().as_deref(),
     );
+    denied.gateway = gateway;
     if let Some(warning) = own_unknown(&denied, cluster.is_ok()) {
         say(stderr, format_args!("{warning}"));
     }
@@ -632,6 +636,12 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
                             say(stderr, format_args!("{line}"));
                             continue;
                         }
+                        FromStream::Gateway(addresses) => {
+                            if let Err(error) = proxy.gateway(addresses) {
+                                say(stderr, format_args!("the gateway's own addresses: {error}"));
+                            }
+                            continue;
+                        }
                         FromStream::Run { config, ran } => (config, ran),
                     };
                     let reloaded = compiled(&config).and_then(|config| {
@@ -738,6 +748,7 @@ fn first(
     handing: &Receiver<FromStream>,
     told: &Receiver<Told>,
     outside: Option<&ApiError>,
+    gateway: &mut Vec<std::net::IpAddr>,
     stderr: &mut impl Write,
 ) -> First {
     loop {
@@ -750,6 +761,10 @@ fn first(
             let (config, ran) = match from {
                 FromStream::Said(line) => {
                     say(stderr, format_args!("{line}"));
+                    continue;
+                }
+                FromStream::Gateway(addresses) => {
+                    *gateway = addresses;
                     continue;
                 }
                 FromStream::Run { config, ran } => (config, ran),
@@ -1039,6 +1054,7 @@ fn denied(pod_ips: Option<&str>, api_server: Option<&str>) -> edgerush_proxy::eg
             .filter_map(|ip| ip.trim().parse().ok())
             .collect(),
         api_server: api_server.and_then(|host| host.trim().parse().ok()),
+        gateway: Vec::new(),
     }
 }
 
@@ -1061,10 +1077,17 @@ fn resolver(proxy: Arc<Proxy>, tell: &Sender<Told>) -> io::Result<()> {
         .name("resolver".to_owned())
         .spawn(move || {
             let mut essential = Essential::new("the resolver".to_owned(), &tell);
+            let wanted = proxy.names();
             let resolving = crate::resolver::resolve_names(
-                proxy,
+                wanted,
                 crate::resolver::system_nameservers(),
                 crate::resolver::Pace::default(),
+                move |name, addresses| {
+                    proxy
+                        .reresolve([(name.to_owned(), addresses)])
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                },
                 |name, failure| {
                     say(&mut io::stderr(), format_args!("name {name}: {failure}"));
                 },
