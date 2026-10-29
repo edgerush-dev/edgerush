@@ -1128,7 +1128,7 @@
           "const": "synchronous"
         },
         {
-          "description": "Each process decides from its copies of the keys and shares what it admitted through\nthe rate-limiting service every cycle (experimental).",
+          "description": "Each process decides from its copies of the keys and shares what it admitted through\nthe rate-limiting service every cycle.",
           "type": "string",
           "const": "asynchronous"
         }

@@ -58,8 +58,9 @@ change takes over without dropping a request.
     time, and what happens while an owner is out of reach is stated too: allow, deny, or
     the data plane's own buckets until it answers. The pods copy their keys to one
     another, so a pod's keys carry on when it leaves.
-  - `asynchronous`, experimental and parked: each process decides from its own copy of
-    each key and reports to the service every cycle.
+  - `asynchronous`: each process decides every request from its own copy of each key,
+    waiting on no one, and shares what it admitted through the service every cycle; a
+    burst on a key it has not heard of yet may overshoot a little.
 
 ### In Kubernetes
 
