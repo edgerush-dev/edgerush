@@ -15,7 +15,9 @@
 pub mod wire;
 
 use crate::grpc::{Boxed, Client, Error, HEARTBEAT, MAX_MESSAGE, Prost, limited};
+use crate::secure::{self, Caller, Dialler, refused};
 use crate::wire::{Empty, Heartbeat as WireHeartbeat};
+use boring::ssl::SslConnector;
 use edgerush_ratelimit::service::membership::{Heartbeat, Membership};
 use edgerush_ratelimit::service::{PodId, View};
 use edgerush_ratelimit::synchronous::{self as owner, HANDLE_PARTS, Handles, Owner, Shared};
@@ -646,6 +648,13 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for SyncServer {
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let pod = self.pod.clone();
         Box::pin(async move {
+            let allowed = match request.uri().path() {
+                DECIDE => Caller::DataPlane,
+                _ => Caller::Pod,
+            };
+            if let Some(status) = refused(&request, allowed) {
+                return Ok(status.into_http());
+            }
             if pod.pod.stopped() {
                 return Ok(Status::unavailable("stopped").into_http());
             }
@@ -695,18 +704,31 @@ pub struct DecideStream {
     pub down: Streaming<wire::Downstream>,
 }
 
-/// Opens a stream to the synchronous pod at `address` (`host:port`): connected within a
+/// Opens a stream to the synchronous pod at `address` (`host:port`), plain or with the
+/// latest of `tls`, the pod's certificate checked against the host: connected within a
 /// second, and then held open for as long as both sides keep it, with no deadline on the
 /// whole.
 ///
 /// # Errors
 ///
-/// When `address` cannot be made into a URI, or the stream cannot be opened.
-pub async fn decide_stream(address: &str) -> Result<DecideStream, Error> {
-    let channel: Channel = Endpoint::from_shared(format!("http://{address}"))?
-        .connect_timeout(Duration::from_secs(1))
-        .tcp_nodelay(true)
-        .connect_lazy();
+/// When `address` cannot be made into a URI, or names no host for `tls` to check, or the
+/// stream cannot be opened.
+pub async fn decide_stream(
+    address: &str,
+    tls: Option<&watch::Receiver<SslConnector>>,
+) -> Result<DecideStream, Error> {
+    let endpoint = Endpoint::from_shared(format!("http://{address}"))?;
+    let channel: Channel = match tls {
+        Some(tls) => {
+            let name = secure::host(endpoint.uri()).ok_or(Error::NoHost)?;
+            let dialler = Dialler::new(address, name, tls.clone(), Duration::from_secs(1));
+            endpoint.connect_with_connector_lazy(dialler)
+        }
+        None => endpoint
+            .connect_timeout(Duration::from_secs(1))
+            .tcp_nodelay(true)
+            .connect_lazy(),
+    };
     let mut grpc = tonic::client::Grpc::new(channel)
         .max_decoding_message_size(MAX_MESSAGE)
         .max_encoding_message_size(MAX_MESSAGE);

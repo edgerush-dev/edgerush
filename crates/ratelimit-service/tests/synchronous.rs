@@ -116,7 +116,7 @@ struct Plane {
 impl Plane {
     /// Opens a stream to the pod at `address`, and the view it is sent first.
     async fn open(address: &str) -> (Self, View) {
-        let mut stream = decide_stream(address).await.unwrap();
+        let mut stream = decide_stream(address, None).await.unwrap();
         let first = tokio::time::timeout(Duration::from_secs(1), stream.down.message())
             .await
             .expect("the view first, in time")
@@ -354,7 +354,7 @@ async fn the_view_goes_down_the_streams_when_a_pod_stops() {
         "the stream carries on"
     );
     assert!(
-        decide_stream(&service.addresses[2]).await.is_err(),
+        decide_stream(&service.addresses[2], None).await.is_err(),
         "a stopped pod opens no stream"
     );
 }
@@ -577,7 +577,7 @@ async fn a_pod_not_taken_in_refuses_data_planes_as_not_serving() {
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!pod.view().1);
-    match decide_stream(&address).await {
+    match decide_stream(&address, None).await {
         Err(edgerush_ratelimit_service::grpc::Error::Status(status)) => assert!(
             edgerush_ratelimit_service::synchronous::is_not_serving(&status),
             "{status:?}"

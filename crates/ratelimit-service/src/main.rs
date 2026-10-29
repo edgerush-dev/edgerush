@@ -3,7 +3,9 @@
 //! ```text
 //! edgerush-ratelimit-service --id 0 --listen 0.0.0.0:7000 \
 //!     --pod 0=rl-0:7000 --pod 1=rl-1:7000 --pod 2=rl-2:7000 [--cycle-ms 10] \
-//!     [--max-key-bytes 268435456] [--metrics 0.0.0.0:9090] [--mode asynchronous]
+//!     [--max-key-bytes 268435456] [--metrics 0.0.0.0:9090] [--mode asynchronous] \
+//!     [--certificate pod.pem --key pod.key --authorities pods-ca.pem \
+//!      --data-plane-authorities data-planes-ca.pem]
 //! ```
 //!
 //! `--mode` is the rate-limiting mode the pod serves, `asynchronous` unless said, or
@@ -15,19 +17,39 @@
 //! which of them serve (`edgerush_ratelimit::service::membership`). `--max-key-bytes` is
 //! what its keys may hold, 256 MiB unless said, past which the least recently changed are
 //! evicted; `--metrics`, where `/metrics` shows what they hold, nowhere unless said.
+//!
+//! The last four go together, PEM files read again every second, and serve the service
+//! with mutual TLS (`edgerush_ratelimit_service::secure`): the pod presents `--certificate`
+//! to data planes and to the other pods alike, takes data planes whose certificate the
+//! `--data-plane-authorities` vouch for and pods whose the `--authorities` do, and dials
+//! the other pods checking theirs against the `--authorities` alone. Without them, it is
+//! served plain, to anyone.
 
+use boring::ssl::SslConnector;
+use edgerush_control_service::reread;
 use edgerush_ratelimit::service::PodId;
 use edgerush_ratelimit_service::grpc::{Client, Server};
 use edgerush_ratelimit_service::pod::{Pod, Timing};
 use edgerush_ratelimit_service::scrape;
+use edgerush_ratelimit_service::secure::{self, PodFiles, PodTls};
 use edgerush_ratelimit_service::synchronous::{self, SyncPod, SyncServer};
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+use tonic::server::NamedService;
+use tonic::transport::server::TcpIncoming;
 
 /// What `--max-key-bytes` is when left out: 256 MiB.
 const MAX_KEY_BYTES: u64 = 256 << 20;
+
+/// How often the certificate files are read again, to take in a Secret replaced.
+const REREAD: Duration = Duration::from_secs(1);
 
 /// The rate-limiting mode a pod serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,11 +67,13 @@ struct Args {
     cycle: Duration,
     max_key_bytes: u64,
     metrics: Option<SocketAddr>,
+    tls: Option<PodFiles>,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let (mut id, mut listen, mut pods, mut cycle) = (None, None, BTreeMap::new(), 10);
     let (mut max_key_bytes, mut metrics, mut mode) = (MAX_KEY_BYTES, None, Mode::Asynchronous);
+    let mut files: [Option<PathBuf>; 4] = [None, None, None, None];
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -88,6 +112,10 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--metrics" => {
                 metrics = Some(value()?.parse().map_err(|_| "--metrics: host:port")?);
             }
+            "--certificate" => files[0] = Some(value()?.into()),
+            "--key" => files[1] = Some(value()?.into()),
+            "--authorities" => files[2] = Some(value()?.into()),
+            "--data-plane-authorities" => files[3] = Some(value()?.into()),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -98,6 +126,16 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     if mode == Mode::Synchronous && metrics.is_some() {
         return Err("--metrics is for the asynchronous mode, for now".to_owned());
     }
+    let tls = match files {
+        [None, None, None, None] => None,
+        [Some(certificate), Some(key), Some(pods), Some(data_planes)] => Some(PodFiles {
+            certificate,
+            key,
+            pods,
+            data_planes,
+        }),
+        _ => return Err(TOGETHER.to_owned()),
+    };
     Ok(Args {
         mode,
         id,
@@ -106,8 +144,12 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         cycle: Duration::from_millis(cycle),
         max_key_bytes,
         metrics,
+        tls,
     })
 }
+
+const TOGETHER: &str =
+    "--certificate, --key, --authorities and --data-plane-authorities go together";
 
 /// A synchronous pod answers on one thread: a stream's decisions and its connection's writes
 /// share it, so that the asks one read brings in are answered in one write, where a
@@ -154,12 +196,22 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .map_or(1, |since| {
             u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
         });
+    let tls = match &args.tls {
+        Some(files) => Some(secured(files.clone()).await?),
+        None => None,
+    };
     let mut peers = BTreeMap::new();
     for (id, address) in &args.pods {
         if *id != args.id {
-            peers.insert(*id, Client::new(address)?);
+            let client = match &tls {
+                Some((_, dialling)) => Client::secured(address, dialling.clone())?,
+                None => Client::new(address)?,
+            };
+            peers.insert(*id, client);
         }
     }
+    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    let serving = tls.map(|(serving, _)| serving);
     if args.mode == Mode::Synchronous {
         let pod = SyncPod::spawn(
             args.id,
@@ -173,9 +225,7 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             "edgerush-ratelimit-service: synchronous pod {} on {}",
             args.id, args.listen
         );
-        tonic::transport::Server::builder()
-            .serve_with_shutdown(args.listen, SyncServer::new(pod), stopped())
-            .await?;
+        serve_on(listener, serving, SyncServer::new(pod)).await?;
         return Ok(());
     }
     let pod = Pod::spawn(
@@ -195,10 +245,68 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "edgerush-ratelimit-service: pod {} on {}",
         args.id, args.listen
     );
-    tonic::transport::Server::builder()
-        .serve_with_shutdown(args.listen, Server::new(pod), stopped())
-        .await?;
+    serve_on(listener, serving, Server::new(pod)).await?;
     Ok(())
+}
+
+/// The pod's TLS from `files`, as it serves and as it dials, each replaced as the files
+/// change: a change that cannot be used is said, and the last that could is kept.
+async fn secured(
+    files: PodFiles,
+) -> Result<(watch::Receiver<Arc<PodTls>>, watch::Receiver<SslConnector>), String> {
+    let credentials = files.read().await.map_err(|error| error.to_string())?;
+    let tls = PodTls::new(&credentials).map_err(|error| error.to_string())?;
+    let (dial, dialling) = watch::channel(tls.connector().clone());
+    let (serve, serving) = watch::channel(Arc::new(tls));
+    tokio::spawn(reread(
+        files,
+        credentials,
+        REREAD,
+        move |changed| match changed.map(PodTls::new) {
+            Ok(Ok(tls)) => {
+                dial.send_replace(tls.connector().clone());
+                serve.send_replace(Arc::new(tls));
+                eprintln!("edgerush-ratelimit-service: certificates replaced");
+            }
+            Ok(Err(error)) => eprintln!("edgerush-ratelimit-service: certificates kept: {error}"),
+            Err(error) => eprintln!("edgerush-ratelimit-service: certificates kept: {error}"),
+        },
+    ));
+    Ok((serving, dialling))
+}
+
+/// Serves `service` on `listener` until told to stop: with TLS if given, else plain.
+async fn serve_on<S>(
+    listener: TcpListener,
+    tls: Option<watch::Receiver<Arc<PodTls>>>,
+    service: S,
+) -> Result<(), tonic::transport::Error>
+where
+    S: tower_service::Service<
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
+            Error = Infallible,
+        > + NamedService
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
+    match tls {
+        Some(tls) => {
+            let refused = |peer, why| {
+                eprintln!("edgerush-ratelimit-service: {peer} refused: {why}");
+            };
+            secure::serve(listener, tls, service, refused, stopped()).await
+        }
+        None => {
+            let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
+            tonic::transport::Server::builder()
+                .serve_with_incoming_shutdown(service, incoming, stopped())
+                .await
+        }
+    }
 }
 
 /// Resolves when the process is told to stop: Ctrl-C, or SIGTERM, which is how Docker and
@@ -310,6 +418,35 @@ mod tests {
         ] {
             let args: Vec<&str> = POD.iter().copied().chain([flag, value]).collect();
             assert_eq!(parsed(&args), Err(error.to_owned()));
+        }
+    }
+
+    #[test]
+    fn the_certificate_files_go_together_or_the_pod_is_served_plain() {
+        assert_eq!(parsed(&POD).unwrap().tls, None);
+        let files = [
+            ("--certificate", "pod.pem"),
+            ("--key", "pod.key"),
+            ("--authorities", "pods.pem"),
+            ("--data-plane-authorities", "planes.pem"),
+        ];
+        let with = |given: &[(&'static str, &'static str)]| -> Vec<&str> {
+            let flags = given.iter().flat_map(|(flag, path)| [*flag, *path]);
+            POD.iter().copied().chain(flags).collect()
+        };
+        assert_eq!(
+            parsed(&with(&files)).unwrap().tls,
+            Some(PodFiles {
+                certificate: "pod.pem".into(),
+                key: "pod.key".into(),
+                pods: "pods.pem".into(),
+                data_planes: "planes.pem".into(),
+            })
+        );
+        for left_out in 0..files.len() {
+            let mut given = files.to_vec();
+            given.remove(left_out);
+            assert_eq!(parsed(&with(&given)), Err(TOGETHER.to_owned()));
         }
     }
 }

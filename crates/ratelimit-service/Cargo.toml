@@ -8,7 +8,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Mutual TLS between data planes and pods, and among pods (06 §4): BoringSSL, as the
+# control stream's, whose TLS and certificate files it reuses.
+boring.workspace = true
 bytes.workspace = true
+edgerush-config.workspace = true
+edgerush-control-service.workspace = true
 edgerush-ratelimit.workspace = true
 edgerush-telemetry.workspace = true
 futures-core.workspace = true
@@ -19,12 +24,15 @@ hyper.workspace = true
 hyper-util.workspace = true
 prost.workspace = true
 thiserror.workspace = true
-# The service pod is a process of its own: a multi-thread runtime, told to stop by a signal.
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# The service pod is a process of its own: a multi-thread runtime, told to stop by a signal;
+# "fs": its certificate files, read again every second.
+tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-boring.workspace = true
 tonic.workspace = true
 tower-service.workspace = true
 
 [dev-dependencies]
+edgerush-certificates = { workspace = true, features = ["testing"] }
 proptest.workspace = true
 
 [lints]

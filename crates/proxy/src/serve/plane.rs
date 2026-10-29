@@ -246,6 +246,13 @@ impl Snapshot {
         logs: Vec<Option<Sink>>,
     ) -> Result<(Self, Retiring), ProxyError> {
         runs_rate_limits(&config, edgerush_ratelimit::service::pooled::supported())?;
+        // Kept for the same config, made again by endpoints found.
+        let service_tls = match previous {
+            Some(previous) if Arc::ptr_eq(&previous.config, &config) => {
+                previous.service_tls.clone()
+            }
+            _ => crate::ratelimit::service_tls(&config)?,
+        };
         let Endpointed {
             kept: resolved,
             refused,
@@ -372,6 +379,7 @@ impl Snapshot {
             secure,
             routed,
             logs,
+            service_tls,
         };
         Ok((snapshot, retiring))
     }
@@ -503,7 +511,7 @@ impl Proxy {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Not started yet, starting them starts it for whichever config runs then.
         let hub = match &rate_limits.failed {
-            Some(failed) => self.hub_for(&snapshot.config, rate_limits.hub.as_ref(), failed)?,
+            Some(failed) => self.hub_for(&snapshot, rate_limits.hub.as_ref(), failed)?,
             None => None,
         };
         let local = match &rate_limits.failed {
@@ -511,9 +519,7 @@ impl Proxy {
             None => None,
         };
         let synchronous = match &rate_limits.failed {
-            Some(failed) => {
-                self.sync_for(&snapshot.config, rate_limits.synchronous.as_ref(), failed)?
-            }
+            Some(failed) => self.sync_for(&snapshot, rate_limits.synchronous.as_ref(), failed)?,
             None => None,
         };
         // Only now that all of it is accepted: a config refused for one listener must not
@@ -523,9 +529,11 @@ impl Proxy {
             tls.install();
         }
         retiring.retire();
-        // A thread kept keeps the keys it holds, now within this config's bound (06 §8).
+        // A thread kept keeps the keys it holds, now within this config's bound (06 §8), and
+        // dials the pods with this config's certificate from now on.
         if let (Some(hub), Some(service)) = (&hub, snapshot.config.rate_limit_service()) {
             hub.set_capacity(service.max_key_bytes);
+            hub.set_tls(snapshot.service_tls.clone());
         }
         // Before any request of it can make a record.
         self.logs.commit(prepared);
@@ -927,11 +935,11 @@ impl Proxy {
     /// if it fails.
     fn hub_for(
         &self,
-        config: &Compiled,
+        snapshot: &Snapshot,
         running: Option<&Arc<crate::ratelimit::Hub>>,
         failed: &crate::ratelimit::Failed,
     ) -> Result<Option<Arc<crate::ratelimit::Hub>>, ProxyError> {
-        let Some(service) = config.rate_limit_service() else {
+        let Some(service) = snapshot.config.rate_limit_service() else {
             return Ok(None);
         };
         if let Some(running) = running.filter(|running| running.serves(service)) {
@@ -942,6 +950,7 @@ impl Proxy {
             self.workers.get(),
             service.max_key_bytes,
             Some(failed.clone()),
+            snapshot.service_tls.clone(),
         )
         .map(Some)
     }
@@ -977,11 +986,11 @@ impl Proxy {
     /// calling `failed` if it fails.
     fn sync_for(
         &self,
-        config: &Compiled,
+        snapshot: &Snapshot,
         running: Option<&Arc<crate::ratelimit::synchronous::Process>>,
         failed: &crate::ratelimit::Failed,
     ) -> Result<Option<Arc<crate::ratelimit::synchronous::Process>>, ProxyError> {
-        let CompiledRateLimiting::Synchronous(synchronous) = config.rate_limiting() else {
+        let CompiledRateLimiting::Synchronous(synchronous) = snapshot.config.rate_limiting() else {
             return Ok(None);
         };
         if let Some(running) = running
@@ -994,6 +1003,7 @@ impl Proxy {
             self.workers,
             Some(failed.clone()),
             running.map(|running| &**running),
+            snapshot.service_tls.clone(),
         )
         .map(Some)
         .map_err(|error| ProxyError::RateLimitThread(format!("no thread: {error}")))
@@ -1069,9 +1079,10 @@ impl Proxy {
             return Ok(());
         }
         let failed = crate::ratelimit::Failed(Arc::new(failed));
-        rate_limits.hub = self.hub_for(&self.current.load().config, None, &failed)?;
-        rate_limits.local = self.local_for(&self.current.load().config, None, &failed)?;
-        rate_limits.synchronous = self.sync_for(&self.current.load().config, None, &failed)?;
+        let current = self.current.load();
+        rate_limits.hub = self.hub_for(&current, None, &failed)?;
+        rate_limits.local = self.local_for(&current.config, None, &failed)?;
+        rate_limits.synchronous = self.sync_for(&current, None, &failed)?;
         rate_limits.failed = Some(failed);
         Ok(())
     }

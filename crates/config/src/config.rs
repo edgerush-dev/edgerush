@@ -205,6 +205,25 @@ pub struct RateLimitService {
     /// client seen in that time. On when left out, the faster.
     #[serde(default)]
     pub schedule_keys: Option<bool>,
+    /// Mutual TLS to its pods ([06 §4](../../../docs/06-rate-limiting.md)); plain when left
+    /// out, as the pods are then served.
+    #[serde(default)]
+    pub tls: Option<RateLimitServiceTls>,
+}
+
+/// Mutual TLS to the rate-limiting service's pods: whom to trust to vouch for them, and
+/// what the data plane shows them ([06 §4](../../../docs/06-rate-limiting.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitServiceTls {
+    /// The certificates, in PEM, of the pods' authorities, trusted to vouch for each pod as
+    /// the host of its address: the pods' alone, not the data planes'.
+    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
+    pub authorities: Vec<String>,
+    /// The name of the certificate the data plane shows the pods, among `certificates`: one
+    /// the data planes' authorities signed, which lets it exchange or decide and no more.
+    pub certificate: String,
 }
 
 /// A place where requests come in. Hostnames are to come; until a listener can be told

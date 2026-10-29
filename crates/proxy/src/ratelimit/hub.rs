@@ -7,6 +7,7 @@
 
 use super::{Decision, EXCHANGE_TIMEOUT, Made, Undecided, Usage};
 use crate::ProxyError;
+use boring::ssl::SslConnector;
 use edgerush_config::CompiledRateLimitService;
 use edgerush_ratelimit::service::pooled::{
     Decision as Pooled, Entry, Levers, Participant, Registry,
@@ -19,7 +20,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 
 /// The time between a worker's handing its signals to its process.
 pub(crate) const SYNC: Duration = Duration::from_millis(1);
@@ -185,6 +186,9 @@ pub(crate) struct Hub {
     /// Woken when a hold settles or a count drains on a key requests are deferred on, by
     /// whichever thread did it: the workers' deferred requests wait on it.
     settled: Arc<Notify>,
+    /// What its clients dial the pods with, if with TLS: replaced by a reload that keeps the
+    /// thread, for the connections made after it.
+    tls: Option<watch::Sender<SslConnector>>,
 }
 
 impl Hub {
@@ -202,6 +206,7 @@ impl Hub {
         workers: usize,
         max_key_bytes: u64,
         failed: Option<Failed>,
+        tls: Option<SslConnector>,
     ) -> Result<Arc<Self>, ProxyError> {
         #[cfg(test)]
         if REFUSE_START.with(Cell::take) {
@@ -217,6 +222,7 @@ impl Hub {
         let set = service.clone();
         let settled = Arc::new(Notify::new());
         let waking = Arc::clone(&settled);
+        let (tls, dialling) = tls.map(watch::channel).unzip();
         // The participant is made on the thread and its registry handed back, or why not.
         let (made, registry) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -227,7 +233,15 @@ impl Hub {
                     settled: waking,
                     failed,
                 };
-                run(&set, workers, max_key_bytes, from, &running, &made);
+                run(
+                    &set,
+                    dialling,
+                    workers,
+                    max_key_bytes,
+                    from,
+                    &running,
+                    &made,
+                );
             })
             .map_err(|error| ProxyError::RateLimitThread(format!("no thread: {error}")))?;
         let registry = registry
@@ -240,7 +254,15 @@ impl Hub {
             service: service.clone(),
             registry,
             settled,
+            tls,
         }))
+    }
+
+    /// What its clients dial the pods with from now on: for a reload that keeps it.
+    pub(crate) fn set_tls(&self, tls: Option<SslConnector>) {
+        if let (Some(dialling), Some(tls)) = (&self.tls, tls) {
+            dialling.send_replace(tls);
+        }
     }
 
     /// The bytes its keys may hold from now on, the process's for all its workers: for a
@@ -264,10 +286,12 @@ impl Hub {
         Arc::clone(&self.settled)
     }
 
-    /// Whether it reaches `service` as it is set now: the same pods, the same cycle, the
-    /// same levers.
+    /// Whether it reaches `service` as it is set now: the same pods, plain or with TLS as
+    /// before, the same cycle, the same levers. Another certificate is no change: it is
+    /// dialled with from then on ([`set_tls`](Self::set_tls)).
     pub(crate) fn serves(&self, service: &CompiledRateLimitService) -> bool {
         self.service.pods == service.pods
+            && self.service.tls.is_some() == service.tls.is_some()
             && self.service.cycle == service.cycle
             && self.service.poll_quiet_keys == service.poll_quiet_keys
             && self.service.schedule_keys == service.schedule_keys
@@ -364,9 +388,11 @@ impl Drop for Guard {
 }
 
 /// The process thread: a runtime of its own, the participant and its clients, until every
-/// sender is gone, as `service` sets it: its pods, its cycle and its levers.
+/// sender is gone, as `service` sets it: its pods, its cycle and its levers; its clients
+/// dialling with the latest of `tls`, if given, else plain.
 fn run(
     service: &CompiledRateLimitService,
+    tls: Option<watch::Receiver<SslConnector>>,
     workers: usize,
     max_key_bytes: u64,
     from: mpsc::UnboundedReceiver<ToHub>,
@@ -390,7 +416,11 @@ fn run(
             .pods
             .iter()
             .map(|address| {
-                Client::new(address).map_err(|error| format!("pod `{address}`: {error}"))
+                match &tls {
+                    Some(tls) => Client::secured(address, tls.clone()),
+                    None => Client::new(address),
+                }
+                .map_err(|error| format!("pod `{address}`: {error}"))
             })
             .collect::<Result<Vec<_>, _>>()
     };

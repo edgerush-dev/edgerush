@@ -16,9 +16,11 @@ pub(crate) mod synchronous;
 pub(crate) use hub::REFUSE_START;
 pub(crate) use hub::{Failed, Hub};
 
+use crate::ProxyError;
 use crate::forwarding::Requester;
 use crate::request::NoTables;
-use edgerush_config::{CompiledLimit, CompiledRateLimitService};
+use boring::ssl::SslConnector;
+use edgerush_config::{Compiled, CompiledLimit, CompiledRateLimitService, CompiledRateLimiting};
 use edgerush_ratelimit::service::pooled::{
     self, Entry, Handle, Local as PooledLocal, Outcome as Pooled, Registry,
 };
@@ -1128,6 +1130,29 @@ pub(crate) fn with_keys<R>(
             then(&parts)
         }
     }
+}
+
+/// What `config` reaches the rate-limiting service's pods with, if with TLS (06 §4): its
+/// certificate shown, each pod checked against the pods' authorities and its host.
+///
+/// # Errors
+///
+/// [`ProxyError::RateLimitServiceTls`] for a certificate or an authority that cannot be
+/// used.
+pub(crate) fn service_tls(config: &Compiled) -> Result<Option<SslConnector>, ProxyError> {
+    let tls = match config.rate_limiting() {
+        CompiledRateLimiting::Synchronous(synchronous) => synchronous.tls.as_ref(),
+        CompiledRateLimiting::Asynchronous(service) => service.tls.as_ref(),
+        CompiledRateLimiting::Off | CompiledRateLimiting::Local { .. } => None,
+    };
+    tls.map(|tls| {
+        edgerush_ratelimit_service::secure::data_plane(
+            &tls.certificate.certificate,
+            &tls.authorities,
+        )
+        .map_err(|error| ProxyError::RateLimitServiceTls(error.to_string()))
+    })
+    .transpose()
 }
 
 #[cfg(test)]
