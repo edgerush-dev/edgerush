@@ -446,10 +446,12 @@ impl Unseen {
     }
 
     /// Emptied of its hits if it is not seen applied within `hold` of first being sent, at
-    /// `now`, and still sent, as the owner applies in order.
-    fn empty_if_stale(&mut self, hold: u64, now: u64) {
+    /// `now`, and still sent, as the owner applies in order: the hits it gave up, forgiven.
+    fn empty_if_stale(&mut self, hold: u64, now: u64) -> u64 {
         if now - self.first > hold {
-            self.count = 0;
+            std::mem::take(&mut self.count)
+        } else {
+            0
         }
     }
 }
@@ -724,7 +726,7 @@ pub struct DataPlane<S = FixedState> {
     holding: u64,
     /// Keys it has evicted to stay within its capacity, all told.
     evicted: u64,
-    /// Hits not seen applied that keys evicted for capacity held, all told.
+    /// Hits given up without being seen applied, all told ([`Self::forgiven`]).
     forgiven: u64,
 }
 
@@ -810,9 +812,10 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         self.evicted
     }
 
-    /// Hits forgiven by evicting for capacity keys that had them unsent or not seen
-    /// applied, all told: at most what was lost, since a report not seen applied may have
-    /// been applied with its answer lost.
+    /// Hits given up without being seen applied, all told: those of keys evicted for
+    /// capacity, unsent or not seen applied, and those of reports not seen applied within
+    /// their key's refill time. At most what was lost, since a report not seen applied may
+    /// have been applied with its answer lost.
     #[must_use]
     pub fn forgiven(&self) -> u64 {
         self.forgiven
@@ -978,7 +981,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             // was made at a time this data plane was given, and time does not go back.
             let mut entries = Vec::new();
             for unseen in &mut at.unacknowledged {
-                unseen.empty_if_stale(hold, now);
+                self.forgiven += unseen.empty_if_stale(hold, now);
             }
             let mut reported = false;
             for unseen in &mut at.unacknowledged {

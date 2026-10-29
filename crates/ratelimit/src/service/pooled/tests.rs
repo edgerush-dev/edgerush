@@ -2502,6 +2502,24 @@ fn a_key_evicted_with_hits_outstanding_is_forgiven_and_counted_afresh() {
     assert_eq!(pod.counted(a), Some(1), "the lost batch not waited for");
 }
 
+/// A report not acknowledged within its key's refill time of first being sent gives up its
+/// hits, counted as forgiven, once, as `DataPlane` counts them.
+#[test]
+fn a_participant_counts_the_hits_of_a_stale_report_as_forgiven() {
+    let mut participant = participant();
+    let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
+    for _ in 0..3 {
+        assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    }
+    participant.on_cycle(CYCLE);
+    // A refill time of some 105 ms from the report's first sending.
+    for (now, forgiven) in [(60 * MS, 0), (120 * MS, 3), (200 * MS, 3)] {
+        let _lost = participant.take_outgoing();
+        participant.on_cycle(now);
+        assert_eq!(participant.forgiven(), forgiven, "at {} ms", now / MS);
+    }
+}
+
 /// Cut off from its owner, a participant keeps at most `MOST_UNACKNOWLEDGED` reports out for
 /// a key, as `DataPlane` does, and later hits wait in its ledger; once the owner is back,
 /// every hit is counted, once.

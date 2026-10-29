@@ -1332,6 +1332,20 @@ fn a_key_made_again_is_counted_from_its_first_report() {
     assert_eq!(net.pods[owner].counted(b"k"), Some(6), "reported");
 }
 
+/// A report not seen applied within its key's refill time of first being sent gives up its
+/// hits, counted as forgiven, once.
+#[test]
+fn a_data_plane_counts_the_hits_of_a_stale_report_as_forgiven() {
+    let mut net = Net::new(1);
+    assert_eq!(net.admits(0, b"k", 3, 0), 3);
+    net.planes[0].on_cycle(0);
+    for (now, forgiven) in [(50 * MS, 0), (110 * MS, 3), (200 * MS, 3)] {
+        let _lost = net.planes[0].take_outgoing();
+        net.planes[0].on_cycle(now);
+        assert_eq!(net.planes[0].forgiven(), forgiven, "at {} ms", now / MS);
+    }
+}
+
 /// Cut off from its owner, a data plane keeps at most `MOST_UNACKNOWLEDGED` reports out for
 /// a key, and later hits wait in its ledger; once the owner is back, every hit is counted,
 /// once.

@@ -54,7 +54,8 @@ pub(crate) struct Usage {
     pub(crate) keys: usize,
     /// Keys evicted to stay within the bytes they may hold.
     pub(crate) evicted: u64,
-    /// Hits not seen applied that the keys evicted held, forgiven with them.
+    /// Hits given up without being seen applied: of keys evicted, and of reports
+    /// unanswered for their key's refill time.
     pub(crate) forgiven: u64,
 }
 /// Why a request was refused, as the worker's entries have it.

@@ -803,7 +803,7 @@ impl WorkerGauges {
 
 /// What one worker's rate limiter holds, as the worker last looked (06 §8): its keys'
 /// bytes, how many there are, those it has evicted to stay within its share, and the hits
-/// forgiven with them.
+/// it gave up without seeing them applied.
 #[derive(Debug, Default)]
 pub(crate) struct LimiterGauges {
     key_bytes: Gauge,
@@ -991,9 +991,10 @@ impl Metrics {
         scrape.family(name, Kind::Counter, help);
         scrape.sample(name, &[], self.limiters.sum(|shard| shard.evicted.get()));
         let name = "edgerush_rate_limit_hits_forgiven_total";
-        let help = "Hits the rate-limiting service had not been seen to apply, forgiven with \
-                    the keys evicted to keep within the bytes they may hold: at most what was \
-                    lost, as a lost answer may leave one applied unseen.";
+        let help = "Hits given up without the rate-limiting service being seen to apply them: \
+                    those of keys evicted to keep within the bytes they may hold, and of \
+                    reports unanswered for a refill time. At most what was lost, as a lost \
+                    answer may leave one applied unseen.";
         scrape.family(name, Kind::Counter, help);
         scrape.sample(name, &[], self.limiters.sum(|shard| shard.forgiven.get()));
         // Limits that share a series are shown once, under a name of its own.

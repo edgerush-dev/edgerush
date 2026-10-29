@@ -1035,7 +1035,7 @@ pub struct Participant<S> {
     /// `evictions`, keeps until it comes or is dropped ([`Self::drop_stale`]).
     stale: u64,
     evicted: u64,
-    /// Hits not seen applied that keys evicted for capacity held, all told.
+    /// Hits given up without being seen applied, all told ([`Self::forgiven`]).
     forgiven: u64,
     /// Lists of unacknowledged batches given back, for keys to take.
     spare: Spare,
@@ -1096,6 +1096,8 @@ struct Visit<'a> {
     sending: &'a BTreeMap<PodId, u64>,
     queued: &'a mut BTreeMap<PodId, Queued>,
     numbered: &'a mut u64,
+    /// Hits given up without being seen applied, all told ([`Participant::forgiven`]).
+    forgiven: &'a mut u64,
     spare: &'a mut Spare,
     cut_off: bool,
     wake: bool,
@@ -1138,7 +1140,7 @@ impl Visit<'_> {
         let bytes = encoded_entry_bytes(key.len());
         let mut left_out = false;
         for unseen in tracked.unacknowledged.as_mut_slice() {
-            unseen.empty_if_stale(hold, now);
+            *self.forgiven += unseen.empty_if_stale(hold, now);
         }
         let mut reported = false;
         for unseen in tracked.unacknowledged.as_mut_slice() {
@@ -1414,9 +1416,10 @@ impl<S: BuildHasher + Clone> Participant<S> {
         self.evicted
     }
 
-    /// Hits forgiven by evicting for capacity keys that had them unsent or unacknowledged,
-    /// all told: as `DataPlane::forgiven`, at most what was lost, since an unacknowledged
-    /// report may have been applied with its answer lost.
+    /// Hits given up without being seen applied, all told, as `DataPlane::forgiven`: those of
+    /// keys evicted for capacity, and those of reports not acknowledged within their key's
+    /// refill time. At most what was lost, since an unacknowledged report may have been
+    /// applied with its answer lost.
     #[must_use]
     pub fn forgiven(&self) -> u64 {
         self.forgiven
@@ -1615,6 +1618,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             sending: &self.sending,
             queued: &mut self.queued,
             numbered: &mut self.numbered,
+            forgiven: &mut self.forgiven,
             spare: &mut self.spare,
             cut_off: false,
             wake: false,
