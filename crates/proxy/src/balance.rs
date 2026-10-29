@@ -23,6 +23,13 @@
 //! What the common case costs — every endpoint serving, none ramping, a first try — is one
 //! look at each endpoint drawn: no endpoint is counted, and no list is made, unless one drawn
 //! may not be taken.
+//!
+//! **Zones**: where an upstream's endpoints hinted for the data plane's zone come first,
+//! [`zone`] says whether a pick keeps to them, which it does while at least half of them
+//! serve and one that serves is not yet tried; the balancer then draws from them alone,
+//! under the same rules, which neither ignore health nor take one tried again among them.
+//! Otherwise it draws from the whole upstream. That look is one at each of the zone's
+//! endpoints, for an upstream that has a zone; one that has none pays nothing.
 
 // What is here is `pub` so that the benchmarks, which are a crate of their own, can name it.
 // The module is public only when they are being built, so in an ordinary build none of this
@@ -119,6 +126,58 @@ impl Tried {
     fn is_empty(&self) -> bool {
         self.len == 0
     }
+}
+
+/// The first endpoints of an upstream, its zone's, as a balancer sees them alone.
+#[derive(Debug, Clone, Copy)]
+pub struct Zone<'a, C> {
+    all: &'a C,
+    zoned: usize,
+}
+
+impl<C: Candidates> Candidates for Zone<'_, C> {
+    fn count(&self) -> usize {
+        self.zoned
+    }
+
+    fn serves(&self, at: usize) -> bool {
+        self.all.serves(at)
+    }
+
+    fn in_flight(&self, at: usize) -> u32 {
+        self.all.in_flight(at)
+    }
+
+    fn share(&self, at: usize) -> Share {
+        self.all.share(at)
+    }
+}
+
+/// The zone's endpoints, the first `zoned` of `candidates`, if a pick keeps to them
+/// ([03 §6](../../docs/03-data-plane.md)): while at least half of them serve, so that its
+/// survivors do not take its whole load, and one that serves is not yet tried. Otherwise
+/// none, and the whole upstream is drawn from under its rules; none too when the zone is
+/// all of them, or none.
+pub fn zone<'a, C: Candidates>(
+    candidates: &'a C,
+    zoned: usize,
+    tried: &Tried,
+) -> Option<Zone<'a, C>> {
+    if zoned == 0 || zoned >= candidates.count() {
+        return None;
+    }
+    let mut serving = 0;
+    let mut untried = false;
+    for at in 0..zoned {
+        if candidates.serves(at) {
+            serving += 1;
+            untried |= !tried.contains(at);
+        }
+    }
+    (serving * 2 >= zoned && untried).then_some(Zone {
+        all: candidates,
+        zoned,
+    })
 }
 
 /// Which endpoints may be taken for one pick, worked out only once one drawn may not be.
@@ -744,7 +803,79 @@ mod tests {
         })
     }
 
+    #[test]
+    fn a_pick_keeps_to_the_zone_while_half_of_it_serves() {
+        // The first four of ten are the zone's.
+        let zone_of = |serves: [bool; 4]| {
+            let mut all = [true; 10];
+            all[..4].copy_from_slice(&serves);
+            Endpoints::with_health(&all)
+        };
+        let all_serving = zone_of([true; 4]);
+        let half = zone_of([true, false, true, false]);
+        let fewer = zone_of([false, false, true, false]);
+        assert!(zone(&all_serving, 4, &Tried::default()).is_some());
+        assert!(zone(&half, 4, &Tried::default()).is_some());
+        assert!(zone(&fewer, 4, &Tried::default()).is_none());
+        // Every one that serves tried: the whole upstream, for a retry elsewhere.
+        assert!(zone(&half, 4, &tried(&[0, 1])).is_some());
+        assert!(zone(&half, 4, &tried(&[0, 2])).is_none());
+        // A zone of none or of all: no zone.
+        assert!(zone(&all_serving, 0, &Tried::default()).is_none());
+        assert!(zone(&all_serving, 10, &Tried::default()).is_none());
+
+        // Kept to, the zone's alone are taken, and never one failing among them.
+        let mut random = generator(1);
+        let picks = tally(10, 1_000, || {
+            p2c(
+                &zone(&half, 4, &Tried::default()).unwrap(),
+                &Tried::default(),
+                &mut random,
+            )
+        });
+        assert_eq!(picks[1] + picks[3], 0, "{picks:?}");
+        assert_eq!(picks[0] + picks[2], 1_000, "{picks:?}");
+        let mut round_robin = RoundRobin::starting_at(7);
+        let picks = tally(10, 100, || {
+            round_robin.pick(
+                &zone(&half, 4, &Tried::default()).unwrap(),
+                &Tried::default(),
+                &mut random,
+            )
+        });
+        assert_eq!(picks[..4], [50, 0, 50, 0], "{picks:?}");
+    }
+
     proptest! {
+        /// A pick that keeps to the zone takes one of its endpoints that serve, untried; one
+        /// that does not keeps to nothing, as its zone is fewer than half serving, or tried.
+        #[test]
+        fn a_zone_kept_to_gives_only_its_own_that_serve_untried(
+            (endpoints, already) in endpoints(),
+            zoned in 0_usize..10,
+            seed in any::<u64>(),
+        ) {
+            let tried = tried(&already);
+            let count = endpoints.count();
+            let serving: Vec<usize> = (0..zoned.min(count)).filter(|&at| endpoints.serves[at]).collect();
+            let untried = serving.iter().any(|at| !already.contains(at));
+            let kept = zoned > 0 && zoned < count && serving.len() * 2 >= zoned && untried;
+            let found = zone(&endpoints, zoned, &tried);
+            prop_assert_eq!(found.is_some(), kept);
+            if let Some(found) = found {
+                let mut random = generator(seed);
+                let mut round_robin = RoundRobin::starting_at(seed as usize);
+                for _ in 0..20 {
+                    for at in [
+                        p2c(&found, &tried, &mut random).unwrap(),
+                        round_robin.pick(&found, &tried, &mut random).unwrap(),
+                    ] {
+                        prop_assert!(at < zoned && endpoints.serves[at] && !already.contains(&at), "{at}");
+                    }
+                }
+            }
+        }
+
         #[test]
         fn a_ramp_never_falls_and_never_passes_all(
             window in 1_u64..,

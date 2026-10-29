@@ -125,6 +125,8 @@ data:
     ingress_hosts_fall_through: false
     ingress_https_redirect: false
     ingress_https_redirect_max_age: 30
+    # Whose slices say the data plane's zone: the Service of its own pods, ready or not.
+    data_plane: { own_service: edgerush-peers.edge.svc.cluster.local }
     listeners:
       http:
         address: "0.0.0.0:8080"
@@ -233,7 +235,8 @@ apiVersion: v1
 kind: ServiceAccount
 metadata: { name: edgerush, namespace: edge }
 ---
-# The data plane's one permission: list and watch EndpointSlices, here in `shop` alone.
+# The data plane's one permission: list and watch EndpointSlices, here in `shop`, where
+# its backends are, and in `edge`, where its own Service's say its zone.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata: { name: endpointslices, namespace: shop }
@@ -245,6 +248,20 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata: { name: edgerush, namespace: shop }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: endpointslices }
+subjects: [{ kind: ServiceAccount, name: edgerush, namespace: edge }]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: endpointslices, namespace: edge }
+rules:
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: edgerush, namespace: edge }
 roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: endpointslices }
 subjects: [{ kind: ServiceAccount, name: edgerush, namespace: edge }]
 ---

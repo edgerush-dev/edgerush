@@ -307,11 +307,13 @@ impl Candidates for Seen<'_> {
 
 impl Upstream {
     /// The endpoint an exchange goes to, among `destinations` — this upstream's, of the
-    /// config this state was made for — keeping away from those in `tried`, and the count it
-    /// holds while in flight. `None` only if there are no endpoints.
+    /// config this state was made for, the first `zoned` of them its zone's — keeping away
+    /// from those in `tried`, and the count it holds while in flight. `None` only if there
+    /// are no endpoints.
     pub(crate) fn pick(
         &self,
         destinations: &[Arc<ReuseIdentity>],
+        zoned: usize,
         tried: &Tried,
     ) -> Option<(usize, InFlight)> {
         let seen = Seen {
@@ -319,16 +321,25 @@ impl Upstream {
             counts: &self.counts,
             window: self.window,
         };
-        let at = match self.balancer {
-            LoadBalancer::P2c => balance::p2c(&seen, tried, &mut random),
+        // The zone's alone while the pick keeps to them (03 §6).
+        let at = match balance::zone(&seen, zoned, tried) {
+            Some(zone) => self.choose(&zone, tried),
+            None => self.choose(&seen, tried),
+        }?;
+        Some((at, InFlight::new(self.counts.get(at)?)))
+    }
+
+    /// The endpoint the upstream's balancer takes among `candidates`.
+    fn choose(&self, candidates: &impl Candidates, tried: &Tried) -> Option<usize> {
+        match self.balancer {
+            LoadBalancer::P2c => balance::p2c(candidates, tried, &mut random),
             LoadBalancer::RoundRobin => {
                 let mut round_robin = self.round_robin.get();
-                let at = round_robin.pick(&seen, tried, &mut random);
+                let at = round_robin.pick(candidates, tried, &mut random);
                 self.round_robin.set(round_robin);
                 at
             }
-        }?;
-        Some((at, InFlight::new(self.counts.get(at)?)))
+        }
     }
 }
 
@@ -373,12 +384,12 @@ mod tests {
         let destinations = state(&config, &Destinations::default(), &keys, &mut balancing, 0);
         let upstream = Rc::clone(balancing.upstream(0).unwrap());
         let (first, held) = upstream
-            .pick(destinations.of(0), &Tried::default())
+            .pick(destinations.of(0), 0, &Tried::default())
             .unwrap();
         assert_eq!(upstream.counts[first].get(), 1);
         // The other has none in flight, so it is the pick while the first is held.
         let (second, _also) = upstream
-            .pick(destinations.of(0), &Tried::default())
+            .pick(destinations.of(0), 0, &Tried::default())
             .unwrap();
         assert_ne!(first, second);
         drop(held);
@@ -393,13 +404,13 @@ mod tests {
         let mut balancing = Balancing::default();
         let first = state(&before, &Destinations::default(), &keys, &mut balancing, 0);
         let upstream = Rc::clone(balancing.upstream(0).unwrap());
-        let (_, held) = upstream.pick(first.of(0), &Tried::default()).unwrap();
+        let (_, held) = upstream.pick(first.of(0), 0, &Tried::default()).unwrap();
 
         let second = state(&after, &first, &keys, &mut balancing, 1);
         let reloaded = balancing.upstream(0).unwrap();
         // The same destination, the same count: what was in flight before still is.
         assert_eq!(reloaded.counts[0].get(), 1);
-        let (at, _) = reloaded.pick(second.of(0), &Tried::default()).unwrap();
+        let (at, _) = reloaded.pick(second.of(0), 0, &Tried::default()).unwrap();
         assert_eq!(at, 1, "the endpoint with nothing in flight");
         drop(held);
         assert_eq!(reloaded.counts[0].get(), 0);
@@ -459,7 +470,7 @@ mod tests {
         let destinations = state(&three, &Destinations::default(), &keys, &mut balancing, 0);
         let upstream = Rc::clone(balancing.upstream(0).unwrap());
         let (at, _) = upstream
-            .pick(destinations.of(0), &Tried::default())
+            .pick(destinations.of(0), 0, &Tried::default())
             .unwrap();
 
         // The same list under a new config: the turn goes on from where it was.
@@ -467,7 +478,7 @@ mod tests {
         let (next, _) = balancing
             .upstream(0)
             .unwrap()
-            .pick(same.of(0), &Tried::default())
+            .pick(same.of(0), 0, &Tried::default())
             .unwrap();
         assert_eq!(next, (at + 1) % 3);
 
@@ -480,7 +491,7 @@ mod tests {
         let grown = state(&four, &same, &keys, &mut balancing, 2);
         let upstream = balancing.upstream(0).unwrap();
         let round: Vec<usize> = (0..4)
-            .map(|_| upstream.pick(grown.of(0), &Tried::default()).unwrap().0)
+            .map(|_| upstream.pick(grown.of(0), 0, &Tried::default()).unwrap().0)
             .collect();
         let mut sorted = round.clone();
         sorted.sort_unstable();
@@ -514,7 +525,7 @@ mod tests {
                 balancing.refresh(0, &config, &destinations, &[], &[]);
                 let upstream = balancing.upstream(0).unwrap();
                 upstream
-                    .pick(destinations.of(0), &Tried::default())
+                    .pick(destinations.of(0), 0, &Tried::default())
                     .unwrap()
                     .0
             })
@@ -670,17 +681,17 @@ mod tests {
         // alternates.
         let b = Rc::clone(balancing.upstream(1).unwrap());
         let held: Vec<(usize, InFlight)> = (0..4)
-            .map(|_| b.pick(destinations.of(1), &Tried::default()).unwrap())
+            .map(|_| b.pick(destinations.of(1), 0, &Tried::default()).unwrap())
             .collect();
         let order: Vec<usize> = held.iter().map(|(at, _)| *at).collect();
         assert_ne!(order[0], order[1]);
         assert_eq!(order[0], order[2]);
         // P2C with one of two held always takes the other.
         let a = Rc::clone(balancing.upstream(0).unwrap());
-        let (first, _keep) = a.pick(destinations.of(0), &Tried::default()).unwrap();
+        let (first, _keep) = a.pick(destinations.of(0), 0, &Tried::default()).unwrap();
         for _ in 0..20 {
             assert_ne!(
-                a.pick(destinations.of(0), &Tried::default()).unwrap().0,
+                a.pick(destinations.of(0), 0, &Tried::default()).unwrap().0,
                 first
             );
         }

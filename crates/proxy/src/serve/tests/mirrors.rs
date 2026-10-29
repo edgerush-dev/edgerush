@@ -56,6 +56,79 @@ async fn a_mirror_is_sent_the_request_as_it_stands_at_its_place() {
         .await;
 }
 
+/// An HTTP/1 upstream at `address` that answers every request `200` and closes, and how
+/// many it has been sent.
+async fn counting_at(address: &str) -> (SocketAddr, Rc<Cell<usize>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let socket = TcpListener::bind(address).await.unwrap();
+    let at = socket.local_addr().unwrap();
+    let count = Rc::new(Cell::new(0));
+    let counted = Rc::clone(&count);
+    let _accepting = tokio::task::spawn_local(async move {
+        while let Ok((mut stream, _)) = socket.accept().await {
+            let mut read = Vec::new();
+            let mut chunk = [0; 4096];
+            while !read.windows(4).any(|four| four == b"\r\n\r\n") {
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => read.extend_from_slice(&chunk[..n]),
+                }
+            }
+            counted.set(counted.get() + 1);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        }
+    });
+    (at, count)
+}
+
+/// A mirror's copy goes to its upstream's endpoints in the data plane's zone, as a request
+/// does (03 §6).
+#[tokio::test]
+async fn a_mirror_keeps_to_the_zone() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (first, near_one) = counting_at("127.0.0.1:0").await;
+            let port = first.port();
+            let mut counts = vec![near_one];
+            for host in 2..=4 {
+                counts.push(counting_at(&format!("127.0.0.{host}:{port}")).await.1);
+            }
+            let mut config = everything_config(first);
+            discovering_up(&mut config);
+            // The copies go to an upstream of their own that follows the same Service.
+            let copy = config.upstreams["up"].clone();
+            config.upstreams.insert("copy".to_owned(), copy);
+            config.routes[0].rules[0]
+                .filters
+                .push(edgerush_config::Filter::RequestMirror(
+                    edgerush_config::Mirror {
+                        upstream: "copy".to_owned(),
+                        fraction: edgerush_config::Fraction {
+                            numerator: 1,
+                            denominator: 1,
+                        },
+                    },
+                ));
+            let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+            zoned(&proxy, port, &[1, 2], &[3, 4]);
+            let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+            for _ in 0..20 {
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+            }
+            // Every request and every copy, to the zone's two.
+            until(|| counts[0].get() + counts[1].get() == 40).await;
+            assert_eq!((counts[2].get(), counts[3].get()), (0, 0));
+        })
+        .await;
+}
+
 /// A worker whose one rule goes to `up` at `primary`, speaking what it says, and mirrors
 /// every request to each of `mirrors`: a name, where it is (nowhere, if not given) and
 /// what it speaks.

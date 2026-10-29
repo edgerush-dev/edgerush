@@ -757,6 +757,9 @@ struct Snapshot {
     /// By position of the upstream, then of the endpoint: where to connect, in the form a
     /// request target takes, made once so that no request formats an address.
     endpoints: Vec<Vec<Authority>>,
+    /// By position of the upstream: how many of its endpoints, first, are the data plane's
+    /// zone's, to be preferred (03 §6); as many as it has when none is.
+    zoned: Vec<usize>,
     /// By position of the upstream: the addresses discovered or resolved for it that are
     /// not sent to, and why (03 §6).
     refused: Vec<Vec<(std::net::SocketAddr, crate::egress::Refusal)>>,
@@ -794,6 +797,14 @@ struct Snapshot {
     /// What the rate-limiting service's pods are reached with, if with TLS (06 §4): made as
     /// the config is taken in, so that one whose certificate cannot be used is refused.
     service_tls: Option<SslConnector>,
+}
+
+impl Snapshot {
+    /// How many of the endpoints of the upstream at `upstream`, first, are the zone's, to be
+    /// preferred (03 §6): as many as it has when none is.
+    fn zoned(&self, upstream: usize) -> usize {
+        self.zoned.get(upstream).copied().unwrap_or(0)
+    }
 }
 
 impl Snapshot {
@@ -932,6 +943,8 @@ struct Others {
     authorities: Vec<Authority>,
     /// By position of the endpoint.
     destinations: Vec<Arc<ReuseIdentity>>,
+    /// How many of them, first, are the zone's (03 §6).
+    zoned: usize,
     /// Where the first try went.
     first: usize,
 }
@@ -960,7 +973,9 @@ impl Directed {
         tried: &Tried,
     ) -> Option<(Uri, Arc<ReuseIdentity>, usize, InFlight)> {
         let others = self.others.as_deref()?;
-        let (at, counted) = self.upstream.pick(&others.destinations, tried)?;
+        let (at, counted) = self
+            .upstream
+            .pick(&others.destinations, others.zoned, tried)?;
         let authority = others.authorities.get(at)?;
         let destination = others.destinations.get(at)?;
         Some((

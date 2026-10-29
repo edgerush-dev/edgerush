@@ -28,6 +28,54 @@ pub(super) fn tcp_to(backend: SocketAddr, extra: &str) -> String {
     )
 }
 
+/// `config` with its upstream `up` following Service `up` of `shop` instead, and the data
+/// plane's own Service `edgerush` of `edge`, whose slices say its zone (03 §6). Loopback,
+/// where the tests' backends are, is allowed to it.
+pub(super) fn discovering_up(config: &mut Config) {
+    config.upstreams.get_mut("up").unwrap().endpoints =
+        edgerush_config::Endpoints::Kubernetes("up.shop.svc.cluster.local:http".to_owned());
+    config.data_plane.own_service = Some("edgerush.edge.svc.cluster.local".to_owned());
+    config.data_plane.experimental_unrestricted_egress = Some(true);
+}
+
+/// Tells `proxy`, made of a config [`discovering_up`] changed, that it is in zone `a`, and
+/// that Service `up`'s endpoints are `127.0.0.<n>:<port>` for each `n` of `near`, hinted
+/// for zone `a`, and of `far`, hinted for `b`: one port, as a Service's endpoints share.
+pub(super) fn zoned(proxy: &Proxy, port: u16, near: &[u8], far: &[u8]) {
+    proxy.deny(
+        crate::egress::Denied {
+            own: vec!["10.9.0.1".parse().unwrap()],
+            ..crate::egress::Denied::default()
+        },
+        |_, _, _| {},
+    );
+    let slice = |namespace: &str, service: &str, endpoints: Vec<String>| {
+        let slice: k8s_openapi::api::discovery::v1::EndpointSlice = serde_saphyr::from_str(&format!(
+            "metadata: {{ name: {service}-1, namespace: {namespace}, labels: {{ kubernetes.io/service-name: {service} }} }}\naddressType: IPv4\nports: [{{ name: http, port: {port} }}]\nendpoints: [{}]\n",
+            endpoints.join(", ")
+        ))
+        .unwrap();
+        (namespace.to_owned(), Some(Arc::from(vec![slice])))
+    };
+    let hinted = |host: u8, zone: &str| {
+        format!(
+            "{{ addresses: [127.0.0.{host}], zone: {zone}, hints: {{ forZones: [{{ name: {zone} }}] }} }}"
+        )
+    };
+    let endpoints = near
+        .iter()
+        .map(|&host| hinted(host, "a"))
+        .chain(far.iter().map(|&host| hinted(host, "b")))
+        .collect();
+    let own = vec!["{ addresses: [10.9.0.1], zone: a }".to_owned()];
+    proxy
+        .rediscover([
+            slice("shop", "up", endpoints),
+            slice("edge", "edgerush", own),
+        ])
+        .unwrap();
+}
+
 /// `everything_config`, its `web` listener trusting `trusted` and taking off the control
 /// plane's default trusted-only headers from anyone else.
 pub(super) fn forwarding_config(upstream: SocketAddr, trusted: &[&str]) -> Config {

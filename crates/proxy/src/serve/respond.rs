@@ -853,8 +853,9 @@ impl Proxy {
         let endpoints = snapshot.endpoints.get(upstream).ok_or(Answer::NoBackend)?;
         let destinations = snapshot.destinations.of(upstream);
         let balance = balance_of(balancing, &snapshot, upstream).ok_or(Answer::NoEndpoints)?;
+        let zoned = snapshot.zoned(upstream);
         let (at, counted) = balance
-            .pick(destinations, &Tried::default())
+            .pick(destinations, zoned, &Tried::default())
             .ok_or(Answer::NoEndpoints)?;
         let endpoint = endpoints.get(at).ok_or(Answer::NoEndpoints)?;
         let identity = snapshot
@@ -917,7 +918,8 @@ impl Proxy {
             }
             let destinations = snapshot.destinations.of(upstream);
             let found = balance_of(balancing, &snapshot, upstream).and_then(|balance| {
-                let (at, counted) = balance.pick(destinations, &Tried::default())?;
+                let zoned = snapshot.zoned(upstream);
+                let (at, counted) = balance.pick(destinations, zoned, &Tried::default())?;
                 let authority = snapshot.endpoints.get(upstream)?.get(at)?;
                 Some((
                     at_endpoint(&target, authority)?,
@@ -950,6 +952,7 @@ impl Proxy {
             Box::new(Others {
                 authorities: endpoints.clone(),
                 destinations: destinations.to_vec(),
+                zoned,
                 first: at,
             })
         });

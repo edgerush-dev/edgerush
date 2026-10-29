@@ -1,0 +1,17 @@
+# One Ingress, for a data plane that states its own settings.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: app, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: app, port: { name: http } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: app, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

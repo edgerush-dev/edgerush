@@ -1,5 +1,5 @@
 use super::*;
-use k8s_openapi::api::discovery::v1::Endpoint;
+use k8s_openapi::api::discovery::v1::{Endpoint, EndpointHints, ForZone};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use proptest::prelude::*;
 
@@ -216,6 +216,123 @@ fn an_address_listed_twice_is_one_endpoint_the_readiest() {
     assert_eq!(addresses(endpoints.terminating()), ["10.0.0.2:8080"]);
 }
 
+fn zone(endpoints: &Endpoints, zone: &str) -> Option<Vec<String>> {
+    endpoints.for_zone(zone).as_ref().map(addresses)
+}
+
+#[test]
+fn the_zones_endpoints_are_preferred_when_every_one_is_hinted() {
+    let endpoints = Endpoints::of(
+        &web(),
+        &[http(
+            "  - { addresses: [10.0.0.1], zone: a, hints: { forZones: [{ name: a }] } }
+  - { addresses: [10.0.0.2], zone: b, hints: { forZones: [{ name: b }] } }
+  - { addresses: [10.0.0.3], zone: c, hints: { forZones: [{ name: a }, { name: c }] } }
+",
+        )],
+    );
+    assert_eq!(
+        zone(&endpoints, "a"),
+        Some(vec!["10.0.0.1:8080".to_owned(), "10.0.0.3:8080".to_owned()])
+    );
+    assert_eq!(
+        zone(&endpoints, "b"),
+        Some(vec!["10.0.0.2:8080".to_owned()])
+    );
+    // No endpoint hinted for the zone: all are used alike.
+    assert_eq!(zone(&endpoints, "d"), None);
+}
+
+#[test]
+fn one_endpoint_without_a_zone_hint_turns_preference_off() {
+    // A Service partly hinted is one whose hints are being written.
+    for unhinted in [
+        "{ addresses: [10.0.0.2], zone: a }",
+        "{ addresses: [10.0.0.2], zone: a, hints: {} }",
+        "{ addresses: [10.0.0.2], zone: a, hints: { forZones: [] } }",
+    ] {
+        let endpoints = Endpoints::of(
+            &web(),
+            &[http(&format!(
+                "  - {{ addresses: [10.0.0.1], zone: a, hints: {{ forZones: [{{ name: a }}] }} }}\n  - {unhinted}\n"
+            ))],
+        );
+        assert_eq!(zone(&endpoints, "a"), None, "{unhinted}");
+    }
+}
+
+#[test]
+fn only_the_endpoints_in_use_count_for_hints() {
+    // Hints are judged among those in use: an unhinted endpoint terminating beside ready
+    // ones does not count, and the terminating are preferred among while none is ready.
+    let terminating = "  - { addresses: [10.0.0.9], conditions: { ready: false, serving: true, terminating: true }, hints: { forZones: [{ name: a }] } }\n";
+    let with_ready = Endpoints::of(
+        &web(),
+        &[http(&format!(
+            "{terminating}  - {{ addresses: [10.0.0.1], hints: {{ forZones: [{{ name: a }}] }} }}\n  - {{ addresses: [10.0.0.2], conditions: {{ ready: false, serving: true, terminating: true }} }}\n"
+        ))],
+    );
+    assert_eq!(
+        zone(&with_ready, "a"),
+        Some(vec!["10.0.0.1:8080".to_owned()])
+    );
+    let alone = Endpoints::of(&web(), &[http(terminating)]);
+    assert_eq!(zone(&alone, "a"), Some(vec!["10.0.0.9:8080".to_owned()]));
+}
+
+#[test]
+fn an_address_listed_twice_is_hinted_only_if_every_copy_is() {
+    let hinted = |zone: &str| {
+        http(&format!(
+            "  - {{ addresses: [10.0.0.1], hints: {{ forZones: [{{ name: {zone} }}] }} }}\n"
+        ))
+    };
+    let both = Endpoints::of(&web(), &[hinted("a"), hinted("b")]);
+    assert_eq!(zone(&both, "a"), Some(vec!["10.0.0.1:8080".to_owned()]));
+    assert_eq!(zone(&both, "b"), Some(vec!["10.0.0.1:8080".to_owned()]));
+    let unhinted = http("  - { addresses: [10.0.0.1] }\n");
+    for slices in [[hinted("a"), unhinted.clone()], [unhinted, hinted("a")]] {
+        assert_eq!(zone(&Endpoints::of(&web(), &slices), "a"), None);
+    }
+}
+
+fn ip(address: &str) -> IpAddr {
+    address.parse().unwrap()
+}
+
+#[test]
+fn the_data_planes_zone_is_that_of_the_endpoint_at_its_own_address() {
+    let slices = [
+        // Another Service's slice, listing the pod too, is passed over.
+        {
+            let mut other = http("  - { addresses: [10.0.0.7], zone: wrong }\n");
+            other.metadata.labels =
+                Some([(SERVICE_NAME_LABEL.to_owned(), "api".to_owned())].into());
+            other
+        },
+        // Not ready yet, and on no port the Service names: still the pod.
+        slice(
+            "IPv4",
+            "[{ name: other, port: 1 }]",
+            "  - { addresses: [10.0.0.6], zone: b }\n  - { addresses: [10.0.0.7], zone: a, conditions: { ready: false } }\n",
+        ),
+        slice("IPv6", "[]", "  - { addresses: [\"fd00::7\"], zone: a6 }\n"),
+    ];
+    assert_eq!(
+        zone_of("shop", "web", &slices, &[ip("10.0.0.7")]),
+        Some("a")
+    );
+    assert_eq!(
+        zone_of("shop", "web", &slices, &[ip("fd00::7")]),
+        Some("a6")
+    );
+    assert_eq!(zone_of("shop", "web", &slices, &[ip("10.0.0.8")]), None);
+    assert_eq!(zone_of("blog", "web", &slices, &[ip("10.0.0.7")]), None);
+    // Listed without a zone: none, as yet.
+    let unzoned = [http("  - { addresses: [10.0.0.7] }\n")];
+    assert_eq!(zone_of("shop", "web", &unzoned, &[ip("10.0.0.7")]), None);
+}
+
 /// Slices of a few addresses, ports and every mix of conditions, some of them `web`'s.
 fn slices() -> impl Strategy<Value = Vec<EndpointSlice>> {
     // Each kind of endpoint often, and every mix of conditions too.
@@ -227,7 +344,12 @@ fn slices() -> impl Strategy<Value = Vec<EndpointSlice>> {
         Just(Some((Some(false), None, None))),
         prop::option::of((condition(), condition(), condition())),
     ];
-    let endpoint = (0..4u8, conditions);
+    // No hint, or hints for zones `a` and `b`, or none of them.
+    let hints = prop::option::of(prop::collection::btree_set(
+        prop::sample::select(vec!["a", "b"]),
+        0..3,
+    ));
+    let endpoint = (0..4u8, conditions, hints);
     let one = (
         any::<bool>(),
         prop::sample::select(vec![("http", 8080), ("http", 9090), ("admin", 9000)]),
@@ -258,7 +380,7 @@ fn slices() -> impl Strategy<Value = Vec<EndpointSlice>> {
                 endpoints: Some(
                     endpoints
                         .into_iter()
-                        .map(|(host, conditions)| Endpoint {
+                        .map(|(host, conditions, hints)| Endpoint {
                             addresses: vec![if v6 {
                                 format!("fd00::{host}")
                             } else {
@@ -270,6 +392,17 @@ fn slices() -> impl Strategy<Value = Vec<EndpointSlice>> {
                                     serving,
                                     terminating,
                                 }
+                            }),
+                            hints: hints.map(|zones| EndpointHints {
+                                for_zones: Some(
+                                    zones
+                                        .into_iter()
+                                        .map(|name| ForZone {
+                                            name: name.to_owned(),
+                                        })
+                                        .collect(),
+                                ),
+                                ..EndpointHints::default()
                             }),
                             ..Endpoint::default()
                         })
@@ -304,7 +437,7 @@ proptest! {
         let endpoints = Endpoints::of(&web(), &slices);
         let mut fits: BTreeMap<SocketAddr, Vec<Option<Fit>>> = BTreeMap::new();
         for slice in &slices {
-            if !is_of(&web(), slice) {
+            if !is_of("shop", "web", slice) {
                 continue;
             }
             let Some(port) = slice.ports.iter().flatten().find(|p| p.name.as_deref() == Some("http")) else {
@@ -327,5 +460,50 @@ proptest! {
         }
         let in_use = if endpoints.ready().is_empty() { endpoints.terminating() } else { endpoints.ready() };
         prop_assert_eq!(endpoints.in_use(), in_use);
+    }
+
+    /// A zone's endpoints are preferred exactly when every one in use has a zone hint in
+    /// every copy and one names the zone; then they are those in use hinted for it in some
+    /// copy.
+    #[test]
+    fn hints_count_only_when_every_copy_in_use_has_one(
+        slices in slices(),
+        wanted in prop::sample::select(vec!["a", "b", "c"]),
+    ) {
+        let endpoints = Endpoints::of(&web(), &slices);
+        let mut copies: BTreeMap<SocketAddr, Vec<Option<BTreeSet<String>>>> = BTreeMap::new();
+        for slice in &slices {
+            if !is_of("shop", "web", slice) {
+                continue;
+            }
+            let Some(port) = slice.ports.iter().flatten().find(|p| p.name.as_deref() == Some("http")) else {
+                continue;
+            };
+            for endpoint in slice.endpoints.iter().flatten() {
+                if fit_of(endpoint.conditions.as_ref()).is_none() {
+                    continue;
+                }
+                let ip = endpoint.addresses[0].parse::<IpAddr>().unwrap();
+                let address = SocketAddr::new(ip, u16::try_from(port.port.unwrap()).unwrap());
+                let zones = endpoint
+                    .hints
+                    .as_ref()
+                    .and_then(|hints| hints.for_zones.as_ref())
+                    .map(|zones| zones.iter().map(|zone| zone.name.clone()).collect::<BTreeSet<_>>())
+                    .filter(|zones| !zones.is_empty());
+                copies.entry(address).or_default().push(zones);
+            }
+        }
+        let in_use = endpoints.in_use();
+        let every_hinted = in_use
+            .iter()
+            .all(|address| copies[address].iter().all(Option::is_some));
+        let named: BTreeSet<SocketAddr> = in_use
+            .iter()
+            .copied()
+            .filter(|address| copies[address].iter().flatten().any(|zones| zones.contains(wanted)))
+            .collect();
+        let expected = (every_hinted && !named.is_empty()).then_some(named);
+        prop_assert_eq!(endpoints.for_zone(wanted), expected);
     }
 }

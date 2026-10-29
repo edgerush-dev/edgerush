@@ -22,8 +22,13 @@ async fn quiet_backend() -> SocketAddr {
 /// A backend that says `name` to every connection as it accepts it, and then reads
 /// until the connection ends.
 async fn naming_backend(name: &'static str) -> SocketAddr {
+    naming_backend_at("127.0.0.1:0", name).await
+}
+
+/// [`naming_backend`], listening at `address`.
+async fn naming_backend_at(address: &str, name: &'static str) -> SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket = TcpListener::bind(address).await.unwrap();
     let address = socket.local_addr().unwrap();
     tokio::task::spawn_local(async move {
         while let Ok((mut stream, _)) = socket.accept().await {
@@ -65,6 +70,39 @@ async fn an_open_tunnel_counts_against_its_backend() {
                     assert_eq!(went[&b'a'], went[&b'b'], "after {opened}: {went:?}");
                 }
             }
+        })
+        .await;
+}
+
+/// A tunnel's backend is picked as a request's is: among the endpoints hinted for the data
+/// plane's zone (03 §6).
+#[tokio::test]
+async fn a_tunnel_keeps_to_the_zone() {
+    use tokio::io::AsyncReadExt;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let first = naming_backend_at("127.0.0.1:0", "1").await;
+            let port = first.port();
+            for (host, name) in [(2, "2"), (3, "3"), (4, "4")] {
+                naming_backend_at(&format!("127.0.0.{host}:{port}"), name).await;
+            }
+            let mut config: Config = serde_saphyr::from_str(&tcp_to(first, "")).unwrap();
+            discovering_up(&mut config);
+            let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+            zoned(&proxy, port, &[1, 2], &[3, 4]);
+            let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+            let mut went = std::collections::BTreeSet::new();
+            for _ in 0..20 {
+                let mut client = TcpStream::connect(front).await.unwrap();
+                let mut name = [0; 1];
+                bounded(client.read_exact(&mut name)).await.unwrap();
+                went.insert(name[0]);
+            }
+            assert_eq!(went, std::collections::BTreeSet::from(*b"12"));
         })
         .await;
 }

@@ -23,6 +23,10 @@
 #     to, and that is said; nor one pointed at a control-plane pod, whose address the
 #     control plane resolves by its headless Service and sends on the stream, and again
 #     once a replica that took over is a new pod;
+#   - with the node labelled with a zone, and the data plane told its own Service, an
+#     EndpointSlice written by hand that hints one backend pod for that zone and another
+#     for one elsewhere has every request go to the first, and to both once one is
+#     unhinted;
 #   - the control plane's leader gone, the other replica takes its Lease and writes status;
 #   - with the control plane gone, the data plane serves on;
 #   - a data plane started while it is gone waits for its first config, serving nothing,
@@ -45,6 +49,9 @@ name="edgerush-${version//./-}"
 kubeconfig=$(kind/cluster.sh up "$version")
 export KUBECONFIG="$kubeconfig"
 k() { kubectl --kubeconfig "$kubeconfig" "$@"; }
+# The zone a cloud's nodes are labelled with, before any pod is placed: the EndpointSlice
+# controller writes each endpoint's zone from its node's (03 §6).
+k label nodes --all topology.kubernetes.io/zone=zone-a --overwrite >/dev/null
 forward_pid=
 finish() {
     [ -n "$forward_pid" ] && kill "$forward_pid" 2>/dev/null || true
@@ -247,6 +254,75 @@ peer=$(control)
 [ -n "$peer" ] || fail "the control plane has no pod address"
 refused "$peer" "one of the gateway's own pods"
 pass "nor one pointed at a control-plane pod, named on the stream"
+
+# Two backend pods, by an EndpointSlice written by hand: the first hinted for zone-a, the
+# data plane's, as its own Service's slices say it is; the second for zone-b. Every request
+# goes to the first, and to both once the second is unhinted, which turns preference off.
+k -n shop scale deploy/web --replicas=2 >/dev/null
+k -n shop rollout status deploy/web --timeout=120s >/dev/null
+# jsonpath ends no line, which `read` says by failing: whether both were found is checked.
+read -r near near_ip far far_ip < <(k -n shop get pod -l app=web \
+    -o jsonpath='{range .items[*]}{.metadata.name} {.status.podIP} {end}') || true
+[ -n "$far_ip" ] || fail "two backend pods were not found"
+zoned() {
+    k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata: { name: zoned, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80, targetPort: 8080 }]
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: zoned-1
+  namespace: shop
+  labels: { kubernetes.io/service-name: zoned }
+addressType: IPv4
+ports: [{ name: http, port: 8080 }]
+endpoints:
+  - { addresses: ["$near_ip"], zone: zone-a, hints: { forZones: [{ name: zone-a }] } }
+  - { addresses: ["$far_ip"], zone: zone-b$1 }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: zoned, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: zoned.example
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: zoned, port: { name: http } } } }
+EOF
+}
+# Which pods answered $1 requests to zoned.example, each once, in order.
+answered() {
+    for _ in $(seq 1 "$1"); do
+        curl -s -H 'host: zoned.example' "http://127.0.0.1:$port/hostname"
+        echo
+    done | sort -u | tr '\n' ' '
+}
+zoned ", hints: { forZones: [{ name: zone-b }] }"
+answers zoned.example 200 30 || fail "the zoned Ingress is not served: $(status zoned.example)"
+# Until the data plane has its zone and both endpoints, a request may go either way.
+for _ in $(seq 1 50); do
+    [ "$(answered 10)" = "$near " ] && break
+    sleep 0.2
+done
+[ "$(answered 30)" = "$near " ] || fail "requests did not keep to the zone: $(answered 30)"
+zoned ""
+both=$(printf '%s\n' "$near" "$far" | sort | tr '\n' ' ')
+for _ in $(seq 1 50); do
+    [ "$(answered 20)" = "$both" ] && break
+    sleep 0.2
+done
+[ "$(answered 40)" = "$both" ] || fail "with an endpoint unhinted, not both pods answered: $(answered 40)"
+k -n shop delete ingress zoned >/dev/null
+k -n shop delete service zoned >/dev/null
+k -n shop delete endpointslice zoned-1 >/dev/null
+k -n shop scale deploy/web --replicas=1 >/dev/null
+pass "requests keep to the endpoints hinted for the data plane's zone, and go to all once one is unhinted"
 
 echo "== the leader gone"
 # Who holds the Lease: a pod's name, and when it started.

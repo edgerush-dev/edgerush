@@ -165,7 +165,11 @@ the certificates in PEM trusted for a Service port spoken to over TLS
 `ingress_https_redirect: true` redirects plain HTTP to HTTPS for the hosts an Ingress's `tls`
 lists, as a `DataPlane` does by default; an Ingress's `gateway.edgerush.dev/https-redirect: "false"`
 or `"true"` overrides it for its own routes. `ingress_https_redirect_max_age` is how long, in
-seconds, a client may keep that redirect (30 for a `DataPlane` by default):
+seconds, a client may keep that redirect (30 for a `DataPlane` by default). `data_plane`,
+the data plane's own settings as its config states them, goes into every config as written:
+`data_plane: { own_service: edgerush.edge.svc.cluster.local }` names the Service of its own
+pods, whose EndpointSlices say its zone, and endpoints EndpointSlices hint for that zone
+are then preferred:
 
 ```yaml
 ingress_class: edge

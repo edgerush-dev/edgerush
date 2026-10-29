@@ -25,6 +25,17 @@ pub struct KubernetesService {
     pub port: ServicePort,
 }
 
+/// A Kubernetes Service, without a port: `<service>.<namespace>.svc.<cluster domain>`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ServiceName {
+    /// The Service's name.
+    pub service: String,
+    /// The namespace it is in.
+    pub namespace: String,
+    /// The cluster's DNS domain, as written. Kept for what is shown.
+    pub cluster_domain: String,
+}
+
 /// One of a Service's ports, as its EndpointSlices know it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ServicePort {
@@ -42,7 +53,7 @@ pub enum ServiceNameError {
     #[error("no port: `<service>.<namespace>.svc.<cluster domain>:<port>`")]
     NoPort,
     /// Not `<service>.<namespace>.svc.<cluster domain>`.
-    #[error("not a Service's name: `<service>.<namespace>.svc.<cluster domain>:<port>`")]
+    #[error("not a Service's name: `<service>.<namespace>.svc.<cluster domain>`")]
     NotAService,
     /// A label that is not a DNS label: 1 to 63 of `a-z`, `0-9` and `-`, neither first nor
     /// last a `-`.
@@ -72,6 +83,32 @@ impl KubernetesService {
     /// Returns a [`ServiceNameError`] saying what is wrong with it.
     pub fn parse(text: &str) -> Result<Self, ServiceNameError> {
         let (name, port) = text.rsplit_once(':').ok_or(ServiceNameError::NoPort)?;
+        let ServiceName {
+            service,
+            namespace,
+            cluster_domain,
+        } = ServiceName::parse(name)?;
+        Ok(Self {
+            service,
+            namespace,
+            cluster_domain,
+            port: service_port(port).ok_or_else(|| ServiceNameError::Port(port.to_owned()))?,
+        })
+    }
+}
+
+impl ServiceName {
+    /// Reads `<service>.<namespace>.svc.<cluster domain>`, in one spelling: lower case, no
+    /// trailing dot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceNameError`] saying what is wrong with it.
+    pub fn parse(name: &str) -> Result<Self, ServiceNameError> {
+        // A port written after it, as an upstream's Service takes one.
+        if name.contains(':') {
+            return Err(ServiceNameError::NotAService);
+        }
         if name.len() > 253 {
             return Err(ServiceNameError::TooLong);
         }
@@ -94,8 +131,17 @@ impl KubernetesService {
             service: (*service).to_owned(),
             namespace: (*namespace).to_owned(),
             cluster_domain: domain.join("."),
-            port: service_port(port).ok_or_else(|| ServiceNameError::Port(port.to_owned()))?,
         })
+    }
+}
+
+impl fmt::Display for ServiceName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}.{}.svc.{}",
+            self.service, self.namespace, self.cluster_domain
+        )
     }
 }
 
@@ -153,6 +199,41 @@ mod tests {
             namespace: namespace.to_owned(),
             cluster_domain: domain.to_owned(),
             port: ServicePort::Named(port.to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_service_without_a_port_is_read_and_shown_as_written() {
+        assert_eq!(
+            ServiceName::parse("edgerush.edge.svc.cluster.local"),
+            Ok(ServiceName {
+                service: "edgerush".to_owned(),
+                namespace: "edge".to_owned(),
+                cluster_domain: "cluster.local".to_owned(),
+            })
+        );
+        assert_eq!(
+            ServiceName::parse("edgerush.edge.svc.cluster.local")
+                .unwrap()
+                .to_string(),
+            "edgerush.edge.svc.cluster.local"
+        );
+        for (text, error) in [
+            (
+                "edgerush.edge.svc.cluster.local:http",
+                ServiceNameError::NotAService,
+            ),
+            ("edgerush.edge.svc", ServiceNameError::NotAService),
+            (
+                "edgerush.edge.svc.Cluster.local",
+                ServiceNameError::Label("Cluster".to_owned()),
+            ),
+            (
+                "1edgerush.edge.svc.cluster.local",
+                ServiceNameError::ServiceStart("1edgerush".to_owned()),
+            ),
+        ] {
+            assert_eq!(ServiceName::parse(text), Err(error), "{text}");
         }
     }
 
