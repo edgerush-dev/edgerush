@@ -15,6 +15,10 @@
 //! served must be those its config's routes are of.
 
 use edgerush_config::{Config, compile};
+use edgerush_gateway_api::gateway::Gateway;
+use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_translate::{Cluster, Plane, translate};
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
@@ -30,6 +34,10 @@ enum Manifest {
     Ingress(Box<Ingress>),
     Service(Box<Service>),
     Secret(Box<Secret>),
+    GatewayClass(Box<GatewayClass>),
+    Gateway(Box<Gateway>),
+    HTTPRoute(Box<HTTPRoute>),
+    ReferenceGrant(Box<ReferenceGrant>),
 }
 
 #[test]
@@ -47,6 +55,10 @@ fn every_case_translates_to_its_config_and_report() {
                 Manifest::Ingress(ingress) => cluster.ingresses.push(*ingress),
                 Manifest::Service(service) => cluster.services.push(*service),
                 Manifest::Secret(secret) => cluster.secrets.push(*secret),
+                Manifest::GatewayClass(class) => cluster.gateway_classes.push(*class),
+                Manifest::Gateway(gateway) => cluster.gateways.push(*gateway),
+                Manifest::HTTPRoute(route) => cluster.http_routes.push(*route),
+                Manifest::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
             }
         }
         cluster

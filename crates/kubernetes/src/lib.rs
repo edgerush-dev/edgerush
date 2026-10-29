@@ -98,6 +98,12 @@ pub enum ApiError {
     /// A namespace's objects asked for of a kind whose objects are the cluster's.
     #[error("a {0} is the cluster's, not a namespace's")]
     NotNamespaced(&'static str),
+    /// A name that no object can have, which would not make a field selector.
+    #[error("`{0}` is not an object's name")]
+    Name(String),
+    /// An object asked for by its name alone of a kind whose objects are a namespace's.
+    #[error("a {0} is a namespace's, and has no name of its own in the cluster")]
+    Namespaced(&'static str),
     /// The API server could not be connected to, or its certificate is not trusted.
     #[error("connecting to the API server: {0}")]
     Connect(String),
@@ -257,7 +263,7 @@ impl ApiServer {
         continue_from: Option<&str>,
     ) -> Result<List<K>, ApiError> {
         let mut path = format!("{}?limit={}", kind::collection::<K>(scope)?, K::PAGE);
-        fields_into::<K>(&mut path);
+        fields_into::<K>(scope, &mut path);
         if let Some(token) = continue_from {
             path.push_str("&continue=");
             encode_into(&mut path, token);
@@ -281,7 +287,7 @@ impl ApiServer {
             "{}?watch=true&allowWatchBookmarks=true&timeoutSeconds={WATCH_SECONDS}",
             kind::collection::<K>(scope)?
         );
-        fields_into::<K>(&mut path);
+        fields_into::<K>(scope, &mut path);
         path.push_str("&resourceVersion=");
         encode_into(&mut path, from);
         let body = self.get(&path, Instant::now() + self.timing.answer).await?;
@@ -637,11 +643,17 @@ fn server(host: Option<&str>, port: Option<&str>) -> Result<(String, u16), ApiEr
     Ok((host.to_owned(), number))
 }
 
-/// `K`'s field selector, if it has one, written into a query.
-fn fields_into<K: Kind>(query: &mut String) {
-    if let Some(fields) = K::FIELDS {
+/// The field selectors of `K` and of `scope`, if either has one, written into a query: an
+/// object named alone is selected by its name.
+fn fields_into<K: Kind>(scope: &Scope, query: &mut String) {
+    let named = match scope {
+        Scope::Named(name) => Some(format!("metadata.name={name}")),
+        _ => None,
+    };
+    let fields: Vec<&str> = K::FIELDS.into_iter().chain(named.as_deref()).collect();
+    if !fields.is_empty() {
         query.push_str("&fieldSelector=");
-        encode_into(query, fields);
+        encode_into(query, &fields.join(","));
     }
 }
 

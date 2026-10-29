@@ -3,6 +3,10 @@
 //! the data plane's settings, and saying what translating them came to, with no cluster.
 
 use edgerush_config::compile;
+use edgerush_gateway_api::gateway::Gateway;
+use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_translate::{Cluster, Plane, Translation, translate};
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
@@ -144,6 +148,10 @@ enum Manifest {
     Ingress(Box<Ingress>),
     Service(Box<Service>),
     Secret(Box<Secret>),
+    GatewayClass(Box<GatewayClass>),
+    Gateway(Box<Gateway>),
+    HTTPRoute(Box<HTTPRoute>),
+    ReferenceGrant(Box<ReferenceGrant>),
     List {
         items: Vec<Manifest>,
     },
@@ -158,6 +166,10 @@ impl Manifest {
             Self::Ingress(ingress) => cluster.ingresses.push(*ingress),
             Self::Service(service) => cluster.services.push(*service),
             Self::Secret(secret) => cluster.secrets.push(*secret),
+            Self::GatewayClass(class) => cluster.gateway_classes.push(*class),
+            Self::Gateway(gateway) => cluster.gateways.push(*gateway),
+            Self::HTTPRoute(route) => cluster.http_routes.push(*route),
+            Self::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
             Self::List { items } => {
                 for item in items {
                     item.into_cluster(cluster);
@@ -408,5 +420,42 @@ items:
                 .collect::<Vec<_>>(),
             ["web"]
         );
+    }
+
+    /// The Gateway API's kinds are read, an object of the experimental channel among them.
+    #[test]
+    fn the_gateway_apis_kinds_are_read() {
+        let yaml = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec: { controllerName: edgerush.dev/gateway-controller }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec: { gatewayClassName: edgerush, listeners: [{ name: http, port: 80, protocol: HTTP }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: web, namespace: shop }
+spec: { rules: [{ filters: [{ type: ExternalAuth, externalAuth: { protocol: HTTP } }] }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: from-edge, namespace: shop }
+spec: { from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: edge }], to: [{ group: '', kind: Service }] }
+";
+        let mut cluster = Cluster::default();
+        for manifest in serde_saphyr::from_multiple::<Manifest>(yaml).unwrap() {
+            manifest.into_cluster(&mut cluster);
+        }
+        let counts = (
+            cluster.gateway_classes.len(),
+            cluster.gateways.len(),
+            cluster.http_routes.len(),
+            cluster.reference_grants.len(),
+        );
+        assert_eq!(counts, (1, 1, 1, 1));
     }
 }

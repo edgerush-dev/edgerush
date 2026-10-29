@@ -11,6 +11,8 @@ publish.workspace = true
 # A Secret's certificate is read as the data plane will read it, by the same code.
 edgerush-certificates.workspace = true
 edgerush-config.workspace = true
+# The Gateway API kinds translated.
+edgerush-gateway-api.workspace = true
 k8s-openapi.workspace = true
 serde.workspace = true
 thiserror.workspace = true

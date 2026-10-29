@@ -23,6 +23,8 @@ edgerush-explain.workspace = true
 edgerush-kubernetes.workspace = true
 edgerush-proxy.workspace = true
 edgerush-translate.workspace = true
+# The Gateway API kinds the control plane follows and `validate` reads.
+edgerush-gateway-api.workspace = true
 # What `dns` upstreams' names resolve to: the queries and answers (03 §6).
 edgerush-dns.workspace = true
 # The webhook's answers, by status.

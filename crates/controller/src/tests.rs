@@ -151,6 +151,13 @@ fn hear(heard: &Rc<RefCell<Heard>>) -> impl Fn(Said<'_>) + 'static {
         let mut heard = heard.borrow_mut();
         let line = match said {
             Said::Waiting(unlisted) => format!("waiting on {}", unlisted.join(", ")),
+            Said::GatewayApi(served) => {
+                let kinds: Vec<String> = served
+                    .iter()
+                    .map(|(kind, served)| format!("{}: {served}", kind.crd()))
+                    .collect();
+                format!("gateway api: {}", kinds.join("; "))
+            }
             Said::Failed { followed, failure } => format!("{followed}: {failure}"),
             Said::Translated(translation) => {
                 heard.translations.push(translation.clone());
@@ -203,6 +210,7 @@ fn follow_of<K>(name: &str, listed: bool, objects: Vec<K>) -> Follow<K> {
     Follow {
         name: name.to_owned(),
         objects: watch::channel(Arc::new(Listed { listed, objects })).1,
+        _tasks: Tasks(Vec::new()),
     }
 }
 
@@ -228,6 +236,7 @@ fn every_follows_objects_are_translated_and_its_secrets_looked_at() {
             vec![secret("shop", &[])],
         )],
         status_service: Vec::new(),
+        gateway_api: None,
     };
     assert_eq!(
         followed.unlisted(),
@@ -250,6 +259,293 @@ fn every_follows_objects_are_translated_and_its_secrets_looked_at() {
         .collect();
     assert_eq!(services, ["shop", "blog"]);
     assert_eq!(cluster.secrets.len(), 1);
+}
+
+/// The CRD of a Gateway API kind, as the API server sends it, serving `versions`.
+fn crd(kind: GatewayKind, versions: &[&str]) -> CustomResourceDefinition {
+    let (plural, group) = kind.crd().split_once('.').unwrap();
+    let versions: Vec<serde_json::Value> = versions
+        .iter()
+        .map(|name| serde_json::json!({ "name": name, "served": true, "storage": false }))
+        .collect();
+    serde_json::from_value(serde_json::json!({
+        "metadata": {
+            "name": kind.crd(),
+            "resourceVersion": "6",
+            "annotations": { "gateway.networking.k8s.io/bundle-version": "v1.7.0" },
+        },
+        "spec": {
+            "group": group,
+            "scope": "Namespaced",
+            "names": { "kind": format!("{kind:?}"), "plural": plural },
+            "versions": versions,
+        },
+    }))
+    .unwrap()
+}
+
+/// The data plane of [`plane`], as the Gateway `edge/web`.
+fn gateway_plane() -> Plane {
+    let mut plane = plane();
+    plane.gateway = Some(edgerush_translate::GatewayName::try_from("edge/web".to_owned()).unwrap());
+    plane
+}
+
+#[test]
+fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
+    let route: HTTPRoute =
+        serde_saphyr::from_str("metadata: { name: web, namespace: shop }\nspec: {}").unwrap();
+    let gateway_api = GatewayApi {
+        crds: vec![
+            (
+                GatewayKind::HTTPRoute,
+                follow_of(
+                    "crd httproutes",
+                    true,
+                    vec![crd(GatewayKind::HTTPRoute, &["v1"])],
+                ),
+            ),
+            (
+                GatewayKind::ReferenceGrant,
+                follow_of("crd referencegrants", false, Vec::new()),
+            ),
+        ],
+        namespace: Scope::Namespace("edge".to_owned()),
+        last: None,
+        gateway_classes: None,
+        gateways: None,
+        http_routes: Some(vec![follow_of("httproutes in shop", false, vec![route])]),
+        reference_grants: None,
+    };
+    assert_eq!(gateway_api.served(), None, "a CRD not listed yet");
+    let unlisted: Vec<String> = gateway_api.unlisted().collect();
+    assert_eq!(unlisted, ["crd referencegrants", "httproutes in shop"]);
+    // A kind no longer served is no longer followed: none of its objects, none waited on.
+    let served = [
+        (GatewayKind::HTTPRoute, Served::Missing),
+        (GatewayKind::ReferenceGrant, Served::Missing),
+    ];
+    let followed_with = |gateway_api| Followed {
+        ingress_classes: Vec::new(),
+        ingresses: Vec::new(),
+        services: Vec::new(),
+        secrets: Vec::new(),
+        status_service: Vec::new(),
+        gateway_api: Some(gateway_api),
+    };
+    let followed = followed_with(gateway_api);
+    assert_eq!(followed.cluster().http_routes.len(), 1);
+    let Some(mut gateway_api) = followed.gateway_api else {
+        unreachable!()
+    };
+    keep(
+        &mut gateway_api.http_routes,
+        served[0].1.is_served(),
+        || panic!("started though not served"),
+    );
+    assert!(gateway_api.http_routes.is_none());
+    let followed = followed_with(gateway_api);
+    assert!(followed.cluster().http_routes.is_empty());
+    assert_eq!(followed.unlisted(), ["crd referencegrants"]);
+}
+
+#[test]
+fn a_kind_followed_is_started_once_and_stopped_when_no_longer_served() {
+    let mut slot: Option<Vec<Follow<HTTPRoute>>> = None;
+    let mut started = 0;
+    for on in [true, true, false, false, true] {
+        keep(&mut slot, on, || {
+            started += 1;
+            vec![follow_of("httproutes", true, Vec::new())]
+        });
+        assert_eq!(slot.is_some(), on);
+    }
+    assert_eq!(started, 2, "started again while followed");
+}
+
+/// The data plane names a Gateway: each Gateway API kind's CRD is followed by its name,
+/// the kinds whose CRDs serve `v1` are followed, Gateways in the Gateway's namespace alone,
+/// one served at an older version alone is never asked for, and a CRD deleted and installed
+/// again stops its kind's follow and starts a new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
+    // 0: the CRD there; 1: deleted; 2: installed again.
+    let stage = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let told = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (at, sent) = (Arc::clone(&stage), Arc::clone(&told));
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        let watching = path.contains("watch=true");
+        let named = |kind: GatewayKind| {
+            path.starts_with("/apis/apiextensions.k8s.io/v1/customresourcedefinitions?")
+                && path.contains(&format!("metadata.name%3D{}", kind.crd()))
+        };
+        if named(GatewayKind::HTTPRoute) && watching {
+            // The change of the stage, sent once on the next watch.
+            let now = at.load(Ordering::SeqCst);
+            if sent.swap(now, Ordering::SeqCst) == now {
+                return Answer {
+                    pause: Duration::from_millis(100),
+                    ..open()
+                };
+            }
+            let kind = if now == 1 { "DELETED" } else { "ADDED" };
+            let event = serde_json::json!({
+                "type": kind,
+                "object": crd(GatewayKind::HTTPRoute, &["v1", "v1beta1"]),
+            });
+            return Answer {
+                status: 200,
+                chunks: vec![Bytes::from(format!("{event}\n"))],
+                pause: Duration::from_millis(100),
+            };
+        }
+        if watching {
+            return open();
+        }
+        let gateway_api = "/apis/gateway.networking.k8s.io/v1/";
+        if named(GatewayKind::HTTPRoute) && at.load(Ordering::SeqCst) == 1 {
+            page::<CustomResourceDefinition>(&[])
+        } else if named(GatewayKind::HTTPRoute) {
+            page(&[crd(GatewayKind::HTTPRoute, &["v1", "v1beta1"])])
+        } else if named(GatewayKind::ReferenceGrant) {
+            // An install before Gateway API v1.5.
+            page(&[crd(GatewayKind::ReferenceGrant, &["v1beta1"])])
+        } else if named(GatewayKind::GatewayClass) {
+            page(&[crd(GatewayKind::GatewayClass, &["v1"])])
+        } else if named(GatewayKind::Gateway) {
+            page(&[crd(GatewayKind::Gateway, &["v1"])])
+        } else if path.starts_with(&format!("{gateway_api}namespaces/edge/gateways?")) {
+            answer(
+                200,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"web","namespace":"edge"},"spec":{"gatewayClassName":"edgerush"}}]}"#,
+            )
+        } else if path.starts_with(&format!("{gateway_api}gatewayclasses?")) {
+            answer(
+                200,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"edgerush"},"spec":{"controllerName":"edgerush.dev/gateway-controller"}}]}"#,
+            )
+        } else if path.starts_with(&format!("{gateway_api}httproutes?")) {
+            answer(
+                200,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"web","namespace":"shop"},"spec":{}}]}"#,
+            )
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[ingress("shop", "web", "shop.example")])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/secrets?") {
+            page(&[secret("shop", &["shop.example"])])
+        } else {
+            answer(500, "")
+        }
+    })
+    .await;
+    let api = fake.client(
+        &token("controller-gateway-api", "secret"),
+        Timing::default(),
+    );
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let said_of = |heard: &Heard, line: &str| heard.lines.iter().filter(|l| *l == line).count();
+    let crd_lines = |httproutes: &str| {
+        format!(
+            "gateway api: gatewayclasses.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
+             gateways.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
+             httproutes.gateway.networking.k8s.io: {httproutes}; \
+             referencegrants.gateway.networking.k8s.io: not served at v1 (only v1beta1; Gateway API v1.7.0), \
+             so taken as having no objects"
+        )
+    };
+    let served_line = crd_lines("served at v1 (Gateway API v1.7.0)");
+    let missing_line = crd_lines("not installed, so taken as having no objects");
+    let waiting_on_routes =
+        "waiting on gatewayclasses in the cluster, gateways in edge, httproutes in the cluster";
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let plane = gateway_plane();
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &[Scope::Cluster],
+                        &plane,
+                        Debounce::default(),
+                        None,
+                        None,
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("translated", || !heard.borrow().translations.is_empty()).await;
+            {
+                let heard = heard.borrow();
+                assert_eq!(said_of(&heard, &served_line), 1, "{:?}", heard.lines);
+                assert_eq!(said_of(&heard, waiting_on_routes), 1, "{:?}", heard.lines);
+                let translation = &heard.translations[0];
+                assert_eq!(routes(translation), ["ingress/shop/web/shop.example"]);
+                let report: Vec<String> =
+                    translation.report.iter().map(ToString::to_string).collect();
+                assert_eq!(
+                    report,
+                    ["Gateway edge/web: not supported yet: the Gateway API"]
+                );
+            }
+            stage.store(1, Ordering::SeqCst);
+            until("the CRD's deletion said", || {
+                said_of(&heard.borrow(), &missing_line) == 1
+            })
+            .await;
+            stage.store(2, Ordering::SeqCst);
+            until("a new follow of HTTPRoutes waited on", || {
+                said_of(&heard.borrow(), waiting_on_routes) == 1
+                    && heard
+                        .borrow()
+                        .lines
+                        .iter()
+                        .any(|line| line == "waiting on httproutes in the cluster")
+            })
+            .await;
+            assert_eq!(
+                said_of(&heard.borrow(), &served_line),
+                2,
+                "{:?}",
+                heard.borrow().lines
+            );
+            controlling.abort();
+        })
+        .await;
+    let lists: Vec<String> = fake
+        .seen()
+        .into_iter()
+        .filter(|seen| !seen.path.contains("watch=true"))
+        .map(|seen| seen.path)
+        .collect();
+    assert!(
+        !lists.iter().any(|path| path.contains("/referencegrants?")),
+        "a kind not served was asked for: {lists:?}"
+    );
+    let gateways: Vec<&str> = lists
+        .iter()
+        .filter(|path| path.contains("/gateways?"))
+        .map(|path| path.split('?').next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        gateways,
+        ["/apis/gateway.networking.k8s.io/v1/namespaces/edge/gateways"],
+        "Gateways followed in the Gateway's namespace alone"
+    );
+    let routes_listed = lists
+        .iter()
+        .filter(|path| path.contains("/httproutes?"))
+        .count();
+    assert_eq!(
+        routes_listed, 2,
+        "HTTPRoutes listed by each follow: {lists:?}"
+    );
 }
 
 #[test]
@@ -291,6 +587,7 @@ fn a_translation_no_different_from_the_last_is_not_said_again() {
         services: vec![service("shop")],
         secrets: vec![secret("shop", hosts)],
         secrets_assumed: false,
+        ..Cluster::default()
     };
     let mut translator = Translator::default();
     let shop = cluster(&["shop.example"]);

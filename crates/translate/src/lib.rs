@@ -26,6 +26,10 @@ use edgerush_config::{
     Redirect, Route, Rule, Scheme, StatedNames, Upstream, UpstreamProtocol, UpstreamTls, Wildcard,
     compile,
 };
+use edgerush_gateway_api::gateway::Gateway;
+use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::{
     Ingress, IngressBackend, IngressClass, IngressServiceBackend,
@@ -40,6 +44,9 @@ use std::fmt;
 /// The controller an IngressClass names to be served by EdgeRush (02 §2).
 pub const CONTROLLER: &str = "edgerush.dev/ingress-controller";
 
+/// The controller a GatewayClass names to be served by EdgeRush (02 §2).
+pub const GATEWAY_CONTROLLER: &str = "edgerush.dev/gateway-controller";
+
 /// The data plane's own settings, which in a cluster are its `DataPlane` resource's
 /// ([05 §1](../../../docs/05-operator.md)).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -47,6 +54,11 @@ pub const CONTROLLER: &str = "edgerush.dev/ingress-controller";
 pub struct Plane {
     /// The IngressClass whose Ingresses it serves.
     pub ingress_class: String,
+    /// The Gateway it is, if it serves the Gateway API, written `<namespace>/<name>`
+    /// ([04 §2](../../../docs/04-control-plane.md)). Only then are the Gateway API's kinds
+    /// followed (04 §1).
+    #[serde(default)]
+    pub gateway: Option<GatewayName>,
     /// Its listeners, as its config states them. An Ingress is served on every `http` one,
     /// and the hosts its `tls` lists on every `https` one too, which names no certificate
     /// of its own: it presents the Ingresses' Secrets'.
@@ -76,6 +88,49 @@ pub struct Plane {
     pub data_plane: DataPlane,
 }
 
+/// The Gateway a data plane is, by namespace and name: `<namespace>/<name>` as written.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(try_from = "String")]
+pub struct GatewayName {
+    /// Its namespace.
+    pub namespace: String,
+    /// Its name.
+    pub name: String,
+}
+
+impl TryFrom<String> for GatewayName {
+    type Error = String;
+
+    fn try_from(written: String) -> Result<Self, String> {
+        let invalid = || format!("`{written}` is not <namespace>/<name>");
+        let (namespace, name) = written.split_once('/').ok_or_else(invalid)?;
+        if !is_label(namespace) || !name.split('.').all(is_label) || name.len() > 253 {
+            return Err(invalid());
+        }
+        Ok(Self {
+            namespace: namespace.to_owned(),
+            name: name.to_owned(),
+        })
+    }
+}
+
+impl fmt::Display for GatewayName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.namespace, self.name)
+    }
+}
+
+/// Whether `label` is a DNS label, as a namespace's name is and each of a Gateway's
+/// name's parts.
+fn is_label(label: &str) -> bool {
+    (1..=63).contains(&label.len())
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+}
+
 /// The objects translated.
 #[derive(Debug, Clone, Default)]
 pub struct Cluster {
@@ -92,6 +147,15 @@ pub struct Cluster {
     /// asked to check them, as repositories seldom hold them (04 §3). The control plane
     /// always looks.
     pub secrets_assumed: bool,
+    /// Every GatewayClass seen, where the data plane is a Gateway: the Gateway API's kinds
+    /// are followed only then (04 §1), and those its install does not serve are none.
+    pub gateway_classes: Vec<GatewayClass>,
+    /// Every Gateway seen.
+    pub gateways: Vec<Gateway>,
+    /// Every HTTPRoute seen.
+    pub http_routes: Vec<HTTPRoute>,
+    /// Every ReferenceGrant seen.
+    pub reference_grants: Vec<ReferenceGrant>,
 }
 
 /// A data plane's config, and what could not go into it.
@@ -400,6 +464,16 @@ pub enum Problem {
 #[must_use]
 pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut report = Vec::new();
+    if let Some(gateway) = &plane.gateway {
+        report.push(Finding {
+            object: Object {
+                kind: "Gateway",
+                namespace: gateway.namespace.clone(),
+                name: gateway.name.clone(),
+            },
+            problem: Problem::NotSupportedYet("the Gateway API"),
+        });
+    }
     // An Ingress is the data plane's when its class is, and its class is when the
     // IngressClass of that name names this controller; one of no class is when that class
     // is the cluster's default.
@@ -1387,6 +1461,32 @@ fn service_port<'a>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_gateway_is_named_by_namespace_and_name() {
+        let named = GatewayName::try_from("edge/web.v2".to_owned()).unwrap();
+        assert_eq!(
+            (named.namespace.as_str(), named.name.as_str()),
+            ("edge", "web.v2")
+        );
+        assert_eq!(named.to_string(), "edge/web.v2");
+        for written in [
+            "web",
+            "/web",
+            "edge/",
+            "Edge/web",
+            "edge/web/x",
+            "edge/-web",
+            "edge/a..b",
+        ] {
+            assert_eq!(
+                GatewayName::try_from(written.to_owned()),
+                Err(format!("`{written}` is not <namespace>/<name>")),
+            );
+        }
+        let long = format!("edge/{}", vec!["a".repeat(63); 4].join("."));
+        assert!(GatewayName::try_from(long).is_err(), "longer than 253");
+    }
+
     const HTTP: &str = "  http: { address: \"[::]:8080\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n";
 
     /// Ingresses `good`, routing `/`, and `bad`, routing a path that climbs, which the data
@@ -1421,6 +1521,7 @@ spec: { controller: edgerush.dev/ingress-controller }
                 services: vec![service],
                 secrets: Vec::new(),
                 secrets_assumed: false,
+                ..Cluster::default()
             },
         )
     }
@@ -1481,6 +1582,7 @@ spec: { controller: edgerush.dev/ingress-controller }
             ],
             secrets: Vec::new(),
             secrets_assumed,
+            ..Cluster::default()
         }
         };
 

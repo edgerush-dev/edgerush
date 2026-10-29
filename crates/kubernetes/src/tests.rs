@@ -1,9 +1,14 @@
 use super::*;
 use crate::testing::*;
+use edgerush_gateway_api::gateway::Gateway;
+use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -380,12 +385,151 @@ fn each_kind_is_asked_for_at_its_own_path_in_the_cluster_or_a_namespace() {
             kind::collection::<EndpointSlice>(&Scope::Cluster),
             "/apis/discovery.k8s.io/v1/endpointslices",
         ),
+        (
+            kind::collection::<GatewayClass>(&Scope::Cluster),
+            "/apis/gateway.networking.k8s.io/v1/gatewayclasses",
+        ),
+        (
+            kind::collection::<Gateway>(&shop),
+            "/apis/gateway.networking.k8s.io/v1/namespaces/shop/gateways",
+        ),
+        (
+            kind::collection::<HTTPRoute>(&shop),
+            "/apis/gateway.networking.k8s.io/v1/namespaces/shop/httproutes",
+        ),
+        (
+            kind::collection::<ReferenceGrant>(&shop),
+            "/apis/gateway.networking.k8s.io/v1/namespaces/shop/referencegrants",
+        ),
+        // One object by its name is the cluster's, selected by its name (below).
+        (
+            kind::collection::<CustomResourceDefinition>(&Scope::Named(
+                "httproutes.gateway.networking.k8s.io".to_owned(),
+            )),
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        ),
     ] {
         assert_eq!(path.as_deref(), Ok(expected));
     }
     assert_eq!(
         kind::collection::<IngressClass>(&shop),
         Err(ApiError::NotNamespaced("IngressClass"))
+    );
+    assert_eq!(
+        kind::collection::<HTTPRoute>(&Scope::Named("web".to_owned())),
+        Err(ApiError::Namespaced("HTTPRoute"))
+    );
+}
+
+#[test]
+fn an_object_is_named_by_a_dns_subdomain() {
+    for name in [
+        "",
+        "Web",
+        "a..b",
+        ".a",
+        "a.",
+        "-a",
+        "a-",
+        "a/b",
+        "a b",
+        &"a".repeat(254),
+    ] {
+        assert_eq!(Scope::named(name), Err(ApiError::Name(name.to_owned())));
+        assert_eq!(
+            kind::collection::<CustomResourceDefinition>(&Scope::Named(name.to_owned())),
+            Err(ApiError::Name(name.to_owned()))
+        );
+    }
+    for name in [
+        "httproutes.gateway.networking.k8s.io",
+        "a",
+        "a-b.c-d",
+        "0.1",
+    ] {
+        assert_eq!(Scope::named(name), Ok(Scope::Named(name.to_owned())));
+    }
+}
+
+/// HTTPRoute's CRD as the API server sends it, cut short: its schema stands for the hundreds
+/// of kilobytes a whole one is.
+const HTTPROUTE_CRD: &str = r#"{"metadata":{"name":"httproutes.gateway.networking.k8s.io","resourceVersion":"7","labels":{"app":"x"},"annotations":{"gateway.networking.k8s.io/bundle-version":"v1.7.0","gateway.networking.k8s.io/channel":"standard","kubectl.kubernetes.io/last-applied-configuration":"{}"},"managedFields":[{"manager":"kubectl"}]},"spec":{"group":"gateway.networking.k8s.io","names":{"kind":"HTTPRoute","plural":"httproutes"},"scope":"Namespaced","versions":[{"name":"v1","served":true,"storage":true,"schema":{"openAPIV3Schema":{"type":"object"}},"additionalPrinterColumns":[{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}]},{"name":"v1beta1","served":true,"storage":false,"schema":{"openAPIV3Schema":{"type":"object"}}}]}}"#;
+
+#[tokio::test]
+async fn a_crd_is_asked_for_by_its_name_and_kept_without_its_schemas() {
+    let fake = Fake::start(&["127.0.0.1"], |path| {
+        if path.contains("watch=true") {
+            answer(
+                200,
+                &format!("{{\"type\":\"ADDED\",\"object\":{HTTPROUTE_CRD}}}\n"),
+            )
+        } else {
+            answer(
+                200,
+                &format!(r#"{{"metadata":{{"resourceVersion":"7"}},"items":[{HTTPROUTE_CRD}]}}"#),
+            )
+        }
+    })
+    .await;
+    let client = fake.client(&token("crds", "secret"), Timing::default());
+    let named = Scope::named("httproutes.gateway.networking.k8s.io").unwrap();
+    let page = client
+        .list::<CustomResourceDefinition>(&named, None)
+        .await
+        .unwrap();
+    let mut events = client
+        .watch::<CustomResourceDefinition>(&named, "7")
+        .await
+        .unwrap();
+    let Some(Ok(WatchEvent::Added(watched))) = events.next().await else {
+        panic!("the CRD is watched");
+    };
+    for crd in [&page.items[0], &watched] {
+        assert_eq!(crd.metadata.managed_fields, None);
+        assert_eq!(crd.metadata.labels, None);
+        assert_eq!(
+            crd.metadata.annotations,
+            Some(BTreeMap::from([
+                (
+                    "gateway.networking.k8s.io/bundle-version".to_owned(),
+                    "v1.7.0".to_owned()
+                ),
+                (
+                    "gateway.networking.k8s.io/channel".to_owned(),
+                    "standard".to_owned()
+                ),
+            ]))
+        );
+        let versions: Vec<_> = crd
+            .spec
+            .versions
+            .iter()
+            .map(|v| {
+                (
+                    v.name.as_str(),
+                    v.served,
+                    v.schema.is_none(),
+                    v.additional_printer_columns.is_none(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            versions,
+            [("v1", true, true, true), ("v1beta1", true, true, true)]
+        );
+    }
+
+    let seen = fake.seen();
+    let selector = "fieldSelector=metadata.name%3Dhttproutes.gateway.networking.k8s.io";
+    assert_eq!(
+        seen[0].path,
+        format!("/apis/apiextensions.k8s.io/v1/customresourcedefinitions?limit=500&{selector}")
+    );
+    assert_eq!(
+        seen[1].path,
+        format!(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions?watch=true&allowWatchBookmarks=true&timeoutSeconds=300&{selector}&resourceVersion=7"
+        )
     );
 }
 

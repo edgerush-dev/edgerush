@@ -1,13 +1,18 @@
 //! The kinds EdgeRush lists and watches, and what it asks of each: the data plane's
-//! EndpointSlices; the control plane's Ingresses, IngressClasses, Services and Secrets
-//! ([04 §1](../../../docs/04-control-plane.md)), and the Lease its replicas elect a leader
-//! by ([02 §3](../../../docs/02-architecture.md)).
+//! EndpointSlices; the control plane's Ingresses, IngressClasses, Services and Secrets, the
+//! Gateway API's kinds and their CRDs ([04 §1](../../../docs/04-control-plane.md)), and the
+//! Lease its replicas elect a leader by ([02 §3](../../../docs/02-architecture.md)).
 
 use crate::ApiError;
+use edgerush_gateway_api::gateway::Gateway;
+use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::{ListableResource, Metadata};
 use serde::de::DeserializeOwned;
@@ -86,13 +91,62 @@ impl Kind for Secret {
     }
 }
 
-/// What is listed and watched of a kind: every object in the cluster, or a namespace's.
+impl Kind for GatewayClass {
+    const NAMESPACED: bool = false;
+}
+
+impl Kind for Gateway {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for HTTPRoute {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for ReferenceGrant {
+    const NAMESPACED: bool = true;
+}
+
+/// The annotations of a CRD that are kept: the Gateway API's release and channel.
+const CRD_ANNOTATIONS: [&str; 2] = [
+    "gateway.networking.k8s.io/bundle-version",
+    "gateway.networking.k8s.io/channel",
+];
+
+impl Kind for CustomResourceDefinition {
+    const NAMESPACED: bool = false;
+
+    /// A CRD is read for the versions it serves, and for the Gateway API's release, so that
+    /// is all that is kept: its schemas, which run to hundreds of kilobytes, go.
+    fn trim(&mut self) {
+        let metadata = self.metadata_mut();
+        metadata.managed_fields = None;
+        metadata.labels = None;
+        if let Some(annotations) = metadata.annotations.as_mut() {
+            annotations.retain(|key, _| CRD_ANNOTATIONS.contains(&key.as_str()));
+        }
+        self.spec.conversion = None;
+        for version in &mut self.spec.versions {
+            version.schema = None;
+            version.additional_printer_columns = None;
+            version.selectable_fields = None;
+        }
+    }
+}
+
+/// What is listed and watched of a kind: every object in the cluster, a namespace's, or one
+/// object by its name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Scope {
     /// Every object in the cluster.
     Cluster,
     /// A namespace's objects.
     Namespace(String),
+    /// The object of this name, of a kind whose objects are the cluster's: what is asked
+    /// for where only some objects of a kind may be read (RBAC's `resourceNames`), such as
+    /// the CRDs of the Gateway API kinds followed (04 §9). Listed as the cluster's with a
+    /// field selector on its name, which a list of no such object answers empty.
+    Named(String),
 }
 
 impl Scope {
@@ -108,6 +162,31 @@ impl Scope {
         }
         Ok(Self::Namespace(name.to_owned()))
     }
+
+    /// The object named `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Name`] for a name no object can have.
+    pub fn named(name: &str) -> Result<Self, ApiError> {
+        if !is_name(name) {
+            return Err(ApiError::Name(name.to_owned()));
+        }
+        Ok(Self::Named(name.to_owned()))
+    }
+}
+
+/// Whether `name` can be an object's: a DNS subdomain, as Kubernetes asks of most.
+fn is_name(name: &str) -> bool {
+    (1..=253).contains(&name.len())
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
 }
 
 /// Whether `name` can be a namespace's: a DNS label.
@@ -129,6 +208,15 @@ pub(crate) fn collection<K: Kind>(scope: &Scope) -> Result<String, ApiError> {
     };
     match scope {
         Scope::Cluster => Ok(format!("{group}/{}", K::URL_PATH_SEGMENT)),
+        Scope::Named(name) => {
+            if K::NAMESPACED {
+                return Err(ApiError::Namespaced(K::KIND));
+            }
+            if !is_name(name) {
+                return Err(ApiError::Name(name.clone()));
+            }
+            Ok(format!("{group}/{}", K::URL_PATH_SEGMENT))
+        }
         Scope::Namespace(namespace) => {
             if !K::NAMESPACED {
                 return Err(ApiError::NotNamespaced(K::KIND));

@@ -288,6 +288,7 @@ name = "edgerush-controller"
 version = "0.0.0"
 dependencies = [
  "edgerush-config",
+ "edgerush-gateway-api",
  "edgerush-kubernetes",
  "edgerush-translate",
  "k8s-openapi",
@@ -360,11 +361,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-gateway-api"
+version = "0.0.0"
+dependencies = [
+ "k8s-openapi",
+ "serde",
+]
+
+[[package]]
 name = "edgerush-kubernetes"
 version = "0.0.0"
 dependencies = [
  "boring",
  "bytes",
+ "edgerush-gateway-api",
  "h2",
  "http",
  "k8s-openapi",
@@ -467,6 +477,7 @@ version = "0.0.0"
 dependencies = [
  "edgerush-certificates",
  "edgerush-config",
+ "edgerush-gateway-api",
  "k8s-openapi",
  "serde",
  "thiserror",

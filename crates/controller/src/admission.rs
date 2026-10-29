@@ -125,6 +125,7 @@ pub fn judge(plane: &Plane, classes: &[IngressClass], ingress: &Ingress) -> Opti
         services: Vec::new(),
         secrets: Vec::new(),
         secrets_assumed: true,
+        ..Cluster::default()
     };
     // Alone, whatever is said of an Ingress is said of this one. What is said of an
     // IngressClass is that none is the data plane's, and what is said of the config as a

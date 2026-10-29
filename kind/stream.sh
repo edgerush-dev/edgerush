@@ -15,6 +15,9 @@
 # `shop`, and the data plane in `edge` dials it at edgerush-control.edge.svc:9443 and is
 # reached by `kubectl port-forward`. Then:
 #   - the Ingress is served, and its status says the data plane's Service's address;
+#   - the data plane named as a Gateway, the control plane says the Gateway API's CRDs are
+#     not installed and serves Ingress as ever; installed, each kind is followed, its CRD
+#     read by name alone as RBAC allows, and the Gateway said not translated yet;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
 #   - asked to reach its Service by the Service's own address, it is served through the
@@ -157,6 +160,41 @@ answers shop.example 200 30 || fail "the Ingress is not served: $(status shop.ex
 said --selector=app=edgerush-control "runs config" 10 ||
     fail "the control plane never heard the data plane run its config"
 pass "the Ingress is served, by $(curl -s -H 'host: shop.example' "http://127.0.0.1:$port/hostname")"
+
+# Waits up to $2 seconds for every control-plane replica's logs, whole, to have a line
+# with $1 in it.
+control_said() {
+    for _ in $(seq 1 $(($2 * 5))); do
+        local all=yes
+        for replica in $(k -n edge get pod -l app=edgerush-control -o name); do
+            k -n edge logs "$replica" 2>/dev/null | grep -q -- "$1" || all=
+        done
+        [ -n "$all" ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+# Whether a control-plane replica was refused anything of the Gateway API.
+refused_any() {
+    for replica in $(k -n edge get pod -l app=edgerush-control -o name); do
+        k -n edge logs "$replica" 2>/dev/null |
+            grep -E "(customresourcedefinitions|gatewayclasses|gateways|httproutes|referencegrants).*(403|forbidden)" &&
+            return 0
+    done
+    return 1
+}
+control_said "httproutes.gateway.networking.k8s.io: not installed" 30 ||
+    fail "the control plane never said the Gateway API's CRDs are not installed"
+pass "without the Gateway API's CRDs, the control plane says so, and serves the Ingress"
+# The CRDs are too large for kubectl's client-side record of what it applied.
+k create -f crates/gateway-api/crds/ >/dev/null
+control_said "httproutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)" 60 ||
+    fail "the control plane never said the Gateway API's CRDs are served"
+control_said "Gateway edge/web: not supported yet: the Gateway API" 30 ||
+    fail "the control plane never said its Gateway is not translated yet"
+refused_any && fail "a control-plane replica was refused something of the Gateway API"
+answers shop.example 200 10 || fail "with the Gateway API followed, $(status shop.example)"
+pass "installed, the Gateway API's kinds are followed, their CRDs read by name alone"
 
 # What the Ingress's status says, its first address.
 says() { k -n shop get ingress web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }
