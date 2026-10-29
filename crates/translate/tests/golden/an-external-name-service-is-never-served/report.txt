@@ -1,0 +1,1 @@
+Ingress shop/away: never served: an ExternalName Service, whose name can lead anywhere

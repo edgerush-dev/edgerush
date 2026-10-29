@@ -4,7 +4,6 @@ Ingress shop/c2-unknown-path-type: invalid: a path type Kubernetes does not have
 Ingress shop/c3-rule-without-paths: not supported yet: a rule without paths
 Ingress shop/c4-host-an-address: invalid: a host that is an IP address
 Ingress shop/f-backend-without-port: invalid: a Service backend without a port
-Ingress shop/h-external-name: not supported yet: an ExternalName Service
 Ingress shop/i-resource: not supported yet: a resource backend
 Ingress shop/i2-annotated: not supported yet: annotations
 Ingress shop/k-class-by-annotation: not supported yet: the `kubernetes.io/ingress.class` annotation
