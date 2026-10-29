@@ -70,6 +70,10 @@ pub struct Plane {
     /// a backend is answered 500.
     #[serde(default)]
     pub backend_authorities: Vec<String>,
+    /// The data plane's own settings, as its config states them
+    /// ([07 §1](../../../docs/07-config-and-dsl.md)), written into every config as they are.
+    #[serde(default)]
+    pub data_plane: DataPlane,
 }
 
 /// The objects translated.
@@ -661,13 +665,16 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         .collect();
     upstreams.retain(|name, _| used.contains(name));
     Translation {
-        config: config_of(
-            plane.listeners.clone(),
-            routes,
-            upstreams,
-            &presented,
-            &refused,
-        ),
+        config: Config {
+            data_plane: plane.data_plane,
+            ..config_of(
+                plane.listeners.clone(),
+                routes,
+                upstreams,
+                &presented,
+                &refused,
+            )
+        },
         report,
         passed_over: others.len(),
         unresolved,
@@ -1528,6 +1535,34 @@ spec: { controller: edgerush.dev/ingress-controller }
             problems
                 .iter()
                 .any(|problem| problem.starts_with("listener `http`")),
+            "{problems:?}"
+        );
+    }
+
+    /// The data plane's own settings go into its config as they are; one its config
+    /// refuses is its own fault, not any Ingress's: each is still judged on its own.
+    #[test]
+    fn the_data_planes_own_settings_go_into_its_config() {
+        let listeners = format!("{HTTP}data_plane: {{ set_aside_ms: 2000 }}\n");
+        let translation = good_and_bad(&listeners);
+        assert_eq!(translation.config.data_plane.set_aside_ms, Some(2000));
+        let refused = format!("{HTTP}data_plane: {{ set_aside_ms: 0 }}\n");
+        let translation = good_and_bad(&refused);
+        let reported = reported(&translation);
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert!(
+            reported[0].starts_with("Ingress shop/bad: "),
+            "{reported:?}"
+        );
+        assert_eq!(translation.config.routes.len(), 1);
+        let problems: Vec<String> = compile(&translation.config)
+            .unwrap_err()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("the data plane: `set_aside_ms` is 0"),
             "{problems:?}"
         );
     }

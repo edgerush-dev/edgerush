@@ -1,0 +1,17 @@
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: ingress/shop/app/app.example.com
+    listeners: [http]
+    hostnames: [{ name: app.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/app/http, weight: 1 }] }
+upstreams:
+  shop/app/http: { load_balancer: p2c, endpoints: { kubernetes: "app.shop.svc.cluster.local:http" } }
+data_plane: { set_aside_ms: 2000 }
