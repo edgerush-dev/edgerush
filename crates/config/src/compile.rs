@@ -151,8 +151,10 @@ pub struct CompiledSynchronous {
 /// Mutual TLS to the rate-limiting service's pods, the certificate shown found by its name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledServiceTls {
-    /// The certificates, in PEM, of the pods' authorities.
+    /// The certificates, in PEM, of the authorities trusted to vouch for the pods.
     pub authorities: Vec<String>,
+    /// The SPIFFE ID the pods' certificates carry.
+    pub pod_id: String,
     /// What the data plane shows the pods.
     pub certificate: NamedCertificate,
 }
@@ -684,6 +686,10 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
             if tls.authorities.is_empty() {
                 errors.push(place.problem(Problem::NoAuthority));
             }
+            if !is_spiffe_id(&tls.pod_id) {
+                let problem = Problem::RateLimitServicePodId(tls.pod_id.clone());
+                errors.push(place.problem(problem));
+            }
             if !config.certificates.contains_key(&tls.certificate) {
                 let problem = Problem::UnknownCertificate(tls.certificate.clone());
                 errors.push(place.problem(problem));
@@ -746,6 +752,7 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
         .and_then(|tls| {
             Some(CompiledServiceTls {
                 authorities: tls.authorities.clone(),
+                pod_id: tls.pod_id.clone(),
                 certificate: named(config, &tls.certificate)?,
             })
         });
@@ -1835,6 +1842,13 @@ fn is_host_and_port(address: &str) -> bool {
         })
 }
 
+/// Whether `id` is a SPIFFE ID, as a workload is known by (12 item 22): `spiffe://` and a
+/// trust domain, then the workload's path.
+fn is_spiffe_id(id: &str) -> bool {
+    id.strip_prefix("spiffe://")
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
+}
+
 /// The listeners a route is for, each once, as far as they exist.
 fn listeners_of<'a>(
     route: &'a Route,
@@ -2682,6 +2696,9 @@ pub enum Problem {
     /// A rate-limiting service whose cycle never comes.
     #[error("`rate_limiting.service`: `cycle_ms` is 0: at least 1")]
     RateLimitServiceCycleNever,
+    /// The pods' ID, to check them by, that is not a SPIFFE ID.
+    #[error("`rate_limiting.service.tls`: `pod_id` `{0}` is no SPIFFE ID (`spiffe://…`)")]
+    RateLimitServicePodId(String),
     /// A mode that needs the service, with none.
     #[error("`rate_limiting`: mode `{0}` needs `service`")]
     RateLimitingServiceMissing(&'static str),
@@ -5560,9 +5577,12 @@ rate_limiting: {{ {section} }}
     /// How a request waits for its owner, as a synchronous data plane is to say it.
     const WAITS: &str = "synchronous: { timeout_ms: 20, when_unreachable: allow, breaker: { failures: 5, probe_after_ms: 1000 } }";
 
+    /// The service's pods' ID, as a data plane checks them for it.
+    const POD_ID: &str = "spiffe://cluster.local/ns/edge/sa/rl";
+
     /// The service's pods are reached with mutual TLS in either mode that shares counts, as
-    /// said: an authority at least, and the certificate shown found among the config's;
-    /// plain when it says nothing.
+    /// said: an authority at least, the pods' ID a SPIFFE ID, and the certificate shown
+    /// found among the config's; plain when it says nothing.
     #[test]
     fn the_service_is_reached_with_tls_as_said() {
         let with = |mode: &str, tls: &str| {
@@ -5590,6 +5610,7 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls} }}{syn
         };
         let said = Some(CompiledServiceTls {
             authorities: vec!["CA".to_owned()],
+            pod_id: POD_ID.to_owned(),
             certificate: NamedCertificate {
                 name: "plane".to_owned(),
                 certificate: Certificate {
@@ -5603,7 +5624,9 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls} }}{syn
             assert_eq!(
                 with(
                     mode,
-                    r#", tls: { authorities: ["CA"], certificate: plane }"#
+                    &format!(
+                        r#", tls: {{ authorities: ["CA"], pod_id: "{POD_ID}", certificate: plane }}"#
+                    )
                 ),
                 Ok(said.clone()),
                 "{mode}"
@@ -5611,10 +5634,11 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls} }}{syn
             assert_eq!(
                 with(
                     mode,
-                    r#", tls: { authorities: [], certificate: elsewhere }"#
+                    r#", tls: { authorities: [], pod_id: "rl.test", certificate: elsewhere }"#
                 ),
                 Err(vec![
                     "the data plane: `tls` needs an authority to trust".to_owned(),
+                    "the data plane: `rate_limiting.service.tls`: `pod_id` `rl.test` is no SPIFFE ID (`spiffe://…`)".to_owned(),
                     "the data plane: there is no certificate `elsewhere`".to_owned(),
                 ]),
                 "{mode}"

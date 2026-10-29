@@ -4,8 +4,8 @@
 //! edgerush-ratelimit-service --id 0 --listen 0.0.0.0:7000 \
 //!     --pod 0=rl-0:7000 --pod 1=rl-1:7000 --pod 2=rl-2:7000 [--cycle-ms 10] \
 //!     [--max-key-bytes 268435456] [--metrics 0.0.0.0:9090] [--mode asynchronous] \
-//!     [--certificate pod.pem --key pod.key --authorities pods-ca.pem \
-//!      --data-plane-authorities data-planes-ca.pem]
+//!     [--certificate pod.pem --key pod.key --authorities ca.pem \
+//!      --data-plane-id spiffe://cluster.local/ns/edge/sa/edge]
 //! ```
 //!
 //! `--mode` is the rate-limiting mode the pod serves, `asynchronous` unless said, or
@@ -18,12 +18,13 @@
 //! what its keys may hold, 256 MiB unless said, past which the least recently changed are
 //! evicted; `--metrics`, where `/metrics` shows what they hold, nowhere unless said.
 //!
-//! The last four go together, PEM files read again every second, and serve the service
-//! with mutual TLS (`edgerush_ratelimit_service::secure`): the pod presents `--certificate`
-//! to data planes and to the other pods alike, takes data planes whose certificate the
-//! `--data-plane-authorities` vouch for and pods whose the `--authorities` do, and dials
-//! the other pods checking theirs against the `--authorities` alone. Without them, it is
-//! served plain, to anyone.
+//! The last four go together, the first three PEM files read again every second, and serve
+//! the service with mutual TLS (`edgerush_ratelimit_service::secure`): the pod presents
+//! `--certificate` to data planes and to the other pods alike, trusts the `--authorities`
+//! to vouch for every caller, and tells them apart by the SPIFFE ID their certificate
+//! carries: its own is the pods', `--data-plane-id` the data plane's it serves, and any
+//! other is refused. It dials the other pods checking theirs for its own ID. Without them,
+//! it is served plain, to anyone.
 
 use boring::ssl::SslConnector;
 use edgerush_control_service::reread;
@@ -73,7 +74,8 @@ struct Args {
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let (mut id, mut listen, mut pods, mut cycle) = (None, None, BTreeMap::new(), 10);
     let (mut max_key_bytes, mut metrics, mut mode) = (MAX_KEY_BYTES, None, Mode::Asynchronous);
-    let mut files: [Option<PathBuf>; 4] = [None, None, None, None];
+    let mut files: [Option<PathBuf>; 3] = [None, None, None];
+    let mut data_plane = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -115,7 +117,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--certificate" => files[0] = Some(value()?.into()),
             "--key" => files[1] = Some(value()?.into()),
             "--authorities" => files[2] = Some(value()?.into()),
-            "--data-plane-authorities" => files[3] = Some(value()?.into()),
+            "--data-plane-id" => data_plane = Some(value()?),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -126,13 +128,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     if mode == Mode::Synchronous && metrics.is_some() {
         return Err("--metrics is for the asynchronous mode, for now".to_owned());
     }
-    let tls = match files {
-        [None, None, None, None] => None,
-        [Some(certificate), Some(key), Some(pods), Some(data_planes)] => Some(PodFiles {
+    let tls = match (files, data_plane) {
+        ([None, None, None], None) => None,
+        ([Some(certificate), Some(key), Some(authorities)], Some(data_plane)) => Some(PodFiles {
             certificate,
             key,
-            pods,
-            data_planes,
+            authorities,
+            data_plane,
         }),
         _ => return Err(TOGETHER.to_owned()),
     };
@@ -148,8 +150,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     })
 }
 
-const TOGETHER: &str =
-    "--certificate, --key, --authorities and --data-plane-authorities go together";
+const TOGETHER: &str = "--certificate, --key, --authorities and --data-plane-id go together";
 
 /// A synchronous pod answers on one thread: a stream's decisions and its connection's writes
 /// share it, so that the asks one read brings in are answered in one write, where a
@@ -427,8 +428,8 @@ mod tests {
         let files = [
             ("--certificate", "pod.pem"),
             ("--key", "pod.key"),
-            ("--authorities", "pods.pem"),
-            ("--data-plane-authorities", "planes.pem"),
+            ("--authorities", "ca.pem"),
+            ("--data-plane-id", "spiffe://cluster.local/ns/edge/sa/edge"),
         ];
         let with = |given: &[(&'static str, &'static str)]| -> Vec<&str> {
             let flags = given.iter().flat_map(|(flag, path)| [*flag, *path]);
@@ -439,8 +440,8 @@ mod tests {
             Some(PodFiles {
                 certificate: "pod.pem".into(),
                 key: "pod.key".into(),
-                pods: "pods.pem".into(),
-                data_planes: "planes.pem".into(),
+                authorities: "ca.pem".into(),
+                data_plane: "spiffe://cluster.local/ns/edge/sa/edge".to_owned(),
             })
         );
         for left_out in 0..files.len() {

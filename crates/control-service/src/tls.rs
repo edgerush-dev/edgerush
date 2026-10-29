@@ -6,9 +6,9 @@ use boring::ssl::{
     AlpnError, SslAcceptor, SslConnector, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion,
     select_next_proto,
 };
-use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
-use edgerush_certificates::{CertificateError, Identity};
+use boring::x509::{X509, X509VerifyError};
+use edgerush_certificates::{CertificateError, Identity, spiffe_id};
 use edgerush_config::Certificate;
 
 /// What one end presents, and whom it trusts to vouch for the other.
@@ -32,6 +32,10 @@ pub enum TlsError {
     /// BoringSSL refused the set-up.
     #[error("setting up TLS: {0}")]
     Setup(String),
+    /// A workload's identity: a certificate without a SPIFFE ID where one is needed, or an
+    /// ID that is not one.
+    #[error("the identity: {0}")]
+    Identity(String),
 }
 
 /// HTTP/2, as gRPC is spoken, in ALPN's form.
@@ -72,6 +76,36 @@ pub fn connector(credentials: &Credentials) -> Result<SslConnector, TlsError> {
     let mut builder = SslConnector::builder(SslMethod::tls()).map_err(setup)?;
     common(&mut builder, credentials)?;
     builder.set_verify(SslVerifyMode::PEER);
+    builder.set_alpn_protos(H2).map_err(setup)?;
+    Ok(builder.build())
+}
+
+/// A connector as [`connector`]'s, that also refuses a peer whose certificate does not
+/// carry the SPIFFE ID `peer`: the authorities establish trust, the ID says which workload
+/// answered (12 item 22).
+///
+/// # Errors
+///
+/// A [`TlsError`] for credentials that cannot be used.
+pub fn connector_to(credentials: &Credentials, peer: &str) -> Result<SslConnector, TlsError> {
+    let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
+    let mut builder = SslConnector::builder(SslMethod::tls()).map_err(setup)?;
+    common(&mut builder, credentials)?;
+    let peer = peer.to_owned();
+    builder.set_verify_callback(SslVerifyMode::PEER, move |trusted, context| {
+        // Depth 0 is the peer's own certificate, reached once the chain above it is checked.
+        if !trusted || context.error_depth() > 0 {
+            return trusted;
+        }
+        let named = context
+            .current_cert()
+            .and_then(spiffe_id)
+            .is_some_and(|id| id == peer);
+        if !named {
+            context.set_error(Err(X509VerifyError::APPLICATION_VERIFICATION));
+        }
+        named
+    });
     builder.set_alpn_protos(H2).map_err(setup)?;
     Ok(builder.build())
 }

@@ -1191,11 +1191,11 @@
       ]
     },
     "RateLimitServiceTls": {
-      "description": "Mutual TLS to the rate-limiting service's pods: whom to trust to vouch for them, and\nwhat the data plane shows them.",
+      "description": "Mutual TLS to the rate-limiting service's pods: whom to trust to vouch for them, which\nworkload they must be, and what the data plane shows them.",
       "type": "object",
       "properties": {
         "authorities": {
-          "description": "The certificates, in PEM, of the pods' authorities, trusted to vouch for each pod as\nthe host of its address: the pods' alone, not the data planes'.",
+          "description": "The certificates, in PEM, of the authorities trusted to vouch for each pod as the\nhost of its address.",
           "type": "array",
           "items": {
             "type": "string"
@@ -1203,13 +1203,18 @@
           "minItems": 1
         },
         "certificate": {
-          "description": "The name of the certificate the data plane shows the pods, among `certificates`: one\nthe data planes' authorities signed, which lets it exchange or decide and no more.",
+          "description": "The name of the certificate the data plane shows the pods, among `certificates`: one\ncarrying the SPIFFE ID the pods are given as the data plane's, which lets it exchange\nor decide and no more.",
+          "type": "string"
+        },
+        "pod_id": {
+          "description": "The SPIFFE ID the pods' certificates carry (`spiffe://…`), which they share: a pod\nwhose certificate carries another is refused.",
           "type": "string"
         }
       },
       "additionalProperties": false,
       "required": [
         "authorities",
+        "pod_id",
         "certificate"
       ]
     },

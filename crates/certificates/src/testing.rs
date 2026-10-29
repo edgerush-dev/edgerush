@@ -17,8 +17,8 @@ use boring::x509::{X509, X509Builder, X509Name, X509NameBuilder, X509NameRef};
 use edgerush_config::Certificate;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// A self-signed certificate for `names`, with its key: each an IP address, or else a DNS
-/// name.
+/// A self-signed certificate for `names`, with its key: each an IP address, a URI such as
+/// a SPIFFE ID, or else a DNS name.
 #[must_use]
 pub fn certificate(names: &[&str]) -> Certificate {
     let key = key();
@@ -65,8 +65,8 @@ impl Authority {
         String::from_utf8(self.certificate.to_pem().unwrap()).unwrap()
     }
 
-    /// A certificate for `names` that it signs, with its key: each an IP address, or else
-    /// a DNS name.
+    /// A certificate for `names` that it signs, with its key: each an IP address, a URI such
+    /// as a SPIFFE ID, or else a DNS name.
     #[must_use]
     pub fn issue(&self, names: &[&str]) -> Certificate {
         let key = key();
@@ -120,6 +120,8 @@ fn alternatives(builder: &mut X509Builder, names: &[&str], issuer: Option<&X509>
     for name in names {
         if name.parse::<std::net::IpAddr>().is_ok() {
             alternatives.ip(name);
+        } else if name.contains("://") {
+            alternatives.uri(name);
         } else {
             alternatives.dns(name);
         }

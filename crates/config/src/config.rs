@@ -219,18 +219,23 @@ pub struct RateLimitService {
     pub tls: Option<RateLimitServiceTls>,
 }
 
-/// Mutual TLS to the rate-limiting service's pods: whom to trust to vouch for them, and
-/// what the data plane shows them ([06 §4](../../../docs/06-rate-limiting.md)).
+/// Mutual TLS to the rate-limiting service's pods: whom to trust to vouch for them, which
+/// workload they must be, and what the data plane shows them
+/// ([06 §4](../../../docs/06-rate-limiting.md)).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitServiceTls {
-    /// The certificates, in PEM, of the pods' authorities, trusted to vouch for each pod as
-    /// the host of its address: the pods' alone, not the data planes'.
+    /// The certificates, in PEM, of the authorities trusted to vouch for each pod as the
+    /// host of its address.
     #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub authorities: Vec<String>,
+    /// The SPIFFE ID the pods' certificates carry (`spiffe://…`), which they share: a pod
+    /// whose certificate carries another is refused.
+    pub pod_id: String,
     /// The name of the certificate the data plane shows the pods, among `certificates`: one
-    /// the data planes' authorities signed, which lets it exchange or decide and no more.
+    /// carrying the SPIFFE ID the pods are given as the data plane's, which lets it exchange
+    /// or decide and no more.
     pub certificate: String,
 }
 

@@ -12,6 +12,7 @@ publish.workspace = true
 # control stream's, whose TLS and certificate files it reuses.
 boring.workspace = true
 bytes.workspace = true
+edgerush-certificates.workspace = true
 edgerush-config.workspace = true
 edgerush-control-service.workspace = true
 edgerush-ratelimit.workspace = true
