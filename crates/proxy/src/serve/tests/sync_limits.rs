@@ -554,21 +554,22 @@ async fn an_owner_that_keeps_timing_out_opens_its_breaker() {
         .await;
 }
 
-/// An owner served with mutual TLS is asked by a data plane whose certificate the data
-/// planes' authority signed. One whose certificate it did not sign reaches no owner, and
-/// its requests are decided as `when_unreachable` says.
+/// An owner served with mutual TLS is asked by a data plane whose certificate carries the
+/// data plane's ID it is given. One whose certificate carries another workload's ID, though
+/// their authority issued it, reaches no owner, nor does one that checks the pods for an ID
+/// they do not carry: their requests are decided as `when_unreachable` says.
 #[tokio::test]
 async fn owners_are_asked_with_the_certificate_the_config_shows() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (pods, planes) = (Authority::new("pods"), Authority::new("data planes"));
+            let authority = Authority::new("workloads");
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let owner = listener.local_addr().unwrap().to_string();
             let tls = PodTls::new(&PodCredentials {
-                certificate: pods.issue(&["127.0.0.1"]),
-                pods: pods.pem(),
-                data_planes: planes.pem(),
+                certificate: authority.issue(&["127.0.0.1", POD_ID]),
+                authorities: authority.pem(),
+                data_plane: PLANE_ID.to_owned(),
             })
             .unwrap();
             let _pod = lone_secured_pod(listener, tls).await;
@@ -580,12 +581,14 @@ async fn owners_are_asked_with_the_certificate_the_config_shows() {
                 500,
                 "deny",
             );
-            let stranger = Authority::new("stranger");
-            for (shown, status, answered) in [
-                (planes.issue(&["plane"]), 200, Some(1)),
-                (stranger.issue(&["plane"]), 503, None),
+            let other = "spiffe://cluster.test/ns/edge/sa/other";
+            for (shown, pod_id, status, answered) in [
+                (PLANE_ID, POD_ID, 200, Some(1)),
+                (other, POD_ID, 503, None),
+                (PLANE_ID, other, 503, None),
             ] {
-                let secured = service_tls(config.clone(), &pods.pem(), shown);
+                let shown = authority.issue(&["plane", shown]);
+                let secured = service_tls(config.clone(), &authority.pem(), pod_id, shown);
                 let (proxy, mut sends) = serving(&secured, 1).await;
                 assert_eq!(statuses(&send_round(&mut sends, 1).await), [status]);
                 assert_eq!(
@@ -613,12 +616,12 @@ async fn an_open_breaker_closes_once_a_probe_hears_from_its_owner() {
                 // bound again could be taken in between, as the system hands it out.)
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let owner = listener.local_addr().unwrap();
-                let (pods, planes) = (Authority::new("pods"), Authority::new("data planes"));
+                let authority = Authority::new("workloads");
                 let _pod = if secured {
                     let tls = PodTls::new(&PodCredentials {
-                        certificate: pods.issue(&["127.0.0.1"]),
-                        pods: pods.pem(),
-                        data_planes: planes.pem(),
+                        certificate: authority.issue(&["127.0.0.1", POD_ID]),
+                        authorities: authority.pem(),
+                        data_plane: PLANE_ID.to_owned(),
                     })
                     .unwrap();
                     lone_secured_pod(listener, tls).await
@@ -639,7 +642,8 @@ async fn an_open_breaker_closes_once_a_probe_hears_from_its_owner() {
                     200,
                 );
                 if secured {
-                    config = service_tls(config, &pods.pem(), planes.issue(&["plane"]));
+                    let shown = authority.issue(&["plane", PLANE_ID]);
+                    config = service_tls(config, &authority.pem(), POD_ID, shown);
                 }
                 let (proxy, mut sends) = serving(&config, 1).await;
                 assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);

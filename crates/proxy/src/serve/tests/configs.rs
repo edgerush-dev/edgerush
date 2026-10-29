@@ -92,9 +92,18 @@ pub(super) fn forwarding_config(upstream: SocketAddr, trusted: &[&str]) -> Confi
 /// `config`'s rate-limiting service reached with mutual TLS: the pods checked against
 /// `pods`, an authority's certificate in PEM, and `shown` shown them, under the name
 /// `plane`.
+/// The SPIFFE ID the rate-limiting service's pods share in the tests.
+pub(super) const POD_ID: &str = "spiffe://cluster.test/ns/edge/sa/ratelimit";
+
+/// The SPIFFE ID of the data plane the pods serve in the tests.
+pub(super) const PLANE_ID: &str = "spiffe://cluster.test/ns/edge/sa/plane";
+
+/// `config` reaching its rate-limiting service's pods with mutual TLS: trusting
+/// `authority`, checking each pod for `pod_id`, and showing `shown`.
 pub(super) fn service_tls(
     mut config: edgerush_config::Config,
-    pods: &str,
+    authority: &str,
+    pod_id: &str,
     shown: edgerush_config::Certificate,
 ) -> edgerush_config::Config {
     config.certificates.insert("plane".to_owned(), shown);
@@ -104,7 +113,8 @@ pub(super) fn service_tls(
         .and_then(|limiting| limiting.service.as_mut())
         .unwrap();
     service.tls = Some(edgerush_config::RateLimitServiceTls {
-        authorities: vec![pods.to_owned()],
+        authorities: vec![authority.to_owned()],
+        pod_id: pod_id.to_owned(),
         certificate: "plane".to_owned(),
     });
     config

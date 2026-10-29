@@ -24,12 +24,12 @@ async fn counted_service(exchanges: &Arc<AtomicUsize>) -> Vec<String> {
 }
 
 /// The same, the answer to every exchange that reaches a pod before `hold` held back for
-/// [`HELD`]; served with mutual TLS if `tls` gives the pods' authority and the data
-/// planes'.
+/// [`HELD`]; served with mutual TLS if `tls` gives the authority that issues the pods'
+/// certificates, carrying [`POD_ID`], to serve the data plane [`PLANE_ID`].
 async fn held_service(
     exchanges: &Arc<AtomicUsize>,
     hold: &Arc<Mutex<Option<Instant>>>,
-    tls: Option<(&Authority, &Authority)>,
+    tls: Option<&Authority>,
 ) -> Vec<String> {
     let mut listeners = Vec::new();
     let mut addresses = Vec::new();
@@ -46,11 +46,11 @@ async fn held_service(
     };
     let mut pods = Vec::new();
     for (id, listener) in (0..3).zip(listeners) {
-        let secured = tls.map(|(pods, planes)| {
+        let secured = tls.map(|authority| {
             PodTls::new(&PodCredentials {
-                certificate: pods.issue(&["127.0.0.1"]),
-                pods: pods.pem(),
-                data_planes: planes.pem(),
+                certificate: authority.issue(&["127.0.0.1", POD_ID]),
+                authorities: authority.pem(),
+                data_plane: PLANE_ID.to_owned(),
             })
             .unwrap()
         });
@@ -665,10 +665,11 @@ async fn a_changed_service_starts_the_process_afresh() {
     assert!(proxy.hub().1.is_some(), "a service again");
 }
 
-/// Pods served with mutual TLS are sent no exchange by a data plane whose certificate the
-/// data planes' authority did not sign: it is refused in the handshake. A reload showing
-/// one it signed keeps the process's thread, keys and all, and its next connections show
-/// that: what waited is reported. One that drops TLS starts the thread afresh, as its
+/// Pods served with mutual TLS are sent no exchange by a data plane whose certificate,
+/// though their authority issued it, carries another workload's ID: it is refused once
+/// its handshake is done. A reload showing one with the data plane's ID keeps the
+/// process's thread, keys and all, and its next connections show that: what waited is
+/// reported. One that drops TLS starts the thread afresh, as its
 /// clients dial otherwise.
 #[tokio::test]
 async fn pods_are_reached_with_the_certificate_the_config_shows() {
@@ -676,17 +677,13 @@ async fn pods_are_reached_with_the_certificate_the_config_shows() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (pods, planes) = (Authority::new("pods"), Authority::new("data planes"));
+            let authority = Authority::new("workloads");
             let exchanges = Arc::new(AtomicUsize::new(0));
-            let service = held_service(
-                &exchanges,
-                &Arc::new(Mutex::new(None)),
-                Some((&pods, &planes)),
-            )
-            .await;
+            let service =
+                held_service(&exchanges, &Arc::new(Mutex::new(None)), Some(&authority)).await;
             let plain = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
-            let stranger = Authority::new("stranger");
-            let refused = service_tls(plain.clone(), &pods.pem(), stranger.issue(&["plane"]));
+            let stranger = authority.issue(&["plane", "spiffe://cluster.test/ns/edge/sa/other"]);
+            let refused = service_tls(plain.clone(), &authority.pem(), POD_ID, stranger);
             let proxy = started(&refused, NonZeroUsize::MIN);
             let hub = hub_of(&proxy);
             let compiled = compile(&refused).unwrap();
@@ -701,10 +698,11 @@ async fn pods_are_reached_with_the_certificate_the_config_shows() {
             assert_eq!(
                 exchanges.load(Ordering::Relaxed),
                 0,
-                "refused in the handshake"
+                "refused once its handshake is done"
             );
 
-            let shown = service_tls(plain.clone(), &pods.pem(), planes.issue(&["plane"]));
+            let ours = authority.issue(&["plane", PLANE_ID]);
+            let shown = service_tls(plain.clone(), &authority.pem(), POD_ID, ours);
             proxy.reload(compile(&shown).unwrap()).unwrap();
             assert!(Arc::ptr_eq(&hub, &hub_of(&proxy)), "the thread kept");
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -726,12 +724,12 @@ async fn pods_are_reached_with_the_certificate_the_config_shows() {
 fn a_service_certificate_that_cannot_be_used_is_refused() {
     let service = ["127.0.0.1:1".to_owned()];
     let plain = limited(everything_config("127.0.0.1:1".parse().unwrap()), &service);
-    let pods = Authority::new("pods");
+    let authority = Authority::new("workloads");
     let broken = edgerush_config::Certificate {
         chain: "not a certificate".to_owned(),
         key: "nor a key".to_owned(),
     };
-    let unusable = service_tls(plain.clone(), &pods.pem(), broken);
+    let unusable = service_tls(plain.clone(), &authority.pem(), POD_ID, broken);
     assert!(matches!(
         Proxy::new(compile(&unusable).unwrap(), NonZeroUsize::MIN),
         Err(ProxyError::RateLimitServiceTls(_))

@@ -1,19 +1,18 @@
-//! Mutual TLS on the service (06 §4): who may call a pod, told apart by the authority that
-//! signed the caller's certificate. A data plane, its certificate signed by the data
-//! planes' authorities, may only exchange, or in the synchronous mode decide; a pod, its
-//! signed by the pods', may only send heartbeats and copies. Each end dials the other with
-//! the control stream's TLS (`edgerush_control_service`): 1.3 alone, the pod dialled
-//! checked against the name dialled and the pods' authorities alone.
+//! Mutual TLS on the service (06 §4): who may call a pod, told apart by the SPIFFE ID in
+//! the caller's certificate, the authorities trusted establishing only that it is one of
+//! the cluster's workloads (12 item 22). A caller with the pod's own ID, which the
+//! service's pods share, is a pod, and may only send heartbeats and copies; one with the
+//! ID of the data plane it serves may only exchange, or in the synchronous mode decide;
+//! any other is refused. Each end dials the other with the control stream's TLS
+//! (`edgerush_control_service`): 1.3 alone, the pod dialled checked against the name
+//! dialled and for the pods' ID.
 //!
 //! TLS is the operator's choice: a pod served plain takes any call from anyone, as before.
 
-use boring::error::ErrorStack;
 use boring::ssl::{SslAcceptor, SslConnector, SslRef};
-use boring::stack::Stack;
-use boring::x509::store::{X509Store, X509StoreBuilder};
-use boring::x509::{X509, X509StoreContext};
+use edgerush_certificates::{Identity, spiffe_id};
 use edgerush_config::Certificate;
-use edgerush_control_service::{Credentials, FilesError, Reread, TlsError, acceptor, connector};
+use edgerush_control_service::{Credentials, FilesError, Reread, TlsError, acceptor, connector_to};
 use http::Uri;
 use hyper_util::rt::TokioIo;
 use std::future::Future;
@@ -36,9 +35,9 @@ use tonic::transport::server::Connected;
 /// served plain tells none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Caller {
-    /// A data plane: its certificate signed by the data planes' authorities.
+    /// The data plane served: its certificate carries that data plane's ID.
     DataPlane,
-    /// A service pod: its certificate signed by the pods'.
+    /// A service pod: its certificate carries the pods' ID.
     Pod,
 }
 
@@ -54,23 +53,27 @@ pub(crate) fn refused<B>(request: &http::Request<B>, allowed: Caller) -> Option<
     }
 }
 
-/// What a pod presents, and whom it trusts to vouch for each kind of caller.
+/// What a pod presents, whom it trusts, and which data plane it serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodCredentials {
-    /// Its certificate, and the key: shown to data planes and to the other pods alike.
+    /// Its certificate, and the key: shown to data planes and to the other pods alike. The
+    /// SPIFFE ID it carries is the pods', which they share.
     pub certificate: Certificate,
-    /// The certificates, in PEM, of the pods' authorities.
-    pub pods: String,
-    /// The certificates, in PEM, of the data planes' authorities: none of them one of the
-    /// pods', or a data plane could pass for a pod.
-    pub data_planes: String,
+    /// The certificates, in PEM, of the authorities trusted to vouch for every caller and
+    /// every pod dialled.
+    pub authorities: String,
+    /// The SPIFFE ID of the data plane it serves: its DataPlane's, which that DataPlane's
+    /// pods share.
+    pub data_plane: String,
 }
 
 /// A pod's TLS, made from its credentials: how it is dialled, how it tells its callers
 /// apart, and how it dials the other pods.
 pub struct PodTls {
     acceptor: SslAcceptor,
-    pods: X509Store,
+    /// The pods' ID, its own.
+    pods: String,
+    data_plane: String,
     connector: SslConnector,
 }
 
@@ -79,38 +82,34 @@ impl PodTls {
     ///
     /// # Errors
     ///
-    /// A [`TlsError`] for credentials that cannot be used, among them an authority that is
-    /// both the pods' and the data planes'.
+    /// A [`TlsError`] for credentials that cannot be used, among them a certificate without
+    /// one SPIFFE ID, and a data plane's ID that is not one or is the pods' own.
     pub fn new(credentials: &PodCredentials) -> Result<Self, TlsError> {
-        let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
-        let read = |pem: &str| {
-            X509::stack_from_pem(pem.as_bytes())
-                .map_err(|error| TlsError::Authorities(error.to_string()))
-        };
-        let pods = read(&credentials.pods)?;
-        let data_planes = read(&credentials.data_planes)?;
-        for authority in &data_planes {
-            for pod in &pods {
-                if authority.to_der().map_err(setup)? == pod.to_der().map_err(setup)? {
-                    return Err(TlsError::Authorities(
-                        "an authority is both the pods' and the data planes'".to_owned(),
-                    ));
-                }
-            }
+        let leaf = Identity::read(&credentials.certificate)?.leaf;
+        let pods = spiffe_id(&leaf).ok_or_else(|| {
+            TlsError::Identity("the pod's certificate carries no one SPIFFE ID".to_owned())
+        })?;
+        let data_plane = &credentials.data_plane;
+        if !data_plane.starts_with("spiffe://") {
+            return Err(TlsError::Identity(format!(
+                "the data plane's ID `{data_plane}` is not a SPIFFE ID"
+            )));
         }
-        let own = |authorities: String| Credentials {
+        // Then a data plane would be served as a pod.
+        if *data_plane == pods {
+            return Err(TlsError::Identity(
+                "the data plane's ID is the pods' own".to_owned(),
+            ));
+        }
+        let own = Credentials {
             certificate: credentials.certificate.clone(),
-            authorities,
+            authorities: credentials.authorities.clone(),
         };
-        let either = format!("{}\n{}", credentials.pods, credentials.data_planes);
-        let mut trusted = X509StoreBuilder::new().map_err(setup)?;
-        for pod in pods {
-            trusted.add_cert(pod).map_err(setup)?;
-        }
         Ok(Self {
-            acceptor: acceptor(&own(either))?,
-            pods: trusted.build(),
-            connector: connector(&own(credentials.pods.clone()))?,
+            acceptor: acceptor(&own)?,
+            connector: connector_to(&own, &pods)?,
+            pods,
+            data_plane: data_plane.clone(),
         })
     }
 
@@ -120,25 +119,22 @@ impl PodTls {
         &self.connector
     }
 
-    /// Who is on the other end of `ssl`, its handshake done: a pod if the pods' authorities
-    /// alone vouch for its certificate, else a data plane, as the handshake found one of
-    /// the two did.
-    fn caller(&self, ssl: &SslRef) -> Result<Caller, ErrorStack> {
-        let Some(leaf) = ssl.peer_certificate() else {
-            // The acceptor refuses a caller without one; this is not reached.
-            return Ok(Caller::DataPlane);
-        };
-        // Served, the chain leaves the leaf out.
-        let none = Stack::new()?;
-        let chain = ssl.peer_cert_chain().unwrap_or(&none);
-        let mut context = X509StoreContext::new()?;
-        let pod = context.init(&self.pods, &leaf, chain, |context| context.verify_cert())?;
-        Ok(if pod { Caller::Pod } else { Caller::DataPlane })
+    /// Who is on the other end of `ssl`, its handshake done: a pod or the data plane, by the
+    /// SPIFFE ID its certificate carries; else why it is refused.
+    fn caller(&self, ssl: &SslRef) -> Result<Caller, String> {
+        // The acceptor has refused a caller without a certificate.
+        let id = ssl.peer_certificate().as_deref().and_then(spiffe_id);
+        match id {
+            Some(id) if id == self.pods => Ok(Caller::Pod),
+            Some(id) if id == self.data_plane => Ok(Caller::DataPlane),
+            Some(id) => Err(format!("{id} is neither a pod nor the data plane served")),
+            None => Err("the caller's certificate carries no one SPIFFE ID".to_owned()),
+        }
     }
 }
 
-/// A data plane's TLS to the pods: `certificate` shown, one the data planes' authorities
-/// signed, and each pod checked against `authorities`, the pods' own, each in PEM.
+/// A data plane's TLS to the pods: `certificate` shown, carrying the data plane's ID, and
+/// each pod checked against `authorities`, each in PEM, and for the pods' ID, `pods`.
 ///
 /// # Errors
 ///
@@ -146,27 +142,26 @@ impl PodTls {
 pub fn data_plane(
     certificate: &Certificate,
     authorities: &[String],
+    pods: &str,
 ) -> Result<SslConnector, TlsError> {
-    connector(&Credentials {
+    let credentials = Credentials {
         certificate: certificate.clone(),
-        authorities: authorities.join(
-            "
-",
-        ),
-    })
+        authorities: authorities.join("\n"),
+    };
+    connector_to(&credentials, pods)
 }
 
-/// Where a pod's credentials are: each a PEM file.
+/// Where a pod's credentials are, each a PEM file, and the data plane it serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodFiles {
     /// The certificate it presents, then the intermediates.
     pub certificate: PathBuf,
     /// Its private key.
     pub key: PathBuf,
-    /// The pods' authorities.
-    pub pods: PathBuf,
-    /// The data planes' authorities.
-    pub data_planes: PathBuf,
+    /// The authorities it trusts.
+    pub authorities: PathBuf,
+    /// The SPIFFE ID of the data plane it serves.
+    pub data_plane: String,
 }
 
 impl PodFiles {
@@ -182,8 +177,8 @@ impl PodFiles {
                 chain: read(&self.certificate).await?,
                 key: read(&self.key).await?,
             },
-            pods: read(&self.pods).await?,
-            data_planes: read(&self.data_planes).await?,
+            authorities: read(&self.authorities).await?,
+            data_plane: self.data_plane.clone(),
         })
     }
 }
@@ -276,7 +271,7 @@ async fn accept(
                 Ok(caller) => {
                     let _stopped = secured.send(Ok(Secured { stream, caller })).await;
                 }
-                Err(error) => refused(peer, error.to_string()),
+                Err(why) => refused(peer, why),
             }
         });
     }

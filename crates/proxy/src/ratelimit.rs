@@ -1133,7 +1133,7 @@ pub(crate) fn with_keys<R>(
 }
 
 /// What `config` reaches the rate-limiting service's pods with, if with TLS (06 §4): its
-/// certificate shown, each pod checked against the pods' authorities and its host.
+/// certificate shown, each pod checked against the authorities, its host and the pods' ID.
 ///
 /// # Errors
 ///
@@ -1149,6 +1149,7 @@ pub(crate) fn service_tls(config: &Compiled) -> Result<Option<SslConnector>, Pro
         edgerush_ratelimit_service::secure::data_plane(
             &tls.certificate.certificate,
             &tls.authorities,
+            &tls.pod_id,
         )
         .map_err(|error| ProxyError::RateLimitServiceTls(error.to_string()))
     })

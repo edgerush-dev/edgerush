@@ -31,7 +31,7 @@ pub use client::{Ended, follow};
 pub use files::{CertificateFiles, Files, FilesError, Reread, reread};
 pub use server::{Heard, ServeError, serve};
 pub use subscribe::{Backoff, Following, Subscription, subscribe};
-pub use tls::{Credentials, TlsError, acceptor, connector, webhook_acceptor};
+pub use tls::{Credentials, TlsError, acceptor, connector, connector_to, webhook_acceptor};
 
 /// The service's name, as gRPC calls it.
 pub const SERVICE: &str = "edgerush.control.v1.Control";

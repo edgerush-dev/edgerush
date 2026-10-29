@@ -10,7 +10,7 @@
 //! Reading does no I/O and asks no clock: an expired certificate is read as any other.
 
 use boring::pkey::{PKey, Private};
-use boring::x509::X509;
+use boring::x509::{X509, X509Ref};
 use edgerush_config::Certificate;
 
 #[cfg(any(test, feature = "testing"))]
@@ -97,6 +97,22 @@ impl Identity {
     }
 }
 
+/// The SPIFFE ID `certificate` names its workload by: its one URI subject alternative name,
+/// if that is a SPIFFE ID (`spiffe://` and a trust domain). None for a certificate with no
+/// URI, or with more than one, as a SPIFFE certificate carries exactly one (the X.509-SVID
+/// standard, §2): a workload is known by one ID or by none.
+#[must_use]
+pub fn spiffe_id(certificate: &X509Ref) -> Option<String> {
+    let alternatives = certificate.subject_alt_names()?;
+    let mut uris = alternatives.iter().filter_map(|name| name.uri());
+    let id = uris.next()?;
+    if uris.next().is_some() {
+        return None;
+    }
+    let domain = id.strip_prefix("spiffe://")?;
+    (!domain.is_empty() && !domain.starts_with('/')).then(|| id.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::testing::certificate;
@@ -114,6 +130,32 @@ mod tests {
             .filter_map(|name| name.dnsname().map(str::to_owned))
             .collect();
         assert_eq!(names, ["a.test"]);
+    }
+
+    #[test]
+    fn a_workload_is_known_by_its_one_spiffe_id() {
+        let id = |names: &[&str]| spiffe_id(&Identity::read(&certificate(names)).unwrap().leaf);
+        assert_eq!(
+            id(&["rl-0", "spiffe://cluster.local/ns/edge/sa/rl"]),
+            Some("spiffe://cluster.local/ns/edge/sa/rl".to_owned())
+        );
+        assert_eq!(id(&["rl-0"]), None);
+        assert_eq!(id(&["https://cluster.local/ns/edge/sa/rl"]), None);
+        assert_eq!(id(&["spiffe:///ns/edge/sa/rl"]), None);
+        assert_eq!(
+            id(&[
+                "spiffe://cluster.local/ns/edge/sa/rl",
+                "spiffe://cluster.local/ns/edge/sa/plane",
+            ]),
+            None
+        );
+        assert_eq!(
+            id(&[
+                "spiffe://cluster.local/ns/edge/sa/rl",
+                "https://elsewhere.test/",
+            ]),
+            None
+        );
     }
 
     #[test]

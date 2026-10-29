@@ -423,6 +423,7 @@ version = "0.0.0"
 dependencies = [
  "boring",
  "bytes",
+ "edgerush-certificates",
  "edgerush-config",
  "edgerush-control-service",
  "edgerush-ratelimit",

@@ -11,7 +11,7 @@
 use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
 use edgerush_certificates::testing::Authority;
 use edgerush_config::Certificate;
-use edgerush_control_service::{Credentials, connector};
+use edgerush_control_service::TlsError;
 use edgerush_ratelimit::service::membership::{Agreed, Heartbeat};
 use edgerush_ratelimit::service::{Batch, PodId, Replicas, View};
 use edgerush_ratelimit_service::grpc::{Client, Error, Server};
@@ -25,29 +25,21 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tonic::Code;
 
-/// The pods' authority and the data planes'.
-struct Authorities {
-    pods: Authority,
-    data_planes: Authority,
-}
+/// The SPIFFE ID the pods share, that of the data plane they serve, and another
+/// workload's, each issued by the one authority.
+const PODS: &str = "spiffe://cluster.test/ns/edge/sa/ratelimit";
+const PLANE: &str = "spiffe://cluster.test/ns/edge/sa/plane";
+const OTHER: &str = "spiffe://cluster.test/ns/edge/sa/other";
 
-fn authorities() -> Authorities {
-    Authorities {
-        pods: Authority::new("pods"),
-        data_planes: Authority::new("data planes"),
-    }
-}
-
-impl Authorities {
-    /// A pod's TLS, presenting `certificate`.
-    fn pod(&self, certificate: Certificate) -> PodTls {
-        PodTls::new(&PodCredentials {
-            certificate,
-            pods: self.pods.pem(),
-            data_planes: self.data_planes.pem(),
-        })
-        .unwrap()
-    }
+/// A pod's TLS, presenting `certificate`, trusting `authority` and serving the data plane
+/// `data_plane`.
+fn pod(authority: &Authority, certificate: Certificate, data_plane: &str) -> PodTls {
+    PodTls::new(&PodCredentials {
+        certificate,
+        authorities: authority.pem(),
+        data_plane: data_plane.to_owned(),
+    })
+    .unwrap()
 }
 
 /// A pod alone in its view, served with the latest of `tls` on a port of its own: its
@@ -76,15 +68,16 @@ async fn serve(tls: watch::Receiver<Arc<PodTls>>) -> (String, mpsc::UnboundedRec
     (address, refused)
 }
 
-/// A client of the pod at `address`, presenting `certificate` and trusting `trusting` to
-/// vouch for the pod.
-fn client(address: &str, certificate: Certificate, trusting: &Authority) -> Client {
-    let tls = connector(&Credentials {
-        certificate,
-        authorities: trusting.pem(),
-    })
-    .unwrap();
+/// A data plane's client of the pod at `address`, presenting `certificate`, trusting
+/// `authority` to vouch for the pod and checking it for the pods' ID.
+fn plane(address: &str, certificate: Certificate, authority: &Authority) -> Client {
+    let tls = secure::data_plane(&certificate, &[authority.pem()], PODS).unwrap();
     Client::secured(address, watch::channel(tls).1).unwrap()
+}
+
+/// A pod's client of the pod at `address`, dialling as `tls` does.
+fn dialled_by(address: &str, tls: &PodTls) -> Client {
+    Client::secured(address, watch::channel(tls.connector().clone()).1).unwrap()
 }
 
 fn batch() -> Batch {
@@ -136,35 +129,49 @@ fn unavailable<T: std::fmt::Debug>(result: Result<T, Error>) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_data_plane_may_only_exchange_and_a_pod_only_beat_and_replicate() {
-    let authorities = authorities();
-    let tls = authorities.pod(authorities.pods.issue(&["127.0.0.1"]));
+    let authority = Authority::new("workloads");
+    let tls = pod(&authority, authority.issue(&["127.0.0.1", PODS]), PLANE);
     let (address, _refused) = serve(watch::channel(Arc::new(tls)).1).await;
-    let plane = client(
+    let data_plane = plane(
         &address,
-        authorities.data_planes.issue(&["data-plane"]),
-        &authorities.pods,
+        authority.issue(&["data-plane", PLANE]),
+        &authority,
     );
-    plane.exchange(batch()).await.unwrap();
-    assert!(denied(plane.heartbeat(beat()).await));
-    assert!(denied(plane.replicate(replicas()).await));
-    let pod = client(
-        &address,
-        authorities.pods.issue(&["127.0.0.2"]),
-        &authorities.pods,
-    );
+    data_plane.exchange(batch()).await.unwrap();
+    assert!(denied(data_plane.heartbeat(beat()).await));
+    assert!(denied(data_plane.replicate(replicas()).await));
+    let other = pod(&authority, authority.issue(&["127.0.0.2", PODS]), PLANE);
+    let pod = dialled_by(&address, &other);
     pod.heartbeat(beat()).await.unwrap();
     pod.replicate(replicas()).await.unwrap();
     assert!(denied(pod.exchange(batch()).await));
 }
 
+/// The authority vouches only that a caller is one of its workloads: one with another
+/// workload's ID, with none, or with two, is refused once its handshake is done, whatever
+/// it would call; one the authority does not vouch for, or without a certificate, in the
+/// handshake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_caller_neither_authority_vouches_for_is_refused_in_its_handshake() {
-    let authorities = authorities();
-    let tls = authorities.pod(authorities.pods.issue(&["127.0.0.1"]));
+async fn a_caller_neither_the_pods_nor_the_data_plane_is_refused() {
+    let authority = Authority::new("workloads");
+    let tls = pod(&authority, authority.issue(&["127.0.0.1", PODS]), PLANE);
     let (address, mut refused) = serve(watch::channel(Arc::new(tls)).1).await;
+    for names in [
+        &["data-plane", OTHER][..],
+        &["data-plane"],
+        &["data-plane", PODS, PLANE],
+    ] {
+        // A client apiece: one whose connection failed may fail its next call undialled,
+        // and the pod would have no refusal to say.
+        let caller = || plane(&address, authority.issue(names), &authority);
+        assert!(failed(caller().exchange(batch()).await), "{names:?}");
+        assert!(refused.recv().await.is_some());
+        assert!(failed(caller().heartbeat(beat()).await), "{names:?}");
+        assert!(refused.recv().await.is_some());
+    }
     let stranger = Authority::new("stranger");
-    let unknown = client(&address, stranger.issue(&["data-plane"]), &authorities.pods);
-    assert!(failed(unknown.exchange(batch()).await));
+    let unknown = plane(&address, stranger.issue(&["data-plane", PODS]), &authority);
+    assert!(failed(unknown.heartbeat(beat()).await));
     assert!(refused.recv().await.is_some());
 
     // TLS 1.3 and HTTP/2, as the service's own client, but no certificate at all.
@@ -179,68 +186,89 @@ async fn a_caller_neither_authority_vouches_for_is_refused_in_its_handshake() {
     assert!(refused.recv().await.is_some());
 }
 
+/// A data plane, and a pod, reach only a pod that the authority vouches for, for the name
+/// dialled, with the pods' ID.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_data_plane_refuses_a_pod_the_pods_authorities_do_not_vouch_for() {
-    let authorities = authorities();
-    // A pod showing what the data planes' authority signed, or what is for another name.
-    for certificate in [
-        authorities.data_planes.issue(&["127.0.0.1"]),
-        authorities.pods.issue(&["elsewhere.test"]),
+async fn a_pod_is_reached_only_with_the_pods_id_and_the_name_dialled() {
+    let authority = Authority::new("workloads");
+    let stranger = Authority::new("stranger");
+    let dialling = pod(&authority, authority.issue(&["127.0.0.2", PODS]), PLANE);
+    for (certificate, reached) in [
+        (authority.issue(&["127.0.0.1", PODS]), true),
+        (authority.issue(&["127.0.0.1", OTHER]), false),
+        (authority.issue(&["elsewhere.test", PODS]), false),
+        (stranger.issue(&["127.0.0.1", PODS]), false),
     ] {
-        let (address, _refused) =
-            serve(watch::channel(Arc::new(authorities.pod(certificate))).1).await;
-        let plane = client(
+        let tls = pod(&authority, certificate, PLANE);
+        let (address, _refused) = serve(watch::channel(Arc::new(tls)).1).await;
+        let data_plane = plane(
             &address,
-            authorities.data_planes.issue(&["data-plane"]),
-            &authorities.pods,
+            authority.issue(&["data-plane", PLANE]),
+            &authority,
         );
-        assert!(unavailable(plane.exchange(batch()).await));
+        let result = data_plane.exchange(batch()).await;
+        assert_eq!(result.is_ok(), reached, "{result:?}");
+        if !reached {
+            assert!(unavailable(result));
+        }
+        let result = dialled_by(&address, &dialling).heartbeat(beat()).await;
+        assert_eq!(result.is_ok(), reached, "{result:?}");
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_authority_both_the_pods_and_the_data_planes_is_refused() {
-    let authorities = authorities();
-    let refused = PodTls::new(&PodCredentials {
-        certificate: authorities.pods.issue(&["127.0.0.1"]),
-        pods: authorities.pods.pem(),
-        data_planes: format!(
-            "{}{}",
-            authorities.data_planes.pem(),
-            authorities.pods.pem()
-        ),
-    });
-    assert!(refused.is_err());
+async fn credentials_that_cannot_tell_callers_apart_are_refused() {
+    let authority = Authority::new("workloads");
+    let with = |names: &[&str], data_plane: &str| {
+        PodTls::new(&PodCredentials {
+            certificate: authority.issue(names),
+            authorities: authority.pem(),
+            data_plane: data_plane.to_owned(),
+        })
+    };
+    assert!(with(&["127.0.0.1", PODS], PLANE).is_ok());
+    assert!(matches!(
+        with(&["127.0.0.1"], PLANE),
+        Err(TlsError::Identity(_))
+    ));
+    assert!(matches!(
+        with(&["127.0.0.1", PODS, OTHER], PLANE),
+        Err(TlsError::Identity(_))
+    ));
+    assert!(matches!(
+        with(&["127.0.0.1", PODS], PODS),
+        Err(TlsError::Identity(_))
+    ));
+    assert!(matches!(
+        with(&["127.0.0.1", PODS], "plane.test"),
+        Err(TlsError::Identity(_))
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn credentials_replaced_serve_the_next_connection() {
-    let authorities = authorities();
-    let served = authorities.pods.issue(&["127.0.0.1"]);
-    let (replace, tls) = watch::channel(Arc::new(authorities.pod(served.clone())));
+    let authority = Authority::new("workloads");
+    let served = authority.issue(&["127.0.0.1", PODS]);
+    let (replace, tls) = watch::channel(Arc::new(pod(&authority, served.clone(), PLANE)));
     let (address, mut refused) = serve(tls).await;
-    let before = client(
+    let before = plane(
         &address,
-        authorities.data_planes.issue(&["data-plane"]),
-        &authorities.pods,
+        authority.issue(&["data-plane", PLANE]),
+        &authority,
     );
     before.exchange(batch()).await.unwrap();
 
-    let others = Authority::new("other data planes");
-    replace.send_replace(Arc::new(
-        PodTls::new(&PodCredentials {
-            certificate: served,
-            pods: authorities.pods.pem(),
-            data_planes: others.pem(),
-        })
-        .unwrap(),
-    ));
-    let after = client(&address, others.issue(&["data-plane"]), &authorities.pods);
-    after.exchange(batch()).await.unwrap();
-    let left = client(
+    replace.send_replace(Arc::new(pod(&authority, served, OTHER)));
+    let after = plane(
         &address,
-        authorities.data_planes.issue(&["data-plane"]),
-        &authorities.pods,
+        authority.issue(&["data-plane", OTHER]),
+        &authority,
+    );
+    after.exchange(batch()).await.unwrap();
+    let left = plane(
+        &address,
+        authority.issue(&["data-plane", PLANE]),
+        &authority,
     );
     assert!(failed(left.exchange(batch()).await));
     assert!(refused.recv().await.is_some());
@@ -248,7 +276,7 @@ async fn credentials_replaced_serve_the_next_connection() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pods_over_tls_agree_on_who_serves() {
-    let authorities = Arc::new(authorities());
+    let authority = Authority::new("workloads");
     let mut listeners = Vec::new();
     let mut addresses = Vec::new();
     for _ in 0..3 {
@@ -258,7 +286,7 @@ async fn pods_over_tls_agree_on_who_serves() {
     }
     let mut pods = Vec::new();
     for (id, listener) in (0..3).zip(listeners) {
-        let tls = authorities.pod(authorities.pods.issue(&["127.0.0.1"]));
+        let tls = pod(&authority, authority.issue(&["127.0.0.1", PODS]), PLANE);
         let dialling = watch::channel(tls.connector().clone()).1;
         let peers: BTreeMap<PodId, Client> = (0..3)
             .filter(|pod| *pod != id)
