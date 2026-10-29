@@ -9,7 +9,7 @@
 //! as one message, the latest copy of each key.
 
 use crate::grpc::{Client, Error};
-use edgerush_ratelimit::service::membership::{Heartbeat, Membership};
+use edgerush_ratelimit::service::membership::{Heartbeat, Membership, Sight};
 use edgerush_ratelimit::service::{self, PodId, ServicePod, View};
 use std::collections::BTreeMap;
 use std::hash::RandomState;
@@ -37,18 +37,23 @@ pub struct Timing {
     pub silence: Duration,
     /// How long a pod is heard before it is taken in.
     pub settle: Duration,
+    /// How long a pod goes without hearing a majority before it stops serving: two
+    /// heartbeats shorter than `silence` at least, so that one cut off from the others stops
+    /// before they take it out, whenever each side heard the other last and looked.
+    pub stop_serving: Duration,
 }
 
 impl Timing {
-    /// A cycle of `cycle`, heartbeats every 100 ms, suspicion after 500 ms, taken in after
-    /// 300 ms.
+    /// A cycle of `cycle`, heartbeats every 100 ms, suspicion after 600 ms, taken in after
+    /// 300 ms, and no serving after 400 ms without a majority.
     #[must_use]
     pub fn with_cycle(cycle: Duration) -> Self {
         Self {
             cycle,
             heartbeat: Duration::from_millis(100),
-            silence: Duration::from_millis(500),
+            silence: Duration::from_millis(600),
             settle: Duration::from_millis(300),
+            stop_serving: Duration::from_millis(400),
         }
     }
 }
@@ -65,6 +70,7 @@ enum Command {
     View(oneshot::Sender<(View, bool)>),
     Capacity(u64),
     Usage(oneshot::Sender<Usage>),
+    Sight(oneshot::Sender<(bool, Sight)>),
     Restart(u64),
     Stop,
 }
@@ -174,6 +180,12 @@ impl Pod {
         self.ask(Command::Usage).await
     }
 
+    /// Whether it serves, and how often and how long it has gone without hearing a
+    /// majority, in this life; none once it is stopped.
+    pub async fn sight(&self) -> Option<(bool, Sight)> {
+        self.ask(Command::Sight).await
+    }
+
     /// Stops it, as a pod gone.
     pub async fn stop(&self) {
         let _stopped = self.commands.send(Command::Stop).await;
@@ -194,6 +206,7 @@ fn fresh(
         members.to_vec(),
         nanos(timing.silence),
         nanos(timing.settle),
+        nanos(timing.stop_serving),
         now,
     );
     let mut node = ServicePod::new(me, nanos(timing.cycle), membership.view().clone());
@@ -277,6 +290,11 @@ impl Running {
                     Some(Command::Capacity(bytes)) => {
                         self.capacity = bytes;
                         self.node.set_capacity(bytes);
+                    }
+                    Some(Command::Sight(answer)) => {
+                        let now = self.now();
+                        let _gone = answer
+                            .send((self.membership.serving(), self.membership.sight(now)));
                     }
                     Some(Command::Usage(answer)) => {
                         let _gone = answer.send(Usage {

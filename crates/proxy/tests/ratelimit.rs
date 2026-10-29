@@ -72,6 +72,9 @@ async fn service() -> Vec<String> {
         heartbeat: Duration::from_millis(20),
         silence: Duration::from_millis(150),
         settle: Duration::from_millis(60),
+        // Two heartbeats shorter than the silence, as a pod's must be, and no shorter, so
+        // that a starved runner's pause does not stop the pods.
+        stop_serving: Duration::from_millis(110),
     };
     let mut pods = Vec::new();
     for (id, listener) in (0..3).zip(listeners) {

@@ -18,7 +18,7 @@ use crate::grpc::{Boxed, Client, Error, HEARTBEAT, MAX_MESSAGE, Prost, limited};
 use crate::secure::{self, Caller, Dialler, refused};
 use crate::wire::{Empty, Heartbeat as WireHeartbeat};
 use boring::ssl::SslConnector;
-use edgerush_ratelimit::service::membership::{Heartbeat, Membership};
+use edgerush_ratelimit::service::membership::{Heartbeat, Membership, Sight};
 use edgerush_ratelimit::service::{PodId, View};
 use edgerush_ratelimit::synchronous::{self as owner, HANDLE_PARTS, Handles, Owner, Shared};
 use futures_core::Stream;
@@ -70,6 +70,10 @@ pub struct Timing {
     pub silence: Duration,
     /// How long a pod is heard before it is taken in.
     pub settle: Duration,
+    /// How long a pod goes without hearing a majority before it stops serving: two
+    /// heartbeats shorter than `silence` at least, so that one cut off from the others stops
+    /// before they take it out, whenever each side heard the other last and looked.
+    pub stop_serving: Duration,
 }
 
 impl Timing {
@@ -82,6 +86,7 @@ impl Timing {
             heartbeat: beat.heartbeat,
             silence: beat.silence,
             settle: beat.settle,
+            stop_serving: beat.stop_serving,
         }
     }
 }
@@ -107,6 +112,9 @@ struct Pod {
     /// The handles its streams hold to keys, as each last said, a part of a [`SWEEP`] ago at
     /// most.
     handles: AtomicUsize,
+    /// How often and how long it has gone without hearing a majority, as of its last
+    /// heartbeat in or out.
+    sight: Mutex<Sight>,
 }
 
 impl Pod {
@@ -152,6 +160,7 @@ impl SyncPod {
             members,
             nanos(timing.silence),
             nanos(timing.settle),
+            nanos(timing.stop_serving),
             0,
         );
         let (publish, view) = watch::channel((membership.view().clone(), membership.serving()));
@@ -168,6 +177,7 @@ impl SyncPod {
             cycle: timing.copy,
             handles: AtomicUsize::new(0),
             stopped,
+            sight: Mutex::new(Sight::default()),
         });
         let senders: Arc<BTreeMap<PodId, CopySender>> = Arc::new(
             peers
@@ -210,6 +220,11 @@ impl SyncPod {
                 let agreed = (membership.view().clone(), membership.serving());
                 if view.is_some() || publish.borrow().1 != agreed.1 {
                     let _gone = publish.send(agreed);
+                }
+                if let Some(pod) = watched.upgrade() {
+                    *pod.sight
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = membership.sight(now);
                 }
                 if view.is_some() {
                     let lives = membership.lives().to_vec();
@@ -281,6 +296,17 @@ impl SyncPod {
     #[must_use]
     pub fn view(&self) -> (View, bool) {
         self.pod.view.borrow().clone()
+    }
+
+    /// How often and how long it has gone without hearing a majority, as of its last
+    /// heartbeat in or out.
+    #[must_use]
+    pub fn sight(&self) -> Sight {
+        *self
+            .pod
+            .sight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The bytes its keys may hold: past them, its sweep evicts.
@@ -400,7 +426,8 @@ impl SyncPod {
                     if changed.is_err() {
                         return;
                     }
-                    // Taken out of the view in this life: no longer ready for data planes.
+                    // Taken out of the view in this life, or hearing no majority: no longer
+                    // ready for data planes.
                     if !view.borrow().1 {
                         let _gone = answers.send(Err(not_serving())).await;
                         return;
@@ -658,8 +685,9 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for SyncServer {
             if pod.pod.stopped() {
                 return Ok(Status::unavailable("stopped").into_http());
             }
-            // Not ready for data planes until the view takes it in, in this life: the other
-            // pods' heartbeats, copies and hand-back still come in, as taking it in needs.
+            // Not ready for data planes until the view takes it in, in this life, nor while it
+            // hears no majority: the other pods' heartbeats, copies and hand-back still come
+            // in, as taking it in and hearing them again need.
             if request.uri().path() == DECIDE && !pod.view().1 {
                 return Ok(not_serving().into_http());
             }
@@ -682,11 +710,14 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for SyncServer {
     }
 }
 
-/// How a pod the view has not taken in, in its present life, refuses a data plane's stream:
-/// not ready, rather than gone, its keys for the data plane to ask of their next owner.
+/// How a pod that does not serve refuses a data plane's stream — the view has not taken it
+/// in, in its present life, or it hears no majority: not ready, rather than gone, its keys
+/// for the data plane to ask of their next owner.
 #[must_use]
 pub fn not_serving() -> Status {
-    Status::failed_precondition("not serving: the view has not taken this pod in")
+    Status::failed_precondition(
+        "not serving: the view has not taken this pod in, or it hears no majority",
+    )
 }
 
 /// Whether `status` is a pod's refusal as [`not_serving`].

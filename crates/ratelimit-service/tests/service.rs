@@ -26,6 +26,9 @@ fn timing() -> Timing {
         heartbeat: Duration::from_millis(20),
         silence: Duration::from_millis(150),
         settle: Duration::from_millis(60),
+        // Two heartbeats shorter than the silence, as a pod's must be, and no shorter, so
+        // that a starved runner's pause does not stop the pods.
+        stop_serving: Duration::from_millis(110),
     }
 }
 
@@ -576,5 +579,44 @@ async fn a_client_lets_go_of_a_connection_that_never_answers() {
             Instant::now() < deadline,
             "every call went on the connection that never answers"
         );
+    }
+}
+
+/// An asynchronous pod that hears no majority stops serving too: it answers batches with its
+/// view alone, as a pod not taken in does, and its metrics say it lost sight of a majority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_that_hears_no_majority_stops_serving_and_says_so() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let service = start().await;
+    service.pods[1].stop().await;
+    service.pods[2].stop().await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while service.pods[0].sight().await.unwrap().0 {
+        assert!(Instant::now() < deadline, "never stopped serving");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (serving, sight) = service.pods[0].sight().await.unwrap();
+    assert!(!serving);
+    assert_eq!((sight.lost, sight.regained), (1, 0));
+    assert!(!service.pods[0].view().await.unwrap().1);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(edgerush_ratelimit_service::scrape::serve(
+        listener,
+        service.pods[0].clone(),
+        1 << 20,
+    ));
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nhost: pod\r\n\r\n")
+        .await
+        .unwrap();
+    let mut scrape = String::new();
+    stream.read_to_string(&mut scrape).await.unwrap();
+    for line in [
+        "edgerush_rate_limit_pod_serving 0\n",
+        "edgerush_rate_limit_majority_lost_total 1\n",
+    ] {
+        assert!(scrape.contains(line), "{line}{scrape}");
     }
 }

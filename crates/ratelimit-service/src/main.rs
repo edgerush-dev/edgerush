@@ -4,6 +4,7 @@
 //! edgerush-ratelimit-service --id 0 --listen 0.0.0.0:7000 \
 //!     --pod 0=rl-0:7000 --pod 1=rl-1:7000 --pod 2=rl-2:7000 [--cycle-ms 10] \
 //!     [--max-key-bytes 268435456] [--metrics 0.0.0.0:9090] [--mode asynchronous] \
+//!     [--silence-ms 600] [--stop-serving-ms 400] \
 //!     [--certificate pod.pem --key pod.key --authorities ca.pem \
 //!      --data-plane-id spiffe://cluster.local/ns/edge/sa/edge]
 //! ```
@@ -14,9 +15,17 @@
 //! what changed.
 //!
 //! `--pod` names every service pod, this one too: the members among which a majority agrees
-//! which of them serve (`edgerush_ratelimit::service::membership`). `--max-key-bytes` is
-//! what its keys may hold, 256 MiB unless said, past which the least recently changed are
-//! evicted; `--metrics`, where `/metrics` shows what they hold, nowhere unless said.
+//! which of them serve (`edgerush_ratelimit::service::membership`). `--silence-ms` is how
+//! long a pod goes unheard before the others take it out of the view, 600 unless said;
+//! `--stop-serving-ms`, how long a pod goes without hearing a majority before it stops
+//! serving, 400 unless said: longer than a heartbeat (100 ms), and two heartbeats shorter
+//! than the silence at least, so that a pod cut off from the others stops before they take
+//! it out, however far apart each side heard the other last and looked. Longer
+//! tolerates longer hiccups between the pods, and leaves a pod that has gone out of reach
+//! for longer. `--max-key-bytes` is what its keys may hold, 256 MiB unless said, past which
+//! the least recently changed are evicted; `--metrics`, where `/metrics` shows whether the
+//! pod serves, how often and how long it has gone without a majority and, in the
+//! asynchronous mode, what its keys hold; nowhere unless said.
 //!
 //! The last four go together, the first three PEM files read again every second, and serve
 //! the service with mutual TLS (`edgerush_ratelimit_service::secure`): the pod presents
@@ -49,6 +58,10 @@ use tonic::transport::server::TcpIncoming;
 /// What `--max-key-bytes` is when left out: 256 MiB.
 const MAX_KEY_BYTES: u64 = 256 << 20;
 
+/// What `--silence-ms` and `--stop-serving-ms` are when left out.
+const SILENCE_MS: u64 = 600;
+const STOP_SERVING_MS: u64 = 400;
+
 /// How often the certificate files are read again, to take in a Secret replaced.
 const REREAD: Duration = Duration::from_secs(1);
 
@@ -68,12 +81,15 @@ struct Args {
     cycle: Duration,
     max_key_bytes: u64,
     metrics: Option<SocketAddr>,
+    silence: Duration,
+    stop_serving: Duration,
     tls: Option<PodFiles>,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let (mut id, mut listen, mut pods, mut cycle) = (None, None, BTreeMap::new(), 10);
     let (mut max_key_bytes, mut metrics, mut mode) = (MAX_KEY_BYTES, None, Mode::Asynchronous);
+    let (mut silence, mut stop_serving) = (SILENCE_MS, STOP_SERVING_MS);
     let mut files: [Option<PathBuf>; 3] = [None, None, None];
     let mut data_plane = None;
     while let Some(flag) = args.next() {
@@ -114,6 +130,16 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--metrics" => {
                 metrics = Some(value()?.parse().map_err(|_| "--metrics: host:port")?);
             }
+            "--silence-ms" => {
+                silence = value()?
+                    .parse()
+                    .map_err(|_| "--silence-ms: a number of milliseconds")?;
+            }
+            "--stop-serving-ms" => {
+                stop_serving = value()?
+                    .parse()
+                    .map_err(|_| "--stop-serving-ms: a number of milliseconds")?;
+            }
             "--certificate" => files[0] = Some(value()?.into()),
             "--key" => files[1] = Some(value()?.into()),
             "--authorities" => files[2] = Some(value()?.into()),
@@ -125,8 +151,17 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     if !pods.contains_key(&id) {
         return Err("--pod must name this pod too".to_owned());
     }
-    if mode == Mode::Synchronous && metrics.is_some() {
-        return Err("--metrics is for the asynchronous mode, for now".to_owned());
+    // A pod would be suspected, or stop, between two heartbeats that both came. And one cut
+    // off stops before the others take it out only with two heartbeats to spare: each side
+    // may have heard the other last up to a heartbeat apart, and look up to one late.
+    let heartbeat = Timing::with_cycle(Duration::from_millis(cycle)).heartbeat;
+    let heartbeat = u64::try_from(heartbeat.as_millis()).unwrap_or(u64::MAX);
+    let spare = heartbeat.saturating_mul(2);
+    if !(heartbeat < stop_serving && stop_serving.saturating_add(spare) <= silence) {
+        return Err(format!(
+            "--stop-serving-ms {stop_serving} must be more than a heartbeat ({heartbeat} ms) \
+             and at least {spare} ms less than --silence-ms {silence}"
+        ));
     }
     let tls = match (files, data_plane) {
         ([None, None, None], None) => None,
@@ -146,6 +181,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         cycle: Duration::from_millis(cycle),
         max_key_bytes,
         metrics,
+        silence: Duration::from_millis(silence),
+        stop_serving: Duration::from_millis(stop_serving),
         tls,
     })
 }
@@ -214,14 +251,18 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     let serving = tls.map(|(serving, _)| serving);
     if args.mode == Mode::Synchronous {
-        let pod = SyncPod::spawn(
-            args.id,
-            members,
-            incarnation,
-            synchronous::Timing::with_copy(args.cycle),
-            peers,
-        )?;
+        let timing = synchronous::Timing {
+            silence: args.silence,
+            stop_serving: args.stop_serving,
+            ..synchronous::Timing::with_copy(args.cycle)
+        };
+        let pod = SyncPod::spawn(args.id, members, incarnation, timing, peers)?;
         pod.set_capacity(args.max_key_bytes);
+        if let Some(address) = args.metrics {
+            let listener = tokio::net::TcpListener::bind(address).await?;
+            eprintln!("edgerush-ratelimit-service: metrics on {address}");
+            tokio::spawn(scrape::serve_synchronous(listener, pod.clone()));
+        }
         eprintln!(
             "edgerush-ratelimit-service: synchronous pod {} on {}",
             args.id, args.listen
@@ -229,13 +270,12 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         serve_on(listener, serving, SyncServer::new(pod)).await?;
         return Ok(());
     }
-    let pod = Pod::spawn(
-        args.id,
-        members,
-        incarnation,
-        Timing::with_cycle(args.cycle),
-        peers,
-    );
+    let timing = Timing {
+        silence: args.silence,
+        stop_serving: args.stop_serving,
+        ..Timing::with_cycle(args.cycle)
+    };
+    let pod = Pod::spawn(args.id, members, incarnation, timing, peers);
     pod.set_capacity(args.max_key_bytes).await;
     if let Some(address) = args.metrics {
         let listener = tokio::net::TcpListener::bind(address).await?;
@@ -366,14 +406,59 @@ mod tests {
             parsed(&with(&["--mode", "eventual"])),
             Err("--mode: asynchronous or synchronous".to_owned())
         );
+        // Either mode serves its metrics.
+        let synchronous = with(&["--mode", "synchronous", "--metrics", "127.0.0.1:9090"]);
         assert_eq!(
-            parsed(&with(&[
-                "--mode",
-                "synchronous",
-                "--metrics",
-                "127.0.0.1:9090"
-            ])),
-            Err("--metrics is for the asynchronous mode, for now".to_owned())
+            parsed(&synchronous).unwrap().metrics,
+            Some("127.0.0.1:9090".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_pod_stops_serving_after_a_while_without_a_majority_before_it_is_taken_out() {
+        let plain = parsed(&POD).unwrap();
+        assert_eq!(
+            (plain.silence, plain.stop_serving),
+            (Duration::from_millis(600), Duration::from_millis(400))
+        );
+        let with = |silence: &'static str, stop: &'static str| -> Vec<&str> {
+            POD.iter()
+                .copied()
+                .chain(["--silence-ms", silence, "--stop-serving-ms", stop])
+                .collect()
+        };
+        let said = parsed(&with("2000", "1000")).unwrap();
+        assert_eq!(
+            (said.silence, said.stop_serving),
+            (Duration::from_millis(2_000), Duration::from_millis(1_000))
+        );
+        // Two heartbeats to spare, exactly, is enough.
+        let said = parsed(&with("600", "400")).unwrap();
+        assert_eq!(said.stop_serving, Duration::from_millis(400));
+        for (silence, stop) in [
+            ("500", "500"),
+            ("500", "600"),
+            ("500", "100"),
+            ("100", "50"),
+            ("500", "400"),
+            ("600", "401"),
+        ] {
+            assert_eq!(
+                parsed(&with(silence, stop)),
+                Err(format!(
+                    "--stop-serving-ms {stop} must be more than a heartbeat (100 ms) and at \
+                     least 200 ms less than --silence-ms {silence}"
+                )),
+                "{silence} {stop}"
+            );
+        }
+        assert_eq!(
+            parsed(&with("soon", "250")),
+            Err("--silence-ms: a number of milliseconds".to_owned())
+        );
+        assert_eq!(
+            parsed(&with("500", "soon")),
+            Err("--stop-serving-ms: a number of milliseconds".to_owned())
         );
     }
 

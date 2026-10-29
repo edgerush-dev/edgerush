@@ -18,6 +18,9 @@ fn pod_timing() -> Timing {
         heartbeat: Duration::from_millis(20),
         silence: Duration::from_millis(150),
         settle: Duration::from_millis(60),
+        // Two heartbeats shorter than the silence, as a pod's must be, and no shorter, so
+        // that a starved runner's pause does not stop the pods.
+        stop_serving: Duration::from_millis(110),
     }
 }
 
