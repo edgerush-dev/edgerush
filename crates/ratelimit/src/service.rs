@@ -58,7 +58,8 @@ pub const ACTIVE_CYCLES: u64 = 30;
 /// it, new hits wait in the key's ledger, one running count, until one is. Above what a
 /// healthy link has out — a report a cycle through the [`ACTIVE_CYCLES`] a lost segment takes
 /// TCP to send again — so that only an outage meets it, and it bounds what a busy key holds
-/// through one, which eviction at the cap does not reach.
+/// through one, which eviction at the cap does not reach. A service pod keeps no more of a
+/// data plane's batches waiting for a missing one.
 pub const MOST_UNACKNOWLEDGED: usize = 32;
 
 /// A data plane: one worker of one EdgeRush pod, in one life of it. A restarted worker is a
@@ -1165,7 +1166,9 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
 struct Record {
     applied: u64,
     /// Batches that came ahead of one still missing, `(sequence, count)` in order: none,
-    /// and no room for any, while batches come in order, as they almost always do.
+    /// and no room for any, while batches come in order, as they almost always do. At most
+    /// [`MOST_UNACKNOWLEDGED`], as many as a data plane has out, so that one sending more
+    /// cannot grow it.
     #[allow(
         clippy::box_collection,
         reason = "a pointer in every record, rather than a list's three words, for what is rarely there"
@@ -1227,6 +1230,8 @@ impl Record {
             let waiting = self.waiting.get_or_insert_default();
             match waiting.binary_search_by_key(&sequence, |(at, _)| *at) {
                 Ok(at) => waiting[at] = (sequence, tally),
+                // Answered unapplied, it comes again, as one whose answer was lost does.
+                Err(_) if waiting.len() >= MOST_UNACKNOWLEDGED => {}
                 Err(at) => waiting.insert(at, (sequence, tally)),
             }
             return Tally::default();

@@ -801,6 +801,43 @@ fn only_batches_ahead_of_a_missing_one_hold_room() {
     assert_eq!(room(&pod), 0, "given back");
 }
 
+/// A pod keeps at most [`MOST_UNACKNOWLEDGED`] of a data plane's batches waiting for a
+/// missing one: one more is answered unapplied, and counted when the data plane sends it
+/// again.
+#[test]
+fn a_pod_keeps_a_bounded_number_of_batches_waiting() {
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    let waiting = |pod: &ServicePod| {
+        pod.keys[&b"k"[..]]
+            .planes
+            .get(1)
+            .unwrap()
+            .waiting
+            .as_ref()
+            .map_or(0, |waiting| waiting.len())
+    };
+    let most = MOST_UNACKNOWLEDGED as u64;
+    let last = most + 8;
+    for sequence in 2..=last {
+        let answer = pod.on_batch(batch(1, hits(sequence, 1, 0)), 0);
+        assert_eq!(answer.entries[0].applied, 0);
+    }
+    assert_eq!(waiting(&pod), MOST_UNACKNOWLEDGED);
+    pod.on_batch(batch(1, hits(2, 1, 0)), CYCLE);
+    assert_eq!(
+        waiting(&pod),
+        MOST_UNACKNOWLEDGED,
+        "one waiting, sent again"
+    );
+    pod.on_batch(batch(1, hits(1, 1, 0)), CYCLE);
+    assert_eq!(pod.counted(b"k"), Some(1 + most));
+    for sequence in most + 2..=last {
+        pod.on_batch(batch(1, hits(sequence, 1, 0)), 2 * CYCLE);
+    }
+    assert_eq!(pod.counted(b"k"), Some(last), "each counted once");
+    assert_eq!(waiting(&pod), 0);
+}
+
 /// A pod that leaves and comes back owns its keys again: the pod that held them meanwhile
 /// hands them over, so the count goes on where it was.
 #[test]
