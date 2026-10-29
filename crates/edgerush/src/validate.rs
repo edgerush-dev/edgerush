@@ -36,7 +36,9 @@ Options:
                                `ingress_hosts_fall_through`,
                                `ingress_https_redirect`,
                                `ingress_https_redirect_max_age` and,
-                               optionally, `backend_authorities`
+                               optionally, `backend_authorities` and
+                               `data_plane`, the data plane's own settings,
+                               written into the config as they are
       --check-secrets          Check the Secrets the Ingresses' `tls` names: each must
                                be among the manifests, its certificate and key usable
                                and covering the host, as the control plane checks them.
