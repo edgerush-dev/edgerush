@@ -40,8 +40,8 @@ pub mod pooled;
 pub use keyed::Keyed;
 
 use crate::reference::{BucketState, Model, TokenBucket};
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::num::NonZeroU64;
 
 /// How many cycles a data plane waits to see a batch applied before sending it again.
@@ -1453,6 +1453,25 @@ impl Owned {
     }
 }
 
+/// A copy waiting to go to another pod, the same as another of the same key: a key changed
+/// again replaces its copy in one step, rather than in a search of those waiting.
+#[derive(Debug)]
+struct ByKey(Replica);
+
+impl PartialEq for ByKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.key == other.0.key
+    }
+}
+
+impl Eq for ByKey {}
+
+impl Hash for ByKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.key.hash(state);
+    }
+}
+
 /// A service pod's side of the protocol: the keys it owns, and a copy of every other key
 /// the service holds.
 pub struct ServicePod<S = FixedState> {
@@ -1460,7 +1479,8 @@ pub struct ServicePod<S = FixedState> {
     cycle: u64,
     view: View,
     keys: HashMap<Box<[u8]>, Owned, S>,
-    replicas: BTreeMap<PodId, Vec<Replica>>,
+    /// Copies waiting to go, to each pod one a key: the latest.
+    replicas: BTreeMap<PodId, HashSet<ByKey, S>>,
     handovers: BTreeMap<PodId, Vec<Replica>>,
     /// Whether the view it holds took it in: until then it answers with its view alone.
     serving: bool,
@@ -1664,10 +1684,11 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             if pod == self.me {
                 continue;
             }
-            let copies = self.replicas.entry(pod).or_default();
             // One copy of a key a batch: the last made holds the others.
-            copies.retain(|copy| copy.key != replica.key);
-            copies.push(replica.clone());
+            self.replicas
+                .entry(pod)
+                .or_default()
+                .replace(ByKey(replica.clone()));
         }
     }
 
@@ -1764,7 +1785,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 self.replicas
                     .entry(pod)
                     .or_default()
-                    .push(owned.replica(key, now));
+                    .replace(ByKey(owned.replica(key, now)));
             }
         }
         if !before.pods.contains(&self.me) && self.view.pods.contains(&self.me) {
@@ -1833,6 +1854,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             .map(message(true));
         std::mem::take(&mut self.replicas)
             .into_iter()
+            .map(|(pod, copies)| (pod, copies.into_iter().map(|ByKey(copy)| copy).collect()))
             .map(message(false))
             .chain(handovers)
             .collect()

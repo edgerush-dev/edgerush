@@ -618,6 +618,41 @@ fn every_change_is_copied_to_every_other_pod() {
     assert_eq!(net.pods[owner as usize].counted(b"k"), Some(4));
 }
 
+/// A key changed again before its copies go is copied once to each pod, as it last stood,
+/// among the copies of the other keys.
+#[test]
+fn a_key_changed_twice_is_copied_once_as_it_last_stood() {
+    let (owner, secondary, third) = roles(b"k");
+    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 1));
+    let other = (0u32..)
+        .map(|n| format!("other{n}").into_bytes())
+        .find(|key| view(&[0, 1, 2], 1).owners(key).0 == Some(owner))
+        .unwrap();
+    pod.on_batch(batch(1, hits(1, 2, 0)), 0);
+    let mut both = batch(1, hits(2, 3, 1));
+    both.entries.push(Entry {
+        key: other[..].into(),
+        contract: contract(),
+        report: hits(1, 1, 0),
+    });
+    pod.on_batch(both, CYCLE);
+    let mut copies = pod.take_replicas();
+    copies.sort_by_key(|(to, _)| *to);
+    let mut expected = [secondary, third];
+    expected.sort_unstable();
+    assert_eq!(copies.len(), 2);
+    for ((to, replicas), pod) in copies.iter().zip(expected) {
+        assert_eq!(*to, pod);
+        let mut entries: Vec<(&[u8], u64)> = replicas
+            .entries
+            .iter()
+            .map(|replica| (&replica.key[..], replica.counted))
+            .collect();
+        entries.sort_unstable();
+        assert_eq!(entries, [(&b"k"[..], 5), (&other[..], 1)], "to pod {pod}");
+    }
+}
+
 /// A pod joining holds no copies: the owners send it one of each key at once.
 #[test]
 fn a_pod_joining_gets_a_copy_of_every_key_at_once() {
