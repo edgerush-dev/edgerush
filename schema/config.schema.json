@@ -1162,11 +1162,46 @@
             "null"
           ],
           "default": null
+        },
+        "tls": {
+          "description": "Mutual TLS to its pods; plain when left\nout, as the pods are then served.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateLimitServiceTls"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,
       "required": [
         "addresses"
+      ]
+    },
+    "RateLimitServiceTls": {
+      "description": "Mutual TLS to the rate-limiting service's pods: whom to trust to vouch for them, and\nwhat the data plane shows them.",
+      "type": "object",
+      "properties": {
+        "authorities": {
+          "description": "The certificates, in PEM, of the pods' authorities, trusted to vouch for each pod as\nthe host of its address: the pods' alone, not the data planes'.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "certificate": {
+          "description": "The name of the certificate the data plane shows the pods, among `certificates`: one\nthe data planes' authorities signed, which lets it exchange or decide and no more.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "authorities",
+        "certificate"
       ]
     },
     "RateLimitSynchronous": {

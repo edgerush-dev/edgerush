@@ -41,6 +41,27 @@ pub(super) fn forwarding_config(upstream: SocketAddr, trusted: &[&str]) -> Confi
     config
 }
 
+/// `config`'s rate-limiting service reached with mutual TLS: the pods checked against
+/// `pods`, an authority's certificate in PEM, and `shown` shown them, under the name
+/// `plane`.
+pub(super) fn service_tls(
+    mut config: edgerush_config::Config,
+    pods: &str,
+    shown: edgerush_config::Certificate,
+) -> edgerush_config::Config {
+    config.certificates.insert("plane".to_owned(), shown);
+    let service = config
+        .rate_limiting
+        .as_mut()
+        .and_then(|limiting| limiting.service.as_mut())
+        .unwrap();
+    service.tls = Some(edgerush_config::RateLimitServiceTls {
+        authorities: vec![pods.to_owned()],
+        certificate: "plane".to_owned(),
+    });
+    config
+}
+
 pub(super) fn trusting(
     server_name: &str,
     authority: &edgerush_config::Certificate,

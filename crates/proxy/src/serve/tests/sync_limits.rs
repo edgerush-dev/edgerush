@@ -2,8 +2,10 @@
 //! asked of its keys' owners, synchronous service pods on real sockets.
 
 use super::*;
+use edgerush_certificates::testing::Authority;
 use edgerush_ratelimit::service::View;
 use edgerush_ratelimit_service::grpc::Client;
+use edgerush_ratelimit_service::secure::{self, PodCredentials, PodTls};
 use edgerush_ratelimit_service::synchronous::wire::{Decide, FromOwner, Key, ToOwner, Upstream};
 use edgerush_ratelimit_service::synchronous::{SyncPod, SyncServer, Timing, decide_stream};
 use std::collections::BTreeMap;
@@ -29,6 +31,24 @@ async fn lone_pod(listener: TcpListener) -> SyncPod {
             .await;
     });
     // Ready for data planes once its view takes it in.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !pod.view().1 {
+        assert!(Instant::now() < deadline, "the pod never served");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    pod
+}
+
+/// A synchronous service pod alone, served with `tls` on `listener`, once it is ready.
+async fn lone_secured_pod(listener: TcpListener, tls: PodTls) -> SyncPod {
+    let pod = SyncPod::spawn(0, vec![0], 1, pod_timing(), BTreeMap::new()).unwrap();
+    tokio::spawn(secure::serve(
+        listener,
+        tokio::sync::watch::channel(std::sync::Arc::new(tls)).1,
+        SyncServer::new(pod.clone()),
+        |_peer, _why| {},
+        std::future::pending(),
+    ));
     let deadline = Instant::now() + Duration::from_secs(5);
     while !pod.view().1 {
         assert!(Instant::now() < deadline, "the pod never served");
@@ -292,7 +312,7 @@ async fn the_owner_holds_a_client_to_one_bucket_across_workers() {
 /// Requests under `key` with ten an hour and a bucket of five, `count` of them, asked of
 /// the pod at `address` directly: how many it admitted.
 async fn ask_directly(address: &str, key: &[u8], count: u64) -> usize {
-    let mut stream = decide_stream(address).await.unwrap();
+    let mut stream = decide_stream(address, None).await.unwrap();
     let mut admitted = 0;
     for id in 0..count {
         let decide = Decide {
@@ -534,50 +554,115 @@ async fn an_owner_that_keeps_timing_out_opens_its_breaker() {
         .await;
 }
 
+/// An owner served with mutual TLS is asked by a data plane whose certificate the data
+/// planes' authority signed. One whose certificate it did not sign reaches no owner, and
+/// its requests are decided as `when_unreachable` says.
+#[tokio::test]
+async fn owners_are_asked_with_the_certificate_the_config_shows() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (pods, planes) = (Authority::new("pods"), Authority::new("data planes"));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let owner = listener.local_addr().unwrap().to_string();
+            let tls = PodTls::new(&PodCredentials {
+                certificate: pods.issue(&["127.0.0.1"]),
+                pods: pods.pem(),
+                data_planes: planes.pem(),
+            })
+            .unwrap();
+            let _pod = lone_secured_pod(listener, tls).await;
+            let (upstream, _) = counting_upstream().await;
+            let config = synchronous_in(
+                everything_config(upstream),
+                &[("per-client", 10)],
+                std::slice::from_ref(&owner),
+                500,
+                "deny",
+            );
+            let stranger = Authority::new("stranger");
+            for (shown, status, answered) in [
+                (planes.issue(&["plane"]), 200, Some(1)),
+                (stranger.issue(&["plane"]), 503, None),
+            ] {
+                let secured = service_tls(config.clone(), &pods.pem(), shown);
+                let (proxy, mut sends) = serving(&secured, 1).await;
+                assert_eq!(statuses(&send_round(&mut sends, 1).await), [status]);
+                assert_eq!(
+                    metric(
+                        &proxy.metrics(),
+                        r#"edgerush_rate_limit_owner_asks_total{pod="0",outcome="answered"}"#
+                    ),
+                    answered.or(Some(0)),
+                );
+            }
+        })
+        .await;
+}
+
 /// An open breaker is probed after `probe_after`: once its owner is back and sends its
 /// view on the probe's stream, the breaker closes, and requests are asked of the owner
-/// again.
+/// again. Plain, and with mutual TLS, which the probe dials with as the streams do.
 #[tokio::test]
 async fn an_open_breaker_closes_once_a_probe_hears_from_its_owner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // Says nothing until its gates open, the owner back. (A port given up and bound
-            // again could be taken in between, as the system hands it out.)
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let owner = listener.local_addr().unwrap();
-            let _pod = lone_pod(listener).await;
-            let relay = GatedRelay::shut(owner).await;
-            let (upstream, _) = counting_upstream().await;
-            let config = with_breaker(
-                synchronous_in(
-                    everything_config(upstream),
-                    &[("per-client", 10)],
-                    std::slice::from_ref(&relay.address),
-                    100,
-                    "deny",
-                ),
-                1,
-                200,
-            );
-            let (proxy, mut sends) = serving(&config, 1).await;
-            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
-            let open = r#"edgerush_rate_limit_owner_breaker_open{pod="0"}"#;
-            assert_eq!(metric(&proxy.metrics(), open), Some(1));
-            relay.open_all();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while metric(&proxy.metrics(), open) != Some(0) {
-                assert!(Instant::now() < deadline, "the breaker never closed");
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            for secured in [false, true] {
+                // Says nothing until its gates open, the owner back. (A port given up and
+                // bound again could be taken in between, as the system hands it out.)
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let owner = listener.local_addr().unwrap();
+                let (pods, planes) = (Authority::new("pods"), Authority::new("data planes"));
+                let _pod = if secured {
+                    let tls = PodTls::new(&PodCredentials {
+                        certificate: pods.issue(&["127.0.0.1"]),
+                        pods: pods.pem(),
+                        data_planes: planes.pem(),
+                    })
+                    .unwrap();
+                    lone_secured_pod(listener, tls).await
+                } else {
+                    lone_pod(listener).await
+                };
+                let relay = GatedRelay::shut(owner).await;
+                let (upstream, _) = counting_upstream().await;
+                let mut config = with_breaker(
+                    synchronous_in(
+                        everything_config(upstream),
+                        &[("per-client", 10)],
+                        std::slice::from_ref(&relay.address),
+                        100,
+                        "deny",
+                    ),
+                    1,
+                    200,
+                );
+                if secured {
+                    config = service_tls(config, &pods.pem(), planes.issue(&["plane"]));
+                }
+                let (proxy, mut sends) = serving(&config, 1).await;
+                assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+                let open = r#"edgerush_rate_limit_owner_breaker_open{pod="0"}"#;
+                assert_eq!(metric(&proxy.metrics(), open), Some(1));
+                relay.open_all();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while metric(&proxy.metrics(), open) != Some(0) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the breaker never closed, secured {secured}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+                assert_eq!(
+                    metric(
+                        &proxy.metrics(),
+                        r#"edgerush_rate_limit_owner_asks_total{pod="0",outcome="answered"}"#
+                    ),
+                    Some(1)
+                );
             }
-            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
-            assert_eq!(
-                metric(
-                    &proxy.metrics(),
-                    r#"edgerush_rate_limit_owner_asks_total{pod="0",outcome="answered"}"#
-                ),
-                Some(1)
-            );
         })
         .await;
 }
@@ -707,7 +792,7 @@ async fn local_buckets_carry_over_from_one_outage_to_the_next() {
 
 /// Gives `count` charges under `key` back to the pod at `address`, directly.
 async fn give_back_directly(address: &str, key: &[u8], count: usize) {
-    let stream = decide_stream(address).await.unwrap();
+    let stream = decide_stream(address, None).await.unwrap();
     for _ in 0..count {
         let back = edgerush_ratelimit_service::synchronous::wire::GiveBack {
             keys: vec![Key {

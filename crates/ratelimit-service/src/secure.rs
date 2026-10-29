@@ -137,6 +137,25 @@ impl PodTls {
     }
 }
 
+/// A data plane's TLS to the pods: `certificate` shown, one the data planes' authorities
+/// signed, and each pod checked against `authorities`, the pods' own, each in PEM.
+///
+/// # Errors
+///
+/// A [`TlsError`] for credentials that cannot be used.
+pub fn data_plane(
+    certificate: &Certificate,
+    authorities: &[String],
+) -> Result<SslConnector, TlsError> {
+    connector(&Credentials {
+        certificate: certificate.clone(),
+        authorities: authorities.join(
+            "
+",
+        ),
+    })
+}
+
 /// Where a pod's credentials are: each a PEM file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodFiles {

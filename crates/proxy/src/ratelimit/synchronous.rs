@@ -18,6 +18,7 @@
 
 use super::local::{LocalLimiter, Process as LocalKeys, SWEEP};
 use super::{Awaited, Failed, KeyedBy, Later, Limited, Refusal, Undecided, Usage, with_keys};
+use boring::ssl::SslConnector;
 use edgerush_config::{CompiledLimit, CompiledSynchronous, WhenUnreachable};
 use edgerush_ratelimit::local::Decision;
 use edgerush_ratelimit::service::{Contract, Decided, PodId, View, longest};
@@ -33,7 +34,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// How many messages may wait for a stream while it is opened: past them, a request is
 /// left to `when_unreachable`, as if the owner did not answer.
@@ -61,6 +62,8 @@ pub(crate) struct Process {
     local: Option<Arc<LocalKeys>>,
     /// The clock its breakers' times are read by, kept across a reload with them.
     start: Instant,
+    /// What its streams dial the pods with, if with TLS.
+    tls: Option<watch::Receiver<SslConnector>>,
 }
 
 /// What a process's workers' asks of one owner came to.
@@ -89,6 +92,7 @@ impl Process {
         workers: NonZeroUsize,
         failed: Option<Failed>,
         running: Option<&Self>,
+        tls: Option<SslConnector>,
     ) -> std::io::Result<Arc<Self>> {
         let kept = |address: &String| {
             let running = running?;
@@ -129,6 +133,8 @@ impl Process {
             local,
             start: running.map_or_else(Instant::now, |running| running.start),
             config,
+            // Fixed for its life: a reload that changes it starts another.
+            tls: tls.map(|tls| watch::channel(tls).1),
         });
         let probed = Arc::downgrade(&process);
         std::thread::Builder::new()
@@ -341,10 +347,11 @@ fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
                 let Some(address) = held.config.addresses.get(pod).cloned() else {
                     continue;
                 };
+                let tls = held.tls.clone();
                 let probed = std::sync::Arc::downgrade(&held);
                 tokio::spawn(async move {
                     let heard = tokio::time::timeout(PROBE_WAIT, async {
-                        let mut stream = decide_stream(&address).await.ok()?;
+                        let mut stream = decide_stream(&address, tls.as_ref()).await.ok()?;
                         let first = stream.down.message().await.ok()??;
                         matches!(first.message, Some(wire::FromOwner::View(_))).then_some(())
                     })
@@ -404,6 +411,7 @@ enum Waiter {
 /// generation of the connection it was sent on.
 struct Stream {
     address: String,
+    tls: Option<watch::Receiver<SslConnector>>,
     link: RefCell<Link>,
     /// The generation the next connection opened gets.
     next: Cell<u64>,
@@ -529,10 +537,13 @@ impl Stream {
 /// out its answers and the pods' view until it ends, or the worker lets go of it. A
 /// connection the worker let go of while it was being opened is closed at once.
 async fn open(stream: Weak<Stream>, view: Weak<RefCell<View>>, generation: u64) {
-    let Some(address) = stream.upgrade().map(|stream| stream.address.clone()) else {
+    let Some((address, tls)) = stream
+        .upgrade()
+        .map(|stream| (stream.address.clone(), stream.tls.clone()))
+    else {
         return;
     };
-    let opened = decide_stream(&address).await;
+    let opened = decide_stream(&address, tls.as_ref()).await;
     let Some(held) = stream.upgrade() else {
         return;
     };
@@ -653,6 +664,7 @@ impl SyncLimiter {
             .map(|address| {
                 Rc::new(Stream {
                     address: address.clone(),
+                    tls: process.tls.clone(),
                     link: RefCell::new(Link::Opening(0, Vec::new())),
                     next: Cell::new(1),
                     waiting: RefCell::new(HashMap::new()),
@@ -1097,6 +1109,7 @@ mod tests {
             breaker_failures: 1,
             probe_after: Duration::from_secs(60),
             max_key_bytes: 1 << 20,
+            tls: None,
         }
     }
 
@@ -1107,7 +1120,8 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let process = Process::start(config(100), NonZeroUsize::MIN, None, None).unwrap();
+                let process =
+                    Process::start(config(100), NonZeroUsize::MIN, None, None, None).unwrap();
                 let limiter = super::SyncLimiter::new(process, 0);
                 let (answered, answer) = tokio::sync::oneshot::channel();
                 let asked = super::Asked {
@@ -1141,10 +1155,10 @@ mod tests {
     #[test]
     fn breakers_carried_across_keep_their_clock() {
         let one = NonZeroUsize::MIN;
-        let before = Process::start(config(20), one, None, None).unwrap();
+        let before = Process::start(config(20), one, None, None, None).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         before.breakers[0].failed(before.now(), 1);
-        let after = Process::start(config(30), one, None, Some(&before)).unwrap();
+        let after = Process::start(config(30), one, None, Some(&before), None).unwrap();
         assert!(after.breakers[0].is_open(), "carried");
         assert!(
             after.now() >= 50_000_000,

@@ -65,6 +65,7 @@ use crate::upstream::secure::{Secure, Socket as UpstreamSocket};
 use crate::way_back::{Way, WebSocket};
 use crate::websocket::Key;
 use arc_swap::ArcSwap;
+use boring::ssl::SslConnector;
 use bytes::Bytes;
 use edgerush_config::{Compiled, CompiledListener, CompiledRetry, CompiledRule, Timeout};
 use edgerush_filters::HeaderModifier;
@@ -790,6 +791,9 @@ struct Snapshot {
     /// By position in [`Proxy::listeners`]: where its access log is written, if it has one
     /// (21 §4).
     logs: Vec<Option<Sink>>,
+    /// What the rate-limiting service's pods are reached with, if with TLS (06 §4): made as
+    /// the config is taken in, so that one whose certificate cannot be used is refused.
+    service_tls: Option<SslConnector>,
 }
 
 impl Snapshot {
@@ -1225,6 +1229,10 @@ pub enum ProxyError {
          limits need"
     )]
     RateLimitsUnsupported,
+    /// The rate-limiting service's TLS that cannot be set up: a certificate or an authority
+    /// that cannot be used.
+    #[error("`rate_limiting.service.tls`: {0}")]
+    RateLimitServiceTls(String),
     /// A rate-limiting thread that could not be started: its pods' addresses, a thread or
     /// its runtime could not be had.
     #[error("`rate_limiting`: its thread cannot be started: {0}")]

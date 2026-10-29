@@ -3,9 +3,11 @@
 //! three service pods on real sockets, and refuses what is over with 429.
 
 use super::*;
+use edgerush_certificates::testing::Authority;
 use edgerush_ratelimit::service::PodId;
 use edgerush_ratelimit_service::grpc::{Client as PodClient, Server};
 use edgerush_ratelimit_service::pod::{Pod, Timing};
+use edgerush_ratelimit_service::secure::{self, PodCredentials, PodTls};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
@@ -18,14 +20,16 @@ async fn service() -> Vec<String> {
 
 /// The same, each exchange any of its pods is sent counted in `exchanges`.
 async fn counted_service(exchanges: &Arc<AtomicUsize>) -> Vec<String> {
-    held_service(exchanges, &Arc::new(Mutex::new(None))).await
+    held_service(exchanges, &Arc::new(Mutex::new(None)), None).await
 }
 
 /// The same, the answer to every exchange that reaches a pod before `hold` held back for
-/// [`HELD`].
+/// [`HELD`]; served with mutual TLS if `tls` gives the pods' authority and the data
+/// planes'.
 async fn held_service(
     exchanges: &Arc<AtomicUsize>,
     hold: &Arc<Mutex<Option<Instant>>>,
+    tls: Option<(&Authority, &Authority)>,
 ) -> Vec<String> {
     let mut listeners = Vec::new();
     let mut addresses = Vec::new();
@@ -42,9 +46,27 @@ async fn held_service(
     };
     let mut pods = Vec::new();
     for (id, listener) in (0..3).zip(listeners) {
+        let secured = tls.map(|(pods, planes)| {
+            PodTls::new(&PodCredentials {
+                certificate: pods.issue(&["127.0.0.1"]),
+                pods: pods.pem(),
+                data_planes: planes.pem(),
+            })
+            .unwrap()
+        });
+        let dialling = secured
+            .as_ref()
+            .map(|secured| tokio::sync::watch::channel(secured.connector().clone()).1);
         let peers: BTreeMap<PodId, PodClient> = (0..3)
             .filter(|pod| *pod != id)
-            .map(|pod| (pod, PodClient::new(&addresses[pod as usize]).unwrap()))
+            .map(|pod| {
+                let address = &addresses[pod as usize];
+                let client = match &dialling {
+                    Some(dialling) => PodClient::secured(address, dialling.clone()),
+                    None => PodClient::new(address),
+                };
+                (pod, client.unwrap())
+            })
             .collect();
         let pod = Pod::spawn(id, vec![0, 1, 2], 1, timing, peers);
         let server = Counted {
@@ -52,12 +74,25 @@ async fn held_service(
             exchanges: Arc::clone(exchanges),
             hold: Arc::clone(hold),
         };
-        tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .serve_with_incoming(server, TcpIncoming::from(listener))
-                .await
-                .unwrap();
-        });
+        match secured {
+            Some(secured) => {
+                tokio::spawn(secure::serve(
+                    listener,
+                    tokio::sync::watch::channel(Arc::new(secured)).1,
+                    server,
+                    |_peer, _why| {},
+                    std::future::pending(),
+                ));
+            }
+            None => {
+                tokio::spawn(async move {
+                    tonic::transport::Server::builder()
+                        .serve_with_incoming(server, TcpIncoming::from(listener))
+                        .await
+                        .unwrap();
+                });
+            }
+        }
         pods.push(pod);
     }
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -145,6 +180,7 @@ fn limited(mut config: Config, service: &[String]) -> Config {
             cycle_ms: Some(10),
             poll_quiet_keys: None,
             schedule_keys: None,
+            tls: None,
         }),
     });
     config
@@ -346,7 +382,7 @@ async fn a_cold_key_decided_locally_does_not_wait_for_the_service() {
             );
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
-            let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
+            let hub = Hub::start(&service, 1, 1 << 20, None, None).unwrap();
             let limiter = Limiter::new(&service, hub, 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = requester("203.0.113.9");
@@ -390,7 +426,7 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
             }
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
-            let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
+            let hub = Hub::start(&service, 1, 1 << 20, None, None).unwrap();
             let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = requester("203.0.113.9");
@@ -452,7 +488,7 @@ async fn scheduled_a_signal_with_no_room_leaves_the_next_free_to_go() {
             }
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
-            let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
+            let hub = Hub::start(&service, 1, 1 << 20, None, None).unwrap();
             let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = requester("203.0.113.9");
@@ -502,11 +538,11 @@ async fn a_late_answer_does_not_give_back_a_spent_bucket() {
     local
         .run_until(async {
             let hold = Arc::new(Mutex::new(None));
-            let service = held_service(&Arc::new(AtomicUsize::new(0)), &hold).await;
+            let service = held_service(&Arc::new(AtomicUsize::new(0)), &hold, None).await;
             let config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
-            let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
+            let hub = Hub::start(&service, 1, 1 << 20, None, None).unwrap();
             let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = requester("203.0.113.9");
@@ -627,6 +663,84 @@ async fn a_changed_service_starts_the_process_afresh() {
     assert!(proxy.hub().1.is_none(), "no service, no thread");
     proxy.reload(compile(&config).unwrap()).unwrap();
     assert!(proxy.hub().1.is_some(), "a service again");
+}
+
+/// Pods served with mutual TLS are sent no exchange by a data plane whose certificate the
+/// data planes' authority did not sign: it is refused in the handshake. A reload showing
+/// one it signed keeps the process's thread, keys and all, and its next connections show
+/// that: what waited is reported. One that drops TLS starts the thread afresh, as its
+/// clients dial otherwise.
+#[tokio::test]
+async fn pods_are_reached_with_the_certificate_the_config_shows() {
+    use crate::ratelimit::{Limited, Limiter};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (pods, planes) = (Authority::new("pods"), Authority::new("data planes"));
+            let exchanges = Arc::new(AtomicUsize::new(0));
+            let service = held_service(
+                &exchanges,
+                &Arc::new(Mutex::new(None)),
+                Some((&pods, &planes)),
+            )
+            .await;
+            let plain = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
+            let stranger = Authority::new("stranger");
+            let refused = service_tls(plain.clone(), &pods.pem(), stranger.issue(&["plane"]));
+            let proxy = started(&refused, NonZeroUsize::MIN);
+            let hub = hub_of(&proxy);
+            let compiled = compile(&refused).unwrap();
+            let limiter = Limiter::new(compiled.rate_limit_service().unwrap(), Arc::clone(&hub), 0);
+            let rule = Arc::clone(&compiled.rules_of(0)[0]);
+            assert!(matches!(
+                limiter.decide_all(&rule.limits, 0b1, requester("203.0.113.9")),
+                Limited::Admit
+            ));
+            // Thirty cycles, each reporting the admission again.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                exchanges.load(Ordering::Relaxed),
+                0,
+                "refused in the handshake"
+            );
+
+            let shown = service_tls(plain.clone(), &pods.pem(), planes.issue(&["plane"]));
+            proxy.reload(compile(&shown).unwrap()).unwrap();
+            assert!(Arc::ptr_eq(&hub, &hub_of(&proxy)), "the thread kept");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while exchanges.load(Ordering::Relaxed) == 0 {
+                assert!(Instant::now() < deadline, "never reported");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            proxy.reload(compile(&plain).unwrap()).unwrap();
+            assert!(!Arc::ptr_eq(&hub, &hub_of(&proxy)), "plain, afresh");
+            proxy.reload(compile(&shown).unwrap()).unwrap();
+            limiter.stop();
+        })
+        .await;
+}
+
+/// A config whose certificate for the rate-limiting service cannot be used is refused, at
+/// start and on a reload alike, whether or not its rate limits have been started.
+#[test]
+fn a_service_certificate_that_cannot_be_used_is_refused() {
+    let service = ["127.0.0.1:1".to_owned()];
+    let plain = limited(everything_config("127.0.0.1:1".parse().unwrap()), &service);
+    let pods = Authority::new("pods");
+    let broken = edgerush_config::Certificate {
+        chain: "not a certificate".to_owned(),
+        key: "nor a key".to_owned(),
+    };
+    let unusable = service_tls(plain.clone(), &pods.pem(), broken);
+    assert!(matches!(
+        Proxy::new(compile(&unusable).unwrap(), NonZeroUsize::MIN),
+        Err(ProxyError::RateLimitServiceTls(_))
+    ));
+    let proxy = Proxy::new(compile(&plain).unwrap(), NonZeroUsize::MIN).unwrap();
+    assert!(matches!(
+        proxy.reload(compile(&unusable).unwrap()),
+        Err(ProxyError::RateLimitServiceTls(_))
+    ));
 }
 
 /// Rate limits whose thread cannot be started refuse the config: at start, which the data
@@ -795,7 +909,7 @@ async fn an_ask_waiting_when_the_thread_goes_is_told_it_is_unavailable() {
             let service = compiled.rate_limit_service().unwrap().clone();
             let (failed, failures) = told_failures();
             let failed = crate::ratelimit::Failed(Arc::new(failed));
-            let hub = Hub::start(&service, 1, 1 << 20, Some(failed)).unwrap();
+            let hub = Hub::start(&service, 1, 1 << 20, Some(failed), None).unwrap();
             let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
             limiter.set_most_made(0, 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
@@ -841,7 +955,7 @@ async fn one_token_limiter() -> (
     );
     let compiled = compile(&config).unwrap();
     let service = compiled.rate_limit_service().unwrap().clone();
-    let hub = crate::ratelimit::Hub::start(&service, 1, 1 << 20, None).unwrap();
+    let hub = crate::ratelimit::Hub::start(&service, 1, 1 << 20, None, None).unwrap();
     let limiter = crate::ratelimit::Limiter::new(&service, Arc::clone(&hub), 0);
     (limiter, Arc::clone(&compiled.rules_of(0)[0]), hub)
 }
@@ -966,7 +1080,7 @@ async fn asking_limiter() -> (
     );
     let compiled = compile(&config).unwrap();
     let service = compiled.rate_limit_service().unwrap().clone();
-    let hub = crate::ratelimit::Hub::start(&service, 1, 1 << 20, None).unwrap();
+    let hub = crate::ratelimit::Hub::start(&service, 1, 1 << 20, None, None).unwrap();
     let limiter = crate::ratelimit::Limiter::new(&service, Arc::clone(&hub), 0);
     limiter.set_most_made(0, 0);
     let (release, stalled) = std::sync::mpsc::channel();
@@ -1182,8 +1296,9 @@ async fn an_ask_gone_or_out_of_time_when_taken_is_not_asked_of_the_service() {
         max_key_bytes: 1 << 20,
         poll_quiet_keys: true,
         schedule_keys: false,
+        tls: None,
     };
-    let hub = Hub::start(&compiled, 1, 1 << 20, None).unwrap();
+    let hub = Hub::start(&compiled, 1, 1 << 20, None, None).unwrap();
     let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
     hub.to.send(ToHub::Join { worker: 0, answers }).unwrap();
     let before = exchanges.load(Ordering::Relaxed);
@@ -1268,7 +1383,7 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
     let exchanges = Arc::new(AtomicUsize::new(0));
     // Every answer held back past the replacing.
     let hold = Arc::new(Mutex::new(Some(Instant::now() + Duration::from_secs(60))));
-    let pods = held_service(&exchanges, &hold).await;
+    let pods = held_service(&exchanges, &hold, None).await;
     let mut config = limited(everything_config("127.0.0.1:1".parse().unwrap()), &pods);
     // A new key asked about, decided by the process and reported next cycle: an exchange.
     let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
@@ -1329,10 +1444,11 @@ async fn a_failed_rate_limiting_thread_tells_once() {
             max_key_bytes: 1 << 20,
             poll_quiet_keys: true,
             schedule_keys: false,
+            tls: None,
         };
         let (failed, failures) = told_failures();
         let failed = crate::ratelimit::Failed(Arc::new(failed));
-        let hub = Hub::start(&compiled, 1, 1 << 20, Some(failed)).unwrap();
+        let hub = Hub::start(&compiled, 1, 1 << 20, Some(failed), None).unwrap();
         let ended = hub.ended();
         let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
         hub.to.send(ToHub::Join { worker: 0, answers }).unwrap();
@@ -1884,7 +2000,7 @@ async fn a_refusal_is_put_down_to_the_limits_the_pod_named() {
             );
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
-            let hub = crate::ratelimit::Hub::start(&service, 1, u64::MAX, None).unwrap();
+            let hub = crate::ratelimit::Hub::start(&service, 1, u64::MAX, None, None).unwrap();
             let limiter = crate::ratelimit::Limiter::new(&service, hub, 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = requester("203.0.113.7");

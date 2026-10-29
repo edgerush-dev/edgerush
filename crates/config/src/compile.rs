@@ -144,6 +144,17 @@ pub struct CompiledSynchronous {
     pub probe_after: Duration,
     /// The bytes the keys may hold on the data plane, held once by its process.
     pub max_key_bytes: u64,
+    /// Mutual TLS to the pods, if they are reached so.
+    pub tls: Option<CompiledServiceTls>,
+}
+
+/// Mutual TLS to the rate-limiting service's pods, the certificate shown found by its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledServiceTls {
+    /// The certificates, in PEM, of the pods' authorities.
+    pub authorities: Vec<String>,
+    /// What the data plane shows the pods.
+    pub certificate: NamedCertificate,
 }
 
 impl CompiledRateLimiting {
@@ -167,6 +178,8 @@ pub struct CompiledRateLimitService {
     pub poll_quiet_keys: bool,
     /// Whether each cycle visits only the keys that need it.
     pub schedule_keys: bool,
+    /// Mutual TLS to the pods, if they are reached so.
+    pub tls: Option<CompiledServiceTls>,
 }
 
 impl CompiledRateLimitService {
@@ -664,6 +677,15 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
         if service.cycle_ms == Some(0) {
             errors.push(place.problem(Problem::RateLimitServiceCycleNever));
         }
+        if let Some(tls) = &service.tls {
+            if tls.authorities.is_empty() {
+                errors.push(place.problem(Problem::NoAuthority));
+            }
+            if !config.certificates.contains_key(&tls.certificate) {
+                let problem = Problem::UnknownCertificate(tls.certificate.clone());
+                errors.push(place.problem(problem));
+            }
+        }
         // Fewer than three cannot fail over: of two, the one left is no majority and cannot
         // take the other out of the view.
         if mode == RateLimitMode::Synchronous
@@ -715,6 +737,15 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
         }
         (None, false) => {}
     }
+    // A certificate not found is refused above, and nothing is compiled.
+    let tls = service
+        .and_then(|service| service.tls.as_ref())
+        .and_then(|tls| {
+            Some(CompiledServiceTls {
+                authorities: tls.authorities.clone(),
+                certificate: named(config, &tls.certificate)?,
+            })
+        });
     match mode {
         RateLimitMode::Off => CompiledRateLimiting::Off,
         RateLimitMode::Local => CompiledRateLimiting::Local { max_key_bytes },
@@ -727,6 +758,7 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
                     breaker_failures: waiting.breaker.failures,
                     probe_after: Duration::from_millis(waiting.breaker.probe_after_ms),
                     max_key_bytes,
+                    tls,
                 })
             }
             _ => CompiledRateLimiting::Off,
@@ -740,6 +772,7 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
                 max_key_bytes,
                 poll_quiet_keys: service.poll_quiet_keys.unwrap_or(false),
                 schedule_keys: service.schedule_keys.unwrap_or(true),
+                tls,
             }),
             None => CompiledRateLimiting::Off,
         },
@@ -5402,6 +5435,7 @@ upstreams: {}
                 breaker_failures: 5,
                 probe_after: Duration::from_secs(1),
                 max_key_bytes: 1000,
+                tls: None,
             }))
         );
         // The mode is always written: a section saying nothing would leave it implied.
@@ -5479,6 +5513,68 @@ rate_limiting: {{ {section} }}
 
     /// How a request waits for its owner, as a synchronous data plane is to say it.
     const WAITS: &str = "synchronous: { timeout_ms: 20, when_unreachable: allow, breaker: { failures: 5, probe_after_ms: 1000 } }";
+
+    /// The service's pods are reached with mutual TLS in either mode that shares counts, as
+    /// said: an authority at least, and the certificate shown found among the config's;
+    /// plain when it says nothing.
+    #[test]
+    fn the_service_is_reached_with_tls_as_said() {
+        let with = |mode: &str, tls: &str| {
+            let yaml = format!(
+                r#"listeners: {{}}
+routes: []
+upstreams: {{}}
+rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls} }}{synchronous} }}
+"#,
+                synchronous = if mode == "synchronous" {
+                    format!(", experimental_fewer_pods: true, {WAITS}")
+                } else {
+                    String::new()
+                },
+            );
+            compile(&with_certificates(config(&yaml), &["plane"]))
+                .map(|compiled| match compiled.rate_limiting() {
+                    CompiledRateLimiting::Synchronous(synchronous) => synchronous.tls.clone(),
+                    CompiledRateLimiting::Asynchronous(service) => service.tls.clone(),
+                    CompiledRateLimiting::Off | CompiledRateLimiting::Local { .. } => {
+                        panic!("a mode without the service")
+                    }
+                })
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let said = Some(CompiledServiceTls {
+            authorities: vec!["CA".to_owned()],
+            certificate: NamedCertificate {
+                name: "plane".to_owned(),
+                certificate: Certificate {
+                    chain: "chain of plane".to_owned(),
+                    key: "key of plane".to_owned(),
+                },
+            },
+        });
+        for mode in ["synchronous", "asynchronous"] {
+            assert_eq!(with(mode, ""), Ok(None), "{mode}");
+            assert_eq!(
+                with(
+                    mode,
+                    r#", tls: { authorities: ["CA"], certificate: plane }"#
+                ),
+                Ok(said.clone()),
+                "{mode}"
+            );
+            assert_eq!(
+                with(
+                    mode,
+                    r#", tls: { authorities: [], certificate: elsewhere }"#
+                ),
+                Err(vec![
+                    "the data plane: `tls` needs an authority to trust".to_owned(),
+                    "the data plane: there is no certificate `elsewhere`".to_owned(),
+                ]),
+                "{mode}"
+            );
+        }
+    }
 
     /// The synchronous mode needs how a request waits for its owner, every field of it
     /// said and none of them nothing, and no other mode takes it; it takes none of the
