@@ -62,6 +62,14 @@ pub const ACTIVE_CYCLES: u64 = 30;
 /// data plane's batches waiting for a missing one.
 pub const MOST_UNACKNOWLEDGED: usize = 32;
 
+/// How long a service pod keeps a data plane's record of a key after the data plane last
+/// admitted it, or for the key's refill time if longer: 10 minutes, a fixed margin, not
+/// measured. Records of data planes gone, restarted workers among them, go even from a key
+/// kept in use; one that comes back says in its next batch which of its batches it saw
+/// applied, and a fresh record starts from there. Never under the refill time, so that data
+/// planes told they share a key stay told so while they poll it.
+const RECORD_KEPT: u64 = 10 * 60 * 1_000_000_000;
+
 /// A data plane: one worker of one EdgeRush pod, in one life of it. A restarted worker is a
 /// new data plane, with a new id.
 pub type PlaneId = u64;
@@ -1272,7 +1280,8 @@ impl Record {
 /// What a service pod keeps of the data planes admitting a key, one record each, in order
 /// of data plane and each found by halving the list: most keys are admitted by one data
 /// plane, and a list has room for no more than it needs where a B-tree's first node has
-/// room for eleven. A record is never removed.
+/// room for eleven. A record goes once its data plane has admitted nothing on the key for
+/// [`RECORD_KEPT`].
 #[derive(Debug, Default)]
 struct Records(Vec<(PlaneId, Record)>);
 
@@ -1310,6 +1319,21 @@ impl Records {
     /// How many records there is room for.
     fn room(&self) -> usize {
         self.0.capacity()
+    }
+
+    /// Lets go of the records of data planes that have admitted nothing within `kept` of
+    /// `now`, those that never have among them, and of the room they took.
+    fn retire(&mut self, now: u64, kept: u64) {
+        let before = self.0.len();
+        self.0.retain(|(_, record)| {
+            record
+                .last_admitted
+                .get()
+                .is_some_and(|at| now.saturating_sub(at) <= kept)
+        });
+        if self.0.len() < before {
+            self.0.shrink_to_fit();
+        }
     }
 }
 
@@ -1757,13 +1781,15 @@ impl<S: BuildHasher + Default> ServicePod<S> {
     }
 
     /// The pod's timer at `now`: keys full again and quiet for a refill time are dropped,
-    /// owned or copies.
+    /// owned or copies, and the records of data planes silent on a key kept are retired.
     pub fn on_timer(&mut self, now: u64) {
         let mut holding = 0;
         self.keys.retain(|key, owned| {
-            let keep = now.saturating_sub(owned.touched) <= owned.contract.refill_time()
+            let refill_time = owned.contract.refill_time();
+            let keep = now.saturating_sub(owned.touched) <= refill_time
                 || owned.bucket().forgettable_at() > now;
             if keep {
+                owned.planes.retire(now, refill_time.max(RECORD_KEPT));
                 holding += pod_key_bytes(key, owned);
             }
             keep

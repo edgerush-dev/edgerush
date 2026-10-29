@@ -838,6 +838,85 @@ fn a_pod_keeps_a_bounded_number_of_batches_waiting() {
     assert_eq!(waiting(&pod), 0);
 }
 
+/// The data planes a pod keeps records of for `key`.
+fn recorded(pod: &ServicePod, key: &[u8]) -> Vec<PlaneId> {
+    pod.keys[key]
+        .planes
+        .iter()
+        .map(|(plane, _)| plane)
+        .collect()
+}
+
+/// A data plane's record of a key goes once it has admitted nothing on it for
+/// [`RECORD_KEPT`], though another keeps the key in use, and the room it took with it; one
+/// that has only polled goes at once.
+#[test]
+fn a_record_silent_for_ten_minutes_is_retired() {
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    pod.on_batch(batch(1, hits(1, 1, 0)), 0);
+    pod.on_batch(batch(2, hits(1, 1, 0)), 0);
+    pod.on_batch(batch(2, hits(2, 1, 1)), RECORD_KEPT);
+    pod.on_batch(batch(3, Report::Poll), RECORD_KEPT);
+    pod.on_timer(RECORD_KEPT);
+    assert_eq!(recorded(&pod, b"k"), [1, 2]);
+    pod.on_batch(batch(2, hits(3, 1, 2)), RECORD_KEPT + CYCLE);
+    pod.on_timer(RECORD_KEPT + CYCLE);
+    assert_eq!(recorded(&pod, b"k"), [2]);
+    assert_eq!(pod.keys[&b"k"[..]].planes.room(), 1);
+}
+
+/// A key whose refill time is longer than [`RECORD_KEPT`] keeps a silent data plane's
+/// record for its refill time.
+#[test]
+fn a_long_refill_keeps_a_silent_record_for_its_refill_time() {
+    let n = |n| NonZeroU64::new(n).unwrap();
+    let hourly = Contract {
+        limit: n(1),
+        window: n(1_000 * MS),
+        burst: n(3_600),
+    };
+    let refill_time = hourly.refill_time();
+    assert!(refill_time > RECORD_KEPT);
+    let send = |pod: &mut ServicePod, from, sequence, now| {
+        let entry = Entry {
+            key: b"k"[..].into(),
+            contract: hourly,
+            report: hits(sequence, 1, sequence - 1),
+        };
+        pod.on_batch(
+            Batch {
+                from,
+                entries: vec![entry],
+                made: 0,
+            },
+            now,
+        );
+    };
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    send(&mut pod, 1, 1, 0);
+    send(&mut pod, 2, 1, 0);
+    send(&mut pod, 2, 2, refill_time);
+    pod.on_timer(refill_time);
+    assert_eq!(recorded(&pod, b"k"), [1, 2]);
+    send(&mut pod, 2, 3, refill_time + CYCLE);
+    pod.on_timer(refill_time + CYCLE);
+    assert_eq!(recorded(&pod, b"k"), [2]);
+}
+
+/// A data plane back after its record went starts a fresh one from the batches it saw
+/// applied: none is counted twice.
+#[test]
+fn a_data_plane_back_after_its_record_went_is_counted_once() {
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    pod.on_batch(batch(1, hits(1, 2, 0)), 0);
+    pod.on_batch(batch(2, hits(1, 1, 0)), RECORD_KEPT + CYCLE);
+    pod.on_timer(RECORD_KEPT + CYCLE);
+    assert_eq!(recorded(&pod, b"k"), [2]);
+    let answer = pod.on_batch(batch(1, hits(2, 3, 1)), RECORD_KEPT + 2 * CYCLE);
+    assert_eq!(answer.entries[0].applied, 2);
+    assert_eq!(pod.counted(b"k"), Some(6));
+}
+
 /// A pod that leaves and comes back owns its keys again: the pod that held them meanwhile
 /// hands them over, so the count goes on where it was.
 #[test]
