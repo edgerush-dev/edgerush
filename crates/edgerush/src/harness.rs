@@ -456,6 +456,9 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         std::env::var("POD_IPS").ok().as_deref(),
         std::env::var("KUBERNETES_SERVICE_HOST").ok().as_deref(),
     );
+    if let Some(warning) = own_unknown(&denied, cluster.is_ok()) {
+        say(stderr, format_args!("{warning}"));
+    }
     proxy.deny(denied, |upstream, address, why| {
         say(
             &mut io::stderr(),
@@ -1039,6 +1042,15 @@ fn denied(pod_ips: Option<&str>, api_server: Option<&str>) -> edgerush_proxy::eg
     }
 }
 
+/// What is said of a data plane in a cluster that was not given its own addresses: that it
+/// sends to them until something else names them (03 §6). Nothing, outside a cluster, where
+/// there is no pod.
+fn own_unknown(denied: &edgerush_proxy::egress::Denied, in_cluster: bool) -> Option<&'static str> {
+    (in_cluster && denied.own.is_empty()).then_some(
+        "POD_IPS is not set: the pod's own addresses are not refused as upstream endpoints          until the control plane names them; set it from status.podIPs (03 §6)",
+    )
+}
+
 /// Resolves the names the running config's upstreams resolve, of the nameservers
 /// `/etc/resolv.conf` lists, on a thread and runtime of its own, as EndpointSlices are
 /// followed (03 §6); what fails is said on stderr with its name.
@@ -1171,6 +1183,17 @@ mod tests {
 
     fn parsed(args: &[&str]) -> Result<Parsed, UsageError> {
         parse(args.iter().map(ToString::to_string))
+    }
+
+    #[test]
+    fn a_data_plane_in_a_cluster_not_given_its_own_addresses_says_so() {
+        let unset = denied(None, Some("10.96.0.1"));
+        assert!(
+            own_unknown(&unset, true).is_some_and(|said| said.starts_with("POD_IPS is not set"))
+        );
+        assert_eq!(own_unknown(&unset, false), None);
+        let given = denied(Some("10.244.0.5"), Some("10.96.0.1"));
+        assert_eq!(own_unknown(&given, true), None);
     }
 
     #[test]
