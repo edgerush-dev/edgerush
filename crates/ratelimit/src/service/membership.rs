@@ -9,6 +9,15 @@
 //! joins when all of them have heard it, in this life, for `settle`. A pod that restarted
 //! leaves first and joins again, so that the pods holding its keys hand them over; until a
 //! view takes it in, it serves nothing.
+//!
+//! Nor does a pod serve while it hears no majority (06 §4): one that has heard none for
+//! `stop_serving`, two heartbeats shorter than `silence` at least, stops, and serves again
+//! once it hears a majority. Cut off from the rest, it stops before they can take it out of the view and give
+//! its keys to another; that narrows the time two pods serve one key, and does not rule it
+//! out: one whose own heartbeats are lost while it still hears a majority is taken out while
+//! it serves, and stops only once it hears of it. Alone, it cannot tell being cut off from
+//! every pod being cut off, so when no pod hears a majority, none serves. Each time it loses sight of a majority, finds one
+//! again, and the time it goes without, are counted ([`Sight`]).
 
 use super::{PodId, View};
 use std::collections::BTreeMap;
@@ -46,6 +55,18 @@ struct Heard {
     hears: Vec<(PodId, u64)>,
 }
 
+/// How often a pod has gone without hearing a majority, and for how long.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sight {
+    /// The times it lost sight of a majority, after hearing one: it stopped serving.
+    pub lost: u64,
+    /// The times it heard a majority again, after losing sight of one.
+    pub regained: u64,
+    /// The time it has gone without, in nanoseconds: from each loss, when it stopped, to
+    /// the majority heard again, or to now.
+    pub without: u64,
+}
+
 /// One pod's part in agreeing on the view.
 pub struct Membership {
     me: PodId,
@@ -54,15 +75,23 @@ pub struct Membership {
     members: Vec<PodId>,
     silence: u64,
     settle: u64,
+    stop_serving: u64,
     agreed: Agreed,
     heard: BTreeMap<PodId, Heard>,
+    /// Whether it heard a majority within `stop_serving` when it last looked.
+    majority: bool,
+    sight: Sight,
+    /// Since when it has gone without a majority, after hearing one.
+    without_since: Option<u64>,
 }
 
 impl Membership {
     /// Pod `me` in its life `incarnation`, started at `now`, among the configured `members`
     /// (itself too); others are suspected after `silence` unheard, and taken in after being
-    /// heard for `settle`. It holds no view yet: every member, at epoch 0, which serves
-    /// nothing until a leader makes the first.
+    /// heard for `settle`; it stops serving after `stop_serving` without hearing a
+    /// majority, which is to be two heartbeats shorter than `silence` at least: each side
+    /// may have heard the other last up to a heartbeat apart, and look up to one late. It holds no view yet: every member,
+    /// at epoch 0, which serves nothing until a leader makes the first.
     #[must_use]
     pub fn new(
         me: PodId,
@@ -70,6 +99,7 @@ impl Membership {
         members: Vec<PodId>,
         silence: u64,
         settle: u64,
+        stop_serving: u64,
         now: u64,
     ) -> Self {
         let view = View {
@@ -83,11 +113,15 @@ impl Membership {
             members,
             silence,
             settle,
+            stop_serving,
             agreed: Agreed {
                 view,
                 incarnations: Vec::new(),
             },
             heard: BTreeMap::new(),
+            majority: false,
+            sight: Sight::default(),
+            without_since: None,
         }
     }
 
@@ -103,12 +137,56 @@ impl Membership {
         &self.agreed.incarnations
     }
 
-    /// Whether the view it holds took it in, in this life: until then it serves nothing.
+    /// Whether it serves: the view it holds took it in, in this life, and it heard a
+    /// majority within `stop_serving` when it last looked, at its last heartbeat in or tick.
     #[must_use]
     pub fn serving(&self) -> bool {
-        self.agreed
-            .incarnations
-            .contains(&(self.me, self.incarnation))
+        self.majority
+            && self
+                .agreed
+                .incarnations
+                .contains(&(self.me, self.incarnation))
+    }
+
+    /// How often it has gone without hearing a majority, and for how long, as of `now`.
+    #[must_use]
+    pub fn sight(&self, now: u64) -> Sight {
+        let mut sight = self.sight;
+        if let Some(since) = self.without_since {
+            sight.without = sight.without.saturating_add(now.saturating_sub(since));
+        }
+        sight
+    }
+
+    /// Whether it hears a majority at `now`, within `stop_serving`, counted as it changes.
+    fn look(&mut self, now: u64) {
+        let heard =
+            self.members
+                .iter()
+                .filter(|pod| {
+                    **pod == self.me
+                        || self.heard.get(pod).is_some_and(|heard| {
+                            now.saturating_sub(heard.last) <= self.stop_serving
+                        })
+                })
+                .count();
+        let majority = heard * 2 > self.members.len();
+        match (self.majority, majority) {
+            (true, false) => {
+                self.sight.lost += 1;
+                self.without_since = Some(now);
+            }
+            (false, true) => {
+                // The first majority it hears is no regaining: it never had one to lose.
+                if let Some(since) = self.without_since.take() {
+                    self.sight.regained += 1;
+                    self.sight.without =
+                        self.sight.without.saturating_add(now.saturating_sub(since));
+                }
+            }
+            _ => {}
+        }
+        self.majority = majority;
     }
 
     fn alive(&self, pod: PodId, now: u64) -> bool {
@@ -163,6 +241,7 @@ impl Membership {
         }
         heard.last = now;
         heard.hears = heartbeat.hears;
+        self.look(now);
         if heartbeat.agreed.view.epoch > self.agreed.view.epoch {
             self.agreed = heartbeat.agreed;
             return Some(self.agreed.view.clone());
@@ -173,6 +252,7 @@ impl Membership {
     /// Its timer at `now`: as the leader of a majority, it changes the view if every pod it
     /// hears agrees; the new view is returned.
     pub fn on_tick(&mut self, now: u64) -> Option<View> {
+        self.look(now);
         let alive: Vec<PodId> = self
             .members
             .iter()
@@ -267,6 +347,7 @@ mod tests {
     const MS: u64 = 1_000_000;
     const SILENCE: u64 = 500 * MS;
     const SETTLE: u64 = 300 * MS;
+    const STOP_SERVING: u64 = 250 * MS;
 
     /// Three pods and which links between them carry heartbeats.
     struct Cluster {
@@ -284,7 +365,17 @@ mod tests {
         fn living(incarnation: u64) -> Self {
             Self {
                 pods: (0..3)
-                    .map(|p| Membership::new(p, incarnation, vec![0, 1, 2], SILENCE, SETTLE, 0))
+                    .map(|p| {
+                        Membership::new(
+                            p,
+                            incarnation,
+                            vec![0, 1, 2],
+                            SILENCE,
+                            SETTLE,
+                            STOP_SERVING,
+                            0,
+                        )
+                    })
                     .collect(),
                 up: vec![true; 3],
                 cut: Vec::new(),
@@ -337,6 +428,7 @@ mod tests {
                 vec![0, 1, 2],
                 SILENCE,
                 SETTLE,
+                STOP_SERVING,
                 now,
             );
         }
@@ -438,6 +530,70 @@ mod tests {
         }
     }
 
+    /// A pod cut off from the others stops serving before they take it out of the view
+    /// and give its keys to another. Heard again, it serves again, and is counted as having
+    /// gone without a majority once.
+    #[test]
+    fn a_pod_cut_off_stops_serving_before_the_others_take_it_out() {
+        let mut cluster = Cluster::new();
+        cluster.run(0, 600 * MS);
+        cluster.cut.extend([(0, 1), (0, 2)]);
+        let (mut stopped, mut taken_out) = (None, None);
+        for step in 7..=30 {
+            let now = step * 100 * MS;
+            cluster.run(now, now);
+            if stopped.is_none() && !cluster.pods[0].serving() {
+                stopped = Some(now);
+            }
+            if taken_out.is_none() && !cluster.view(1).1.contains(&0) {
+                taken_out = Some(now);
+            }
+        }
+        let (stopped, taken_out) = (stopped.unwrap(), taken_out.unwrap());
+        assert!(
+            stopped < taken_out,
+            "stopped at {stopped}, taken out at {taken_out}"
+        );
+        assert!(cluster.pods[1].serving() && cluster.pods[2].serving());
+        cluster.cut.clear();
+        cluster.run(3_100 * MS, 4_000 * MS);
+        assert_eq!(cluster.view(0), (3, vec![0, 1, 2]));
+        assert!(cluster.pods[0].serving());
+        let sight = cluster.pods[0].sight(4_000 * MS);
+        assert_eq!((sight.lost, sight.regained), (1, 1));
+        // From when it stopped to the first heartbeat heard again.
+        assert_eq!(sight.without, 3_100 * MS - stopped);
+        assert_eq!(cluster.pods[1].sight(4_000 * MS), Sight::default());
+    }
+
+    /// With every link down, no pod hears a majority and none serves; nor can any change
+    /// the view. Once heartbeats come again, every pod serves the view it held, at once.
+    #[test]
+    fn every_pod_cut_off_stops_serving_and_serves_again_in_the_same_view() {
+        let mut cluster = Cluster::new();
+        cluster.run(0, 600 * MS);
+        cluster.cut.extend([(0, 1), (0, 2), (1, 2)]);
+        cluster.run(700 * MS, 800 * MS);
+        for pod in 0..3 {
+            assert!(cluster.pods[pod].serving(), "pod {pod}: not 250 ms yet");
+        }
+        cluster.run(900 * MS, 2_000 * MS);
+        for pod in 0..3 {
+            assert!(!cluster.pods[pod].serving(), "pod {pod}");
+            assert_eq!(cluster.view(pod), (1, vec![0, 1, 2]), "pod {pod}");
+            // Still without, as of now: from the stop, at 900 ms, to 2 s.
+            let sight = cluster.pods[pod].sight(2_000 * MS);
+            assert_eq!((sight.lost, sight.regained), (1, 0), "pod {pod}");
+            assert_eq!(sight.without, 1_100 * MS, "pod {pod}");
+        }
+        cluster.cut.clear();
+        cluster.run(2_100 * MS, 2_100 * MS);
+        for pod in 0..3 {
+            assert!(cluster.pods[pod].serving(), "pod {pod}");
+            assert_eq!(cluster.view(pod), (1, vec![0, 1, 2]), "pod {pod}");
+        }
+    }
+
     #[test]
     fn a_restarted_pod_leaves_and_joins_again_and_serves_only_then() {
         let mut cluster = Cluster::new();
@@ -464,6 +620,7 @@ mod tests {
         cluster.up[1] = false;
         cluster.run(700 * MS, 3_000 * MS);
         assert_eq!(cluster.view(2), (1, vec![0, 1, 2]), "no majority");
+        assert!(!cluster.pods[2].serving(), "alone, it serves nothing");
     }
 
     /// Only the lowest-numbered pod of a majority changes the view: the other, alone in
@@ -502,7 +659,7 @@ mod tests {
     /// A view of the same epoch is not taken over: only a later one is.
     #[test]
     fn a_view_of_the_same_epoch_is_not_taken_over() {
-        let mut pod = Membership::new(0, 1, vec![0, 1, 2], SILENCE, SETTLE, 0);
+        let mut pod = Membership::new(0, 1, vec![0, 1, 2], SILENCE, SETTLE, STOP_SERVING, 0);
         let beat = |epoch, pods: Vec<PodId>| Heartbeat {
             from: 1,
             incarnation: 1,
