@@ -243,8 +243,8 @@ pub struct GatewaySpec {
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct GatewayAddresses {
     /// Type of the address.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<String>,
+    #[serde(default = "default_gateway_addresses_type")]
+    pub r#type: String,
     /// When a value is unspecified, an implementation SHOULD automatically
     /// assign an address matching the requested type if possible.
     ///
@@ -262,8 +262,8 @@ pub struct GatewayAddresses {
 pub struct GatewayAllowedListeners {
     /// Namespaces defines which namespaces ListenerSets can be attached to this Gateway.
     /// The default value is to allow no ListenerSets.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespaces: Option<GatewayAllowedListenersNamespaces>,
+    #[serde(default = "default_gateway_allowed_listeners_namespaces")]
+    pub namespaces: GatewayAllowedListenersNamespaces,
 }
 
 /// Namespaces defines which namespaces ListenerSets can be attached to this Gateway.
@@ -281,8 +281,8 @@ pub struct GatewayAllowedListenersNamespaces {
     /// The default value None
     ///
     /// The schema's values: `All`, `Selector`, `Same`, `None`. Another is read as it is.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from: Option<String>,
+    #[serde(default = "default_gateway_allowed_listeners_namespaces_from")]
+    pub from: String,
     /// Selector must be specified when From is set to "Selector". In that case,
     /// only ListenerSets in Namespaces matching this Selector will be selected by this
     /// Gateway. This field is ignored for other values of "From".
@@ -433,8 +433,8 @@ pub struct GatewayListeners {
     ///
     /// Support: Core
     #[serde(rename = "allowedRoutes")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allowed_routes: Option<GatewayListenersAllowedRoutes>,
+    #[serde(default = "default_gateway_listeners_allowed_routes")]
+    pub allowed_routes: GatewayListenersAllowedRoutes,
     /// Hostname specifies the virtual hostname to match for protocol types that
     /// define this concept. When unspecified, all hostnames are matched. This
     /// field is ignored for protocols that don't require hostname based
@@ -559,16 +559,16 @@ pub struct GatewayListenersAllowedRoutes {
     /// Listener. This is restricted to the namespace of this Gateway by default.
     ///
     /// Support: Core
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespaces: Option<GatewayListenersAllowedRoutesNamespaces>,
+    #[serde(default = "default_gateway_listeners_allowed_routes_namespaces")]
+    pub namespaces: GatewayListenersAllowedRoutesNamespaces,
 }
 
 /// RouteGroupKind indicates the group and kind of a Route resource.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct GatewayListenersAllowedRoutesKinds {
     /// Group is the group of the Route.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
+    #[serde(default = "default_gateway_listeners_allowed_routes_kinds_group")]
+    pub group: String,
     /// Kind is the kind of the Route.
     #[serde(default)]
     pub kind: String,
@@ -591,8 +591,8 @@ pub struct GatewayListenersAllowedRoutesNamespaces {
     /// Support: Core
     ///
     /// The schema's values: `All`, `Selector`, `Same`. Another is read as it is.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from: Option<String>,
+    #[serde(default = "default_gateway_listeners_allowed_routes_namespaces_from")]
+    pub from: String,
     /// Selector must be specified when From is set to "Selector". In that case,
     /// only Routes in Namespaces matching this Selector will be selected by this
     /// Gateway. This field is ignored for other values of "From".
@@ -696,8 +696,8 @@ pub struct GatewayListenersTls {
     /// Support: Core
     ///
     /// The schema's values: `Terminate`, `Passthrough`. Another is read as it is.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
+    #[serde(default = "default_gateway_listeners_tls_mode")]
+    pub mode: String,
     /// Options are a list of key/value pairs to enable extended TLS
     /// configuration for each implementation. For example, configuring the
     /// minimum TLS version or supported cipher suites.
@@ -725,11 +725,11 @@ pub struct GatewayListenersTls {
 pub struct GatewayListenersTlsCertificateRefs {
     /// Group is the group of the referent. For example, "gateway.networking.k8s.io".
     /// When unspecified or empty string, core API group is inferred.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
+    #[serde(default = "default_gateway_listeners_tls_certificate_refs_group")]
+    pub group: String,
     /// Kind is kind of the referent. For example "Secret".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+    #[serde(default = "default_gateway_listeners_tls_certificate_refs_kind")]
+    pub kind: String,
     /// Name is the name of the referent.
     #[serde(default)]
     pub name: String,
@@ -834,11 +834,11 @@ pub struct GatewayTlsBackend {
 pub struct GatewayTlsBackendClientCertificateRef {
     /// Group is the group of the referent. For example, "gateway.networking.k8s.io".
     /// When unspecified or empty string, core API group is inferred.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
+    #[serde(default = "default_gateway_tls_backend_client_certificate_ref_group")]
+    pub group: String,
     /// Kind is kind of the referent. For example "Secret".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+    #[serde(default = "default_gateway_tls_backend_client_certificate_ref_kind")]
+    pub kind: String,
     /// Name is the name of the referent.
     #[serde(default)]
     pub name: String,
@@ -969,8 +969,8 @@ pub struct GatewayTlsFrontendDefaultValidation {
     /// Support: Core
     ///
     /// The schema's values: `AllowValidOnly`, `AllowInsecureFallback`. Another is read as it is.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
+    #[serde(default = "default_gateway_tls_frontend_default_validation_mode")]
+    pub mode: String,
 }
 
 /// ObjectReference identifies an API object including its namespace.
@@ -1114,8 +1114,8 @@ pub struct GatewayTlsFrontendPerPortTlsValidation {
     /// Support: Core
     ///
     /// The schema's values: `AllowValidOnly`, `AllowInsecureFallback`. Another is read as it is.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
+    #[serde(default = "default_gateway_tls_frontend_per_port_tls_validation_mode")]
+    pub mode: String,
 }
 
 /// ObjectReference identifies an API object including its namespace.
@@ -1267,6 +1267,90 @@ pub struct GatewayStatusListenersSupportedKinds {
     /// Kind is the kind of the Route.
     #[serde(default)]
     pub kind: String,
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_addresses_type() -> String {
+    String::from("IPAddress")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_allowed_listeners_namespaces() -> GatewayAllowedListenersNamespaces {
+    GatewayAllowedListenersNamespaces { from: String::from("None"), ..Default::default() }
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_allowed_listeners_namespaces_from() -> String {
+    String::from("None")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_listeners_allowed_routes() -> GatewayListenersAllowedRoutes {
+    GatewayListenersAllowedRoutes { namespaces: GatewayListenersAllowedRoutesNamespaces { from: String::from("Same"), ..Default::default() }, ..Default::default() }
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_listeners_allowed_routes_namespaces() -> GatewayListenersAllowedRoutesNamespaces {
+    GatewayListenersAllowedRoutesNamespaces { from: String::from("Same"), ..Default::default() }
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_listeners_allowed_routes_kinds_group() -> String {
+    String::from("gateway.networking.k8s.io")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_listeners_allowed_routes_namespaces_from() -> String {
+    String::from("Same")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_listeners_tls_mode() -> String {
+    String::from("Terminate")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_listeners_tls_certificate_refs_group() -> String {
+    String::from("")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_listeners_tls_certificate_refs_kind() -> String {
+    String::from("Secret")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_tls_backend_client_certificate_ref_group() -> String {
+    String::from("")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_tls_backend_client_certificate_ref_kind() -> String {
+    String::from("Secret")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_tls_frontend_default_validation_mode() -> String {
+    String::from("AllowValidOnly")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_gateway_tls_frontend_per_port_tls_validation_mode() -> String {
+    String::from("AllowValidOnly")
 }
 
 impl k8s_openapi::Resource for Gateway {

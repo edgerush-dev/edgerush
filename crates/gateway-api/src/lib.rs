@@ -5,7 +5,9 @@
 //!
 //! An enumerated string is a `String` and a field the types lack is passed over, so that an
 //! object of a newer release or of the experimental channel is read as well, for
-//! translation to judge what it does not know ([05 §6](../../../docs/05-operator.md)).
+//! translation to judge what it does not know ([05 §6](../../../docs/05-operator.md)). A
+//! field the CRD gives a default holds it where an object leaves the field out, so that a
+//! manifest read from a file is what the API server would have stored.
 //!
 //! Types alone: no I/O. The modules are written, never edited: `crds/` is fetched with
 //! `fetch.sh` and the modules written again with

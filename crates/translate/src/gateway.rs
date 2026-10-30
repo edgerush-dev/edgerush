@@ -445,15 +445,17 @@ fn kinds_for(protocol: &str) -> &'static [&'static str] {
 /// operator, of a release newer than the types.
 fn allowed(listener: &GatewayListeners, namespace: &str) -> (Allowed, Option<String>) {
     let carried = kinds_for(&listener.protocol);
-    let routes = listener.allowed_routes.as_ref();
+    // `allowedRoutes`, its `namespaces` and a kind's `group` hold the schema's defaults where
+    // the listener leaves them out (`from: Same`, the Gateway API's group).
+    let routes = &listener.allowed_routes;
     let mut kinds: Vec<&'static str> = Vec::new();
     let mut invalid_kinds: Vec<String> = Vec::new();
-    match routes.and_then(|routes| routes.kinds.as_ref()) {
+    match routes.kinds.as_ref() {
         // None named: every kind its protocol carries.
         None => kinds.extend(carried),
         Some(named) => {
             for named in named {
-                let group = named.group.as_deref().unwrap_or(GROUP);
+                let group = named.group.as_str();
                 match carried.iter().find(|kind| **kind == named.kind) {
                     Some(kind) if group == GROUP => {
                         if !kinds.contains(kind) {
@@ -465,10 +467,7 @@ fn allowed(listener: &GatewayListeners, namespace: &str) -> (Allowed, Option<Str
             }
         }
     }
-    let (namespaces, unread) = match routes.and_then(|routes| routes.namespaces.as_ref()) {
-        None => (Namespaces::Same(namespace.to_owned()), None),
-        Some(written) => namespaces(written, namespace),
-    };
+    let (namespaces, unread) = namespaces(&routes.namespaces, namespace);
     (
         Allowed {
             kinds,
@@ -484,10 +483,10 @@ fn namespaces(
     written: &GatewayListenersAllowedRoutesNamespaces,
     namespace: &str,
 ) -> (Namespaces, Option<String>) {
-    match written.from.as_deref() {
-        None | Some("Same") => (Namespaces::Same(namespace.to_owned()), None),
-        Some("All") => (Namespaces::All, None),
-        Some("Selector") => match written.selector.as_ref() {
+    match written.from.as_str() {
+        "Same" => (Namespaces::Same(namespace.to_owned()), None),
+        "All" => (Namespaces::All, None),
+        "Selector" => match written.selector.as_ref() {
             // The schema asks for a selector with `Selector`; none, and none is taken.
             None => (
                 Namespaces::None,
@@ -498,7 +497,7 @@ fn namespaces(
                 Err(why) => (Namespaces::None, Some(why)),
             },
         },
-        Some(other) => (
+        other => (
             Namespaces::None,
             Some(format!("`from: {other}` is not one translation reads")),
         ),

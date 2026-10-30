@@ -21,14 +21,14 @@ pub struct Widget {
 pub struct WidgetSpec {
     /// How many parts it may have.
     #[serde(rename = "partCount")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub part_count: Option<i32>,
+    #[serde(default = "default_widget_spec_part_count")]
+    pub part_count: i32,
     /// Its parts.
     ///
     /// ```text
     /// parts: [{ kind: Gear }]
     /// ```
-    #[serde(default)]
+    #[serde(default = "default_widget_spec_parts")]
     pub parts: Vec<WidgetParts>,
 }
 
@@ -41,8 +41,8 @@ pub struct WidgetParts {
     #[serde(default)]
     pub kind: String,
     /// `labels`, which the schema does not describe.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub labels: Option<BTreeMap<String, String>>,
+    #[serde(default = "default_widget_parts_labels")]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// `WidgetStatus`, which the schema does not describe.
@@ -51,6 +51,24 @@ pub struct WidgetStatus {
     /// `conditions`, which the schema does not describe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<Condition>>,
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_widget_spec_part_count() -> i32 {
+    4
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_widget_spec_parts() -> Vec<WidgetParts> {
+    vec![WidgetParts { kind: String::from("Gear"), labels: default_widget_parts_labels() }]
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_widget_parts_labels() -> BTreeMap<String, String> {
+    BTreeMap::from([(String::from("colour"), String::from("blue"))])
 }
 
 impl k8s_openapi::Resource for Widget {

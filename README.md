@@ -326,7 +326,8 @@ crates/controller  the control plane (`edgerush-controller`): the objects a data
                    change, a moment's changes at once, and each config that compiles handed on
 crates/crdgen      Rust types written from a CRD's schema (`edgerush-crdgen`), adapted from
                    kopium (its NOTICE): an enumerated string kept a `String`, a missing field
-                   read empty, so that no object of a newer release fails its list; no I/O
+                   read empty, so that no object of a newer release fails its list, and the
+                   schema's defaults filled in, as the API server fills them; no I/O
 crates/discovery   a Kubernetes Service's endpoints, from its EndpointSlices (`edgerush-discovery`):
                    which addresses take requests, and which are hinted for a zone; pure, no I/O
 crates/dns         DNS's wire (`edgerush-dns`): A and AAAA queries written and a nameserver's

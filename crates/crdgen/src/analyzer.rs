@@ -187,6 +187,7 @@ fn container(
         members.push(Member {
             name: key.clone(),
             json: key.clone(),
+            default: value.default.as_ref().map(|default| default.0.clone()),
             type_,
             serde,
             docs: value.description.clone(),

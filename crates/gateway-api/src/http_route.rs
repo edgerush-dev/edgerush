@@ -142,8 +142,8 @@ pub struct HTTPRouteSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_refs: Option<Vec<HTTPRouteParentRefs>>,
     /// Rules are a list of HTTP matchers, filters and actions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rules: Option<Vec<HTTPRouteRules>>,
+    #[serde(default = "default_http_route_spec_rules")]
+    pub rules: Vec<HTTPRouteRules>,
 }
 
 /// ParentReference identifies an API object (usually a Gateway) that can be considered
@@ -166,8 +166,8 @@ pub struct HTTPRouteParentRefs {
     /// Group must be explicitly set to "" (empty string).
     ///
     /// Support: Core
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
+    #[serde(default = "default_http_route_parent_refs_group")]
+    pub group: String,
     /// Kind is kind of the referent.
     ///
     /// There are two kinds of parent resources with "Core" support:
@@ -176,8 +176,8 @@ pub struct HTTPRouteParentRefs {
     /// * Service (Mesh conformance profile, ClusterIP Services only)
     ///
     /// Support for other resources is Implementation-Specific.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+    #[serde(default = "default_http_route_parent_refs_kind")]
+    pub kind: String,
     /// Name is the name of the referent.
     ///
     /// Support: Core
@@ -387,8 +387,8 @@ pub struct HTTPRouteRules {
     ///
     /// When no rules matching a request have been successfully attached to the
     /// parent a request is coming from, a HTTP 404 status code MUST be returned.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub matches: Option<Vec<HTTPRouteRulesMatches>>,
+    #[serde(default = "default_http_route_rules_matches")]
+    pub matches: Vec<HTTPRouteRulesMatches>,
     /// Name is the name of the route rule. This name MUST be unique within a Route if it is set.
     ///
     /// Support: Extended
@@ -428,8 +428,8 @@ pub struct HTTPRouteRulesBackendRefs {
     pub filters: Option<Vec<HTTPRouteRulesBackendRefsFilters>>,
     /// Group is the group of the referent. For example, "gateway.networking.k8s.io".
     /// When unspecified or empty string, core API group is inferred.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
+    #[serde(default = "default_http_route_rules_backend_refs_group")]
+    pub group: String,
     /// Kind is the Kubernetes resource kind of the referent. For example
     /// "Service".
     ///
@@ -444,8 +444,8 @@ pub struct HTTPRouteRulesBackendRefs {
     /// Support: Core (Services with a type other than ExternalName)
     ///
     /// Support: Implementation-specific (Services with type ExternalName)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+    #[serde(default = "default_http_route_rules_backend_refs_kind")]
+    pub kind: String,
     /// Name is the name of the referent.
     #[serde(default)]
     pub name: String,
@@ -480,8 +480,8 @@ pub struct HTTPRouteRulesBackendRefs {
     /// defaults to 1.
     ///
     /// Support for this field varies based on the context where used.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub weight: Option<i32>,
+    #[serde(default = "default_http_route_rules_backend_refs_weight")]
+    pub weight: i32,
 }
 
 /// HTTPRouteFilter defines processing steps that must be completed during the
@@ -804,8 +804,8 @@ pub struct HTTPRouteRulesBackendRefsFiltersCors {
     /// When the `MaxAge` field is unspecified, the gateway sets the response
     /// header "Access-Control-Max-Age: 5" by default.
     #[serde(rename = "maxAge")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_age: Option<i32>,
+    #[serde(default = "default_http_route_rules_backend_refs_filters_cors_max_age")]
+    pub max_age: i32,
 }
 
 /// ExtensionRef is an optional, implementation-specific extension to the
@@ -1017,8 +1017,10 @@ pub struct HTTPRouteRulesBackendRefsFiltersRequestMirror {
 pub struct HTTPRouteRulesBackendRefsFiltersRequestMirrorBackendRef {
     /// Group is the group of the referent. For example, "gateway.networking.k8s.io".
     /// When unspecified or empty string, core API group is inferred.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
+    #[serde(
+        default = "default_http_route_rules_backend_refs_filters_request_mirror_backend_ref_group"
+    )]
+    pub group: String,
     /// Kind is the Kubernetes resource kind of the referent. For example
     /// "Service".
     ///
@@ -1033,8 +1035,10 @@ pub struct HTTPRouteRulesBackendRefsFiltersRequestMirrorBackendRef {
     /// Support: Core (Services with a type other than ExternalName)
     ///
     /// Support: Implementation-specific (Services with type ExternalName)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+    #[serde(
+        default = "default_http_route_rules_backend_refs_filters_request_mirror_backend_ref_kind"
+    )]
+    pub kind: String,
     /// Name is the name of the referent.
     #[serde(default)]
     pub name: String,
@@ -1066,8 +1070,10 @@ pub struct HTTPRouteRulesBackendRefsFiltersRequestMirrorBackendRef {
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct HTTPRouteRulesBackendRefsFiltersRequestMirrorFraction {
     /// `denominator`, which the schema does not describe.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub denominator: Option<i32>,
+    #[serde(
+        default = "default_http_route_rules_backend_refs_filters_request_mirror_fraction_denominator"
+    )]
+    pub denominator: i32,
     /// `numerator`, which the schema does not describe.
     #[serde(default)]
     pub numerator: i32,
@@ -1146,8 +1152,10 @@ pub struct HTTPRouteRulesBackendRefsFiltersRequestRedirect {
     ///
     /// Support: statusCode 301 and 302 are Core; all others are Extended.
     #[serde(rename = "statusCode")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_code: Option<i64>,
+    #[serde(
+        default = "default_http_route_rules_backend_refs_filters_request_redirect_status_code"
+    )]
+    pub status_code: i64,
 }
 
 /// Path defines parameters used to modify the path of the incoming request.
@@ -1676,8 +1684,8 @@ pub struct HTTPRouteRulesFiltersCors {
     /// When the `MaxAge` field is unspecified, the gateway sets the response
     /// header "Access-Control-Max-Age: 5" by default.
     #[serde(rename = "maxAge")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_age: Option<i32>,
+    #[serde(default = "default_http_route_rules_filters_cors_max_age")]
+    pub max_age: i32,
 }
 
 /// ExtensionRef is an optional, implementation-specific extension to the
@@ -1889,8 +1897,8 @@ pub struct HTTPRouteRulesFiltersRequestMirror {
 pub struct HTTPRouteRulesFiltersRequestMirrorBackendRef {
     /// Group is the group of the referent. For example, "gateway.networking.k8s.io".
     /// When unspecified or empty string, core API group is inferred.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
+    #[serde(default = "default_http_route_rules_filters_request_mirror_backend_ref_group")]
+    pub group: String,
     /// Kind is the Kubernetes resource kind of the referent. For example
     /// "Service".
     ///
@@ -1905,8 +1913,8 @@ pub struct HTTPRouteRulesFiltersRequestMirrorBackendRef {
     /// Support: Core (Services with a type other than ExternalName)
     ///
     /// Support: Implementation-specific (Services with type ExternalName)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+    #[serde(default = "default_http_route_rules_filters_request_mirror_backend_ref_kind")]
+    pub kind: String,
     /// Name is the name of the referent.
     #[serde(default)]
     pub name: String,
@@ -1938,8 +1946,8 @@ pub struct HTTPRouteRulesFiltersRequestMirrorBackendRef {
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct HTTPRouteRulesFiltersRequestMirrorFraction {
     /// `denominator`, which the schema does not describe.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub denominator: Option<i32>,
+    #[serde(default = "default_http_route_rules_filters_request_mirror_fraction_denominator")]
+    pub denominator: i32,
     /// `numerator`, which the schema does not describe.
     #[serde(default)]
     pub numerator: i32,
@@ -2018,8 +2026,8 @@ pub struct HTTPRouteRulesFiltersRequestRedirect {
     ///
     /// Support: statusCode 301 and 302 are Core; all others are Extended.
     #[serde(rename = "statusCode")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_code: Option<i64>,
+    #[serde(default = "default_http_route_rules_filters_request_redirect_status_code")]
+    pub status_code: i64,
 }
 
 /// Path defines parameters used to modify the path of the incoming request.
@@ -2263,8 +2271,8 @@ pub struct HTTPRouteRulesMatches {
     pub method: Option<String>,
     /// Path specifies a HTTP request path matcher. If this field is not
     /// specified, a default prefix match on the "/" path is provided.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<HTTPRouteRulesMatchesPath>,
+    #[serde(default = "default_http_route_rules_matches_path")]
+    pub path: HTTPRouteRulesMatchesPath,
     /// QueryParams specifies HTTP query parameter matchers. Multiple match
     /// values are ANDed together, meaning, a request must match all the
     /// specified query parameters to select the route.
@@ -2307,8 +2315,8 @@ pub struct HTTPRouteRulesMatchesHeaders {
     /// determine the supported dialect.
     ///
     /// The schema's values: `Exact`, `RegularExpression`. Another is read as it is.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<String>,
+    #[serde(default = "default_http_route_rules_matches_headers_type")]
+    pub r#type: String,
     /// Value is the value of HTTP Header to be matched.
     #[serde(default)]
     pub value: String,
@@ -2325,11 +2333,11 @@ pub struct HTTPRouteRulesMatchesPath {
     /// Support: Implementation-specific (RegularExpression)
     ///
     /// The schema's values: `Exact`, `PathPrefix`, `RegularExpression`. Another is read as it is.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<String>,
+    #[serde(default = "default_http_route_rules_matches_path_type")]
+    pub r#type: String,
     /// Value of the HTTP path to match against.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
+    #[serde(default = "default_http_route_rules_matches_path_value")]
+    pub value: String,
 }
 
 /// HTTPQueryParamMatch describes how to select a HTTP route by matching HTTP
@@ -2367,8 +2375,8 @@ pub struct HTTPRouteRulesMatchesQueryParams {
     /// documentation to determine the supported dialect.
     ///
     /// The schema's values: `Exact`, `RegularExpression`. Another is read as it is.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<String>,
+    #[serde(default = "default_http_route_rules_matches_query_params_type")]
+    pub r#type: String,
     /// Value is the value of HTTP query param to be matched.
     #[serde(default)]
     pub value: String,
@@ -2394,8 +2402,8 @@ pub struct HTTPRouteRulesRetry {
     /// An explicit zero value MUST disable retries.
     ///
     /// Support: Extended
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attempts: Option<i64>,
+    #[serde(default = "default_http_route_rules_retry_attempts")]
+    pub attempts: i64,
     /// Backoff specifies the base interval for a backoff strategy between
     /// retry attempts and is represented in Gateway API Duration formatting.
     /// The duration a Gateway waits before a retry attempt is determined
@@ -2659,6 +2667,144 @@ pub struct HTTPRouteStatusParentsParentRef {
     #[serde(rename = "sectionName")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_name: Option<String>,
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_spec_rules() -> Vec<HTTPRouteRules> {
+    vec![HTTPRouteRules { matches: vec![HTTPRouteRulesMatches { path: HTTPRouteRulesMatchesPath { r#type: String::from("PathPrefix"), value: String::from("/") }, ..Default::default() }], ..Default::default() }]
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_parent_refs_group() -> String {
+    String::from("gateway.networking.k8s.io")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_parent_refs_kind() -> String {
+    String::from("Gateway")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_matches() -> Vec<HTTPRouteRulesMatches> {
+    vec![HTTPRouteRulesMatches { path: HTTPRouteRulesMatchesPath { r#type: String::from("PathPrefix"), value: String::from("/") }, ..Default::default() }]
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_backend_refs_group() -> String {
+    String::from("")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_backend_refs_kind() -> String {
+    String::from("Service")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_backend_refs_weight() -> i32 {
+    1
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_backend_refs_filters_cors_max_age() -> i32 {
+    5
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_backend_refs_filters_request_mirror_backend_ref_group() -> String {
+    String::from("")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_backend_refs_filters_request_mirror_backend_ref_kind() -> String {
+    String::from("Service")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_backend_refs_filters_request_mirror_fraction_denominator() -> i32 {
+    100
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_backend_refs_filters_request_redirect_status_code() -> i64 {
+    302
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_filters_cors_max_age() -> i32 {
+    5
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_filters_request_mirror_backend_ref_group() -> String {
+    String::from("")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_filters_request_mirror_backend_ref_kind() -> String {
+    String::from("Service")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_filters_request_mirror_fraction_denominator() -> i32 {
+    100
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_filters_request_redirect_status_code() -> i64 {
+    302
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_matches_path() -> HTTPRouteRulesMatchesPath {
+    HTTPRouteRulesMatchesPath { r#type: String::from("PathPrefix"), value: String::from("/") }
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_matches_headers_type() -> String {
+    String::from("Exact")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_matches_path_type() -> String {
+    String::from("PathPrefix")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_matches_path_value() -> String {
+    String::from("/")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_matches_query_params_type() -> String {
+    String::from("Exact")
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_http_route_rules_retry_attempts() -> i64 {
+    1
 }
 
 impl k8s_openapi::Resource for HTTPRoute {

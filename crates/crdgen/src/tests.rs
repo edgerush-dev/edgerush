@@ -432,7 +432,9 @@ spec:
                 description: How many parts it may have.
                 type: integer
                 format: int32
+                default: 4
               parts:
+                default: [{ kind: Gear }]
                 description: |-
                   Its parts.
 
@@ -451,10 +453,12 @@ spec:
                     labels:
                       type: object
                       additionalProperties: { type: string }
+                      default: { colour: blue }
           status:
             type: object
             properties:
               conditions:
+                default: []
                 type: array
                 items:
                   type: object
@@ -491,14 +495,44 @@ fn a_required_field_missing_is_read_empty() {
     assert_eq!(widget.spec.parts.len(), 1);
     assert_eq!(widget.spec.parts[0].kind, "");
     let widget: widgets::Widget = serde_saphyr::from_str("metadata: { name: w }").unwrap();
-    assert!(widget.spec.parts.is_empty());
+    assert!(
+        widget.spec.parts.is_empty(),
+        "a spec left out is empty, no default made in it"
+    );
 }
 
 /// The module for [`WIDGETS`] is `src/tests/widgets.rs`, as written, and compiles (above).
 #[test]
 fn a_crd_is_written_as_a_module() {
+    let written = generate(&crd(WIDGETS), "v1").unwrap();
+    // `EDGERUSH_WRITE_TYPES=1 cargo test -p edgerush-crdgen` writes it again, to be read over.
+    if std::env::var_os("EDGERUSH_WRITE_TYPES").is_some() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tests/widgets.rs");
+        std::fs::write(path, &written).unwrap();
+    }
     let compiled = include_str!("tests/widgets.rs").replace("\r\n", "\n");
-    assert_eq!(compiled, generate(&crd(WIDGETS), "v1").unwrap());
+    assert_eq!(compiled, written);
+}
+
+#[test]
+fn a_field_left_out_holds_the_schemas_default_its_own_nested_ones_with_it() {
+    let widget: widgets::Widget =
+        serde_saphyr::from_str("metadata: { name: w }\nspec: {}\nstatus: {}").unwrap();
+    assert_eq!(widget.spec.part_count, 4);
+    assert_eq!(widget.spec.parts.len(), 1);
+    assert_eq!(widget.spec.parts[0].kind, "Gear");
+    // The default list's item leaves `labels` out: its own default is applied.
+    let blue = std::collections::BTreeMap::from([("colour".to_owned(), "blue".to_owned())]);
+    assert_eq!(widget.spec.parts[0].labels, blue);
+    // A field the object states keeps what it states; the status takes no default.
+    let widget: widgets::Widget = serde_saphyr::from_str(
+        "metadata: { name: w }\nspec: { partCount: 2, parts: [{ kind: Spring, labels: {} }] }\nstatus: {}",
+    )
+    .unwrap();
+    assert_eq!(widget.spec.part_count, 2);
+    assert_eq!(widget.spec.parts[0].kind, "Spring");
+    assert!(widget.spec.parts[0].labels.is_empty());
+    assert_eq!(widget.status.unwrap().conditions, None);
 }
 
 #[test]
@@ -525,5 +559,23 @@ fn what_cannot_be_written_is_said() {
     assert_eq!(
         generate(&crd(&clashing), "v1"),
         Err(Error::Clash("WidgetStatus".to_owned()))
+    );
+    // A default of a field its schema does not have cannot be written.
+    let odd = WIDGETS.replace(
+        "default: [{ kind: Gear }]",
+        "default: [{ kind: Gear, size: 3 }]",
+    );
+    assert_eq!(
+        generate(&crd(&odd), "v1"),
+        Err(Error::Schema(
+            "the default of default_widget_spec_parts: WidgetParts has no field size".to_owned()
+        ))
+    );
+    let odd = WIDGETS.replace("default: 4", "default: four");
+    assert_eq!(
+        generate(&crd(&odd), "v1"),
+        Err(Error::Schema(
+            "the default of default_widget_spec_part_count: \"four\" is not an integer".to_owned()
+        ))
     );
 }

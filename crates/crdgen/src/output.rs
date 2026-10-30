@@ -71,6 +71,9 @@ pub(crate) struct Member {
     /// The values an enumerated string may take, said in its docs: the field is a `String`
     /// all the same, so that a value from a newer release or another channel is read.
     pub(crate) values: Vec<String>,
+    /// The schema's default, written into the types where it is not the status's
+    /// ([`crate::defaults`]).
+    pub(crate) default: Option<serde_json::Value>,
 }
 
 impl Container {

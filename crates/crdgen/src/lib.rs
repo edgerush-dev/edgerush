@@ -13,12 +13,16 @@
 //! judge, where an enum would fail the object and, with it, the whole list it came in. A
 //! field the types do not have is passed over, and one they require but the object lacks
 //! is read as its empty value, as Go's types read it, for the same reason. Kubernetes' standard
-//! conditions and object references are k8s-openapi's types. The kind's own struct holds
+//! conditions and object references are k8s-openapi's types. **A field the schema gives a
+//! default holds it** when the object leaves the field out, as the API server would have
+//! stored it, nested defaults with it; such a field is not optional. The status is left as
+//! it is, a controller's to write. The kind's own struct holds
 //! its `metadata` and implements k8s-openapi's `Resource`, `ListableResource` and
 //! `Metadata`, as the list and watch client asks.
 
 mod analyzer;
 mod case;
+mod defaults;
 mod output;
 
 use std::collections::BTreeSet;
@@ -75,7 +79,7 @@ pub fn generate(crd: &CustomResourceDefinition, version: &str) -> Result<String,
     let mut structs = analyzer::analyze(schema, kind)
         .and_then(output::Output::named)
         .map_err(Error::Schema)?;
-    let root = match structs.first() {
+    let mut root = match structs.first() {
         Some(c) if c.level == 0 => structs.remove(0),
         _ => {
             return Err(Error::Schema(format!(
@@ -97,12 +101,15 @@ pub fn generate(crd: &CustomResourceDefinition, version: &str) -> Result<String,
         }
     }
 
+    let defaults = defaults::apply(&mut root, &mut structs, kind).map_err(Error::Schema)?;
+
     let mut src = String::new();
     write_uses(&mut src, &root, &structs);
     write_root(&mut src, &root, kind);
     for c in &structs {
         write_struct(&mut src, c);
     }
+    src.push_str(&defaults);
     let api_version = if crd.spec.group.is_empty() {
         version.to_owned()
     } else {
@@ -241,9 +248,27 @@ fn write_member(src: &mut String, m: &output::Member) {
     let (renames, rest): (Vec<&String>, Vec<&String>) =
         m.serde.iter().partition(|a| a.starts_with("rename"));
     for group in [renames, rest] {
-        if !group.is_empty() {
-            let group: Vec<&str> = group.into_iter().map(String::as_str).collect();
-            let _ = writeln!(src, "    #[serde({})]", group.join(", "));
+        if group.is_empty() {
+            continue;
+        }
+        let group: Vec<&str> = group.into_iter().map(String::as_str).collect();
+        let joined = group.join(", ");
+        // As rustfmt has it: several arguments wider than its `attr_fn_like_width`, or one
+        // that would take the line to its full 100 columns, put a line each.
+        let line = format!("    #[serde({joined})]");
+        let fits = if group.len() == 1 {
+            line.len() < 100
+        } else {
+            joined.len() <= 70 && line.len() < 100
+        };
+        if fits {
+            let _ = writeln!(src, "    #[serde({joined})]");
+        } else {
+            let _ = writeln!(
+                src,
+                "    #[serde(\n        {}\n    )]",
+                group.join(",\n        ")
+            );
         }
     }
     // rustfmt's width, past which it puts the type on a line of its own.
