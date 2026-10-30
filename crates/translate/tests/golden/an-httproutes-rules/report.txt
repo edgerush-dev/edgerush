@@ -6,4 +6,4 @@ HTTPRoute shop/shop: rule 7 dropped: the data plane would refuse it: route `http
 HTTPRoute shop/shop: rule 8 dropped: a header match of type `Near` is not one translation reads
 HTTPRoute shop/shop: rule 2: a backend's share is answered 500: Service shop/gone does not exist
 HTTPRoute shop/shop: rule 5: a backend's share is answered 500: a backend of kind example.com/Other is not one translation reads
-HTTPRoute shop/shop: rule 6: a backend's share is answered 500: Service blog/web is another namespace's, and ReferenceGrants are not read yet
+HTTPRoute shop/shop: rule 6: a backend's share is answered 500: Service blog/web is another namespace's, and no ReferenceGrant there lets HTTPRoutes of shop reach it

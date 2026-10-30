@@ -5,6 +5,8 @@
 # (09 §1); the control plane reads the cluster's IngressClasses and `shop`'s Ingresses,
 # Services and Secrets, writes the status of `shop`'s Ingresses, and reads the data plane's
 # Service in `edge` for the address they say: an external IP, as kind has no load balancer.
+# It follows `blog` too, where an HTTPRoute leads to `shop`'s Service while a ReferenceGrant
+# allows it.
 # The control plane runs as two replicas, which elect the one that writes status by a Lease
 # in `edge`; both serve the stream, and the admission webhook, with a certificate of the same
 # authority for edgerush-control.edge.svc. The webhook's registration is the script's, made
@@ -16,6 +18,10 @@ metadata: { name: shop }
 apiVersion: v1
 kind: Namespace
 metadata: { name: edge }
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: blog }
 ---
 # The backend: agnhost's netexec, which answers /hostname with the name of its pod.
 apiVersion: apps/v1
@@ -130,6 +136,26 @@ subjects: [{ kind: ServiceAccount, name: edgerush-control, namespace: edge }]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
+metadata: { name: edgerush-control, namespace: blog }
+rules:
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [httproutes, referencegrants]
+    verbs: [list, watch]
+  - apiGroups: [""]
+    resources: [services, secrets]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: edgerush-control, namespace: blog }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: edgerush-control }
+subjects: [{ kind: ServiceAccount, name: edgerush-control, namespace: edge }]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
 metadata: { name: edgerush-control-status, namespace: edge }
 rules:
   - apiGroups: [""]
@@ -192,6 +218,8 @@ spec:
             - /etc/edgerush/plane.yaml
             - --namespace
             - shop
+            - --namespace
+            - blog
             - --listen
             - "0.0.0.0:9443"
             - --certificate

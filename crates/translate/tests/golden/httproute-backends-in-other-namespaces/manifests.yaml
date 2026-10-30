@@ -1,0 +1,124 @@
+# An HTTPRoute's backends in other namespaces, as the conformance tests have them: one is
+# reached only where a ReferenceGrant in its namespace lets HTTPRoutes of the route's own
+# namespace reach it, by name or a grant of every Service there; entries of a grant's from
+# and to are either-or. A grant in another namespace, or one whose from or to differs in
+# group, kind, namespace or name, lets nothing through, so that backend's share answers 500
+# beside the rest of the rule. A backend naming the route's own namespace needs no grant.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: across, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [across.example.com]
+  rules:
+    - matches: [{ path: { value: /granted } }]
+      backendRefs: [{ name: web, namespace: blog, port: 80 }]
+    - matches: [{ path: { value: /every-service } }]
+      backendRefs: [{ name: anything, namespace: books, port: 80 }]
+    - matches: [{ path: { value: /not-there } }]
+      backendRefs: [{ name: gone, namespace: books, port: 80 }]
+    - matches: [{ path: { value: /refused } }]
+      backendRefs: [{ name: web, namespace: news, port: 80, weight: 3 }, { name: web, namespace: blog, port: 80 }]
+    - matches: [{ path: { value: /own } }]
+      backendRefs: [{ name: web, namespace: shop, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: to-web, namespace: blog }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: shop }]
+  to: [{ group: "", kind: Service, name: web }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: every-service, namespace: books }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: blog }, { group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: shop }]
+  to: [{ group: "", kind: Secret }, { group: "", kind: Service }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: in-the-routes-namespace, namespace: shop }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: shop }]
+  to: [{ group: "", kind: Service, name: web }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: from-another-group, namespace: news }
+spec:
+  from: [{ group: example.com, kind: HTTPRoute, namespace: shop }]
+  to: [{ group: "", kind: Service, name: web }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: from-another-kind, namespace: news }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: Gateway, namespace: shop }]
+  to: [{ group: "", kind: Service, name: web }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: from-another-namespace, namespace: news }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: blog }]
+  to: [{ group: "", kind: Service, name: web }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: to-another-group, namespace: news }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: shop }]
+  to: [{ group: example.com, kind: Service, name: web }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: to-another-kind, namespace: news }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: shop }]
+  to: [{ group: "", kind: Secret, name: web }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: to-another-name, namespace: news }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: shop }]
+  to: [{ group: "", kind: Service, name: other }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: blog }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: anything, namespace: books }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: news }
+spec:
+  ports: [{ name: http, port: 80 }]

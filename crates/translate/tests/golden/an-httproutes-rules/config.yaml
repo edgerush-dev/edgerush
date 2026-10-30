@@ -23,7 +23,7 @@ routes:
       - matches: [{ path: { prefix: /other-kind } }]
         forward: { backends: [{ invalid: "a backend of kind example.com/Other is not one translation reads", weight: 1 }] }
       - matches: [{ path: { prefix: /elsewhere } }]
-        forward: { backends: [{ invalid: "Service blog/web is another namespace's, and ReferenceGrants are not read yet", weight: 1 }] }
+        forward: { backends: [{ invalid: "Service blog/web is another namespace's, and no ReferenceGrant there lets HTTPRoutes of shop reach it", weight: 1 }] }
 upstreams:
   shop/canary/http: { load_balancer: p2c, endpoints: { kubernetes: "canary.shop.svc.cluster.local:http" } }
   shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

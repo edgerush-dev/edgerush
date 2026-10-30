@@ -19,7 +19,8 @@
 #     not installed and serves Ingress as ever; installed, each kind is followed, its CRD
 #     read by name alone as RBAC allows, and an HTTPRoute attached to the Gateway, of this
 #     controller's class, its listener on the port the data plane binds, is served beside
-#     the Ingress, from one data plane;
+#     the Ingress, from one data plane; an HTTPRoute in `blog` led to `shop`'s Service
+#     answers 500 until a ReferenceGrant in `shop` allows it, and again once it is deleted;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
 #   - asked to reach its Service by the Service's own address, it is served through the
@@ -220,6 +221,29 @@ answers shop.example 200 5 || fail "beside the HTTPRoute, the Ingress is not ser
 refused_any && fail "a control-plane replica was refused something of the Gateway API"
 answers shop.example 200 10 || fail "with the Gateway API followed, $(status shop.example)"
 pass "installed, the Gateway API's kinds are followed, their CRDs read by name alone, and an HTTPRoute is served beside the Ingress"
+
+k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: across, namespace: blog }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [across.example]
+  rules: [{ backendRefs: [{ name: web, namespace: shop, port: 80 }] }]
+EOF
+answers across.example 500 30 || fail "with no ReferenceGrant, another namespace's Service answers $(status across.example)"
+k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: from-blog, namespace: shop }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: blog }]
+  to: [{ group: "", kind: Service, name: web }]
+EOF
+answers across.example 200 30 || fail "with a ReferenceGrant, another namespace's Service answers $(status across.example)"
+k -n shop delete referencegrant from-blog >/dev/null
+answers across.example 500 30 || fail "its ReferenceGrant deleted, another namespace's Service answers $(status across.example)"
+pass "an HTTPRoute reaches another namespace's Service only while a ReferenceGrant there allows it"
 
 # What the Ingress's status says, its first address.
 says() { k -n shop get ingress web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }

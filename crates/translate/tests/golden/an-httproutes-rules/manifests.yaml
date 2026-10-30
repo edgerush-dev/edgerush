@@ -1,6 +1,6 @@
 # An HTTPRoute's rules, each as the config has it: path, header, query and method matches;
 # weighted backends; a backend that is not there, of another kind, or another namespace's
-# (ReferenceGrants are not read yet), its share answered 500. A rule with what translation
+# that no ReferenceGrant lets the route reach, its share answered 500. A rule with what translation
 # does not take yet, or that the data plane would refuse, is dropped by itself, the rest
 # served; a route all of whose rules are dropped is not accepted.
 apiVersion: gateway.networking.k8s.io/v1

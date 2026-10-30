@@ -646,7 +646,8 @@ fn predicate(name: &str, kind: &str, value: &str, what: &str) -> Result<ValuePre
 }
 
 /// The upstream a backendRef leads to, by name, as an Ingress backend of the same Service
-/// and port does; or why it is invalid, its share answered 500.
+/// and port does; or why it is invalid, its share answered 500. A Service of another
+/// namespace is reached only where a ReferenceGrant there allows it.
 fn backend(
     written: &HTTPRouteRulesBackendRefs,
     route_namespace: &str,
@@ -659,20 +660,18 @@ fn backend(
             written.group, written.kind
         ));
     }
-    if written
-        .namespace
-        .as_deref()
-        .is_some_and(|theirs| theirs != route_namespace)
+    let namespace = written.namespace.as_deref().unwrap_or(route_namespace);
+    if namespace != route_namespace && !granted(cluster, route_namespace, namespace, &written.name)
     {
         return Err(format!(
-            "Service {}/{} is another namespace's, and ReferenceGrants are not read yet",
-            written.namespace.as_deref().unwrap_or_default(),
+            "Service {namespace}/{} is another namespace's, and no ReferenceGrant there lets \
+             HTTPRoutes of {route_namespace} reach it",
             written.name
         ));
     }
     let Some(port) = written.port else {
         return Err(format!(
-            "Service {route_namespace}/{} is named with no port",
+            "Service {namespace}/{} is named with no port",
             written.name
         ));
     };
@@ -686,11 +685,30 @@ fn backend(
         }),
         resource: None,
     };
-    match backend_upstream(plane, cluster, route_namespace, &reference, false) {
+    match backend_upstream(plane, cluster, namespace, &reference, false) {
         Ok(Ok(found)) => Ok(found),
         Ok(Err(missing)) => Err(missing),
         Err(problem) => Err(problem.to_string()),
     }
+}
+
+/// Whether a ReferenceGrant in `namespace` lets HTTPRoutes of `from` reach its Service
+/// `service`: one whose `from` names them and whose `to` names that Service, or every
+/// Service there. Entries of each list are either-or, as the spec has it.
+fn granted(cluster: &Cluster, from: &str, namespace: &str, service: &str) -> bool {
+    cluster
+        .reference_grants
+        .iter()
+        .filter(|grant| grant.metadata.namespace.as_deref() == Some(namespace))
+        .any(|grant| {
+            grant.spec.from.iter().any(|theirs| {
+                theirs.group == GROUP && theirs.kind == "HTTPRoute" && theirs.namespace == from
+            }) && grant.spec.to.iter().any(|ours| {
+                ours.group.is_empty()
+                    && ours.kind == "Service"
+                    && ours.name.as_deref().is_none_or(|name| name == service)
+            })
+        })
 }
 
 #[cfg(test)]
