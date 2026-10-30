@@ -847,6 +847,57 @@ spec:
     );
     std::fs::remove_file(manifests.join("gateway.yml"))?;
 
+    // A note fails nothing: a retry's attempts taken as the data plane's most are said, and
+    // validate exits 0.
+    std::fs::write(
+        manifests.join("gateway.yml"),
+        "apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec: { controllerName: edgerush.dev/gateway-controller }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners: [{ name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: retried, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [retried.example.com]
+  rules: [{ backendRefs: [{ name: web, port: 80 }], retry: { attempts: 100 } }]
+",
+    )?;
+    let output = edgerush(&[
+        "validate",
+        "--from-manifests",
+        manifests.to_str().expect("a path that is text"),
+        "--data-plane",
+        gateway_plane.to_str().expect("a path that is text"),
+    ])?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with(
+            "note: HTTPRoute shop/retried: rule 0: a retry of 100 attempts is taken as 5, the most the data plane makes
+"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("; 0 left out;")
+            && stdout.ends_with(
+                "; 1 notes
+"
+            ),
+        "{stdout}"
+    );
+    std::fs::remove_file(manifests.join("gateway.yml"))?;
+
     // A config the data plane would refuse: a `tcp` listener with no route of its own.
     let tcp = "  db: { address: \"[::]:5432\", protocol: tcp, proxy_protocol: off }\n";
     std::fs::write(&data_plane, plane(&format!("{http}{tcp}")))?;

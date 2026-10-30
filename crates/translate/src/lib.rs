@@ -211,6 +211,16 @@ pub struct Translation {
     pub taken: Vec<Taken>,
 }
 
+impl Problem {
+    /// Whether this is a note on what is served as the spec has it, not a fault: said, but
+    /// no reason for `validate` to fail (04 §3). A retry's attempts taken as the data
+    /// plane's most are one.
+    #[must_use]
+    pub fn is_note(&self) -> bool {
+        matches!(self, Self::RetryCapped { .. })
+    }
+}
+
 /// A path whose backend is not there: its Service does not exist, has no such port, or the
 /// port's `appProtocol` is one the gateway cannot speak. The path is translated all the
 /// same, with an invalid backend in its place, and is answered 500 until the Service is

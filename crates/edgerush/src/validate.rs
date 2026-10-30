@@ -23,10 +23,10 @@ Translates Kubernetes manifests as the control plane would for one data plane, c
 config as the data plane would, and says what was left out and why, without a cluster.
 Ingresses of another class, or of none, are another data plane's: they are counted, not
 translated.
-Exits 0 when everything was translated and the config compiles, 1 when something was left
-out, a path's backend is not there, a host or entry `tls` lists is not served as listed, a
-path is shadowed by another Ingress's or the config would be refused, and 2 when the files
-could not be read.
+Exits 0 when everything was translated and the config compiles, notes aside (a retry's
+attempts taken as the data plane's most), 1 when something was left out, a path's backend
+is not there, a host or entry `tls` lists is not served as listed, a path is shadowed by
+another Ingress's or the config would be refused, and 2 when the files could not be read.
 
 Options:
       --from-manifests <PATH>  Manifests in YAML: a file, or a directory read for every
@@ -215,7 +215,10 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
             true
         }
     };
-    let clean = translation.report.is_empty()
+    let clean = translation
+        .report
+        .iter()
+        .all(|finding| finding.problem.is_note())
         && translation.unresolved.is_empty()
         && translation.tls.is_empty()
         && translation.shadowed.is_empty()
@@ -230,7 +233,11 @@ pub(crate) fn described(translation: &Translation) -> String {
     let mut text = String::new();
     for finding in &translation.report {
         // Writing to a `String` cannot fail.
-        let _ = writeln!(text, "{finding}");
+        let _ = if finding.problem.is_note() {
+            writeln!(text, "note: {finding}")
+        } else {
+            writeln!(text, "{finding}")
+        };
     }
     for unresolved in &translation.unresolved {
         let _ = writeln!(text, "{unresolved}");
@@ -245,19 +252,29 @@ pub(crate) fn described(translation: &Translation) -> String {
         let _ = writeln!(text, "{taken}");
     }
     let config = &translation.config;
-    let _ = writeln!(
+    let notes = translation
+        .report
+        .iter()
+        .filter(|finding| finding.problem.is_note())
+        .count();
+    let _ = write!(
         text,
         "{} routes and {} upstreams translated; {} left out; {} paths without their backend; \
          {} TLS hosts or entries not served as listed; {} paths shadowed; {} Ingresses of other classes \
          or none passed over",
         config.routes.len(),
         config.upstreams.len(),
-        translation.report.len(),
+        translation.report.len() - notes,
         translation.unresolved.len(),
         translation.tls.len(),
         translation.shadowed.len(),
         translation.passed_over
     );
+    // Said only where there are any, as they fail nothing.
+    if notes > 0 {
+        let _ = write!(text, "; {notes} notes");
+    }
+    let _ = writeln!(text);
     text
 }
 
