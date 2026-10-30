@@ -216,6 +216,21 @@ async fn a_pod_is_reached_only_with_the_pods_id_and_the_name_dialled() {
     }
 }
 
+/// A pod dialling another checks it for the pods' own ID, apart from what the pod dialled
+/// would accept: an impostor carrying another ID, which takes the dialling pod for its data
+/// plane and so would answer it, is refused by the dialling pod in its handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_refuses_to_dial_a_pod_with_another_id_even_one_that_would_answer() {
+    let authority = Authority::new("workloads");
+    // The impostor's own ID is OTHER, and it serves PODS as its data plane: a pod dialling it
+    // passes its caller check as a data plane, allowed to exchange.
+    let impostor = pod(&authority, authority.issue(&["127.0.0.1", OTHER]), PODS);
+    let (address, _refused) = serve(watch::channel(Arc::new(impostor)).1).await;
+    let dialling = pod(&authority, authority.issue(&["127.0.0.2", PODS]), PLANE);
+    let result = dialled_by(&address, &dialling).exchange(batch()).await;
+    assert!(unavailable(result), "the impostor was reached");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn credentials_that_cannot_tell_callers_apart_are_refused() {
     let authority = Authority::new("workloads");
