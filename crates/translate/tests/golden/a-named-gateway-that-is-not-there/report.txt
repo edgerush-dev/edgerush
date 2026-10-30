@@ -1,0 +1,1 @@
+Gateway edge/web: not among the objects, so nothing of the Gateway API is translated

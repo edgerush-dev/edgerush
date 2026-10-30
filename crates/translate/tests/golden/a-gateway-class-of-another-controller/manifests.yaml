@@ -1,0 +1,15 @@
+# The data plane's Gateway is of a class another controller serves: it is not
+# translated, and that is said.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: other }
+spec:
+  controllerName: example.com/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: other
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP }

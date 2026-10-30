@@ -417,7 +417,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
         } else if path.starts_with(&format!("{gateway_api}namespaces/edge/gateways?")) {
             answer(
                 200,
-                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"web","namespace":"edge"},"spec":{"gatewayClassName":"edgerush"}}]}"#,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"web","namespace":"edge"},"spec":{"gatewayClassName":"edgerush","listeners":[{"name":"http","port":8080,"protocol":"HTTP"}]}}]}"#,
             )
         } else if path.starts_with(&format!("{gateway_api}gatewayclasses?")) {
             answer(
@@ -491,7 +491,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                     translation.report.iter().map(ToString::to_string).collect();
                 assert_eq!(
                     report,
-                    ["Gateway edge/web: not supported yet: the Gateway API"]
+                    ["Gateway edge/web: not supported yet: routes of the Gateway API"]
                 );
             }
             stage.store(1, Ordering::SeqCst);

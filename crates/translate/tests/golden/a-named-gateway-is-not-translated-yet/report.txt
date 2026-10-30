@@ -1,1 +1,0 @@
-Gateway edge/web: not supported yet: the Gateway API

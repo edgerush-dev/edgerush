@@ -18,6 +18,10 @@
 //! Over plain HTTP, a host its `tls` lists is redirected there, secured or not, unless the
 //! data plane's settings or the Ingress's `gateway.edgerush.dev/https-redirect` annotation
 //! say not, and is served over plain HTTP only where they do.
+//!
+//! Where the data plane is a Gateway, its class is checked to name this controller and
+//! each of its listeners fitted to the data plane's own, or refused and why ([`gateway`]);
+//! its routes are not translated yet.
 
 use edgerush_certificates::Identity;
 use edgerush_config::{
@@ -40,6 +44,10 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::btree_map::Entry;
 use std::fmt;
+
+pub mod gateway;
+
+pub use gateway::{GatewayOutcome, ListenerOutcome, ListenerProblem};
 
 /// The controller an IngressClass names to be served by EdgeRush (02 §2).
 pub const CONTROLLER: &str = "edgerush.dev/ingress-controller";
@@ -181,6 +189,9 @@ pub struct Translation {
     /// Every Ingress of the data plane's class, served or not, in the order they rank:
     /// those whose status is this data plane's to write.
     pub claimed: Vec<Object>,
+    /// The data plane's Gateway, where it names one that is there and this controller's:
+    /// what its status is to say of it.
+    pub gateway: Option<GatewayOutcome>,
 }
 
 /// A path whose backend is not there: its Service does not exist, has no such port, or the
@@ -458,22 +469,36 @@ pub enum Problem {
          class is translated"
     )]
     ClassNotOurs(String),
+    /// The data plane's Gateway is not there.
+    #[error("not among the objects, so nothing of the Gateway API is translated")]
+    GatewayMissing,
+    /// The data plane's Gateway's GatewayClass is not there.
+    #[error("not among the objects, so its Gateway is not translated")]
+    GatewayClassMissing,
+    /// The data plane's Gateway's GatewayClass is another controller's.
+    #[error(
+        "names controller `{0}`, not `edgerush.dev/gateway-controller`, so its Gateway is not \
+         translated"
+    )]
+    GatewayClassNotOurs(String),
+    /// A listener of the data plane's Gateway is not accepted.
+    #[error("listener {name}: not accepted: {problem}")]
+    Listener {
+        /// The listener's name.
+        name: String,
+        /// Why.
+        problem: ListenerProblem,
+    },
+    /// No listener of the data plane's Gateway is accepted.
+    #[error("none of its listeners is accepted, so it serves nothing")]
+    NoListenerAccepted,
 }
 
 /// Translates `cluster`'s objects into the config of the data plane `plane` describes.
 #[must_use]
 pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut report = Vec::new();
-    if let Some(gateway) = &plane.gateway {
-        report.push(Finding {
-            object: Object {
-                kind: "Gateway",
-                namespace: gateway.namespace.clone(),
-                name: gateway.name.clone(),
-            },
-            problem: Problem::NotSupportedYet("the Gateway API"),
-        });
-    }
+    let gateway = gateway::outcome(plane, cluster, &mut report);
     // An Ingress is the data plane's when its class is, and its class is when the
     // IngressClass of that name names this controller; one of no class is when that class
     // is the cluster's default.
@@ -756,6 +781,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         shadowed,
         served: served_ingresses,
         claimed: of_the_class,
+        gateway,
     }
 }
 

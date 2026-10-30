@@ -1,0 +1,1 @@
+GatewayClass edgerush: not among the objects, so its Gateway is not translated

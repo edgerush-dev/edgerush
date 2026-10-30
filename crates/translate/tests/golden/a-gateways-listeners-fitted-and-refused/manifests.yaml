@@ -1,0 +1,25 @@
+# Each of the Gateway's listeners as the data plane can serve it, or why it cannot: one on
+# a port the data plane binds for HTTP twice is served on both; one on a port it binds for
+# another protocol, or on none, is refused; protocols not taken yet, or never, are refused;
+# two that cannot be told apart are both refused, none chosen, while one beside them that
+# differs by its hostname alone is served.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP }
+    - { name: elsewhere, port: 9000, protocol: HTTP }
+    - { name: plain-on-secure, port: 8443, protocol: HTTP }
+    - { name: secure, port: 8443, protocol: HTTPS }
+    - { name: dns, port: 53, protocol: UDP }
+    - { name: first, port: 8080, protocol: HTTP, hostname: a.example.com }
+    - { name: second, port: 8080, protocol: HTTP, hostname: a.example.com }
+    - { name: apart, port: 8080, protocol: HTTP, hostname: b.example.com }

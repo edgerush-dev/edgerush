@@ -7,7 +7,9 @@
 //! first, then the paths whose backend is not there, then what of a `tls` is not served as
 //! it lists it, then the paths shadowed; where the case says, `certificates.txt`, the names of the
 //! certificates the config carries, a line each (none otherwise); and, where the case says,
-//! `passed-over.txt`, how many Ingresses were another data plane's.
+//! `passed-over.txt`, how many Ingresses were another data plane's; and, where the case
+//! says, `gateway.txt`, what was made of the data plane's Gateway's listeners, a line each
+//! (none otherwise: the data plane is no Gateway, or names one not there or not ours).
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
 //! the objects of `tests/golden/shared.yaml` go with every case's.
 //! Every config translated must also pass the data plane's own `compile`, and, written as
@@ -126,6 +128,15 @@ fn every_case_translates_to_its_config_and_report() {
             .map(str::to_owned)
             .collect();
         assert_eq!(report, expected, "{name}: report");
+        let listed = case.join("gateway.txt");
+        let listeners: Option<Vec<String>> = translation
+            .gateway
+            .as_ref()
+            .map(|gateway| gateway.listeners.iter().map(ToString::to_string).collect());
+        let expected: Option<Vec<String>> = listed
+            .exists()
+            .then(|| read(&listed).lines().map(str::to_owned).collect());
+        assert_eq!(listeners, expected, "{name}: the Gateway's listeners");
         // The Ingresses served are those the config's routes are of, each route named
         // `ingress/<namespace>/<name>/...`.
         let mut of_routes: Vec<String> = translation

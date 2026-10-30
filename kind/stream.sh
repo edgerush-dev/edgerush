@@ -17,7 +17,8 @@
 #   - the Ingress is served, and its status says the data plane's Service's address;
 #   - the data plane named as a Gateway, the control plane says the Gateway API's CRDs are
 #     not installed and serves Ingress as ever; installed, each kind is followed, its CRD
-#     read by name alone as RBAC allows, and the Gateway said not translated yet;
+#     read by name alone as RBAC allows, and the Gateway, of this controller's class, its
+#     listener on the port the data plane binds, accepted, its routes not translated yet;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
 #   - asked to reach its Service by the Service's own address, it is served through the
@@ -192,8 +193,21 @@ pass "without the Gateway API's CRDs, the control plane says so, and serves the 
 k create -f crates/gateway-api/crds/ >/dev/null
 control_said "httproutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)" 60 ||
     fail "the control plane never said the Gateway API's CRDs are served"
-control_said "Gateway edge/web: not supported yet: the Gateway API" 30 ||
-    fail "the control plane never said its Gateway is not translated yet"
+k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec: { controllerName: edgerush.dev/gateway-controller }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners: [{ name: http, port: 8080, protocol: HTTP }]
+EOF
+control_said "Gateway edge/web: not supported yet: routes of the Gateway API" 30 ||
+    fail "the control plane never said its Gateway is accepted, its routes not translated yet"
 refused_any && fail "a control-plane replica was refused something of the Gateway API"
 answers shop.example 200 10 || fail "with the Gateway API followed, $(status shop.example)"
 pass "installed, the Gateway API's kinds are followed, their CRDs read by name alone"
