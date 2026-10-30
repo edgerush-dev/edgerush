@@ -170,6 +170,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "offered_hello"
+path = "fuzz_targets/offered_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "dns_answer"
 path = "fuzz_targets/dns_answer.rs"
 test = false

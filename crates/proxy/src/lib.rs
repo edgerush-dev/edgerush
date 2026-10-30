@@ -63,6 +63,11 @@ pub mod l4;
 #[cfg(not(feature = "fuzzing"))]
 mod l4;
 mod linger;
+// Private, save when the fuzz targets are being built.
+#[cfg(feature = "fuzzing")]
+pub mod offered;
+#[cfg(not(feature = "fuzzing"))]
+mod offered;
 // Private, save when the fuzz targets and benchmarks are being built, as `raw` is.
 #[cfg(feature = "fuzzing")]
 pub mod map_head;

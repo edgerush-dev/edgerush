@@ -629,6 +629,80 @@ async fn the_certificate_is_chosen_by_the_name_asked_for() {
         .await;
 }
 
+/// Of two certificates for one name, an RSA one and an ECDSA one, a client is given the
+/// first whose key it can verify a signature by, as its ClientHello offers (03 §3): in
+/// TLS 1.3 by its signature schemes, below it by its suites too; one that can use both is
+/// given the first. So a Gateway listener's RSA and ECDSA certificates are both served.
+#[tokio::test]
+async fn of_two_certificates_for_a_name_a_client_is_given_one_it_can_verify() {
+    use boring::ssl::{SslConnectorBuilder, SslVersion};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let leaf = |certificate: &edgerush_config::Certificate| {
+                boring::x509::X509::from_pem(certificate.chain.as_bytes())
+                    .unwrap()
+                    .to_der()
+                    .unwrap()
+            };
+            let rsa = edgerush_certificates::testing::rsa_certificate(&["both.test"]);
+            let ecdsa = crate::tls::testing::certificate(&["both.test"]);
+            let serving = |certificates: Vec<edgerush_config::Certificate>| {
+                let mut config = everything_config(upstream);
+                secured(&mut config, certificates, None);
+                serving_compiled(compile(&config).unwrap())
+            };
+            type Offering = Box<dyn FnOnce(&mut SslConnectorBuilder)>;
+            let schemes = |list: &'static str| -> Offering {
+                Box::new(move |builder| builder.set_sigalgs_list(list).unwrap())
+            };
+            let suite = |list: &'static str| -> Offering {
+                Box::new(move |builder| {
+                    builder
+                        .set_max_proto_version(Some(SslVersion::TLS1_2))
+                        .unwrap();
+                    builder.set_cipher_list(list).unwrap();
+                })
+            };
+            for (first, second) in [(&rsa, &ecdsa), (&ecdsa, &rsa)] {
+                let (front, _worker) = serving(vec![first.clone(), second.clone()]).await;
+                let given = |client: tokio_boring::SslStream<tokio::net::TcpStream>| {
+                    client.ssl().peer_certificate().unwrap().to_der().unwrap()
+                };
+                let shown = |configure: Offering| async move {
+                    given(
+                        tls_client(front, "both.test", None, configure)
+                            .await
+                            .unwrap(),
+                    )
+                };
+                assert_eq!(shown(schemes("ECDSA+SHA256")).await, leaf(&ecdsa));
+                assert_eq!(shown(schemes("RSA-PSS+SHA256")).await, leaf(&rsa));
+                assert_eq!(
+                    shown(schemes("ECDSA+SHA256:RSA-PSS+SHA256")).await,
+                    leaf(first)
+                );
+                assert_eq!(
+                    shown(suite("ECDHE-ECDSA-AES128-GCM-SHA256")).await,
+                    leaf(&ecdsa)
+                );
+                assert_eq!(
+                    shown(suite("ECDHE-RSA-AES128-GCM-SHA256")).await,
+                    leaf(&rsa)
+                );
+            }
+            // One it cannot use at all: the first, and the handshake fails as it would.
+            let (front, _worker) = serving(vec![ecdsa.clone()]).await;
+            assert!(
+                tls_client(front, "both.test", None, schemes("RSA-PSS+SHA256"))
+                    .await
+                    .is_err()
+            );
+        })
+        .await;
+}
+
 /// A certificate whose names the listener states answers for those alone, whatever else
 /// it carries: a name it carries but is not stated goes to the certificate stated or
 /// carrying it after, or is refused when there is none (03 §3). An Ingress's certificate

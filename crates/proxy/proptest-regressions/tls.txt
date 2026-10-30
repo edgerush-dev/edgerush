@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 6ad1d91e93b7d539d673801856ffb879f3e4b17e43fd66760d05910b56435a11 # shrinks to certificates = [[], ["*.ba"]], asked = ".ba"
+cc 650bedecd3e1d3fc470c606965f1d7e552077adf3341820c458bc30622e24d1a # shrinks to certificates = [["*"], ["*"]], asked = "", usable = [false, true, false, false, false]
