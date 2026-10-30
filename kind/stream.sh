@@ -144,9 +144,11 @@ pod() {
     k -n edge get pod -l app=edgerush -o jsonpath='{.items[0].metadata.name}'
 }
 # Waits up to $3 seconds for the logs of deploy or pod $1 to have a line with $2 in it.
+# Here and below, grep reads a log whole: with -q it stops at the first match, kubectl,
+# still writing, ends on SIGPIPE, and pipefail takes the pipeline for a failure.
 said() {
     for _ in $(seq 1 $(($3 * 5))); do
-        k -n edge logs "$1" 2>/dev/null | grep -q -- "$2" && return 0
+        k -n edge logs "$1" 2>/dev/null | grep -- "$2" >/dev/null && return 0
         sleep 0.2
     done
     return 1
@@ -167,7 +169,7 @@ control_said() {
     for _ in $(seq 1 $(($2 * 5))); do
         local all=yes
         for replica in $(k -n edge get pod -l app=edgerush-control -o name); do
-            k -n edge logs "$replica" 2>/dev/null | grep -q -- "$1" || all=
+            k -n edge logs "$replica" 2>/dev/null | grep -- "$1" >/dev/null || all=
         done
         [ -n "$all" ] && return 0
         sleep 0.2
@@ -412,7 +414,7 @@ pod=$(pod)
 said "$pod" "waiting for the first config from the control plane" 30 ||
     fail "a data plane started without its control plane did not say it waits"
 said "$pod" "dialled again in" 30 || fail "it never said why it cannot dial"
-k -n edge logs "$pod" | grep -q " is on " &&
+k -n edge logs "$pod" | grep " is on " >/dev/null &&
     fail "it bound a listener before its first config"
 pass "a data plane started while it is gone waits, serving nothing"
 
