@@ -8,7 +8,7 @@ use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_translate::{Cluster, Plane, Translation, translate};
-use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -152,6 +152,7 @@ enum Manifest {
     Gateway(Box<Gateway>),
     HTTPRoute(Box<HTTPRoute>),
     ReferenceGrant(Box<ReferenceGrant>),
+    Namespace(Box<Namespace>),
     List {
         items: Vec<Manifest>,
     },
@@ -170,6 +171,7 @@ impl Manifest {
             Self::Gateway(gateway) => cluster.gateways.push(*gateway),
             Self::HTTPRoute(route) => cluster.http_routes.push(*route),
             Self::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
+            Self::Namespace(namespace) => cluster.namespaces.push(*namespace),
             Self::List { items } => {
                 for item in items {
                     item.into_cluster(cluster);
@@ -422,7 +424,8 @@ items:
         );
     }
 
-    /// The Gateway API's kinds are read, an object of the experimental channel among them.
+    /// The Gateway API's kinds are read, an object of the experimental channel among them, and
+    /// Namespaces, for their labels.
     #[test]
     fn the_gateway_apis_kinds_are_read() {
         let yaml = "\
@@ -445,6 +448,10 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: ReferenceGrant
 metadata: { name: from-edge, namespace: shop }
 spec: { from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: edge }], to: [{ group: '', kind: Service }] }
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: shop, labels: { team: shop } }
 ";
         let mut cluster = Cluster::default();
         for manifest in serde_saphyr::from_multiple::<Manifest>(yaml).unwrap() {
@@ -455,7 +462,8 @@ spec: { from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: e
             cluster.gateways.len(),
             cluster.http_routes.len(),
             cluster.reference_grants.len(),
+            cluster.namespaces.len(),
         );
-        assert_eq!(counts, (1, 1, 1, 1));
+        assert_eq!(counts, (1, 1, 1, 1, 1));
     }
 }

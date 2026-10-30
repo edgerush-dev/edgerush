@@ -1,0 +1,5 @@
+Gateway edge/web: listener kinds-mixed: takes no route of kind gateway.networking.k8s.io/InvalidRoute, example.com/HTTPRoute
+Gateway edge/web: listener kinds-none-carried: takes no route of kind gateway.networking.k8s.io/TLSRoute
+Gateway edge/web: listener unreadable-operator: takes routes from no namespace, as a selector's operator `Near` is not one Kubernetes has
+Gateway edge/web: listener unreadable-from: takes routes from no namespace, as `from: Elsewhere` is not one translation reads
+Gateway edge/web: not supported yet: routes of the Gateway API

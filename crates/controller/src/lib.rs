@@ -20,7 +20,7 @@ use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_kubernetes::{ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow};
 use edgerush_translate::{Cluster, GatewayName, Object, Plane, Translation, translate};
-use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
@@ -103,7 +103,7 @@ pub enum Said<'a> {
 /// change, once every one has been listed whole; says how it goes to `said`. Where `plane`
 /// names a Gateway, the Gateway API's kinds are followed too, GatewayClasses in the
 /// cluster and Gateways in that Gateway's namespace alone, each from when its CRD is listed
-/// and serves the version read until it no longer does. With
+/// and serves the version read until it no longer does, and Namespaces in the cluster. With
 /// `status`, it writes each Ingress's status to say the addresses it gives as the config
 /// handed on serves the Ingress, where it says otherwise; with `leading` too, only while it
 /// says this replica leads, every status that says otherwise written as it comes to (02 §3).
@@ -321,6 +321,9 @@ impl Drop for Tasks {
 /// objects while the CRD serves the version read.
 struct GatewayApi {
     crds: Vec<(GatewayKind, Follow<CustomResourceDefinition>)>,
+    /// Every Namespace, for the labels a listener's selector of namespaces matches: a kind
+    /// every cluster has, so followed whatever the CRDs say.
+    namespaces: Vec<Follow<Namespace>>,
     /// The data plane's Gateway's namespace: the one Gateways are followed in, as no other
     /// Gateway is read (04 §2).
     namespace: Scope,
@@ -346,6 +349,7 @@ impl GatewayApi {
             .collect();
         Self {
             crds,
+            namespaces: start.follows(&[Scope::Cluster]),
             namespace: Scope::Namespace(gateway.namespace.clone()),
             last: None,
             gateway_classes: None,
@@ -398,6 +402,7 @@ impl GatewayApi {
             .map(|(_, follow)| follow)
             .filter(|follow| !follow.objects.borrow().listed)
             .map(|follow| follow.name.clone())
+            .chain(unlisted(&self.namespaces))
             .chain(unlisted(
                 self.gateway_classes.as_deref().unwrap_or_default(),
             ))
@@ -484,6 +489,9 @@ impl Followed {
             gateways: of(gateway_api.and_then(|g| g.gateways.as_ref())),
             http_routes: of(gateway_api.and_then(|g| g.http_routes.as_ref())),
             reference_grants: of(gateway_api.and_then(|g| g.reference_grants.as_ref())),
+            namespaces: gateway_api
+                .map(|g| objects(&g.namespaces))
+                .unwrap_or_default(),
         }
     }
 }

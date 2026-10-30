@@ -34,7 +34,7 @@ use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
-use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{
     Ingress, IngressBackend, IngressClass, IngressServiceBackend,
 };
@@ -47,7 +47,9 @@ use std::fmt;
 
 pub mod gateway;
 
-pub use gateway::{GatewayOutcome, ListenerOutcome, ListenerProblem};
+pub use gateway::{
+    Allowed, GatewayOutcome, ListenerOutcome, ListenerProblem, Namespaces, Requirement, Selector,
+};
 
 /// The controller an IngressClass names to be served by EdgeRush (02 §2).
 pub const CONTROLLER: &str = "edgerush.dev/ingress-controller";
@@ -164,6 +166,9 @@ pub struct Cluster {
     pub http_routes: Vec<HTTPRoute>,
     /// Every ReferenceGrant seen.
     pub reference_grants: Vec<ReferenceGrant>,
+    /// Every Namespace seen, where the data plane is a Gateway: their labels are what a
+    /// listener's selector of namespaces matches.
+    pub namespaces: Vec<Namespace>,
 }
 
 /// A data plane's config, and what could not go into it.
@@ -492,6 +497,24 @@ pub enum Problem {
     /// No listener of the data plane's Gateway is accepted.
     #[error("none of its listeners is accepted, so it serves nothing")]
     NoListenerAccepted,
+    /// A listener of the data plane's Gateway names route kinds it cannot take
+    /// (`InvalidRouteKinds`); it takes the others.
+    #[error("listener {name}: takes no route of kind {kinds}")]
+    ListenerKinds {
+        /// The listener's name.
+        name: String,
+        /// The kinds, `group/kind`.
+        kinds: String,
+    },
+    /// A listener of the data plane's Gateway says which namespaces it takes routes from in
+    /// a way translation cannot read: it takes none.
+    #[error("listener {name}: takes routes from no namespace, as {why}")]
+    ListenerNamespaces {
+        /// The listener's name.
+        name: String,
+        /// Why.
+        why: String,
+    },
 }
 
 /// Translates `cluster`'s objects into the config of the data plane `plane` describes.

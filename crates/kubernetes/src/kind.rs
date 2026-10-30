@@ -9,7 +9,7 @@ use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use k8s_openapi::api::coordination::v1::Lease;
-use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
@@ -88,6 +88,20 @@ impl Kind for Secret {
         if let Some(data) = self.data.as_mut() {
             data.retain(|key, _| CERTIFICATE_KEYS.contains(&key.as_str()));
         }
+    }
+}
+
+impl Kind for Namespace {
+    const NAMESPACED: bool = false;
+
+    /// A Namespace is read for its labels, which a Gateway listener's selector of the
+    /// namespaces it takes routes from matches: they alone are kept.
+    fn trim(&mut self) {
+        let metadata = self.metadata_mut();
+        metadata.managed_fields = None;
+        metadata.annotations = None;
+        self.spec = None;
+        self.status = None;
     }
 }
 

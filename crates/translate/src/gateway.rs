@@ -1,12 +1,19 @@
 //! The data plane's Gateway ([04 §2](../../../docs/04-control-plane.md)): found by the name
 //! its settings give, its class checked to name this controller, and each of its listeners
-//! fitted to the data plane's own listeners bound to its port, or not accepted and why.
+//! fitted to the data plane's own listeners bound to its port, or not accepted and why, and
+//! the routes each takes: of which kinds, from which namespaces.
 
 use crate::{Cluster, Finding, GATEWAY_CONTROLLER, Object, Plane, Problem};
 use edgerush_config::Protocol;
-use edgerush_gateway_api::gateway::{Gateway, GatewayListeners};
+use edgerush_gateway_api::gateway::{
+    Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespaces,
+    GatewayListenersAllowedRoutesNamespacesSelector,
+};
 use std::collections::BTreeMap;
 use std::fmt;
+
+/// The API group of the Gateway API's kinds.
+const GROUP: &str = "gateway.networking.k8s.io";
 
 /// What translation made of the data plane's Gateway.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +33,8 @@ pub struct ListenerOutcome {
     /// The data plane's listeners bound to its port for its protocol, or why it is not
     /// accepted.
     pub served: Result<Vec<String>, ListenerProblem>,
+    /// The routes it takes: what its status says of every listener, accepted or not.
+    pub allowed: Allowed,
 }
 
 impl fmt::Display for ListenerOutcome {
@@ -33,11 +42,153 @@ impl fmt::Display for ListenerOutcome {
         match &self.served {
             Ok(listeners) => write!(
                 f,
-                "listener {}: served on {}",
+                "listener {}: served on {}, taking {}",
                 self.name,
-                listeners.join(", ")
+                listeners.join(", "),
+                self.allowed
             ),
             Err(problem) => write!(f, "listener {}: not accepted: {problem}", self.name),
+        }
+    }
+}
+
+/// The routes a listener takes (`allowedRoutes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Allowed {
+    /// The kinds it takes, of those its protocol can carry, as its `supportedKinds` says.
+    pub kinds: Vec<&'static str>,
+    /// The kinds it names that it cannot take, `group/kind` (`InvalidRouteKinds`): of
+    /// another group, unknown, or not for its protocol.
+    pub invalid_kinds: Vec<String>,
+    /// The namespaces its routes may be in.
+    pub namespaces: Namespaces,
+}
+
+impl fmt::Display for Allowed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kinds = if self.kinds.is_empty() {
+            "no route".to_owned()
+        } else {
+            self.kinds.join(", ")
+        };
+        write!(f, "{kinds} {}", self.namespaces)
+    }
+}
+
+/// The namespaces a listener takes routes from (`allowedRoutes.namespaces`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Namespaces {
+    /// Its Gateway's own (`Same`, when nothing is said).
+    Same(String),
+    /// Every namespace (`All`).
+    All,
+    /// Those whose labels its selector matches (`Selector`).
+    Selector(Selector),
+    /// None: the listener says what translation cannot read, and that is said.
+    None,
+}
+
+impl Namespaces {
+    /// Whether a route in `namespace`, whose labels are as `cluster` has them, may attach.
+    #[must_use]
+    pub fn allow(&self, namespace: &str, cluster: &Cluster) -> bool {
+        match self {
+            Self::Same(own) => own == namespace,
+            Self::All => true,
+            Self::Selector(selector) => cluster
+                .namespaces
+                .iter()
+                .find(|object| object.metadata.name.as_deref() == Some(namespace))
+                .is_some_and(|object| {
+                    let none = BTreeMap::new();
+                    selector.matches(object.metadata.labels.as_ref().unwrap_or(&none))
+                }),
+            Self::None => false,
+        }
+    }
+}
+
+impl fmt::Display for Namespaces {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Same(own) => write!(f, "from namespace {own}"),
+            Self::All => write!(f, "from every namespace"),
+            Self::Selector(selector) => write!(f, "from namespaces labelled {selector}"),
+            Self::None => write!(f, "from no namespace"),
+        }
+    }
+}
+
+/// A label selector, as Kubernetes matches one: every label it states, and every
+/// requirement, held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selector {
+    /// Labels a namespace must have, with these values.
+    pub labels: BTreeMap<String, String>,
+    /// Requirements a namespace's labels must meet.
+    pub requirements: Vec<Requirement>,
+}
+
+/// One requirement of a label selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Requirement {
+    /// The label is there, with one of the values.
+    In(String, Vec<String>),
+    /// The label is not there, or not with any of the values.
+    NotIn(String, Vec<String>),
+    /// The label is there.
+    Exists(String),
+    /// The label is not there.
+    DoesNotExist(String),
+}
+
+impl Selector {
+    /// Whether `labels` meet it. A selector that states nothing matches every namespace,
+    /// as an empty one does in Kubernetes.
+    #[must_use]
+    pub fn matches(&self, labels: &BTreeMap<String, String>) -> bool {
+        self.labels
+            .iter()
+            .all(|(key, value)| labels.get(key) == Some(value))
+            && self
+                .requirements
+                .iter()
+                .all(|requirement| match requirement {
+                    Requirement::In(key, values) => {
+                        labels.get(key).is_some_and(|v| values.contains(v))
+                    }
+                    Requirement::NotIn(key, values) => {
+                        labels.get(key).is_none_or(|v| !values.contains(v))
+                    }
+                    Requirement::Exists(key) => labels.contains_key(key),
+                    Requirement::DoesNotExist(key) => !labels.contains_key(key),
+                })
+    }
+}
+
+impl fmt::Display for Selector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut parts: Vec<String> = self
+            .labels
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        parts.extend(
+            self.requirements
+                .iter()
+                .map(|requirement| match requirement {
+                    Requirement::In(key, values) => format!("{key} in ({})", values.join(", ")),
+                    Requirement::NotIn(key, values) => {
+                        format!("{key} notin ({})", values.join(", "))
+                    }
+                    Requirement::Exists(key) => key.clone(),
+                    Requirement::DoesNotExist(key) => format!("!{key}"),
+                }),
+        );
+        if parts.is_empty() {
+            write!(f, "with any labels")
+        } else {
+            write!(f, "{}", parts.join(", "))
         }
     }
 }
@@ -97,8 +248,9 @@ pub(crate) fn outcome(
     if !class_ours(gateway, cluster, report) {
         return None;
     }
-    let listeners = listeners(plane, &gateway.spec.listeners);
-    for listener in &listeners {
+    let mut listeners = listeners(plane, &gateway.spec.listeners);
+    for (listener, written) in listeners.iter_mut().zip(&gateway.spec.listeners) {
+        let (allowed, unread) = allowed(written, &named.namespace);
         if let Err(problem) = &listener.served {
             report.push(Finding {
                 object: object.clone(),
@@ -108,6 +260,25 @@ pub(crate) fn outcome(
                 },
             });
         }
+        if !allowed.invalid_kinds.is_empty() {
+            report.push(Finding {
+                object: object.clone(),
+                problem: Problem::ListenerKinds {
+                    name: listener.name.clone(),
+                    kinds: allowed.invalid_kinds.join(", "),
+                },
+            });
+        }
+        if let Some(why) = unread {
+            report.push(Finding {
+                object: object.clone(),
+                problem: Problem::ListenerNamespaces {
+                    name: listener.name.clone(),
+                    why,
+                },
+            });
+        }
+        listener.allowed = allowed;
     }
     let problem = if listeners.iter().any(|listener| listener.served.is_ok()) {
         // Until routes are attached (the next slice), an accepted Gateway serves nothing.
@@ -200,6 +371,11 @@ fn listeners(plane: &Plane, listeners: &[GatewayListeners]) -> Vec<ListenerOutco
             ListenerOutcome {
                 name: listener.name.clone(),
                 served,
+                allowed: Allowed {
+                    kinds: Vec::new(),
+                    invalid_kinds: Vec::new(),
+                    namespaces: Namespaces::None,
+                },
             }
         })
         .collect()
@@ -252,5 +428,210 @@ fn fitted(plane: &Plane, port: i32, protocol: Protocol) -> Result<Vec<String>, L
             wanted: name_of(protocol),
         }),
         None => Err(ListenerProblem::PortUnbound(port)),
+    }
+}
+
+/// The route kinds a listener of `protocol` can take: those whose routes its data plane
+/// listener serves. GRPCRoute joins HTTP and HTTPS with its slice.
+fn kinds_for(protocol: &str) -> &'static [&'static str] {
+    match protocol {
+        "HTTP" | "HTTPS" => &["HTTPRoute"],
+        _ => &[],
+    }
+}
+
+/// The routes `listener` takes, its Gateway in `namespace`; and why it takes none from any
+/// namespace, where it says what translation cannot read: a `from`, or a selector's
+/// operator, of a release newer than the types.
+fn allowed(listener: &GatewayListeners, namespace: &str) -> (Allowed, Option<String>) {
+    let carried = kinds_for(&listener.protocol);
+    let routes = listener.allowed_routes.as_ref();
+    let mut kinds: Vec<&'static str> = Vec::new();
+    let mut invalid_kinds: Vec<String> = Vec::new();
+    match routes.and_then(|routes| routes.kinds.as_ref()) {
+        // None named: every kind its protocol carries.
+        None => kinds.extend(carried),
+        Some(named) => {
+            for named in named {
+                let group = named.group.as_deref().unwrap_or(GROUP);
+                match carried.iter().find(|kind| **kind == named.kind) {
+                    Some(kind) if group == GROUP => {
+                        if !kinds.contains(kind) {
+                            kinds.push(kind);
+                        }
+                    }
+                    _ => invalid_kinds.push(format!("{group}/{}", named.kind)),
+                }
+            }
+        }
+    }
+    let (namespaces, unread) = match routes.and_then(|routes| routes.namespaces.as_ref()) {
+        None => (Namespaces::Same(namespace.to_owned()), None),
+        Some(written) => namespaces(written, namespace),
+    };
+    (
+        Allowed {
+            kinds,
+            invalid_kinds,
+            namespaces,
+        },
+        unread,
+    )
+}
+
+/// The namespaces `written` allows, its Gateway in `namespace`.
+fn namespaces(
+    written: &GatewayListenersAllowedRoutesNamespaces,
+    namespace: &str,
+) -> (Namespaces, Option<String>) {
+    match written.from.as_deref() {
+        None | Some("Same") => (Namespaces::Same(namespace.to_owned()), None),
+        Some("All") => (Namespaces::All, None),
+        Some("Selector") => match written.selector.as_ref() {
+            // The schema asks for a selector with `Selector`; none, and none is taken.
+            None => (
+                Namespaces::None,
+                Some("`from: Selector` names no selector".to_owned()),
+            ),
+            Some(selector) => match selector_of(selector) {
+                Ok(selector) => (Namespaces::Selector(selector), None),
+                Err(why) => (Namespaces::None, Some(why)),
+            },
+        },
+        Some(other) => (
+            Namespaces::None,
+            Some(format!("`from: {other}` is not one translation reads")),
+        ),
+    }
+}
+
+/// A label selector as written, read; or why it cannot be.
+fn selector_of(
+    written: &GatewayListenersAllowedRoutesNamespacesSelector,
+) -> Result<Selector, String> {
+    let requirements = written
+        .match_expressions
+        .iter()
+        .flatten()
+        .map(|expression| {
+            let (key, values) = (
+                expression.key.clone(),
+                expression.values.clone().unwrap_or_default(),
+            );
+            match expression.operator.as_str() {
+                "In" => Ok(Requirement::In(key, values)),
+                "NotIn" => Ok(Requirement::NotIn(key, values)),
+                "Exists" => Ok(Requirement::Exists(key)),
+                "DoesNotExist" => Ok(Requirement::DoesNotExist(key)),
+                other => Err(format!(
+                    "a selector's operator `{other}` is not one Kubernetes has"
+                )),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Selector {
+        labels: written.match_labels.clone().unwrap_or_default(),
+        requirements,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Namespaces, Requirement, Selector};
+    use crate::Cluster;
+    use std::collections::BTreeMap;
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_selector_matches_as_kubernetes_does() {
+        let selector = Selector {
+            labels: labels(&[("team", "shop")]),
+            requirements: vec![
+                Requirement::In("stage".to_owned(), strings(&["live", "canary"])),
+                Requirement::NotIn("tier".to_owned(), strings(&["free"])),
+                Requirement::Exists("owner".to_owned()),
+                Requirement::DoesNotExist("frozen".to_owned()),
+            ],
+        };
+        let all = [("team", "shop"), ("stage", "live"), ("owner", "x")];
+        assert!(selector.matches(&labels(&all)));
+        // NotIn holds where the label is missing, and with another value.
+        assert!(selector.matches(&labels(&[
+            ("team", "shop"),
+            ("stage", "canary"),
+            ("owner", "x"),
+            ("tier", "paid")
+        ])));
+        for broken in [
+            vec![("team", "blog"), ("stage", "live"), ("owner", "x")],
+            vec![("stage", "live"), ("owner", "x")],
+            vec![("team", "shop"), ("stage", "test"), ("owner", "x")],
+            vec![("team", "shop"), ("owner", "x")],
+            vec![
+                ("team", "shop"),
+                ("stage", "live"),
+                ("owner", "x"),
+                ("tier", "free"),
+            ],
+            vec![("team", "shop"), ("stage", "live")],
+            vec![
+                ("team", "shop"),
+                ("stage", "live"),
+                ("owner", "x"),
+                ("frozen", ""),
+            ],
+        ] {
+            assert!(!selector.matches(&labels(&broken)), "{broken:?}");
+        }
+        let empty = Selector {
+            labels: BTreeMap::new(),
+            requirements: Vec::new(),
+        };
+        assert!(
+            empty.matches(&BTreeMap::new()),
+            "an empty selector matches everything"
+        );
+    }
+
+    #[test]
+    fn a_route_is_allowed_from_the_namespaces_a_listener_says() {
+        let namespace = |name: &str, pairs: &[(&str, &str)]| {
+            let mut object = k8s_openapi::api::core::v1::Namespace::default();
+            object.metadata.name = Some(name.to_owned());
+            object.metadata.labels = Some(labels(pairs));
+            object
+        };
+        let cluster = Cluster {
+            namespaces: vec![
+                namespace("shop", &[("team", "shop")]),
+                namespace("blog", &[]),
+            ],
+            ..Cluster::default()
+        };
+        let same = Namespaces::Same("edge".to_owned());
+        assert!(same.allow("edge", &cluster));
+        assert!(!same.allow("shop", &cluster));
+        assert!(Namespaces::All.allow("anywhere", &cluster));
+        assert!(!Namespaces::None.allow("edge", &cluster));
+        let selected = Namespaces::Selector(Selector {
+            labels: labels(&[("team", "shop")]),
+            requirements: Vec::new(),
+        });
+        assert!(selected.allow("shop", &cluster));
+        assert!(!selected.allow("blog", &cluster));
+        assert!(
+            !selected.allow("unseen", &cluster),
+            "a namespace not seen has no labels to match"
+        );
     }
 }

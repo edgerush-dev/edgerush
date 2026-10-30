@@ -310,6 +310,11 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
                 follow_of("crd referencegrants", false, Vec::new()),
             ),
         ],
+        namespaces: vec![follow_of(
+            "namespaces in the cluster",
+            true,
+            vec![serde_saphyr::from_str("metadata: { name: shop }").unwrap()],
+        )],
         namespace: Scope::Namespace("edge".to_owned()),
         last: None,
         gateway_classes: None,
@@ -335,6 +340,11 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
     };
     let followed = followed_with(gateway_api);
     assert_eq!(followed.cluster().http_routes.len(), 1);
+    assert_eq!(
+        followed.cluster().namespaces.len(),
+        1,
+        "Namespaces, for their labels"
+    );
     let Some(mut gateway_api) = followed.gateway_api else {
         unreachable!()
     };
@@ -429,6 +439,11 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 200,
                 r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"web","namespace":"shop"},"spec":{}}]}"#,
             )
+        } else if path.starts_with("/api/v1/namespaces?") {
+            answer(
+                200,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"shop","labels":{"team":"shop"}}}]}"#,
+            )
         } else if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
             page(&[class()])
         } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
@@ -459,8 +474,18 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
     };
     let served_line = crd_lines("served at v1 (Gateway API v1.7.0)");
     let missing_line = crd_lines("not installed, so taken as having no objects");
-    let waiting_on_routes =
-        "waiting on gatewayclasses in the cluster, gateways in edge, httproutes in the cluster";
+    // The kinds' follows waited on, in one line: Namespaces, followed from the start, may
+    // still be in it.
+    let waited_on_kinds = |heard: &Heard| {
+        heard
+            .lines
+            .iter()
+            .filter(|line| {
+                line.starts_with("waiting on ")
+                    && line.contains("gatewayclasses in the cluster, gateways in edge, httproutes in the cluster")
+            })
+            .count()
+    };
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -484,7 +509,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
             {
                 let heard = heard.borrow();
                 assert_eq!(said_of(&heard, &served_line), 1, "{:?}", heard.lines);
-                assert_eq!(said_of(&heard, waiting_on_routes), 1, "{:?}", heard.lines);
+                assert_eq!(waited_on_kinds(&heard), 1, "{:?}", heard.lines);
                 let translation = &heard.translations[0];
                 assert_eq!(routes(translation), ["ingress/shop/web/shop.example"]);
                 let report: Vec<String> =
@@ -501,7 +526,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
             .await;
             stage.store(2, Ordering::SeqCst);
             until("a new follow of HTTPRoutes waited on", || {
-                said_of(&heard.borrow(), waiting_on_routes) == 1
+                waited_on_kinds(&heard.borrow()) == 1
                     && heard
                         .borrow()
                         .lines

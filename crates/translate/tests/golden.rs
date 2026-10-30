@@ -22,7 +22,7 @@ use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_translate::{Cluster, Plane, translate};
-use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use serde::Deserialize;
 use std::fs;
@@ -40,6 +40,7 @@ enum Manifest {
     Gateway(Box<Gateway>),
     HTTPRoute(Box<HTTPRoute>),
     ReferenceGrant(Box<ReferenceGrant>),
+    Namespace(Box<Namespace>),
 }
 
 #[test]
@@ -61,6 +62,7 @@ fn every_case_translates_to_its_config_and_report() {
                 Manifest::Gateway(gateway) => cluster.gateways.push(*gateway),
                 Manifest::HTTPRoute(route) => cluster.http_routes.push(*route),
                 Manifest::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
+                Manifest::Namespace(namespace) => cluster.namespaces.push(*namespace),
             }
         }
         cluster

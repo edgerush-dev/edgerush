@@ -592,6 +592,32 @@ async fn secrets_are_asked_for_without_helms_and_tokens_and_kept_as_certificates
 }
 
 #[tokio::test]
+async fn a_namespace_is_kept_for_its_labels_alone() {
+    let namespace = r#"{"metadata":{"name":"shop","resourceVersion":"2","labels":{"team":"shop"},"annotations":{"kubectl.kubernetes.io/last-applied-configuration":"{}"},"managedFields":[{"manager":"kubectl"}]},"spec":{"finalizers":["kubernetes"]},"status":{"phase":"Active"}}"#;
+    let fake = Fake::start(&["127.0.0.1"], move |_| {
+        answer(
+            200,
+            &format!(r#"{{"metadata":{{"resourceVersion":"2"}},"items":[{namespace}]}}"#),
+        )
+    })
+    .await;
+    let client = fake.client(&token("namespaces", "secret"), Timing::default());
+    let page = client
+        .list::<k8s_openapi::api::core::v1::Namespace>(&Scope::Cluster, None)
+        .await
+        .unwrap();
+    let kept = &page.items[0];
+    assert_eq!(
+        kept.metadata.labels,
+        Some(BTreeMap::from([("team".to_owned(), "shop".to_owned())]))
+    );
+    assert_eq!(kept.metadata.annotations, None);
+    assert_eq!(kept.metadata.managed_fields, None);
+    assert_eq!((kept.spec.is_none(), kept.status.is_none()), (true, true));
+    assert_eq!(fake.seen()[0].path, "/api/v1/namespaces?limit=500");
+}
+
+#[tokio::test]
 async fn every_kind_is_kept_without_its_managed_fields() {
     let ingress = r#"{"metadata":{"name":"web","namespace":"shop","resourceVersion":"2","annotations":{"a":"b"},"managedFields":[{"manager":"kubectl"}]},"spec":{}}"#;
     let fake = Fake::start(&["127.0.0.1"], move |_| {

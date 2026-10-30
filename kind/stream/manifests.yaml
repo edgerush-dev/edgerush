@@ -77,14 +77,18 @@ metadata: { name: edgerush-control-ingressclasses }
 roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edgerush-control-ingressclasses }
 subjects: [{ kind: ServiceAccount, name: edgerush-control, namespace: edge }]
 ---
-# The Gateway API's: GatewayClasses in the cluster, and the CRDs of the kinds followed,
-# those four alone, read by name (04 §9).
+# The Gateway API's: GatewayClasses and Namespaces in the cluster, and the CRDs of the
+# kinds followed, those four alone, read by name (04 §9).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata: { name: edgerush-control-gateway-api }
 rules:
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gatewayclasses]
+    verbs: [list, watch]
+  # Namespaces' labels, which a listener's selector of namespaces matches.
+  - apiGroups: [""]
+    resources: [namespaces]
     verbs: [list, watch]
   - apiGroups: [apiextensions.k8s.io]
     resources: [customresourcedefinitions]
