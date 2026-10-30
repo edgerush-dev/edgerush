@@ -22,7 +22,8 @@
 #     the Ingress, from one data plane; an HTTPRoute in `blog` led to `shop`'s Service
 #     answers 500 until a ReferenceGrant in `shop` allows it, and again once it is deleted;
 #     an HTTPRoute and an Ingress of one host and path are ranked by when the cluster made
-#     them, whichever API each is of: the older takes the requests;
+#     them, whichever API each is of: the older takes the requests, the other is said
+#     shadowed;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
 #   - asked to reach its Service by the Service's own address, it is served through the
@@ -282,6 +283,8 @@ spec:
 EOF
 answers ranked-ingress.example 200 30 || fail "the Ingress is not served: $(status ranked-ingress.example)"
 answers ranked.example 500 5 || fail "beside an older HTTPRoute, the Ingress's path answers $(status ranked.example)"
+control_said "Ingress shop/ranked: path / (Prefix) on ranked.example is already HTTPRoute shop/ranked's, which comes first" 30 ||
+    fail "the control plane never said the Ingress's path is the older HTTPRoute's"
 k -n shop delete httproute ranked >/dev/null
 answers ranked-route.example 404 30 || fail "the HTTPRoute deleted still answers $(status ranked-route.example)"
 answers ranked.example 200 5 || fail "the HTTPRoute gone, the Ingress's path answers $(status ranked.example)"
@@ -289,7 +292,7 @@ ranked_route
 answers ranked.example 200 5 || fail "beside a newer HTTPRoute, the Ingress's path answers $(status ranked.example)"
 k -n shop delete httproute ranked >/dev/null
 k -n shop delete ingress ranked >/dev/null
-pass "an HTTPRoute and an Ingress of one host and path are ranked by age: the older serves it"
+pass "an HTTPRoute and an Ingress of one host and path are ranked by age: the older serves it, the other said shadowed"
 
 # What the Ingress's status says, its first address.
 says() { k -n shop get ingress web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }
