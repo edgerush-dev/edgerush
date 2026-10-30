@@ -35,7 +35,8 @@ routes:
       - matches: [{ path: { prefix: /gone } }]
         forward: { backends: [{ invalid: "Service shop/gone does not exist", weight: 1 }, { upstream: shop/web/http, weight: 1 }] }
       - matches: [{ path: { prefix: /filtered } }]
-        forward: { backends: [{ invalid: "not supported yet: mirrors", weight: 1 }] }
+        filters: [{ type: request_mirror, upstream: shop/canary/http, fraction: { numerator: 1, denominator: 1 } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
       - matches: [{ path: { prefix: /timed } }]
         forward: { backends: [{ invalid: "not supported yet: timeouts", weight: 1 }] }
       - matches: [{ path: { prefix: /other-kind } }]

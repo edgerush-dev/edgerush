@@ -544,6 +544,15 @@ pub enum Problem {
         /// Why.
         why: String,
     },
+    /// A mirror of an HTTPRoute's rule is left off, its backend not there or not permitted,
+    /// and the rule served without it, as the spec has it (`ResolvedRefs` false).
+    #[error("rule {rule}: a mirror is left off, the rule served without it: {why}")]
+    MirrorLeftOff {
+        /// Its rule's position among the route's rules.
+        rule: usize,
+        /// Why.
+        why: String,
+    },
     /// A listener of the data plane's Gateway names route kinds it cannot take
     /// (`InvalidRouteKinds`); it takes the others.
     #[error("listener {name}: takes no route of kind {kinds}")]
@@ -894,6 +903,15 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                     },
                 });
             }
+            for (rule, why) in &translated.mirrors_left_off {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::MirrorLeftOff {
+                        rule: *rule,
+                        why: why.clone(),
+                    },
+                });
+            }
             if translated.answered.len() + translated.left_out.len() == route.spec.rules.len() {
                 report.push(Finding {
                     object: outcome.route.clone(),
@@ -916,13 +934,23 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         routes.extend(http_route::claims(gateway));
     }
     let taken = http_route::taken(&routes);
-    // An upstream only routes served on no listener led to is left out with them.
+    // An upstream only routes served on no listener led to, or copied to, is left out with
+    // them.
     let used: Vec<String> = routes
         .iter()
         .flat_map(|route| &route.rules)
-        .filter_map(|rule| rule.forward.as_ref())
-        .flat_map(|forward| &forward.backends)
-        .filter_map(|backend| backend.upstream.clone())
+        .flat_map(|rule| {
+            let backends = rule
+                .forward
+                .iter()
+                .flat_map(|forward| &forward.backends)
+                .filter_map(|backend| backend.upstream.clone());
+            let mirrors = rule.filters.iter().filter_map(|filter| match filter {
+                Filter::RequestMirror(mirror) => Some(mirror.upstream.clone()),
+                _ => None,
+            });
+            backends.chain(mirrors)
+        })
         .collect();
     upstreams.retain(|name, _| used.contains(name));
     Translation {

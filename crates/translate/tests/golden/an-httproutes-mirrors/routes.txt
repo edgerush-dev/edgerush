@@ -1,0 +1,1 @@
+HTTPRoute shop/mirrors: attached to http (shop.example.com)

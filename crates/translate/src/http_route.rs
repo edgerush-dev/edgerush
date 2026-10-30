@@ -9,11 +9,12 @@
 use crate::gateway::{GatewayOutcome, ListenerOutcome};
 use crate::{Cluster, Object, Plane, backend_upstream, namespace};
 use edgerush_config::{
-    Backend, Filter, Forward, Header, HeaderChanges, Hostname, Match, PathChange, PathMatch, Query,
-    Redirect, Route, Rule, Scheme, Upstream, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
+    Backend, Filter, Forward, Fraction, Header, HeaderChanges, Hostname, Match, Mirror, PathChange,
+    PathMatch, Query, Redirect, Route, Rule, Scheme, Upstream, UrlRewrite, ValueMatch,
+    ValuePredicate, Wildcard,
 };
 use edgerush_gateway_api::http_route::{
-    HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesBackendRefs,
+    HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesFiltersRequestMirror,
     HTTPRouteRulesFiltersRequestRedirect,
 };
 use k8s_openapi::api::networking::v1::{IngressBackend, IngressServiceBackend, ServiceBackendPort};
@@ -436,8 +437,8 @@ fn takes(ours: &Hostname, theirs: &Hostname) -> bool {
 
 /// What an HTTPRoute's rules come to: its config routes, one for each listener it is attached
 /// to, and the upstreams they lead to; the rules left out, each with why; the rules that
-/// answer 500 for all they match, each with why; and the backends answered 500, each with
-/// why.
+/// answer 500 for all they match, each with why; the backends answered 500, each with why;
+/// and the mirrors left off, each with why.
 #[derive(Debug, Default)]
 pub(crate) struct Translated {
     pub(crate) routes: Vec<Route>,
@@ -445,6 +446,7 @@ pub(crate) struct Translated {
     pub(crate) left_out: Vec<(usize, String)>,
     pub(crate) answered: Vec<(usize, String)>,
     pub(crate) invalid: Vec<(usize, String)>,
+    pub(crate) mirrors_left_off: Vec<(usize, String)>,
 }
 
 /// The rules of `route`, attached as `outcome` says, translated for the listeners of
@@ -474,10 +476,22 @@ pub(crate) fn translated(
         };
         let mut upstreams = BTreeMap::new();
         let mut invalid = Vec::new();
+        let mut left_off = Vec::new();
         let taken = match unsupported(rule) {
             Some(why) => Err(why),
-            None => filtered(rule),
+            None => filtered(
+                rule,
+                route_namespace,
+                plane,
+                cluster,
+                &mut upstreams,
+                &mut left_off,
+            ),
         };
+        if taken.is_err() {
+            upstreams.clear();
+            left_off.clear();
+        }
         let compiled = match &taken {
             Err(why) => answering(matches.clone(), why),
             Ok(Filtered {
@@ -528,9 +542,14 @@ pub(crate) fn translated(
         }
         match taken {
             Err(why) => translated.answered.push((at, why)),
-            Ok(_) => translated
-                .invalid
-                .extend(invalid.into_iter().map(|why| (at, why))),
+            Ok(_) => {
+                translated
+                    .invalid
+                    .extend(invalid.into_iter().map(|why| (at, why)));
+                translated
+                    .mirrors_left_off
+                    .extend(left_off.into_iter().map(|why| (at, why)));
+            }
         }
         translated.upstreams.extend(upstreams);
         rules.push(compiled);
@@ -676,10 +695,20 @@ struct Filtered {
     redirect: Option<Redirect>,
 }
 
-/// A rule's filters as the config has them, or why translation cannot take them. A request's
-/// header changes beside a redirect are left out, as nothing goes upstream for them to
-/// change and nothing a client sees differs ([18 §2](../../../docs/18-redirects-and-rewrites.md)).
-fn filtered(rule: &HTTPRouteRules) -> Result<Filtered, String> {
+/// A rule's filters as the config has them, the upstreams its mirrors copy to put in
+/// `upstreams` and the mirrors whose backend is not there or not permitted left off and said
+/// in `left_off`, as the spec has them not configured; or why translation cannot take them.
+/// A request's header changes beside a redirect are left out, as nothing goes upstream for
+/// them to change and nothing a client sees differs; a mirror beside one cannot be, as its
+/// upstream would be sent nothing ([18 §2](../../../docs/18-redirects-and-rewrites.md)).
+fn filtered(
+    rule: &HTTPRouteRules,
+    route_namespace: &str,
+    plane: &Plane,
+    cluster: &Cluster,
+    upstreams: &mut BTreeMap<String, Upstream>,
+    left_off: &mut Vec<String>,
+) -> Result<Filtered, String> {
     let mut filters = Vec::new();
     let mut redirect = None;
     for written in rule.filters.iter().flatten() {
@@ -729,7 +758,28 @@ fn filtered(rule: &HTTPRouteRules) -> Result<Filtered, String> {
                     path,
                 }));
             }
-            "RequestMirror" => return Err("not supported yet: mirrors".to_owned()),
+            "RequestMirror" => {
+                let written = written.request_mirror.as_ref().ok_or_else(missing)?;
+                let fraction = mirrored(written)?;
+                let to = &written.backend_ref;
+                let reference = Reference {
+                    group: &to.group,
+                    kind: &to.kind,
+                    name: &to.name,
+                    namespace: to.namespace.as_deref(),
+                    port: to.port,
+                };
+                match backend(&reference, route_namespace, plane, cluster) {
+                    Ok((name, upstream)) => {
+                        upstreams.insert(name.clone(), upstream);
+                        filters.push(Filter::RequestMirror(Mirror {
+                            upstream: name,
+                            fraction,
+                        }));
+                    }
+                    Err(why) => left_off.push(why),
+                }
+            }
             "CORS" => return Err("not supported yet: CORS".to_owned()),
             "ExtensionRef" => {
                 let extension = written.extension_ref.as_ref().ok_or_else(missing)?;
@@ -746,9 +796,36 @@ fn filtered(rule: &HTTPRouteRules) -> Result<Filtered, String> {
         }
     }
     if redirect.is_some() {
+        if filters
+            .iter()
+            .any(|filter| matches!(filter, Filter::RequestMirror(_)))
+        {
+            return Err(
+                "a mirror beside a redirect, which sends nothing upstream to copy".to_owned(),
+            );
+        }
         filters.retain(|filter| !matches!(filter, Filter::RequestHeaderModifier(_)));
     }
     Ok(Filtered { filters, redirect })
+}
+
+/// The share of requests a mirror copies: its percent, its fraction, or every one.
+fn mirrored(written: &HTTPRouteRulesFiltersRequestMirror) -> Result<Fraction, String> {
+    let share = |numerator: i32, denominator: i32| match (
+        u32::try_from(numerator),
+        u32::try_from(denominator),
+    ) {
+        (Ok(numerator), Ok(denominator)) => Ok(Fraction {
+            numerator,
+            denominator,
+        }),
+        _ => Err(format!("a mirror of {numerator} in {denominator}")),
+    };
+    match (written.percent, &written.fraction) {
+        (Some(percent), _) => share(percent, 100),
+        (None, Some(fraction)) => share(fraction.numerator, fraction.denominator),
+        (None, None) => share(1, 1),
+    }
 }
 
 /// Header changes as the config has them.
@@ -833,7 +910,14 @@ fn backends(
     for written in rule.backend_refs.iter().flatten() {
         // The schema holds a weight to 0–1,000,000.
         let weight = u32::try_from(written.weight).unwrap_or_default();
-        match backend(written, route_namespace, plane, cluster) {
+        let reference = Reference {
+            group: &written.group,
+            kind: &written.kind,
+            name: &written.name,
+            namespace: written.namespace.as_deref(),
+            port: written.port,
+        };
+        match backend(&reference, route_namespace, plane, cluster) {
             Ok((name, upstream)) => {
                 upstreams.insert(name.clone(), upstream);
                 backends.push(Backend {
@@ -880,11 +964,20 @@ fn predicate(name: &str, kind: &str, value: &str, what: &str) -> Result<ValuePre
     })
 }
 
-/// The upstream a backendRef leads to, by name, as an Ingress backend of the same Service
-/// and port does; or why it is invalid, its share answered 500. A Service of another
-/// namespace is reached only where a ReferenceGrant there allows it.
+/// A backend a route names: for a request to go to, or a mirror to copy it to.
+struct Reference<'a> {
+    group: &'a str,
+    kind: &'a str,
+    name: &'a str,
+    namespace: Option<&'a str>,
+    port: Option<i32>,
+}
+
+/// The upstream a backend leads to, by name, as an Ingress backend of the same Service and
+/// port does; or why it is invalid: its share answered 500, or a mirror to it left off. A
+/// Service of another namespace is reached only where a ReferenceGrant there allows it.
 fn backend(
-    written: &HTTPRouteRulesBackendRefs,
+    written: &Reference<'_>,
     route_namespace: &str,
     plane: &Plane,
     cluster: &Cluster,
@@ -895,9 +988,8 @@ fn backend(
             written.group, written.kind
         ));
     }
-    let namespace = written.namespace.as_deref().unwrap_or(route_namespace);
-    if namespace != route_namespace && !granted(cluster, route_namespace, namespace, &written.name)
-    {
+    let namespace = written.namespace.unwrap_or(route_namespace);
+    if namespace != route_namespace && !granted(cluster, route_namespace, namespace, written.name) {
         return Err(format!(
             "Service {namespace}/{} is another namespace's, and no ReferenceGrant there lets \
              HTTPRoutes of {route_namespace} reach it",
@@ -912,7 +1004,7 @@ fn backend(
     };
     let reference = IngressBackend {
         service: Some(IngressServiceBackend {
-            name: written.name.clone(),
+            name: written.name.to_owned(),
             port: Some(ServiceBackendPort {
                 number: Some(port),
                 name: None,

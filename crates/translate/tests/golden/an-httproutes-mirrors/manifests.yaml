@@ -1,0 +1,86 @@
+# An HTTPRoute's mirrors: each copies its share of the rule's requests, every one unless it
+# says a percent or a fraction, to its backend, reached as a backend is, another
+# namespace's where a ReferenceGrant allows it. A mirror whose backend is not there, or not
+# permitted, is left off and said, and the rule served without it, as the spec has it. A
+# mirror beside a redirect answers 500: nothing goes upstream for it to copy.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: mirrors, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [shop.example.com]
+  rules:
+    - matches: [{ path: { value: /every } }]
+      filters: [{ type: RequestMirror, requestMirror: { backendRef: { name: shadow, port: 80 } } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /percent } }]
+      filters: [{ type: RequestMirror, requestMirror: { backendRef: { name: shadow, port: 80 }, percent: 20 } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /fraction } }]
+      filters: [{ type: RequestMirror, requestMirror: { backendRef: { name: shadow, port: 80 }, fraction: { numerator: 1, denominator: 3 } } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /two } }]
+      filters: [{ type: RequestMirror, requestMirror: { backendRef: { name: shadow, port: 80 }, percent: 50 } }, { type: RequestMirror, requestMirror: { backendRef: { name: canary, port: 80 } } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /not-there } }]
+      filters: [{ type: RequestMirror, requestMirror: { backendRef: { name: gone, port: 80 } } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /not-permitted } }]
+      filters: [{ type: RequestMirror, requestMirror: { backendRef: { name: web, namespace: blog, port: 80 } } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /granted } }]
+      filters: [{ type: RequestMirror, requestMirror: { backendRef: { name: web, namespace: books, port: 80 } } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /redirected } }]
+      filters: [{ type: RequestMirror, requestMirror: { backendRef: { name: shadow, port: 80 } } }, { type: RequestRedirect, requestRedirect: { hostname: example.org } }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: from-shop, namespace: books }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: shop }]
+  to: [{ group: "", kind: Service }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: shadow, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: canary, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: blog }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: books }
+spec:
+  ports: [{ name: http, port: 80 }]
