@@ -852,9 +852,6 @@ fn retry(forward: &Forward, place: &Place, errors: &mut Vec<ConfigError>) -> Opt
     if retry.attempts == 0 || retry.attempts > MOST_ATTEMPTS {
         problems.push(Problem::RetryAttempts(retry.attempts));
     }
-    if retry.http_statuses.is_empty() && retry.grpc_statuses.is_empty() && !retry.on_timeout {
-        problems.push(Problem::RetryOnNothing);
-    }
     // A try's clock is its `backend_request_ms`, or the fixed clocks where the rule states
     // no timeout. A timeout stated takes the fixed clocks' place, so with no try's clock
     // among them only the request's own deadline ends a try, and leaves nothing to try
@@ -2646,9 +2643,6 @@ pub enum Problem {
     /// A retry count of nothing, or more than a retry is worth.
     #[error("`retry.attempts` is {0}: from 1 to 5")]
     RetryAttempts(u32),
-    /// A retry for no answer at all.
-    #[error("`retry` names no status and no timeout to send a request again for")]
-    RetryOnNothing,
     /// A retry for a try that runs out of time, where no clock of a try's own runs.
     #[error("`retry` says `on_timeout` with no clock of a try's own to run out")]
     RetryOnTimeoutNever,
@@ -6377,10 +6371,9 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
             problems(&format!("{{ attempts: 6, http_statuses: [503], {base} }}"))[0]
                 .contains("from 1 to 5")
         );
-        assert!(
-            problems(&format!("{{ attempts: 1, {base} }}"))[0]
-                .ends_with("names no status and no timeout to send a request again for")
-        );
+        // Of no status and no `on_timeout`, a retry still sends on a try that could not
+        // connect, as Gateway API's retry of no codes asks.
+        assert!(with(&format!("{{ attempts: 1, {base} }}")).is_ok());
         assert!(
             problems(&format!("{{ attempts: 1, http_statuses: [200], {base} }}"))[0]
                 .ends_with("only 4xx and 5xx")

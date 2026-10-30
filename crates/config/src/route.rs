@@ -269,9 +269,11 @@ pub struct Timeouts {
 
 /// When a request is sent again, and how often (Gateway API's HTTPRoute retry, with
 /// gRPC's statuses beside HTTP's). A try that could not connect is sent again whatever is
-/// named, as Gateway API asks: nothing of it reached the endpoint. Otherwise decided on an
-/// answer's head alone: once a head has gone to the client, the request is not sent again.
-/// Within a budget of the upstream's, and only for a body small enough to be kept.
+/// named, as Gateway API asks: nothing of it reached the endpoint; a retry that names no
+/// status and not `on_timeout` is for those tries alone, as Gateway API's of no codes is.
+/// Otherwise decided on an answer's head alone: once a head has gone to the client, the
+/// request is not sent again. Within a budget of the upstream's, and only for a body small
+/// enough to be kept.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -295,7 +297,7 @@ pub struct Retry {
     /// go on, running out. Stated whichever way, so that a config says what it does. `true`
     /// needs a try to have a clock of its own: the fixed clocks, which stay while `timeouts`
     /// states neither `request_ms` nor `backend_request_ms`, or a `backend_request_ms` above
-    /// 0. A retry names at least one status, or says `true` here.
+    /// 0.
     pub on_timeout: bool,
     /// Milliseconds before the first retry; each after it waits twice as long, and as much
     /// again at random. No more than `backoff_max_ms`.

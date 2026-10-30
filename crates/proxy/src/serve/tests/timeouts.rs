@@ -377,6 +377,12 @@ fn a_try_that_could_not_connect_is_wanted_again_under_any_retry() {
     let unconnected = Err(Answer::Unreachable);
     assert!(wants_again(&retry(vec![503], false), &unconnected));
     assert!(wants_again(&retry(vec![], true), &unconnected));
+    // A retry of nothing else, as Gateway API's of no codes, for that alone.
+    assert!(wants_again(&retry(vec![], false), &unconnected));
+    assert!(!wants_again(
+        &retry(vec![], false),
+        &Err(Answer::UpstreamFailed)
+    ));
     assert!(!wants_again(
         &retry(vec![503], false),
         &Err(Answer::UpstreamFailed)
