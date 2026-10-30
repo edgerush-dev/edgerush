@@ -586,7 +586,7 @@ pub(crate) const RETRY_STATUSES: std::ops::RangeInclusive<u16> = 400..=599;
 
 /// The most times a request may be sent again: beyond it a retry policy is a load
 /// multiplier more than a remedy.
-pub(crate) const MOST_ATTEMPTS: u32 = 5;
+pub const MOST_ATTEMPTS: u32 = 5;
 
 /// The largest a bound in seconds may be: 99,999 hours, the most a Gateway API duration
 /// says (GEP-2257). Each is added to a clock where it is used, which a larger one could

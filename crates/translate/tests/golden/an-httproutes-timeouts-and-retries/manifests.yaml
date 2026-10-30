@@ -1,0 +1,70 @@
+# An HTTPRoute's timeouts and retries, as the config has them: durations as Gateway API
+# writes them (GEP-2257), 0s for no limit; a retry's attempts, the statuses it names and
+# its backoff, Envoy's 25 ms where it states none and ten times its base at most, a wait of
+# none taken as the least the data plane makes. A try that runs out of its own clock is sent
+# again where it has one: a backendRequest above 0, or the data plane's fixed clocks where
+# the rule states no timeout. More attempts than the data plane makes are taken as its
+# most, and said; none, no retry. A duration translation cannot read answers 500.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: settings, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [shop.example.com]
+  rules:
+    - matches: [{ path: { value: /request } }]
+      timeouts: { request: 5s }
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /compound } }]
+      timeouts: { request: 1h2m3s4ms }
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /no-limit } }]
+      timeouts: { request: 0s }
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /both } }]
+      timeouts: { request: 10s, backendRequest: 2s }
+      retry: { attempts: 2, codes: [502, 503], backoff: 100ms }
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /retry-as-written } }]
+      retry: {}
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /no-clock-of-a-try } }]
+      timeouts: { request: 10s }
+      retry: { attempts: 2 }
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /a-try-of-no-limit } }]
+      timeouts: { backendRequest: 0s }
+      retry: { attempts: 1, codes: [503] }
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /many } }]
+      retry: { attempts: 100 }
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /none } }]
+      retry: { attempts: 0 }
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /no-wait } }]
+      retry: { attempts: 1, backoff: 0s }
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /unreadable } }]
+      timeouts: { request: 5 seconds }
+      backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

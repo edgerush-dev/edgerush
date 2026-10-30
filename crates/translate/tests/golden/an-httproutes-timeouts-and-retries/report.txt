@@ -1,0 +1,2 @@
+HTTPRoute shop/settings: rule 10 answers 500 for all it matches: a duration of `5 seconds` is not one translation reads
+HTTPRoute shop/settings: rule 7: a retry of 100 attempts is taken as 5, the most the data plane makes

@@ -10,12 +10,12 @@ use crate::gateway::{GatewayOutcome, ListenerOutcome};
 use crate::{Cluster, Object, Plane, backend_upstream, namespace};
 use edgerush_config::{
     Backend, Filter, Forward, Fraction, Header, HeaderChanges, Hostname, Match, Mirror, PathChange,
-    PathMatch, Query, Redirect, Route, Rule, Scheme, Upstream, UrlRewrite, ValueMatch,
-    ValuePredicate, Wildcard,
+    PathMatch, Query, Redirect, Retry, Route, Rule, Scheme, Timeouts, Upstream, UrlRewrite,
+    ValueMatch, ValuePredicate, Wildcard,
 };
 use edgerush_gateway_api::http_route::{
     HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesFiltersRequestMirror,
-    HTTPRouteRulesFiltersRequestRedirect,
+    HTTPRouteRulesFiltersRequestRedirect, HTTPRouteRulesRetry, HTTPRouteRulesTimeouts,
 };
 use k8s_openapi::api::networking::v1::{IngressBackend, IngressServiceBackend, ServiceBackendPort};
 use std::collections::BTreeMap;
@@ -447,6 +447,7 @@ pub(crate) struct Translated {
     pub(crate) answered: Vec<(usize, String)>,
     pub(crate) invalid: Vec<(usize, String)>,
     pub(crate) mirrors_left_off: Vec<(usize, String)>,
+    pub(crate) retries_capped: Vec<(usize, i64)>,
 }
 
 /// The rules of `route`, attached as `outcome` says, translated for the listeners of
@@ -486,7 +487,8 @@ pub(crate) fn translated(
                 cluster,
                 &mut upstreams,
                 &mut left_off,
-            ),
+            )
+            .and_then(|filtered| Ok((filtered, settings(rule)?))),
         };
         if taken.is_err() {
             upstreams.clear();
@@ -494,10 +496,13 @@ pub(crate) fn translated(
         }
         let compiled = match &taken {
             Err(why) => answering(matches.clone(), why),
-            Ok(Filtered {
-                filters,
-                redirect: Some(redirect),
-            }) => Rule {
+            Ok((
+                Filtered {
+                    filters,
+                    redirect: Some(redirect),
+                },
+                _,
+            )) => Rule {
                 matches: matches.clone(),
                 filters: filters.clone(),
                 forward: None,
@@ -505,10 +510,13 @@ pub(crate) fn translated(
                 paths: None,
                 rate_limits: Vec::new(),
             },
-            Ok(Filtered {
-                filters,
-                redirect: None,
-            }) => Rule {
+            Ok((
+                Filtered {
+                    filters,
+                    redirect: None,
+                },
+                settings,
+            )) => Rule {
                 matches: matches.clone(),
                 filters: filters.clone(),
                 forward: Some(Forward {
@@ -520,8 +528,8 @@ pub(crate) fn translated(
                         &mut upstreams,
                         &mut invalid,
                     ),
-                    timeouts: None,
-                    retry: None,
+                    timeouts: settings.timeouts.clone(),
+                    retry: settings.retry.clone(),
                 }),
                 redirect: None,
                 paths: None,
@@ -542,7 +550,10 @@ pub(crate) fn translated(
         }
         match taken {
             Err(why) => translated.answered.push((at, why)),
-            Ok(_) => {
+            Ok((_, settings)) => {
+                translated
+                    .retries_capped
+                    .extend(settings.capped.map(|asked| (at, asked)));
                 translated
                     .invalid
                     .extend(invalid.into_iter().map(|why| (at, why)));
@@ -667,14 +678,9 @@ fn matches(rule: &HTTPRouteRules) -> Result<Vec<Match>, String> {
         .collect()
 }
 
-/// What of a rule, beyond its matches and filters, translation cannot take yet, if anything.
+/// What of a rule, beyond its matches, filters and settings, translation cannot take yet, if
+/// anything.
 fn unsupported(rule: &HTTPRouteRules) -> Option<String> {
-    if rule.timeouts.is_some() {
-        return Some("not supported yet: timeouts".to_owned());
-    }
-    if rule.retry.is_some() {
-        return Some("not supported yet: retry".to_owned());
-    }
     rule.backend_refs
         .iter()
         .flatten()
@@ -896,6 +902,139 @@ fn path_change(kind: &str, full: Option<&str>, prefix: Option<&str>) -> Result<P
     }
 }
 
+/// A rule's timeouts and retry as the config has them, and the attempts its retry asked for
+/// where they were more than the data plane makes.
+#[derive(Debug)]
+struct Settings {
+    timeouts: Option<Timeouts>,
+    retry: Option<Retry>,
+    capped: Option<i64>,
+}
+
+/// The backoff before a first retry where a retry states none: Envoy's.
+const BACKOFF_MS: u64 = 25;
+
+/// How many times its base a backoff may double to: Envoy's, which Envoy Gateway leaves.
+const BACKOFF_GROWTH: u64 = 10;
+
+/// A rule's timeouts and retry as the config has them, or why translation cannot take them.
+fn settings(rule: &HTTPRouteRules) -> Result<Settings, String> {
+    let timeouts = rule.timeouts.as_ref().map(timeouts).transpose()?.flatten();
+    let (retry, capped) = match &rule.retry {
+        Some(written) => retry(written, timeouts.as_ref())?,
+        None => (None, None),
+    };
+    Ok(Settings {
+        timeouts,
+        retry,
+        capped,
+    })
+}
+
+/// A rule's timeouts as the config has them: none where it states neither.
+fn timeouts(written: &HTTPRouteRulesTimeouts) -> Result<Option<Timeouts>, String> {
+    let request_ms = written.request.as_deref().map(milliseconds).transpose()?;
+    let backend_request_ms = written
+        .backend_request
+        .as_deref()
+        .map(milliseconds)
+        .transpose()?;
+    Ok(
+        (request_ms.is_some() || backend_request_ms.is_some()).then_some(Timeouts {
+            request_ms,
+            backend_request_ms,
+            tunnel_idle_ms: None,
+        }),
+    )
+}
+
+/// A rule's retry as the config has it, and the attempts it asked for where they were more
+/// than the data plane makes, which are taken as its most (04 §2). None for no attempts. A
+/// try that runs out of its own clock is sent again, as GEP-1731 has it, where it has one:
+/// a `backendRequest` above 0, or the data plane's fixed clocks where the rule states no
+/// timeout; with neither, the retry is for tries that could not connect and the statuses
+/// it names.
+fn retry(
+    written: &HTTPRouteRulesRetry,
+    timeouts: Option<&Timeouts>,
+) -> Result<(Option<Retry>, Option<i64>), String> {
+    let Ok(asked) = u32::try_from(written.attempts) else {
+        return Err(format!("a retry of {} attempts", written.attempts));
+    };
+    if asked == 0 {
+        return Ok((None, None));
+    }
+    let most = edgerush_config::MOST_ATTEMPTS;
+    let capped = (asked > most).then_some(written.attempts);
+    let http_statuses = written
+        .codes
+        .iter()
+        .flatten()
+        .map(|code| u16::try_from(*code).map_err(|_| format!("a retry on status {code}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    // A wait of none at all is the data plane's least.
+    let backoff_base_ms = written
+        .backoff
+        .as_deref()
+        .map(milliseconds)
+        .transpose()?
+        .unwrap_or(BACKOFF_MS)
+        .max(1);
+    let on_timeout = timeouts.is_none_or(|timeouts| {
+        timeouts
+            .backend_request_ms
+            .is_some_and(|backend_request| backend_request > 0)
+    });
+    Ok((
+        Some(Retry {
+            attempts: asked.min(most),
+            http_statuses,
+            grpc_statuses: Vec::new(),
+            on_timeout,
+            backoff_base_ms,
+            backoff_max_ms: backoff_base_ms.saturating_mul(BACKOFF_GROWTH),
+        }),
+        capped,
+    ))
+}
+
+/// A Gateway API duration in milliseconds (GEP-2257): one to four parts, each a number of
+/// one to five digits and its unit, `h`, `m`, `s` or `ms`, `1h2m3s4ms`; or why it is not
+/// one.
+fn milliseconds(written: &str) -> Result<u64, String> {
+    let bad = || format!("a duration of `{written}` is not one translation reads");
+    let mut total: u64 = 0;
+    let mut rest = written;
+    let mut parts = 0;
+    while !rest.is_empty() {
+        let digits = rest.find(|c: char| !c.is_ascii_digit()).ok_or_else(bad)?;
+        if digits == 0 || digits > 5 {
+            return Err(bad());
+        }
+        let (number, after) = rest.split_at(digits);
+        let number: u64 = number.parse().map_err(|_| bad())?;
+        let (unit, after) = if let Some(after) = after.strip_prefix("ms") {
+            (1, after)
+        } else if let Some(after) = after.strip_prefix('h') {
+            (3_600_000, after)
+        } else if let Some(after) = after.strip_prefix('m') {
+            (60_000, after)
+        } else if let Some(after) = after.strip_prefix('s') {
+            (1_000, after)
+        } else {
+            return Err(bad());
+        };
+        // Five digits of hours each, four parts at most: far from u64's end.
+        total += number * unit;
+        parts += 1;
+        rest = after;
+    }
+    if parts == 0 || parts > 4 {
+        return Err(bad());
+    }
+    Ok(total)
+}
+
 /// A rule's backends as the config has them, their upstreams put in `upstreams` and those
 /// answered 500 said in `invalid`.
 fn backends(
@@ -1040,8 +1179,38 @@ fn granted(cluster: &Cluster, from: &str, namespace: &str, service: &str) -> boo
 
 #[cfg(test)]
 mod tests {
-    use super::{claim, intersection, takes, within};
+    use super::{claim, intersection, milliseconds, takes, within};
     use edgerush_config::{Hostname, Wildcard};
+
+    #[test]
+    fn durations_are_read_as_gep_2257_has_them() {
+        for (written, ms) in [
+            ("500ms", 500),
+            ("0s", 0),
+            ("10s", 10_000),
+            ("1m", 60_000),
+            ("2h", 7_200_000),
+            ("1h2m3s4ms", 3_723_004),
+            ("1s500ms", 1_500),
+            ("99999h", 359_996_400_000),
+        ] {
+            assert_eq!(milliseconds(written), Ok(ms), "{written}");
+        }
+        for written in [
+            "",
+            "10",
+            "s",
+            "1x",
+            "1.5s",
+            "-1s",
+            "100000s",
+            "1h1h1h1h1h",
+            " 1s",
+            "1S",
+        ] {
+            assert!(milliseconds(written).is_err(), "{written}");
+        }
+    }
 
     #[test]
     fn hostnames_meet_as_the_spec_has_them() {

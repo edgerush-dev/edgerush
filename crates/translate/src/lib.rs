@@ -553,6 +553,18 @@ pub enum Problem {
         /// Why.
         why: String,
     },
+    /// A retry of an HTTPRoute's rule asks for more attempts than the data plane makes: it
+    /// makes its most (04 §2).
+    #[error(
+        "rule {rule}: a retry of {asked} attempts is taken as {}, the most the data plane makes",
+        edgerush_config::MOST_ATTEMPTS
+    )]
+    RetryCapped {
+        /// Its rule's position among the route's rules.
+        rule: usize,
+        /// The attempts asked for.
+        asked: i64,
+    },
     /// A listener of the data plane's Gateway names route kinds it cannot take
     /// (`InvalidRouteKinds`); it takes the others.
     #[error("listener {name}: takes no route of kind {kinds}")]
@@ -900,6 +912,15 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                     problem: Problem::BackendInvalid {
                         rule: *rule,
                         why: why.clone(),
+                    },
+                });
+            }
+            for (rule, asked) in &translated.retries_capped {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::RetryCapped {
+                        rule: *rule,
+                        asked: *asked,
                     },
                 });
             }

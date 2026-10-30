@@ -38,13 +38,13 @@ routes:
         filters: [{ type: request_mirror, upstream: shop/canary/http, fraction: { numerator: 1, denominator: 1 } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
       - matches: [{ path: { prefix: /timed } }]
-        forward: { backends: [{ invalid: "not supported yet: timeouts", weight: 1 }] }
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }], timeouts: { request_ms: 5000 } }
       - matches: [{ path: { prefix: /other-kind } }]
         forward: { backends: [{ invalid: "a backend of kind example.com/Other is not one translation reads", weight: 1 }] }
       - matches: [{ path: { prefix: /elsewhere } }]
         forward: { backends: [{ invalid: "Service blog/web is another namespace's, and no ReferenceGrant there lets HTTPRoutes of shop reach it", weight: 1 }] }
       - matches: [{ path: { prefix: /retried } }]
-        forward: { backends: [{ invalid: "not supported yet: retry", weight: 1 }] }
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }], retry: { attempts: 2, on_timeout: true, backoff_base_ms: 25, backoff_max_ms: 250 } }
       - matches: [{ path: { prefix: /backend-filtered } }]
         forward: { backends: [{ invalid: "not supported yet: a backend's filters", weight: 1 }] }
 upstreams:
