@@ -1484,12 +1484,11 @@
           }
         },
         "rules": {
-          "description": "The rules, in order.",
+          "description": "The rules, in order. None claims the route's hostnames and serves nothing on them,\nanswering 404 there: what listener isolation writes for a listener's hostname that no\nroute claims.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/Rule"
-          },
-          "minItems": 1
+          }
         }
       },
       "additionalProperties": false,

@@ -55,7 +55,7 @@ impl Snapshot {
                 method: &Method::GET,
                 headers: &none,
             };
-            explain(self.matches.sni_of(&listener.name), &asked)
+            explain(self.matches.sni_of(&listener.name), &[], &asked)
         });
         let routed = l4.route(sni);
         if let Some(walk) = &walk

@@ -107,7 +107,11 @@ impl Snapshot {
             |request| {
                 routed = listener.router.route(request).copied();
                 walk = Some(Walk {
-                    explanation: explain(matches.of(&listener.name), request),
+                    explanation: explain(
+                        matches.of(&listener.name),
+                        matches.claims_of(&listener.name),
+                        request,
+                    ),
                     path: request.path.to_owned(),
                     method: request.method.clone(),
                 });
@@ -262,6 +266,11 @@ fn text(
             }
             if considered.is_empty() {
                 lines.push("  no match is for this host".to_owned());
+            }
+            if walk.explanation.claimed > 0 {
+                lines.push(
+                    "  a route of no rules claims this host, and serves nothing on it".to_owned(),
+                );
             }
             match walk.explanation.other_hosts {
                 0 => {}
@@ -1053,6 +1062,38 @@ rate_limiting: { mode: asynchronous, service: { addresses: ["rl-0:7000"] } }
             text.contains("\n          - upgrade: websocket\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_host_a_route_of_no_rules_claims_is_said_and_answered_404() {
+        let config = r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+routes:
+  - name: wild
+    listeners: [web]
+    hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: web, weight: 1 }] }
+  - name: claimed
+    listeners: [web]
+    hostnames: [{ name: api.example.com, falls_through: false }]
+    rules: []
+upstreams:
+  web: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000"] } }
+"#;
+        let snapshot = Snapshot::new(serde_saphyr::from_str(config).unwrap()).unwrap();
+        let listener = snapshot.listener("web").unwrap();
+        let asked = asked("1.1", "GET", "http://api.example.com/x", &[]);
+        let text = snapshot.explain(listener, &asked).unwrap().text();
+        assert!(
+            text.contains(
+                "  wild rule 0 match 0  api.example.com claims this host, and this match's hostname does not fall through\n  a route of no rules claims this host, and serves nothing on it\n"
+            ),
+            "{text}"
+        );
+        assert!(text.ends_with("answer    404 no_route\n"), "{text}");
     }
 
     #[test]

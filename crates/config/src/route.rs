@@ -19,8 +19,9 @@ pub struct Route {
     /// The hosts served; every host is asked for by the name `*`.
     #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub hostnames: Vec<Hostname>,
-    /// The rules, in order.
-    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
+    /// The rules, in order. None claims the route's hostnames and serves nothing on them,
+    /// answering 404 there: what listener isolation writes for a listener's hostname that no
+    /// route claims.
     pub rules: Vec<Rule>,
     /// The rate-limiting engine's limits every rule of the route that forwards is under, by
     /// name.

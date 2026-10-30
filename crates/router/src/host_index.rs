@@ -8,9 +8,9 @@
 //! members of a group, and only turn to the next group when none of them serves.
 //!
 //! Whether less specific claims stay candidates on a host that something more specific
-//! also claims is decided per claim ([`HostClaim::falls_through`]): Gateway API requires
-//! it, nginx-style Ingress does not want it. Either way it is resolved when the index is
-//! built. Every host's list of groups is laid out then, so a request pays for one lookup;
+//! also claims is decided per claim ([`HostClaim::falls_through`]): neither Gateway API's
+//! claims nor nginx-style Ingress's do, unless the data plane lets Ingress fall through.
+//! Either way it is resolved when the index is built. Every host's list of groups is laid out then, so a request pays for one lookup;
 //! and a group that falls through onto many hosts is built once and shared, not copied.
 
 use crate::WildcardLabels;
