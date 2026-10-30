@@ -31,8 +31,8 @@ use edgerush_certificates::Identity;
 use edgerush_config::{
     Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, Header, HeaderChanges,
     Hostname, Listener, ListenerCertificate, LoadBalancer, Match, PathMatch, Protocol, Query,
-    Redirect, Route, Rule, Scheme, StatedNames, Upstream, UpstreamProtocol, UpstreamTls, Wildcard,
-    compile,
+    Redirect, Route, Rule, Scheme, StatedNames, Upstream, UpstreamProtocol, UpstreamTls,
+    ValueMatch, Wildcard, compile,
 };
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
@@ -42,7 +42,7 @@ use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{
     Ingress, IngressBackend, IngressClass, IngressServiceBackend,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -364,18 +364,19 @@ impl fmt::Display for TlsFinding {
     }
 }
 
-/// A path that never takes a request: an older Ingress, or an earlier rule of the same one,
-/// has it on the same host, matched the same way, and the router ranks the older first
-/// (07 §1).
+/// A match that never takes a request: an older Ingress or HTTPRoute, or an earlier rule of
+/// the same one, has it on the same listener and host, matched the same way, and the router
+/// ranks the older first, whichever API each is of (04 §1, 07 §1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shadowed {
-    /// The Ingress whose path it is.
+    /// The Ingress or HTTPRoute whose match it is.
     pub object: Object,
-    /// The host, as the Ingress names it (`*` for every host).
+    /// The host, as the object names it (`*` for every host).
     pub host: String,
-    /// The path and how it is matched: `/api (Prefix)`.
+    /// The path and how it is matched, and what else the match asks: `/api (Prefix)`,
+    /// `/api (Exact) for POST with header x-beta: on`.
     pub path: String,
-    /// The Ingress that has it first: older, or as old and first by namespace and name.
+    /// The object that has it first: older, or as old and first by namespace and name.
     pub by: Object,
     /// Whether both carry their creation times, so that `by` is the one the cluster takes
     /// first. Manifests written by hand do not, and are ranked by name, which may not be
@@ -695,7 +696,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 }
             }
         }
-        accepted.push((object(), dated, translated, taken));
+        accepted.push((object(), rank(&ingress.metadata, 0), translated, taken));
     }
     // Every Ingress in, a host some Ingress secures is served over HTTPS whichever Ingress's
     // route it is, so that both kinds of listener rank the same paths for it; a host none
@@ -715,17 +716,16 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         .filter(|(_, listener)| listener.protocol == Protocol::Https)
         .map(|(name, _)| name.clone())
         .collect();
-    let mut routes = Vec::new();
+    // Each object's config routes, with its rank: those of every Ingress and HTTPRoute are
+    // put in the config in one order, oldest first, whichever API each is of (04 §1).
+    let mut ranked: Vec<Ranked> = Vec::new();
     let mut upstreams = BTreeMap::new();
     let mut unresolved = Vec::new();
     let mut tls = Vec::new();
     let mut refused: Vec<String> = Vec::new();
-    // Each host and path, matched one way, and the Ingress that had it first: oldest first,
-    // as the router ranks them.
-    let mut claimed: BTreeMap<(String, String), (Object, bool)> = BTreeMap::new();
-    let mut shadowed = Vec::new();
     let mut served_ingresses = Vec::new();
-    for (object, dated, translated, taken) in accepted {
+    for (object, rank, translated, taken) in accepted {
+        let mut routes = Vec::new();
         let mut served = Vec::new();
         let mut redirected = Vec::new();
         for mut route in translated.routes {
@@ -766,24 +766,6 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             }
             if route.listeners.is_empty() && redirect.is_none() {
                 continue;
-            }
-            for (host, path) in claims(&route) {
-                match claimed.entry((host, path)) {
-                    Entry::Vacant(free) => {
-                        free.insert((object.clone(), dated));
-                    }
-                    Entry::Occupied(first) => {
-                        let (host, path) = first.key().clone();
-                        let (by, by_dated) = first.get().clone();
-                        shadowed.push(Shadowed {
-                            object: object.clone(),
-                            host,
-                            path,
-                            by,
-                            by_age: dated && by_dated,
-                        });
-                    }
-                }
             }
             served.push(host);
             // A route whose host cannot be secured has nothing left but its redirect.
@@ -834,8 +816,13 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         );
         upstreams.extend(translated.upstreams);
         if !served.is_empty() {
-            served_ingresses.push(object);
+            served_ingresses.push(object.clone());
         }
+        ranked.push(Ranked {
+            rank,
+            object,
+            routes,
+        });
     }
     // Each attached HTTPRoute's rules, each compiled alone, with the listeners it could be
     // served on, so that one the data plane would refuse is dropped by itself (04 §2).
@@ -913,11 +900,19 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                     problem: Problem::NoRuleServed,
                 });
             }
-            routes.extend(translated.routes);
+            ranked.push(Ranked {
+                rank: rank(&route.metadata, 1),
+                object: outcome.route.clone(),
+                routes: translated.routes,
+            });
             upstreams.extend(translated.upstreams);
         }
-        // Each listener hostname of the Gateway is claimed, so that nothing less specific
-        // serves it (04 §2, listener isolation).
+    }
+    ranked.sort_by(|a, b| a.rank.cmp(&b.rank));
+    let (mut routes, shadowed) = in_order(ranked);
+    // Each listener hostname of the Gateway is claimed, so that nothing less specific serves
+    // it (04 §2, listener isolation).
+    if let Some(gateway) = &gateway {
         routes.extend(http_route::claims(gateway));
     }
     let taken = http_route::taken(&routes);
@@ -954,23 +949,175 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     }
 }
 
-/// The hosts and paths a route claims, each path with how it is matched.
-fn claims(route: &Route) -> impl Iterator<Item = (String, String)> + '_ {
-    route.hostnames.iter().flat_map(move |hostname| {
-        route
-            .rules
-            .iter()
-            .flat_map(|rule| &rule.matches)
-            .filter_map(|matched| Some((hostname.name.clone(), described(matched.path.as_ref()?))))
+/// Where an object's config routes go among all others: oldest first, then by namespace and
+/// name, as Gateway API ranks routes, whichever API each is of (04 §1); an Ingress and an
+/// HTTPRoute alike in all three, the Ingress first, as the one more likely there before.
+/// The order is precedence's last tie-breaker (07 §1).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Rank {
+    created: Option<Time>,
+    namespace: String,
+    name: String,
+    /// 0 for an Ingress, 1 for an HTTPRoute: the Ingress first.
+    api: u8,
+}
+
+/// The rank of the object of `metadata`, of API `api` (0 for Ingress, 1 for HTTPRoute).
+fn rank(metadata: &ObjectMeta, api: u8) -> Rank {
+    Rank {
+        created: metadata.creation_timestamp.clone(),
+        namespace: namespace(metadata).to_owned(),
+        name: metadata.name.clone().unwrap_or_default(),
+        api,
+    }
+}
+
+/// An object's config routes, and its rank.
+struct Ranked {
+    rank: Rank,
+    object: Object,
+    routes: Vec<Route>,
+}
+
+/// The routes of objects ranked in order, and each match among them that never takes a
+/// request: one an earlier route already has on the same listener and host, the same in all
+/// the router ranks by. A wildcard hostname of any labels covers one of a single label of
+/// the same name, but not the other way about: Ingress's `*.example.com` and Gateway API's
+/// claim different hosts.
+fn in_order(ranked: Vec<Ranked>) -> (Vec<Route>, Vec<Shadowed>) {
+    // Under each key, the first object to have it with each kind of wildcard.
+    let mut first: BTreeMap<String, Vec<(Option<Wildcard>, Object, bool)>> = BTreeMap::new();
+    let mut shadowed = Vec::new();
+    let mut routes = Vec::new();
+    for Ranked {
+        rank,
+        object,
+        routes: theirs,
+    } in ranked
+    {
+        let dated = rank.created.is_some();
+        for route in &theirs {
+            for (key, hostname, path) in matched(route) {
+                let earlier = first.entry(key).or_default();
+                let wildcard = wildcard_of(hostname);
+                match earlier
+                    .iter()
+                    .find(|(theirs, ..)| covers(*theirs, wildcard))
+                {
+                    None => earlier.push((wildcard, object.clone(), dated)),
+                    Some((_, by, by_dated)) => {
+                        let found = Shadowed {
+                            object: object.clone(),
+                            host: hostname.name.clone(),
+                            path,
+                            by: by.clone(),
+                            by_age: dated && *by_dated,
+                        };
+                        // Said once, however many listeners it is shadowed on.
+                        if !shadowed.contains(&found) {
+                            shadowed.push(found);
+                        }
+                    }
+                }
+            }
+        }
+        routes.extend(theirs);
+    }
+    (routes, shadowed)
+}
+
+/// What the `*` of a hostname stands for, where it is a wildcard.
+fn wildcard_of(hostname: &Hostname) -> Option<Wildcard> {
+    hostname
+        .name
+        .starts_with("*.")
+        .then_some(hostname.wildcard)
+        .flatten()
+}
+
+/// Whether a hostname of wildcard `theirs` covers every host one of the same name and
+/// wildcard `ours` does.
+fn covers(theirs: Option<Wildcard>, ours: Option<Wildcard>) -> bool {
+    theirs == ours || (theirs == Some(Wildcard::AnyLabels) && ours == Some(Wildcard::OneLabel))
+}
+
+/// Each match of a route on each of its listeners and hostnames: a key that is the same for
+/// two matches alike in all the router ranks them by but their hostname's wildcard, the
+/// hostname, and the match as the report says it.
+fn matched(route: &Route) -> impl Iterator<Item = (String, &Hostname, String)> + '_ {
+    route.listeners.iter().flat_map(move |listener| {
+        route.hostnames.iter().flat_map(move |hostname| {
+            route
+                .rules
+                .iter()
+                .flat_map(|rule| &rule.matches)
+                .filter_map(move |matched| {
+                    let said = described(matched)?;
+                    Some((
+                        format!("{listener} {} {said}", hostname.name),
+                        hostname,
+                        said,
+                    ))
+                })
+        })
     })
 }
 
+/// A match as the report says it: its path and how it is matched, `/api (Prefix)`, then its
+/// method, headers and query parameters, these in order of name, as the router takes them
+/// in any order. None for a match of no path.
+fn described(matched: &Match) -> Option<String> {
+    let mut said = path_said(matched.path.as_ref()?);
+    if let Some(method) = &matched.method {
+        said.push_str(" for ");
+        said.push_str(method);
+    }
+    // Header names are matched without regard to case.
+    let mut headers: Vec<String> = matched
+        .headers
+        .iter()
+        .map(|header| {
+            format!(
+                "header {}",
+                value_said(&header.name.to_ascii_lowercase(), &header.value)
+            )
+        })
+        .collect();
+    headers.sort();
+    let mut query: Vec<String> = matched
+        .query
+        .iter()
+        .map(|parameter| {
+            format!(
+                "query parameter {}",
+                value_said(&parameter.name, &parameter.value)
+            )
+        })
+        .collect();
+    query.sort();
+    headers.extend(query);
+    if !headers.is_empty() {
+        said.push_str(" with ");
+        said.push_str(&headers.join(", "));
+    }
+    Some(said)
+}
+
 /// A path and how it is matched, as the report says it: `/api (Prefix)`.
-fn described(path: &PathMatch) -> String {
+fn path_said(path: &PathMatch) -> String {
     match path {
         PathMatch::Prefix(path) => format!("{path} (Prefix)"),
         PathMatch::Exact(path) => format!("{path} (Exact)"),
         PathMatch::Regex(path) => format!("{path} (regex)"),
+    }
+}
+
+/// A header's or query parameter's match as the report says it: `x-beta: on`,
+/// `tenant matching [a-z]+`.
+fn value_said(name: &str, value: &ValueMatch) -> String {
+    match value {
+        ValueMatch::Exact(value) => format!("{name}: {value}"),
+        ValueMatch::Regex(value) => format!("{name} matching {value}"),
     }
 }
 
@@ -1269,7 +1416,7 @@ fn ingress_routes(
                 }
                 _ => return Err(Problem::Invalid("a path type Kubernetes does not have")),
             };
-            let backend = backend_of(&path.backend, host, Some(described(&matched)))?;
+            let backend = backend_of(&path.backend, host, Some(path_said(&matched)))?;
             by_host
                 .entry(host.to_owned())
                 .or_default()

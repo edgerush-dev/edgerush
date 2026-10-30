@@ -1,0 +1,7 @@
+HTTPRoute blog/early: attached to http (docs.example.com)
+HTTPRoute deep/any: attached to http (*.deep.example.com)
+HTTPRoute tie/web: attached to http (tie.example.com)
+HTTPRoute two/first: attached to http (two.example.com)
+HTTPRoute shop/new: attached to http (both.example.com)
+HTTPRoute two/second: attached to http (two.example.com)
+HTTPRoute wild/any: attached to http (*.wild.example.com)

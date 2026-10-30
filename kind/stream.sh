@@ -21,6 +21,8 @@
 #     controller's class, its listener on the port the data plane binds, is served beside
 #     the Ingress, from one data plane; an HTTPRoute in `blog` led to `shop`'s Service
 #     answers 500 until a ReferenceGrant in `shop` allows it, and again once it is deleted;
+#     an HTTPRoute and an Ingress of one host and path are ranked by when the cluster made
+#     them, whichever API each is of: the older takes the requests;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
 #   - asked to reach its Service by the Service's own address, it is served through the
@@ -244,6 +246,50 @@ answers across.example 200 30 || fail "with a ReferenceGrant, another namespace'
 k -n shop delete referencegrant from-blog >/dev/null
 answers across.example 500 30 || fail "its ReferenceGrant deleted, another namespace's Service answers $(status across.example)"
 pass "an HTTPRoute reaches another namespace's Service only while a ReferenceGrant there allows it"
+
+# The HTTPRoute's backend is not there, so it answers 500 where it takes the requests, and
+# the Ingress's is, 200. Each has a host of its own too, to know once it is served.
+# Creation times are to the second, so the second is made a second on.
+ranked_route() {
+    k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: ranked, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [ranked.example, ranked-route.example]
+  rules: [{ backendRefs: [{ name: not-there, port: 80 }] }]
+EOF
+    answers ranked-route.example 500 30 || fail "the HTTPRoute is not served: $(status ranked-route.example)"
+}
+ranked_route
+sleep 1.5
+k apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: ranked, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: ranked.example
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: ranked-ingress.example
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+EOF
+answers ranked-ingress.example 200 30 || fail "the Ingress is not served: $(status ranked-ingress.example)"
+answers ranked.example 500 5 || fail "beside an older HTTPRoute, the Ingress's path answers $(status ranked.example)"
+k -n shop delete httproute ranked >/dev/null
+answers ranked-route.example 404 30 || fail "the HTTPRoute deleted still answers $(status ranked-route.example)"
+answers ranked.example 200 5 || fail "the HTTPRoute gone, the Ingress's path answers $(status ranked.example)"
+ranked_route
+answers ranked.example 200 5 || fail "beside a newer HTTPRoute, the Ingress's path answers $(status ranked.example)"
+k -n shop delete httproute ranked >/dev/null
+k -n shop delete ingress ranked >/dev/null
+pass "an HTTPRoute and an Ingress of one host and path are ranked by age: the older serves it"
 
 # What the Ingress's status says, its first address.
 says() { k -n shop get ingress web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }

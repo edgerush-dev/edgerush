@@ -1,0 +1,88 @@
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: httproute/blog/early/http
+    listeners: [http]
+    hostnames: [{ name: "docs.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { exact: /docs } }]
+        forward: { backends: [{ upstream: blog/web/http, weight: 1 }] }
+  - name: httproute/deep/any/http
+    listeners: [http]
+    hostnames: [{ name: "*.deep.example.com", wildcard: any_labels, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /y } }]
+        forward: { backends: [{ upstream: deep/web/http, weight: 1 }] }
+  - name: ingress/shop/old/both.example.com
+    listeners: [http]
+    hostnames: [{ name: "both.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /api } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/tie/web/tie.example.com
+    listeners: [http]
+    hostnames: [{ name: "tie.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: tie/web/http, weight: 1 }] }
+  - name: httproute/tie/web/http
+    listeners: [http]
+    hostnames: [{ name: "tie.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: tie/web/http, weight: 1 }] }
+  - name: httproute/two/first/http
+    listeners: [http]
+    hostnames: [{ name: "two.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /pay }, method: POST, headers: [{ name: X-B, value: { exact: "2" } }, { name: x-a, value: { exact: "1" } }], query: [{ name: id, value: { regex: "[0-9]+" } }] }]
+        forward: { backends: [{ upstream: two/web/http, weight: 1 }] }
+  - name: ingress/wild/one/*.wild.example.com
+    listeners: [http]
+    hostnames: [{ name: "*.wild.example.com", wildcard: one_label, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /x } }]
+        forward: { backends: [{ upstream: wild/web/http, weight: 1 }] }
+  - name: ingress/deep/one/*.deep.example.com
+    listeners: [http]
+    hostnames: [{ name: "*.deep.example.com", wildcard: one_label, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /y } }]
+        forward: { backends: [{ upstream: deep/web/http, weight: 1 }] }
+  - name: httproute/shop/new/http
+    listeners: [http]
+    hostnames: [{ name: both.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /api } }, { path: { prefix: /api }, headers: [{ name: X-Beta, value: { exact: "on" } }] }]
+        forward: { backends: [{ upstream: shop/canary/http, weight: 1 }] }
+  - name: httproute/two/second/http
+    listeners: [http]
+    hostnames: [{ name: "two.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /pay }, method: POST, headers: [{ name: X-A, value: { exact: "1" } }, { name: x-b, value: { exact: "2" } }], query: [{ name: id, value: { regex: "[0-9]+" } }] }]
+        forward: { backends: [{ upstream: two/web/http, weight: 1 }] }
+  - name: httproute/wild/any/http
+    listeners: [http]
+    hostnames: [{ name: "*.wild.example.com", wildcard: any_labels, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /x } }]
+        forward: { backends: [{ upstream: wild/web/http, weight: 1 }] }
+  - name: ingress/blog/late/docs.example.com
+    listeners: [http]
+    hostnames: [{ name: "docs.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { exact: /docs } }]
+        forward: { backends: [{ upstream: blog/web/http, weight: 1 }] }
+upstreams:
+  blog/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.blog.svc.cluster.local:http" } }
+  deep/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.deep.svc.cluster.local:http" } }
+  shop/canary/http: { load_balancer: p2c, endpoints: { kubernetes: "canary.shop.svc.cluster.local:http" } }
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }
+  tie/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.tie.svc.cluster.local:http" } }
+  two/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.two.svc.cluster.local:http" } }
+  wild/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.wild.svc.cluster.local:http" } }

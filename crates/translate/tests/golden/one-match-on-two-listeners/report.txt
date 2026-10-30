@@ -1,0 +1,1 @@
+HTTPRoute shop/second: path / (Prefix) on both.example.com is already HTTPRoute shop/first's, which comes first

@@ -1,0 +1,189 @@
+# Ingresses and HTTPRoutes on one data plane are ranked as one: their routes go into the
+# config oldest first, then by namespace and name, whichever API each is of, and an Ingress
+# and an HTTPRoute alike in all three, the Ingress first. A match that never takes a request,
+# as an older object of either API, or an earlier route of the same one, has it the same
+# way on the same listener and host, is said shadowed, with what it asks beyond its path;
+# one that asks more (a header) is not, nor one under a wildcard that claims more hosts than
+# the older's: Gateway API's `*.wild.example.com` takes hosts of two labels and more,
+# Ingress's of one alone. Under the same name, an Ingress's wildcard of one label is
+# shadowed by an older HTTPRoute's.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: old, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: "both.example.com"
+      http:
+        paths:
+          - { path: /api, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: new, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: ["both.example.com"]
+  rules:
+    - matches: [{ path: { value: /api } }, { path: { value: /api }, headers: [{ name: X-Beta, value: "on" }] }]
+      backendRefs: [{ name: canary, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: early, namespace: blog, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: ["docs.example.com"]
+  rules:
+    - matches: [{ path: { type: Exact, value: /docs } }]
+      backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: late, namespace: blog, creationTimestamp: "2026-03-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: "docs.example.com"
+      http:
+        paths:
+          - { path: /docs, pathType: Exact, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: one, namespace: wild, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: "*.wild.example.com"
+      http:
+        paths:
+          - { path: /x, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: any, namespace: wild, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: ["*.wild.example.com"]
+  rules:
+    - matches: [{ path: { value: /x } }]
+      backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: any, namespace: deep, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: ["*.deep.example.com"]
+  rules:
+    - matches: [{ path: { value: /y } }]
+      backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: one, namespace: deep, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: "*.deep.example.com"
+      http:
+        paths:
+          - { path: /y, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: first, namespace: two, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: ["two.example.com"]
+  rules:
+    - matches: [{ path: { value: /pay }, method: POST, headers: [{ name: X-B, value: "2" }, { name: x-a, value: "1" }], queryParams: [{ name: id, type: RegularExpression, value: "[0-9]+" }] }]
+      backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: second, namespace: two, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: ["two.example.com"]
+  rules:
+    - matches: [{ path: { value: /pay }, method: POST, headers: [{ name: X-A, value: "1" }, { name: x-b, value: "2" }], queryParams: [{ name: id, type: RegularExpression, value: "[0-9]+" }] }]
+      backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: web, namespace: tie, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: ["tie.example.com"]
+  rules:
+    - matches: [{ path: { value: / } }]
+      backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: tie, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: "tie.example.com"
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: canary, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: blog }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: wild }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: deep }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: two }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: tie }
+spec:
+  ports: [{ name: http, port: 80 }]
