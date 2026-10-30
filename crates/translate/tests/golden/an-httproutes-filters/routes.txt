@@ -1,0 +1,2 @@
+HTTPRoute shop/filters, section http: attached to http (shop.example.com)
+HTTPRoute shop/low, section low: attached to low (low.example.com)

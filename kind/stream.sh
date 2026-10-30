@@ -24,6 +24,8 @@
 #     an HTTPRoute and an Ingress of one host and path are ranked by when the cluster made
 #     them, whichever API each is of: the older takes the requests, the other is said
 #     shadowed;
+#     an HTTPRoute's redirect that states only a host sends the client to the listener's
+#     port;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
 #   - asked to reach its Service by the Service's own address, it is served through the
@@ -293,6 +295,23 @@ answers ranked.example 200 5 || fail "beside a newer HTTPRoute, the Ingress's pa
 k -n shop delete httproute ranked >/dev/null
 k -n shop delete ingress ranked >/dev/null
 pass "an HTTPRoute and an Ingress of one host and path are ranked by age: the older serves it, the other said shadowed"
+
+# A redirect that states only a host sends the client to the listener's port.
+k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: moved, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [moved.example]
+  rules: [{ filters: [{ type: RequestRedirect, requestRedirect: { hostname: example.org } }] }]
+EOF
+answers moved.example 302 30 || fail "the redirecting HTTPRoute answers $(status moved.example)"
+location=$(curl -s -o /dev/null -w '%{redirect_url}' -H 'host: moved.example' "http://127.0.0.1:$port/hostname")
+[ "$location" = "http://example.org:8080/hostname" ] ||
+    fail "the redirect sends the client to $location, not the listener's port"
+k -n shop delete httproute moved >/dev/null
+pass "an HTTPRoute's redirect of a host alone sends the client there on the listener's port"
 
 # What the Ingress's status says, its first address.
 says() { k -n shop get ingress web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }

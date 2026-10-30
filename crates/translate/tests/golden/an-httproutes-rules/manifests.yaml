@@ -38,7 +38,7 @@ spec:
     - matches: [{ path: { value: /gone } }]
       backendRefs: [{ name: gone, port: 80 }, { name: web, port: 80 }]
     - matches: [{ path: { value: /filtered } }]
-      filters: [{ type: RequestHeaderModifier, requestHeaderModifier: { set: [{ name: X-A, value: b }] } }]
+      filters: [{ type: RequestMirror, requestMirror: { backendRef: { name: canary, port: 80 } } }]
       backendRefs: [{ name: web, port: 80 }]
     - matches: [{ path: { value: /timed } }]
       timeouts: { request: 5s }
@@ -67,7 +67,7 @@ spec:
   parentRefs: [{ name: web, namespace: edge }]
   hostnames: [left.example.com]
   rules:
-    - filters: [{ type: RequestRedirect, requestRedirect: { scheme: https } }]
+    - filters: [{ type: CORS, cors: { allowOrigins: ["https://app.example.com"] } }]
 ---
 # A guarded path beside a catch-all: its filter not taken, /admin answers 500, never
 # served by / without it.

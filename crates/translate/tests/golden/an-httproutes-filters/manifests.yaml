@@ -1,0 +1,73 @@
+# An HTTPRoute's filters, as the config has them, in the order written: header changes to
+# the request and its answer, a URL rewrite, and a redirect, 302 unless it says, its query
+# kept. A redirect that states neither scheme nor port sends the client to the listener's
+# port, stated where it is not 80; one that states a scheme alone, to that scheme's own.
+# Beside a redirect, a change to the request's headers is left out, nothing going upstream.
+# A filter the data plane would refuse (a header it does not let a rule change) or one
+# translation does not read answers 500 for all the rule matches.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+    - { name: low, port: 80, protocol: HTTP, hostname: low.example.com, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: filters, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: http }]
+  hostnames: [shop.example.com]
+  rules:
+    - matches: [{ path: { value: /headers } }]
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier: { set: [{ name: X-A, value: "1" }], add: [{ name: X-B, value: "2" }], remove: [X-C] }
+        - type: ResponseHeaderModifier
+          responseHeaderModifier: { set: [{ name: X-D, value: "3" }] }
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /to-https } }]
+      filters: [{ type: RequestRedirect, requestRedirect: { scheme: https } }]
+    - matches: [{ path: { value: /to-host } }]
+      filters: [{ type: RequestRedirect, requestRedirect: { hostname: example.org, statusCode: 301 } }]
+    - matches: [{ path: { value: /to-port } }]
+      filters: [{ type: RequestRedirect, requestRedirect: { scheme: https, port: 8443, path: { type: ReplaceFullPath, replaceFullPath: /full } } }]
+    - matches: [{ path: { value: /moved } }]
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier: { set: [{ name: X-A, value: "1" }] }
+        - type: RequestRedirect
+          requestRedirect: { path: { type: ReplacePrefixMatch, replacePrefixMatch: /new } }
+        - type: ResponseHeaderModifier
+          responseHeaderModifier: { set: [{ name: X-R, value: "1" }] }
+    - matches: [{ path: { value: /rewritten } }]
+      filters: [{ type: URLRewrite, urlRewrite: { hostname: internal.example.com, path: { type: ReplacePrefixMatch, replacePrefixMatch: /v2 } } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /bad-header } }]
+      filters: [{ type: RequestHeaderModifier, requestHeaderModifier: { set: [{ name: Host, value: other.example.com } ] } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /unknown } }]
+      filters: [{ type: Gzip }]
+      backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: low, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: low }]
+  rules:
+    - filters: [{ type: RequestRedirect, requestRedirect: { hostname: example.org } }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

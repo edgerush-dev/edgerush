@@ -1,0 +1,2 @@
+listener http: served on http, taking HTTPRoute from every namespace
+listener low: served on low, taking HTTPRoute from every namespace

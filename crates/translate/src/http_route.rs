@@ -9,11 +9,12 @@
 use crate::gateway::{GatewayOutcome, ListenerOutcome};
 use crate::{Cluster, Object, Plane, backend_upstream, namespace};
 use edgerush_config::{
-    Backend, Forward, Hostname, Match, PathMatch, Route, Rule, Upstream, ValueMatch,
-    ValuePredicate, Wildcard,
+    Backend, Filter, Forward, Header, HeaderChanges, Hostname, Match, PathChange, PathMatch, Query,
+    Redirect, Route, Rule, Scheme, Upstream, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
 };
 use edgerush_gateway_api::http_route::{
     HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesBackendRefs,
+    HTTPRouteRulesFiltersRequestRedirect,
 };
 use k8s_openapi::api::networking::v1::{IngressBackend, IngressServiceBackend, ServiceBackendPort};
 use std::collections::BTreeMap;
@@ -473,41 +474,61 @@ pub(crate) fn translated(
         };
         let mut upstreams = BTreeMap::new();
         let mut invalid = Vec::new();
-        let unsupported = unsupported(rule);
-        let backends = match &unsupported {
-            Some(why) => vec![Backend {
-                upstream: None,
-                invalid: Some(why.clone()),
-                weight: 1,
-            }],
-            None => backends(
-                rule,
-                route_namespace,
-                plane,
-                cluster,
-                &mut upstreams,
-                &mut invalid,
-            ),
+        let taken = match unsupported(rule) {
+            Some(why) => Err(why),
+            None => filtered(rule),
         };
-        let compiled = Rule {
-            matches,
-            filters: Vec::new(),
-            forward: Some(Forward {
-                backends,
-                timeouts: None,
-                retry: None,
-            }),
-            redirect: None,
-            paths: None,
-            rate_limits: Vec::new(),
+        let compiled = match &taken {
+            Err(why) => answering(matches.clone(), why),
+            Ok(Filtered {
+                filters,
+                redirect: Some(redirect),
+            }) => Rule {
+                matches: matches.clone(),
+                filters: filters.clone(),
+                forward: None,
+                redirect: Some(redirect.clone()),
+                paths: None,
+                rate_limits: Vec::new(),
+            },
+            Ok(Filtered {
+                filters,
+                redirect: None,
+            }) => Rule {
+                matches: matches.clone(),
+                filters: filters.clone(),
+                forward: Some(Forward {
+                    backends: backends(
+                        rule,
+                        route_namespace,
+                        plane,
+                        cluster,
+                        &mut upstreams,
+                        &mut invalid,
+                    ),
+                    timeouts: None,
+                    retry: None,
+                }),
+                redirect: None,
+                paths: None,
+                rate_limits: Vec::new(),
+            },
         };
         if let Some(why) = refused(&compiled, &upstreams) {
-            translated.left_out.push((at, why));
+            // Refused for what the rule does, its matches answer 500 in its place; refused
+            // for its matches, nothing could take its requests, and it is left out.
+            let standing = answering(matches, &why);
+            if refused(&standing, &BTreeMap::new()).is_some() {
+                translated.left_out.push((at, why));
+            } else {
+                translated.answered.push((at, why));
+                rules.push(standing);
+            }
             continue;
         }
-        match unsupported {
-            Some(why) => translated.answered.push((at, why)),
-            None => translated
+        match taken {
+            Err(why) => translated.answered.push((at, why)),
+            Ok(_) => translated
                 .invalid
                 .extend(invalid.into_iter().map(|why| (at, why))),
         }
@@ -522,12 +543,14 @@ pub(crate) fn translated(
             continue;
         };
         for attachment in attachments {
-            let served = gateway
+            let Some(listener) = gateway
                 .listeners
                 .iter()
                 .find(|listener| listener.name == attachment.listener)
-                .and_then(|listener| listener.served.as_ref().ok());
-            let (Some(served), false) = (served, attachment.hostnames.is_empty()) else {
+            else {
+                continue;
+            };
+            let (Ok(served), false) = (&listener.served, attachment.hostnames.is_empty()) else {
                 continue;
             };
             let name = format!(
@@ -541,12 +564,49 @@ pub(crate) fn translated(
                 name,
                 listeners: served.clone(),
                 hostnames: attachment.hostnames.iter().map(|h| claim(h)).collect(),
-                rules: rules.clone(),
+                rules: rules
+                    .iter()
+                    .map(|rule| on_port(rule, listener.port))
+                    .collect(),
                 rate_limits: Vec::new(),
             });
         }
     }
     translated
+}
+
+/// A rule that answers 500 for every request its matches take, saying why.
+fn answering(matches: Vec<Match>, why: &str) -> Rule {
+    Rule {
+        matches,
+        filters: Vec::new(),
+        forward: Some(Forward {
+            backends: vec![Backend {
+                upstream: None,
+                invalid: Some(why.to_owned()),
+                weight: 1,
+            }],
+            timeouts: None,
+            retry: None,
+        }),
+        redirect: None,
+        paths: None,
+        rate_limits: Vec::new(),
+    }
+}
+
+/// `rule` on a listener of `port`: a redirect that states neither scheme nor port sends the
+/// client to the listener's port, as Gateway API has it, stated where it is not the
+/// listener's scheme's default ([18 §2](../../../docs/18-redirects-and-rewrites.md)).
+fn on_port(rule: &Rule, port: u16) -> Rule {
+    let mut rule = rule.clone();
+    if let Some(redirect) = &mut rule.redirect {
+        // Plain HTTP listeners alone are served so far.
+        if redirect.scheme.is_none() && redirect.port.is_none() && port != 80 {
+            redirect.port = Some(port);
+        }
+    }
+    rule
 }
 
 /// A rule's matches as the config has them, or why they cannot be built: a match of a type
@@ -588,15 +648,8 @@ fn matches(rule: &HTTPRouteRules) -> Result<Vec<Match>, String> {
         .collect()
 }
 
-/// What of a rule, beyond its matches, translation cannot take yet, if anything.
+/// What of a rule, beyond its matches and filters, translation cannot take yet, if anything.
 fn unsupported(rule: &HTTPRouteRules) -> Option<String> {
-    if rule
-        .filters
-        .as_ref()
-        .is_some_and(|filters| !filters.is_empty())
-    {
-        return Some("not supported yet: filters".to_owned());
-    }
     if rule.timeouts.is_some() {
         return Some("not supported yet: timeouts".to_owned());
     }
@@ -613,6 +666,157 @@ fn unsupported(rule: &HTTPRouteRules) -> Option<String> {
                 .is_some_and(|filters| !filters.is_empty())
         })
         .then(|| "not supported yet: a backend's filters".to_owned())
+}
+
+/// A rule's filters as the config has them: those done to a request or its answer, in the
+/// order written, and a redirect.
+#[derive(Debug)]
+struct Filtered {
+    filters: Vec<Filter>,
+    redirect: Option<Redirect>,
+}
+
+/// A rule's filters as the config has them, or why translation cannot take them. A request's
+/// header changes beside a redirect are left out, as nothing goes upstream for them to
+/// change and nothing a client sees differs ([18 §2](../../../docs/18-redirects-and-rewrites.md)).
+fn filtered(rule: &HTTPRouteRules) -> Result<Filtered, String> {
+    let mut filters = Vec::new();
+    let mut redirect = None;
+    for written in rule.filters.iter().flatten() {
+        let missing = || format!("a {} filter of no settings", written.r#type);
+        match written.r#type.as_str() {
+            "RequestHeaderModifier" => {
+                let changes = written
+                    .request_header_modifier
+                    .as_ref()
+                    .ok_or_else(missing)?;
+                filters.push(Filter::RequestHeaderModifier(header_changes(
+                    changes.set.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.add.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.remove.iter().flatten(),
+                )));
+            }
+            "ResponseHeaderModifier" => {
+                let changes = written
+                    .response_header_modifier
+                    .as_ref()
+                    .ok_or_else(missing)?;
+                filters.push(Filter::ResponseHeaderModifier(header_changes(
+                    changes.set.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.add.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.remove.iter().flatten(),
+                )));
+            }
+            "RequestRedirect" => {
+                let written = written.request_redirect.as_ref().ok_or_else(missing)?;
+                redirect = Some(redirected(written)?);
+            }
+            "URLRewrite" => {
+                let written = written.url_rewrite.as_ref().ok_or_else(missing)?;
+                let path = written
+                    .path
+                    .as_ref()
+                    .map(|path| {
+                        path_change(
+                            &path.r#type,
+                            path.replace_full_path.as_deref(),
+                            path.replace_prefix_match.as_deref(),
+                        )
+                    })
+                    .transpose()?;
+                filters.push(Filter::UrlRewrite(UrlRewrite {
+                    host: written.hostname.clone(),
+                    path,
+                }));
+            }
+            "RequestMirror" => return Err("not supported yet: mirrors".to_owned()),
+            "CORS" => return Err("not supported yet: CORS".to_owned()),
+            "ExtensionRef" => {
+                let extension = written.extension_ref.as_ref().ok_or_else(missing)?;
+                return Err(format!(
+                    "a filter of {}/{} {} is not one EdgeRush has",
+                    extension.group, extension.kind, extension.name
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "a filter of type `{other}` is not one translation reads"
+                ));
+            }
+        }
+    }
+    if redirect.is_some() {
+        filters.retain(|filter| !matches!(filter, Filter::RequestHeaderModifier(_)));
+    }
+    Ok(Filtered { filters, redirect })
+}
+
+/// Header changes as the config has them.
+fn header_changes<'a>(
+    set: impl Iterator<Item = (&'a String, &'a String)>,
+    add: impl Iterator<Item = (&'a String, &'a String)>,
+    remove: impl Iterator<Item = &'a String>,
+) -> HeaderChanges {
+    let header = |(name, value): (&String, &String)| Header {
+        name: name.clone(),
+        value: value.clone(),
+    };
+    HeaderChanges {
+        set: set.map(header).collect(),
+        add: add.map(header).collect(),
+        remove: remove.cloned().collect(),
+    }
+}
+
+/// A redirect as the config has it: the status written, 302 by the schema's default, and
+/// the query kept ([18 §2](../../../docs/18-redirects-and-rewrites.md)).
+fn redirected(written: &HTTPRouteRulesFiltersRequestRedirect) -> Result<Redirect, String> {
+    let status = u16::try_from(written.status_code)
+        .map_err(|_| format!("a redirect of status {}", written.status_code))?;
+    let scheme = match written.scheme.as_deref() {
+        None => None,
+        Some("http") => Some(Scheme::Http),
+        Some("https") => Some(Scheme::Https),
+        Some(other) => {
+            return Err(format!(
+                "a redirect to scheme `{other}` is not one translation reads"
+            ));
+        }
+    };
+    let port = written
+        .port
+        .map(|port| u16::try_from(port).map_err(|_| format!("a redirect to port {port}")))
+        .transpose()?;
+    let path = written
+        .path
+        .as_ref()
+        .map(|path| {
+            path_change(
+                &path.r#type,
+                path.replace_full_path.as_deref(),
+                path.replace_prefix_match.as_deref(),
+            )
+        })
+        .transpose()?;
+    Ok(Redirect {
+        status,
+        scheme,
+        host: written.hostname.clone(),
+        port,
+        path,
+        query: Query::Keep,
+    })
+}
+
+/// A path change as the config has it, of its type and the replacement that type names.
+fn path_change(kind: &str, full: Option<&str>, prefix: Option<&str>) -> Result<PathChange, String> {
+    match (kind, full, prefix) {
+        ("ReplaceFullPath", Some(full), _) => Ok(PathChange::ReplaceFull(full.to_owned())),
+        ("ReplacePrefixMatch", _, Some(prefix)) => Ok(PathChange::ReplacePrefix(prefix.to_owned())),
+        (other, ..) => Err(format!(
+            "a path change of type `{other}` with no replacement of that type"
+        )),
+    }
 }
 
 /// A rule's backends as the config has them, their upstreams put in `upstreams` and those
