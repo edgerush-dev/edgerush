@@ -6,6 +6,20 @@ listeners:
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
 routes:
+  - name: httproute/shop/guarded/http
+    listeners: [http]
+    hostnames: [{ name: guarded.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /admin } }]
+        forward: { backends: [{ invalid: "not supported yet: filters", weight: 1 }] }
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: httproute/shop/nothing-left/http
+    listeners: [http]
+    hostnames: [{ name: left.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ invalid: "not supported yet: filters", weight: 1 }] }
   - name: httproute/shop/shop/http
     listeners: [http]
     hostnames: [{ name: shop.example.com, falls_through: false }]
@@ -20,10 +34,18 @@ routes:
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
       - matches: [{ path: { prefix: /gone } }]
         forward: { backends: [{ invalid: "Service shop/gone does not exist", weight: 1 }, { upstream: shop/web/http, weight: 1 }] }
+      - matches: [{ path: { prefix: /filtered } }]
+        forward: { backends: [{ invalid: "not supported yet: filters", weight: 1 }] }
+      - matches: [{ path: { prefix: /timed } }]
+        forward: { backends: [{ invalid: "not supported yet: timeouts", weight: 1 }] }
       - matches: [{ path: { prefix: /other-kind } }]
         forward: { backends: [{ invalid: "a backend of kind example.com/Other is not one translation reads", weight: 1 }] }
       - matches: [{ path: { prefix: /elsewhere } }]
         forward: { backends: [{ invalid: "Service blog/web is another namespace's, and no ReferenceGrant there lets HTTPRoutes of shop reach it", weight: 1 }] }
+      - matches: [{ path: { prefix: /retried } }]
+        forward: { backends: [{ invalid: "not supported yet: retry", weight: 1 }] }
+      - matches: [{ path: { prefix: /backend-filtered } }]
+        forward: { backends: [{ invalid: "not supported yet: a backend's filters", weight: 1 }] }
 upstreams:
   shop/canary/http: { load_balancer: p2c, endpoints: { kubernetes: "canary.shop.svc.cluster.local:http" } }
   shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

@@ -1,9 +1,12 @@
-HTTPRoute shop/nothing-left: rule 0 dropped: not supported yet: filters
-HTTPRoute shop/nothing-left: every rule is dropped, so it is not accepted
-HTTPRoute shop/shop: rule 3 dropped: not supported yet: filters
-HTTPRoute shop/shop: rule 4 dropped: not supported yet: timeouts
-HTTPRoute shop/shop: rule 7 dropped: the data plane would refuse it: route `httproute`, rules[0], matches[0]: path: invalid regular expression: regex parse error: /( ^ error: unclosed group
-HTTPRoute shop/shop: rule 8 dropped: a header match of type `Near` is not one translation reads
+HTTPRoute shop/guarded: rule 0 answers 500 for all it matches: not supported yet: filters
+HTTPRoute shop/nothing-left: rule 0 answers 500 for all it matches: not supported yet: filters
+HTTPRoute shop/nothing-left: no rule is served as written, so it is not accepted
+HTTPRoute shop/shop: rule 3 answers 500 for all it matches: not supported yet: filters
+HTTPRoute shop/shop: rule 4 answers 500 for all it matches: not supported yet: timeouts
+HTTPRoute shop/shop: rule 9 answers 500 for all it matches: not supported yet: retry
+HTTPRoute shop/shop: rule 10 answers 500 for all it matches: not supported yet: a backend's filters
+HTTPRoute shop/shop: rule 7 left out: the data plane would refuse it: route `httproute`, rules[0], matches[0]: path: invalid regular expression: regex parse error: /( ^ error: unclosed group
+HTTPRoute shop/shop: rule 8 left out: a header match of type `Near` is not one translation reads
 HTTPRoute shop/shop: rule 2: a backend's share is answered 500: Service shop/gone does not exist
 HTTPRoute shop/shop: rule 5: a backend's share is answered 500: a backend of kind example.com/Other is not one translation reads
 HTTPRoute shop/shop: rule 6: a backend's share is answered 500: Service blog/web is another namespace's, and no ReferenceGrant there lets HTTPRoutes of shop reach it

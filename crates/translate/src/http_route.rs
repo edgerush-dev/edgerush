@@ -2,9 +2,9 @@
 //! each `parentRef` to it fitted to the listeners it names, those that take the route's kind
 //! and namespace, and whose hostnames meet the route's; the hostnames each listener is left
 //! with once those of more specific listeners are taken away (listener isolation); the claim
-//! of no rules each listener's hostname makes; each route's rules, a rule translation cannot
-//! take dropped by itself; and every host a claim of one API takes from a claim of the
-//! other.
+//! of no rules each listener's hostname makes; each route's rules, a rule with what
+//! translation cannot take answering 500 for all it matches, one whose matches cannot be
+//! built left out; and every host a claim of one API takes from a claim of the other.
 
 use crate::gateway::{GatewayOutcome, ListenerOutcome};
 use crate::{Cluster, Object, Plane, backend_upstream, namespace};
@@ -434,20 +434,24 @@ fn takes(ours: &Hostname, theirs: &Hostname) -> bool {
 }
 
 /// What an HTTPRoute's rules come to: its config routes, one for each listener it is attached
-/// to, and the upstreams they lead to; the rules dropped, each with why; and the backends
-/// answered 500, each with why.
+/// to, and the upstreams they lead to; the rules left out, each with why; the rules that
+/// answer 500 for all they match, each with why; and the backends answered 500, each with
+/// why.
 #[derive(Debug, Default)]
 pub(crate) struct Translated {
     pub(crate) routes: Vec<Route>,
     pub(crate) upstreams: BTreeMap<String, Upstream>,
-    pub(crate) dropped: Vec<(usize, String)>,
+    pub(crate) left_out: Vec<(usize, String)>,
+    pub(crate) answered: Vec<(usize, String)>,
     pub(crate) invalid: Vec<(usize, String)>,
 }
 
 /// The rules of `route`, attached as `outcome` says, translated for the listeners of
 /// `gateway` that serve each attachment; `refused` says why the data plane would refuse a
-/// rule compiled alone with its upstreams, if it would, so that such a rule is dropped by
-/// itself.
+/// rule compiled alone with its upstreams, if it would, so that such a rule is left out by
+/// itself. A rule with what translation cannot take answers 500 for all it matches, never
+/// served with part of it ignored nor leaving its requests to another rule; one whose
+/// matches cannot be built is left out (04 §2).
 pub(crate) fn translated(
     route: &HTTPRoute,
     outcome: &RouteOutcome,
@@ -460,28 +464,55 @@ pub(crate) fn translated(
     let route_namespace = namespace(&route.metadata);
     let mut rules = Vec::new();
     for (at, rule) in route.spec.rules.iter().enumerate() {
+        let matches = match matches(rule) {
+            Ok(matches) => matches,
+            Err(why) => {
+                translated.left_out.push((at, why));
+                continue;
+            }
+        };
         let mut upstreams = BTreeMap::new();
         let mut invalid = Vec::new();
-        match config_rule(
-            rule,
-            route_namespace,
-            plane,
-            cluster,
-            &mut upstreams,
-            &mut invalid,
-        ) {
-            Err(why) => translated.dropped.push((at, why)),
-            Ok(compiled) => match refused(&compiled, &upstreams) {
-                Some(why) => translated.dropped.push((at, why)),
-                None => {
-                    translated
-                        .invalid
-                        .extend(invalid.into_iter().map(|why| (at, why)));
-                    translated.upstreams.extend(upstreams);
-                    rules.push(compiled);
-                }
-            },
+        let unsupported = unsupported(rule);
+        let backends = match &unsupported {
+            Some(why) => vec![Backend {
+                upstream: None,
+                invalid: Some(why.clone()),
+                weight: 1,
+            }],
+            None => backends(
+                rule,
+                route_namespace,
+                plane,
+                cluster,
+                &mut upstreams,
+                &mut invalid,
+            ),
+        };
+        let compiled = Rule {
+            matches,
+            filters: Vec::new(),
+            forward: Some(Forward {
+                backends,
+                timeouts: None,
+                retry: None,
+            }),
+            redirect: None,
+            paths: None,
+            rate_limits: Vec::new(),
+        };
+        if let Some(why) = refused(&compiled, &upstreams) {
+            translated.left_out.push((at, why));
+            continue;
         }
+        match unsupported {
+            Some(why) => translated.answered.push((at, why)),
+            None => translated
+                .invalid
+                .extend(invalid.into_iter().map(|why| (at, why))),
+        }
+        translated.upstreams.extend(upstreams);
+        rules.push(compiled);
     }
     if rules.is_empty() {
         return translated;
@@ -518,31 +549,10 @@ pub(crate) fn translated(
     translated
 }
 
-/// A rule as the config has it, its upstreams put in `upstreams` and its backends answered
-/// 500 said in `invalid`; or why it is dropped: what translation cannot take yet.
-fn config_rule(
-    rule: &HTTPRouteRules,
-    route_namespace: &str,
-    plane: &Plane,
-    cluster: &Cluster,
-    upstreams: &mut BTreeMap<String, Upstream>,
-    invalid: &mut Vec<String>,
-) -> Result<Rule, String> {
-    if rule
-        .filters
-        .as_ref()
-        .is_some_and(|filters| !filters.is_empty())
-    {
-        return Err("not supported yet: filters".to_owned());
-    }
-    if rule.timeouts.is_some() {
-        return Err("not supported yet: timeouts".to_owned());
-    }
-    if rule.retry.is_some() {
-        return Err("not supported yet: retry".to_owned());
-    }
-    let matches = rule
-        .matches
+/// A rule's matches as the config has them, or why they cannot be built: a match of a type
+/// translation does not read.
+fn matches(rule: &HTTPRouteRules) -> Result<Vec<Match>, String> {
+    rule.matches
         .iter()
         .map(|written| {
             let path = match written.path.r#type.as_str() {
@@ -575,16 +585,48 @@ fn config_rule(
                 query,
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect()
+}
+
+/// What of a rule, beyond its matches, translation cannot take yet, if anything.
+fn unsupported(rule: &HTTPRouteRules) -> Option<String> {
+    if rule
+        .filters
+        .as_ref()
+        .is_some_and(|filters| !filters.is_empty())
+    {
+        return Some("not supported yet: filters".to_owned());
+    }
+    if rule.timeouts.is_some() {
+        return Some("not supported yet: timeouts".to_owned());
+    }
+    if rule.retry.is_some() {
+        return Some("not supported yet: retry".to_owned());
+    }
+    rule.backend_refs
+        .iter()
+        .flatten()
+        .any(|written| {
+            written
+                .filters
+                .as_ref()
+                .is_some_and(|filters| !filters.is_empty())
+        })
+        .then(|| "not supported yet: a backend's filters".to_owned())
+}
+
+/// A rule's backends as the config has them, their upstreams put in `upstreams` and those
+/// answered 500 said in `invalid`.
+fn backends(
+    rule: &HTTPRouteRules,
+    route_namespace: &str,
+    plane: &Plane,
+    cluster: &Cluster,
+    upstreams: &mut BTreeMap<String, Upstream>,
+    invalid: &mut Vec<String>,
+) -> Vec<Backend> {
     let mut backends = Vec::new();
     for written in rule.backend_refs.iter().flatten() {
-        if written
-            .filters
-            .as_ref()
-            .is_some_and(|filters| !filters.is_empty())
-        {
-            return Err("not supported yet: a backend's filters".to_owned());
-        }
         // The schema holds a weight to 0–1,000,000.
         let weight = u32::try_from(written.weight).unwrap_or_default();
         match backend(written, route_namespace, plane, cluster) {
@@ -614,18 +656,7 @@ fn config_rule(
             weight: 1,
         });
     }
-    Ok(Rule {
-        matches,
-        filters: Vec::new(),
-        forward: Some(Forward {
-            backends,
-            timeouts: None,
-            retry: None,
-        }),
-        redirect: None,
-        paths: None,
-        rate_limits: Vec::new(),
-    })
+    backends
 }
 
 /// A header's or query parameter's match, or why it is not one translation reads.

@@ -23,7 +23,8 @@
 //! each of its listeners fitted to the data plane's own, or refused and why ([`gateway`]);
 //! each HTTPRoute that names it is attached to the listeners that take it, and each
 //! listener's hostname claimed for isolation ([`http_route`]), and its rules translated:
-//! matches and backends, a rule with what translation does not take yet dropped by itself.
+//! matches and backends, a rule with what translation does not take yet answering 500 by
+//! itself, one whose matches cannot be built left out.
 //! Every host a claim of one API takes from the other's is said.
 
 use edgerush_certificates::Identity;
@@ -511,17 +512,28 @@ pub enum Problem {
     /// A `parentRef` of an HTTPRoute to the data plane's Gateway attaches it to no listener.
     #[error("not attached to the data plane's Gateway: {0}")]
     NotAttached(NotAttached),
-    /// A rule of an HTTPRoute is dropped, the rest of the route served (`PartiallyInvalid`).
-    #[error("rule {rule} dropped: {why}")]
-    RuleDropped {
+    /// A rule of an HTTPRoute has what translation cannot take: it answers 500 for every
+    /// request it matches, the rest of the route served (`PartiallyInvalid`).
+    #[error("rule {rule} answers 500 for all it matches: {why}")]
+    RuleAnswered {
         /// Its position among the route's rules.
         rule: usize,
         /// Why.
         why: String,
     },
-    /// Every rule of an HTTPRoute is dropped: it is not accepted.
-    #[error("every rule is dropped, so it is not accepted")]
-    NoRuleLeft,
+    /// A rule of an HTTPRoute whose matches cannot be built is left out, its requests left
+    /// to the route's other rules, the rest of the route served (`PartiallyInvalid`).
+    #[error("rule {rule} left out: {why}")]
+    RuleLeftOut {
+        /// Its position among the route's rules.
+        rule: usize,
+        /// Why.
+        why: String,
+    },
+    /// No rule of an HTTPRoute is served as written: it is not accepted, though those of its
+    /// rules that answer 500 still answer.
+    #[error("no rule is served as written, so it is not accepted")]
+    NoRuleServed,
     /// A backend of an HTTPRoute's rule is invalid: its share of the rule's requests is
     /// answered 500 (`ResolvedRefs` false).
     #[error("rule {rule}: a backend's share is answered 500: {why}")]
@@ -868,10 +880,19 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             };
             let translated =
                 http_route::translated(route, outcome, gateway, plane, cluster, refused);
-            for (rule, why) in &translated.dropped {
+            for (rule, why) in &translated.answered {
                 report.push(Finding {
                     object: outcome.route.clone(),
-                    problem: Problem::RuleDropped {
+                    problem: Problem::RuleAnswered {
+                        rule: *rule,
+                        why: why.clone(),
+                    },
+                });
+            }
+            for (rule, why) in &translated.left_out {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::RuleLeftOut {
                         rule: *rule,
                         why: why.clone(),
                     },
@@ -886,10 +907,10 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                     },
                 });
             }
-            if translated.dropped.len() == route.spec.rules.len() {
+            if translated.answered.len() + translated.left_out.len() == route.spec.rules.len() {
                 report.push(Finding {
                     object: outcome.route.clone(),
-                    problem: Problem::NoRuleLeft,
+                    problem: Problem::NoRuleServed,
                 });
             }
             routes.extend(translated.routes);
