@@ -883,18 +883,73 @@ spec:
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.starts_with(
-            "note: HTTPRoute shop/retried: rule 0: a retry of 100 attempts is taken as 5, the most the data plane makes
-"
+            "note: HTTPRoute shop/retried: rule 0: a retry of 100 attempts is taken as 5, the most the data plane makes\n"
         ),
         "{stdout}"
     );
     assert!(
-        stdout.contains("; 0 left out;")
-            && stdout.ends_with(
-                "; 1 notes
-"
-            ),
+        stdout.contains("; 0 left out;") && stdout.ends_with("; 1 notes\n"),
         "{stdout}"
+    );
+    std::fs::remove_file(manifests.join("gateway.yml"))?;
+
+    // An HTTPS listener's Secret is named, and taken as it will be in the cluster, unless
+    // validate is asked to check it: then one that is not there leaves the listener out.
+    std::fs::write(
+        manifests.join("gateway.yml"),
+        "apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec: { controllerName: edgerush.dev/gateway-controller }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - name: secure
+      port: 8443
+      protocol: HTTPS
+      hostname: secure.example.com
+      tls: { certificateRefs: [{ name: web-tls }] }
+",
+    )?;
+    let secure_plane = root.join("secure-data-plane.yaml");
+    let https = "  https: { address: \"[::]:8443\", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [], without_sni: none } }\n";
+    std::fs::write(
+        &secure_plane,
+        plane(&format!("{http}{https}")).replace(
+            "ingress_class: edge\n",
+            "ingress_class: edge\ngateway: edge/web\n",
+        ),
+    )?;
+    let secure = |more: &[&str]| {
+        let mut args = vec![
+            "validate",
+            "--from-manifests",
+            manifests.to_str().expect("a path that is text"),
+            "--data-plane",
+            secure_plane.to_str().expect("a path that is text"),
+        ];
+        args.extend(more);
+        edgerush(&args)
+    };
+    let output = secure(&[])?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).ends_with(
+            "TLS Secrets were taken as they will be in the cluster, not checked: --check-secrets checks them\n"
+        ),
+        "{output:?}"
+    );
+    let output = secure(&["--check-secrets"])?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with(
+            "Gateway edge/web: listener secure: a certificate cannot be used: Secret edge/web-tls does not exist\n"
+        ),
+        "{output:?}"
     );
     std::fs::remove_file(manifests.join("gateway.yml"))?;
 

@@ -1,0 +1,9 @@
+Gateway edge/web: listener kinds: a certificate cannot be used: a certificateRef of kind example.com/Vault is not one translation reads
+Gateway edge/web: listener wild-unusable: a certificate cannot be used: Secret edge/missing does not exist
+Gateway edge/web: listener wild-unusable: not accepted: no certificateRef of it can be used
+Gateway edge/web: listener unusable: a certificate cannot be used: Secret edge/missing does not exist
+Gateway edge/web: listener unusable: a certificate cannot be used: Secret shop/keyless has no tls.key
+Gateway edge/web: listener unusable: not accepted: no certificateRef of it can be used
+Gateway edge/web: listener denied: a certificate cannot be used: Secret blog/secret is another namespace's, and no ReferenceGrant there lets Gateways of edge reach it
+Gateway edge/web: listener denied: not accepted: no certificateRef of it can be used
+Gateway edge/web: listener migrated: plain.example.com, which an Ingress serves over plain HTTP alone, is served over HTTPS by it

@@ -1,0 +1,5 @@
+edge/own
+shop/ingress-only
+shop/secure
+shop/shop-tls
+shop/wild

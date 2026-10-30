@@ -1,0 +1,181 @@
+# A Gateway's HTTPS listeners, each fitted to the data plane's `https` listeners on its
+# port and presenting there the certificates of its certificateRefs: Secrets of the
+# Gateway's namespace, or of another whose ReferenceGrant lets Gateways of it reach them,
+# asked before whether the Secret is there; each read as an Ingress's are. A certificate is
+# stated for its listener's hostname, or, for a listener of none, for every name no other
+# answers for and for a client that asks for no name. A ref that cannot be used is said and
+# passed over; a listener of none left is not served, and its hostname refused so that no
+# other certificate answers for it, unless a wildcard, which cannot be. An HTTPRoute is
+# served on an HTTPS listener as on an HTTP one. On a data plane listener the Gateway's
+# certificates come first, in its order, before Ingresses'; a Secret both name is one
+# certificate for both's names. A host an Ingress serves over plain HTTP alone is served
+# over HTTPS by a Gateway listener of that hostname, no longer refused there, and said.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - name: catch-all
+      port: 8443
+      protocol: HTTPS
+      allowedRoutes: { namespaces: { from: All } }
+      tls: { certificateRefs: [{ name: shop-tls, namespace: shop }] }
+    - name: exact
+      port: 8443
+      protocol: HTTPS
+      hostname: "secure.example.com"
+      allowedRoutes: { namespaces: { from: All } }
+      tls: { certificateRefs: [{ name: own }, { name: secure, namespace: shop }] }
+    - name: wild
+      port: 8443
+      protocol: HTTPS
+      hostname: "*.wild.example.com"
+      allowedRoutes: { namespaces: { from: All } }
+      tls: { certificateRefs: [{ name: wild, namespace: shop }] }
+    - name: kinds
+      port: 8443
+      protocol: HTTPS
+      hostname: "kinds.example.com"
+      allowedRoutes: { namespaces: { from: All } }
+      tls: { certificateRefs: [{ group: example.com, kind: Vault, name: x }, { name: own }] }
+    - name: later
+      port: 8443
+      protocol: HTTPS
+      hostname: "later.example.com"
+      allowedRoutes: { namespaces: { from: All } }
+      tls: { certificateRefs: [{ name: secure, namespace: shop }] }
+    - name: migrated
+      port: 8443
+      protocol: HTTPS
+      hostname: "plain.example.com"
+      allowedRoutes: { namespaces: { from: All } }
+      tls: { certificateRefs: [{ name: own }] }
+    - name: wild-unusable
+      port: 8443
+      protocol: HTTPS
+      hostname: "*.none.example.com"
+      allowedRoutes: { namespaces: { from: All } }
+      tls: { certificateRefs: [{ name: missing }] }
+    - name: unusable
+      port: 8443
+      protocol: HTTPS
+      hostname: "unusable.example.com"
+      allowedRoutes: { namespaces: { from: All } }
+      tls: { certificateRefs: [{ name: missing }, { name: keyless, namespace: shop }] }
+    - name: denied
+      port: 8443
+      protocol: HTTPS
+      hostname: "denied.example.com"
+      allowedRoutes: { namespaces: { from: All } }
+      tls: { certificateRefs: [{ name: secret, namespace: blog }] }
+    - name: elsewhere
+      port: 9443
+      protocol: HTTPS
+      hostname: "more.example.com"
+      allowedRoutes: { namespaces: { from: All } }
+      tls: { certificateRefs: [{ name: own }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: from-edge, namespace: shop }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: Gateway, namespace: edge }]
+  to: [{ group: "", kind: Secret }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: app, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: catch-all }]
+  hostnames: [app.example.com]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: legacy, namespace: shop }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [shop.example.com], secretName: ingress-only }]
+  rules:
+    - host: shop.example.com
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }] }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: plain, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: plain.example.com
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }] }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: shared, namespace: shop }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [legacy.example.com], secretName: wild }]
+  rules:
+    - host: legacy.example.com
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }] }
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: own, namespace: edge }
+type: kubernetes.io/tls
+stringData:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+    DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+    MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+    hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+    /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+    vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+    AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+    RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+    MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgdZaZ6tG6zh0h1cqS
+    23pUIQKMY6JSkLCYIVIsIc7eZ8mhRANCAAT0Y4ToHByUvCc8nl7g3jPjWFbXCx1U
+    xMPpnOJVpR/iSYSwRdqtUkuO4vOaN0GBx4nr7/wUnH5m6xJPwjOZczke
+    -----END PRIVATE KEY-----
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: ingress-only, namespace: shop }
+type: kubernetes.io/tls
+stringData:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+    DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+    MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+    hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+    /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+    vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+    AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+    RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+    MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgdZaZ6tG6zh0h1cqS
+    23pUIQKMY6JSkLCYIVIsIc7eZ8mhRANCAAT0Y4ToHByUvCc8nl7g3jPjWFbXCx1U
+    xMPpnOJVpR/iSYSwRdqtUkuO4vOaN0GBx4nr7/wUnH5m6xJPwjOZczke
+    -----END PRIVATE KEY-----
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

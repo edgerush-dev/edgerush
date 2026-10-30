@@ -214,10 +214,11 @@ pub struct Translation {
 impl Problem {
     /// Whether this is a note on what is served as the spec has it, not a fault: said, but
     /// no reason for `validate` to fail (04 §3). A retry's attempts taken as the data
-    /// plane's most are one.
+    /// plane's most are one, and a host an Ingress serves over plain HTTP alone served over
+    /// HTTPS by a Gateway listener another.
     #[must_use]
     pub fn is_note(&self) -> bool {
-        matches!(self, Self::RetryCapped { .. })
+        matches!(self, Self::RetryCapped { .. } | Self::HostOverTls { .. })
     }
 }
 
@@ -574,6 +575,28 @@ pub enum Problem {
         rule: usize,
         /// The attempts asked for.
         asked: i64,
+    },
+    /// A `certificateRef` of an HTTPS listener of the data plane's Gateway cannot be used
+    /// (`ResolvedRefs` false): the listener is served with the others, or not at all where
+    /// none is left.
+    #[error("listener {name}: a certificate cannot be used: {why}")]
+    ListenerCertificate {
+        /// The listener's name.
+        name: String,
+        /// Why.
+        why: String,
+    },
+    /// A host an Ingress serves over plain HTTP alone is a Gateway HTTPS listener's
+    /// hostname: served over HTTPS by that listener's certificate, no longer refused over TLS
+    /// (04 §2). A note: a move from Ingress to Gateway API, as it is meant to be made.
+    #[error(
+        "listener {name}: {host}, which an Ingress serves over plain HTTP alone, is served over HTTPS by it"
+    )]
+    HostOverTls {
+        /// The listener's name.
+        name: String,
+        /// The host.
+        host: String,
     },
     /// A listener of the data plane's Gateway names route kinds it cannot take
     /// (`InvalidRouteKinds`); it takes the others.
@@ -984,17 +1007,21 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         })
         .collect();
     upstreams.retain(|name, _| used.contains(name));
+    let mut config = Config {
+        data_plane: plane.data_plane.clone(),
+        ..config_of(
+            plane.listeners.clone(),
+            routes,
+            upstreams,
+            &presented,
+            &refused,
+        )
+    };
+    if let Some(gateway) = &gateway {
+        gateway_tls(&mut config, gateway, cluster, &mut report);
+    }
     Translation {
-        config: Config {
-            data_plane: plane.data_plane.clone(),
-            ..config_of(
-                plane.listeners.clone(),
-                routes,
-                upstreams,
-                &presented,
-                &refused,
-            )
-        },
+        config,
         report,
         passed_over: others.len(),
         unresolved,
@@ -1178,6 +1205,140 @@ fn value_said(name: &str, value: &ValueMatch) -> String {
         ValueMatch::Exact(value) => format!("{name}: {value}"),
         ValueMatch::Regex(value) => format!("{name} matching {value}"),
     }
+}
+
+/// The certificates of the data plane's Gateway's HTTPS listeners, on the data plane's
+/// listeners that serve each (04 §2): each stated for its listener's hostname, or, where it
+/// has none, for every name no other answers for and for a client that asks for none, the
+/// spec's "longest matching SNI"; before an Ingress's on the same listener, the Gateway's
+/// listener owning its hostname, and a Secret both name one certificate for both's names.
+/// A listener none of whose certificates can be used has its hostname refused, so that no
+/// other certificate answers for it; a wildcard cannot be. One that can has its hostname
+/// taken off the names refused, where an Ingress serving it over plain HTTP alone put it,
+/// and that is said in `report` as a note.
+fn gateway_tls(
+    config: &mut Config,
+    gateway: &GatewayOutcome,
+    cluster: &Cluster,
+    report: &mut Vec<Finding>,
+) {
+    // By the data plane's listener: each certificate and the names stated for it.
+    let mut gathered: BTreeMap<String, Vec<(String, Vec<String>)>> = BTreeMap::new();
+    let mut without_sni: BTreeMap<String, String> = BTreeMap::new();
+    for listener in &gateway.listeners {
+        let stated = listener.hostname.clone().unwrap_or_else(|| "*".to_owned());
+        let serving = match &listener.served {
+            Ok(serving) if !listener.certificates.is_empty() => serving,
+            Err(gateway::ListenerProblem::NoCertificate) => {
+                if !stated.contains('*') {
+                    for tls in https_on(config, listener.port) {
+                        if !tls.refused.contains(&stated) {
+                            tls.refused.push(stated.clone());
+                        }
+                    }
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        for name in &listener.certificates {
+            let certificate = name.split_once('/').and_then(|(namespace, secret)| {
+                if cluster.secrets_assumed {
+                    // Named, and not looked at: what it holds is the cluster's.
+                    return Some(Certificate {
+                        chain: String::new(),
+                        key: String::new(),
+                    });
+                }
+                secret_certificate(cluster, namespace, secret)
+                    .ok()
+                    .map(|(certificate, _)| certificate)
+            });
+            // Read once already, when the listener was fitted.
+            let Some(certificate) = certificate else {
+                continue;
+            };
+            config.certificates.insert(name.clone(), certificate);
+        }
+        let mut taken_off = false;
+        for listening in serving {
+            if let Some(tls) = config
+                .listeners
+                .get_mut(listening)
+                .and_then(|listener| listener.tls.as_mut())
+            {
+                let before = tls.refused.len();
+                tls.refused.retain(|refused| *refused != stated);
+                taken_off |= tls.refused.len() != before;
+            }
+            let entries = gathered.entry(listening.clone()).or_default();
+            for name in &listener.certificates {
+                match entries.iter_mut().find(|(named, _)| named == name) {
+                    Some((_, names)) if !names.contains(&stated) => names.push(stated.clone()),
+                    Some(_) => {}
+                    None => entries.push((name.clone(), vec![stated.clone()])),
+                }
+            }
+            if listener.hostname.is_none()
+                && let Some(first) = listener.certificates.first()
+            {
+                without_sni
+                    .entry(listening.clone())
+                    .or_insert_with(|| first.clone());
+            }
+        }
+        if taken_off {
+            report.push(Finding {
+                object: gateway.gateway.clone(),
+                problem: Problem::HostOverTls {
+                    name: listener.name.clone(),
+                    host: stated.clone(),
+                },
+            });
+        }
+    }
+    // Each data plane listener's, in the Gateway's order, before the Ingresses'.
+    for (listening, entries) in gathered {
+        let Some(tls) = config
+            .listeners
+            .get_mut(&listening)
+            .and_then(|listener| listener.tls.as_mut())
+        else {
+            continue;
+        };
+        let mut ours = Vec::with_capacity(entries.len() + tls.certificates.len());
+        for (name, mut names) in entries {
+            // A Secret an Ingress names too is one certificate, for both's names.
+            if let Some(at) = tls
+                .certificates
+                .iter()
+                .position(|presented| presented.name() == name)
+            {
+                let theirs = tls.certificates.remove(at);
+                names.extend(theirs.stated().into_iter().flatten().cloned());
+            }
+            ours.push(ListenerCertificate::Stated(StatedNames {
+                certificate: name,
+                names,
+            }));
+        }
+        ours.append(&mut tls.certificates);
+        tls.certificates = ours;
+        if let Some(name) = without_sni.remove(&listening) {
+            tls.without_sni = name;
+        }
+    }
+}
+
+/// The TLS of the data plane's `https` listeners bound to `port`.
+fn https_on(config: &mut Config, port: u16) -> impl Iterator<Item = &mut edgerush_config::Tls> {
+    config
+        .listeners
+        .values_mut()
+        .filter(move |listener| {
+            listener.protocol == Protocol::Https && listener.address.port() == port
+        })
+        .filter_map(|listener| listener.tls.as_mut())
 }
 
 /// A config of these listeners, routes and upstreams, and nothing else but `presented`:
@@ -1861,6 +2022,33 @@ fn service_port<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notes_are_what_is_served_as_the_spec_has_it_and_nothing_else() {
+        let notes = [
+            Problem::RetryCapped {
+                rule: 0,
+                asked: 100,
+            },
+            Problem::HostOverTls {
+                name: "secure".to_owned(),
+                host: "shop.example.com".to_owned(),
+            },
+        ];
+        assert!(notes.iter().all(Problem::is_note));
+        let faults = [
+            Problem::NoRuleServed,
+            Problem::MirrorLeftOff {
+                rule: 0,
+                why: String::new(),
+            },
+            Problem::ListenerCertificate {
+                name: "secure".to_owned(),
+                why: String::new(),
+            },
+        ];
+        assert!(!faults.iter().any(Problem::is_note));
+    }
 
     #[test]
     fn a_gateway_is_named_by_namespace_and_name() {

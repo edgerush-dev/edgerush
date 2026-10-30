@@ -1,6 +1,7 @@
 # Each of the Gateway's listeners as the data plane can serve it, or why it cannot: one on
 # a port the data plane binds for HTTP twice is served on both; one on a port it binds for
-# another protocol, or on none, is refused; protocols not taken yet, or never, are refused;
+# another protocol, or on none, is refused; protocols not taken yet, or never, are refused,
+# and an HTTPS listener of no certificate;
 # two that cannot be told apart are both refused, none chosen, while one beside them that
 # differs by its hostname alone is served.
 apiVersion: gateway.networking.k8s.io/v1

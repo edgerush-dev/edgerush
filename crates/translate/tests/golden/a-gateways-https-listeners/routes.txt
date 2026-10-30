@@ -1,0 +1,1 @@
+HTTPRoute shop/app, section catch-all: attached to catch-all (app.example.com)

@@ -1128,7 +1128,13 @@ fn backend(
         ));
     }
     let namespace = written.namespace.unwrap_or(route_namespace);
-    if namespace != route_namespace && !granted(cluster, route_namespace, namespace, written.name) {
+    if namespace != route_namespace
+        && !granted(
+            cluster,
+            ("HTTPRoute", route_namespace),
+            ("Service", namespace, written.name),
+        )
+    {
         return Err(format!(
             "Service {namespace}/{} is another namespace's, and no ReferenceGrant there lets \
              HTTPRoutes of {route_namespace} reach it",
@@ -1158,21 +1164,26 @@ fn backend(
     }
 }
 
-/// Whether a ReferenceGrant in `namespace` lets HTTPRoutes of `from` reach its Service
-/// `service`: one whose `from` names them and whose `to` names that Service, or every
-/// Service there. Entries of each list are either-or, as the spec has it.
-fn granted(cluster: &Cluster, from: &str, namespace: &str, service: &str) -> bool {
+/// Whether a ReferenceGrant in the namespace of `to` lets objects of the Gateway API's kind
+/// and namespace `from` reach its core object of the kind and name `to` says: one whose
+/// `from` names them and whose `to` names that object, or every object of its kind there.
+/// Entries of each list are either-or, as the spec has it.
+pub(crate) fn granted(
+    cluster: &Cluster,
+    (from_kind, from): (&str, &str),
+    (kind, namespace, name): (&str, &str, &str),
+) -> bool {
     cluster
         .reference_grants
         .iter()
         .filter(|grant| grant.metadata.namespace.as_deref() == Some(namespace))
         .any(|grant| {
             grant.spec.from.iter().any(|theirs| {
-                theirs.group == GROUP && theirs.kind == "HTTPRoute" && theirs.namespace == from
+                theirs.group == GROUP && theirs.kind == from_kind && theirs.namespace == from
             }) && grant.spec.to.iter().any(|ours| {
                 ours.group.is_empty()
-                    && ours.kind == "Service"
-                    && ours.name.as_deref().is_none_or(|name| name == service)
+                    && ours.kind == kind
+                    && ours.name.as_deref().is_none_or(|theirs| theirs == name)
             })
         })
 }

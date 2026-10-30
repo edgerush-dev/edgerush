@@ -3,7 +3,8 @@
 //! fitted to the data plane's own listeners bound to its port, or not accepted and why, and
 //! the routes each takes: of which kinds, from which namespaces.
 
-use crate::{Cluster, Finding, GATEWAY_CONTROLLER, Object, Plane, Problem};
+use crate::http_route::granted;
+use crate::{Cluster, Finding, GATEWAY_CONTROLLER, Object, Plane, Problem, secret_certificate};
 use edgerush_config::Protocol;
 use edgerush_gateway_api::gateway::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespaces,
@@ -39,16 +40,29 @@ pub struct ListenerOutcome {
     pub hostname: Option<String>,
     /// Its port.
     pub port: u16,
+    /// An HTTPS listener's certificates that can be used, by the config's names for them,
+    /// `<namespace>/<Secret>`, in the order its `certificateRefs` list them.
+    pub certificates: Vec<String>,
+    /// Its `certificateRefs` that cannot be used, each with why (`ResolvedRefs` false).
+    pub certificate_problems: Vec<String>,
 }
 
 impl fmt::Display for ListenerOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.served {
-            Ok(listeners) => write!(
+            Ok(listeners) if self.certificates.is_empty() => write!(
                 f,
                 "listener {}: served on {}, taking {}",
                 self.name,
                 listeners.join(", "),
+                self.allowed
+            ),
+            Ok(listeners) => write!(
+                f,
+                "listener {}: served on {}, presenting {}, taking {}",
+                self.name,
+                listeners.join(", "),
+                self.certificates.join(", "),
                 self.allowed
             ),
             Err(problem) => write!(f, "listener {}: not accepted: {problem}", self.name),
@@ -213,6 +227,15 @@ pub enum ListenerProblem {
     /// No listener of the data plane is bound to its port (`PortUnavailable`).
     #[error("port {0} is bound by no listener of the data plane")]
     PortUnbound(u16),
+    /// An HTTPS listener none of whose `certificateRefs` can be used (`ResolvedRefs`
+    /// false, `InvalidCertificateRef` or `RefNotPermitted`): not served, its hostname
+    /// refused over TLS so that no other certificate answers for it.
+    #[error("no certificateRef of it can be used")]
+    NoCertificate,
+    /// An HTTPS listener of a TLS mode other than `Terminate`, which the spec does not let
+    /// one have.
+    #[error("TLS mode `{0}` is not one an HTTPS listener takes")]
+    TlsMode(String),
     /// The data plane binds its port for another protocol (`PortUnavailable`).
     #[error("port {port} is bound by the data plane for {bound}, not {wanted}")]
     PortOtherProtocol {
@@ -254,6 +277,18 @@ pub(crate) fn outcome(
     }
     let mut listeners = listeners(plane, &gateway.spec.listeners);
     for (listener, written) in listeners.iter_mut().zip(&gateway.spec.listeners) {
+        if listener.served.is_ok() && written.protocol == "HTTPS" {
+            certificates(listener, written, &named.namespace, cluster);
+        }
+        for why in &listener.certificate_problems {
+            report.push(Finding {
+                object: object.clone(),
+                problem: Problem::ListenerCertificate {
+                    name: listener.name.clone(),
+                    why: why.clone(),
+                },
+            });
+        }
         let (allowed, unread) = allowed(written, &named.namespace);
         if let Err(problem) = &listener.served {
             report.push(Finding {
@@ -294,6 +329,68 @@ pub(crate) fn outcome(
         gateway: object,
         listeners,
     })
+}
+
+/// An HTTPS listener's certificates, put in `listener`: each of its `certificateRefs` that
+/// names a Secret, of the Gateway's namespace or of one whose ReferenceGrant lets Gateways
+/// of it reach that Secret, asked first as conformance has it, and that holds a certificate
+/// and key the data plane can use, read as an Ingress's are (04 §2); each other said why.
+/// Of none it can use, the listener is not served.
+fn certificates(
+    listener: &mut ListenerOutcome,
+    written: &GatewayListeners,
+    gateway_namespace: &str,
+    cluster: &Cluster,
+) {
+    let mode = written
+        .tls
+        .as_ref()
+        .map_or("Terminate", |tls| tls.mode.as_str());
+    if mode != "Terminate" {
+        listener.served = Err(ListenerProblem::TlsMode(mode.to_owned()));
+        return;
+    }
+    let refs = written
+        .tls
+        .iter()
+        .flat_map(|tls| tls.certificate_refs.iter().flatten());
+    for reference in refs {
+        let namespace = reference.namespace.as_deref().unwrap_or(gateway_namespace);
+        let name = &reference.name;
+        let usable = if !(reference.group.is_empty() && reference.kind == "Secret") {
+            Err(format!(
+                "a certificateRef of kind {}/{} is not one translation reads",
+                reference.group, reference.kind
+            ))
+        } else if namespace != gateway_namespace
+            && !granted(
+                cluster,
+                ("Gateway", gateway_namespace),
+                ("Secret", namespace, name),
+            )
+        {
+            Err(format!(
+                "Secret {namespace}/{name} is another namespace's, and no ReferenceGrant there \
+                 lets Gateways of {gateway_namespace} reach it"
+            ))
+        } else if cluster.secrets_assumed {
+            Ok(())
+        } else {
+            secret_certificate(cluster, namespace, name).map(|_| ())
+        };
+        match usable {
+            Ok(()) => listener.certificates.push(format!("{namespace}/{name}")),
+            Err(why) => listener.certificate_problems.push(why),
+        }
+    }
+    if listener.certificates.is_empty() {
+        if listener.certificate_problems.is_empty() {
+            listener
+                .certificate_problems
+                .push("it names no certificateRef".to_owned());
+        }
+        listener.served = Err(ListenerProblem::NoCertificate);
+    }
 }
 
 /// Whether the Gateway's GatewayClass is there and names this controller; said where not.
@@ -379,6 +476,8 @@ fn listeners(plane: &Plane, listeners: &[GatewayListeners]) -> Vec<ListenerOutco
                 hostname: listener.hostname.clone(),
                 // The schema holds a port to 1–65535.
                 port: u16::try_from(listener.port).unwrap_or_default(),
+                certificates: Vec::new(),
+                certificate_problems: Vec::new(),
             }
         })
         .collect()
@@ -389,7 +488,7 @@ fn listeners(plane: &Plane, listeners: &[GatewayListeners]) -> Vec<ListenerOutco
 fn protocol(written: &str) -> Result<Protocol, ListenerProblem> {
     match written {
         "HTTP" => Ok(Protocol::Http),
-        "HTTPS" => Err(ListenerProblem::NotSupportedYet("HTTPS")),
+        "HTTPS" => Ok(Protocol::Https),
         "TLS" => Err(ListenerProblem::NotSupportedYet("TLS")),
         "TCP" => Err(ListenerProblem::NotSupportedYet("TCP")),
         other => Err(ListenerProblem::UnsupportedProtocol(other.to_owned())),
