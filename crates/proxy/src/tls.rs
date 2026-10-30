@@ -481,8 +481,9 @@ pub(crate) fn identity(named: &NamedCertificate) -> Result<Identity, TlsError> {
 
 /// Which certificate answers for which name: by the names the listener states for it, or,
 /// where it states none, the DNS names in its subject alternative names; exact names before
-/// wildcards, and among certificates that answer for the same name, the first. A name the
-/// listener refuses, or that no certificate answers for, is answered by none.
+/// wildcards, wildcards before one stated for every name (`*`), and among certificates that
+/// answer for the same name, the first. A name the listener refuses, or that no certificate
+/// answers for, is answered by none.
 #[derive(Debug, Default)]
 struct Names {
     /// The names refused before any certificate is looked at, in lower case.
@@ -492,6 +493,8 @@ struct Names {
     /// By what follows the `*.`, in lower case: a wildcard stands for one label, whole
     /// (RFC 6125 §6.4.3).
     wildcard: HashMap<String, usize>,
+    /// The first stated for every name.
+    any: Option<usize>,
 }
 
 impl Names {
@@ -506,12 +509,22 @@ impl Names {
         let Some(alternatives) = leaf.subject_alt_names() else {
             return;
         };
-        for name in alternatives.iter().filter_map(|name| name.dnsname()) {
+        // A `*` a certificate carries is no DNS name a client could ask for (RFC 6125 §6.4.3):
+        // only a listener makes a certificate answer for every name.
+        for name in alternatives
+            .iter()
+            .filter_map(|name| name.dnsname())
+            .filter(|name| *name != "*")
+        {
             self.add_name(name, index);
         }
     }
 
     fn add_name(&mut self, name: &str, index: usize) {
+        if name == "*" {
+            self.any.get_or_insert(index);
+            return;
+        }
         let name = name.to_ascii_lowercase();
         match name.strip_prefix("*.") {
             Some(parent) => self.wildcard.entry(parent.to_owned()).or_insert(index),
@@ -534,6 +547,7 @@ impl Names {
             .filter(|(label, _)| !label.is_empty())
             .and_then(|(_, parent)| self.wildcard.get(parent))
             .copied()
+            .or(self.any)
     }
 }
 
@@ -613,13 +627,38 @@ mod tests {
         assert_eq!(names.choose("c.x.test"), Some(0));
     }
 
+    #[test]
+    fn a_name_none_other_answers_for_is_answered_by_the_one_stated_for_every_name() {
+        let mut names = names(&[&["a.test"], &["*"], &["*.b.test"], &["*"]]);
+        assert_eq!(names.choose("a.test"), Some(0));
+        assert_eq!(names.choose("x.b.test"), Some(2));
+        // The first stated for every name, for any other, however deep or odd.
+        assert_eq!(names.choose("elsewhere.test"), Some(1));
+        assert_eq!(names.choose("y.x.b.test"), Some(1));
+        assert_eq!(names.choose("b.test"), Some(1));
+        // Refused before it as before any.
+        names.refused = ["refused.test".to_owned()].into();
+        assert_eq!(names.choose("refused.test"), None);
+    }
+
+    #[test]
+    fn a_star_a_certificate_carries_makes_it_answer_for_no_other_name() {
+        let carrying = presented("carrying", certificate(&["*", "a.test"]));
+        let leaf = X509::from_pem(carrying.certificate.certificate.chain.as_bytes()).unwrap();
+        let mut names = Names::default();
+        names.add(&carrying, &leaf, 0);
+        assert_eq!(names.choose("a.test"), Some(0));
+        assert_eq!(names.choose("elsewhere.test"), None);
+    }
+
     proptest! {
         /// Against a naive reading of the rules: every certificate's names in order, an
-        /// exact match anywhere first, then the first wildcard that covers the name.
+        /// exact match anywhere first, then the first wildcard that covers the name, then
+        /// the first stated for every name.
         #[test]
         fn choosing_agrees_with_a_naive_reading(
             certificates in prop::collection::vec(
-                prop::collection::vec("(\\*\\.)?[ab]{1,2}(\\.[ab]{1,2}){0,2}", 0..4),
+                prop::collection::vec("\\*|(\\*\\.)?[ab]{1,2}(\\.[ab]{1,2}){0,2}", 0..4),
                 1..5,
             ),
             asked in "[ab.]{0,8}",
@@ -641,7 +680,8 @@ mod tests {
                     })
                 })
             });
-            prop_assert_eq!(chosen, exact.or(wildcard));
+            let any = carried.iter().position(|names| names.contains(&"*"));
+            prop_assert_eq!(chosen, exact.or(wildcard).or(any));
         }
     }
 

@@ -1213,9 +1213,9 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                     errors.push(Place::listener(name).problem(problem));
                 }
                 // As a certificate's own names are written: a wildcard stands for one whole
-                // label, leftmost.
+                // label, leftmost; or `*`, every name no other certificate answers for.
                 for stated in stated {
-                    if !is_host_name(stated.strip_prefix("*.").unwrap_or(stated)) {
+                    if stated != "*" && !is_host_name(stated.strip_prefix("*.").unwrap_or(stated)) {
                         let problem = Problem::StatedName {
                             certificate: certificate.to_owned(),
                             name: stated.clone(),
@@ -2505,8 +2505,8 @@ pub enum Problem {
     /// A certificate a listener states no names for: it would answer for none.
     #[error("certificate `{0}` is stated no names to answer for")]
     NoNamesStated(String),
-    /// A name stated for a certificate that is neither a host name nor `*.` and one.
-    #[error("certificate `{certificate}`: `{name}` is not a host name, or `*.` and one")]
+    /// A name stated for a certificate that is neither a host name, `*.` and one, nor `*`.
+    #[error("certificate `{certificate}`: `{name}` is not a host name, `*.` and one, or `*`")]
     StatedName {
         /// The certificate's name.
         certificate: String,
@@ -4046,14 +4046,23 @@ upstreams: {{}}
         );
         assert_eq!(
             problems(
-                "{ certificates: [{ certificate: a, names: [\"*\", \"a.*.example.com\", \"*.*.example.com\", 192.0.2.1, a.example.com] }], without_sni: none }"
+                "{ certificates: [{ certificate: a, names: [\"**\", \"*.\", \"a.*.example.com\", \"*.*.example.com\", 192.0.2.1, a.example.com] }], without_sni: none }"
             ),
             [
-                "listener `l`: certificate `a`: `*` is not a host name, or `*.` and one",
-                "listener `l`: certificate `a`: `a.*.example.com` is not a host name, or `*.` and one",
-                "listener `l`: certificate `a`: `*.*.example.com` is not a host name, or `*.` and one",
-                "listener `l`: certificate `a`: `192.0.2.1` is not a host name, or `*.` and one",
+                "listener `l`: certificate `a`: `**` is not a host name, `*.` and one, or `*`",
+                "listener `l`: certificate `a`: `*.` is not a host name, `*.` and one, or `*`",
+                "listener `l`: certificate `a`: `a.*.example.com` is not a host name, `*.` and one, or `*`",
+                "listener `l`: certificate `a`: `*.*.example.com` is not a host name, `*.` and one, or `*`",
+                "listener `l`: certificate `a`: `192.0.2.1` is not a host name, `*.` and one, or `*`",
             ]
+        );
+        // `*` is every name no other certificate answers for (Gateway API's HTTPS listener of
+        // no hostname).
+        assert!(
+            compile(&with(
+                "{ certificates: [{ certificate: a, names: [\"*\"] }], without_sni: a }"
+            ))
+            .is_ok()
         );
         // Named twice, stated or not, is twice.
         assert_eq!(

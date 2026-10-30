@@ -1623,7 +1623,7 @@
           "type": "string"
         },
         "names": {
-          "description": "Host names, or `*.` and a host name for every name one label longer, as a\ncertificate's own wildcard stands for one whole label.",
+          "description": "Host names, or `*.` and a host name for every name one label longer, as a\ncertificate's own wildcard stands for one whole label; or `*`, the least specific,\nfor every name no other certificate of the listener answers for (Gateway API's\nHTTPS listener of no hostname).",
           "type": "array",
           "items": {
             "type": "string"

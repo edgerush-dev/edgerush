@@ -476,7 +476,9 @@ pub struct StatedNames {
     /// The certificate's name, among the config's.
     pub certificate: String,
     /// Host names, or `*.` and a host name for every name one label longer, as a
-    /// certificate's own wildcard stands for one whole label.
+    /// certificate's own wildcard stands for one whole label; or `*`, the least specific,
+    /// for every name no other certificate of the listener answers for (Gateway API's
+    /// HTTPS listener of no hostname).
     #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub names: Vec<String>,
 }
