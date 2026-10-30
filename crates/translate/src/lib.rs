@@ -21,7 +21,9 @@
 //!
 //! Where the data plane is a Gateway, its class is checked to name this controller and
 //! each of its listeners fitted to the data plane's own, or refused and why ([`gateway`]);
-//! its routes are not translated yet.
+//! each HTTPRoute that names it is attached to the listeners that take it, and each
+//! listener's hostname claimed for isolation ([`http_route`]); the routes' rules are not
+//! translated yet. Every host a claim of one API takes from the other's is said.
 
 use edgerush_certificates::Identity;
 use edgerush_config::{
@@ -46,10 +48,12 @@ use std::collections::btree_map::Entry;
 use std::fmt;
 
 pub mod gateway;
+pub mod http_route;
 
 pub use gateway::{
     Allowed, GatewayOutcome, ListenerOutcome, ListenerProblem, Namespaces, Requirement, Selector,
 };
+pub use http_route::{Attachment, NotAttached, ParentOutcome, RouteOutcome, Taken};
 
 /// The controller an IngressClass names to be served by EdgeRush (02 §2).
 pub const CONTROLLER: &str = "edgerush.dev/ingress-controller";
@@ -197,6 +201,12 @@ pub struct Translation {
     /// The data plane's Gateway, where it names one that is there and this controller's:
     /// what its status is to say of it.
     pub gateway: Option<GatewayOutcome>,
+    /// Each HTTPRoute that names that Gateway among its parents, and what became of each
+    /// such parent: what their status is to say.
+    pub http_routes: Vec<RouteOutcome>,
+    /// The hosts a claim of one API takes from a claim of the other, which no longer serves
+    /// them: said, so that a move from one API to the other meets no surprise (04).
+    pub taken: Vec<Taken>,
 }
 
 /// A path whose backend is not there: its Service does not exist, has no such port, or the
@@ -497,6 +507,9 @@ pub enum Problem {
     /// No listener of the data plane's Gateway is accepted.
     #[error("none of its listeners is accepted, so it serves nothing")]
     NoListenerAccepted,
+    /// A `parentRef` of an HTTPRoute to the data plane's Gateway attaches it to no listener.
+    #[error("not attached to the data plane's Gateway: {0}")]
+    NotAttached(NotAttached),
     /// A listener of the data plane's Gateway names route kinds it cannot take
     /// (`InvalidRouteKinds`); it takes the others.
     #[error("listener {name}: takes no route of kind {kinds}")]
@@ -522,6 +535,22 @@ pub enum Problem {
 pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut report = Vec::new();
     let gateway = gateway::outcome(plane, cluster, &mut report);
+    let http_routes = gateway
+        .as_ref()
+        .map(|gateway| http_route::attached(cluster, gateway))
+        .unwrap_or_default();
+    for outcome in &http_routes {
+        for parent in &outcome.parents {
+            let problem = match parent.attached {
+                Ok(_) => Problem::NotSupportedYet("rules of HTTPRoutes"),
+                Err(why) => Problem::NotAttached(why),
+            };
+            report.push(Finding {
+                object: outcome.route.clone(),
+                problem,
+            });
+        }
+    }
     // An Ingress is the data plane's when its class is, and its class is when the
     // IngressClass of that name names this controller; one of no class is when that class
     // is the cluster's default.
@@ -777,6 +806,12 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             served_ingresses.push(object);
         }
     }
+    // Each listener hostname of the Gateway is claimed, so that nothing less specific serves
+    // it (04 §2, listener isolation).
+    if let Some(gateway) = &gateway {
+        routes.extend(http_route::claims(gateway));
+    }
+    let taken = http_route::taken(&routes);
     // An upstream only routes served on no listener led to is left out with them.
     let used: Vec<String> = routes
         .iter()
@@ -805,6 +840,8 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         served: served_ingresses,
         claimed: of_the_class,
         gateway,
+        http_routes,
+        taken,
     }
 }
 

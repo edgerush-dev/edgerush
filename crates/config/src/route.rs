@@ -77,7 +77,8 @@ pub struct Hostname {
     #[serde(default)]
     pub wildcard: Option<Wildcard>,
     /// Whether this claim stays a candidate on hosts that a more specific claim also
-    /// covers: Gateway API requires it, nginx-style Ingress does not want it.
+    /// covers: neither Gateway API's claims nor nginx-style Ingress's do, unless the data
+    /// plane lets Ingress fall through.
     pub falls_through: bool,
 }
 

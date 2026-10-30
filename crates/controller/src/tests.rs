@@ -427,7 +427,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
         } else if path.starts_with(&format!("{gateway_api}namespaces/edge/gateways?")) {
             answer(
                 200,
-                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"web","namespace":"edge"},"spec":{"gatewayClassName":"edgerush","listeners":[{"name":"http","port":8080,"protocol":"HTTP"}]}}]}"#,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"web","namespace":"edge"},"spec":{"gatewayClassName":"edgerush","listeners":[{"name":"http","port":8080,"protocol":"HTTP","allowedRoutes":{"namespaces":{"from":"All"}}}]}}]}"#,
             )
         } else if path.starts_with(&format!("{gateway_api}gatewayclasses?")) {
             answer(
@@ -437,7 +437,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
         } else if path.starts_with(&format!("{gateway_api}httproutes?")) {
             answer(
                 200,
-                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"web","namespace":"shop"},"spec":{}}]}"#,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"web","namespace":"shop"},"spec":{"parentRefs":[{"name":"web","namespace":"edge"}]}}]}"#,
             )
         } else if path.starts_with("/api/v1/namespaces?") {
             answer(
@@ -516,7 +516,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                     translation.report.iter().map(ToString::to_string).collect();
                 assert_eq!(
                     report,
-                    ["Gateway edge/web: not supported yet: routes of the Gateway API"]
+                    ["HTTPRoute shop/web: not supported yet: rules of HTTPRoutes"]
                 );
             }
             stage.store(1, Ordering::SeqCst);

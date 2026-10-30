@@ -218,7 +218,8 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
     let clean = translation.report.is_empty()
         && translation.unresolved.is_empty()
         && translation.tls.is_empty()
-        && translation.shadowed.is_empty();
+        && translation.shadowed.is_empty()
+        && translation.taken.is_empty();
     Ok((text, clean && !refused))
 }
 
@@ -239,6 +240,9 @@ pub(crate) fn described(translation: &Translation) -> String {
     }
     for shadowed in &translation.shadowed {
         let _ = writeln!(text, "{shadowed}");
+    }
+    for taken in &translation.taken {
+        let _ = writeln!(text, "{taken}");
     }
     let config = &translation.config;
     let _ = writeln!(

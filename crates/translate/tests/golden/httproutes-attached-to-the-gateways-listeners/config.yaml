@@ -1,0 +1,33 @@
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: gateway/edge/web/example
+    listeners: [http]
+    hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: false }]
+    rules: []
+  - name: gateway/edge/web/foo
+    listeners: [http]
+    hostnames: [{ name: "*.foo.example.com", wildcard: any_labels, falls_through: false }]
+    rules: []
+  - name: gateway/edge/web/abc
+    listeners: [http]
+    hostnames: [{ name: "abc.foo.example.com", falls_through: false }]
+    rules: []
+  - name: gateway/edge/web/same-only
+    listeners: [http]
+    hostnames: [{ name: "same.example.org", falls_through: false }]
+    rules: []
+  - name: gateway/edge/web/selected
+    listeners: [http]
+    hostnames: [{ name: "sel.example.org", falls_through: false }]
+    rules: []
+  - name: gateway/edge/web/tls-only
+    listeners: [http]
+    hostnames: [{ name: "tls.example.org", falls_through: false }]
+    rules: []
+upstreams: {}

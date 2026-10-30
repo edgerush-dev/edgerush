@@ -18,5 +18,9 @@ listeners:
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
     tls: { certificates: [], without_sni: none }
-routes: []
+routes:
+  - name: gateway/edge/web/apart
+    listeners: [http, http-v4]
+    hostnames: [{ name: "b.example.com", falls_through: false }]
+    rules: []
 upstreams: {}

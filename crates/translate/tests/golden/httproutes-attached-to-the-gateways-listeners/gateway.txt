@@ -1,0 +1,7 @@
+listener any: served on http, taking HTTPRoute from every namespace
+listener example: served on http, taking HTTPRoute from every namespace
+listener foo: served on http, taking HTTPRoute from every namespace
+listener abc: served on http, taking HTTPRoute from every namespace
+listener same-only: served on http, taking HTTPRoute from namespace edge
+listener selected: served on http, taking HTTPRoute from namespaces labelled team=shop
+listener tls-only: served on http, taking no route from every namespace

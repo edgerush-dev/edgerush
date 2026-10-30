@@ -5,5 +5,29 @@ listeners:
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
-routes: []
+routes:
+  - name: gateway/edge/web/kinds-mixed
+    listeners: [http]
+    hostnames: [{ name: "mixed.example.com", falls_through: false }]
+    rules: []
+  - name: gateway/edge/web/kinds-none-carried
+    listeners: [http]
+    hostnames: [{ name: "tls.example.com", falls_through: false }]
+    rules: []
+  - name: gateway/edge/web/every-namespace
+    listeners: [http]
+    hostnames: [{ name: "all.example.com", falls_through: false }]
+    rules: []
+  - name: gateway/edge/web/selected
+    listeners: [http]
+    hostnames: [{ name: "selected.example.com", falls_through: false }]
+    rules: []
+  - name: gateway/edge/web/unreadable-operator
+    listeners: [http]
+    hostnames: [{ name: "odd.example.com", falls_through: false }]
+    rules: []
+  - name: gateway/edge/web/unreadable-from
+    listeners: [http]
+    hostnames: [{ name: "none.example.com", falls_through: false }]
+    rules: []
 upstreams: {}

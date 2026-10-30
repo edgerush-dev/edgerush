@@ -4,4 +4,3 @@ Gateway edge/web: listener secure: not accepted: not supported yet: HTTPS listen
 Gateway edge/web: listener dns: not accepted: protocol `UDP` is not one the gateway serves
 Gateway edge/web: listener first: not accepted: listeners first, second have the same port, protocol and hostname
 Gateway edge/web: listener second: not accepted: listeners first, second have the same port, protocol and hostname
-Gateway edge/web: not supported yet: routes of the Gateway API

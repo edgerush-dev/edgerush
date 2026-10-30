@@ -603,7 +603,7 @@
       "type": "object",
       "properties": {
         "falls_through": {
-          "description": "Whether this claim stays a candidate on hosts that a more specific claim also\ncovers: Gateway API requires it, nginx-style Ingress does not want it.",
+          "description": "Whether this claim stays a candidate on hosts that a more specific claim also\ncovers: neither Gateway API's claims nor nginx-style Ingress's do, unless the data\nplane lets Ingress fall through.",
           "type": "boolean"
         },
         "name": {

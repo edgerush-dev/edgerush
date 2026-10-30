@@ -1,1 +1,1 @@
-listener http: served on http, taking HTTPRoute from namespace edge
+listener http: served on http, taking HTTPRoute from every namespace

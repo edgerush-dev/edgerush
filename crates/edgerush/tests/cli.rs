@@ -806,6 +806,47 @@ spec:
     );
     std::fs::remove_file(manifests.join("gone.yml"))?;
 
+    // The data plane a Gateway whose listener claims `*.example.com`: the Ingress's
+    // shop.example.com takes that host from it, which is said, and validate exits 1.
+    std::fs::write(
+        manifests.join("gateway.yml"),
+        "apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec: { controllerName: edgerush.dev/gateway-controller }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners: [{ name: wild, port: 8080, protocol: HTTP, hostname: \"*.example.com\" }]
+",
+    )?;
+    let gateway_plane = root.join("gateway-data-plane.yaml");
+    std::fs::write(
+        &gateway_plane,
+        plane(http).replace(
+            "ingress_class: edge\n",
+            "ingress_class: edge\ngateway: edge/web\n",
+        ),
+    )?;
+    let output = edgerush(&[
+        "validate",
+        "--from-manifests",
+        manifests.to_str().expect("a path that is text"),
+        "--data-plane",
+        gateway_plane.to_str().expect("a path that is text"),
+    ])?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with(
+            "Ingress shop/web claims shop.example.com, taking it from Gateway edge/web listener wild's *.example.com, which does not fall through\n"
+        ),
+        "{output:?}"
+    );
+    std::fs::remove_file(manifests.join("gateway.yml"))?;
+
     // A config the data plane would refuse: a `tcp` listener with no route of its own.
     let tcp = "  db: { address: \"[::]:5432\", protocol: tcp, proxy_protocol: off }\n";
     std::fs::write(&data_plane, plane(&format!("{http}{tcp}")))?;

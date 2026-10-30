@@ -9,7 +9,10 @@
 //! certificates the config carries, a line each (none otherwise); and, where the case says,
 //! `passed-over.txt`, how many Ingresses were another data plane's; and, where the case
 //! says, `gateway.txt`, what was made of the data plane's Gateway's listeners, a line each
-//! (none otherwise: the data plane is no Gateway, or names one not there or not ours).
+//! (none otherwise: the data plane is no Gateway, or names one not there or not ours); and,
+//! where the case says, `routes.txt`, what became of each HTTPRoute's parents of that
+//! Gateway, a line each (none otherwise). The report's last lines are the hosts a claim of
+//! one API takes from the other's.
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
 //! the objects of `tests/golden/shared.yaml` go with every case's.
 //! Every config translated must also pass the data plane's own `compile`, and, written as
@@ -124,6 +127,7 @@ fn every_case_translates_to_its_config_and_report() {
             .chain(translation.unresolved.iter().map(ToString::to_string))
             .chain(translation.tls.iter().map(ToString::to_string))
             .chain(translation.shadowed.iter().map(ToString::to_string))
+            .chain(translation.taken.iter().map(ToString::to_string))
             .collect();
         let expected: Vec<String> = read(&case.join("report.txt"))
             .lines()
@@ -139,6 +143,24 @@ fn every_case_translates_to_its_config_and_report() {
             .exists()
             .then(|| read(&listed).lines().map(str::to_owned).collect());
         assert_eq!(listeners, expected, "{name}: the Gateway's listeners");
+        let listed = case.join("routes.txt");
+        let routes: Vec<String> = translation
+            .http_routes
+            .iter()
+            .flat_map(|outcome| {
+                outcome
+                    .to_string()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let expected: Vec<String> = if listed.exists() {
+            read(&listed).lines().map(str::to_owned).collect()
+        } else {
+            Vec::new()
+        };
+        assert_eq!(routes, expected, "{name}: the HTTPRoutes' parents");
         // The Ingresses served are those the config's routes are of, each route named
         // `ingress/<namespace>/<name>/...`.
         let mut of_routes: Vec<String> = translation

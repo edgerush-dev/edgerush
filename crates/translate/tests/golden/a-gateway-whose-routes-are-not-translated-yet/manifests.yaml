@@ -1,7 +1,7 @@
 # The data plane is the Gateway edge/web, whose class names this controller, its one
-# listener on the port the data plane binds, and an HTTPRoute attaches to it: the Gateway
-# is accepted, its routes are not translated yet, and the Ingress beside it is served as
-# ever.
+# listener on the port the data plane binds, taking routes from every namespace, and an
+# HTTPRoute attaches to it: the Gateway is accepted, the route's rules are not translated
+# yet, and the Ingress beside it is served as ever.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
@@ -14,7 +14,7 @@ metadata: { name: web, namespace: edge }
 spec:
   gatewayClassName: edgerush
   listeners:
-    - { name: http, port: 8080, protocol: HTTP }
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute

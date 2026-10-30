@@ -35,6 +35,10 @@ pub struct ListenerOutcome {
     pub served: Result<Vec<String>, ListenerProblem>,
     /// The routes it takes: what its status says of every listener, accepted or not.
     pub allowed: Allowed,
+    /// Its hostname, if it has one: none is every host.
+    pub hostname: Option<String>,
+    /// Its port.
+    pub port: u16,
 }
 
 impl fmt::Display for ListenerOutcome {
@@ -280,16 +284,12 @@ pub(crate) fn outcome(
         }
         listener.allowed = allowed;
     }
-    let problem = if listeners.iter().any(|listener| listener.served.is_ok()) {
-        // Until routes are attached (the next slice), an accepted Gateway serves nothing.
-        Problem::NotSupportedYet("routes of the Gateway API")
-    } else {
-        Problem::NoListenerAccepted
-    };
-    report.push(Finding {
-        object: object.clone(),
-        problem,
-    });
+    if !listeners.iter().any(|listener| listener.served.is_ok()) {
+        report.push(Finding {
+            object: object.clone(),
+            problem: Problem::NoListenerAccepted,
+        });
+    }
     Some(GatewayOutcome {
         gateway: object,
         listeners,
@@ -376,6 +376,9 @@ fn listeners(plane: &Plane, listeners: &[GatewayListeners]) -> Vec<ListenerOutco
                     invalid_kinds: Vec::new(),
                     namespaces: Namespaces::None,
                 },
+                hostname: listener.hostname.clone(),
+                // The schema holds a port to 1–65535.
+                port: u16::try_from(listener.port).unwrap_or_default(),
             }
         })
         .collect()

@@ -17,8 +17,9 @@
 #   - the Ingress is served, and its status says the data plane's Service's address;
 #   - the data plane named as a Gateway, the control plane says the Gateway API's CRDs are
 #     not installed and serves Ingress as ever; installed, each kind is followed, its CRD
-#     read by name alone as RBAC allows, and the Gateway, of this controller's class, its
-#     listener on the port the data plane binds, accepted, its routes not translated yet;
+#     read by name alone as RBAC allows, and an HTTPRoute attached to the Gateway, of this
+#     controller's class, its listener on the port the data plane binds, its rules not
+#     translated yet;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
 #   - asked to reach its Service by the Service's own address, it is served through the
@@ -204,10 +205,17 @@ kind: Gateway
 metadata: { name: web, namespace: edge }
 spec:
   gatewayClassName: edgerush
-  listeners: [{ name: http, port: 8080, protocol: HTTP }]
+  listeners: [{ name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: web, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]
 EOF
-control_said "Gateway edge/web: not supported yet: routes of the Gateway API" 30 ||
-    fail "the control plane never said its Gateway is accepted, its routes not translated yet"
+control_said "HTTPRoute shop/web: not supported yet: rules of HTTPRoutes" 30 ||
+    fail "the control plane never said the HTTPRoute is attached, its rules not translated yet"
 refused_any && fail "a control-plane replica was refused something of the Gateway API"
 answers shop.example 200 10 || fail "with the Gateway API followed, $(status shop.example)"
 pass "installed, the Gateway API's kinds are followed, their CRDs read by name alone"
