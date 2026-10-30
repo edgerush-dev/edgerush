@@ -1,0 +1,2 @@
+HTTPRoute shop/nothing-left: attached to http (left.example.com)
+HTTPRoute shop/shop: attached to http (shop.example.com)

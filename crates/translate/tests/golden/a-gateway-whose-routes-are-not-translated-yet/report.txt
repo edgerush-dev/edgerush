@@ -1,1 +1,0 @@
-HTTPRoute shop/web: not supported yet: rules of HTTPRoutes

@@ -18,8 +18,8 @@
 #   - the data plane named as a Gateway, the control plane says the Gateway API's CRDs are
 #     not installed and serves Ingress as ever; installed, each kind is followed, its CRD
 #     read by name alone as RBAC allows, and an HTTPRoute attached to the Gateway, of this
-#     controller's class, its listener on the port the data plane binds, its rules not
-#     translated yet;
+#     controller's class, its listener on the port the data plane binds, is served beside
+#     the Ingress, from one data plane;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
 #   - asked to reach its Service by the Service's own address, it is served through the
@@ -212,13 +212,14 @@ kind: HTTPRoute
 metadata: { name: web, namespace: shop }
 spec:
   parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [route.example]
   rules: [{ backendRefs: [{ name: web, port: 80 }] }]
 EOF
-control_said "HTTPRoute shop/web: not supported yet: rules of HTTPRoutes" 30 ||
-    fail "the control plane never said the HTTPRoute is attached, its rules not translated yet"
+answers route.example 200 30 || fail "the HTTPRoute is not served: $(status route.example)"
+answers shop.example 200 5 || fail "beside the HTTPRoute, the Ingress is not served: $(status shop.example)"
 refused_any && fail "a control-plane replica was refused something of the Gateway API"
 answers shop.example 200 10 || fail "with the Gateway API followed, $(status shop.example)"
-pass "installed, the Gateway API's kinds are followed, their CRDs read by name alone"
+pass "installed, the Gateway API's kinds are followed, their CRDs read by name alone, and an HTTPRoute is served beside the Ingress"
 
 # What the Ingress's status says, its first address.
 says() { k -n shop get ingress web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }

@@ -3,7 +3,8 @@
 # with each listener's and those of more specific listeners on the port taken away
 # (listener isolation, as Gateway API's conformance test of it has it); or not attached,
 # and why. A parent that is another Gateway is passed over. Each listener's hostname is
-# claimed with no rules, so that nothing less specific serves it.
+# claimed with no rules, so that nothing less specific serves it. The routes name no
+# backend, so their one rule, the schema's default, answers 500, as the spec has it.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
@@ -55,6 +56,8 @@ kind: HTTPRoute
 metadata: { name: by-port, namespace: shop }
 spec:
   parentRefs: [{ name: web, namespace: edge, port: 9999 }]
+  # Attached nowhere, so nothing of it is translated: not even its rule's filter is said.
+  rules: [{ filters: [{ type: RequestRedirect, requestRedirect: { scheme: https } }] }]
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute

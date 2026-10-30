@@ -1,0 +1,9 @@
+HTTPRoute shop/nothing-left: rule 0 dropped: not supported yet: filters
+HTTPRoute shop/nothing-left: every rule is dropped, so it is not accepted
+HTTPRoute shop/shop: rule 3 dropped: not supported yet: filters
+HTTPRoute shop/shop: rule 4 dropped: not supported yet: timeouts
+HTTPRoute shop/shop: rule 7 dropped: the data plane would refuse it: route `httproute`, rules[0], matches[0]: path: invalid regular expression: regex parse error: /( ^ error: unclosed group
+HTTPRoute shop/shop: rule 8 dropped: a header match of type `Near` is not one translation reads
+HTTPRoute shop/shop: rule 2: a backend's share is answered 500: Service shop/gone does not exist
+HTTPRoute shop/shop: rule 5: a backend's share is answered 500: a backend of kind example.com/Other is not one translation reads
+HTTPRoute shop/shop: rule 6: a backend's share is answered 500: Service blog/web is another namespace's, and ReferenceGrants are not read yet

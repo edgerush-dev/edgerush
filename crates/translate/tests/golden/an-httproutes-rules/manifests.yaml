@@ -1,0 +1,71 @@
+# An HTTPRoute's rules, each as the config has it: path, header, query and method matches;
+# weighted backends; a backend that is not there, of another kind, or another namespace's
+# (ReferenceGrants are not read yet), its share answered 500. A rule with what translation
+# does not take yet, or that the data plane would refuse, is dropped by itself, the rest
+# served; a route all of whose rules are dropped is not accepted.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: shop, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [shop.example.com]
+  rules:
+    - matches:
+        - path: { type: Exact, value: /checkout }
+          method: POST
+          headers: [{ name: X-Beta, value: "on" }]
+          queryParams: [{ type: RegularExpression, name: tenant, value: "[a-z]+" }]
+      backendRefs: [{ name: web, port: 80, weight: 9 }, { name: canary, port: 80, weight: 1 }]
+    - matches: [{ path: { type: RegularExpression, value: "/orders/[0-9]+" } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /gone } }]
+      backendRefs: [{ name: gone, port: 80 }, { name: web, port: 80 }]
+    - matches: [{ path: { value: /filtered } }]
+      filters: [{ type: RequestHeaderModifier, requestHeaderModifier: { set: [{ name: X-A, value: b }] } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /timed } }]
+      timeouts: { request: 5s }
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /other-kind } }]
+      backendRefs: [{ group: example.com, kind: Other, name: thing }]
+    - matches: [{ path: { value: /elsewhere } }]
+      backendRefs: [{ name: web, namespace: blog, port: 80 }]
+    - matches: [{ path: { type: RegularExpression, value: "/(" } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /odd }, headers: [{ type: Near, name: X-A, value: b }] }]
+      backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: nothing-left, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [left.example.com]
+  rules:
+    - filters: [{ type: RequestRedirect, requestRedirect: { scheme: https } }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: canary, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

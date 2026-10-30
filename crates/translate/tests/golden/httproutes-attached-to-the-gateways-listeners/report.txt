@@ -1,10 +1,6 @@
 Gateway edge/web: listener tls-only: takes no route of kind gateway.networking.k8s.io/TLSRoute
-HTTPRoute edge/in-edge: not supported yet: rules of HTTPRoutes
 HTTPRoute shop/by-port: not attached to the data plane's Gateway: no listener the Gateway serves has the name and port it names
-HTTPRoute shop/by-section: not supported yet: rules of HTTPRoutes
 HTTPRoute shop/disjoint: not attached to the data plane's Gateway: its hostnames meet no hostname of a listener that takes it
-HTTPRoute shop/everywhere: not supported yet: rules of HTTPRoutes
 HTTPRoute shop/not-allowed: not attached to the data plane's Gateway: no listener it names takes an HTTPRoute from its namespace
-HTTPRoute shop/selected: not supported yet: rules of HTTPRoutes
 HTTPRoute shop/unknown-section: not attached to the data plane's Gateway: no listener the Gateway serves has the name and port it names
 HTTPRoute shop/wrong-kind: not attached to the data plane's Gateway: no listener it names takes an HTTPRoute from its namespace

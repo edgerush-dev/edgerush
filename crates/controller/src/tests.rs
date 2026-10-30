@@ -437,7 +437,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
         } else if path.starts_with(&format!("{gateway_api}httproutes?")) {
             answer(
                 200,
-                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"web","namespace":"shop"},"spec":{"parentRefs":[{"name":"web","namespace":"edge"}]}}]}"#,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"web","namespace":"shop"},"spec":{"parentRefs":[{"name":"web","namespace":"edge"}],"hostnames":["route.example"],"rules":[{"backendRefs":[{"name":"web","port":80}]}]}}]}"#,
             )
         } else if path.starts_with("/api/v1/namespaces?") {
             answer(
@@ -511,13 +511,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 assert_eq!(said_of(&heard, &served_line), 1, "{:?}", heard.lines);
                 assert_eq!(waited_on_kinds(&heard), 1, "{:?}", heard.lines);
                 let translation = &heard.translations[0];
-                assert_eq!(routes(translation), ["ingress/shop/web/shop.example"]);
+                assert_eq!(
+                    routes(translation),
+                    ["ingress/shop/web/shop.example", "httproute/shop/web/http"]
+                );
                 let report: Vec<String> =
                     translation.report.iter().map(ToString::to_string).collect();
-                assert_eq!(
-                    report,
-                    ["HTTPRoute shop/web: not supported yet: rules of HTTPRoutes"]
-                );
+                assert!(report.is_empty(), "{report:?}");
             }
             stage.store(1, Ordering::SeqCst);
             until("the CRD's deletion said", || {

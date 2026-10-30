@@ -22,8 +22,9 @@
 //! Where the data plane is a Gateway, its class is checked to name this controller and
 //! each of its listeners fitted to the data plane's own, or refused and why ([`gateway`]);
 //! each HTTPRoute that names it is attached to the listeners that take it, and each
-//! listener's hostname claimed for isolation ([`http_route`]); the routes' rules are not
-//! translated yet. Every host a claim of one API takes from the other's is said.
+//! listener's hostname claimed for isolation ([`http_route`]), and its rules translated:
+//! matches and backends, a rule with what translation does not take yet dropped by itself.
+//! Every host a claim of one API takes from the other's is said.
 
 use edgerush_certificates::Identity;
 use edgerush_config::{
@@ -510,6 +511,26 @@ pub enum Problem {
     /// A `parentRef` of an HTTPRoute to the data plane's Gateway attaches it to no listener.
     #[error("not attached to the data plane's Gateway: {0}")]
     NotAttached(NotAttached),
+    /// A rule of an HTTPRoute is dropped, the rest of the route served (`PartiallyInvalid`).
+    #[error("rule {rule} dropped: {why}")]
+    RuleDropped {
+        /// Its position among the route's rules.
+        rule: usize,
+        /// Why.
+        why: String,
+    },
+    /// Every rule of an HTTPRoute is dropped: it is not accepted.
+    #[error("every rule is dropped, so it is not accepted")]
+    NoRuleLeft,
+    /// A backend of an HTTPRoute's rule is invalid: its share of the rule's requests is
+    /// answered 500 (`ResolvedRefs` false).
+    #[error("rule {rule}: a backend's share is answered 500: {why}")]
+    BackendInvalid {
+        /// Its rule's position among the route's rules.
+        rule: usize,
+        /// Why.
+        why: String,
+    },
     /// A listener of the data plane's Gateway names route kinds it cannot take
     /// (`InvalidRouteKinds`); it takes the others.
     #[error("listener {name}: takes no route of kind {kinds}")]
@@ -541,14 +562,12 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         .unwrap_or_default();
     for outcome in &http_routes {
         for parent in &outcome.parents {
-            let problem = match parent.attached {
-                Ok(_) => Problem::NotSupportedYet("rules of HTTPRoutes"),
-                Err(why) => Problem::NotAttached(why),
-            };
-            report.push(Finding {
-                object: outcome.route.clone(),
-                problem,
-            });
+            if let Err(why) = parent.attached {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::NotAttached(why),
+                });
+            }
         }
     }
     // An Ingress is the data plane's when its class is, and its class is when the
@@ -806,9 +825,78 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             served_ingresses.push(object);
         }
     }
-    // Each listener hostname of the Gateway is claimed, so that nothing less specific serves
-    // it (04 §2, listener isolation).
+    // Each attached HTTPRoute's rules, each compiled alone, with the listeners it could be
+    // served on, so that one the data plane would refuse is dropped by itself (04 §2).
     if let Some(gateway) = &gateway {
+        let refused = |rule: &Rule, upstreams: &BTreeMap<String, Upstream>| {
+            if !checked_alone {
+                return None;
+            }
+            let alone = Route {
+                name: "httproute".to_owned(),
+                listeners: served_on.keys().cloned().collect(),
+                hostnames: vec![http_route::claim("*")],
+                rules: vec![rule.clone()],
+                rate_limits: Vec::new(),
+            };
+            compile(&config_of(
+                served_on.clone(),
+                vec![alone],
+                upstreams.clone(),
+                &[],
+                &[],
+            ))
+            .err()
+            .map(|problems| {
+                let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
+                // On one line, as a report's finding is: a regex's error runs over several.
+                let said: Vec<&str> = problems.iter().flat_map(|p| p.split_whitespace()).collect();
+                format!("the data plane would refuse it: {}", said.join(" "))
+            })
+        };
+        for outcome in &http_routes {
+            // A route attached to no listener has nothing translated, its parents said.
+            if !outcome.parents.iter().any(|parent| parent.attached.is_ok()) {
+                continue;
+            }
+            let Some(route) = cluster
+                .http_routes
+                .iter()
+                .find(|route| Object::of("HTTPRoute", &route.metadata) == outcome.route)
+            else {
+                continue;
+            };
+            let translated =
+                http_route::translated(route, outcome, gateway, plane, cluster, refused);
+            for (rule, why) in &translated.dropped {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::RuleDropped {
+                        rule: *rule,
+                        why: why.clone(),
+                    },
+                });
+            }
+            for (rule, why) in &translated.invalid {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::BackendInvalid {
+                        rule: *rule,
+                        why: why.clone(),
+                    },
+                });
+            }
+            if translated.dropped.len() == route.spec.rules.len() {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::NoRuleLeft,
+                });
+            }
+            routes.extend(translated.routes);
+            upstreams.extend(translated.upstreams);
+        }
+        // Each listener hostname of the Gateway is claimed, so that nothing less specific
+        // serves it (04 §2, listener isolation).
         routes.extend(http_route::claims(gateway));
     }
     let taken = http_route::taken(&routes);

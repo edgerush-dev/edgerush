@@ -1,0 +1,29 @@
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: httproute/shop/shop/http
+    listeners: [http]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches:
+          - path: { exact: /checkout }
+            method: POST
+            headers: [{ name: X-Beta, value: { exact: "on" } }]
+            query: [{ name: tenant, value: { regex: "[a-z]+" } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 9 }, { upstream: shop/canary/http, weight: 1 }] }
+      - matches: [{ path: { regex: "/orders/[0-9]+" } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+      - matches: [{ path: { prefix: /gone } }]
+        forward: { backends: [{ invalid: "Service shop/gone does not exist", weight: 1 }, { upstream: shop/web/http, weight: 1 }] }
+      - matches: [{ path: { prefix: /other-kind } }]
+        forward: { backends: [{ invalid: "a backend of kind example.com/Other is not one translation reads", weight: 1 }] }
+      - matches: [{ path: { prefix: /elsewhere } }]
+        forward: { backends: [{ invalid: "Service blog/web is another namespace's, and ReferenceGrants are not read yet", weight: 1 }] }
+upstreams:
+  shop/canary/http: { load_balancer: p2c, endpoints: { kubernetes: "canary.shop.svc.cluster.local:http" } }
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

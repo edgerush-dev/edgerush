@@ -12,5 +12,11 @@ routes:
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: httproute/shop/web/http
+    listeners: [http]
+    hostnames: [{ name: route.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
 upstreams:
   shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

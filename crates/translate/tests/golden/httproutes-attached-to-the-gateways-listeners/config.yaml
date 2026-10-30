@@ -6,6 +6,48 @@ listeners:
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
 routes:
+  - name: httproute/edge/in-edge/same-only
+    listeners: [http]
+    hostnames: [{ name: "same.example.org", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ invalid: "the rule names no backend", weight: 1 }] }
+  - name: httproute/shop/by-section/foo
+    listeners: [http]
+    hostnames: [{ name: "x.foo.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ invalid: "the rule names no backend", weight: 1 }] }
+  - name: httproute/shop/everywhere/any
+    listeners: [http]
+    hostnames: [{ name: "bar.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ invalid: "the rule names no backend", weight: 1 }] }
+  - name: httproute/shop/everywhere/example
+    listeners: [http]
+    hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ invalid: "the rule names no backend", weight: 1 }] }
+  - name: httproute/shop/everywhere/foo
+    listeners: [http]
+    hostnames: [{ name: "*.foo.example.com", wildcard: any_labels, falls_through: false }, { name: "y.foo.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ invalid: "the rule names no backend", weight: 1 }] }
+  - name: httproute/shop/everywhere/abc
+    listeners: [http]
+    hostnames: [{ name: "abc.foo.example.com", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ invalid: "the rule names no backend", weight: 1 }] }
+  - name: httproute/shop/selected/selected
+    listeners: [http]
+    hostnames: [{ name: "sel.example.org", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ invalid: "the rule names no backend", weight: 1 }] }
   - name: gateway/edge/web/example
     listeners: [http]
     hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: false }]
