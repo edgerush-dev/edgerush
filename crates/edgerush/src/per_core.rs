@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::thread;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::runtime::Builder;
-use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::task::LocalSet;
 
 /// The most connections a worker holds before it stops accepting ([14 §8]): open ones,
@@ -55,6 +56,64 @@ struct HandedOver {
     held: Held,
 }
 
+/// A listener's sockets for a worker that runs, posted to it by [`Workers::add`].
+#[derive(Debug)]
+struct Added {
+    /// The listener's slot ([`Proxy::listeners`]).
+    slot: usize,
+    name: String,
+    tcp: std::net::TcpListener,
+    /// Its UDP socket, where it serves HTTP/3, and the worker's share of its QUIC inboxes.
+    udp: Option<(std::net::UdpSocket, Forwarding)>,
+    /// Where the worker says whether it serves them.
+    said: std::sync::mpsc::Sender<Result<(), String>>,
+}
+
+/// The workers that run, for the main loop: what they hold, and where to post each the
+/// sockets of a listener added.
+#[derive(Debug)]
+pub(crate) struct Workers {
+    pub(crate) loads: Arc<Loads>,
+    /// By position of the worker.
+    adding: Vec<UnboundedSender<Added>>,
+}
+
+impl Workers {
+    /// Has every worker accept on its sockets of `sockets`, one entry a worker in their
+    /// order, as the listener `name` whose slot is `slot`, and serve HTTP/3 on its UDP
+    /// socket where it has one. Returns once every worker has said whether it does: what
+    /// each could not do. The listener has its share of the workers' room from now on.
+    pub(crate) fn add(&self, slot: usize, name: &str, sockets: Vec<Sockets>) -> Vec<String> {
+        self.loads.listener_added();
+        let (said, saying) = std::sync::mpsc::channel();
+        let mut forwarding = Forwarding::group(sockets.len()).into_iter();
+        let mut posted = 0;
+        let mut failed = Vec::new();
+        for (position, (worker, (tcp, udp))) in self.adding.iter().zip(sockets).enumerate() {
+            let added = Added {
+                slot,
+                name: name.to_owned(),
+                tcp,
+                udp: udp.zip(forwarding.next()),
+                said: said.clone(),
+            };
+            match worker.send(added) {
+                Ok(()) => posted += 1,
+                Err(_) => failed.push(format!("worker {position} takes no listeners")),
+            }
+        }
+        // Every worker's answer, or none from one that went without giving it.
+        drop(said);
+        let answers: Vec<Result<(), String>> = saying.iter().collect();
+        if answers.len() < posted {
+            let unsaid = posted - answers.len();
+            failed.push(format!("{unsaid} workers went without saying"));
+        }
+        failed.extend(answers.into_iter().filter_map(Result::err));
+        failed
+    }
+}
+
 /// What a worker works with. Its share of the data plane is an `Rc` and goes no further
 /// than the thread it was made on, which is why this is put together there and not here.
 #[derive(Debug, Clone)]
@@ -73,9 +132,9 @@ pub(crate) type Sockets = (std::net::TcpListener, Option<std::net::UdpSocket>);
 /// Starts a worker on a thread of its own for every entry of `sockets` — the sockets of
 /// every listener, in the order of the listeners — all serving the one `proxy`, each
 /// accepting only while it holds fewer than `connections` allows, an HTTP/3 connection
-/// counting as it says. Returns what the workers hold, for whoever wants to look, once every
-/// worker has set up what it serves. What a worker cannot do without, and the worker
-/// itself, tell `tell` when they end ([`crate::essential`]).
+/// counting as it says. Returns the workers once every one has set up what it serves. What
+/// a worker cannot do without, and the worker itself, tell `tell` when they end
+/// ([`crate::essential`]).
 ///
 /// # Errors
 ///
@@ -88,7 +147,7 @@ pub(crate) fn start(
     limits: H1Limits,
     connections: Connections,
     tell: &std::sync::mpsc::Sender<Told>,
-) -> Result<Arc<Loads>, NotStarted> {
+) -> Result<Workers, NotStarted> {
     let started = sockets.len();
     // Each worker says, once it has set up what it serves, whether it could.
     let (ready, readied) = std::sync::mpsc::channel::<Result<(), NotStarted>>();
@@ -108,14 +167,18 @@ pub(crate) fn start(
         .map(|_| mpsc::channel::<HandedOver>(ON_THEIR_WAY))
         .unzip();
     let workers: Arc<[Sender<HandedOver>]> = workers.into();
+    let (adding, added): (Vec<_>, Vec<_>) = sockets
+        .iter()
+        .map(|_| mpsc::unbounded_channel::<Added>())
+        .unzip();
     // For every listener, the workers' shares of its QUIC inboxes: a datagram one worker
     // receives for another's connection is handed to it (16 §3).
-    let listeners = sockets.first().map_or(0, Vec::len);
     let mut forwarding: Vec<std::vec::IntoIter<Forwarding>> = (0..listeners)
         .map(|_| Forwarding::group(sockets.len()).into_iter())
         .collect();
 
-    for (position, (sockets, handed_over)) in sockets.into_iter().zip(handed_over).enumerate() {
+    let each = sockets.into_iter().zip(handed_over).zip(added);
+    for (position, ((sockets, handed_over), added)) in each.enumerate() {
         let runtime = Builder::new_current_thread().enable_all().build()?;
         // Sockets are handed to the runtime that is entered. Here, and not on the worker's
         // thread, so that a socket the runtime will not take stops the harness starting.
@@ -191,9 +254,11 @@ pub(crate) fn start(
                     }
                 }
                 local.spawn_local(watched(
-                    worker.receive(handed_over),
+                    worker.clone().receive(handed_over),
                     essential("connections handed over".to_owned()),
                 ));
+                // Not one it cannot do without: a listener it cannot take is said to be.
+                local.spawn_local(worker.adding(added, tell.clone()));
                 drop(entered);
                 let _told = ready.send(Ok(()));
                 // Accepting has no end but a drain, so neither has the LocalSet that waits on
@@ -208,7 +273,7 @@ pub(crate) fn start(
     for worker in readied.iter().take(started) {
         worker?;
     }
-    Ok(loads)
+    Ok(Workers { loads, adding })
 }
 
 /// Why the workers did not all start.
@@ -288,6 +353,58 @@ impl Worker {
         }
     }
 
+    /// Takes on the listeners posted to it, until the main loop has gone.
+    async fn adding(
+        self,
+        mut added: UnboundedReceiver<Added>,
+        tell: std::sync::mpsc::Sender<Told>,
+    ) {
+        while let Some(Added {
+            slot,
+            name,
+            tcp,
+            udp,
+            said,
+        }) = added.recv().await
+        {
+            let _gone = said.send(self.listen(slot, &name, tcp, udp, &tell));
+        }
+    }
+
+    /// Accepts on `tcp` as the listener `name` whose slot is `slot`, and serves HTTP/3 on
+    /// `udp` if there is one, beside what it serves already: the first even if the second
+    /// cannot be, so that no connection the kernel gives this worker waits unaccepted.
+    fn listen(
+        &self,
+        slot: usize,
+        name: &str,
+        tcp: std::net::TcpListener,
+        udp: Option<(std::net::UdpSocket, Forwarding)>,
+        tell: &std::sync::mpsc::Sender<Told>,
+    ) -> Result<(), String> {
+        let position = self.position;
+        let essential = |what: String| Essential::new(format!("worker {position}'s {what}"), tell);
+        let cannot = |what: &str, error: io::Error| {
+            format!("worker {position} cannot {what} listener \"{name}\": {error}")
+        };
+        let socket = TcpListener::from_std(tcp).map_err(|error| cannot("accept on", error))?;
+        let _detached = tokio::task::spawn_local(watched(
+            self.clone().accept(slot, socket),
+            essential(format!("accepting on listener \"{name}\"")),
+        ));
+        let Some((udp, share)) = udp else {
+            return Ok(());
+        };
+        let serving = UdpSocket::from_std(udp)
+            .and_then(|udp| Rc::clone(&self.plane).serve_h3(slot, udp, share))
+            .map_err(|error| cannot("serve HTTP/3 on", error))?;
+        let _detached = tokio::task::spawn_local(watched(
+            serving,
+            essential(format!("HTTP/3 on listener \"{name}\"")),
+        ));
+        Ok(())
+    }
+
     async fn receive(self, mut handed_over: Receiver<HandedOver>) {
         while let Some(HandedOver {
             listener,
@@ -316,8 +433,8 @@ impl Worker {
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use crate::bind::{Port, listen};
-    use edgerush_config::{Config, compile};
+    use crate::bind::{Port, datagrams, listen};
+    use edgerush_config::{Compiled, Config, compile};
     use edgerush_proxy::connections::QUIC_MOST;
     use std::io::{Read, Write};
     use std::net::SocketAddr;
@@ -385,7 +502,8 @@ upstreams:
             capped(connections),
             &tell,
         )
-        .unwrap();
+        .unwrap()
+        .loads;
         (address, loads, proxy, told)
     }
 
@@ -506,7 +624,8 @@ upstreams:
             capped(connections),
             &tell,
         )
-        .unwrap();
+        .unwrap()
+        .loads;
         (addresses["a"], addresses["b"], loads, proxy)
     }
 
@@ -616,6 +735,151 @@ upstreams:
         assert_eq!(held.iter().sum::<usize>(), 8, "{held:?}");
         for connection in &mut connections {
             assert_eq!(request(connection), "HTTP/1.1 503 Service Unavailable");
+        }
+    }
+
+    /// `count` workers holding no more than `connections` each, serving `web` (as
+    /// [`capped_workers`] has it) and a listener `api` with no routes, whose sockets are
+    /// opened and posted to them once they run: the addresses of `web` and of `api`, TCP and
+    /// UDP, and what the workers hold and the data plane.
+    fn added_later(
+        count: usize,
+        port: Port,
+        connections: usize,
+    ) -> (SocketAddr, SocketAddr, Arc<Loads>, Arc<Proxy>) {
+        let config = |listeners: &str| -> Compiled {
+            let yaml = format!(
+                r#"
+listeners:
+  web: {{ address: "127.0.0.1:1", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+{listeners}
+routes:
+  - name: everything
+    listeners: [web]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: / }}
+        forward: {{ backends: [{{ upstream: nowhere, weight: 1 }}] }}
+upstreams:
+  nowhere: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }}
+"#
+            );
+            let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+            compile(&config).unwrap()
+        };
+        let workers = NonZeroUsize::new(count).unwrap();
+        let proxy = Arc::new(Proxy::new(config(""), workers).unwrap());
+        let mut web: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut sockets = Vec::new();
+        for _ in 0..count {
+            let socket = listen(web, port).unwrap();
+            web = socket.local_addr().unwrap();
+            sockets.push(vec![(socket, None)]);
+        }
+        let (tell, _told) = std::sync::mpsc::channel();
+        let running = start(
+            &proxy,
+            sockets,
+            Accept::Balanced,
+            H1Limits::default(),
+            capped(connections),
+            &tell,
+        )
+        .unwrap();
+
+        // What the main loop does at a reload that adds a listener.
+        let mut address: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut sockets = Vec::new();
+        for _ in 0..count {
+            let tcp = listen(address, port).unwrap();
+            address = tcp.local_addr().unwrap();
+            sockets.push((tcp, Some(datagrams(address, port).unwrap())));
+        }
+        let api = "  api: { address: \"127.0.0.1:2\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }";
+        let opened = edgerush_proxy::Opened {
+            name: "api".to_owned(),
+            quic: Some(address.port()),
+        };
+        assert_eq!(proxy.reload_with(config(api), &[opened]).unwrap(), [1]);
+        assert_eq!(running.add(1, "api", sockets), [""; 0]);
+        (web, address, running.loads, proxy)
+    }
+
+    /// A datagram of a QUIC version nobody speaks, as large as an Initial: what an HTTP/3
+    /// listener answers with a version negotiation, whatever else it is set up with.
+    fn unknown_version() -> Vec<u8> {
+        let mut datagram = vec![0xc0, 0x1a, 0x2a, 0x3a, 0x4a, 8];
+        datagram.extend([1; 8]);
+        datagram.push(8);
+        datagram.extend([2; 8]);
+        datagram.resize(1200, 0);
+        datagram
+    }
+
+    /// Whether the UDP socket at `address` answers a QUIC client with a version negotiation.
+    fn negotiates(address: SocketAddr) -> bool {
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        client.send_to(&unknown_version(), address).unwrap();
+        let mut answer = [0; 1500];
+        let Ok((read, _)) = client.recv_from(&mut answer) else {
+            return false;
+        };
+        // A long header whose version is 0.
+        read > 5 && answer[0] & 0x80 != 0 && answer[1..5] == [0; 4]
+    }
+
+    /// A listener added while a worker runs is accepted on, as the listener its slot names,
+    /// and its UDP socket is read.
+    #[test]
+    fn a_worker_that_runs_takes_on_a_listener_added_to_it() {
+        let (_, address, loads, proxy) = added_later(1, Port::Own, CONNECTIONS_PER_WORKER);
+        let mut connection = std::net::TcpStream::connect(address).unwrap();
+        // No route of `api`'s: the data plane's own 404, counted as the listener's.
+        assert_eq!(request(&mut connection), "HTTP/1.1 404 Not Found");
+        assert_eq!(loads.now(), [1]);
+        let scrape = proxy.metrics();
+        let counted = "edgerush_listener_responses_total{listener=\"api\",class=\"4xx\"} 1\n";
+        assert!(scrape.contains(counted), "{scrape}");
+        assert!(negotiates(address), "no version negotiation");
+    }
+
+    /// A listener added has its share of a worker's room as the others do: once the worker
+    /// is short, the listener holding its share leaves the next connection in its backlog,
+    /// and the one added is served (03 §9).
+    #[test]
+    fn a_listener_added_has_its_share_of_a_workers_room() {
+        // Short from 7 of 8; with two listeners, a share is 4.
+        let (web, api, loads, _proxy) = added_later(1, Port::Own, 8);
+        let _held: Vec<std::net::TcpStream> = (0..7)
+            .map(|_| {
+                let mut connection = std::net::TcpStream::connect(web).unwrap();
+                assert_eq!(request(&mut connection), "HTTP/1.1 503 Service Unavailable");
+                connection
+            })
+            .collect();
+        assert_eq!(loads.now(), [7]);
+        let mut waiting = std::net::TcpStream::connect(web).unwrap();
+        assert!(!answered_soon(&mut waiting), "answered past its share");
+        let mut added = std::net::TcpStream::connect(api).unwrap();
+        assert_eq!(request(&mut added), "HTTP/1.1 404 Not Found");
+    }
+
+    /// Every worker takes on its sockets of a listener added: none of the connections the
+    /// kernel deals out among them waits unaccepted.
+    #[cfg(unix)]
+    #[test]
+    fn every_worker_takes_on_a_listener_added_to_them() {
+        let (_, address, _loads, _proxy) = added_later(4, Port::Shared, CONNECTIONS_PER_WORKER);
+        let mut connections: Vec<_> = (0..16)
+            .map(|_| std::net::TcpStream::connect(address).unwrap())
+            .collect();
+        for connection in &mut connections {
+            assert_eq!(request(connection), "HTTP/1.1 404 Not Found");
         }
     }
 

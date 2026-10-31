@@ -21,6 +21,7 @@ mod kubernetes;
 mod logged;
 mod passthrough;
 mod plane;
+pub use plane::Opened;
 mod respond;
 mod tries;
 mod watched;
@@ -740,6 +741,19 @@ impl Admitted {
     }
 }
 
+/// By slot ([`Proxy::listeners`]): the listeners whose sockets the data plane holds. A
+/// socket is served as the listener its slot names, whatever configs come later; a slot
+/// is taken as a listener's sockets are opened ([`Proxy::reload_with`]), and the sockets
+/// of a slot are never moved.
+#[derive(Debug, Clone)]
+struct ListenerSlots {
+    /// The name of the listener whose sockets it holds, if one's are.
+    names: Arc<[Option<String>]>,
+    /// The port its HTTP/3 is served on, where it has a UDP socket: whatever the config
+    /// says now, it is where the socket is (03 §4).
+    quic: Arc<[Option<u16>]>,
+}
+
 /// A compiled config and what the data plane works out from it, once, when it arrives.
 #[derive(Debug)]
 struct Snapshot {
@@ -748,9 +762,8 @@ struct Snapshot {
     /// Which config this is, counting from the first: what tells a worker its balancing
     /// state is for an earlier one.
     generation: u64,
-    /// By slot: the name of the listener whose socket it is, if one's is. A socket is served
-    /// as the listener its slot names, whatever configs come later.
-    names: Arc<[Option<String>]>,
+    /// By slot: whose sockets it holds.
+    slots: ListenerSlots,
     /// By slot: where this config has the listener of that name, if it has one. No request
     /// looks a listener up by its name.
     listeners: Vec<Option<usize>>,
@@ -781,10 +794,6 @@ struct Snapshot {
     /// it is to speak TLS. Kept from the config before for as long as the certificates
     /// are the same, and with it the keys of the session tickets it has issued.
     tls: Vec<Option<Arc<Tls>>>,
-    /// By slot ([`Proxy::listeners`]): the port its HTTP/3 is served on, where it has
-    /// a UDP socket. The first config's: sockets are bound once, at the start, and a reload
-    /// opens, closes and moves none of them (03 §4).
-    quic: Vec<Option<u16>>,
     /// By slot ([`Proxy::listeners`]): the `Alt-Svc` its answers carry, if it serves
     /// HTTP/3 (16 §5), made once so that no answer formats it.
     alt_svc: Vec<Option<HeaderModifier>>,
@@ -1265,6 +1274,14 @@ pub enum ProxyError {
         /// Why not.
         error: String,
     },
+    /// A listener said to have had its sockets opened that already has them.
+    #[error("listener `{0}` has its sockets already")]
+    ListenerOpen(String),
+    /// A listener whose sockets were opened with every slot taken ([`MOST_LISTENERS`]).
+    ///
+    /// [`MOST_LISTENERS`]: edgerush_config::MOST_LISTENERS
+    #[error("listener `{0}`: every listener's slot is taken")]
+    NoSlot(String),
 }
 
 impl From<CannotOpen> for ProxyError {

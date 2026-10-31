@@ -1,7 +1,9 @@
 //! The data plane as a whole: the snapshots it is made and reloaded with, its drain, and
 //! what it tells a scrape and the health checker.
 
-use super::{ACCEPT_PAUSE, Proxy, ProxyError, Snapshot, authority, is_about_one_connection};
+use super::{
+    ACCEPT_PAUSE, ListenerSlots, Proxy, ProxyError, Snapshot, authority, is_about_one_connection,
+};
 use crate::access_log::{Logs, Sink};
 use crate::downstream::h3::listener as h3_listener;
 use crate::egress::{Denied, Refusal};
@@ -270,7 +272,7 @@ impl Snapshot {
     pub(super) fn new(
         config: Arc<Compiled>,
         found: Found<'_>,
-        names: Arc<[Option<String>]>,
+        slots: ListenerSlots,
         metrics: &Metrics,
         previous: Option<&Snapshot>,
         keys: &Keys,
@@ -295,8 +297,9 @@ impl Snapshot {
             .collect::<Result<_, _>>()?;
         let nothing_routed = Routed::default();
         let previous_routed = previous.map_or(&nothing_routed, |previous| &previous.routed);
-        let routed = Routed::reconcile(&config, &names, previous_routed, keys);
-        let listeners: Vec<Option<usize>> = names
+        let routed = Routed::reconcile(&config, &slots.names, previous_routed, keys);
+        let listeners: Vec<Option<usize>> = slots
+            .names
             .iter()
             .map(|name| {
                 let name = name.as_ref()?;
@@ -329,23 +332,10 @@ impl Snapshot {
                     })
             })
             .collect::<Result<_, _>>()?;
-        // Where HTTP/3 is served: the first config says, as its sockets are the ones bound.
-        // A port the operating system chose is one the config does not know.
-        let quic: Vec<Option<u16>> = match previous {
-            Some(previous) => previous.quic.clone(),
-            None => listeners
-                .iter()
-                .map(|at| {
-                    let listener = at.and_then(|at| config.listeners().get(at))?;
-                    listener.http3?;
-                    Some(listener.address.port()).filter(|port| *port != 0)
-                })
-                .collect(),
-        };
         // Advertised only where a socket serves it, on the port it is on.
         let alt_svc = listeners
             .iter()
-            .zip(&quic)
+            .zip(slots.quic.iter())
             .map(|(at, port)| {
                 crate::way_back::alt_svc(at.and_then(|at| config.listeners().get(at))?, (*port)?)
             })
@@ -401,7 +391,7 @@ impl Snapshot {
         let snapshot = Self {
             config,
             generation: previous.map_or(0, |previous| previous.generation + 1),
-            names,
+            slots,
             listeners,
             endpoints,
             zoned,
@@ -411,7 +401,6 @@ impl Snapshot {
             carried,
             destinations,
             tls,
-            quic,
             alt_svc,
             secure,
             routed,
@@ -420,6 +409,43 @@ impl Snapshot {
         };
         Ok((snapshot, retiring))
     }
+}
+
+impl ListenerSlots {
+    /// These slots with the listeners `opened` names in the first that are free, and which
+    /// each took, in the order of `opened`.
+    fn taking(&self, opened: &[Opened]) -> Result<(Self, Vec<usize>), ProxyError> {
+        let mut names = self.names.to_vec();
+        let mut quic = self.quic.to_vec();
+        let mut taken = Vec::with_capacity(opened.len());
+        for listener in opened {
+            if names.iter().flatten().any(|name| *name == listener.name) {
+                return Err(ProxyError::ListenerOpen(listener.name.clone()));
+            }
+            let Some(slot) = names.iter().position(Option::is_none) else {
+                return Err(ProxyError::NoSlot(listener.name.clone()));
+            };
+            if let (Some(name), Some(port)) = (names.get_mut(slot), quic.get_mut(slot)) {
+                *name = Some(listener.name.clone());
+                *port = listener.quic;
+            }
+            taken.push(slot);
+        }
+        let slots = Self {
+            names: names.into(),
+            quic: quic.into(),
+        };
+        Ok((slots, taken))
+    }
+}
+
+/// A listener whose sockets have been opened, for [`Proxy::reload_with`] to serve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Opened {
+    /// The listener's name in the config.
+    pub name: String,
+    /// The port of its UDP socket, where it serves HTTP/3: what `Alt-Svc` tells clients.
+    pub quic: Option<u16>,
 }
 
 impl Proxy {
@@ -438,21 +464,40 @@ impl Proxy {
     /// [`Worker::new`]: super::Worker::new
     pub fn new(config: Compiled, workers: NonZeroUsize) -> Result<Self, ProxyError> {
         // Every slot there will be, the first config's listeners in the first of them.
-        let slots: Arc<[Option<String>]> = config
-            .listeners()
-            .iter()
-            .map(|listener| Some(listener.name.clone()))
-            .chain(std::iter::repeat(None))
-            .take(MOST_LISTENERS.max(config.listeners().len()))
-            .collect();
+        let most = MOST_LISTENERS.max(config.listeners().len());
+        let slots = ListenerSlots {
+            names: config
+                .listeners()
+                .iter()
+                .map(|listener| Some(listener.name.clone()))
+                .chain(std::iter::repeat(None))
+                .take(most)
+                .collect(),
+            // A port the operating system chose is one the config does not know.
+            quic: config
+                .listeners()
+                .iter()
+                .map(|listener| {
+                    listener.http3?;
+                    Some(listener.address.port()).filter(|port| *port != 0)
+                })
+                .chain(std::iter::repeat(None))
+                .take(most)
+                .collect(),
+        };
         // A shard for every worker, so that no two write to one line of cache.
-        let metrics = Metrics::new(workers, slots.len());
-        for (slot, _) in slots.iter().enumerate().filter(|(_, name)| name.is_some()) {
+        let metrics = Metrics::new(workers, most);
+        for (slot, _) in slots
+            .names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| name.is_some())
+        {
             metrics.listen(slot);
         }
         let keys = Keys::default();
         let logs = Logs::new(workers.get(), Arc::clone(&metrics.logs_dropped));
-        let prepared = logs.prepare(&config, &slots)?;
+        let prepared = logs.prepare(&config, &slots.names)?;
         let (namespaces, _) = tokio::sync::watch::channel(namespaces_of(&config));
         let (names, _) = tokio::sync::watch::channel(names_of(&config));
         // After none, nothing to retire; and nothing discovered or resolved yet.
@@ -490,11 +535,13 @@ impl Proxy {
         })
     }
 
-    /// The listeners' slots, each named by the listener whose socket it is, if one's is: the
-    /// config the data plane was made with has the first of them, in its order.
+    /// The listeners' slots, each named by the listener whose sockets it holds, if one's
+    /// are: the config the data plane was made with has the first of them, in its order, and
+    /// a listener whose sockets are opened later the first that is free
+    /// ([`Proxy::reload_with`]).
     #[must_use]
     pub fn listeners(&self) -> Arc<[Option<String>]> {
-        Arc::clone(&self.current.load().names)
+        Arc::clone(&self.current.load().slots.names)
     }
 
     /// Drains the data plane: every worker, at its next sweep, stops accepting and lets its
@@ -508,20 +555,39 @@ impl Proxy {
     /// are under way finish by the rule they began with; sockets stay open and upstream
     /// connections stay warm.
     ///
-    /// A listener keeps its socket by its name. While a config does not have it, nothing
-    /// that comes in on its socket has a route; listeners that only a later config has are
-    /// not served, as no socket is theirs.
+    /// A listener keeps its sockets by its name. While a config does not have it, nothing
+    /// that comes in on its sockets has a route; a listener that has no sockets is not
+    /// served until [`Proxy::reload_with`] is told they are open.
     ///
     /// # Errors
     ///
     /// Returns a [`ProxyError`] as [`Proxy::new`] does; the data plane then runs on as it
     /// was.
     pub fn reload(&self, config: Compiled) -> Result<(), ProxyError> {
+        self.reload_with(config, &[]).map(|_| ())
+    }
+
+    /// Runs `config` from now on, as [`Proxy::reload`] does, and with it the listeners
+    /// `opened` names, whose sockets are open and are to be served from now on: each takes
+    /// the first slot that is free, its counters and its access log with it. Their slots, in
+    /// the order of `opened`, for the sockets to be accepted on as those listeners.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProxyError`] as [`Proxy::new`] does, and for a listener of `opened`
+    /// that already has sockets, or that no slot is free for; the data plane then runs on as
+    /// it was, and no slot is taken.
+    pub fn reload_with(
+        &self,
+        config: Compiled,
+        opened: &[Opened],
+    ) -> Result<Vec<usize>, ProxyError> {
         let _making = self.making.lock().unwrap_or_else(PoisonError::into_inner);
         // Against the config on its way out, so that a destination which has not changed
         // keeps what its connections are filed under and one that has gone is retired.
         let previous = self.current.load();
-        let prepared = self.logs.prepare(&config, &previous.names)?;
+        let (slots, taken) = previous.slots.taking(opened)?;
+        let prepared = self.logs.prepare(&config, &slots.names)?;
         let discovered = self
             .discovered
             .lock()
@@ -535,7 +601,7 @@ impl Proxy {
                 named: &named,
                 denied: &denied,
             },
-            Arc::clone(&previous.names),
+            slots,
             &self.metrics,
             Some(&previous),
             &self.keys,
@@ -577,8 +643,11 @@ impl Proxy {
             hub.set_capacity(service.max_key_bytes);
             hub.set_tls(snapshot.service_tls.clone());
         }
-        // Before any request of it can make a record.
+        // Before any request of it can make a record, or be counted.
         self.logs.commit(prepared);
+        for slot in &taken {
+            self.metrics.listen(*slot);
+        }
         let namespaces = namespaces_of(&snapshot.config);
         let names = names_of(&snapshot.config);
         self.current.store(Arc::new(snapshot));
@@ -602,7 +671,7 @@ impl Proxy {
         let now = SystemTime::now().duration_since(UNIX_EPOCH);
         let now = now.map_or(0, |since_epoch| since_epoch.as_secs());
         self.metrics.last_reload.store(now, Ordering::Relaxed);
-        Ok(())
+        Ok(taken)
     }
 
     /// Takes in the EndpointSlices of namespaces followed: for each, every slice it now
@@ -654,7 +723,7 @@ impl Proxy {
         let (snapshot, retiring) = Snapshot::new(
             Arc::clone(&previous.config),
             then,
-            Arc::clone(&previous.names),
+            previous.slots.clone(),
             &self.metrics,
             Some(&previous),
             &self.keys,
@@ -727,7 +796,7 @@ impl Proxy {
         let (snapshot, retiring) = Snapshot::new(
             Arc::clone(&previous.config),
             then,
-            Arc::clone(&previous.names),
+            previous.slots.clone(),
             &self.metrics,
             Some(&previous),
             &self.keys,
@@ -802,7 +871,7 @@ impl Proxy {
             let (snapshot, retiring) = Snapshot::new(
                 Arc::clone(&previous.config),
                 then,
-                Arc::clone(&previous.names),
+                previous.slots.clone(),
                 &self.metrics,
                 Some(&previous),
                 &self.keys,
@@ -908,7 +977,9 @@ impl Proxy {
             .zip(snapshot.limit_slots.iter())
             .map(|(limit, slot)| (limit.name.as_str(), *slot, limit.dry_run))
             .collect();
-        let mut scrape = self.metrics.render(&snapshot.names, &upstreams, &endpoints);
+        let mut scrape = self
+            .metrics
+            .render(&snapshot.slots.names, &upstreams, &endpoints);
         let mut refused: Vec<(&str, &'static str, usize)> = Vec::new();
         for (upstream, addresses) in snapshot.config.upstreams().iter().zip(&snapshot.refused) {
             let mut by_why: BTreeMap<Refusal, usize> = BTreeMap::new();

@@ -232,12 +232,16 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
     assert!(harness.wait_for("elsewhere").contains("upstream"));
     assert!(get(web, "/")?.contains("x-upstream: two"));
 
-    // A listener that is new is told of and not bound, and what can be reloaded is.
-    let more = config("127.0.0.1:0", "up", Some(one))
-        + "  api: { address: \"127.0.0.1:1\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n";
+    // A listener that is new is listened on as its config takes over, and served.
+    let free = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let more = config("127.0.0.1:0", "up", Some(one)).replace("[web]", "[web, api]")
+        + &format!(
+            "  api: {{ address: \"{free}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
+        );
     std::fs::write(&file, more)?;
     harness.wait_for("config reloaded");
-    harness.wait_for("warning: listener \"api\" is new");
+    assert_eq!(harness.address_after("listener \"api\" is on "), free);
+    assert!(get(free, "/")?.contains("x-upstream: one"));
     assert!(get(web, "/")?.contains("x-upstream: one"));
 
     let scrape = get(metrics, "/metrics")?;
@@ -248,6 +252,51 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
     );
     let served = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"} 4\n";
     assert!(scrape.contains(served), "{scrape}");
+    let added = "edgerush_listener_responses_total{listener=\"api\",class=\"2xx\"} 1\n";
+    assert!(scrape.contains(added), "{scrape}");
+
+    // A listener whose port is taken is said not to be served, the rest of its config
+    // running; and it is listened on at the next config, once the port is free.
+    let taken = TcpListener::bind("127.0.0.1:0")?;
+    let busy = taken.local_addr()?;
+    let with_busy = |comment: &str| {
+        config("127.0.0.1:0", "up", Some(two)).replace("[web]", "[web, busy]")
+            + &format!(
+                "  busy: {{ address: \"{busy}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n# {comment}\n"
+            )
+    };
+    std::fs::write(&file, with_busy("taken"))?;
+    harness.wait_for("config reloaded");
+    let refused = harness.wait_for("for listener \"busy\"");
+    assert!(
+        refused.starts_with(&format!(
+            "warning: cannot listen on {busy} for listener \"busy\": "
+        )),
+        "{refused}"
+    );
+    assert!(
+        refused.ends_with(": it is not served, and is tried again at the next config"),
+        "{refused}"
+    );
+    assert!(get(web, "/")?.contains("x-upstream: two"));
+    drop(taken);
+    std::fs::write(&file, with_busy("free"))?;
+    harness.wait_for("config reloaded");
+    assert_eq!(harness.address_after("listener \"busy\" is on "), busy);
+    assert!(get(busy, "/")?.contains("x-upstream: two"));
+
+    // Renamed, it is another listener, on an address the one gone still holds: not opened
+    // beside it, which would share the port between the two.
+    let renamed = with_busy("renamed").replace("busy", "moved");
+    std::fs::write(&file, renamed)?;
+    harness.wait_for("config reloaded");
+    assert_eq!(
+        harness.wait_for("listener \"moved\" is on "),
+        format!(
+            "warning: listener \"moved\" is on {busy}, which listener \"busy\" keeps: it is not \
+             served until a restart"
+        )
+    );
     Ok(())
 }
 
@@ -365,15 +414,31 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
     assert!(get(web, "/")?.contains("x-upstream: two"));
     assert_eq!(reported().running.config.as_deref(), Some(second.version()));
 
+    // A listener that is new is listened on as its config takes over, as a file's is.
+    let free = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let added = offered(
+        &(config("127.0.0.1:0", "up", Some(two)).replace("[web]", "[web, api]")
+            + &format!(
+                "  api: {{ address: \"{free}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
+            )),
+        Some(&second),
+        &mut versions,
+    );
+    offers.send_replace(Some(Arc::new(added.clone())));
+    harness.wait_for("config from the control plane runs");
+    assert_eq!(harness.address_after("listener \"api\" is on "), free);
+    assert!(get(free, "/")?.contains("x-upstream: two"));
+    assert_eq!(reported().running.config.as_deref(), Some(added.version()));
+
     // A config that cannot be run: said, and the one before it runs on.
     let third = offered(
         &config("127.0.0.1:0", "elsewhere", Some(one)),
-        Some(&second),
+        Some(&added),
         &mut versions,
     );
     offers.send_replace(Some(Arc::new(third.clone())));
     let report = reported();
-    assert_eq!(report.running.config.as_deref(), Some(second.version()));
+    assert_eq!(report.running.config.as_deref(), Some(added.version()));
     assert_eq!(
         report.refused.map(|refusal| refusal.config),
         Some(third.version().to_owned())

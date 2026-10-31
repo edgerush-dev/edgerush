@@ -127,6 +127,11 @@ impl Loads {
         self.listening.store(listeners, Ordering::Relaxed);
     }
 
+    /// Another slot is a listener's from now on.
+    pub fn listener_added(&self) {
+        self.listening.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The connections all the workers together may hold.
     fn limit(&self) -> usize {
         (self.cap / CONNECTION).saturating_mul(self.held.len())

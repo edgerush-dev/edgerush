@@ -345,6 +345,64 @@ async fn a_reload_advertises_only_the_http3_a_listener_has_a_socket_for() {
         .await;
 }
 
+/// A listener whose sockets are opened at a reload is served in the slot it takes, over
+/// HTTP/3 too, and its TCP answers advertise the port its UDP socket is on (16 §5).
+#[tokio::test]
+async fn a_listener_opened_at_a_reload_is_served_over_http3_and_says_where() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::Client;
+            let (upstream, _) = counting_upstream().await;
+            let mut config = everything_config(upstream);
+            config.listeners.get_mut("web").unwrap().http3 = Some(edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            });
+            secured(
+                &mut config,
+                vec![crate::tls::testing::certificate(&["a.test"])],
+                None,
+            );
+            // Made with another listener alone, in the first slot.
+            let admin: Config = serde_saphyr::from_str(
+                "routes: []\nupstreams: {}\nlisteners:\n  admin: { address: \"127.0.0.1:1\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n",
+            )
+            .unwrap();
+            let proxy = Arc::new(Proxy::new(compile(&admin).unwrap(), NonZeroUsize::MIN).unwrap());
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let quic = udp.local_addr().unwrap();
+            let opened = Opened {
+                name: "web".to_owned(),
+                quic: Some(quic.port()),
+            };
+            let slots = proxy
+                .reload_with(compile(&config).unwrap(), &[opened])
+                .unwrap();
+            assert_eq!(slots, [1]);
+
+            let worker = Worker::with_deadlines(Arc::clone(&proxy), H1Limits::default(), SHORT);
+            let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
+            let alone = Forwarding::group(1).remove(0);
+            let _quic = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(1, udp, alone).unwrap());
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = tcp.local_addr().unwrap();
+            let _tcp = tokio::task::spawn_local(Rc::clone(&worker).serve(1, tcp));
+
+            let stream = tls_client(front, "a.test", None, |_| {}).await.unwrap();
+            let answer = h1_over_or_nothing(stream).await.to_ascii_lowercase();
+            assert!(answer.starts_with("http/1.1 200 ok\r\n"), "{answer}");
+            let advertised = format!("\r\nalt-svc: h3=\":{}\"; ma=60\r\n", quic.port());
+            assert!(answer.contains(&advertised), "{answer}");
+            let mut client = Client::connect(quic, "a.test").await;
+            assert_eq!(client.get("a.test", "/").await.final_status(), Some("200"));
+            let counted = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"} 2\n";
+            let scrape = proxy.metrics();
+            assert!(scrape.contains(counted), "{scrape}");
+        })
+        .await;
+}
+
 /// A worker counts the handshakes under way on all its HTTP/3 listeners as one, which
 /// is what its Retry threshold is held to (16 §6).
 #[tokio::test]

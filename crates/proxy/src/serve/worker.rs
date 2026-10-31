@@ -106,7 +106,7 @@ impl Worker {
         let received = Received::new(Rc::clone(blocks.borrow().storage()));
         let (validations, validated) = {
             let snapshot = proxy.current.load();
-            let validations = (0..snapshot.names.len())
+            let validations = (0..snapshot.slots.names.len())
                 .map(|listener| Validation {
                     tls: snapshot.tls.get(listener).cloned().flatten(),
                     drain: Rc::new(Drain::default()),
