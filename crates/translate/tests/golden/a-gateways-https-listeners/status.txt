@@ -1,0 +1,12 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener catch-all: HTTPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener exact: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener wild: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener kinds: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/InvalidCertificateRef (a certificateRef of kind example.com/Vault is not one translation reads)
+listener later: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener migrated: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener wild-unusable: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/InvalidCertificateRef (Secret edge/missing does not exist); Programmed=False/Invalid (no certificateRef of it can be used)
+listener unusable: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/InvalidCertificateRef (Secret edge/missing does not exist; Secret shop/keyless has no tls.key); Programmed=False/Invalid (no certificateRef of it can be used)
+listener denied: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Secret blog/secret is another namespace's, and no ReferenceGrant there lets Gateways of edge reach it); Programmed=False/Invalid (no certificateRef of it can be used)
+listener elsewhere: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/app, generation 0, parent web section catch-all: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

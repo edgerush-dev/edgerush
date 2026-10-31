@@ -1,0 +1,3 @@
+listener http: served on http, taking HTTPRoute from every namespace
+listener unwatched: accepted, serving nothing: no certificateRef of it can be used
+listener ungranted: accepted, serving nothing: no certificateRef of it can be used

@@ -20,6 +20,12 @@ routes:
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ invalid: "not supported yet: CORS", weight: 1 }] }
+  - name: httproute/shop/odd-kind/http
+    listeners: [http]
+    hostnames: [{ name: odd.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ invalid: "a backend of kind example.com/Other is not one translation reads", weight: 1 }] }
   - name: httproute/shop/shop/http
     listeners: [http]
     hostnames: [{ name: shop.example.com, falls_through: false }]

@@ -375,6 +375,53 @@ impl ApiServer {
         self.write(Method::PUT, &path, object).await
     }
 
+    /// Replaces the status of `K`'s object `name` in `namespace` (`""` for a kind whose
+    /// objects are the cluster's) with `status`, as of `version`, the `resourceVersion` it
+    /// was read at: the object is sent with its metadata and status alone, as the API server
+    /// takes nothing else of it there.
+    ///
+    /// # Errors
+    ///
+    /// An [`ApiError`]: [`ApiError::is_conflict`] when it has changed since that version.
+    pub async fn replace_status<K: Kind>(
+        &self,
+        namespace: &str,
+        name: &str,
+        version: &str,
+        status: &impl serde::Serialize,
+    ) -> Result<(), ApiError> {
+        let mut path = object_path::<K>(namespace, name)?;
+        path.push_str("/status");
+        let api_version = if K::GROUP.is_empty() {
+            K::VERSION.to_owned()
+        } else {
+            format!("{}/{}", K::GROUP, K::VERSION)
+        };
+        let mut metadata = serde_json::json!({ "name": name, "resourceVersion": version });
+        if !namespace.is_empty() {
+            metadata["namespace"] = serde_json::Value::from(namespace);
+        }
+        let object = serde_json::json!({
+            "apiVersion": api_version,
+            "kind": K::KIND,
+            "metadata": metadata,
+            "status": status,
+        });
+        let body =
+            serde_json::to_vec(&object).map_err(|error| ApiError::Http(error.to_string()))?;
+        let deadline = Instant::now() + self.timing.answer;
+        // What it answers, the object as it now is, is not needed.
+        let _object = self
+            .send(
+                Method::PUT,
+                &path,
+                Some(("application/json", Bytes::from(body))),
+                deadline,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Sends `object` with `method` to `path`, and reads back what the API server made of
     /// it.
     async fn write<K: Kind + serde::Serialize>(
@@ -533,7 +580,13 @@ impl ApiServer {
 
 /// The path of `K`'s object `name` in `namespace`.
 fn object_path<K: Kind>(namespace: &str, name: &str) -> Result<String, ApiError> {
-    let mut path = kind::collection::<K>(&Scope::namespace(namespace)?)?;
+    // A kind whose objects are the cluster's is named in no namespace.
+    let scope = match (K::NAMESPACED, namespace) {
+        (false, "") => Scope::Cluster,
+        (false, _) => return Err(ApiError::NotNamespaced(K::KIND)),
+        (true, namespace) => Scope::namespace(namespace)?,
+    };
+    let mut path = kind::collection::<K>(&scope)?;
     path.push('/');
     encode_into(&mut path, name);
     Ok(path)

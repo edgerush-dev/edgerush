@@ -1,0 +1,3 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener http: HTTPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/mirrors, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Service shop/gone does not exist; Service blog/web is another namespace's, and no ReferenceGrant there lets HTTPRoutes of shop reach it); PartiallyInvalid=True/UnsupportedValue (Dropped Rule: rule 7 answers 500 for all it matches: a mirror beside a redirect, which sends nothing upstream to copy)

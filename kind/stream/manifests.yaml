@@ -92,6 +92,10 @@ rules:
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gatewayclasses]
     verbs: [list, watch]
+  # Its status, that of the class its Gateway names (04 §6).
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gatewayclasses/status]
+    verbs: [update]
   # Namespaces' labels, which a listener's selector of namespaces matches.
   - apiGroups: [""]
     resources: [namespaces]
@@ -121,6 +125,9 @@ rules:
   - apiGroups: [gateway.networking.k8s.io]
     resources: [httproutes, referencegrants]
     verbs: [list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [httproutes/status]
+    verbs: [update]
   - apiGroups: [""]
     resources: [services, secrets]
     verbs: [list, watch]
@@ -144,6 +151,9 @@ rules:
   - apiGroups: [gateway.networking.k8s.io]
     resources: [httproutes, referencegrants]
     verbs: [list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [httproutes/status]
+    verbs: [update]
   - apiGroups: [""]
     resources: [services, secrets]
     verbs: [list, watch]
@@ -164,10 +174,21 @@ rules:
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, create, update]
+  # Each replica's report of what its data planes run, which the leader merges (04 §6).
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, create, update]
+  # The data plane's own Service's EndpointSlices: its ready pods, counted for Programmed.
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list, watch]
   # Its own Gateway's namespace, where Gateways are followed.
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gateways]
     verbs: [list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gateways/status]
+    verbs: [update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -243,6 +264,10 @@ spec:
             - /etc/edgerush/webhook/tls.crt
             - --webhook-key
             - /etc/edgerush/webhook/tls.key
+          env:
+            # Its Pod's UID, which owns the report of what its data planes run (04 §6).
+            - name: EDGERUSH_POD_UID
+              valueFrom: { fieldRef: { fieldPath: metadata.uid } }
           ports:
             - { name: stream, containerPort: 9443 }
             - { name: webhook, containerPort: 8443 }

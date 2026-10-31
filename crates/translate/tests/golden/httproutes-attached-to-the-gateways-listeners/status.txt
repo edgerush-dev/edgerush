@@ -1,0 +1,17 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener any: HTTPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener example: HTTPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener foo: HTTPRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener abc: HTTPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener same-only: HTTPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener selected: HTTPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener tls-only: no kind, attached 0: Accepted=True/Accepted; ResolvedRefs=False/InvalidRouteKinds (takes no route of kind gateway.networking.k8s.io/TLSRoute)
+HTTPRoute edge/in-edge, generation 0, parent web section same-only: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/by-port, generation 0, parent web port 9999: Accepted=False/NoMatchingParent (no listener the Gateway serves has the name and port it names); ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/by-section, generation 0, parent web section foo: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/disjoint, generation 0, parent web section abc: Accepted=False/NoMatchingListenerHostname (its hostnames meet no hostname of a listener that takes it); ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/everywhere, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/not-allowed, generation 0, parent web section same-only: Accepted=False/NotAllowedByListeners (no listener it names takes an HTTPRoute from its namespace); ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/selected, generation 0, parent web section selected: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/unknown-section, generation 0, parent web section nope: Accepted=False/NoMatchingParent (no listener the Gateway serves has the name and port it names); ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/wrong-kind, generation 0, parent web section tls-only: Accepted=False/NotAllowedByListeners (no listener it names takes an HTTPRoute from its namespace); ResolvedRefs=True/ResolvedRefs

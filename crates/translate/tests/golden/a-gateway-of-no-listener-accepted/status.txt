@@ -1,0 +1,2 @@
+Gateway, generation 0: Accepted=False/ListenersNotValid (no listener is accepted); nothing to program
+listener http: no kind, attached 0: Accepted=False/PortUnavailable (port 80 is bound by no listener of the data plane); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (port 80 is bound by no listener of the data plane)

@@ -1,0 +1,2 @@
+HTTPRoute shop/across, section http: attached to http (across.example.com)
+HTTPRoute shop/secured, section unwatched: attached to unwatched (unwatched.example.com)

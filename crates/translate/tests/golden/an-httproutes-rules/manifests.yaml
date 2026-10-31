@@ -69,6 +69,17 @@ spec:
   rules:
     - filters: [{ type: CORS, cors: { allowOrigins: ["https://app.example.com"] } }]
 ---
+# A route whose only backend is of a kind translation does not read: accepted, its share
+# answered 500, `ResolvedRefs` false as `InvalidKind`.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: odd-kind, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [odd.example.com]
+  rules:
+    - backendRefs: [{ group: example.com, kind: Other, name: thing }]
+---
 # A guarded path beside a catch-all: its filter not taken, /admin answers 500, never
 # served by / without it.
 apiVersion: gateway.networking.k8s.io/v1

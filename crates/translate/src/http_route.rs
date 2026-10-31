@@ -7,7 +7,7 @@
 //! built left out; and every host a claim of one API takes from a claim of the other.
 
 use crate::gateway::{GatewayOutcome, ListenerOutcome};
-use crate::{Cluster, Object, Plane, backend_upstream, namespace};
+use crate::{Cluster, Object, Plane, RefProblem, RefReason, backend_upstream, namespace};
 use edgerush_config::{
     Backend, Filter, Forward, Fraction, Header, HeaderChanges, Hostname, Match, Mirror, PathChange,
     PathMatch, Query, Redirect, Retry, Route, Rule, Scheme, Timeouts, Upstream, UrlRewrite,
@@ -29,6 +29,8 @@ const GROUP: &str = "gateway.networking.k8s.io";
 pub struct RouteOutcome {
     /// The HTTPRoute.
     pub route: Object,
+    /// Its generation: what its status says of.
+    pub generation: i64,
     /// Each of its `parentRefs` to the data plane's Gateway, in the order it lists them.
     pub parents: Vec<ParentOutcome>,
 }
@@ -36,6 +38,10 @@ pub struct RouteOutcome {
 /// One `parentRef` of an HTTPRoute to the data plane's Gateway, and what became of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentOutcome {
+    /// The Gateway's namespace, as it writes it: none for the route's own.
+    pub namespace: Option<String>,
+    /// The Gateway's name.
+    pub name: String,
     /// The listener it names, if it names one.
     pub section_name: Option<String>,
     /// The port it names, if it names one.
@@ -131,6 +137,8 @@ pub(crate) fn attached(cluster: &Cluster, gateway: &GatewayOutcome) -> Vec<Route
                 .flatten()
                 .filter(|parent| names(parent, route_namespace, &gateway.gateway))
                 .map(|parent| ParentOutcome {
+                    namespace: parent.namespace.clone(),
+                    name: parent.name.clone(),
                     section_name: parent.section_name.clone(),
                     port: parent.port,
                     attached: attach(route, route_namespace, parent, gateway, cluster),
@@ -138,6 +146,7 @@ pub(crate) fn attached(cluster: &Cluster, gateway: &GatewayOutcome) -> Vec<Route
                 .collect();
             (!parents.is_empty()).then(|| RouteOutcome {
                 route: Object::of("HTTPRoute", &route.metadata),
+                generation: route.metadata.generation.unwrap_or_default(),
                 parents,
             })
         })
@@ -160,7 +169,7 @@ fn attach(
     gateway: &GatewayOutcome,
     cluster: &Cluster,
 ) -> Result<Vec<Attachment>, NotAttached> {
-    let accepted = |listener: &&ListenerOutcome| listener.served.is_ok();
+    let accepted = |listener: &&ListenerOutcome| listener.accepted();
     let named: Vec<&ListenerOutcome> = gateway
         .listeners
         .iter()
@@ -445,8 +454,8 @@ pub(crate) struct Translated {
     pub(crate) upstreams: BTreeMap<String, Upstream>,
     pub(crate) left_out: Vec<(usize, String)>,
     pub(crate) answered: Vec<(usize, String)>,
-    pub(crate) invalid: Vec<(usize, String)>,
-    pub(crate) mirrors_left_off: Vec<(usize, String)>,
+    pub(crate) invalid: Vec<(usize, RefProblem)>,
+    pub(crate) mirrors_left_off: Vec<(usize, RefProblem)>,
     pub(crate) retries_capped: Vec<(usize, i64)>,
 }
 
@@ -713,7 +722,7 @@ fn filtered(
     plane: &Plane,
     cluster: &Cluster,
     upstreams: &mut BTreeMap<String, Upstream>,
-    left_off: &mut Vec<String>,
+    left_off: &mut Vec<RefProblem>,
 ) -> Result<Filtered, String> {
     let mut filters = Vec::new();
     let mut redirect = None;
@@ -1043,7 +1052,7 @@ fn backends(
     plane: &Plane,
     cluster: &Cluster,
     upstreams: &mut BTreeMap<String, Upstream>,
-    invalid: &mut Vec<String>,
+    invalid: &mut Vec<RefProblem>,
 ) -> Vec<Backend> {
     let mut backends = Vec::new();
     for written in rule.backend_refs.iter().flatten() {
@@ -1065,13 +1074,13 @@ fn backends(
                     weight,
                 });
             }
-            Err(why) => {
-                invalid.push(why.clone());
+            Err(problem) => {
                 backends.push(Backend {
                     upstream: None,
-                    invalid: Some(why),
+                    invalid: Some(problem.why.clone()),
                     weight,
                 });
+                invalid.push(problem);
             }
         }
     }
@@ -1120,32 +1129,31 @@ fn backend(
     route_namespace: &str,
     plane: &Plane,
     cluster: &Cluster,
-) -> Result<(String, Upstream), String> {
+) -> Result<(String, Upstream), RefProblem> {
     if !(written.group.is_empty() && written.kind == "Service") {
-        return Err(format!(
-            "a backend of kind {}/{} is not one translation reads",
-            written.group, written.kind
-        ));
+        return Err(RefProblem {
+            reason: RefReason::InvalidKind,
+            why: format!(
+                "a backend of kind {}/{} is not one translation reads",
+                written.group, written.kind
+            ),
+        });
     }
     let namespace = written.namespace.unwrap_or(route_namespace);
-    if namespace != route_namespace
-        && !granted(
-            cluster,
-            ("HTTPRoute", route_namespace),
-            ("Service", namespace, written.name),
-        )
-    {
-        return Err(format!(
-            "Service {namespace}/{} is another namespace's, and no ReferenceGrant there lets \
-             HTTPRoutes of {route_namespace} reach it",
-            written.name
-        ));
-    }
+    reachable(
+        cluster,
+        ("HTTPRoute", route_namespace),
+        ("Service", namespace, written.name),
+    )
+    .map_err(|why| RefProblem {
+        reason: RefReason::NotPermitted,
+        why,
+    })?;
     let Some(port) = written.port else {
-        return Err(format!(
-            "Service {namespace}/{} is named with no port",
-            written.name
-        ));
+        return Err(RefProblem {
+            reason: RefReason::NotFound,
+            why: format!("Service {namespace}/{} is named with no port", written.name),
+        });
     };
     let reference = IngressBackend {
         service: Some(IngressServiceBackend {
@@ -1160,7 +1168,43 @@ fn backend(
     match backend_upstream(plane, cluster, namespace, &reference, false) {
         Ok(Ok(found)) => Ok(found),
         Ok(Err(missing)) => Err(missing),
-        Err(problem) => Err(problem.to_string()),
+        Err(problem) => Err(RefProblem {
+            reason: RefReason::Unsupported,
+            why: problem.to_string(),
+        }),
+    }
+}
+
+/// Whether an object of the Gateway API's kind and namespace `from` may reach the core
+/// object of the kind, namespace and name `to` says, or why not: one of its own namespace
+/// always; another's only where a ReferenceGrant there allows it, and never one of a
+/// namespace the control plane does not watch, where no grant can be seen, said as such
+/// rather than as no grant there (04 §9).
+pub(crate) fn reachable(
+    cluster: &Cluster,
+    (from_kind, from): (&str, &str),
+    (kind, namespace, name): (&str, &str, &str),
+) -> Result<(), String> {
+    if namespace == from {
+        return Ok(());
+    }
+    if cluster
+        .watched
+        .as_ref()
+        .is_some_and(|watched| !watched.iter().any(|ours| ours == namespace))
+    {
+        return Err(format!(
+            "{kind} {namespace}/{name} is in {namespace}, which the control plane does not \
+             watch, so no ReferenceGrant there can be seen"
+        ));
+    }
+    if granted(cluster, (from_kind, from), (kind, namespace, name)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{kind} {namespace}/{name} is another namespace's, and no ReferenceGrant there \
+             lets {from_kind}s of {from} reach it"
+        ))
     }
 }
 
@@ -1168,7 +1212,7 @@ fn backend(
 /// and namespace `from` reach its core object of the kind and name `to` says: one whose
 /// `from` names them and whose `to` names that object, or every object of its kind there.
 /// Entries of each list are either-or, as the spec has it.
-pub(crate) fn granted(
+fn granted(
     cluster: &Cluster,
     (from_kind, from): (&str, &str),
     (kind, namespace, name): (&str, &str, &str),

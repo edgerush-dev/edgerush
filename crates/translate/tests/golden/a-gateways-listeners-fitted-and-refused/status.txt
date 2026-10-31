@@ -1,0 +1,9 @@
+Gateway, generation 0: Accepted=True/ListenersNotValid (listeners not accepted: elsewhere, plain-on-secure, dns, first, second)
+listener http: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener elsewhere: no kind, attached 0: Accepted=False/PortUnavailable (port 9000 is bound by no listener of the data plane); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (port 9000 is bound by no listener of the data plane)
+listener plain-on-secure: no kind, attached 0: Accepted=False/PortUnavailable (port 8443 is bound by the data plane for https, not http); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (port 8443 is bound by the data plane for https, not http)
+listener secure: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/InvalidCertificateRef (it names no certificateRef); Programmed=False/Invalid (no certificateRef of it can be used)
+listener dns: no kind, attached 0: Accepted=False/UnsupportedProtocol (protocol `UDP` is not one the gateway serves); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (protocol `UDP` is not one the gateway serves)
+listener first: no kind, attached 0: Accepted=False/HostnameConflict (listeners first, second have the same port, protocol and hostname); Conflicted=True/HostnameConflict (listeners first, second have the same port, protocol and hostname); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (listeners first, second have the same port, protocol and hostname)
+listener second: no kind, attached 0: Accepted=False/HostnameConflict (listeners first, second have the same port, protocol and hostname); Conflicted=True/HostnameConflict (listeners first, second have the same port, protocol and hostname); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (listeners first, second have the same port, protocol and hostname)
+listener apart: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

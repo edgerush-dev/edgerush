@@ -1,0 +1,7 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener kinds-mixed: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/InvalidRouteKinds (takes no route of kind gateway.networking.k8s.io/InvalidRoute, example.com/HTTPRoute)
+listener kinds-none-carried: no kind, attached 0: Accepted=True/Accepted; ResolvedRefs=False/InvalidRouteKinds (takes no route of kind gateway.networking.k8s.io/TLSRoute)
+listener every-namespace: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener selected: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener unreadable-operator: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener unreadable-from: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

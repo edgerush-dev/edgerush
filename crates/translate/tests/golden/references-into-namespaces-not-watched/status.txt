@@ -1,0 +1,6 @@
+Gateway, generation 4: Accepted=True/Accepted
+listener http: HTTPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener unwatched: HTTPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Secret blog/cert is in blog, which the control plane does not watch, so no ReferenceGrant there can be seen); Programmed=False/Invalid (no certificateRef of it can be used)
+listener ungranted: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Secret news/cert is another namespace's, and no ReferenceGrant there lets Gateways of edge reach it); Programmed=False/Invalid (no certificateRef of it can be used)
+HTTPRoute shop/across, generation 2, parent web section http: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Service blog/web is in blog, which the control plane does not watch, so no ReferenceGrant there can be seen; Service news/web is another namespace's, and no ReferenceGrant there lets HTTPRoutes of shop reach it)
+HTTPRoute shop/secured, generation 1, parent web section unwatched: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

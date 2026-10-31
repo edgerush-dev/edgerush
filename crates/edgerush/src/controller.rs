@@ -12,10 +12,11 @@ use edgerush_control_service::{
     webhook_acceptor,
 };
 use edgerush_control_stream::{Offer, OfferError, Versions};
+use edgerush_controller::acks::{Pods, Reporter, Runs};
 use edgerush_controller::admission::{self, Asked};
 use edgerush_controller::lease::{self, elect};
 use edgerush_controller::status::{Addresses, address};
-use edgerush_controller::{Debounce, Said, control};
+use edgerush_controller::{Acks, Debounce, Reports, Said, control};
 use edgerush_kubernetes::{ApiError, ApiServer, Listed, Retry, Scope, follow};
 use edgerush_translate::{Plane, Translation};
 use http::StatusCode;
@@ -52,9 +53,15 @@ said on stderr. The certificate, key and authorities are PEM files, read again e
 second, so that ones replaced serve the next connection. With --own-name, the addresses
 the names resolve to, the gateway's own pods, are sent on the stream too, for data planes
 never to send a request to.
+Where the data plane is a Gateway, its GatewayClass, the Gateway and each HTTPRoute of it
+say in their status what is served of them, the Gateway programmed once every ready pod of
+the data plane runs its generation, as the data planes say on the stream.
 With --status-service or --status-address, each Ingress served says the data plane's
-addresses in its status, and each of the class that is not says none. With --leader-lease,
-the replicas elect one by that Lease, which alone writes status; every one serves.
+addresses in its status, each of the class that is not says none, and the Gateway says
+them. With --leader-lease, the replicas elect one by that Lease, which alone writes
+status; every one serves, and reports what its data planes run in a ConfigMap of the
+Lease's namespace, <LEASE>-acks-<HOSTNAME>, owned by its Pod where EDGERUSH_POD_UID gives
+the Pod's UID, for the leader to merge.
 With --webhook-listen, it serves the admission webhook there, HTTPS, reviews POSTed to
 /validate: an Ingress of the data plane's class is refused where, alone, it does not
 translate into something the data plane accepts. Its certificate and key are read again
@@ -149,11 +156,18 @@ pub(crate) fn command(
     // The election's own client, so that its writes never wait behind the follows'.
     let elector = match &options.leader {
         Some(_) => match ApiServer::in_cluster() {
-            Ok(api) => Some(Elector {
-                api,
-                identity: identity(),
-                timing: lease::Timing::default(),
-            }),
+            Ok(api) => match ApiServer::in_cluster() {
+                Ok(reports) => Some(Elector {
+                    api,
+                    reports,
+                    identity: identity(),
+                    timing: lease::Timing::default(),
+                }),
+                Err(error) => {
+                    return writeln!(stderr, "error: {}", outside(&error))
+                        .map_or(1, |()| crate::EXIT_USAGE);
+                }
+            },
             Err(error) => {
                 return writeln!(stderr, "error: {}", outside(&error))
                     .map_or(1, |()| crate::EXIT_USAGE);
@@ -504,6 +518,8 @@ fn named(value: &str) -> Option<(String, String)> {
 struct Elector {
     /// A client of its own, so that its writes never wait behind the follows'.
     api: ApiServer,
+    /// Another, for the report of what this replica's data planes run (04 §6).
+    reports: ApiServer,
     /// This replica, as the Lease names its holder.
     identity: String,
     timing: lease::Timing,
@@ -572,10 +588,35 @@ async fn control_until(
     let write_config = options.write_config;
     let status = options.status;
     let mut electing = Vec::new();
+    // What each data plane this replica serves runs, as it says it (04 §6).
+    let runs: Rc<RefCell<Runs>> = Rc::default();
+    let (pods, running) = watch::channel(Pods::new());
+    let mut reports = None;
     let leading = match (options.leader, elector) {
         (Some((namespace, name)), Some(elector)) => {
             let (leads, leading) = watch::channel(false);
             let lease = format!("Lease {namespace}/{name}");
+            // Every replica reports what its data planes run, for the leader to merge.
+            let reporter = Reporter {
+                namespace: namespace.clone(),
+                lease: name.clone(),
+                pod: std::env::var("HOSTNAME").unwrap_or_else(|_| "edgerush".to_owned()),
+                uid: std::env::var("EDGERUSH_POD_UID").ok(),
+            };
+            reports = Some(Reports {
+                namespace: namespace.clone(),
+                lease: name.clone(),
+                own: reporter.name(),
+            });
+            let (reporting, telling) = (elector.reports, Rc::clone(&say));
+            let (running, failed) = (running.clone(), format!("report {}", reporter.name()));
+            electing.push(tokio::task::spawn_local(async move {
+                reporter
+                    .publish(&reporting, running, |error| {
+                        telling(&format!("{failed} cannot be written: {error}"));
+                    })
+                    .await;
+            }));
             let telling = Rc::clone(&say);
             let failed = lease.clone();
             electing.push(tokio::task::spawn_local(async move {
@@ -635,17 +676,22 @@ async fn control_until(
                     offered,
                     addresses,
                     move |peer, said| {
-                        let _stopped = heard.send(told_of(peer, &said));
+                        let _stopped = heard.send((told_of(peer, &said), ran(peer, &said)));
                     },
                     async move {
                         let _ = stopped.await;
                     },
                 )),
             ));
-            let telling = Rc::clone(&say);
+            let (telling, taking, telling_pods) = (Rc::clone(&say), Rc::clone(&runs), pods.clone());
             tasks.push(tokio::task::spawn_local(async move {
-                while let Some(line) = hearing.recv().await {
+                while let Some((line, ran)) = hearing.recv().await {
                     telling(&line);
+                    if let Some(ran) = ran {
+                        let mut runs = taking.borrow_mut();
+                        ran.into(&mut runs);
+                        said_runs(&telling_pods, &runs);
+                    }
                 }
             }));
             let telling = Rc::clone(&say);
@@ -658,6 +704,8 @@ async fn control_until(
             Some(Offering {
                 versions: RefCell::new(serving.versions),
                 offers,
+                runs: Rc::clone(&runs),
+                pods: pods.clone(),
             })
         }
         None => None,
@@ -686,6 +734,10 @@ async fn control_until(
             Debounce::default(),
             status,
             leading,
+            Acks {
+                own: running,
+                reports,
+            },
             move |said| {
                 let mut text = told(&said, write_config.as_deref());
                 if let (Said::Translated(translation), Some(offering)) = (&said, &offering) {
@@ -753,6 +805,9 @@ async fn resolve_own(own: Own, gateway: watch::Sender<Arc<[IpAddr]>>, say: Rc<dy
 struct Offering {
     versions: RefCell<Versions>,
     offers: watch::Sender<Option<Arc<Offer>>>,
+    /// What each data plane runs, each version offered among it.
+    runs: Rc<RefCell<Runs>>,
+    pods: watch::Sender<Pods>,
 }
 
 impl Offering {
@@ -765,9 +820,77 @@ impl Offering {
             &mut self.versions.borrow_mut(),
         )?;
         let version = offer.version().to_owned();
+        let generation = translation.gateway_status.as_ref().map(|s| s.generation);
+        let mut runs = self.runs.borrow_mut();
+        runs.offered(&version, generation);
+        said_runs(&self.pods, &runs);
         self.offers.send_replace(Some(Arc::new(offer)));
         Ok(version)
     }
+}
+
+/// What a data plane said of the config it holds or runs.
+enum Ran {
+    /// It runs this, and refused that, if it did.
+    Runs {
+        pod: IpAddr,
+        running: Option<String>,
+        refused: Option<(String, String)>,
+    },
+    /// Its stream ended.
+    Closed(IpAddr),
+}
+
+impl Ran {
+    /// Takes it into `runs`.
+    fn into(self, runs: &mut Runs) {
+        match self {
+            Self::Runs {
+                pod,
+                running,
+                refused,
+            } => runs.reported(
+                pod,
+                running.as_deref(),
+                refused
+                    .as_ref()
+                    .map(|(version, why)| (version.as_str(), why.as_str())),
+            ),
+            Self::Closed(pod) => runs.closed(pod),
+        }
+    }
+}
+
+/// What `heard` of the data plane at `peer` says of the config it runs, if anything.
+fn ran(peer: SocketAddr, heard: &Heard) -> Option<Ran> {
+    let pod = peer.ip();
+    match heard {
+        Heard::Refused(_) => None,
+        Heard::Opened { held, .. } => Some(Ran::Runs {
+            pod,
+            running: held.config.clone(),
+            refused: None,
+        }),
+        Heard::Reported(report) => Some(Ran::Runs {
+            pod,
+            running: report.running.config.clone(),
+            refused: report
+                .refused
+                .as_ref()
+                .map(|refused| (refused.config.clone(), refused.why.clone())),
+        }),
+        Heard::Closed(_) => Some(Ran::Closed(pod)),
+    }
+}
+
+/// Hands on what each data plane runs, as `runs` has it, where it changed.
+fn said_runs(pods: &watch::Sender<Pods>, runs: &Runs) {
+    let now = runs.pods();
+    pods.send_if_modified(|said| {
+        let changed = *said != now;
+        *said = now.clone();
+        changed
+    });
 }
 
 /// Serves the webhook `hooking` holds on a thread and runtime of its own (04 §3), so that a
@@ -946,6 +1069,10 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
             format!("the Gateway API's kinds:{}", kinds.concat())
         }
         Said::Failed { followed, failure } => format!("{followed}: {failure}"),
+        Said::GatewayApiStatus { object, written } => match written {
+            Ok(()) => format!("status of {object} written"),
+            Err(error) => format!("status of {object} cannot be written: {error}"),
+        },
         Said::Status {
             ingress,
             addresses,
