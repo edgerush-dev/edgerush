@@ -6,6 +6,7 @@
 //! and other controllers' parents of a route, kept whole; this controller's own parents of
 //! a route that are no longer wanted taken away. Pure: the time is passed in.
 
+use crate::acks::Pods;
 use crate::gateway_api::{GatewayKind, Served, supported};
 use edgerush_gateway_api::gateway::{
     GatewayStatus, GatewayStatusAddresses, GatewayStatusListeners,
@@ -19,6 +20,7 @@ use edgerush_translate::{self as translate, GATEWAY_CONTROLLER, Object};
 use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use k8s_openapi::jiff::Timestamp;
+use std::net::IpAddr;
 
 /// The API group of the Gateway API's kinds.
 const GROUP: &str = "gateway.networking.k8s.io";
@@ -158,19 +160,87 @@ pub(crate) fn class(
     }
 }
 
+/// Whether the data plane runs a generation of its Gateway, as its pods say they do: what
+/// the Gateway's `Programmed` says, and each listener's that is served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Programmed {
+    status: &'static str,
+    reason: &'static str,
+    message: String,
+}
+
+impl Programmed {
+    /// What it says of `generation`, the Gateway's in the config handed on, its pods
+    /// running what `pods` says and `ready` those ready (none known: those `pods` says):
+    /// true once every ready pod runs it; false where one refused the latest config; and
+    /// until then unknown, or false once `overdue`, the bound it is waited on past.
+    pub(crate) fn of(
+        generation: i64,
+        pods: &Pods,
+        ready: Option<&[IpAddr]>,
+        overdue: bool,
+    ) -> Self {
+        let ready: Vec<IpAddr> = match ready {
+            Some(ready) => ready.to_vec(),
+            None => pods.keys().copied().collect(),
+        };
+        if let Some((pod, why)) = ready.iter().find_map(|pod| {
+            pods.get(pod)
+                .and_then(|said| said.refused.as_ref())
+                .map(|why| (pod, why))
+        }) {
+            return Self {
+                status: "False",
+                reason: "Invalid",
+                message: format!("data plane {pod} refused the config: {why}"),
+            };
+        }
+        let running = ready
+            .iter()
+            .filter(|pod| {
+                pods.get(pod)
+                    .is_some_and(|said| said.runs == Some(generation))
+            })
+            .count();
+        let message = format!(
+            "{running} of {} data plane pods run generation {generation}",
+            ready.len()
+        );
+        let status = match (running == ready.len() && running > 0, overdue) {
+            (true, _) => "True",
+            (false, true) => "False",
+            (false, false) => "Unknown",
+        };
+        Self {
+            status,
+            reason: if status == "True" {
+                "Programmed"
+            } else {
+                "Pending"
+            },
+            message,
+        }
+    }
+
+    fn wanted(&self) -> Wanted {
+        Wanted::new("Programmed", self.status, self.reason, self.message.clone())
+    }
+}
+
 /// What the data plane's Gateway's status is to say, as `wanted` has it, its addresses
-/// `addresses`, merged with `live`. `Programmed` waits on the data plane's acks, not read
-/// yet: unknown where there is something to program.
+/// `addresses`, merged with `live`: its `Programmed` and that of each listener served as
+/// `programmed` says.
 pub(crate) fn gateway(
     live: Option<&GatewayStatus>,
     wanted: &translate::GatewayStatus,
     addresses: &[GatewayStatusAddresses],
+    programmed: &Programmed,
     now: Timestamp,
 ) -> GatewayStatus {
     let generation = wanted.generation;
     let mut conditions: Vec<Wanted> = wanted.conditions.iter().map(Wanted::from).collect();
     conditions.push(if wanted.programmable {
-        pending()
+        programmed.wanted()
     } else {
         Wanted::new(
             "Programmed",
@@ -189,7 +259,7 @@ pub(crate) fn gateway(
             let mut conditions: Vec<Wanted> =
                 listener.conditions.iter().map(Wanted::from).collect();
             conditions.push(match &listener.programmable {
-                Ok(()) => pending(),
+                Ok(()) => programmed.wanted(),
                 Err(why) => Wanted::new("Programmed", "False", "Invalid", why.clone()),
             });
             let old = live_listeners
@@ -249,16 +319,6 @@ pub(crate) fn addresses(addresses: &[IngressLoadBalancerIngress]) -> Vec<Gateway
             (None, None) => None,
         })
         .collect()
-}
-
-/// `Programmed` before the data plane's acks are read.
-fn pending() -> Wanted {
-    Wanted::new(
-        "Programmed",
-        "Unknown",
-        "Pending",
-        "waiting for the data plane to run it".to_owned(),
-    )
 }
 
 /// What the status of an HTTPRoute of `namespace` is to say, as `wanted` has it of its

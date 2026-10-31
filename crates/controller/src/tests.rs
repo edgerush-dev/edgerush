@@ -139,6 +139,14 @@ async fn until(what: &str, done: impl Fn() -> bool) {
     .unwrap_or_else(|_| panic!("never: {what}"));
 }
 
+/// What no data plane runs: this replica's alone, of none.
+fn acks() -> Acks {
+    Acks {
+        own: watch::channel(acks::Pods::new()).1,
+        reports: None,
+    }
+}
+
 /// What the control plane said, a line each, and its translations.
 #[derive(Default)]
 struct Heard {
@@ -246,6 +254,8 @@ fn every_follows_objects_are_translated_and_its_secrets_looked_at() {
             Scope::Namespace("shop".to_owned()),
             Scope::Namespace("blog".to_owned()),
         ]),
+        reports: Vec::new(),
+        ready: Vec::new(),
     };
     assert_eq!(
         followed.unlisted(),
@@ -364,6 +374,8 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
         status_service: Vec::new(),
         gateway_api: Some(gateway_api),
         watched: None,
+        reports: Vec::new(),
+        ready: Vec::new(),
     };
     let followed = followed_with(gateway_api);
     assert_eq!(followed.cluster().http_routes.len(), 1);
@@ -527,6 +539,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                         Debounce::default(),
                         None,
                         None,
+                        acks(),
                         said,
                     )
                     .await;
@@ -751,7 +764,17 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
                         quiet: Duration::from_secs(1),
                         most: Duration::from_secs(5),
                     };
-                    control(api, &[Scope::Cluster], &plane, debounce, None, None, said).await;
+                    control(
+                        api,
+                        &[Scope::Cluster],
+                        &plane,
+                        debounce,
+                        None,
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
                 }
             });
             until("the Secrets' failure said", || {
@@ -857,7 +880,17 @@ async fn each_namespace_of_the_scope_is_followed_and_all_are_translated_together
             let controlling = tokio::task::spawn_local({
                 let said = hear(&heard);
                 async move {
-                    control(api, &scope, &plane, Debounce::default(), None, None, said).await;
+                    control(
+                        api,
+                        &scope,
+                        &plane,
+                        Debounce::default(),
+                        None,
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
                 }
             });
             until("translated", || !heard.borrow().translations.is_empty()).await;
@@ -1088,6 +1121,7 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
                         Debounce::default(),
                         Some(source),
                         None,
+                        acks(),
                         said,
                     )
                     .await;
@@ -1173,6 +1207,7 @@ async fn a_config_is_not_held_up_by_its_status() {
                         Debounce::default(),
                         Some(source),
                         None,
+                        acks(),
                         said,
                     )
                     .await;
@@ -1332,6 +1367,7 @@ async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
                         Debounce::default(),
                         Some(source),
                         Some(leading),
+                        acks(),
                         said,
                     )
                     .await;
@@ -1444,12 +1480,13 @@ status:
     let heard: Rc<RefCell<Heard>> = Rc::default();
     let said = hear(&heard);
     let addresses = gateway_status::addresses(&[status::address("192.0.2.10")]);
+    let programmed = Programmed::of(2, &acks::Pods::new(), None, false);
     following(
         vec![class.clone()],
         vec![gateway.clone()],
         vec![app.clone(), old.clone()],
     )
-    .write_statuses(&api, &handed, &addresses, &said)
+    .write_statuses(&api, &handed, &addresses, &programmed, &said)
     .await;
     assert_eq!(
         heard.borrow().lines,
@@ -1499,7 +1536,94 @@ status:
     app.status = serde_json::from_value(bodies[2]["status"].clone()).unwrap();
     old.status = serde_json::from_value(bodies[3]["status"].clone()).unwrap();
     following(vec![class], vec![gateway], vec![app, old])
-        .write_statuses(&api, &handed, &addresses, &said)
+        .write_statuses(&api, &handed, &addresses, &programmed, &said)
         .await;
     assert_eq!(fake.seen().len(), 4, "a status written again");
+}
+
+#[test]
+fn the_leader_merges_every_replicas_report_and_counts_the_ready_pods() {
+    use acks::{Pod, Pods, Reporter};
+    let pod = |last: u8| IpAddr::from([10, 0, 0, last]);
+    let runs = |generation: i64| Pod {
+        runs: Some(generation),
+        refused: None,
+    };
+    let report = |pod_name: &str, lease: &str, pods: Pods| {
+        Reporter {
+            namespace: "edge".to_owned(),
+            lease: lease.to_owned(),
+            pod: pod_name.to_owned(),
+            uid: None,
+        }
+        .report(&pods)
+        .unwrap()
+    };
+    let reports = vec![
+        // This replica's own report, behind what it knows, of a pod it no longer serves
+        // among them: not read.
+        report(
+            "one",
+            "control",
+            Pods::from([(pod(1), runs(1)), (pod(5), runs(1))]),
+        ),
+        report(
+            "two",
+            "control",
+            Pods::from([(pod(1), runs(2)), (pod(2), runs(3))]),
+        ),
+        // Another control plane's.
+        report("three", "other", Pods::from([(pod(3), runs(3))])),
+    ];
+    let slice = |service: &str, endpoints: serde_json::Value| -> EndpointSlice {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": format!("{service}-x"), "namespace": "edge",
+                "labels": { "kubernetes.io/service-name": service } },
+            "addressType": "IPv4",
+            "endpoints": endpoints,
+        }))
+        .unwrap()
+    };
+    let slices = vec![
+        slice(
+            "edgerush-peers",
+            serde_json::json!([
+                { "addresses": ["10.0.0.1"], "conditions": { "ready": true } },
+                { "addresses": ["10.0.0.2"] },
+                { "addresses": ["10.0.0.4"], "conditions": { "ready": false } },
+            ]),
+        ),
+        slice(
+            "elsewhere",
+            serde_json::json!([{ "addresses": ["10.0.0.9"], "conditions": { "ready": true } }]),
+        ),
+    ];
+    let followed = Followed {
+        ingress_classes: Vec::new(),
+        ingresses: Vec::new(),
+        services: Vec::new(),
+        secrets: Vec::new(),
+        status_service: Vec::new(),
+        gateway_api: None,
+        watched: None,
+        reports: vec![follow_of("configmaps in edge", true, reports)],
+        ready: vec![follow_of("endpointslices in edge", true, slices)],
+    };
+    let (_own, said) = watch::channel(Pods::from([(pod(1), runs(4))]));
+    let acks = Acks {
+        own: said,
+        reports: Some(Reports {
+            namespace: "edge".to_owned(),
+            lease: "control".to_owned(),
+            own: "control-acks-one".to_owned(),
+        }),
+    };
+    // Its own pods as it knows them, the rest as the other replicas of its Lease say.
+    assert_eq!(
+        followed.pods(&acks),
+        Pods::from([(pod(1), runs(4)), (pod(2), runs(3))])
+    );
+    let service =
+        edgerush_config::ServiceName::parse("edgerush-peers.edge.svc.cluster.local").unwrap();
+    assert_eq!(followed.ready(&service), [pod(1), pod(2)]);
 }

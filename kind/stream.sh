@@ -21,7 +21,8 @@
 #     controller's class, its listener on the port the data plane binds, is served beside
 #     the Ingress, from one data plane, and the GatewayClass, the Gateway and the
 #     HTTPRoute say they are accepted, of their generation, the Gateway the data plane's
-#     address and its route; an HTTPRoute in `blog` led to `shop`'s Service
+#     address and its route, and programmed once the data plane runs it, as the replicas
+#     report; an HTTPRoute in `blog` led to `shop`'s Service
 #     answers 500 until a ReferenceGrant in `shop` allows it, and again once it is deleted;
 #     an HTTPRoute and an Ingress of one host and path are ranked by when the cluster made
 #     them, whichever API each is of: the older takes the requests, the other is said
@@ -255,8 +256,16 @@ stated 192.0.2.10 '{.status.addresses[0].value}' 5 -n edge gateway web ||
 stated 1 '{.status.listeners[0].attachedRoutes}' 5 -n edge gateway web ||
     fail "the Gateway's listener does not count its route: $(said_of -n edge gateway web)"
 stated "edgerush.dev/gateway-controller True"     '{.status.parents[0].controllerName} {.status.parents[0].conditions[?(@.type=="Accepted")].status}'     30 -n shop httproute web || fail "the HTTPRoute says $(said_of -n shop httproute web)"
+# Programmed once every ready data-plane pod runs the Gateway's generation, as the replica
+# it reaches reports it and the leader merges the reports.
+stated True "$(condition Programmed status)" 30 -n edge gateway web ||
+    fail "the Gateway is not said programmed: $(said_of -n edge gateway web)"
+stated True '{.status.listeners[0].conditions[?(@.type=="Programmed")].status}' 5 -n edge gateway web ||
+    fail "the Gateway's listener is not said programmed: $(said_of -n edge gateway web)"
+k -n edge get configmap -l gateway.edgerush.dev/acks=edgerush-control -o name | grep -q . ||
+    fail "no replica reports what its data planes run"
 refused_any && fail "a control-plane replica was refused a status of the Gateway API"
-pass "the GatewayClass, the Gateway and the HTTPRoute say they are accepted, the Gateway its address and its route, each of its generation"
+pass "the GatewayClass, the Gateway and the HTTPRoute say they are accepted, the Gateway its address and its route, each of its generation, and the Gateway programmed once its data plane runs it"
 
 k apply -f - >/dev/null <<EOF
 apiVersion: gateway.networking.k8s.io/v1

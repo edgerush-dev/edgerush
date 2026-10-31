@@ -1,4 +1,5 @@
 use super::*;
+use crate::acks::{Pod, Pods};
 use edgerush_translate::{ListenerStatus, ParentStatus, RouteStatus};
 
 /// The time `seconds` after the epoch.
@@ -237,7 +238,8 @@ fn a_gateway_says_its_listeners_as_wanted_and_keeps_what_is_not_ours() {
         r#type: Some("IPAddress".to_owned()),
         value: "192.0.2.10".to_owned(),
     }];
-    let status = gateway(Some(&live), &wanted_gateway(), &addresses, at(50));
+    let unknown = Programmed::of(4, &Pods::new(), None, false);
+    let status = gateway(Some(&live), &wanted_gateway(), &addresses, &unknown, at(50));
     assert_eq!(status.addresses.as_deref(), Some(addresses.as_slice()));
     assert_eq!(status.attached_listener_sets, Some(3), "not ours, kept");
     assert_eq!(
@@ -295,7 +297,8 @@ fn a_gateway_of_nothing_served_is_not_programmed_and_says_no_address_of_none() {
         programmable: false,
         ..wanted_gateway()
     };
-    let status = gateway(None, &wanted, &[], at(50));
+    let unknown = Programmed::of(4, &Pods::new(), None, false);
+    let status = gateway(None, &wanted, &[], &unknown, at(50));
     assert_eq!(status.addresses, None);
     let programmed = status
         .conditions
@@ -443,5 +446,78 @@ fn an_address_is_an_ip_address_or_else_a_host_name() {
             (Some("IPAddress"), "2001:db8::1"),
             (Some("Hostname"), "lb.example.com"),
         ]
+    );
+}
+
+#[test]
+fn programmed_once_every_ready_pod_runs_the_generation_and_false_once_overdue_or_refused() {
+    let pod = |last: u8| IpAddr::from([10, 0, 0, last]);
+    let running = |generation: i64| Pod {
+        runs: Some(generation),
+        refused: None,
+    };
+    let said = |p: &Programmed| (p.status, p.reason, p.message.clone());
+    let pods = Pods::from([(pod(1), running(4)), (pod(2), running(3))]);
+    let ready = [pod(1), pod(2)];
+    assert_eq!(
+        said(&Programmed::of(4, &pods, Some(&ready), false)),
+        (
+            "Unknown",
+            "Pending",
+            "1 of 2 data plane pods run generation 4".to_owned()
+        )
+    );
+    assert_eq!(
+        said(&Programmed::of(4, &pods, Some(&ready), true)).0,
+        "False",
+        "overdue"
+    );
+    assert_eq!(
+        said(&Programmed::of(4, &pods, Some(&ready[..1]), false)).0,
+        "True"
+    );
+    assert_eq!(
+        said(&Programmed::of(4, &pods, Some(&ready[..1]), false)).1,
+        "Programmed"
+    );
+    // A ready pod no replica reports runs nothing; without the ready pods known, those
+    // reported are taken.
+    assert_eq!(
+        said(&Programmed::of(4, &pods, Some(&[pod(1), pod(9)]), false)).2,
+        "1 of 2 data plane pods run generation 4"
+    );
+    let all = Pods::from([(pod(1), running(4)), (pod(2), running(4))]);
+    assert_eq!(said(&Programmed::of(4, &all, None, false)).0, "True");
+    assert_eq!(
+        said(&Programmed::of(4, &Pods::new(), Some(&[]), true)),
+        (
+            "False",
+            "Pending",
+            "0 of 0 data plane pods run generation 4".to_owned()
+        ),
+        "no pod at all is not programmed"
+    );
+    // A ready pod that refused the latest config makes it invalid; one not ready, nothing.
+    let refusing = Pods::from([
+        (pod(1), running(4)),
+        (
+            pod(2),
+            Pod {
+                runs: Some(3),
+                refused: Some("an unknown field".to_owned()),
+            },
+        ),
+    ]);
+    assert_eq!(
+        said(&Programmed::of(4, &refusing, Some(&ready), false)),
+        (
+            "False",
+            "Invalid",
+            "data plane 10.0.0.2 refused the config: an unknown field".to_owned()
+        )
+    );
+    assert_eq!(
+        said(&Programmed::of(4, &refusing, Some(&ready[..1]), false)).0,
+        "True"
     );
 }

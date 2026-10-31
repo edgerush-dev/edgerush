@@ -15,6 +15,8 @@
 //! webhook's reviews are read, the Ingress each asks about judged alone, and answered by
 //! [`admission`] (04 §3).
 
+use acks::{Pods, REPORT_LABEL};
+use edgerush_config::ServiceName;
 use edgerush_config::{ConfigError, compile};
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
@@ -24,10 +26,13 @@ use edgerush_kubernetes::{ApiError, ApiServer, Failure, Kind, Listed, Retry, Sco
 use edgerush_translate::{
     Cluster, GatewayName, GatewayStatus, Object, Plane, RouteStatus, Translation, translate,
 };
-use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
+use gateway_status::Programmed;
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +40,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
 
+pub mod acks;
 pub mod admission;
 pub mod gateway_api;
 mod gateway_status;
@@ -43,6 +49,32 @@ pub mod status;
 
 use gateway_api::{GatewayKind, Served};
 use status::Addresses;
+
+/// How long the data plane's pods are waited on to run a generation of its Gateway before
+/// its `Programmed` says false (04 §6).
+pub const PROGRAMMED_WITHIN: Duration = Duration::from_secs(30);
+
+/// What the data-plane pods run, as the replicas that serve them say it (04 §6).
+#[derive(Debug, Clone)]
+pub struct Acks {
+    /// What those this replica serves run.
+    pub own: watch::Receiver<Pods>,
+    /// Where every replica reports what its pods run, where there are several: their
+    /// namespace, the Lease they share, which labels each report, and this replica's own
+    /// report, which `own` says sooner.
+    pub reports: Option<Reports>,
+}
+
+/// Where the replicas' reports are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reports {
+    /// Their namespace.
+    pub namespace: String,
+    /// The Lease the replicas share.
+    pub lease: String,
+    /// This replica's own report's name.
+    pub own: String,
+}
 
 /// How long changes are gathered before they are translated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +157,7 @@ pub enum Said<'a> {
 /// comes to (02 §3).
 /// Runs for as long as it is polled, its follows ended with it. For a thread and runtime of
 /// its own, in a `LocalSet`.
+#[allow(clippy::too_many_arguments)]
 pub async fn control(
     api: ApiServer,
     scope: &[Scope],
@@ -132,6 +165,7 @@ pub async fn control(
     debounce: Debounce,
     status: Option<Addresses>,
     leading: Option<watch::Receiver<bool>>,
+    acks: Acks,
     said: impl Fn(Said<'_>) + 'static,
 ) {
     let api = Rc::new(api);
@@ -160,7 +194,26 @@ pub async fn control(
             .as_ref()
             .map(|gateway| GatewayApi::start(&mut start, gateway)),
         watched: watched(scope),
+        reports: match &acks.reports {
+            Some(reports) => start.follows(&[Scope::Namespace(reports.namespace.clone())]),
+            None => Vec::new(),
+        },
+        ready: match own_service(plane) {
+            Some(service) => start.follows(&[Scope::Namespace(service.namespace)]),
+            None => Vec::new(),
+        },
     };
+    // What this replica's pods run changing is a change.
+    {
+        let (mut told, changed) = (acks.own.clone(), Rc::clone(&changed));
+        tasks.spawn_local(async move {
+            while told.changed().await.is_ok() {
+                changed.notify_one();
+            }
+        });
+    }
+    // The generation of the Gateway handed on, and when it was first.
+    let mut handed_since: Option<(i64, Instant)> = None;
     // Coming to lead is a change: every status is looked at, as the last leader may have
     // left some stale.
     if let Some(leading) = &leading {
@@ -201,6 +254,12 @@ pub async fn control(
             Step::Translated(translation) => {
                 handed = Some((translation.claimed.clone(), translation.served.clone()));
                 handed_api = Handed::of(translation);
+                if let Some(handed) = &handed_api {
+                    let generation = handed.status.generation;
+                    if handed_since.is_none_or(|(since, _)| since != generation) {
+                        handed_since = Some((generation, Instant::now()));
+                    }
+                }
                 said(Said::Translated(translation));
             }
             Step::Refused {
@@ -233,8 +292,14 @@ pub async fn control(
             (&followed.gateway_api, &handed_api, &addresses, leads)
         {
             let addresses = gateway_status::addresses(addresses);
+            let pods = followed.pods(&acks);
+            let ready = own_service(plane).map(|service| followed.ready(&service));
+            let overdue =
+                handed_since.is_some_and(|(_, since)| since.elapsed() >= PROGRAMMED_WITHIN);
+            let programmed =
+                Programmed::of(handed.status.generation, &pods, ready.as_deref(), overdue);
             gateway_api
-                .write_statuses(&api, handed, &addresses, &*said)
+                .write_statuses(&api, handed, &addresses, &programmed, &*said)
                 .await;
         }
         // An Ingress's only where the control plane is told where the addresses are.
@@ -258,8 +323,22 @@ pub async fn control(
                 });
             }
         }
-        // Until a change comes, and then until its moment is over.
-        changed.notified().await;
+        // Until a change comes, or the bound its pods are waited on to run the Gateway's
+        // generation, and then until its moment is over.
+        let bound = handed_since
+            .map(|(_, since)| since + PROGRAMMED_WITHIN)
+            .filter(|bound| *bound > Instant::now());
+        match bound {
+            Some(bound) => {
+                if tokio::time::timeout_at(bound, changed.notified())
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+            }
+            None => changed.notified().await,
+        }
         waiting.changed(Instant::now());
         while let Some(due) = waiting.due(debounce) {
             if tokio::time::timeout_at(due, changed.notified())
@@ -479,6 +558,7 @@ impl GatewayApi {
         api: &ApiServer,
         handed: &Handed,
         addresses: &[edgerush_gateway_api::gateway::GatewayStatusAddresses],
+        programmed: &Programmed,
         said: &dyn Fn(Said<'_>),
     ) {
         let now = lease::wall_clock();
@@ -520,8 +600,13 @@ impl GatewayApi {
                 });
             }
         }
-        let status =
-            gateway_status::gateway(gateway.status.as_ref(), &handed.status, addresses, now);
+        let status = gateway_status::gateway(
+            gateway.status.as_ref(),
+            &handed.status,
+            addresses,
+            programmed,
+            now,
+        );
         if gateway.status.as_ref() != Some(&status) {
             let object = &handed.gateway;
             let version = gateway
@@ -599,6 +684,10 @@ struct Followed {
     gateway_api: Option<GatewayApi>,
     /// The namespaces watched, where not every one is.
     watched: Option<Vec<String>>,
+    /// The namespace of the replicas' reports of what their pods run.
+    reports: Vec<Follow<ConfigMap>>,
+    /// The namespace of the data plane's own Service, for its ready pods.
+    ready: Vec<Follow<EndpointSlice>>,
 }
 
 impl Followed {
@@ -618,6 +707,53 @@ impl Followed {
         self.status_service
             .iter()
             .all(|follow| follow.objects.borrow().listed)
+    }
+
+    /// What each data-plane pod runs: as this replica's own say, and as every other
+    /// replica's report of `acks` says for the rest.
+    fn pods(&self, acks: &Acks) -> Pods {
+        let mut pods = acks.own.borrow().clone();
+        if let Some(reports) = &acks.reports {
+            for report in objects(&self.reports) {
+                let labels = report.metadata.labels.as_ref();
+                let theirs = labels.and_then(|labels| labels.get(REPORT_LABEL))
+                    == Some(&reports.lease)
+                    && report.metadata.name.as_deref() != Some(reports.own.as_str());
+                if let (true, Some(said)) = (theirs, acks::read(&report)) {
+                    for (pod, runs) in said {
+                        pods.entry(pod).or_insert(runs);
+                    }
+                }
+            }
+        }
+        pods
+    }
+
+    /// The addresses of `service`'s ready endpoints: the data plane's ready pods.
+    fn ready(&self, service: &ServiceName) -> Vec<IpAddr> {
+        objects(&self.ready)
+            .iter()
+            .filter(|slice| {
+                slice
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("kubernetes.io/service-name"))
+                    == Some(&service.service)
+            })
+            .flat_map(|slice| slice.endpoints.iter().flatten())
+            .filter(|endpoint| {
+                endpoint
+                    .conditions
+                    .as_ref()
+                    .and_then(|conditions| conditions.ready)
+                    != Some(false)
+            })
+            .flat_map(|endpoint| &endpoint.addresses)
+            .filter_map(|address| address.parse().ok())
+            .collect::<std::collections::BTreeSet<IpAddr>>()
+            .into_iter()
+            .collect()
     }
 
     /// The Ingresses followed, as they are now.
@@ -665,6 +801,13 @@ fn watched(scope: &[Scope]) -> Option<Vec<String>> {
             Scope::Cluster | Scope::Named(_) => None,
         })
         .collect()
+}
+
+/// The data plane's own Service, where its settings name it: its ready pods are those
+/// counted for `Programmed`.
+fn own_service(plane: &Plane) -> Option<ServiceName> {
+    let named = plane.data_plane.own_service.as_deref()?;
+    ServiceName::parse(named).ok()
 }
 
 /// The objects of `follows`, as they last published them.
