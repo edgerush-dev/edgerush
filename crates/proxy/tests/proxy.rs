@@ -147,6 +147,9 @@ async fn reloadable_proxy(yaml: &str) -> (Arc<Proxy>, BTreeMap<String, SocketAdd
     let mut addresses = BTreeMap::new();
     let mut sockets = Vec::new();
     for (position, listener) in proxy.listeners().iter().enumerate() {
+        let Some(listener) = listener else {
+            continue;
+        };
         // Of the standard library's kind, to be handed to the worker's runtime and to no
         // other, exactly as the harness hands its listeners over.
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

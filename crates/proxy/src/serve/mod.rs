@@ -375,9 +375,6 @@ impl HttpBody for Body {
 /// What a worker keeps to itself is in [`Worker`].
 #[derive(Debug)]
 pub struct Proxy {
-    /// The names of the listeners of the config the data plane was made with. A socket is
-    /// served as the listener at its position here, whatever configs come later.
-    listeners: Vec<String>,
     current: ArcSwap<Snapshot>,
     /// Outside the snapshot, so that a reload resets no counter.
     metrics: Metrics,
@@ -499,7 +496,7 @@ pub struct Worker {
     /// threshold of which a client proves its address first, and the connection closed to
     /// make room until it has gone (16 §6).
     h3_listeners: Rc<h3_listener::Common>,
-    /// By position in [`Proxy::listeners`]: the client validation its connections here are
+    /// By slot ([`Proxy::listeners`]): the client validation its connections here are
     /// accepted under, and the drain they hear.
     validations: RefCell<Vec<Validation>>,
     /// Which snapshot `validations` and `routes` were last brought up to.
@@ -751,8 +748,11 @@ struct Snapshot {
     /// Which config this is, counting from the first: what tells a worker its balancing
     /// state is for an earlier one.
     generation: u64,
-    /// By position in [`Proxy::listeners`]: where this config has the listener of that
-    /// name, if it has one. No request looks a listener up by its name.
+    /// By slot: the name of the listener whose socket it is, if one's is. A socket is served
+    /// as the listener its slot names, whatever configs come later.
+    names: Arc<[Option<String>]>,
+    /// By slot: where this config has the listener of that name, if it has one. No request
+    /// looks a listener up by its name.
     listeners: Vec<Option<usize>>,
     /// By position of the upstream, then of the endpoint: where to connect, in the form a
     /// request target takes, made once so that no request formats an address.
@@ -777,21 +777,21 @@ struct Snapshot {
     /// By position of the upstream: what its connections are secured with, if anything.
     /// Kept from the config before for as long as the TLS is the same.
     secure: Vec<Option<Arc<Secure>>>,
-    /// By position in [`Proxy::listeners`]: what a connection to it is accepted with, if
+    /// By slot ([`Proxy::listeners`]): what a connection to it is accepted with, if
     /// it is to speak TLS. Kept from the config before for as long as the certificates
     /// are the same, and with it the keys of the session tickets it has issued.
     tls: Vec<Option<Arc<Tls>>>,
-    /// By position in [`Proxy::listeners`]: the port its HTTP/3 is served on, where it has
+    /// By slot ([`Proxy::listeners`]): the port its HTTP/3 is served on, where it has
     /// a UDP socket. The first config's: sockets are bound once, at the start, and a reload
     /// opens, closes and moves none of them (03 §4).
     quic: Vec<Option<u16>>,
-    /// By position in [`Proxy::listeners`]: the `Alt-Svc` its answers carry, if it serves
+    /// By slot ([`Proxy::listeners`]): the `Alt-Svc` its answers carry, if it serves
     /// HTTP/3 (16 §5), made once so that no answer formats it.
     alt_svc: Vec<Option<HeaderModifier>>,
     /// What its tunnels are routed by, keyed so that a worker sees at a reload which went
     /// (03 §10). Worked out against the config this one replaces, as `destinations` are.
     routed: Routed,
-    /// By position in [`Proxy::listeners`]: where its access log is written, if it has one
+    /// By slot ([`Proxy::listeners`]): where its access log is written, if it has one
     /// (21 §4).
     logs: Vec<Option<Sink>>,
     /// What the rate-limiting service's pods are reached with, if with TLS (06 §4): made as

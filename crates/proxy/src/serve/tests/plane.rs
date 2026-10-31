@@ -752,7 +752,9 @@ fn config_with(listeners: &[&str]) -> Compiled {
 
 #[test]
 fn a_snapshot_knows_where_it_has_the_listeners_that_have_sockets() {
-    let sockets = ["admin".to_owned(), "web".to_owned()];
+    // Two slots taken and one no listener has.
+    let sockets: Arc<[Option<String>]> =
+        [Some("admin".to_owned()), Some("web".to_owned()), None].into();
     let metrics = Metrics::new(NonZeroUsize::MIN, sockets.len());
     let listeners = |names: &[&str]| {
         Snapshot::new(
@@ -762,7 +764,7 @@ fn a_snapshot_knows_where_it_has_the_listeners_that_have_sockets() {
                 named: &HashMap::new(),
                 denied: &crate::egress::Denied::default(),
             },
-            &sockets,
+            Arc::clone(&sockets),
             &metrics,
             None,
             &Keys::default(),
@@ -773,22 +775,30 @@ fn a_snapshot_knows_where_it_has_the_listeners_that_have_sockets() {
         .listeners
     };
 
-    assert_eq!(listeners(&["admin", "web"]), [Some(0), Some(1)]);
+    assert_eq!(listeners(&["admin", "web"]), [Some(0), Some(1), None]);
     // Listeners are held in the order of their names, so one more moves the others.
     assert_eq!(
         listeners(&["aaa", "admin", "metrics", "web"]),
-        [Some(1), Some(3)]
+        [Some(1), Some(3), None]
     );
-    assert_eq!(listeners(&["web"]), [None, Some(0)]);
-    assert_eq!(listeners(&["other"]), [None, None]);
+    assert_eq!(listeners(&["web"]), [None, Some(0), None]);
+    assert_eq!(listeners(&["other"]), [None, None, None]);
 }
 
 #[test]
 fn a_data_plane_serves_the_listeners_it_was_made_with() {
     let proxy = Proxy::new(config_with(&["web", "admin"]), NonZeroUsize::MIN).unwrap();
-    assert_eq!(proxy.listeners(), ["admin", "web"]);
+    let named = |listeners: &[Option<String>]| -> Vec<String> {
+        listeners.iter().flatten().cloned().collect()
+    };
+    // A slot for every listener there can be, the first config's in the first of them.
+    assert_eq!(proxy.listeners().len(), edgerush_config::MOST_LISTENERS);
+    assert_eq!(
+        proxy.listeners()[..2],
+        [Some("admin".to_owned()), Some("web".to_owned())]
+    );
     proxy.reload(config_with(&["later"])).unwrap();
-    assert_eq!(proxy.listeners(), ["admin", "web"]);
+    assert_eq!(named(&proxy.listeners()), ["admin", "web"]);
 }
 
 #[test]

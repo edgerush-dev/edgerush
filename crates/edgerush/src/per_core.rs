@@ -92,10 +92,17 @@ pub(crate) fn start(
     let started = sockets.len();
     // Each worker says, once it has set up what it serves, whether it could.
     let (ready, readied) = std::sync::mpsc::channel::<Result<(), NotStarted>>();
-    let names: Arc<[String]> = proxy.listeners().into();
+    // By slot, as the data plane numbers its listeners: the first are the sockets'.
+    let names = proxy.listeners();
     // Every worker has a socket for every listener, the same ones in the same order.
     let listeners = sockets.first().map_or(0, Vec::len);
-    let loads = Loads::new(sockets.len(), connections.each, connections.quic, listeners);
+    let loads = Loads::new(
+        sockets.len(),
+        connections.each,
+        connections.quic,
+        names.len(),
+    );
+    loads.listening(listeners);
     let (workers, handed_over): (Vec<_>, Vec<_>) = sockets
         .iter()
         .map(|_| mpsc::channel::<HandedOver>(ON_THEIR_WAY))
@@ -138,7 +145,12 @@ pub(crate) fn start(
                 let mut thread = Essential::new(format!("worker {position}"), &tell);
                 let essential =
                     |what: String| Essential::new(format!("worker {position}'s {what}"), &tell);
-                let name = |listener: usize| names.get(listener).map_or("", String::as_str);
+                let name = |listener: usize| {
+                    names
+                        .get(listener)
+                        .and_then(Option::as_deref)
+                        .unwrap_or_default()
+                };
                 let local = LocalSet::new();
                 let entered = runtime.enter();
                 // The upstream connections of this worker and of no other, made where

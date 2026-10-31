@@ -13,6 +13,10 @@ use std::path::PathBuf;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Where requests come in, by name. They have no order.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(extend("maxProperties" = crate::compile::MOST_LISTENERS))
+    )]
     pub listeners: BTreeMap<String, Listener>,
     /// The routes, in order of precedence among otherwise equal matches.
     pub routes: Vec<Route>,

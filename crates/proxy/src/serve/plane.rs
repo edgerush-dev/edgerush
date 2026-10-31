@@ -12,7 +12,7 @@ use crate::upstream::balancing::Carry;
 use crate::upstream::destination::{Aside, Destinations, Keys, Retiring, ReuseIdentity};
 use crate::upstream::secure::Secure;
 use arc_swap::ArcSwap;
-use edgerush_config::{Compiled, CompiledRateLimiting};
+use edgerush_config::{Compiled, CompiledRateLimiting, MOST_LISTENERS};
 use edgerush_discovery::{Endpoints, SERVICE_NAME_LABEL, zone_of};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -270,7 +270,7 @@ impl Snapshot {
     pub(super) fn new(
         config: Arc<Compiled>,
         found: Found<'_>,
-        listeners: &[String],
+        names: Arc<[Option<String>]>,
         metrics: &Metrics,
         previous: Option<&Snapshot>,
         keys: &Keys,
@@ -295,10 +295,13 @@ impl Snapshot {
             .collect::<Result<_, _>>()?;
         let nothing_routed = Routed::default();
         let previous_routed = previous.map_or(&nothing_routed, |previous| &previous.routed);
-        let routed = Routed::reconcile(&config, listeners, previous_routed, keys);
-        let listeners: Vec<Option<usize>> = listeners
+        let routed = Routed::reconcile(&config, &names, previous_routed, keys);
+        let listeners: Vec<Option<usize>> = names
             .iter()
-            .map(|name| config.listeners().iter().position(|l| l.name == *name))
+            .map(|name| {
+                let name = name.as_ref()?;
+                config.listeners().iter().position(|l| l.name == *name)
+            })
             .collect();
         let tls = listeners
             .iter()
@@ -398,6 +401,7 @@ impl Snapshot {
         let snapshot = Self {
             config,
             generation: previous.map_or(0, |previous| previous.generation + 1),
+            names,
             listeners,
             endpoints,
             zoned,
@@ -433,16 +437,22 @@ impl Proxy {
     ///
     /// [`Worker::new`]: super::Worker::new
     pub fn new(config: Compiled, workers: NonZeroUsize) -> Result<Self, ProxyError> {
-        let listeners: Vec<String> = config
+        // Every slot there will be, the first config's listeners in the first of them.
+        let slots: Arc<[Option<String>]> = config
             .listeners()
             .iter()
-            .map(|listener| listener.name.clone())
+            .map(|listener| Some(listener.name.clone()))
+            .chain(std::iter::repeat(None))
+            .take(MOST_LISTENERS.max(config.listeners().len()))
             .collect();
         // A shard for every worker, so that no two write to one line of cache.
-        let metrics = Metrics::new(workers, listeners.len());
+        let metrics = Metrics::new(workers, slots.len());
+        for (slot, _) in slots.iter().enumerate().filter(|(_, name)| name.is_some()) {
+            metrics.listen(slot);
+        }
         let keys = Keys::default();
         let logs = Logs::new(workers.get(), Arc::clone(&metrics.logs_dropped));
-        let prepared = logs.prepare(&config, &listeners)?;
+        let prepared = logs.prepare(&config, &slots)?;
         let (namespaces, _) = tokio::sync::watch::channel(namespaces_of(&config));
         let (names, _) = tokio::sync::watch::channel(names_of(&config));
         // After none, nothing to retire; and nothing discovered or resolved yet.
@@ -453,7 +463,7 @@ impl Proxy {
                 named: &Named::new(),
                 denied: &Denied::default(),
             },
-            &listeners,
+            slots,
             &metrics,
             None,
             &keys,
@@ -463,7 +473,6 @@ impl Proxy {
             h3_listener::Secrets::new().map_err(|error| ProxyError::Random(error.to_string()))?;
         logs.commit(prepared);
         Ok(Self {
-            listeners,
             current: ArcSwap::from_pointee(snapshot),
             metrics,
             workers,
@@ -481,11 +490,11 @@ impl Proxy {
         })
     }
 
-    /// The names of the listeners that can be served: those of the config the data plane
-    /// was made with, in its order.
+    /// The listeners' slots, each named by the listener whose socket it is, if one's is: the
+    /// config the data plane was made with has the first of them, in its order.
     #[must_use]
-    pub fn listeners(&self) -> &[String] {
-        &self.listeners
+    pub fn listeners(&self) -> Arc<[Option<String>]> {
+        Arc::clone(&self.current.load().names)
     }
 
     /// Drains the data plane: every worker, at its next sweep, stops accepting and lets its
@@ -512,7 +521,7 @@ impl Proxy {
         // Against the config on its way out, so that a destination which has not changed
         // keeps what its connections are filed under and one that has gone is retired.
         let previous = self.current.load();
-        let prepared = self.logs.prepare(&config, &self.listeners)?;
+        let prepared = self.logs.prepare(&config, &previous.names)?;
         let discovered = self
             .discovered
             .lock()
@@ -526,7 +535,7 @@ impl Proxy {
                 named: &named,
                 denied: &denied,
             },
-            &self.listeners,
+            Arc::clone(&previous.names),
             &self.metrics,
             Some(&previous),
             &self.keys,
@@ -645,7 +654,7 @@ impl Proxy {
         let (snapshot, retiring) = Snapshot::new(
             Arc::clone(&previous.config),
             then,
-            &self.listeners,
+            Arc::clone(&previous.names),
             &self.metrics,
             Some(&previous),
             &self.keys,
@@ -718,7 +727,7 @@ impl Proxy {
         let (snapshot, retiring) = Snapshot::new(
             Arc::clone(&previous.config),
             then,
-            &self.listeners,
+            Arc::clone(&previous.names),
             &self.metrics,
             Some(&previous),
             &self.keys,
@@ -793,7 +802,7 @@ impl Proxy {
             let (snapshot, retiring) = Snapshot::new(
                 Arc::clone(&previous.config),
                 then,
-                &self.listeners,
+                Arc::clone(&previous.names),
                 &self.metrics,
                 Some(&previous),
                 &self.keys,
@@ -899,7 +908,7 @@ impl Proxy {
             .zip(snapshot.limit_slots.iter())
             .map(|(limit, slot)| (limit.name.as_str(), *slot, limit.dry_run))
             .collect();
-        let mut scrape = self.metrics.render(&self.listeners, &upstreams, &endpoints);
+        let mut scrape = self.metrics.render(&snapshot.names, &upstreams, &endpoints);
         let mut refused: Vec<(&str, &'static str, usize)> = Vec::new();
         for (upstream, addresses) in snapshot.config.upstreams().iter().zip(&snapshot.refused) {
             let mut by_why: BTreeMap<Refusal, usize> = BTreeMap::new();

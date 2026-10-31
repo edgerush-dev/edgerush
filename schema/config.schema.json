@@ -33,7 +33,8 @@
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/Listener"
-      }
+      },
+      "maxProperties": 64
     },
     "rate_limiting": {
       "description": "How the data plane enforces the rate limits its rules are under; left out, it\nenforces none, though it checks them.",

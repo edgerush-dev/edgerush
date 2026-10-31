@@ -752,8 +752,9 @@ fn class_of(status: StatusCode) -> usize {
 #[derive(Debug)]
 pub(crate) struct Metrics {
     shards: NonZeroUsize,
-    /// By the position of the listener's socket.
-    listeners: Vec<Sharded<ListenerCounters>>,
+    /// By the slot of the listener's socket; a slot is filled when a listener first takes
+    /// it, so that slots no listener has taken cost nothing.
+    listeners: Box<[OnceLock<Sharded<ListenerCounters>>]>,
     /// By slot; a slot is filled when it is given out and stays filled.
     upstreams: Box<[OnceLock<Sharded<UpstreamCounters>>]>,
     /// Which slot an upstream's name has. Only reloads and scrapes come here.
@@ -867,7 +868,7 @@ impl Metrics {
     pub(crate) fn new(shards: NonZeroUsize, listeners: usize) -> Self {
         Self {
             shards,
-            listeners: (0..listeners).map(|_| Sharded::new(shards)).collect(),
+            listeners: (0..listeners).map(|_| OnceLock::new()).collect(),
             upstreams: (0..UPSTREAM_SLOTS).map(|_| OnceLock::new()).collect(),
             slots: Mutex::default(),
             limits: (0..LIMIT_SLOTS).map(|_| OnceLock::new()).collect(),
@@ -906,9 +907,16 @@ impl Metrics {
         self.limiters.local()
     }
 
-    /// This thread's shard of a listener's counters.
+    /// This thread's shard of a listener's counters, if a listener has taken its slot.
     pub(crate) fn listener(&self, socket: usize) -> Option<&ListenerCounters> {
-        self.listeners.get(socket).map(Sharded::local)
+        self.listeners.get(socket)?.get().map(Sharded::local)
+    }
+
+    /// Fills the slot of a listener's socket, for a listener taking it.
+    pub(crate) fn listen(&self, socket: usize) {
+        if let Some(series) = self.listeners.get(socket) {
+            series.get_or_init(|| Sharded::new(self.shards));
+        }
     }
 
     /// The connections open on every listener, over TCP and QUIC alike, every worker's.
@@ -916,6 +924,7 @@ impl Metrics {
         let open: i64 = self
             .listeners
             .iter()
+            .filter_map(OnceLock::get)
             .map(|series| series.sum(|shard| shard.active.get()))
             .sum();
         usize::try_from(open).unwrap_or(0)
@@ -1085,17 +1094,23 @@ impl Metrics {
         slot
     }
 
-    /// The scrape: the listeners by their names, and the upstreams of the current config
-    /// by theirs, each with the slot it has; and, for the upstreams of the current config,
-    /// how many of their endpoints pass their checks and how many are set aside.
+    /// The scrape: the listeners by their names, by the slot each has, and the upstreams of
+    /// the current config by theirs, each with the slot it has; and, for the upstreams of
+    /// the current config, how many of their endpoints pass their checks and how many are
+    /// set aside.
     pub(crate) fn render(
         &self,
-        listeners: &[String],
+        listeners: &[Option<String>],
         upstreams: &[(&str, usize)],
         endpoints: &[(&str, usize, usize)],
     ) -> String {
         let mut scrape = Exposition::new();
-        let listeners = || listeners.iter().zip(&self.listeners);
+        let listeners = || {
+            listeners
+                .iter()
+                .zip(&self.listeners)
+                .filter_map(|(name, series)| Some((name.as_ref()?, series.get()?)))
+        };
 
         let name = "edgerush_listener_connections_accepted_total";
         scrape.family(name, Kind::Counter, "Connections accepted.");
@@ -1465,8 +1480,12 @@ fn seconds(nanoseconds: u64) -> f64 {
 mod tests {
     use super::*;
 
+    /// Metrics of two listeners, in the first two of three slots.
     fn metrics() -> Metrics {
-        Metrics::new(NonZeroUsize::new(4).unwrap(), 2)
+        let metrics = Metrics::new(NonZeroUsize::new(4).unwrap(), 3);
+        metrics.listen(0);
+        metrics.listen(1);
+        metrics
     }
 
     #[test]
@@ -1647,7 +1666,7 @@ mod tests {
     fn help_has_no_runs_of_spaces() {
         let metrics = metrics();
         let writes = metrics.limit_slot("writes");
-        let scrape = metrics.render(&["web".to_owned()], &[("cart", 1)], &[("cart", 1, 0)])
+        let scrape = metrics.render(&[Some("web".to_owned())], &[("cart", 1)], &[("cart", 1, 0)])
             + &metrics.render_limits(&[("writes", writes, true)], 1 << 20);
         let broken: Vec<&str> = scrape
             .lines()
@@ -1659,7 +1678,7 @@ mod tests {
     #[test]
     fn a_scrape_shows_what_was_counted() {
         let metrics = metrics();
-        let listeners = ["admin".to_owned(), "web".to_owned()];
+        let listeners = [Some("admin".to_owned()), Some("web".to_owned()), None];
         let cart = metrics.upstream_slot("cart");
 
         let web = metrics.listener(1).unwrap();
@@ -1708,6 +1727,29 @@ mod tests {
     }
 
     #[test]
+    fn a_slot_no_listener_has_taken_counts_nothing_and_shows_nothing() {
+        let metrics = metrics();
+        assert!(metrics.listener(2).is_none());
+        assert!(metrics.listener(3).is_none());
+        // Named by a config but never taken: nothing to show.
+        let named = [Some("admin".to_owned()), None, Some("late".to_owned())];
+        let scrape = metrics.render(&named, &[], &[]);
+        assert!(scrape.contains("{listener=\"admin\"}"), "{scrape}");
+        assert!(!scrape.contains("late"), "{scrape}");
+
+        metrics.listen(2);
+        metrics.listener(2).unwrap().accepted.inc();
+        let scrape = metrics.render(&named, &[], &[]);
+        assert!(
+            scrape.contains("edgerush_listener_connections_accepted_total{listener=\"late\"} 1\n"),
+            "{scrape}"
+        );
+        // Taken again, it keeps what it counted.
+        metrics.listen(2);
+        assert_eq!(metrics.listener(2).unwrap().accepted.get(), 1);
+    }
+
+    #[test]
     fn what_is_counted_on_other_threads_shows_too() {
         let metrics = std::sync::Arc::new(metrics());
         let threads: Vec<_> = (0..6)
@@ -1724,7 +1766,7 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        let scrape = metrics.render(&["web".to_owned()], &[], &[]);
+        let scrape = metrics.render(&[Some("web".to_owned())], &[], &[]);
         let line = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"} 6\n";
         assert!(scrape.contains(line), "{scrape}");
     }
@@ -1761,7 +1803,7 @@ mod tests {
             }
         }
         assert!(shards.iter().collect::<HashSet<_>>().len() < shards.len());
-        let scrape = metrics.render(&["web".to_owned()], &[], &[]);
+        let scrape = metrics.render(&[Some("web".to_owned())], &[], &[]);
         let sample = |name: &str| {
             scrape
                 .lines()
@@ -1790,7 +1832,7 @@ mod tests {
         counters.refused(StatusCode::BAD_REQUEST, "bad_connection");
         counters.answered(Answer::BadConnection);
         counters.refused(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, "head_too_long");
-        let scrape = metrics.render(&["web".to_owned(), "api".to_owned()], &[], &[]);
+        let scrape = metrics.render(&[Some("web".to_owned()), Some("api".to_owned())], &[], &[]);
         for line in [
             "edgerush_listener_responses_total{listener=\"web\",class=\"4xx\"} 3\n",
             "edgerush_listener_local_answers_total{listener=\"web\",reason=\"repeated_length\"} 1\n",
@@ -1816,7 +1858,7 @@ mod tests {
         web.paused(AcceptPause::Share);
         web.paused(AcceptPause::Share);
         web.paused(AcceptPause::WorkerCap);
-        let scrape = metrics.render(&["web".to_owned()], &[], &[]);
+        let scrape = metrics.render(&[Some("web".to_owned())], &[], &[]);
         for line in [
             "edgerush_listener_accept_paused_total{listener=\"web\",reason=\"share\"} 2
 ",
@@ -1834,7 +1876,7 @@ mod tests {
         web.proxy_header(ProxyHeader::Accepted);
         web.proxy_header(ProxyHeader::Accepted);
         web.proxy_header(ProxyHeader::Missing);
-        let scrape = metrics.render(&["web".to_owned()], &[], &[]);
+        let scrape = metrics.render(&[Some("web".to_owned())], &[], &[]);
         for (outcome, count) in [
             ("accepted", 2),
             ("local", 0),

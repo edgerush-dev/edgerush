@@ -27,6 +27,10 @@ use std::path::PathBuf;
 #[serde(deny_unknown_fields)]
 pub struct HarnessFile {
     /// Where requests come in, by name.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(extend("maxProperties" = crate::compile::MOST_LISTENERS))
+    )]
     pub listeners: BTreeMap<String, Listener>,
     /// The routes of `http` and `https` listeners, in order of precedence among otherwise
     /// equal matches; empty for none.
