@@ -820,3 +820,72 @@ async fn an_object_is_read_created_and_replaced_as_of_its_version() {
         serde_json::from_str(&seen.iter().find(|seen| seen.method == "PUT").unwrap().body).unwrap();
     assert_eq!(put, lease("three", "8"));
 }
+
+#[tokio::test]
+async fn a_status_is_replaced_as_of_its_version_in_a_namespace_or_the_cluster() {
+    let fake = Fake::start_by_method(&["127.0.0.1"], |method, path| match (method, path) {
+        (
+            "PUT",
+            "/apis/gateway.networking.k8s.io/v1/gatewayclasses/edgerush/status"
+            | "/apis/gateway.networking.k8s.io/v1/namespaces/shop/httproutes/web/status",
+        ) => answer(200, "{}"),
+        _ => answer(
+            409,
+            r#"{"kind":"Status","code":409,"message":"the object has been modified"}"#,
+        ),
+    })
+    .await;
+    let client = fake.client(&token("statuses", "secret"), Timing::default());
+    let status = serde_json::json!({ "conditions": [] });
+    client
+        .replace_status::<GatewayClass>("", "edgerush", "7", &status)
+        .await
+        .unwrap();
+    client
+        .replace_status::<HTTPRoute>("shop", "web", "3", &status)
+        .await
+        .unwrap();
+    let conflict = client
+        .replace_status::<HTTPRoute>("shop", "other", "3", &status)
+        .await
+        .unwrap_err();
+    assert!(conflict.is_conflict(), "{conflict:?}");
+    // A cluster's kind is named in no namespace, and a namespace's in one.
+    assert_eq!(
+        client
+            .replace_status::<GatewayClass>("shop", "edgerush", "7", &status)
+            .await
+            .unwrap_err(),
+        ApiError::NotNamespaced("GatewayClass")
+    );
+    assert_eq!(
+        client
+            .replace_status::<HTTPRoute>("", "web", "3", &status)
+            .await
+            .unwrap_err(),
+        ApiError::Namespace(String::new())
+    );
+    let seen = fake.seen();
+    assert_eq!(seen.len(), 3, "a refused name was sent");
+    // What is written is the object's kind, name and version, and its status.
+    let bodies: Vec<serde_json::Value> = seen
+        .iter()
+        .map(|seen| {
+            assert_eq!(seen.content_type.as_deref(), Some("application/json"));
+            serde_json::from_str(&seen.body).unwrap()
+        })
+        .collect();
+    assert_eq!(
+        bodies[0],
+        serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "GatewayClass",
+            "metadata": { "name": "edgerush", "resourceVersion": "7" },
+            "status": { "conditions": [] },
+        })
+    );
+    assert_eq!(
+        bodies[1]["metadata"],
+        serde_json::json!({ "name": "web", "namespace": "shop", "resourceVersion": "3" })
+    );
+}
