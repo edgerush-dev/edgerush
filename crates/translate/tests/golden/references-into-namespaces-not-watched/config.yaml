@@ -1,0 +1,30 @@
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  https:
+    address: "[::]:8443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates: []
+      without_sni: none
+      refused: [unwatched.example.com, ungranted.example.com]
+routes:
+  - name: httproute/shop/across/http
+    listeners: [http]
+    hostnames: [{ name: across.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /unwatched } }]
+        forward: { backends: [{ invalid: "Service blog/web is in blog, which the control plane does not watch, so no ReferenceGrant there can be seen", weight: 1 }] }
+      - matches: [{ path: { prefix: /ungranted } }]
+        forward: { backends: [{ invalid: "Service news/web is another namespace's, and no ReferenceGrant there lets HTTPRoutes of shop reach it", weight: 1 }] }
+      - matches: [{ path: { prefix: /own } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+upstreams:
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

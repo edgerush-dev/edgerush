@@ -1128,19 +1128,11 @@ fn backend(
         ));
     }
     let namespace = written.namespace.unwrap_or(route_namespace);
-    if namespace != route_namespace
-        && !granted(
-            cluster,
-            ("HTTPRoute", route_namespace),
-            ("Service", namespace, written.name),
-        )
-    {
-        return Err(format!(
-            "Service {namespace}/{} is another namespace's, and no ReferenceGrant there lets \
-             HTTPRoutes of {route_namespace} reach it",
-            written.name
-        ));
-    }
+    reachable(
+        cluster,
+        ("HTTPRoute", route_namespace),
+        ("Service", namespace, written.name),
+    )?;
     let Some(port) = written.port else {
         return Err(format!(
             "Service {namespace}/{} is named with no port",
@@ -1164,11 +1156,44 @@ fn backend(
     }
 }
 
+/// Whether an object of the Gateway API's kind and namespace `from` may reach the core
+/// object of the kind, namespace and name `to` says, or why not: one of its own namespace
+/// always; another's only where a ReferenceGrant there allows it, and never one of a
+/// namespace the control plane does not watch, where no grant can be seen, said as such
+/// rather than as no grant there (04 §9).
+pub(crate) fn reachable(
+    cluster: &Cluster,
+    (from_kind, from): (&str, &str),
+    (kind, namespace, name): (&str, &str, &str),
+) -> Result<(), String> {
+    if namespace == from {
+        return Ok(());
+    }
+    if cluster
+        .watched
+        .as_ref()
+        .is_some_and(|watched| !watched.iter().any(|ours| ours == namespace))
+    {
+        return Err(format!(
+            "{kind} {namespace}/{name} is in {namespace}, which the control plane does not \
+             watch, so no ReferenceGrant there can be seen"
+        ));
+    }
+    if granted(cluster, (from_kind, from), (kind, namespace, name)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{kind} {namespace}/{name} is another namespace's, and no ReferenceGrant there \
+             lets {from_kind}s of {from} reach it"
+        ))
+    }
+}
+
 /// Whether a ReferenceGrant in the namespace of `to` lets objects of the Gateway API's kind
 /// and namespace `from` reach its core object of the kind and name `to` says: one whose
 /// `from` names them and whose `to` names that object, or every object of its kind there.
 /// Entries of each list are either-or, as the spec has it.
-pub(crate) fn granted(
+fn granted(
     cluster: &Cluster,
     (from_kind, from): (&str, &str),
     (kind, namespace, name): (&str, &str, &str),

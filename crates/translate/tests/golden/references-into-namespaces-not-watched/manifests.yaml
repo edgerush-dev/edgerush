@@ -1,0 +1,54 @@
+# References into namespaces, where the control plane watches only edge, shop and news: no
+# object of blog is ever seen, so a backend or certificate there is refused as one no
+# ReferenceGrant allows, and said as being in a namespace not watched, not as one of no
+# grant. One into news, watched, with no grant there, is said as one of no grant; one into
+# the route's own namespace needs none.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+    - name: unwatched
+      port: 8443
+      protocol: HTTPS
+      hostname: "unwatched.example.com"
+      tls: { certificateRefs: [{ name: cert, namespace: blog }] }
+    - name: ungranted
+      port: 8443
+      protocol: HTTPS
+      hostname: "ungranted.example.com"
+      tls: { certificateRefs: [{ name: cert, namespace: news }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: across, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: http }]
+  hostnames: [across.example.com]
+  rules:
+    - matches: [{ path: { value: /unwatched } }]
+      backendRefs: [{ name: web, namespace: blog, port: 80 }]
+    - matches: [{ path: { value: /ungranted } }]
+      backendRefs: [{ name: web, namespace: news, port: 80 }]
+    - matches: [{ path: { value: /own } }]
+      backendRefs: [{ name: web, namespace: shop, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: news }
+spec:
+  ports: [{ name: http, port: 80 }]

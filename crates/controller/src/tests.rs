@@ -237,6 +237,10 @@ fn every_follows_objects_are_translated_and_its_secrets_looked_at() {
         )],
         status_service: Vec::new(),
         gateway_api: None,
+        watched: watched(&[
+            Scope::Namespace("shop".to_owned()),
+            Scope::Namespace("blog".to_owned()),
+        ]),
     };
     assert_eq!(
         followed.unlisted(),
@@ -259,6 +263,23 @@ fn every_follows_objects_are_translated_and_its_secrets_looked_at() {
         .collect();
     assert_eq!(services, ["shop", "blog"]);
     assert_eq!(cluster.secrets.len(), 1);
+    assert_eq!(
+        cluster.watched,
+        Some(vec!["shop".to_owned(), "blog".to_owned()])
+    );
+}
+
+#[test]
+fn a_scope_of_the_whole_cluster_watches_every_namespace() {
+    assert_eq!(watched(&[Scope::Cluster]), None);
+    assert_eq!(
+        watched(&[Scope::Namespace("shop".to_owned()), Scope::Cluster]),
+        None
+    );
+    assert_eq!(
+        watched(&[Scope::Namespace("shop".to_owned())]),
+        Some(vec!["shop".to_owned()])
+    );
 }
 
 /// The CRD of a Gateway API kind, as the API server sends it, serving `versions`.
@@ -337,6 +358,7 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
         secrets: Vec::new(),
         status_service: Vec::new(),
         gateway_api: Some(gateway_api),
+        watched: None,
     };
     let followed = followed_with(gateway_api);
     assert_eq!(followed.cluster().http_routes.len(), 1);

@@ -175,6 +175,10 @@ pub struct Cluster {
     /// Every Namespace seen, where the data plane is a Gateway: their labels are what a
     /// listener's selector of namespaces matches.
     pub namespaces: Vec<Namespace>,
+    /// The namespaces the control plane watches, where it watches some and not all: no
+    /// object of another is seen, so a reference into one is said as such (04 §9). None for
+    /// every namespace, as `edgerush validate` reads them.
+    pub watched: Option<Vec<String>>,
 }
 
 /// A data plane's config, and what could not go into it.

@@ -14,7 +14,8 @@
 //! Gateway, a line each (none otherwise). The report's last lines are the hosts a claim of
 //! one API takes from the other's.
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
-//! the objects of `tests/golden/shared.yaml` go with every case's.
+//! the objects of `tests/golden/shared.yaml` go with every case's. Every namespace is
+//! watched, unless the case lists those that are in `watched.txt`, a line each.
 //! Every config translated must also pass the data plane's own `compile`, and, written as
 //! YAML as the control plane writes it, read back the same; and the Ingresses it says it
 //! served must be those its config's routes are of.
@@ -95,7 +96,12 @@ fn every_case_translates_to_its_config_and_report() {
             read(&root.join("shared.yaml")),
             read(&case.join("manifests.yaml"))
         );
-        let translation = translate(&plane, &cluster(&manifests));
+        let mut cluster = cluster(&manifests);
+        let watched = case.join("watched.txt");
+        if watched.exists() {
+            cluster.watched = Some(read(&watched).lines().map(str::to_owned).collect());
+        }
+        let translation = translate(&plane, &cluster);
         // How many Ingresses were another data plane's, where the case says.
         let passed_over = case.join("passed-over.txt");
         if passed_over.exists() {

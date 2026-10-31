@@ -3,7 +3,7 @@
 //! fitted to the data plane's own listeners bound to its port, or not accepted and why, and
 //! the routes each takes: of which kinds, from which namespaces.
 
-use crate::http_route::granted;
+use crate::http_route::reachable;
 use crate::{Cluster, Finding, GATEWAY_CONTROLLER, Object, Plane, Problem, secret_certificate};
 use edgerush_config::Protocol;
 use edgerush_gateway_api::gateway::{
@@ -362,17 +362,12 @@ fn certificates(
                 "a certificateRef of kind {}/{} is not one translation reads",
                 reference.group, reference.kind
             ))
-        } else if namespace != gateway_namespace
-            && !granted(
-                cluster,
-                ("Gateway", gateway_namespace),
-                ("Secret", namespace, name),
-            )
-        {
-            Err(format!(
-                "Secret {namespace}/{name} is another namespace's, and no ReferenceGrant there \
-                 lets Gateways of {gateway_namespace} reach it"
-            ))
+        } else if let Err(why) = reachable(
+            cluster,
+            ("Gateway", gateway_namespace),
+            ("Secret", namespace, name),
+        ) {
+            Err(why)
         } else if cluster.secrets_assumed {
             Ok(())
         } else {

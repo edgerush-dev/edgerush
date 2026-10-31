@@ -143,6 +143,7 @@ pub async fn control(
             .gateway
             .as_ref()
             .map(|gateway| GatewayApi::start(&mut start, gateway)),
+        watched: watched(scope),
     };
     // Coming to lead is a change: every status is looked at, as the last leader may have
     // left some stale.
@@ -441,6 +442,8 @@ struct Followed {
     status_service: Vec<Follow<Service>>,
     /// The Gateway API's kinds, where the data plane is a Gateway.
     gateway_api: Option<GatewayApi>,
+    /// The namespaces watched, where not every one is.
+    watched: Option<Vec<String>>,
 }
 
 impl Followed {
@@ -492,8 +495,21 @@ impl Followed {
             namespaces: gateway_api
                 .map(|g| objects(&g.namespaces))
                 .unwrap_or_default(),
+            watched: self.watched.clone(),
         }
     }
+}
+
+/// The namespaces `scope` watches, where it does not watch the whole cluster: those a
+/// reference into another is said to be out of (04 §9).
+fn watched(scope: &[Scope]) -> Option<Vec<String>> {
+    scope
+        .iter()
+        .map(|part| match part {
+            Scope::Namespace(namespace) => Some(namespace.clone()),
+            Scope::Cluster | Scope::Named(_) => None,
+        })
+        .collect()
 }
 
 /// The objects of `follows`, as they last published them.

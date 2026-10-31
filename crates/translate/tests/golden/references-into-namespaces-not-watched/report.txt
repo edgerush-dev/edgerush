@@ -1,0 +1,6 @@
+Gateway edge/web: listener unwatched: a certificate cannot be used: Secret blog/cert is in blog, which the control plane does not watch, so no ReferenceGrant there can be seen
+Gateway edge/web: listener unwatched: not accepted: no certificateRef of it can be used
+Gateway edge/web: listener ungranted: a certificate cannot be used: Secret news/cert is another namespace's, and no ReferenceGrant there lets Gateways of edge reach it
+Gateway edge/web: listener ungranted: not accepted: no certificateRef of it can be used
+HTTPRoute shop/across: rule 0: a backend's share is answered 500: Service blog/web is in blog, which the control plane does not watch, so no ReferenceGrant there can be seen
+HTTPRoute shop/across: rule 1: a backend's share is answered 500: Service news/web is another namespace's, and no ReferenceGrant there lets HTTPRoutes of shop reach it
