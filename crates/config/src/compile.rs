@@ -60,6 +60,7 @@ pub struct MatchId {
 #[derive(Debug, Default)]
 pub struct Matches {
     http: BTreeMap<String, Vec<RouteMatch<MatchId>>>,
+    claims: BTreeMap<String, Vec<HostClaim<()>>>,
     sni: BTreeMap<String, Vec<RouteMatch<usize>>>,
 }
 
@@ -69,6 +70,14 @@ impl Matches {
     #[must_use]
     pub fn of(&self, listener: &str) -> &[RouteMatch<MatchId>] {
         self.http.get(listener).map_or(&[], Vec::as_slice)
+    }
+
+    /// The hostnames of the routes of no rules on the listener called `listener`, which its
+    /// router claims and serves nothing on ([`Router::with_claims`]); none for a `tcp` or
+    /// `tls` listener, or a name there is no listener by.
+    #[must_use]
+    pub fn claims_of(&self, listener: &str) -> &[HostClaim<()>] {
+        self.claims.get(listener).map_or(&[], Vec::as_slice)
     }
 
     /// The routes of the `tls` listener called `listener`, each a match on its hostnames
@@ -577,7 +586,7 @@ pub(crate) const RETRY_STATUSES: std::ops::RangeInclusive<u16> = 400..=599;
 
 /// The most times a request may be sent again: beyond it a retry policy is a load
 /// multiplier more than a remedy.
-pub(crate) const MOST_ATTEMPTS: u32 = 5;
+pub const MOST_ATTEMPTS: u32 = 5;
 
 /// The largest a bound in seconds may be: 99,999 hours, the most a Gateway API duration
 /// says (GEP-2257). Each is added to a clock where it is used, which a larger one could
@@ -842,9 +851,6 @@ fn retry(forward: &Forward, place: &Place, errors: &mut Vec<ConfigError>) -> Opt
     let mut problems = Vec::new();
     if retry.attempts == 0 || retry.attempts > MOST_ATTEMPTS {
         problems.push(Problem::RetryAttempts(retry.attempts));
-    }
-    if retry.http_statuses.is_empty() && retry.grpc_statuses.is_empty() && !retry.on_timeout {
-        problems.push(Problem::RetryOnNothing);
     }
     // A try's clock is its `backend_request_ms`, or the fixed clocks where the rule states
     // no timeout. A timeout stated takes the fixed clocks' place, so with no try's clock
@@ -1207,9 +1213,9 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                     errors.push(Place::listener(name).problem(problem));
                 }
                 // As a certificate's own names are written: a wildcard stands for one whole
-                // label, leftmost.
+                // label, leftmost; or `*`, every name no other certificate answers for.
                 for stated in stated {
-                    if !is_host_name(stated.strip_prefix("*.").unwrap_or(stated)) {
+                    if stated != "*" && !is_host_name(stated.strip_prefix("*.").unwrap_or(stated)) {
                         let problem = Problem::StatedName {
                             certificate: certificate.to_owned(),
                             name: stated.clone(),
@@ -1326,6 +1332,8 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
     let mut names = HashSet::new();
     // The routes of every listener, by the listener's name.
     let mut http_routes: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    // The hostnames of every listener's routes of no rules, by the listener's name.
+    let mut claims: BTreeMap<&str, Vec<HostClaim<()>>> = BTreeMap::new();
     for (route_at, route) in config.routes.iter().enumerate() {
         let place = Place::route(&route.name);
         if !names.insert(route.name.as_str()) {
@@ -1346,6 +1354,15 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             }
         }
         let hosts = host_claims(route, &place, &mut errors);
+        // A route of no rules claims its hostnames and serves nothing on them (07 §1).
+        if route.rules.is_empty() {
+            for listener in &listeners {
+                claims
+                    .entry(listener)
+                    .or_default()
+                    .extend(hosts.iter().cloned());
+            }
+        }
 
         let mut compiled_rules = Vec::new();
         for (rule_at, rule) in route.rules.iter().enumerate() {
@@ -1409,13 +1426,16 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
 
     if errors.is_empty() {
         let mut kept = BTreeMap::new();
+        let mut kept_claims = BTreeMap::new();
         let listeners = config
             .listeners
             .iter()
             .map(|(name, listener)| {
                 let own = matches.remove(name.as_str()).unwrap_or_default();
+                let claimed = claims.remove(name.as_str()).unwrap_or_default();
                 if keep {
                     kept.insert(name.clone(), own.clone());
+                    kept_claims.insert(name.clone(), claimed.clone());
                 }
                 CompiledListener {
                     name: name.clone(),
@@ -1446,7 +1466,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                         client_validation: tls.client_validation.clone(),
                     }),
                     http3: listener.http3,
-                    router: Router::new(own.into_iter().map(by_rule)),
+                    router: Router::with_claims(own.into_iter().map(by_rule), claimed),
                     http_routes: http_routes.remove(name.as_str()).unwrap_or_default(),
                     l4: l4.remove(name.as_str()),
                     tunnel_idle: Duration::from_secs(
@@ -1489,7 +1509,14 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         } else {
             BTreeMap::new()
         };
-        Ok((compiled, Matches { http: kept, sni }))
+        Ok((
+            compiled,
+            Matches {
+                http: kept,
+                claims: kept_claims,
+                sni,
+            },
+        ))
     } else {
         Err(errors)
     }
@@ -1875,9 +1902,6 @@ fn listeners_of<'a>(
 fn host_claims(route: &Route, place: &Place, errors: &mut Vec<ConfigError>) -> Vec<HostClaim<()>> {
     if route.hostnames.is_empty() {
         errors.push(place.problem(Problem::NoHostnames));
-    }
-    if route.rules.is_empty() {
-        errors.push(place.problem(Problem::NoRules));
     }
     let mut hosts = Vec::new();
     for hostname in &route.hostnames {
@@ -2481,8 +2505,8 @@ pub enum Problem {
     /// A certificate a listener states no names for: it would answer for none.
     #[error("certificate `{0}` is stated no names to answer for")]
     NoNamesStated(String),
-    /// A name stated for a certificate that is neither a host name nor `*.` and one.
-    #[error("certificate `{certificate}`: `{name}` is not a host name, or `*.` and one")]
+    /// A name stated for a certificate that is neither a host name, `*.` and one, nor `*`.
+    #[error("certificate `{certificate}`: `{name}` is not a host name, `*.` and one, or `*`")]
     StatedName {
         /// The certificate's name.
         certificate: String,
@@ -2619,9 +2643,6 @@ pub enum Problem {
     /// A retry count of nothing, or more than a retry is worth.
     #[error("`retry.attempts` is {0}: from 1 to 5")]
     RetryAttempts(u32),
-    /// A retry for no answer at all.
-    #[error("`retry` names no status and no timeout to send a request again for")]
-    RetryOnNothing,
     /// A retry for a try that runs out of time, where no clock of a try's own runs.
     #[error("`retry` says `on_timeout` with no clock of a try's own to run out")]
     RetryOnTimeoutNever,
@@ -2769,9 +2790,6 @@ pub enum Problem {
     /// The route serves no host.
     #[error("no hostnames; every host is the name `*`")]
     NoHostnames,
-    /// The route has no rules.
-    #[error("no rules")]
-    NoRules,
     /// The rule is for no request.
     #[error("no matches; any path is `{{ prefix: / }}`")]
     NoMatches,
@@ -3056,6 +3074,49 @@ upstreams:
         assert!(matches.of("nowhere").is_empty());
     }
 
+    /// A data plane with a route of no rules for `api.example.com`, beside a wildcard that
+    /// does not fall through.
+    const CLAIMED: &str = r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+routes:
+  - name: wild
+    listeners: [web]
+    hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: web, weight: 1 }] }
+  - name: claimed
+    listeners: [web]
+    hostnames: [{ name: api.example.com, falls_through: false }]
+    rules: []
+upstreams:
+  web: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000"] } }
+"#;
+
+    #[test]
+    fn a_route_of_no_rules_claims_its_hostnames_and_serves_nothing_on_them() {
+        let (compiled, matches) = compile_with_matches(&config(CLAIMED)).unwrap();
+        // The wildcard is kept off the claimed host, which nothing serves: a 404.
+        assert_eq!(route(&compiled, "api.example.com", "/"), None);
+        assert_eq!(route(&compiled, "www.example.com", "/"), Some((0, 0)));
+        assert_eq!(matches.claims_of("web").len(), 1);
+        assert!(matches.claims_of("nowhere").is_empty());
+        // As the walk says it.
+        let headers = HeaderMap::new();
+        let request = RequestParts {
+            host: "api.example.com",
+            path: "/",
+            query: "",
+            method: &Method::GET,
+            headers: &headers,
+        };
+        let walked =
+            edgerush_router::explain(matches.of("web"), matches.claims_of("web"), &request);
+        assert!(walked.chosen().is_none());
+        assert_eq!(walked.claimed, 1);
+    }
+
     #[test]
     fn a_route_for_two_listeners_has_its_matches_kept_for_each() {
         let two = SHOP
@@ -3089,7 +3150,8 @@ upstreams:
                 method: &method.parse().unwrap(),
                 headers: &headers,
             };
-            let walked = edgerush_router::explain(matches.of("web"), &request);
+            let walked =
+                edgerush_router::explain(matches.of("web"), matches.claims_of("web"), &request);
             assert_eq!(
                 walked.chosen().map(|chosen| chosen.value.rule),
                 web.router.route(&request).copied(),
@@ -3334,7 +3396,6 @@ upstreams:
                 "listener `web-again`: address [::]:8080 is already taken by listener `web`",
                 "route `a`: no listeners",
                 "route `a`: no hostnames; every host is the name `*`",
-                "route `a`: no rules",
                 "route `a`: another route has the same name",
                 "route `a`: there is no listener `wbe`",
                 "route `a`: listener `web` is listed twice",
@@ -3985,14 +4046,23 @@ upstreams: {{}}
         );
         assert_eq!(
             problems(
-                "{ certificates: [{ certificate: a, names: [\"*\", \"a.*.example.com\", \"*.*.example.com\", 192.0.2.1, a.example.com] }], without_sni: none }"
+                "{ certificates: [{ certificate: a, names: [\"**\", \"*.\", \"a.*.example.com\", \"*.*.example.com\", 192.0.2.1, a.example.com] }], without_sni: none }"
             ),
             [
-                "listener `l`: certificate `a`: `*` is not a host name, or `*.` and one",
-                "listener `l`: certificate `a`: `a.*.example.com` is not a host name, or `*.` and one",
-                "listener `l`: certificate `a`: `*.*.example.com` is not a host name, or `*.` and one",
-                "listener `l`: certificate `a`: `192.0.2.1` is not a host name, or `*.` and one",
+                "listener `l`: certificate `a`: `**` is not a host name, `*.` and one, or `*`",
+                "listener `l`: certificate `a`: `*.` is not a host name, `*.` and one, or `*`",
+                "listener `l`: certificate `a`: `a.*.example.com` is not a host name, `*.` and one, or `*`",
+                "listener `l`: certificate `a`: `*.*.example.com` is not a host name, `*.` and one, or `*`",
+                "listener `l`: certificate `a`: `192.0.2.1` is not a host name, `*.` and one, or `*`",
             ]
+        );
+        // `*` is every name no other certificate answers for (Gateway API's HTTPS listener of
+        // no hostname).
+        assert!(
+            compile(&with(
+                "{ certificates: [{ certificate: a, names: [\"*\"] }], without_sni: a }"
+            ))
+            .is_ok()
         );
         // Named twice, stated or not, is twice.
         assert_eq!(
@@ -4358,7 +4428,7 @@ upstreams:
                 method: &Method::GET,
                 headers: &none,
             };
-            let walked = edgerush_router::explain(kept, &asked);
+            let walked = edgerush_router::explain(kept, &[], &asked);
             assert_eq!(
                 walked.chosen().map(|chosen| chosen.value),
                 router.route_at(name).map(|(at, _)| at),
@@ -6310,10 +6380,9 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
             problems(&format!("{{ attempts: 6, http_statuses: [503], {base} }}"))[0]
                 .contains("from 1 to 5")
         );
-        assert!(
-            problems(&format!("{{ attempts: 1, {base} }}"))[0]
-                .ends_with("names no status and no timeout to send a request again for")
-        );
+        // Of no status and no `on_timeout`, a retry still sends on a try that could not
+        // connect, as Gateway API's retry of no codes asks.
+        assert!(with(&format!("{{ attempts: 1, {base} }}")).is_ok());
         assert!(
             problems(&format!("{{ attempts: 1, http_statuses: [200], {base} }}"))[0]
                 .ends_with("only 4xx and 5xx")

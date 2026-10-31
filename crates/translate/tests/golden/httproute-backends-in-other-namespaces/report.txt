@@ -1,0 +1,2 @@
+HTTPRoute shop/across: rule 2: a backend's share is answered 500: Service books/gone does not exist
+HTTPRoute shop/across: rule 3: a backend's share is answered 500: Service news/web is another namespace's, and no ReferenceGrant there lets HTTPRoutes of shop reach it

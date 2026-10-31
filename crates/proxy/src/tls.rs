@@ -19,11 +19,16 @@
 //! client resumes whichever worker it reaches. That key is not rotated, where BoringSSL
 //! rotates the TCP front's every two days.
 
+use crate::offered::{Curve, Hello, Key, Offered};
 use arc_swap::ArcSwap;
 use boring::error::ErrorStack;
+use boring::ex_data::Index;
+use boring::nid::Nid;
+use boring::pkey::Id;
 use boring::ssl::{
-    AlpnError, NameType, SniError, SslAcceptor, SslAlert, SslContext, SslContextBuilder, SslMethod,
-    SslSessionCacheMode, SslVerifyMode, SslVersion, select_next_proto,
+    AlpnError, ExtensionType, NameType, SniError, Ssl, SslAcceptor, SslAlert, SslContext,
+    SslContextBuilder, SslMethod, SslSessionCacheMode, SslVerifyMode, SslVersion,
+    select_next_proto,
 };
 use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
@@ -97,6 +102,8 @@ struct Front {
 struct Certificates {
     names: Names,
     contexts: Vec<SslContext>,
+    /// The kind of key each context's certificate holds, in the same order.
+    keys: Vec<Key>,
     /// The one for a client that asks for no name; none, and such a client is refused.
     without_sni: Option<usize>,
 }
@@ -239,7 +246,7 @@ impl Tls {
         if let Some(authorities) = &self.front.authorities {
             validate_clients(&mut builder, authorities)?;
         }
-        choose_by_name(&mut builder, &self.front.quic_serving);
+        choose_by_name(&mut builder, &self.front.quic_serving)?;
         Ok(builder)
     }
 
@@ -281,23 +288,58 @@ impl Front {
         if let Some(authorities) = authorities {
             validate_clients(&mut builder, authorities)?;
         }
-        choose_by_name(&mut builder, serving);
+        choose_by_name(&mut builder, serving)?;
         Ok(builder.build())
     }
 }
 
+/// Where a connection keeps what its ClientHello offers, between the two callbacks.
+fn offered_index() -> Result<Index<Ssl, Offered>, TlsError> {
+    static INDEX: std::sync::OnceLock<Option<Index<Ssl, Offered>>> = std::sync::OnceLock::new();
+    // BoringSSL's indices are the process's, never given back: one, for every context.
+    INDEX
+        .get_or_init(|| Ssl::new_ex_index().ok())
+        .ok_or_else(|| TlsError::Setup("no index for what a ClientHello offers".to_owned()))
+}
+
 /// Moves every connection a front starts to the context of the certificate for the name it
 /// asked for, among those `serving` holds at the time, or of the listener's certificate
-/// for a client that asked for none. A name no certificate carries, or no name where the
-/// listener has no certificate for that, is refused with a fatal unrecognized_name alert
-/// (RFC 9325 §3.7), as NGINX's `ssl_reject_handshake` does: never one of the others.
-fn choose_by_name(builder: &mut SslContextBuilder, serving: &Arc<ArcSwap<Certificates>>) {
+/// for a client that asked for none. Among the certificates for a name, the first whose key
+/// the client can verify a signature by, as its ClientHello offers, read before anything
+/// else of it as Envoy and HAProxy read it ([`Offered`]); none it can, the first. A name no
+/// certificate carries, or no name where the listener has no certificate for that, is
+/// refused with a fatal unrecognized_name alert (RFC 9325 §3.7), as NGINX's
+/// `ssl_reject_handshake` does: never one of the others. Refused there, by the name's own
+/// callback, and not in the early one, whose refusals BoringSSL answers with
+/// handshake_failure.
+fn choose_by_name(
+    builder: &mut SslContextBuilder,
+    serving: &Arc<ArcSwap<Certificates>>,
+) -> Result<(), TlsError> {
+    let index = offered_index()?;
+    builder.set_select_certificate_callback(move |mut hello| {
+        let offered = Offered::of(&Hello {
+            schemes: hello.get_extension(ExtensionType::SIGNATURE_ALGORITHMS),
+            groups: hello.get_extension(ExtensionType::SUPPORTED_GROUPS),
+            versions: hello.get_extension(ExtensionType::SUPPORTED_VERSIONS),
+            suites: hello.ciphers(),
+        });
+        hello.ssl_mut().set_ex_data(index, offered);
+        Ok(())
+    });
     let serving = Arc::clone(serving);
-    // Called for every handshake, a name asked for or not.
+    // Called for every handshake, a name asked for or not, after the early callback.
     builder.set_servername_callback(move |ssl, alert| {
         let certificates = serving.load();
+        let offered = ssl.ex_data(index).copied().unwrap_or_default();
+        let usable = |at: usize| {
+            certificates
+                .keys
+                .get(at)
+                .is_some_and(|key| offered.can_use(*key))
+        };
         let chosen = match ssl.servername(NameType::HOST_NAME) {
-            Some(asked) => certificates.names.choose(asked),
+            Some(asked) => certificates.names.choose(asked, usable),
             None => certificates.without_sni,
         };
         let Some(context) = chosen.and_then(|at| certificates.contexts.get(at)) else {
@@ -308,6 +350,24 @@ fn choose_by_name(builder: &mut SslContextBuilder, serving: &Arc<ArcSwap<Certifi
         let _moved = ssl.set_ssl_context(context);
         Ok(())
     });
+    Ok(())
+}
+
+/// The kind of key `leaf` holds.
+fn key_of(leaf: &X509) -> Key {
+    let Ok(key) = leaf.public_key() else {
+        return Key::Other;
+    };
+    match key.id() {
+        Id::RSA => Key::Rsa,
+        Id::EC => match key.ec_key().ok().and_then(|key| key.group().curve_name()) {
+            Some(Nid::X9_62_PRIME256V1) => Key::Ecdsa(Curve::P256),
+            Some(Nid::SECP384R1) => Key::Ecdsa(Curve::P384),
+            Some(Nid::SECP521R1) => Key::Ecdsa(Curve::P521),
+            _ => Key::Other,
+        },
+        _ => Key::Other,
+    }
 }
 
 impl Certificates {
@@ -326,6 +386,7 @@ impl Certificates {
             ..Names::default()
         };
         let mut contexts = Vec::with_capacity(source.certificates.len());
+        let mut keys = Vec::with_capacity(source.certificates.len());
         for (index, presented) in source.certificates.iter().enumerate() {
             let certificate = &presented.certificate;
             let context = match transport {
@@ -340,6 +401,7 @@ impl Certificates {
                         validate_clients(&mut builder, authorities)?;
                     }
                     names.add(presented, &leaf, index);
+                    keys.push(key_of(&leaf));
                     builder.build().into_context()
                 }
                 Transport::Quic => {
@@ -349,6 +411,7 @@ impl Certificates {
                         validate_clients(&mut builder, authorities)?;
                     }
                     names.add(presented, &leaf, index);
+                    keys.push(key_of(&leaf));
                     builder.build()
                 }
             };
@@ -357,6 +420,7 @@ impl Certificates {
         Ok(Self {
             names,
             contexts,
+            keys,
             without_sni: source.without_sni,
         })
     }
@@ -479,19 +543,23 @@ pub(crate) fn identity(named: &NamedCertificate) -> Result<Identity, TlsError> {
     })
 }
 
-/// Which certificate answers for which name: by the names the listener states for it, or,
-/// where it states none, the DNS names in its subject alternative names; exact names before
-/// wildcards, and among certificates that answer for the same name, the first. A name the
-/// listener refuses, or that no certificate answers for, is answered by none.
+/// Which certificates answer for which name: by the names the listener states for them,
+/// or, where it states none, the DNS names in their subject alternative names; exact names
+/// before wildcards, wildcards before one stated for every name (`*`), and among
+/// certificates that answer for the name at the first of these it meets, those in their
+/// order. A name the listener refuses, or that no certificate answers for, is answered by
+/// none.
 #[derive(Debug, Default)]
 struct Names {
     /// The names refused before any certificate is looked at, in lower case.
     refused: HashSet<String>,
     /// By the name, in lower case.
-    exact: HashMap<String, usize>,
+    exact: HashMap<String, Vec<usize>>,
     /// By what follows the `*.`, in lower case: a wildcard stands for one label, whole
     /// (RFC 6125 §6.4.3).
-    wildcard: HashMap<String, usize>,
+    wildcard: HashMap<String, Vec<usize>>,
+    /// Those stated for every name.
+    any: Vec<usize>,
 }
 
 impl Names {
@@ -506,34 +574,54 @@ impl Names {
         let Some(alternatives) = leaf.subject_alt_names() else {
             return;
         };
-        for name in alternatives.iter().filter_map(|name| name.dnsname()) {
+        // A `*` a certificate carries is no DNS name a client could ask for (RFC 6125 §6.4.3):
+        // only a listener makes a certificate answer for every name.
+        for name in alternatives
+            .iter()
+            .filter_map(|name| name.dnsname())
+            .filter(|name| *name != "*")
+        {
             self.add_name(name, index);
         }
     }
 
     fn add_name(&mut self, name: &str, index: usize) {
-        let name = name.to_ascii_lowercase();
-        match name.strip_prefix("*.") {
-            Some(parent) => self.wildcard.entry(parent.to_owned()).or_insert(index),
-            None => self.exact.entry(name).or_insert(index),
+        let answering = if name == "*" {
+            &mut self.any
+        } else {
+            let name = name.to_ascii_lowercase();
+            match name.strip_prefix("*.") {
+                Some(parent) => self.wildcard.entry(parent.to_owned()).or_default(),
+                None => self.exact.entry(name).or_default(),
+            }
         };
+        answering.push(index);
     }
 
-    /// The certificate for a client that asked for `name`, if one carries it and the
-    /// listener does not refuse it.
-    fn choose(&self, name: &str) -> Option<usize> {
+    /// The certificate for a client that asked for `name`, if one answers for it and the
+    /// listener does not refuse it: of those that answer for it at its most specific, the
+    /// first `usable` says the client can use, or the first.
+    fn choose(&self, name: &str, usable: impl Fn(usize) -> bool) -> Option<usize> {
         // Once for a handshake, which does far more than this.
         let name = name.to_ascii_lowercase();
         if self.refused.contains(&name) {
             return None;
         }
-        if let Some(&index) = self.exact.get(&name) {
-            return Some(index);
-        }
-        name.split_once('.')
-            .filter(|(label, _)| !label.is_empty())
-            .and_then(|(_, parent)| self.wildcard.get(parent))
+        let answering = self
+            .exact
+            .get(&name)
+            .or_else(|| {
+                name.split_once('.')
+                    .filter(|(label, _)| !label.is_empty())
+                    .and_then(|(_, parent)| self.wildcard.get(parent))
+            })
+            .map(Vec::as_slice)
+            .unwrap_or(&self.any);
+        answering
+            .iter()
             .copied()
+            .find(|&at| usable(at))
+            .or_else(|| answering.first().copied())
     }
 }
 
@@ -581,26 +669,26 @@ mod tests {
     #[test]
     fn a_name_is_answered_by_the_certificate_that_carries_it() {
         let names = names(&[&["default.test"], &["a.test", "*.b.test"], &["c.test"]]);
-        assert_eq!(names.choose("a.test"), Some(1));
-        assert_eq!(names.choose("c.test"), Some(2));
-        assert_eq!(names.choose("default.test"), Some(0));
+        assert_eq!(names.choose("a.test", |_| true), Some(1));
+        assert_eq!(names.choose("c.test", |_| true), Some(2));
+        assert_eq!(names.choose("default.test", |_| true), Some(0));
         // Names are not told apart by case.
-        assert_eq!(names.choose("A.Test"), Some(1));
+        assert_eq!(names.choose("A.Test", |_| true), Some(1));
         // A wildcard stands for one whole label: not none, not two.
-        assert_eq!(names.choose("x.b.test"), Some(1));
-        assert_eq!(names.choose("b.test"), None);
-        assert_eq!(names.choose("y.x.b.test"), None);
-        assert_eq!(names.choose(".b.test"), None);
+        assert_eq!(names.choose("x.b.test", |_| true), Some(1));
+        assert_eq!(names.choose("b.test", |_| true), None);
+        assert_eq!(names.choose("y.x.b.test", |_| true), None);
+        assert_eq!(names.choose(".b.test", |_| true), None);
         // Nobody's name: none, not the first (RFC 9325 §3.7).
-        assert_eq!(names.choose("elsewhere.test"), None);
-        assert_eq!(names.choose(""), None);
+        assert_eq!(names.choose("elsewhere.test", |_| true), None);
+        assert_eq!(names.choose("", |_| true), None);
     }
 
     #[test]
     fn an_exact_name_comes_before_a_wildcard_and_the_first_before_the_rest() {
         let names = names(&[&["*.x.test"], &["a.x.test"], &["a.x.test", "*.x.test"]]);
-        assert_eq!(names.choose("a.x.test"), Some(1));
-        assert_eq!(names.choose("b.x.test"), Some(0));
+        assert_eq!(names.choose("a.x.test", |_| true), Some(1));
+        assert_eq!(names.choose("b.x.test", |_| true), Some(0));
     }
 
     #[test]
@@ -608,31 +696,80 @@ mod tests {
         let mut names = names(&[&["*.x.test"], &["b.x.test"]]);
         names.refused = ["a.x.test".to_owned(), "b.x.test".to_owned()].into();
         // Refused before the wildcard, and before an exact name alike, in any letter case.
-        assert_eq!(names.choose("a.x.test"), None);
-        assert_eq!(names.choose("B.X.test"), None);
-        assert_eq!(names.choose("c.x.test"), Some(0));
+        assert_eq!(names.choose("a.x.test", |_| true), None);
+        assert_eq!(names.choose("B.X.test", |_| true), None);
+        assert_eq!(names.choose("c.x.test", |_| true), Some(0));
+    }
+
+    #[test]
+    fn a_name_none_other_answers_for_is_answered_by_the_one_stated_for_every_name() {
+        let mut names = names(&[&["a.test"], &["*"], &["*.b.test"], &["*"]]);
+        assert_eq!(names.choose("a.test", |_| true), Some(0));
+        assert_eq!(names.choose("x.b.test", |_| true), Some(2));
+        // The first stated for every name, for any other, however deep or odd.
+        assert_eq!(names.choose("elsewhere.test", |_| true), Some(1));
+        assert_eq!(names.choose("y.x.b.test", |_| true), Some(1));
+        assert_eq!(names.choose("b.test", |_| true), Some(1));
+        // Refused before it as before any.
+        names.refused = ["refused.test".to_owned()].into();
+        assert_eq!(names.choose("refused.test", |_| true), None);
+    }
+
+    #[test]
+    fn a_star_a_certificate_carries_makes_it_answer_for_no_other_name() {
+        let carrying = presented("carrying", certificate(&["*", "a.test"]));
+        let leaf = X509::from_pem(carrying.certificate.certificate.chain.as_bytes()).unwrap();
+        let mut names = Names::default();
+        names.add(&carrying, &leaf, 0);
+        assert_eq!(names.choose("a.test", |_| true), Some(0));
+        assert_eq!(names.choose("elsewhere.test", |_| true), None);
+    }
+
+    #[test]
+    fn of_a_names_certificates_the_first_the_client_can_use_is_chosen() {
+        let names = names(&[
+            &["a.test"],
+            &["a.test"],
+            &["*.b.test"],
+            &["*.b.test"],
+            &["*.test"],
+        ]);
+        assert_eq!(names.choose("a.test", |at| at == 1), Some(1));
+        assert_eq!(names.choose("a.test", |at| at != 1), Some(0));
+        assert_eq!(names.choose("x.b.test", |at| at == 3), Some(3));
+        // None it can use: the first, the handshake left to fail as it would.
+        assert_eq!(names.choose("a.test", |_| false), Some(0));
+        // The most specific first: a certificate it can use for a less specific name is
+        // not one for this name.
+        assert_eq!(names.choose("x.b.test", |at| at == 4), Some(2));
     }
 
     proptest! {
         /// Against a naive reading of the rules: every certificate's names in order, an
-        /// exact match anywhere first, then the first wildcard that covers the name.
+        /// exact match anywhere first, then the first wildcard that covers the name, then
+        /// the first stated for every name; among those at the first of these that any
+        /// answers at, the first the client can use, or else the first.
         #[test]
         fn choosing_agrees_with_a_naive_reading(
             certificates in prop::collection::vec(
-                prop::collection::vec("(\\*\\.)?[ab]{1,2}(\\.[ab]{1,2}){0,2}", 0..4),
+                prop::collection::vec("\\*|(\\*\\.)?[ab]{1,2}(\\.[ab]{1,2}){0,2}", 0..4),
                 1..5,
             ),
             asked in "[ab.]{0,8}",
+            usable in prop::collection::vec(prop::bool::ANY, 5),
         ) {
             let carried: Vec<Vec<&str>> = certificates
                 .iter()
                 .map(|names| names.iter().map(String::as_str).collect())
                 .collect();
             let borrowed: Vec<&[&str]> = carried.iter().map(Vec::as_slice).collect();
-            let chosen = names(&borrowed).choose(&asked);
+            let chosen = names(&borrowed).choose(&asked, |at| usable[at]);
 
-            let exact = carried.iter().position(|names| names.contains(&asked.as_str()));
-            let wildcard = carried.iter().position(|names| {
+            let answering = |answers: &dyn Fn(&[&str]) -> bool| -> Vec<usize> {
+                (0..carried.len()).filter(|&at| answers(&carried[at])).collect()
+            };
+            let exact = answering(&|names| names.contains(&asked.as_str()));
+            let wildcard = answering(&|names| {
                 names.iter().any(|name| {
                     name.strip_prefix("*.").is_some_and(|parent| {
                         asked
@@ -641,7 +778,17 @@ mod tests {
                     })
                 })
             });
-            prop_assert_eq!(chosen, exact.or(wildcard));
+            let star = answering(&|names| names.contains(&"*"));
+            let level = [exact, wildcard, star]
+                .into_iter()
+                .find(|level| !level.is_empty())
+                .unwrap_or_default();
+            let expected = level
+                .iter()
+                .copied()
+                .find(|&at| usable[at])
+                .or_else(|| level.first().copied());
+            prop_assert_eq!(chosen, expected);
         }
     }
 
@@ -814,6 +961,40 @@ mod tests {
                     Some(UNRECOGNIZED_NAME),
                     "{name:?}"
                 );
+            }
+        }
+
+        /// Over QUIC as over TCP, of two certificates for one name a client is given the
+        /// first whose key it can verify a signature by: QUIC's TLS is 1.3's, so its
+        /// signature schemes decide.
+        #[test]
+        fn of_two_certificates_for_a_name_a_quic_client_is_given_one_it_can_verify() {
+            let rsa = edgerush_certificates::testing::rsa_certificate(&["both.test"]);
+            let ecdsa = certificate(&["both.test"]);
+            let tls = Tls::new(&CompiledTls {
+                certificates: vec![
+                    presented("rsa", rsa.clone()),
+                    presented("ecdsa", ecdsa.clone()),
+                ],
+                without_sni: None,
+                refused: Vec::new(),
+                client_validation: None,
+            })
+            .unwrap();
+            let offering = |schemes: &str| {
+                let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+                builder.set_sigalgs_list(schemes).unwrap();
+                client_config_over(builder)
+            };
+            for (schemes, shown) in [
+                ("ECDSA+SHA256", &ecdsa),
+                ("RSA-PSS+SHA256", &rsa),
+                ("ECDSA+SHA256:RSA-PSS+SHA256", &rsa),
+            ] {
+                let client = client_for("both.test", &mut offering(schemes));
+                let pipe = handshake(client, &mut worker_config(&tls));
+                assert!(pipe.server.is_established(), "{schemes}");
+                assert_eq!(pipe.client.peer_cert(), Some(&der(shown)[..]), "{schemes}");
             }
         }
 

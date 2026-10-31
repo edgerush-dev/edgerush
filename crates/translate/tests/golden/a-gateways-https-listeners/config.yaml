@@ -1,0 +1,82 @@
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  https:
+    address: "[::]:8443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: shop/shop-tls, names: ["*"] }
+        - { certificate: edge/own, names: [secure.example.com, kinds.example.com, plain.example.com] }
+        - { certificate: shop/secure, names: [secure.example.com, later.example.com] }
+        - { certificate: shop/wild, names: ["*.wild.example.com", legacy.example.com] }
+        - { certificate: shop/ingress-only, names: [shop.example.com] }
+      without_sni: shop/shop-tls
+      refused: [unusable.example.com, denied.example.com]
+  more:
+    address: "[::]:9443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: edge/own, names: [more.example.com] }
+        - { certificate: shop/ingress-only, names: [shop.example.com] }
+        - { certificate: shop/wild, names: [legacy.example.com] }
+      without_sni: none
+      refused: [plain.example.com]
+routes:
+  - name: httproute/shop/app/catch-all
+    listeners: [https]
+    hostnames: [{ name: app.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/legacy/shop.example.com
+    listeners: [https, more]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/legacy/shop.example.com/https-redirect
+    listeners: [http]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: max-age=30 }], add: [], remove: [] }]
+        redirect: { status: 308, scheme: https, port: 8443, query: keep }
+  - name: ingress/shop/plain/plain.example.com
+    listeners: [http]
+    hostnames: [{ name: plain.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/shared/legacy.example.com
+    listeners: [https, more]
+    hostnames: [{ name: legacy.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/shared/legacy.example.com/https-redirect
+    listeners: [http]
+    hostnames: [{ name: legacy.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: max-age=30 }], add: [], remove: [] }]
+        redirect: { status: 308, scheme: https, port: 8443, query: keep }
+  - { name: gateway/edge/web/exact, listeners: [https], hostnames: [{ name: "secure.example.com", falls_through: false }], rules: [] }
+  - { name: gateway/edge/web/wild, listeners: [https], hostnames: [{ name: "*.wild.example.com", wildcard: any_labels, falls_through: false }], rules: [] }
+  - { name: gateway/edge/web/kinds, listeners: [https], hostnames: [{ name: "kinds.example.com", falls_through: false }], rules: [] }
+  - { name: gateway/edge/web/later, listeners: [https], hostnames: [{ name: "later.example.com", falls_through: false }], rules: [] }
+  - { name: gateway/edge/web/migrated, listeners: [https], hostnames: [{ name: "plain.example.com", falls_through: false }], rules: [] }
+  - { name: gateway/edge/web/elsewhere, listeners: [more], hostnames: [{ name: "more.example.com", falls_through: false }], rules: [] }
+upstreams:
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

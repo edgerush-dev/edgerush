@@ -1,7 +1,9 @@
 //! EdgeRush's control plane ([04](../../../docs/04-control-plane.md)): the objects a data
 //! plane's config is made of, followed in the scope the control plane watches, translated
 //! for the data plane once every kind has been listed whole, and each config that compiles
-//! and differs from the last handed on.
+//! and differs from the last handed on. Where the data plane is a Gateway, the Gateway
+//! API's kinds are followed too, each while its CRD serves the version read
+//! ([`gateway_api`]).
 //!
 //! The changes of a moment make one translation: it waits until no change has come for
 //! [`Debounce::quiet`], and never more than [`Debounce::most`] after the first it waits on
@@ -12,22 +14,29 @@
 //! about judged alone, and answered by [`admission`] (04 §3).
 
 use edgerush_config::{ConfigError, compile};
+use edgerush_gateway_api::gateway::Gateway;
+use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_kubernetes::{ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow};
-use edgerush_translate::{Cluster, Object, Plane, Translation, translate};
-use k8s_openapi::api::core::v1::{Secret, Service};
+use edgerush_translate::{Cluster, GatewayName, Object, Plane, Translation, translate};
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, watch};
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
 
 pub mod admission;
+pub mod gateway_api;
 pub mod lease;
 pub mod status;
 
+use gateway_api::{GatewayKind, Served};
 use status::Addresses;
 
 /// How long changes are gathered before they are translated.
@@ -55,6 +64,10 @@ pub enum Said<'a> {
     /// These have not been listed whole, and nothing is translated until they are: said at
     /// the start, and again each time they are fewer, until none are left.
     Waiting(&'a [String]),
+    /// What the cluster has of each Gateway API kind, where the data plane is a Gateway:
+    /// said once each kind's CRD has been listed, and again whenever it changes. A kind not
+    /// served is taken as having no objects.
+    GatewayApi(&'a [(GatewayKind, Served)]),
     /// Asking for what is followed failed, and is asked again after a wait.
     Failed {
         /// What is followed: `secrets in shop`, `ingressclasses in the cluster`.
@@ -87,7 +100,10 @@ pub enum Said<'a> {
 
 /// Follows, through `api`, the kinds `plane`'s config is made of in each of `scope`'s
 /// parts, IngressClasses in the cluster, and translates them for it each time they
-/// change, once every one has been listed whole; says how it goes to `said`. With
+/// change, once every one has been listed whole; says how it goes to `said`. Where `plane`
+/// names a Gateway, the Gateway API's kinds are followed too, GatewayClasses in the
+/// cluster and Gateways in that Gateway's namespace alone, each from when its CRD is listed
+/// and serves the version read until it no longer does, and Namespaces in the cluster. With
 /// `status`, it writes each Ingress's status to say the addresses it gives as the config
 /// handed on serves the Ingress, where it says otherwise; with `leading` too, only while it
 /// says this replica leads, every status that says otherwise written as it comes to (02 §3).
@@ -112,7 +128,7 @@ pub async fn control(
         changed: &changed,
         said: &said,
     };
-    let followed = Followed {
+    let mut followed = Followed {
         ingress_classes: start.follows(&[Scope::Cluster]),
         ingresses: start.follows(scope),
         services: start.follows(scope),
@@ -123,6 +139,10 @@ pub async fn control(
             }
             _ => Vec::new(),
         },
+        gateway_api: plane
+            .gateway
+            .as_ref()
+            .map(|gateway| GatewayApi::start(&mut start, gateway)),
     };
     // Coming to lead is a change: every status is looked at, as the last leader may have
     // left some stale.
@@ -139,6 +159,23 @@ pub async fn control(
     // What the config handed on serves: the Ingresses claimed, and those served.
     let mut handed: Option<(Vec<Object>, Vec<Object>)> = None;
     loop {
+        // The follows of the Gateway API kinds, started and stopped as their CRDs say.
+        if let Some(gateway_api) = &mut followed.gateway_api
+            && let Some(served) = gateway_api.served()
+            && gateway_api.last.as_ref() != Some(&served)
+        {
+            let mut start = Start {
+                tasks: &mut tasks,
+                api: &api,
+                changed: &changed,
+                said: &said,
+            };
+            gateway_api.follow(&served, &mut start, scope);
+            said(Said::GatewayApi(&served));
+            gateway_api.last = Some(served);
+        }
+        // Follows stopped are aborted: what is left of them is let go of.
+        while tasks.try_join_next().is_some() {}
         match translator.step(plane, followed.unlisted(), || followed.cluster()) {
             Step::Nothing => {}
             Step::Waiting(unlisted) => said(Said::Waiting(unlisted)),
@@ -226,7 +263,7 @@ impl Start<'_> {
                     part.clone(),
                     name.clone(),
                 );
-                self.tasks.spawn_local(async move {
+                let following = self.tasks.spawn_local(async move {
                     follow(&api, &part, Retry::default(), out, |failure| {
                         said(Said::Failed {
                             followed: &failed,
@@ -237,12 +274,16 @@ impl Start<'_> {
                 });
                 // Each change to the objects is a change to wait out.
                 let (mut told, changed) = (objects.clone(), Rc::clone(self.changed));
-                self.tasks.spawn_local(async move {
+                let telling = self.tasks.spawn_local(async move {
                     while told.changed().await.is_ok() {
                         changed.notify_one();
                     }
                 });
-                Follow { name, objects }
+                Follow {
+                    name,
+                    objects,
+                    _tasks: Tasks(vec![following, telling]),
+                }
             })
             .collect()
     }
@@ -253,13 +294,141 @@ fn followed<K: Kind>(part: &Scope) -> String {
     match part {
         Scope::Cluster => format!("{} in the cluster", K::URL_PATH_SEGMENT),
         Scope::Namespace(namespace) => format!("{} in {namespace}", K::URL_PATH_SEGMENT),
+        Scope::Named(name) => format!("{} named {name}", K::URL_PATH_SEGMENT),
     }
 }
 
-/// A kind's objects in one part of the scope, as their follow last published them.
+/// A kind's objects in one part of the scope, as their follow last published them. Let go
+/// of, it is stopped.
 struct Follow<K> {
     name: String,
     objects: watch::Receiver<Arc<Listed<K>>>,
+    _tasks: Tasks,
+}
+
+/// A follow's tasks, aborted as it is let go of.
+struct Tasks(Vec<AbortHandle>);
+
+impl Drop for Tasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// The follows of the Gateway API's kinds: each kind's CRD by its name, and the kind's
+/// objects while the CRD serves the version read.
+struct GatewayApi {
+    crds: Vec<(GatewayKind, Follow<CustomResourceDefinition>)>,
+    /// Every Namespace, for the labels a listener's selector of namespaces matches: a kind
+    /// every cluster has, so followed whatever the CRDs say.
+    namespaces: Vec<Follow<Namespace>>,
+    /// The data plane's Gateway's namespace: the one Gateways are followed in, as no other
+    /// Gateway is read (04 §2).
+    namespace: Scope,
+    /// What was last said of the kinds, and followed by.
+    last: Option<Vec<(GatewayKind, Served)>>,
+    gateway_classes: Option<Vec<Follow<GatewayClass>>>,
+    gateways: Option<Vec<Follow<Gateway>>>,
+    http_routes: Option<Vec<Follow<HTTPRoute>>>,
+    reference_grants: Option<Vec<Follow<ReferenceGrant>>>,
+}
+
+impl GatewayApi {
+    /// Starts following each kind's CRD; the kinds wait on what they say.
+    fn start(start: &mut Start<'_>, gateway: &GatewayName) -> Self {
+        let crds = GatewayKind::ALL
+            .into_iter()
+            .flat_map(|kind| {
+                start
+                    .follows(&[Scope::Named(kind.crd().to_owned())])
+                    .into_iter()
+                    .map(move |follow| (kind, follow))
+            })
+            .collect();
+        Self {
+            crds,
+            namespaces: start.follows(&[Scope::Cluster]),
+            namespace: Scope::Namespace(gateway.namespace.clone()),
+            last: None,
+            gateway_classes: None,
+            gateways: None,
+            http_routes: None,
+            reference_grants: None,
+        }
+    }
+
+    /// What the cluster has of each kind, once every CRD has been listed.
+    fn served(&self) -> Option<Vec<(GatewayKind, Served)>> {
+        self.crds
+            .iter()
+            .map(|(kind, follow)| {
+                let listed = follow.objects.borrow();
+                listed.listed.then(|| (*kind, Served::of(&listed.objects)))
+            })
+            .collect()
+    }
+
+    /// Follows each kind `served` says is served, in `scope` (GatewayClasses in the
+    /// cluster, Gateways in the data plane's Gateway's namespace), and stops following each
+    /// it says is not.
+    fn follow(&mut self, served: &[(GatewayKind, Served)], start: &mut Start<'_>, scope: &[Scope]) {
+        for (kind, served) in served {
+            let on = served.is_served();
+            match kind {
+                GatewayKind::GatewayClass => {
+                    keep(&mut self.gateway_classes, on, || {
+                        start.follows(&[Scope::Cluster])
+                    });
+                }
+                GatewayKind::Gateway => {
+                    let namespace = std::slice::from_ref(&self.namespace);
+                    keep(&mut self.gateways, on, || start.follows(namespace));
+                }
+                GatewayKind::HTTPRoute => keep(&mut self.http_routes, on, || start.follows(scope)),
+                GatewayKind::ReferenceGrant => {
+                    keep(&mut self.reference_grants, on, || start.follows(scope));
+                }
+            }
+        }
+    }
+
+    /// Every follow translation waits on that has not been listed whole: the CRDs', and
+    /// those of each kind followed.
+    fn unlisted(&self) -> impl Iterator<Item = String> + '_ {
+        self.crds
+            .iter()
+            .map(|(_, follow)| follow)
+            .filter(|follow| !follow.objects.borrow().listed)
+            .map(|follow| follow.name.clone())
+            .chain(unlisted(&self.namespaces))
+            .chain(unlisted(
+                self.gateway_classes.as_deref().unwrap_or_default(),
+            ))
+            .chain(unlisted(self.gateways.as_deref().unwrap_or_default()))
+            .chain(unlisted(self.http_routes.as_deref().unwrap_or_default()))
+            .chain(unlisted(
+                self.reference_grants.as_deref().unwrap_or_default(),
+            ))
+    }
+}
+
+/// `slot`'s follows started where `on` and there are none, and stopped where not `on`.
+fn keep<K>(slot: &mut Option<Vec<Follow<K>>>, on: bool, start: impl FnOnce() -> Vec<Follow<K>>) {
+    if on && slot.is_none() {
+        *slot = Some(start());
+    } else if !on {
+        *slot = None;
+    }
+}
+
+/// The names of `follows` that have not been listed whole.
+fn unlisted<K>(follows: &[Follow<K>]) -> impl Iterator<Item = String> + '_ {
+    follows
+        .iter()
+        .filter(|follow| !follow.objects.borrow().listed)
+        .map(|follow| follow.name.clone())
 }
 
 /// Every follow, by kind.
@@ -270,21 +439,18 @@ struct Followed {
     secrets: Vec<Follow<Secret>>,
     /// The namespace of the data plane's Service, followed for its addresses.
     status_service: Vec<Follow<Service>>,
+    /// The Gateway API's kinds, where the data plane is a Gateway.
+    gateway_api: Option<GatewayApi>,
 }
 
 impl Followed {
     /// The follows translation waits on that have not been listed whole, by name.
     fn unlisted(&self) -> Vec<String> {
-        fn of<K>(follows: &[Follow<K>]) -> impl Iterator<Item = String> {
-            follows
-                .iter()
-                .filter(|follow| !follow.objects.borrow().listed)
-                .map(|follow| follow.name.clone())
-        }
-        of(&self.ingress_classes)
-            .chain(of(&self.ingresses))
-            .chain(of(&self.services))
-            .chain(of(&self.secrets))
+        unlisted(&self.ingress_classes)
+            .chain(unlisted(&self.ingresses))
+            .chain(unlisted(&self.services))
+            .chain(unlisted(&self.secrets))
+            .chain(self.gateway_api.iter().flat_map(GatewayApi::unlisted))
             .collect()
     }
 
@@ -308,12 +474,24 @@ impl Followed {
 
     /// Every object followed, as translation takes them.
     fn cluster(&self) -> Cluster {
+        let gateway_api = self.gateway_api.as_ref();
+        // A kind not followed has no objects.
+        fn of<K: Clone>(follows: Option<&Vec<Follow<K>>>) -> Vec<K> {
+            follows.map(|follows| objects(follows)).unwrap_or_default()
+        }
         Cluster {
             ingress_classes: objects(&self.ingress_classes),
             ingresses: objects(&self.ingresses),
             services: objects(&self.services),
             secrets: objects(&self.secrets),
             secrets_assumed: false,
+            gateway_classes: of(gateway_api.and_then(|g| g.gateway_classes.as_ref())),
+            gateways: of(gateway_api.and_then(|g| g.gateways.as_ref())),
+            http_routes: of(gateway_api.and_then(|g| g.http_routes.as_ref())),
+            reference_grants: of(gateway_api.and_then(|g| g.reference_grants.as_ref())),
+            namespaces: gateway_api
+                .map(|g| objects(&g.namespaces))
+                .unwrap_or_default(),
         }
     }
 }

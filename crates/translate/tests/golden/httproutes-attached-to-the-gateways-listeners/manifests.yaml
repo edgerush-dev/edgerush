@@ -1,0 +1,103 @@
+# Each HTTPRoute's parents of the data plane's Gateway, fitted to its listeners: attached to
+# every listener that takes it, or to the one its section names, the route's hostnames met
+# with each listener's and those of more specific listeners on the port taken away
+# (listener isolation, as Gateway API's conformance test of it has it); or not attached,
+# and why. A parent that is another Gateway is passed over. Each listener's hostname is
+# claimed with no rules, so that nothing less specific serves it. The routes name no
+# backend, so their one rule, the schema's default, answers 500, as the spec has it.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: shop, labels: { team: shop } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: any, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+    - { name: example, port: 8080, protocol: HTTP, hostname: "*.example.com", allowedRoutes: { namespaces: { from: All } } }
+    - { name: foo, port: 8080, protocol: HTTP, hostname: "*.foo.example.com", allowedRoutes: { namespaces: { from: All } } }
+    - { name: abc, port: 8080, protocol: HTTP, hostname: abc.foo.example.com, allowedRoutes: { namespaces: { from: All } } }
+    - { name: same-only, port: 8080, protocol: HTTP, hostname: same.example.org }
+    - name: selected
+      port: 8080
+      protocol: HTTP
+      hostname: sel.example.org
+      allowedRoutes: { namespaces: { from: Selector, selector: { matchLabels: { team: shop } } } }
+    - name: tls-only
+      port: 8080
+      protocol: HTTP
+      hostname: tls.example.org
+      allowedRoutes: { kinds: [{ kind: TLSRoute }], namespaces: { from: All } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: everywhere, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [bar.com, "*.example.com", "*.foo.example.com", abc.foo.example.com, y.foo.example.com]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: by-section, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: foo }]
+  hostnames: [x.foo.example.com]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: by-port, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, port: 9999 }]
+  # Attached nowhere, so nothing of it is translated: not even its rule's filter is said.
+  rules: [{ filters: [{ type: RequestRedirect, requestRedirect: { scheme: https } }] }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: unknown-section, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: nope }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: not-allowed, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: same-only }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: selected, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: selected }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: disjoint, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: abc }]
+  hostnames: [other.example.net]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: elsewhere, namespace: shop }
+spec:
+  parentRefs: [{ name: other, namespace: shop }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: in-edge, namespace: edge }
+spec:
+  parentRefs: [{ name: web, sectionName: same-only }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: wrong-kind, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: tls-only }]

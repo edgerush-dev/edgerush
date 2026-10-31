@@ -18,27 +18,50 @@
 //! Over plain HTTP, a host its `tls` lists is redirected there, secured or not, unless the
 //! data plane's settings or the Ingress's `gateway.edgerush.dev/https-redirect` annotation
 //! say not, and is served over plain HTTP only where they do.
+//!
+//! Where the data plane is a Gateway, its class is checked to name this controller and
+//! each of its listeners fitted to the data plane's own, or refused and why ([`gateway`]);
+//! each HTTPRoute that names it is attached to the listeners that take it, and each
+//! listener's hostname claimed for isolation ([`http_route`]), and its rules translated:
+//! matches and backends, a rule with what translation does not take yet answering 500 by
+//! itself, one whose matches cannot be built left out.
+//! Every host a claim of one API takes from the other's is said.
 
 use edgerush_certificates::Identity;
 use edgerush_config::{
     Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, Header, HeaderChanges,
     Hostname, Listener, ListenerCertificate, LoadBalancer, Match, PathMatch, Protocol, Query,
-    Redirect, Route, Rule, Scheme, StatedNames, Upstream, UpstreamProtocol, UpstreamTls, Wildcard,
-    compile,
+    Redirect, Route, Rule, Scheme, StatedNames, Upstream, UpstreamProtocol, UpstreamTls,
+    ValueMatch, Wildcard, compile,
 };
-use k8s_openapi::api::core::v1::{Secret, Service};
+use edgerush_gateway_api::gateway::Gateway;
+use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::reference_grant::ReferenceGrant;
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{
     Ingress, IngressBackend, IngressClass, IngressServiceBackend,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::btree_map::Entry;
 use std::fmt;
 
+pub mod gateway;
+pub mod http_route;
+
+pub use gateway::{
+    Allowed, GatewayOutcome, ListenerOutcome, ListenerProblem, Namespaces, Requirement, Selector,
+};
+pub use http_route::{Attachment, NotAttached, ParentOutcome, RouteOutcome, Taken};
+
 /// The controller an IngressClass names to be served by EdgeRush (02 §2).
 pub const CONTROLLER: &str = "edgerush.dev/ingress-controller";
+
+/// The controller a GatewayClass names to be served by EdgeRush (02 §2).
+pub const GATEWAY_CONTROLLER: &str = "edgerush.dev/gateway-controller";
 
 /// The data plane's own settings, which in a cluster are its `DataPlane` resource's
 /// ([05 §1](../../../docs/05-operator.md)).
@@ -47,6 +70,11 @@ pub const CONTROLLER: &str = "edgerush.dev/ingress-controller";
 pub struct Plane {
     /// The IngressClass whose Ingresses it serves.
     pub ingress_class: String,
+    /// The Gateway it is, if it serves the Gateway API, written `<namespace>/<name>`
+    /// ([04 §2](../../../docs/04-control-plane.md)). Only then are the Gateway API's kinds
+    /// followed (04 §1).
+    #[serde(default)]
+    pub gateway: Option<GatewayName>,
     /// Its listeners, as its config states them. An Ingress is served on every `http` one,
     /// and the hosts its `tls` lists on every `https` one too, which names no certificate
     /// of its own: it presents the Ingresses' Secrets'.
@@ -76,6 +104,49 @@ pub struct Plane {
     pub data_plane: DataPlane,
 }
 
+/// The Gateway a data plane is, by namespace and name: `<namespace>/<name>` as written.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(try_from = "String")]
+pub struct GatewayName {
+    /// Its namespace.
+    pub namespace: String,
+    /// Its name.
+    pub name: String,
+}
+
+impl TryFrom<String> for GatewayName {
+    type Error = String;
+
+    fn try_from(written: String) -> Result<Self, String> {
+        let invalid = || format!("`{written}` is not <namespace>/<name>");
+        let (namespace, name) = written.split_once('/').ok_or_else(invalid)?;
+        if !is_label(namespace) || !name.split('.').all(is_label) || name.len() > 253 {
+            return Err(invalid());
+        }
+        Ok(Self {
+            namespace: namespace.to_owned(),
+            name: name.to_owned(),
+        })
+    }
+}
+
+impl fmt::Display for GatewayName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.namespace, self.name)
+    }
+}
+
+/// Whether `label` is a DNS label, as a namespace's name is and each of a Gateway's
+/// name's parts.
+fn is_label(label: &str) -> bool {
+    (1..=63).contains(&label.len())
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+}
+
 /// The objects translated.
 #[derive(Debug, Clone, Default)]
 pub struct Cluster {
@@ -92,6 +163,18 @@ pub struct Cluster {
     /// asked to check them, as repositories seldom hold them (04 §3). The control plane
     /// always looks.
     pub secrets_assumed: bool,
+    /// Every GatewayClass seen, where the data plane is a Gateway: the Gateway API's kinds
+    /// are followed only then (04 §1), and those its install does not serve are none.
+    pub gateway_classes: Vec<GatewayClass>,
+    /// Every Gateway seen.
+    pub gateways: Vec<Gateway>,
+    /// Every HTTPRoute seen.
+    pub http_routes: Vec<HTTPRoute>,
+    /// Every ReferenceGrant seen.
+    pub reference_grants: Vec<ReferenceGrant>,
+    /// Every Namespace seen, where the data plane is a Gateway: their labels are what a
+    /// listener's selector of namespaces matches.
+    pub namespaces: Vec<Namespace>,
 }
 
 /// A data plane's config, and what could not go into it.
@@ -117,6 +200,26 @@ pub struct Translation {
     /// Every Ingress of the data plane's class, served or not, in the order they rank:
     /// those whose status is this data plane's to write.
     pub claimed: Vec<Object>,
+    /// The data plane's Gateway, where it names one that is there and this controller's:
+    /// what its status is to say of it.
+    pub gateway: Option<GatewayOutcome>,
+    /// Each HTTPRoute that names that Gateway among its parents, and what became of each
+    /// such parent: what their status is to say.
+    pub http_routes: Vec<RouteOutcome>,
+    /// The hosts a claim of one API takes from a claim of the other, which no longer serves
+    /// them: said, so that a move from one API to the other meets no surprise (04).
+    pub taken: Vec<Taken>,
+}
+
+impl Problem {
+    /// Whether this is a note on what is served as the spec has it, not a fault: said, but
+    /// no reason for `validate` to fail (04 §3). A retry's attempts taken as the data
+    /// plane's most are one, and a host an Ingress serves over plain HTTP alone served over
+    /// HTTPS by a Gateway listener another.
+    #[must_use]
+    pub fn is_note(&self) -> bool {
+        matches!(self, Self::RetryCapped { .. } | Self::HostOverTls { .. })
+    }
 }
 
 /// A path whose backend is not there: its Service does not exist, has no such port, or the
@@ -272,18 +375,19 @@ impl fmt::Display for TlsFinding {
     }
 }
 
-/// A path that never takes a request: an older Ingress, or an earlier rule of the same one,
-/// has it on the same host, matched the same way, and the router ranks the older first
-/// (07 §1).
+/// A match that never takes a request: an older Ingress or HTTPRoute, or an earlier rule of
+/// the same one, has it on the same listener and host, matched the same way, and the router
+/// ranks the older first, whichever API each is of (04 §1, 07 §1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shadowed {
-    /// The Ingress whose path it is.
+    /// The Ingress or HTTPRoute whose match it is.
     pub object: Object,
-    /// The host, as the Ingress names it (`*` for every host).
+    /// The host, as the object names it (`*` for every host).
     pub host: String,
-    /// The path and how it is matched: `/api (Prefix)`.
+    /// The path and how it is matched, and what else the match asks: `/api (Prefix)`,
+    /// `/api (Exact) for POST with header x-beta: on`.
     pub path: String,
-    /// The Ingress that has it first: older, or as old and first by namespace and name.
+    /// The object that has it first: older, or as old and first by namespace and name.
     pub by: Object,
     /// Whether both carry their creation times, so that `by` is the one the cluster takes
     /// first. Manifests written by hand do not, and are ranked by name, which may not be
@@ -394,12 +498,145 @@ pub enum Problem {
          class is translated"
     )]
     ClassNotOurs(String),
+    /// The data plane's Gateway is not there.
+    #[error("not among the objects, so nothing of the Gateway API is translated")]
+    GatewayMissing,
+    /// The data plane's Gateway's GatewayClass is not there.
+    #[error("not among the objects, so its Gateway is not translated")]
+    GatewayClassMissing,
+    /// The data plane's Gateway's GatewayClass is another controller's.
+    #[error(
+        "names controller `{0}`, not `edgerush.dev/gateway-controller`, so its Gateway is not \
+         translated"
+    )]
+    GatewayClassNotOurs(String),
+    /// A listener of the data plane's Gateway is not accepted.
+    #[error("listener {name}: not accepted: {problem}")]
+    Listener {
+        /// The listener's name.
+        name: String,
+        /// Why.
+        problem: ListenerProblem,
+    },
+    /// No listener of the data plane's Gateway is accepted.
+    #[error("none of its listeners is accepted, so it serves nothing")]
+    NoListenerAccepted,
+    /// A `parentRef` of an HTTPRoute to the data plane's Gateway attaches it to no listener.
+    #[error("not attached to the data plane's Gateway: {0}")]
+    NotAttached(NotAttached),
+    /// A rule of an HTTPRoute has what translation cannot take: it answers 500 for every
+    /// request it matches, the rest of the route served (`PartiallyInvalid`).
+    #[error("rule {rule} answers 500 for all it matches: {why}")]
+    RuleAnswered {
+        /// Its position among the route's rules.
+        rule: usize,
+        /// Why.
+        why: String,
+    },
+    /// A rule of an HTTPRoute whose matches cannot be built is left out, its requests left
+    /// to the route's other rules, the rest of the route served (`PartiallyInvalid`).
+    #[error("rule {rule} left out: {why}")]
+    RuleLeftOut {
+        /// Its position among the route's rules.
+        rule: usize,
+        /// Why.
+        why: String,
+    },
+    /// No rule of an HTTPRoute is served as written: it is not accepted, though those of its
+    /// rules that answer 500 still answer.
+    #[error("no rule is served as written, so it is not accepted")]
+    NoRuleServed,
+    /// A backend of an HTTPRoute's rule is invalid: its share of the rule's requests is
+    /// answered 500 (`ResolvedRefs` false).
+    #[error("rule {rule}: a backend's share is answered 500: {why}")]
+    BackendInvalid {
+        /// Its rule's position among the route's rules.
+        rule: usize,
+        /// Why.
+        why: String,
+    },
+    /// A mirror of an HTTPRoute's rule is left off, its backend not there or not permitted,
+    /// and the rule served without it, as the spec has it (`ResolvedRefs` false).
+    #[error("rule {rule}: a mirror is left off, the rule served without it: {why}")]
+    MirrorLeftOff {
+        /// Its rule's position among the route's rules.
+        rule: usize,
+        /// Why.
+        why: String,
+    },
+    /// A retry of an HTTPRoute's rule asks for more attempts than the data plane makes: it
+    /// makes its most (04 §2).
+    #[error(
+        "rule {rule}: a retry of {asked} attempts is taken as {}, the most the data plane makes",
+        edgerush_config::MOST_ATTEMPTS
+    )]
+    RetryCapped {
+        /// Its rule's position among the route's rules.
+        rule: usize,
+        /// The attempts asked for.
+        asked: i64,
+    },
+    /// A `certificateRef` of an HTTPS listener of the data plane's Gateway cannot be used
+    /// (`ResolvedRefs` false): the listener is served with the others, or not at all where
+    /// none is left.
+    #[error("listener {name}: a certificate cannot be used: {why}")]
+    ListenerCertificate {
+        /// The listener's name.
+        name: String,
+        /// Why.
+        why: String,
+    },
+    /// A host an Ingress serves over plain HTTP alone is a Gateway HTTPS listener's
+    /// hostname: served over HTTPS by that listener's certificate, no longer refused over TLS
+    /// (04 §2). A note: a move from Ingress to Gateway API, as it is meant to be made.
+    #[error(
+        "listener {name}: {host}, which an Ingress serves over plain HTTP alone, is served over HTTPS by it"
+    )]
+    HostOverTls {
+        /// The listener's name.
+        name: String,
+        /// The host.
+        host: String,
+    },
+    /// A listener of the data plane's Gateway names route kinds it cannot take
+    /// (`InvalidRouteKinds`); it takes the others.
+    #[error("listener {name}: takes no route of kind {kinds}")]
+    ListenerKinds {
+        /// The listener's name.
+        name: String,
+        /// The kinds, `group/kind`.
+        kinds: String,
+    },
+    /// A listener of the data plane's Gateway says which namespaces it takes routes from in
+    /// a way translation cannot read: it takes none.
+    #[error("listener {name}: takes routes from no namespace, as {why}")]
+    ListenerNamespaces {
+        /// The listener's name.
+        name: String,
+        /// Why.
+        why: String,
+    },
 }
 
 /// Translates `cluster`'s objects into the config of the data plane `plane` describes.
 #[must_use]
 pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut report = Vec::new();
+    let gateway = gateway::outcome(plane, cluster, &mut report);
+    let http_routes = gateway
+        .as_ref()
+        .map(|gateway| http_route::attached(cluster, gateway))
+        .unwrap_or_default();
+    for outcome in &http_routes {
+        for parent in &outcome.parents {
+            if let Err(why) = parent.attached {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::NotAttached(why),
+                });
+            }
+        }
+    }
     // An Ingress is the data plane's when its class is, and its class is when the
     // IngressClass of that name names this controller; one of no class is when that class
     // is the cluster's default.
@@ -513,7 +750,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 }
             }
         }
-        accepted.push((object(), dated, translated, taken));
+        accepted.push((object(), rank(&ingress.metadata, 0), translated, taken));
     }
     // Every Ingress in, a host some Ingress secures is served over HTTPS whichever Ingress's
     // route it is, so that both kinds of listener rank the same paths for it; a host none
@@ -533,17 +770,29 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         .filter(|(_, listener)| listener.protocol == Protocol::Https)
         .map(|(name, _)| name.clone())
         .collect();
-    let mut routes = Vec::new();
+    // The port a redirect to HTTPS states: none where an `https` listener binds 443, the
+    // default, and else the lowest such listener's, as pods bind ports as written and so
+    // are reached on them (05 §2, Lucas).
+    let https_ports = plane
+        .listeners
+        .values()
+        .filter(|listener| listener.protocol == Protocol::Https)
+        .map(|listener| listener.address.port());
+    let https_port = if https_ports.clone().any(|port| port == 443) {
+        None
+    } else {
+        https_ports.min()
+    };
+    // Each object's config routes, with its rank: those of every Ingress and HTTPRoute are
+    // put in the config in one order, oldest first, whichever API each is of (04 §1).
+    let mut ranked: Vec<Ranked> = Vec::new();
     let mut upstreams = BTreeMap::new();
     let mut unresolved = Vec::new();
     let mut tls = Vec::new();
     let mut refused: Vec<String> = Vec::new();
-    // Each host and path, matched one way, and the Ingress that had it first: oldest first,
-    // as the router ranks them.
-    let mut claimed: BTreeMap<(String, String), (Object, bool)> = BTreeMap::new();
-    let mut shadowed = Vec::new();
     let mut served_ingresses = Vec::new();
-    for (object, dated, translated, taken) in accepted {
+    for (object, rank, translated, taken) in accepted {
+        let mut routes = Vec::new();
         let mut served = Vec::new();
         let mut redirected = Vec::new();
         for mut route in translated.routes {
@@ -564,6 +813,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                     redirect = Some(https_redirect(
                         &route,
                         http,
+                        https_port,
                         plane.ingress_https_redirect_max_age,
                     ));
                 }
@@ -584,24 +834,6 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             }
             if route.listeners.is_empty() && redirect.is_none() {
                 continue;
-            }
-            for (host, path) in claims(&route) {
-                match claimed.entry((host, path)) {
-                    Entry::Vacant(free) => {
-                        free.insert((object.clone(), dated));
-                    }
-                    Entry::Occupied(first) => {
-                        let (host, path) = first.key().clone();
-                        let (by, by_dated) = first.get().clone();
-                        shadowed.push(Shadowed {
-                            object: object.clone(),
-                            host,
-                            path,
-                            by,
-                            by_age: dated && by_dated,
-                        });
-                    }
-                }
             }
             served.push(host);
             // A route whose host cannot be secured has nothing left but its redirect.
@@ -652,29 +884,158 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         );
         upstreams.extend(translated.upstreams);
         if !served.is_empty() {
-            served_ingresses.push(object);
+            served_ingresses.push(object.clone());
+        }
+        ranked.push(Ranked {
+            rank,
+            object,
+            routes,
+        });
+    }
+    // Each attached HTTPRoute's rules, each compiled alone, with the listeners it could be
+    // served on, so that one the data plane would refuse is dropped by itself (04 §2).
+    if let Some(gateway) = &gateway {
+        let refused = |rule: &Rule, upstreams: &BTreeMap<String, Upstream>| {
+            if !checked_alone {
+                return None;
+            }
+            let alone = Route {
+                name: "httproute".to_owned(),
+                listeners: served_on.keys().cloned().collect(),
+                hostnames: vec![http_route::claim("*")],
+                rules: vec![rule.clone()],
+                rate_limits: Vec::new(),
+            };
+            compile(&config_of(
+                served_on.clone(),
+                vec![alone],
+                upstreams.clone(),
+                &[],
+                &[],
+            ))
+            .err()
+            .map(|problems| {
+                let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
+                // On one line, as a report's finding is: a regex's error runs over several.
+                let said: Vec<&str> = problems.iter().flat_map(|p| p.split_whitespace()).collect();
+                format!("the data plane would refuse it: {}", said.join(" "))
+            })
+        };
+        for outcome in &http_routes {
+            // A route attached to no listener has nothing translated, its parents said.
+            if !outcome.parents.iter().any(|parent| parent.attached.is_ok()) {
+                continue;
+            }
+            let Some(route) = cluster
+                .http_routes
+                .iter()
+                .find(|route| Object::of("HTTPRoute", &route.metadata) == outcome.route)
+            else {
+                continue;
+            };
+            let translated =
+                http_route::translated(route, outcome, gateway, plane, cluster, refused);
+            for (rule, why) in &translated.answered {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::RuleAnswered {
+                        rule: *rule,
+                        why: why.clone(),
+                    },
+                });
+            }
+            for (rule, why) in &translated.left_out {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::RuleLeftOut {
+                        rule: *rule,
+                        why: why.clone(),
+                    },
+                });
+            }
+            for (rule, why) in &translated.invalid {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::BackendInvalid {
+                        rule: *rule,
+                        why: why.clone(),
+                    },
+                });
+            }
+            for (rule, asked) in &translated.retries_capped {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::RetryCapped {
+                        rule: *rule,
+                        asked: *asked,
+                    },
+                });
+            }
+            for (rule, why) in &translated.mirrors_left_off {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::MirrorLeftOff {
+                        rule: *rule,
+                        why: why.clone(),
+                    },
+                });
+            }
+            if translated.answered.len() + translated.left_out.len() == route.spec.rules.len() {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::NoRuleServed,
+                });
+            }
+            ranked.push(Ranked {
+                rank: rank(&route.metadata, 1),
+                object: outcome.route.clone(),
+                routes: translated.routes,
+            });
+            upstreams.extend(translated.upstreams);
         }
     }
-    // An upstream only routes served on no listener led to is left out with them.
+    ranked.sort_by(|a, b| a.rank.cmp(&b.rank));
+    let (mut routes, shadowed) = in_order(ranked);
+    // Each listener hostname of the Gateway is claimed, so that nothing less specific serves
+    // it (04 §2, listener isolation).
+    if let Some(gateway) = &gateway {
+        routes.extend(http_route::claims(gateway));
+    }
+    let taken = http_route::taken(&routes);
+    // An upstream only routes served on no listener led to, or copied to, is left out with
+    // them.
     let used: Vec<String> = routes
         .iter()
         .flat_map(|route| &route.rules)
-        .filter_map(|rule| rule.forward.as_ref())
-        .flat_map(|forward| &forward.backends)
-        .filter_map(|backend| backend.upstream.clone())
+        .flat_map(|rule| {
+            let backends = rule
+                .forward
+                .iter()
+                .flat_map(|forward| &forward.backends)
+                .filter_map(|backend| backend.upstream.clone());
+            let mirrors = rule.filters.iter().filter_map(|filter| match filter {
+                Filter::RequestMirror(mirror) => Some(mirror.upstream.clone()),
+                _ => None,
+            });
+            backends.chain(mirrors)
+        })
         .collect();
     upstreams.retain(|name, _| used.contains(name));
+    let mut config = Config {
+        data_plane: plane.data_plane.clone(),
+        ..config_of(
+            plane.listeners.clone(),
+            routes,
+            upstreams,
+            &presented,
+            &refused,
+        )
+    };
+    if let Some(gateway) = &gateway {
+        gateway_tls(&mut config, gateway, cluster, &mut report);
+    }
     Translation {
-        config: Config {
-            data_plane: plane.data_plane.clone(),
-            ..config_of(
-                plane.listeners.clone(),
-                routes,
-                upstreams,
-                &presented,
-                &refused,
-            )
-        },
+        config,
         report,
         passed_over: others.len(),
         unresolved,
@@ -682,27 +1043,316 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         shadowed,
         served: served_ingresses,
         claimed: of_the_class,
+        gateway,
+        http_routes,
+        taken,
     }
 }
 
-/// The hosts and paths a route claims, each path with how it is matched.
-fn claims(route: &Route) -> impl Iterator<Item = (String, String)> + '_ {
-    route.hostnames.iter().flat_map(move |hostname| {
-        route
-            .rules
-            .iter()
-            .flat_map(|rule| &rule.matches)
-            .filter_map(|matched| Some((hostname.name.clone(), described(matched.path.as_ref()?))))
+/// Where an object's config routes go among all others: oldest first, then by namespace and
+/// name, as Gateway API ranks routes, whichever API each is of (04 §1); an Ingress and an
+/// HTTPRoute alike in all three, the Ingress first, as the one more likely there before.
+/// The order is precedence's last tie-breaker (07 §1).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Rank {
+    created: Option<Time>,
+    namespace: String,
+    name: String,
+    /// 0 for an Ingress, 1 for an HTTPRoute: the Ingress first.
+    api: u8,
+}
+
+/// The rank of the object of `metadata`, of API `api` (0 for Ingress, 1 for HTTPRoute).
+fn rank(metadata: &ObjectMeta, api: u8) -> Rank {
+    Rank {
+        created: metadata.creation_timestamp.clone(),
+        namespace: namespace(metadata).to_owned(),
+        name: metadata.name.clone().unwrap_or_default(),
+        api,
+    }
+}
+
+/// An object's config routes, and its rank.
+struct Ranked {
+    rank: Rank,
+    object: Object,
+    routes: Vec<Route>,
+}
+
+/// The routes of objects ranked in order, and each match among them that never takes a
+/// request: one an earlier route already has on the same listener and host, the same in all
+/// the router ranks by. A wildcard hostname of any labels covers one of a single label of
+/// the same name, but not the other way about: Ingress's `*.example.com` and Gateway API's
+/// claim different hosts.
+fn in_order(ranked: Vec<Ranked>) -> (Vec<Route>, Vec<Shadowed>) {
+    // Under each key, the first object to have it with each kind of wildcard.
+    let mut first: BTreeMap<String, Vec<(Option<Wildcard>, Object, bool)>> = BTreeMap::new();
+    let mut shadowed = Vec::new();
+    let mut routes = Vec::new();
+    for Ranked {
+        rank,
+        object,
+        routes: theirs,
+    } in ranked
+    {
+        let dated = rank.created.is_some();
+        for route in &theirs {
+            for (key, hostname, path) in matched(route) {
+                let earlier = first.entry(key).or_default();
+                let wildcard = wildcard_of(hostname);
+                match earlier
+                    .iter()
+                    .find(|(theirs, ..)| covers(*theirs, wildcard))
+                {
+                    None => earlier.push((wildcard, object.clone(), dated)),
+                    Some((_, by, by_dated)) => {
+                        let found = Shadowed {
+                            object: object.clone(),
+                            host: hostname.name.clone(),
+                            path,
+                            by: by.clone(),
+                            by_age: dated && *by_dated,
+                        };
+                        // Said once, however many listeners it is shadowed on.
+                        if !shadowed.contains(&found) {
+                            shadowed.push(found);
+                        }
+                    }
+                }
+            }
+        }
+        routes.extend(theirs);
+    }
+    (routes, shadowed)
+}
+
+/// What the `*` of a hostname stands for, where it is a wildcard.
+fn wildcard_of(hostname: &Hostname) -> Option<Wildcard> {
+    hostname
+        .name
+        .starts_with("*.")
+        .then_some(hostname.wildcard)
+        .flatten()
+}
+
+/// Whether a hostname of wildcard `theirs` covers every host one of the same name and
+/// wildcard `ours` does.
+fn covers(theirs: Option<Wildcard>, ours: Option<Wildcard>) -> bool {
+    theirs == ours || (theirs == Some(Wildcard::AnyLabels) && ours == Some(Wildcard::OneLabel))
+}
+
+/// Each match of a route on each of its listeners and hostnames: a key that is the same for
+/// two matches alike in all the router ranks them by but their hostname's wildcard, the
+/// hostname, and the match as the report says it.
+fn matched(route: &Route) -> impl Iterator<Item = (String, &Hostname, String)> + '_ {
+    route.listeners.iter().flat_map(move |listener| {
+        route.hostnames.iter().flat_map(move |hostname| {
+            route
+                .rules
+                .iter()
+                .flat_map(|rule| &rule.matches)
+                .filter_map(move |matched| {
+                    let said = described(matched)?;
+                    Some((
+                        format!("{listener} {} {said}", hostname.name),
+                        hostname,
+                        said,
+                    ))
+                })
+        })
     })
 }
 
+/// A match as the report says it: its path and how it is matched, `/api (Prefix)`, then its
+/// method, headers and query parameters, these in order of name, as the router takes them
+/// in any order. None for a match of no path.
+fn described(matched: &Match) -> Option<String> {
+    let mut said = path_said(matched.path.as_ref()?);
+    if let Some(method) = &matched.method {
+        said.push_str(" for ");
+        said.push_str(method);
+    }
+    // Header names are matched without regard to case.
+    let mut headers: Vec<String> = matched
+        .headers
+        .iter()
+        .map(|header| {
+            format!(
+                "header {}",
+                value_said(&header.name.to_ascii_lowercase(), &header.value)
+            )
+        })
+        .collect();
+    headers.sort();
+    let mut query: Vec<String> = matched
+        .query
+        .iter()
+        .map(|parameter| {
+            format!(
+                "query parameter {}",
+                value_said(&parameter.name, &parameter.value)
+            )
+        })
+        .collect();
+    query.sort();
+    headers.extend(query);
+    if !headers.is_empty() {
+        said.push_str(" with ");
+        said.push_str(&headers.join(", "));
+    }
+    Some(said)
+}
+
 /// A path and how it is matched, as the report says it: `/api (Prefix)`.
-fn described(path: &PathMatch) -> String {
+fn path_said(path: &PathMatch) -> String {
     match path {
         PathMatch::Prefix(path) => format!("{path} (Prefix)"),
         PathMatch::Exact(path) => format!("{path} (Exact)"),
         PathMatch::Regex(path) => format!("{path} (regex)"),
     }
+}
+
+/// A header's or query parameter's match as the report says it: `x-beta: on`,
+/// `tenant matching [a-z]+`.
+fn value_said(name: &str, value: &ValueMatch) -> String {
+    match value {
+        ValueMatch::Exact(value) => format!("{name}: {value}"),
+        ValueMatch::Regex(value) => format!("{name} matching {value}"),
+    }
+}
+
+/// The certificates of the data plane's Gateway's HTTPS listeners, on the data plane's
+/// listeners that serve each (04 §2): each stated for its listener's hostname, or, where it
+/// has none, for every name no other answers for and for a client that asks for none, the
+/// spec's "longest matching SNI"; before an Ingress's on the same listener, the Gateway's
+/// listener owning its hostname, and a Secret both name one certificate for both's names.
+/// A listener none of whose certificates can be used has its hostname refused, so that no
+/// other certificate answers for it; a wildcard cannot be. One that can has its hostname
+/// taken off the names refused, where an Ingress serving it over plain HTTP alone put it,
+/// and that is said in `report` as a note.
+fn gateway_tls(
+    config: &mut Config,
+    gateway: &GatewayOutcome,
+    cluster: &Cluster,
+    report: &mut Vec<Finding>,
+) {
+    // By the data plane's listener: each certificate and the names stated for it.
+    let mut gathered: BTreeMap<String, Vec<(String, Vec<String>)>> = BTreeMap::new();
+    let mut without_sni: BTreeMap<String, String> = BTreeMap::new();
+    for listener in &gateway.listeners {
+        let stated = listener.hostname.clone().unwrap_or_else(|| "*".to_owned());
+        let serving = match &listener.served {
+            Ok(serving) if !listener.certificates.is_empty() => serving,
+            Err(gateway::ListenerProblem::NoCertificate) => {
+                if !stated.contains('*') {
+                    for tls in https_on(config, listener.port) {
+                        if !tls.refused.contains(&stated) {
+                            tls.refused.push(stated.clone());
+                        }
+                    }
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        for name in &listener.certificates {
+            let certificate = name.split_once('/').and_then(|(namespace, secret)| {
+                if cluster.secrets_assumed {
+                    // Named, and not looked at: what it holds is the cluster's.
+                    return Some(Certificate {
+                        chain: String::new(),
+                        key: String::new(),
+                    });
+                }
+                secret_certificate(cluster, namespace, secret)
+                    .ok()
+                    .map(|(certificate, _)| certificate)
+            });
+            // Read once already, when the listener was fitted.
+            let Some(certificate) = certificate else {
+                continue;
+            };
+            config.certificates.insert(name.clone(), certificate);
+        }
+        let mut taken_off = false;
+        for listening in serving {
+            if let Some(tls) = config
+                .listeners
+                .get_mut(listening)
+                .and_then(|listener| listener.tls.as_mut())
+            {
+                let before = tls.refused.len();
+                tls.refused.retain(|refused| *refused != stated);
+                taken_off |= tls.refused.len() != before;
+            }
+            let entries = gathered.entry(listening.clone()).or_default();
+            for name in &listener.certificates {
+                match entries.iter_mut().find(|(named, _)| named == name) {
+                    Some((_, names)) if !names.contains(&stated) => names.push(stated.clone()),
+                    Some(_) => {}
+                    None => entries.push((name.clone(), vec![stated.clone()])),
+                }
+            }
+            if listener.hostname.is_none()
+                && let Some(first) = listener.certificates.first()
+            {
+                without_sni
+                    .entry(listening.clone())
+                    .or_insert_with(|| first.clone());
+            }
+        }
+        if taken_off {
+            report.push(Finding {
+                object: gateway.gateway.clone(),
+                problem: Problem::HostOverTls {
+                    name: listener.name.clone(),
+                    host: stated.clone(),
+                },
+            });
+        }
+    }
+    // Each data plane listener's, in the Gateway's order, before the Ingresses'.
+    for (listening, entries) in gathered {
+        let Some(tls) = config
+            .listeners
+            .get_mut(&listening)
+            .and_then(|listener| listener.tls.as_mut())
+        else {
+            continue;
+        };
+        let mut ours = Vec::with_capacity(entries.len() + tls.certificates.len());
+        for (name, mut names) in entries {
+            // A Secret an Ingress names too is one certificate, for both's names.
+            if let Some(at) = tls
+                .certificates
+                .iter()
+                .position(|presented| presented.name() == name)
+            {
+                let theirs = tls.certificates.remove(at);
+                names.extend(theirs.stated().into_iter().flatten().cloned());
+            }
+            ours.push(ListenerCertificate::Stated(StatedNames {
+                certificate: name,
+                names,
+            }));
+        }
+        ours.append(&mut tls.certificates);
+        tls.certificates = ours;
+        if let Some(name) = without_sni.remove(&listening) {
+            tls.without_sni = name;
+        }
+    }
+}
+
+/// The TLS of the data plane's `https` listeners bound to `port`.
+fn https_on(config: &mut Config, port: u16) -> impl Iterator<Item = &mut edgerush_config::Tls> {
+    config
+        .listeners
+        .values_mut()
+        .filter(move |listener| {
+            listener.protocol == Protocol::Https && listener.address.port() == port
+        })
+        .filter_map(|listener| listener.tls.as_mut())
 }
 
 /// A config of these listeners, routes and upstreams, and nothing else but `presented`:
@@ -1000,7 +1650,7 @@ fn ingress_routes(
                 }
                 _ => return Err(Problem::Invalid("a path type Kubernetes does not have")),
             };
-            let backend = backend_of(&path.backend, host, Some(described(&matched)))?;
+            let backend = backend_of(&path.backend, host, Some(path_said(&matched)))?;
             by_host
                 .entry(host.to_owned())
                 .or_default()
@@ -1157,11 +1807,11 @@ fn secret_certificate(
 }
 
 /// The route that answers on `listeners` what `route` takes, each of its paths, with a
-/// redirect to the same URL over HTTPS: on its default port, the one a data plane's Service
-/// serves HTTPS on (05 §1); 308, so that a client keeps its method and body, as ingress-nginx
-/// answers; the query kept; and to be kept `max_age` seconds, as a browser may otherwise keep
-/// a permanent redirect for ever (04 §5).
-fn https_redirect(route: &Route, listeners: Vec<String>, max_age: u32) -> Route {
+/// redirect to the same URL over HTTPS: on `port`, none for its default; 308, so that a
+/// client keeps its method and body, as ingress-nginx answers; the query kept; and to be
+/// kept `max_age` seconds, as a browser may otherwise keep a permanent redirect for ever
+/// (04 §5).
+fn https_redirect(route: &Route, listeners: Vec<String>, port: Option<u16>, max_age: u32) -> Route {
     let kept = Filter::ResponseHeaderModifier(HeaderChanges {
         set: vec![Header {
             name: "cache-control".to_owned(),
@@ -1181,7 +1831,7 @@ fn https_redirect(route: &Route, listeners: Vec<String>, max_age: u32) -> Route 
                 status: 308,
                 scheme: Some(Scheme::Https),
                 host: None,
-                port: None,
+                port,
                 path: None,
                 query: Query::Keep,
             }),
@@ -1387,6 +2037,59 @@ fn service_port<'a>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn notes_are_what_is_served_as_the_spec_has_it_and_nothing_else() {
+        let notes = [
+            Problem::RetryCapped {
+                rule: 0,
+                asked: 100,
+            },
+            Problem::HostOverTls {
+                name: "secure".to_owned(),
+                host: "shop.example.com".to_owned(),
+            },
+        ];
+        assert!(notes.iter().all(Problem::is_note));
+        let faults = [
+            Problem::NoRuleServed,
+            Problem::MirrorLeftOff {
+                rule: 0,
+                why: String::new(),
+            },
+            Problem::ListenerCertificate {
+                name: "secure".to_owned(),
+                why: String::new(),
+            },
+        ];
+        assert!(!faults.iter().any(Problem::is_note));
+    }
+
+    #[test]
+    fn a_gateway_is_named_by_namespace_and_name() {
+        let named = GatewayName::try_from("edge/web.v2".to_owned()).unwrap();
+        assert_eq!(
+            (named.namespace.as_str(), named.name.as_str()),
+            ("edge", "web.v2")
+        );
+        assert_eq!(named.to_string(), "edge/web.v2");
+        for written in [
+            "web",
+            "/web",
+            "edge/",
+            "Edge/web",
+            "edge/web/x",
+            "edge/-web",
+            "edge/a..b",
+        ] {
+            assert_eq!(
+                GatewayName::try_from(written.to_owned()),
+                Err(format!("`{written}` is not <namespace>/<name>")),
+            );
+        }
+        let long = format!("edge/{}", vec!["a".repeat(63); 4].join("."));
+        assert!(GatewayName::try_from(long).is_err(), "longer than 253");
+    }
+
     const HTTP: &str = "  http: { address: \"[::]:8080\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n";
 
     /// Ingresses `good`, routing `/`, and `bad`, routing a path that climbs, which the data
@@ -1421,6 +2124,7 @@ spec: { controller: edgerush.dev/ingress-controller }
                 services: vec![service],
                 secrets: Vec::new(),
                 secrets_assumed: false,
+                ..Cluster::default()
             },
         )
     }
@@ -1481,6 +2185,7 @@ spec: { controller: edgerush.dev/ingress-controller }
             ],
             secrets: Vec::new(),
             secrets_assumed,
+            ..Cluster::default()
         }
         };
 

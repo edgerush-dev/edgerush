@@ -1,0 +1,23 @@
+# The data plane names the Gateway edge/web, but only others are there, one of its name in
+# another namespace: nothing of the Gateway API is translated, and that is said.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: other, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP }

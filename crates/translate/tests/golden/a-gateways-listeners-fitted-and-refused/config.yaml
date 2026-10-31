@@ -1,0 +1,26 @@
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  http-v4:
+    address: "0.0.0.0:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  https:
+    address: "[::]:8443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls: { certificates: [], without_sni: none }
+routes:
+  - name: gateway/edge/web/apart
+    listeners: [http, http-v4]
+    hostnames: [{ name: "b.example.com", falls_through: false }]
+    rules: []
+upstreams: {}

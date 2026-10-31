@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 edgerush-config.workspace = true
+# The Gateway API kinds followed.
+edgerush-gateway-api.workspace = true
 edgerush-kubernetes.workspace = true
 edgerush-translate.workspace = true
 k8s-openapi.workspace = true

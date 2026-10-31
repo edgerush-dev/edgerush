@@ -7,7 +7,12 @@
 //! first, then the paths whose backend is not there, then what of a `tls` is not served as
 //! it lists it, then the paths shadowed; where the case says, `certificates.txt`, the names of the
 //! certificates the config carries, a line each (none otherwise); and, where the case says,
-//! `passed-over.txt`, how many Ingresses were another data plane's.
+//! `passed-over.txt`, how many Ingresses were another data plane's; and, where the case
+//! says, `gateway.txt`, what was made of the data plane's Gateway's listeners, a line each
+//! (none otherwise: the data plane is no Gateway, or names one not there or not ours); and,
+//! where the case says, `routes.txt`, what became of each HTTPRoute's parents of that
+//! Gateway, a line each (none otherwise). The report's last lines are the hosts a claim of
+//! one API takes from the other's.
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
 //! the objects of `tests/golden/shared.yaml` go with every case's.
 //! Every config translated must also pass the data plane's own `compile`, and, written as
@@ -15,8 +20,12 @@
 //! served must be those its config's routes are of.
 
 use edgerush_config::{Config, compile};
+use edgerush_gateway_api::gateway::Gateway;
+use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_translate::{Cluster, Plane, translate};
-use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use serde::Deserialize;
 use std::fs;
@@ -30,6 +39,11 @@ enum Manifest {
     Ingress(Box<Ingress>),
     Service(Box<Service>),
     Secret(Box<Secret>),
+    GatewayClass(Box<GatewayClass>),
+    Gateway(Box<Gateway>),
+    HTTPRoute(Box<HTTPRoute>),
+    ReferenceGrant(Box<ReferenceGrant>),
+    Namespace(Box<Namespace>),
 }
 
 #[test]
@@ -47,6 +61,11 @@ fn every_case_translates_to_its_config_and_report() {
                 Manifest::Ingress(ingress) => cluster.ingresses.push(*ingress),
                 Manifest::Service(service) => cluster.services.push(*service),
                 Manifest::Secret(secret) => cluster.secrets.push(*secret),
+                Manifest::GatewayClass(class) => cluster.gateway_classes.push(*class),
+                Manifest::Gateway(gateway) => cluster.gateways.push(*gateway),
+                Manifest::HTTPRoute(route) => cluster.http_routes.push(*route),
+                Manifest::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
+                Manifest::Namespace(namespace) => cluster.namespaces.push(*namespace),
             }
         }
         cluster
@@ -108,12 +127,40 @@ fn every_case_translates_to_its_config_and_report() {
             .chain(translation.unresolved.iter().map(ToString::to_string))
             .chain(translation.tls.iter().map(ToString::to_string))
             .chain(translation.shadowed.iter().map(ToString::to_string))
+            .chain(translation.taken.iter().map(ToString::to_string))
             .collect();
         let expected: Vec<String> = read(&case.join("report.txt"))
             .lines()
             .map(str::to_owned)
             .collect();
         assert_eq!(report, expected, "{name}: report");
+        let listed = case.join("gateway.txt");
+        let listeners: Option<Vec<String>> = translation
+            .gateway
+            .as_ref()
+            .map(|gateway| gateway.listeners.iter().map(ToString::to_string).collect());
+        let expected: Option<Vec<String>> = listed
+            .exists()
+            .then(|| read(&listed).lines().map(str::to_owned).collect());
+        assert_eq!(listeners, expected, "{name}: the Gateway's listeners");
+        let listed = case.join("routes.txt");
+        let routes: Vec<String> = translation
+            .http_routes
+            .iter()
+            .flat_map(|outcome| {
+                outcome
+                    .to_string()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let expected: Vec<String> = if listed.exists() {
+            read(&listed).lines().map(str::to_owned).collect()
+        } else {
+            Vec::new()
+        };
+        assert_eq!(routes, expected, "{name}: the HTTPRoutes' parents");
         // The Ingresses served are those the config's routes are of, each route named
         // `ingress/<namespace>/<name>/...`.
         let mut of_routes: Vec<String> = translation

@@ -603,7 +603,7 @@
       "type": "object",
       "properties": {
         "falls_through": {
-          "description": "Whether this claim stays a candidate on hosts that a more specific claim also\ncovers: Gateway API requires it, nginx-style Ingress does not want it.",
+          "description": "Whether this claim stays a candidate on hosts that a more specific claim also\ncovers: neither Gateway API's claims nor nginx-style Ingress's do, unless the data\nplane lets Ingress fall through.",
           "type": "boolean"
         },
         "name": {
@@ -1396,7 +1396,7 @@
       ]
     },
     "Retry": {
-      "description": "When a request is sent again, and how often (Gateway API's HTTPRoute retry, with\ngRPC's statuses beside HTTP's). A try that could not connect is sent again whatever is\nnamed, as Gateway API asks: nothing of it reached the endpoint. Otherwise decided on an\nanswer's head alone: once a head has gone to the client, the request is not sent again.\nWithin a budget of the upstream's, and only for a body small enough to be kept.",
+      "description": "When a request is sent again, and how often (Gateway API's HTTPRoute retry, with\ngRPC's statuses beside HTTP's). A try that could not connect is sent again whatever is\nnamed, as Gateway API asks: nothing of it reached the endpoint; a retry that names no\nstatus and not `on_timeout` is for those tries alone, as Gateway API's of no codes is.\nOtherwise decided on an answer's head alone: once a head has gone to the client, the\nrequest is not sent again. Within a budget of the upstream's, and only for a body small\nenough to be kept.",
       "type": "object",
       "properties": {
         "attempts": {
@@ -1439,7 +1439,7 @@
           }
         },
         "on_timeout": {
-          "description": "Whether a try that ran out of time before its answer's head is sent again: the\nupstream's fixed clocks for a head, or for the request's upload or the answer to\ngo on, running out. Stated whichever way, so that a config says what it does. `true`\nneeds a try to have a clock of its own: the fixed clocks, which stay while `timeouts`\nstates neither `request_ms` nor `backend_request_ms`, or a `backend_request_ms` above\n0. A retry names at least one status, or says `true` here.",
+          "description": "Whether a try that ran out of time before its answer's head is sent again: the\nupstream's fixed clocks for a head, or for the request's upload or the answer to\ngo on, running out. Stated whichever way, so that a config says what it does. `true`\nneeds a try to have a clock of its own: the fixed clocks, which stay while `timeouts`\nstates neither `request_ms` nor `backend_request_ms`, or a `backend_request_ms` above\n0.",
           "type": "boolean"
         }
       },
@@ -1484,12 +1484,11 @@
           }
         },
         "rules": {
-          "description": "The rules, in order.",
+          "description": "The rules, in order. None claims the route's hostnames and serves nothing on them,\nanswering 404 there: what listener isolation writes for a listener's hostname that no\nroute claims.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/Rule"
-          },
-          "minItems": 1
+          }
         }
       },
       "additionalProperties": false,
@@ -1624,7 +1623,7 @@
           "type": "string"
         },
         "names": {
-          "description": "Host names, or `*.` and a host name for every name one label longer, as a\ncertificate's own wildcard stands for one whole label.",
+          "description": "Host names, or `*.` and a host name for every name one label longer, as a\ncertificate's own wildcard stands for one whole label; or `*`, the least specific,\nfor every name no other certificate of the listener answers for (Gateway API's\nHTTPS listener of no hostname).",
           "type": "array",
           "items": {
             "type": "string"

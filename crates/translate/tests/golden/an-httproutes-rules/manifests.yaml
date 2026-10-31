@@ -1,0 +1,96 @@
+# An HTTPRoute's rules, each as the config has it: path, header, query and method matches;
+# weighted backends; a backend that is not there, of another kind, or another namespace's
+# that no ReferenceGrant lets the route reach, its share answered 500. A rule with what
+# translation does not take yet answers 500 for all it matches, in its place among the
+# rules, so that no other rule takes its requests; one whose matches cannot be built, of a
+# type translation does not read or a pattern the data plane would refuse, is left out by
+# itself; the rest are served. A route of no rule served as written is not accepted, its
+# rules that answer 500 still answering.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: shop, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [shop.example.com]
+  rules:
+    - matches:
+        - path: { type: Exact, value: /checkout }
+          method: POST
+          headers: [{ name: X-Beta, value: "on" }]
+          queryParams: [{ type: RegularExpression, name: tenant, value: "[a-z]+" }]
+      backendRefs: [{ name: web, port: 80, weight: 9 }, { name: canary, port: 80, weight: 1 }]
+    - matches: [{ path: { type: RegularExpression, value: "/orders/[0-9]+" } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /gone } }]
+      backendRefs: [{ name: gone, port: 80 }, { name: web, port: 80 }]
+    - matches: [{ path: { value: /filtered } }]
+      filters: [{ type: RequestMirror, requestMirror: { backendRef: { name: canary, port: 80 } } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /timed } }]
+      timeouts: { request: 5s }
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /other-kind } }]
+      backendRefs: [{ group: example.com, kind: Other, name: thing }]
+    - matches: [{ path: { value: /elsewhere } }]
+      backendRefs: [{ name: web, namespace: blog, port: 80 }]
+    - matches: [{ path: { type: RegularExpression, value: "/(" } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /odd }, headers: [{ type: Near, name: X-A, value: b }] }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /retried } }]
+      retry: { attempts: 2 }
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { value: /backend-filtered } }]
+      backendRefs:
+        - name: web
+          port: 80
+          filters: [{ type: RequestHeaderModifier, requestHeaderModifier: { set: [{ name: X-A, value: b }] } }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: nothing-left, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [left.example.com]
+  rules:
+    - filters: [{ type: CORS, cors: { allowOrigins: ["https://app.example.com"] } }]
+---
+# A guarded path beside a catch-all: its filter not taken, /admin answers 500, never
+# served by / without it.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: guarded, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [guarded.example.com]
+  rules:
+    - matches: [{ path: { value: /admin } }]
+      filters: [{ type: ExtensionRef, extensionRef: { group: example.com, kind: Login, name: staff } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: canary, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

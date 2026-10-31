@@ -1,0 +1,1 @@
+GatewayClass other: names controller `example.com/gateway-controller`, not `edgerush.dev/gateway-controller`, so its Gateway is not translated

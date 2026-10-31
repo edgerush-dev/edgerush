@@ -1,0 +1,2 @@
+HTTPRoute shop/filters: rule 6 answers 500 for all it matches: the data plane would refuse it: route `httproute`, rules[0], filters[0]: header `host` is the gateway's own and cannot be modified
+HTTPRoute shop/filters: rule 7 answers 500 for all it matches: a filter of type `Gzip` is not one translation reads

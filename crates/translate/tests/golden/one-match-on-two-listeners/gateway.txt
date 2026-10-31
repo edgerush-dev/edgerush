@@ -1,0 +1,2 @@
+listener http: served on http, taking HTTPRoute from every namespace
+listener alt: served on alt, taking HTTPRoute from every namespace

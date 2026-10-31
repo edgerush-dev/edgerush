@@ -1,0 +1,5 @@
+HTTPRoute tie/web: path / (Prefix) on tie.example.com is already Ingress tie/web's, which comes first
+Ingress deep/one: path /y (Prefix) on *.deep.example.com is already HTTPRoute deep/any's, which comes first
+HTTPRoute shop/new: path /api (Prefix) on both.example.com is already Ingress shop/old's, which comes first
+HTTPRoute two/second: path /pay (Prefix) for POST with header x-a: 1, header x-b: 2, query parameter id matching [0-9]+ on two.example.com is already HTTPRoute two/first's, which comes first
+Ingress blog/late: path /docs (Exact) on docs.example.com is already HTTPRoute blog/early's, which comes first

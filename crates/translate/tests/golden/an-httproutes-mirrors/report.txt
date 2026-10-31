@@ -1,0 +1,3 @@
+HTTPRoute shop/mirrors: rule 7 answers 500 for all it matches: a mirror beside a redirect, which sends nothing upstream to copy
+HTTPRoute shop/mirrors: rule 4: a mirror is left off, the rule served without it: Service shop/gone does not exist
+HTTPRoute shop/mirrors: rule 5: a mirror is left off, the rule served without it: Service blog/web is another namespace's, and no ReferenceGrant there lets HTTPRoutes of shop reach it

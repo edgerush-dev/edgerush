@@ -1,0 +1,8 @@
+listener http: served on http, http-v4, taking HTTPRoute from namespace edge
+listener elsewhere: not accepted: port 9000 is bound by no listener of the data plane
+listener plain-on-secure: not accepted: port 8443 is bound by the data plane for https, not http
+listener secure: not accepted: no certificateRef of it can be used
+listener dns: not accepted: protocol `UDP` is not one the gateway serves
+listener first: not accepted: listeners first, second have the same port, protocol and hostname
+listener second: not accepted: listeners first, second have the same port, protocol and hostname
+listener apart: served on http, http-v4, taking HTTPRoute from namespace edge

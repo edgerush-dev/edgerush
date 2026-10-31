@@ -26,6 +26,10 @@ pub struct Explanation<'m, T> {
     pub considered: Vec<Considered<'m, T>>,
     /// How many matches have no hostname that covers the request's host.
     pub other_hosts: usize,
+    /// How many claims of no match cover the request's host: the hostnames of routes of no
+    /// rules, which serve nothing and keep less specific hostnames that do not fall through
+    /// off the host, so that a request they leave with nothing is a 404.
+    pub claimed: usize,
 }
 
 impl<'m, T> Explanation<'m, T> {
@@ -129,11 +133,13 @@ pub enum Key {
     Order,
 }
 
-/// Explains a request against the matches a router is built from, given in the same
-/// order: the router's winner is the match chosen here.
+/// Explains a request against the matches and claims a router is built from
+/// ([`Router::with_claims`](crate::Router::with_claims)), given in the same order: the
+/// router's winner is the match chosen here.
 #[must_use]
 pub fn explain<'m, T, F: Fields + ?Sized>(
     matches: &'m [RouteMatch<T>],
+    claims: &'m [HostClaim<()>],
     request: &RequestParts<'_, F>,
 ) -> Explanation<'m, T> {
     let covers = |claim: &&HostClaim<()>| {
@@ -147,6 +153,7 @@ pub fn explain<'m, T, F: Fields + ?Sized>(
     let top = matches
         .iter()
         .flat_map(|route_match| &route_match.hosts)
+        .chain(claims)
         .filter(covers)
         .max_by_key(|claim| specificity(claim));
     let most_specific = top.map(specificity);
@@ -203,6 +210,7 @@ pub fn explain<'m, T, F: Fields + ?Sized>(
     Explanation {
         considered,
         other_hosts,
+        claimed: claims.iter().filter(covers).count(),
     }
 }
 
@@ -293,7 +301,7 @@ fn first_failure<'m, T, F: Fields + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reference::{self, PathKind, RequestSpec, RouteSpec};
+    use crate::reference::{self, HostClaimSpec, PathKind, RequestSpec, RouteSpec};
     use crate::strategies::{compile, get, header_map, on, pairs, request_spec, route_spec};
     use crate::{Router, WildcardLabels};
     use proptest::prelude::*;
@@ -328,11 +336,33 @@ mod tests {
     /// the predicates themselves, and gives what became of each match listed, by its
     /// position, with the count of matches for other hosts.
     fn explained(routes: &[RouteSpec], request: &RequestSpec) -> (Vec<(usize, Outcome)>, usize) {
+        explained_claiming(routes, &[], request)
+    }
+
+    /// [`explained`], with `claims` beside the routes that no match comes with.
+    fn explained_claiming(
+        routes: &[RouteSpec],
+        claims: &[Vec<HostClaimSpec>],
+        request: &RequestSpec,
+    ) -> (Vec<(usize, Outcome)>, usize) {
         let matches: Vec<RouteMatch<usize>> = routes
             .iter()
             .enumerate()
             .map(|(position, spec)| compile(spec, position))
             .collect();
+        let claiming = |hosts: &Vec<HostClaimSpec>| RouteSpec {
+            hosts: hosts.clone(),
+            path: ("/".to_owned(), PathKind::Prefix),
+            method: None,
+            headers: Vec::new(),
+            query: Vec::new(),
+        };
+        let claimed: Vec<HostClaim<()>> = claims
+            .iter()
+            .flat_map(|hosts| compile(&claiming(hosts), 0).hosts)
+            .collect();
+        let mut all = routes.to_vec();
+        all.extend(claims.iter().map(claiming));
         let method: Method = request.method.parse().unwrap();
         let headers = header_map(&request.headers);
         let parts = RequestParts {
@@ -342,21 +372,37 @@ mod tests {
             method: &method,
             headers: &headers,
         };
-        let explanation = explain(&matches, &parts);
+        let explanation = explain(&matches, &claimed, &parts);
 
         // The winner is the router's, and the reference's.
         let chosen = explanation.chosen().map(|chosen| chosen.value);
-        let path_matches = |position: usize| matches[position].path.matches(&request.path);
+        let path_matches = |position: usize| {
+            matches
+                .get(position)
+                .is_some_and(|m| m.path.matches(&request.path))
+        };
         assert_eq!(
             chosen,
-            Router::new(matches.clone()).route(&parts).copied(),
+            Router::with_claims(matches.clone(), claimed.clone())
+                .route(&parts)
+                .copied(),
             "explain and the router disagree"
         );
         assert_eq!(
             chosen,
-            reference::route(routes, request, path_matches),
+            reference::route(&all, request, path_matches),
             "explain and the reference disagree"
         );
+        let covering = claims
+            .iter()
+            .flatten()
+            .filter(|(pattern, _)| {
+                pattern.as_ref().is_none_or(|(text, wildcard)| {
+                    reference::host_matches(text, *wildcard, &request.host)
+                })
+            })
+            .count();
+        assert_eq!(explanation.claimed, covering, "claims covering the host");
 
         // Every match is listed once if a hostname of its covers the host, and counted if
         // none does.
@@ -382,9 +428,10 @@ mod tests {
         assert_eq!(once, reached);
         assert_eq!(explanation.other_hosts, routes.len() - reached.len());
 
-        // Candidates are listed in the reference's order.
-        let groups = reference::host_groups(routes, &request.host);
-        let rank = |position: usize| (groups[position], reference::precedence(routes, position));
+        // Candidates are listed in the reference's order, which the claims of no match shape
+        // too: they are after the routes.
+        let groups = reference::host_groups(&all, &request.host);
+        let rank = |position: usize| (groups[position], reference::precedence(&all, position));
         let candidates: Vec<usize> = listed
             .iter()
             .copied()
@@ -788,6 +835,18 @@ mod tests {
     }
 
     #[test]
+    fn a_wildcard_is_overshadowed_by_a_hostname_claimed_without_a_rule() {
+        let mut wildcard = on("*.b", PathKind::Prefix, "/");
+        wildcard.hosts[0].1 = false;
+        let claims = [vec![(
+            Some(("a.b".to_owned(), WildcardLabels::OneOrMore)),
+            false,
+        )]];
+        let (outcomes, _) = explained_claiming(&[wildcard], &claims, &get("a.b", "/x"));
+        assert_eq!(outcomes, [(0, Overshadowed("a.b".to_owned()))]);
+    }
+
+    #[test]
     fn a_match_under_several_hostnames_is_listed_once_where_it_is_a_candidate() {
         // Reached through both hostnames, and listed at the more specific.
         let mut both = on(HOST, PathKind::Prefix, "/");
@@ -866,10 +925,11 @@ mod tests {
         #[test]
         fn explanations_agree_with_the_router_the_reference_and_the_predicates(
             routes in prop::collection::vec(route_spec(), 0..8),
+            claims in prop::collection::vec(route_spec().prop_map(|spec| spec.hosts), 0..3),
             request in request_spec(),
         ) {
-            // The checks are inside `explained`.
-            explained(&routes, &request);
+            // The checks are inside `explained_claiming`.
+            explained_claiming(&routes, &claims, &request);
         }
 
         #[test]

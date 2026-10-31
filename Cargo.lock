@@ -270,6 +270,7 @@ dependencies = [
  "edgerush-controller",
  "edgerush-dns",
  "edgerush-explain",
+ "edgerush-gateway-api",
  "edgerush-kubernetes",
  "edgerush-proxy",
  "edgerush-translate",
@@ -355,6 +356,7 @@ dependencies = [
  "bytes",
  "edgerush-certificates",
  "edgerush-config",
+ "edgerush-gateway-api",
  "edgerush-kubernetes",
  "edgerush-translate",
  "k8s-openapi",
@@ -364,6 +366,17 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "edgerush-crdgen"
+version = "0.0.0"
+dependencies = [
+ "k8s-openapi",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -409,12 +422,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-gateway-api"
+version = "0.0.0"
+dependencies = [
+ "edgerush-crdgen",
+ "k8s-openapi",
+ "serde",
+ "serde-saphyr",
+]
+
+[[package]]
 name = "edgerush-kubernetes"
 version = "0.0.0"
 dependencies = [
  "boring",
  "bytes",
  "edgerush-certificates",
+ "edgerush-gateway-api",
  "h2",
  "http",
  "k8s-openapi",
@@ -547,6 +571,7 @@ version = "0.0.0"
 dependencies = [
  "edgerush-certificates",
  "edgerush-config",
+ "edgerush-gateway-api",
  "k8s-openapi",
  "serde",
  "serde-saphyr",

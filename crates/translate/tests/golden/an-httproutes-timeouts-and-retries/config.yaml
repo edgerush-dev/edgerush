@@ -1,0 +1,36 @@
+listeners:
+  http:
+    address: "[::]:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: httproute/shop/settings/http
+    listeners: [http]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /request } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }], timeouts: { request_ms: 5000 } }
+      - matches: [{ path: { prefix: /compound } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }], timeouts: { request_ms: 3723004 } }
+      - matches: [{ path: { prefix: /no-limit } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }], timeouts: { request_ms: 0 } }
+      - matches: [{ path: { prefix: /both } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }], timeouts: { request_ms: 10000, backend_request_ms: 2000 }, retry: { attempts: 2, http_statuses: [502, 503], on_timeout: true, backoff_base_ms: 100, backoff_max_ms: 1000 } }
+      - matches: [{ path: { prefix: /retry-as-written } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }], retry: { attempts: 1, on_timeout: true, backoff_base_ms: 25, backoff_max_ms: 250 } }
+      - matches: [{ path: { prefix: /no-clock-of-a-try } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }], timeouts: { request_ms: 10000 }, retry: { attempts: 2, on_timeout: false, backoff_base_ms: 25, backoff_max_ms: 250 } }
+      - matches: [{ path: { prefix: /a-try-of-no-limit } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }], timeouts: { backend_request_ms: 0 }, retry: { attempts: 1, http_statuses: [503], on_timeout: false, backoff_base_ms: 25, backoff_max_ms: 250 } }
+      - matches: [{ path: { prefix: /many } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }], retry: { attempts: 5, on_timeout: true, backoff_base_ms: 25, backoff_max_ms: 250 } }
+      - matches: [{ path: { prefix: /none } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+      - matches: [{ path: { prefix: /no-wait } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }], retry: { attempts: 1, on_timeout: true, backoff_base_ms: 1, backoff_max_ms: 10 } }
+      - matches: [{ path: { prefix: /unreadable } }]
+        forward: { backends: [{ invalid: "a duration of `5 seconds` is not one translation reads", weight: 1 }] }
+upstreams:
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

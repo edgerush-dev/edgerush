@@ -15,6 +15,17 @@
 # `shop`, and the data plane in `edge` dials it at edgerush-control.edge.svc:9443 and is
 # reached by `kubectl port-forward`. Then:
 #   - the Ingress is served, and its status says the data plane's Service's address;
+#   - the data plane named as a Gateway, the control plane says the Gateway API's CRDs are
+#     not installed and serves Ingress as ever; installed, each kind is followed, its CRD
+#     read by name alone as RBAC allows, and an HTTPRoute attached to the Gateway, of this
+#     controller's class, its listener on the port the data plane binds, is served beside
+#     the Ingress, from one data plane; an HTTPRoute in `blog` led to `shop`'s Service
+#     answers 500 until a ReferenceGrant in `shop` allows it, and again once it is deleted;
+#     an HTTPRoute and an Ingress of one host and path are ranked by when the cluster made
+#     them, whichever API each is of: the older takes the requests, the other is said
+#     shadowed;
+#     an HTTPRoute's redirect that states only a host sends the client to the listener's
+#     port;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
 #   - asked to reach its Service by the Service's own address, it is served through the
@@ -141,9 +152,11 @@ pod() {
     k -n edge get pod -l app=edgerush -o jsonpath='{.items[0].metadata.name}'
 }
 # Waits up to $3 seconds for the logs of deploy or pod $1 to have a line with $2 in it.
+# Here and below, grep reads a log whole: with -q it stops at the first match, kubectl,
+# still writing, ends on SIGPIPE, and pipefail takes the pipeline for a failure.
 said() {
     for _ in $(seq 1 $(($3 * 5))); do
-        k -n edge logs "$1" 2>/dev/null | grep -q -- "$2" && return 0
+        k -n edge logs "$1" 2>/dev/null | grep -- "$2" >/dev/null && return 0
         sleep 0.2
     done
     return 1
@@ -157,6 +170,148 @@ answers shop.example 200 30 || fail "the Ingress is not served: $(status shop.ex
 said --selector=app=edgerush-control "runs config" 10 ||
     fail "the control plane never heard the data plane run its config"
 pass "the Ingress is served, by $(curl -s -H 'host: shop.example' "http://127.0.0.1:$port/hostname")"
+
+# Waits up to $2 seconds for every control-plane replica's logs, whole, to have a line
+# with $1 in it.
+control_said() {
+    for _ in $(seq 1 $(($2 * 5))); do
+        local all=yes
+        for replica in $(k -n edge get pod -l app=edgerush-control -o name); do
+            k -n edge logs "$replica" 2>/dev/null | grep -- "$1" >/dev/null || all=
+        done
+        [ -n "$all" ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+# Whether a control-plane replica was refused anything of the Gateway API.
+refused_any() {
+    for replica in $(k -n edge get pod -l app=edgerush-control -o name); do
+        k -n edge logs "$replica" 2>/dev/null |
+            grep -E "(customresourcedefinitions|gatewayclasses|gateways|httproutes|referencegrants).*(403|forbidden)" &&
+            return 0
+    done
+    return 1
+}
+control_said "httproutes.gateway.networking.k8s.io: not installed" 30 ||
+    fail "the control plane never said the Gateway API's CRDs are not installed"
+pass "without the Gateway API's CRDs, the control plane says so, and serves the Ingress"
+# The CRDs are too large for kubectl's client-side record of what it applied.
+k create -f crates/gateway-api/crds/ >/dev/null
+control_said "httproutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)" 60 ||
+    fail "the control plane never said the Gateway API's CRDs are served"
+k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec: { controllerName: edgerush.dev/gateway-controller }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners: [{ name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: web, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [route.example]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]
+EOF
+answers route.example 200 30 || fail "the HTTPRoute is not served: $(status route.example)"
+answers shop.example 200 5 || fail "beside the HTTPRoute, the Ingress is not served: $(status shop.example)"
+refused_any && fail "a control-plane replica was refused something of the Gateway API"
+answers shop.example 200 10 || fail "with the Gateway API followed, $(status shop.example)"
+pass "installed, the Gateway API's kinds are followed, their CRDs read by name alone, and an HTTPRoute is served beside the Ingress"
+
+k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: across, namespace: blog }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [across.example]
+  rules: [{ backendRefs: [{ name: web, namespace: shop, port: 80 }] }]
+EOF
+answers across.example 500 30 || fail "with no ReferenceGrant, another namespace's Service answers $(status across.example)"
+k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: from-blog, namespace: shop }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: blog }]
+  to: [{ group: "", kind: Service, name: web }]
+EOF
+answers across.example 200 30 || fail "with a ReferenceGrant, another namespace's Service answers $(status across.example)"
+k -n shop delete referencegrant from-blog >/dev/null
+answers across.example 500 30 || fail "its ReferenceGrant deleted, another namespace's Service answers $(status across.example)"
+pass "an HTTPRoute reaches another namespace's Service only while a ReferenceGrant there allows it"
+
+# The HTTPRoute's backend is not there, so it answers 500 where it takes the requests, and
+# the Ingress's is, 200. Each has a host of its own too, to know once it is served.
+# Creation times are to the second, so the second is made a second on.
+ranked_route() {
+    k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: ranked, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [ranked.example, ranked-route.example]
+  rules: [{ backendRefs: [{ name: not-there, port: 80 }] }]
+EOF
+    answers ranked-route.example 500 30 || fail "the HTTPRoute is not served: $(status ranked-route.example)"
+}
+ranked_route
+sleep 1.5
+k apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: ranked, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: ranked.example
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+    - host: ranked-ingress.example
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+EOF
+answers ranked-ingress.example 200 30 || fail "the Ingress is not served: $(status ranked-ingress.example)"
+answers ranked.example 500 5 || fail "beside an older HTTPRoute, the Ingress's path answers $(status ranked.example)"
+control_said "Ingress shop/ranked: path / (Prefix) on ranked.example is already HTTPRoute shop/ranked's, which comes first" 30 ||
+    fail "the control plane never said the Ingress's path is the older HTTPRoute's"
+k -n shop delete httproute ranked >/dev/null
+answers ranked-route.example 404 30 || fail "the HTTPRoute deleted still answers $(status ranked-route.example)"
+answers ranked.example 200 5 || fail "the HTTPRoute gone, the Ingress's path answers $(status ranked.example)"
+ranked_route
+answers ranked.example 200 5 || fail "beside a newer HTTPRoute, the Ingress's path answers $(status ranked.example)"
+k -n shop delete httproute ranked >/dev/null
+k -n shop delete ingress ranked >/dev/null
+pass "an HTTPRoute and an Ingress of one host and path are ranked by age: the older serves it, the other said shadowed"
+
+# A redirect that states only a host sends the client to the listener's port.
+k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: moved, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [moved.example]
+  rules: [{ filters: [{ type: RequestRedirect, requestRedirect: { hostname: example.org } }] }]
+EOF
+answers moved.example 302 30 || fail "the redirecting HTTPRoute answers $(status moved.example)"
+location=$(curl -s -o /dev/null -w '%{redirect_url}' -H 'host: moved.example' "http://127.0.0.1:$port/hostname")
+[ "$location" = "http://example.org:8080/hostname" ] ||
+    fail "the redirect sends the client to $location, not the listener's port"
+k -n shop delete httproute moved >/dev/null
+pass "an HTTPRoute's redirect of a host alone sends the client there on the listener's port"
 
 # What the Ingress's status says, its first address.
 says() { k -n shop get ingress web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }
@@ -374,7 +529,7 @@ pod=$(pod)
 said "$pod" "waiting for the first config from the control plane" 30 ||
     fail "a data plane started without its control plane did not say it waits"
 said "$pod" "dialled again in" 30 || fail "it never said why it cannot dial"
-k -n edge logs "$pod" | grep -q " is on " &&
+k -n edge logs "$pod" | grep " is on " >/dev/null &&
     fail "it bound a listener before its first config"
 pass "a data plane started while it is gone waits, serving nothing"
 

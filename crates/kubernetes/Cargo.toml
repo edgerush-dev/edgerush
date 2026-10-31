@@ -19,6 +19,8 @@ bytes.workspace = true
 edgerush-certificates = { workspace = true, optional = true }
 # HTTP/2, which the data plane already speaks to upstreams: one connection to the API
 # server carries every namespace's list and watch, as Kubernetes' own clients do.
+# The Gateway API kinds the control plane follows.
+edgerush-gateway-api.workspace = true
 h2.workspace = true
 http.workspace = true
 k8s-openapi.workspace = true

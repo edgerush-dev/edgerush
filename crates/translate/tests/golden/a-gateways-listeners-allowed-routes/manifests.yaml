@@ -1,0 +1,60 @@
+# Which routes each listener takes: by kind, those named that its protocol carries, the
+# others said and left out; by namespace, its Gateway's own unless it says every one or
+# those a selector picks, and none where it says what cannot be read.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - name: kinds-mixed
+      port: 8080
+      protocol: HTTP
+      hostname: mixed.example.com
+      allowedRoutes:
+        kinds: [{ kind: InvalidRoute }, { kind: HTTPRoute }, { group: example.com, kind: HTTPRoute }]
+    - name: kinds-none-carried
+      port: 8080
+      protocol: HTTP
+      hostname: tls.example.com
+      allowedRoutes:
+        kinds: [{ kind: TLSRoute }]
+    - name: every-namespace
+      port: 8080
+      protocol: HTTP
+      hostname: all.example.com
+      allowedRoutes:
+        namespaces: { from: All }
+    - name: selected
+      port: 8080
+      protocol: HTTP
+      hostname: selected.example.com
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels: { team: shop }
+            matchExpressions:
+              - { key: stage, operator: In, values: [live, canary] }
+              - { key: frozen, operator: DoesNotExist }
+    - name: unreadable-operator
+      port: 8080
+      protocol: HTTP
+      hostname: odd.example.com
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchExpressions: [{ key: team, operator: Near, values: [shop] }]
+    - name: unreadable-from
+      port: 8080
+      protocol: HTTP
+      hostname: none.example.com
+      allowedRoutes:
+        namespaces: { from: Elsewhere }

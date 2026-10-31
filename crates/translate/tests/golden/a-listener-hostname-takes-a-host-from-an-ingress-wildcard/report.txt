@@ -1,0 +1,1 @@
+Gateway edge/web listener api claims api.example.com, taking it from Ingress shop/web's *.example.com, which does not fall through

@@ -100,11 +100,23 @@ impl<T> Entry<T> {
 impl<T> Router<T> {
     /// Builds the router. The order of `matches` is the last tie-breaker.
     pub fn new(matches: impl IntoIterator<Item = RouteMatch<T>>) -> Self {
-        let mut claims = Vec::new();
+        Self::with_claims(matches, std::iter::empty())
+    }
+
+    /// Builds the router from `matches` and from `claims` that no match comes with: the
+    /// hostnames of a route of no rules ([07 §1](../../../docs/07-config-and-dsl.md)). Such a
+    /// claim takes its hosts as a match's claim would, from less specific claims that do not
+    /// fall through onto them, and serves nothing there: a request it alone is left with is
+    /// a 404, as listener isolation asks.
+    pub fn with_claims(
+        matches: impl IntoIterator<Item = RouteMatch<T>>,
+        claims: impl IntoIterator<Item = HostClaim<()>>,
+    ) -> Self {
+        let mut hosts = Vec::new();
         let mut paths = Vec::new();
         let mut entries = Vec::new();
         for (position, route_match) in matches.into_iter().enumerate() {
-            claims.extend(route_match.hosts.into_iter().map(|claim| HostClaim {
+            hosts.extend(route_match.hosts.into_iter().map(|claim| HostClaim {
                 pattern: claim.pattern,
                 falls_through: claim.falls_through,
                 value: position,
@@ -117,6 +129,15 @@ impl<T> Router<T> {
                 value: route_match.value,
             });
         }
+        // A claim of no match is a member of its host's group at a position no match has:
+        // no path of it goes into the group's path index, so it serves no request.
+        let first = entries.len();
+        hosts.extend(claims.into_iter().enumerate().map(|(at, claim)| HostClaim {
+            pattern: claim.pattern,
+            falls_through: claim.falls_through,
+            value: first + at,
+        }));
+        let claims = hosts;
 
         // Within a group the path decides first, and the path index keeps members with the
         // same path in the order it is given them: so give it the order of what comes
@@ -159,25 +180,43 @@ impl<T> Router<T> {
 mod tests {
     use super::*;
     use crate::WildcardLabels;
-    use crate::reference::{self, PathKind, RequestSpec, RouteSpec};
+    use crate::reference::{self, HostClaimSpec, PathKind, RequestSpec, RouteSpec};
     use crate::strategies::{compile, get, header_map, on, pairs, request_spec, route_spec};
     use proptest::prelude::*;
 
     /// Routes the request both ways and checks that they agree, so that every example below
     /// is also an example for the reference.
     fn route(routes: &[RouteSpec], request: &RequestSpec) -> Option<usize> {
+        route_claiming(routes, &[], request)
+    }
+
+    /// [`route`], with `claims` beside the routes that no match comes with: to the reference,
+    /// routes whose path matches nothing, after the others.
+    fn route_claiming(
+        routes: &[RouteSpec],
+        claims: &[Vec<HostClaimSpec>],
+        request: &RequestSpec,
+    ) -> Option<usize> {
         let matches: Vec<RouteMatch<usize>> = routes
             .iter()
             .enumerate()
             .map(|(value, spec)| compile(spec, value))
             .collect();
-        let expected = reference::route(routes, request, |position| {
-            matches[position].path.matches(&request.path)
+        let claimed: Vec<HostClaim<()>> = claims
+            .iter()
+            .flat_map(|hosts| compile(&claiming(hosts), 0).hosts)
+            .collect();
+        let mut all = routes.to_vec();
+        all.extend(claims.iter().map(|hosts| claiming(hosts)));
+        let expected = reference::route(&all, request, |position| {
+            matches
+                .get(position)
+                .is_some_and(|m| m.path.matches(&request.path))
         });
 
         let method: Method = request.method.parse().unwrap();
         let headers = header_map(&request.headers);
-        let routed = Router::new(matches)
+        let routed = Router::with_claims(matches, claimed)
             .route(&RequestParts {
                 host: &request.host,
                 path: &request.path,
@@ -188,6 +227,52 @@ mod tests {
             .copied();
         assert_eq!(routed, expected, "router and reference disagree");
         routed
+    }
+
+    /// Claims of no route as a route the reference can rank: on the hosts given, on every
+    /// path, which the reference is told matches nothing.
+    fn claiming(hosts: &[HostClaimSpec]) -> RouteSpec {
+        RouteSpec {
+            hosts: hosts.to_vec(),
+            path: ("/".to_owned(), PathKind::Prefix),
+            method: None,
+            headers: Vec::new(),
+            query: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_host_claimed_without_a_rule_serves_nothing_and_is_kept_from_wildcards() {
+        let exact = |host: &str, falls_through| {
+            vec![(
+                Some((host.to_owned(), WildcardLabels::OneOrMore)),
+                falls_through,
+            )]
+        };
+        let mut wildcard = on("*.b", PathKind::Prefix, "/");
+        // A wildcard that does not fall through: kept off the claimed host, which is a 404.
+        wildcard.hosts[0].1 = false;
+        let claims = [exact("a.b", false)];
+        assert_eq!(
+            route_claiming(&[wildcard.clone()], &claims, &get("a.b", "/x")),
+            None
+        );
+        assert_eq!(
+            route_claiming(&[wildcard.clone()], &claims, &get("c.b", "/x")),
+            Some(0)
+        );
+        // One that falls through still serves it, after the claim's group, which has nothing.
+        wildcard.hosts[0].1 = true;
+        assert_eq!(
+            route_claiming(&[wildcard], &claims, &get("a.b", "/x")),
+            Some(0)
+        );
+        // Beside a route on the same host the claim changes nothing.
+        let exact_route = on("a.b", PathKind::Prefix, "/a");
+        assert_eq!(
+            route_claiming(&[exact_route], &claims, &get("a.b", "/a")),
+            Some(0)
+        );
     }
 
     #[test]
@@ -375,10 +460,11 @@ mod tests {
         #[test]
         fn routing_agrees_with_the_sort_everything_reference(
             routes in prop::collection::vec(route_spec(), 0..8),
+            claims in prop::collection::vec(route_spec().prop_map(|spec| spec.hosts), 0..3),
             request in request_spec(),
         ) {
-            // The comparison is inside `route`.
-            route(&routes, &request);
+            // The comparison is inside `route_claiming`.
+            route_claiming(&routes, &claims, &request);
         }
     }
 }

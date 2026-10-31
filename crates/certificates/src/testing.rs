@@ -12,6 +12,7 @@ use boring::ec::{EcGroup, EcKey};
 use boring::hash::MessageDigest;
 use boring::nid::Nid;
 use boring::pkey::{PKey, Private};
+use boring::rsa::Rsa;
 use boring::x509::extension::{BasicConstraints, KeyUsage, SubjectAlternativeName};
 use boring::x509::{X509, X509Builder, X509Name, X509NameBuilder, X509NameRef};
 use edgerush_config::Certificate;
@@ -22,6 +23,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[must_use]
 pub fn certificate(names: &[&str]) -> Certificate {
     let key = key();
+    let subject = subject(names.first().copied().unwrap_or("none"));
+    let mut builder = builder(&subject, &subject, &key);
+    alternatives(&mut builder, names, None);
+    builder.sign(&key, MessageDigest::sha256()).unwrap();
+    written(&builder.build(), &key)
+}
+
+/// The same, of an RSA key of 2048 bits in place of an ECDSA key on P-256: for tests of a
+/// listener that holds both kinds for one name.
+#[must_use]
+pub fn rsa_certificate(names: &[&str]) -> Certificate {
+    let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
     let subject = subject(names.first().copied().unwrap_or("none"));
     let mut builder = builder(&subject, &subject, &key);
     alternatives(&mut builder, names, None);

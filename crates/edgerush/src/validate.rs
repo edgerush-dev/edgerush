@@ -3,8 +3,12 @@
 //! the data plane's settings, and saying what translating them came to, with no cluster.
 
 use edgerush_config::compile;
+use edgerush_gateway_api::gateway::Gateway;
+use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_translate::{Cluster, Plane, Translation, translate};
-use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -19,10 +23,10 @@ Translates Kubernetes manifests as the control plane would for one data plane, c
 config as the data plane would, and says what was left out and why, without a cluster.
 Ingresses of another class, or of none, are another data plane's: they are counted, not
 translated.
-Exits 0 when everything was translated and the config compiles, 1 when something was left
-out, a path's backend is not there, a host or entry `tls` lists is not served as listed, a
-path is shadowed by another Ingress's or the config would be refused, and 2 when the files
-could not be read.
+Exits 0 when everything was translated and the config compiles, notes aside (a retry's
+attempts taken as the data plane's most), 1 when something was left out, a path's backend
+is not there, a host or entry `tls` lists is not served as listed, a path is shadowed by
+another Ingress's or the config would be refused, and 2 when the files could not be read.
 
 Options:
       --from-manifests <PATH>  Manifests in YAML: a file, or a directory read for every
@@ -144,6 +148,11 @@ enum Manifest {
     Ingress(Box<Ingress>),
     Service(Box<Service>),
     Secret(Box<Secret>),
+    GatewayClass(Box<GatewayClass>),
+    Gateway(Box<Gateway>),
+    HTTPRoute(Box<HTTPRoute>),
+    ReferenceGrant(Box<ReferenceGrant>),
+    Namespace(Box<Namespace>),
     List {
         items: Vec<Manifest>,
     },
@@ -158,6 +167,11 @@ impl Manifest {
             Self::Ingress(ingress) => cluster.ingresses.push(*ingress),
             Self::Service(service) => cluster.services.push(*service),
             Self::Secret(secret) => cluster.secrets.push(*secret),
+            Self::GatewayClass(class) => cluster.gateway_classes.push(*class),
+            Self::Gateway(gateway) => cluster.gateways.push(*gateway),
+            Self::HTTPRoute(route) => cluster.http_routes.push(*route),
+            Self::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
+            Self::Namespace(namespace) => cluster.namespaces.push(*namespace),
             Self::List { items } => {
                 for item in items {
                     item.into_cluster(cluster);
@@ -201,10 +215,14 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
             true
         }
     };
-    let clean = translation.report.is_empty()
+    let clean = translation
+        .report
+        .iter()
+        .all(|finding| finding.problem.is_note())
         && translation.unresolved.is_empty()
         && translation.tls.is_empty()
-        && translation.shadowed.is_empty();
+        && translation.shadowed.is_empty()
+        && translation.taken.is_empty();
     Ok((text, clean && !refused))
 }
 
@@ -215,7 +233,11 @@ pub(crate) fn described(translation: &Translation) -> String {
     let mut text = String::new();
     for finding in &translation.report {
         // Writing to a `String` cannot fail.
-        let _ = writeln!(text, "{finding}");
+        let _ = if finding.problem.is_note() {
+            writeln!(text, "note: {finding}")
+        } else {
+            writeln!(text, "{finding}")
+        };
     }
     for unresolved in &translation.unresolved {
         let _ = writeln!(text, "{unresolved}");
@@ -226,20 +248,33 @@ pub(crate) fn described(translation: &Translation) -> String {
     for shadowed in &translation.shadowed {
         let _ = writeln!(text, "{shadowed}");
     }
+    for taken in &translation.taken {
+        let _ = writeln!(text, "{taken}");
+    }
     let config = &translation.config;
-    let _ = writeln!(
+    let notes = translation
+        .report
+        .iter()
+        .filter(|finding| finding.problem.is_note())
+        .count();
+    let _ = write!(
         text,
         "{} routes and {} upstreams translated; {} left out; {} paths without their backend; \
          {} TLS hosts or entries not served as listed; {} paths shadowed; {} Ingresses of other classes \
          or none passed over",
         config.routes.len(),
         config.upstreams.len(),
-        translation.report.len(),
+        translation.report.len() - notes,
         translation.unresolved.len(),
         translation.tls.len(),
         translation.shadowed.len(),
         translation.passed_over
     );
+    // Said only where there are any, as they fail nothing.
+    if notes > 0 {
+        let _ = write!(text, "; {notes} notes");
+    }
+    let _ = writeln!(text);
     text
 }
 
@@ -408,5 +443,48 @@ items:
                 .collect::<Vec<_>>(),
             ["web"]
         );
+    }
+
+    /// The Gateway API's kinds are read, an object of the experimental channel among them, and
+    /// Namespaces, for their labels.
+    #[test]
+    fn the_gateway_apis_kinds_are_read() {
+        let yaml = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec: { controllerName: edgerush.dev/gateway-controller }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec: { gatewayClassName: edgerush, listeners: [{ name: http, port: 80, protocol: HTTP }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: web, namespace: shop }
+spec: { rules: [{ filters: [{ type: ExternalAuth, externalAuth: { protocol: HTTP } }] }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: from-edge, namespace: shop }
+spec: { from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: edge }], to: [{ group: '', kind: Service }] }
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: shop, labels: { team: shop } }
+";
+        let mut cluster = Cluster::default();
+        for manifest in serde_saphyr::from_multiple::<Manifest>(yaml).unwrap() {
+            manifest.into_cluster(&mut cluster);
+        }
+        let counts = (
+            cluster.gateway_classes.len(),
+            cluster.gateways.len(),
+            cluster.http_routes.len(),
+            cluster.reference_grants.len(),
+            cluster.namespaces.len(),
+        );
+        assert_eq!(counts, (1, 1, 1, 1, 1));
     }
 }

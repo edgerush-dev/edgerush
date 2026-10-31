@@ -1,0 +1,9 @@
+HTTPRoute edge/in-edge, section same-only: attached to same-only (same.example.org)
+HTTPRoute shop/by-port, port 9999: not attached: no listener the Gateway serves has the name and port it names
+HTTPRoute shop/by-section, section foo: attached to foo (x.foo.example.com)
+HTTPRoute shop/disjoint, section abc: not attached: its hostnames meet no hostname of a listener that takes it
+HTTPRoute shop/everywhere: attached to any (bar.com); example (*.example.com); foo (*.foo.example.com, y.foo.example.com); abc (abc.foo.example.com)
+HTTPRoute shop/not-allowed, section same-only: not attached: no listener it names takes an HTTPRoute from its namespace
+HTTPRoute shop/selected, section selected: attached to selected (sel.example.org)
+HTTPRoute shop/unknown-section, section nope: not attached: no listener the Gateway serves has the name and port it names
+HTTPRoute shop/wrong-kind, section tls-only: not attached: no listener it names takes an HTTPRoute from its namespace

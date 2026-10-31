@@ -1,0 +1,4 @@
+HTTPRoute shop/first: attached to http (both.example.com); alt (both.example.com)
+HTTPRoute shop/on-alt, section alt: attached to alt (same.example.com)
+HTTPRoute shop/on-http, section http: attached to http (same.example.com)
+HTTPRoute shop/second: attached to http (both.example.com); alt (both.example.com)

@@ -1,0 +1,10 @@
+listener catch-all: served on https, presenting shop/shop-tls, taking HTTPRoute from every namespace
+listener exact: served on https, presenting edge/own, shop/secure, taking HTTPRoute from every namespace
+listener wild: served on https, presenting shop/wild, taking HTTPRoute from every namespace
+listener kinds: served on https, presenting edge/own, taking HTTPRoute from every namespace
+listener later: served on https, presenting shop/secure, taking HTTPRoute from every namespace
+listener migrated: served on https, presenting edge/own, taking HTTPRoute from every namespace
+listener wild-unusable: not accepted: no certificateRef of it can be used
+listener unusable: not accepted: no certificateRef of it can be used
+listener denied: not accepted: no certificateRef of it can be used
+listener elsewhere: served on more, presenting edge/own, taking HTTPRoute from every namespace

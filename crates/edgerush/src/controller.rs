@@ -938,6 +938,13 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
         Said::Waiting(unlisted) => {
             format!("waiting to have listed {}", unlisted.join(", "))
         }
+        Said::GatewayApi(served) => {
+            let kinds: Vec<String> = served
+                .iter()
+                .map(|(kind, served)| format!("\n  {}: {served}", kind.crd()))
+                .collect();
+            format!("the Gateway API's kinds:{}", kinds.concat())
+        }
         Said::Failed { followed, failure } => format!("{followed}: {failure}"),
         Said::Status {
             ingress,

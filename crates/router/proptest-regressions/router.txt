@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bf04e5570a33645f2a03a8754c139e753a033cd30097af4d41f849e647a39d09 # shrinks to routes = [RouteSpec { hosts: [], path: ("/", Exact), method: None, headers: [], query: [] }, RouteSpec { hosts: [], path: ("a", GrpcMethod), method: None, headers: [], query: [] }], claims = [[(None, false), (None, false)]], request = RequestSpec { host: "a.b", path: "/b/a", query: "", method: "GET", headers: [] }
