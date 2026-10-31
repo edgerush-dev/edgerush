@@ -3,7 +3,8 @@
 # ReferenceGrant allows, and said as being in a namespace not watched, not as one of no
 # grant. One into news, watched, with no grant there, is said as one of no grant; one into
 # the route's own namespace needs none. A listener of no certificate it can use is accepted
-# and serves nothing: a route attached to it is not served.
+# and serves nothing: a route attached to it counts among its routes, and is not served.
+# Each status says of its object's generation.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
@@ -12,7 +13,7 @@ spec:
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
-metadata: { name: web, namespace: edge }
+metadata: { name: web, namespace: edge, generation: 4 }
 spec:
   gatewayClassName: edgerush
   listeners:
@@ -31,7 +32,7 @@ spec:
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
-metadata: { name: across, namespace: shop }
+metadata: { name: across, namespace: shop, generation: 2 }
 spec:
   parentRefs: [{ name: web, namespace: edge, sectionName: http }]
   hostnames: [across.example.com]
@@ -45,7 +46,7 @@ spec:
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
-metadata: { name: secured, namespace: shop }
+metadata: { name: secured, namespace: shop, generation: 1 }
 spec:
   parentRefs: [{ name: web, namespace: edge, sectionName: unwatched }]
   rules:

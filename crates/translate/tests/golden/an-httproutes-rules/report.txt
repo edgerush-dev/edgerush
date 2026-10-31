@@ -1,6 +1,7 @@
 HTTPRoute shop/guarded: rule 0 answers 500 for all it matches: a filter of example.com/Login staff is not one EdgeRush has
 HTTPRoute shop/nothing-left: rule 0 answers 500 for all it matches: not supported yet: CORS
 HTTPRoute shop/nothing-left: no rule is served as written, so it is not accepted
+HTTPRoute shop/odd-kind: rule 0: a backend's share is answered 500: a backend of kind example.com/Other is not one translation reads
 HTTPRoute shop/shop: rule 10 answers 500 for all it matches: not supported yet: a backend's filters
 HTTPRoute shop/shop: rule 7 left out: the data plane would refuse it: route `httproute`, rules[0], matches[0]: path: invalid regular expression: regex parse error: /( ^ error: unclosed group
 HTTPRoute shop/shop: rule 8 left out: a header match of type `Near` is not one translation reads

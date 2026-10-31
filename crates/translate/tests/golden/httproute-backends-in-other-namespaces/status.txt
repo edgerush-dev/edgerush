@@ -1,0 +1,3 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener http: HTTPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/across, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Service books/gone does not exist; Service news/web is another namespace's, and no ReferenceGrant there lets HTTPRoutes of shop reach it)

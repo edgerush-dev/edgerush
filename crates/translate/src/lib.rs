@@ -51,11 +51,13 @@ use std::fmt;
 
 pub mod gateway;
 pub mod http_route;
+pub mod status;
 
 pub use gateway::{
     Allowed, GatewayOutcome, ListenerOutcome, ListenerProblem, Namespaces, Requirement, Selector,
 };
 pub use http_route::{Attachment, NotAttached, ParentOutcome, RouteOutcome, Taken};
+pub use status::{Condition, GatewayStatus, ListenerStatus, ParentStatus, RouteStatus};
 
 /// The controller an IngressClass names to be served by EdgeRush (02 §2).
 pub const CONTROLLER: &str = "edgerush.dev/ingress-controller";
@@ -208,8 +210,12 @@ pub struct Translation {
     /// what its status is to say of it.
     pub gateway: Option<GatewayOutcome>,
     /// Each HTTPRoute that names that Gateway among its parents, and what became of each
-    /// such parent: what their status is to say.
+    /// such parent.
     pub http_routes: Vec<RouteOutcome>,
+    /// What that Gateway's status is to say (04 §6).
+    pub gateway_status: Option<GatewayStatus>,
+    /// What each of those HTTPRoutes' status is to say of those parents, in their order.
+    pub route_statuses: Vec<RouteStatus>,
     /// The hosts a claim of one API takes from a claim of the other, which no longer serves
     /// them: said, so that a move from one API to the other meets no surprise (04).
     pub taken: Vec<Taken>,
@@ -439,6 +445,47 @@ impl fmt::Display for Finding {
     }
 }
 
+/// Why a reference of a Gateway API object cannot be followed, as its `ResolvedRefs`
+/// condition says it (04 §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefReason {
+    /// Another namespace's, that no ReferenceGrant there lets it reach, or one the control
+    /// plane does not watch (`RefNotPermitted`).
+    NotPermitted,
+    /// Not there: no such object, no such port of it, or not usable as what it is named
+    /// for (`BackendNotFound`; `InvalidCertificateRef` of a certificate).
+    NotFound,
+    /// Of a group and kind translation does not read (`InvalidKind`;
+    /// `InvalidCertificateRef` of a certificate).
+    InvalidKind,
+    /// Of a protocol the gateway does not speak (`UnsupportedProtocol`).
+    UnsupportedProtocol,
+    /// Of something translation does not take, such as an ExternalName Service
+    /// (`UnsupportedValue`, a reason of the controller's own).
+    Unsupported,
+}
+
+/// A reference that cannot be followed, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefProblem {
+    /// Why, as status says it.
+    pub reason: RefReason,
+    /// Why, as it is said.
+    pub why: String,
+}
+
+impl RefProblem {
+    fn new(reason: RefReason, why: String) -> Self {
+        Self { reason, why }
+    }
+}
+
+impl fmt::Display for RefProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
 /// A Kubernetes object, by kind, namespace and name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Object {
@@ -557,7 +604,7 @@ pub enum Problem {
         /// Its rule's position among the route's rules.
         rule: usize,
         /// Why.
-        why: String,
+        why: RefProblem,
     },
     /// A mirror of an HTTPRoute's rule is left off, its backend not there or not permitted,
     /// and the rule served without it, as the spec has it (`ResolvedRefs` false).
@@ -566,7 +613,7 @@ pub enum Problem {
         /// Its rule's position among the route's rules.
         rule: usize,
         /// Why.
-        why: String,
+        why: RefProblem,
     },
     /// A retry of an HTTPRoute's rule asks for more attempts than the data plane makes: it
     /// makes its most (04 §2).
@@ -1038,6 +1085,10 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     if let Some(gateway) = &gateway {
         gateway_tls(&mut config, gateway, cluster, &mut report);
     }
+    let route_statuses = status::routes(&http_routes, &report);
+    let gateway_status = gateway
+        .as_ref()
+        .map(|gateway| status::gateway(gateway, &route_statuses, &http_routes));
     Translation {
         config,
         report,
@@ -1049,6 +1100,8 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         claimed: of_the_class,
         gateway,
         http_routes,
+        gateway_status,
+        route_statuses,
         taken,
     }
 }
@@ -1615,11 +1668,11 @@ fn ingress_routes(
                         weight: 1,
                     }
                 }
-                Err(reason) => {
-                    missing.push((host.to_owned(), path, reason.clone()));
+                Err(problem) => {
+                    missing.push((host.to_owned(), path, problem.why.clone()));
                     Backend {
                         upstream: None,
-                        invalid: Some(reason),
+                        invalid: Some(problem.why),
                         weight: 1,
                     }
                 }
@@ -1884,7 +1937,7 @@ fn backend_upstream(
     namespace: &str,
     backend: &IngressBackend,
     by_address: bool,
-) -> Result<Result<(String, Upstream), String>, Problem> {
+) -> Result<Result<(String, Upstream), RefProblem>, Problem> {
     let Some(backend) = &backend.service else {
         return Err(Problem::NotSupportedYet("a resource backend"));
     };
@@ -1903,9 +1956,12 @@ fn backend_upstream(
         None | Some("kubernetes.io/ws") => (UpstreamProtocol::Http1, None),
         Some("kubernetes.io/h2c") => (UpstreamProtocol::Http2, None),
         Some("kubernetes.io/wss") if plane.backend_authorities.is_empty() => {
-            return Ok(Err(format!(
-                "Service {namespace}/{service} port {port} is kubernetes.io/wss, and the data \
-                 plane trusts no authorities for TLS to backends"
+            return Ok(Err(RefProblem::new(
+                RefReason::UnsupportedProtocol,
+                format!(
+                    "Service {namespace}/{service} port {port} is kubernetes.io/wss, and the \
+                     data plane trusts no authorities for TLS to backends"
+                ),
             )));
         }
         // The certificate must carry the Service's own name, as a client inside the
@@ -1921,18 +1977,24 @@ fn backend_upstream(
         // A protocol the gateway cannot speak makes the backend invalid, as Gateway API has
         // it (`UnsupportedProtocol`), rather than spoken to in HTTP/1.1 regardless.
         Some(other) => {
-            return Ok(Err(format!(
-                "Service {namespace}/{service} port {port} has appProtocol {other}, which \
-                 the gateway does not speak"
+            return Ok(Err(RefProblem::new(
+                RefReason::UnsupportedProtocol,
+                format!(
+                    "Service {namespace}/{service} port {port} has appProtocol {other}, which \
+                     the gateway does not speak"
+                ),
             )));
         }
     };
     // A headless Service's name resolves to its pods, which listen on their own ports, not
     // the Service's.
     if by_address && headless {
-        return Ok(Err(format!(
-            "Service {namespace}/{service} has no cluster IP for \
-             {SERVICE_UPSTREAM_ANNOTATION} to reach it by"
+        return Ok(Err(RefProblem::new(
+            RefReason::NotFound,
+            format!(
+                "Service {namespace}/{service} has no cluster IP for \
+                 {SERVICE_UPSTREAM_ANNOTATION} to reach it by"
+            ),
         )));
     }
     let (name, endpoints) = if by_address {
@@ -1977,7 +2039,7 @@ fn service_port<'a>(
     cluster: &'a Cluster,
     namespace: &str,
     backend: &IngressServiceBackend,
-) -> Result<Result<ServicePort<'a>, String>, Problem> {
+) -> Result<Result<ServicePort<'a>, RefProblem>, Problem> {
     // Kubernetes requires a port, by name or by number, of a Service backend.
     let wanted = match &backend.port {
         Some(wanted) if wanted.name.is_some() || wanted.number.is_some() => wanted,
@@ -1988,8 +2050,9 @@ fn service_port<'a>(
         service.metadata.name.as_deref() == Some(service_name.as_str())
             && self::namespace(&service.metadata) == namespace
     }) else {
-        return Ok(Err(format!(
-            "Service {namespace}/{service_name} does not exist"
+        return Ok(Err(RefProblem::new(
+            RefReason::NotFound,
+            format!("Service {namespace}/{service_name} does not exist"),
         )));
     };
     let spec = service.spec.as_ref();
@@ -2015,8 +2078,9 @@ fn service_port<'a>(
             (Some(name), _) => format!("named {name}"),
             (None, number) => number.unwrap_or_default().to_string(),
         };
-        return Ok(Err(format!(
-            "Service {namespace}/{service_name} has no port {wanted}"
+        return Ok(Err(RefProblem::new(
+            RefReason::NotFound,
+            format!("Service {namespace}/{service_name} has no port {wanted}"),
         )));
     };
     let name = match port.name.as_deref() {
@@ -2058,7 +2122,7 @@ mod tests {
             Problem::NoRuleServed,
             Problem::MirrorLeftOff {
                 rule: 0,
-                why: String::new(),
+                why: RefProblem::new(RefReason::NotFound, String::new()),
             },
             Problem::ListenerCertificate {
                 name: "secure".to_owned(),

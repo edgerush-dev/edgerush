@@ -4,7 +4,10 @@
 //! the routes each takes: of which kinds, from which namespaces.
 
 use crate::http_route::reachable;
-use crate::{Cluster, Finding, GATEWAY_CONTROLLER, Object, Plane, Problem, secret_certificate};
+use crate::{
+    Cluster, Finding, GATEWAY_CONTROLLER, Object, Plane, Problem, RefProblem, RefReason,
+    secret_certificate,
+};
 use edgerush_config::Protocol;
 use edgerush_gateway_api::gateway::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespaces,
@@ -21,6 +24,8 @@ const GROUP: &str = "gateway.networking.k8s.io";
 pub struct GatewayOutcome {
     /// The Gateway.
     pub gateway: Object,
+    /// Its generation: what its status says of.
+    pub generation: i64,
     /// Each of its listeners, in the order it lists them.
     pub listeners: Vec<ListenerOutcome>,
 }
@@ -44,7 +49,7 @@ pub struct ListenerOutcome {
     /// `<namespace>/<Secret>`, in the order its `certificateRefs` list them.
     pub certificates: Vec<String>,
     /// Its `certificateRefs` that cannot be used, each with why (`ResolvedRefs` false).
-    pub certificate_problems: Vec<String>,
+    pub certificate_problems: Vec<RefProblem>,
 }
 
 impl fmt::Display for ListenerOutcome {
@@ -325,7 +330,7 @@ pub(crate) fn outcome(
                 object: object.clone(),
                 problem: Problem::ListenerCertificate {
                     name: listener.name.clone(),
-                    why: why.clone(),
+                    why: why.why.clone(),
                 },
             });
         }
@@ -367,6 +372,7 @@ pub(crate) fn outcome(
     }
     Some(GatewayOutcome {
         gateway: object,
+        generation: gateway.metadata.generation.unwrap_or_default(),
         listeners,
     })
 }
@@ -398,20 +404,31 @@ fn certificates(
         let namespace = reference.namespace.as_deref().unwrap_or(gateway_namespace);
         let name = &reference.name;
         let usable = if !(reference.group.is_empty() && reference.kind == "Secret") {
-            Err(format!(
-                "a certificateRef of kind {}/{} is not one translation reads",
-                reference.group, reference.kind
-            ))
+            Err(RefProblem {
+                reason: RefReason::InvalidKind,
+                why: format!(
+                    "a certificateRef of kind {}/{} is not one translation reads",
+                    reference.group, reference.kind
+                ),
+            })
         } else if let Err(why) = reachable(
             cluster,
             ("Gateway", gateway_namespace),
             ("Secret", namespace, name),
         ) {
-            Err(why)
+            Err(RefProblem {
+                reason: RefReason::NotPermitted,
+                why,
+            })
         } else if cluster.secrets_assumed {
             Ok(())
         } else {
-            secret_certificate(cluster, namespace, name).map(|_| ())
+            secret_certificate(cluster, namespace, name)
+                .map(|_| ())
+                .map_err(|why| RefProblem {
+                    reason: RefReason::NotFound,
+                    why,
+                })
         };
         match usable {
             Ok(()) => listener.certificates.push(format!("{namespace}/{name}")),
@@ -420,9 +437,10 @@ fn certificates(
     }
     if listener.certificates.is_empty() {
         if listener.certificate_problems.is_empty() {
-            listener
-                .certificate_problems
-                .push("it names no certificateRef".to_owned());
+            listener.certificate_problems.push(RefProblem {
+                reason: RefReason::NotFound,
+                why: "it names no certificateRef".to_owned(),
+            });
         }
         listener.served = Err(ListenerProblem::NoCertificate);
     }

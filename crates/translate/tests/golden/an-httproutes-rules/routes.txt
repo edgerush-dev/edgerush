@@ -1,3 +1,4 @@
 HTTPRoute shop/guarded: attached to http (guarded.example.com)
 HTTPRoute shop/nothing-left: attached to http (left.example.com)
+HTTPRoute shop/odd-kind: attached to http (odd.example.com)
 HTTPRoute shop/shop: attached to http (shop.example.com)

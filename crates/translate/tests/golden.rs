@@ -11,8 +11,10 @@
 //! says, `gateway.txt`, what was made of the data plane's Gateway's listeners, a line each
 //! (none otherwise: the data plane is no Gateway, or names one not there or not ours); and,
 //! where the case says, `routes.txt`, what became of each HTTPRoute's parents of that
-//! Gateway, a line each (none otherwise). The report's last lines are the hosts a claim of
-//! one API takes from the other's.
+//! Gateway, a line each (none otherwise); and, where the case says, `status.txt`, what the
+//! status of that Gateway, each of its listeners and each HTTPRoute's parent of it is to
+//! say, a line each. The report's last lines are the hosts a claim of one API takes from the
+//! other's.
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
 //! the objects of `tests/golden/shared.yaml` go with every case's. Every namespace is
 //! watched, unless the case lists those that are in `watched.txt`, a line each.
@@ -167,6 +169,18 @@ fn every_case_translates_to_its_config_and_report() {
             Vec::new()
         };
         assert_eq!(routes, expected, "{name}: the HTTPRoutes' parents");
+        let listed = case.join("status.txt");
+        if listed.exists() {
+            let said: Vec<String> = translation
+                .gateway_status
+                .iter()
+                .map(ToString::to_string)
+                .chain(translation.route_statuses.iter().map(ToString::to_string))
+                .flat_map(|said| said.lines().map(str::to_owned).collect::<Vec<_>>())
+                .collect();
+            let expected: Vec<String> = read(&listed).lines().map(str::to_owned).collect();
+            assert_eq!(said, expected, "{name}: status");
+        }
         // The Ingresses served are those the config's routes are of, each route named
         // `ingress/<namespace>/<name>/...`.
         let mut of_routes: Vec<String> = translation
