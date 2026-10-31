@@ -42,6 +42,8 @@
 #     for one elsewhere has every request go to the first, and to both once one is
 #     unhinted;
 #   - the control plane's leader gone, the other replica takes its Lease and writes status;
+#   - requests without pause to the Ingress and the HTTPRoute, through the control plane
+#     stopped and back, are every one answered 200;
 #   - with the control plane gone, the data plane serves on;
 #   - a data plane started while it is gone waits for its first config, serving nothing,
 #     and serves once the control plane is back;
@@ -552,6 +554,48 @@ newest=$(control)
 [ -n "$newest" ] && [ "$newest" != "$peer" ] || fail "no new control-plane pod took the deleted one's place"
 refused "$newest" "one of the gateway's own pods"
 pass "a control-plane pod made since is not sent to either, named on the stream as it changed"
+
+echo "== an outage of the control plane"
+# Requests without pause to the Ingress and the HTTPRoute, from before the control plane
+# is stopped until after it is back and the data plane has dialled it again: every one
+# answered as before (the stage's exit, 11).
+outage=$(mktemp -d)
+(
+    while [ ! -e "$outage/stop" ]; do
+        for host in other.example route.example; do
+            echo "$host $(status "$host")"
+        done
+    done
+) >"$outage/answers" &
+loading=$!
+replicas=$(k -n edge get deploy edgerush-control -o jsonpath='{.spec.replicas}')
+sleep 3
+k -n edge scale deploy/edgerush-control --replicas=0 >/dev/null
+for _ in $(seq 1 300); do
+    [ "$(k -n edge get pod -l app=edgerush-control -o name | grep -c .)" = 0 ] && break
+    sleep 0.2
+done
+said deploy/edgerush "dialled again in" 30 || fail "the data plane never said its stream ended"
+sleep 10
+k -n edge scale deploy/edgerush-control --replicas="$replicas" >/dev/null
+k -n edge rollout status deploy/edgerush-control --timeout=120s >/dev/null
+# Back, a replica says the data plane runs its config: the one it ran, kept.
+back=
+for _ in $(seq 1 300); do
+    k -n edge logs -l app=edgerush-control --tail=-1 2>/dev/null | grep -q "runs config" && back=yes && break
+    sleep 0.2
+done
+[ -n "$back" ] || fail "no replica back says the data plane runs its config"
+sleep 3
+touch "$outage/stop"
+wait "$loading"
+total=$(grep -c . "$outage/answers")
+# A count of none is grep's failure.
+other=$(grep -vc ' 200$' "$outage/answers" || true)
+[ "$other" = 0 ] && [ "$total" -gt 50 ] ||
+    fail "$other of $total requests through the outage were not answered 200: $(grep -v ' 200$' "$outage/answers" | sort | uniq -c | head -5)"
+rm -r "$outage"
+pass "through the control plane's outage and its return, all $total requests to the Ingress and the HTTPRoute were answered 200"
 
 echo "== the control plane gone"
 k -n edge scale deploy/edgerush-control --replicas=0 >/dev/null
