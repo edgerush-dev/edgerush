@@ -22,21 +22,21 @@ routes:
     hostnames: [{ name: "a.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
-        redirect: { status: 308, scheme: https, query: keep }
+        redirect: { status: 308, scheme: https, port: 8443, query: keep }
         filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=120" }] }]
   - name: ingress/shop/web/b.example.com/https-redirect
     listeners: [http]
     hostnames: [{ name: "b.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
-        redirect: { status: 308, scheme: https, query: keep }
+        redirect: { status: 308, scheme: https, port: 8443, query: keep }
         filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=120" }] }]
   - name: ingress/shop/web/c.example.com/https-redirect
     listeners: [http]
     hostnames: [{ name: "c.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
-        redirect: { status: 308, scheme: https, query: keep }
+        redirect: { status: 308, scheme: https, port: 8443, query: keep }
         filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=120" }] }]
   - name: ingress/shop/web/e.example.com
     listeners: [https]
@@ -49,14 +49,14 @@ routes:
     hostnames: [{ name: "e.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
-        redirect: { status: 308, scheme: https, query: keep }
+        redirect: { status: 308, scheme: https, port: 8443, query: keep }
         filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=120" }] }]
   - name: ingress/shop/extra/a.example.com/https-redirect
     listeners: [http]
     hostnames: [{ name: "a.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: /extra } }]
-        redirect: { status: 308, scheme: https, query: keep }
+        redirect: { status: 308, scheme: https, port: 8443, query: keep }
         filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=120" }] }]
   - name: ingress/shop/kept/d.example.com
     listeners: [http]

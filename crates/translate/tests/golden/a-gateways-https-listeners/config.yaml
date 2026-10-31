@@ -52,7 +52,7 @@ routes:
     rules:
       - matches: [{ path: { prefix: / } }]
         filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: max-age=30 }], add: [], remove: [] }]
-        redirect: { status: 308, scheme: https, query: keep }
+        redirect: { status: 308, scheme: https, port: 8443, query: keep }
   - name: ingress/shop/plain/plain.example.com
     listeners: [http]
     hostnames: [{ name: plain.example.com, falls_through: false }]
@@ -71,7 +71,7 @@ routes:
     rules:
       - matches: [{ path: { prefix: / } }]
         filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: max-age=30 }], add: [], remove: [] }]
-        redirect: { status: 308, scheme: https, query: keep }
+        redirect: { status: 308, scheme: https, port: 8443, query: keep }
   - { name: gateway/edge/web/exact, listeners: [https], hostnames: [{ name: "secure.example.com", falls_through: false }], rules: [] }
   - { name: gateway/edge/web/wild, listeners: [https], hostnames: [{ name: "*.wild.example.com", wildcard: any_labels, falls_through: false }], rules: [] }
   - { name: gateway/edge/web/kinds, listeners: [https], hostnames: [{ name: "kinds.example.com", falls_through: false }], rules: [] }

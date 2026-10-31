@@ -770,6 +770,19 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         .filter(|(_, listener)| listener.protocol == Protocol::Https)
         .map(|(name, _)| name.clone())
         .collect();
+    // The port a redirect to HTTPS states: none where an `https` listener binds 443, the
+    // default, and else the lowest such listener's, as pods bind ports as written and so
+    // are reached on them (05 §2, Lucas).
+    let https_ports = plane
+        .listeners
+        .values()
+        .filter(|listener| listener.protocol == Protocol::Https)
+        .map(|listener| listener.address.port());
+    let https_port = if https_ports.clone().any(|port| port == 443) {
+        None
+    } else {
+        https_ports.min()
+    };
     // Each object's config routes, with its rank: those of every Ingress and HTTPRoute are
     // put in the config in one order, oldest first, whichever API each is of (04 §1).
     let mut ranked: Vec<Ranked> = Vec::new();
@@ -800,6 +813,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                     redirect = Some(https_redirect(
                         &route,
                         http,
+                        https_port,
                         plane.ingress_https_redirect_max_age,
                     ));
                 }
@@ -1793,11 +1807,11 @@ fn secret_certificate(
 }
 
 /// The route that answers on `listeners` what `route` takes, each of its paths, with a
-/// redirect to the same URL over HTTPS: on its default port, the one a data plane's Service
-/// serves HTTPS on (05 §1); 308, so that a client keeps its method and body, as ingress-nginx
-/// answers; the query kept; and to be kept `max_age` seconds, as a browser may otherwise keep
-/// a permanent redirect for ever (04 §5).
-fn https_redirect(route: &Route, listeners: Vec<String>, max_age: u32) -> Route {
+/// redirect to the same URL over HTTPS: on `port`, none for its default; 308, so that a
+/// client keeps its method and body, as ingress-nginx answers; the query kept; and to be
+/// kept `max_age` seconds, as a browser may otherwise keep a permanent redirect for ever
+/// (04 §5).
+fn https_redirect(route: &Route, listeners: Vec<String>, port: Option<u16>, max_age: u32) -> Route {
     let kept = Filter::ResponseHeaderModifier(HeaderChanges {
         set: vec![Header {
             name: "cache-control".to_owned(),
@@ -1817,7 +1831,7 @@ fn https_redirect(route: &Route, listeners: Vec<String>, max_age: u32) -> Route 
                 status: 308,
                 scheme: Some(Scheme::Https),
                 host: None,
-                port: None,
+                port,
                 path: None,
                 query: Query::Keep,
             }),
