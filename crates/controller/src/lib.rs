@@ -8,10 +8,12 @@
 //! The changes of a moment make one translation: it waits until no change has come for
 //! [`Debounce::quiet`], and never more than [`Debounce::most`] after the first it waits on
 //! (04 §2). Each translation is whole, of everything followed, and pure
-//! ([`edgerush_translate`]); the follows and the waiting are all that is not. Where it is
-//! asked to, it writes each Ingress's status as the config handed on serves it (04 §6),
-//! [`status`]. The admission webhook's reviews are read, the Ingress each asks
-//! about judged alone, and answered by [`admission`] (04 §3).
+//! ([`edgerush_translate`]); the follows and the waiting are all that is not. It writes the
+//! status of the data plane's GatewayClass, its Gateway and each HTTPRoute of that Gateway
+//! as the config handed on serves them, merged with what each says now as the spec has it;
+//! where it is asked to, each Ingress's likewise (04 §6), [`status`]. The admission
+//! webhook's reviews are read, the Ingress each asks about judged alone, and answered by
+//! [`admission`] (04 §3).
 
 use edgerush_config::{ConfigError, compile};
 use edgerush_gateway_api::gateway::Gateway;
@@ -19,7 +21,9 @@ use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_kubernetes::{ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow};
-use edgerush_translate::{Cluster, GatewayName, Object, Plane, Translation, translate};
+use edgerush_translate::{
+    Cluster, GatewayName, GatewayStatus, Object, Plane, RouteStatus, Translation, translate,
+};
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
@@ -33,6 +37,7 @@ use tokio::time::Instant;
 
 pub mod admission;
 pub mod gateway_api;
+mod gateway_status;
 pub mod lease;
 pub mod status;
 
@@ -86,6 +91,14 @@ pub enum Said<'a> {
         /// Why the data plane would refuse it.
         problems: &'a [ConfigError],
     },
+    /// The status of a Gateway API object written, as the config handed on serves it; or
+    /// why it could not be, to be written again at the next change.
+    GatewayApiStatus {
+        /// The object.
+        object: &'a Object,
+        /// Whether it says it now.
+        written: Result<(), &'a ApiError>,
+    },
     /// An Ingress's status written to say these addresses, none taking them away; or why it
     /// could not be, to be written again at the next change.
     Status {
@@ -105,8 +118,11 @@ pub enum Said<'a> {
 /// cluster and Gateways in that Gateway's namespace alone, each from when its CRD is listed
 /// and serves the version read until it no longer does, and Namespaces in the cluster. With
 /// `status`, it writes each Ingress's status to say the addresses it gives as the config
-/// handed on serves the Ingress, where it says otherwise; with `leading` too, only while it
-/// says this replica leads, every status that says otherwise written as it comes to (02 §3).
+/// handed on serves the Ingress, where it says otherwise. It writes that of the data
+/// plane's GatewayClass, its Gateway (those addresses among it, or none without `status`)
+/// and each HTTPRoute that names or named that Gateway likewise, always. With `leading`,
+/// only while it says this replica leads, every status that says otherwise written as it
+/// comes to (02 §3).
 /// Runs for as long as it is polled, its follows ended with it. For a thread and runtime of
 /// its own, in a `LocalSet`.
 pub async fn control(
@@ -159,6 +175,8 @@ pub async fn control(
     let mut translator = Translator::default();
     // What the config handed on serves: the Ingresses claimed, and those served.
     let mut handed: Option<(Vec<Object>, Vec<Object>)> = None;
+    // What the config handed on says the Gateway API's objects' status is to say.
+    let mut handed_api: Option<Handed> = None;
     loop {
         // The follows of the Gateway API kinds, started and stopped as their CRDs say.
         if let Some(gateway_api) = &mut followed.gateway_api
@@ -182,6 +200,7 @@ pub async fn control(
             Step::Waiting(unlisted) => said(Said::Waiting(unlisted)),
             Step::Translated(translation) => {
                 handed = Some((translation.claimed.clone(), translation.served.clone()));
+                handed_api = Handed::of(translation);
                 said(Said::Translated(translation));
             }
             Step::Refused {
@@ -194,23 +213,36 @@ pub async fn control(
         }
         // Every round, so that a status changed by another, or written in vain, is written
         // again; one at a time, which is all the pace there is. A status written is a change
-        // to its Ingress, and the round it brings finds nothing more to write.
-        if let (Some(source), Some((claimed, served))) = (&status, &handed)
-            && followed.status_listed()
-            && leading.as_ref().is_none_or(|leads| *leads.borrow())
+        // to its object, and the round it brings finds nothing more to write. The data
+        // plane's addresses, where it is told where to find them, once they are listed.
+        let addresses = match &status {
+            _ if !followed.status_listed() => None,
+            None => Some(Vec::new()),
+            Some(Addresses::Stated(addresses)) => Some(addresses.clone()),
+            Some(Addresses::Service { name, .. }) => {
+                let services = followed.status_services();
+                let named = services
+                    .iter()
+                    .find(|service| service.metadata.name.as_deref() == Some(name.as_str()));
+                Some(status::of_service(named))
+            }
+        };
+        let leads = leading.as_ref().is_none_or(|leads| *leads.borrow());
+        // The Gateway API's, always, as the spec has every controller write them (04 §6).
+        if let (Some(gateway_api), Some(handed), Some(addresses), true) =
+            (&followed.gateway_api, &handed_api, &addresses, leads)
         {
-            let addresses = match source {
-                Addresses::Stated(addresses) => addresses.clone(),
-                Addresses::Service { name, .. } => {
-                    let services = followed.status_services();
-                    let named = services
-                        .iter()
-                        .find(|service| service.metadata.name.as_deref() == Some(name.as_str()));
-                    status::of_service(named)
-                }
-            };
+            let addresses = gateway_status::addresses(addresses);
+            gateway_api
+                .write_statuses(&api, handed, &addresses, &*said)
+                .await;
+        }
+        // An Ingress's only where the control plane is told where the addresses are.
+        if let (Some(_), Some((claimed, served)), Some(addresses), true) =
+            (&status, &handed, &addresses, leads)
+        {
             let ingresses = followed.ingresses();
-            for change in status::changes(claimed, served, &ingresses, &addresses) {
+            for change in status::changes(claimed, served, &ingresses, addresses) {
                 let written = match status::patch(&change.addresses) {
                     Ok(patch) => {
                         let object = &change.ingress;
@@ -412,6 +444,129 @@ impl GatewayApi {
             .chain(unlisted(
                 self.reference_grants.as_deref().unwrap_or_default(),
             ))
+    }
+}
+
+/// What the config handed on says the status of the Gateway API's objects is to say.
+#[derive(Debug)]
+struct Handed {
+    /// The data plane's Gateway.
+    gateway: Object,
+    /// Its status.
+    status: GatewayStatus,
+    /// That of each HTTPRoute that names it.
+    routes: Vec<RouteStatus>,
+}
+
+impl Handed {
+    /// What `translation` says, where it translated the data plane's Gateway.
+    fn of(translation: &Translation) -> Option<Self> {
+        let gateway = translation.gateway.as_ref()?;
+        Some(Self {
+            gateway: gateway.gateway.clone(),
+            status: translation.gateway_status.clone()?,
+            routes: translation.route_statuses.clone(),
+        })
+    }
+}
+
+impl GatewayApi {
+    /// Writes, one at a time, each status that says other than `handed` has it: that of
+    /// the data plane's Gateway's class, of the Gateway, `addresses` among it, and of each
+    /// HTTPRoute followed, whether or not it still names the Gateway.
+    async fn write_statuses(
+        &self,
+        api: &ApiServer,
+        handed: &Handed,
+        addresses: &[edgerush_gateway_api::gateway::GatewayStatusAddresses],
+        said: &dyn Fn(Said<'_>),
+    ) {
+        let now = lease::wall_clock();
+        let gateways = self.gateways.as_deref().map(objects).unwrap_or_default();
+        let Some(gateway) = gateways.iter().find(|gateway| {
+            gateway.metadata.namespace.as_deref() == Some(handed.gateway.namespace.as_str())
+                && gateway.metadata.name.as_deref() == Some(handed.gateway.name.as_str())
+        }) else {
+            return;
+        };
+        let classes = self
+            .gateway_classes
+            .as_deref()
+            .map(objects)
+            .unwrap_or_default();
+        let class = classes.iter().find(|class| {
+            class.metadata.name.as_deref() == Some(gateway.spec.gateway_class_name.as_str())
+        });
+        if let (Some(class), Some(served)) = (class, &self.last) {
+            let generation = class.metadata.generation.unwrap_or_default();
+            let status = gateway_status::class(class.status.as_ref(), generation, served, now);
+            if class.status.as_ref() != Some(&status) {
+                let object = Object {
+                    kind: "GatewayClass",
+                    namespace: String::new(),
+                    name: gateway.spec.gateway_class_name.clone(),
+                };
+                let version = class
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .unwrap_or_default();
+                let result = api
+                    .replace_status::<GatewayClass>("", &object.name, version, &status)
+                    .await;
+                said(Said::GatewayApiStatus {
+                    object: &object,
+                    written: result.as_ref().map(|_| ()),
+                });
+            }
+        }
+        let status =
+            gateway_status::gateway(gateway.status.as_ref(), &handed.status, addresses, now);
+        if gateway.status.as_ref() != Some(&status) {
+            let object = &handed.gateway;
+            let version = gateway
+                .metadata
+                .resource_version
+                .as_deref()
+                .unwrap_or_default();
+            let result = api
+                .replace_status::<Gateway>(&object.namespace, &object.name, version, &status)
+                .await;
+            said(Said::GatewayApiStatus {
+                object,
+                written: result.as_ref().map(|_| ()),
+            });
+        }
+        let routes = self.http_routes.as_deref().map(objects).unwrap_or_default();
+        for route in &routes {
+            let object = Object {
+                kind: "HTTPRoute",
+                namespace: route.metadata.namespace.clone().unwrap_or_default(),
+                name: route.metadata.name.clone().unwrap_or_default(),
+            };
+            let wanted = handed.routes.iter().find(|wanted| wanted.route == object);
+            let status = gateway_status::route(
+                route.status.as_ref(),
+                &object.namespace,
+                &handed.gateway,
+                wanted,
+                now,
+            );
+            if route.status.clone().unwrap_or_default() != status {
+                let version = route
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .unwrap_or_default();
+                let result = api
+                    .replace_status::<HTTPRoute>(&object.namespace, &object.name, version, &status)
+                    .await;
+                said(Said::GatewayApiStatus {
+                    object: &object,
+                    written: result.as_ref().map(|_| ()),
+                });
+            }
+        }
     }
 }
 

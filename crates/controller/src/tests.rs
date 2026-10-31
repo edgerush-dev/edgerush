@@ -2,6 +2,7 @@ use super::*;
 use bytes::Bytes;
 use edgerush_kubernetes::Timing;
 use edgerush_kubernetes::testing::{Answer, Fake, answer, token};
+use edgerush_translate::GATEWAY_CONTROLLER;
 use k8s_openapi::ByteString;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde::Serialize;
@@ -164,6 +165,10 @@ fn hear(heard: &Rc<RefCell<Heard>>) -> impl Fn(Said<'_>) + 'static {
                 "translated".to_owned()
             }
             Said::Refused { problems, .. } => format!("refused: {problems:?}"),
+            Said::GatewayApiStatus { object, written } => match written {
+                Ok(()) => format!("status of {object}"),
+                Err(error) => format!("status of {object} not written: {error}"),
+            },
             Said::Status {
                 ingress,
                 addresses,
@@ -1350,4 +1355,151 @@ async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
             controlling.abort();
         })
         .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_gateway_apis_statuses_are_written_where_they_say_otherwise_and_once() {
+    let class: GatewayClass = serde_saphyr::from_str(
+        "metadata: { name: edgerush, generation: 1, resourceVersion: '5' }
+spec: { controllerName: edgerush.dev/gateway-controller }",
+    )
+    .unwrap();
+    let gateway: Gateway = serde_saphyr::from_str(
+        "metadata: { name: web, namespace: edge, generation: 2, resourceVersion: '6' }
+spec:
+  gatewayClassName: edgerush
+  listeners: [{ name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }]",
+    )
+    .unwrap();
+    let app: HTTPRoute = serde_saphyr::from_str(
+        "metadata: { name: app, namespace: shop, generation: 3, resourceVersion: '7' }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]",
+    )
+    .unwrap();
+    // A route that named the Gateway once: the parent of ours is taken away, another
+    // controller's kept.
+    let old: HTTPRoute = serde_saphyr::from_str(
+        "metadata: { name: old, namespace: shop, generation: 1, resourceVersion: '8' }
+spec: { parentRefs: [{ name: elsewhere, namespace: edge }] }
+status:
+  parents:
+    - controllerName: edgerush.dev/gateway-controller
+      parentRef: { group: gateway.networking.k8s.io, kind: Gateway, name: web, namespace: edge }
+      conditions: [{ type: Accepted, status: 'True', reason: Accepted, message: '', lastTransitionTime: '2026-10-01T00:00:00Z', observedGeneration: 1 }]
+    - controllerName: example.com/other
+      parentRef: { group: gateway.networking.k8s.io, kind: Gateway, name: elsewhere, namespace: edge }
+      conditions: []",
+    )
+    .unwrap();
+    let known = [
+        "/apis/gateway.networking.k8s.io/v1/gatewayclasses/edgerush/status",
+        "/apis/gateway.networking.k8s.io/v1/namespaces/edge/gateways/web/status",
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/httproutes/app/status",
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/httproutes/old/status",
+    ];
+    let fake = Fake::start_by_method(&["127.0.0.1"], move |method, path| {
+        if method == "PUT" && known.contains(&path) {
+            answer(200, "{}")
+        } else {
+            answer(404, r#"{"kind":"Status","code":404,"message":"not found"}"#)
+        }
+    })
+    .await;
+    let api = fake.client(
+        &token("controller-gateway-status", "secret"),
+        Timing::default(),
+    );
+    let cluster = Cluster {
+        services: vec![service("shop")],
+        gateway_classes: vec![class.clone()],
+        gateways: vec![gateway.clone()],
+        http_routes: vec![app.clone(), old.clone()],
+        ..Cluster::default()
+    };
+    let translation = translate(&gateway_plane(), &cluster);
+    let handed = Handed::of(&translation).expect("the Gateway translated");
+    let served: Vec<(GatewayKind, Served)> = GatewayKind::ALL
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                Served::Served {
+                    release: Some("v1.7.0".to_owned()),
+                },
+            )
+        })
+        .collect();
+    let following = |classes: Vec<GatewayClass>, gateways: Vec<Gateway>, routes| GatewayApi {
+        crds: Vec::new(),
+        namespaces: Vec::new(),
+        namespace: Scope::Namespace("edge".to_owned()),
+        last: Some(served.clone()),
+        gateway_classes: Some(vec![follow_of("gatewayclasses", true, classes)]),
+        gateways: Some(vec![follow_of("gateways in edge", true, gateways)]),
+        http_routes: Some(vec![follow_of("httproutes", true, routes)]),
+        reference_grants: None,
+    };
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let said = hear(&heard);
+    let addresses = gateway_status::addresses(&[status::address("192.0.2.10")]);
+    following(
+        vec![class.clone()],
+        vec![gateway.clone()],
+        vec![app.clone(), old.clone()],
+    )
+    .write_statuses(&api, &handed, &addresses, &said)
+    .await;
+    assert_eq!(
+        heard.borrow().lines,
+        [
+            "status of GatewayClass edgerush",
+            "status of Gateway edge/web",
+            "status of HTTPRoute shop/app",
+            "status of HTTPRoute shop/old",
+        ]
+    );
+    let bodies: Vec<serde_json::Value> = fake
+        .seen()
+        .iter()
+        .map(|seen| {
+            assert_eq!(seen.method, "PUT");
+            serde_json::from_str(&seen.body).unwrap()
+        })
+        .collect();
+    let status = |n: usize| &bodies[n]["status"];
+    assert_eq!(
+        bodies[0]["metadata"]["resourceVersion"], "5",
+        "written as of the version read"
+    );
+    assert_eq!(status(0)["conditions"][0]["type"], "Accepted");
+    assert_eq!(status(0)["conditions"][1]["type"], "SupportedVersion");
+    assert_eq!(status(0)["conditions"][1]["status"], "True");
+    assert_eq!(status(1)["addresses"][0]["value"], "192.0.2.10");
+    assert_eq!(status(1)["listeners"][0]["attachedRoutes"], 1);
+    assert_eq!(status(1)["conditions"][0]["observedGeneration"], 2);
+    assert_eq!(
+        status(2)["parents"][0]["controllerName"],
+        GATEWAY_CONTROLLER
+    );
+    assert_eq!(
+        status(2)["parents"][0]["conditions"][0]["observedGeneration"],
+        3
+    );
+    assert_eq!(status(3)["parents"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        status(3)["parents"][0]["controllerName"],
+        "example.com/other"
+    );
+    // Read back as written, every status says what it should: nothing more is written.
+    let (mut class, mut gateway, mut app, mut old) = (class, gateway, app, old);
+    class.status = serde_json::from_value(bodies[0]["status"].clone()).unwrap();
+    gateway.status = serde_json::from_value(bodies[1]["status"].clone()).unwrap();
+    app.status = serde_json::from_value(bodies[2]["status"].clone()).unwrap();
+    old.status = serde_json::from_value(bodies[3]["status"].clone()).unwrap();
+    following(vec![class], vec![gateway], vec![app, old])
+        .write_statuses(&api, &handed, &addresses, &said)
+        .await;
+    assert_eq!(fake.seen().len(), 4, "a status written again");
 }

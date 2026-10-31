@@ -150,7 +150,7 @@ impl Election {
 }
 
 /// The wall clock's time, as a Lease holds one; the epoch for a clock before it.
-fn wall_clock() -> Timestamp {
+pub(crate) fn wall_clock() -> Timestamp {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .ok()

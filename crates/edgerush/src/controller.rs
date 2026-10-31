@@ -946,6 +946,10 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
             format!("the Gateway API's kinds:{}", kinds.concat())
         }
         Said::Failed { followed, failure } => format!("{followed}: {failure}"),
+        Said::GatewayApiStatus { object, written } => match written {
+            Ok(()) => format!("status of {object} written"),
+            Err(error) => format!("status of {object} cannot be written: {error}"),
+        },
         Said::Status {
             ingress,
             addresses,

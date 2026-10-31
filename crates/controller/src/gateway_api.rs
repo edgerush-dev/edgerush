@@ -13,6 +13,9 @@ pub const VERSION: &str = "v1";
 /// The annotation on a Gateway API CRD that names the release it is from.
 pub const RELEASE: &str = "gateway.networking.k8s.io/bundle-version";
 
+/// The Gateway API minor releases supported: the latest two (05 §6).
+pub const SUPPORTED: [&str; 2] = ["v1.6", "v1.7"];
+
 /// A Gateway API kind the control plane follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GatewayKind {
@@ -97,6 +100,56 @@ impl Served {
     #[must_use]
     pub fn is_served(&self) -> bool {
         matches!(self, Self::Served { .. })
+    }
+}
+
+impl GatewayKind {
+    /// Its name, as a manifest's `kind` says it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::GatewayClass => "GatewayClass",
+            Self::Gateway => "Gateway",
+            Self::HTTPRoute => "HTTPRoute",
+            Self::ReferenceGrant => "ReferenceGrant",
+        }
+    }
+}
+
+/// Whether the release of every kind `served` is one supported, its CRD there and serving
+/// [`VERSION`], as a GatewayClass's `SupportedVersion` says (04 §6); or what of each is
+/// not.
+///
+/// # Errors
+///
+/// What of each kind is not supported, and the releases that are.
+pub fn supported(served: &[(GatewayKind, Served)]) -> Result<(), String> {
+    let unsupported: Vec<String> = served
+        .iter()
+        .filter(|(_, served)| match served {
+            Served::Served {
+                release: Some(release),
+            } => !SUPPORTED.iter().any(|minor| minor_of(release) == *minor),
+            _ => true,
+        })
+        .map(|(kind, served)| format!("{} {served}", kind.name()))
+        .collect();
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}; supported: Gateway API {}",
+            unsupported.join("; "),
+            SUPPORTED.join(", ")
+        ))
+    }
+}
+
+/// A release's minor: `v1.7` of `v1.7.0`.
+fn minor_of(release: &str) -> &str {
+    match release.match_indices('.').nth(1) {
+        Some((at, _)) => release.get(..at).unwrap_or(release),
+        None => release,
     }
 }
 

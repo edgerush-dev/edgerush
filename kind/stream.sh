@@ -19,7 +19,9 @@
 #     not installed and serves Ingress as ever; installed, each kind is followed, its CRD
 #     read by name alone as RBAC allows, and an HTTPRoute attached to the Gateway, of this
 #     controller's class, its listener on the port the data plane binds, is served beside
-#     the Ingress, from one data plane; an HTTPRoute in `blog` led to `shop`'s Service
+#     the Ingress, from one data plane, and the GatewayClass, the Gateway and the
+#     HTTPRoute say they are accepted, of their generation, the Gateway the data plane's
+#     address and its route; an HTTPRoute in `blog` led to `shop`'s Service
 #     answers 500 until a ReferenceGrant in `shop` allows it, and again once it is deleted;
 #     an HTTPRoute and an Ingress of one host and path are ranked by when the cluster made
 #     them, whichever API each is of: the older takes the requests, the other is said
@@ -226,6 +228,35 @@ answers shop.example 200 5 || fail "beside the HTTPRoute, the Ingress is not ser
 refused_any && fail "a control-plane replica was refused something of the Gateway API"
 answers shop.example 200 10 || fail "with the Gateway API followed, $(status shop.example)"
 pass "installed, the Gateway API's kinds are followed, their CRDs read by name alone, and an HTTPRoute is served beside the Ingress"
+
+# Each object's status as the leader writes it, of the object's generation (04 §6).
+stated() { # what, jsonpath, seconds, the object
+    local want=$1 path=$2 seconds=$3
+    shift 3
+    for _ in $(seq 1 $((seconds * 5))); do
+        [ "$(k get "$@" -o jsonpath="$path" 2>/dev/null)" = "$want" ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+said_of() { k get "$@" -o jsonpath='{.status}'; }
+condition() { echo "{.status.conditions[?(@.type==\"$1\")].$2}"; }
+stated True "$(condition Accepted status)" 30 gatewayclass edgerush ||
+    fail "the GatewayClass says $(said_of gatewayclass edgerush)"
+stated True "$(condition SupportedVersion status)" 5 gatewayclass edgerush ||
+    fail "the GatewayClass's version is not said supported: $(said_of gatewayclass edgerush)"
+stated True "$(condition Accepted status)" 30 -n edge gateway web ||
+    fail "the Gateway says $(said_of -n edge gateway web)"
+generation=$(k -n edge get gateway web -o jsonpath='{.metadata.generation}')
+stated "$generation" "$(condition Accepted observedGeneration)" 5 -n edge gateway web ||
+    fail "the Gateway's status is not of generation $generation: $(said_of -n edge gateway web)"
+stated 192.0.2.10 '{.status.addresses[0].value}' 5 -n edge gateway web ||
+    fail "the Gateway does not say the data plane's address: $(said_of -n edge gateway web)"
+stated 1 '{.status.listeners[0].attachedRoutes}' 5 -n edge gateway web ||
+    fail "the Gateway's listener does not count its route: $(said_of -n edge gateway web)"
+stated "edgerush.dev/gateway-controller True"     '{.status.parents[0].controllerName} {.status.parents[0].conditions[?(@.type=="Accepted")].status}'     30 -n shop httproute web || fail "the HTTPRoute says $(said_of -n shop httproute web)"
+refused_any && fail "a control-plane replica was refused a status of the Gateway API"
+pass "the GatewayClass, the Gateway and the HTTPRoute say they are accepted, the Gateway its address and its route, each of its generation"
 
 k apply -f - >/dev/null <<EOF
 apiVersion: gateway.networking.k8s.io/v1
