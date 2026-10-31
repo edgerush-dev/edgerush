@@ -65,8 +65,27 @@ impl fmt::Display for ListenerOutcome {
                 self.certificates.join(", "),
                 self.allowed
             ),
-            Err(problem) => write!(f, "listener {}: not accepted: {problem}", self.name),
+            Err(problem) => write!(
+                f,
+                "listener {}: {}: {problem}",
+                self.name,
+                problem.verdict()
+            ),
         }
+    }
+}
+
+impl ListenerOutcome {
+    /// Whether it is accepted: served, or refused for its certificates alone, which leaves
+    /// it accepted with the routes that attach to it, and serving none of them, as the
+    /// spec's conformance has a listener of unresolved `certificateRefs` count its routes
+    /// (04 §6).
+    #[must_use]
+    pub fn accepted(&self) -> bool {
+        self.served
+            .as_ref()
+            .err()
+            .is_none_or(ListenerProblem::accepted)
     }
 }
 
@@ -228,8 +247,9 @@ pub enum ListenerProblem {
     #[error("port {0} is bound by no listener of the data plane")]
     PortUnbound(u16),
     /// An HTTPS listener none of whose `certificateRefs` can be used (`ResolvedRefs`
-    /// false, `InvalidCertificateRef` or `RefNotPermitted`): not served, its hostname
-    /// refused over TLS so that no other certificate answers for it.
+    /// false, `InvalidCertificateRef` or `RefNotPermitted`): accepted, its routes attached,
+    /// and not served, its hostname refused over TLS so that no other certificate answers
+    /// for it.
     #[error("no certificateRef of it can be used")]
     NoCertificate,
     /// An HTTPS listener of a TLS mode other than `Terminate`, which the spec does not let
@@ -246,6 +266,26 @@ pub enum ListenerProblem {
         /// The listener's.
         wanted: &'static str,
     },
+}
+
+impl ListenerProblem {
+    /// Whether a listener refused for it is accepted all the same: one of no certificate
+    /// that can be used, which serves nothing.
+    #[must_use]
+    pub fn accepted(&self) -> bool {
+        matches!(self, Self::NoCertificate)
+    }
+
+    /// What it makes of its listener, as said: `not accepted`, or accepted and serving
+    /// nothing.
+    #[must_use]
+    pub fn verdict(&self) -> &'static str {
+        if self.accepted() {
+            "accepted, serving nothing"
+        } else {
+            "not accepted"
+        }
+    }
 }
 
 /// The data plane's Gateway, its class checked, its listeners fitted: `None`, said in
@@ -322,7 +362,7 @@ pub(crate) fn outcome(
     if !listeners.iter().any(|listener| listener.served.is_ok()) {
         report.push(Finding {
             object: object.clone(),
-            problem: Problem::NoListenerAccepted,
+            problem: Problem::NoListenerServed,
         });
     }
     Some(GatewayOutcome {

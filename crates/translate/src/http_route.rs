@@ -160,7 +160,7 @@ fn attach(
     gateway: &GatewayOutcome,
     cluster: &Cluster,
 ) -> Result<Vec<Attachment>, NotAttached> {
-    let accepted = |listener: &&ListenerOutcome| listener.served.is_ok();
+    let accepted = |listener: &&ListenerOutcome| listener.accepted();
     let named: Vec<&ListenerOutcome> = gateway
         .listeners
         .iter()

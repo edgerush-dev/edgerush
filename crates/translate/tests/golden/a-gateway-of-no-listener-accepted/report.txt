@@ -1,2 +1,2 @@
 Gateway edge/web: listener http: not accepted: port 80 is bound by no listener of the data plane
-Gateway edge/web: none of its listeners is accepted, so it serves nothing
+Gateway edge/web: none of its listeners is served, so it serves nothing

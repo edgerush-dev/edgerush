@@ -2,7 +2,8 @@
 # object of blog is ever seen, so a backend or certificate there is refused as one no
 # ReferenceGrant allows, and said as being in a namespace not watched, not as one of no
 # grant. One into news, watched, with no grant there, is said as one of no grant; one into
-# the route's own namespace needs none.
+# the route's own namespace needs none. A listener of no certificate it can use is accepted
+# and serves nothing: a route attached to it is not served.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
@@ -20,6 +21,7 @@ spec:
       port: 8443
       protocol: HTTPS
       hostname: "unwatched.example.com"
+      allowedRoutes: { namespaces: { from: All } }
       tls: { certificateRefs: [{ name: cert, namespace: blog }] }
     - name: ungranted
       port: 8443
@@ -40,6 +42,14 @@ spec:
       backendRefs: [{ name: web, namespace: news, port: 80 }]
     - matches: [{ path: { value: /own } }]
       backendRefs: [{ name: web, namespace: shop, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: secured, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: unwatched }]
+  rules:
+    - backendRefs: [{ name: web, port: 80 }]
 ---
 apiVersion: v1
 kind: Service

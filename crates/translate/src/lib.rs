@@ -514,17 +514,17 @@ pub enum Problem {
          translated"
     )]
     GatewayClassNotOurs(String),
-    /// A listener of the data plane's Gateway is not accepted.
-    #[error("listener {name}: not accepted: {problem}")]
+    /// A listener of the data plane's Gateway is not accepted, or is and serves nothing.
+    #[error("listener {name}: {}: {problem}", problem.verdict())]
     Listener {
         /// The listener's name.
         name: String,
         /// Why.
         problem: ListenerProblem,
     },
-    /// No listener of the data plane's Gateway is accepted.
-    #[error("none of its listeners is accepted, so it serves nothing")]
-    NoListenerAccepted,
+    /// No listener of the data plane's Gateway is served.
+    #[error("none of its listeners is served, so it serves nothing")]
+    NoListenerServed,
     /// A `parentRef` of an HTTPRoute to the data plane's Gateway attaches it to no listener.
     #[error("not attached to the data plane's Gateway: {0}")]
     NotAttached(NotAttached),

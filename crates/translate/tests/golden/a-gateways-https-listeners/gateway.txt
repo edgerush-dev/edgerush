@@ -4,7 +4,7 @@ listener wild: served on https, presenting shop/wild, taking HTTPRoute from ever
 listener kinds: served on https, presenting edge/own, taking HTTPRoute from every namespace
 listener later: served on https, presenting shop/secure, taking HTTPRoute from every namespace
 listener migrated: served on https, presenting edge/own, taking HTTPRoute from every namespace
-listener wild-unusable: not accepted: no certificateRef of it can be used
-listener unusable: not accepted: no certificateRef of it can be used
-listener denied: not accepted: no certificateRef of it can be used
+listener wild-unusable: accepted, serving nothing: no certificateRef of it can be used
+listener unusable: accepted, serving nothing: no certificateRef of it can be used
+listener denied: accepted, serving nothing: no certificateRef of it can be used
 listener elsewhere: served on more, presenting edge/own, taking HTTPRoute from every namespace
