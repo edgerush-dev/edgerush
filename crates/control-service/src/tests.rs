@@ -150,6 +150,7 @@ fn follower(
                 std::future::ready(ran)
             },
             |_| {},
+            None,
         )
         .await
     });
@@ -363,7 +364,15 @@ async fn a_data_plane_that_dials_again_is_sent_only_what_it_lacks() {
     {
         // Followed until the config runs and is reported, then dropped, as a connection
         // lost.
-        let following = follow(&address, "control.test", &tls, &mut staging, run, |_| {});
+        let following = follow(
+            &address,
+            "control.test",
+            &tls,
+            &mut staging,
+            run,
+            |_| {},
+            None,
+        );
         tokio::pin!(following);
         let heard = hear(&mut plane, following.as_mut()).await;
         assert!(matches!(heard, Heard::Opened { .. }), "{heard:?}");
@@ -372,7 +381,15 @@ async fn a_data_plane_that_dials_again_is_sent_only_what_it_lacks() {
     }
     assert!(matches!(plane.next().await, Heard::Closed(_)));
     {
-        let following = follow(&address, "control.test", &tls, &mut staging, run, |_| {});
+        let following = follow(
+            &address,
+            "control.test",
+            &tls,
+            &mut staging,
+            run,
+            |_| {},
+            None,
+        );
         tokio::pin!(following);
         let heard = hear(&mut plane, following.as_mut()).await;
         let Heard::Opened { held, .. } = heard else {
@@ -388,6 +405,100 @@ async fn a_data_plane_that_dials_again_is_sent_only_what_it_lacks() {
     }
     // Nothing was sent again, and nothing ran again.
     assert_eq!(runs.get(), 1);
+    plane.join().await;
+}
+
+/// What the data plane says it serves of its listeners goes with the report of the config
+/// it runs, is reported on its own whenever it changes, and is reported again as a stream
+/// opens anew, for a control plane that has just started.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_the_data_plane_serves_of_its_listeners_is_reported_as_it_changes() {
+    use edgerush_control_stream::{Listening, Unserved};
+    let authority = Authority::new("stream");
+    let offer = Offer::new(&config(80), None, &mut Versions::new(7)).unwrap();
+    let mut plane = Plane::start(
+        &credentials(&authority, &["control.test"]),
+        Some(offer.clone()),
+    )
+    .await;
+    let tls = connector(&credentials(&authority, &["data-plane"])).unwrap();
+    let address = plane.address.clone();
+    let mut staging = Staging::new();
+    let unserved = Listening {
+        unserved: vec![Unserved {
+            listener: "api".to_owned(),
+            why: "its port is taken".to_owned(),
+        }],
+        draining: Vec::new(),
+    };
+    let (saying, mut watched) = tokio::sync::watch::channel(Listening::default());
+    // Said as the config runs, so that its report says it.
+    let said = saying.clone();
+    let with = unserved.clone();
+    let run = move |_| {
+        said.send_replace(with.clone());
+        std::future::ready(Ok(()))
+    };
+    async fn hear(plane: &mut Plane, following: Pin<&mut impl Future<Output = Ended>>) -> Heard {
+        tokio::select! {
+            ended = following => panic!("{ended}"),
+            heard = plane.next() => heard,
+        }
+    }
+    let reported = |heard: Heard| match heard {
+        Heard::Reported(report) => report,
+        other => panic!("{other:?}"),
+    };
+    {
+        let following = follow(
+            &address,
+            "control.test",
+            &tls,
+            &mut staging,
+            run,
+            |_| {},
+            Some(&mut watched),
+        );
+        tokio::pin!(following);
+        let heard = hear(&mut plane, following.as_mut()).await;
+        assert!(matches!(heard, Heard::Opened { .. }), "{heard:?}");
+        let report = reported(hear(&mut plane, following.as_mut()).await);
+        assert_eq!(report.running.config.as_deref(), Some(offer.version()));
+        assert_eq!(report.listening, unserved, "the run's report");
+
+        let draining = Listening {
+            unserved: Vec::new(),
+            draining: vec!["admin".to_owned()],
+        };
+        saying.send_replace(draining.clone());
+        let report = reported(hear(&mut plane, following.as_mut()).await);
+        assert_eq!(report.listening, draining, "a report of its own");
+        assert_eq!(report.running.config.as_deref(), Some(offer.version()));
+    }
+    assert!(matches!(plane.next().await, Heard::Closed(_)));
+    {
+        let following = follow(
+            &address,
+            "control.test",
+            &tls,
+            &mut staging,
+            |_| std::future::ready(Ok(())),
+            |_| {},
+            Some(&mut watched),
+        );
+        tokio::pin!(following);
+        assert!(matches!(
+            hear(&mut plane, following.as_mut()).await,
+            Heard::Opened { .. }
+        ));
+        let report = reported(hear(&mut plane, following.as_mut()).await);
+        assert_eq!(
+            report.listening.draining,
+            ["admin"],
+            "said again as it opened"
+        );
+    }
+    plane.signal();
     plane.join().await;
 }
 
@@ -582,6 +693,7 @@ fn subscriber(
                 std::future::ready(Ok(()))
             },
             |_| {},
+            None,
             |following| {
                 let _ = said.send(following);
             },
@@ -771,6 +883,7 @@ async fn the_stream_goes_on_while_a_config_waits_to_run() {
                 }
             },
             |_| {},
+            None,
             |following| {
                 let _ = said.send(following);
             },
@@ -858,6 +971,7 @@ async fn the_gateways_addresses_come_before_the_config_and_again_as_they_change(
             move |addresses| {
                 let _ = handed.send(Handed::Gateway(addresses));
             },
+            None,
         )
         .await
     });

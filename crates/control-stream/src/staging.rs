@@ -1,7 +1,7 @@
 //! The data plane's side of the stream: what it was sent, held until it can run.
 
 use crate::encode::{CONFIG_VERSION, OLDEST_CONFIG_VERSION};
-use crate::{Held, Malformed, Refusal, Report, Versioned, wire};
+use crate::{Held, Listening, Malformed, Refusal, Report, Versioned, wire};
 use edgerush_config::{Certificate, Config};
 use std::collections::BTreeMap;
 
@@ -22,6 +22,8 @@ pub struct Staging {
     /// What was refused, so that it is not given to run again unchanged. Versions are
     /// never named twice, so it matches nothing once another config is sent.
     refused_run: Option<Held>,
+    /// What the data plane last said it serves of the listeners of what runs.
+    listening: Listening,
 }
 
 /// The latest config sent.
@@ -114,7 +116,18 @@ impl Staging {
         Report {
             running: self.running.as_ref().map(Run::held).unwrap_or_default(),
             refused: self.refused.clone(),
+            listening: self.listening.clone(),
         }
+    }
+
+    /// What the data plane serves of the listeners of what runs is `listening` from now on:
+    /// what to say, if that changed it. A report made from now on says it too.
+    pub fn listening(&mut self, listening: Listening) -> Option<Report> {
+        if self.listening == listening {
+            return None;
+        }
+        self.listening = listening;
+        Some(self.report())
     }
 
     /// Takes a message sent.

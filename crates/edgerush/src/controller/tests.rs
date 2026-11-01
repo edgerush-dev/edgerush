@@ -922,6 +922,7 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
             move |addresses| {
                 let _ = named.send(addresses);
             },
+            None,
         )
         .await
     });
@@ -958,6 +959,7 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
             &mut staging,
             |_| std::future::ready(Ok(())),
             |_| {},
+            None,
         )
         .await
     });

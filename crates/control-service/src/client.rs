@@ -3,7 +3,7 @@
 use crate::{Prost, Received, SUBSCRIBE};
 use boring::ssl::SslConnector;
 use edgerush_config::Config;
-use edgerush_control_stream::{MAX_MESSAGE, Malformed, Report, Staging, Taken, wire};
+use edgerush_control_stream::{Listening, MAX_MESSAGE, Malformed, Report, Staging, Taken, wire};
 use http::Uri;
 use http::uri::PathAndQuery;
 use hyper_util::rt::TokioIo;
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_boring::SslStream;
 use tonic::Request;
 use tonic::transport::Endpoint;
@@ -48,8 +48,9 @@ pub enum Ended {
 /// Dials the control plane at `address` (`host:port`), with `tls`, its certificate
 /// checked against `name`, and follows the stream until it ends: from what `staging`
 /// holds, each config given to run handed to `run`, which runs it, or says why it cannot,
-/// and each outcome reported; and the addresses of the gateway's own pods handed to
-/// `gateway` each time they come.
+/// and each outcome reported; the addresses of the gateway's own pods handed to `gateway`
+/// each time they come; and what the data plane serves of the listeners of what runs, as
+/// `listening` says it, reported as it changes and with every outcome.
 pub async fn follow<R>(
     address: &str,
     name: &str,
@@ -57,6 +58,7 @@ pub async fn follow<R>(
     staging: &mut Staging,
     mut run: impl FnMut(Box<Config>) -> R,
     mut gateway: impl FnMut(Vec<IpAddr>),
+    mut listening: Option<&mut watch::Receiver<Listening>>,
 ) -> Ended
 where
     R: Future<Output = Result<(), String>>,
@@ -99,8 +101,40 @@ where
         Err(status) => return unreachable(status.message().to_owned()),
     };
     let say = async |report: Report| up.send((&report).into()).await.is_ok();
+    // Said as the stream opens, if there is anything to say: a control plane that has just
+    // started knows nothing of it.
+    if let Some(watched) = listening.as_deref_mut() {
+        let now = watched.borrow_and_update().clone();
+        let changed = staging.listening(now);
+        let report = changed.or_else(|| {
+            let report = staging.report();
+            (report.listening != Listening::default()).then_some(report)
+        });
+        if let Some(report) = report
+            && !say(report).await
+        {
+            return Ended::Closed;
+        }
+    }
     loop {
-        let message = match down.message().await {
+        let message = tokio::select! {
+            message = down.message() => message,
+            changed = changed(&mut listening) => {
+                match changed {
+                    Some(now) => {
+                        if let Some(report) = staging.listening(now)
+                            && !say(report).await
+                        {
+                            return Ended::Closed;
+                        }
+                    }
+                    // Nobody says it any more: what was last said stands.
+                    None => listening = None,
+                }
+                continue;
+            }
+        };
+        let message = match message {
             Ok(Some(message)) => message,
             Ok(None) => return Ended::Closed,
             Err(status) => return Ended::Ended(status.message().to_owned()),
@@ -114,10 +148,18 @@ where
             }
             Ok(Taken::Say(report)) => Some(report),
             // Awaited, not waited on: the connection, its pings answered, goes on meanwhile.
-            Ok(Taken::Run(config)) => match run(config).await {
-                Ok(()) => staging.ran(),
-                Err(why) => staging.failed(why),
-            },
+            // The outcome says what the data plane serves after it, without a report of
+            // its own.
+            Ok(Taken::Run(config)) => {
+                let ran = run(config).await;
+                if let Some(watched) = listening.as_deref_mut() {
+                    let _said_below = staging.listening(watched.borrow_and_update().clone());
+                }
+                match ran {
+                    Ok(()) => staging.ran(),
+                    Err(why) => staging.failed(why),
+                }
+            }
         };
         if let Some(report) = report
             && !say(report).await
@@ -125,6 +167,16 @@ where
             return Ended::Closed;
         }
     }
+}
+
+/// What `listening` says next, once it changes: none once nobody says it, and never
+/// without one.
+async fn changed(listening: &mut Option<&mut watch::Receiver<Listening>>) -> Option<Listening> {
+    let Some(watched) = listening.as_deref_mut() else {
+        return std::future::pending().await;
+    };
+    watched.changed().await.ok()?;
+    Some(watched.borrow_and_update().clone())
 }
 
 /// An error and what caused it, as one line: tonic's own say little more than "transport

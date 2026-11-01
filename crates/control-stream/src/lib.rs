@@ -44,13 +44,37 @@ pub struct Held {
     pub certificates: BTreeMap<String, String>,
 }
 
-/// What a data plane says after a config it was sent.
+/// What a data plane says after a config it was sent, and whenever what it serves of the
+/// config it runs changes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
     /// The config it runs, and the certificates that config uses.
     pub running: Held,
     /// The latest config, if it refused it.
     pub refused: Option<Refusal>,
+    /// What it serves of the listeners of the config it runs.
+    pub listening: Listening,
+}
+
+/// What of a config's listeners a data plane does not serve as it asks (03 §10): those
+/// whose sockets it has not, and those taken away whose connections still drain. Each is
+/// named as the config names it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listening {
+    /// Listeners of the config it runs that have no sockets served, and why: a port it
+    /// cannot bind, a drain it waits for, or no slot.
+    pub unserved: Vec<Unserved>,
+    /// Listeners taken away whose sockets are closed and whose connections still drain.
+    pub draining: Vec<String>,
+}
+
+/// A listener a data plane does not serve, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unserved {
+    /// Its name in the config.
+    pub listener: String,
+    /// Why, as the data plane says it.
+    pub why: String,
 }
 
 /// A config a data plane refused, and why.
@@ -120,6 +144,16 @@ impl From<&Report> for wire::FromDataPlane {
                     config: refusal.config.clone(),
                     why: refusal.why.clone(),
                 }),
+                unserved: report
+                    .listening
+                    .unserved
+                    .iter()
+                    .map(|unserved| wire::Unserved {
+                        listener: unserved.listener.clone(),
+                        why: unserved.why.clone(),
+                    })
+                    .collect(),
+                draining: report.listening.draining.clone(),
             })),
         }
     }
@@ -137,9 +171,21 @@ impl TryFrom<wire::Report> for Report {
             }),
             None => None,
         };
+        let unserved = report
+            .unserved
+            .into_iter()
+            .map(|unserved| Unserved {
+                listener: unserved.listener,
+                why: unserved.why,
+            })
+            .collect();
         Ok(Self {
             running: report.running.unwrap_or_default().try_into()?,
             refused,
+            listening: Listening {
+                unserved,
+                draining: report.draining,
+            },
         })
     }
 }

@@ -12,7 +12,7 @@
 use edgerush_certificates::testing::Authority;
 use edgerush_config::HarnessFile;
 use edgerush_control_service::{Credentials, Heard, acceptor, serve};
-use edgerush_control_stream::{Offer, Versions};
+use edgerush_control_stream::{Listening, Offer, Versions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
@@ -650,15 +650,65 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
     assert!(get(free, "/")?.contains("x-upstream: two"));
     assert_eq!(reported().running.config.as_deref(), Some(added.version()));
 
+    // Taken away, a listener is reported draining until it has drained, and then reported
+    // no more: at once, as nothing holds it, perhaps before its config's report is made.
+    let without = offered(
+        &config("127.0.0.1:0", "up", Some(two)),
+        Some(&added),
+        &mut versions,
+    );
+    offers.send_replace(Some(Arc::new(without.clone())));
+    let mut report = reported();
+    assert_eq!(report.running.config.as_deref(), Some(without.version()));
+    if report.listening.draining == ["api"] {
+        report = reported();
+    }
+    assert_eq!(report.listening, Listening::default());
+    harness.wait_for("listener \"api\" has drained");
+
+    // One whose port is taken is reported not served, and why; with the port free, it is
+    // listened on at the next config and reported no more.
+    let taken = TcpListener::bind("127.0.0.1:0")?;
+    let busy = taken.local_addr()?;
+    let with_busy = |backend: SocketAddr| {
+        config("127.0.0.1:0", "up", Some(backend)).replace("[web]", "[web, busy]")
+            + &format!(
+                "  busy: {{ address: \"{busy}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+"
+            )
+    };
+    let unbound = offered(&with_busy(one), Some(&without), &mut versions);
+    offers.send_replace(Some(Arc::new(unbound.clone())));
+    let report = reported();
+    assert_eq!(report.running.config.as_deref(), Some(unbound.version()));
+    let [unserved] = report.listening.unserved.as_slice() else {
+        panic!("{:?}", report.listening)
+    };
+    assert_eq!(unserved.listener, "busy");
+    assert!(
+        unserved
+            .why
+            .starts_with(&format!("cannot listen on {busy} for listener \"busy\": ")),
+        "{}",
+        unserved.why
+    );
+    drop(taken);
+    let bound = offered(&with_busy(two), Some(&unbound), &mut versions);
+    offers.send_replace(Some(Arc::new(bound.clone())));
+    let report = reported();
+    assert_eq!(report.running.config.as_deref(), Some(bound.version()));
+    assert_eq!(report.listening, Listening::default());
+    assert_eq!(harness.address_after("listener \"busy\" is on "), busy);
+
     // A config that cannot be run: said, and the one before it runs on.
     let third = offered(
         &config("127.0.0.1:0", "elsewhere", Some(one)),
-        Some(&added),
+        Some(&bound),
         &mut versions,
     );
     offers.send_replace(Some(Arc::new(third.clone())));
     let report = reported();
-    assert_eq!(report.running.config.as_deref(), Some(added.version()));
+    assert_eq!(report.running.config.as_deref(), Some(bound.version()));
     assert_eq!(
         report.refused.map(|refusal| refusal.config),
         Some(third.version().to_owned())

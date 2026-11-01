@@ -31,6 +31,7 @@ use crate::per_core::{self, Accept, Closed, Sockets, Workers};
 use crate::stream::{FromStream, Stream, StreamError};
 use edgerush_config::{Compiled, Config, compile};
 use edgerush_control_service::Files;
+use edgerush_control_stream::{Listening as Served, Unserved};
 use edgerush_kubernetes::{ApiError, ApiServer};
 use edgerush_proxy::{Changes, H1Limits, Opened, Proxy, ProxyError};
 use std::io::{self, Write};
@@ -409,6 +410,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     })
     .map_err(Failure::Runtime)?;
     let mut gateway: Vec<std::net::IpAddr> = Vec::new();
+    // Where the stream, if the config comes from one, hears what is served of its listeners.
+    let mut reporting: Option<tokio::sync::watch::Sender<Served>> = None;
     let (mut configs, config, named, first_ran) = match source {
         Source::File(path) => {
             let (file, config) = match ConfigFile::open(path.clone()) {
@@ -426,7 +429,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             (Configs::File(file), config, named, None)
         }
         Source::ControlPlane(stream) => {
-            let handing = crate::stream::start(&stream, &stopping)?;
+            let (handing, saying) = crate::stream::start(&stream, &stopping)?;
+            reporting = Some(saying);
             // What the control plane names as the gateway's own before the first config,
             // which it sends first, for the proxy to refuse from its start.
             say(
@@ -560,7 +564,11 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         count: workers,
         port,
     };
-    let mut listeners = Listeners { bound, wanted };
+    let mut listeners = Listeners {
+        bound,
+        wanted,
+        unserved: std::collections::BTreeMap::new(),
+    };
     health_checks(Arc::clone(&proxy), &stopping).map_err(Failure::Runtime)?;
     if let Some(socket) = metrics {
         let address = socket.local_addr().map_err(Failure::Runtime)?;
@@ -601,6 +609,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             Next::Failed(ended) => return Err(Failure::Ended(ended)),
         }
         listening.tend(&mut listeners).say(stderr);
+        report(reporting.as_ref(), &listeners);
         match &mut configs {
             Configs::File(file) => {
                 let Some(changed) = file.changed() else {
@@ -648,6 +657,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
                         runnable(&config, outside.as_ref())?;
                         listening.reloaded(&mut listeners, config)
                     });
+                    // Before the outcome goes, so that its report says what it serves.
+                    report(reporting.as_ref(), &listeners);
                     match &reloaded {
                         Ok(reloaded) => {
                             say(stderr, format_args!("config from the control plane runs"));
@@ -818,6 +829,56 @@ struct Listeners {
     /// The listeners of the config that runs, as it has them: what is opened once what held
     /// its name or address has drained.
     wanted: Vec<Bound>,
+    /// Why each of `wanted` that has no sockets served has none, as it was said, by name.
+    unserved: std::collections::BTreeMap<String, String>,
+}
+
+/// What the data plane serves of the listeners of the config that runs, as its report on
+/// the stream says it (03 §10): those with no sockets served, and why, and those draining.
+fn served(listeners: &Listeners) -> Served {
+    let has = |name: &str| {
+        listeners
+            .bound
+            .iter()
+            .any(|bound| bound.name == name && bound.draining.is_none())
+    };
+    Served {
+        unserved: listeners
+            .wanted
+            .iter()
+            .filter(|wanted| !has(&wanted.name))
+            .map(|wanted| Unserved {
+                listener: wanted.name.clone(),
+                why: listeners
+                    .unserved
+                    .get(&wanted.name)
+                    .cloned()
+                    .unwrap_or_else(|| "not listened on yet".to_owned()),
+            })
+            .collect(),
+        draining: listeners
+            .bound
+            .iter()
+            .filter(|bound| bound.draining.is_some())
+            .map(|bound| bound.name.clone())
+            .collect(),
+    }
+}
+
+/// Has the stream, if the config comes from one, report what the data plane serves of its
+/// listeners, if that changed.
+fn report(reporting: Option<&tokio::sync::watch::Sender<Served>>, listeners: &Listeners) {
+    let Some(reporting) = reporting else {
+        return;
+    };
+    let now = served(listeners);
+    reporting.send_if_modified(|said| {
+        let changed = *said != now;
+        if changed {
+            *said = now;
+        }
+        changed
+    });
 }
 
 /// What a reload, or a drain that ended, did that is said: the listeners it opened, those
@@ -835,10 +896,17 @@ struct Reloaded {
 #[derive(Debug, Default)]
 struct Opening {
     sockets: Vec<(Bound, Vec<Sockets>)>,
-    /// Those that wait for a listener's drain.
-    waiting: Vec<String>,
-    /// Those that cannot be served until a restart or the next config.
-    refused: Vec<String>,
+    /// Those that wait for a listener's drain, by name, and what is said of each.
+    waiting: Vec<(String, String)>,
+    /// Those that cannot be served until a restart or the next config, the same.
+    refused: Vec<(String, String)>,
+}
+
+impl Opening {
+    /// Why each listener it did not open is not, by name.
+    fn unserved(&self) -> std::collections::BTreeMap<String, String> {
+        self.waiting.iter().chain(&self.refused).cloned().collect()
+    }
 }
 
 impl Reloaded {
@@ -894,8 +962,9 @@ impl Listening<'_> {
             .collect();
         let wanted: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
         let opening = self.opening(&listeners.bound, &closing, &wanted);
-        warnings.extend(opening.waiting);
-        warnings.extend(opening.refused);
+        let unserved = opening.unserved();
+        warnings.extend(opening.waiting.iter().map(|(_, said)| said.clone()));
+        warnings.extend(opening.refused.iter().map(|(_, said)| said.clone()));
         let mut changes = Changes {
             opened: to_open(&opening.sockets),
             closed: closing.clone(),
@@ -931,6 +1000,7 @@ impl Listening<'_> {
             .reload_with(config, &changes)
             .map_err(|error| error.to_string())?;
         listeners.wanted = wanted;
+        listeners.unserved = unserved;
         for (name, slot) in closing.iter().zip(&slotted.closed) {
             self.workers.stop(*slot);
             if let Some(bound) = listeners.bound.iter_mut().find(|b| b.name == *name) {
@@ -1040,7 +1110,10 @@ impl Listening<'_> {
             .cloned()
             .collect();
         let opening = self.opening(&listeners.bound, &[], &waited);
-        reloaded.warnings.extend(opening.refused);
+        listeners.unserved.extend(opening.unserved());
+        reloaded
+            .warnings
+            .extend(opening.refused.iter().map(|(_, said)| said.clone()));
         let changes = Changes {
             opened: to_open(&opening.sockets),
             ..Changes::default()
@@ -1113,9 +1186,12 @@ impl Listening<'_> {
                 continue;
             }
             if bound.iter().any(|bound| bound.name == listener.name) {
-                opening.waiting.push(format!(
-                    "listener \"{}\" waits for its earlier sockets to drain",
-                    listener.name
+                opening.waiting.push((
+                    listener.name.clone(),
+                    format!(
+                        "listener \"{}\" waits for its earlier sockets to drain",
+                        listener.name
+                    ),
                 ));
                 continue;
             }
@@ -1125,7 +1201,7 @@ impl Listening<'_> {
                     && (bound.address == listener.address || bound.listens_on == listener.address)
             });
             if let Some(holder) = held {
-                opening.waiting.push(if goes(holder) {
+                let said = if goes(holder) {
                     format!(
                         "listener \"{}\" is on {}, which listener \"{}\" holds: it waits for that one to drain",
                         listener.name, listener.address, holder.name
@@ -1135,13 +1211,17 @@ impl Listening<'_> {
                         "listener \"{}\" is on {}, which listener \"{}\" keeps: it is not served until a restart",
                         listener.name, listener.address, holder.name
                     )
-                });
+                };
+                opening.waiting.push((listener.name.clone(), said));
                 continue;
             }
             let Some(left) = free.checked_sub(1) else {
-                opening.refused.push(format!(
-                    "listener \"{}\": every listener's slot is taken: it is not served until a restart",
-                    listener.name
+                opening.refused.push((
+                    listener.name.clone(),
+                    format!(
+                        "listener \"{}\": every listener's slot is taken: it is not served until a restart",
+                        listener.name
+                    ),
                 ));
                 continue;
             };
@@ -1155,8 +1235,9 @@ impl Listening<'_> {
                     free = left;
                     opening.sockets.push((added, sockets));
                 }
-                Err(failure) => opening.refused.push(format!(
-                    "{failure}: it is not served, and is tried again at the next config"
+                Err(failure) => opening.refused.push((
+                    listener.name.clone(),
+                    format!("{failure}: it is not served, and is tried again at the next config"),
                 )),
             }
         }
@@ -1180,6 +1261,7 @@ impl Listening<'_> {
                 .opened
                 .push((added.name.clone(), added.listens_on, added.http3));
             added.slot = *slot;
+            listeners.unserved.remove(&added.name);
             listeners.bound.push(added);
         }
     }
@@ -2039,7 +2121,11 @@ upstreams: {{}}
             port: Port::Own,
         };
         let wanted = bound.clone();
-        let mut listeners = Listeners { bound, wanted };
+        let mut listeners = Listeners {
+            bound,
+            wanted,
+            unserved: std::collections::BTreeMap::new(),
+        };
         assert!(negotiates(address, Duration::from_secs(10)));
 
         let off = listening.reloaded(&mut listeners, with(false)).unwrap();
@@ -2065,6 +2151,43 @@ upstreams: {{}}
             ]
         );
         assert!(negotiates(address, Duration::from_secs(10)));
+    }
+
+    /// What the stream is told the data plane serves: each listener of the config that runs
+    /// with no sockets served, with why as it was said, and those that drain.
+    #[test]
+    fn what_is_served_of_the_listeners_is_said_by_name() {
+        let config = listeners(&[
+            ("admin", "127.0.0.1:81"),
+            ("api", "127.0.0.1:82"),
+            ("web", "[::]:80"),
+        ]);
+        let wanted: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
+        // `api` not listened on; `admin` taken away and back, waiting for its drain.
+        let mut bound: Vec<Bound> = wanted.iter().filter(|b| b.name != "api").cloned().collect();
+        bound[0].draining = Some(0);
+        let waits = "listener \"admin\" waits for its earlier sockets to drain".to_owned();
+        let listeners = Listeners {
+            bound,
+            wanted,
+            unserved: [("admin".to_owned(), waits.clone())].into(),
+        };
+        assert_eq!(
+            served(&listeners),
+            Served {
+                unserved: vec![
+                    Unserved {
+                        listener: "admin".to_owned(),
+                        why: waits,
+                    },
+                    Unserved {
+                        listener: "api".to_owned(),
+                        why: "not listened on yet".to_owned(),
+                    },
+                ],
+                draining: vec!["admin".to_owned()],
+            }
+        );
     }
 
     #[test]

@@ -188,6 +188,64 @@ fn a_config_runs_once_its_certificates_are_there() {
     assert_eq!(session.held(), &running(&offer));
 }
 
+/// What a data plane serves of the listeners of what runs goes in every report from when it
+/// is said, and makes a report of its own when it changes; as the control plane hears it,
+/// and as one that predates it does, which skips it.
+#[test]
+fn what_a_data_plane_serves_of_its_listeners_is_reported_as_it_changes() {
+    let mut versions = Versions::new(7);
+    let offer = Offer::new(&config(80, &[]), None, &mut versions).unwrap();
+    let mut staging = Staging::new();
+    let mut session = hello(&staging);
+    take(&mut staging, session.send(&offer));
+    staging.ran().unwrap();
+    let listening = Listening {
+        unserved: vec![Unserved {
+            listener: "api".to_owned(),
+            why: "cannot listen on 127.0.0.1:8080".to_owned(),
+        }],
+        draining: vec!["admin".to_owned()],
+    };
+    let report = staging.listening(listening.clone()).unwrap();
+    assert_eq!(report.running, running(&offer));
+    assert_eq!(report.listening, listening);
+    assert_eq!(
+        staging.listening(listening.clone()),
+        None,
+        "said again unchanged"
+    );
+    assert_eq!(
+        session.heard((&report).into()).unwrap(),
+        Some(report.clone())
+    );
+
+    // A newer config's report says it too, until it changes.
+    let next = Offer::new(&config(81, &[]), Some(&offer), &mut versions).unwrap();
+    take(&mut staging, session.send(&next));
+    assert_eq!(staging.ran().unwrap().listening, listening);
+    let served = staging.listening(Listening::default()).unwrap();
+    assert_eq!(served.listening, Listening::default());
+
+    // The bytes a report is sent as, read without the two fields: what a control plane that
+    // predates them makes of them.
+    let bytes = wire::FromDataPlane::from(&report).encode_to_vec();
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct Older {
+        #[prost(message, optional, tag = "1")]
+        running: Option<wire::Held>,
+        #[prost(message, optional, tag = "2")]
+        refused: Option<wire::Refusal>,
+    }
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OlderSaid {
+        #[prost(message, optional, tag = "2")]
+        report: Option<Older>,
+    }
+    let older = OlderSaid::decode(bytes.as_slice()).unwrap();
+    let held: Held = older.report.unwrap().running.unwrap().try_into().unwrap();
+    assert_eq!(held, running(&offer));
+}
+
 #[test]
 fn a_config_waits_for_each_certificate_at_the_version_it_names() {
     let mut versions = Versions::new(7);
@@ -398,6 +456,7 @@ fn a_message_the_protocol_does_not_allow_ends_the_stream() {
         said: Some(wire::Said::Report(wire::Report {
             running: None,
             refused: Some(wire::Refusal::default()),
+            ..Default::default()
         })),
     };
     assert_eq!(session.heard(refused).unwrap_err(), Malformed::Unversioned);
