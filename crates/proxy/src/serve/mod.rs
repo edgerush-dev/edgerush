@@ -21,7 +21,7 @@ mod kubernetes;
 mod logged;
 mod passthrough;
 mod plane;
-pub use plane::Opened;
+pub use plane::{Opened, Slotted};
 mod respond;
 mod tries;
 mod watched;
@@ -500,6 +500,10 @@ pub struct Worker {
     /// By slot ([`Proxy::listeners`]): the client validation its connections here are
     /// accepted under, and the drain they hear.
     validations: RefCell<Vec<Validation>>,
+    /// By slot ([`Proxy::listeners`]): what stops its accepting here, and its HTTP/3
+    /// listener's taking new connections: this worker's drain, or its listener taken away
+    /// ([`Worker::stop`]).
+    listening: RefCell<Vec<Rc<Drain>>>,
     /// Which snapshot `validations` and `routes` were last brought up to.
     validated: Cell<u64>,
     /// By key ([`Routed`]): the drain of the tunnels routed by a listener, route and
@@ -552,6 +556,7 @@ where
     let listener = ours.listener;
     // For the record of a head the server refuses, which no request's future makes.
     let logged_client = Rc::clone(&client);
+    let cut_by = Rc::clone(&client);
     // The connection is kept by this for as long as it is served; each request's future
     // owns only a handle on the worker. It is that future itself, not one wrapped around
     // it, so that it is not moved into another on every request.
@@ -576,6 +581,12 @@ where
         &connection.drain,
         respond,
         |went| connection.went(went),
+        |why| {
+            cut_by.cut(why);
+            if let Some(counters) = worker.proxy.metrics.listener(listener) {
+                counters.closed(why);
+            }
+        },
         &slots,
     )
     .await;
@@ -743,8 +754,9 @@ impl Admitted {
 
 /// By slot ([`Proxy::listeners`]): the listeners whose sockets the data plane holds. A
 /// socket is served as the listener its slot names, whatever configs come later; a slot
-/// is taken as a listener's sockets are opened ([`Proxy::reload_with`]), and the sockets
-/// of a slot are never moved.
+/// is taken as a listener's sockets are opened ([`Proxy::reload_with`]), held while they
+/// are closed and its connections drain, and freed once they have ([`Proxy::free`]). The
+/// sockets of a slot are never moved.
 #[derive(Debug, Clone)]
 struct ListenerSlots {
     /// The name of the listener whose sockets it holds, if one's are.
@@ -752,7 +764,16 @@ struct ListenerSlots {
     /// The port its HTTP/3 is served on, where it has a UDP socket: whatever the config
     /// says now, it is where the socket is (03 §4).
     quic: Arc<[Option<u16>]>,
+    /// Its listener was taken away: no longer served, its connections draining.
+    draining: Arc<[bool]>,
+    /// For a slot that drains, its listener as the last config that had it said: what the
+    /// records of its connections' requests say of it.
+    left: Arc<[Option<Left>]>,
 }
+
+/// A listener taken away, as the last config that had it said: that config, and where it
+/// has the listener.
+type Left = (Arc<Compiled>, usize);
 
 /// A compiled config and what the data plane works out from it, once, when it arrives.
 #[derive(Debug)]
@@ -821,6 +842,15 @@ impl Snapshot {
     fn listener(&self, position: usize) -> Option<&CompiledListener> {
         let at = self.listeners.get(position).copied().flatten()?;
         self.config.listeners().get(at)
+    }
+
+    /// The listener at `position` as its records are to say it: the config's, or for one
+    /// taken away and draining, the last config's that had it.
+    fn logged_listener(&self, position: usize) -> Option<&CompiledListener> {
+        self.listener(position).or_else(|| {
+            let (config, at) = self.slots.left.get(position)?.as_ref()?;
+            config.listeners().get(*at)
+        })
     }
 }
 
@@ -1282,6 +1312,12 @@ pub enum ProxyError {
     /// [`MOST_LISTENERS`]: edgerush_config::MOST_LISTENERS
     #[error("listener `{0}`: every listener's slot is taken")]
     NoSlot(String),
+    /// A listener said to be taken away that has no sockets being served.
+    #[error("listener `{0}` has no sockets to close")]
+    ListenerNotOpen(String),
+    /// A slot said to be freed that is not draining.
+    #[error("listener slot {0} is not draining")]
+    NotDraining(usize),
 }
 
 impl From<CannotOpen> for ProxyError {

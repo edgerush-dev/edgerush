@@ -29,6 +29,9 @@ pub struct Bounds {
     pub linger_quiet: Duration,
     /// A lingering close at the most, however much keeps arriving.
     pub linger_most: Duration,
+    /// A request still under way once the connection drains, from the drain's start, as
+    /// HTTP/2's streams are held to it (03 §10).
+    pub drain: Duration,
 }
 
 impl Default for Bounds {
@@ -40,6 +43,7 @@ impl Default for Bounds {
             idle: Duration::from_secs(30),
             linger_quiet: Duration::from_secs(5),
             linger_most: Duration::from_secs(30),
+            drain: Duration::from_secs(25),
         }
     }
 }
@@ -55,6 +59,7 @@ impl Bounds {
             self.idle,
             self.linger_quiet,
             self.linger_most,
+            self.drain,
         ]
         .into_iter()
         .min()
@@ -79,6 +84,8 @@ pub enum Clock {
     LingerQuiet,
     /// A lingering close ran as long as one may.
     LingerMost,
+    /// A request was still under way at the drain's bound.
+    Drained,
 }
 
 /// Where the connection is.
@@ -109,6 +116,9 @@ enum Phase {
 pub struct Deadlines {
     bounds: Bounds,
     phase: Phase,
+    /// Once the connection drains: when a request still under way is cut off. Absolute,
+    /// set once.
+    drained_by: Option<Instant>,
 }
 
 impl Deadlines {
@@ -119,6 +129,15 @@ impl Deadlines {
             phase: Phase::First {
                 by: now + bounds.first_request,
             },
+            drained_by: None,
+        }
+    }
+
+    /// The connection drains from `now` on: a request under way has until the drain's bound,
+    /// which nothing moves. Said again, it changes nothing.
+    pub fn draining(&mut self, now: Instant) {
+        if self.drained_by.is_none() {
+            self.drained_by = Some(now + self.bounds.drain);
         }
     }
 
@@ -257,20 +276,27 @@ impl Deadlines {
         matches!(self.phase, Phase::KeepAlive { .. })
     }
 
-    /// The deadline that falls due first, and when.
+    /// The deadline that falls due first, and when. The drain's runs in every phase up to
+    /// the close, from its start, so that it never comes sooner than when it was set: an
+    /// idle connection closes as it drains in any case.
     pub fn next(&self) -> Option<(Clock, Instant)> {
+        let drained = self.drained_by.map(|due| (Clock::Drained, due));
+        let sooner = |one: (Clock, Instant)| match drained {
+            Some(drained) if drained.1 < one.1 => drained,
+            _ => one,
+        };
         match self.phase {
-            Phase::First { by } => Some((Clock::FirstRequest, by)),
-            Phase::NextHead { by } => Some((Clock::NextHead, by)),
-            Phase::KeepAlive { by } => Some((Clock::KeepAlive, by)),
+            Phase::First { by } => Some(sooner((Clock::FirstRequest, by))),
+            Phase::NextHead { by } => Some(sooner((Clock::NextHead, by))),
+            Phase::KeepAlive { by } => Some(sooner((Clock::KeepAlive, by))),
             Phase::Shutting { by } => Some((Clock::WriteIdle, by)),
             Phase::Serving { body, write } => {
                 let body = body.map(|due| (Clock::BodyIdle, due));
                 let write = write.map(|due| (Clock::WriteIdle, due));
-                match (body, write) {
-                    (Some(body), Some(write)) => Some(if write.1 < body.1 { write } else { body }),
-                    (one, other) => one.or(other),
-                }
+                [body, write, drained]
+                    .into_iter()
+                    .flatten()
+                    .min_by_key(|(_, due)| *due)
             }
             Phase::Lingering { quiet, most } => Some(if most <= quiet {
                 (Clock::LingerMost, most)
@@ -318,6 +344,38 @@ mod tests {
             connection.expired(start + secs(10)),
             Some(Clock::FirstRequest)
         );
+    }
+
+    /// A request under way when the connection drains has the drain's bound from then,
+    /// which neither progress nor its idle clocks move; one that ends before is not cut.
+    #[test]
+    fn a_request_under_way_when_the_connection_drains_has_the_drains_bound() {
+        let (mut connection, start) = accepted();
+        connection.head_read();
+        connection.write_waited_on(start + secs(1), true);
+        connection.draining(start + secs(2));
+        // Said again later, the bound stays where it was.
+        connection.draining(start + secs(20));
+        for second in 3..27 {
+            connection.write_moved(start + secs(second));
+        }
+        assert_eq!(connection.expired(start + secs(26)), None);
+        assert_eq!(connection.expired(start + secs(27)), Some(Clock::Drained));
+        // The idle clock, sooner, comes first.
+        let (mut stalled, start) = accepted();
+        stalled.head_read();
+        stalled.draining(start);
+        stalled.body_waited_on(start, true);
+        assert_eq!(stalled.next(), Some((Clock::Drained, start + secs(25))));
+        stalled.body_waited_on(start + secs(20), false);
+        stalled.write_waited_on(start + secs(20), true);
+        assert_eq!(stalled.next(), Some((Clock::Drained, start + secs(25))));
+        // Between requests it runs on, sooner than the keep-alive's.
+        stalled.answered(start + secs(21), false);
+        assert_eq!(stalled.next(), Some((Clock::Drained, start + secs(25))));
+        // Closing, the connection's own bounds are what it is held to.
+        stalled.lingering(start + secs(22));
+        assert_eq!(stalled.next(), Some((Clock::LingerQuiet, start + secs(27))));
     }
 
     #[test]
@@ -505,12 +563,12 @@ mod tests {
         /// this: set that far ahead, no deadline set after it falls due before it.
         #[test]
         fn a_deadline_comes_sooner_only_by_the_shortest_bound_from_now(
-            seconds in proptest::collection::vec(1_u64..40, 6),
-            events in proptest::collection::vec((0_u8..11, 0_u64..20_000, proptest::bool::ANY), 0..40),
+            seconds in proptest::collection::vec(1_u64..40, 7),
+            events in proptest::collection::vec((0_u8..12, 0_u64..20_000, proptest::bool::ANY), 0..40),
         ) {
-            let [first_request, next_head, keep_alive, idle, linger_quiet, linger_most] =
-                [0, 1, 2, 3, 4, 5].map(|at| secs(seconds[at]));
-            let bounds = Bounds { first_request, next_head, keep_alive, idle, linger_quiet, linger_most };
+            let [first_request, next_head, keep_alive, idle, linger_quiet, linger_most, drain] =
+                [0, 1, 2, 3, 4, 5, 6].map(|at| secs(seconds[at]));
+            let bounds = Bounds { first_request, next_head, keep_alive, idle, linger_quiet, linger_most, drain };
             let start = Instant::now();
             let mut connection = Deadlines::accepted(start, bounds);
             let mut now = start;
@@ -528,6 +586,7 @@ mod tests {
                     7 => connection.lingering(now),
                     8 => connection.closed(),
                     9 => connection.shutting(now),
+                    10 => connection.draining(now),
                     _ => {}
                 }
                 if let Some((clock, due)) = connection.next()

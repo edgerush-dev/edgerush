@@ -293,6 +293,7 @@ async fn composed(client: Vec<ClientStep>, core: Core, pipe: usize) -> Run {
                     &never,
                     respond,
                     |_| {},
+                    |_| {},
                     &slots,
                 ))
                 .await;

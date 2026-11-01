@@ -285,19 +285,139 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
     assert_eq!(harness.address_after("listener \"busy\" is on "), busy);
     assert!(get(busy, "/")?.contains("x-upstream: two"));
 
-    // Renamed, it is another listener, on an address the one gone still holds: not opened
-    // beside it, which would share the port between the two.
+    // Renamed, it is another listener, on an address the one gone holds until it has
+    // drained: not opened beside it, which would share the port between the two, but once
+    // it has.
     let renamed = with_busy("renamed").replace("busy", "moved");
     std::fs::write(&file, renamed)?;
     harness.wait_for("config reloaded");
     assert_eq!(
         harness.wait_for("listener \"moved\" is on "),
         format!(
-            "warning: listener \"moved\" is on {busy}, which listener \"busy\" keeps: it is not \
-             served until a restart"
+            "warning: listener \"moved\" is on {busy}, which listener \"busy\" holds: it waits \
+             for that one to drain"
         )
     );
+    harness.wait_for("listener \"busy\" has drained");
+    assert_eq!(harness.address_after("listener \"moved\" is on "), busy);
+    assert!(get(busy, "/")?.contains("x-upstream: two"));
     Ok(())
+}
+
+/// A listener a config takes away is no longer listened on, and its connections drain as
+/// at shutdown: one with a request under way is answered, saying it closes. Moved
+/// meanwhile, it waits for that drain, then is listened on where it went, its counts from
+/// zero (03 §10).
+#[test]
+fn proxy_drains_a_listener_taken_away_and_moves_it_once_drained() -> io::Result<()> {
+    let one = upstream("one")?;
+    let (held, arrived, release) = held_upstream()?;
+    let listener = |name: &str, at: &str| {
+        format!(
+            "  {name}: {{ address: \"{at}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
+        )
+    };
+    let with = |api: Option<SocketAddr>| {
+        let on = if api.is_some() { "[web, api]" } else { "[web]" };
+        let mut yaml = format!(
+            r#"upstreams:
+  up: {{ load_balancer: p2c, endpoints: {{ listed: ["{one}"] }} }}
+  held: {{ load_balancer: p2c, endpoints: {{ listed: ["{held}"] }} }}
+routes:
+  - name: everything
+    listeners: {on}
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: /held }}
+        forward: {{ backends: [{{ upstream: held, weight: 1 }}] }}
+      - matches:
+          - path: {{ prefix: / }}
+        forward: {{ backends: [{{ upstream: up, weight: 1 }}] }}
+listeners:
+"#
+        );
+        yaml += &listener("web", "127.0.0.1:0");
+        if let Some(api) = api {
+            yaml += &listener("api", &api.to_string());
+        }
+        yaml
+    };
+    let first = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let moved = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let file = scratch("drained.yaml");
+    std::fs::write(&file, with(Some(first)))?;
+    let args = [
+        "--config",
+        &file,
+        "--workers",
+        "1",
+        "--metrics",
+        "127.0.0.1:0",
+    ];
+    let mut harness = Harness::start(&args)?;
+    let metrics = harness.address_after("metrics are on ");
+    harness.wait_for("1 worker, thread-per-core");
+    assert!(get(first, "/")?.contains("x-upstream: one"));
+
+    // A request under way on `api`, held at its upstream, when `api` is taken away.
+    let mut under_way = TcpStream::connect(first)?;
+    under_way.set_read_timeout(Some(PATIENCE))?;
+    write!(
+        under_way,
+        "GET /held HTTP/1.1\r\nhost: harness.test\r\n\r\n"
+    )?;
+    arrived
+        .recv_timeout(PATIENCE)
+        .expect("the request at its upstream");
+    std::fs::write(&file, with(None))?;
+    harness.wait_for("config reloaded");
+    assert!(
+        refused_soon(first),
+        "a listener taken away is still listened on"
+    );
+
+    // Moved while it drains, it waits for the drain.
+    std::fs::write(&file, with(Some(moved)))?;
+    harness.wait_for("config reloaded");
+    assert_eq!(
+        harness.wait_for("listener \"api\""),
+        "warning: listener \"api\" waits for its earlier sockets to drain"
+    );
+    assert!(
+        TcpStream::connect(moved).is_err(),
+        "listened on before the drain ended"
+    );
+
+    // Answered, the connection closing, and the drain ends with it.
+    release.send(()).expect("the upstream to answer");
+    let mut answer = String::new();
+    under_way.read_to_string(&mut answer)?;
+    let answer = answer.to_ascii_lowercase();
+    assert!(answer.starts_with("http/1.1 200 ok\r\n"), "{answer}");
+    assert!(answer.contains("\r\nconnection: close\r\n"), "{answer}");
+    harness.wait_for("listener \"api\" has drained");
+    assert_eq!(harness.address_after("listener \"api\" is on "), moved);
+    assert!(get(moved, "/")?.contains("x-upstream: one"));
+    // Two answered where it was, counted there, and not here.
+    let scrape = get(metrics, "/metrics")?;
+    let counted = "edgerush_listener_responses_total{listener=\"api\",class=\"2xx\"} 1\n";
+    assert!(scrape.contains(counted), "{scrape}");
+    Ok(())
+}
+
+/// Whether connecting to `address` is refused within [`PATIENCE`]: a socket the data plane
+/// closes is closed by its worker a moment after the config that takes it away runs.
+fn refused_soon(address: SocketAddr) -> bool {
+    let began = std::time::Instant::now();
+    while began.elapsed() < PATIENCE {
+        if TcpStream::connect(address).is_err() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
 }
 
 /// The config `config` gives, as the control plane offers it.
@@ -1101,7 +1221,6 @@ fn upstream(name: &'static str) -> io::Result<SocketAddr> {
 
 /// Starts an upstream that says on `arrived` when a request has come, and answers it
 /// once told to on `release`.
-#[cfg(unix)]
 fn held_upstream() -> io::Result<(SocketAddr, Receiver<()>, mpsc::Sender<()>)> {
     let socket = TcpListener::bind("127.0.0.1:0")?;
     let address = socket.local_addr()?;

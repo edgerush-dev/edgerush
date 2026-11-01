@@ -48,6 +48,13 @@ impl<const N: usize> Histogram<N> {
     pub fn sum(&self) -> u64 {
         self.sum.get()
     }
+
+    /// Back to no values, as [`Counter::reset`].
+    pub fn reset(&self) {
+        for counter in self.buckets.iter().chain([&self.beyond, &self.sum]) {
+            counter.reset();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -72,6 +79,17 @@ mod tests {
         assert_eq!(counts(&[10]), [1, 0, 0, 0, 0]);
         assert_eq!(counts(&[11]), [0, 1, 0, 0, 0]);
         assert_eq!(counts(&[10_000]), [0, 0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn a_histogram_reset_has_no_values() {
+        let histogram = Histogram::<4>::default();
+        for value in [5, 50, 50_000] {
+            histogram.observe(&BOUNDS, value);
+        }
+        histogram.reset();
+        assert_eq!(histogram.counts().collect::<Vec<_>>(), [0; 5]);
+        assert_eq!(histogram.sum(), 0);
     }
 
     #[test]

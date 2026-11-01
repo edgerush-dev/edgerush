@@ -173,6 +173,14 @@ impl Prepared {
     pub(crate) fn by_listener(&self) -> Vec<Option<Sink>> {
         self.by_listener.clone()
     }
+
+    /// Has the listener at `position` write to `sink`, one a config before opened: for one
+    /// taken away whose connections still drain.
+    pub(crate) fn keep(&mut self, position: usize, sink: Option<Sink>) {
+        if let Some(kept) = self.by_listener.get_mut(position) {
+            *kept = sink;
+        }
+    }
 }
 
 /// Why a config's access log cannot be written.

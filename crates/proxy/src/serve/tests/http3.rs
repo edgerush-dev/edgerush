@@ -377,9 +377,9 @@ async fn a_listener_opened_at_a_reload_is_served_over_http3_and_says_where() {
                 quic: Some(quic.port()),
             };
             let slots = proxy
-                .reload_with(compile(&config).unwrap(), &[opened])
+                .reload_with(compile(&config).unwrap(), &[opened], &[])
                 .unwrap();
-            assert_eq!(slots, [1]);
+            assert_eq!(slots.opened, [1]);
 
             let worker = Worker::with_deadlines(Arc::clone(&proxy), H1Limits::default(), SHORT);
             let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
@@ -399,6 +399,58 @@ async fn a_listener_opened_at_a_reload_is_served_over_http3_and_says_where() {
             let counted = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"} 2\n";
             let scrape = proxy.metrics();
             assert!(scrape.contains(counted), "{scrape}");
+        })
+        .await;
+}
+
+/// A listener taken away takes no new QUIC connection, and its HTTP/3 listener ends,
+/// its UDP socket with it, once its last connection has: drained as at shutdown, a request
+/// under way answered first (03 §10).
+#[tokio::test]
+async fn a_listener_taken_away_ends_its_http3_once_its_last_connection_has() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::{Client, get};
+            let (upstream, held) = scripted_upstream().await;
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let config = compile(&h3_config(upstream, http3)).unwrap();
+            let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN).unwrap());
+            let worker = Worker::with_deadlines(proxy, H1Limits::default(), SHORT);
+            let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let alone = Forwarding::group(1).remove(0);
+            let serving =
+                tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone).unwrap());
+            let mut client = Client::connect(front, "a.test").await;
+            assert_eq!(
+                client.get("a.test", "/ok").await.final_status(),
+                Some("200")
+            );
+            let under_way = client.request(&get("a.test", "/held"), true);
+            client.flush().await;
+            while held.borrow().is_empty() {
+                client.hear_for(Duration::from_millis(20)).await;
+            }
+
+            worker.stop(0);
+            let mut late = Client::new(front, "a.test").await;
+            late.flush().await;
+            late.hear_for(Duration::from_millis(300)).await;
+            assert!(!late.quic.is_established(), "a new connection was taken");
+            assert!(!serving.is_finished(), "ended with a request under way");
+            // The upstream goes; the gateway answers for it, and the connection closes.
+            held.borrow_mut().clear();
+            let answer = client.answer(under_way).await;
+            assert_eq!(answer.final_status(), Some("502"));
+            client
+                .until(|client| client.quic.is_closed() || client.quic.is_draining())
+                .await;
+            within(serving).await.unwrap();
         })
         .await;
 }

@@ -132,6 +132,21 @@ impl Loads {
         self.listening.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A slot's listener takes no more connections from now on: it has no share to keep.
+    pub fn listener_removed(&self) {
+        let _was = self
+            .listening
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
+
+    /// Whether any worker holds a connection of the listener `listener`, over TCP or QUIC.
+    #[must_use]
+    pub fn holds_on(&self, listener: usize) -> bool {
+        self.by_listener
+            .get(listener)
+            .is_some_and(|held| held.load(Ordering::Relaxed) > 0)
+    }
+
     /// The connections all the workers together may hold.
     fn limit(&self) -> usize {
         (self.cap / CONNECTION).saturating_mul(self.held.len())

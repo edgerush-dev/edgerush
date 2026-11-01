@@ -103,11 +103,11 @@ async fn a_worker_accepts_a_batch_then_lets_the_rest_run() {
                 // it, so the kernel is given the moment it needs.
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
-                within(worker.accept(&socket)).await.unwrap().unwrap();
+                within(worker.accept(0, &socket)).await.unwrap().unwrap();
                 let ran = Rc::new(Cell::new(false));
                 let running = Rc::clone(&ran);
                 let _other = tokio::task::spawn_local(async move { running.set(true) });
-                within(worker.accept(&socket)).await.unwrap().unwrap();
+                within(worker.accept(0, &socket)).await.unwrap().unwrap();
                 assert_eq!(ran.get(), other_ran, "batch of {batch}");
             }
         })

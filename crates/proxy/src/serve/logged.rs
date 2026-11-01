@@ -91,7 +91,7 @@ impl Logging {
     ) -> Option<Rc<Self>> {
         let came_in = Instant::now();
         let sink = (*snapshot.logs.get(listener)?)?;
-        let compiled = snapshot.listener(listener)?;
+        let compiled = snapshot.logged_listener(listener)?;
         let mut texts = String::with_capacity(160);
         let listener = keep(&mut texts, &compiled.name);
         let method = keep(
@@ -384,9 +384,10 @@ pub(super) fn refused(
         return;
     }
     let snapshot = worker.proxy.current.load();
-    let (Some(Some(sink)), Some(compiled)) =
-        (snapshot.logs.get(listener), snapshot.listener(listener))
-    else {
+    let (Some(Some(sink)), Some(compiled)) = (
+        snapshot.logs.get(listener),
+        snapshot.logged_listener(listener),
+    ) else {
         return;
     };
     let record = Record {
@@ -438,7 +439,7 @@ impl Passing {
         accepted: Instant,
     ) -> Option<Self> {
         let sink = (*snapshot.logs.get(listener)?)?;
-        let compiled = snapshot.listener(listener)?;
+        let compiled = snapshot.logged_listener(listener)?;
         let mut texts = String::with_capacity(96);
         let listener = keep(&mut texts, &compiled.name);
         Some(Self {

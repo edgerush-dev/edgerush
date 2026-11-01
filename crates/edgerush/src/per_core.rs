@@ -11,10 +11,12 @@
 //! Everything a worker runs lives in a `LocalSet` of its own, so that a connection and all
 //! the engine spawns for it stay on the one thread and need not be `Send`.
 
-use crate::essential::{Essential, Told, watched};
+use crate::essential::{Essential, Told, watched, watched_unless_stopped};
 use crate::limits::Connections;
 use edgerush_proxy::connections::{Held, Loads};
 use edgerush_proxy::{AcceptPause, Forwarding, H1Limits, Proxy};
+use std::cell::RefCell;
+use std::future::Future;
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -56,6 +58,14 @@ struct HandedOver {
     held: Held,
 }
 
+/// What a worker that runs is told of its listeners.
+#[derive(Debug)]
+enum Change {
+    Add(Added),
+    /// Stop serving the listener whose slot this is ([`Workers::stop`]).
+    Stop(usize),
+}
+
 /// A listener's sockets for a worker that runs, posted to it by [`Workers::add`].
 #[derive(Debug)]
 struct Added {
@@ -69,13 +79,16 @@ struct Added {
     said: std::sync::mpsc::Sender<Result<(), String>>,
 }
 
-/// The workers that run, for the main loop: what they hold, and where to post each the
-/// sockets of a listener added.
+/// The workers that run, for the main loop: what they hold, where to tell each of a
+/// listener added or taken away, and where they say they have closed a slot's sockets.
 #[derive(Debug)]
 pub(crate) struct Workers {
     pub(crate) loads: Arc<Loads>,
     /// By position of the worker.
-    adding: Vec<UnboundedSender<Added>>,
+    changing: Vec<UnboundedSender<Change>>,
+    /// A worker's position and a slot it was stopped on, once every task it ran on the
+    /// slot's sockets has ended: its sockets are closed.
+    closed: std::sync::mpsc::Receiver<(usize, usize)>,
 }
 
 impl Workers {
@@ -89,7 +102,7 @@ impl Workers {
         let mut forwarding = Forwarding::group(sockets.len()).into_iter();
         let mut posted = 0;
         let mut failed = Vec::new();
-        for (position, (worker, (tcp, udp))) in self.adding.iter().zip(sockets).enumerate() {
+        for (position, (worker, (tcp, udp))) in self.changing.iter().zip(sockets).enumerate() {
             let added = Added {
                 slot,
                 name: name.to_owned(),
@@ -97,7 +110,7 @@ impl Workers {
                 udp: udp.zip(forwarding.next()),
                 said: said.clone(),
             };
-            match worker.send(added) {
+            match worker.send(Change::Add(added)) {
                 Ok(()) => posted += 1,
                 Err(_) => failed.push(format!("worker {position} takes no listeners")),
             }
@@ -112,6 +125,111 @@ impl Workers {
         failed.extend(answers.into_iter().filter_map(Result::err));
         failed
     }
+
+    /// Has every worker stop serving the listener whose slot is `slot`, taken away: it
+    /// stops accepting there and closes its TCP sockets, and its connections drain; its
+    /// UDP sockets close once its QUIC connections have ended ([`Workers::closed`]). It has
+    /// no share of the workers' room from now on.
+    pub(crate) fn stop(&self, slot: usize) {
+        self.loads.listener_removed();
+        for worker in &self.changing {
+            // A worker that has gone stops nothing; the main loop hears it went.
+            let _gone = worker.send(Change::Stop(slot));
+        }
+    }
+
+    /// The workers and slots that have closed a slot's sockets since last asked, each as
+    /// (worker, slot).
+    pub(crate) fn closed(&self) -> Vec<(usize, usize)> {
+        self.closed.try_iter().collect()
+    }
+
+    /// How many workers there are.
+    pub(crate) fn count(&self) -> usize {
+        self.changing.len()
+    }
+}
+
+/// The tasks a worker runs on each slot's sockets — accepting, and HTTP/3 — counted, so
+/// that the main loop hears once a slot it stopped has none left: its sockets closed.
+#[derive(Debug)]
+struct Running {
+    position: usize,
+    /// By slot: the tasks on its sockets, and whether it was stopped.
+    slots: RefCell<Vec<(usize, bool)>>,
+    closed: std::sync::mpsc::Sender<(usize, usize)>,
+}
+
+impl Running {
+    fn new(position: usize, slots: usize, closed: std::sync::mpsc::Sender<(usize, usize)>) -> Self {
+        Self {
+            position,
+            slots: RefCell::new(vec![(0, false); slots]),
+            closed,
+        }
+    }
+
+    /// A task on `slot`'s sockets, counted until it is dropped.
+    fn task(self: &Rc<Self>, slot: usize) -> Task {
+        if let Some((tasks, _)) = self.slots.borrow_mut().get_mut(slot) {
+            *tasks += 1;
+        }
+        Task {
+            running: Rc::clone(self),
+            slot,
+        }
+    }
+
+    /// `slot` was stopped: said closed once it has no task left, which may be now.
+    fn stopped(&self, slot: usize) {
+        let closed = {
+            let mut slots = self.slots.borrow_mut();
+            let Some((tasks, stopped)) = slots.get_mut(slot) else {
+                return;
+            };
+            *stopped = *tasks > 0;
+            *tasks == 0
+        };
+        if closed {
+            self.close(slot);
+        }
+    }
+
+    fn ended(&self, slot: usize) {
+        let closed = {
+            let mut slots = self.slots.borrow_mut();
+            let Some((tasks, stopped)) = slots.get_mut(slot) else {
+                return;
+            };
+            *tasks = tasks.saturating_sub(1);
+            let closed = *tasks == 0 && *stopped;
+            if closed {
+                *stopped = false;
+            }
+            closed
+        };
+        if closed {
+            self.close(slot);
+        }
+    }
+
+    fn close(&self, slot: usize) {
+        // With nobody to hear it, the data plane is ending anyway.
+        let _gone = self.closed.send((self.position, slot));
+    }
+}
+
+/// Carried by a task on a slot's sockets, counted in [`Running`] while it lives.
+#[derive(Debug)]
+struct Task {
+    running: Rc<Running>,
+    slot: usize,
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        self.running.ended(self.slot);
+    }
 }
 
 /// What a worker works with. Its share of the data plane is an `Rc` and goes no further
@@ -124,6 +242,8 @@ struct Worker {
     /// Where to hand a connection over to each worker, by position.
     workers: Arc<[Sender<HandedOver>]>,
     accept: Accept,
+    running: Rc<Running>,
+    tell: std::sync::mpsc::Sender<Told>,
 }
 
 /// A worker's sockets for one listener: TCP, and UDP where the listener serves HTTP/3.
@@ -167,18 +287,19 @@ pub(crate) fn start(
         .map(|_| mpsc::channel::<HandedOver>(ON_THEIR_WAY))
         .unzip();
     let workers: Arc<[Sender<HandedOver>]> = workers.into();
-    let (adding, added): (Vec<_>, Vec<_>) = sockets
+    let (changing, changes): (Vec<_>, Vec<_>) = sockets
         .iter()
-        .map(|_| mpsc::unbounded_channel::<Added>())
+        .map(|_| mpsc::unbounded_channel::<Change>())
         .unzip();
+    let (closing, closed) = std::sync::mpsc::channel();
     // For every listener, the workers' shares of its QUIC inboxes: a datagram one worker
     // receives for another's connection is handed to it (16 §3).
     let mut forwarding: Vec<std::vec::IntoIter<Forwarding>> = (0..listeners)
         .map(|_| Forwarding::group(sockets.len()).into_iter())
         .collect();
 
-    let each = sockets.into_iter().zip(handed_over).zip(added);
-    for (position, ((sockets, handed_over), added)) in each.enumerate() {
+    let each = sockets.into_iter().zip(handed_over).zip(changes);
+    for (position, ((sockets, handed_over), changes)) in each.enumerate() {
         let runtime = Builder::new_current_thread().enable_all().build()?;
         // Sockets are handed to the runtime that is entered. Here, and not on the worker's
         // thread, so that a socket the runtime will not take stops the harness starting.
@@ -199,6 +320,7 @@ pub(crate) fn start(
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "more than 65,536 workers"))?;
         let (proxy, loads, senders) = (Arc::clone(proxy), Arc::clone(&loads), Arc::clone(&workers));
         let (tell, ready, names) = (tell.clone(), ready.clone(), Arc::clone(&names));
+        let closing = closing.clone();
         // A runtime without threads of its own runs on the thread that waits on it, and a
         // LocalSet belongs to one thread, so it is made on that one.
         thread::Builder::new()
@@ -224,26 +346,23 @@ pub(crate) fn start(
                     Rc::clone(&plane).maintain(),
                     essential("sweep and timers".to_owned()),
                 ));
+                let running = Running::new(position, names.len(), closing);
                 let worker = Worker {
                     position,
                     plane,
                     loads,
                     workers: senders,
                     accept,
+                    running: Rc::new(running),
+                    tell: tell.clone(),
                 };
                 for (listener, socket) in sockets.into_iter().enumerate() {
-                    local.spawn_local(watched(
-                        worker.clone().accept(listener, socket),
-                        essential(format!("accepting on listener \"{}\"", name(listener))),
-                    ));
+                    local.spawn_local(worker.accepting(listener, name(listener), socket));
                 }
                 for (listener, socket, share) in datagrams {
                     match Rc::clone(&worker.plane).serve_h3(listener, socket, share) {
                         Ok(serving) => {
-                            local.spawn_local(watched(
-                                serving,
-                                essential(format!("HTTP/3 on listener \"{}\"", name(listener))),
-                            ));
+                            local.spawn_local(worker.serving_h3(listener, name(listener), serving));
                         }
                         Err(error) => {
                             let listener = name(listener).to_owned();
@@ -258,7 +377,7 @@ pub(crate) fn start(
                     essential("connections handed over".to_owned()),
                 ));
                 // Not one it cannot do without: a listener it cannot take is said to be.
-                local.spawn_local(worker.adding(added, tell.clone()));
+                local.spawn_local(worker.changing(changes));
                 drop(entered);
                 let _told = ready.send(Ok(()));
                 // Accepting has no end but a drain, so neither has the LocalSet that waits on
@@ -273,7 +392,11 @@ pub(crate) fn start(
     for worker in readied.iter().take(started) {
         worker?;
     }
-    Ok(Workers { loads, adding })
+    Ok(Workers {
+        loads,
+        changing,
+        closed,
+    })
 }
 
 /// Why the workers did not all start.
@@ -286,7 +409,53 @@ pub(crate) enum NotStarted {
 }
 
 impl Worker {
-    async fn accept(self, listener: usize, socket: TcpListener) {
+    /// Accepting on `socket` as the listener `name` whose slot is `slot`, watched, and
+    /// counted among the slot's tasks.
+    fn accepting(
+        &self,
+        slot: usize,
+        name: &str,
+        socket: TcpListener,
+    ) -> impl Future<Output = ()> + 'static {
+        let task = self.running.task(slot);
+        let what = format!(
+            "worker {}'s accepting on listener \"{name}\"",
+            self.position
+        );
+        let essential = Essential::new(what, &self.tell);
+        let accepting = self.clone().accept(slot, socket);
+        async move {
+            let _task = task;
+            watched_unless_stopped(accepting, essential).await;
+        }
+    }
+
+    /// `serving`, HTTP/3 on the listener `name` whose slot is `slot`, watched as
+    /// [`Worker::accepting`] is.
+    fn serving_h3(
+        &self,
+        slot: usize,
+        name: &str,
+        serving: impl Future<Output = ()> + 'static,
+    ) -> impl Future<Output = ()> + 'static {
+        let task = self.running.task(slot);
+        let what = format!("worker {}'s HTTP/3 on listener \"{name}\"", self.position);
+        let essential = Essential::new(what, &self.tell);
+        let plane = Rc::clone(&self.plane);
+        async move {
+            let _task = task;
+            // Ended with the worker's drain, or with its listener taken away.
+            let stopped = async move {
+                serving.await;
+                !plane.drains()
+            };
+            watched_unless_stopped(stopped, essential).await;
+        }
+    }
+
+    /// Accepts on `socket` until the worker drains, or the listener is taken away: whether
+    /// it was taken away.
+    async fn accept(self, listener: usize, socket: TcpListener) -> bool {
         loop {
             // A worker at its cap leaves what comes in the backlog until one of its
             // connections ends, rather than take on what it has no room for; and a listener
@@ -302,9 +471,9 @@ impl Worker {
                     .accept_paused(listener, AcceptPause::Share);
             }
             self.loads.room(self.position, listener).await;
-            // Draining: nothing new is taken, and the socket goes with this.
-            let Some(accepted) = self.plane.accept(&socket).await else {
-                return;
+            // Draining, or taken away: nothing new is taken, and the socket goes with this.
+            let Some(accepted) = self.plane.accept(listener, &socket).await else {
+                return !self.plane.drains();
             };
             match accepted {
                 Ok(stream) => self.place(listener, stream),
@@ -353,21 +522,25 @@ impl Worker {
         }
     }
 
-    /// Takes on the listeners posted to it, until the main loop has gone.
-    async fn adding(
-        self,
-        mut added: UnboundedReceiver<Added>,
-        tell: std::sync::mpsc::Sender<Told>,
-    ) {
-        while let Some(Added {
-            slot,
-            name,
-            tcp,
-            udp,
-            said,
-        }) = added.recv().await
-        {
-            let _gone = said.send(self.listen(slot, &name, tcp, udp, &tell));
+    /// Takes on the listeners posted to it and stops those taken away, until the main loop
+    /// has gone.
+    async fn changing(self, mut changes: UnboundedReceiver<Change>) {
+        while let Some(change) = changes.recv().await {
+            match change {
+                Change::Add(Added {
+                    slot,
+                    name,
+                    tcp,
+                    udp,
+                    said,
+                }) => {
+                    let _gone = said.send(self.listen(slot, &name, tcp, udp));
+                }
+                Change::Stop(slot) => {
+                    self.plane.stop(slot);
+                    self.running.stopped(slot);
+                }
+            }
         }
     }
 
@@ -380,28 +553,22 @@ impl Worker {
         name: &str,
         tcp: std::net::TcpListener,
         udp: Option<(std::net::UdpSocket, Forwarding)>,
-        tell: &std::sync::mpsc::Sender<Told>,
     ) -> Result<(), String> {
         let position = self.position;
-        let essential = |what: String| Essential::new(format!("worker {position}'s {what}"), tell);
         let cannot = |what: &str, error: io::Error| {
             format!("worker {position} cannot {what} listener \"{name}\": {error}")
         };
+        // The slot's own drain from now on: one a listener before it had was started.
+        self.plane.open(slot);
         let socket = TcpListener::from_std(tcp).map_err(|error| cannot("accept on", error))?;
-        let _detached = tokio::task::spawn_local(watched(
-            self.clone().accept(slot, socket),
-            essential(format!("accepting on listener \"{name}\"")),
-        ));
+        let _detached = tokio::task::spawn_local(self.accepting(slot, name, socket));
         let Some((udp, share)) = udp else {
             return Ok(());
         };
         let serving = UdpSocket::from_std(udp)
             .and_then(|udp| Rc::clone(&self.plane).serve_h3(slot, udp, share))
             .map_err(|error| cannot("serve HTTP/3 on", error))?;
-        let _detached = tokio::task::spawn_local(watched(
-            serving,
-            essential(format!("HTTP/3 on listener \"{name}\"")),
-        ));
+        let _detached = tokio::task::spawn_local(self.serving_h3(slot, name, serving));
         Ok(())
     }
 
@@ -741,12 +908,18 @@ upstreams:
     /// `count` workers holding no more than `connections` each, serving `web` (as
     /// [`capped_workers`] has it) and a listener `api` with no routes, whose sockets are
     /// opened and posted to them once they run: the addresses of `web` and of `api`, TCP and
-    /// UDP, and what the workers hold and the data plane.
+    /// UDP, the workers and the data plane, and what the workers tell of what ends.
     fn added_later(
         count: usize,
         port: Port,
         connections: usize,
-    ) -> (SocketAddr, SocketAddr, Arc<Loads>, Arc<Proxy>) {
+    ) -> (
+        SocketAddr,
+        SocketAddr,
+        Workers,
+        Arc<Proxy>,
+        std::sync::mpsc::Receiver<Told>,
+    ) {
         let config = |listeners: &str| -> Compiled {
             let yaml = format!(
                 r#"
@@ -778,7 +951,7 @@ upstreams:
             web = socket.local_addr().unwrap();
             sockets.push(vec![(socket, None)]);
         }
-        let (tell, _told) = std::sync::mpsc::channel();
+        let (tell, told) = std::sync::mpsc::channel();
         let running = start(
             &proxy,
             sockets,
@@ -802,9 +975,10 @@ upstreams:
             name: "api".to_owned(),
             quic: Some(address.port()),
         };
-        assert_eq!(proxy.reload_with(config(api), &[opened]).unwrap(), [1]);
+        let slotted = proxy.reload_with(config(api), &[opened], &[]).unwrap();
+        assert_eq!(slotted.opened, [1]);
         assert_eq!(running.add(1, "api", sockets), [""; 0]);
-        (web, address, running.loads, proxy)
+        (web, address, running, proxy, told)
     }
 
     /// A datagram of a QUIC version nobody speaks, as large as an Initial: what an HTTP/3
@@ -837,7 +1011,8 @@ upstreams:
     /// and its UDP socket is read.
     #[test]
     fn a_worker_that_runs_takes_on_a_listener_added_to_it() {
-        let (_, address, loads, proxy) = added_later(1, Port::Own, CONNECTIONS_PER_WORKER);
+        let (_, address, running, proxy, _told) = added_later(1, Port::Own, CONNECTIONS_PER_WORKER);
+        let loads = running.loads;
         let mut connection = std::net::TcpStream::connect(address).unwrap();
         // No route of `api`'s: the data plane's own 404, counted as the listener's.
         assert_eq!(request(&mut connection), "HTTP/1.1 404 Not Found");
@@ -854,7 +1029,8 @@ upstreams:
     #[test]
     fn a_listener_added_has_its_share_of_a_workers_room() {
         // Short from 7 of 8; with two listeners, a share is 4.
-        let (web, api, loads, _proxy) = added_later(1, Port::Own, 8);
+        let (web, api, running, _proxy, _told) = added_later(1, Port::Own, 8);
+        let loads = running.loads;
         let _held: Vec<std::net::TcpStream> = (0..7)
             .map(|_| {
                 let mut connection = std::net::TcpStream::connect(web).unwrap();
@@ -874,13 +1050,66 @@ upstreams:
     #[cfg(unix)]
     #[test]
     fn every_worker_takes_on_a_listener_added_to_them() {
-        let (_, address, _loads, _proxy) = added_later(4, Port::Shared, CONNECTIONS_PER_WORKER);
+        let (_, address, _running, _proxy, _told) =
+            added_later(4, Port::Shared, CONNECTIONS_PER_WORKER);
         let mut connections: Vec<_> = (0..16)
             .map(|_| std::net::TcpStream::connect(address).unwrap())
             .collect();
         for connection in &mut connections {
             assert_eq!(request(connection), "HTTP/1.1 404 Not Found");
         }
+    }
+
+    /// A slot stopped is said closed once the last task on its sockets has ended: at once,
+    /// with none left, and not before, with some; and not again, nor for a slot not stopped.
+    #[test]
+    fn a_slot_is_said_closed_once_its_last_task_has_ended() {
+        let (closing, closed) = std::sync::mpsc::channel();
+        let running = Rc::new(Running::new(3, 2, closing));
+        running.stopped(1);
+        assert_eq!(closed.try_iter().collect::<Vec<_>>(), [(3, 1)]);
+
+        let (accepting, serving) = (running.task(0), running.task(0));
+        drop(accepting);
+        running.stopped(0);
+        assert!(
+            closed.try_recv().is_err(),
+            "closed with a task still running"
+        );
+        drop(serving);
+        assert_eq!(closed.try_iter().collect::<Vec<_>>(), [(3, 0)]);
+
+        // Taken again and its task ended, unstopped: nothing to say.
+        drop(running.task(0));
+        assert!(closed.try_recv().is_err(), "said closed though not stopped");
+    }
+
+    /// A listener stopped closes its sockets on every worker, TCP at once and UDP with its
+    /// last QUIC connection, and each worker says so; the other listener is served on, and
+    /// nothing is told as ended.
+    #[test]
+    fn every_worker_closes_the_sockets_of_a_listener_stopped() {
+        let (web, api, running, _proxy, told) =
+            added_later(2, Port::Shared, CONNECTIONS_PER_WORKER);
+        running.stop(1);
+        let began = Instant::now();
+        let mut closed = Vec::new();
+        while closed.len() < 2 && began.elapsed() < Duration::from_secs(10) {
+            closed.extend(running.closed());
+            thread::sleep(Duration::from_millis(5));
+        }
+        closed.sort_unstable();
+        assert_eq!(closed, [(0, 1), (1, 1)]);
+        assert!(
+            std::net::TcpStream::connect(api).is_err(),
+            "still listened on"
+        );
+        assert!(!negotiates(api), "its UDP socket still read");
+        for _ in 0..4 {
+            let mut connection = std::net::TcpStream::connect(web).unwrap();
+            assert_eq!(request(&mut connection), "HTTP/1.1 503 Service Unavailable");
+        }
+        assert!(told.try_recv().is_err(), "a stop was told as an end");
     }
 
     /// What a worker cannot do without tells when it ends: as the data plane drains, the

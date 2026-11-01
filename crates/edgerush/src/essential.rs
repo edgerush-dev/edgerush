@@ -48,6 +48,8 @@ pub(crate) struct Essential {
     what: String,
     tell: Sender<Told>,
     finished: bool,
+    /// What it watches was let go of on purpose: nothing is told.
+    dismissed: bool,
 }
 
 impl Essential {
@@ -57,6 +59,7 @@ impl Essential {
             what,
             tell: tell.clone(),
             finished: false,
+            dismissed: false,
         }
     }
 
@@ -64,10 +67,18 @@ impl Essential {
     pub(crate) fn finished(&mut self) {
         self.finished = true;
     }
+
+    /// What it watches is no longer needed: its end is nobody's concern.
+    pub(crate) fn dismiss(&mut self) {
+        self.dismissed = true;
+    }
 }
 
 impl Drop for Essential {
     fn drop(&mut self) {
+        if self.dismissed && !std::thread::panicking() {
+            return;
+        }
         let ended = Ended {
             what: std::mem::take(&mut self.what),
             finished: self.finished && !std::thread::panicking(),
@@ -82,6 +93,19 @@ impl Drop for Essential {
 pub(crate) async fn watched(future: impl Future<Output = ()>, mut essential: Essential) {
     future.await;
     essential.finished();
+}
+
+/// `future`, watched as [`watched`] watches it, except that an end it says was asked for
+/// (`true`: a listener taken away) is told to nobody. A panic is told all the same.
+pub(crate) async fn watched_unless_stopped(
+    future: impl Future<Output = bool>,
+    mut essential: Essential,
+) {
+    if future.await {
+        essential.dismiss();
+    } else {
+        essential.finished();
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +152,23 @@ mod tests {
         let ended = ended(&told);
         assert_eq!(ended.to_string(), "a task panicked");
         assert!(!ended.finished);
+    }
+
+    /// An end asked for is told to nobody; any other is told as ended.
+    #[test]
+    fn a_task_stopped_on_purpose_is_told_to_nobody() {
+        let (tell, told) = mpsc::channel();
+        let runtime = Builder::new_current_thread().build().unwrap();
+        runtime.block_on(watched_unless_stopped(
+            async { true },
+            Essential::new("a stopped task".to_owned(), &tell),
+        ));
+        assert!(told.try_recv().is_err(), "a stop was told");
+        runtime.block_on(watched_unless_stopped(
+            async { false },
+            Essential::new("a task".to_owned(), &tell),
+        ));
+        assert_eq!(ended(&told).to_string(), "a task ended");
     }
 
     #[test]

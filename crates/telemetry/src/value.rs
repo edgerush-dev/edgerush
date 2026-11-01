@@ -25,6 +25,12 @@ impl Counter {
     pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
+
+    /// Back to zero, for a series that starts again: what is counted meanwhile may be lost
+    /// or kept, so only for one nothing counts in.
+    pub fn reset(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
 }
 
 /// A number that goes up and down: how many of something there are right now.
@@ -58,6 +64,11 @@ impl Gauge {
     pub fn get(&self) -> i64 {
         self.0.load(Ordering::Relaxed)
     }
+
+    /// Back to zero, as [`Counter::reset`].
+    pub fn reset(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -71,6 +82,20 @@ mod tests {
         counter.inc();
         counter.add(41);
         assert_eq!(counter.get(), 42);
+    }
+
+    #[test]
+    fn a_counter_and_a_gauge_reset_start_again_from_zero() {
+        let counter = Counter::default();
+        counter.add(7);
+        counter.reset();
+        assert_eq!(counter.get(), 0);
+        counter.inc();
+        assert_eq!(counter.get(), 1);
+        let gauge = Gauge::default();
+        gauge.add(-3);
+        gauge.reset();
+        assert_eq!(gauge.get(), 0);
     }
 
     #[test]

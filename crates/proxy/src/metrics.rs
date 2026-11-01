@@ -605,6 +605,28 @@ pub(crate) struct ListenerCounters {
 }
 
 impl ListenerCounters {
+    /// Everything back to zero, for a slot another listener takes.
+    fn reset(&self) {
+        let arrays = [
+            &self.paused[..],
+            &self.responses[..],
+            &self.answers[..],
+            &self.closed[..],
+            &self.refusals[..],
+            &self.grpc[..],
+            &self.quic[..],
+            &self.tunnels[..],
+            &self.proxy_headers[..],
+        ];
+        for counter in arrays.into_iter().flatten() {
+            counter.reset();
+        }
+        self.accepted.reset();
+        self.accept_errors.reset();
+        self.active.reset();
+        self.head_time.reset();
+    }
+
     /// A response is on its way to the client, `nanoseconds` after its request came in.
     pub(crate) fn responded(&self, status: StatusCode, nanoseconds: u64) {
         if let Some(class) = self.responses.get(class_of(status)) {
@@ -912,11 +934,18 @@ impl Metrics {
         self.listeners.get(socket)?.get().map(Sharded::local)
     }
 
-    /// Fills the slot of a listener's socket, for a listener taking it.
+    /// Fills the slot of a listener's socket, for a listener taking it: at zero, whatever
+    /// a listener that had it before counted. Nothing counts in a slot as it is taken.
     pub(crate) fn listen(&self, socket: usize) {
-        if let Some(series) = self.listeners.get(socket) {
-            series.get_or_init(|| Sharded::new(self.shards));
+        let Some(series) = self.listeners.get(socket) else {
+            return;
+        };
+        if let Some(before) = series.get() {
+            for shard in before.shards() {
+                shard.reset();
+            }
         }
+        series.get_or_init(|| Sharded::new(self.shards));
     }
 
     /// The connections open on every listener, over TCP and QUIC alike, every worker's.
@@ -1744,9 +1773,20 @@ mod tests {
             scrape.contains("edgerush_listener_connections_accepted_total{listener=\"late\"} 1\n"),
             "{scrape}"
         );
-        // Taken again, it keeps what it counted.
+        // Taken again, by a listener the slot was freed for, it starts from zero, histogram
+        // and all.
+        let listener = metrics.listener(2).unwrap();
+        listener.responded(StatusCode::OK, 1_000);
+        listener.quic(Quic::Negotiation);
         metrics.listen(2);
-        assert_eq!(metrics.listener(2).unwrap().accepted.get(), 1);
+        let scrape = metrics.render(&named, &[], &[]);
+        assert!(
+            scrape.contains("edgerush_listener_connections_accepted_total{listener=\"late\"} 0\n"),
+            "{scrape}"
+        );
+        let listener = metrics.listener(2).unwrap();
+        assert_eq!(listener.head_time.counts().sum::<u64>(), 0);
+        assert!(listener.quic.iter().all(|counter| counter.get() == 0));
     }
 
     #[test]

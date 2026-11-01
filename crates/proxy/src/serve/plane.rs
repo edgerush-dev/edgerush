@@ -297,9 +297,9 @@ impl Snapshot {
             .collect::<Result<_, _>>()?;
         let nothing_routed = Routed::default();
         let previous_routed = previous.map_or(&nothing_routed, |previous| &previous.routed);
-        let routed = Routed::reconcile(&config, &slots.names, previous_routed, keys);
-        let listeners: Vec<Option<usize>> = slots
-            .names
+        let serving = slots.serving();
+        let routed = Routed::reconcile(&config, &serving, previous_routed, keys);
+        let listeners: Vec<Option<usize>> = serving
             .iter()
             .map(|name| {
                 let name = name.as_ref()?;
@@ -412,12 +412,60 @@ impl Snapshot {
 }
 
 impl ListenerSlots {
-    /// These slots with the listeners `opened` names in the first that are free, and which
-    /// each took, in the order of `opened`.
-    fn taking(&self, opened: &[Opened]) -> Result<(Self, Vec<usize>), ProxyError> {
+    /// By slot, the name of the listener it serves: none for a slot that drains.
+    fn serving(&self) -> Vec<Option<String>> {
+        self.names
+            .iter()
+            .zip(self.draining.iter())
+            .map(|(name, draining)| name.clone().filter(|_| !draining))
+            .collect()
+    }
+
+    /// These slots changed: `freed`, if it is given, free again; the listeners `closed`
+    /// names draining; and those `opened` names in the first that are free. Which slots
+    /// were opened and closed.
+    fn changing(
+        &self,
+        running: &Arc<Compiled>,
+        opened: &[Opened],
+        closed: &[String],
+        freed: Option<usize>,
+    ) -> Result<(Self, Slotted), ProxyError> {
         let mut names = self.names.to_vec();
         let mut quic = self.quic.to_vec();
-        let mut taken = Vec::with_capacity(opened.len());
+        let mut draining = self.draining.to_vec();
+        let mut left = self.left.to_vec();
+        let mut slotted = Slotted::default();
+        if let Some(slot) = freed {
+            let at = (
+                names.get_mut(slot),
+                quic.get_mut(slot),
+                draining.get_mut(slot),
+            );
+            let (Some(name), Some(port), Some(drains @ true)) = at else {
+                return Err(ProxyError::NotDraining(slot));
+            };
+            (*name, *port, *drains) = (None, None, false);
+            if let Some(gone) = left.get_mut(slot) {
+                *gone = None;
+            }
+        }
+        for listener in closed {
+            let slot = names
+                .iter()
+                .zip(&draining)
+                .position(|(name, draining)| !draining && name.as_ref() == Some(listener));
+            let Some((slot, drains)) = slot.and_then(|slot| Some((slot, draining.get_mut(slot)?)))
+            else {
+                return Err(ProxyError::ListenerNotOpen(listener.clone()));
+            };
+            *drains = true;
+            let at = running.listeners().iter().position(|l| l.name == *listener);
+            if let (Some(gone), Some(at)) = (left.get_mut(slot), at) {
+                *gone = Some((Arc::clone(running), at));
+            }
+            slotted.closed.push(slot);
+        }
         for listener in opened {
             if names.iter().flatten().any(|name| *name == listener.name) {
                 return Err(ProxyError::ListenerOpen(listener.name.clone()));
@@ -429,14 +477,25 @@ impl ListenerSlots {
                 *name = Some(listener.name.clone());
                 *port = listener.quic;
             }
-            taken.push(slot);
+            slotted.opened.push(slot);
         }
         let slots = Self {
             names: names.into(),
             quic: quic.into(),
+            draining: draining.into(),
+            left: left.into(),
         };
-        Ok((slots, taken))
+        Ok((slots, slotted))
     }
+}
+
+/// The slots a change of listeners took and closed ([`Proxy::reload_with`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Slotted {
+    /// The slot each listener opened took, in the order they were given.
+    pub opened: Vec<usize>,
+    /// The slot of each listener closed, in the order they were given.
+    pub closed: Vec<usize>,
 }
 
 /// A listener whose sockets have been opened, for [`Proxy::reload_with`] to serve.
@@ -484,6 +543,8 @@ impl Proxy {
                 .chain(std::iter::repeat(None))
                 .take(most)
                 .collect(),
+            draining: vec![false; most].into(),
+            left: vec![None; most].into(),
         };
         // A shard for every worker, so that no two write to one line of cache.
         let metrics = Metrics::new(workers, most);
@@ -564,30 +625,81 @@ impl Proxy {
     /// Returns a [`ProxyError`] as [`Proxy::new`] does; the data plane then runs on as it
     /// was.
     pub fn reload(&self, config: Compiled) -> Result<(), ProxyError> {
-        self.reload_with(config, &[]).map(|_| ())
+        self.reload_with(config, &[], &[]).map(|_| ())
     }
 
     /// Runs `config` from now on, as [`Proxy::reload`] does, and with it the listeners
-    /// `opened` names, whose sockets are open and are to be served from now on: each takes
-    /// the first slot that is free, its counters and its access log with it. Their slots, in
-    /// the order of `opened`, for the sockets to be accepted on as those listeners.
+    /// `opened` names, whose sockets are open and are to be served from now on, and without
+    /// those `closed` names, whose sockets are to close: each opened takes the first slot
+    /// that is free, its counters at zero and its access log with it; each closed drains
+    /// in its slot, serving nothing, until [`Proxy::free`] frees it. Their slots, for the
+    /// sockets to be accepted on as those listeners and the workers to stop accepting on.
     ///
     /// # Errors
     ///
     /// Returns a [`ProxyError`] as [`Proxy::new`] does, and for a listener of `opened`
-    /// that already has sockets, or that no slot is free for; the data plane then runs on as
-    /// it was, and no slot is taken.
+    /// that has sockets or a slot that drains, or that no slot is free for, and for one of
+    /// `closed` whose sockets are not served; the data plane then runs on as it was, and no
+    /// slot changes.
     pub fn reload_with(
         &self,
         config: Compiled,
         opened: &[Opened],
-    ) -> Result<Vec<usize>, ProxyError> {
+        closed: &[String],
+    ) -> Result<Slotted, ProxyError> {
+        let slotted = self.publish(Some(Arc::new(config)), opened, closed, None)?;
+        self.metrics.reloads.inc();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH);
+        let now = now.map_or(0, |since_epoch| since_epoch.as_secs());
+        self.metrics.last_reload.store(now, Ordering::Relaxed);
+        Ok(slotted)
+    }
+
+    /// Serves the listeners `opened` names, of the config that runs, whose sockets are open
+    /// from now on: as [`Proxy::reload_with`] serves them, for a listener that waited for
+    /// another's drain. Their slots.
+    ///
+    /// # Errors
+    ///
+    /// As [`Proxy::reload_with`]'s; the data plane then runs on as it was.
+    pub fn listen(&self, opened: &[Opened]) -> Result<Vec<usize>, ProxyError> {
+        self.publish(None, opened, &[], None)
+            .map(|slotted| slotted.opened)
+    }
+
+    /// Frees `slot`, whose listener's sockets are closed and whose connections have all
+    /// ended: another listener may take it, its counters at zero.
+    ///
+    /// # Errors
+    ///
+    /// For a slot that is not draining, or as [`Proxy::reload_with`]'s; the data plane then
+    /// runs on as it was.
+    pub fn free(&self, slot: usize) -> Result<(), ProxyError> {
+        self.publish(None, &[], &[], Some(slot)).map(drop)
+    }
+
+    /// Publishes `config`, or the config that runs again, with the slots changed as
+    /// [`ListenerSlots::changing`] changes them.
+    fn publish(
+        &self,
+        config: Option<Arc<Compiled>>,
+        opened: &[Opened],
+        closed: &[String],
+        freed: Option<usize>,
+    ) -> Result<Slotted, ProxyError> {
         let _making = self.making.lock().unwrap_or_else(PoisonError::into_inner);
         // Against the config on its way out, so that a destination which has not changed
         // keeps what its connections are filed under and one that has gone is retired.
         let previous = self.current.load();
-        let (slots, taken) = previous.slots.taking(opened)?;
-        let prepared = self.logs.prepare(&config, &slots.names)?;
+        let config = config.unwrap_or_else(|| Arc::clone(&previous.config));
+        let (slots, slotted) = previous
+            .slots
+            .changing(&previous.config, opened, closed, freed)?;
+        let mut prepared = self.logs.prepare(&config, &slots.serving())?;
+        // A listener that drains logs where it did until it has drained.
+        for (slot, _) in slots.draining.iter().enumerate().filter(|(_, d)| **d) {
+            prepared.keep(slot, previous.logs.get(slot).copied().flatten());
+        }
         let discovered = self
             .discovered
             .lock()
@@ -595,7 +707,7 @@ impl Proxy {
         let named = self.named.lock().unwrap_or_else(PoisonError::into_inner);
         let (denied, told) = self.denied();
         let (snapshot, retiring) = Snapshot::new(
-            Arc::new(config),
+            config,
             Found {
                 discovered: &discovered,
                 named: &named,
@@ -645,7 +757,7 @@ impl Proxy {
         }
         // Before any request of it can make a record, or be counted.
         self.logs.commit(prepared);
-        for slot in &taken {
+        for slot in &slotted.opened {
             self.metrics.listen(*slot);
         }
         let namespaces = namespaces_of(&snapshot.config);
@@ -667,11 +779,7 @@ impl Proxy {
         rate_limits.synchronous = synchronous;
         drop(rate_limits);
         tell(told.as_ref(), refusals);
-        self.metrics.reloads.inc();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH);
-        let now = now.map_or(0, |since_epoch| since_epoch.as_secs());
-        self.metrics.last_reload.store(now, Ordering::Relaxed);
-        Ok(taken)
+        Ok(slotted)
     }
 
     /// Takes in the EndpointSlices of namespaces followed: for each, every slice it now

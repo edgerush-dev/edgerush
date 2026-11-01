@@ -55,7 +55,8 @@ and a change takes over without dropping a request. With --control-plane, from t
 stream that control plane serves: nothing is bound or served until its first config runs,
 which is waited for, and each config after it takes over as a file's does; the certificate,
 key and authorities are PEM files, read again every second. A listener that is new is
-listened on as its config takes over; one that has moved or is gone takes a restart.
+listened on as its config takes over; one that is gone or has moved is drained, and one
+that waits for its name or address is listened on once that drain ends.
 Ctrl-C or SIGTERM drains it: what is under way is finished, for up to 29 seconds; a
 second one stops it at once. SIGUSR1 opens the access logs' files again, for rotation.
 
@@ -444,7 +445,12 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             }
         }
     };
+    // In the slots the data plane gives the first config's listeners: in its order.
     let mut bound: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
+    for (slot, listener) in bound.iter_mut().enumerate() {
+        listener.slot = slot;
+    }
+    let wanted: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
     // Limits checked but enforced in none is said once, so that a mode left out is seen.
     let unenforced = (!config.rate_limiting().enforces()).then_some(config.limits().len());
     let unrestricted_from_start = unrestricted(&config);
@@ -553,6 +559,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         count: workers,
         port,
     };
+    let mut listeners = Listeners { bound, wanted };
     health_checks(Arc::clone(&proxy), &stopping).map_err(Failure::Runtime)?;
     if let Some(socket) = metrics {
         let address = socket.local_addr().map_err(Failure::Runtime)?;
@@ -592,6 +599,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             Next::Stop => break,
             Next::Failed(ended) => return Err(Failure::Ended(ended)),
         }
+        listening.tend(&mut listeners).say(stderr);
         match &mut configs {
             Configs::File(file) => {
                 let Some(changed) = file.changed() else {
@@ -608,7 +616,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
                     }
                 };
                 let reloaded = runnable(&config, outside.as_ref())
-                    .and_then(|()| listening.reloaded(&mut bound, config));
+                    .and_then(|()| listening.reloaded(&mut listeners, config));
                 match reloaded {
                     Ok(reloaded) => {
                         say(stderr, format_args!("config reloaded"));
@@ -637,7 +645,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
                     };
                     let reloaded = compiled(&config).and_then(|config| {
                         runnable(&config, outside.as_ref())?;
-                        listening.reloaded(&mut bound, config)
+                        listening.reloaded(&mut listeners, config)
                     });
                     match &reloaded {
                         Ok(reloaded) => {
@@ -802,15 +810,39 @@ struct Listening<'a> {
     port: Port,
 }
 
-/// What a reload did that is said: the listeners it opened, and its warnings.
+/// The listeners the main loop keeps sockets for, and those it is to.
+struct Listeners {
+    /// Every listener with sockets: served, or taken away and draining.
+    bound: Vec<Bound>,
+    /// The listeners of the config that runs, as it has them: what is opened once what held
+    /// its name or address has drained.
+    wanted: Vec<Bound>,
+}
+
+/// What a reload, or a drain that ended, did that is said: the listeners it opened, those
+/// that drained, and its warnings.
 #[derive(Debug, Default)]
 struct Reloaded {
     opened: Vec<(String, SocketAddr, bool)>,
+    drained: Vec<String>,
     warnings: Vec<String>,
+}
+
+/// Listeners opened, ready to be served, and why others are not.
+#[derive(Debug, Default)]
+struct Opening {
+    sockets: Vec<(Bound, Vec<Sockets>)>,
+    /// Those that wait for a listener's drain.
+    waiting: Vec<String>,
+    /// Those that cannot be served until a restart or the next config.
+    refused: Vec<String>,
 }
 
 impl Reloaded {
     fn say(&self, stderr: &mut impl Write) {
+        for name in &self.drained {
+            say(stderr, format_args!("listener \"{name}\" has drained"));
+        }
         for (name, address, http3) in &self.opened {
             let also = if *http3 { ", HTTP/3 too" } else { "" };
             say(
@@ -826,24 +858,141 @@ impl Reloaded {
 
 impl Listening<'_> {
     /// Has the data plane run `config`, published once, for every worker at once, so that
-    /// none of them sees the old config after another has seen the new one, and with it
-    /// the listeners it has that have no sockets yet: theirs opened on every worker before
-    /// anything changes, and accepted on once it is published. A listener whose sockets
-    /// cannot be opened is said not to be served, and tried again at the next config; so
-    /// is one on an address another listener keeps, and one there is no slot for.
-    /// What it opened and what takes a restart, or why the config was refused.
-    fn reloaded(&self, bound: &mut Vec<Bound>, config: Compiled) -> Result<Reloaded, String> {
-        let mut warnings = restart_needed(bound, &config);
+    /// none of them sees the old config after another has seen the new one; with it the
+    /// listeners it has that have no sockets yet, theirs opened on every worker before
+    /// anything changes and accepted on once it is published, and without those it takes
+    /// away or moves, whose sockets close and whose connections drain (03 §10). A listener
+    /// whose sockets cannot be opened is said not to be served, and tried again at the next
+    /// config; one whose name or address a draining listener holds waits for that drain
+    /// ([`Listening::tend`]); one on an address a listener kept holds, or with no slot free,
+    /// is not served until a restart. What it did and what takes a restart, or why the
+    /// config was refused.
+    fn reloaded(&self, listeners: &mut Listeners, config: Compiled) -> Result<Reloaded, String> {
+        let mut warnings = restart_needed(&listeners.bound, &config);
         warnings.extend(unrestricted(&config).map(ToOwned::to_owned));
-        let free = self
+        // Taken away: gone from the config, or moved, which is gone and added.
+        let closing: Vec<String> = listeners
+            .bound
+            .iter()
+            .filter(|bound| bound.draining.is_none())
+            .filter(|bound| {
+                let kept = config.listeners().iter().find(|l| l.name == bound.name);
+                kept.is_none_or(|kept| kept.address != bound.address)
+            })
+            .map(|bound| bound.name.clone())
+            .collect();
+        let wanted: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
+        let opening = self.opening(&listeners.bound, &closing, &wanted);
+        warnings.extend(opening.waiting);
+        warnings.extend(opening.refused);
+        let opened = to_open(&opening.sockets);
+        let slotted = self
+            .proxy
+            .reload_with(config, &opened, &closing)
+            .map_err(|error| error.to_string())?;
+        listeners.wanted = wanted;
+        for (name, slot) in closing.iter().zip(&slotted.closed) {
+            self.workers.stop(*slot);
+            if let Some(bound) = listeners.bound.iter_mut().find(|b| b.name == *name) {
+                bound.draining = Some(0);
+            }
+        }
+        let mut reloaded = Reloaded {
+            warnings,
+            ..Reloaded::default()
+        };
+        self.add(listeners, opening.sockets, &slotted.opened, &mut reloaded);
+        Ok(reloaded)
+    }
+
+    /// Looks after the listeners that drain: once every worker has closed one's sockets and
+    /// none holds a connection of it, its slot is freed, and the listeners that waited for
+    /// it are opened and served. What it did.
+    fn tend(&self, listeners: &mut Listeners) -> Reloaded {
+        for (_, slot) in self.workers.closed() {
+            let draining = listeners
+                .bound
+                .iter_mut()
+                .find(|bound| bound.slot == slot)
+                .and_then(|bound| bound.draining.as_mut());
+            if let Some(closed) = draining {
+                *closed += 1;
+            }
+        }
+        let mut reloaded = Reloaded::default();
+        let mut freed: Vec<Bound> = Vec::new();
+        let drained: Vec<usize> = listeners
+            .bound
+            .iter()
+            .filter(|bound| {
+                bound.draining == Some(self.workers.count())
+                    && !self.workers.loads.holds_on(bound.slot)
+            })
+            .map(|bound| bound.slot)
+            .collect();
+        for slot in drained {
+            match self.proxy.free(slot) {
+                Ok(()) => {
+                    if let Some(at) = listeners.bound.iter().position(|b| b.slot == slot) {
+                        let gone = listeners.bound.remove(at);
+                        reloaded.drained.push(gone.name.clone());
+                        freed.push(gone);
+                    }
+                }
+                Err(error) => reloaded.warnings.push(error.to_string()),
+            }
+        }
+        if freed.is_empty() {
+            return reloaded;
+        }
+        // Only those that waited for what was freed, its name or its address: one refused
+        // for want of its port is tried again at the next config, as it was told. Said to
+        // wait at the reload, what still waits for another is not said again.
+        let waited: Vec<Bound> = listeners
+            .wanted
+            .iter()
+            .filter(|listener| {
+                freed.iter().any(|gone| {
+                    gone.name == listener.name
+                        || (listener.address.port() != 0
+                            && (gone.address == listener.address
+                                || gone.listens_on == listener.address))
+                })
+            })
+            .cloned()
+            .collect();
+        let opening = self.opening(&listeners.bound, &[], &waited);
+        reloaded.warnings.extend(opening.refused);
+        match self.proxy.listen(&to_open(&opening.sockets)) {
+            Ok(slots) => self.add(listeners, opening.sockets, &slots, &mut reloaded),
+            Err(error) => reloaded.warnings.push(error.to_string()),
+        }
+        reloaded
+    }
+
+    /// The listeners of `wanted` that have no sockets served, opened on every worker: none
+    /// whose name or address one of `bound` holds, those `closing` names among them.
+    fn opening(&self, bound: &[Bound], closing: &[String], wanted: &[Bound]) -> Opening {
+        let mut free = self
             .proxy
             .listeners()
             .iter()
             .filter(|slot| slot.is_none())
             .count();
-        let mut opening: Vec<(Bound, Vec<Sockets>)> = Vec::new();
-        for listener in config.listeners() {
+        let goes = |bound: &Bound| bound.draining.is_some() || closing.contains(&bound.name);
+        let mut opening = Opening::default();
+        for listener in wanted {
+            let served = bound
+                .iter()
+                .any(|bound| bound.name == listener.name && !goes(bound));
+            if served {
+                continue;
+            }
             if bound.iter().any(|bound| bound.name == listener.name) {
+                opening.waiting.push(format!(
+                    "listener \"{}\" waits for its earlier sockets to drain",
+                    listener.name
+                ));
                 continue;
             }
             // A port left to the operating system is one nobody holds yet.
@@ -852,53 +1001,75 @@ impl Listening<'_> {
                     && (bound.address == listener.address || bound.listens_on == listener.address)
             });
             if let Some(holder) = held {
-                warnings.push(format!(
-                    "listener \"{}\" is on {}, which listener \"{}\" keeps: it is not served until a restart",
-                    listener.name, listener.address, holder.name
-                ));
+                opening.waiting.push(if goes(holder) {
+                    format!(
+                        "listener \"{}\" is on {}, which listener \"{}\" holds: it waits for that one to drain",
+                        listener.name, listener.address, holder.name
+                    )
+                } else {
+                    format!(
+                        "listener \"{}\" is on {}, which listener \"{}\" keeps: it is not served until a restart",
+                        listener.name, listener.address, holder.name
+                    )
+                });
                 continue;
             }
-            if opening.len() == free {
-                warnings.push(format!(
+            let Some(left) = free.checked_sub(1) else {
+                opening.refused.push(format!(
                     "listener \"{}\": every listener's slot is taken: it is not served until a restart",
                     listener.name
                 ));
                 continue;
-            }
-            let mut added = Bound::from(listener);
+            };
+            let mut added = Bound {
+                slot: 0,
+                draining: None,
+                ..listener.clone()
+            };
             match opened(&mut added, self.count, self.port) {
-                Ok(sockets) => opening.push((added, sockets)),
-                Err(failure) => warnings.push(format!(
+                Ok(sockets) => {
+                    free = left;
+                    opening.sockets.push((added, sockets));
+                }
+                Err(failure) => opening.refused.push(format!(
                     "{failure}: it is not served, and is tried again at the next config"
                 )),
             }
         }
-        let opened: Vec<Opened> = opening
-            .iter()
-            .map(|(added, _)| Opened {
-                name: added.name.clone(),
-                quic: added.http3.then_some(added.listens_on.port()),
-            })
-            .collect();
-        let slots = self
-            .proxy
-            .reload_with(config, &opened)
-            .map_err(|error| error.to_string())?;
-        let mut reloaded = Reloaded {
-            opened: Vec::with_capacity(opening.len()),
-            warnings,
-        };
-        for ((added, sockets), slot) in opening.into_iter().zip(slots) {
+        opening
+    }
+
+    /// Has the workers accept on `opening`'s sockets, in the slots the data plane gave
+    /// them, `slots`, and keeps them among `listeners`.
+    fn add(
+        &self,
+        listeners: &mut Listeners,
+        opening: Vec<(Bound, Vec<Sockets>)>,
+        slots: &[usize],
+        reloaded: &mut Reloaded,
+    ) {
+        for ((mut added, sockets), slot) in opening.into_iter().zip(slots) {
             reloaded
                 .warnings
-                .extend(self.workers.add(slot, &added.name, sockets));
+                .extend(self.workers.add(*slot, &added.name, sockets));
             reloaded
                 .opened
                 .push((added.name.clone(), added.listens_on, added.http3));
-            bound.push(added);
+            added.slot = *slot;
+            listeners.bound.push(added);
         }
-        Ok(reloaded)
     }
+}
+
+/// What the data plane is told of the listeners `opening` opened.
+fn to_open(opening: &[(Bound, Vec<Sockets>)]) -> Vec<Opened> {
+    opening
+        .iter()
+        .map(|(added, _)| Opened {
+            name: added.name.clone(),
+            quic: added.http3.then_some(added.listens_on.port()),
+        })
+        .collect()
 }
 
 /// How a drain ended.
@@ -1224,10 +1395,14 @@ fn rate_limits_failed(tell: &Sender<Told>) -> impl Fn() + Send + Sync + 'static 
     }
 }
 
-/// A listener that has a socket.
-#[derive(Debug, PartialEq, Eq)]
+/// A listener that has sockets, or that a config has and is to.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Bound {
     name: String,
+    /// Its slot ([`Proxy::listeners`]).
+    slot: usize,
+    /// Taken away and draining: how many workers have closed its sockets.
+    draining: Option<usize>,
     /// The address the config gave it then: what a later config's is compared with.
     address: SocketAddr,
     /// The address its socket has, which is another when the config left the port to the
@@ -1241,6 +1416,8 @@ impl From<&edgerush_config::CompiledListener> for Bound {
     fn from(listener: &edgerush_config::CompiledListener) -> Self {
         Self {
             name: listener.name.clone(),
+            slot: 0,
+            draining: None,
             address: listener.address,
             listens_on: listener.address,
             http3: listener.http3.is_some(),
@@ -1285,30 +1462,21 @@ fn open(what: String, address: SocketAddr, port: Port) -> Result<std::net::TcpLi
     })
 }
 
-/// What a config asks of the listeners that only a restart can give: a listener's sockets
-/// are opened once, and a reload changes what is served on them, not where they are.
+/// What a config asks of the listeners that only a restart can give: HTTP/3 turned on or
+/// off for a listener it keeps where it was, whose UDP socket is opened once.
 fn restart_needed(bound: &[Bound], config: &Compiled) -> Vec<String> {
     let mut warnings = Vec::new();
     for listener in config.listeners() {
-        match bound.iter().find(|bound| bound.name == listener.name) {
-            None => {}
-            Some(bound) if bound.address != listener.address => warnings.push(format!(
-                "listener \"{}\" has moved from {} to {}: it stays where it was until a restart",
-                listener.name, bound.address, listener.address
-            )),
-            Some(bound) if bound.http3 != listener.http3.is_some() => warnings.push(format!(
+        let kept = bound.iter().find(|bound| {
+            bound.name == listener.name
+                && bound.draining.is_none()
+                && bound.address == listener.address
+        });
+        if let Some(bound) = kept.filter(|bound| bound.http3 != listener.http3.is_some()) {
+            warnings.push(format!(
                 "listener \"{}\" has HTTP/3 turned {}: its UDP socket is opened or closed at a restart",
                 listener.name,
                 if bound.http3 { "off" } else { "on" }
-            )),
-            Some(_) => {}
-        }
-    }
-    for bound in bound {
-        if !config.listeners().iter().any(|l| l.name == bound.name) {
-            warnings.push(format!(
-                "listener \"{}\" is gone: its socket stays open, with no routes (404), until a restart",
-                bound.name
             ));
         }
     }
@@ -1662,19 +1830,27 @@ upstreams: {{}}
     }
 
     #[test]
-    fn a_listener_that_has_moved_or_is_gone_needs_a_restart_and_one_that_is_new_does_not() {
+    fn only_http3_turned_on_or_off_where_a_listener_is_kept_needs_a_restart() {
         let before = listeners(&[("admin", "127.0.0.1:81"), ("web", "[::]:80")]);
-        let bound: Vec<Bound> = before.listeners().iter().map(Bound::from).collect();
-        let after = listeners(&[("api", "[::]:8080"), ("web", "[::]:8000")]);
+        let mut bound: Vec<Bound> = before.listeners().iter().map(Bound::from).collect();
+        for listener in &mut bound {
+            listener.http3 = true;
+        }
+        // `admin` gone and `api` new are drained and opened; `web` moved is both, its
+        // HTTP/3 with it.
+        let moved = listeners(&[("api", "[::]:8080"), ("web", "[::]:8000")]);
+        assert_eq!(restart_needed(&bound, &moved), [""; 0]);
+        let kept = listeners(&[("web", "[::]:80")]);
         assert_eq!(
-            restart_needed(&bound, &after),
+            restart_needed(&bound, &kept),
             [
-                "listener \"web\" has moved from [::]:80 to [::]:8000: it stays where it was \
-                 until a restart",
-                "listener \"admin\" is gone: its socket stays open, with no routes (404), \
-                 until a restart",
+                "listener \"web\" has HTTP/3 turned off: its UDP socket is opened or closed at \
+                 a restart"
             ]
         );
+        // Draining, it is not kept.
+        bound[1].draining = Some(0);
+        assert_eq!(restart_needed(&bound, &kept), [""; 0]);
     }
 
     /// A drain ends as soon as the last connection goes.
