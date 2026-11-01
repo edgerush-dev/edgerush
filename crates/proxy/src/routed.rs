@@ -44,14 +44,17 @@ impl Routed {
     /// rest, so that a key `previous` had and this has not is gone.
     pub(crate) fn reconcile(
         config: &Compiled,
-        listeners: &[String],
+        listeners: &[Option<String>],
         previous: &Self,
         keys: &Keys,
     ) -> Self {
         let mut routed = Self::default();
         for name in listeners {
             let mut here = HashMap::new();
-            if let Some(listener) = config.listeners().iter().find(|l| l.name == *name) {
+            let found = name
+                .as_ref()
+                .and_then(|name| config.listeners().iter().find(|l| l.name == *name));
+            if let (Some(name), Some(listener)) = (name, found) {
                 for (through, route, upstream) in routes_of(config, listener) {
                     let Some(upstream_name) = config.upstream(upstream).map(|u| u.name.as_str())
                     else {
@@ -180,9 +183,14 @@ upstreams:
         )
     }
 
-    /// The listeners as the data plane numbers them: by the first config's names, in order.
-    fn listeners() -> Vec<String> {
-        ["db", "sni", "web"].map(str::to_owned).to_vec()
+    /// The listeners' slots as the data plane numbers them: the first config's names, in
+    /// order, then a slot no listener has.
+    fn listeners() -> Vec<Option<String>> {
+        ["db", "sni", "web"]
+            .map(|name| Some(name.to_owned()))
+            .into_iter()
+            .chain([None])
+            .collect()
     }
 
     /// Positions of the configs below: `one` is upstream 0, `two` upstream 1.

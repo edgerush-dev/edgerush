@@ -189,6 +189,54 @@ async fn a_requests_record_follows_the_config_that_routed_it() {
         .await;
 }
 
+/// A listener taken away logs where it did until it has drained: a request on one of its
+/// connections once the config without it runs is recorded under its name, as the 404 it
+/// gets; freed, its slot logs nothing (03 §10).
+#[tokio::test]
+async fn a_listener_taken_away_logs_its_drain() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _held) = scripted_upstream().await;
+            let logged = recording("taken-away", everything_config(upstream)).await;
+            let proxy = Arc::clone(logged.worker.proxy());
+            // `web` gone, and its route on another listener that logs nothing.
+            let mut without = everything_config(upstream);
+            let mut admin = without.listeners.remove("web").unwrap();
+            admin.address = "127.0.0.1:1".parse().unwrap();
+            without.listeners.insert("admin".to_owned(), admin);
+            without.routes[0].listeners = vec!["admin".to_owned()];
+            proxy
+                .reload_with(
+                    compile(&without).unwrap(),
+                    &Changes {
+                        closed: vec!["web".to_owned()],
+                        ..Changes::default()
+                    },
+                )
+                .unwrap();
+            let request = b"GET /a/ok HTTP/1.1\r\nhost: example.test\r\nconnection: close\r\n\r\n";
+            let answer = h1_answer(logged.front, request).await;
+            assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
+            let records = logged.records(1).await;
+            let record = &records[0];
+            assert_eq!(record["listener"], "web");
+            assert_eq!(record["status"], 404);
+            assert_eq!(record["reason"], "no_route");
+
+            proxy.free(0).unwrap();
+            let head = Request::get("http://example.test/")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0;
+            let client = Rc::new(crate::forwarding::Client::new("127.0.0.1".parse().unwrap()));
+            let freed = proxy.current.load_full();
+            assert!(logged.worker.logging(&freed, 0, &client, &head).is_none());
+        })
+        .await;
+}
+
 /// The data plane's own answer says why it gave it, with as much of where the request
 /// was going as it got to.
 #[tokio::test]
@@ -451,6 +499,36 @@ async fn a_stream_cut_at_the_drain_bound_is_logged_as_drained() {
                 );
                 assert!(scrape.lines().any(|shown| shown == line), "{line}");
             }
+        })
+        .await;
+}
+
+/// An HTTP/1 request the worker's drain cuts at its bound, as HTTP/2's streams are cut, is
+/// recorded as drained, and the closure counted.
+#[tokio::test]
+async fn an_http1_request_cut_at_the_drain_bound_is_logged_as_drained() {
+    use tokio::io::AsyncWriteExt;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, held) = scripted_upstream().await;
+            let logged = recording("h1-drain-cut", everything_config(upstream)).await;
+            let mut stream = TcpStream::connect(logged.front).await.unwrap();
+            stream
+                .write_all(b"GET /held HTTP/1.1\r\nhost: example.test\r\n\r\n")
+                .await
+                .unwrap();
+            until(|| held.borrow().len() == 1).await;
+            logged.worker.drain();
+            let _closed = closed_after(&mut stream).await;
+            let records = logged.records(1).await;
+            let record = &records[0];
+            assert_eq!(record["reason"], "drained", "{record}");
+            assert!(record["status"].is_null(), "{record}");
+            let scrape = logged.worker.proxy.metrics();
+            let line =
+                "edgerush_listener_connections_closed_total{listener=\"web\",reason=\"drained\"} 1";
+            assert!(scrape.lines().any(|shown| shown == line), "{scrape}");
         })
         .await;
 }

@@ -645,6 +645,11 @@ fn bucket_under_two_cycles(limit: &CompiledLimit, cycle: Duration) -> Option<Pro
     })
 }
 
+/// The most listeners a data plane has: what it sizes everything it keeps by listener to
+/// when it starts, so that a listener a later config adds takes a slot already there and
+/// nothing a request touches is made larger (03 §10 in the docs).
+pub const MOST_LISTENERS: usize = 64;
+
 /// The most limits a rule's requests can be under: which of them a request is under is
 /// told in 64 bits.
 pub(crate) const MOST_LIMITS: usize = 64;
@@ -1168,6 +1173,10 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         }
     }
 
+    if config.listeners.len() > MOST_LISTENERS {
+        let problem = Problem::ListenersTooMany(config.listeners.len());
+        errors.push(Place::of(Object::DataPlane).problem(problem));
+    }
     // Until listeners can share a socket, two on one address cannot both be served.
     let mut addresses: BTreeMap<SocketAddr, &str> = BTreeMap::new();
     for (name, listener) in &config.listeners {
@@ -2485,6 +2494,9 @@ impl fmt::Display for Place {
 /// What is wrong.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Problem {
+    /// More listeners than the data plane has slots for.
+    #[error("{0} listeners, at most {MOST_LISTENERS}")]
+    ListenersTooMany(usize),
     /// Another listener has the same address.
     #[error("address {address} is already taken by listener `{other}`")]
     AddressTaken {
@@ -3415,6 +3427,41 @@ upstreams:
                  empty",
                 "route `a`, rules[1], forward.backends[1]: there is no upstream `wbe`",
             ]
+        );
+    }
+
+    #[test]
+    fn a_data_plane_has_at_most_as_many_listeners_as_it_has_slots_for() {
+        let listeners = |count: usize| {
+            let listeners: String = (0..count)
+                .map(|n| {
+                    format!(
+                        "  l{n}: {{ address: \"[::]:{}\", protocol: http, proxy_protocol: off, \
+                         forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, \
+                         request_id: generate }}\n",
+                        9000 + n
+                    )
+                })
+                .collect();
+            config(&format!(
+                "listeners:\n{listeners}routes: []\nupstreams: {{}}\n"
+            ))
+        };
+        let errors = |count: usize| -> Vec<String> {
+            compile(&listeners(count))
+                .err()
+                .unwrap_or_default()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(errors(MOST_LISTENERS), [""; 0]);
+        assert_eq!(
+            errors(MOST_LISTENERS + 1),
+            [format!(
+                "the data plane: {} listeners, at most {MOST_LISTENERS}",
+                MOST_LISTENERS + 1
+            )]
         );
     }
 

@@ -103,11 +103,11 @@ async fn a_worker_accepts_a_batch_then_lets_the_rest_run() {
                 // it, so the kernel is given the moment it needs.
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
-                within(worker.accept(&socket)).await.unwrap().unwrap();
+                within(worker.accept(0, &socket)).await.unwrap().unwrap();
                 let ran = Rc::new(Cell::new(false));
                 let running = Rc::clone(&ran);
                 let _other = tokio::task::spawn_local(async move { running.set(true) });
-                within(worker.accept(&socket)).await.unwrap().unwrap();
+                within(worker.accept(0, &socket)).await.unwrap().unwrap();
                 assert_eq!(ran.get(), other_ran, "batch of {batch}");
             }
         })
@@ -479,7 +479,7 @@ fn what_became_of_a_connection_is_counted() {
             assert_eq!(status_over_http1(front).await, StatusCode::OK);
         }
         // One connection opened for the first request, and taken again for the rest.
-        let scrape = proxy.metrics.render(&["web".to_owned()], &[], &[]);
+        let scrape = proxy.metrics.render(&[Some("web".to_owned())], &[], &[]);
         assert!(
             scrape.contains(
                 "edgerush_upstream_connections_total{state=\"opened\"} 1
@@ -502,7 +502,7 @@ fn what_became_of_a_connection_is_counted() {
             worker.idle_connections(),
             storage,
         );
-        let scrape = proxy.metrics.render(&["web".to_owned()], &[], &[]);
+        let scrape = proxy.metrics.render(&[Some("web".to_owned())], &[], &[]);
         assert!(
             scrape.contains(
                 "edgerush_upstream_connections_idle 1
@@ -582,7 +582,7 @@ content-length: 0
         let up = proxy.metrics.upstream_slot("up");
         let scrape = proxy
             .metrics
-            .render(&["web".to_owned()], &[("up", up)], &[]);
+            .render(&[Some("web".to_owned())], &[("up", up)], &[]);
         assert!(
             scrape.contains(
                 "edgerush_listener_local_answers_total{listener=\"web\",reason=\"exhausted\"} 1\n"
@@ -645,7 +645,7 @@ fn a_body_that_cannot_be_read_is_answered_400_and_not_held_against_the_upstream(
         let up = proxy.metrics.upstream_slot("up");
         let scrape = proxy
             .metrics
-            .render(&["web".to_owned()], &[("up", up)], &[]);
+            .render(&[Some("web".to_owned())], &[("up", up)], &[]);
         assert!(
             scrape.contains(
                 "edgerush_listener_local_answers_total{listener=\"web\",reason=\"bad_body\"} 1\n"
@@ -896,7 +896,7 @@ fn why_an_exchange_stopped_is_counted_by_a_name_of_ours() {
         let up = proxy.metrics.upstream_slot("up");
         let scrape = proxy
             .metrics
-            .render(&["web".to_owned()], &[("up", up)], &[]);
+            .render(&[Some("web".to_owned())], &[("up", up)], &[]);
         assert!(
             scrape.contains("edgerush_upstream_exchanges_stopped_total{reason=\"codec\"} 1\n"),
             "{scrape}"
@@ -974,7 +974,7 @@ fn a_body_that_fails_after_its_head_is_counted() {
         let up = proxy.metrics.upstream_slot("up");
         let scrape = proxy
             .metrics
-            .render(&["web".to_owned()], &[("up", up)], &[]);
+            .render(&[Some("web".to_owned())], &[("up", up)], &[]);
         assert!(
             scrape.contains("edgerush_upstream_body_failures_total{upstream=\"up\"} 1\n"),
             "{scrape}"

@@ -8,13 +8,13 @@ use edgerush_config::Config;
 use edgerush_control_service::{
     Backoff, Credentials, Files, Following, Subscription, connector, subscribe,
 };
-use edgerush_control_stream::Staging;
+use edgerush_control_stream::{Listening, Staging};
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 use tokio::runtime::Builder;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 /// How often the certificate files are read again.
 const REREAD: Duration = Duration::from_secs(1);
@@ -50,12 +50,13 @@ pub(crate) enum StreamError {
     Runtime(io::Error),
 }
 
-/// Starts following `stream`: what it hands the main loop comes on what is returned, and
-/// `tell` is told if its thread ends.
+/// Starts following `stream`: what it hands the main loop comes on what is returned, with
+/// where the main loop says what it serves of the listeners of what runs, which is reported
+/// as it changes; and `tell` is told if its thread ends.
 pub(crate) fn start(
     stream: &Stream,
     tell: &Sender<Told>,
-) -> Result<Receiver<FromStream>, StreamError> {
+) -> Result<(Receiver<FromStream>, watch::Sender<Listening>), StreamError> {
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
@@ -73,6 +74,7 @@ pub(crate) fn start(
         backoff: Backoff::default(),
     };
     let (handed, handing) = mpsc::channel();
+    let (listening, watched) = watch::channel(Listening::default());
     let tell = tell.clone();
     thread::Builder::new()
         .name("config stream".to_owned())
@@ -89,6 +91,7 @@ pub(crate) fn start(
                 |addresses| {
                     let _gone = gateway.send(FromStream::Gateway(addresses));
                 },
+                Some(watched),
                 |following| {
                     let _gone = said.send(FromStream::Said(told(&address, &following)));
                 },
@@ -100,7 +103,7 @@ pub(crate) fn start(
             essential.finished();
         })
         .map_err(StreamError::Runtime)?;
-    Ok(handing)
+    Ok((handing, listening))
 }
 
 /// Hands `config` to the main loop, and awaits whether it runs: awaited rather than waited

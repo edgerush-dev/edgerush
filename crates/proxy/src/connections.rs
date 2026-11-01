@@ -91,8 +91,10 @@ pub struct Loads {
     room: Vec<Notify>,
     /// Connections held by every worker together.
     total: AtomicUsize,
-    /// Connections held, by listener, whichever worker holds them.
+    /// Connections held, by listener's slot, whichever worker holds them.
     by_listener: Vec<AtomicUsize>,
+    /// How many listeners there are, among the slots: one alone may take all the room.
+    listening: AtomicUsize,
     /// How many listeners hold at least one connection.
     holding: AtomicUsize,
     /// For every worker and listener, at `worker * listeners + listener`, what wakes the
@@ -102,8 +104,9 @@ pub struct Loads {
 
 impl Loads {
     /// The counts of `workers` workers that may each hold `cap` connections, on
-    /// `listeners` listeners, none held, an HTTP/3 connection counting as `quic` sixteenths
-    /// of one: from [`CONNECTION`] to [`QUIC_MOST`], and held to that.
+    /// `listeners` slots of listeners, each taken until [`Loads::listening`] says otherwise,
+    /// none held, an HTTP/3 connection counting as `quic` sixteenths of one: from
+    /// [`CONNECTION`] to [`QUIC_MOST`], and held to that.
     #[must_use]
     pub fn new(workers: usize, cap: usize, quic: usize, listeners: usize) -> Arc<Self> {
         Arc::new(Self {
@@ -113,9 +116,35 @@ impl Loads {
             room: (0..workers * listeners).map(|_| Notify::new()).collect(),
             total: AtomicUsize::new(0),
             by_listener: (0..listeners).map(|_| AtomicUsize::new(0)).collect(),
+            listening: AtomicUsize::new(listeners),
             holding: AtomicUsize::new(0),
             listener_room: (0..workers * listeners).map(|_| Notify::new()).collect(),
         })
+    }
+
+    /// How many of the slots are listeners' from now on.
+    pub fn listening(&self, listeners: usize) {
+        self.listening.store(listeners, Ordering::Relaxed);
+    }
+
+    /// Another slot is a listener's from now on.
+    pub fn listener_added(&self) {
+        self.listening.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A slot's listener takes no more connections from now on: it has no share to keep.
+    pub fn listener_removed(&self) {
+        let _was = self
+            .listening
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
+
+    /// Whether any worker holds a connection of the listener `listener`, over TCP or QUIC.
+    #[must_use]
+    pub fn holds_on(&self, listener: usize) -> bool {
+        self.by_listener
+            .get(listener)
+            .is_some_and(|held| held.load(Ordering::Relaxed) > 0)
     }
 
     /// The connections all the workers together may hold.
@@ -139,7 +168,7 @@ impl Loads {
             connections(self.total.load(Ordering::Relaxed)),
             connections(own.load(Ordering::Relaxed)),
             self.holding.load(Ordering::Relaxed),
-            self.by_listener.len() < 2,
+            self.listening.load(Ordering::Relaxed) < 2,
         )
     }
 
@@ -503,6 +532,14 @@ mod tests {
         let alone = Loads::new(2, 8, QUIC_MOST, 1);
         let _held: Vec<Held> = (0..15).map(|at| alone.hold(at % 2, 0)).collect();
         assert!(alone.listener_has_room(0));
+
+        // One listener among slots no other has taken is alone all the same.
+        let slots = Loads::new(2, 8, QUIC_MOST, 4);
+        slots.listening(1);
+        let _held: Vec<Held> = (0..15).map(|at| slots.hold(at % 2, 0)).collect();
+        assert!(slots.listener_has_room(0));
+        slots.listening(2);
+        assert!(!slots.listener_has_room(0));
     }
 
     /// A connection taken rather than accepted is counted only while the worker has room

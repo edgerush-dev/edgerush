@@ -93,7 +93,8 @@ pub struct Subscription {
 
 /// Follows the control plane for as long as it is polled: each config given to run handed
 /// to `run`, which runs it or says why it cannot, from what `staging` holds, the addresses
-/// of the gateway's own pods to `gateway` each time they come, and what happens along the
+/// of the gateway's own pods to `gateway` each time they come, what `listening` says the
+/// data plane serves of its listeners reported ([`follow`]), and what happens along the
 /// way to `told`.
 ///
 /// # Errors
@@ -104,6 +105,7 @@ pub async fn subscribe<R>(
     staging: &mut Staging,
     mut run: impl FnMut(Box<Config>) -> R,
     mut gateway: impl FnMut(Vec<std::net::IpAddr>),
+    mut listening: Option<watch::Receiver<edgerush_control_stream::Listening>>,
     told: impl Fn(Following),
 ) -> Result<Infallible, TlsError>
 where
@@ -145,6 +147,7 @@ where
                     run(config)
                 },
                 &mut gateway,
+                listening.as_mut(),
             )
             .await;
             if carried {

@@ -1231,7 +1231,7 @@ async fn an_upload_to_an_http2_upstream_the_worker_cannot_pay_for_is_answered_50
             let up = proxy.metrics.upstream_slot("up");
             let scrape = proxy
                 .metrics
-                .render(&["web".to_owned()], &[("up", up)], &[]);
+                .render(&[Some("web".to_owned())], &[("up", up)], &[]);
             assert!(
                 scrape.contains("edgerush_upstream_failures_total{upstream=\"up\"} 0\n"),
                 "{scrape}"
@@ -1290,7 +1290,7 @@ async fn a_request_on_an_upstream_connection_shed_for_storage_is_answered_503() 
             let up = proxy.metrics.upstream_slot("up");
             let scrape = proxy
                 .metrics
-                .render(&["web".to_owned()], &[("up", up)], &[]);
+                .render(&[Some("web".to_owned())], &[("up", up)], &[]);
             assert!(
                 scrape.contains("edgerush_upstream_failures_total{upstream=\"up\"} 0\n"),
                 "{scrape}"
@@ -1346,7 +1346,7 @@ async fn an_answer_cut_by_a_connection_shed_for_storage_is_not_the_upstreams_bod
             let up = proxy.metrics.upstream_slot("up");
             let scrape = proxy
                 .metrics
-                .render(&["web".to_owned()], &[("up", up)], &[]);
+                .render(&[Some("web".to_owned())], &[("up", up)], &[]);
             assert!(
                 scrape.contains("edgerush_upstream_body_failures_total{upstream=\"up\"} 0\n"),
                 "{scrape}"

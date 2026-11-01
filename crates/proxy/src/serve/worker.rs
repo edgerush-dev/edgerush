@@ -95,6 +95,7 @@ impl Worker {
                 next_head: Bounds::default().next_head.min(deadlines.next_request),
                 keep_alive: deadlines.next_request,
                 idle: deadlines.idle,
+                drain: deadlines.drain,
                 ..Bounds::default()
             },
             budget: h1::Budget::default(),
@@ -106,7 +107,7 @@ impl Worker {
         let received = Received::new(Rc::clone(blocks.borrow().storage()));
         let (validations, validated) = {
             let snapshot = proxy.current.load();
-            let validations = (0..proxy.listeners.len())
+            let validations: Vec<Validation> = (0..snapshot.slots.names.len())
                 .map(|listener| Validation {
                     tls: snapshot.tls.get(listener).cloned().flatten(),
                     drain: Rc::new(Drain::default()),
@@ -114,6 +115,14 @@ impl Worker {
                 .collect();
             (RefCell::new(validations), Cell::new(snapshot.generation))
         };
+        let undrained = || -> RefCell<Vec<Rc<Drain>>> {
+            RefCell::new(
+                (0..validations.borrow().len())
+                    .map(|_| Rc::new(Drain::default()))
+                    .collect(),
+            )
+        };
+        let (listening, quic_listening) = (undrained(), undrained());
         let batches = proxy.logs.worker();
         let pool = Rc::new(RefCell::new(Pool::default()));
         // Room among the files is made by closing an idle socket of the worker's.
@@ -152,6 +161,8 @@ impl Worker {
             received,
             h3_listeners: Rc::default(),
             validations,
+            listening,
+            quic_listening,
             validated,
             routes: RefCell::default(),
             batches,
@@ -167,12 +178,15 @@ impl Worker {
     /// (03 §10). A worker's sweep does this by itself once [`Proxy::drain`] has been called.
     pub fn drain(&self) {
         self.drain.start();
-        // Every connection's and tunnel's drain too; one made later is started as it is.
+        // Every listener's, connection's and tunnel's drain too; one made later is started as
+        // it is.
         let drains: Vec<Rc<Drain>> = self
             .validations
             .borrow()
             .iter()
             .map(|validation| Rc::clone(&validation.drain))
+            .chain(self.listening.borrow().iter().map(Rc::clone))
+            .chain(self.quic_listening.borrow().iter().map(Rc::clone))
             .chain(self.routes.borrow().values().map(Rc::clone))
             .collect();
         for drain in drains {
@@ -280,9 +294,86 @@ impl Worker {
         self.drain.started().await;
     }
 
-    /// The next connection on `socket`, or `None` once this worker drains: a draining
-    /// worker takes nothing new (03 §10).
-    pub async fn accept(&self, socket: &TcpListener) -> Option<io::Result<TcpStream>> {
+    /// Whether this worker drains.
+    #[must_use]
+    pub fn drains(&self) -> bool {
+        self.drain.is_on()
+    }
+
+    /// Stops serving the listener whose slot is `slot`, taken away: its accepting ends,
+    /// its HTTP/3 listener takes no new connection and ends once its last has, and its
+    /// connections drain as at shutdown (03 §10).
+    pub fn stop(&self, slot: usize) {
+        let listening = self.listening.borrow().get(slot).map(Rc::clone);
+        let quic = self.quic_listening.borrow().get(slot).map(Rc::clone);
+        let replaced = {
+            let mut validations = self.validations.borrow_mut();
+            validations
+                .get_mut(slot)
+                .map(|validation| self.replace(validation, None))
+        };
+        // Started once nothing is borrowed: a waker may run what it wakes.
+        for drain in listening.into_iter().chain(quic).chain(replaced) {
+            drain.start();
+        }
+    }
+
+    /// Stops serving HTTP/3 on the listener whose slot is `slot`, turned off: its HTTP/3
+    /// listener takes no new connection, its QUIC connections drain as at shutdown, and it
+    /// ends once its last has; its TCP connections are left alone (03 §10).
+    pub fn stop_http3(&self, slot: usize) {
+        let quic = self.quic_listening.borrow().get(slot).map(Rc::clone);
+        if let Some(quic) = quic {
+            quic.start();
+        }
+    }
+
+    /// Readies `slot` for a listener that takes it, after one [`Worker::stop`] stopped: what
+    /// it accepts on and serves HTTP/3 on from now on is stopped by drains of its own.
+    pub fn open(&self, slot: usize) {
+        Self::reopen(&self.listening, &self.drain, slot);
+        self.open_http3(slot);
+    }
+
+    /// Readies `slot`'s HTTP/3 for a UDP socket opened after one [`Worker::stop_http3`]
+    /// stopped.
+    pub fn open_http3(&self, slot: usize) {
+        Self::reopen(&self.quic_listening, &self.drain, slot);
+    }
+
+    /// Puts an undrained drain in `slot` of `drains`, or one already started if the worker
+    /// drains, `worker`'s.
+    fn reopen(drains: &RefCell<Vec<Rc<Drain>>>, worker: &Drain, slot: usize) {
+        let drain = Rc::new(Drain::default());
+        if worker.is_on() {
+            drain.start();
+        }
+        if let Some(kept) = drains.borrow_mut().get_mut(slot) {
+            *kept = drain;
+        }
+    }
+
+    /// What stops the listener whose slot is `slot` accepting here: the worker's drain for
+    /// a slot there is none of.
+    pub(super) fn listening(&self, slot: usize) -> Rc<Drain> {
+        self.listening
+            .borrow()
+            .get(slot)
+            .map_or_else(|| Rc::clone(&self.drain), Rc::clone)
+    }
+
+    /// What stops the HTTP/3 listener of the listener whose slot is `slot` here, as
+    /// [`Worker::listening`] says for its accepting.
+    pub(super) fn quic_listening(&self, slot: usize) -> Rc<Drain> {
+        self.quic_listening
+            .borrow()
+            .get(slot)
+            .map_or_else(|| Rc::clone(&self.drain), Rc::clone)
+    }
+
+    /// The next connection on `socket`, the listener whose slot is `slot`'s, or `None` once
+    /// this worker drains or the listener is taken away: either takes nothing new (03 §10).
+    pub async fn accept(&self, slot: usize, socket: &TcpListener) -> Option<io::Result<TcpStream>> {
         // After a batch, everything else the worker has ready goes first: accepting all a
         // backlog holds would put a flood of new connections ahead of the requests of the
         // ones it has (03 §3).
@@ -291,9 +382,10 @@ impl Worker {
             tokio::task::yield_now().await;
         }
         self.accepted.set(self.accepted.get() + 1);
-        let mut draining = pin!(self.drain.notified());
+        let listening = self.listening(slot);
+        let mut draining = pin!(listening.notified());
         std::future::poll_fn(|cx| {
-            if self.drain.poll_on(draining.as_mut(), cx).is_ready() {
+            if listening.poll_on(draining.as_mut(), cx).is_ready() {
                 return Poll::Ready(None);
             }
             socket

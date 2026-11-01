@@ -305,6 +305,8 @@ impl Proxy {
                     respond,
                     // Its own answers are not counted, so nothing is owed them.
                     |_| {},
+                    // It never drains.
+                    |_| {},
                     &slots,
                 )
                 .await;

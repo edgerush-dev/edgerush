@@ -79,8 +79,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost -addext su
 Enable the `secure` entry, keeping `client_validation` commented unless you supply your
 own client CA. Replace the empty `certificates` map with the commented `server` entry,
 written as `certs/server-chain.pem` relative to the YAML file, and add `secure` to the
-`application` and `assets` routes' listeners. Restart the proxy to bind the added
-listener. Use a client that trusts this certificate; HTTP/3 also needs an HTTP/3-capable
+`application` and `assets` routes' listeners. A proxy running the file listens on the
+added listener as it reads the change. Use a client that trusts this certificate; HTTP/3 also needs an HTTP/3-capable
 client and UDP on port 8443. For mTLS or upstream TLS, replace the commented CA
 placeholders with real PEM contents and supply the named client certificate where used.
 Generated files in `examples/certs/` are ignored by Git.

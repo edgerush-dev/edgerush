@@ -46,7 +46,7 @@ impl Worker {
     /// [`Proxy::listeners`]: super::Proxy::listeners
     pub async fn serve(self: Rc<Self>, listener: usize, socket: TcpListener) {
         // Draining: nothing new is taken, and the socket goes with this.
-        while let Some(accepted) = self.accept(&socket).await {
+        while let Some(accepted) = self.accept(listener, &socket).await {
             match accepted {
                 Ok(stream) => {
                     let connection = Rc::clone(&self).serve_connection(listener, stream);
@@ -436,7 +436,7 @@ impl Worker {
             &self.proxy.quic,
             self.position,
             Rc::clone(&self.timers),
-            Rc::clone(&self.drain),
+            self.quic_listening(listener),
             Rc::clone(self.blocks.borrow().storage()),
             Rc::clone(&self.h3_listeners),
             room,

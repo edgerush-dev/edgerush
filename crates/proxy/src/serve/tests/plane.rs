@@ -752,7 +752,9 @@ fn config_with(listeners: &[&str]) -> Compiled {
 
 #[test]
 fn a_snapshot_knows_where_it_has_the_listeners_that_have_sockets() {
-    let sockets = ["admin".to_owned(), "web".to_owned()];
+    // Two slots taken and one no listener has.
+    let sockets: Arc<[Option<String>]> =
+        [Some("admin".to_owned()), Some("web".to_owned()), None].into();
     let metrics = Metrics::new(NonZeroUsize::MIN, sockets.len());
     let listeners = |names: &[&str]| {
         Snapshot::new(
@@ -762,7 +764,12 @@ fn a_snapshot_knows_where_it_has_the_listeners_that_have_sockets() {
                 named: &HashMap::new(),
                 denied: &crate::egress::Denied::default(),
             },
-            &sockets,
+            ListenerSlots {
+                names: Arc::clone(&sockets),
+                quic: vec![None; sockets.len()].into(),
+                draining: vec![false; sockets.len()].into(),
+                left: vec![None; sockets.len()].into(),
+            },
             &metrics,
             None,
             &Keys::default(),
@@ -773,22 +780,143 @@ fn a_snapshot_knows_where_it_has_the_listeners_that_have_sockets() {
         .listeners
     };
 
-    assert_eq!(listeners(&["admin", "web"]), [Some(0), Some(1)]);
+    assert_eq!(listeners(&["admin", "web"]), [Some(0), Some(1), None]);
     // Listeners are held in the order of their names, so one more moves the others.
     assert_eq!(
         listeners(&["aaa", "admin", "metrics", "web"]),
-        [Some(1), Some(3)]
+        [Some(1), Some(3), None]
     );
-    assert_eq!(listeners(&["web"]), [None, Some(0)]);
-    assert_eq!(listeners(&["other"]), [None, None]);
+    assert_eq!(listeners(&["web"]), [None, Some(0), None]);
+    assert_eq!(listeners(&["other"]), [None, None, None]);
 }
 
 #[test]
 fn a_data_plane_serves_the_listeners_it_was_made_with() {
     let proxy = Proxy::new(config_with(&["web", "admin"]), NonZeroUsize::MIN).unwrap();
-    assert_eq!(proxy.listeners(), ["admin", "web"]);
+    let named = |listeners: &[Option<String>]| -> Vec<String> {
+        listeners.iter().flatten().cloned().collect()
+    };
+    // A slot for every listener there can be, the first config's in the first of them.
+    assert_eq!(proxy.listeners().len(), edgerush_config::MOST_LISTENERS);
+    assert_eq!(
+        proxy.listeners()[..2],
+        [Some("admin".to_owned()), Some("web".to_owned())]
+    );
     proxy.reload(config_with(&["later"])).unwrap();
-    assert_eq!(proxy.listeners(), ["admin", "web"]);
+    assert_eq!(named(&proxy.listeners()), ["admin", "web"]);
+}
+
+fn opened(name: &str) -> Opened {
+    Opened {
+        name: name.to_owned(),
+        quic: None,
+    }
+}
+
+/// The listener `name` opened, as a change.
+fn opening(name: &str) -> Changes {
+    Changes {
+        opened: vec![opened(name)],
+        ..Changes::default()
+    }
+}
+
+/// The listener `name` closed, as a change.
+fn closing(name: &str) -> Changes {
+    Changes {
+        closed: vec![name.to_owned()],
+        ..Changes::default()
+    }
+}
+
+/// A listener whose sockets are opened takes the first slot that is free, and is served
+/// there; one said to be opened that has its sockets already is refused, and the data
+/// plane runs on as it was.
+#[test]
+fn a_listener_whose_sockets_are_opened_takes_the_first_free_slot() {
+    let proxy = Proxy::new(config_with(&["web", "admin"]), NonZeroUsize::MIN).unwrap();
+    let after = config_with(&["admin", "api", "web"]);
+    let slotted = proxy.reload_with(after, &opening("api")).unwrap();
+    assert_eq!(slotted.opened, [2]);
+    let named = |names: &[&str]| -> Vec<Option<String>> {
+        names.iter().map(|name| Some((*name).to_owned())).collect()
+    };
+    assert_eq!(proxy.listeners()[..3], named(&["admin", "web", "api"]));
+    assert_eq!(
+        proxy.current.load().listeners[..3],
+        [Some(0), Some(2), Some(1)]
+    );
+
+    let again = proxy
+        .reload_with(config_with(&["api"]), &opening("api"))
+        .unwrap_err();
+    assert_eq!(again.to_string(), "listener `api` has its sockets already");
+    assert_eq!(proxy.current.load().config.listeners().len(), 3);
+}
+
+/// A listener taken away drains in its slot, serving nothing and not to be opened again;
+/// once freed, the slot is another listener's, its counters at zero.
+#[test]
+fn a_listener_taken_away_holds_its_slot_until_it_is_freed() {
+    let proxy = Proxy::new(config_with(&["admin", "web"]), NonZeroUsize::MIN).unwrap();
+    proxy.metrics.listener(0).unwrap().accepted.inc();
+    let slotted = proxy
+        .reload_with(config_with(&["web"]), &closing("admin"))
+        .unwrap();
+    assert_eq!(slotted.closed, [0]);
+    assert_eq!(proxy.listeners()[0].as_deref(), Some("admin"));
+    assert_eq!(proxy.current.load().listeners[..2], [None, Some(0)]);
+    // Back in a config while it drains, it is still not served there.
+    proxy.reload(config_with(&["admin", "web"])).unwrap();
+    assert_eq!(proxy.current.load().listeners[..2], [None, Some(1)]);
+
+    let again = proxy
+        .reload_with(config_with(&["admin", "web"]), &opening("admin"))
+        .unwrap_err();
+    assert_eq!(
+        again.to_string(),
+        "listener `admin` has its sockets already"
+    );
+    let twice = proxy
+        .reload_with(config_with(&["web"]), &closing("admin"))
+        .unwrap_err();
+    assert_eq!(
+        twice.to_string(),
+        "listener `admin` has no sockets to close"
+    );
+    let kept = proxy.free(1).unwrap_err();
+    assert_eq!(kept.to_string(), "listener slot 1 is not draining");
+
+    proxy.free(0).unwrap();
+    assert_eq!(proxy.listeners()[0], None);
+    assert_eq!(proxy.listen(&opening("admin")).unwrap().opened, [0]);
+    assert_eq!(proxy.current.load().listeners[..2], [Some(0), Some(1)]);
+    assert_eq!(proxy.metrics.listener(0).unwrap().accepted.get(), 0);
+}
+
+/// With every slot taken, a listener whose sockets are opened is refused, and takes none.
+#[test]
+fn a_listener_no_slot_is_free_for_is_refused() {
+    let names: Vec<String> = (0..edgerush_config::MOST_LISTENERS)
+        .map(|at| format!("l{at:02}"))
+        .collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let proxy = Proxy::new(config_with(&names), NonZeroUsize::MIN).unwrap();
+    let refused = proxy
+        .reload_with(config_with(&["late"]), &opening("late"))
+        .unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        "listener `late`: every listener's slot is taken"
+    );
+    assert!(proxy.listeners().iter().all(Option::is_some));
+    assert!(
+        !proxy
+            .listeners()
+            .iter()
+            .flatten()
+            .any(|name| name == "late")
+    );
 }
 
 #[test]

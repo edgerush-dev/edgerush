@@ -186,7 +186,10 @@ pub(crate) async fn drive<R, F, B, D, G>(
     poll_fn(|cx| {
         conn.drive_with(cx.waker());
         loop {
-            if driving.drain_by.is_none() && conn.drain.poll_on(drain_heard.as_mut(), cx).is_ready()
+            if driving.drain_by.is_none()
+                && (conn.drain.poll_on(drain_heard.as_mut(), cx).is_ready()
+                    // Its listener's HTTP/3 turned off, which stirs it: the QUIC side alone.
+                    || shared.drain.is_on())
             {
                 driving.drain_by = Some(Instant::now() + settings.drain_within);
                 go_away(&conn, &mut driving);

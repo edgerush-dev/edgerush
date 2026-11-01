@@ -29,6 +29,7 @@ use super::writer::{
     Asked, BodyFramer, Content, Delimited, WriteError, Written, write_head, write_interim,
 };
 use crate::drain::{Drain, Heard};
+use crate::forwarding::Cut;
 use crate::h1::{BodyReader, CodecError, Framing, Piece};
 use crate::head::Head as _;
 use crate::interim::Interim;
@@ -417,6 +418,14 @@ enum Stop {
     TimedOut(Clock),
     Gone,
     Exhausted,
+}
+
+/// Tells `cut` the connection is closed at the drain's bound, if that is what `stop` is:
+/// before the request's future goes, whose record ends with it.
+fn drained(stop: &Stop, cut: &impl Fn(Cut)) {
+    if *stop == Stop::TimedOut(Clock::Drained) {
+        cut(Cut::Drained);
+    }
 }
 
 impl From<Stop> for Ended {
@@ -1159,7 +1168,8 @@ impl FinalHead {
 /// Serves `socket` until the connection ends, handing each request to `respond` as its raw
 /// head and its body, and says how it ended. The caller closes the socket, lingering where
 /// bytes may still be arriving. Once `drain` starts, the connection closes when idle and says
-/// so on the answer in hand (03 §10).
+/// so on the answer in hand, or at the drain's bound closes with it still under way, telling
+/// `cut` first (03 §10).
 ///
 /// A connection that ends in order — nothing of a message left part way — has its sending
 /// half shut first, within the write's idle bound: over TLS that is the closure alert RFC 9112
@@ -1182,6 +1192,7 @@ pub(crate) async fn serve<S, R, F, B>(
     drain: &Drain,
     mut respond: R,
     went: impl Fn(Went<'_, B::Error>),
+    cut: impl Fn(Cut),
     slots: &Slots<F>,
 ) -> Ended
 where
@@ -1232,6 +1243,9 @@ where
                     slots.start(|| respond(head, RequestBody::Ours(body), interim.clone()));
                 poll_fn(|context| -> Poll<Result<Answered<B>, Stop>> {
                     connection.inbound.borrow_mut().heard_by(context);
+                    if drain.poll_on(draining.as_mut(), context).is_ready() {
+                        connection.deadlines.draining(now());
+                    }
                     loop {
                         if connection.spent() {
                             return connection.yield_turn(context);
@@ -1267,7 +1281,9 @@ where
                             }
                         }
                         if !moved {
-                            connection.poll_deadline(context)?;
+                            connection
+                                .poll_deadline(context)
+                                .inspect_err(|stop| drained(stop, &cut))?;
                             return connection.wait();
                         }
                     }
@@ -1309,6 +1325,9 @@ where
         let mut told = false;
         // Whether the body ended, or the error it failed with.
         let sent = poll_fn(|context| -> Poll<Result<Option<B::Error>, Stop>> {
+            if drain.poll_on(draining.as_mut(), context).is_ready() {
+                connection.deadlines.draining(now());
+            }
             loop {
                 if connection.spent() {
                     return connection.yield_turn(context);
@@ -1383,7 +1402,9 @@ where
                     return Poll::Ready(Ok(None));
                 }
                 if !moved {
-                    connection.poll_deadline(context)?;
+                    connection
+                        .poll_deadline(context)
+                        .inspect_err(|stop| drained(stop, &cut))?;
                     return connection.wait();
                 }
             }
@@ -1624,6 +1645,7 @@ mod tests {
                     async move { Answered::Map(answering.await) }
                 },
                 went,
+                |_| {},
                 &slots,
             ))
             .await
@@ -3528,6 +3550,7 @@ mod tests {
                 &Drain::default(),
                 answering,
                 |_| {},
+                |_| {},
                 &Slots::default(),
             ),
         )
@@ -3684,6 +3707,7 @@ mod tests {
                 &never,
                 respond,
                 |_| {},
+                |_| {},
                 slots,
             ))
             .await
@@ -3797,6 +3821,7 @@ mod tests {
                     date,
                     drain,
                     respond,
+                    |_| {},
                     |_| {},
                     slots,
                 )

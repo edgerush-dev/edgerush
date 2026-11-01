@@ -12,7 +12,7 @@
 use edgerush_certificates::testing::Authority;
 use edgerush_config::HarnessFile;
 use edgerush_control_service::{Credentials, Heard, acceptor, serve};
-use edgerush_control_stream::{Offer, Versions};
+use edgerush_control_stream::{Listening, Offer, Versions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
@@ -232,12 +232,16 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
     assert!(harness.wait_for("elsewhere").contains("upstream"));
     assert!(get(web, "/")?.contains("x-upstream: two"));
 
-    // A listener that is new is told of and not bound, and what can be reloaded is.
-    let more = config("127.0.0.1:0", "up", Some(one))
-        + "  api: { address: \"127.0.0.1:1\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n";
+    // A listener that is new is listened on as its config takes over, and served.
+    let free = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let more = config("127.0.0.1:0", "up", Some(one)).replace("[web]", "[web, api]")
+        + &format!(
+            "  api: {{ address: \"{free}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
+        );
     std::fs::write(&file, more)?;
     harness.wait_for("config reloaded");
-    harness.wait_for("warning: listener \"api\" is new");
+    assert_eq!(harness.address_after("listener \"api\" is on "), free);
+    assert!(get(free, "/")?.contains("x-upstream: one"));
     assert!(get(web, "/")?.contains("x-upstream: one"));
 
     let scrape = get(metrics, "/metrics")?;
@@ -248,7 +252,281 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
     );
     let served = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"} 4\n";
     assert!(scrape.contains(served), "{scrape}");
+    let added = "edgerush_listener_responses_total{listener=\"api\",class=\"2xx\"} 1\n";
+    assert!(scrape.contains(added), "{scrape}");
+
+    // A listener whose port is taken is said not to be served, the rest of its config
+    // running; and it is listened on at the next config, once the port is free.
+    let taken = TcpListener::bind("127.0.0.1:0")?;
+    let busy = taken.local_addr()?;
+    let with_busy = |comment: &str| {
+        config("127.0.0.1:0", "up", Some(two)).replace("[web]", "[web, busy]")
+            + &format!(
+                "  busy: {{ address: \"{busy}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n# {comment}\n"
+            )
+    };
+    std::fs::write(&file, with_busy("taken"))?;
+    harness.wait_for("config reloaded");
+    let refused = harness.wait_for("for listener \"busy\"");
+    assert!(
+        refused.starts_with(&format!(
+            "warning: cannot listen on {busy} for listener \"busy\": "
+        )),
+        "{refused}"
+    );
+    assert!(
+        refused.ends_with(": it is not served, and is tried again at the next config"),
+        "{refused}"
+    );
+    assert!(get(web, "/")?.contains("x-upstream: two"));
+    drop(taken);
+    std::fs::write(&file, with_busy("free"))?;
+    harness.wait_for("config reloaded");
+    assert_eq!(harness.address_after("listener \"busy\" is on "), busy);
+    assert!(get(busy, "/")?.contains("x-upstream: two"));
+
+    // Renamed, it is another listener, on an address the one gone holds until it has
+    // drained: not opened beside it, which would share the port between the two, but once
+    // it has.
+    let renamed = with_busy("renamed").replace("busy", "moved");
+    std::fs::write(&file, renamed)?;
+    harness.wait_for("config reloaded");
+    assert_eq!(
+        harness.wait_for("listener \"moved\" is on "),
+        format!(
+            "warning: listener \"moved\" is on {busy}, which listener \"busy\" holds: it waits \
+             for that one to drain"
+        )
+    );
+    harness.wait_for("listener \"busy\" has drained");
+    assert_eq!(harness.address_after("listener \"moved\" is on "), busy);
+    assert!(get(busy, "/")?.contains("x-upstream: two"));
     Ok(())
+}
+
+/// A listener a config takes away is no longer listened on, and its connections drain as
+/// at shutdown: one with a request under way is answered, saying it closes. Moved
+/// meanwhile, it waits for that drain, then is listened on where it went, its counts from
+/// zero (03 §10).
+#[test]
+fn proxy_drains_a_listener_taken_away_and_moves_it_once_drained() -> io::Result<()> {
+    let one = upstream("one")?;
+    let (held, arrived, release) = held_upstream()?;
+    // Every port it binds chosen at once, so that none is another's: one left to the
+    // operating system could be given the port `moved` holds here, once that is let go.
+    let reserved: Vec<TcpListener> = (0..4)
+        .map(|_| TcpListener::bind("127.0.0.1:0"))
+        .collect::<io::Result<_>>()?;
+    let ports: Vec<SocketAddr> = reserved
+        .iter()
+        .map(TcpListener::local_addr)
+        .collect::<io::Result<_>>()?;
+    drop(reserved);
+    let (web, first, moved, metrics_on) = (ports[0], ports[1], ports[2], ports[3].to_string());
+    let listener = |name: &str, at: &str| {
+        format!(
+            "  {name}: {{ address: \"{at}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
+        )
+    };
+    let with = |api: Option<SocketAddr>| {
+        let on = if api.is_some() { "[web, api]" } else { "[web]" };
+        let mut yaml = format!(
+            r#"upstreams:
+  up: {{ load_balancer: p2c, endpoints: {{ listed: ["{one}"] }} }}
+  held: {{ load_balancer: p2c, endpoints: {{ listed: ["{held}"] }} }}
+routes:
+  - name: everything
+    listeners: {on}
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: /held }}
+        forward: {{ backends: [{{ upstream: held, weight: 1 }}] }}
+      - matches:
+          - path: {{ prefix: / }}
+        forward: {{ backends: [{{ upstream: up, weight: 1 }}] }}
+listeners:
+"#
+        );
+        yaml += &listener("web", &web.to_string());
+        if let Some(api) = api {
+            yaml += &listener("api", &api.to_string());
+        }
+        yaml
+    };
+    let file = scratch("moved-while-draining.yaml");
+    std::fs::write(&file, with(Some(first)))?;
+    let args = [
+        "--config",
+        &file,
+        "--workers",
+        "1",
+        "--metrics",
+        &metrics_on,
+    ];
+    let mut harness = Harness::start(&args)?;
+    let metrics = harness.address_after("metrics are on ");
+    harness.wait_for("1 worker, thread-per-core");
+    assert!(get(first, "/")?.contains("x-upstream: one"));
+
+    // A request under way on `api`, held at its upstream, when `api` is taken away.
+    let mut under_way = TcpStream::connect(first)?;
+    under_way.set_read_timeout(Some(PATIENCE))?;
+    write!(
+        under_way,
+        "GET /held HTTP/1.1\r\nhost: harness.test\r\n\r\n"
+    )?;
+    arrived
+        .recv_timeout(PATIENCE)
+        .expect("the request at its upstream");
+    std::fs::write(&file, with(None))?;
+    harness.wait_for("config reloaded");
+    assert!(
+        refused_soon(first),
+        "a listener taken away is still listened on"
+    );
+
+    // Moved while it drains, it waits for the drain.
+    std::fs::write(&file, with(Some(moved)))?;
+    harness.wait_for("config reloaded");
+    assert_eq!(
+        harness.wait_for("listener \"api\""),
+        "warning: listener \"api\" waits for its earlier sockets to drain"
+    );
+    assert!(
+        TcpStream::connect(moved).is_err(),
+        "listened on before the drain ended"
+    );
+
+    // Answered, the connection closing, and the drain ends with it.
+    release.send(()).expect("the upstream to answer");
+    let mut answer = String::new();
+    under_way.read_to_string(&mut answer)?;
+    let answer = answer.to_ascii_lowercase();
+    assert!(answer.starts_with("http/1.1 200 ok\r\n"), "{answer}");
+    assert!(answer.contains("\r\nconnection: close\r\n"), "{answer}");
+    harness.wait_for("listener \"api\" has drained");
+    assert_eq!(harness.address_after("listener \"api\" is on "), moved);
+    assert!(get(moved, "/")?.contains("x-upstream: one"));
+    // Two answered where it was, counted there, and not here.
+    let scrape = get(metrics, "/metrics")?;
+    let counted = "edgerush_listener_responses_total{listener=\"api\",class=\"2xx\"} 1\n";
+    assert!(scrape.contains(counted), "{scrape}");
+    Ok(())
+}
+
+/// HTTP/3 turned on for a listener a config keeps is served on its port as that config
+/// takes over, and turned off is drained and no longer served: its UDP sockets alone are
+/// opened and closed, its TCP side served all along (03 §10).
+#[test]
+fn proxy_turns_a_listeners_http3_on_and_off() -> io::Result<()> {
+    let one = upstream("one")?;
+    let authority = Authority::new("http3");
+    let issued = authority.issue(&["localhost"]);
+    let (chain, key) = (scratch("http3-chain.pem"), scratch("http3-key.pem"));
+    std::fs::write(&chain, &issued.chain)?;
+    std::fs::write(&key, &issued.key)?;
+    let at = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let with = |http3: bool, comment: &str| {
+        let http3 = if http3 {
+            ", http3: { alt_svc_max_age: 60, force_retry: false }"
+        } else {
+            ""
+        };
+        format!(
+            r#"upstreams:
+  up: {{ load_balancer: p2c, endpoints: {{ listed: ["{one}"] }} }}
+routes:
+  - name: everything
+    listeners: [secure]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: / }}
+        forward: {{ backends: [{{ upstream: up, weight: 1 }}] }}
+listeners:
+  secure: {{ address: "{at}", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [server], without_sni: server }}{http3} }}
+certificates:
+  server: {{ chain_file: '{chain}', key_file: '{key}' }}
+# {comment}
+"#
+        )
+    };
+    let file = scratch("http3.yaml");
+    std::fs::write(&file, with(false, "off"))?;
+    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
+    assert_eq!(harness.address_after("listener \"secure\" is on "), at);
+    harness.wait_for("1 worker, thread-per-core");
+    assert!(
+        !negotiates(at, Duration::from_secs(1)),
+        "HTTP/3 served while off"
+    );
+
+    std::fs::write(&file, with(true, "on"))?;
+    harness.wait_for("config reloaded");
+    assert_eq!(
+        harness.address_after("listener \"secure\" serves HTTP/3 on "),
+        at
+    );
+    assert!(negotiates(at, PATIENCE), "HTTP/3 not served once on");
+    assert!(TcpStream::connect(at).is_ok(), "its TCP side not served");
+
+    std::fs::write(&file, with(false, "off again"))?;
+    harness.wait_for("config reloaded");
+    harness.wait_for("listener \"secure\" no longer serves HTTP/3");
+    harness.wait_for("listener \"secure\"'s HTTP/3 has drained");
+    assert!(
+        !negotiates(at, Duration::from_secs(1)),
+        "HTTP/3 served once off"
+    );
+    assert!(TcpStream::connect(at).is_ok(), "its TCP side not served");
+
+    // On again once drained: a UDP socket of its own.
+    std::fs::write(&file, with(true, "on again"))?;
+    harness.wait_for("config reloaded");
+    assert_eq!(
+        harness.address_after("listener \"secure\" serves HTTP/3 on "),
+        at
+    );
+    assert!(negotiates(at, PATIENCE), "HTTP/3 not served once on again");
+    Ok(())
+}
+
+/// Whether the UDP socket at `address` answers a QUIC client within `wait`, with a version
+/// negotiation for a datagram of a version nobody speaks, as large as an Initial: what an
+/// HTTP/3 listener answers whatever else it is set up with.
+fn negotiates(address: SocketAddr, wait: Duration) -> bool {
+    let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("a UDP socket");
+    client.set_read_timeout(Some(wait)).expect("a read timeout");
+    let mut datagram = vec![0xc0, 0x1a, 0x2a, 0x3a, 0x4a, 8];
+    datagram.extend([1; 8]);
+    datagram.push(8);
+    datagram.extend([2; 8]);
+    datagram.resize(1200, 0);
+    if client.send_to(&datagram, address).is_err() {
+        return false;
+    }
+    let mut answer = [0; 1500];
+    let Ok((read, _)) = client.recv_from(&mut answer) else {
+        return false;
+    };
+    // A long header whose version is 0.
+    read > 5 && answer[0] & 0x80 != 0 && answer[1..5] == [0; 4]
+}
+
+/// Whether connecting to `address` is refused within [`PATIENCE`]: a socket the data plane
+/// closes is closed by its worker a moment after the config that takes it away runs.
+fn refused_soon(address: SocketAddr) -> bool {
+    let began = std::time::Instant::now();
+    while began.elapsed() < PATIENCE {
+        if TcpStream::connect(address).is_err() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
 }
 
 /// The config `config` gives, as the control plane offers it.
@@ -365,15 +643,81 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
     assert!(get(web, "/")?.contains("x-upstream: two"));
     assert_eq!(reported().running.config.as_deref(), Some(second.version()));
 
+    // A listener that is new is listened on as its config takes over, as a file's is.
+    let free = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let added = offered(
+        &(config("127.0.0.1:0", "up", Some(two)).replace("[web]", "[web, api]")
+            + &format!(
+                "  api: {{ address: \"{free}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
+            )),
+        Some(&second),
+        &mut versions,
+    );
+    offers.send_replace(Some(Arc::new(added.clone())));
+    harness.wait_for("config from the control plane runs");
+    assert_eq!(harness.address_after("listener \"api\" is on "), free);
+    assert!(get(free, "/")?.contains("x-upstream: two"));
+    assert_eq!(reported().running.config.as_deref(), Some(added.version()));
+
+    // Taken away, a listener is reported draining until it has drained, and then reported
+    // no more: at once, as nothing holds it, perhaps before its config's report is made.
+    let without = offered(
+        &config("127.0.0.1:0", "up", Some(two)),
+        Some(&added),
+        &mut versions,
+    );
+    offers.send_replace(Some(Arc::new(without.clone())));
+    let mut report = reported();
+    assert_eq!(report.running.config.as_deref(), Some(without.version()));
+    if report.listening.draining == ["api"] {
+        report = reported();
+    }
+    assert_eq!(report.listening, Listening::default());
+    harness.wait_for("listener \"api\" has drained");
+
+    // One whose port is taken is reported not served, and why; with the port free, it is
+    // listened on at the next config and reported no more.
+    let taken = TcpListener::bind("127.0.0.1:0")?;
+    let busy = taken.local_addr()?;
+    let with_busy = |backend: SocketAddr| {
+        config("127.0.0.1:0", "up", Some(backend)).replace("[web]", "[web, busy]")
+            + &format!(
+                "  busy: {{ address: \"{busy}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+"
+            )
+    };
+    let unbound = offered(&with_busy(one), Some(&without), &mut versions);
+    offers.send_replace(Some(Arc::new(unbound.clone())));
+    let report = reported();
+    assert_eq!(report.running.config.as_deref(), Some(unbound.version()));
+    let [unserved] = report.listening.unserved.as_slice() else {
+        panic!("{:?}", report.listening)
+    };
+    assert_eq!(unserved.listener, "busy");
+    assert!(
+        unserved
+            .why
+            .starts_with(&format!("cannot listen on {busy} for listener \"busy\": ")),
+        "{}",
+        unserved.why
+    );
+    drop(taken);
+    let bound = offered(&with_busy(two), Some(&unbound), &mut versions);
+    offers.send_replace(Some(Arc::new(bound.clone())));
+    let report = reported();
+    assert_eq!(report.running.config.as_deref(), Some(bound.version()));
+    assert_eq!(report.listening, Listening::default());
+    assert_eq!(harness.address_after("listener \"busy\" is on "), busy);
+
     // A config that cannot be run: said, and the one before it runs on.
     let third = offered(
         &config("127.0.0.1:0", "elsewhere", Some(one)),
-        Some(&second),
+        Some(&bound),
         &mut versions,
     );
     offers.send_replace(Some(Arc::new(third.clone())));
     let report = reported();
-    assert_eq!(report.running.config.as_deref(), Some(second.version()));
+    assert_eq!(report.running.config.as_deref(), Some(bound.version()));
     assert_eq!(
         report.refused.map(|refusal| refusal.config),
         Some(third.version().to_owned())
@@ -575,7 +919,7 @@ fn a_second_signal_while_draining_exits_at_once() -> io::Result<()> {
 #[cfg(not(unix))]
 #[test]
 fn more_than_one_worker_does_not_start_where_a_port_cannot_be_shared() -> io::Result<()> {
-    let file = scratch("per-core.yaml");
+    let file = scratch("one-worker-alone.yaml");
     std::fs::write(&file, config("127.0.0.1:0", "up", None))?;
     let output = edgerush(&["proxy", "--config", &file, "--workers", "2"])?;
     assert_eq!(output.status.code(), Some(1));
@@ -981,6 +1325,24 @@ fn config_text() -> String {
     config("127.0.0.1:1", "up", None)
 }
 
+/// Each scratch file is one test's alone: the tests run side by side in one directory, and
+/// one that wrote another's file would change the config that test's proxy follows.
+#[test]
+fn every_scratch_file_is_named_once() {
+    let mut names: Vec<&str> = include_str!("cli.rs")
+        .split("scratch(\"")
+        .skip(1)
+        .filter_map(|after| after.split_once('"').map(|(name, _)| name))
+        .collect();
+    names.sort_unstable();
+    let twice: Vec<&&str> = names
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .map(|pair| &pair[0])
+        .collect();
+    assert!(twice.is_empty(), "named more than once: {twice:?}");
+}
+
 /// A path for a file of the test's own, as text for the command line.
 fn scratch(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -1036,7 +1398,6 @@ fn upstream(name: &'static str) -> io::Result<SocketAddr> {
 
 /// Starts an upstream that says on `arrived` when a request has come, and answers it
 /// once told to on `release`.
-#[cfg(unix)]
 fn held_upstream() -> io::Result<(SocketAddr, Receiver<()>, mpsc::Sender<()>)> {
     let socket = TcpListener::bind("127.0.0.1:0")?;
     let address = socket.local_addr()?;
@@ -1079,6 +1440,8 @@ const PATIENCE: Duration = Duration::from_secs(20);
 struct Harness {
     process: Child,
     said: Receiver<String>,
+    /// Every line it has said so far, for a wait that fails to say them all.
+    heard: Vec<String>,
 }
 
 impl Harness {
@@ -1101,17 +1464,28 @@ impl Harness {
                 }
             }
         });
-        Ok(Self { process, said })
+        Ok(Self {
+            process,
+            said,
+            heard: Vec::new(),
+        })
     }
 
-    /// The next line on stderr that has `part` in it; the lines before it are let go.
+    /// The next line on stderr that has `part` in it; the lines before it are let go. One
+    /// that does not come fails the test, saying every line said since the start.
     fn wait_for(&mut self, part: &str) -> String {
-        let mut passed = Vec::new();
         loop {
             match self.said.recv_timeout(PATIENCE) {
-                Ok(line) if line.contains(part) => return line,
-                Ok(line) => passed.push(line),
-                Err(_) => panic!("no line with {part:?} came; these did: {passed:#?}"),
+                Ok(line) => {
+                    self.heard.push(line.clone());
+                    if line.contains(part) {
+                        return line;
+                    }
+                }
+                Err(_) => panic!(
+                    "no line with {part:?} came; every line said: {:#?}",
+                    self.heard
+                ),
             }
         }
     }

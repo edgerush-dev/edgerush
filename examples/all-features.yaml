@@ -37,7 +37,7 @@ listeners:
 
   # HTTPS and HTTP/3. To try it, create a certificate (examples/README.md), uncomment this
   # listener and the `server` certificate at the end, and add `secure` to the routes'
-  # listeners. A new listener takes a restart.
+  # listeners. A running proxy listens on it as the file changes.
   # secure:
   #   address: "127.0.0.1:8443"
   #   protocol: https

@@ -173,6 +173,14 @@ impl Prepared {
     pub(crate) fn by_listener(&self) -> Vec<Option<Sink>> {
         self.by_listener.clone()
     }
+
+    /// Has the listener at `position` write to `sink`, one a config before opened: for one
+    /// taken away whose connections still drain.
+    pub(crate) fn keep(&mut self, position: usize, sink: Option<Sink>) {
+        if let Some(kept) = self.by_listener.get_mut(position) {
+            *kept = sink;
+        }
+    }
 }
 
 /// Why a config's access log cannot be written.
@@ -202,7 +210,7 @@ impl Logs {
     pub(crate) fn prepare(
         &self,
         config: &Compiled,
-        listeners: &[String],
+        listeners: &[Option<String>],
     ) -> Result<Prepared, CannotOpen> {
         let named = lock(&self.named);
         let mut next = named.next;
@@ -232,6 +240,7 @@ impl Logs {
         let by_listener = listeners
             .iter()
             .map(|name| {
+                let name = name.as_ref()?;
                 let listener = config.listeners().iter().find(|l| l.name == *name)?;
                 sinks.get(listener.access_log.as_ref()?).copied()
             })
@@ -633,12 +642,12 @@ mod tests {
         compile(&serde_saphyr::from_str::<Config>(&yaml).unwrap()).unwrap()
     }
 
-    fn names(names: &[&str]) -> Vec<String> {
-        names.iter().map(ToString::to_string).collect()
+    fn names(names: &[&str]) -> Vec<Option<String>> {
+        names.iter().map(|name| Some((*name).to_owned())).collect()
     }
 
     /// The sink of each of `listeners`, `config` in force.
-    fn running(logs: &Logs, config: &Compiled, listeners: &[String]) -> Vec<Option<Sink>> {
+    fn running(logs: &Logs, config: &Compiled, listeners: &[Option<String>]) -> Vec<Option<Sink>> {
         let prepared = logs.prepare(config, listeners).unwrap();
         let sinks = prepared.by_listener();
         logs.commit(prepared);

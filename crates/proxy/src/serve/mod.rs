@@ -21,6 +21,7 @@ mod kubernetes;
 mod logged;
 mod passthrough;
 mod plane;
+pub use plane::{Changes, Opened, Slotted};
 mod respond;
 mod tries;
 mod watched;
@@ -375,9 +376,6 @@ impl HttpBody for Body {
 /// What a worker keeps to itself is in [`Worker`].
 #[derive(Debug)]
 pub struct Proxy {
-    /// The names of the listeners of the config the data plane was made with. A socket is
-    /// served as the listener at its position here, whatever configs come later.
-    listeners: Vec<String>,
     current: ArcSwap<Snapshot>,
     /// Outside the snapshot, so that a reload resets no counter.
     metrics: Metrics,
@@ -499,9 +497,15 @@ pub struct Worker {
     /// threshold of which a client proves its address first, and the connection closed to
     /// make room until it has gone (16 §6).
     h3_listeners: Rc<h3_listener::Common>,
-    /// By position in [`Proxy::listeners`]: the client validation its connections here are
+    /// By slot ([`Proxy::listeners`]): the client validation its connections here are
     /// accepted under, and the drain they hear.
     validations: RefCell<Vec<Validation>>,
+    /// By slot ([`Proxy::listeners`]): what stops its accepting here: this worker's drain,
+    /// or its listener taken away ([`Worker::stop`]).
+    listening: RefCell<Vec<Rc<Drain>>>,
+    /// By slot: what stops its HTTP/3 listener here, which then takes no new connection and
+    /// drains those it has: the same, or its HTTP/3 turned off ([`Worker::stop_http3`]).
+    quic_listening: RefCell<Vec<Rc<Drain>>>,
     /// Which snapshot `validations` and `routes` were last brought up to.
     validated: Cell<u64>,
     /// By key ([`Routed`]): the drain of the tunnels routed by a listener, route and
@@ -554,6 +558,7 @@ where
     let listener = ours.listener;
     // For the record of a head the server refuses, which no request's future makes.
     let logged_client = Rc::clone(&client);
+    let cut_by = Rc::clone(&client);
     // The connection is kept by this for as long as it is served; each request's future
     // owns only a handle on the worker. It is that future itself, not one wrapped around
     // it, so that it is not moved into another on every request.
@@ -578,6 +583,12 @@ where
         &connection.drain,
         respond,
         |went| connection.went(went),
+        |why| {
+            cut_by.cut(why);
+            if let Some(counters) = worker.proxy.metrics.listener(listener) {
+                counters.closed(why);
+            }
+        },
         &slots,
     )
     .await;
@@ -743,6 +754,29 @@ impl Admitted {
     }
 }
 
+/// By slot ([`Proxy::listeners`]): the listeners whose sockets the data plane holds. A
+/// socket is served as the listener its slot names, whatever configs come later; a slot
+/// is taken as a listener's sockets are opened ([`Proxy::reload_with`]), held while they
+/// are closed and its connections drain, and freed once they have ([`Proxy::free`]). The
+/// sockets of a slot are never moved.
+#[derive(Debug, Clone)]
+struct ListenerSlots {
+    /// The name of the listener whose sockets it holds, if one's are.
+    names: Arc<[Option<String>]>,
+    /// The port its HTTP/3 is served on, where it has a UDP socket: whatever the config
+    /// says now, it is where the socket is (03 §4).
+    quic: Arc<[Option<u16>]>,
+    /// Its listener was taken away: no longer served, its connections draining.
+    draining: Arc<[bool]>,
+    /// For a slot that drains, its listener as the last config that had it said: what the
+    /// records of its connections' requests say of it.
+    left: Arc<[Option<Left>]>,
+}
+
+/// A listener taken away, as the last config that had it said: that config, and where it
+/// has the listener.
+type Left = (Arc<Compiled>, usize);
+
 /// A compiled config and what the data plane works out from it, once, when it arrives.
 #[derive(Debug)]
 struct Snapshot {
@@ -751,8 +785,10 @@ struct Snapshot {
     /// Which config this is, counting from the first: what tells a worker its balancing
     /// state is for an earlier one.
     generation: u64,
-    /// By position in [`Proxy::listeners`]: where this config has the listener of that
-    /// name, if it has one. No request looks a listener up by its name.
+    /// By slot: whose sockets it holds.
+    slots: ListenerSlots,
+    /// By slot: where this config has the listener of that name, if it has one. No request
+    /// looks a listener up by its name.
     listeners: Vec<Option<usize>>,
     /// By position of the upstream, then of the endpoint: where to connect, in the form a
     /// request target takes, made once so that no request formats an address.
@@ -777,21 +813,17 @@ struct Snapshot {
     /// By position of the upstream: what its connections are secured with, if anything.
     /// Kept from the config before for as long as the TLS is the same.
     secure: Vec<Option<Arc<Secure>>>,
-    /// By position in [`Proxy::listeners`]: what a connection to it is accepted with, if
+    /// By slot ([`Proxy::listeners`]): what a connection to it is accepted with, if
     /// it is to speak TLS. Kept from the config before for as long as the certificates
     /// are the same, and with it the keys of the session tickets it has issued.
     tls: Vec<Option<Arc<Tls>>>,
-    /// By position in [`Proxy::listeners`]: the port its HTTP/3 is served on, where it has
-    /// a UDP socket. The first config's: sockets are bound once, at the start, and a reload
-    /// opens, closes and moves none of them (03 §4).
-    quic: Vec<Option<u16>>,
-    /// By position in [`Proxy::listeners`]: the `Alt-Svc` its answers carry, if it serves
+    /// By slot ([`Proxy::listeners`]): the `Alt-Svc` its answers carry, if it serves
     /// HTTP/3 (16 §5), made once so that no answer formats it.
     alt_svc: Vec<Option<HeaderModifier>>,
     /// What its tunnels are routed by, keyed so that a worker sees at a reload which went
     /// (03 §10). Worked out against the config this one replaces, as `destinations` are.
     routed: Routed,
-    /// By position in [`Proxy::listeners`]: where its access log is written, if it has one
+    /// By slot ([`Proxy::listeners`]): where its access log is written, if it has one
     /// (21 §4).
     logs: Vec<Option<Sink>>,
     /// What the rate-limiting service's pods are reached with, if with TLS (06 §4): made as
@@ -812,6 +844,15 @@ impl Snapshot {
     fn listener(&self, position: usize) -> Option<&CompiledListener> {
         let at = self.listeners.get(position).copied().flatten()?;
         self.config.listeners().get(at)
+    }
+
+    /// The listener at `position` as its records are to say it: the config's, or for one
+    /// taken away and draining, the last config's that had it.
+    fn logged_listener(&self, position: usize) -> Option<&CompiledListener> {
+        self.listener(position).or_else(|| {
+            let (config, at) = self.slots.left.get(position)?.as_ref()?;
+            config.listeners().get(*at)
+        })
     }
 }
 
@@ -1265,6 +1306,20 @@ pub enum ProxyError {
         /// Why not.
         error: String,
     },
+    /// A listener said to have had its sockets opened that already has them.
+    #[error("listener `{0}` has its sockets already")]
+    ListenerOpen(String),
+    /// A listener whose sockets were opened with every slot taken ([`MOST_LISTENERS`]).
+    ///
+    /// [`MOST_LISTENERS`]: edgerush_config::MOST_LISTENERS
+    #[error("listener `{0}`: every listener's slot is taken")]
+    NoSlot(String),
+    /// A listener said to be taken away that has no sockets being served.
+    #[error("listener `{0}` has no sockets to close")]
+    ListenerNotOpen(String),
+    /// A slot said to be freed that is not draining.
+    #[error("listener slot {0} is not draining")]
+    NotDraining(usize),
 }
 
 impl From<CannotOpen> for ProxyError {

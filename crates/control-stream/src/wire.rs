@@ -139,7 +139,9 @@ pub struct Held {
     pub certificates: BTreeMap<String, String>,
 }
 
-/// What a data plane runs, and the config it refused, if it refused the latest.
+/// What a data plane runs, the config it refused, if it refused the latest, and what of the
+/// listeners of the one it runs it does not serve. A control plane that does not know the
+/// last two skips them, as protobuf skips a field it has no tag for.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Report {
     /// The config it runs and the certificates that config uses.
@@ -148,6 +150,23 @@ pub struct Report {
     /// The config refused.
     #[prost(message, optional, tag = "2")]
     pub refused: Option<Refusal>,
+    /// Listeners of the config it runs that have no sockets served.
+    #[prost(message, repeated, tag = "3")]
+    pub unserved: Vec<Unserved>,
+    /// Listeners taken away that still drain, by name.
+    #[prost(string, repeated, tag = "4")]
+    pub draining: Vec<String>,
+}
+
+/// A listener a data plane does not serve, and why.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Unserved {
+    /// Its name in the config.
+    #[prost(string, tag = "1")]
+    pub listener: String,
+    /// Why.
+    #[prost(string, tag = "2")]
+    pub why: String,
 }
 
 /// A config a data plane refused, and why.
