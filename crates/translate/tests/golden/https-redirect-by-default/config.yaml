@@ -1,12 +1,6 @@
 listeners:
-  http:
-    address: "[::]:8080"
-    protocol: http
-    proxy_protocol: off
-    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
-    request_id: generate
-  https:
-    address: "[::]:8443"
+  port-443:
+    address: "0.0.0.0:443"
     protocol: https
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
@@ -17,15 +11,21 @@ listeners:
         - { certificate: shop/secure, names: [secure.example.com] }
       without_sni: none
       refused: [plain.example.com]
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
 routes:
   - name: ingress/shop/web/plain.example.com
-    listeners: [http]
+    listeners: [port-80]
     hostnames: [{ name: "plain.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
   - name: ingress/shop/web/shop.example.com
-    listeners: [https]
+    listeners: [port-443]
     hostnames: [{ name: "shop.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
@@ -33,30 +33,30 @@ routes:
       - matches: [{ path: { exact: /api } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
   - name: ingress/shop/web/shop.example.com/https-redirect
-    listeners: [http]
+    listeners: [port-80]
     hostnames: [{ name: "shop.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
-        redirect: { status: 308, scheme: https, port: 8443, query: keep }
+        redirect: { status: 308, scheme: https, query: keep }
         filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
       - matches: [{ path: { exact: /api } }]
-        redirect: { status: 308, scheme: https, port: 8443, query: keep }
+        redirect: { status: 308, scheme: https, query: keep }
         filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
   - name: ingress/shop/extra/shop.example.com
-    listeners: [https]
+    listeners: [port-443]
     hostnames: [{ name: "shop.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: /extra } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
   - name: ingress/shop/extra/shop.example.com/https-redirect
-    listeners: [http]
+    listeners: [port-80]
     hostnames: [{ name: "shop.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: /extra } }]
-        redirect: { status: 308, scheme: https, port: 8443, query: keep }
+        redirect: { status: 308, scheme: https, query: keep }
         filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
   - name: ingress/shop/kept/secure.example.com
-    listeners: [http, https]
+    listeners: [port-80, port-443]
     hostnames: [{ name: "secure.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]

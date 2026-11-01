@@ -211,13 +211,6 @@ data:
     ingress_https_redirect_max_age: 30
     # Whose slices say the data plane's zone: the Service of its own pods, ready or not.
     data_plane: { own_service: edgerush-peers.edge.svc.cluster.local }
-    listeners:
-      http:
-        address: "0.0.0.0:8080"
-        protocol: http
-        proxy_protocol: off
-        forwarding: { trusted_proxies: [], trusted_only_headers: [] }
-        request_id: generate
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -365,6 +358,9 @@ spec:
     metadata: { labels: { app: edgerush } }
     spec:
       serviceAccountName: edgerush
+      # Run as nobody, it binds the ports its listeners state, 80 among them (05 §2).
+      securityContext:
+        sysctls: [{ name: net.ipv4.ip_unprivileged_port_start, value: "0" }]
       containers:
         - name: edgerush
           image: edgerush:kind
@@ -385,7 +381,8 @@ spec:
           env:
             - name: POD_IPS
               valueFrom: { fieldRef: { fieldPath: status.podIPs } }
-          ports: [{ name: http, containerPort: 8080 }]
+          # The Ingress HTTP port, which the Gateway's `http` listener shares.
+          ports: [{ name: http, containerPort: 80 }]
           volumeMounts: [{ name: stream, mountPath: /etc/edgerush/stream }]
       volumes:
         - name: stream

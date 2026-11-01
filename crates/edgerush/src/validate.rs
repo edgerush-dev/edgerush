@@ -36,11 +36,13 @@ Options:
                                plane's IngressClass must be among them, naming
                                `edgerush.dev/ingress-controller`
       --data-plane <FILE>      The data plane's settings, in YAML: `ingress_class`,
-                               `listeners`, `cluster_domain`,
+                               `cluster_domain`,
                                `ingress_hosts_fall_through`,
                                `ingress_https_redirect`,
                                `ingress_https_redirect_max_age` and,
-                               optionally, `backend_authorities` and
+                               optionally, `gateway`, `ingress_http_port`,
+                               `ingress_https_port`, `ports`, `ip_family`,
+                               `backend_authorities` and
                                `data_plane`, the data plane's own settings,
                                written into the config as they are
       --check-secrets          Check the Secrets the Ingresses' `tls` names: each must

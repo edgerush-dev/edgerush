@@ -1,14 +1,8 @@
-# A data plane with an `https` listener alone.
+# A data plane, the Gateway shop/web, which has an HTTPS listener alone.
 ingress_class: edge
+gateway: shop/web
+ingress_http_port: 443
 cluster_domain: cluster.local
 ingress_hosts_fall_through: false
 ingress_https_redirect: true
 ingress_https_redirect_max_age: 30
-listeners:
-  https:
-    address: "[::]:8443"
-    protocol: https
-    proxy_protocol: off
-    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
-    request_id: generate
-    tls: { certificates: [], without_sni: none }

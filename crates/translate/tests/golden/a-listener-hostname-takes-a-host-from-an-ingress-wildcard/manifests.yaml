@@ -13,7 +13,7 @@ metadata: { name: web, namespace: edge }
 spec:
   gatewayClassName: edgerush
   listeners:
-    - { name: api, port: 8080, protocol: HTTP, hostname: api.example.com }
+    - { name: api, port: 80, protocol: HTTP, hostname: api.example.com }
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress

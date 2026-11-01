@@ -1,2 +1,2 @@
-Ingress shop/plain: the data plane has no `http` listener to serve it on
+Ingress shop/plain: port 443, where Ingress is served over plain HTTP, is bound for HTTPS
 Ingress shop/web2: gone.example.com is not served: Secret shop/gone does not exist

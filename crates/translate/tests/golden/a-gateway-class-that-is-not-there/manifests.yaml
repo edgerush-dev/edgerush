@@ -1,5 +1,5 @@
 # The data plane's Gateway names a class that is not there: it is not translated, and
-# that is said.
+# that is said, and the data plane binds no port.
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata: { name: web, namespace: edge }

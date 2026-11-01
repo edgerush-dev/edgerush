@@ -14,12 +14,13 @@
 # an Ingress of class `edge`, for host shop.example; the control plane in `edge` follows
 # `shop`, and the data plane in `edge` dials it at edgerush-control.edge.svc:9443 and is
 # reached by `kubectl port-forward`. Then:
-#   - the Ingress is served, and its status says the data plane's Service's address;
 #   - the data plane named as a Gateway, the control plane says the Gateway API's CRDs are
-#     not installed and serves Ingress as ever; installed, each kind is followed, its CRD
-#     read by name alone as RBAC allows, and an HTTPRoute attached to the Gateway, of this
-#     controller's class, its listener on the port the data plane binds, is served beside
-#     the Ingress, from one data plane, and the GatewayClass, the Gateway and the
+#     not installed, and the Ingress is served on its own port, 80; installed, each kind is
+#     followed, its CRD read by name alone as RBAC allows, and every request to the Ingress
+#     answered as they come and the Gateway is made, its `http` listener sharing the port;
+#     an HTTPRoute attached to the Gateway, of this controller's class, is served beside
+#     the Ingress, from one data plane, and on the Gateway's other port alone, where the
+#     Ingress is not; the GatewayClass, the Gateway and the
 #     HTTPRoute say they are accepted, of their generation, the Gateway the data plane's
 #     address and its route, and programmed once the data plane runs it, as the replicas
 #     report; an HTTPRoute in `blog` led to `shop`'s Service
@@ -29,6 +30,7 @@
 #     shadowed;
 #     an HTTPRoute's redirect that states only a host sends the client to the listener's
 #     port;
+#   - the Ingress's status says the data plane's Service's address;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
 #   - asked to reach its Service by the Service's own address, it is served through the
@@ -126,12 +128,13 @@ k -n edge rollout status deploy/edgerush-control --timeout=120s >/dev/null
 k -n edge rollout status deploy/edgerush --timeout=120s >/dev/null
 
 # The data plane on localhost:$port, through a port-forward started afresh after a restart,
-# on a port of its own each time, so that none waits for the last to let its port go.
+# on a port of its own each time, so that none waits for the last to let its port go; to
+# the pod's port $1, or 80, the Ingress HTTP port, which the Gateway's `http` listener shares.
 port=18080
 forward() {
     [ -n "$forward_pid" ] && kill "$forward_pid" 2>/dev/null || true
     port=$((port + 1))
-    k -n edge port-forward deploy/edgerush "$port:8080" >/dev/null 2>&1 &
+    k -n edge port-forward deploy/edgerush "$port:${1:-80}" >/dev/null 2>&1 &
     forward_pid=$!
     for _ in $(seq 1 50); do
         curl -s -o /dev/null "http://127.0.0.1:$port/" && return 0
@@ -169,12 +172,9 @@ said() {
 
 said deploy/edgerush "config from the control plane runs" 60 ||
     fail "the data plane never ran a config: $(k -n edge logs deploy/edgerush | tail -5)"
-forward
-answers shop.example 200 30 || fail "the Ingress is not served: $(status shop.example)"
 # Whichever replica the data plane dialled.
 said --selector=app=edgerush-control "runs config" 10 ||
     fail "the control plane never heard the data plane run its config"
-pass "the Ingress is served, by $(curl -s -H 'host: shop.example' "http://127.0.0.1:$port/hostname")"
 
 # Waits up to $2 seconds for every control-plane replica's logs, whole, to have a line
 # with $1 in it.
@@ -200,11 +200,27 @@ refused_any() {
 }
 control_said "httproutes.gateway.networking.k8s.io: not installed" 30 ||
     fail "the control plane never said the Gateway API's CRDs are not installed"
-pass "without the Gateway API's CRDs, the control plane says so, and serves the Ingress"
+said deploy/edgerush 'listener "port-80" is on 0.0.0.0:80' 60 ||
+    fail "without the CRDs, the data plane never bound the Ingress HTTP port: $(k -n edge logs deploy/edgerush | tail -5)"
+forward
+answers shop.example 200 30 || fail "without the CRDs, the Ingress is not served: $(status shop.example)"
+pass "without the Gateway API's CRDs, the control plane says so, and the Ingress is served on its own port, 80"
+# Requests without pause to the Ingress from before the CRDs are installed until its
+# Gateway, made after them, is served: Ingress's port, which asks nothing of the Gateway,
+# is never let go, and every request is answered (04 §2).
+installing=$(mktemp -d)
+(
+    while [ ! -e "$installing/stop" ]; do
+        echo "$(status shop.example)"
+    done
+) >"$installing/answers" &
+loading=$!
+sleep 2
 # The CRDs are too large for kubectl's client-side record of what it applied.
 k create -f crates/gateway-api/crds/ >/dev/null
 control_said "httproutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)" 60 ||
     fail "the control plane never said the Gateway API's CRDs are served"
+sleep 3
 k apply -f - >/dev/null <<EOF
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
@@ -216,7 +232,9 @@ kind: Gateway
 metadata: { name: web, namespace: edge }
 spec:
   gatewayClassName: edgerush
-  listeners: [{ name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }]
+  listeners:
+    - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+    - { name: alt, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -226,8 +244,28 @@ spec:
   hostnames: [route.example]
   rules: [{ backendRefs: [{ name: web, port: 80 }] }]
 EOF
+said deploy/edgerush 'listener "port-8080" is on 0.0.0.0:8080' 60 ||
+    fail "the data plane never bound its Gateway's other listener: $(k -n edge logs deploy/edgerush | tail -5)"
 answers route.example 200 30 || fail "the HTTPRoute is not served: $(status route.example)"
+sleep 2
+touch "$installing/stop"
+wait "$loading"
+total=$(grep -c . "$installing/answers")
+# A count of none is grep's failure.
+other=$(grep -vc '^200$' "$installing/answers" || true)
+[ "$other" = 0 ] && [ "$total" -gt 20 ] ||
+    fail "$other of $total requests to the Ingress as the Gateway API came were not answered 200: $(grep -v '^200$' "$installing/answers" | sort | uniq -c | head -5)"
+rm -r "$installing"
+k -n edge logs deploy/edgerush | grep 'listener "port-80" has drained' >/dev/null &&
+    fail "the Ingress HTTP port was let go as the Gateway took it"
+pass "the CRDs installed and the Gateway made, all $total requests to the Ingress were answered 200, its port shared with the Gateway's, by $(curl -s -H 'host: shop.example' "http://127.0.0.1:$port/hostname")"
 answers shop.example 200 5 || fail "beside the HTTPRoute, the Ingress is not served: $(status shop.example)"
+# On the Gateway's other port, the HTTPRoute alone: Ingress is served on its own.
+forward 8080
+answers route.example 200 30 || fail "on the Gateway's other listener, the HTTPRoute answers $(status route.example)"
+answers shop.example 404 5 || fail "on the Gateway's other listener, the Ingress answers $(status shop.example)"
+forward
+pass "on a port of the Gateway's other than Ingress's, the HTTPRoute is served and the Ingress is not"
 refused_any && fail "a control-plane replica was refused something of the Gateway API"
 answers shop.example 200 10 || fail "with the Gateway API followed, $(status shop.example)"
 pass "installed, the Gateway API's kinds are followed, their CRDs read by name alone, and an HTTPRoute is served beside the Ingress"
@@ -348,10 +386,13 @@ spec:
   hostnames: [moved.example]
   rules: [{ filters: [{ type: RequestRedirect, requestRedirect: { hostname: example.org } }] }]
 EOF
+# On the Gateway's `alt` listener, whose port is not the scheme's own and so is stated.
+forward 8080
 answers moved.example 302 30 || fail "the redirecting HTTPRoute answers $(status moved.example)"
 location=$(curl -s -o /dev/null -w '%{redirect_url}' -H 'host: moved.example' "http://127.0.0.1:$port/hostname")
 [ "$location" = "http://example.org:8080/hostname" ] ||
     fail "the redirect sends the client to $location, not the listener's port"
+forward
 k -n shop delete httproute moved >/dev/null
 pass "an HTTPRoute's redirect of a host alone sends the client there on the listener's port"
 

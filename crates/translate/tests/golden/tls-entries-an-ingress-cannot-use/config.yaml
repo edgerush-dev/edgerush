@@ -1,12 +1,6 @@
 listeners:
-  http:
-    address: "[::]:8080"
-    protocol: http
-    proxy_protocol: off
-    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
-    request_id: generate
-  https:
-    address: "[::]:8443"
+  port-443:
+    address: "0.0.0.0:443"
     protocol: https
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
@@ -16,15 +10,21 @@ listeners:
         - { certificate: shop/shop-tls, names: [shop.example.com] }
       without_sni: none
       refused: [nosecret.example.com]
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
 routes:
   - name: ingress/shop/web/nosecret.example.com
-    listeners: [http]
+    listeners: [port-80]
     hostnames: [{ name: "nosecret.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
   - name: ingress/shop/web/shop.example.com
-    listeners: [http, https]
+    listeners: [port-80, port-443]
     hostnames: [{ name: "shop.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]

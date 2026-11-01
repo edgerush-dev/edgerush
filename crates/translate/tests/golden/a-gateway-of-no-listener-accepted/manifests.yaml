@@ -1,4 +1,5 @@
-# None of the Gateway's listeners can be served: it serves nothing, and that is said.
+# None of the Gateway's listeners can be served, its one of a protocol not taken yet: it
+# serves nothing, and that is said, and the data plane binds no port for it.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
@@ -11,4 +12,4 @@ metadata: { name: web, namespace: edge }
 spec:
   gatewayClassName: edgerush
   listeners:
-    - { name: http, port: 80, protocol: HTTP }
+    - { name: tcp, port: 80, protocol: TCP }

@@ -1,19 +1,19 @@
 listeners:
-  http:
-    address: "[::]:8080"
+  port-80:
+    address: "0.0.0.0:80"
     protocol: http
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
 routes:
   - name: ingress/shop/older/shop.example.com
-    listeners: [http]
+    listeners: [port-80]
     hostnames: [{ name: shop.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: /api } }]
         forward: { backends: [{ upstream: shop/api/http, weight: 1 }] }
   - name: ingress/shop/newer/shop.example.com
-    listeners: [http]
+    listeners: [port-80]
     hostnames: [{ name: shop.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: /api } }]

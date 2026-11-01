@@ -1,0 +1,7 @@
+# The shared data plane, its Ingress HTTPS port the one it binds for plain HTTP.
+ingress_class: edge
+cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+ingress_https_redirect: true
+ingress_https_redirect_max_age: 30
+ingress_https_port: 80

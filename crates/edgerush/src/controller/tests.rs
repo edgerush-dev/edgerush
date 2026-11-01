@@ -93,9 +93,8 @@ fn file(name: &str, contents: &str) -> PathBuf {
     path
 }
 
-/// A data plane of class `edge`, with an `http` listener at `http` and an `https` one at
-/// `https`.
-fn plane_at(http: &str, https: &str) -> String {
+/// A data plane of class `edge`, of no Gateway, with these more settings.
+fn plane_with(more: &str) -> String {
     format!(
         r#"
 ingress_class: edge
@@ -103,28 +102,18 @@ cluster_domain: cluster.local
 ingress_hosts_fall_through: false
 ingress_https_redirect: false
 ingress_https_redirect_max_age: 30
-listeners:
-  http:
-    address: "{http}"
-    protocol: http
-    proxy_protocol: off
-    forwarding: {{ trusted_proxies: [], trusted_only_headers: [Forwarded] }}
-    request_id: generate
-  https:
-    address: "{https}"
-    protocol: https
-    proxy_protocol: off
-    forwarding: {{ trusted_proxies: [], trusted_only_headers: [Forwarded] }}
-    request_id: generate
-    tls: {{ certificates: [], without_sni: none }}
-"#
+{more}"#
     )
+}
+
+fn plane() -> String {
+    plane_with("")
 }
 
 /// Outside a cluster, there is no API server to follow the cluster through, and it says so.
 #[test]
 fn outside_a_cluster_it_does_not_start() {
-    let plane = file("outside-plane.yaml", &plane_at("[::]:8080", "[::]:8443"));
+    let plane = file("outside-plane.yaml", &plane());
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     let status = command(
         ["--data-plane", plane.to_str().unwrap()]
@@ -267,7 +256,7 @@ async fn each_translation_is_said_and_written_as_a_harness_file() {
     let lines = run_until(
         &fake,
         "controller-writes",
-        &plane_at("[::]:8080", "[::]:8443"),
+        &plane(),
         Some(written.clone()),
         Listeners {
             stream: None,
@@ -313,13 +302,16 @@ async fn a_config_the_data_plane_would_refuse_is_said_and_not_written() {
     let lines = run_until(
         &fake,
         "controller-refuses",
-        &plane_at("[::]:8080", "[::]:8080"),
+        &plane_with(
+            "ports:
+  80: { forwarding: { trusted_proxies: [\"10.1.2.3/8\"], trusted_only_headers: [] } }",
+        ),
         Some(written.clone()),
         Listeners {
             stream: None,
             webhook: None,
         },
-        |lines| lines.iter().any(|line| line.contains("already taken")),
+        |lines| lines.iter().any(|line| line.contains("listener `port-80`")),
     )
     .await;
     assert!(
@@ -493,7 +485,7 @@ fn the_webhook_is_given_whole_or_not_at_all() {
 
 #[test]
 fn a_webhook_certificate_that_cannot_be_used_stops_it_before_it_looks_for_a_cluster() {
-    let plane = file("webhook-plane.yaml", &plane_at("[::]:8080", "[::]:8443"));
+    let plane = file("webhook-plane.yaml", &plane());
     let missing = std::env::temp_dir()
         .join("edgerush-controller-tests")
         .join("missing-webhook.crt");
@@ -551,7 +543,7 @@ fn classes(listed: bool) -> Listed<IngressClass> {
 
 #[test]
 fn a_review_is_answered_once_the_classes_are_listed_and_what_is_none_is_a_bad_request() {
-    let plane: Plane = serde_saphyr::from_str(&plane_at("[::]:8080", "[::]:8443")).unwrap();
+    let plane: Plane = serde_saphyr::from_str(&plane()).unwrap();
     let answered = |listed: bool, body: &[u8]| {
         let answer = review(&plane, &classes(listed), body);
         (answer.status, String::from_utf8(answer.body).unwrap())
@@ -748,7 +740,7 @@ async fn the_webhook_answers_reviews_and_its_certificate_replaced_serves_the_nex
     let lines = run_until(
         &fake,
         "controller-webhook",
-        &plane_at("[::]:8080", "[::]:8443"),
+        &plane(),
         None,
         Listeners {
             stream: None,
@@ -788,7 +780,7 @@ async fn the_webhook_answers_reviews_and_its_certificate_replaced_serves_the_nex
 
 #[test]
 fn certificates_that_cannot_be_read_stop_it_before_it_looks_for_a_cluster() {
-    let plane = file("stream-plane.yaml", &plane_at("[::]:8080", "[::]:8443"));
+    let plane = file("stream-plane.yaml", &plane());
     let missing = std::env::temp_dir()
         .join("edgerush-controller-tests")
         .join("missing.crt");
@@ -974,7 +966,7 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
     let lines = run_until(
         &fake,
         "controller-serves",
-        &plane_at("[::]:8080", "[::]:8443"),
+        &plane(),
         None,
         Listeners {
             stream: Some(serving),

@@ -1,19 +1,19 @@
 listeners:
-  http:
-    address: "[::]:8080"
+  port-80:
+    address: "0.0.0.0:80"
     protocol: http
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
-  low:
-    address: "[::]:80"
+  port-8080:
+    address: "0.0.0.0:8080"
     protocol: http
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
 routes:
   - name: httproute/shop/filters/http
-    listeners: [http]
+    listeners: [port-8080]
     hostnames: [{ name: shop.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: /headers } }]
@@ -38,13 +38,13 @@ routes:
       - matches: [{ path: { prefix: /unknown } }]
         forward: { backends: [{ invalid: "a filter of type `Gzip` is not one translation reads", weight: 1 }] }
   - name: httproute/shop/low/low
-    listeners: [low]
+    listeners: [port-80]
     hostnames: [{ name: low.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
         redirect: { status: 302, host: example.org, query: keep }
   - name: gateway/edge/web/low
-    listeners: [low]
+    listeners: [port-80]
     hostnames: [{ name: low.example.com, falls_through: false }]
     rules: []
 upstreams:

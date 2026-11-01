@@ -1,0 +1,1 @@
+listener https: served on port-443, presenting shop/shop-tls, taking HTTPRoute from namespace shop
