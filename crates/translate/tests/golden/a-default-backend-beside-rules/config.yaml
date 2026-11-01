@@ -1,13 +1,13 @@
 listeners:
-  http:
-    address: "[::]:8080"
+  port-80:
+    address: "0.0.0.0:80"
     protocol: http
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
 routes:
   - name: ingress/shop/gone/d.example.com
-    listeners: [http]
+    listeners: [port-80]
     hostnames: [{ name: d.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: /api } }]
@@ -15,7 +15,7 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ invalid: "Service shop/gone does not exist", weight: 1 }] }
   - name: ingress/shop/web/a.example.com
-    listeners: [http]
+    listeners: [port-80]
     hostnames: [{ name: a.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: /api } }]
@@ -23,13 +23,13 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: shop/fallback/http, weight: 1 }] }
   - name: ingress/shop/web/b.example.com
-    listeners: [http]
+    listeners: [port-80]
     hostnames: [{ name: b.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
   - name: ingress/shop/web/c.example.com
-    listeners: [http]
+    listeners: [port-80]
     hostnames: [{ name: c.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]

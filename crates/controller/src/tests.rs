@@ -10,9 +10,8 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// A data plane of class `edge` with an `http` and an `https` listener, at `http` and
-/// `https`.
-fn plane_at(http: &str, https: &str) -> Plane {
+/// A data plane of class `edge`, of no Gateway, with these more settings.
+fn plane_with(more: &str) -> Plane {
     serde_saphyr::from_str(&format!(
         r#"
 ingress_class: edge
@@ -20,27 +19,13 @@ cluster_domain: cluster.local
 ingress_hosts_fall_through: false
 ingress_https_redirect: false
 ingress_https_redirect_max_age: 30
-listeners:
-  http:
-    address: "{http}"
-    protocol: http
-    proxy_protocol: off
-    forwarding: {{ trusted_proxies: [], trusted_only_headers: [Forwarded] }}
-    request_id: generate
-  https:
-    address: "{https}"
-    protocol: https
-    proxy_protocol: off
-    forwarding: {{ trusted_proxies: [], trusted_only_headers: [Forwarded] }}
-    request_id: generate
-    tls: {{ certificates: [], without_sni: none }}
-"#
+{more}"#
     ))
     .unwrap()
 }
 
 fn plane() -> Plane {
-    plane_at("[::]:8080", "[::]:8443")
+    plane_with("")
 }
 
 /// IngressClass `edge`, which names this controller.
@@ -675,25 +660,31 @@ fn a_translation_no_different_from_the_last_is_not_said_again() {
 }
 
 /// Each object is compiled alone as it is translated, so only the data plane's own settings
-/// make a whole config it would refuse: two listeners at one address.
+/// make a whole config it would refuse: those of the port an Ingress is served on, trusting
+/// a network written wrongly.
 #[test]
 fn a_config_the_data_plane_would_refuse_is_said_once_and_not_handed_on() {
-    let plane = plane_at("[::]:8080", "[::]:8080");
+    let plane = plane_with(
+        "ports:
+  80: { forwarding: { trusted_proxies: [\"10.1.2.3/8\"], trusted_only_headers: [] } }",
+    );
+    let cluster = || Cluster {
+        ingress_classes: vec![class()],
+        ingresses: vec![ingress("shop", "shop.example", "shop.example")],
+        services: vec![service("shop")],
+        ..Cluster::default()
+    };
     let mut translator = Translator::default();
-    let Step::Refused { problems, .. } = translator.step(&plane, Vec::new(), Cluster::default)
-    else {
-        panic!("a config of two listeners at one address handed on");
+    let Step::Refused { problems, .. } = translator.step(&plane, Vec::new(), cluster) else {
+        panic!("a config of a port's settings the data plane refuses handed on");
     };
     assert!(
         problems
             .iter()
-            .any(|problem| problem.to_string().contains("already taken")),
+            .any(|problem| problem.to_string().starts_with("listener `port-80`")),
         "{problems:?}"
     );
-    assert_eq!(
-        translator.step(&plane, Vec::new(), Cluster::default),
-        Step::Nothing
-    );
+    assert_eq!(translator.step(&plane, Vec::new(), cluster), Step::Nothing);
 }
 
 /// Every kind is followed in the cluster, nothing translated while one is not listed; once

@@ -129,7 +129,8 @@ pub fn judge(plane: &Plane, classes: &[IngressClass], ingress: &Ingress) -> Opti
     };
     // Alone, whatever is said of an Ingress is said of this one. What is said of an
     // IngressClass is that none is the data plane's, and what is said of the config as a
-    // whole is of the data plane's own settings: neither is this Ingress's fault.
+    // whole is of the data plane's own settings: neither is this Ingress's fault. Nor is the
+    // Gateway there: Ingress is served on its own ports all the same.
     let problems: Vec<String> = translate(plane, &cluster)
         .report
         .iter()
@@ -155,6 +156,7 @@ pub fn answer(uid: &str, refused: Option<&str>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgerush_translate::GatewayName;
     use proptest::prelude::*;
     use serde_json::Value;
 
@@ -272,7 +274,7 @@ mod tests {
         }
     }
 
-    /// The data plane: class `edge`, plain HTTP and HTTPS.
+    /// The data plane: class `edge`, of no Gateway, so plain HTTP and HTTPS.
     fn plane() -> Plane {
         serde_saphyr::from_str(
             r#"
@@ -281,20 +283,6 @@ cluster_domain: cluster.local
 ingress_hosts_fall_through: false
 ingress_https_redirect: true
 ingress_https_redirect_max_age: 30
-listeners:
-  http:
-    address: "[::]:8080"
-    protocol: http
-    proxy_protocol: off
-    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded] }
-    request_id: generate
-  https:
-    address: "[::]:8443"
-    protocol: https
-    proxy_protocol: off
-    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded] }
-    request_id: generate
-    tls: { certificates: [], without_sni: none }
 "#,
         )
         .unwrap()
@@ -332,6 +320,27 @@ listeners:
             ingress["spec"]["rules"][0]["http"]["paths"] = json!([path.clone(), path]);
         });
         assert_eq!(judge(&plane(), &ours(), &twice), None);
+    }
+
+    #[test]
+    fn an_ingress_is_judged_whatever_its_data_planes_gateway_says() {
+        // Alone, the Gateway the data plane is is not there either.
+        let of_a_gateway = Plane {
+            gateway: Some(GatewayName {
+                namespace: "edge".to_owned(),
+                name: "web".to_owned(),
+            }),
+            ..plane()
+        };
+        assert_eq!(judge(&of_a_gateway, &ours(), &ingress(|_| {})), None);
+        let climbing = ingress(|ingress| {
+            ingress["spec"]["rules"][0]["http"]["paths"][0]["path"] = json!("/a/../admin");
+        });
+        assert!(judge(&plane(), &ours(), &climbing).is_some());
+        assert_eq!(
+            judge(&of_a_gateway, &ours(), &climbing),
+            judge(&plane(), &ours(), &climbing)
+        );
     }
 
     #[test]

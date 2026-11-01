@@ -1,5 +1,6 @@
 # The data plane names the Gateway edge/web, but only others are there, one of its name in
-# another namespace: nothing of the Gateway API is translated, and that is said.
+# another namespace: nothing of the Gateway API is translated, and that is said. Its
+# Ingress is served all the same, on Ingress's own ports, which ask nothing of the Gateway.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
@@ -21,3 +22,21 @@ spec:
   gatewayClassName: edgerush
   listeners:
     - { name: http, port: 8080, protocol: HTTP }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [shop.example.com], secretName: shop-tls }]
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

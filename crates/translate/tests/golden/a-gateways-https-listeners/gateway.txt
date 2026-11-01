@@ -1,10 +1,11 @@
-listener catch-all: served on https, presenting shop/shop-tls, taking HTTPRoute from every namespace
-listener exact: served on https, presenting edge/own, shop/secure, taking HTTPRoute from every namespace
-listener wild: served on https, presenting shop/wild, taking HTTPRoute from every namespace
-listener kinds: served on https, presenting edge/own, taking HTTPRoute from every namespace
-listener later: served on https, presenting shop/secure, taking HTTPRoute from every namespace
-listener migrated: served on https, presenting edge/own, taking HTTPRoute from every namespace
+listener catch-all: served on port-443, presenting shop/shop-tls, taking HTTPRoute from every namespace
+listener exact: served on port-443, presenting edge/own, shop/secure, taking HTTPRoute from every namespace
+listener wild: served on port-443, presenting shop/wild, taking HTTPRoute from every namespace
+listener kinds: served on port-443, presenting edge/own, taking HTTPRoute from every namespace
+listener later: served on port-443, presenting shop/secure, taking HTTPRoute from every namespace
+listener migrated: served on port-443, presenting edge/own, taking HTTPRoute from every namespace
 listener wild-unusable: accepted, serving nothing: no certificateRef of it can be used
 listener unusable: accepted, serving nothing: no certificateRef of it can be used
 listener denied: accepted, serving nothing: no certificateRef of it can be used
-listener elsewhere: served on more, presenting edge/own, taking HTTPRoute from every namespace
+listener elsewhere: served on port-9443, presenting edge/own, taking HTTPRoute from every namespace
+listener plain: served on port-80, taking HTTPRoute from every namespace

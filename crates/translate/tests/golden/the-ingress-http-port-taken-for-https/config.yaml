@@ -1,0 +1,13 @@
+listeners:
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: shop/shop-tls, names: ["*"] }
+      without_sni: shop/shop-tls
+routes: []
+upstreams: {}

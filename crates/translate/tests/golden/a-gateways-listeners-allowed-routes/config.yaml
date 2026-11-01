@@ -1,33 +1,33 @@
 listeners:
-  http:
-    address: "[::]:8080"
+  port-8080:
+    address: "0.0.0.0:8080"
     protocol: http
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
 routes:
   - name: gateway/edge/web/kinds-mixed
-    listeners: [http]
+    listeners: [port-8080]
     hostnames: [{ name: "mixed.example.com", falls_through: false }]
     rules: []
   - name: gateway/edge/web/kinds-none-carried
-    listeners: [http]
+    listeners: [port-8080]
     hostnames: [{ name: "tls.example.com", falls_through: false }]
     rules: []
   - name: gateway/edge/web/every-namespace
-    listeners: [http]
+    listeners: [port-8080]
     hostnames: [{ name: "all.example.com", falls_through: false }]
     rules: []
   - name: gateway/edge/web/selected
-    listeners: [http]
+    listeners: [port-8080]
     hostnames: [{ name: "selected.example.com", falls_through: false }]
     rules: []
   - name: gateway/edge/web/unreadable-operator
-    listeners: [http]
+    listeners: [port-8080]
     hostnames: [{ name: "odd.example.com", falls_through: false }]
     rules: []
   - name: gateway/edge/web/unreadable-from
-    listeners: [http]
+    listeners: [port-8080]
     hostnames: [{ name: "none.example.com", falls_through: false }]
     rules: []
 upstreams: {}

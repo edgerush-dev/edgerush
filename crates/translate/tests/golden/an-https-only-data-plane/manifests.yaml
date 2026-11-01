@@ -1,7 +1,25 @@
-# With no `http` listener, hosts whose Secret can be used are served over HTTPS alone; one
-# whose Secret is not there is served nowhere, and only that is said of it, not its
-# missing backend, nor the upstream it would have had; an Ingress with a host it does not
-# secure is left out.
+# The Ingress HTTP port is 443, which the Gateway's one listener has for HTTPS: with no
+# `http` listener, hosts whose Secret can be used are served over HTTPS alone; one whose
+# Secret is not there is served nowhere, and only that is said of it, not its missing
+# backend, nor the upstream it would have had; an Ingress with a host it does not secure
+# is left out, said.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      tls: { certificateRefs: [{ name: shop-tls }] }
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: web, namespace: shop }

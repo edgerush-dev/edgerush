@@ -1011,14 +1011,15 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
         std::fs::remove_dir_all(&root)?;
     }
     std::fs::create_dir_all(manifests.join("shop"))?;
-    let plane = |listeners: &str| {
+    // A data plane of these more settings; of no Gateway, it binds `http` on 80, and `https`
+    // on 443 for the Ingresses' TLS hosts.
+    let plane = |more: &str| {
         format!(
-            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\ningress_https_redirect_max_age: 30\nlisteners:\n{listeners}"
+            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\ningress_https_redirect_max_age: 30\n{more}"
         )
     };
-    let http = "  http: { address: \"[::]:8080\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n";
     let data_plane = root.join("data-plane.yaml");
-    std::fs::write(&data_plane, plane(http))?;
+    std::fs::write(&data_plane, plane(""))?;
     // Read from a directory below, from a `List`, beside a kind that is not translated, and
     // without the file that is not YAML.
     std::fs::write(
@@ -1069,16 +1070,13 @@ fn validate_translates_a_directory_of_manifests_and_exits_0_1_or_2() -> io::Resu
         manifests.join("tls.yml"),
         "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: { name: secure, namespace: shop }\nspec:\n  ingressClassName: edge\n  tls: [{ hosts: [secure.example.com], secretName: secure }]\n  rules:\n    - host: secure.example.com\n      http:\n        paths:\n          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }\n",
     )?;
-    let secured_plane = root.join("secured-data-plane.yaml");
-    let https = "  https: { address: \"[::]:8443\", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [], without_sni: none } }\n";
-    std::fs::write(&secured_plane, plane(&format!("{http}{https}")))?;
     let secured = |checked: bool| {
         let mut args = vec![
             "validate",
             "--from-manifests",
             manifests.to_str().expect("a path that is text"),
             "--data-plane",
-            secured_plane.to_str().expect("a path that is text"),
+            data_plane.to_str().expect("a path that is text"),
         ];
         if checked {
             args.push("--check-secrets");
@@ -1168,13 +1166,7 @@ spec:
 ",
     )?;
     let gateway_plane = root.join("gateway-data-plane.yaml");
-    std::fs::write(
-        &gateway_plane,
-        plane(http).replace(
-            "ingress_class: edge\n",
-            "ingress_class: edge\ngateway: edge/web\n",
-        ),
-    )?;
+    std::fs::write(&gateway_plane, plane("gateway: edge/web\n"))?;
     let output = edgerush(&[
         "validate",
         "--from-manifests",
@@ -1259,22 +1251,13 @@ spec:
       tls: { certificateRefs: [{ name: web-tls }] }
 ",
     )?;
-    let secure_plane = root.join("secure-data-plane.yaml");
-    let https = "  https: { address: \"[::]:8443\", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [], without_sni: none } }\n";
-    std::fs::write(
-        &secure_plane,
-        plane(&format!("{http}{https}")).replace(
-            "ingress_class: edge\n",
-            "ingress_class: edge\ngateway: edge/web\n",
-        ),
-    )?;
     let secure = |more: &[&str]| {
         let mut args = vec![
             "validate",
             "--from-manifests",
             manifests.to_str().expect("a path that is text"),
             "--data-plane",
-            secure_plane.to_str().expect("a path that is text"),
+            gateway_plane.to_str().expect("a path that is text"),
         ];
         args.extend(more);
         edgerush(&args)
@@ -1297,15 +1280,20 @@ spec:
     );
     std::fs::remove_file(manifests.join("gateway.yml"))?;
 
-    // A config the data plane would refuse: a `tcp` listener with no route of its own.
-    let tcp = "  db: { address: \"[::]:5432\", protocol: tcp, proxy_protocol: off }\n";
-    std::fs::write(&data_plane, plane(&format!("{http}{tcp}")))?;
+    // A config the data plane would refuse: a port's settings trusting a network written
+    // wrongly.
+    std::fs::write(
+        &data_plane,
+        plane(
+            "ports:\n  80: { forwarding: { trusted_proxies: [\"10.1.2.3/8\"], trusted_only_headers: [] } }\n",
+        ),
+    )?;
     let output = validate(&manifests)?;
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.ends_with(
-            "0 left out; 0 paths without their backend; 0 TLS hosts or entries not served as listed; 0 paths shadowed; 1 Ingresses of other classes or none passed over\nthe data plane would refuse the config:\n  listener `db`: a `tcp` listener needs exactly one TCP route; it has 0\n"
+            "0 left out; 0 paths without their backend; 0 TLS hosts or entries not served as listed; 0 paths shadowed; 1 Ingresses of other classes or none passed over\nthe data plane would refuse the config:\n  listener `port-80`: `forwarding`: `10.1.2.3/8` has bits set past its prefix; the range is `10.0.0.0/8`\n"
         ),
         "{stdout}"
     );

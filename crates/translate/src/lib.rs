@@ -12,19 +12,21 @@
 //! that asks for anything more is left out whole, reported as not supported yet, rather
 //! than translated in part. A path whose Service, or port, is not there, or whose port's
 //! `appProtocol` the gateway does not speak, is translated with an invalid backend, answered
-//! 500, and reported too. Hosts its `tls` lists are served on the `https` listeners as well,
-//! with their Secret's certificate, read as the data plane reads one; a host whose Secret
+//! 500, and reported too. An Ingress is served on the Ingress HTTP port, and hosts its `tls`
+//! lists on the Ingress HTTPS port as well, with their Secret's certificate, read as the data plane reads one; a host whose Secret
 //! is not there, cannot be used or does not cover it is refused over HTTPS, and reported.
 //! Over plain HTTP, a host its `tls` lists is redirected there, secured or not, unless the
 //! data plane's settings or the Ingress's `gateway.edgerush.dev/https-redirect` annotation
 //! say not, and is served over plain HTTP only where they do.
 //!
 //! Where the data plane is a Gateway, its class is checked to name this controller and
-//! each of its listeners fitted to the data plane's own, or refused and why ([`gateway`]);
-//! each HTTPRoute that names it is attached to the listeners that take it, and each
-//! listener's hostname claimed for isolation ([`http_route`]), and its rules translated:
-//! matches and backends, a rule with what translation does not take yet answering 500 by
-//! itself, one whose matches cannot be built left out.
+//! each of its listeners accepted, or refused and why ([`gateway`]); the ports those
+//! accepted state are the data plane's listeners ([`listeners`]), with Ingress's own two
+//! where no listener of the Gateway is on them and an Ingress is served there, and nothing
+//! else, whether the Gateway is there or not; each HTTPRoute that names it is attached to the listeners that take it,
+//! and each listener's hostname claimed for isolation ([`http_route`]), and its rules
+//! translated: matches and backends, a rule with what translation does not take yet
+//! answering 500 by itself, one whose matches cannot be built left out.
 //! Every host a claim of one API takes from the other's is said.
 
 use edgerush_certificates::Identity;
@@ -51,6 +53,7 @@ use std::fmt;
 
 pub mod gateway;
 pub mod http_route;
+pub mod listeners;
 pub mod status;
 
 pub use gateway::{
@@ -77,10 +80,24 @@ pub struct Plane {
     /// followed (04 §1).
     #[serde(default)]
     pub gateway: Option<GatewayName>,
-    /// Its listeners, as its config states them. An Ingress is served on every `http` one,
-    /// and the hosts its `tls` lists on every `https` one too, which names no certificate
-    /// of its own: it presents the Ingresses' Secrets'.
-    pub listeners: BTreeMap<String, Listener>,
+    /// What Gateway API has no field for, by port: each applied to the data plane's
+    /// listener bound to that port; a port not here has the control plane's defaults
+    /// ([04 §2](../../../docs/04-control-plane.md)).
+    #[serde(default)]
+    pub ports: BTreeMap<u16, PortSettings>,
+    /// What each port is bound on (04 §2).
+    #[serde(default)]
+    pub ip_family: IpFamily,
+    /// The port an Ingress's hosts are served on over plain HTTP, where no listener of the
+    /// Gateway names them: bound only while one is, and shared with the Gateway's listener
+    /// there if that is `HTTP` (04 §2).
+    #[serde(default = "http_port")]
+    pub ingress_http_port: u16,
+    /// The port an Ingress's TLS hosts are served on, where no listener of the Gateway names
+    /// them: bound only while one is, and shared with the Gateway's listener there if that
+    /// is `HTTPS` (04 §2).
+    #[serde(default = "https_port")]
+    pub ingress_https_port: u16,
     /// The cluster's DNS domain, which a Service's name ends in: `cluster.local` unless the
     /// cluster was set up otherwise.
     pub cluster_domain: String,
@@ -104,6 +121,56 @@ pub struct Plane {
     /// ([07 §1](../../../docs/07-config-and-dsl.md)), written into every config as they are.
     #[serde(default)]
     pub data_plane: DataPlane,
+}
+
+/// 80, where an Ingress's hosts are served over plain HTTP unless the settings say
+/// otherwise.
+fn http_port() -> u16 {
+    80
+}
+
+/// 443, where an Ingress's TLS hosts are served unless the settings say otherwise.
+fn https_port() -> u16 {
+    443
+}
+
+/// What a port's listener is set up with that Gateway API has no field for
+/// ([04 §2](../../../docs/04-control-plane.md)): each left out has the control plane's
+/// default, written as the data plane's config states it ([07 §1](../../../docs/07-config-and-dsl.md)).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortSettings {
+    /// HTTP/3 as well, on the same port over UDP: an `https` port's alone.
+    #[serde(default)]
+    pub http3: Option<edgerush_config::Http3>,
+    /// Whether every connection starts with a PROXY protocol header; `off` by default.
+    #[serde(default)]
+    pub proxy_protocol: Option<edgerush_config::ListenerProxyProtocol>,
+    /// Whom its requests' forwarding headers are believed from; by default no one, the
+    /// headers only a trusted proxy may send being `Forwarded`, `X-Real-IP` and
+    /// `X-Forwarded-*`.
+    #[serde(default)]
+    pub forwarding: Option<edgerush_config::Forwarding>,
+    /// Whether each request is given an ID of its own; `generate` by default.
+    #[serde(default)]
+    pub request_id: Option<edgerush_config::RequestId>,
+    /// Where a record of each of its requests is written; nowhere by default.
+    #[serde(default)]
+    pub access_log: Option<edgerush_config::AccessLog>,
+}
+
+/// What a data plane's ports are bound on ([04 §2](../../../docs/04-control-plane.md)).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpFamily {
+    /// `0.0.0.0`: IPv4, which binds wherever there is a network.
+    #[default]
+    Ipv4,
+    /// `[::]`, which takes IPv4 as well wherever the host has it; the Service says which
+    /// the cluster reaches.
+    Ipv6,
+    /// The same socket, the Service reached over both.
+    Dual,
 }
 
 /// The Gateway a data plane is, by namespace and name: `<namespace>/<name>` as written.
@@ -319,7 +386,7 @@ pub enum Served {
     /// Not at all: refused over HTTPS, and redirected there over plain HTTP, as its Ingress
     /// asked for it secured.
     Redirected,
-    /// Not at all: the data plane has no `http` listener.
+    /// Not at all: there is no `http` listener on the Ingress HTTP port.
     Nowhere,
     /// Over HTTPS too, with another Ingress's Secret, which secures the same host.
     With {
@@ -537,9 +604,10 @@ pub enum Problem {
     /// says them.
     #[error("the data plane would refuse it: {0}")]
     Refused(String),
-    /// The data plane has no listener to serve it on.
-    #[error("the data plane has no `http` listener to serve it on")]
-    NoListener,
+    /// The Ingress HTTP port is a Gateway listener's of another protocol, so its hosts
+    /// cannot be served over plain HTTP.
+    #[error("port {0}, where Ingress is served over plain HTTP, is bound for HTTPS")]
+    HttpPortTaken(u16),
     /// The data plane's IngressClass is not there, so no Ingress is its.
     #[error("not among the objects, so no Ingress of the class is translated")]
     ClassMissing,
@@ -712,12 +780,32 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         };
         key(a).cmp(&key(b))
     });
+    // The data plane's listeners: one for each port its Gateway's accepted listeners state,
+    // none where it names no Gateway or one that cannot be served. And Ingress's own, each
+    // only where no listener of the Gateway is on its port and kept only if a route is
+    // served on it: `http` on the Ingress HTTP port, `https` on the Ingress HTTPS port
+    // (04 §2). So each API binds what its own objects ask for, and nothing else.
+    let mut ports: BTreeMap<u16, Protocol> = gateway
+        .as_ref()
+        .map(|gateway| gateway.ports.clone())
+        .unwrap_or_default();
+    let mut implicit = Vec::new();
+    for (port, protocol) in [
+        (plane.ingress_http_port, Protocol::Http),
+        (plane.ingress_https_port, Protocol::Https),
+    ] {
+        if let Entry::Vacant(free) = ports.entry(port) {
+            free.insert(protocol);
+            implicit.push(listeners::name(port));
+        }
+    }
+    let mut bound = listeners::bound(plane, &ports);
+    let (ingress_http, ingress_https) = ingress_listeners(plane, &bound);
     // Each Ingress is compiled alone, with the listeners it is served on, so that one the
     // data plane would refuse is left out by itself rather than refusing every other's
     // (04 §2). Unless those listeners are refused with no routes at all: then the fault is
     // the data plane's settings, not any Ingress's, and the whole config says so.
-    let served_on: BTreeMap<String, Listener> = plane
-        .listeners
+    let served_on: BTreeMap<String, Listener> = bound
         .iter()
         .filter(|(_, listener)| matches!(listener.protocol, Protocol::Http | Protocol::Https))
         .map(|(name, listener)| (name.clone(), listener.clone()))
@@ -726,6 +814,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         served_on.clone(),
         Vec::new(),
         BTreeMap::new(),
+        &[],
         &[],
         &[],
     ))
@@ -743,7 +832,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     for ingress in ingresses {
         let object = || Object::of("Ingress", &ingress.metadata);
         let dated = ingress.metadata.creation_timestamp.is_some();
-        let translated = match ingress_routes(plane, cluster, ingress) {
+        let translated = match ingress_routes(plane, cluster, &bound, ingress) {
             Ok(translated) => translated,
             Err(problem) => {
                 report.push(Finding {
@@ -758,7 +847,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             // Ingress secures its hosts is not known yet.
             let mut routes = translated.routes.clone();
             for route in &mut routes {
-                route.listeners = served_on.keys().cloned().collect();
+                route.listeners = ingress_http.iter().chain(&ingress_https).cloned().collect();
             }
             let alone = config_of(
                 served_on.clone(),
@@ -766,6 +855,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 translated.upstreams.clone(),
                 &translated.certificates,
                 &[],
+                &ingress_https,
             );
             if let Err(problems) = compile(&alone) {
                 let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
@@ -815,25 +905,11 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         .iter()
         .flat_map(|(_, _, translated, _)| translated.unsecurable.iter().cloned())
         .collect();
-    let https: Vec<String> = plane
-        .listeners
-        .iter()
-        .filter(|(_, listener)| listener.protocol == Protocol::Https)
-        .map(|(name, _)| name.clone())
-        .collect();
-    // The port a redirect to HTTPS states: none where an `https` listener binds 443, the
-    // default, and else the lowest such listener's, as pods bind ports as written and so
-    // are reached on them (05 §2, Lucas).
-    let https_ports = plane
-        .listeners
-        .values()
-        .filter(|listener| listener.protocol == Protocol::Https)
-        .map(|listener| listener.address.port());
-    let https_port = if https_ports.clone().any(|port| port == 443) {
-        None
-    } else {
-        https_ports.min()
-    };
+    let https = &ingress_https;
+    // The port a redirect to HTTPS states: the Ingress HTTPS port, where its TLS hosts are
+    // served, none where that is 443, the default; pods bind ports as written and so are
+    // reached on them (05 §2, Lucas).
+    let https_port = Some(plane.ingress_https_port).filter(|port| *port != 443);
     // Each object's config routes, with its rank: those of every Ingress and HTTPRoute are
     // put in the config in one order, oldest first, whichever API each is of (04 §1).
     let mut ranked: Vec<Ranked> = Vec::new();
@@ -870,7 +946,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 }
             }
             if secured {
-                for listener in &https {
+                for listener in https {
                     if !route.listeners.contains(listener) {
                         route.listeners.push(listener.clone());
                     }
@@ -963,6 +1039,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 upstreams.clone(),
                 &[],
                 &[],
+                &[],
             ))
             .err()
             .map(|problems| {
@@ -1052,6 +1129,12 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     if let Some(gateway) = &gateway {
         routes.extend(http_route::claims(gateway));
     }
+    // Ingress's own listeners, bound only where a route is served on them.
+    for name in &implicit {
+        if !routes.iter().any(|route| route.listeners.contains(name)) {
+            bound.remove(name);
+        }
+    }
     let taken = http_route::taken(&routes);
     // An upstream only routes served on no listener led to, or copied to, is left out with
     // them.
@@ -1075,11 +1158,12 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut config = Config {
         data_plane: plane.data_plane.clone(),
         ..config_of(
-            plane.listeners.clone(),
+            bound,
             routes,
             upstreams,
             &presented,
             &refused,
+            &ingress_https,
         )
     };
     if let Some(gateway) = &gateway {
@@ -1325,7 +1409,7 @@ fn gateway_tls(
                     .ok()
                     .map(|(certificate, _)| certificate)
             });
-            // Read once already, when the listener was fitted.
+            // Read once already, when the listener's certificates were.
             let Some(certificate) = certificate else {
                 continue;
             };
@@ -1413,20 +1497,23 @@ fn https_on(config: &mut Config, port: u16) -> impl Iterator<Item = &mut edgerus
 }
 
 /// A config of these listeners, routes and upstreams, and nothing else but `presented`:
-/// certificates each `https` listener presents for the hosts stated with them, after any
-/// it names itself; and the host names it refuses.
+/// certificates the listener `ingress_https` names, if it is `https`, presents for the hosts
+/// stated with them, after any it names itself; and the host names it refuses.
 fn config_of(
     mut listeners: BTreeMap<String, Listener>,
     routes: Vec<Route>,
     upstreams: BTreeMap<String, Upstream>,
     presented: &[(String, Certificate, Vec<String>)],
     refused: &[String],
+    ingress_https: &[String],
 ) -> Config {
-    for listener in listeners.values_mut() {
+    // Ingress's certificates and the hosts it refuses go on the listener its TLS hosts are
+    // served on alone, the one `presented` and `refused` are for.
+    for (name, listener) in &mut listeners {
         let Some(tls) = listener.tls.as_mut() else {
             continue;
         };
-        if listener.protocol == Protocol::Https {
+        if listener.protocol == Protocol::Https && ingress_https.contains(name) {
             tls.refused.extend(refused.iter().cloned());
             tls.certificates
                 .extend(presented.iter().map(|(name, _, hosts)| {
@@ -1451,6 +1538,27 @@ fn config_of(
             .collect(),
         limits: None,
     }
+}
+
+/// The listeners Ingress is served on, by name: over plain HTTP, the one on the Ingress
+/// HTTP port, if it is `http`; over HTTPS, the one on the Ingress HTTPS port, if it is
+/// `https`. Each is the Gateway's listener there, or Ingress's own (04 §2).
+fn ingress_listeners(
+    plane: &Plane,
+    bound: &BTreeMap<String, Listener>,
+) -> (Vec<String>, Vec<String>) {
+    let on_port = |port: u16, protocol: Protocol| -> Vec<String> {
+        let name = listeners::name(port);
+        bound
+            .get(&name)
+            .filter(|listener| listener.protocol == protocol)
+            .map(|_| vec![name])
+            .unwrap_or_default()
+    };
+    (
+        on_port(plane.ingress_http_port, Protocol::Http),
+        on_port(plane.ingress_https_port, Protocol::Https),
+    )
 }
 
 /// An object without a namespace is in `default`, as Kubernetes takes it.
@@ -1534,7 +1642,7 @@ fn class_of(ingress: &Ingress) -> Option<&str> {
 #[derive(Default)]
 struct IngressRoutes {
     /// Its routes, one a host, each on the listeners its own `tls` gives it: none at all for
-    /// a host it would have only over plain HTTP where the data plane has no `http` listener.
+    /// a host it would have only over plain HTTP where the Ingress HTTP port is not `http`.
     routes: Vec<Route>,
     /// The upstreams they lead to.
     upstreams: BTreeMap<String, Upstream>,
@@ -1561,6 +1669,7 @@ struct IngressRoutes {
 fn ingress_routes(
     plane: &Plane,
     cluster: &Cluster,
+    bound: &BTreeMap<String, Listener>,
     ingress: &Ingress,
 ) -> Result<IngressRoutes, Problem> {
     // Ours by the old annotation, with no `ingressClassName`: said apart from other
@@ -1642,15 +1751,7 @@ fn ingress_routes(
             }
         }
     }
-    let of_protocol = |protocol: Protocol| -> Vec<String> {
-        plane
-            .listeners
-            .iter()
-            .filter(|(_, listener)| listener.protocol == protocol)
-            .map(|(name, _)| name.clone())
-            .collect()
-    };
-    let (http, https) = (of_protocol(Protocol::Http), of_protocol(Protocol::Https));
+    let (http, https) = ingress_listeners(plane, bound);
     let namespace = namespace(&ingress.metadata);
     let mut by_host: BTreeMap<String, Vec<Rule>> = BTreeMap::new();
     let mut upstreams = BTreeMap::new();
@@ -1736,10 +1837,10 @@ fn ingress_routes(
     if by_host.is_empty() {
         return Ok(IngressRoutes::default());
     }
-    // Every host is served on the `http` listeners, and one `tls` lists on the `https` ones
-    // too, with its Secret's certificate, when that can be used and covers it (04 §5). One
-    // that cannot be secured stays on `http`, and is said; one asked for over plain HTTP
-    // where the data plane has no `http` listener leaves the Ingress out.
+    // Every host is served on the Ingress HTTP port, and one `tls` lists on the Ingress
+    // HTTPS port too, with its Secret's certificate, when that can be used and covers it
+    // (04 §5). One that cannot be secured stays on plain HTTP, and is said; one asked for
+    // over plain HTTP where the Gateway has that port for HTTPS leaves the Ingress out.
     let mut certificates: Vec<(String, Certificate, Vec<String>)> = Vec::new();
     let mut read: BTreeMap<&str, Result<(Certificate, Option<Identity>), String>> = BTreeMap::new();
     let mut unsecured = Vec::new();
@@ -1748,7 +1849,7 @@ fn ingress_routes(
     for host in by_host.keys() {
         let mut listeners = http.clone();
         match tls_hosts.get(host.as_str()) {
-            None if http.is_empty() => return Err(Problem::NoListener),
+            None if http.is_empty() => return Err(Problem::HttpPortTaken(plane.ingress_http_port)),
             None => {}
             Some(None) => {
                 unsecured.push((host.clone(), "its TLS entry names no Secret".to_owned()));
@@ -1775,9 +1876,10 @@ fn ingress_routes(
                     Ok((_, Some(identity))) if !identity.covers(host) => {
                         Some(format!("Secret {namespace}/{secret} does not cover {host}"))
                     }
-                    Ok(_) if https.is_empty() => {
-                        Some("the data plane has no `https` listener".to_owned())
-                    }
+                    Ok(_) if https.is_empty() => Some(format!(
+                        "port {}, where Ingress TLS hosts are served, is bound for plain HTTP",
+                        plane.ingress_https_port
+                    )),
                     Ok((certificate, _)) => {
                         let name = format!("{namespace}/{secret}");
                         match certificates.iter_mut().find(|(named, ..)| *named == name) {
@@ -2158,15 +2260,12 @@ mod tests {
         assert!(GatewayName::try_from(long).is_err(), "longer than 253");
     }
 
-    const HTTP: &str = "  http: { address: \"[::]:8080\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n";
+    const PLANE: &str = "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\ningress_https_redirect_max_age: 30\n";
 
     /// Ingresses `good`, routing `/`, and `bad`, routing a path that climbs, which the data
-    /// plane refuses, translated for a data plane with these listeners.
-    fn good_and_bad(listeners: &str) -> Translation {
-        let plane: Plane = serde_saphyr::from_str(&format!(
-            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\ningress_https_redirect_max_age: 30\nlisteners:\n{listeners}"
-        ))
-        .unwrap();
+    /// plane refuses, translated for a data plane of no Gateway with these more settings.
+    fn good_and_bad(more: &str) -> Translation {
+        let plane: Plane = serde_saphyr::from_str(&format!("{PLANE}{more}")).unwrap();
         let ingress = |name: &str, path: &str| -> Ingress {
             serde_saphyr::from_str(&format!(
                 "metadata: {{ name: {name}, namespace: shop }}\nspec:\n  ingressClassName: edge\n  rules:\n    - host: {name}.example.com\n      http:\n        paths:\n          - {{ path: \"{path}\", pathType: Prefix, backend: {{ service: {{ name: web, port: {{ number: 80 }} }} }} }}\n"
@@ -2201,13 +2300,11 @@ spec: { controller: edgerush.dev/ingress-controller }
         translation.report.iter().map(ToString::to_string).collect()
     }
 
-    /// An Ingress is compiled alone with the listeners it is served on: a `tcp` listener of
-    /// the data plane's, which wants a TCP route no Ingress gives it, neither stops that
-    /// check nor is blamed on any Ingress.
+    /// An Ingress is compiled alone with the listeners it is served on: one the data plane
+    /// would refuse is left out by itself, the others served.
     #[test]
-    fn an_ingress_is_checked_with_its_own_listeners_only() {
-        let tcp = "  db: { address: \"[::]:5432\", protocol: tcp, proxy_protocol: off }\n";
-        let translation = good_and_bad(&format!("{HTTP}{tcp}"));
+    fn an_ingress_is_checked_alone() {
+        let translation = good_and_bad("");
         assert_eq!(
             reported(&translation),
             [
@@ -2227,10 +2324,7 @@ spec: { controller: edgerush.dev/ingress-controller }
     /// though none is among the objects; looked at, the same Secret is not there.
     #[test]
     fn assumed_secrets_secure_their_hosts_unread() {
-        let plane: Plane = serde_saphyr::from_str(&format!(
-            "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\ningress_https_redirect_max_age: 30\nlisteners:\n{HTTP}  https: {{ address: \"[::]:8443\", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [], without_sni: none }} }}\n"
-        ))
-        .unwrap();
+        let plane: Plane = serde_saphyr::from_str(PLANE).unwrap();
         let cluster = |secrets_assumed| {
             Cluster {
             ingress_classes: vec![
@@ -2259,8 +2353,9 @@ spec: { controller: edgerush.dev/ingress-controller }
 
         let assumed = translate(&plane, &cluster(true));
         assert!(assumed.tls.is_empty(), "{:?}", assumed.tls);
-        assert_eq!(assumed.config.routes[0].listeners, ["https"]);
-        assert_eq!(assumed.config.routes[1].listeners, ["http"]);
+        // On the Ingress HTTPS port, which the default listeners leave to its TLS hosts.
+        assert_eq!(assumed.config.routes[0].listeners, ["port-443"]);
+        assert_eq!(assumed.config.routes[1].listeners, ["port-80"]);
         assert!(assumed.config.routes[1].rules[0].redirect.is_some());
         let unread = Certificate {
             chain: String::new(),
@@ -2270,7 +2365,7 @@ spec: { controller: edgerush.dev/ingress-controller }
             assumed.config.certificates.get("shop/shop-tls"),
             Some(&unread)
         );
-        let https = &assumed.config.listeners["https"];
+        let https = &assumed.config.listeners["port-443"];
         let stated = https.tls.as_ref().unwrap().certificates[0].stated();
         assert_eq!(stated, Some(&["shop.example.com".to_owned()][..]));
         assert!(compile(&assumed.config).is_ok());
@@ -2283,9 +2378,11 @@ spec: { controller: edgerush.dev/ingress-controller }
                 "Ingress shop/web: shop.example.com is refused over HTTPS and redirected there over plain HTTP: Secret shop/shop-tls does not exist"
             ]
         );
-        // Its redirect alone, on `http`: the host is asked for secured, never served unencrypted.
+        // Its redirect alone, on `http`: the host is asked for secured, never served unencrypted;
+        // and no `https` listener, as none of its hosts is served there.
         assert_eq!(checked.config.routes.len(), 1);
-        assert_eq!(checked.config.routes[0].listeners, ["http"]);
+        assert_eq!(checked.config.routes[0].listeners, ["port-80"]);
+        assert!(!checked.config.listeners.contains_key("port-443"));
         assert!(checked.config.routes[0].rules[0].redirect.is_some());
         assert!(checked.config.certificates.is_empty());
     }
@@ -2295,8 +2392,9 @@ spec: { controller: edgerush.dev/ingress-controller }
     /// the whole config's problems are the listener's and the Ingresses' together.
     #[test]
     fn a_fault_of_the_data_planes_own_is_not_any_ingresses() {
-        let refused = HTTP.replace("trusted_proxies: []", "trusted_proxies: [\"10.1.2.3/8\"]");
-        let translation = good_and_bad(&refused);
+        let translation = good_and_bad(
+            "ports:\n  80: { forwarding: { trusted_proxies: [\"10.1.2.3/8\"], trusted_only_headers: [] } }\n",
+        );
         assert_eq!(reported(&translation), Vec::<String>::new());
         assert_eq!(translation.config.routes.len(), 2);
         let problems: Vec<String> = compile(&translation.config)
@@ -2307,7 +2405,7 @@ spec: { controller: edgerush.dev/ingress-controller }
         assert!(
             problems
                 .iter()
-                .any(|problem| problem.starts_with("listener `http`")),
+                .any(|problem| problem.starts_with("listener `port-80`")),
             "{problems:?}"
         );
     }
@@ -2316,11 +2414,9 @@ spec: { controller: edgerush.dev/ingress-controller }
     /// refuses is its own fault, not any Ingress's: each is still judged on its own.
     #[test]
     fn the_data_planes_own_settings_go_into_its_config() {
-        let listeners = format!("{HTTP}data_plane: {{ set_aside_ms: 2000 }}\n");
-        let translation = good_and_bad(&listeners);
+        let translation = good_and_bad("data_plane: { set_aside_ms: 2000 }\n");
         assert_eq!(translation.config.data_plane.set_aside_ms, Some(2000));
-        let refused = format!("{HTTP}data_plane: {{ set_aside_ms: 0 }}\n");
-        let translation = good_and_bad(&refused);
+        let translation = good_and_bad("data_plane: { set_aside_ms: 0 }\n");
         let reported = reported(&translation);
         assert_eq!(reported.len(), 1, "{reported:?}");
         assert!(

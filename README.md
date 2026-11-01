@@ -183,18 +183,20 @@ cluster_domain: cluster.local
 ingress_hosts_fall_through: false
 ingress_https_redirect: true
 ingress_https_redirect_max_age: 30
-listeners:
-  http: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 ```
 
 | Setting | What it is |
 |---|---|
 | `ingress_class` | The IngressClass whose Ingresses this data plane serves. |
-| `listeners` | As in a config. An Ingress is served on every `http` listener, and the hosts its `tls` lists on every `https` one; written with `tls: { certificates: [], without_sni: none }`, an `https` listener presents the Ingresses' TLS Secrets. |
 | `cluster_domain` | The cluster's DNS domain, which Services' names end in. |
 | `ingress_hosts_fall_through` | Whether an Ingress host stays a candidate on hosts a more specific one also covers; `false` is ingress-nginx's way. |
 | `ingress_https_redirect` | Whether plain HTTP to a host an Ingress's `tls` lists is redirected to HTTPS, as a `DataPlane` does by default. An Ingress's `gateway.edgerush.dev/https-redirect: "false"` or `"true"` overrides it for its own routes. |
 | `ingress_https_redirect_max_age` | How long, in seconds, a client may keep that redirect (30 for a `DataPlane` by default). |
+| `gateway` | Optional: the Gateway this data plane is, as `namespace/name`. Its listeners are bound: one data-plane listener for each port they state, named `port-<n>`. Ingress binds only its own two ports, below, and only while it serves something there. |
+| `ingress_http_port` | Optional: the port an Ingress is served on over plain HTTP, 80 by default: shared with the Gateway's listener there if that is `HTTP`, bound for `http` if no listener of the Gateway is. |
+| `ingress_https_port` | Optional: the port the hosts an Ingress's `tls` lists are served on over HTTPS, 443 by default: shared with the Gateway's listener there if that is `HTTPS`, bound for `https` if no listener of the Gateway is, and named in a redirect there unless 443. |
+| `ports` | Optional: each port's settings, as a config's listener states them: `http3` (an `https` port's alone), `proxy_protocol`, `forwarding`, `request_id` and `access_log`. A port not listed trusts no proxy's forwarding headers, gives each request an ID and logs nothing. |
+| `ip_family` | Optional: `ipv4`, the default, binds `0.0.0.0`; `ipv6` and `dual` bind `[::]`. |
 | `backend_authorities` | Optional: certificates in PEM trusted for a Service port spoken to over TLS (`appProtocol: kubernetes.io/wss`). |
 | `data_plane` | Optional: the data plane's own settings, as a config states them, written into every config. `own_service: edgerush.edge.svc.cluster.local` names the Service of the data plane's own pods, whose EndpointSlices say its zone. |
 

@@ -1,24 +1,25 @@
 listeners:
-  https:
-    address: "[::]:8443"
+  port-443:
+    address: "0.0.0.0:443"
     protocol: https
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
     tls:
       certificates:
+        - { certificate: shop/shop-tls, names: ["*"] }
         - { certificate: shop/secure, names: [secure.example.com, www.secure.example.com] }
-      without_sni: none
+      without_sni: shop/shop-tls
       refused: [gone.example.com]
 routes:
   - name: ingress/shop/web/secure.example.com
-    listeners: [https]
+    listeners: [port-443]
     hostnames: [{ name: "secure.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
   - name: ingress/shop/web/www.secure.example.com
-    listeners: [https]
+    listeners: [port-443]
     hostnames: [{ name: "www.secure.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]

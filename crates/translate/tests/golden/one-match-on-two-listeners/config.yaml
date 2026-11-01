@@ -1,49 +1,49 @@
 listeners:
-  alt:
-    address: "[::]:9090"
+  port-8080:
+    address: "0.0.0.0:8080"
     protocol: http
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
-  http:
-    address: "[::]:8080"
+  port-9090:
+    address: "0.0.0.0:9090"
     protocol: http
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
 routes:
   - name: httproute/shop/first/http
-    listeners: [http]
+    listeners: [port-8080]
     hostnames: [{ name: both.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
   - name: httproute/shop/first/alt
-    listeners: [alt]
+    listeners: [port-9090]
     hostnames: [{ name: both.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
   - name: httproute/shop/on-alt/alt
-    listeners: [alt]
+    listeners: [port-9090]
     hostnames: [{ name: same.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
   - name: httproute/shop/on-http/http
-    listeners: [http]
+    listeners: [port-8080]
     hostnames: [{ name: same.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
   - name: httproute/shop/second/http
-    listeners: [http]
+    listeners: [port-8080]
     hostnames: [{ name: both.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
   - name: httproute/shop/second/alt
-    listeners: [alt]
+    listeners: [port-9090]
     hostnames: [{ name: both.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]

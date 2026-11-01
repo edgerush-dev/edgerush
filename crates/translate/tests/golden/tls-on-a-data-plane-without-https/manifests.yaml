@@ -1,4 +1,5 @@
-# The shared data plane has no `https` listener: a host `tls` lists is served over plain
+# The data plane's Ingress HTTPS port is the one it binds for plain HTTP, so it has no
+# `https` listener for an Ingress's TLS hosts: a host `tls` lists is served over plain
 # HTTP, and the report says why; not redirected, with nowhere to redirect it to, whether its
 # entry names a Secret or not.
 apiVersion: networking.k8s.io/v1

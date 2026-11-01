@@ -1,5 +1,5 @@
-# A Gateway's HTTPS listeners, each fitted to the data plane's `https` listeners on its
-# port and presenting there the certificates of its certificateRefs: Secrets of the
+# A Gateway's HTTPS listeners, each served by the data plane's listener on its port,
+# and presenting there the certificates of its certificateRefs: Secrets of the
 # Gateway's namespace, or of another whose ReferenceGrant lets Gateways of it reach them,
 # asked before whether the Secret is there; each read as an Ingress's are. A certificate is
 # stated for its listener's hostname, or, for a listener of none, for every name no other
@@ -9,7 +9,8 @@
 # served on an HTTPS listener as on an HTTP one. On a data plane listener the Gateway's
 # certificates come first, in its order, before Ingresses'; a Secret both name is one
 # certificate for both's names. A host an Ingress serves over plain HTTP alone is served
-# over HTTPS by a Gateway listener of that hostname, no longer refused there, and said.
+# over HTTPS by a Gateway listener of that hostname, no longer refused there, and said;
+# over plain HTTP by the Gateway's HTTP listener.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
@@ -23,54 +24,54 @@ spec:
   gatewayClassName: edgerush
   listeners:
     - name: catch-all
-      port: 8443
+      port: 443
       protocol: HTTPS
       allowedRoutes: { namespaces: { from: All } }
       tls: { certificateRefs: [{ name: shop-tls, namespace: shop }] }
     - name: exact
-      port: 8443
+      port: 443
       protocol: HTTPS
       hostname: "secure.example.com"
       allowedRoutes: { namespaces: { from: All } }
       tls: { certificateRefs: [{ name: own }, { name: secure, namespace: shop }] }
     - name: wild
-      port: 8443
+      port: 443
       protocol: HTTPS
       hostname: "*.wild.example.com"
       allowedRoutes: { namespaces: { from: All } }
       tls: { certificateRefs: [{ name: wild, namespace: shop }] }
     - name: kinds
-      port: 8443
+      port: 443
       protocol: HTTPS
       hostname: "kinds.example.com"
       allowedRoutes: { namespaces: { from: All } }
       tls: { certificateRefs: [{ group: example.com, kind: Vault, name: x }, { name: own }] }
     - name: later
-      port: 8443
+      port: 443
       protocol: HTTPS
       hostname: "later.example.com"
       allowedRoutes: { namespaces: { from: All } }
       tls: { certificateRefs: [{ name: secure, namespace: shop }] }
     - name: migrated
-      port: 8443
+      port: 443
       protocol: HTTPS
       hostname: "plain.example.com"
       allowedRoutes: { namespaces: { from: All } }
       tls: { certificateRefs: [{ name: own }] }
     - name: wild-unusable
-      port: 8443
+      port: 443
       protocol: HTTPS
       hostname: "*.none.example.com"
       allowedRoutes: { namespaces: { from: All } }
       tls: { certificateRefs: [{ name: missing }] }
     - name: unusable
-      port: 8443
+      port: 443
       protocol: HTTPS
       hostname: "unusable.example.com"
       allowedRoutes: { namespaces: { from: All } }
       tls: { certificateRefs: [{ name: missing }, { name: keyless, namespace: shop }] }
     - name: denied
-      port: 8443
+      port: 443
       protocol: HTTPS
       hostname: "denied.example.com"
       allowedRoutes: { namespaces: { from: All } }
@@ -81,6 +82,10 @@ spec:
       hostname: "more.example.com"
       allowedRoutes: { namespaces: { from: All } }
       tls: { certificateRefs: [{ name: own }] }
+    - name: plain
+      port: 80
+      protocol: HTTP
+      allowedRoutes: { namespaces: { from: All } }
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: ReferenceGrant

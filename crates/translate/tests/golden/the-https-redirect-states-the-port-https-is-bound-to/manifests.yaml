@@ -1,6 +1,6 @@
-# A redirect to HTTPS goes to the port the data plane binds HTTPS on, as pods bind ports
-# as written and are reached on them: none where an `https` listener binds 443, the
-# default, and else the lowest such port (the other cases' 8443).
+# A redirect to HTTPS goes to the data plane's Ingress HTTPS port, where its TLS hosts are
+# served, as pods bind ports as written and are reached on them: here 8443; none where it
+# is 443, the default (the other cases).
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: web, namespace: shop }

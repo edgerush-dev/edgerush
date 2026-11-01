@@ -1,7 +1,8 @@
 //! The data plane's Gateway ([04 §2](../../../docs/04-control-plane.md)): found by the name
 //! its settings give, its class checked to name this controller, and each of its listeners
-//! fitted to the data plane's own listeners bound to its port, or not accepted and why, and
-//! the routes each takes: of which kinds, from which namespaces.
+//! served by the data plane's listener bound to its port, or not accepted and why, and the
+//! routes each takes: of which kinds, from which namespaces. The ports its accepted
+//! listeners state are what the data plane binds.
 
 use crate::http_route::reachable;
 use crate::{
@@ -13,7 +14,7 @@ use edgerush_gateway_api::gateway::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespaces,
     GatewayListenersAllowedRoutesNamespacesSelector,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// The API group of the Gateway API's kinds.
@@ -28,6 +29,9 @@ pub struct GatewayOutcome {
     pub generation: i64,
     /// Each of its listeners, in the order it lists them.
     pub listeners: Vec<ListenerOutcome>,
+    /// The ports its accepted listeners state, and the protocol each is bound for: the data
+    /// plane's listeners.
+    pub ports: BTreeMap<u16, Protocol>,
 }
 
 /// One of a Gateway's listeners: accepted, and served by the data plane's listeners named,
@@ -248,9 +252,6 @@ pub enum ListenerProblem {
     /// be told apart from the other and none of them is accepted (`HostnameConflict`).
     #[error("listeners {0} have the same port, protocol and hostname")]
     HostnameConflict(String),
-    /// No listener of the data plane is bound to its port (`PortUnavailable`).
-    #[error("port {0} is bound by no listener of the data plane")]
-    PortUnbound(u16),
     /// An HTTPS listener none of whose `certificateRefs` can be used (`ResolvedRefs`
     /// false, `InvalidCertificateRef` or `RefNotPermitted`): accepted, its routes attached,
     /// and not served, its hostname refused over TLS so that no other certificate answers
@@ -261,15 +262,14 @@ pub enum ListenerProblem {
     /// one have.
     #[error("TLS mode `{0}` is not one an HTTPS listener takes")]
     TlsMode(String),
-    /// The data plane binds its port for another protocol (`PortUnavailable`).
-    #[error("port {port} is bound by the data plane for {bound}, not {wanted}")]
-    PortOtherProtocol {
+    /// Other listeners of the Gateway state its port for another protocol, so that the
+    /// port can be bound for none of them, and none on it is accepted (`ProtocolConflict`).
+    #[error("port {port} is stated for {protocols}")]
+    ProtocolConflict {
         /// The port.
         port: u16,
-        /// The protocol the data plane binds it for.
-        bound: &'static str,
-        /// The listener's.
-        wanted: &'static str,
+        /// The protocols stated for it, as the data plane's config writes them.
+        protocols: String,
     },
 }
 
@@ -293,8 +293,8 @@ impl ListenerProblem {
     }
 }
 
-/// The data plane's Gateway, its class checked, its listeners fitted: `None`, said in
-/// `report`, where the data plane names a Gateway that is not there or not this
+/// The data plane's Gateway, its class checked, its listeners accepted or refused: `None`,
+/// said in `report`, where the data plane names a Gateway that is not there or not this
 /// controller's; `None`, unsaid, where it names none.
 pub(crate) fn outcome(
     plane: &Plane,
@@ -320,7 +320,15 @@ pub(crate) fn outcome(
     if !class_ours(gateway, cluster, report) {
         return None;
     }
-    let mut listeners = listeners(plane, &gateway.spec.listeners);
+    let mut listeners = listeners(&gateway.spec.listeners);
+    // Bound as long as one listener on them is accepted: one whose certificates cannot be
+    // used too, which keeps its port refusing its hostname (04 §2).
+    let ports: BTreeMap<u16, Protocol> = listeners
+        .iter()
+        .zip(&gateway.spec.listeners)
+        .filter(|(listener, _)| listener.served.is_ok())
+        .filter_map(|(listener, written)| Some((listener.port, protocol(&written.protocol).ok()?)))
+        .collect();
     for (listener, written) in listeners.iter_mut().zip(&gateway.spec.listeners) {
         if listener.served.is_ok() && written.protocol == "HTTPS" {
             certificates(listener, written, &named.namespace, cluster);
@@ -374,6 +382,7 @@ pub(crate) fn outcome(
         gateway: object,
         generation: gateway.metadata.generation.unwrap_or_default(),
         listeners,
+        ports,
     })
 }
 
@@ -478,13 +487,25 @@ fn class_ours(gateway: &Gateway, cluster: &Cluster, report: &mut Vec<Finding>) -
 /// Each listener's outcome. A protocol not taken is refused first, and plays no part in
 /// what conflicts (the spec: a listener of a protocol not supported is not accepted, and
 /// the rules of distinctness are for those that are); then listeners that cannot be told
-/// apart are all refused, none chosen; then each is fitted to the data plane's listeners
-/// bound to its port.
-fn listeners(plane: &Plane, listeners: &[GatewayListeners]) -> Vec<ListenerOutcome> {
+/// apart, or that state one port for two protocols, are all refused, none chosen; each
+/// other is served by the data plane's listener bound to its port.
+fn listeners(listeners: &[GatewayListeners]) -> Vec<ListenerOutcome> {
     let protocols: Vec<Result<Protocol, ListenerProblem>> = listeners
         .iter()
         .map(|listener| protocol(&listener.protocol))
         .collect();
+    // The protocols each port is stated for. Two, and no protocol can win: every listener
+    // on the port is conflicted and the port bound for none, as the spec has a conflicted
+    // listener's port configured nowhere, and as Envoy Gateway does among a Gateway's own.
+    let mut stated: BTreeMap<i32, BTreeSet<&'static str>> = BTreeMap::new();
+    for (listener, protocol) in listeners.iter().zip(&protocols) {
+        if let Ok(protocol) = protocol {
+            stated
+                .entry(listener.port)
+                .or_default()
+                .insert(name_of(*protocol));
+        }
+    }
     // Listeners of a protocol taken, by port, protocol and hostname: two in one place are
     // indistinct. TCP sharing a port with any other, which the spec also refuses, is for
     // when TCP listeners are taken.
@@ -505,17 +526,25 @@ fn listeners(plane: &Plane, listeners: &[GatewayListeners]) -> Vec<ListenerOutco
         .iter()
         .zip(protocols)
         .map(|(listener, protocol)| {
+            // The schema holds a port to 1–65535.
+            let port = u16::try_from(listener.port).unwrap_or_default();
             let served = protocol.and_then(|protocol| {
                 let place = (
                     listener.port,
                     name_of(protocol),
                     listener.hostname.as_deref(),
                 );
-                match places.get(&place) {
-                    Some(names) if names.len() > 1 => {
+                match (stated.get(&listener.port), places.get(&place)) {
+                    (Some(protocols), _) if protocols.len() > 1 => {
+                        Err(ListenerProblem::ProtocolConflict {
+                            port,
+                            protocols: protocols.iter().copied().collect::<Vec<_>>().join(", "),
+                        })
+                    }
+                    (_, Some(names)) if names.len() > 1 => {
                         Err(ListenerProblem::HostnameConflict(names.join(", ")))
                     }
-                    _ => fitted(plane, listener.port, protocol),
+                    _ => Ok(vec![crate::listeners::name(port)]),
                 }
             });
             ListenerOutcome {
@@ -527,8 +556,7 @@ fn listeners(plane: &Plane, listeners: &[GatewayListeners]) -> Vec<ListenerOutco
                     namespaces: Namespaces::None,
                 },
                 hostname: listener.hostname.clone(),
-                // The schema holds a port to 1–65535.
-                port: u16::try_from(listener.port).unwrap_or_default(),
+                port,
                 certificates: Vec::new(),
                 certificate_problems: Vec::new(),
             }
@@ -555,34 +583,6 @@ fn name_of(protocol: Protocol) -> &'static str {
         Protocol::Https => "https",
         Protocol::Tcp => "tcp",
         Protocol::Tls => "tls",
-    }
-}
-
-/// The data plane's listeners bound to `port` for `protocol`, by name; or why there are none.
-fn fitted(plane: &Plane, port: i32, protocol: Protocol) -> Result<Vec<String>, ListenerProblem> {
-    // The schema holds a port to 1–65535.
-    let port = u16::try_from(port).unwrap_or_default();
-    let on_port: Vec<(&String, Protocol)> = plane
-        .listeners
-        .iter()
-        .filter(|(_, listener)| listener.address.port() == port)
-        .map(|(name, listener)| (name, listener.protocol))
-        .collect();
-    let serving: Vec<String> = on_port
-        .iter()
-        .filter(|(_, bound)| *bound == protocol)
-        .map(|(name, _)| (*name).clone())
-        .collect();
-    if !serving.is_empty() {
-        return Ok(serving);
-    }
-    match on_port.first() {
-        Some((_, bound)) => Err(ListenerProblem::PortOtherProtocol {
-            port,
-            bound: name_of(*bound),
-            wanted: name_of(protocol),
-        }),
-        None => Err(ListenerProblem::PortUnbound(port)),
     }
 }
 
