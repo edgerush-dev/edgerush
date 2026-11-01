@@ -21,7 +21,7 @@ mod kubernetes;
 mod logged;
 mod passthrough;
 mod plane;
-pub use plane::{Opened, Slotted};
+pub use plane::{Changes, Opened, Slotted};
 mod respond;
 mod tries;
 mod watched;
@@ -500,10 +500,12 @@ pub struct Worker {
     /// By slot ([`Proxy::listeners`]): the client validation its connections here are
     /// accepted under, and the drain they hear.
     validations: RefCell<Vec<Validation>>,
-    /// By slot ([`Proxy::listeners`]): what stops its accepting here, and its HTTP/3
-    /// listener's taking new connections: this worker's drain, or its listener taken away
-    /// ([`Worker::stop`]).
+    /// By slot ([`Proxy::listeners`]): what stops its accepting here: this worker's drain,
+    /// or its listener taken away ([`Worker::stop`]).
     listening: RefCell<Vec<Rc<Drain>>>,
+    /// By slot: what stops its HTTP/3 listener here, which then takes no new connection and
+    /// drains those it has: the same, or its HTTP/3 turned off ([`Worker::stop_http3`]).
+    quic_listening: RefCell<Vec<Rc<Drain>>>,
     /// Which snapshot `validations` and `routes` were last brought up to.
     validated: Cell<u64>,
     /// By key ([`Routed`]): the drain of the tunnels routed by a listener, route and

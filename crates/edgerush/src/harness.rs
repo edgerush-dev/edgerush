@@ -27,12 +27,12 @@ use crate::bind::{Port, datagrams, listen};
 use crate::config_file::Problems;
 use crate::config_file::{ConfigFile, Rejected};
 use crate::essential::{Ended, Essential, Told};
-use crate::per_core::{self, Accept, Sockets, Workers};
+use crate::per_core::{self, Accept, Closed, Sockets, Workers};
 use crate::stream::{FromStream, Stream, StreamError};
 use edgerush_config::{Compiled, Config, compile};
 use edgerush_control_service::Files;
 use edgerush_kubernetes::{ApiError, ApiServer};
-use edgerush_proxy::{H1Limits, Opened, Proxy, ProxyError};
+use edgerush_proxy::{Changes, H1Limits, Opened, Proxy, ProxyError};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -56,7 +56,8 @@ stream that control plane serves: nothing is bound or served until its first con
 which is waited for, and each config after it takes over as a file's does; the certificate,
 key and authorities are PEM files, read again every second. A listener that is new is
 listened on as its config takes over; one that is gone or has moved is drained, and one
-that waits for its name or address is listened on once that drain ends.
+that waits for its name or address is listened on once that drain ends; HTTP/3 turned on
+or off opens or drains a listener's UDP sockets alone.
 Ctrl-C or SIGTERM drains it: what is under way is finished, for up to 29 seconds; a
 second one stops it at once. SIGUSR1 opens the access logs' files again, for rotation.
 
@@ -825,6 +826,8 @@ struct Listeners {
 struct Reloaded {
     opened: Vec<(String, SocketAddr, bool)>,
     drained: Vec<String>,
+    /// What else changed of the listeners' sockets, as it is said.
+    said: Vec<String>,
     warnings: Vec<String>,
 }
 
@@ -850,6 +853,9 @@ impl Reloaded {
                 format_args!("listener \"{name}\" is on {address}{also}"),
             );
         }
+        for line in &self.said {
+            say(stderr, format_args!("{line}"));
+        }
         for warning in &self.warnings {
             say(stderr, format_args!("warning: {warning}"));
         }
@@ -865,11 +871,16 @@ impl Listening<'_> {
     /// whose sockets cannot be opened is said not to be served, and tried again at the next
     /// config; one whose name or address a draining listener holds waits for that drain
     /// ([`Listening::tend`]); one on an address a listener kept holds, or with no slot free,
-    /// is not served until a restart. What it did and what takes a restart, or why the
-    /// config was refused.
+    /// is not served until a restart. A listener kept whose HTTP/3 it turns on has its UDP
+    /// sockets opened, and one whose HTTP/3 it turns off has them closed once its QUIC
+    /// connections have drained, `Alt-Svc` saying so at once. What it did, or why the config
+    /// was refused.
     fn reloaded(&self, listeners: &mut Listeners, config: Compiled) -> Result<Reloaded, String> {
-        let mut warnings = restart_needed(&listeners.bound, &config);
-        warnings.extend(unrestricted(&config).map(ToOwned::to_owned));
+        let mut warnings: Vec<String> = unrestricted(&config)
+            .map(ToOwned::to_owned)
+            .into_iter()
+            .collect();
+        let turned = http3_turned(&listeners.bound, &config);
         // Taken away: gone from the config, or moved, which is gone and added.
         let closing: Vec<String> = listeners
             .bound
@@ -885,10 +896,39 @@ impl Listening<'_> {
         let opening = self.opening(&listeners.bound, &closing, &wanted);
         warnings.extend(opening.waiting);
         warnings.extend(opening.refused);
-        let opened = to_open(&opening.sockets);
+        let mut changes = Changes {
+            opened: to_open(&opening.sockets),
+            closed: closing.clone(),
+            http3: Vec::new(),
+        };
+        let mut serving: Vec<(String, Vec<std::net::UdpSocket>)> = Vec::new();
+        for (name, on) in &turned {
+            let Some(bound) = listeners.bound.iter().find(|bound| bound.name == *name) else {
+                continue;
+            };
+            if !on {
+                changes.http3.push((name.clone(), None));
+            } else if bound.http3_draining.is_some() {
+                warnings.push(format!(
+                    "listener \"{name}\" has HTTP/3 turned on: it waits for its earlier HTTP/3 to drain"
+                ));
+            } else {
+                match all_datagrams(name, bound.listens_on, self.count, self.port) {
+                    Ok(sockets) => {
+                        changes
+                            .http3
+                            .push((name.clone(), Some(bound.listens_on.port())));
+                        serving.push((name.clone(), sockets));
+                    }
+                    Err(failure) => warnings.push(format!(
+                        "{failure}: its HTTP/3 is not served, and is tried again at the next config"
+                    )),
+                }
+            }
+        }
         let slotted = self
             .proxy
-            .reload_with(config, &opened, &closing)
+            .reload_with(config, &changes)
             .map_err(|error| error.to_string())?;
         listeners.wanted = wanted;
         for (name, slot) in closing.iter().zip(&slotted.closed) {
@@ -901,25 +941,63 @@ impl Listening<'_> {
             warnings,
             ..Reloaded::default()
         };
+        for (name, port) in &changes.http3 {
+            if port.is_some() {
+                continue;
+            }
+            if let Some(bound) = listeners.bound.iter_mut().find(|b| b.name == *name) {
+                self.workers.stop_http3(bound.slot);
+                bound.http3 = false;
+                bound.http3_draining = Some(0);
+                reloaded
+                    .said
+                    .push(format!("listener \"{name}\" no longer serves HTTP/3"));
+            }
+        }
+        for (name, sockets) in serving {
+            self.add_http3(listeners, &name, sockets, &mut reloaded);
+        }
         self.add(listeners, opening.sockets, &slotted.opened, &mut reloaded);
         Ok(reloaded)
+    }
+
+    /// Has the workers serve HTTP/3 on `sockets` for the kept listener `name`.
+    fn add_http3(
+        &self,
+        listeners: &mut Listeners,
+        name: &str,
+        sockets: Vec<std::net::UdpSocket>,
+        reloaded: &mut Reloaded,
+    ) {
+        let Some(bound) = listeners.bound.iter_mut().find(|b| b.name == name) else {
+            return;
+        };
+        reloaded
+            .warnings
+            .extend(self.workers.add_http3(bound.slot, name, sockets));
+        bound.http3 = true;
+        reloaded.said.push(format!(
+            "listener \"{name}\" serves HTTP/3 on {}",
+            bound.listens_on
+        ));
     }
 
     /// Looks after the listeners that drain: once every worker has closed one's sockets and
     /// none holds a connection of it, its slot is freed, and the listeners that waited for
     /// it are opened and served. What it did.
     fn tend(&self, listeners: &mut Listeners) -> Reloaded {
-        for (_, slot) in self.workers.closed() {
-            let draining = listeners
-                .bound
-                .iter_mut()
-                .find(|bound| bound.slot == slot)
-                .and_then(|bound| bound.draining.as_mut());
+        for (_, slot, what) in self.workers.closed() {
+            let bound = listeners.bound.iter_mut().find(|bound| bound.slot == slot);
+            let draining = bound.and_then(|bound| match what {
+                Closed::Listener => bound.draining.as_mut(),
+                Closed::Http3 => bound.http3_draining.as_mut(),
+            });
             if let Some(closed) = draining {
                 *closed += 1;
             }
         }
         let mut reloaded = Reloaded::default();
+        self.tend_http3(listeners, &mut reloaded);
         let mut freed: Vec<Bound> = Vec::new();
         let drained: Vec<usize> = listeners
             .bound
@@ -963,11 +1041,57 @@ impl Listening<'_> {
             .collect();
         let opening = self.opening(&listeners.bound, &[], &waited);
         reloaded.warnings.extend(opening.refused);
-        match self.proxy.listen(&to_open(&opening.sockets)) {
-            Ok(slots) => self.add(listeners, opening.sockets, &slots, &mut reloaded),
+        let changes = Changes {
+            opened: to_open(&opening.sockets),
+            ..Changes::default()
+        };
+        match self.proxy.listen(&changes) {
+            Ok(slotted) => self.add(listeners, opening.sockets, &slotted.opened, &mut reloaded),
             Err(error) => reloaded.warnings.push(error.to_string()),
         }
         reloaded
+    }
+
+    /// Looks after HTTP/3 turned off: once every worker has closed a listener's UDP
+    /// sockets, its HTTP/3 has drained, and is opened again if the config that runs wants it.
+    fn tend_http3(&self, listeners: &mut Listeners, reloaded: &mut Reloaded) {
+        let count = self.workers.count();
+        let mut again = Vec::new();
+        for bound in &mut listeners.bound {
+            if bound.http3_draining != Some(count) {
+                continue;
+            }
+            bound.http3_draining = None;
+            reloaded
+                .said
+                .push(format!("listener \"{}\"'s HTTP/3 has drained", bound.name));
+            let wanted = listeners
+                .wanted
+                .iter()
+                .any(|wanted| wanted.name == bound.name && wanted.http3);
+            if wanted && bound.draining.is_none() {
+                again.push((bound.name.clone(), bound.listens_on));
+            }
+        }
+        for (name, address) in again {
+            let sockets = match all_datagrams(&name, address, self.count, self.port) {
+                Ok(sockets) => sockets,
+                Err(failure) => {
+                    reloaded.warnings.push(format!(
+                        "{failure}: its HTTP/3 is not served, and is tried again at the next config"
+                    ));
+                    continue;
+                }
+            };
+            let changes = Changes {
+                http3: vec![(name.clone(), Some(address.port()))],
+                ..Changes::default()
+            };
+            match self.proxy.listen(&changes) {
+                Ok(_) => self.add_http3(listeners, &name, sockets, reloaded),
+                Err(error) => reloaded.warnings.push(error.to_string()),
+            }
+        }
     }
 
     /// The listeners of `wanted` that have no sockets served, opened on every worker: none
@@ -1403,6 +1527,8 @@ struct Bound {
     slot: usize,
     /// Taken away and draining: how many workers have closed its sockets.
     draining: Option<usize>,
+    /// Its HTTP/3 turned off and draining: how many workers have closed its UDP sockets.
+    http3_draining: Option<usize>,
     /// The address the config gave it then: what a later config's is compared with.
     address: SocketAddr,
     /// The address its socket has, which is another when the config left the port to the
@@ -1418,6 +1544,7 @@ impl From<&edgerush_config::CompiledListener> for Bound {
             name: listener.name.clone(),
             slot: 0,
             draining: None,
+            http3_draining: None,
             address: listener.address,
             listens_on: listener.address,
             http3: listener.http3.is_some(),
@@ -1462,25 +1589,42 @@ fn open(what: String, address: SocketAddr, port: Port) -> Result<std::net::TcpLi
     })
 }
 
-/// What a config asks of the listeners that only a restart can give: HTTP/3 turned on or
-/// off for a listener it keeps where it was, whose UDP socket is opened once.
-fn restart_needed(bound: &[Bound], config: &Compiled) -> Vec<String> {
-    let mut warnings = Vec::new();
-    for listener in config.listeners() {
-        let kept = bound.iter().find(|bound| {
-            bound.name == listener.name
-                && bound.draining.is_none()
-                && bound.address == listener.address
-        });
-        if let Some(bound) = kept.filter(|bound| bound.http3 != listener.http3.is_some()) {
-            warnings.push(format!(
-                "listener \"{}\" has HTTP/3 turned {}: its UDP socket is opened or closed at a restart",
-                listener.name,
-                if bound.http3 { "off" } else { "on" }
-            ));
-        }
-    }
-    warnings
+/// The listeners `config` keeps where they were whose HTTP/3 it turns on (`true`) or off:
+/// their UDP sockets alone are opened or closed. One it moves is drained and opened anew,
+/// HTTP/3 and all.
+fn http3_turned(bound: &[Bound], config: &Compiled) -> Vec<(String, bool)> {
+    config
+        .listeners()
+        .iter()
+        .filter_map(|listener| {
+            let kept = bound.iter().find(|bound| {
+                bound.name == listener.name
+                    && bound.draining.is_none()
+                    && bound.address == listener.address
+            })?;
+            let on = listener.http3.is_some();
+            (kept.http3 != on).then(|| (listener.name.clone(), on))
+        })
+        .collect()
+}
+
+/// Every worker's UDP socket for the listener `name`'s HTTP/3, on `address`, the port its
+/// TCP sockets have, in the workers' order.
+fn all_datagrams(
+    name: &str,
+    address: SocketAddr,
+    workers: NonZeroUsize,
+    port: Port,
+) -> Result<Vec<std::net::UdpSocket>, Failure> {
+    (0..workers.get())
+        .map(|_| {
+            datagrams(address, port).map_err(|error| Failure::Listen {
+                what: format!("listener \"{name}\" (HTTP/3)"),
+                address,
+                error,
+            })
+        })
+        .collect()
 }
 
 /// A line for whoever runs the harness. With nobody there to read it, it runs on.
@@ -1822,15 +1966,116 @@ upstreams: {{}}
         compile(&config).unwrap()
     }
 
+    /// Whether the UDP socket at `address` answers a QUIC client with a version negotiation
+    /// within `wait`: what an HTTP/3 listener answers a version nobody speaks.
+    fn negotiates(address: SocketAddr, wait: Duration) -> bool {
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_read_timeout(Some(wait)).unwrap();
+        let mut datagram = vec![0xc0, 0x1a, 0x2a, 0x3a, 0x4a, 8];
+        datagram.extend([1; 8]);
+        datagram.push(8);
+        datagram.extend([2; 8]);
+        datagram.resize(1200, 0);
+        if client.send_to(&datagram, address).is_err() {
+            return false;
+        }
+        let mut answer = [0; 1500];
+        let Ok((read, _)) = client.recv_from(&mut answer) else {
+            return false;
+        };
+        read > 5 && answer[0] & 0x80 != 0 && answer[1..5] == [0; 4]
+    }
+
+    /// HTTP/3 turned on again while its drain from being turned off is under way waits for
+    /// that drain, and is served on its port once every worker has closed its UDP socket
+    /// (03 §10): a config read before the workers have said so finds it draining.
     #[test]
-    fn listeners_that_are_as_they_were_need_no_restart() {
-        let config = listeners(&[("admin", "127.0.0.1:81"), ("web", "[::]:80")]);
-        let bound: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
-        assert_eq!(restart_needed(&bound, &config), [""; 0]);
+    fn http3_turned_on_while_it_drains_waits_for_the_drain() {
+        let authority = edgerush_certificates::testing::Authority::new("waits");
+        let issued = authority.issue(&["localhost"]);
+        let with = |http3: bool| -> Compiled {
+            let http3 = if http3 {
+                ", http3: { alt_svc_max_age: 60, force_retry: false }"
+            } else {
+                ""
+            };
+            let yaml = format!(
+                "routes: []\nupstreams: {{}}\nlisteners:\n  secure: {{ address: \"127.0.0.1:0\", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [server], without_sni: server }}{http3} }}\n"
+            );
+            let mut config: Config = serde_saphyr::from_str(&yaml).unwrap();
+            config.certificates.insert(
+                "server".to_owned(),
+                edgerush_config::Certificate {
+                    chain: issued.chain.clone(),
+                    key: issued.key.clone(),
+                },
+            );
+            compile(&config).unwrap()
+        };
+        let first = with(true);
+        let mut bound: Vec<Bound> = first.listeners().iter().map(Bound::from).collect();
+        let sockets = opened(&mut bound[0], NonZeroUsize::MIN, Port::Own).unwrap();
+        let address = bound[0].listens_on;
+        let proxy = Arc::new(Proxy::new(first, NonZeroUsize::MIN).unwrap());
+        let (tell, _told) = mpsc::channel();
+        let connections = crate::limits::Connections {
+            each: 64,
+            set_by: "the test",
+            quic: QUIC_MOST,
+        };
+        let running = per_core::start(
+            &proxy,
+            vec![sockets],
+            Accept::Balanced,
+            H1Limits::default(),
+            connections,
+            &tell,
+        )
+        .unwrap();
+        let listening = Listening {
+            proxy: &proxy,
+            workers: &running,
+            count: NonZeroUsize::MIN,
+            port: Port::Own,
+        };
+        let wanted = bound.clone();
+        let mut listeners = Listeners { bound, wanted };
+        assert!(negotiates(address, Duration::from_secs(10)));
+
+        let off = listening.reloaded(&mut listeners, with(false)).unwrap();
+        assert_eq!(off.said, ["listener \"secure\" no longer serves HTTP/3"]);
+        let on = listening.reloaded(&mut listeners, with(true)).unwrap();
+        assert_eq!(
+            on.warnings,
+            ["listener \"secure\" has HTTP/3 turned on: it waits for its earlier HTTP/3 to drain"]
+        );
+        assert!(on.said.is_empty(), "{:?}", on.said);
+
+        let began = Instant::now();
+        let mut said = Vec::new();
+        while said.len() < 2 && began.elapsed() < Duration::from_secs(10) {
+            said.extend(listening.tend(&mut listeners).said);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            said,
+            [
+                "listener \"secure\"'s HTTP/3 has drained".to_owned(),
+                format!("listener \"secure\" serves HTTP/3 on {address}"),
+            ]
+        );
+        assert!(negotiates(address, Duration::from_secs(10)));
     }
 
     #[test]
-    fn only_http3_turned_on_or_off_where_a_listener_is_kept_needs_a_restart() {
+    fn listeners_that_are_as_they_were_turn_no_http3_on_or_off() {
+        let config = listeners(&[("admin", "127.0.0.1:81"), ("web", "[::]:80")]);
+        let bound: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
+        assert_eq!(http3_turned(&bound, &config), []);
+    }
+
+    #[test]
+    fn http3_is_turned_on_or_off_only_where_a_listener_is_kept() {
         let before = listeners(&[("admin", "127.0.0.1:81"), ("web", "[::]:80")]);
         let mut bound: Vec<Bound> = before.listeners().iter().map(Bound::from).collect();
         for listener in &mut bound {
@@ -1839,18 +2084,15 @@ upstreams: {{}}
         // `admin` gone and `api` new are drained and opened; `web` moved is both, its
         // HTTP/3 with it.
         let moved = listeners(&[("api", "[::]:8080"), ("web", "[::]:8000")]);
-        assert_eq!(restart_needed(&bound, &moved), [""; 0]);
+        assert_eq!(http3_turned(&bound, &moved), []);
         let kept = listeners(&[("web", "[::]:80")]);
-        assert_eq!(
-            restart_needed(&bound, &kept),
-            [
-                "listener \"web\" has HTTP/3 turned off: its UDP socket is opened or closed at \
-                 a restart"
-            ]
-        );
+        assert_eq!(http3_turned(&bound, &kept), [("web".to_owned(), false)]);
+        bound[1].http3 = false;
+        assert_eq!(http3_turned(&bound, &kept), []);
         // Draining, it is not kept.
+        bound[1].http3 = true;
         bound[1].draining = Some(0);
-        assert_eq!(restart_needed(&bound, &kept), [""; 0]);
+        assert_eq!(http3_turned(&bound, &kept), []);
     }
 
     /// A drain ends as soon as the last connection goes.

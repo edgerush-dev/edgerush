@@ -377,7 +377,13 @@ async fn a_listener_opened_at_a_reload_is_served_over_http3_and_says_where() {
                 quic: Some(quic.port()),
             };
             let slots = proxy
-                .reload_with(compile(&config).unwrap(), &[opened], &[])
+                .reload_with(
+                    compile(&config).unwrap(),
+                    &Changes {
+                        opened: vec![opened],
+                        ..Changes::default()
+                    },
+                )
                 .unwrap();
             assert_eq!(slots.opened, [1]);
 
@@ -451,6 +457,165 @@ async fn a_listener_taken_away_ends_its_http3_once_its_last_connection_has() {
                 .until(|client| client.quic.is_closed() || client.quic.is_draining())
                 .await;
             within(serving).await.unwrap();
+        })
+        .await;
+}
+
+/// A listener whose HTTP/3 is turned off drains its QUIC connections and takes no new one,
+/// its HTTP/3 listener ending once its last has gone, while its TCP side is served on;
+/// turned on again, a new UDP socket of its is served (03 §10).
+#[tokio::test]
+async fn a_listener_whose_http3_is_turned_off_drains_its_quic_connections_alone() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::{Client, get};
+            let (upstream, _) = counting_upstream().await;
+            let (holding, held) = scripted_upstream().await;
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            // `/held` to an upstream that holds it, the rest to one that answers.
+            let mut config = h3_config(upstream, http3);
+            config.upstreams.insert(
+                "held".to_owned(),
+                serde_saphyr::from_str(&format!(
+                    "{{ load_balancer: p2c, endpoints: {{ listed: [\"{holding}\"] }} }}"
+                ))
+                .unwrap(),
+            );
+            config.routes[0].rules.insert(
+                0,
+                serde_saphyr::from_str(
+                    "matches: [{ path: { prefix: /held } }]\nforward: { backends: [{ upstream: held, weight: 1 }] }",
+                )
+                .unwrap(),
+            );
+            let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+            // The default deadlines: no timer of the connection's own wakes it to hear the
+            // drain before its listener does.
+            let worker = Worker::with_deadlines(proxy, H1Limits::default(), Deadlines::default());
+            let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = tcp.local_addr().unwrap();
+            let _tcp = tokio::task::spawn_local(Rc::clone(&worker).serve(0, tcp));
+            let serve_udp = async || {
+                let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let quic = udp.local_addr().unwrap();
+                let alone = Forwarding::group(1).remove(0);
+                let serving = Rc::clone(&worker).serve_h3(0, udp, alone).unwrap();
+                (quic, tokio::task::spawn_local(serving))
+            };
+            let (quic, serving) = serve_udp().await;
+            let mut client = Client::connect(quic, "a.test").await;
+            assert_eq!(client.get("a.test", "/").await.final_status(), Some("200"));
+            let under_way = client.request(&get("a.test", "/held"), true);
+            client.flush().await;
+            while held.borrow().is_empty() {
+                client.hear_for(Duration::from_millis(20)).await;
+            }
+
+            // Quiet, what the client owes sent first, so that nothing but the listener's
+            // drain is there to wake it.
+            client.flush().await;
+            client.hear_for(Duration::from_millis(500)).await;
+            client.flush().await;
+            // Told to go at once, with its request under way, which is answered first.
+            worker.stop_http3(0);
+            let began = tokio::time::Instant::now();
+            client.until(|client| client.goaway.is_some()).await;
+            let took = began.elapsed();
+            assert!(took < SLACK, "told to go {took:?} after HTTP/3 was turned off");
+            let mut late = Client::new(quic, "a.test").await;
+            late.flush().await;
+            late.hear_for(Duration::from_millis(300)).await;
+            assert!(!late.quic.is_established(), "a new connection was taken");
+            assert!(!serving.is_finished(), "ended with a request under way");
+            held.borrow_mut().clear();
+            assert_eq!(client.answer(under_way).await.final_status(), Some("502"));
+            client
+                .until(|client| client.quic.is_closed() || client.quic.is_draining())
+                .await;
+            within(serving).await.unwrap();
+            let stream = tls_client(front, "a.test", None, |_| {}).await.unwrap();
+            let answer = h1_over_or_nothing(stream).await.to_ascii_lowercase();
+            assert!(answer.starts_with("http/1.1 200 ok\r\n"), "{answer}");
+
+            worker.open_http3(0);
+            let (quic, _serving) = serve_udp().await;
+            let mut again = Client::connect(quic, "a.test").await;
+            assert_eq!(again.get("a.test", "/").await.final_status(), Some("200"));
+        })
+        .await;
+}
+
+/// What a listener kept advertises follows its HTTP/3 turned on or off with the UDP socket
+/// opened or closed for it (16 §5); turned on or off for a listener without sockets, it is
+/// refused, and nothing changes.
+#[tokio::test]
+async fn a_kept_listener_advertises_the_http3_it_is_turned_to() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let with = |http3: bool| {
+                let mut config = everything_config(upstream);
+                let web = config.listeners.get_mut("web").unwrap();
+                web.address = "127.0.0.1:8443".parse().unwrap();
+                web.http3 = http3.then_some(edgerush_config::Http3 {
+                    alt_svc_max_age: 60,
+                    force_retry: false,
+                });
+                secured(
+                    &mut config,
+                    vec![crate::tls::testing::certificate(&["a.test"])],
+                    None,
+                );
+                compile(&config).unwrap()
+            };
+            let advertised = async |proxy: &Arc<Proxy>| {
+                let worker = Worker::with_deadlines(Arc::clone(proxy), H1Limits::default(), SHORT);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = serving(&worker, socket);
+                let stream = tls_client(front, "a.test", None, |_| {}).await.unwrap();
+                let answer = h1_over_or_nothing(stream).await.to_ascii_lowercase();
+                assert!(answer.starts_with("http/1.1 200 ok\r\n"), "{answer}");
+                answer
+                    .lines()
+                    .find_map(|line| line.strip_prefix("alt-svc: "))
+                    .map(str::to_owned)
+            };
+            let turned = |port: Option<u16>| Changes {
+                http3: vec![("web".to_owned(), port)],
+                ..Changes::default()
+            };
+            let proxy = Arc::new(Proxy::new(with(true), NonZeroUsize::MIN).unwrap());
+            assert_eq!(
+                advertised(&proxy).await.as_deref(),
+                Some("h3=\":8443\"; ma=60")
+            );
+            proxy.reload_with(with(false), &turned(None)).unwrap();
+            assert_eq!(advertised(&proxy).await, None);
+            proxy.reload_with(with(true), &turned(Some(9443))).unwrap();
+            assert_eq!(
+                advertised(&proxy).await.as_deref(),
+                Some("h3=\":9443\"; ma=60")
+            );
+            let unknown = Changes {
+                http3: vec![("other".to_owned(), None)],
+                ..Changes::default()
+            };
+            let refused = proxy.listen(&unknown).unwrap_err();
+            assert_eq!(
+                refused.to_string(),
+                "listener `other` has no sockets to close"
+            );
+            assert_eq!(
+                advertised(&proxy).await.as_deref(),
+                Some("h3=\":9443\"; ma=60")
+            );
         })
         .await;
 }

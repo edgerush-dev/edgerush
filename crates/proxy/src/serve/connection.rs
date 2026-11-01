@@ -436,7 +436,7 @@ impl Worker {
             &self.proxy.quic,
             self.position,
             Rc::clone(&self.timers),
-            self.listening(listener),
+            self.quic_listening(listener),
             Rc::clone(self.blocks.borrow().storage()),
             Rc::clone(&self.h3_listeners),
             room,

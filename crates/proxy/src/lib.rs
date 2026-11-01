@@ -149,7 +149,7 @@ pub use metrics::AcceptPause;
 pub use request::{
     Copied, Decision, Forward, Mirroring, Opening, Redirected, Rejection, decide, decide_routed,
 };
-pub use serve::{Forwarding, Opened, Proxy, ProxyError, Slotted, Worker};
+pub use serve::{Changes, Forwarding, Opened, Proxy, ProxyError, Slotted, Worker};
 pub use tls::TlsError;
 // What a worker will not go beyond. There is no configuration for these; what there
 // is, is one value per worker, which whoever makes the workers hands them.

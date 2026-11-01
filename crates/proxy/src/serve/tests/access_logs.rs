@@ -207,7 +207,13 @@ async fn a_listener_taken_away_logs_its_drain() {
             without.listeners.insert("admin".to_owned(), admin);
             without.routes[0].listeners = vec!["admin".to_owned()];
             proxy
-                .reload_with(compile(&without).unwrap(), &[], &["web".to_owned()])
+                .reload_with(
+                    compile(&without).unwrap(),
+                    &Changes {
+                        closed: vec!["web".to_owned()],
+                        ..Changes::default()
+                    },
+                )
                 .unwrap();
             let request = b"GET /a/ok HTTP/1.1\r\nhost: example.test\r\nconnection: close\r\n\r\n";
             let answer = h1_answer(logged.front, request).await;

@@ -427,10 +427,14 @@ impl ListenerSlots {
     fn changing(
         &self,
         running: &Arc<Compiled>,
-        opened: &[Opened],
-        closed: &[String],
+        changes: &Changes,
         freed: Option<usize>,
     ) -> Result<(Self, Slotted), ProxyError> {
+        let Changes {
+            opened,
+            closed,
+            http3,
+        } = changes;
         let mut names = self.names.to_vec();
         let mut quic = self.quic.to_vec();
         let mut draining = self.draining.to_vec();
@@ -466,6 +470,16 @@ impl ListenerSlots {
             }
             slotted.closed.push(slot);
         }
+        for (listener, port) in http3 {
+            let slot = names
+                .iter()
+                .zip(&draining)
+                .position(|(name, draining)| !draining && name.as_ref() == Some(listener));
+            let Some(served) = slot.and_then(|slot| quic.get_mut(slot)) else {
+                return Err(ProxyError::ListenerNotOpen(listener.clone()));
+            };
+            *served = *port;
+        }
         for listener in opened {
             if names.iter().flatten().any(|name| *name == listener.name) {
                 return Err(ProxyError::ListenerOpen(listener.name.clone()));
@@ -487,6 +501,18 @@ impl ListenerSlots {
         };
         Ok((slots, slotted))
     }
+}
+
+/// What a config changes of the listeners' sockets ([`Proxy::reload_with`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Changes {
+    /// Listeners whose sockets have been opened, to be served from now on.
+    pub opened: Vec<Opened>,
+    /// Listeners whose sockets are to close, to drain in their slots.
+    pub closed: Vec<String>,
+    /// Listeners kept whose HTTP/3 is turned on, on the port of the UDP socket opened for
+    /// it, or off: what `Alt-Svc` says from now on.
+    pub http3: Vec<(String, Option<u16>)>,
 }
 
 /// The slots a change of listeners took and closed ([`Proxy::reload_with`]).
@@ -625,29 +651,24 @@ impl Proxy {
     /// Returns a [`ProxyError`] as [`Proxy::new`] does; the data plane then runs on as it
     /// was.
     pub fn reload(&self, config: Compiled) -> Result<(), ProxyError> {
-        self.reload_with(config, &[], &[]).map(|_| ())
+        self.reload_with(config, &Changes::default()).map(|_| ())
     }
 
-    /// Runs `config` from now on, as [`Proxy::reload`] does, and with it the listeners
-    /// `opened` names, whose sockets are open and are to be served from now on, and without
-    /// those `closed` names, whose sockets are to close: each opened takes the first slot
-    /// that is free, its counters at zero and its access log with it; each closed drains
-    /// in its slot, serving nothing, until [`Proxy::free`] frees it. Their slots, for the
-    /// sockets to be accepted on as those listeners and the workers to stop accepting on.
+    /// Runs `config` from now on, as [`Proxy::reload`] does, with the listeners' sockets
+    /// changed as `changes` says: each listener opened takes the first slot that is free,
+    /// its counters at zero and its access log with it; each closed drains in its slot,
+    /// serving nothing, until [`Proxy::free`] frees it; each whose HTTP/3 is turned on or
+    /// off says so in its `Alt-Svc`. Their slots, for the sockets to be accepted on as those
+    /// listeners and the workers to stop accepting on.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProxyError`] as [`Proxy::new`] does, and for a listener of `opened`
-    /// that has sockets or a slot that drains, or that no slot is free for, and for one of
-    /// `closed` whose sockets are not served; the data plane then runs on as it was, and no
-    /// slot changes.
-    pub fn reload_with(
-        &self,
-        config: Compiled,
-        opened: &[Opened],
-        closed: &[String],
-    ) -> Result<Slotted, ProxyError> {
-        let slotted = self.publish(Some(Arc::new(config)), opened, closed, None)?;
+    /// Returns a [`ProxyError`] as [`Proxy::new`] does, and for a listener opened that has
+    /// sockets or a slot that drains, or that no slot is free for, and for one closed or
+    /// with HTTP/3 changed whose sockets are not served; the data plane then runs on as it
+    /// was, and no slot changes.
+    pub fn reload_with(&self, config: Compiled, changes: &Changes) -> Result<Slotted, ProxyError> {
+        let slotted = self.publish(Some(Arc::new(config)), changes, None)?;
         self.metrics.reloads.inc();
         let now = SystemTime::now().duration_since(UNIX_EPOCH);
         let now = now.map_or(0, |since_epoch| since_epoch.as_secs());
@@ -655,16 +676,14 @@ impl Proxy {
         Ok(slotted)
     }
 
-    /// Serves the listeners `opened` names, of the config that runs, whose sockets are open
-    /// from now on: as [`Proxy::reload_with`] serves them, for a listener that waited for
-    /// another's drain. Their slots.
+    /// Changes the listeners' sockets as `changes` says, under the config that runs, as
+    /// [`Proxy::reload_with`] changes them: for what waited for another's drain. Their slots.
     ///
     /// # Errors
     ///
     /// As [`Proxy::reload_with`]'s; the data plane then runs on as it was.
-    pub fn listen(&self, opened: &[Opened]) -> Result<Vec<usize>, ProxyError> {
-        self.publish(None, opened, &[], None)
-            .map(|slotted| slotted.opened)
+    pub fn listen(&self, changes: &Changes) -> Result<Slotted, ProxyError> {
+        self.publish(None, changes, None)
     }
 
     /// Frees `slot`, whose listener's sockets are closed and whose connections have all
@@ -675,7 +694,8 @@ impl Proxy {
     /// For a slot that is not draining, or as [`Proxy::reload_with`]'s; the data plane then
     /// runs on as it was.
     pub fn free(&self, slot: usize) -> Result<(), ProxyError> {
-        self.publish(None, &[], &[], Some(slot)).map(drop)
+        self.publish(None, &Changes::default(), Some(slot))
+            .map(drop)
     }
 
     /// Publishes `config`, or the config that runs again, with the slots changed as
@@ -683,8 +703,7 @@ impl Proxy {
     fn publish(
         &self,
         config: Option<Arc<Compiled>>,
-        opened: &[Opened],
-        closed: &[String],
+        changes: &Changes,
         freed: Option<usize>,
     ) -> Result<Slotted, ProxyError> {
         let _making = self.making.lock().unwrap_or_else(PoisonError::into_inner);
@@ -692,9 +711,7 @@ impl Proxy {
         // keeps what its connections are filed under and one that has gone is retired.
         let previous = self.current.load();
         let config = config.unwrap_or_else(|| Arc::clone(&previous.config));
-        let (slots, slotted) = previous
-            .slots
-            .changing(&previous.config, opened, closed, freed)?;
+        let (slots, slotted) = previous.slots.changing(&previous.config, changes, freed)?;
         let mut prepared = self.logs.prepare(&config, &slots.serving())?;
         // A listener that drains logs where it did until it has drained.
         for (slot, _) in slots.draining.iter().enumerate().filter(|(_, d)| **d) {

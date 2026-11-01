@@ -443,9 +443,20 @@ pub(crate) async fn serve<T, R, F, B, D, O, G>(
     };
     // A forwarded datagram the wait below took out of the inbox.
     let mut waiting: Option<Forwarded> = None;
+    // Whether the connections were stirred to hear the listener's drain.
+    let mut told = false;
     loop {
         if shared.drain.is_on() && shared.table.borrow().is_empty() {
             return;
+        }
+        if shared.drain.is_on() && !told {
+            // Each hears it at its next turn, reading the flag: nothing for a connection to
+            // watch while the listener does not drain.
+            told = true;
+            let connections: Vec<Rc<Conn>> = shared.table.borrow().values().cloned().collect();
+            for conn in connections {
+                conn.stir();
+            }
         }
         serving.admitted = 0;
         let mut read = 0;

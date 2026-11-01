@@ -64,6 +64,37 @@ enum Change {
     Add(Added),
     /// Stop serving the listener whose slot this is ([`Workers::stop`]).
     Stop(usize),
+    /// Serve HTTP/3 on a listener it serves over TCP ([`Workers::add_http3`]).
+    AddHttp3(AddedHttp3),
+    /// Stop serving HTTP/3 on the listener whose slot this is ([`Workers::stop_http3`]).
+    StopHttp3(usize),
+}
+
+/// A UDP socket for a listener a worker serves already, posted by [`Workers::add_http3`].
+#[derive(Debug)]
+struct AddedHttp3 {
+    slot: usize,
+    name: String,
+    udp: std::net::UdpSocket,
+    /// The worker's share of the listener's QUIC inboxes.
+    share: Forwarding,
+    said: std::sync::mpsc::Sender<Result<(), String>>,
+}
+
+/// What of a slot's sockets a worker has closed, once it was stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Closed {
+    /// Every socket of the listener's ([`Workers::stop`]).
+    Listener,
+    /// Its UDP socket ([`Workers::stop_http3`]).
+    Http3,
+}
+
+/// Which of a slot's sockets a task runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Socket {
+    Tcp,
+    Udp,
 }
 
 /// A listener's sockets for a worker that runs, posted to it by [`Workers::add`].
@@ -86,9 +117,9 @@ pub(crate) struct Workers {
     pub(crate) loads: Arc<Loads>,
     /// By position of the worker.
     changing: Vec<UnboundedSender<Change>>,
-    /// A worker's position and a slot it was stopped on, once every task it ran on the
-    /// slot's sockets has ended: its sockets are closed.
-    closed: std::sync::mpsc::Receiver<(usize, usize)>,
+    /// A worker's position, a slot it was stopped on and what it stopped, once every task
+    /// it ran on those sockets has ended: they are closed.
+    closed: std::sync::mpsc::Receiver<(usize, usize, Closed)>,
 }
 
 impl Workers {
@@ -115,15 +146,46 @@ impl Workers {
                 Err(_) => failed.push(format!("worker {position} takes no listeners")),
             }
         }
-        // Every worker's answer, or none from one that went without giving it.
-        drop(said);
-        let answers: Vec<Result<(), String>> = saying.iter().collect();
-        if answers.len() < posted {
-            let unsaid = posted - answers.len();
-            failed.push(format!("{unsaid} workers went without saying"));
+        answered(said, &saying, posted, failed)
+    }
+
+    /// Has every worker serve HTTP/3 on its socket of `sockets`, one a worker in their
+    /// order, for the listener `name` whose slot is `slot`, which it serves over TCP
+    /// already. Returns once every worker has said whether it does: what each could not do.
+    pub(crate) fn add_http3(
+        &self,
+        slot: usize,
+        name: &str,
+        sockets: Vec<std::net::UdpSocket>,
+    ) -> Vec<String> {
+        let (said, saying) = std::sync::mpsc::channel();
+        let shares = Forwarding::group(sockets.len());
+        let mut posted = 0;
+        let mut failed = Vec::new();
+        let each = self.changing.iter().zip(sockets).zip(shares);
+        for (position, ((worker, udp), share)) in each.enumerate() {
+            let added = AddedHttp3 {
+                slot,
+                name: name.to_owned(),
+                udp,
+                share,
+                said: said.clone(),
+            };
+            match worker.send(Change::AddHttp3(added)) {
+                Ok(()) => posted += 1,
+                Err(_) => failed.push(format!("worker {position} takes no listeners")),
+            }
         }
-        failed.extend(answers.into_iter().filter_map(Result::err));
-        failed
+        answered(said, &saying, posted, failed)
+    }
+
+    /// Has every worker stop serving HTTP/3 on the listener whose slot is `slot`, turned
+    /// off: its QUIC connections drain, and its UDP sockets close once they have ended
+    /// ([`Workers::closed`]). Its TCP side is left alone.
+    pub(crate) fn stop_http3(&self, slot: usize) {
+        for worker in &self.changing {
+            let _gone = worker.send(Change::StopHttp3(slot));
+        }
     }
 
     /// Has every worker stop serving the listener whose slot is `slot`, taken away: it
@@ -138,9 +200,9 @@ impl Workers {
         }
     }
 
-    /// The workers and slots that have closed a slot's sockets since last asked, each as
-    /// (worker, slot).
-    pub(crate) fn closed(&self) -> Vec<(usize, usize)> {
+    /// What the workers have closed of slots they were stopped on since last asked, each as
+    /// (worker, slot, what).
+    pub(crate) fn closed(&self) -> Vec<(usize, usize, Closed)> {
         self.closed.try_iter().collect()
     }
 
@@ -150,72 +212,120 @@ impl Workers {
     }
 }
 
-/// The tasks a worker runs on each slot's sockets — accepting, and HTTP/3 — counted, so
-/// that the main loop hears once a slot it stopped has none left: its sockets closed.
+/// What the workers answered, `posted` of them asked by `said`, with what `failed` of
+/// posting already: what each could not do.
+fn answered(
+    said: std::sync::mpsc::Sender<Result<(), String>>,
+    saying: &std::sync::mpsc::Receiver<Result<(), String>>,
+    posted: usize,
+    mut failed: Vec<String>,
+) -> Vec<String> {
+    // Every worker's answer, or none from one that went without giving it.
+    drop(said);
+    let answers: Vec<Result<(), String>> = saying.iter().collect();
+    if answers.len() < posted {
+        let unsaid = posted - answers.len();
+        failed.push(format!("{unsaid} workers went without saying"));
+    }
+    failed.extend(answers.into_iter().filter_map(Result::err));
+    failed
+}
+
+/// The tasks a worker runs on each slot's sockets — accepting on TCP, and HTTP/3 on UDP —
+/// counted, so that the main loop hears once a slot it stopped has none left on what it
+/// stopped: those sockets closed.
 #[derive(Debug)]
 struct Running {
     position: usize,
-    /// By slot: the tasks on its sockets, and whether it was stopped.
-    slots: RefCell<Vec<(usize, bool)>>,
-    closed: std::sync::mpsc::Sender<(usize, usize)>,
+    /// By slot.
+    slots: RefCell<Vec<Tasks>>,
+    closed: std::sync::mpsc::Sender<(usize, usize, Closed)>,
+}
+
+/// A slot's tasks, by the socket they run on, and what of it was stopped.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tasks {
+    tcp: usize,
+    udp: usize,
+    stopped: bool,
+    http3_stopped: bool,
+}
+
+impl Tasks {
+    /// What it was stopped on that no task runs on any more, once each: said now.
+    fn closing(&mut self) -> Vec<Closed> {
+        let mut closed = Vec::new();
+        if self.http3_stopped && self.udp == 0 {
+            self.http3_stopped = false;
+            closed.push(Closed::Http3);
+        }
+        if self.stopped && self.tcp + self.udp == 0 {
+            self.stopped = false;
+            closed.push(Closed::Listener);
+        }
+        closed
+    }
 }
 
 impl Running {
-    fn new(position: usize, slots: usize, closed: std::sync::mpsc::Sender<(usize, usize)>) -> Self {
+    fn new(
+        position: usize,
+        slots: usize,
+        closed: std::sync::mpsc::Sender<(usize, usize, Closed)>,
+    ) -> Self {
         Self {
             position,
-            slots: RefCell::new(vec![(0, false); slots]),
+            slots: RefCell::new(vec![Tasks::default(); slots]),
             closed,
         }
     }
 
-    /// A task on `slot`'s sockets, counted until it is dropped.
-    fn task(self: &Rc<Self>, slot: usize) -> Task {
-        if let Some((tasks, _)) = self.slots.borrow_mut().get_mut(slot) {
-            *tasks += 1;
+    /// A task on `slot`'s `socket`, counted until it is dropped.
+    fn task(self: &Rc<Self>, slot: usize, socket: Socket) -> Task {
+        if let Some(tasks) = self.slots.borrow_mut().get_mut(slot) {
+            match socket {
+                Socket::Tcp => tasks.tcp += 1,
+                Socket::Udp => tasks.udp += 1,
+            }
         }
         Task {
             running: Rc::clone(self),
             slot,
+            socket,
         }
     }
 
-    /// `slot` was stopped: said closed once it has no task left, which may be now.
+    /// `slot` was stopped, every socket of it: said closed once it has no task left, which
+    /// may be now.
     fn stopped(&self, slot: usize) {
-        let closed = {
-            let mut slots = self.slots.borrow_mut();
-            let Some((tasks, stopped)) = slots.get_mut(slot) else {
-                return;
-            };
-            *stopped = *tasks > 0;
-            *tasks == 0
-        };
-        if closed {
-            self.close(slot);
-        }
+        self.changed(slot, |tasks| tasks.stopped = true);
     }
 
-    fn ended(&self, slot: usize) {
-        let closed = {
-            let mut slots = self.slots.borrow_mut();
-            let Some((tasks, stopped)) = slots.get_mut(slot) else {
-                return;
-            };
-            *tasks = tasks.saturating_sub(1);
-            let closed = *tasks == 0 && *stopped;
-            if closed {
-                *stopped = false;
-            }
-            closed
-        };
-        if closed {
-            self.close(slot);
-        }
+    /// `slot`'s HTTP/3 was stopped: said closed once it has no task on its UDP socket left.
+    fn stopped_http3(&self, slot: usize) {
+        self.changed(slot, |tasks| tasks.http3_stopped = true);
     }
 
-    fn close(&self, slot: usize) {
-        // With nobody to hear it, the data plane is ending anyway.
-        let _gone = self.closed.send((self.position, slot));
+    fn ended(&self, slot: usize, socket: Socket) {
+        self.changed(slot, |tasks| match socket {
+            Socket::Tcp => tasks.tcp = tasks.tcp.saturating_sub(1),
+            Socket::Udp => tasks.udp = tasks.udp.saturating_sub(1),
+        });
+    }
+
+    fn changed(&self, slot: usize, change: impl FnOnce(&mut Tasks)) {
+        let closed = {
+            let mut slots = self.slots.borrow_mut();
+            let Some(tasks) = slots.get_mut(slot) else {
+                return;
+            };
+            change(tasks);
+            tasks.closing()
+        };
+        for what in closed {
+            // With nobody to hear it, the data plane is ending anyway.
+            let _gone = self.closed.send((self.position, slot, what));
+        }
     }
 }
 
@@ -224,11 +334,12 @@ impl Running {
 struct Task {
     running: Rc<Running>,
     slot: usize,
+    socket: Socket,
 }
 
 impl Drop for Task {
     fn drop(&mut self) {
-        self.running.ended(self.slot);
+        self.running.ended(self.slot, self.socket);
     }
 }
 
@@ -417,7 +528,7 @@ impl Worker {
         name: &str,
         socket: TcpListener,
     ) -> impl Future<Output = ()> + 'static {
-        let task = self.running.task(slot);
+        let task = self.running.task(slot, Socket::Tcp);
         let what = format!(
             "worker {}'s accepting on listener \"{name}\"",
             self.position
@@ -438,7 +549,7 @@ impl Worker {
         name: &str,
         serving: impl Future<Output = ()> + 'static,
     ) -> impl Future<Output = ()> + 'static {
-        let task = self.running.task(slot);
+        let task = self.running.task(slot, Socket::Udp);
         let what = format!("worker {}'s HTTP/3 on listener \"{name}\"", self.position);
         let essential = Essential::new(what, &self.tell);
         let plane = Rc::clone(&self.plane);
@@ -540,6 +651,19 @@ impl Worker {
                     self.plane.stop(slot);
                     self.running.stopped(slot);
                 }
+                Change::AddHttp3(AddedHttp3 {
+                    slot,
+                    name,
+                    udp,
+                    share,
+                    said,
+                }) => {
+                    let _gone = said.send(self.listen_http3(slot, &name, udp, share));
+                }
+                Change::StopHttp3(slot) => {
+                    self.plane.stop_http3(slot);
+                    self.running.stopped_http3(slot);
+                }
             }
         }
     }
@@ -562,12 +686,28 @@ impl Worker {
         self.plane.open(slot);
         let socket = TcpListener::from_std(tcp).map_err(|error| cannot("accept on", error))?;
         let _detached = tokio::task::spawn_local(self.accepting(slot, name, socket));
-        let Some((udp, share)) = udp else {
-            return Ok(());
-        };
+        match udp {
+            Some((udp, share)) => self.listen_http3(slot, name, udp, share),
+            None => Ok(()),
+        }
+    }
+
+    /// Serves HTTP/3 on `udp` for the listener `name` whose slot is `slot`.
+    fn listen_http3(
+        &self,
+        slot: usize,
+        name: &str,
+        udp: std::net::UdpSocket,
+        share: Forwarding,
+    ) -> Result<(), String> {
+        // Its own drain from now on: one its HTTP/3 had before was started.
+        self.plane.open_http3(slot);
         let serving = UdpSocket::from_std(udp)
             .and_then(|udp| Rc::clone(&self.plane).serve_h3(slot, udp, share))
-            .map_err(|error| cannot("serve HTTP/3 on", error))?;
+            .map_err(|error| {
+                let position = self.position;
+                format!("worker {position} cannot serve HTTP/3 on listener \"{name}\": {error}")
+            })?;
         let _detached = tokio::task::spawn_local(self.serving_h3(slot, name, serving));
         Ok(())
     }
@@ -975,7 +1115,11 @@ upstreams:
             name: "api".to_owned(),
             quic: Some(address.port()),
         };
-        let slotted = proxy.reload_with(config(api), &[opened], &[]).unwrap();
+        let changes = edgerush_proxy::Changes {
+            opened: vec![opened],
+            ..edgerush_proxy::Changes::default()
+        };
+        let slotted = proxy.reload_with(config(api), &changes).unwrap();
         assert_eq!(slotted.opened, [1]);
         assert_eq!(running.add(1, "api", sockets), [""; 0]);
         (web, address, running, proxy, told)
@@ -1067,9 +1211,12 @@ upstreams:
         let (closing, closed) = std::sync::mpsc::channel();
         let running = Rc::new(Running::new(3, 2, closing));
         running.stopped(1);
-        assert_eq!(closed.try_iter().collect::<Vec<_>>(), [(3, 1)]);
+        assert_eq!(
+            closed.try_iter().collect::<Vec<_>>(),
+            [(3, 1, Closed::Listener)]
+        );
 
-        let (accepting, serving) = (running.task(0), running.task(0));
+        let (accepting, serving) = (running.task(0, Socket::Tcp), running.task(0, Socket::Udp));
         drop(accepting);
         running.stopped(0);
         assert!(
@@ -1077,10 +1224,29 @@ upstreams:
             "closed with a task still running"
         );
         drop(serving);
-        assert_eq!(closed.try_iter().collect::<Vec<_>>(), [(3, 0)]);
+        assert_eq!(
+            closed.try_iter().collect::<Vec<_>>(),
+            [(3, 0, Closed::Listener)]
+        );
 
         // Taken again and its task ended, unstopped: nothing to say.
-        drop(running.task(0));
+        drop(running.task(0, Socket::Tcp));
+        assert!(closed.try_recv().is_err(), "said closed though not stopped");
+
+        // Its HTTP/3 stopped alone: said once the task on its UDP socket has ended, whatever
+        // runs on its TCP socket, which is not said closed.
+        let (tcp, udp) = (running.task(0, Socket::Tcp), running.task(0, Socket::Udp));
+        running.stopped_http3(0);
+        assert!(
+            closed.try_recv().is_err(),
+            "HTTP/3 closed with its task running"
+        );
+        drop(udp);
+        assert_eq!(
+            closed.try_iter().collect::<Vec<_>>(),
+            [(3, 0, Closed::Http3)]
+        );
+        drop(tcp);
         assert!(closed.try_recv().is_err(), "said closed though not stopped");
     }
 
@@ -1099,7 +1265,7 @@ upstreams:
             thread::sleep(Duration::from_millis(5));
         }
         closed.sort_unstable();
-        assert_eq!(closed, [(0, 1), (1, 1)]);
+        assert_eq!(closed, [(0, 1, Closed::Listener), (1, 1, Closed::Listener)]);
         assert!(
             std::net::TcpStream::connect(api).is_err(),
             "still listened on"
@@ -1109,6 +1275,33 @@ upstreams:
             let mut connection = std::net::TcpStream::connect(web).unwrap();
             assert_eq!(request(&mut connection), "HTTP/1.1 503 Service Unavailable");
         }
+        assert!(told.try_recv().is_err(), "a stop was told as an end");
+    }
+
+    /// A listener's HTTP/3 stopped alone closes its UDP sockets on every worker, each saying
+    /// so, its TCP side served on; added again, it is served on new ones; nothing is told as
+    /// ended.
+    #[test]
+    fn every_worker_stops_and_adds_a_listeners_http3_alone() {
+        let (_, api, running, _proxy, told) = added_later(2, Port::Shared, CONNECTIONS_PER_WORKER);
+        running.stop_http3(1);
+        let began = Instant::now();
+        let mut closed = Vec::new();
+        while closed.len() < 2 && began.elapsed() < Duration::from_secs(10) {
+            closed.extend(running.closed());
+            thread::sleep(Duration::from_millis(5));
+        }
+        closed.sort_unstable();
+        assert_eq!(closed, [(0, 1, Closed::Http3), (1, 1, Closed::Http3)]);
+        assert!(!negotiates(api), "its UDP socket still read");
+        let mut connection = std::net::TcpStream::connect(api).unwrap();
+        assert_eq!(request(&mut connection), "HTTP/1.1 404 Not Found");
+
+        let sockets = (0..2)
+            .map(|_| datagrams(api, Port::Shared).unwrap())
+            .collect();
+        assert_eq!(running.add_http3(1, "api", sockets), [""; 0]);
+        assert!(negotiates(api), "its new UDP socket not read");
         assert!(told.try_recv().is_err(), "a stop was told as an end");
     }
 

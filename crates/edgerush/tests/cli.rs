@@ -407,6 +407,106 @@ listeners:
     Ok(())
 }
 
+/// HTTP/3 turned on for a listener a config keeps is served on its port as that config
+/// takes over, and turned off is drained and no longer served: its UDP sockets alone are
+/// opened and closed, its TCP side served all along (03 §10).
+#[test]
+fn proxy_turns_a_listeners_http3_on_and_off() -> io::Result<()> {
+    let one = upstream("one")?;
+    let authority = Authority::new("http3");
+    let issued = authority.issue(&["localhost"]);
+    let (chain, key) = (scratch("http3-chain.pem"), scratch("http3-key.pem"));
+    std::fs::write(&chain, &issued.chain)?;
+    std::fs::write(&key, &issued.key)?;
+    let at = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let with = |http3: bool, comment: &str| {
+        let http3 = if http3 {
+            ", http3: { alt_svc_max_age: 60, force_retry: false }"
+        } else {
+            ""
+        };
+        format!(
+            r#"upstreams:
+  up: {{ load_balancer: p2c, endpoints: {{ listed: ["{one}"] }} }}
+routes:
+  - name: everything
+    listeners: [secure]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: / }}
+        forward: {{ backends: [{{ upstream: up, weight: 1 }}] }}
+listeners:
+  secure: {{ address: "{at}", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [server], without_sni: server }}{http3} }}
+certificates:
+  server: {{ chain_file: '{chain}', key_file: '{key}' }}
+# {comment}
+"#
+        )
+    };
+    let file = scratch("http3.yaml");
+    std::fs::write(&file, with(false, "off"))?;
+    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
+    assert_eq!(harness.address_after("listener \"secure\" is on "), at);
+    harness.wait_for("1 worker, thread-per-core");
+    assert!(
+        !negotiates(at, Duration::from_secs(1)),
+        "HTTP/3 served while off"
+    );
+
+    std::fs::write(&file, with(true, "on"))?;
+    harness.wait_for("config reloaded");
+    assert_eq!(
+        harness.address_after("listener \"secure\" serves HTTP/3 on "),
+        at
+    );
+    assert!(negotiates(at, PATIENCE), "HTTP/3 not served once on");
+    assert!(TcpStream::connect(at).is_ok(), "its TCP side not served");
+
+    std::fs::write(&file, with(false, "off again"))?;
+    harness.wait_for("config reloaded");
+    harness.wait_for("listener \"secure\" no longer serves HTTP/3");
+    harness.wait_for("listener \"secure\"'s HTTP/3 has drained");
+    assert!(
+        !negotiates(at, Duration::from_secs(1)),
+        "HTTP/3 served once off"
+    );
+    assert!(TcpStream::connect(at).is_ok(), "its TCP side not served");
+
+    // On again once drained: a UDP socket of its own.
+    std::fs::write(&file, with(true, "on again"))?;
+    harness.wait_for("config reloaded");
+    assert_eq!(
+        harness.address_after("listener \"secure\" serves HTTP/3 on "),
+        at
+    );
+    assert!(negotiates(at, PATIENCE), "HTTP/3 not served once on again");
+    Ok(())
+}
+
+/// Whether the UDP socket at `address` answers a QUIC client within `wait`, with a version
+/// negotiation for a datagram of a version nobody speaks, as large as an Initial: what an
+/// HTTP/3 listener answers whatever else it is set up with.
+fn negotiates(address: SocketAddr, wait: Duration) -> bool {
+    let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("a UDP socket");
+    client.set_read_timeout(Some(wait)).expect("a read timeout");
+    let mut datagram = vec![0xc0, 0x1a, 0x2a, 0x3a, 0x4a, 8];
+    datagram.extend([1; 8]);
+    datagram.push(8);
+    datagram.extend([2; 8]);
+    datagram.resize(1200, 0);
+    if client.send_to(&datagram, address).is_err() {
+        return false;
+    }
+    let mut answer = [0; 1500];
+    let Ok((read, _)) = client.recv_from(&mut answer) else {
+        return false;
+    };
+    // A long header whose version is 0.
+    read > 5 && answer[0] & 0x80 != 0 && answer[1..5] == [0; 4]
+}
+
 /// Whether connecting to `address` is refused within [`PATIENCE`]: a socket the data plane
 /// closes is closed by its worker a moment after the config that takes it away runs.
 fn refused_soon(address: SocketAddr) -> bool {

@@ -813,6 +813,22 @@ fn opened(name: &str) -> Opened {
     }
 }
 
+/// The listener `name` opened, as a change.
+fn opening(name: &str) -> Changes {
+    Changes {
+        opened: vec![opened(name)],
+        ..Changes::default()
+    }
+}
+
+/// The listener `name` closed, as a change.
+fn closing(name: &str) -> Changes {
+    Changes {
+        closed: vec![name.to_owned()],
+        ..Changes::default()
+    }
+}
+
 /// A listener whose sockets are opened takes the first slot that is free, and is served
 /// there; one said to be opened that has its sockets already is refused, and the data
 /// plane runs on as it was.
@@ -820,7 +836,7 @@ fn opened(name: &str) -> Opened {
 fn a_listener_whose_sockets_are_opened_takes_the_first_free_slot() {
     let proxy = Proxy::new(config_with(&["web", "admin"]), NonZeroUsize::MIN).unwrap();
     let after = config_with(&["admin", "api", "web"]);
-    let slotted = proxy.reload_with(after, &[opened("api")], &[]).unwrap();
+    let slotted = proxy.reload_with(after, &opening("api")).unwrap();
     assert_eq!(slotted.opened, [2]);
     let named = |names: &[&str]| -> Vec<Option<String>> {
         names.iter().map(|name| Some((*name).to_owned())).collect()
@@ -832,7 +848,7 @@ fn a_listener_whose_sockets_are_opened_takes_the_first_free_slot() {
     );
 
     let again = proxy
-        .reload_with(config_with(&["api"]), &[opened("api")], &[])
+        .reload_with(config_with(&["api"]), &opening("api"))
         .unwrap_err();
     assert_eq!(again.to_string(), "listener `api` has its sockets already");
     assert_eq!(proxy.current.load().config.listeners().len(), 3);
@@ -845,7 +861,7 @@ fn a_listener_taken_away_holds_its_slot_until_it_is_freed() {
     let proxy = Proxy::new(config_with(&["admin", "web"]), NonZeroUsize::MIN).unwrap();
     proxy.metrics.listener(0).unwrap().accepted.inc();
     let slotted = proxy
-        .reload_with(config_with(&["web"]), &[], &["admin".to_owned()])
+        .reload_with(config_with(&["web"]), &closing("admin"))
         .unwrap();
     assert_eq!(slotted.closed, [0]);
     assert_eq!(proxy.listeners()[0].as_deref(), Some("admin"));
@@ -855,14 +871,14 @@ fn a_listener_taken_away_holds_its_slot_until_it_is_freed() {
     assert_eq!(proxy.current.load().listeners[..2], [None, Some(1)]);
 
     let again = proxy
-        .reload_with(config_with(&["admin", "web"]), &[opened("admin")], &[])
+        .reload_with(config_with(&["admin", "web"]), &opening("admin"))
         .unwrap_err();
     assert_eq!(
         again.to_string(),
         "listener `admin` has its sockets already"
     );
     let twice = proxy
-        .reload_with(config_with(&["web"]), &[], &["admin".to_owned()])
+        .reload_with(config_with(&["web"]), &closing("admin"))
         .unwrap_err();
     assert_eq!(
         twice.to_string(),
@@ -873,7 +889,7 @@ fn a_listener_taken_away_holds_its_slot_until_it_is_freed() {
 
     proxy.free(0).unwrap();
     assert_eq!(proxy.listeners()[0], None);
-    assert_eq!(proxy.listen(&[opened("admin")]).unwrap(), [0]);
+    assert_eq!(proxy.listen(&opening("admin")).unwrap().opened, [0]);
     assert_eq!(proxy.current.load().listeners[..2], [Some(0), Some(1)]);
     assert_eq!(proxy.metrics.listener(0).unwrap().accepted.get(), 0);
 }
@@ -887,7 +903,7 @@ fn a_listener_no_slot_is_free_for_is_refused() {
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let proxy = Proxy::new(config_with(&names), NonZeroUsize::MIN).unwrap();
     let refused = proxy
-        .reload_with(config_with(&["late"]), &[opened("late")], &[])
+        .reload_with(config_with(&["late"]), &opening("late"))
         .unwrap_err();
     assert_eq!(
         refused.to_string(),

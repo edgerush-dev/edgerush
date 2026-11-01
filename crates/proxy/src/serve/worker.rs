@@ -115,11 +115,14 @@ impl Worker {
                 .collect();
             (RefCell::new(validations), Cell::new(snapshot.generation))
         };
-        let listening = RefCell::new(
-            (0..validations.borrow().len())
-                .map(|_| Rc::new(Drain::default()))
-                .collect(),
-        );
+        let undrained = || -> RefCell<Vec<Rc<Drain>>> {
+            RefCell::new(
+                (0..validations.borrow().len())
+                    .map(|_| Rc::new(Drain::default()))
+                    .collect(),
+            )
+        };
+        let (listening, quic_listening) = (undrained(), undrained());
         let batches = proxy.logs.worker();
         let pool = Rc::new(RefCell::new(Pool::default()));
         // Room among the files is made by closing an idle socket of the worker's.
@@ -159,6 +162,7 @@ impl Worker {
             h3_listeners: Rc::default(),
             validations,
             listening,
+            quic_listening,
             validated,
             routes: RefCell::default(),
             batches,
@@ -182,6 +186,7 @@ impl Worker {
             .iter()
             .map(|validation| Rc::clone(&validation.drain))
             .chain(self.listening.borrow().iter().map(Rc::clone))
+            .chain(self.quic_listening.borrow().iter().map(Rc::clone))
             .chain(self.routes.borrow().values().map(Rc::clone))
             .collect();
         for drain in drains {
@@ -300,6 +305,7 @@ impl Worker {
     /// connections drain as at shutdown (03 §10).
     pub fn stop(&self, slot: usize) {
         let listening = self.listening.borrow().get(slot).map(Rc::clone);
+        let quic = self.quic_listening.borrow().get(slot).map(Rc::clone);
         let replaced = {
             let mut validations = self.validations.borrow_mut();
             validations
@@ -307,27 +313,59 @@ impl Worker {
                 .map(|validation| self.replace(validation, None))
         };
         // Started once nothing is borrowed: a waker may run what it wakes.
-        for drain in listening.into_iter().chain(replaced) {
+        for drain in listening.into_iter().chain(quic).chain(replaced) {
             drain.start();
+        }
+    }
+
+    /// Stops serving HTTP/3 on the listener whose slot is `slot`, turned off: its HTTP/3
+    /// listener takes no new connection, its QUIC connections drain as at shutdown, and it
+    /// ends once its last has; its TCP connections are left alone (03 §10).
+    pub fn stop_http3(&self, slot: usize) {
+        let quic = self.quic_listening.borrow().get(slot).map(Rc::clone);
+        if let Some(quic) = quic {
+            quic.start();
         }
     }
 
     /// Readies `slot` for a listener that takes it, after one [`Worker::stop`] stopped: what
-    /// it accepts on and serves HTTP/3 on from now on is stopped by a drain of its own.
+    /// it accepts on and serves HTTP/3 on from now on is stopped by drains of its own.
     pub fn open(&self, slot: usize) {
+        Self::reopen(&self.listening, &self.drain, slot);
+        self.open_http3(slot);
+    }
+
+    /// Readies `slot`'s HTTP/3 for a UDP socket opened after one [`Worker::stop_http3`]
+    /// stopped.
+    pub fn open_http3(&self, slot: usize) {
+        Self::reopen(&self.quic_listening, &self.drain, slot);
+    }
+
+    /// Puts an undrained drain in `slot` of `drains`, or one already started if the worker
+    /// drains, `worker`'s.
+    fn reopen(drains: &RefCell<Vec<Rc<Drain>>>, worker: &Drain, slot: usize) {
         let drain = Rc::new(Drain::default());
-        if self.drain.is_on() {
+        if worker.is_on() {
             drain.start();
         }
-        if let Some(listening) = self.listening.borrow_mut().get_mut(slot) {
-            *listening = drain;
+        if let Some(kept) = drains.borrow_mut().get_mut(slot) {
+            *kept = drain;
         }
     }
 
-    /// What stops the listener whose slot is `slot` here: the worker's drain for a slot
-    /// there is none of.
+    /// What stops the listener whose slot is `slot` accepting here: the worker's drain for
+    /// a slot there is none of.
     pub(super) fn listening(&self, slot: usize) -> Rc<Drain> {
         self.listening
+            .borrow()
+            .get(slot)
+            .map_or_else(|| Rc::clone(&self.drain), Rc::clone)
+    }
+
+    /// What stops the HTTP/3 listener of the listener whose slot is `slot` here, as
+    /// [`Worker::listening`] says for its accepting.
+    pub(super) fn quic_listening(&self, slot: usize) -> Rc<Drain> {
+        self.quic_listening
             .borrow()
             .get(slot)
             .map_or_else(|| Rc::clone(&self.drain), Rc::clone)
