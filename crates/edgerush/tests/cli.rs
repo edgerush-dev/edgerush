@@ -1422,6 +1422,8 @@ const PATIENCE: Duration = Duration::from_secs(20);
 struct Harness {
     process: Child,
     said: Receiver<String>,
+    /// Every line it has said so far, for a wait that fails to say them all.
+    heard: Vec<String>,
 }
 
 impl Harness {
@@ -1444,17 +1446,28 @@ impl Harness {
                 }
             }
         });
-        Ok(Self { process, said })
+        Ok(Self {
+            process,
+            said,
+            heard: Vec::new(),
+        })
     }
 
-    /// The next line on stderr that has `part` in it; the lines before it are let go.
+    /// The next line on stderr that has `part` in it; the lines before it are let go. One
+    /// that does not come fails the test, saying every line said since the start.
     fn wait_for(&mut self, part: &str) -> String {
-        let mut passed = Vec::new();
         loop {
             match self.said.recv_timeout(PATIENCE) {
-                Ok(line) if line.contains(part) => return line,
-                Ok(line) => passed.push(line),
-                Err(_) => panic!("no line with {part:?} came; these did: {passed:#?}"),
+                Ok(line) => {
+                    self.heard.push(line.clone());
+                    if line.contains(part) {
+                        return line;
+                    }
+                }
+                Err(_) => panic!(
+                    "no line with {part:?} came; every line said: {:#?}",
+                    self.heard
+                ),
             }
         }
     }
