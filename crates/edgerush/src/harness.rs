@@ -1201,18 +1201,19 @@ impl Listening<'_> {
                     && (bound.address == listener.address || bound.listens_on == listener.address)
             });
             if let Some(holder) = held {
-                let said = if goes(holder) {
-                    format!(
+                if goes(holder) {
+                    let said = format!(
                         "listener \"{}\" is on {}, which listener \"{}\" holds: it waits for that one to drain",
                         listener.name, listener.address, holder.name
-                    )
+                    );
+                    opening.waiting.push((listener.name.clone(), said));
                 } else {
-                    format!(
+                    let said = format!(
                         "listener \"{}\" is on {}, which listener \"{}\" keeps: it is not served until a restart",
                         listener.name, listener.address, holder.name
-                    )
-                };
-                opening.waiting.push((listener.name.clone(), said));
+                    );
+                    opening.refused.push((listener.name.clone(), said));
+                }
                 continue;
             }
             let Some(left) = free.checked_sub(1) else {
@@ -2151,6 +2152,83 @@ upstreams: {{}}
             ]
         );
         assert!(negotiates(address, Duration::from_secs(10)));
+    }
+
+    /// A listener moved while it drains onto the address a listener kept holds is said, once
+    /// its drain ends, not to be served until a restart: not left unsaid, as one that still
+    /// waits for another's drain is.
+    #[test]
+    fn a_listener_moved_onto_a_kept_ones_address_is_said_unserved_once_it_has_drained() {
+        let first = listeners(&[("api", "127.0.0.2:0"), ("web", "127.0.0.1:0")]);
+        let mut bound: Vec<Bound> = first.listeners().iter().map(Bound::from).collect();
+        let sockets: Vec<Sockets> = bound
+            .iter_mut()
+            .map(|listener| {
+                opened(listener, NonZeroUsize::MIN, Port::Own)
+                    .unwrap()
+                    .remove(0)
+            })
+            .collect();
+        let web = bound.iter().find(|b| b.name == "web").unwrap().listens_on;
+        let proxy = Arc::new(Proxy::new(first, NonZeroUsize::MIN).unwrap());
+        let (tell, _told) = mpsc::channel();
+        let connections = crate::limits::Connections {
+            each: 64,
+            set_by: "the test",
+            quic: QUIC_MOST,
+        };
+        let running = per_core::start(
+            &proxy,
+            vec![sockets],
+            Accept::Balanced,
+            H1Limits::default(),
+            connections,
+            &tell,
+        )
+        .unwrap();
+        let listening = Listening {
+            proxy: &proxy,
+            workers: &running,
+            count: NonZeroUsize::MIN,
+            port: Port::Own,
+        };
+        let wanted = bound.clone();
+        let mut state = Listeners {
+            bound,
+            wanted,
+            unserved: std::collections::BTreeMap::new(),
+        };
+
+        // Taken away, and back at once on `web`'s address, before its drain could end.
+        let gone = listening
+            .reloaded(&mut state, listeners(&[("web", "127.0.0.1:0")]))
+            .unwrap();
+        assert!(gone.warnings.is_empty(), "{:?}", gone.warnings);
+        let back = listening
+            .reloaded(
+                &mut state,
+                listeners(&[("api", &web.to_string()), ("web", "127.0.0.1:0")]),
+            )
+            .unwrap();
+        assert_eq!(
+            back.warnings,
+            ["listener \"api\" waits for its earlier sockets to drain"]
+        );
+
+        let began = Instant::now();
+        let mut tended = Reloaded::default();
+        while tended.drained.is_empty() && began.elapsed() < Duration::from_secs(10) {
+            tended = listening.tend(&mut state);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(tended.drained, ["api"]);
+        assert!(tended.opened.is_empty(), "{:?}", tended.opened);
+        assert_eq!(
+            tended.warnings,
+            [format!(
+                "listener \"api\" is on {web}, which listener \"web\" keeps: it is not served until a restart"
+            )]
+        );
     }
 
     /// What the stream is told the data plane serves: each listener of the config that runs
