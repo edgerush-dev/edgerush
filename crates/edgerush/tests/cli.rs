@@ -355,7 +355,7 @@ listeners:
         }
         yaml
     };
-    let file = scratch("drained.yaml");
+    let file = scratch("moved-while-draining.yaml");
     std::fs::write(&file, with(Some(first)))?;
     let args = [
         "--config",
@@ -919,7 +919,7 @@ fn a_second_signal_while_draining_exits_at_once() -> io::Result<()> {
 #[cfg(not(unix))]
 #[test]
 fn more_than_one_worker_does_not_start_where_a_port_cannot_be_shared() -> io::Result<()> {
-    let file = scratch("per-core.yaml");
+    let file = scratch("one-worker-alone.yaml");
     std::fs::write(&file, config("127.0.0.1:0", "up", None))?;
     let output = edgerush(&["proxy", "--config", &file, "--workers", "2"])?;
     assert_eq!(output.status.code(), Some(1));
@@ -1323,6 +1323,24 @@ spec:
 /// The config of [`config`] with no upstream to reach: for the commands that only read it.
 fn config_text() -> String {
     config("127.0.0.1:1", "up", None)
+}
+
+/// Each scratch file is one test's alone: the tests run side by side in one directory, and
+/// one that wrote another's file would change the config that test's proxy follows.
+#[test]
+fn every_scratch_file_is_named_once() {
+    let mut names: Vec<&str> = include_str!("cli.rs")
+        .split("scratch(\"")
+        .skip(1)
+        .filter_map(|after| after.split_once('"').map(|(name, _)| name))
+        .collect();
+    names.sort_unstable();
+    let twice: Vec<&&str> = names
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .map(|pair| &pair[0])
+        .collect();
+    assert!(twice.is_empty(), "named more than once: {twice:?}");
 }
 
 /// A path for a file of the test's own, as text for the command line.
