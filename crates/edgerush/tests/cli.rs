@@ -312,6 +312,17 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
 fn proxy_drains_a_listener_taken_away_and_moves_it_once_drained() -> io::Result<()> {
     let one = upstream("one")?;
     let (held, arrived, release) = held_upstream()?;
+    // Every port it binds chosen at once, so that none is another's: one left to the
+    // operating system could be given the port `moved` holds here, once that is let go.
+    let reserved: Vec<TcpListener> = (0..4)
+        .map(|_| TcpListener::bind("127.0.0.1:0"))
+        .collect::<io::Result<_>>()?;
+    let ports: Vec<SocketAddr> = reserved
+        .iter()
+        .map(TcpListener::local_addr)
+        .collect::<io::Result<_>>()?;
+    drop(reserved);
+    let (web, first, moved, metrics_on) = (ports[0], ports[1], ports[2], ports[3].to_string());
     let listener = |name: &str, at: &str| {
         format!(
             "  {name}: {{ address: \"{at}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
@@ -338,14 +349,12 @@ routes:
 listeners:
 "#
         );
-        yaml += &listener("web", "127.0.0.1:0");
+        yaml += &listener("web", &web.to_string());
         if let Some(api) = api {
             yaml += &listener("api", &api.to_string());
         }
         yaml
     };
-    let first = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
-    let moved = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
     let file = scratch("drained.yaml");
     std::fs::write(&file, with(Some(first)))?;
     let args = [
@@ -354,7 +363,7 @@ listeners:
         "--workers",
         "1",
         "--metrics",
-        "127.0.0.1:0",
+        &metrics_on,
     ];
     let mut harness = Harness::start(&args)?;
     let metrics = harness.address_after("metrics are on ");
