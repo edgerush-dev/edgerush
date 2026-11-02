@@ -1,1 +1,3 @@
+HTTPRoute blog/blog, ListenerSet blog/other: not attached: the ListenerSet it names is not attached to the Gateway
+HTTPRoute shop/team, ListenerSet shop/team, section api: attached to api (api.example.com)
 HTTPRoute shop/web, section api: not attached: no listener the Gateway serves has the name and port it names

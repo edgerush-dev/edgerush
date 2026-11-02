@@ -208,6 +208,8 @@ fn wanted_gateway() -> translate::GatewayStatus {
                 programmable: Err("no certificateRef of it can be used".to_owned()),
             },
         ],
+        attached_listener_sets: 1,
+        listener_sets: Vec::new(),
     }
 }
 
@@ -241,7 +243,11 @@ fn a_gateway_says_its_listeners_as_wanted_and_keeps_what_is_not_ours() {
     let unknown = Programmed::of(4, &Pods::new(), None, false);
     let status = gateway(Some(&live), &wanted_gateway(), &addresses, &unknown, at(50));
     assert_eq!(status.addresses.as_deref(), Some(addresses.as_slice()));
-    assert_eq!(status.attached_listener_sets, Some(3), "not ours, kept");
+    assert_eq!(
+        status.attached_listener_sets,
+        Some(1),
+        "ours to say, as translation counts them"
+    );
     assert_eq!(
         seen(status.conditions.as_deref().unwrap()),
         [
@@ -444,6 +450,7 @@ fn wanted_route(generation: i64) -> RouteStatus {
         },
         generation,
         parents: vec![ParentStatus {
+            kind: "Gateway",
             namespace: Some("edge".to_owned()),
             name: "web".to_owned(),
             section_name: None,
@@ -467,7 +474,13 @@ fn a_routes_parents_are_ours_of_our_gateway_beside_every_other_kept_whole() {
             another_plane.clone(),
         ],
     };
-    let status = route(Some(&live), "shop", &web(), Some(&wanted_route(2)), at(50));
+    let status = route(
+        Some(&live),
+        "shop",
+        &[web()],
+        Some(&wanted_route(2)),
+        at(50),
+    );
     assert_eq!(status.parents.len(), 3);
     assert_eq!(status.parents[0], theirs, "another controller's changed");
     assert_eq!(
@@ -485,8 +498,104 @@ fn a_routes_parents_are_ours_of_our_gateway_beside_every_other_kept_whole() {
         ]
     );
     // A route that no longer names the Gateway has no parent of ours there, the rest kept.
-    let gone = route(Some(&live), "shop", &web(), None, at(60));
+    let gone = route(Some(&live), "shop", &[web()], None, at(60));
     assert_eq!(gone.parents, [theirs, another_plane]);
+}
+
+/// A ListenerSet's status is of its own listeners, its `Programmed` the config's while one
+/// is served, and each listener's as a Gateway's; one the Gateway does not take says so in
+/// both.
+#[test]
+fn a_listener_sets_status_is_of_its_own_listeners() {
+    let pod = IpAddr::from([10, 0, 0, 1]);
+    let running = Pods::from([(
+        pod,
+        Pod {
+            runs: Some(4),
+            ..Pod::default()
+        },
+    )]);
+    let programmed = Programmed::of(4, &running, Some(&[pod]), false);
+    let set = Object {
+        kind: "ListenerSet",
+        namespace: "shop".to_owned(),
+        name: "team".to_owned(),
+    };
+    let wanted = translate::ListenerSetStatus {
+        set: set.clone(),
+        generation: 2,
+        conditions: vec![said("Accepted", true, "Accepted")],
+        programmable: Ok(()),
+        listeners: vec![wanted_gateway().listeners[0].clone()],
+    };
+    let status = listener_set(None, &wanted, &programmed, at(50));
+    let types: Vec<(&str, &str)> = status
+        .conditions
+        .iter()
+        .flatten()
+        .map(|c| (c.type_.as_str(), c.status.as_str()))
+        .collect();
+    assert_eq!(types, [("Accepted", "True"), ("Programmed", "True")]);
+    let listeners = status.listeners.unwrap();
+    assert_eq!(listeners.len(), 1);
+    assert_eq!(listeners[0].attached_routes, 2);
+    assert!(
+        listeners[0]
+            .conditions
+            .iter()
+            .any(|c| c.type_ == "Programmed" && c.status == "True")
+    );
+    assert!(
+        listeners[0]
+            .conditions
+            .iter()
+            .all(|c| c.observed_generation == Some(2))
+    );
+    let refused = translate::ListenerSetStatus {
+        conditions: vec![said("Accepted", false, "NotAllowed")],
+        programmable: Err(said("Programmed", false, "NotAllowed")),
+        listeners: Vec::new(),
+        ..wanted
+    };
+    let status = listener_set(None, &refused, &programmed, at(50));
+    let reasons: Vec<(&str, &str)> = status
+        .conditions
+        .iter()
+        .flatten()
+        .map(|c| (c.type_.as_str(), c.reason.as_str()))
+        .collect();
+    assert_eq!(
+        reasons,
+        [("Accepted", "NotAllowed"), ("Programmed", "NotAllowed")]
+    );
+}
+
+/// A route's parent that is a ListenerSet naming the data plane's Gateway is written of that
+/// kind, and is this controller's as the Gateway is.
+#[test]
+fn a_routes_parent_of_a_listener_set_is_ours_and_said_of_its_kind() {
+    let set = Object {
+        kind: "ListenerSet",
+        namespace: "shop".to_owned(),
+        name: "team".to_owned(),
+    };
+    let mut wanted = wanted_route(2);
+    wanted.parents[0].kind = "ListenerSet";
+    wanted.parents[0].namespace = None;
+    wanted.parents[0].name = "team".to_owned();
+    let status = route(None, "shop", &[web(), set.clone()], Some(&wanted), at(50));
+    let ours = &status.parents[0].parent_ref;
+    assert_eq!(
+        (ours.kind.as_deref(), ours.name.as_str()),
+        (Some("ListenerSet"), "team")
+    );
+    // Written again, it is taken for the same parent, and no other added.
+    let again = route(Some(&status), "shop", &[web(), set], Some(&wanted), at(60));
+    assert_eq!(again.parents.len(), 1);
+    assert_eq!(
+        again.parents[0].conditions[0].last_transition_time,
+        Time(at(50))
+    );
 }
 
 #[test]
@@ -497,7 +606,7 @@ fn a_parent_of_the_routes_own_namespace_is_the_same_written_either_way() {
         parents: vec![parent(GATEWAY_CONTROLLER, None, "web")],
     };
     let wanted = wanted_route(2);
-    let status = route(Some(&live), "edge", &web(), Some(&wanted), at(50));
+    let status = route(Some(&live), "edge", &[web()], Some(&wanted), at(50));
     assert_eq!(status.parents.len(), 1);
     assert_eq!(
         status.parents[0].conditions[0].last_transition_time,
@@ -513,7 +622,13 @@ fn a_routes_parents_are_as_many_as_its_status_holds() {
             .map(|n| parent("example.com/other", Some("edge"), &format!("gateway-{n}")))
             .collect(),
     };
-    let status = route(Some(&live), "shop", &web(), Some(&wanted_route(2)), at(50));
+    let status = route(
+        Some(&live),
+        "shop",
+        &[web()],
+        Some(&wanted_route(2)),
+        at(50),
+    );
     assert_eq!(status.parents.len(), MOST_PARENTS);
     assert!(
         status

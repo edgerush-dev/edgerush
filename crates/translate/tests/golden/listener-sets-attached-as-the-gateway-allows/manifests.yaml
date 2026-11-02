@@ -2,7 +2,10 @@
 # ListenerSet is attached, its listener bound beside the Gateway's own, and an Ingress host
 # it names joins it; blog's is not, and that is said; its own namespace is not taken by a
 # selector that does not match it. One naming another Gateway is another's. A route naming
-# the Gateway attaches to its own listeners alone, not to a ListenerSet's of the name.
+# the Gateway attaches to its own listeners alone, not to a ListenerSet's of the name; one
+# naming shop's ListenerSet attaches to its listener, and one naming blog's, not attached,
+# to none. Each ListenerSet's status is of its own listeners, and the Gateway counts those
+# attached.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
@@ -55,6 +58,20 @@ kind: HTTPRoute
 metadata: { name: web, namespace: shop }
 spec:
   parentRefs: [{ name: web, namespace: edge, sectionName: api }]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: team, namespace: shop }
+spec:
+  parentRefs: [{ kind: ListenerSet, name: team, sectionName: api }]
+  rules: [{ matches: [{ path: { type: PathPrefix, value: /team } }], backendRefs: [{ name: web, port: 80 }] }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: blog, namespace: blog }
+spec:
+  parentRefs: [{ kind: ListenerSet, name: other }]
   rules: [{ backendRefs: [{ name: web, port: 80 }] }]
 ---
 apiVersion: networking.k8s.io/v1

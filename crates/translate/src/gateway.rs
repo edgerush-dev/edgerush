@@ -35,6 +35,20 @@ pub struct GatewayOutcome {
     /// The ports its accepted listeners state, and the protocol each is bound for: the data
     /// plane's listeners.
     pub ports: BTreeMap<u16, Protocol>,
+    /// Each ListenerSet naming it as its parent, in precedence: those it takes, whose
+    /// listeners are among `listeners`, and those it does not.
+    pub sets: Vec<SetOutcome>,
+}
+
+/// A ListenerSet naming the data plane's Gateway as its parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetOutcome {
+    /// The ListenerSet.
+    pub set: Object,
+    /// Its generation: what its status says of.
+    pub generation: i64,
+    /// Whether the Gateway's `allowedListeners` takes it.
+    pub attached: bool,
 }
 
 impl GatewayOutcome {
@@ -372,7 +386,8 @@ pub(crate) fn outcome(
             namespace: named.namespace.clone(),
         })
         .collect();
-    written.extend(attached_sets(gateway, &object, cluster, report));
+    let (sets, theirs) = attached_sets(gateway, &object, cluster, report);
+    written.extend(theirs);
     let mut listeners = listeners(&written, &object);
     // Bound as long as one listener on them is accepted: one whose certificates cannot be
     // used too, which keeps its port refusing its hostname (04 §2).
@@ -453,6 +468,7 @@ pub(crate) fn outcome(
         generation: gateway.metadata.generation.unwrap_or_default(),
         listeners,
         ports,
+        sets,
     })
 }
 
@@ -526,15 +542,15 @@ fn certificates(
     }
 }
 
-/// The listeners of each ListenerSet attached to `gateway`, `object`: one naming it as its
-/// parent, of a namespace its `allowedListeners` takes, in precedence, oldest first and then
-/// by namespace and name (04 §2, GEP-1713). One naming it that it does not take is said.
+/// Each ListenerSet naming `gateway`, `object`, as its parent, in precedence, oldest first
+/// and then by namespace and name, and the listeners of those of a namespace its
+/// `allowedListeners` takes (04 §2, GEP-1713). One naming it that it does not take is said.
 fn attached_sets(
     gateway: &Gateway,
     object: &Object,
     cluster: &Cluster,
     report: &mut Vec<Finding>,
-) -> Vec<Written> {
+) -> (Vec<SetOutcome>, Vec<Written>) {
     let mut naming: Vec<&ListenerSet> = cluster
         .listener_sets
         .iter()
@@ -558,9 +574,16 @@ fn attached_sets(
         key(a).cmp(&key(b))
     });
     let mut written = Vec::new();
+    let mut sets = Vec::new();
     for set in naming {
         let stater = Object::of("ListenerSet", &set.metadata);
-        if !takes_sets_of(gateway, &stater.namespace, cluster) {
+        let attached = takes_sets_of(gateway, &stater.namespace, cluster);
+        sets.push(SetOutcome {
+            set: stater.clone(),
+            generation: set.metadata.generation.unwrap_or_default(),
+            attached,
+        });
+        if !attached {
             report.push(Finding {
                 object: stater,
                 problem: Problem::ListenerSetNotAllowed(object.clone()),
@@ -581,7 +604,7 @@ fn attached_sets(
             });
         }
     }
-    written
+    (sets, written)
 }
 
 /// Whether `gateway` takes ListenerSets of `namespace`, as its `allowedListeners` says: none
