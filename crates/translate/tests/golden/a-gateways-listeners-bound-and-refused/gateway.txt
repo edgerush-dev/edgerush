@@ -1,9 +1,9 @@
 listener http: served on port-8080, taking HTTPRoute from namespace edge
 listener elsewhere: served on port-9000, taking HTTPRoute from namespace edge
-listener plain-on-secure: not accepted: port 8443 is stated for http, https
-listener secure: not accepted: port 8443 is stated for http, https
+listener plain-on-secure: served on port-8443, taking HTTPRoute from namespace edge
+listener secure: not accepted: port 8443 is taken for http by listener plain-on-secure, which comes first
 listener unsigned: accepted, serving nothing: no certificateRef of it can be used
 listener dns: not accepted: protocol `UDP` is not one the gateway serves
-listener first: not accepted: listeners first, second have the same port, protocol and hostname
-listener second: not accepted: listeners first, second have the same port, protocol and hostname
+listener first: served on port-8080, taking HTTPRoute from namespace edge
+listener second: not accepted: listener first, which comes first, has its port, protocol and hostname
 listener apart: served on port-8080, taking HTTPRoute from namespace edge

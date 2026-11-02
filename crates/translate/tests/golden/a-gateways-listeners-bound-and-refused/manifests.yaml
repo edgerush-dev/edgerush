@@ -1,10 +1,10 @@
 # Each of the Gateway's listeners as the data plane can serve it, or why it cannot: each
-# port is bound once, however many listeners state it; two listeners stating one port for
-# two protocols are both refused, none chosen, and the port bound for neither; protocols
-# not taken yet, or never, are refused; an HTTPS listener of no certificate is accepted,
-# serving nothing, its port bound and refusing every handshake until it has one;
-# two that cannot be told apart are both refused, none chosen, while one beside them that
-# differs by its hostname alone is served.
+# port is bound once, however many listeners state it; of two listeners stating one port
+# for two protocols, the first takes the port for its own and the later is refused;
+# protocols not taken yet, or never, are refused; an HTTPS listener of no certificate is
+# accepted, serving nothing, its port bound and refusing every handshake until it has one;
+# of two that cannot be told apart, the first is served and the later refused, and one
+# beside them that differs by its hostname alone is served.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }

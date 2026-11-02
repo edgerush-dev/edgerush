@@ -14,7 +14,7 @@ use edgerush_gateway_api::gateway::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespaces,
     GatewayListenersAllowedRoutesNamespacesSelector,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// The API group of the Gateway API's kinds.
@@ -248,10 +248,13 @@ pub enum ListenerProblem {
     /// A protocol whose listeners translation does not take yet (`UnsupportedProtocol`).
     #[error("not supported yet: {0} listeners")]
     NotSupportedYet(&'static str),
-    /// Another listener of the Gateway has its port, protocol and hostname, so neither can
-    /// be told apart from the other and none of them is accepted (`HostnameConflict`).
-    #[error("listeners {0} have the same port, protocol and hostname")]
-    HostnameConflict(String),
+    /// A listener before it has its port, protocol and hostname, so the two could not be
+    /// told apart: that one is accepted, this not (`HostnameConflict`).
+    #[error("listener {by}, which comes first, has its port, protocol and hostname")]
+    HostnameConflict {
+        /// The listener before it.
+        by: String,
+    },
     /// An HTTPS listener none of whose `certificateRefs` can be used (`ResolvedRefs`
     /// false, `InvalidCertificateRef` or `RefNotPermitted`): accepted, its routes attached,
     /// and not served, its hostname refused over TLS so that no other certificate answers
@@ -262,14 +265,16 @@ pub enum ListenerProblem {
     /// one have.
     #[error("TLS mode `{0}` is not one an HTTPS listener takes")]
     TlsMode(String),
-    /// Other listeners of the Gateway state its port for another protocol, so that the
-    /// port can be bound for none of them, and none on it is accepted (`ProtocolConflict`).
-    #[error("port {port} is stated for {protocols}")]
+    /// A listener before it states its port for another protocol, and has the port: that
+    /// one is accepted, this not (`ProtocolConflict`).
+    #[error("port {port} is taken for {protocol} by listener {by}, which comes first")]
     ProtocolConflict {
         /// The port.
         port: u16,
-        /// The protocols stated for it, as the data plane's config writes them.
-        protocols: String,
+        /// The protocol it is taken for, as the data plane's config writes it.
+        protocol: &'static str,
+        /// The listener that has it.
+        by: String,
     },
     /// Its port is past the data plane's slots for the Gateway API's ports, taken in the
     /// order listeners state them (`PortUnavailable`).
@@ -494,75 +499,48 @@ fn class_ours(gateway: &Gateway, cluster: &Cluster, report: &mut Vec<Finding>) -
     true
 }
 
-/// Each listener's outcome. A protocol not taken is refused first, and plays no part in
-/// what conflicts (the spec: a listener of a protocol not supported is not accepted, and
-/// the rules of distinctness are for those that are); then listeners that cannot be told
-/// apart, or that state one port for two protocols, are all refused, none chosen; each
-/// other is served by the data plane's listener bound to its port.
+/// Each listener's outcome, in the order listeners come (04 §2). A protocol not taken is
+/// refused first, and plays no part in what conflicts (the spec: a listener of a protocol
+/// not supported is not accepted, and the rules of distinctness are for those that are);
+/// then the first listener on a port takes it for its protocol, and a later one stating
+/// it for another, or in a place an earlier one has (port, protocol and hostname), is
+/// refused, as the spec has a conflicting listener refused in precedence and conformance
+/// pins it; each other is served by the data plane's listener bound to its port, a port
+/// past the data plane's slots refused for every listener on it.
 fn listeners(listeners: &[GatewayListeners]) -> Vec<ListenerOutcome> {
-    let protocols: Vec<Result<Protocol, ListenerProblem>> = listeners
-        .iter()
-        .map(|listener| protocol(&listener.protocol))
-        .collect();
-    // The protocols each port is stated for. Two, and no protocol can win: every listener
-    // on the port is conflicted and the port bound for none, as the spec has a conflicted
-    // listener's port configured nowhere, and as Envoy Gateway does among a Gateway's own.
-    let mut stated: BTreeMap<i32, BTreeSet<&'static str>> = BTreeMap::new();
-    for (listener, protocol) in listeners.iter().zip(&protocols) {
-        if let Ok(protocol) = protocol {
-            stated
-                .entry(listener.port)
-                .or_default()
-                .insert(name_of(*protocol));
-        }
-    }
-    // Listeners of a protocol taken, by port, protocol and hostname: two in one place are
-    // indistinct. TCP sharing a port with any other, which the spec also refuses, is for
-    // when TCP listeners are taken.
-    let mut places: BTreeMap<(i32, &'static str, Option<&str>), Vec<&str>> = BTreeMap::new();
-    for (listener, protocol) in listeners.iter().zip(&protocols) {
-        if let Ok(protocol) = protocol {
-            places
-                .entry((
-                    listener.port,
-                    name_of(*protocol),
-                    listener.hostname.as_deref(),
-                ))
-                .or_default()
-                .push(&listener.name);
-        }
-    }
-    // The ports taken, in the order listeners state them, each by the first accepted on it:
-    // one past the data plane's slots is refused for every listener on it (04 §2).
-    let mut taken: Vec<i32> = Vec::new();
+    // Each port taken, by the protocol and the listener that took it; each place, by the
+    // listener in it: only those accepted.
+    let mut ports: BTreeMap<i32, (&'static str, &str)> = BTreeMap::new();
+    let mut places: BTreeMap<(i32, &'static str, Option<&str>), &str> = BTreeMap::new();
     listeners
         .iter()
-        .zip(protocols)
-        .map(|(listener, protocol)| {
+        .map(|listener| {
             // The schema holds a port to 1–65535.
             let port = u16::try_from(listener.port).unwrap_or_default();
-            let served = protocol.and_then(|protocol| {
-                let place = (
-                    listener.port,
-                    name_of(protocol),
-                    listener.hostname.as_deref(),
-                );
-                match (stated.get(&listener.port), places.get(&place)) {
-                    (Some(protocols), _) if protocols.len() > 1 => {
+            let served = protocol(&listener.protocol).and_then(|protocol| {
+                let name = name_of(protocol);
+                let place = (listener.port, name, listener.hostname.as_deref());
+                match (ports.get(&listener.port), places.get(&place)) {
+                    (Some((taken, by)), _) if *taken != name => {
                         Err(ListenerProblem::ProtocolConflict {
                             port,
-                            protocols: protocols.iter().copied().collect::<Vec<_>>().join(", "),
+                            protocol: taken,
+                            by: (*by).to_owned(),
                         })
                     }
-                    (_, Some(names)) if names.len() > 1 => {
-                        Err(ListenerProblem::HostnameConflict(names.join(", ")))
-                    }
-                    _ if taken.contains(&listener.port) => Ok(vec![crate::listeners::name(port)]),
-                    _ if taken.len() < crate::listeners::MOST_GATEWAY_PORTS => {
-                        taken.push(listener.port);
+                    (_, Some(by)) => Err(ListenerProblem::HostnameConflict {
+                        by: (*by).to_owned(),
+                    }),
+                    (Some(_), None) => {
+                        places.insert(place, &listener.name);
                         Ok(vec![crate::listeners::name(port)])
                     }
-                    _ => Err(ListenerProblem::PortPastSlots { port }),
+                    (None, None) if ports.len() < crate::listeners::MOST_GATEWAY_PORTS => {
+                        ports.insert(listener.port, (name, &listener.name));
+                        places.insert(place, &listener.name);
+                        Ok(vec![crate::listeners::name(port)])
+                    }
+                    (None, None) => Err(ListenerProblem::PortPastSlots { port }),
                 }
             });
             ListenerOutcome {
@@ -723,6 +701,41 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// Listeners that clash go to the first: a later one stating a port taken for another
+    /// protocol, or in the place of an earlier one, is refused, and the earlier served.
+    #[test]
+    fn the_first_of_listeners_that_clash_is_served() {
+        let written: Vec<GatewayListeners> = [
+            "{ name: plain, port: 8443, protocol: HTTP }",
+            "{ name: secure, port: 8443, protocol: HTTPS }",
+            "{ name: first, port: 8080, protocol: HTTP, hostname: a.example.com }",
+            "{ name: second, port: 8080, protocol: HTTP, hostname: a.example.com }",
+            "{ name: apart, port: 8080, protocol: HTTP, hostname: b.example.com }",
+            "{ name: dns, port: 8080, protocol: UDP }",
+        ]
+        .iter()
+        .map(|yaml| serde_saphyr::from_str(yaml).unwrap())
+        .collect();
+        let said: Vec<String> = listeners(&written)
+            .iter()
+            .map(|o| match &o.served {
+                Ok(on) => format!("{}: {}", o.name, on.join(", ")),
+                Err(why) => format!("{}: {why}", o.name),
+            })
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "plain: port-8443",
+                "secure: port 8443 is taken for http by listener plain, which comes first",
+                "first: port-8080",
+                "second: listener first, which comes first, has its port, protocol and hostname",
+                "apart: port-8080",
+                "dns: protocol `UDP` is not one the gateway serves",
+            ]
+        );
     }
 
     /// Ports take the data plane's Gateway slots in the order the listeners state them, a

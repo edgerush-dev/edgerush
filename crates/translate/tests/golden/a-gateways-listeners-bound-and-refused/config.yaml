@@ -5,13 +5,21 @@ listeners:
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
+  port-8443:
+    address: "0.0.0.0:8443"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
   port-8444:
     address: "0.0.0.0:8444"
     protocol: https
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
-    tls: { certificates: [], without_sni: none }
+    tls:
+      certificates: []
+      without_sni: none
   port-9000:
     address: "0.0.0.0:9000"
     protocol: http
@@ -19,8 +27,6 @@ listeners:
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
 routes:
-  - name: gateway/edge/web/apart
-    listeners: [port-8080]
-    hostnames: [{ name: "b.example.com", falls_through: false }]
-    rules: []
+  - { name: gateway/edge/web/first, listeners: [port-8080], hostnames: [{ name: a.example.com, falls_through: false }], rules: [] }
+  - { name: gateway/edge/web/apart, listeners: [port-8080], hostnames: [{ name: b.example.com, falls_through: false }], rules: [] }
 upstreams: {}
