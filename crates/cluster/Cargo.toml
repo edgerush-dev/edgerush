@@ -1,0 +1,11 @@
+[package]
+name = "edgerush-cluster"
+description = "EdgeRush's cluster store for the rate-limiting service: an elected table of shard owners, leases, copies to replicas and handoffs; pure, no I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

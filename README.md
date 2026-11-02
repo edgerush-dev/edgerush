@@ -313,6 +313,17 @@ crates/certificates
                    a certificate and its key read and checked to belong together
                    (`edgerush-certificates`), by BoringSSL: what the data plane presents and what
                    translation admits are read by the same code; no I/O
+crates/cluster     the rate-limiting service's cluster store (`edgerush-cluster`): an elected
+                   table of shard owners, leases, copies to replicas and handoffs, for any value
+                   that merges; pure, no I/O, used by nothing yet
+crates/cluster-sim the cluster's simulation (`edgerush-cluster-sim`): the store's pods over a
+                   network that delays, loses and cuts, with clients standing for data planes,
+                   seeded and deterministic; its scenarios and chaos runs are its tests, and
+                   `cargo run --release -p edgerush-cluster-sim --bin measure` sweeps them
+crates/cluster-synchronous
+                   the synchronous mode on the cluster store (`edgerush-cluster-synchronous`):
+                   each request decided by its key's owner, give-backs and requests under
+                   several keys; pure, no I/O, used by nothing yet
 crates/config      the config model and its compilation (`edgerush-config`): pure, format-free
 crates/control-service
                    the config stream over gRPC and mutual TLS (`edgerush-control-service`):

@@ -298,6 +298,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-cluster"
+version = "0.0.0"
+
+[[package]]
+name = "edgerush-cluster-sim"
+version = "0.0.0"
+dependencies = [
+ "edgerush-cluster",
+ "edgerush-cluster-synchronous",
+]
+
+[[package]]
+name = "edgerush-cluster-synchronous"
+version = "0.0.0"
+dependencies = [
+ "edgerush-cluster",
+]
+
+[[package]]
 name = "edgerush-config"
 version = "0.0.0"
 dependencies = [
