@@ -56,6 +56,27 @@ pub struct GatewayStatus {
     pub programmable: bool,
     /// Each of its listeners', in the order it lists them.
     pub listeners: Vec<ListenerStatus>,
+    /// How many ListenerSets are attached to it and accepted (`attachedListenerSets`).
+    pub attached_listener_sets: i32,
+    /// What the status of each ListenerSet naming it is to say, in precedence.
+    pub listener_sets: Vec<ListenerSetStatus>,
+}
+
+/// What a ListenerSet's status is to say: of its own listeners alone, its `Programmed`
+/// that of the Gateway's config where any of them is served (GEP-1713).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerSetStatus {
+    /// The ListenerSet.
+    pub set: Object,
+    /// The generation it says of.
+    pub generation: i64,
+    /// Its conditions.
+    pub conditions: Vec<Condition>,
+    /// Whether any of its listeners is served, what its `Programmed` waits on; or its
+    /// `Programmed` where none is.
+    pub programmable: Result<(), Condition>,
+    /// Each of its listeners', in the order it lists them.
+    pub listeners: Vec<ListenerStatus>,
 }
 
 /// What a listener's status is to say.
@@ -82,23 +103,47 @@ impl fmt::Display for GatewayStatus {
             f.write_str("; nothing to program")?;
         }
         for listener in &self.listeners {
-            let kinds = if listener.supported_kinds.is_empty() {
-                "no kind".to_owned()
-            } else {
-                listener.supported_kinds.join(", ")
-            };
+            listener_line(f, listener)?;
+        }
+        // Said where ListenerSets name the Gateway, so that a Gateway of none reads as ever.
+        if !self.listener_sets.is_empty() {
             write!(
                 f,
-                "\nlistener {}: {kinds}, attached {}: ",
-                listener.name, listener.attached_routes
+                "\nattached ListenerSets: {}",
+                self.attached_listener_sets
             )?;
-            conditions(f, &listener.conditions)?;
-            if let Err(why) = &listener.programmable {
-                write!(f, "; Programmed=False/Invalid ({why})")?;
+        }
+        for set in &self.listener_sets {
+            write!(f, "\n{}, generation {}: ", set.set, set.generation)?;
+            conditions(f, &set.conditions)?;
+            if let Err(programmed) = &set.programmable {
+                write!(f, "; {programmed}")?;
+            }
+            for listener in &set.listeners {
+                listener_line(f, listener)?;
             }
         }
         Ok(())
     }
+}
+
+/// A listener's status, on a line of its own.
+fn listener_line(f: &mut fmt::Formatter<'_>, listener: &ListenerStatus) -> fmt::Result {
+    let kinds = if listener.supported_kinds.is_empty() {
+        "no kind".to_owned()
+    } else {
+        listener.supported_kinds.join(", ")
+    };
+    write!(
+        f,
+        "\nlistener {}: {kinds}, attached {}: ",
+        listener.name, listener.attached_routes
+    )?;
+    conditions(f, &listener.conditions)?;
+    if let Err(why) = &listener.programmable {
+        write!(f, "; Programmed=False/Invalid ({why})")?;
+    }
+    Ok(())
 }
 
 /// What an HTTPRoute's status is to say for each of its parents that is the data plane's
@@ -116,6 +161,8 @@ pub struct RouteStatus {
 /// What an HTTPRoute's status is to say of one of its parents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentStatus {
+    /// The parent's kind: `Gateway` or `ListenerSet`.
+    pub kind: &'static str,
     /// The parent's namespace, as its `parentRef` writes it: none for the route's own.
     pub namespace: Option<String>,
     /// The parent's name.
@@ -134,11 +181,11 @@ impl fmt::Display for RouteStatus {
             if n > 0 {
                 f.write_str("\n")?;
             }
-            write!(
-                f,
-                "{}, generation {}, parent {}",
-                self.route, self.generation, parent.name
-            )?;
+            write!(f, "{}, generation {}, parent ", self.route, self.generation)?;
+            if parent.kind != "Gateway" {
+                write!(f, "{} ", parent.kind)?;
+            }
+            f.write_str(&parent.name)?;
             if let Some(section) = &parent.section_name {
                 write!(f, " section {section}")?;
             }
@@ -164,22 +211,90 @@ fn conditions(f: &mut fmt::Formatter<'_>, conditions: &[Condition]) -> fmt::Resu
 }
 
 /// What the Gateway's status is to say, its listeners' with the routes accepted on each:
-/// those `routes` say are accepted, attached there as `outcomes` say.
+/// those `routes` say are accepted, attached there as `outcomes` say; and each ListenerSet
+/// naming it, of its own listeners alone, as a Gateway's is of its (GEP-1713).
 pub(crate) fn gateway(
     gateway: &GatewayOutcome,
     routes: &[RouteStatus],
     outcomes: &[RouteOutcome],
 ) -> GatewayStatus {
-    // Of the Gateway's own listeners: a ListenerSet's are in its own status (GEP-1713).
-    let own: Vec<&crate::ListenerOutcome> = gateway.own().collect();
-    let refused: Vec<&str> = own
+    let own: Vec<&ListenerOutcome> = gateway.own().collect();
+    let (accepted, listeners) = of_listeners(&own, routes, outcomes);
+    let listener_sets: Vec<ListenerSetStatus> = gateway
+        .sets
+        .iter()
+        .map(|set| {
+            if !set.attached {
+                let why = format!(
+                    "{} takes no ListenerSet of its namespace, as its allowedListeners say",
+                    gateway.gateway
+                );
+                return ListenerSetStatus {
+                    set: set.set.clone(),
+                    generation: set.generation,
+                    conditions: vec![Condition::new("Accepted", false, "NotAllowed", why.clone())],
+                    programmable: Err(Condition::new("Programmed", false, "NotAllowed", why)),
+                    listeners: Vec::new(),
+                };
+            }
+            let theirs: Vec<&ListenerOutcome> = gateway
+                .listeners
+                .iter()
+                .filter(|listener| listener.set.as_ref() == Some(&set.set))
+                .collect();
+            let (accepted, listeners) = of_listeners(&theirs, routes, outcomes);
+            let programmable = if listeners.iter().any(|l| l.programmable.is_ok()) {
+                Ok(())
+            } else {
+                Err(Condition::new(
+                    "Programmed",
+                    false,
+                    "ListenersNotValid",
+                    "no listener is served".to_owned(),
+                ))
+            };
+            ListenerSetStatus {
+                set: set.set.clone(),
+                generation: set.generation,
+                conditions: vec![accepted],
+                programmable,
+                listeners,
+            }
+        })
+        .collect();
+    let attached = listener_sets
+        .iter()
+        .filter(|set| {
+            set.conditions
+                .iter()
+                .any(|c| c.kind == "Accepted" && c.status)
+        })
+        .count();
+    GatewayStatus {
+        generation: gateway.generation,
+        conditions: vec![accepted],
+        programmable: listeners.iter().any(|l| l.programmable.is_ok()),
+        listeners,
+        attached_listener_sets: i32::try_from(attached).unwrap_or(i32::MAX),
+        listener_sets,
+    }
+}
+
+/// The `Accepted` of a Gateway or a ListenerSet, of `listeners`, its own, and what each of
+/// them is to say.
+fn of_listeners(
+    listeners: &[&ListenerOutcome],
+    routes: &[RouteStatus],
+    outcomes: &[RouteOutcome],
+) -> (Condition, Vec<ListenerStatus>) {
+    let refused: Vec<&str> = listeners
         .iter()
         .filter(|listener| !listener.accepted())
         .map(|listener| listener.name.as_str())
         .collect();
     let accepted = if refused.is_empty() {
         Condition::new("Accepted", true, "Accepted", String::new())
-    } else if refused.len() < own.len() {
+    } else if refused.len() < listeners.len() {
         Condition::new(
             "Accepted",
             true,
@@ -194,7 +309,7 @@ pub(crate) fn gateway(
             "no listener is accepted".to_owned(),
         )
     };
-    let listeners: Vec<ListenerStatus> = own
+    let statuses = listeners
         .iter()
         .map(|listener| ListenerStatus {
             name: listener.name.clone(),
@@ -203,7 +318,7 @@ pub(crate) fn gateway(
             } else {
                 Vec::new()
             },
-            attached_routes: attached(&listener.name, routes, outcomes),
+            attached_routes: attached(listener, routes, outcomes),
             conditions: listener_conditions(listener),
             programmable: match &listener.served {
                 Ok(served) => Ok(served.clone()),
@@ -211,17 +326,12 @@ pub(crate) fn gateway(
             },
         })
         .collect();
-    GatewayStatus {
-        generation: gateway.generation,
-        conditions: vec![accepted],
-        programmable: listeners.iter().any(|l| l.programmable.is_ok()),
-        listeners,
-    }
+    (accepted, statuses)
 }
 
-/// How many routes are accepted on the listener `name`: each once, however many of its
-/// parents attach it there; only those accepted, as the spec has it.
-fn attached(name: &str, routes: &[RouteStatus], outcomes: &[RouteOutcome]) -> i32 {
+/// How many routes are accepted on `listener`: each once, however many of its parents
+/// attach it there; only those accepted, as the spec has it.
+fn attached(listener: &ListenerOutcome, routes: &[RouteStatus], outcomes: &[RouteOutcome]) -> i32 {
     let count = outcomes
         .iter()
         .zip(routes)
@@ -232,10 +342,10 @@ fn attached(name: &str, routes: &[RouteStatus], outcomes: &[RouteOutcome]) -> i3
                 .zip(&status.parents)
                 .any(|(parent, said)| {
                     accepted(said)
-                        && parent
-                            .attached
-                            .as_ref()
-                            .is_ok_and(|on| on.iter().any(|a| a.listener == name))
+                        && parent.attached.as_ref().is_ok_and(|on| {
+                            on.iter()
+                                .any(|a| a.listener == listener.name && a.set == listener.set)
+                        })
                 })
         })
         .count();
@@ -338,6 +448,7 @@ pub(crate) fn routes(outcomes: &[RouteOutcome], report: &[Finding]) -> Vec<Route
                     .parents
                     .iter()
                     .map(|parent| ParentStatus {
+                        kind: parent.kind,
                         namespace: parent.namespace.clone(),
                         name: parent.name.clone(),
                         section_name: parent.section_name.clone(),
@@ -357,7 +468,7 @@ fn parent_conditions(parent: &ParentOutcome, said: &[&Problem]) -> Vec<Condition
     let accepted = match parent.attached {
         Err(why) => {
             let reason = match why {
-                NotAttached::NoMatchingParent => "NoMatchingParent",
+                NotAttached::NoMatchingParent | NotAttached::SetNotAttached => "NoMatchingParent",
                 NotAttached::NotAllowedByListeners => "NotAllowedByListeners",
                 NotAttached::NoMatchingListenerHostname => "NoMatchingListenerHostname",
             };

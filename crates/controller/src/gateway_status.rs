@@ -16,6 +16,9 @@ use edgerush_gateway_api::gateway_class::GatewayClassStatus;
 use edgerush_gateway_api::http_route::{
     HTTPRouteStatus, HTTPRouteStatusParents, HTTPRouteStatusParentsParentRef,
 };
+use edgerush_gateway_api::listener_set::{
+    ListenerSetStatus, ListenerSetStatusListeners, ListenerSetStatusListenersSupportedKinds,
+};
 use edgerush_translate::{self as translate, GATEWAY_CONTROLLER, Object};
 use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
@@ -37,6 +40,8 @@ const GATEWAY_TYPES: [&str; 2] = ["Accepted", "Programmed"];
 const LISTENER_TYPES: [&str; 4] = ["Accepted", "Conflicted", "ResolvedRefs", "Programmed"];
 /// On a route's parent.
 const PARENT_TYPES: [&str; 3] = ["Accepted", "ResolvedRefs", "PartiallyInvalid"];
+/// On a ListenerSet.
+const SET_TYPES: [&str; 2] = ["Accepted", "Programmed"];
 
 /// A condition to write.
 struct Wanted {
@@ -287,12 +292,6 @@ pub(crate) fn gateway(
         .listeners
         .iter()
         .map(|listener| {
-            let mut conditions: Vec<Wanted> =
-                listener.conditions.iter().map(Wanted::from).collect();
-            conditions.push(match &listener.programmable {
-                Ok(served_on) => programmed.of_listener(served_on),
-                Err(why) => Wanted::new("Programmed", "False", "Invalid", why.clone()),
-            });
             let old = live_listeners
                 .iter()
                 .find(|old| old.name == listener.name)
@@ -300,7 +299,7 @@ pub(crate) fn gateway(
                 .unwrap_or_default();
             GatewayStatusListeners {
                 attached_routes: listener.attached_routes,
-                conditions: merged(old, conditions, &LISTENER_TYPES, generation, now),
+                conditions: listener_conditions(old, listener, programmed, generation, now),
                 name: listener.name.clone(),
                 supported_kinds: Some(
                     listener
@@ -320,12 +319,87 @@ pub(crate) fn gateway(
         .unwrap_or_default();
     GatewayStatus {
         addresses: (!addresses.is_empty()).then(|| addresses.to_vec()),
-        // Not this controller's to say.
-        attached_listener_sets: live.and_then(|status| status.attached_listener_sets),
+        attached_listener_sets: Some(wanted.attached_listener_sets),
         conditions: Some(merged(
             live_conditions,
             conditions,
             &GATEWAY_TYPES,
+            generation,
+            now,
+        )),
+        listeners: Some(listeners),
+    }
+}
+
+/// A listener's conditions, as `wanted` has them and `programmed` its `Programmed`, merged
+/// with `old`, its live ones: a Gateway's and a ListenerSet's alike.
+fn listener_conditions(
+    old: &[Condition],
+    wanted: &translate::ListenerStatus,
+    programmed: &Programmed,
+    generation: i64,
+    now: Timestamp,
+) -> Vec<Condition> {
+    let mut conditions: Vec<Wanted> = wanted.conditions.iter().map(Wanted::from).collect();
+    conditions.push(match &wanted.programmable {
+        Ok(served_on) => programmed.of_listener(served_on),
+        Err(why) => Wanted::new("Programmed", "False", "Invalid", why.clone()),
+    });
+    merged(old, conditions, &LISTENER_TYPES, generation, now)
+}
+
+/// What a ListenerSet's status is to say, as `wanted` has it, merged with `live`: of its own
+/// listeners alone, its `Programmed` the Gateway's config's where any of them is served
+/// (GEP-1713), each listener's as a Gateway's is.
+pub(crate) fn listener_set(
+    live: Option<&ListenerSetStatus>,
+    wanted: &translate::ListenerSetStatus,
+    programmed: &Programmed,
+    now: Timestamp,
+) -> ListenerSetStatus {
+    let generation = wanted.generation;
+    let mut conditions: Vec<Wanted> = wanted.conditions.iter().map(Wanted::from).collect();
+    conditions.push(match &wanted.programmable {
+        Ok(()) => programmed.wanted(),
+        Err(condition) => Wanted::from(condition),
+    });
+    let live_listeners = live
+        .and_then(|status| status.listeners.as_deref())
+        .unwrap_or_default();
+    let listeners = wanted
+        .listeners
+        .iter()
+        .map(|listener| {
+            let old = live_listeners
+                .iter()
+                .find(|old| old.name == listener.name)
+                .map(|old| old.conditions.as_slice())
+                .unwrap_or_default();
+            ListenerSetStatusListeners {
+                attached_routes: listener.attached_routes,
+                conditions: listener_conditions(old, listener, programmed, generation, now),
+                name: listener.name.clone(),
+                supported_kinds: Some(
+                    listener
+                        .supported_kinds
+                        .iter()
+                        .map(|kind| ListenerSetStatusListenersSupportedKinds {
+                            group: Some(GROUP.to_owned()),
+                            kind: (*kind).to_owned(),
+                        })
+                        .collect(),
+                ),
+            }
+        })
+        .collect();
+    let live_conditions = live
+        .and_then(|status| status.conditions.as_deref())
+        .unwrap_or_default();
+    ListenerSetStatus {
+        conditions: Some(merged(
+            live_conditions,
+            conditions,
+            &SET_TYPES,
             generation,
             now,
         )),
@@ -353,14 +427,15 @@ pub(crate) fn addresses(addresses: &[IngressLoadBalancerIngress]) -> Vec<Gateway
 }
 
 /// What the status of an HTTPRoute of `namespace` is to say, as `wanted` has it of its
-/// parents that are `gateway`, the data plane's, merged with `live`: none wanted where it
-/// no longer names that Gateway. Other controllers' parents, and this controller's of other
-/// Gateways (other data planes'), are kept whole; this controller's of `gateway` are those
-/// wanted, in their order, after them, as many as the status can hold.
+/// parents that are `parents_of_ours`, the data plane's Gateway and the ListenerSets naming
+/// it, merged with `live`: none wanted where it no longer names one. Other controllers'
+/// parents, and this controller's of other Gateways (other data planes'), are kept whole;
+/// this controller's of `parents_of_ours` are those wanted, in their order, after them, as
+/// many as the status can hold.
 pub(crate) fn route(
     live: Option<&HTTPRouteStatus>,
     namespace: &str,
-    gateway: &Object,
+    parents_of_ours: &[Object],
     wanted: Option<&translate::RouteStatus>,
     now: Timestamp,
 ) -> HTTPRouteStatus {
@@ -371,9 +446,11 @@ pub(crate) fn route(
         let to = &parent.parent_ref;
         parent.controller_name == GATEWAY_CONTROLLER
             && to.group.as_deref().unwrap_or(GROUP) == GROUP
-            && to.kind.as_deref().unwrap_or("Gateway") == "Gateway"
-            && to.namespace.as_deref().unwrap_or(namespace) == gateway.namespace
-            && to.name == gateway.name
+            && parents_of_ours.iter().any(|ours| {
+                to.kind.as_deref().unwrap_or("Gateway") == ours.kind
+                    && to.namespace.as_deref().unwrap_or(namespace) == ours.namespace
+                    && to.name == ours.name
+            })
     };
     let mut parents: Vec<HTTPRouteStatusParents> = live_parents
         .iter()
@@ -387,7 +464,7 @@ pub(crate) fn route(
             }
             let parent_ref = HTTPRouteStatusParentsParentRef {
                 group: Some(GROUP.to_owned()),
-                kind: Some("Gateway".to_owned()),
+                kind: Some(parent.kind.to_owned()),
                 name: parent.name.clone(),
                 namespace: parent.namespace.clone(),
                 port: parent.port,

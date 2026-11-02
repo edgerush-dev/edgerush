@@ -234,6 +234,7 @@ kind: Gateway
 metadata: { name: web, namespace: edge }
 spec:
   gatewayClassName: edgerush
+  allowedListeners: { namespaces: { from: All } }
   listeners:
     - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
     - { name: alt, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
@@ -330,6 +331,44 @@ k -n edge patch gateway web --type=json -p '[{"op":"remove","path":"/spec/listen
 stated "http alt" '{.status.listeners[*].name}' 30 -n edge gateway web ||
     fail "the listener taken away is still said: $(said_of -n edge gateway web)"
 pass "a listener on a port its data plane cannot bind alone is not programmed, pending, saying the pod and why; the Gateway and its other listeners are"
+
+# A ListenerSet of shop's, which the Gateway takes from every namespace, adds a listener of
+# its own, bound beside the Gateway's; a route naming the ListenerSet is served on it; the
+# ListenerSet, the route's parent and the Gateway's count of ListenerSets say so (04 §6).
+k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: team, namespace: shop }
+spec:
+  parentRef: { name: web, namespace: edge }
+  listeners: [{ name: team, port: 9090, protocol: HTTP, hostname: team.example }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: team, namespace: shop }
+spec:
+  parentRefs: [{ kind: ListenerSet, name: team }]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]
+EOF
+said deploy/edgerush 'listener "port-9090" is on 0.0.0.0:9090' 60 ||
+    fail "the data plane never bound the ListenerSet's listener: $(k -n edge logs deploy/edgerush | tail -5)"
+forward 9090
+answers team.example 200 30 || fail "the route of the ListenerSet is not served: $(status team.example)"
+forward
+stated True "$(condition Accepted status)" 30 -n shop listenerset team ||
+    fail "the ListenerSet is not said accepted: $(said_of -n shop listenerset team)"
+stated True "$(condition Programmed status)" 30 -n shop listenerset team ||
+    fail "the ListenerSet is not said programmed: $(said_of -n shop listenerset team)"
+stated 1 '{.status.listeners[0].attachedRoutes}' 5 -n shop listenerset team ||
+    fail "the ListenerSet's listener does not count its route: $(said_of -n shop listenerset team)"
+stated "ListenerSet True" \
+    '{.status.parents[0].parentRef.kind} {.status.parents[0].conditions[?(@.type=="Accepted")].status}' \
+    30 -n shop httproute team || fail "the route of the ListenerSet says $(said_of -n shop httproute team)"
+stated 1 '{.status.attachedListenerSets}' 30 -n edge gateway web ||
+    fail "the Gateway does not count the ListenerSet: $(said_of -n edge gateway web)"
+k -n shop delete httproute team >/dev/null
+k -n shop delete listenerset team >/dev/null
+pass "a ListenerSet the Gateway takes adds a listener of its own, a route naming it served there, each said in status"
 
 k apply -f - >/dev/null <<EOF
 apiVersion: gateway.networking.k8s.io/v1

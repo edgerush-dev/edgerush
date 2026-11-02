@@ -12,6 +12,12 @@ listeners:
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
 routes:
+  - name: httproute/shop/team/shop/team/api
+    listeners: [port-9000]
+    hostnames: [{ name: api.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /team } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
   - name: ingress/shop/web/api.example.com
     listeners: [port-80, port-9000]
     hostnames: [{ name: api.example.com, falls_through: false }]

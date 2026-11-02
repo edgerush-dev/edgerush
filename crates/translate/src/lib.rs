@@ -59,9 +59,12 @@ pub mod status;
 
 pub use gateway::{
     Allowed, GatewayOutcome, ListenerOutcome, ListenerProblem, Namespaces, Requirement, Selector,
+    SetOutcome,
 };
 pub use http_route::{Attachment, NotAttached, ParentOutcome, RouteOutcome, Taken};
-pub use status::{Condition, GatewayStatus, ListenerStatus, ParentStatus, RouteStatus};
+pub use status::{
+    Condition, GatewayStatus, ListenerSetStatus, ListenerStatus, ParentStatus, RouteStatus,
+};
 
 /// The controller an IngressClass names to be served by EdgeRush (02 §2).
 pub const CONTROLLER: &str = "edgerush.dev/ingress-controller";

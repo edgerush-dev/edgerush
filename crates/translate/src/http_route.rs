@@ -31,16 +31,20 @@ pub struct RouteOutcome {
     pub route: Object,
     /// Its generation: what its status says of.
     pub generation: i64,
-    /// Each of its `parentRefs` to the data plane's Gateway, in the order it lists them.
+    /// Each of its `parentRefs` to the data plane's Gateway or a ListenerSet naming it, in
+    /// the order it lists them.
     pub parents: Vec<ParentOutcome>,
 }
 
-/// One `parentRef` of an HTTPRoute to the data plane's Gateway, and what became of it.
+/// One `parentRef` of an HTTPRoute to the data plane's Gateway, or to a ListenerSet naming
+/// it, and what became of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentOutcome {
-    /// The Gateway's namespace, as it writes it: none for the route's own.
+    /// The parent's kind: `Gateway` or `ListenerSet`.
+    pub kind: &'static str,
+    /// The parent's namespace, as it writes it: none for the route's own.
     pub namespace: Option<String>,
-    /// The Gateway's name.
+    /// The parent's name.
     pub name: String,
     /// The listener it names, if it names one.
     pub section_name: Option<String>,
@@ -55,6 +59,8 @@ pub struct ParentOutcome {
 pub struct Attachment {
     /// The listener.
     pub listener: String,
+    /// The ListenerSet stating it; none for the Gateway's own.
+    pub set: Option<Object>,
     /// The route's hostnames there: each the route's own and the listener's met, those of
     /// more specific listeners on its port taken away. None left, and the route serves
     /// nothing through this listener, attached all the same.
@@ -67,6 +73,10 @@ pub enum NotAttached {
     /// No accepted listener has the `sectionName` and `port` it names (`NoMatchingParent`).
     #[error("no listener the Gateway serves has the name and port it names")]
     NoMatchingParent,
+    /// It names a ListenerSet the Gateway does not take, so none of whose listeners is
+    /// served (`NoMatchingParent`).
+    #[error("the ListenerSet it names is not attached to the Gateway")]
+    SetNotAttached,
     /// Every listener it names refuses the route's kind or namespace
     /// (`NotAllowedByListeners`).
     #[error("no listener it names takes an HTTPRoute from its namespace")]
@@ -86,6 +96,10 @@ impl fmt::Display for RouteOutcome {
             }
             first = false;
             write!(f, "{}", self.route)?;
+            if parent.kind == "ListenerSet" {
+                let namespace = parent.namespace.as_deref().unwrap_or(&self.route.namespace);
+                write!(f, ", ListenerSet {namespace}/{}", parent.name)?;
+            }
             if let Some(section) = &parent.section_name {
                 write!(f, ", section {section}")?;
             }
@@ -135,13 +149,14 @@ pub(crate) fn attached(cluster: &Cluster, gateway: &GatewayOutcome) -> Vec<Route
                 .parent_refs
                 .iter()
                 .flatten()
-                .filter(|parent| names(parent, route_namespace, &gateway.gateway))
-                .map(|parent| ParentOutcome {
+                .filter_map(|parent| Some((parent, parent_of(parent, route_namespace, gateway)?)))
+                .map(|(parent, kind)| ParentOutcome {
+                    kind: kind.kind(),
                     namespace: parent.namespace.clone(),
                     name: parent.name.clone(),
                     section_name: parent.section_name.clone(),
                     port: parent.port,
-                    attached: attach(route, route_namespace, parent, gateway, cluster),
+                    attached: attach(route, route_namespace, parent, &kind, gateway, cluster),
                 })
                 .collect();
             (!parents.is_empty()).then(|| RouteOutcome {
@@ -153,27 +168,65 @@ pub(crate) fn attached(cluster: &Cluster, gateway: &GatewayOutcome) -> Vec<Route
         .collect()
 }
 
-/// Whether `parent`, of a route in `route_namespace`, is the Gateway `gateway`.
-fn names(parent: &HTTPRouteParentRefs, route_namespace: &str, gateway: &Object) -> bool {
-    parent.group == GROUP
-        && parent.kind == "Gateway"
-        && parent.namespace.as_deref().unwrap_or(route_namespace) == gateway.namespace
-        && parent.name == gateway.name
+/// A route's parent of the data plane's: its Gateway, or a ListenerSet naming it, which
+/// it takes or not.
+enum Parent<'a> {
+    Gateway,
+    ListenerSet(&'a crate::gateway::SetOutcome),
 }
 
-/// The listeners `parent` attaches `route` to, or why none.
+impl Parent<'_> {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Gateway => "Gateway",
+            Self::ListenerSet(_) => "ListenerSet",
+        }
+    }
+}
+
+/// Which of the data plane's parents `parent`, of a route in `route_namespace`, is, if any.
+fn parent_of<'a>(
+    parent: &HTTPRouteParentRefs,
+    route_namespace: &str,
+    gateway: &'a GatewayOutcome,
+) -> Option<Parent<'a>> {
+    if parent.group != GROUP {
+        return None;
+    }
+    let namespace = parent.namespace.as_deref().unwrap_or(route_namespace);
+    let is = |object: &Object| object.namespace == namespace && object.name == parent.name;
+    match parent.kind.as_str() {
+        "Gateway" if is(&gateway.gateway) => Some(Parent::Gateway),
+        "ListenerSet" => gateway
+            .sets
+            .iter()
+            .find(|set| is(&set.set))
+            .map(Parent::ListenerSet),
+        _ => None,
+    }
+}
+
+/// The listeners `parent`, which is `kind`, attaches `route` to, or why none.
 fn attach(
     route: &HTTPRoute,
     route_namespace: &str,
     parent: &HTTPRouteParentRefs,
+    kind: &Parent<'_>,
     gateway: &GatewayOutcome,
     cluster: &Cluster,
 ) -> Result<Vec<Attachment>, NotAttached> {
     let accepted = |listener: &&ListenerOutcome| listener.accepted();
-    // A route naming the Gateway attaches to its own listeners alone, not its ListenerSets'
-    // (GEP-1713).
+    // The direct parent's listeners alone: a route naming the Gateway attaches to its own,
+    // not its ListenerSets', and one naming a ListenerSet to that one's (GEP-1713).
+    let set = match kind {
+        Parent::Gateway => None,
+        Parent::ListenerSet(set) if set.attached => Some(&set.set),
+        Parent::ListenerSet(_) => return Err(NotAttached::SetNotAttached),
+    };
     let named: Vec<&ListenerOutcome> = gateway
-        .own()
+        .listeners
+        .iter()
+        .filter(|listener| listener.set.as_ref() == set)
         .filter(accepted)
         .filter(|l| {
             parent
@@ -235,6 +288,7 @@ fn attach(
         }
         attachments.push(Attachment {
             listener: listener.name.clone(),
+            set: listener.set.clone(),
             hostnames,
         });
     }
@@ -601,18 +655,22 @@ pub(crate) fn translated(
             continue;
         };
         for attachment in attachments {
-            let Some(listener) = gateway
-                .own()
-                .find(|listener| listener.name == attachment.listener)
-            else {
+            let Some(listener) = gateway.listeners.iter().find(|listener| {
+                listener.set == attachment.set && listener.name == attachment.listener
+            }) else {
                 continue;
             };
             let (Ok(served), false) = (&listener.served, attachment.hostnames.is_empty()) else {
                 continue;
             };
+            // A listener's name is unique within its Gateway or ListenerSet alone.
+            let on = match &attachment.set {
+                Some(set) => format!("{}/{}/{}", set.namespace, set.name, attachment.listener),
+                None => attachment.listener.clone(),
+            };
             let name = format!(
-                "httproute/{}/{}/{}",
-                outcome.route.namespace, outcome.route.name, attachment.listener
+                "httproute/{}/{}/{on}",
+                outcome.route.namespace, outcome.route.name
             );
             if translated.routes.iter().any(|known| known.name == name) {
                 continue;

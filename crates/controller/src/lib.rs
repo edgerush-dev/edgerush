@@ -559,8 +559,9 @@ impl Handed {
 
 impl GatewayApi {
     /// Writes, one at a time, each status that says other than `handed` has it: that of
-    /// the data plane's Gateway's class, of the Gateway, `addresses` among it, and of each
-    /// HTTPRoute followed, whether or not it still names the Gateway.
+    /// the data plane's Gateway's class, of the Gateway, `addresses` among it, of each
+    /// ListenerSet naming it, and of each HTTPRoute followed, whether or not it still names
+    /// the Gateway or one of those ListenerSets.
     async fn write_statuses(
         &self,
         api: &ApiServer,
@@ -630,6 +631,47 @@ impl GatewayApi {
                 written: result.as_ref().map(|_| ()),
             });
         }
+        let sets = self
+            .listener_sets
+            .as_deref()
+            .map(objects)
+            .unwrap_or_default();
+        for wanted in &handed.status.listener_sets {
+            let object = &wanted.set;
+            let Some(set) = sets.iter().find(|set| {
+                set.metadata.namespace.as_deref() == Some(object.namespace.as_str())
+                    && set.metadata.name.as_deref() == Some(object.name.as_str())
+            }) else {
+                continue;
+            };
+            let status = gateway_status::listener_set(set.status.as_ref(), wanted, programmed, now);
+            if set.status.as_ref() != Some(&status) {
+                let version = set.metadata.resource_version.as_deref().unwrap_or_default();
+                let result = api
+                    .replace_status::<ListenerSet>(
+                        &object.namespace,
+                        &object.name,
+                        version,
+                        &status,
+                    )
+                    .await;
+                said(Said::GatewayApiStatus {
+                    object,
+                    written: result.as_ref().map(|_| ()),
+                });
+            }
+        }
+        // A route's parents of this data plane's: its Gateway, and each ListenerSet naming
+        // it, taken or not.
+        let parents_of_ours: Vec<Object> = std::iter::once(handed.gateway.clone())
+            .chain(
+                handed
+                    .status
+                    .listener_sets
+                    .iter()
+                    .map(|set| set.set.clone()),
+            )
+            .collect();
         let routes = self.http_routes.as_deref().map(objects).unwrap_or_default();
         for route in &routes {
             let object = Object {
@@ -641,7 +683,7 @@ impl GatewayApi {
             let status = gateway_status::route(
                 route.status.as_ref(),
                 &object.namespace,
-                &handed.gateway,
+                &parents_of_ours,
                 wanted,
                 now,
             );
