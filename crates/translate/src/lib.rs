@@ -362,6 +362,18 @@ pub enum TlsProblem {
         /// How it is served instead.
         served: Served,
     },
+    /// A host a Gateway listener names on the listener Ingress's TLS hosts share, served
+    /// there with that listener's certificate: the Ingress's own Secret is passed over.
+    PassedOver {
+        /// The host.
+        host: String,
+        /// The Ingress's own Secret, by namespace and name.
+        secret: String,
+        /// The Gateway.
+        gateway: Object,
+        /// Its listener naming the host.
+        listener: String,
+    },
     /// A host an older Ingress states another Secret for, which is the one served.
     Taken {
         /// The host.
@@ -427,6 +439,16 @@ impl fmt::Display for TlsFinding {
                     "{object}: {host} is served over HTTPS with {by}'s Secret {secret}: {reason}"
                 ),
             },
+            TlsProblem::PassedOver {
+                host,
+                secret,
+                gateway,
+                listener,
+            } => write!(
+                f,
+                "{object}: {host} is served with the certificate of {gateway}'s listener \
+                 {listener}, which names it, not Secret {secret}"
+            ),
             TlsProblem::Taken {
                 host,
                 secret,
@@ -906,6 +928,24 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         .flat_map(|(_, _, translated, _)| translated.unsecurable.iter().cloned())
         .collect();
     let https = &ingress_https;
+    // The Gateway listeners naming each host as written, each by the data plane's listener
+    // it is served on, its protocol and its name: an Ingress host joins every one, as well
+    // as being served on Ingress's own ports (04 §2).
+    let mut joins: BTreeMap<String, Vec<(String, Protocol, String)>> = BTreeMap::new();
+    for listener in gateway.iter().flat_map(|gateway| &gateway.listeners) {
+        let (Some(hostname), Ok(serving)) = (&listener.hostname, &listener.served) else {
+            continue;
+        };
+        for listening in serving {
+            if let Some(bound) = bound.get(listening) {
+                joins.entry(hostname.clone()).or_default().push((
+                    listening.clone(),
+                    bound.protocol,
+                    listener.name.clone(),
+                ));
+            }
+        }
+    }
     // The port a redirect to HTTPS states: the Ingress HTTPS port, where its TLS hosts are
     // served, none where that is 443, the default; pods bind ports as written and so are
     // reached on them (05 §2, Lucas).
@@ -957,6 +997,18 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 }
                 if !host.starts_with('*') && !refused.contains(&host) {
                     refused.push(host.clone());
+                }
+            }
+            // Joined to each Gateway listener that names its host: over plain HTTP as Ingress
+            // serves it there, by its redirect if it has one, and over HTTPS with that
+            // listener's certificate, whether or not the Ingress secures the host.
+            for (listening, protocol, _) in joins.get(&host).into_iter().flatten() {
+                let on = match (protocol, redirect.as_mut()) {
+                    (Protocol::Http, Some(redirect)) => &mut redirect.listeners,
+                    _ => &mut route.listeners,
+                };
+                if !on.contains(listening) {
+                    on.push(listening.clone());
                 }
             }
             if route.listeners.is_empty() && redirect.is_none() {
@@ -1155,6 +1207,68 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         })
         .collect();
     upstreams.retain(|name, _| used.contains(name));
+    // A host a Gateway HTTPS listener names on the listener Ingress's TLS hosts share is
+    // served there with that listener's certificate: the Ingress's Secret for it is passed
+    // over, and said (04 §2).
+    for (host, joined) in &joins {
+        let Some((_, _, listener)) = joined.iter().find(|(listening, protocol, _)| {
+            *protocol == Protocol::Https && ingress_https.contains(listening)
+        }) else {
+            continue;
+        };
+        for (secret, _, hosts) in &mut presented {
+            let Some(at) = hosts.iter().position(|named| named == host) else {
+                continue;
+            };
+            hosts.remove(at);
+            if let (Some((object, ..)), Some(gateway)) = (stated.get(host), &gateway) {
+                tls.push(TlsFinding {
+                    object: object.clone(),
+                    problem: TlsProblem::PassedOver {
+                        host: host.clone(),
+                        secret: secret.clone(),
+                        gateway: gateway.gateway.clone(),
+                        listener: listener.clone(),
+                    },
+                });
+            }
+        }
+    }
+    presented.retain(|(_, _, hosts)| !hosts.is_empty());
+    // Beside a Gateway listener of no hostname presenting a certificate, which answers every
+    // name no other does, Ingress refuses none of the hosts it serves over plain HTTP alone:
+    // that listener serves them, and that is said (04 §2). One an Ingress asked to secure
+    // with a Secret it cannot use stays refused, never served with another certificate; one
+    // a Gateway listener names is that listener's to say.
+    let catch_all = gateway
+        .iter()
+        .flat_map(|gateway| &gateway.listeners)
+        .find(|listener| {
+            listener.hostname.is_none()
+                && !listener.certificates.is_empty()
+                && listener
+                    .served
+                    .as_ref()
+                    .is_ok_and(|serving| serving.iter().any(|on| ingress_https.contains(on)))
+        });
+    if let (Some(catch_all), Some(gateway)) = (catch_all, &gateway) {
+        refused.retain(|host| {
+            let named = joins
+                .get(host)
+                .is_some_and(|joined| joined.iter().any(|(on, ..)| ingress_https.contains(on)));
+            if unsecurable.contains(host) || named {
+                return true;
+            }
+            report.push(Finding {
+                object: gateway.gateway.clone(),
+                problem: Problem::HostOverTls {
+                    name: catch_all.name.clone(),
+                    host: host.clone(),
+                },
+            });
+            false
+        });
+    }
     let mut config = Config {
         data_plane: plane.data_plane.clone(),
         ..config_of(
