@@ -4,13 +4,23 @@
 //! defaults.
 
 use crate::{IpFamily, Plane};
-use edgerush_config::{Forwarding, Listener, ListenerProxyProtocol, Protocol, RequestId, Tls};
+use edgerush_config::{
+    Forwarding, Listener, ListenerProxyProtocol, MOST_LISTENERS, Protocol, RequestId, Tls,
+};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// The headers only a trusted proxy may send unless a port's settings say otherwise: the
 /// control plane's default ([07 §1](../../../docs/07-config-and-dsl.md)).
 const TRUSTED_ONLY_HEADERS: [&str; 3] = ["Forwarded", "X-Real-IP", "X-Forwarded-*"];
+
+/// The ports Ingress has of its own: one for plain HTTP, one for its TLS hosts (04 §2).
+const INGRESS_PORTS: usize = 2;
+
+/// The most ports of the Gateway API a data plane binds: its slots but those kept for
+/// Ingress's own ports, so that a Gateway's every listener, as many as its CRD allows, and
+/// Ingress's ports are bound together (04 §2).
+pub const MOST_GATEWAY_PORTS: usize = MOST_LISTENERS - INGRESS_PORTS;
 
 /// The name of the data plane's listener bound to `port`: in a cluster a name changes only
 /// with its port, so that a listener is kept as long as its port is (03 §10).

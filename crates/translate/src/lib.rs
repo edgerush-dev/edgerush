@@ -2387,6 +2387,94 @@ spec: { controller: edgerush.dev/ingress-controller }
         assert!(checked.config.certificates.is_empty());
     }
 
+    /// A Gateway's every listener, as many as its CRD allows, each on a port of its own, and
+    /// an Ingress needing both its own ports, are bound together: the data plane has a slot
+    /// for each, and the config compiles.
+    #[test]
+    fn a_gateway_of_every_listener_and_ingress_fit_the_data_plane() {
+        let plane: Plane = serde_saphyr::from_str(&format!(
+            "{PLANE}gateway: edge/web
+"
+        ))
+        .unwrap();
+        // As many as the Gateway CRD allows (`maxItems: 64`).
+        let listeners: String = (0..64)
+            .map(|at| {
+                format!(
+                    "    - {{ name: l{at}, port: {}, protocol: HTTP }}
+",
+                    2000 + at
+                )
+            })
+            .collect();
+        let cluster = Cluster {
+            ingress_classes: vec![
+                serde_saphyr::from_str(
+                    "metadata: { name: edge }
+spec: { controller: edgerush.dev/ingress-controller }
+",
+                )
+                .unwrap(),
+            ],
+            gateway_classes: vec![
+                serde_saphyr::from_str(
+                    "metadata: { name: edgerush }
+spec: { controllerName: edgerush.dev/gateway-controller }
+",
+                )
+                .unwrap(),
+            ],
+            gateways: vec![
+                serde_saphyr::from_str(&format!(
+                    "metadata: {{ name: web, namespace: edge }}
+spec:
+  gatewayClassName: edgerush
+  listeners:
+{listeners}"
+                ))
+                .unwrap(),
+            ],
+            ingresses: vec![
+                serde_saphyr::from_str(
+                    "metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [shop.example.com], secretName: shop-tls }]
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+",
+                )
+                .unwrap(),
+            ],
+            services: vec![
+                serde_saphyr::from_str(
+                    "metadata: { name: web, namespace: shop }
+spec: { ports: [{ name: http, port: 80 }] }
+",
+                )
+                .unwrap(),
+            ],
+            secrets_assumed: true,
+            ..Cluster::default()
+        };
+        let translation = translate(&plane, &cluster);
+        assert!(
+            reported(&translation).is_empty(),
+            "{:?}",
+            reported(&translation)
+        );
+        assert_eq!(
+            translation.config.listeners.len(),
+            edgerush_config::MOST_LISTENERS
+        );
+        assert!(translation.config.listeners.contains_key("port-80"));
+        assert!(translation.config.listeners.contains_key("port-443"));
+        assert!(compile(&translation.config).is_ok());
+    }
+
     /// Where the data plane's own listeners are what it would refuse, compiling an Ingress
     /// alone would refuse every one for a fault none of them has: each is translated, and
     /// the whole config's problems are the listener's and the Ingresses' together.

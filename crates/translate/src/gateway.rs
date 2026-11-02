@@ -271,6 +271,16 @@ pub enum ListenerProblem {
         /// The protocols stated for it, as the data plane's config writes them.
         protocols: String,
     },
+    /// Its port is past the data plane's slots for the Gateway API's ports, taken in the
+    /// order listeners state them (`PortUnavailable`).
+    #[error(
+        "the data plane serves at most {most} ports of the Gateway API; port {port} is past them",
+        most = crate::listeners::MOST_GATEWAY_PORTS
+    )]
+    PortPastSlots {
+        /// The port.
+        port: u16,
+    },
 }
 
 impl ListenerProblem {
@@ -522,6 +532,9 @@ fn listeners(listeners: &[GatewayListeners]) -> Vec<ListenerOutcome> {
                 .push(&listener.name);
         }
     }
+    // The ports taken, in the order listeners state them, each by the first accepted on it:
+    // one past the data plane's slots is refused for every listener on it (04 §2).
+    let mut taken: Vec<i32> = Vec::new();
     listeners
         .iter()
         .zip(protocols)
@@ -544,7 +557,12 @@ fn listeners(listeners: &[GatewayListeners]) -> Vec<ListenerOutcome> {
                     (_, Some(names)) if names.len() > 1 => {
                         Err(ListenerProblem::HostnameConflict(names.join(", ")))
                     }
-                    _ => Ok(vec![crate::listeners::name(port)]),
+                    _ if taken.contains(&listener.port) => Ok(vec![crate::listeners::name(port)]),
+                    _ if taken.len() < crate::listeners::MOST_GATEWAY_PORTS => {
+                        taken.push(listener.port);
+                        Ok(vec![crate::listeners::name(port)])
+                    }
+                    _ => Err(ListenerProblem::PortPastSlots { port }),
                 }
             });
             ListenerOutcome {
@@ -691,9 +709,10 @@ fn selector_of(
 
 #[cfg(test)]
 mod tests {
-    use super::{Namespaces, Requirement, Selector};
+    use super::{GatewayListeners, Namespaces, Requirement, Selector, listeners};
     use crate::Cluster;
-    use std::collections::BTreeMap;
+    use crate::listeners::MOST_GATEWAY_PORTS;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -704,6 +723,58 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// Ports take the data plane's Gateway slots in the order the listeners state them, a
+    /// port its first listener's: listeners sharing one share its slot, and every listener
+    /// on a port past the slots is refused, so that the config never asks for more.
+    #[test]
+    fn ports_past_the_gateway_slots_are_refused_in_listing_order() {
+        let listener = |name: &str, port: usize| -> GatewayListeners {
+            serde_saphyr::from_str(&format!("{{ name: {name}, port: {port}, protocol: HTTP }}"))
+                .unwrap()
+        };
+        let mut written: Vec<GatewayListeners> = (0..MOST_GATEWAY_PORTS)
+            .map(|at| listener(&format!("l{at}"), 2000 - at))
+            .collect();
+        // Sharing a port, told apart by hostname.
+        let named = |name: &str, port: usize, host: &str| -> GatewayListeners {
+            serde_saphyr::from_str(&format!(
+                "{{ name: {name}, port: {port}, protocol: HTTP, hostname: {host} }}"
+            ))
+            .unwrap()
+        };
+        written.push(listener("past", 3000));
+        written.push(named("shares", 2000, "shares.example.com"));
+        written.push(named("past-too", 3000, "past.example.com"));
+        let outcomes = listeners(&written);
+        let refused: Vec<(&str, String)> = outcomes
+            .iter()
+            .filter_map(|o| {
+                o.served
+                    .as_ref()
+                    .err()
+                    .map(|e| (o.name.as_str(), e.to_string()))
+            })
+            .collect();
+        let why = format!(
+            "the data plane serves at most {MOST_GATEWAY_PORTS} ports of the Gateway API; port 3000 is past them"
+        );
+        assert_eq!(refused, [("past", why.clone()), ("past-too", why)]);
+        let served: BTreeSet<&str> = outcomes
+            .iter()
+            .filter_map(|o| o.served.as_ref().ok())
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(served.len(), MOST_GATEWAY_PORTS);
+        // A listener refused for another reason takes no slot.
+        let mut unsupported = written[..MOST_GATEWAY_PORTS].to_vec();
+        unsupported[0] =
+            serde_saphyr::from_str("{ name: tcp, port: 4000, protocol: TCP }").unwrap();
+        unsupported.push(listener("fits", 3000));
+        let outcomes = listeners(&unsupported);
+        assert!(outcomes.last().unwrap().served.is_ok());
     }
 
     #[test]

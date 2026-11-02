@@ -647,8 +647,9 @@ fn bucket_under_two_cycles(limit: &CompiledLimit, cycle: Duration) -> Option<Pro
 
 /// The most listeners a data plane has: what it sizes everything it keeps by listener to
 /// when it starts, so that a listener a later config adds takes a slot already there and
-/// nothing a request touches is made larger (03 §10 in the docs).
-pub const MOST_LISTENERS: usize = 64;
+/// nothing a request touches is made larger (03 §10 in the docs). A Gateway's 64, as many as
+/// its CRD allows, and Ingress's own two (04 §2).
+pub const MOST_LISTENERS: usize = 66;
 
 /// The most limits a rule's requests can be under: which of them a request is under is
 /// told in 64 bits.
