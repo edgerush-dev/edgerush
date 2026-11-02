@@ -294,6 +294,7 @@ and the filters' `reference` modules, the same ones the property tests use. The 
 | `rules_compile` | A limit rule's three parts compile or fail with an error placed in the part it is about, and what compiles decides a request without failing. |
 | `admission_review` | Any bytes read as a webhook review never fail, and the answer carries the review's uid. |
 | `dns_answer` | Any bytes read as a nameserver's answer never fail, and each address found is listed once, in order. |
+| `cluster_wire` | Any bytes read as a message between the rate-limiting service's pods, on either stream, never fail, and what is taken comes back the same; any run of pieces is put together without failing or holding past its bound. |
 
 An input that fails is saved under `fuzz/artifacts/`: fix the bug and add the input to the
 unit tests. Run a target after changing the code it covers. Being

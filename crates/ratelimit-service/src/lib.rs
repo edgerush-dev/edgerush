@@ -3,6 +3,8 @@
 //! gRPC, and the client the data planes use to reach them.
 //!
 //! - [`wire`]: the messages as protobuf, and their conversions.
+//! - [`cluster`]: the cluster store's messages as protobuf (`edgerush_cluster`), which the
+//!   service is moving onto.
 //! - [`grpc`]: the gRPC service and its client.
 //! - [`pod`]: a service pod running, on real time.
 //! - [`scrape`]: its metrics, at `/metrics`.
@@ -10,6 +12,7 @@
 //! - [`synchronous`]: the synchronous mode's pod, apart from all of the above but the
 //!   codec, the view and the heartbeats it shares.
 
+pub mod cluster;
 pub mod grpc;
 pub mod pod;
 pub mod scrape;
