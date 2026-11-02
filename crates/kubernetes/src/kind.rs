@@ -7,6 +7,7 @@ use crate::ApiError;
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
@@ -114,6 +115,10 @@ impl Kind for GatewayClass {
 }
 
 impl Kind for Gateway {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for ListenerSet {
     const NAMESPACED: bool = true;
 }
 

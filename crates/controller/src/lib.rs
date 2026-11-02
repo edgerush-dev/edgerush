@@ -21,6 +21,7 @@ use edgerush_config::{ConfigError, compile};
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_kubernetes::{ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow};
 use edgerush_translate::{
@@ -443,6 +444,7 @@ struct GatewayApi {
     last: Option<Vec<(GatewayKind, Served)>>,
     gateway_classes: Option<Vec<Follow<GatewayClass>>>,
     gateways: Option<Vec<Follow<Gateway>>>,
+    listener_sets: Option<Vec<Follow<ListenerSet>>>,
     http_routes: Option<Vec<Follow<HTTPRoute>>>,
     reference_grants: Option<Vec<Follow<ReferenceGrant>>>,
 }
@@ -466,6 +468,7 @@ impl GatewayApi {
             last: None,
             gateway_classes: None,
             gateways: None,
+            listener_sets: None,
             http_routes: None,
             reference_grants: None,
         }
@@ -483,8 +486,8 @@ impl GatewayApi {
     }
 
     /// Follows each kind `served` says is served, in `scope` (GatewayClasses in the
-    /// cluster, Gateways in the data plane's Gateway's namespace), and stops following each
-    /// it says is not.
+    /// cluster, Gateways in the data plane's Gateway's namespace; ListenerSets, HTTPRoutes
+    /// and ReferenceGrants in `scope`), and stops following each it says is not.
     fn follow(&mut self, served: &[(GatewayKind, Served)], start: &mut Start<'_>, scope: &[Scope]) {
         for (kind, served) in served {
             let on = served.is_served();
@@ -497,6 +500,9 @@ impl GatewayApi {
                 GatewayKind::Gateway => {
                     let namespace = std::slice::from_ref(&self.namespace);
                     keep(&mut self.gateways, on, || start.follows(namespace));
+                }
+                GatewayKind::ListenerSet => {
+                    keep(&mut self.listener_sets, on, || start.follows(scope));
                 }
                 GatewayKind::HTTPRoute => keep(&mut self.http_routes, on, || start.follows(scope)),
                 GatewayKind::ReferenceGrant => {
@@ -519,6 +525,7 @@ impl GatewayApi {
                 self.gateway_classes.as_deref().unwrap_or_default(),
             ))
             .chain(unlisted(self.gateways.as_deref().unwrap_or_default()))
+            .chain(unlisted(self.listener_sets.as_deref().unwrap_or_default()))
             .chain(unlisted(self.http_routes.as_deref().unwrap_or_default()))
             .chain(unlisted(
                 self.reference_grants.as_deref().unwrap_or_default(),
@@ -781,6 +788,7 @@ impl Followed {
             secrets_assumed: false,
             gateway_classes: of(gateway_api.and_then(|g| g.gateway_classes.as_ref())),
             gateways: of(gateway_api.and_then(|g| g.gateways.as_ref())),
+            listener_sets: of(gateway_api.and_then(|g| g.listener_sets.as_ref())),
             http_routes: of(gateway_api.and_then(|g| g.http_routes.as_ref())),
             reference_grants: of(gateway_api.and_then(|g| g.reference_grants.as_ref())),
             namespaces: gateway_api

@@ -158,10 +158,10 @@ fn the_class_says_whether_every_kinds_release_is_supported() {
         assert_eq!(status.supported_features, None);
     }
     let mut older = served("v1.7.0");
-    older[2].1 = Served::Served {
+    older[3].1 = Served::Served {
         release: Some("v1.5.1".to_owned()),
     };
-    older[3].1 = Served::Missing;
+    older[4].1 = Served::Missing;
     assert_eq!(
         version(&class(None, 3, &older, at(50))),
         (

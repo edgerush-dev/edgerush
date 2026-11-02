@@ -340,6 +340,7 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
         last: None,
         gateway_classes: None,
         gateways: None,
+        listener_sets: None,
         http_routes: Some(vec![follow_of("httproutes in shop", false, vec![route])]),
         reference_grants: None,
     };
@@ -448,6 +449,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
             page(&[crd(GatewayKind::GatewayClass, &["v1"])])
         } else if named(GatewayKind::Gateway) {
             page(&[crd(GatewayKind::Gateway, &["v1"])])
+        } else if named(GatewayKind::ListenerSet) {
+            page(&[crd(GatewayKind::ListenerSet, &["v1"])])
+        } else if path.starts_with(&format!("{gateway_api}listenersets?")) {
+            answer(
+                200,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"team","namespace":"shop"},"spec":{"parentRef":{"name":"web","namespace":"edge"},"listeners":[{"name":"team","port":9000,"protocol":"HTTP"}]}}]}"#,
+            )
         } else if path.starts_with(&format!("{gateway_api}namespaces/edge/gateways?")) {
             answer(
                 200,
@@ -491,6 +499,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
         format!(
             "gateway api: gatewayclasses.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              gateways.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
+             listenersets.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              httproutes.gateway.networking.k8s.io: {httproutes}; \
              referencegrants.gateway.networking.k8s.io: not served at v1 (only v1beta1; Gateway API v1.7.0), \
              so taken as having no objects"
@@ -506,7 +515,9 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
             .iter()
             .filter(|line| {
                 line.starts_with("waiting on ")
-                    && line.contains("gatewayclasses in the cluster, gateways in edge, httproutes in the cluster")
+                    && line.contains(
+                        "gatewayclasses in the cluster, gateways in edge, listenersets in the cluster, httproutes in the cluster",
+                    )
             })
             .count()
     };
@@ -544,6 +555,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                     translation.report.iter().map(ToString::to_string).collect();
                 assert!(report.is_empty(), "{report:?}");
             }
+            // ListenerSets are listed in the scope routes are, their CRD serving `v1`.
+            assert!(
+                fake.seen().iter().any(|seen| seen
+                    .path
+                    .starts_with("/apis/gateway.networking.k8s.io/v1/listenersets?")),
+                "ListenerSets never listed"
+            );
             stage.store(1, Ordering::SeqCst);
             until("the CRD's deletion said", || {
                 said_of(&heard.borrow(), &missing_line) == 1
@@ -1465,6 +1483,7 @@ status:
         last: Some(served.clone()),
         gateway_classes: Some(vec![follow_of("gatewayclasses", true, classes)]),
         gateways: Some(vec![follow_of("gateways in edge", true, gateways)]),
+        listener_sets: None,
         http_routes: Some(vec![follow_of("httproutes", true, routes)]),
         reference_grants: None,
     };

@@ -4,6 +4,7 @@
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use k8s_openapi::{ListableResource, Resource};
 
@@ -83,6 +84,23 @@ spec: { gatewayClassName: x, listeners: [{ name: http, port: 80, protocol: HTTP 
         gateway.spec.listeners[0].allowed_routes.namespaces.from,
         "Same"
     );
+    // A ListenerSet's parent is a Gateway of the Gateway API's group unless it says
+    // otherwise, and its listeners take routes from their own namespace.
+    let set: ListenerSet = serde_saphyr::from_str(
+        "metadata: { name: team, namespace: shop }
+spec:
+  parentRef: { name: web, namespace: edge }
+  listeners: [{ name: http, port: 8080, protocol: HTTP }]",
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            set.spec.parent_ref.group.as_str(),
+            set.spec.parent_ref.kind.as_str()
+        ),
+        ("gateway.networking.k8s.io", "Gateway")
+    );
+    assert_eq!(set.spec.listeners[0].allowed_routes.namespaces.from, "Same");
 }
 
 #[test]
@@ -112,6 +130,10 @@ fn each_kind_is_listed_where_the_api_server_serves_it() {
     assert_eq!(
         of::<HTTPRoute>(),
         at(group, "v1", "httproutes", "HTTPRouteList")
+    );
+    assert_eq!(
+        of::<ListenerSet>(),
+        at(group, "v1", "listenersets", "ListenerSetList")
     );
     assert_eq!(
         of::<ReferenceGrant>(),
