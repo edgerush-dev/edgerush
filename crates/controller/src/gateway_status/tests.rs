@@ -195,7 +195,7 @@ fn wanted_gateway() -> translate::GatewayStatus {
                     said("Accepted", true, "Accepted"),
                     said("ResolvedRefs", true, "ResolvedRefs"),
                 ],
-                programmable: Ok(()),
+                programmable: Ok(vec!["port-80".to_owned()]),
             },
             ListenerStatus {
                 name: "secure".to_owned(),
@@ -289,6 +289,102 @@ fn a_gateway_says_its_listeners_as_wanted_and_keeps_what_is_not_ours() {
             .filter(|c| c.type_ != "example.com/Stale")
             .all(|c| c.observed_generation == Some(4))
     );
+}
+
+/// A listener whose port a ready pod running the generation does not serve is not
+/// programmed, saying that pod and why, while the Gateway and its other listeners are, as
+/// the config runs on every pod; a pod still on an older generation says nothing of the
+/// new one's ports; and a refusal says the same of every listener, as before.
+#[test]
+fn a_listener_is_programmed_only_where_every_ready_pod_on_the_generation_serves_its_port() {
+    let pod = |last: u8| IpAddr::from([10, 0, 0, last]);
+    let ready = [pod(1), pod(2)];
+    let runs = |generation: i64, unserved: &[&str]| Pod {
+        runs: Some(generation),
+        unserved: unserved
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    format!("listener \"{name}\": address in use"),
+                )
+            })
+            .collect(),
+        ..Pod::default()
+    };
+    let mut wanted = wanted_gateway();
+    wanted.listeners[1] = ListenerStatus {
+        name: "metrics".to_owned(),
+        programmable: Ok(vec!["port-9100".to_owned()]),
+        ..wanted.listeners[0].clone()
+    };
+    let programmed = |status: &GatewayStatus, listener: Option<usize>| {
+        let conditions = match listener {
+            Some(at) => &status.listeners.as_ref().unwrap()[at].conditions,
+            None => status.conditions.as_ref().unwrap(),
+        };
+        let c = conditions.iter().find(|c| c.type_ == "Programmed").unwrap();
+        (c.status.clone(), c.reason.clone(), c.message.clone())
+    };
+    let one_not = Pods::from([(pod(1), runs(4, &[])), (pod(2), runs(4, &["port-9100"]))]);
+    let status = gateway(
+        None,
+        &wanted,
+        &[],
+        &Programmed::of(4, &one_not, Some(&ready), false),
+        at(50),
+    );
+    let all = "2 of 2 data plane pods run generation 4".to_owned();
+    assert_eq!(
+        programmed(&status, None),
+        ("True".to_owned(), "Programmed".to_owned(), all.clone())
+    );
+    assert_eq!(
+        programmed(&status, Some(0)),
+        ("True".to_owned(), "Programmed".to_owned(), all)
+    );
+    assert_eq!(
+        programmed(&status, Some(1)),
+        (
+            "False".to_owned(),
+            "Pending".to_owned(),
+            "data plane 10.0.0.2: listener \"port-9100\": address in use".to_owned()
+        )
+    );
+    // On an older generation, its ports are its config's: the listener waits as the
+    // Gateway does.
+    let older = Pods::from([(pod(1), runs(4, &[])), (pod(2), runs(3, &["port-9100"]))]);
+    let status = gateway(
+        None,
+        &wanted,
+        &[],
+        &Programmed::of(4, &older, Some(&ready), false),
+        at(50),
+    );
+    assert_eq!(programmed(&status, Some(1)), programmed(&status, None));
+    assert_eq!(programmed(&status, None).0, "Unknown");
+    // A refusal is said of every listener, before any port.
+    let mut refusing = one_not.clone();
+    refusing.get_mut(&pod(1)).unwrap().refused = Some("an unknown field".to_owned());
+    let status = gateway(
+        None,
+        &wanted,
+        &[],
+        &Programmed::of(4, &refusing, Some(&ready), false),
+        at(50),
+    );
+    for listener in [None, Some(0), Some(1)] {
+        assert_eq!(programmed(&status, listener).1, "Invalid", "{listener:?}");
+    }
+    // A pod not ready is not counted.
+    let status = gateway(
+        None,
+        &wanted,
+        &[],
+        &Programmed::of(4, &one_not, Some(&ready[..1]), false),
+        at(50),
+    );
+    assert_eq!(programmed(&status, Some(1)).0, "True");
 }
 
 #[test]
@@ -454,7 +550,7 @@ fn programmed_once_every_ready_pod_runs_the_generation_and_false_once_overdue_or
     let pod = |last: u8| IpAddr::from([10, 0, 0, last]);
     let running = |generation: i64| Pod {
         runs: Some(generation),
-        refused: None,
+        ..Pod::default()
     };
     let said = |p: &Programmed| (p.status, p.reason, p.message.clone());
     let pods = Pods::from([(pod(1), running(4)), (pod(2), running(3))]);
@@ -505,6 +601,7 @@ fn programmed_once_every_ready_pod_runs_the_generation_and_false_once_overdue_or
             Pod {
                 runs: Some(3),
                 refused: Some("an unknown field".to_owned()),
+                ..Pod::default()
             },
         ),
     ]);

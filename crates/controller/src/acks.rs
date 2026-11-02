@@ -1,6 +1,7 @@
 //! What the data-plane pods a replica serves run ([04 §6](../../../docs/04-control-plane.md)):
 //! for each, by its address, the generation of the data plane's Gateway in the config it
-//! runs, and the latest config if it refused it. What `Programmed` is said from, once the
+//! runs, the listeners of that config it does not serve, and the latest config if it
+//! refused it. What `Programmed` is said from, once the
 //! leader has merged every replica's. Pure: the versions offered and what each pod says are
 //! passed in.
 
@@ -23,6 +24,10 @@ pub struct Pod {
     /// Why it refused the latest config, if it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
+    /// The listeners of the config it runs that it does not serve, by name, each with why,
+    /// as it says them: a port it cannot bind, a drain it waits for, no slot.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unserved: BTreeMap<String, String>,
 }
 
 /// How many of the versions offered last are kept, though no pod says it runs them: a pod
@@ -42,12 +47,13 @@ pub struct Runs {
     said: BTreeMap<IpAddr, Said>,
 }
 
-/// What a pod says: the config version it runs, and the latest it refused, if it did, with
-/// why.
+/// What a pod says: the config version it runs, the listeners of it that it does not serve,
+/// and the latest it refused, if it did, with why.
 #[derive(Debug)]
 struct Said {
     running: Option<String>,
     refused: Option<(String, String)>,
+    unserved: BTreeMap<String, String>,
 }
 
 impl Runs {
@@ -61,14 +67,21 @@ impl Runs {
         self.prune();
     }
 
-    /// `pod` says it runs `running`, and refused `refused` (the version, and why), if it
-    /// did.
-    pub fn reported(&mut self, pod: IpAddr, running: Option<&str>, refused: Option<(&str, &str)>) {
+    /// `pod` says it runs `running`, serving none of it of `unserved` (by listener, with
+    /// why), and refused `refused` (the version, and why), if it did.
+    pub fn reported(
+        &mut self,
+        pod: IpAddr,
+        running: Option<&str>,
+        refused: Option<(&str, &str)>,
+        unserved: BTreeMap<String, String>,
+    ) {
         self.said.insert(
             pod,
             Said {
                 running: running.map(str::to_owned),
                 refused: refused.map(|(version, why)| (version.to_owned(), why.to_owned())),
+                unserved,
             },
         );
         self.prune();
@@ -86,7 +99,12 @@ impl Runs {
     pub fn pods(&self) -> BTreeMap<IpAddr, Pod> {
         self.said
             .iter()
-            .map(|(pod, Said { running, refused })| {
+            .map(|(pod, said)| {
+                let Said {
+                    running,
+                    refused,
+                    unserved,
+                } = said;
                 let runs = running
                     .as_ref()
                     .and_then(|version| self.versions.get(version).copied().flatten());
@@ -94,7 +112,15 @@ impl Runs {
                     .as_ref()
                     .filter(|(version, _)| self.offered.back() == Some(version))
                     .map(|(_, why)| why.clone());
-                (*pod, Pod { runs, refused })
+                let unserved = unserved.clone();
+                (
+                    *pod,
+                    Pod {
+                        runs,
+                        refused,
+                        unserved,
+                    },
+                )
             })
             .collect()
     }
@@ -230,6 +256,7 @@ pub fn read(report: &ConfigMap) -> Option<Pods> {
 #[cfg(test)]
 mod tests {
     use super::{Pod, Pods, Reporter, Runs, read};
+    use std::collections::BTreeMap;
     use std::net::IpAddr;
 
     fn pod(last: u8) -> IpAddr {
@@ -240,8 +267,8 @@ mod tests {
     fn each_pod_runs_the_generation_of_the_config_it_says() {
         let mut runs = Runs::default();
         runs.offered("a-1", Some(3));
-        runs.reported(pod(1), Some("a-1"), None);
-        runs.reported(pod(2), None, None);
+        runs.reported(pod(1), Some("a-1"), None, BTreeMap::new());
+        runs.reported(pod(2), None, None, BTreeMap::new());
         runs.offered("a-2", Some(4));
         assert_eq!(
             runs.pods().into_iter().collect::<Vec<_>>(),
@@ -250,17 +277,18 @@ mod tests {
                     pod(1),
                     Pod {
                         runs: Some(3),
-                        refused: None
+                        refused: None,
+                        ..Pod::default()
                     }
                 ),
                 (pod(2), Pod::default()),
             ]
         );
-        runs.reported(pod(1), Some("a-2"), None);
+        runs.reported(pod(1), Some("a-2"), None, BTreeMap::new());
         assert_eq!(runs.pods()[&pod(1)].runs, Some(4));
         // A config of no Gateway runs none.
         runs.offered("a-3", None);
-        runs.reported(pod(2), Some("a-3"), None);
+        runs.reported(pod(2), Some("a-3"), None, BTreeMap::new());
         assert_eq!(runs.pods()[&pod(2)].runs, None);
     }
 
@@ -269,12 +297,18 @@ mod tests {
         let mut runs = Runs::default();
         runs.offered("a-1", Some(3));
         runs.offered("a-2", Some(4));
-        runs.reported(pod(1), Some("a-1"), Some(("a-2", "an unknown field")));
+        runs.reported(
+            pod(1),
+            Some("a-1"),
+            Some(("a-2", "an unknown field")),
+            BTreeMap::new(),
+        );
         assert_eq!(
             runs.pods()[&pod(1)],
             Pod {
                 runs: Some(3),
-                refused: Some("an unknown field".to_owned())
+                refused: Some("an unknown field".to_owned()),
+                ..Pod::default()
             }
         );
         runs.offered("a-3", Some(5));
@@ -285,11 +319,37 @@ mod tests {
         );
     }
 
+    /// What a pod does not serve of the config it runs is said with it, by listener, and
+    /// read back as written; a report that says none, as an older replica's, reads as none.
+    #[test]
+    fn the_listeners_a_pod_does_not_serve_are_said_with_what_it_runs() {
+        let mut runs = Runs::default();
+        runs.offered("a-1", Some(3));
+        let unserved = BTreeMap::from([(
+            "port-9100".to_owned(),
+            "listener \"port-9100\": address in use".to_owned(),
+        )]);
+        runs.reported(pod(1), Some("a-1"), None, unserved.clone());
+        let pods = runs.pods();
+        assert_eq!(pods[&pod(1)].unserved, unserved);
+        runs.reported(pod(1), Some("a-1"), None, BTreeMap::new());
+        assert!(runs.pods()[&pod(1)].unserved.is_empty(), "served since");
+        let reporter = Reporter {
+            namespace: "edge".to_owned(),
+            lease: "control".to_owned(),
+            pod: "one".to_owned(),
+            uid: None,
+        };
+        assert_eq!(read(&reporter.report(&pods).unwrap()), Some(pods));
+        let older: Pods = serde_json::from_str(r#"{"10.0.0.1":{"runs":3}}"#).unwrap();
+        assert!(older[&pod(1)].unserved.is_empty());
+    }
+
     #[test]
     fn a_pod_whose_stream_ends_is_said_no_more_and_versions_run_by_none_are_forgotten() {
         let mut runs = Runs::default();
         runs.offered("a-1", Some(3));
-        runs.reported(pod(1), Some("a-1"), None);
+        runs.reported(pod(1), Some("a-1"), None, BTreeMap::new());
         runs.offered("a-2", Some(4));
         for n in 3..=10 {
             runs.offered(&format!("a-{n}"), Some(n));
@@ -320,6 +380,7 @@ mod tests {
                 Pod {
                     runs: Some(4),
                     refused: None,
+                    ..Pod::default()
                 },
             ),
             (
@@ -327,6 +388,7 @@ mod tests {
                 Pod {
                     runs: None,
                     refused: Some("an unknown field".to_owned()),
+                    ..Pod::default()
                 },
             ),
         ]
@@ -378,6 +440,7 @@ mod tests {
                     Pod {
                         runs: Some(runs),
                         refused: None,
+                        ..Pod::default()
                     },
                 )]))
                 .unwrap();
@@ -400,6 +463,7 @@ mod tests {
                 Pod {
                     runs: Some(runs),
                     refused: None,
+                    ..Pod::default()
                 },
             )])
         };

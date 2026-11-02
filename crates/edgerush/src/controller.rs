@@ -831,11 +831,13 @@ impl Offering {
 
 /// What a data plane said of the config it holds or runs.
 enum Ran {
-    /// It runs this, and refused that, if it did.
+    /// It runs this, serves none of it of these listeners (each with why), and refused
+    /// that, if it did.
     Runs {
         pod: IpAddr,
         running: Option<String>,
         refused: Option<(String, String)>,
+        unserved: BTreeMap<String, String>,
     },
     /// Its stream ended.
     Closed(IpAddr),
@@ -849,12 +851,14 @@ impl Ran {
                 pod,
                 running,
                 refused,
+                unserved,
             } => runs.reported(
                 pod,
                 running.as_deref(),
                 refused
                     .as_ref()
                     .map(|(version, why)| (version.as_str(), why.as_str())),
+                unserved,
             ),
             Self::Closed(pod) => runs.closed(pod),
         }
@@ -866,10 +870,12 @@ fn ran(peer: SocketAddr, heard: &Heard) -> Option<Ran> {
     let pod = peer.ip();
     match heard {
         Heard::Refused(_) => None,
+        // What it serves of the config it holds comes in a report after.
         Heard::Opened { held, .. } => Some(Ran::Runs {
             pod,
             running: held.config.clone(),
             refused: None,
+            unserved: BTreeMap::new(),
         }),
         Heard::Reported(report) => Some(Ran::Runs {
             pod,
@@ -878,6 +884,12 @@ fn ran(peer: SocketAddr, heard: &Heard) -> Option<Ran> {
                 .refused
                 .as_ref()
                 .map(|refused| (refused.config.clone(), refused.why.clone())),
+            unserved: report
+                .listening
+                .unserved
+                .iter()
+                .map(|unserved| (unserved.listener.clone(), unserved.why.clone()))
+                .collect(),
         }),
         Heard::Closed(_) => Some(Ran::Closed(pod)),
     }

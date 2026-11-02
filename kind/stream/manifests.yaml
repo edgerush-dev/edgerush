@@ -377,6 +377,9 @@ spec:
             - /etc/edgerush/stream/ca.crt
             - --workers
             - "1"
+            # Also a port taken, which a Gateway listener on it cannot bind.
+            - --metrics
+            - 0.0.0.0:9100
           # The pod's own addresses, which it never sends a request to (03 §6).
           env:
             - name: POD_IPS

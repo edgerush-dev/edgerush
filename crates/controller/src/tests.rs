@@ -1538,7 +1538,7 @@ fn the_leader_merges_every_replicas_report_and_counts_the_ready_pods() {
     let pod = |last: u8| IpAddr::from([10, 0, 0, last]);
     let runs = |generation: i64| Pod {
         runs: Some(generation),
-        refused: None,
+        ..Pod::default()
     };
     let report = |pod_name: &str, lease: &str, pods: Pods| {
         Reporter {
