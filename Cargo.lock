@@ -541,6 +541,7 @@ dependencies = [
  "hyper-util",
  "proptest",
  "prost",
+ "serde-saphyr",
  "thiserror",
  "tokio",
  "tokio-boring",

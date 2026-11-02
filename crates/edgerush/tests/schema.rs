@@ -1,5 +1,6 @@
-//! The config file's JSON Schema, `schema/config.schema.json`, and the rate-limiting engine's
-//! limits file's, `schema/limits.schema.json`, are the ones the config model's types make:
+//! The config file's JSON Schema, `schema/config.schema.json`, the rate-limiting engine's
+//! limits file's, `schema/limits.schema.json`, and the rate-limiting service pod's config
+//! file's, `schema/ratelimit-service.schema.json`, are the ones the config model's types make:
 //! every section, field and choice, each described by its rustdoc. A change to the model that
 //! a published schema does not have fails here.
 //!
@@ -11,7 +12,7 @@
     reason = "test set-up: the helper that makes the schema fails the tests the way they would"
 )]
 
-use edgerush_config::{HarnessFile, Limits};
+use edgerush_config::{HarnessFile, Limits, ServiceFile};
 use schemars::JsonSchema;
 use schemars::generate::SchemaSettings;
 use schemars::transform::RecursiveTransform;
@@ -24,6 +25,10 @@ const CONFIG: &str = concat!(
 const LIMITS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../schema/limits.schema.json"
+);
+const SERVICE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../schema/ratelimit-service.schema.json"
 );
 
 /// The schema of `T` as the types make it, with the rustdoc's references to the design docs,
@@ -115,8 +120,17 @@ fn the_published_limits_schema_is_the_one_the_types_make() {
 }
 
 #[test]
+fn the_published_service_schema_is_the_one_the_types_make() {
+    published_is(SERVICE, &schema::<ServiceFile>());
+}
+
+#[test]
 fn no_description_points_into_the_design_docs() {
-    for made in [schema::<HarnessFile>(), schema::<Limits>()] {
+    for made in [
+        schema::<HarnessFile>(),
+        schema::<Limits>(),
+        schema::<ServiceFile>(),
+    ] {
         assert!(
             !made.contains("docs/"),
             "a link into the design docs is left"

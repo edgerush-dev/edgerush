@@ -541,18 +541,19 @@ def build_edgerush(n, workers=1, sharing="", cpus=None):
     `workers` workers each on as many CPUs (or `cpus`), each proxy one participant of the
     service, its workers deciding from the entries it keeps; `sharing` is more of the
     service's settings (", poll_quiet_keys: true", say)."""
-    pods = [f"{pod}={SERVICE_IPS[pod]}:7000" for pod in range(3)]
+    pods = ", ".join(f"{pod}: {SERVICE_IPS[pod]}:7000" for pod in range(3))
     services = {}
+    files = {}
     for pod in range(3):
-        command = ["/opt/bin/edgerush-ratelimit-service", "--id", str(pod),
-                   "--listen", "0.0.0.0:7000", "--cycle-ms", "10"]
-        for named in pods:
-            command += ["--pod", named]
+        files[f"rl{pod}.yaml"] = (
+            f"pod: {{ id: {pod}, listen: 0.0.0.0:7000, cycle_ms: 10 }}\n"
+            f"membership: {{ pods: {{ {pods} }} }}\n"
+        )
         services[f"rl{pod}"] = {
             "image": IMAGES["edgerush"],
             "container_name": f"{PROJECT}-rl{pod}",
-            "command": command,
-            "volumes": [f"{BINARIES}:/opt/bin:ro"],
+            "command": ["/opt/bin/edgerush-ratelimit-service", "--config", "/etc/rl.yaml"],
+            "volumes": [f"{BINARIES}:/opt/bin:ro", f"./rl{pod}.yaml:/etc/rl.yaml:ro"],
             "networks": {"back": {"ipv4_address": SERVICE_IPS[pod]}},
         }
     for i in range(n):
@@ -565,7 +566,7 @@ def build_edgerush(n, workers=1, sharing="", cpus=None):
             volumes=[f"{BINARIES}:/opt/bin:ro", "./edgerush.yaml:/etc/edgerush.yaml:ro",
                      "./limits.yaml:/etc/limits.yaml:ro"],
         )
-    files = {
+    files |= {
         "edgerush.yaml": EDGERUSH % {
             "upstream": UPSTREAM_IP,
             "pods": ", ".join(f'"{ip}:7000"' for ip in SERVICE_IPS),

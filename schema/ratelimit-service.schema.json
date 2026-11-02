@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EdgeRush rate-limiting service config file",
+  "description": "A rate-limiting service pod's config file, as `edgerush-ratelimit-service --config`\nreads it once, at the start; its certificate files are read again every second.",
+  "type": "object",
+  "properties": {
+    "keys": {
+      "description": "What the pod's keys may hold; left out, each has its value.",
+      "$ref": "#/$defs/ServiceKeys"
+    },
+    "membership": {
+      "description": "The pods among which a majority agrees which of them serve.",
+      "$ref": "#/$defs/ServiceMembership"
+    },
+    "mode": {
+      "description": "The rate-limiting mode the pod serves: a pod serves one. Asynchronous when left out.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ServiceMode"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "pod": {
+      "description": "The pod itself.",
+      "$ref": "#/$defs/ServicePod"
+    },
+    "tls": {
+      "description": "The files of the pod's mutual TLS, with data planes and with the other pods alike;\nleft out, the pod is served plain, to anyone.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ServicePodTls"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "pod",
+    "membership"
+  ],
+  "$defs": {
+    "ServiceKeys": {
+      "description": "What a service pod's keys may hold.",
+      "type": "object",
+      "properties": {
+        "max_bytes": {
+          "description": "Bytes the keys may hold, past which the least recently changed are evicted. 256 MiB\nwhen left out.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ServiceMembership": {
+      "description": "The pods among which a majority agrees which of them serve, and how long each waits on\nthe others.",
+      "type": "object",
+      "properties": {
+        "pods": {
+          "description": "Every pod, this one too, by its id: where it is reached, `host:port`.",
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^\\d+$": {
+              "type": "string"
+            }
+          }
+        },
+        "silence_ms": {
+          "description": "Milliseconds a pod goes unheard before the others take it out of the view. 600 when\nleft out.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "stop_serving_ms": {
+          "description": "Milliseconds a pod goes without hearing a majority before it stops serving: more\nthan a heartbeat, and two heartbeats less than `silence_ms` at least, so that a pod\ncut off from the others stops before they take it out. Longer tolerates longer\nhiccups between the pods, and leaves a pod gone out of reach serving for longer. 400\nwhen left out.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pods"
+      ]
+    },
+    "ServiceMode": {
+      "description": "The rate-limiting mode a service pod serves.",
+      "oneOf": [
+        {
+          "description": "Data planes decide from their copies of the keys and share what they admitted every\ncycle.",
+          "type": "string",
+          "const": "asynchronous"
+        },
+        {
+          "description": "The key's owner decides every request.",
+          "type": "string",
+          "const": "synchronous"
+        }
+      ]
+    },
+    "ServicePod": {
+      "description": "A service pod: which it is, where it is reached, and its cycle.",
+      "type": "object",
+      "properties": {
+        "cycle_ms": {
+          "description": "Milliseconds of a cycle: in the asynchronous mode the data planes', and in the\nsynchronous mode the pod's own, between its copies of what changed. 10 when left\nout.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        },
+        "id": {
+          "description": "Which of the `membership`'s pods this one is.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "listen": {
+          "description": "Where it serves data planes and the other pods, `host:port`.",
+          "type": "string"
+        },
+        "metrics": {
+          "description": "Where `/metrics` shows whether the pod serves, how often and how long it has gone\nwithout a majority and, in the asynchronous mode, what its keys hold; nowhere when\nleft out.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "listen"
+      ]
+    },
+    "ServicePodTls": {
+      "description": "The files of a service pod's mutual TLS, each PEM and read again every second, each\nrelative to the config file's directory unless it is absolute.",
+      "type": "object",
+      "properties": {
+        "authorities": {
+          "description": "The authorities trusted to vouch for every caller.",
+          "type": "string"
+        },
+        "certificate": {
+          "description": "The certificate the pod presents to data planes and to the other pods, then the\nintermediates.",
+          "type": "string"
+        },
+        "data_plane_id": {
+          "description": "The SPIFFE ID of the data plane the pod serves. A caller is told apart by the ID its\ncertificate carries: the pod's own is the pods', this one the data plane's, and any\nother is refused.",
+          "type": "string"
+        },
+        "key": {
+          "description": "Its private key.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "certificate",
+        "key",
+        "authorities",
+        "data_plane_id"
+      ]
+    }
+  }
+}
