@@ -37,7 +37,7 @@ use crate::downstream::h2;
 use crate::downstream::h3::listener as h3_listener;
 pub use crate::downstream::h3::listener::Forwarding;
 use crate::drain::Drain;
-use crate::forwarding::Client;
+use crate::forwarding::{Asked, Client};
 use crate::gathered::Gathered;
 use crate::grpc::answer::{Answered as GrpcAnswered, Count};
 use crate::grpc::call::Call;
@@ -66,7 +66,7 @@ use crate::upstream::secure::{Secure, Socket as UpstreamSocket};
 use crate::way_back::{Way, WebSocket};
 use crate::websocket::Key;
 use arc_swap::ArcSwap;
-use boring::ssl::SslConnector;
+use boring::ssl::{NameType, SslConnector};
 use bytes::Bytes;
 use edgerush_config::{Compiled, CompiledListener, CompiledRetry, CompiledRule, Timeout};
 use edgerush_filters::HeaderModifier;
@@ -525,9 +525,9 @@ pub struct Worker {
 }
 
 /// The client validation a listener's connections were accepted under on a worker, and the
-/// drain they hear: the worker's drain starts it, and so does a reload that replaces the
-/// validation, which drains the connections accepted under the one before (03 §3, §10). A
-/// certificate rotation keeps it.
+/// listeners sharing its port they were told apart among, and the drain they hear: the
+/// worker's drain starts it, and so does a reload that replaces either, which drains the
+/// connections accepted under the one before (03 §3, §10). A certificate rotation keeps it.
 #[derive(Debug)]
 struct Validation {
     /// The listener's TLS when they were accepted, for its front, which a reload keeps
@@ -541,7 +541,7 @@ impl Validation {
     fn holds_for(&self, tls: Option<&Arc<Tls>>) -> bool {
         match (&self.tls, tls) {
             (None, None) => true,
-            (Some(kept), Some(tls)) => kept.same_front(tls),
+            (Some(kept), Some(tls)) => kept.same_front(tls) && kept.shares_alike(tls),
             _ => false,
         }
     }
@@ -651,6 +651,10 @@ async fn serve_tls(
     let Ok(secured) = tokio_boring::accept(tls.acceptor(), socket).await else {
         return;
     };
+    if let Some(shared) = tls.shared_by() {
+        let name = secured.ssl().servername(NameType::HOST_NAME);
+        client.asked(Asked::new(shared, name));
+    }
     if secured.ssl().selected_alpn_protocol() == Some(tls::H2) {
         serve_h2(ours, client, asking, deadlines, secured).await;
     } else {

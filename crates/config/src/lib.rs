@@ -31,15 +31,16 @@ pub use compile::{
     CompiledRateLimitService, CompiledRateLimiting, CompiledRetry, CompiledRule,
     CompiledServiceTls, CompiledSynchronous, CompiledTimeouts, CompiledTls, CompiledUpstream,
     CompiledUpstreamTls, ConfigError, L4, L4Route, MOST_ATTEMPTS, MOST_LISTENERS, MatchId, Matches,
-    NamedCertificate, Object, Outcome, Place, PresentedCertificate, Problem, RuleId, SniRouter,
-    Step, Timeout, compile, compile_with_matches,
+    NamedCertificate, Object, Outcome, Place, PresentedCertificate, Problem, RuleId,
+    SharedListeners, SniRouter, Step, Timeout, compile, compile_with_matches,
 };
 pub use config::{
     AccessLog, Certificate, ClientValidation, Config, DataPlane, Endpoints, Forwarding,
     HealthCheck, Http3, Keepalive, Listener, ListenerCertificate, ListenerProxyProtocol,
     LoadBalancer, Probe, Protocol, ProxyProtocolVersion, RateLimitBreaker, RateLimitMode,
     RateLimitService, RateLimitServiceTls, RateLimitSynchronous, RateLimiting, RequestId,
-    SlowStart, StatedNames, Tls, Upstream, UpstreamProtocol, UpstreamTls, WhenUnreachable,
+    SharingHostname, SharingListener, SlowStart, StatedNames, Tls, Upstream, UpstreamProtocol,
+    UpstreamTls, WhenUnreachable,
 };
 pub use dns::{DnsName, DnsNameError};
 pub use harness_file::{CertificateFiles, HarnessFile};

@@ -15,7 +15,7 @@ use crate::{
     AccessLog, Backend, Certificate, ClientValidation, Config, DnsName, DnsNameError, Endpoints,
     Forwarding, HealthCheck, Http3, Keepalive, KubernetesService, ListenerProxyProtocol,
     LoadBalancer, Probe, Protocol, ProxyProtocolVersion, RateLimitMode, RequestId, Rule,
-    ServiceName, ServiceNameError, SlowStart, UpstreamProtocol,
+    ServiceName, ServiceNameError, SharingListener, SlowStart, UpstreamProtocol,
 };
 use edgerush_filters::forwarding::{ForwardingError, HeaderNames, TrustedProxies};
 use edgerush_filters::{
@@ -963,7 +963,80 @@ pub struct CompiledTls {
     /// Clients must show a certificate these authorities vouch for (mTLS); none, and any
     /// client is served.
     pub client_validation: Option<ClientValidation>,
+    /// The listeners sharing its port, where two or more do: `None` checks nothing.
+    pub shared_by: Option<Arc<SharedListeners>>,
 }
+
+/// The most listeners that share an `https` listener's port: a Gateway's 64, as many as
+/// its CRD allows, all on the one port, and Ingress's TLS hosts, one listener together
+/// (04 §2 in the docs).
+pub(crate) const MOST_SHARING: usize = 65;
+
+/// The listeners, in Gateway API's sense, sharing an `https` listener's port, found by
+/// name: the one a connection's SNI is for, and the one each of its requests' hosts is for
+/// (03 §3 in the docs).
+#[derive(Debug)]
+pub struct SharedListeners {
+    /// As the config states them, which is what tells one set from another.
+    stated: Vec<SharingListener>,
+    /// Each hostname's listener, by its position.
+    hosts: HostIndex<Option<u8>>,
+    /// The catch-all's, if one shares the port.
+    catch_all: Option<u8>,
+}
+
+impl SharedListeners {
+    /// The listeners, if two or more share the port and fit; `None` otherwise, for which
+    /// nothing is checked.
+    fn new(stated: &[SharingListener]) -> Option<Self> {
+        if stated.len() < 2 {
+            return None;
+        }
+        let mut claims = Vec::new();
+        let mut catch_all = None;
+        for (at, listener) in stated.iter().enumerate() {
+            let at = u8::try_from(at).ok()?;
+            for hostname in &listener.hostnames {
+                let pattern = host_pattern(&hostname.name, hostname.wildcard).ok()?;
+                if pattern.is_none() {
+                    catch_all = Some(at);
+                }
+                claims.push(HostClaim {
+                    pattern,
+                    falls_through: false,
+                    value: at,
+                });
+            }
+        }
+        Some(Self {
+            stated: stated.to_vec(),
+            hosts: HostIndex::new(claims, |members: Vec<u8>| members.first().copied()),
+            catch_all,
+        })
+    }
+
+    /// The position of the listener `name` is for, of those the config states: the one of
+    /// the most specific hostname that covers it, or for `None`, a client that asks for no
+    /// name, the catch-all; none if no hostname covers it. Never allocates.
+    #[must_use]
+    pub fn of(&self, name: Option<&str>) -> Option<u8> {
+        match name {
+            Some(name) => {
+                let name = name.strip_suffix('.').unwrap_or(name);
+                self.hosts.lookup(name).next().copied().flatten()
+            }
+            None => self.catch_all,
+        }
+    }
+}
+
+impl PartialEq for SharedListeners {
+    fn eq(&self, other: &Self) -> bool {
+        self.stated == other.stated
+    }
+}
+
+impl Eq for SharedListeners {}
 
 /// TLS to an upstream's endpoints, the certificate it shows found by its name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1252,6 +1325,26 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                         .problem(Problem::WithoutSniUnknown(tls.without_sni.clone())),
                 );
             }
+            if tls.shared_by.len() > MOST_SHARING {
+                let problem = Problem::TooManySharing(tls.shared_by.len());
+                errors.push(Place::listener(name).problem(problem));
+            }
+            // Each name one listener's, so that which one it is for is never a tie.
+            let mut stated = HashSet::new();
+            for sharing in &tls.shared_by {
+                if sharing.hostnames.is_empty() {
+                    errors.push(Place::listener(name).problem(Problem::NoSharingHostnames));
+                }
+                for hostname in &sharing.hostnames {
+                    if let Err(problem) = host_pattern(&hostname.name, hostname.wildcard) {
+                        errors.push(Place::listener(name).problem(problem));
+                    }
+                    if !stated.insert(hostname.name.to_ascii_lowercase()) {
+                        let problem = Problem::SharingHostnameTwice(hostname.name.clone());
+                        errors.push(Place::listener(name).problem(problem));
+                    }
+                }
+            }
         }
         // QUIC is always TLS: there is no HTTP/3 in the clear (RFC 9114 §3.1).
         if listener.http3.is_some() && listener.protocol != Protocol::Https {
@@ -1474,6 +1567,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                             .flatten(),
                         refused: tls.refused.clone(),
                         client_validation: tls.client_validation.clone(),
+                        shared_by: SharedListeners::new(&tls.shared_by).map(Arc::new),
                     }),
                     http3: listener.http3,
                     router: Router::with_claims(own.into_iter().map(by_rule), claimed),
@@ -1924,33 +2018,35 @@ fn host_claims(route: &Route, place: &Place, errors: &mut Vec<ConfigError>) -> V
 }
 
 fn host_claim(hostname: &Hostname) -> Result<HostClaim<()>, Problem> {
-    let pattern = if hostname.name == "*" {
-        None
-    } else {
-        let is_wildcard = hostname.name.starts_with('*');
-        let labels = match hostname.wildcard {
-            Some(Wildcard::OneLabel) => WildcardLabels::One,
-            Some(Wildcard::AnyLabels) => WildcardLabels::OneOrMore,
-            None if is_wildcard => {
-                return Err(Problem::WildcardUnstated {
-                    name: hostname.name.clone(),
-                });
-            }
-            // An exact name: the kind has no meaning, so any will do.
-            None => WildcardLabels::One,
-        };
-        let pattern =
-            HostPattern::parse(&hostname.name, labels).map_err(|reason| Problem::Hostname {
-                name: hostname.name.clone(),
-                reason,
-            })?;
-        Some(pattern)
-    };
     Ok(HostClaim {
-        pattern,
+        pattern: host_pattern(&hostname.name, hostname.wildcard)?,
         falls_through: hostname.falls_through,
         value: (),
     })
+}
+
+/// The hosts a hostname claims, as a route's or a listener's is written: `None` for `*`,
+/// every host.
+fn host_pattern(name: &str, wildcard: Option<Wildcard>) -> Result<Option<HostPattern>, Problem> {
+    if name == "*" {
+        return Ok(None);
+    }
+    let labels = match wildcard {
+        Some(Wildcard::OneLabel) => WildcardLabels::One,
+        Some(Wildcard::AnyLabels) => WildcardLabels::OneOrMore,
+        None if name.starts_with('*') => {
+            return Err(Problem::WildcardUnstated {
+                name: name.to_owned(),
+            });
+        }
+        // An exact name: the kind has no meaning, so any will do.
+        None => WildcardLabels::One,
+    };
+    let pattern = HostPattern::parse(name, labels).map_err(|reason| Problem::Hostname {
+        name: name.to_owned(),
+        reason,
+    })?;
+    Ok(Some(pattern))
 }
 
 /// What a rule does with an encoded slash inside a path segment, as the router has it.
@@ -2532,6 +2628,15 @@ pub enum Problem {
     /// A name a listener refuses that is not a host name.
     #[error("`refused` names `{0}`, which is not a host name")]
     RefusedName(String),
+    /// More listeners sharing a listener's port than any Gateway and Ingress make.
+    #[error("{0} listeners share the port; the most is 65")]
+    TooManySharing(usize),
+    /// A listener sharing the port that has no hostname: no name would be for it.
+    #[error("a listener sharing the port has no hostnames")]
+    NoSharingHostnames,
+    /// A hostname two listeners sharing the port both have, or one has twice.
+    #[error("hostname `{0}` is stated twice among the listeners sharing the port")]
+    SharingHostnameTwice(String),
     /// TLS on a listener that does not speak it.
     #[error("`tls` is for protocol `https`")]
     TlsUnwanted,
@@ -4250,6 +4355,174 @@ upstreams: {{}}
         // Said on every listener with TLS: a config without it is not read.
         let unsaid = yaml("a").replace(", without_sni: a", "");
         assert!(serde_saphyr::from_str::<Config>(&unsaid).is_err());
+    }
+
+    /// `l`, an `https` listener whose port the listeners `shared_by` says share.
+    fn sharing(shared_by: &str) -> Result<Compiled, Vec<String>> {
+        let yaml = format!(
+            r#"
+listeners:
+  l: {{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [c], without_sni: c, shared_by: [{shared_by}] }} }}
+routes: []
+upstreams: {{}}
+"#
+        );
+        compile(&with_certificates(config(&yaml), &["c"]))
+            .map_err(|errors| errors.iter().map(ToString::to_string).collect())
+    }
+
+    /// The listeners sharing `l`'s port, as compiled.
+    fn shared_of(compiled: &Compiled) -> Option<&SharedListeners> {
+        compiled.listeners[0].tls.as_ref()?.shared_by.as_deref()
+    }
+
+    /// Which listener sharing a port a name is for is the one of the most specific
+    /// hostname covering it: an exact name, then the longest wildcard, then the catch-all,
+    /// which a client asking for no name is for too (03 §3). The cases are those of Gateway
+    /// API's conformance test, `HTTPRouteHTTPSListenerDetectMisdirectedRequests`: a request
+    /// is misdirected, 421, where its host's listener and its SNI's differ, and is routed,
+    /// to 200 or 404, where they are the same.
+    #[test]
+    fn the_listener_a_name_is_for_is_the_one_of_the_most_specific_hostname_covering_it() {
+        let compiled = sharing(
+            r#"{ hostnames: [{ name: "*" }] }, { hostnames: [{ name: second-example.org }] }, { hostnames: [{ name: "*.wildcard.org", wildcard: any_labels }] }, { hostnames: [{ name: fourth-example.wildcard.org }] }"#,
+        )
+        .unwrap();
+        let shared = shared_of(&compiled).unwrap();
+        let cases = [
+            ("example.org", "example.org", false),
+            ("example.org", "second-example.org", true),
+            ("example.org", "unknown-example.org", false),
+            ("second-example.org", "second-example.org", false),
+            ("second-example.org", "example.org", true),
+            ("second-example.org", "unknown-example.org", true),
+            (
+                "third-example.wildcard.org",
+                "third-example.wildcard.org",
+                false,
+            ),
+            (
+                "third-example.wildcard.org",
+                "fith-example.wildcard.org",
+                false,
+            ),
+            (
+                "third-example.wildcard.org",
+                "fourth-example.wildcard.org",
+                true,
+            ),
+            ("third-example.wildcard.org", "second-example.org", true),
+            ("third-example.wildcard.org", "unknown-example.org", true),
+            (
+                "fourth-example.wildcard.org",
+                "fourth-example.wildcard.org",
+                false,
+            ),
+            (
+                "fourth-example.wildcard.org",
+                "fith-example.wildcard.org",
+                true,
+            ),
+            ("unknown-example.org", "example.org", false),
+            ("unknown-example.org", "unknown-example.org", false),
+        ];
+        for (sni, host, misdirected) in cases {
+            assert_eq!(
+                shared.of(Some(sni)) != shared.of(Some(host)),
+                misdirected,
+                "SNI {sni}, host {host}"
+            );
+        }
+        assert_eq!(shared.of(Some("example.org")), Some(0));
+        assert_eq!(shared.of(Some("second-example.org")), Some(1));
+        assert_eq!(shared.of(Some("a.b.wildcard.org")), Some(2));
+        assert_eq!(shared.of(Some("fourth-example.wildcard.org")), Some(3));
+        // As a name is for a host, whatever its case, with or without its root's dot.
+        assert_eq!(shared.of(Some("Second-Example.ORG.")), Some(1));
+        assert_eq!(shared.of(None), Some(0), "no name: the catch-all's");
+
+        // Ingress's wildcard stands for one label; no catch-all, and what nothing covers,
+        // and a client that asks for no name, are for none.
+        let compiled = sharing(
+            r#"{ hostnames: [{ name: a.example.com }] }, { hostnames: [{ name: b.example.com }, { name: "*.example.com", wildcard: one_label }] }"#,
+        )
+        .unwrap();
+        let shared = shared_of(&compiled).unwrap();
+        assert_eq!(shared.of(Some("a.example.com")), Some(0));
+        assert_eq!(shared.of(Some("b.example.com")), Some(1));
+        assert_eq!(shared.of(Some("c.example.com")), Some(1));
+        assert_eq!(shared.of(Some("c.d.example.com")), None);
+        assert_eq!(shared.of(Some("example.com")), None);
+        assert_eq!(shared.of(None), None);
+    }
+
+    /// A port of one listener, or of none said, has nothing to tell apart: nothing is
+    /// checked there, at no cost (03 §3).
+    #[test]
+    fn a_port_of_one_listener_tells_nothing_apart() {
+        let compiled = sharing("").unwrap();
+        assert!(shared_of(&compiled).is_none());
+        let compiled =
+            sharing(r#"{ hostnames: [{ name: a.example.com }, { name: "*" }] }"#).unwrap();
+        assert!(shared_of(&compiled).is_none());
+    }
+
+    /// Each hostname is one listener's, written as a route's is, so that which listener a
+    /// name is for is never a tie; each listener has one at least, and no more listeners
+    /// share a port than a Gateway's 64 and Ingress's one (03 §3, 07 §1).
+    #[test]
+    fn listeners_sharing_a_port_have_hostnames_of_their_own() {
+        let refused = |shared_by: &str| sharing(shared_by).unwrap_err();
+        assert_eq!(
+            refused(
+                r#"{ hostnames: [{ name: a.example.com }] }, { hostnames: [{ name: A.example.com }] }"#
+            ),
+            [
+                "listener `l`: hostname `A.example.com` is stated twice among the listeners sharing the port"
+            ]
+        );
+        assert_eq!(
+            refused(
+                r#"{ hostnames: [{ name: "*" }, { name: "*" }] }, { hostnames: [{ name: a.example.com }] }"#
+            ),
+            ["listener `l`: hostname `*` is stated twice among the listeners sharing the port"]
+        );
+        // One wildcard, whatever its `*` stands for.
+        assert_eq!(
+            refused(
+                r#"{ hostnames: [{ name: "*.example.com", wildcard: one_label }] }, { hostnames: [{ name: "*.example.com", wildcard: any_labels }] }"#
+            ),
+            [
+                "listener `l`: hostname `*.example.com` is stated twice among the listeners sharing the port"
+            ]
+        );
+        assert_eq!(
+            refused(r#"{ hostnames: [] }, { hostnames: [{ name: a.example.com }] }"#),
+            ["listener `l`: a listener sharing the port has no hostnames"]
+        );
+        assert_eq!(
+            refused(
+                r#"{ hostnames: [{ name: "*.example.com" }] }, { hostnames: [{ name: a.example.com }] }"#
+            ),
+            [
+                "listener `l`: hostname `*.example.com` is a wildcard; `wildcard` must say `one_label` or `any_labels`"
+            ]
+        );
+        assert_eq!(
+            refused(r#"{ hostnames: [{ name: "a..example.com" }] }, { hostnames: [{ name: a.example.com }] }"#).len(),
+            1
+        );
+        let listeners = |count: usize| {
+            (0..count)
+                .map(|at| format!("{{ hostnames: [{{ name: l{at}.example.com }}] }}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        assert!(sharing(&listeners(65)).is_ok());
+        assert_eq!(
+            refused(&listeners(66)),
+            ["listener `l`: 66 listeners share the port; the most is 65"]
+        );
     }
 
     /// Certificates reach a data plane apart from the rest of its config, so no file a

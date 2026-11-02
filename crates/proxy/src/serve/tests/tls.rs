@@ -537,6 +537,212 @@ async fn connections_drain_with_the_client_validation_they_were_accepted_under()
     );
 }
 
+/// A config of one `https` listener, `web`, presenting one certificate for `a.test`,
+/// `b.test` and `c.test`, shared by a listener for each of `sharing`'s hostnames, that
+/// sends everything to `upstream`.
+fn shared_to(
+    upstream: SocketAddr,
+    served: &edgerush_config::Certificate,
+    sharing: &[&str],
+) -> Compiled {
+    let mut config = everything_config(upstream);
+    secured(&mut config, vec![served.clone()], None);
+    let tls = config
+        .listeners
+        .get_mut("web")
+        .unwrap()
+        .tls
+        .as_mut()
+        .unwrap();
+    tls.shared_by = sharing
+        .iter()
+        .map(|name| edgerush_config::SharingListener {
+            hostnames: vec![edgerush_config::SharingHostname {
+                name: (*name).to_owned(),
+                wildcard: None,
+            }],
+        })
+        .collect();
+    compile(&config).unwrap()
+}
+
+/// Asks for `/` of `host` on a connection it keeps, and reads the answer's status line.
+async fn status_for<S>(client: &mut S, host: &str) -> String
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let request = format!("GET / HTTP/1.1\r\nhost: {host}\r\n\r\n");
+    client.write_all(request.as_bytes()).await.unwrap();
+    let mut answer = Vec::new();
+    // The upstream's `ok`, or the gateway's own answer, which says how long it is.
+    loop {
+        let text = String::from_utf8_lossy(&answer).into_owned();
+        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .and_then(|length| length.parse::<usize>().ok());
+            if body.len() >= length.unwrap_or(2) {
+                return head.lines().next().unwrap_or_default().to_owned();
+            }
+        }
+        let mut some = [0; 512];
+        let got = within(client.read(&mut some)).await.unwrap();
+        assert_ne!(got, 0, "{text:?}");
+        answer.extend_from_slice(&some[..got]);
+    }
+}
+
+/// Over HTTP/1, a request on a connection made for one listener sharing the port, for
+/// another's host, is answered 421 and the connection kept, its next request for its own
+/// listener's host served there (03 §3).
+#[tokio::test]
+async fn a_request_for_another_listeners_host_is_misdirected_over_http1() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::tls::testing::certificate;
+            let (upstream, _) = counting_upstream().await;
+            let served = certificate(&["a.test", "b.test", "c.test"]);
+            let config = shared_to(upstream, &served, &["a.test", "b.test"]);
+            let (front, _worker) = serving_compiled(config).await;
+            let mut client = tls_client(front, "a.test", None, |_| {}).await.unwrap();
+            assert_eq!(status_for(&mut client, "a.test").await, "HTTP/1.1 200 OK");
+            assert_eq!(
+                status_for(&mut client, "b.test").await,
+                "HTTP/1.1 421 Misdirected Request"
+            );
+            assert_eq!(status_for(&mut client, "a.test").await, "HTTP/1.1 200 OK");
+            let mut client = tls_client(front, "b.test", None, |_| {}).await.unwrap();
+            assert_eq!(status_for(&mut client, "b.test").await, "HTTP/1.1 200 OK");
+        })
+        .await;
+}
+
+/// The same over HTTP/2, the connection a browser would coalesce onto: the stream for
+/// another listener's `:authority` is answered 421, and the connection's others served.
+#[tokio::test]
+async fn a_request_for_another_listeners_host_is_misdirected_over_http2() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::tls::testing::certificate;
+            let (upstream, _) = counting_upstream().await;
+            let served = certificate(&["a.test", "b.test", "c.test"]);
+            let config = shared_to(upstream, &served, &["a.test", "b.test"]);
+            let (front, _worker) = serving_compiled(config).await;
+            let offered: &[u8] = b"\x02h2";
+            let stream = tls_client(front, "a.test", Some(offered), |_| {})
+                .await
+                .unwrap();
+            let (mut send, connection) = within(::h2::client::handshake(stream)).await.unwrap();
+            let _driving = tokio::task::spawn_local(connection);
+            for (authority, status) in [
+                ("a.test", StatusCode::OK),
+                ("b.test", StatusCode::MISDIRECTED_REQUEST),
+                ("a.test", StatusCode::OK),
+            ] {
+                let request = Request::get(format!("https://{authority}/"))
+                    .body(())
+                    .unwrap();
+                let (answer, _) = send.send_request(request, true).unwrap();
+                assert_eq!(
+                    within(answer).await.unwrap().status(),
+                    status,
+                    "{authority}"
+                );
+            }
+        })
+        .await;
+}
+
+/// A reload that changes the listeners sharing the port drains the connections made
+/// among those before, from the worker's next sweep, so that each is made again and its
+/// name told apart among those now (03 §3, §10); one that keeps them keeps them.
+#[tokio::test]
+async fn a_reload_that_changes_the_listeners_sharing_a_port_drains_its_connections() {
+    use tokio::io::AsyncReadExt;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::tls::testing::certificate;
+            let (upstream, _) = counting_upstream().await;
+            let served = certificate(&["a.test", "b.test", "c.test"]);
+            let (front, worker) =
+                serving_swept(shared_to(upstream, &served, &["a.test", "b.test"])).await;
+            let mut client = tls_client(front, "a.test", None, |_| {}).await.unwrap();
+            assert_eq!(status_for(&mut client, "a.test").await, "HTTP/1.1 200 OK");
+
+            // The same listeners: kept, past a sweep.
+            worker
+                .proxy()
+                .reload(shared_to(upstream, &served, &["a.test", "b.test"]))
+                .unwrap();
+            tokio::time::sleep(worker.limits.sweep + SLACK).await;
+            assert_eq!(status_for(&mut client, "a.test").await, "HTTP/1.1 200 OK");
+
+            worker
+                .proxy()
+                .reload(shared_to(
+                    upstream,
+                    &served,
+                    &["a.test", "b.test", "c.test"],
+                ))
+                .unwrap();
+            let reloaded = tokio::time::Instant::now();
+            let mut rest = Vec::new();
+            let _ended = within(client.read_to_end(&mut rest)).await;
+            let took = reloaded.elapsed();
+            assert!(
+                rest.is_empty(),
+                "said more: {}",
+                String::from_utf8_lossy(&rest)
+            );
+            assert!(
+                took < worker.limits.sweep + SLACK && took < SHORT.next_request,
+                "closed {took:?} after the reload"
+            );
+            let mut client = tls_client(front, "c.test", None, |_| {}).await.unwrap();
+            assert_eq!(status_for(&mut client, "c.test").await, "HTTP/1.1 200 OK");
+            assert_eq!(
+                status_for(&mut client, "a.test").await,
+                "HTTP/1.1 421 Misdirected Request"
+            );
+        })
+        .await;
+}
+
+/// What a worker's connections drain with follows the listeners sharing the port they
+/// were made among as it follows the validation: a port that comes to be shared, one whose
+/// listeners change and one no longer shared each start it; one kept keeps it.
+#[tokio::test]
+async fn connections_drain_with_the_listeners_sharing_the_port_they_were_made_among() {
+    use crate::tls::testing::certificate;
+    let upstream: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let served = certificate(&["a.test", "b.test", "c.test"]);
+    let proxy = Proxy::new(shared_to(upstream, &served, &["a.test"]), NonZeroUsize::MIN).unwrap();
+    let worker = Worker::new(Arc::new(proxy));
+    let tls_now = || worker.proxy.current.load().tls[0].clone();
+    let mut drain = worker.drain_for(0, tls_now().as_ref());
+    for (sharing, drained) in [
+        (&["a.test"][..], false),
+        (&["a.test", "b.test"][..], true),
+        (&["a.test", "b.test"][..], false),
+        (&["b.test", "a.test"][..], true),
+        (&["b.test"][..], true),
+    ] {
+        worker
+            .proxy
+            .reload(shared_to(upstream, &served, sharing))
+            .unwrap();
+        worker.revalidate();
+        assert_eq!(drain.is_on(), drained, "{sharing:?}");
+        drain = worker.drain_for(0, tls_now().as_ref());
+        assert!(!drain.is_on());
+    }
+}
+
 /// A reload with new certificates has new handshakes given them at once, behind the
 /// front the listener already had.
 #[tokio::test]

@@ -214,6 +214,11 @@ pub enum Rejection {
     /// carries (RFC 9220 §3: a server "SHOULD respond ... with a 501").
     #[error("extended CONNECT for a protocol not carried")]
     Protocol,
+    /// For a host of another listener than the one its connection was made for, where
+    /// listeners share the port: Gateway API's misdirected request, which the client sends
+    /// again on a connection of its own (RFC 9110 §15.5.20).
+    #[error("misdirected: the host is another listener's than the connection's")]
+    Misdirected,
 }
 
 impl Rejection {
@@ -238,6 +243,7 @@ impl Rejection {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::Protocol => StatusCode::NOT_IMPLEMENTED,
+            Self::Misdirected => StatusCode::MISDIRECTED_REQUEST,
             Self::MaxForwards { options: true } => StatusCode::OK,
             Self::MaxForwards { options: false } => StatusCode::METHOD_NOT_ALLOWED,
         }
@@ -432,6 +438,11 @@ fn decide_with<'a, H: Head>(
         }
         _ => bare_host(head.host_field()?)?,
     };
+    // Before routing: the connection's listener does not serve the host, whatever routes
+    // it has, and another's might.
+    if client.misdirects(host) {
+        return Err(Rejection::Misdirected);
+    }
     // An encoded slash inside a segment is kept for routing, and refused below by every
     // rule but one that takes it (03 §11); the usual path never takes the second pass.
     let (path, encoded_slash) = match normalise_path(head.uri().path()) {
@@ -651,6 +662,7 @@ fn with_path(uri: &Uri, path: String) -> Result<Uri, Rejection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forwarding::Asked;
     use crate::head::survey;
     use crate::raw::RawHead;
     use edgerush_config::{Config, compile};
@@ -816,6 +828,76 @@ upstreams:
 
     fn upstream_for(target: &str, fields: &[(&str, &str)]) -> Result<String, Rejection> {
         decide_on("web", &mut head(target, fields), 0)
+    }
+
+    /// A request on a connection made for one of the listeners sharing its port, for a
+    /// host another of them is for, is misdirected before it is routed, whatever routes
+    /// there are: 421, which a client sends again on a connection of its own (03 §3). One
+    /// for its own listener's host is routed as ever, to a route or to none, whatever its
+    /// case or port, in origin-form or with its host in the target; and nothing is told
+    /// apart on a connection made where nothing is.
+    #[test]
+    fn a_request_for_another_listeners_host_is_misdirected() {
+        let yaml = SHOP.replace(
+            "tls: { certificates: [secure], without_sni: secure }",
+            r#"tls: { certificates: [secure], without_sni: secure, shared_by: [{ hostnames: [{ name: shop.example.com }] }, { hostnames: [{ name: "*" }] }] }"#,
+        );
+        let shop = compile(&shop_config(&yaml)).unwrap();
+        let secure = shop
+            .listeners()
+            .iter()
+            .find(|l| l.name == "secure")
+            .unwrap();
+        let shared = secure.tls.as_ref().unwrap().shared_by.as_ref().unwrap();
+        let decided = |asked: Option<Option<&str>>, target: &str, host: &str| {
+            let client = peer();
+            if let Some(name) = asked {
+                client.asked(Asked::new(shared, name));
+            }
+            let mut head = head(target, &[("host", host)]);
+            decide(&shop, secure, &mut head, &client, &mut || 0, None).map(|decision| {
+                shop.upstream(forwarding(decision).upstream)
+                    .unwrap()
+                    .name
+                    .clone()
+            })
+        };
+        let shop_host = Some(Some("shop.example.com"));
+        let search = Ok("search".to_owned());
+        assert_eq!(decided(shop_host, "/v1", "shop.example.com"), search);
+        assert_eq!(decided(shop_host, "/v1", "SHOP.example.com:8443"), search);
+        assert_eq!(
+            decided(shop_host, "/v1", "other.example.com"),
+            Err(Rejection::Misdirected)
+        );
+        assert_eq!(
+            decided(
+                shop_host,
+                "https://other.example.com/v1",
+                "other.example.com"
+            ),
+            Err(Rejection::Misdirected)
+        );
+        // The catch-all's, by its name or by none: its own hosts are its routes' to serve.
+        for asked in [Some(Some("other.example.com")), Some(None)] {
+            assert_eq!(
+                decided(asked, "/v1", "shop.example.com"),
+                Err(Rejection::Misdirected)
+            );
+            assert_eq!(
+                decided(asked, "/v1", "another.example.com"),
+                Err(Rejection::NoRoute)
+            );
+        }
+        assert_eq!(
+            decided(None, "/v1", "other.example.com"),
+            Err(Rejection::NoRoute)
+        );
+        assert_eq!(
+            Rejection::Misdirected.status(),
+            StatusCode::MISDIRECTED_REQUEST
+        );
+        assert_eq!(Rejection::Misdirected.reason(), "misdirected");
     }
 
     /// What routing was given: host, path, query, method, and the `Host` and

@@ -58,6 +58,7 @@ fn listener(plane: &Plane, port: u16, protocol: Protocol) -> Listener {
             without_sni: "none".to_owned(),
             refused: Vec::new(),
             client_validation: None,
+            shared_by: Vec::new(),
         }),
         // An `http` port's is not used: HTTP/3 is TLS's alone.
         http3: settings

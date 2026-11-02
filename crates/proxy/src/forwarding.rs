@@ -16,13 +16,14 @@
 
 use crate::head::Head;
 use crate::request::Rejection;
-use edgerush_config::{CompiledListener, Protocol};
+use edgerush_config::{CompiledListener, Protocol, SharedListeners};
 use edgerush_filters::forwarding::{address_value, client_address, proto_value, via_value};
 use edgerush_filters::request_id;
 use edgerush_router::Fields;
 use http::header::{HeaderName, HeaderValue, VIA};
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 /// `X-Forwarded-For`.
 pub(crate) const FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -43,6 +44,36 @@ pub struct Client {
     address: IpAddr,
     value: HeaderValue,
     peer: Option<SocketAddr>,
+    /// The listener its handshake's name is for, where listeners share the port; set once
+    /// the handshake is done, and never where none do.
+    asked: OnceCell<Asked>,
+}
+
+/// Which of the listeners sharing a port a connection was made for: the one the name its
+/// client asked for in the handshake is for (03 §3 in the docs).
+#[derive(Debug, Clone)]
+pub struct Asked {
+    /// As they were at the handshake: a reload that changes them drains the connection.
+    shared: Arc<SharedListeners>,
+    listener: Option<u8>,
+}
+
+impl Asked {
+    /// A connection among `shared` whose client asked for `name` (SNI), or for none.
+    #[must_use]
+    pub fn new(shared: &Arc<SharedListeners>, name: Option<&str>) -> Self {
+        Self {
+            shared: Arc::clone(shared),
+            listener: shared.of(name),
+        }
+    }
+
+    /// Whether `host` is another listener's. Out of line, so that a request where nothing
+    /// is told apart pays for the one branch that finds so, not for a lookup inlined.
+    #[inline(never)]
+    fn misdirects(&self, host: &str) -> bool {
+        self.shared.of(Some(host)) != self.listener
+    }
 }
 
 impl Client {
@@ -55,7 +86,22 @@ impl Client {
             address,
             value: address_value(address),
             peer: None,
+            asked: OnceCell::new(),
         }
+    }
+
+    /// Its connection was made for `asked`'s listener: each of its requests for another's
+    /// host is misdirected. Once; a second time is not taken.
+    pub fn asked(&self, asked: Asked) {
+        // Only the handshake sets it, once for the connection.
+        let _ = self.asked.set(asked);
+    }
+
+    /// Whether a request for `host` is for another listener than its connection was made
+    /// for, among listeners that share the port; never where none do.
+    #[must_use]
+    pub fn misdirects(&self, host: &str) -> bool {
+        self.asked.get().is_some_and(|asked| asked.misdirects(host))
     }
 
     /// The client at `address`, of a connection made from `peer`.
