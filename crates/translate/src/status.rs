@@ -170,15 +170,16 @@ pub(crate) fn gateway(
     routes: &[RouteStatus],
     outcomes: &[RouteOutcome],
 ) -> GatewayStatus {
-    let refused: Vec<&str> = gateway
-        .listeners
+    // Of the Gateway's own listeners: a ListenerSet's are in its own status (GEP-1713).
+    let own: Vec<&crate::ListenerOutcome> = gateway.own().collect();
+    let refused: Vec<&str> = own
         .iter()
         .filter(|listener| !listener.accepted())
         .map(|listener| listener.name.as_str())
         .collect();
     let accepted = if refused.is_empty() {
         Condition::new("Accepted", true, "Accepted", String::new())
-    } else if refused.len() < gateway.listeners.len() {
+    } else if refused.len() < own.len() {
         Condition::new(
             "Accepted",
             true,
@@ -193,8 +194,7 @@ pub(crate) fn gateway(
             "no listener is accepted".to_owned(),
         )
     };
-    let listeners: Vec<ListenerStatus> = gateway
-        .listeners
+    let listeners: Vec<ListenerStatus> = own
         .iter()
         .map(|listener| ListenerStatus {
             name: listener.name.clone(),
@@ -262,6 +262,7 @@ fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
                 ListenerProblem::HostnameConflict { .. } => "HostnameConflict",
                 ListenerProblem::ProtocolConflict { .. } => "ProtocolConflict",
                 ListenerProblem::PortPastSlots { .. } => "PortUnavailable",
+                ListenerProblem::TooManyListeners { .. } => "TooManyListeners",
                 ListenerProblem::TlsMode(_) | ListenerProblem::NoCertificate => "UnsupportedValue",
             };
             conditions.push(Condition::new(

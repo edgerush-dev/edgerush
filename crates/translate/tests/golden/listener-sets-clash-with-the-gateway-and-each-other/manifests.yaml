@@ -1,0 +1,38 @@
+# Listeners merged from the Gateway and the ListenerSets it takes go to the first, in
+# precedence: the Gateway's own, then ListenerSets oldest first. A ListenerSet's listener
+# stating a port the Gateway has for another protocol, or a place it has, is refused; so
+# is one of a younger ListenerSet in an older's place, though its name sorts first. What a
+# ListenerSet is told names neither the Gateway's listener nor another ListenerSet.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  allowedListeners: { namespaces: { from: All } }
+  listeners:
+    - { name: http, port: 80, protocol: HTTP, hostname: www.example.com }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: zz-older, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRef: { name: web, namespace: edge }
+  listeners:
+    - { name: secure, port: 80, protocol: HTTPS, hostname: shop.example.com }
+    - { name: www, port: 80, protocol: HTTP, hostname: www.example.com }
+    - { name: shop, port: 80, protocol: HTTP, hostname: shop.example.com }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: aa-younger, namespace: blog, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  parentRef: { name: web, namespace: edge }
+  listeners:
+    - { name: shop, port: 80, protocol: HTTP, hostname: shop.example.com }
+    - { name: blog, port: 80, protocol: HTTP, hostname: blog.example.com }

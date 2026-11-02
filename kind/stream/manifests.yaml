@@ -183,9 +183,9 @@ rules:
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
     verbs: [list, watch]
-  # Its own Gateway's namespace, where Gateways are followed.
+  # Its own Gateway's namespace, where Gateways are followed, and ListenerSets too.
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [gateways]
+    resources: [gateways, listenersets]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gateways/status]

@@ -384,6 +384,26 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
     assert_eq!(followed.unlisted(), ["crd referencegrants"]);
 }
 
+/// ListenerSets are followed where routes are, and in the Gateway's own namespace too, as a
+/// Gateway takes them `from: Same` there whatever the scope.
+#[test]
+fn listener_sets_are_followed_in_the_scope_and_the_gateways_namespace() {
+    let edge = Scope::Namespace("edge".to_owned());
+    let shop = Scope::Namespace("shop".to_owned());
+    assert_eq!(
+        listener_set_scope(std::slice::from_ref(&shop), &edge),
+        [shop.clone(), edge.clone()]
+    );
+    assert_eq!(
+        listener_set_scope(&[shop.clone(), edge.clone()], &edge),
+        [shop, edge.clone()]
+    );
+    assert_eq!(
+        listener_set_scope(&[Scope::Cluster], &edge),
+        [Scope::Cluster]
+    );
+}
+
 #[test]
 fn a_kind_followed_is_started_once_and_stopped_when_no_longer_served() {
     let mut slot: Option<Vec<Follow<HTTPRoute>>> = None;
@@ -454,7 +474,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
         } else if path.starts_with(&format!("{gateway_api}listenersets?")) {
             answer(
                 200,
-                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"team","namespace":"shop"},"spec":{"parentRef":{"name":"web","namespace":"edge"},"listeners":[{"name":"team","port":9000,"protocol":"HTTP"}]}}]}"#,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"team","namespace":"shop"},"spec":{"parentRef":{"name":"other","namespace":"edge"},"listeners":[{"name":"team","port":9000,"protocol":"HTTP"}]}}]}"#,
             )
         } else if path.starts_with(&format!("{gateway_api}namespaces/edge/gateways?")) {
             answer(
@@ -555,7 +575,8 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                     translation.report.iter().map(ToString::to_string).collect();
                 assert!(report.is_empty(), "{report:?}");
             }
-            // ListenerSets are listed in the scope routes are, their CRD serving `v1`.
+            // ListenerSets are listed in the scope routes are, their CRD serving `v1` (this one
+            // is another Gateway's, and so says nothing here).
             assert!(
                 fake.seen().iter().any(|seen| seen
                     .path

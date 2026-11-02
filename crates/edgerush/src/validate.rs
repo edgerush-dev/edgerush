@@ -6,6 +6,7 @@ use edgerush_config::compile;
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_translate::{Cluster, Plane, Translation, translate};
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
@@ -152,6 +153,7 @@ enum Manifest {
     Secret(Box<Secret>),
     GatewayClass(Box<GatewayClass>),
     Gateway(Box<Gateway>),
+    ListenerSet(Box<ListenerSet>),
     HTTPRoute(Box<HTTPRoute>),
     ReferenceGrant(Box<ReferenceGrant>),
     Namespace(Box<Namespace>),
@@ -171,6 +173,7 @@ impl Manifest {
             Self::Secret(secret) => cluster.secrets.push(*secret),
             Self::GatewayClass(class) => cluster.gateway_classes.push(*class),
             Self::Gateway(gateway) => cluster.gateways.push(*gateway),
+            Self::ListenerSet(set) => cluster.listener_sets.push(*set),
             Self::HTTPRoute(route) => cluster.http_routes.push(*route),
             Self::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
             Self::Namespace(namespace) => cluster.namespaces.push(*namespace),
@@ -463,6 +466,11 @@ metadata: { name: web, namespace: edge }
 spec: { gatewayClassName: edgerush, listeners: [{ name: http, port: 80, protocol: HTTP }] }
 ---
 apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: team, namespace: edge }
+spec: { parentRef: { name: web }, listeners: [{ name: team, port: 8080, protocol: HTTP }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata: { name: web, namespace: shop }
 spec: { rules: [{ filters: [{ type: ExternalAuth, externalAuth: { protocol: HTTP } }] }] }
@@ -483,10 +491,11 @@ metadata: { name: shop, labels: { team: shop } }
         let counts = (
             cluster.gateway_classes.len(),
             cluster.gateways.len(),
+            cluster.listener_sets.len(),
             cluster.http_routes.len(),
             cluster.reference_grants.len(),
             cluster.namespaces.len(),
         );
-        assert_eq!(counts, (1, 1, 1, 1, 1));
+        assert_eq!(counts, (1, 1, 1, 1, 1, 1));
     }
 }

@@ -1,0 +1,85 @@
+# A ListenerSet's HTTPS listeners read Secrets of its own namespace freely, and another's
+# where a ReferenceGrant there lets ListenerSets of its namespace: shop's is let reach
+# edge's. A grant to Gateways is not a ListenerSet's: blog's, which holds one alone, is
+# refused that Secret, and its listener is accepted, serving nothing.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  allowedListeners: { namespaces: { from: All } }
+  listeners:
+    - { name: http, port: 80, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: team, namespace: shop }
+spec:
+  parentRef: { name: web, namespace: edge }
+  listeners:
+    - name: own-namespace
+      port: 8443
+      protocol: HTTPS
+      hostname: secure.example.com
+      tls: { certificateRefs: [{ name: secure }] }
+    - name: granted
+      port: 8443
+      protocol: HTTPS
+      hostname: own.example.com
+      tls: { certificateRefs: [{ name: own, namespace: edge }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: other, namespace: blog }
+spec:
+  parentRef: { name: web, namespace: edge }
+  listeners:
+    - name: ungranted
+      port: 8443
+      protocol: HTTPS
+      hostname: blog.example.com
+      tls: { certificateRefs: [{ name: own, namespace: edge }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: listener-sets-of-shop, namespace: edge }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: ListenerSet, namespace: shop }]
+  to: [{ group: "", kind: Secret }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: gateways-of-blog, namespace: edge }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: Gateway, namespace: blog }]
+  to: [{ group: "", kind: Secret }]
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: own, namespace: edge }
+type: kubernetes.io/tls
+stringData:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+    DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+    MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+    hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+    /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+    vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+    AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+    RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+    MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgdZaZ6tG6zh0h1cqS
+    23pUIQKMY6JSkLCYIVIsIc7eZ8mhRANCAAT0Y4ToHByUvCc8nl7g3jPjWFbXCx1U
+    xMPpnOJVpR/iSYSwRdqtUkuO4vOaN0GBx4nr7/wUnH5m6xJPwjOZczke
+    -----END PRIVATE KEY-----

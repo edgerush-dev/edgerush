@@ -1,0 +1,3 @@
+ListenerSet blog/other: not attached: Gateway edge/web takes no ListenerSet of its namespace, as its allowedListeners say
+ListenerSet edge/own: not attached: Gateway edge/web takes no ListenerSet of its namespace, as its allowedListeners say
+HTTPRoute shop/web: not attached to the data plane's Gateway: no listener the Gateway serves has the name and port it names

@@ -170,9 +170,10 @@ fn attach(
     cluster: &Cluster,
 ) -> Result<Vec<Attachment>, NotAttached> {
     let accepted = |listener: &&ListenerOutcome| listener.accepted();
+    // A route naming the Gateway attaches to its own listeners alone, not its ListenerSets'
+    // (GEP-1713).
     let named: Vec<&ListenerOutcome> = gateway
-        .listeners
-        .iter()
+        .own()
         .filter(accepted)
         .filter(|l| {
             parent
@@ -210,7 +211,10 @@ fn attach(
             .listeners
             .iter()
             .filter(accepted)
-            .filter(|other| other.name != listener.name && other.port == listener.port)
+            .filter(|other| {
+                (&other.set, &other.name) != (&listener.set, &listener.name)
+                    && other.port == listener.port
+            })
             .collect();
         let left: Vec<String> = met
             .into_iter()
@@ -313,10 +317,18 @@ pub(crate) fn claims(gateway: &GatewayOutcome) -> Vec<Route> {
         .filter_map(|listener| {
             let served = listener.served.as_ref().ok()?;
             let hostname = listener.hostname.as_ref()?;
+            // Named after whose listener it is: names are unique within a Gateway or a
+            // ListenerSet alone.
+            let stater = listener.set.as_ref().unwrap_or(&gateway.gateway);
+            let kind = if listener.set.is_some() {
+                "listenerset"
+            } else {
+                "gateway"
+            };
             Some(Route {
                 name: format!(
-                    "gateway/{}/{}/{}",
-                    gateway.gateway.namespace, gateway.gateway.name, listener.name
+                    "{kind}/{}/{}/{}",
+                    stater.namespace, stater.name, listener.name
                 ),
                 listeners: served.clone(),
                 hostnames: vec![claim(hostname)],
@@ -366,7 +378,7 @@ impl fmt::Display for Taken {
 }
 
 /// A route's object, from its name: `Ingress shop/web`, `Gateway edge/web listener api`,
-/// `HTTPRoute shop/web`.
+/// `ListenerSet shop/team listener api`, `HTTPRoute shop/web`.
 fn described(route: &str) -> String {
     let mut parts = route.splitn(4, '/');
     let (api, namespace, name, rest) = (parts.next(), parts.next(), parts.next(), parts.next());
@@ -374,6 +386,10 @@ fn described(route: &str) -> String {
         (Some("ingress"), Some(namespace), Some(name)) => format!("Ingress {namespace}/{name}"),
         (Some("gateway"), Some(namespace), Some(name)) => format!(
             "Gateway {namespace}/{name} listener {}",
+            rest.unwrap_or_default()
+        ),
+        (Some("listenerset"), Some(namespace), Some(name)) => format!(
+            "ListenerSet {namespace}/{name} listener {}",
             rest.unwrap_or_default()
         ),
         (Some("httproute"), Some(namespace), Some(name)) => format!("HTTPRoute {namespace}/{name}"),
@@ -385,7 +401,10 @@ fn described(route: &str) -> String {
 fn api(route: &Route) -> Option<&'static str> {
     if route.name.starts_with("ingress/") {
         Some("Ingress")
-    } else if route.name.starts_with("gateway/") || route.name.starts_with("httproute/") {
+    } else if ["gateway/", "listenerset/", "httproute/"]
+        .iter()
+        .any(|prefix| route.name.starts_with(prefix))
+    {
         Some("Gateway API")
     } else {
         None
@@ -583,8 +602,7 @@ pub(crate) fn translated(
         };
         for attachment in attachments {
             let Some(listener) = gateway
-                .listeners
-                .iter()
+                .own()
                 .find(|listener| listener.name == attachment.listener)
             else {
                 continue;

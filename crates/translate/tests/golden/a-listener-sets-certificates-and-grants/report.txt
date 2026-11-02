@@ -1,0 +1,2 @@
+ListenerSet blog/other: listener ungranted: a certificate cannot be used: Secret edge/own is another namespace's, and no ReferenceGrant there lets ListenerSets of blog reach it
+ListenerSet blog/other: listener ungranted: accepted, serving nothing: no certificateRef of it can be used
