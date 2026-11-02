@@ -9,8 +9,9 @@
 # served on an HTTPS listener as on an HTTP one. On a data plane listener the Gateway's
 # certificates come first, in its order, before Ingresses'; a Secret both name is one
 # certificate for both's names. A host an Ingress serves over plain HTTP alone is served
-# over HTTPS by a Gateway listener of that hostname, no longer refused there, and said;
-# over plain HTTP by the Gateway's HTTP listener.
+# over HTTPS by a Gateway listener of that hostname, the Ingress's routes for it joining
+# that listener, no longer refused there, and said; over plain HTTP by the Gateway's HTTP
+# listener.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }

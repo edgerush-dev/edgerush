@@ -1,0 +1,34 @@
+listeners:
+  port-443:
+    address: "0.0.0.0:443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: shop/wild, names: ["*"] }
+      without_sni: shop/wild
+      refused: [broken.example.com]
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: ingress/shop/web/broken.example.com/https-redirect
+    listeners: [port-80]
+    hostnames: [{ name: broken.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
+        redirect: { status: 308, scheme: https, query: keep }
+  - name: ingress/shop/web/plain.example.com
+    listeners: [port-80]
+    hostnames: [{ name: plain.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+upstreams:
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

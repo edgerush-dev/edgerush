@@ -51,7 +51,7 @@ routes:
         filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
         redirect: { status: 308, scheme: https, query: keep }
   - name: ingress/shop/plain/plain.example.com
-    listeners: [port-80]
+    listeners: [port-80, port-443]
     hostnames: [{ name: plain.example.com, falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
