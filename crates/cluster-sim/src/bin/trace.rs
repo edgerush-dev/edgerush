@@ -19,14 +19,14 @@ fn line(world: &World, label: &str) {
     };
     let owned: Vec<(NodeId, usize)> = table
         .members
-        .iter()
+        .keys()
         .map(|member| (*member, table.owned_by(*member).count()))
         .collect();
     println!(
         "{:>7} {label} alive {alive:?} leader {leader:?} table {:?} members {:?} voting {:?} draining {:?} moves {} owned {owned:?} refused {} lost {} unserved {}",
         world.now() / 1_000_000,
         table.stamp(),
-        table.members,
+        table.members.keys().collect::<Vec<_>>(),
         table.voting,
         table.draining,
         table.moves.len(),

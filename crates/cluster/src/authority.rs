@@ -21,7 +21,7 @@ use crate::message::{Message, Stamp};
 use crate::node::Outbox;
 use crate::table::is_quorum;
 use crate::{Config, NodeId, Time, generation_of};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// What a pod last answered the control plane, and to which question.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,10 +36,11 @@ struct Reported {
 pub struct Authority {
     heartbeat: Time,
     form_wait: Time,
-    /// The generation last named, 0 for none, the pods named to form it and the latest table
-    /// any of them had then: kept across restarts, as a naming sent may form after one.
+    /// The generation last named, 0 for none, the pods named to form it, with their addresses,
+    /// and the latest table any of them had then: kept across restarts, as a naming sent may
+    /// form after one.
     generation: u64,
-    named: Vec<NodeId>,
+    named: BTreeMap<NodeId, String>,
     latest: Stamp,
     /// This life of the control plane, apart from every other's, and its last question.
     life: u64,
@@ -69,7 +70,7 @@ impl Authority {
             round: 0,
             reports: BTreeMap::new(),
             needed_since: None,
-            named: Vec::new(),
+            named: BTreeMap::new(),
             latest: (0, 0),
             asked_at: None,
             named_at: None,
@@ -129,10 +130,10 @@ impl Authority {
         }
     }
 
-    /// Its timer at `now`, `running` being the pods the API shows running. A pod's life is over
-    /// once its pod is deleted, its container restarted, or it has been Terminating on a node
-    /// not ready for longer than a timeout.
-    pub fn tick<V: Clone>(&mut self, now: Time, running: &BTreeSet<NodeId>) -> Outbox<V> {
+    /// Its timer at `now`, `running` being the pods the API shows running, each with its
+    /// address. A pod's life is over once its pod is deleted, its container restarted, or it
+    /// has been Terminating on a node not ready for longer than a timeout.
+    pub fn tick<V: Clone>(&mut self, now: Time, running: &BTreeMap<NodeId, String>) -> Outbox<V> {
         if !self.named.is_empty() {
             let _ = self.named_at.get_or_insert(now);
         }
@@ -141,20 +142,20 @@ impl Authority {
         if needed || waited_out {
             let since = *self.needed_since.get_or_insert(self.round);
             // Every pod running has answered a question asked since: what it said was so then.
-            let answered = running.iter().all(|pod| {
+            let answered = running.keys().all(|pod| {
                 self.reports
                     .get(pod)
                     .is_some_and(|report| report.round > since)
             });
             if answered {
                 self.generation += 1;
-                self.named = running.iter().copied().collect();
+                self.named = running.clone();
                 self.latest = if waited_out {
                     self.without_the_latest += 1;
                     (0, 0)
                 } else {
                     running
-                        .iter()
+                        .keys()
                         .filter_map(|pod| self.reports.get(pod))
                         .map(|report| report.committed)
                         .max()
@@ -178,7 +179,7 @@ impl Authority {
                 life: self.life,
                 round: self.round,
             };
-            out.extend(running.iter().map(|pod| (*pod, probe.clone())));
+            out.extend(running.keys().map(|pod| (*pod, probe.clone())));
             let form = Message::Form {
                 generation: self.generation,
                 voters: self.named.clone(),
@@ -187,9 +188,9 @@ impl Authority {
             // Told again until each has a table of the generation, or is gone.
             out.extend(
                 self.named
-                    .iter()
+                    .keys()
                     .filter(|pod| {
-                        running.contains(pod)
+                        running.contains_key(pod)
                             && self.reports.get(pod).is_none_or(|report| {
                                 generation_of(report.committed.0) < self.generation
                             })
@@ -206,25 +207,26 @@ impl Authority {
     /// has applied a table a majority of whose voting set runs. (An election needs a
     /// majority of the applied table's voting set too, so a cluster none of whose pods has one
     /// can never change its table again.)
-    fn needed(&self, running: &BTreeSet<NodeId>) -> bool {
-        if running.is_empty() || !running.iter().all(|pod| self.reports.contains_key(pod)) {
+    fn needed(&self, running: &BTreeMap<NodeId, String>) -> bool {
+        if running.is_empty() || !running.keys().all(|pod| self.reports.contains_key(pod)) {
             return false;
         }
         if self.generation == 0 {
             return true;
         }
-        let gone = |voters: &[NodeId]| !is_quorum(voters, |pod| running.contains(&pod));
-        let reports = || running.iter().filter_map(|pod| self.reports.get(pod));
+        let gone = |voters: &[NodeId]| !is_quorum(voters, |pod| running.contains_key(&pod));
+        let reports = || running.keys().filter_map(|pod| self.reports.get(pod));
         let formed = reports().any(|report| generation_of(report.committed.0) >= self.generation);
         if !formed && !self.named.is_empty() {
-            let holder = self.named.iter().any(|pod| {
-                running.contains(pod)
+            let holder = self.named.keys().any(|pod| {
+                running.contains_key(pod)
                     && self
                         .reports
                         .get(pod)
                         .is_some_and(|report| report.committed >= self.latest)
             });
-            return gone(&self.named) || !holder;
+            let named: Vec<NodeId> = self.named.keys().copied().collect();
+            return gone(&named) || !holder;
         }
         reports().all(|report| gone(&report.voting))
     }
@@ -233,14 +235,14 @@ impl Authority {
     /// the latest table, which a pod running holds: one cut off from the rest of those named
     /// would hold forming up until the cut healed, the service down meanwhile. A rate limiter
     /// loses less by forming without its counts.
-    fn waited_out(&self, now: Time, running: &BTreeSet<NodeId>) -> bool {
+    fn waited_out(&self, now: Time, running: &BTreeMap<NodeId, String>) -> bool {
         let formed = running
-            .iter()
+            .keys()
             .filter_map(|pod| self.reports.get(pod))
             .any(|report| generation_of(report.committed.0) >= self.generation);
         !formed
             && self.latest > (0, 0)
-            && running.iter().all(|pod| self.reports.contains_key(pod))
+            && running.keys().all(|pod| self.reports.contains_key(pod))
             && self
                 .named_at
                 .is_some_and(|at| now.saturating_sub(at) >= self.form_wait)
@@ -252,6 +254,7 @@ mod tests {
     use super::*;
     use crate::kept::Counts;
     use crate::{first_term, ms};
+    use std::collections::BTreeSet;
 
     type Outbox = crate::node::Outbox<Counts>;
 
@@ -286,14 +289,17 @@ mod tests {
             .filter_map(|(to, message)| match message {
                 Message::Form {
                     generation, voters, ..
-                } => Some((*to, *generation, voters.clone())),
+                } => Some((*to, *generation, voters.keys().copied().collect())),
                 _ => None,
             })
             .collect()
     }
 
-    fn running(pods: &[NodeId]) -> BTreeSet<NodeId> {
-        pods.iter().copied().collect()
+    /// `pods` running, each with an address of its own.
+    fn running(pods: &[NodeId]) -> BTreeMap<NodeId, String> {
+        pods.iter()
+            .map(|pod| (*pod, format!("pod-{pod}:7000")))
+            .collect()
     }
 
     /// What each group of pods answers: who, the table's number and its voting set.
@@ -346,6 +352,11 @@ mod tests {
                 .iter()
                 .all(|(_, generation, voters)| *generation == 1 && *voters == vec![1, 2, 3, 4])
         );
+        // Each named with the address the API shows it at, for the first table to carry.
+        assert!(out.iter().all(|(_, message)| match message {
+            Message::Form { voters, .. } => *voters == running(&[1, 2, 3, 4]),
+            _ => true,
+        }));
         let formed = (first_term(1), 1);
         let answers: Answers = &[
             (&[1, 2, 3, 4], formed, &[1, 2, 3, 4]),

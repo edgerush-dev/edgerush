@@ -30,8 +30,9 @@ pub enum Role {
         /// Since when.
         since: Time,
         /// Forming the term's generation of the cluster, the pods the control plane named
-        /// with it: its votes are counted against them, whatever naming comes after.
-        named: Option<Vec<NodeId>>,
+        /// with it, with their addresses: its votes are counted against them, whatever naming
+        /// comes after.
+        named: Option<BTreeMap<NodeId, String>>,
     },
     /// It leads its term.
     Leader {
@@ -81,6 +82,8 @@ struct Heard {
 #[derive(Clone, Debug)]
 pub struct Node<V> {
     id: NodeId,
+    /// Where it is reached: given as it asks to join, for the table to carry.
+    address: String,
     config: Config,
     /// Every pod it knows how to reach.
     peers: BTreeSet<NodeId>,
@@ -143,8 +146,9 @@ pub struct Node<V> {
     /// so that the next goes to it as what changed. Its heartbeats, every 100 ms, lag tables
     /// published every few milliseconds while shards move.
     accepted_by: BTreeMap<NodeId, Stamp>,
-    /// As leader: new members asking in, and members asking to drain, each when last asked.
-    joining: BTreeMap<NodeId, Time>,
+    /// As leader: new members asking in, each when last asked and with the address it gave,
+    /// and members asking to drain, each when last asked.
+    joining: BTreeMap<NodeId, (Time, String)>,
     draining_asked: BTreeMap<NodeId, Time>,
     /// Takers reported caught up, each on the move planned from which table: waiting to be
     /// published, kept by every voter, as the leader may change before it acts.
@@ -158,18 +162,25 @@ pub struct Node<V> {
     wall_offset: i64,
     /// The pod it last had a table or a commit from, and when.
     tabled: Option<(NodeId, Time)>,
-    /// The generation the control plane named it to form, with the others named and the
-    /// latest table any of them had; and when the control plane last repeated it.
-    grant: Option<(u64, Vec<NodeId>, Stamp)>,
+    /// The generation the control plane named it to form, with the others named and their
+    /// addresses, and the latest table any of them had; and when the control plane last
+    /// repeated it.
+    grant: Option<(u64, BTreeMap<NodeId, String>, Stamp)>,
     granted_at: Time,
 }
 
 impl<V: Held> Node<V> {
-    /// Pod `id`, new, started at `now`, knowing how to reach `peers`.
+    /// Pod `id`, reached at `address`, new, knowing how to reach `peers`.
     #[must_use]
-    pub fn new(id: NodeId, config: Config, peers: impl IntoIterator<Item = NodeId>) -> Self {
+    pub fn new(
+        id: NodeId,
+        address: String,
+        config: Config,
+        peers: impl IntoIterator<Item = NodeId>,
+    ) -> Self {
         Self {
             id,
+            address,
             config,
             peers: peers.into_iter().filter(|peer| *peer != id).collect(),
             term: 0,
@@ -447,7 +458,7 @@ impl<V: Held> Node<V> {
         self.committed.as_ref().is_some_and(|table| {
             table
                 .members
-                .iter()
+                .keys()
                 .all(|member| *member == self.id || self.heard_within(*member, now, recent))
         })
     }
@@ -657,7 +668,10 @@ impl<V: Held> Node<V> {
             .map(|(peer, _)| *peer)
             .collect();
         if !member && !with_table.is_empty() {
-            out.extend(with_table.iter().map(|peer| (*peer, Message::JoinCluster)));
+            let ask = Message::JoinCluster {
+                address: self.address.clone(),
+            };
+            out.extend(with_table.iter().map(|peer| (*peer, ask.clone())));
         }
         let let_go = self
             .committed
@@ -789,7 +803,7 @@ impl<V: Held> Node<V> {
         };
         out.extend(
             named
-                .iter()
+                .keys()
                 .filter(|peer| **peer != self.id)
                 .map(|peer| (*peer, ask.clone())),
         );
@@ -853,14 +867,18 @@ impl<V: Held> Node<V> {
             self.draining_asked.insert(self.id, now);
         }
         self.joining
-            .retain(|_, at| now.saturating_sub(*at) <= silence);
+            .retain(|_, (at, _)| now.saturating_sub(*at) <= silence);
         self.draining_asked
             .retain(|_, at| now.saturating_sub(*at) <= silence);
-        let mut joining: BTreeSet<NodeId> = self.joining.keys().copied().collect();
+        let mut joining: BTreeMap<NodeId, String> = self
+            .joining
+            .iter()
+            .map(|(member, (_, address))| (*member, address.clone()))
+            .collect();
         // A leader its table leaves out — one it accepted, never committed, then won with —
         // takes itself in: it asks nobody to, as it is the one asked.
         if !self.draining {
-            joining.insert(self.id);
+            joining.insert(self.id, self.address.clone());
         }
         // Those that have answered its latest heartbeats, it with them.
         let recent = self.config.heartbeat * 2;
@@ -961,7 +979,7 @@ impl<V: Held> Node<V> {
         });
         let to: BTreeSet<NodeId> = table
             .members
-            .iter()
+            .keys()
             .copied()
             .chain(self.peers.iter().copied())
             .filter(|peer| *peer != self.id)
@@ -1012,7 +1030,7 @@ impl<V: Held> Node<V> {
         let stamp = table.stamp();
         let to: BTreeSet<NodeId> = table
             .members
-            .iter()
+            .keys()
             .copied()
             .chain(self.peers.iter().copied())
             .filter(|peer| *peer != self.id)
@@ -1134,7 +1152,7 @@ impl<V: Held> Node<V> {
         self.behind.retain(|copy, _| still(copy));
         self.unacked.retain(|copy, _| still(copy));
         self.assignments.retain(|copy, _| still(copy));
-        for member in &table.members {
+        for member in table.members.keys() {
             self.add_peer(*member);
         }
         if self
@@ -1685,9 +1703,9 @@ impl<V: Held> Node<V> {
                 },
             )),
             Message::Report { .. } => {}
-            Message::JoinCluster => {
+            Message::JoinCluster { address } => {
                 if self.is_leader() {
-                    self.joining.insert(from, now);
+                    self.joining.insert(from, (now, address));
                 }
             }
             Message::Drain => {
@@ -1949,24 +1967,37 @@ impl<V: Held> Node<V> {
         };
         let forming = named.is_some();
         let table = if let Some(named) = named {
-            if !is_quorum(named, |member| joins.contains(&member)) {
+            let voters: Vec<NodeId> = named.keys().copied().collect();
+            if !is_quorum(&voters, |member| joins.contains(&member)) {
                 return;
             }
+            // Those that voted, with the addresses the control plane named them with: every
+            // vote is from one named, as only they are asked.
+            let formers: BTreeMap<NodeId, String> = named
+                .iter()
+                .filter(|(member, _)| joins.contains(member))
+                .map(|(member, address)| (*member, address.clone()))
+                .collect();
             // All of those named vote, so that every table of the generation needs a majority
             // of them; the leader works the set down to odd as usual.
             let mut table = match &self.accepted {
                 Some(accepted) => {
                     let mut table = Table::clone(accepted);
                     table.version += 1;
-                    let mut members: BTreeSet<NodeId> = table.members.iter().copied().collect();
-                    members.extend(joins.iter().copied());
-                    table.members = members.into_iter().collect();
+                    for (member, address) in formers {
+                        table.members.entry(member).or_insert(address);
+                    }
                     table
                 }
-                None => table::first(joins, self.config.shards, self.config.replicas, self.term),
+                None => table::first(
+                    &formers,
+                    self.config.shards,
+                    self.config.replicas,
+                    self.term,
+                ),
             };
             table.term = self.term;
-            table.voting.clone_from(named);
+            table.voting = voters;
             table
         } else {
             if !self.majority(joins) {
@@ -2102,6 +2133,19 @@ mod tests {
     }
     use crate::ms;
 
+    /// Where pod `id` is reached, in these tests.
+    fn address(id: NodeId) -> String {
+        format!("pod-{id}:7000")
+    }
+
+    /// `members`, each with its address.
+    fn named(members: &[NodeId]) -> BTreeMap<NodeId, String> {
+        members
+            .iter()
+            .map(|member| (*member, address(*member)))
+            .collect()
+    }
+
     fn config() -> Config {
         let mut config = Config::defaults();
         config.shards = 4;
@@ -2114,8 +2158,8 @@ mod tests {
     }
 
     fn member_under(config: Config) -> Node {
-        let mut node = Node::new(2, config, [1, 3]);
-        let members = [1, 2, 3].into_iter().collect();
+        let mut node = Node::new(2, address(2), config, [1, 3]);
+        let members = named(&[1, 2, 3]);
         let table = table::first(&members, 4, 2, 1);
         let _ = node.receive(1, Message::TableReply { table }, ms(1));
         node
@@ -2123,6 +2167,56 @@ mod tests {
 
     fn key_in(shard: ShardId) -> u64 {
         (0..).find(|key| shard_of(*key, 4) == shard).unwrap_or(0)
+    }
+
+    /// The first table carries the addresses the control plane named the pods with, and a pod
+    /// asking to join gives its own, which the leader's next table carries to every member.
+    #[test]
+    fn the_table_carries_the_addresses_pods_were_named_with_or_gave() {
+        let mut nodes: BTreeMap<NodeId, Node> = [1, 2, 3]
+            .into_iter()
+            .map(|id| (id, Node::new(id, address(id), config(), [1, 2, 3])))
+            .collect();
+        let form = Message::Form {
+            generation: 1,
+            voters: named(&[1, 2, 3]),
+            latest: (0, 0),
+        };
+        // Every message is delivered a millisecond after it is sent; the control plane, 99,
+        // repeats its naming every heartbeat.
+        let mut sent: Vec<(NodeId, NodeId, Message<Counts>)> = Vec::new();
+        for at in 1..3_000 {
+            let now = ms(at);
+            if at % 100 == 1 {
+                sent.extend([1, 2, 3].map(|pod| (99, pod, form.clone())));
+            }
+            if at == 1_000 {
+                assert!(
+                    nodes
+                        .values()
+                        .all(|node| node.committed().map(|table| &table.members)
+                            == Some(&named(&[1, 2, 3]))),
+                    "formed with the addresses named"
+                );
+                nodes.insert(4, Node::new(4, address(4), config(), [1, 2, 3]));
+            }
+            for (from, to, message) in std::mem::take(&mut sent) {
+                if let Some(node) = nodes.get_mut(&to) {
+                    let out = node.receive(from, message, now);
+                    sent.extend(out.into_iter().map(|(next, message)| (to, next, message)));
+                }
+            }
+            for (id, node) in &mut nodes {
+                let out = node.tick(now);
+                sent.extend(out.into_iter().map(|(to, message)| (*id, to, message)));
+            }
+        }
+        for node in nodes.values() {
+            assert_eq!(
+                node.committed().map(|table| &table.members),
+                Some(&named(&[1, 2, 3, 4]))
+            );
+        }
     }
 
     /// A copy under a shard term older than the one the pod knows is refused: it is from an
@@ -2153,8 +2247,8 @@ mod tests {
     fn an_owners_eviction_goes_to_its_replicas_as_a_deletion() {
         let mut capped = config();
         capped.max_key_bytes = Some(100);
-        let mut node = Node::new(1, capped, [2, 3]);
-        let members = [1, 2, 3].into_iter().collect();
+        let mut node = Node::new(1, address(1), capped, [2, 3]);
+        let members = named(&[1, 2, 3]);
         let table = table::first(&members, 4, 2, 1);
         let _ = node.receive(2, Message::TableReply { table }, ms(1));
         let keys: Vec<u64> = (0..).filter(|key| shard_of(*key, 4) == 0).take(3).collect();
@@ -2183,8 +2277,8 @@ mod tests {
     fn past_its_cap_a_pod_evicts_the_keys_it_may_forget_soonest() {
         let mut capped = config();
         capped.max_key_bytes = Some(100);
-        let mut node = Node::new(2, capped, [1, 3]);
-        let members = [1, 2, 3].into_iter().collect();
+        let mut node = Node::new(2, address(2), capped, [1, 3]);
+        let members = named(&[1, 2, 3]);
         let table = table::first(&members, 4, 2, 1);
         let _ = node.receive(1, Message::TableReply { table }, ms(1));
         let keys: Vec<u64> = (0..).filter(|key| shard_of(*key, 4) == 0).take(3).collect();
@@ -2433,10 +2527,10 @@ mod tests {
     /// stands under the naming, within the time it would otherwise hold.
     #[test]
     fn a_naming_overtaken_by_a_later_generation_is_spent() {
-        let mut node = Node::new(4, config(), [3, 5]);
+        let mut node = Node::new(4, address(4), config(), [3, 5]);
         let form = Message::Form {
             generation: 1,
-            voters: vec![3, 4, 5],
+            voters: named(&[3, 4, 5]),
             latest: (0, 0),
         };
         let _ = node.receive(99, form, ms(1));
@@ -2485,10 +2579,10 @@ mod tests {
     /// than a silence, a pod never stands; named again, it does.
     #[test]
     fn a_naming_not_repeated_lapses() {
-        let mut node = Node::new(4, config(), [3, 5]);
+        let mut node = Node::new(4, address(4), config(), [3, 5]);
         let form = Message::Form {
             generation: 1,
-            voters: vec![3, 4, 5],
+            voters: named(&[3, 4, 5]),
             latest: (0, 0),
         };
         let stands = |node: &mut Node, from: u64| {
@@ -2510,8 +2604,8 @@ mod tests {
     /// hand the shard to it on that word.
     #[test]
     fn a_copy_from_a_table_ahead_is_kept_through_one_behind() {
-        let mut node = Node::new(2, config(), [1, 3, 4]);
-        let members = [1, 2, 3, 4].into_iter().collect();
+        let mut node = Node::new(2, address(2), config(), [1, 3, 4]);
+        let members = named(&[1, 2, 3, 4]);
         let behind = table::first(&members, 4, 2, 1);
         let shard = 2;
         assert!(!behind.shards[usize::from(shard)].replicas.contains(&2));
@@ -2589,10 +2683,10 @@ mod tests {
     #[test]
     fn a_pod_named_behind_the_latest_table_does_not_stand_to_form() {
         let stands = |latest| {
-            let mut node = Node::new(4, config(), [3, 5]);
+            let mut node = Node::new(4, address(4), config(), [3, 5]);
             let form = Message::Form {
                 generation: 2,
-                voters: vec![3, 4, 5],
+                voters: named(&[3, 4, 5]),
                 latest,
             };
             let _ = node.receive(99, form, ms(1));
@@ -2940,8 +3034,8 @@ mod tests {
     }
 
     fn owner_copying_to_2_under(config: Config) -> (Node, ShardId, u64, u64) {
-        let mut owner = Node::new(1, config, [2, 3]);
-        let members = [1, 2, 3].into_iter().collect();
+        let mut owner = Node::new(1, address(1), config, [2, 3]);
+        let members = named(&[1, 2, 3]);
         let first = table::first(&members, 4, 2, 1);
         let Some(shard) = (0..4).find(|shard| {
             first.owner(*shard) == Some(1)
@@ -3062,8 +3156,8 @@ mod tests {
     fn a_pod_left_out_and_taken_back_between_ticks_is_not_ready() {
         let mut three = config();
         three.shards = 3;
-        let first = table::first(&[1, 2, 3].into_iter().collect(), 3, 2, 1);
-        let mut node = Node::new(1, three, [2, 3, 4]);
+        let first = table::first(&named(&[1, 2, 3]), 3, 2, 1);
+        let mut node = Node::new(1, address(1), three, [2, 3, 4]);
         let _ = node.receive(
             3,
             Message::TableReply {
@@ -3089,7 +3183,7 @@ mod tests {
         let _ = node.tick(0);
         assert!(node.ready(0));
         let live = [2, 3, 4].into_iter().collect();
-        let joining = [4].into_iter().collect();
+        let joining = named(&[4]);
         let Some(mut without) = table::repair(&first, &live, &live, &joining, 2) else {
             panic!("pod 1 not left out");
         };
@@ -3102,7 +3196,7 @@ mod tests {
             ms(1),
         );
         let mut back = without.clone();
-        back.members = vec![1, 2, 3, 4];
+        back.members = named(&[1, 2, 3, 4]);
         back.version = 3;
         back.moves.push((0, 1, without.stamp()));
         let _ = node.receive(
@@ -3240,8 +3334,8 @@ mod tests {
     /// and the owner sends it the shard again.
     #[test]
     fn a_replica_put_back_is_sent_the_shard_again_whatever_it_said_before() {
-        let mut owner = Node::new(1, config(), [2, 3]);
-        let members = [1, 2, 3].into_iter().collect();
+        let mut owner = Node::new(1, address(1), config(), [2, 3]);
+        let members = named(&[1, 2, 3]);
         let first = table::first(&members, 4, 2, 1);
         let Some(shard) = (0..4).find(|shard| {
             first.owner(*shard) == Some(1)
@@ -3492,10 +3586,10 @@ mod tests {
     /// first naming's five voters, named alone in the next, never make it lead.
     #[test]
     fn a_candidacy_counts_votes_against_the_naming_it_stood_under() {
-        let mut node = Node::new(1, config(), [2, 3, 4, 5]);
+        let mut node = Node::new(1, address(1), config(), [2, 3, 4, 5]);
         let form = |generation, voters: &[NodeId]| Message::Form {
             generation,
-            voters: voters.to_vec(),
+            voters: named(voters),
             latest: (0, 0),
         };
         let _ = node.receive(99, form(1, &[1, 2, 3, 4, 5]), ms(1));
@@ -3519,7 +3613,7 @@ mod tests {
     /// late, is still taken, and it stands to form the generation with the table it holds.
     #[test]
     fn a_naming_reaching_a_pod_after_the_first_table_is_still_taken() {
-        let mut node = Node::new(3, config(), [1, 2]);
+        let mut node = Node::new(3, address(3), config(), [1, 2]);
         let term = first_term(1);
         let _ = node.receive(
             1,
@@ -3529,7 +3623,7 @@ mod tests {
             },
             ms(1),
         );
-        let members = [1, 2, 3].into_iter().collect();
+        let members = named(&[1, 2, 3]);
         let mut first = table::first(&members, 4, 2, term);
         first.voting = vec![1, 2, 3];
         let _ = node.receive(1, Message::Publish { table: first }, ms(2));
@@ -3538,7 +3632,7 @@ mod tests {
             99,
             Message::Form {
                 generation: 1,
-                voters: vec![1, 2, 3],
+                voters: named(&[1, 2, 3]),
                 latest: (0, 0),
             },
             ms(3),
@@ -3550,7 +3644,7 @@ mod tests {
                     99,
                     Message::Form {
                         generation: 1,
-                        voters: vec![1, 2, 3],
+                        voters: named(&[1, 2, 3]),
                         latest: (0, 0),
                     },
                     ms(at * 5),
@@ -3568,8 +3662,8 @@ mod tests {
     /// leader stands down, and leads again above that term.
     #[test]
     fn a_leader_hearing_a_voter_in_a_later_term_stands_down() {
-        let mut node = Node::new(1, config(), [2, 3]);
-        let members = [1, 2, 3].into_iter().collect();
+        let mut node = Node::new(1, address(1), config(), [2, 3]);
+        let members = named(&[1, 2, 3]);
         let first = table::first(&members, 4, 2, 1);
         let _ = node.receive(2, Message::TableReply { table: first }, ms(1));
         let ahead = 50;
@@ -3624,8 +3718,8 @@ mod tests {
     /// the next election with it: as leader it takes itself back in, as nobody else will.
     #[test]
     fn a_leader_left_out_of_its_table_takes_itself_back_in() {
-        let mut node = Node::new(1, config(), [2, 3]);
-        let members = [1, 2, 3].into_iter().collect();
+        let mut node = Node::new(1, address(1), config(), [2, 3]);
+        let members = named(&[1, 2, 3]);
         let first = table::first(&members, 4, 2, 1);
         let _ = node.receive(
             2,
@@ -3636,7 +3730,7 @@ mod tests {
         );
         let mut without = first;
         without.version = 2;
-        without.members = vec![2, 3];
+        without.members = named(&[2, 3]);
         for shard in &mut without.shards {
             shard.replicas.retain(|replica| *replica != 1);
             if shard.owner == Some(1) {
@@ -3692,10 +3786,10 @@ mod tests {
     /// of them members, leaves nobody to lead.
     #[test]
     fn a_voter_that_is_not_a_member_stands_when_the_leader_goes() {
-        let mut node = Node::new(3, config(), [1, 2]);
-        let members = [1, 2, 3].into_iter().collect();
+        let mut node = Node::new(3, address(3), config(), [1, 2]);
+        let members = named(&[1, 2, 3]);
         let mut table = table::first(&members, 4, 2, 1);
-        table.members = vec![2];
+        table.members = named(&[2]);
         for shard in &mut table.shards {
             shard.owner = Some(2);
             shard.replicas.clear();

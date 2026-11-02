@@ -180,7 +180,7 @@ fn random_faults_never_break_the_rules_and_the_cluster_always_settles() {
                 eprintln!(
                     "  {:?} members {:?} voting {:?} draining {:?} moves {}",
                     table.stamp(),
-                    table.members,
+                    table.members.keys().collect::<Vec<_>>(),
                     table.voting,
                     table.draining,
                     table.moves.len()

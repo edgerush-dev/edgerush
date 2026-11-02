@@ -383,8 +383,9 @@ impl<M: Mode> Sim<M> {
         self.judged_gone.insert(id);
     }
 
-    /// The pods the API shows running: alive and not judged gone, or stopped within `api_lag`.
-    fn api_running(&self) -> BTreeSet<NodeId> {
+    /// The pods the API shows running, with their addresses: alive and not judged gone, or
+    /// stopped within `api_lag`.
+    fn api_running(&self) -> BTreeMap<NodeId, String> {
         let stopped: BTreeMap<NodeId, Time> =
             self.stopped.iter().map(|(id, at, _)| (*id, *at)).collect();
         self.pods
@@ -398,7 +399,7 @@ impl<M: Mode> Sim<M> {
                         .get(id)
                         .is_some_and(|at| self.now.saturating_sub(*at) < self.api_lag)
             })
-            .map(|(id, _)| *id)
+            .map(|(id, _)| (*id, address(*id)))
             .collect()
     }
 
@@ -736,7 +737,7 @@ impl<M: Mode> Sim<M> {
         let Some(table) = self.node(leader).and_then(Node::committed) else {
             return false;
         };
-        let members_on_it = table.members.iter().all(|member| {
+        let members_on_it = table.members.keys().all(|member| {
             self.node(*member)
                 .and_then(Node::committed)
                 .is_some_and(|theirs| theirs.stamp() == table.stamp())
@@ -1144,7 +1145,7 @@ const fn store_kind<V>(message: &StoreMessage<V>) -> &'static str {
         StoreMessage::StartJoin { .. } | StoreMessage::Join { .. } => "election",
         StoreMessage::Publish { .. } | StoreMessage::PublishChanges { .. } => "publish",
         StoreMessage::PublishAck { .. } | StoreMessage::Commit { .. } => "commit",
-        StoreMessage::JoinCluster | StoreMessage::Drain => "join or drain",
+        StoreMessage::JoinCluster { .. } | StoreMessage::Drain => "join or drain",
         StoreMessage::Probe { .. } | StoreMessage::Report { .. } | StoreMessage::Form { .. } => {
             "control plane"
         }
@@ -1157,7 +1158,14 @@ const fn store_kind<V>(message: &StoreMessage<V>) -> &'static str {
     }
 }
 
-/// About how many bytes a store's message takes on the wire.
+/// Where pod `id` is reached, as its table names it: a pod is a member in one life only.
+fn address(id: NodeId) -> String {
+    format!("pod-{id}:7000")
+}
+
+/// About how many bytes a store's message takes on the wire. Members' addresses, a few tens
+/// of bytes each, are left out: under a hundredth of a table at 256 shards, and sizes set when
+/// messages arrive, so that counting them would move every run measured before them.
 fn store_size<V: Held>(message: &StoreMessage<V>) -> u64 {
     // Each key with its value, as the store sizes it, and each key dropped.
     let entries = |entries: &[(u64, edgerush_cluster::Kept<V>)], dropped: &[u64]| {

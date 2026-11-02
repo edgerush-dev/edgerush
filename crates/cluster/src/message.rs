@@ -3,6 +3,7 @@
 
 use crate::table::{Changes, Table};
 use crate::{Kept, NodeId, ShardId, Time};
+use std::collections::BTreeMap;
 
 /// A table's number, `(term, version)`: `(0, 0)` for no table. The term's upper half is the
 /// cluster's generation, so a cluster formed again outnumbers every table before it.
@@ -91,7 +92,10 @@ pub enum Message<V> {
         stamp: Stamp,
     },
     /// A new member asks to be taken in.
-    JoinCluster,
+    JoinCluster {
+        /// Where it is reached, for the table to carry.
+        address: String,
+    },
     /// From the control plane, every heartbeat: what table does the pod hold now? Numbered, so
     /// that an answer shows it was written after the question was asked.
     Probe {
@@ -116,8 +120,8 @@ pub enum Message<V> {
     Form {
         /// The generation.
         generation: u64,
-        /// The pods named, in order.
-        voters: Vec<NodeId>,
+        /// The pods named, in order, each with its address.
+        voters: BTreeMap<NodeId, String>,
         /// The latest table any of them had applied when named, `(0, 0)` for none: a pod
         /// that has accepted none as late does not stand.
         latest: Stamp,
