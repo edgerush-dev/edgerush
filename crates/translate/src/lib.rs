@@ -39,6 +39,7 @@ use edgerush_config::{
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::http_route::HTTPRoute;
+use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{
@@ -237,6 +238,9 @@ pub struct Cluster {
     pub gateway_classes: Vec<GatewayClass>,
     /// Every Gateway seen.
     pub gateways: Vec<Gateway>,
+    /// Every ListenerSet seen, where the data plane is a Gateway: one attached to it, as
+    /// its `allowedListeners` lets, adds listeners of its own (04 §2).
+    pub listener_sets: Vec<ListenerSet>,
     /// Every HTTPRoute seen.
     pub http_routes: Vec<HTTPRoute>,
     /// Every ReferenceGrant seen.

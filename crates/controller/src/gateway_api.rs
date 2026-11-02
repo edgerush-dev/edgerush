@@ -23,6 +23,8 @@ pub enum GatewayKind {
     GatewayClass,
     /// `Gateway`.
     Gateway,
+    /// `ListenerSet`.
+    ListenerSet,
     /// `HTTPRoute`.
     HTTPRoute,
     /// `ReferenceGrant`.
@@ -31,9 +33,10 @@ pub enum GatewayKind {
 
 impl GatewayKind {
     /// Every kind followed, in the order said.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::GatewayClass,
         Self::Gateway,
+        Self::ListenerSet,
         Self::HTTPRoute,
         Self::ReferenceGrant,
     ];
@@ -44,6 +47,7 @@ impl GatewayKind {
         match self {
             Self::GatewayClass => "gatewayclasses.gateway.networking.k8s.io",
             Self::Gateway => "gateways.gateway.networking.k8s.io",
+            Self::ListenerSet => "listenersets.gateway.networking.k8s.io",
             Self::HTTPRoute => "httproutes.gateway.networking.k8s.io",
             Self::ReferenceGrant => "referencegrants.gateway.networking.k8s.io",
         }
@@ -110,6 +114,7 @@ impl GatewayKind {
         match self {
             Self::GatewayClass => "GatewayClass",
             Self::Gateway => "Gateway",
+            Self::ListenerSet => "ListenerSet",
             Self::HTTPRoute => "HTTPRoute",
             Self::ReferenceGrant => "ReferenceGrant",
         }
@@ -249,6 +254,7 @@ mod tests {
             [
                 "gatewayclasses.gateway.networking.k8s.io",
                 "gateways.gateway.networking.k8s.io",
+                "listenersets.gateway.networking.k8s.io",
                 "httproutes.gateway.networking.k8s.io",
                 "referencegrants.gateway.networking.k8s.io",
             ]
