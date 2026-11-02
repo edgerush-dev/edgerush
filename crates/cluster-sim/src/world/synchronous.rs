@@ -19,7 +19,7 @@ impl Mode for Synchronous {
     type Client = Client;
 
     fn pod(id: NodeId, config: Config, peers: Vec<NodeId>, forwarding: bool) -> Pod {
-        let mut pod = Pod::new(id, config, peers);
+        let mut pod = Pod::new(id, super::address(id), config, peers);
         pod.set_forwarding(forwarding);
         pod
     }

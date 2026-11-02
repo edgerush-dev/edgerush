@@ -36,6 +36,9 @@ pub enum Invalid {
     /// A rolling window's slot given twice.
     #[error("a slot given twice")]
     SlotTwice,
+    /// A member named twice, in a table or a naming.
+    #[error("a member named twice")]
+    MemberTwice,
 }
 
 /// A mode's value as the wire carries it: a protobuf message of the mode's own.
@@ -93,6 +96,17 @@ pub struct Move {
     pub from: Option<Stamp>,
 }
 
+/// A member, and where it is reached.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Member {
+    /// The member.
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    /// Its address, `host:port`.
+    #[prost(string, tag = "2")]
+    pub address: String,
+}
+
 /// A table.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct Table {
@@ -102,9 +116,9 @@ pub struct Table {
     /// Its version.
     #[prost(uint64, tag = "2")]
     pub version: u64,
-    /// The members, in order.
-    #[prost(uint64, repeated, tag = "3")]
-    pub members: Vec<u64>,
+    /// The members, in order, each with its address.
+    #[prost(message, repeated, tag = "3")]
+    pub members: Vec<Member>,
     /// The voting set, in order.
     #[prost(uint64, repeated, tag = "4")]
     pub voting: Vec<u64>,
@@ -139,9 +153,9 @@ pub struct Changes {
     /// Its version.
     #[prost(uint64, tag = "2")]
     pub version: u64,
-    /// Its members.
-    #[prost(uint64, repeated, tag = "3")]
-    pub members: Vec<u64>,
+    /// Its members, each with its address.
+    #[prost(message, repeated, tag = "3")]
+    pub members: Vec<Member>,
     /// Its voting set.
     #[prost(uint64, repeated, tag = "4")]
     pub voting: Vec<u64>,
@@ -266,15 +280,23 @@ pub struct Report {
     pub voting: Vec<u64>,
 }
 
+/// A new member asking in.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct JoinCluster {
+    /// Where it is reached.
+    #[prost(string, tag = "1")]
+    pub address: String,
+}
+
 /// The control plane's naming of the pods to form a generation.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct Form {
     /// The generation.
     #[prost(uint64, tag = "1")]
     pub generation: u64,
-    /// The pods, in order.
-    #[prost(uint64, repeated, tag = "2")]
-    pub voters: Vec<u64>,
+    /// The pods, in order, each with its address.
+    #[prost(message, repeated, tag = "2")]
+    pub voters: Vec<Member>,
     /// The latest table any had applied.
     #[prost(message, optional, tag = "3")]
     pub latest: Option<Stamp>,
@@ -431,7 +453,7 @@ pub enum Control<W: prost::Message + Default + Debug> {
     Commit(Stamp),
     /// A new member asking in.
     #[prost(message, tag = "13")]
-    JoinCluster(Empty),
+    JoinCluster(JoinCluster),
     /// The control plane's question.
     #[prost(message, tag = "14")]
     Probe(Probe),
@@ -589,7 +611,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
                 changes: Some(Changes {
                     term: changes.term,
                     version: changes.version,
-                    members: changes.members,
+                    members: members_to_wire(changes.members),
                     voting: changes.voting,
                     draining: changes.draining,
                     moves: moves_to_wire(changes.moves),
@@ -606,7 +628,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
         }
         Message::PublishAck { stamp: acked } => peer(Control::PublishAck(stamp(acked))),
         Message::Commit { stamp: committed } => peer(Control::Commit(stamp(committed))),
-        Message::JoinCluster => peer(Control::JoinCluster(Empty {})),
+        Message::JoinCluster { address } => peer(Control::JoinCluster(JoinCluster { address })),
         Message::Probe { life, round } => peer(Control::Probe(Probe { life, round })),
         Message::Report {
             life,
@@ -625,7 +647,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             latest,
         } => peer(Control::Form(Form {
             generation,
-            voters,
+            voters: members_to_wire(voters),
             latest: Some(stamp(latest)),
         })),
         Message::Drain => peer(Control::Drain(Empty {})),
@@ -710,7 +732,7 @@ pub fn from_peer<V: Value>(sent: ToPeer<V::Wire>) -> Result<(NodeId, Message<V>)
                 changes: StoreChanges {
                     term: changes.term,
                     version: changes.version,
-                    members: changes.members,
+                    members: members_from(changes.members)?,
                     voting: changes.voting,
                     draining: changes.draining,
                     moves: moves_from(changes.moves)?,
@@ -733,7 +755,9 @@ pub fn from_peer<V: Value>(sent: ToPeer<V::Wire>) -> Result<(NodeId, Message<V>)
         Control::Commit(committed) => Message::Commit {
             stamp: (committed.term, committed.version),
         },
-        Control::JoinCluster(_) => Message::JoinCluster,
+        Control::JoinCluster(join) => Message::JoinCluster {
+            address: join.address,
+        },
         Control::Probe(probe) => Message::Probe {
             life: probe.life,
             round: probe.round,
@@ -746,7 +770,7 @@ pub fn from_peer<V: Value>(sent: ToPeer<V::Wire>) -> Result<(NodeId, Message<V>)
         },
         Control::Form(form) => Message::Form {
             generation: form.generation,
-            voters: form.voters,
+            voters: members_from(form.voters)?,
             latest: stamp_from(form.latest)?,
         },
         Control::Drain(_) => Message::Drain,
@@ -853,11 +877,29 @@ fn moves_from(moves: Vec<Move>) -> Result<Vec<(ShardId, NodeId, StoreStamp)>, In
         .collect()
 }
 
+fn members_to_wire(members: BTreeMap<NodeId, String>) -> Vec<Member> {
+    members
+        .into_iter()
+        .map(|(id, address)| Member { id, address })
+        .collect()
+}
+
+/// Members from the wire: one named twice is refused, rather than one of its addresses kept.
+fn members_from(members: Vec<Member>) -> Result<BTreeMap<NodeId, String>, Invalid> {
+    let mut named = BTreeMap::new();
+    for member in members {
+        if named.insert(member.id, member.address).is_some() {
+            return Err(Invalid::MemberTwice);
+        }
+    }
+    Ok(named)
+}
+
 fn table_to_wire(table: StoreTable) -> Table {
     Table {
         term: table.term,
         version: table.version,
-        members: table.members,
+        members: members_to_wire(table.members),
         voting: table.voting,
         draining: table.draining,
         shards: table.shards.into_iter().map(shard_to_wire).collect(),
@@ -869,7 +911,7 @@ fn table_from(table: Table) -> Result<StoreTable, Invalid> {
     Ok(StoreTable {
         term: table.term,
         version: table.version,
-        members: table.members,
+        members: members_from(table.members)?,
         voting: table.voting,
         draining: table.draining,
         shards: table.shards.into_iter().map(shard_from).collect(),
@@ -1148,6 +1190,11 @@ mod tests {
         )
     }
 
+    /// Members with addresses, any text among them.
+    fn members() -> impl Strategy<Value = BTreeMap<NodeId, String>> {
+        prop::collection::btree_map(any::<u64>(), any::<String>(), 0..4)
+    }
+
     fn moves() -> impl Strategy<Value = Vec<(ShardId, NodeId, StoreStamp)>> {
         prop::collection::vec((any::<ShardId>(), any::<u64>(), stamps()), 0..4)
     }
@@ -1155,7 +1202,7 @@ mod tests {
     fn table() -> impl Strategy<Value = StoreTable> {
         (
             any::<(u64, u64)>(),
-            nodes(),
+            members(),
             nodes(),
             nodes(),
             prop::collection::vec(shard(), 0..6),
@@ -1177,7 +1224,7 @@ mod tests {
     fn changes() -> impl Strategy<Value = StoreChanges> {
         (
             any::<(u64, u64)>(),
-            nodes(),
+            members(),
             nodes(),
             nodes(),
             moves(),
@@ -1233,7 +1280,7 @@ mod tests {
                 .prop_map(|(base, changes)| Message::PublishChanges { base, changes }),
             stamps().prop_map(|stamp| Message::PublishAck { stamp }),
             stamps().prop_map(|stamp| Message::Commit { stamp }),
-            Just(Message::JoinCluster),
+            any::<String>().prop_map(|address| Message::JoinCluster { address }),
             any::<(u64, u64)>().prop_map(|(life, round)| Message::Probe { life, round }),
             (any::<(u64, u64)>(), stamps(), nodes()).prop_map(
                 |((life, round), committed, voting)| Message::Report {
@@ -1243,7 +1290,7 @@ mod tests {
                     voting,
                 }
             ),
-            (any::<u64>(), nodes(), stamps()).prop_map(|(generation, voters, latest)| {
+            (any::<u64>(), members(), stamps()).prop_map(|(generation, voters, latest)| {
                 Message::Form {
                     generation,
                     voters,
@@ -1485,6 +1532,54 @@ mod tests {
             })),
         };
         assert_eq!(SyncValue::from_wire(twice), Err(Invalid::SlotTwice));
+    }
+
+    /// A member named twice, in a table, what changed of one or a naming, is refused, rather
+    /// than one of its addresses kept.
+    #[test]
+    fn a_member_named_twice_is_refused() {
+        let twice = || {
+            vec![
+                Member {
+                    id: 3,
+                    address: "pod-3:7000".to_owned(),
+                },
+                Member {
+                    id: 3,
+                    address: "elsewhere:7000".to_owned(),
+                },
+            ]
+        };
+        let sent = |message| ToPeer::<Synchronous> {
+            from: 1,
+            message: Some(message),
+        };
+        let table = Table {
+            members: twice(),
+            ..Table::default()
+        };
+        let changes = PublishChanges {
+            base: Some(Stamp::default()),
+            changes: Some(Changes {
+                members: twice(),
+                ..Changes::default()
+            }),
+        };
+        let form = Form {
+            generation: 1,
+            voters: twice(),
+            latest: Some(Stamp::default()),
+        };
+        for message in [
+            Control::Publish(table),
+            Control::PublishChanges(changes),
+            Control::Form(form),
+        ] {
+            assert_eq!(
+                from_peer::<SyncValue>(sent(message)),
+                Err(Invalid::MemberTwice)
+            );
+        }
     }
 
     /// A message past what a receiver takes is refused once it passes, what was held

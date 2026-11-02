@@ -24,8 +24,8 @@ pub struct Table {
     pub term: u64,
     /// Rises with every table, across terms.
     pub version: u64,
-    /// The members, in order.
-    pub members: Vec<NodeId>,
+    /// The members, in order, each with its address: where it is reached, `host:port`.
+    pub members: BTreeMap<NodeId, String>,
     /// The members whose votes count, in order; one gone may be kept, counted absent.
     pub voting: Vec<NodeId>,
     /// Members on their way out: they own nothing new and are not kept in the voting set.
@@ -47,8 +47,8 @@ pub struct Changes {
     pub term: u64,
     /// Its version.
     pub version: u64,
-    /// Its members.
-    pub members: Vec<NodeId>,
+    /// Its members, with their addresses.
+    pub members: BTreeMap<NodeId, String>,
     /// Its voting set.
     pub voting: Vec<NodeId>,
     /// Its members draining.
@@ -116,7 +116,7 @@ impl Table {
     /// Whether `member` is one.
     #[must_use]
     pub fn has_member(&self, member: NodeId) -> bool {
-        self.members.binary_search(&member).is_ok()
+        self.members.contains_key(&member)
     }
 
     /// Whether `member` votes.
@@ -206,7 +206,7 @@ pub const fn round_down_to_odd(n: usize) -> usize {
 pub fn voting_set(table: &Table, live: &BTreeSet<NodeId>) -> Vec<NodeId> {
     let eligible: Vec<NodeId> = table
         .members
-        .iter()
+        .keys()
         .copied()
         .filter(|member| live.contains(member) && !table.is_draining(*member))
         .collect();
@@ -244,23 +244,24 @@ pub fn voting_set(table: &Table, live: &BTreeSet<NodeId>) -> Vec<NodeId> {
     chosen
 }
 
-/// The first table of a cluster formed by `members`: the lowest of them voting, as many as is
+/// The first table of a cluster formed by `members`, with their addresses: the lowest of them
+/// voting, as many as is
 /// odd, and the shards dealt out among them, each with `replicas` copies on the members after
 /// its owner, and the table's term: the generation in its upper half, so that a cluster formed
 /// without the latest table, its holder cut off, outranks every owner of an earlier one.
 #[must_use]
-pub fn first(members: &BTreeSet<NodeId>, shards: u16, replicas: usize, term: u64) -> Table {
-    let members: Vec<NodeId> = members.iter().copied().collect();
-    let voting: Vec<NodeId> = members
+pub fn first(members: &BTreeMap<NodeId, String>, shards: u16, replicas: usize, term: u64) -> Table {
+    let ids: Vec<NodeId> = members.keys().copied().collect();
+    let voting: Vec<NodeId> = ids
         .iter()
         .copied()
-        .take(round_down_to_odd(members.len()))
+        .take(round_down_to_odd(ids.len()))
         .collect();
     let shards = (0..usize::from(shards))
         .map(|index| {
-            let owner = members.get(index % members.len().max(1)).copied();
-            let replicas = (1..=replicas.min(members.len().saturating_sub(1)))
-                .filter_map(|step| members.get((index + step) % members.len()).copied())
+            let owner = ids.get(index % ids.len().max(1)).copied();
+            let replicas = (1..=replicas.min(ids.len().saturating_sub(1)))
+                .filter_map(|step| ids.get((index + step) % ids.len()).copied())
                 .collect();
             Shard {
                 owner,
@@ -272,7 +273,7 @@ pub fn first(members: &BTreeSet<NodeId>, shards: u16, replicas: usize, term: u64
     Table {
         term,
         version: 1,
-        members,
+        members: members.clone(),
         voting,
         draining: Vec::new(),
         shards,
@@ -281,8 +282,8 @@ pub fn first(members: &BTreeSet<NodeId>, shards: u16, replicas: usize, term: u64
 }
 
 /// What the leader changes in `table` given the members it hears (`live`), those that have
-/// answered its latest heartbeats (`answering`) and those asking to join (`joining`): new
-/// members taken in, members gone taken out, each shard whose owner is gone given to a live
+/// answered its latest heartbeats (`answering`) and those asking to join (`joining`, each with
+/// the address it gave): new members taken in, members gone taken out, each shard whose owner is gone given to a live
 /// replica with its term raised, replicas gone replaced so that each shard keeps `replicas`
 /// live copies where it can, and the voting set worked towards. `None` when nothing changes.
 /// The term and version are left to the publisher.
@@ -291,25 +292,22 @@ pub fn repair(
     table: &Table,
     live: &BTreeSet<NodeId>,
     answering: &BTreeSet<NodeId>,
-    joining: &BTreeSet<NodeId>,
+    joining: &BTreeMap<NodeId, String>,
     replicas: usize,
 ) -> Option<Table> {
     let mut next = table.clone();
-    let mut members: BTreeSet<NodeId> = table
-        .members
-        .iter()
-        .copied()
-        .filter(|member| live.contains(member))
-        .collect();
-    members.extend(
-        joining
-            .iter()
-            .copied()
-            .filter(|member| live.contains(member)),
-    );
-    next.members = members.iter().copied().collect();
-    next.draining.retain(|member| members.contains(member));
-    let gone = |member: &NodeId| !members.contains(member);
+    next.members.retain(|member, _| live.contains(member));
+    for (member, address) in joining {
+        if live.contains(member) {
+            // A member's address is fixed for its life: one it gives again changes nothing.
+            next.members
+                .entry(*member)
+                .or_insert_with(|| address.clone());
+        }
+    }
+    let members = next.members.clone();
+    next.draining.retain(|member| members.contains_key(member));
+    let gone = |member: &NodeId| !members.contains_key(member);
     for shard in &mut next.shards {
         shard.replicas.retain(|replica| !gone(replica));
         if shard.owner.is_some_and(|owner| gone(&owner)) {
@@ -338,7 +336,7 @@ pub fn repair(
         if !next.shards[index].owner.is_some_and(|owner| gone(&owner)) {
             continue;
         }
-        let taker = members.iter().copied().min_by_key(|member| {
+        let taker = members.keys().copied().min_by_key(|member| {
             (
                 next.draining.contains(member),
                 !answering.contains(member),
@@ -361,7 +359,7 @@ pub fn repair(
 fn fill_replicas(table: &mut Table, replicas: usize) {
     let mut load: BTreeMap<NodeId, usize> = table
         .members
-        .iter()
+        .keys()
         .filter(|member| !table.draining.contains(member))
         .map(|member| (*member, 0))
         .collect();
@@ -407,7 +405,7 @@ pub fn plan_moves(
     let mut next = table.clone();
     let takers: Vec<NodeId> = table
         .members
-        .iter()
+        .keys()
         .copied()
         .filter(|member| {
             live.contains(member) && answering.contains(member) && !table.is_draining(*member)
@@ -545,11 +543,23 @@ mod tests {
         members.iter().copied().collect()
     }
 
+    /// `members`, each with an address of its own.
+    fn named(members: &[NodeId]) -> BTreeMap<NodeId, String> {
+        members
+            .iter()
+            .map(|member| (*member, format!("pod-{member}:7000")))
+            .collect()
+    }
+
+    fn ids(table: &Table) -> Vec<NodeId> {
+        table.members.keys().copied().collect()
+    }
+
     /// A table's changes from the one before carry only the shards changed, and make it again
     /// from that one; a shard the base lacks makes nothing.
     #[test]
     fn a_tables_changes_make_it_again_from_the_one_before() {
-        let base = first(&set(&[1, 2, 3]), 6, 2, 1);
+        let base = first(&named(&[1, 2, 3]), 6, 2, 1);
         let mut next = base.clone();
         next.version = base.version + 1;
         next.draining = vec![3];
@@ -558,13 +568,31 @@ mod tests {
         let changes = next.changes_from(&base);
         assert_eq!(changes.shards, vec![(2, next.shards[2].clone())]);
         assert_eq!(base.with_changes(changes.clone()), Some(next));
-        let short = first(&set(&[1, 2, 3]), 2, 2, 1);
+        let short = first(&named(&[1, 2, 3]), 2, 2, 1);
         assert_eq!(short.with_changes(changes), None);
+    }
+
+    /// Each member's address is in the table: given by a member joining, it comes in with it,
+    /// and goes with it; given again by a member already in, it changes nothing, as a member's
+    /// address is fixed for its life. What changed carries them whole, as it does the members.
+    #[test]
+    fn a_members_address_comes_in_with_it_and_goes_with_it() {
+        let table = first(&named(&[1, 2, 3]), 3, 2, 1);
+        assert_eq!(table.members, named(&[1, 2, 3]));
+        let mut joining = named(&[4]);
+        joining.insert(2, "elsewhere:7000".to_owned());
+        let all = set(&[1, 2, 3, 4]);
+        let joined = repair(&table, &all, &all, &joining, 2).unwrap();
+        assert_eq!(joined.members, named(&[1, 2, 3, 4]));
+        let live = set(&[2, 3, 4]);
+        let gone = repair(&joined, &live, &live, &BTreeMap::new(), 2).unwrap();
+        assert_eq!(gone.members, named(&[2, 3, 4]));
+        assert_eq!(joined.with_changes(gone.changes_from(&joined)), Some(gone));
     }
 
     #[test]
     fn a_first_table_deals_the_shards_out_evenly_with_their_replicas() {
-        let table = first(&set(&[1, 2, 3]), 6, 2, 1);
+        let table = first(&named(&[1, 2, 3]), 6, 2, 1);
         assert_eq!(table.voting, [1, 2, 3]);
         let owners: Vec<Option<NodeId>> = table.shards.iter().map(|shard| shard.owner).collect();
         assert_eq!(
@@ -573,22 +601,22 @@ mod tests {
         );
         assert_eq!(table.shards[0].replicas, [2, 3]);
         assert_eq!(table.shards[2].replicas, [1, 2]);
-        let four = first(&set(&[1, 2, 3, 4]), 4, 2, 1);
+        let four = first(&named(&[1, 2, 3, 4]), 4, 2, 1);
         assert_eq!(four.voting, [1, 2, 3], "four rounded down to three");
     }
 
     #[test]
     fn the_voting_set_is_odd_and_keeps_three_with_one_gone() {
-        let table = first(&set(&[1, 2, 3]), 3, 2, 1);
+        let table = first(&named(&[1, 2, 3]), 3, 2, 1);
         // One gone: kept, counted absent, as three is the floor.
         assert_eq!(voting_set(&table, &set(&[1, 2])), [1, 2, 3]);
         // A fourth joins and the gone one is replaced.
         let mut four = table.clone();
-        four.members = vec![1, 2, 3, 4];
+        four.members = named(&[1, 2, 3, 4]);
         assert_eq!(voting_set(&four, &set(&[1, 2, 4])), [1, 2, 4]);
         // Five, all live: all five vote.
         let mut five = table.clone();
-        five.members = vec![1, 2, 3, 4, 5];
+        five.members = named(&[1, 2, 3, 4, 5]);
         assert_eq!(voting_set(&five, &set(&[1, 2, 3, 4, 5])), [1, 2, 3, 4, 5]);
         // Four live of five: rounded down to three, the live voters first.
         five.voting = vec![1, 2, 3, 4, 5];
@@ -606,16 +634,16 @@ mod tests {
 
     #[test]
     fn a_set_the_live_members_are_no_majority_of_is_not_taken() {
-        let table = first(&set(&[1, 2, 3]), 3, 2, 1);
+        let table = first(&named(&[1, 2, 3]), 3, 2, 1);
         // Only one live: three would be kept with two absent, which it is no majority of.
         assert_eq!(voting_set(&table, &set(&[1])), [1, 2, 3]);
     }
 
     #[test]
     fn a_member_gone_has_its_shards_taken_by_a_replica_with_their_term_raised() {
-        let table = first(&set(&[1, 2, 3]), 3, 2, 1);
-        let next = repair(&table, &set(&[2, 3]), &set(&[2, 3]), &BTreeSet::new(), 2).unwrap();
-        assert_eq!(next.members, [2, 3]);
+        let table = first(&named(&[1, 2, 3]), 3, 2, 1);
+        let next = repair(&table, &set(&[2, 3]), &set(&[2, 3]), &BTreeMap::new(), 2).unwrap();
+        assert_eq!(ids(&next), [2, 3]);
         assert_eq!(next.shards[0].owner, Some(2));
         assert_eq!(next.shards[0].term, 2);
         assert_eq!(next.shards[1].term, 1, "not its owner: unchanged");
@@ -629,7 +657,7 @@ mod tests {
             "the floor keeps the gone one, absent"
         );
         assert_eq!(
-            repair(&next, &set(&[2, 3]), &set(&[2, 3]), &BTreeSet::new(), 2),
+            repair(&next, &set(&[2, 3]), &set(&[2, 3]), &BTreeMap::new(), 2),
             None
         );
     }
@@ -639,19 +667,19 @@ mod tests {
     /// or with its owner and its one replica gone together.
     #[test]
     fn a_shard_with_every_copy_gone_is_taken_by_a_live_member() {
-        let table = first(&set(&[1, 2, 3]), 3, 0, 1);
-        let next = repair(&table, &set(&[1, 3]), &set(&[1, 3]), &BTreeSet::new(), 0).unwrap();
-        assert_eq!(next.members, [1, 3]);
+        let table = first(&named(&[1, 2, 3]), 3, 0, 1);
+        let next = repair(&table, &set(&[1, 3]), &set(&[1, 3]), &BTreeMap::new(), 0).unwrap();
+        assert_eq!(ids(&next), [1, 3]);
         for shard in &next.shards {
             assert!(shard.owner.is_some_and(|owner| owner != 2), "{next:?}");
         }
         let taken = next.shards.iter().find(|shard| shard.term == 2).unwrap();
         assert!(taken.replicas.is_empty());
-        let wide = first(&set(&[1, 2, 3, 4, 5]), 10, 1, 1);
+        let wide = first(&named(&[1, 2, 3, 4, 5]), 10, 1, 1);
         let both = |shard: &Shard| shard.owner == Some(1) && shard.replicas == [2];
         assert!(wide.shards.iter().any(both), "{wide:?}");
         let live = set(&[3, 4, 5]);
-        let next = repair(&wide, &live, &live, &BTreeSet::new(), 1).unwrap();
+        let next = repair(&wide, &live, &live, &BTreeMap::new(), 1).unwrap();
         for shard in &next.shards {
             assert!(
                 shard.owner.is_some_and(|owner| live.contains(&owner)),
@@ -663,10 +691,10 @@ mod tests {
 
     #[test]
     fn a_member_joining_takes_replicas_and_a_vote_in_place_of_one_gone() {
-        let table = first(&set(&[1, 2, 3]), 3, 2, 1);
-        let gone = repair(&table, &set(&[2, 3]), &set(&[2, 3]), &BTreeSet::new(), 2).unwrap();
-        let joined = repair(&gone, &set(&[2, 3, 4]), &set(&[2, 3, 4]), &set(&[4]), 2).unwrap();
-        assert_eq!(joined.members, [2, 3, 4]);
+        let table = first(&named(&[1, 2, 3]), 3, 2, 1);
+        let gone = repair(&table, &set(&[2, 3]), &set(&[2, 3]), &BTreeMap::new(), 2).unwrap();
+        let joined = repair(&gone, &set(&[2, 3, 4]), &set(&[2, 3, 4]), &named(&[4]), 2).unwrap();
+        assert_eq!(ids(&joined), [2, 3, 4]);
         assert_eq!(joined.voting, [2, 3, 4]);
         for shard in &joined.shards {
             assert_eq!(shard.replicas.len(), 2, "{shard:?}");
@@ -675,7 +703,7 @@ mod tests {
 
     #[test]
     fn a_draining_owner_has_its_shards_moved_to_replicas_a_few_at_a_time() {
-        let mut table = first(&set(&[1, 2, 3, 4]), 8, 2, 1);
+        let mut table = first(&named(&[1, 2, 3, 4]), 8, 2, 1);
         table.draining = vec![1];
         let next = plan_moves(&table, &set(&[1, 2, 3, 4]), &set(&[1, 2, 3, 4]), 1).unwrap();
         assert_eq!(
@@ -703,8 +731,8 @@ mod tests {
 
     #[test]
     fn a_member_joining_is_given_shards_until_no_two_differ_by_more_than_one() {
-        let mut table = first(&set(&[1, 2, 3]), 9, 2, 1);
-        table.members = vec![1, 2, 3, 4];
+        let mut table = first(&named(&[1, 2, 3]), 9, 2, 1);
+        table.members = named(&[1, 2, 3, 4]);
         let mut live = set(&[1, 2, 3, 4]);
         let mut now = table;
         for _ in 0..10 {
@@ -738,7 +766,7 @@ mod tests {
     #[test]
     fn a_shard_is_moved_only_to_a_member_that_answers() {
         let all = set(&[1, 2, 3, 4]);
-        let mut table = first(&all, 8, 2, 1);
+        let mut table = first(&named(&[1, 2, 3, 4]), 8, 2, 1);
         table.draining = vec![1];
         let next = plan_moves(&table, &all, &set(&[1, 3, 4]), 16).unwrap();
         assert_eq!(
@@ -759,7 +787,7 @@ mod tests {
     #[test]
     fn a_move_asked_for_again_is_not_completed_by_a_report_on_the_one_before() {
         let all = set(&[1, 2, 3, 4]);
-        let mut table = first(&all, 8, 2, 1);
+        let mut table = first(&named(&[1, 2, 3, 4]), 8, 2, 1);
         table.draining = vec![1];
         // Each table as published: numbered one on.
         let publish = |mut next: Table| {

@@ -59,11 +59,16 @@ pub struct Pod {
 }
 
 impl Pod {
-    /// Pod `id`, new, started at `now`, knowing how to reach `peers`.
+    /// Pod `id`, reached at `address`, new, knowing how to reach `peers`.
     #[must_use]
-    pub fn new(id: NodeId, config: Config, peers: impl IntoIterator<Item = NodeId>) -> Self {
+    pub fn new(
+        id: NodeId,
+        address: String,
+        config: Config,
+        peers: impl IntoIterator<Item = NodeId>,
+    ) -> Self {
         Self {
-            node: Store::new(id, config, peers),
+            node: Store::new(id, address, config, peers),
             forwarding: false,
             gathering: BTreeMap::new(),
             parts: BTreeMap::new(),
@@ -568,8 +573,8 @@ mod tests {
 
     /// Pod 2 holding the first table of pods 1, 2 and 3.
     fn member() -> Pod {
-        let mut node = Pod::new(2, config(), [1, 3]);
-        let members = [1, 2, 3].into_iter().collect();
+        let mut node = Pod::new(2, "pod-2:7000".to_owned(), config(), [1, 3]);
+        let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
         let table = table::first(&members, 4, 2, 1);
         let _ = node.receive(1, StoreMessage::TableReply { table }, ms(1));
         node
@@ -582,8 +587,8 @@ mod tests {
 
     #[test]
     fn a_gathering_pod_gives_back_a_part_counted_late_until_given_back() {
-        let mut node = Pod::new(1, config(), [2, 3]);
-        let members = [1, 2, 3].into_iter().collect();
+        let mut node = Pod::new(1, "pod-1:7000".to_owned(), config(), [2, 3]);
+        let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
         let first = table::first(&members, 4, 2, 1);
         let mine = (0..4)
             .find(|shard| first.owner(*shard) == Some(1))
@@ -684,8 +689,8 @@ mod tests {
     /// pod 3's part is still out, one completes pod 2's key and the other is given back.
     #[test]
     fn a_gathering_pod_gives_back_a_part_counted_twice() {
-        let mut node = Pod::new(1, config(), [2, 3]);
-        let members = [1, 2, 3].into_iter().collect();
+        let mut node = Pod::new(1, "pod-1:7000".to_owned(), config(), [2, 3]);
+        let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
         let first = table::first(&members, 4, 2, 1);
         let of = |pod| {
             (0..4)
@@ -772,8 +777,8 @@ mod tests {
     /// good, and a pod forgotten, which may only be cut off, still has its late answer taken.
     #[test]
     fn a_part_unanswered_is_kept_for_a_while_its_pod_forgotten_or_not() {
-        let mut node = Pod::new(1, config(), [2, 3]);
-        let members = [1, 2, 3].into_iter().collect();
+        let mut node = Pod::new(1, "pod-1:7000".to_owned(), config(), [2, 3]);
+        let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
         let first = table::first(&members, 4, 2, 1);
         let theirs = (0..4)
             .find(|shard| first.owner(*shard) == Some(2))
@@ -835,7 +840,7 @@ mod tests {
         let _ = node.tick(start + ms(20));
         assert_eq!(node.parts.len(), 1);
         let survivors = [1, 3, 4].into_iter().collect();
-        let joining = [4].into_iter().collect();
+        let joining = [(4, "pod-4:7000".to_owned())].into();
         let mut without = table::repair(&first, &survivors, &survivors, &joining, 2)
             .unwrap_or_else(|| first.clone());
         assert!(!without.votes(2) && !without.has_member(2), "{without:?}");

@@ -276,7 +276,7 @@ fn a_late_answer_does_not_open_a_stream_that_is_down() {
     use edgerush_cluster_sim::Rng;
     use edgerush_cluster_sim::client::Client;
     use edgerush_cluster_synchronous::{Answer, Message};
-    let members = [1, 2, 3].into_iter().collect();
+    let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
     let first = table::first(&members, 16, 2, 1);
     // A key of pod 1's, asked three times in turn.
     let Some(key) = (0..).find(|key| first.owner(table::shard_of(*key, 16)) == Some(1)) else {

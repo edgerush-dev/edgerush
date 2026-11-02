@@ -11,9 +11,9 @@
 //!   term, a pre-vote first that a voter refuses while it still hears a live leader — and
 //!   standing down once it hears no majority.
 //! - **The table.** Published by the leader, numbered by term and version, counting once a
-//!   majority of the voting set has accepted it: the members, the voting set, and a fixed
-//!   number of shards, each with an owner, replicas and a shard term raised whenever its
-//!   owner changes.
+//!   majority of the voting set has accepted it: the members, each with its address, the
+//!   voting set, and a fixed number of shards, each with an owner, replicas and a shard term
+//!   raised whenever its owner changes.
 //! - **Serving.** An owner answers for its shards while the table it holds names it and it
 //!   has heard a majority of the voting set within `stop_serving`: a lease. No leader is
 //!   needed to serve; only changing the table waits for one.
