@@ -778,17 +778,24 @@ PY
 # second pod of its own serving the synchronous mode, since a pod serves one mode.
 rl_pid=
 rl_sync_pid=
+# A lone pod's config file, serving mode $1 on 127.0.0.1:$2.
+rl_service_config() {
+    printf 'mode: %s\npod: { id: 0, listen: 127.0.0.1:%s, cycle_ms: %s }\n' "$1" "$2" "$RL_CYCLE_MS"
+    printf 'membership: { pods: { 0: 127.0.0.1:%s } }\n' "$2"
+    if [ -n "$RL_MAX_KEY_BYTES" ]; then
+        printf 'keys: { max_bytes: %s }\n' "$RL_MAX_KEY_BYTES"
+    fi
+}
 start_rl_service() {
     [ -x "$RL_SERVICE" ] || { echo "no service at $RL_SERVICE: build it first" >&2; exit 2; }
-    taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --id 0 --listen 127.0.0.1:7000 --cycle-ms "$RL_CYCLE_MS" \
-        --pod 0=127.0.0.1:7000 ${RL_MAX_KEY_BYTES:+--max-key-bytes "$RL_MAX_KEY_BYTES"} \
-        2>>"$OUT/rl-service.log" &
+    rl_service_config asynchronous 7000 >"$OUT/rl-service.yaml"
+    taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --config "$OUT/rl-service.yaml" 2>>"$OUT/rl-service.log" &
     rl_pid=$!
     case " $VARIANTS " in
     *" ours-sync "*)
-        taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --mode synchronous --id 0 --listen 127.0.0.1:7001 \
-            --cycle-ms "$RL_CYCLE_MS" --pod 0=127.0.0.1:7001 \
-            ${RL_MAX_KEY_BYTES:+--max-key-bytes "$RL_MAX_KEY_BYTES"} 2>>"$OUT/rl-sync-service.log" &
+        rl_service_config synchronous 7001 >"$OUT/rl-sync-service.yaml"
+        taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --config "$OUT/rl-sync-service.yaml" \
+            2>>"$OUT/rl-sync-service.log" &
         rl_sync_pid=$!
         ;;
     esac

@@ -12,7 +12,8 @@
 //! So far: listeners, with the TLS they terminate and what they tell upstreams of a client, routes with their rules, header filters and weighted backends, and
 //! upstreams ([`Config`]), and their compilation ([`compile`]) into a router per listener
 //! and what each rule does and leads to ([`Compiled`]); and what the development harness
-//! reads from its file ([`HarnessFile`]).
+//! reads from its file ([`HarnessFile`]); and what a pod of the rate-limiting service reads
+//! from its file ([`ServiceFile`]).
 
 mod backends;
 mod compile;
@@ -22,6 +23,7 @@ mod harness_file;
 mod kubernetes;
 mod limits;
 mod route;
+mod service_file;
 
 pub use backends::{Destination, UpstreamId, WeightedBackends};
 pub use compile::{
@@ -47,4 +49,7 @@ pub use route::{
     Backend, EncodedSlash, Filter, Forward, Fraction, GrpcMethod, Header, HeaderChanges, Hostname,
     Match, Mirror, PathChange, PathMatch, Query, Redirect, Retry, Route, Rule, RulePaths, Scheme,
     TcpRoute, Timeouts, TlsRoute, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
+};
+pub use service_file::{
+    ServiceFile, ServiceKeys, ServiceMembership, ServiceMode, ServicePod, ServicePodTls,
 };
