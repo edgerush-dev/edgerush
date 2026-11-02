@@ -1,0 +1,15 @@
+[package]
+name = "edgerush-cluster-sim"
+description = "EdgeRush's cluster simulation: the cluster store's pods over a network that delays, loses and cuts, deterministic, with its scenarios and measurements"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+edgerush-cluster.workspace = true
+edgerush-cluster-synchronous.workspace = true
+
+[lints]
+workspace = true

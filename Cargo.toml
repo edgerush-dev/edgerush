@@ -33,6 +33,8 @@ boring = "5.2"
 # in the tree through hyper and http, at the same version.
 bytes = "1.12"
 edgerush-certificates = { path = "crates/certificates" }
+edgerush-cluster = { path = "crates/cluster" }
+edgerush-cluster-synchronous = { path = "crates/cluster-synchronous" }
 edgerush-config = { path = "crates/config" }
 edgerush-control-service = { path = "crates/control-service" }
 edgerush-control-stream = { path = "crates/control-stream" }
@@ -154,6 +156,19 @@ codegen-units = 1
 # line; `CARGO_PROFILE_DEV_DEBUG=2` brings the information back for a debugger.
 [profile.dev]
 debug = 0
+
+# The cluster store and its simulation optimised in debug builds and tests: the simulation's
+# scenarios run thousands of simulated seconds, and unoptimised they took 12 minutes of
+# check.sh on Windows, optimised under 3 (43 s of it compiling). Overflow checks and debug
+# assertions stay on, as everywhere in this profile.
+[profile.dev.package.edgerush-cluster]
+opt-level = 3
+
+[profile.dev.package.edgerush-cluster-synchronous]
+opt-level = 3
+
+[profile.dev.package.edgerush-cluster-sim]
+opt-level = 3
 
 # quiche 0.30.0 as published, but for changes of ours (16 §2): to how it fills a packet and
 # acknowledges one, how it follows a client that moves, what it bounds and accounts for of
