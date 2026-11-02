@@ -646,6 +646,10 @@ pub enum Problem {
     /// The data plane's Gateway is not there.
     #[error("not among the objects, so nothing of the Gateway API is translated")]
     GatewayMissing,
+    /// A ListenerSet naming the data plane's Gateway as its parent, of a namespace the
+    /// Gateway's `allowedListeners` does not take: not attached, its listeners not bound.
+    #[error("not attached: {0} takes no ListenerSet of its namespace, as its allowedListeners say")]
+    ListenerSetNotAllowed(Object),
     /// The data plane's Gateway's GatewayClass is not there.
     #[error("not among the objects, so its Gateway is not translated")]
     GatewayClassMissing,

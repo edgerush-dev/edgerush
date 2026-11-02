@@ -14,6 +14,8 @@ use edgerush_gateway_api::gateway::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespaces,
     GatewayListenersAllowedRoutesNamespacesSelector,
 };
+use edgerush_gateway_api::listener_set::ListenerSet;
+use k8s_openapi::serde_json;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -27,19 +29,32 @@ pub struct GatewayOutcome {
     pub gateway: Object,
     /// Its generation: what its status says of.
     pub generation: i64,
-    /// Each of its listeners, in the order it lists them.
+    /// Each of its listeners, its own in the order it lists them, then those of each
+    /// ListenerSet attached to it, in precedence (04 §2).
     pub listeners: Vec<ListenerOutcome>,
     /// The ports its accepted listeners state, and the protocol each is bound for: the data
     /// plane's listeners.
     pub ports: BTreeMap<u16, Protocol>,
 }
 
+impl GatewayOutcome {
+    /// The Gateway's own listeners, those of its `spec.listeners`: what a route naming the
+    /// Gateway attaches to, and its status says.
+    pub fn own(&self) -> impl Iterator<Item = &ListenerOutcome> {
+        self.listeners
+            .iter()
+            .filter(|listener| listener.set.is_none())
+    }
+}
+
 /// One of a Gateway's listeners: accepted, and served by the data plane's listeners named,
 /// or not, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerOutcome {
-    /// Its name.
+    /// Its name, unique within the Gateway or ListenerSet stating it.
     pub name: String,
+    /// The ListenerSet stating it, attached to the Gateway; none for the Gateway's own.
+    pub set: Option<Object>,
     /// The data plane's listeners bound to its port for its protocol, or why it is not
     /// accepted.
     pub served: Result<Vec<String>, ListenerProblem>,
@@ -58,28 +73,25 @@ pub struct ListenerOutcome {
 
 impl fmt::Display for ListenerOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "listener {}", self.name)?;
+        if let Some(set) = &self.set {
+            write!(f, " of {set}")?;
+        }
         match &self.served {
             Ok(listeners) if self.certificates.is_empty() => write!(
                 f,
-                "listener {}: served on {}, taking {}",
-                self.name,
+                ": served on {}, taking {}",
                 listeners.join(", "),
                 self.allowed
             ),
             Ok(listeners) => write!(
                 f,
-                "listener {}: served on {}, presenting {}, taking {}",
-                self.name,
+                ": served on {}, presenting {}, taking {}",
                 listeners.join(", "),
                 self.certificates.join(", "),
                 self.allowed
             ),
-            Err(problem) => write!(
-                f,
-                "listener {}: {}: {problem}",
-                self.name,
-                problem.verdict()
-            ),
+            Err(problem) => write!(f, ": {}: {problem}", problem.verdict()),
         }
     }
 }
@@ -250,9 +262,10 @@ pub enum ListenerProblem {
     NotSupportedYet(&'static str),
     /// A listener before it has its port, protocol and hostname, so the two could not be
     /// told apart: that one is accepted, this not (`HostnameConflict`).
-    #[error("listener {by}, which comes first, has its port, protocol and hostname")]
+    #[error("{by}, which comes first, has its port, protocol and hostname")]
     HostnameConflict {
-        /// The listener before it.
+        /// The listener before it, as said: by name within one resource, by whose it is
+        /// beyond.
         by: String,
     },
     /// An HTTPS listener none of whose `certificateRefs` can be used (`ResolvedRefs`
@@ -267,13 +280,14 @@ pub enum ListenerProblem {
     TlsMode(String),
     /// A listener before it states its port for another protocol, and has the port: that
     /// one is accepted, this not (`ProtocolConflict`).
-    #[error("port {port} is taken for {protocol} by listener {by}, which comes first")]
+    #[error("port {port} is taken for {protocol} by {by}, which comes first")]
     ProtocolConflict {
         /// The port.
         port: u16,
         /// The protocol it is taken for, as the data plane's config writes it.
         protocol: &'static str,
-        /// The listener that has it.
+        /// The listener that has it, as said: by name within one resource, by whose it is
+        /// beyond.
         by: String,
     },
     /// Its port is past the data plane's slots for the Gateway API's ports, taken in the
@@ -283,6 +297,18 @@ pub enum ListenerProblem {
         most = crate::listeners::MOST_GATEWAY_PORTS
     )]
     PortPastSlots {
+        /// The port.
+        port: u16,
+    },
+    /// A ListenerSet's listener whose port is past the data plane's slots for the Gateway
+    /// API's ports, which the Gateway's listeners and the ListenerSets before it take
+    /// (`TooManyListeners`, GEP-1713).
+    #[error(
+        "the data plane serves at most {most} ports of the Gateway API, which the Gateway \
+         and the ListenerSets before this one take; port {port} is past them",
+        most = crate::listeners::MOST_GATEWAY_PORTS
+    )]
+    TooManyListeners {
         /// The port.
         port: u16,
     },
@@ -335,32 +361,57 @@ pub(crate) fn outcome(
     if !class_ours(gateway, cluster, report) {
         return None;
     }
-    let mut listeners = listeners(&gateway.spec.listeners);
+    // The Gateway's own listeners, then those of each ListenerSet it takes, in precedence.
+    let mut written: Vec<Written> = gateway
+        .spec
+        .listeners
+        .iter()
+        .map(|listener| Written {
+            listener: listener.clone(),
+            set: None,
+            namespace: named.namespace.clone(),
+        })
+        .collect();
+    written.extend(attached_sets(gateway, &object, cluster, report));
+    let mut listeners = listeners(&written, &object);
     // Bound as long as one listener on them is accepted: one whose certificates cannot be
     // used too, which keeps its port refusing its hostname (04 §2).
     let ports: BTreeMap<u16, Protocol> = listeners
         .iter()
-        .zip(&gateway.spec.listeners)
+        .zip(&written)
         .filter(|(listener, _)| listener.served.is_ok())
-        .filter_map(|(listener, written)| Some((listener.port, protocol(&written.protocol).ok()?)))
+        .filter_map(|(listener, written)| {
+            Some((listener.port, protocol(&written.listener.protocol).ok()?))
+        })
         .collect();
-    for (listener, written) in listeners.iter_mut().zip(&gateway.spec.listeners) {
-        if listener.served.is_ok() && written.protocol == "HTTPS" {
-            certificates(listener, written, &named.namespace, cluster);
+    for (listener, written) in listeners.iter_mut().zip(&written) {
+        // Said of the Gateway or the ListenerSet that states it, whose namespace its
+        // Secrets and routes are taken from, and whose ReferenceGrants are asked.
+        let (stater, kind) = match &written.set {
+            Some(set) => (set.clone(), "ListenerSet"),
+            None => (object.clone(), "Gateway"),
+        };
+        if listener.served.is_ok() && written.listener.protocol == "HTTPS" {
+            certificates(
+                listener,
+                &written.listener,
+                (kind, &written.namespace),
+                cluster,
+            );
         }
         for why in &listener.certificate_problems {
             report.push(Finding {
-                object: object.clone(),
+                object: stater.clone(),
                 problem: Problem::ListenerCertificate {
                     name: listener.name.clone(),
                     why: why.why.clone(),
                 },
             });
         }
-        let (allowed, unread) = allowed(written, &named.namespace);
+        let (allowed, unread) = allowed(&written.listener, &written.namespace);
         if let Err(problem) = &listener.served {
             report.push(Finding {
-                object: object.clone(),
+                object: stater.clone(),
                 problem: Problem::Listener {
                     name: listener.name.clone(),
                     problem: problem.clone(),
@@ -369,7 +420,7 @@ pub(crate) fn outcome(
         }
         if !allowed.invalid_kinds.is_empty() {
             report.push(Finding {
-                object: object.clone(),
+                object: stater.clone(),
                 problem: Problem::ListenerKinds {
                     name: listener.name.clone(),
                     kinds: allowed.invalid_kinds.join(", "),
@@ -378,7 +429,7 @@ pub(crate) fn outcome(
         }
         if let Some(why) = unread {
             report.push(Finding {
-                object: object.clone(),
+                object: stater.clone(),
                 problem: Problem::ListenerNamespaces {
                     name: listener.name.clone(),
                     why,
@@ -387,7 +438,11 @@ pub(crate) fn outcome(
         }
         listener.allowed = allowed;
     }
-    if !listeners.iter().any(|listener| listener.served.is_ok()) {
+    // The Gateway's own: its `Accepted` and `Programmed` are of them alone (GEP-1713).
+    if !listeners
+        .iter()
+        .any(|listener| listener.set.is_none() && listener.served.is_ok())
+    {
         report.push(Finding {
             object: object.clone(),
             problem: Problem::NoListenerServed,
@@ -402,14 +457,15 @@ pub(crate) fn outcome(
 }
 
 /// An HTTPS listener's certificates, put in `listener`: each of its `certificateRefs` that
-/// names a Secret, of the Gateway's namespace or of one whose ReferenceGrant lets Gateways
-/// of it reach that Secret, asked first as conformance has it, and that holds a certificate
+/// names a Secret, of the namespace of the `kind` stating it (the Gateway, or a ListenerSet
+/// attached to it) or of one whose ReferenceGrant lets that kind of it reach that Secret,
+/// neither's grants the other's (GEP-1713), asked first as conformance has it, and that holds a certificate
 /// and key the data plane can use, read as an Ingress's are (04 §2); each other said why.
 /// Of none it can use, the listener is not served.
 fn certificates(
     listener: &mut ListenerOutcome,
     written: &GatewayListeners,
-    gateway_namespace: &str,
+    (kind, stater_namespace): (&'static str, &str),
     cluster: &Cluster,
 ) {
     let mode = written
@@ -425,7 +481,7 @@ fn certificates(
         .iter()
         .flat_map(|tls| tls.certificate_refs.iter().flatten());
     for reference in refs {
-        let namespace = reference.namespace.as_deref().unwrap_or(gateway_namespace);
+        let namespace = reference.namespace.as_deref().unwrap_or(stater_namespace);
         let name = &reference.name;
         let usable = if !(reference.group.is_empty() && reference.kind == "Secret") {
             Err(RefProblem {
@@ -437,7 +493,7 @@ fn certificates(
             })
         } else if let Err(why) = reachable(
             cluster,
-            ("Gateway", gateway_namespace),
+            (kind, stater_namespace),
             ("Secret", namespace, name),
         ) {
             Err(RefProblem {
@@ -470,6 +526,83 @@ fn certificates(
     }
 }
 
+/// The listeners of each ListenerSet attached to `gateway`, `object`: one naming it as its
+/// parent, of a namespace its `allowedListeners` takes, in precedence, oldest first and then
+/// by namespace and name (04 §2, GEP-1713). One naming it that it does not take is said.
+fn attached_sets(
+    gateway: &Gateway,
+    object: &Object,
+    cluster: &Cluster,
+    report: &mut Vec<Finding>,
+) -> Vec<Written> {
+    let mut naming: Vec<&ListenerSet> = cluster
+        .listener_sets
+        .iter()
+        .filter(|set| {
+            let parent = &set.spec.parent_ref;
+            let namespace = set.metadata.namespace.as_deref().unwrap_or("default");
+            parent.group == GROUP
+                && parent.kind == "Gateway"
+                && parent.name == object.name
+                && parent.namespace.as_deref().unwrap_or(namespace) == object.namespace
+        })
+        .collect();
+    naming.sort_by(|a, b| {
+        let key = |set: &ListenerSet| {
+            (
+                set.metadata.creation_timestamp.clone(),
+                set.metadata.namespace.clone().unwrap_or_default(),
+                set.metadata.name.clone(),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+    let mut written = Vec::new();
+    for set in naming {
+        let stater = Object::of("ListenerSet", &set.metadata);
+        if !takes_sets_of(gateway, &stater.namespace, cluster) {
+            report.push(Finding {
+                object: stater,
+                problem: Problem::ListenerSetNotAllowed(object.clone()),
+            });
+            continue;
+        }
+        for listener in &set.spec.listeners {
+            // One listener's fields as the other's: the two types are written from one
+            // schema of the Gateway API's (`ListenerEntry`), each passing over what it lacks.
+            let Ok(listener) = serde_json::to_value(listener).and_then(serde_json::from_value)
+            else {
+                continue;
+            };
+            written.push(Written {
+                listener,
+                set: Some(stater.clone()),
+                namespace: stater.namespace.clone(),
+            });
+        }
+    }
+    written
+}
+
+/// Whether `gateway` takes ListenerSets of `namespace`, as its `allowedListeners` says: none
+/// where it says nothing, or `None` (GEP-1713).
+fn takes_sets_of(gateway: &Gateway, namespace: &str, cluster: &Cluster) -> bool {
+    let Some(allowed) = &gateway.spec.allowed_listeners else {
+        return false;
+    };
+    if allowed.namespaces.from == "None" {
+        return false;
+    }
+    // Its namespaces are written as a listener's routes' are, by one schema.
+    let Ok(written) = serde_json::to_value(&allowed.namespaces)
+        .and_then(serde_json::from_value::<GatewayListenersAllowedRoutesNamespaces>)
+    else {
+        return false;
+    };
+    let own = gateway.metadata.namespace.as_deref().unwrap_or("default");
+    namespaces(&written, own).0.allow(namespace, cluster)
+}
+
 /// Whether the Gateway's GatewayClass is there and names this controller; said where not.
 fn class_ours(gateway: &Gateway, cluster: &Cluster, report: &mut Vec<Finding>) -> bool {
     let name = &gateway.spec.gateway_class_name;
@@ -499,52 +632,78 @@ fn class_ours(gateway: &Gateway, cluster: &Cluster, report: &mut Vec<Finding>) -
     true
 }
 
-/// Each listener's outcome, in the order listeners come (04 §2). A protocol not taken is
-/// refused first, and plays no part in what conflicts (the spec: a listener of a protocol
-/// not supported is not accepted, and the rules of distinctness are for those that are);
-/// then the first listener on a port takes it for its protocol, and a later one stating
-/// it for another, or in a place an earlier one has (port, protocol and hostname), is
-/// refused, as the spec has a conflicting listener refused in precedence and conformance
-/// pins it; each other is served by the data plane's listener bound to its port, a port
-/// past the data plane's slots refused for every listener on it.
-fn listeners(listeners: &[GatewayListeners]) -> Vec<ListenerOutcome> {
+/// A listener as written, with whose it is, the Gateway's own or a ListenerSet's attached
+/// to it, and the namespace its references and routes are taken from: its stater's.
+pub(crate) struct Written {
+    pub(crate) listener: GatewayListeners,
+    pub(crate) set: Option<Object>,
+    pub(crate) namespace: String,
+}
+
+/// Each listener's outcome, in the order listeners merge (04 §2): the Gateway's own, then
+/// each attached ListenerSet's. A protocol not taken is refused first, and plays no part in
+/// what conflicts (the spec: a listener of a protocol not supported is not accepted, and
+/// the rules of distinctness are for those that are); then the first listener on a port
+/// takes it for its protocol, and a later one stating it for another, or in a place an
+/// earlier one has (port, protocol and hostname), is refused, as the spec has a conflicting
+/// listener refused in precedence and conformance pins it; each other is served by the
+/// data plane's listener bound to its port, a port past the data plane's slots refused for
+/// every listener on it. An earlier listener of another resource is said by whose it is,
+/// never by name, as nothing of a parent or a sibling is told a ListenerSet (GEP-1713).
+pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOutcome> {
     // Each port taken, by the protocol and the listener that took it; each place, by the
-    // listener in it: only those accepted.
-    let mut ports: BTreeMap<i32, (&'static str, &str)> = BTreeMap::new();
-    let mut places: BTreeMap<(i32, &'static str, Option<&str>), &str> = BTreeMap::new();
-    listeners
+    // listener in it: only those accepted, by their place in `written`.
+    let mut ports: BTreeMap<i32, (&'static str, usize)> = BTreeMap::new();
+    let mut places: BTreeMap<(i32, &'static str, Option<&str>), usize> = BTreeMap::new();
+    let by = |earlier: usize, now: &Written| {
+        let earlier = &written[earlier];
+        if earlier.set == now.set {
+            format!("listener {}", earlier.listener.name)
+        } else if earlier.set.is_none() {
+            format!("a listener of {gateway}")
+        } else {
+            "a listener of another ListenerSet attached to the same Gateway".to_owned()
+        }
+    };
+    written
         .iter()
-        .map(|listener| {
+        .enumerate()
+        .map(|(at, stated)| {
+            let listener = &stated.listener;
             // The schema holds a port to 1–65535.
             let port = u16::try_from(listener.port).unwrap_or_default();
             let served = protocol(&listener.protocol).and_then(|protocol| {
                 let name = name_of(protocol);
                 let place = (listener.port, name, listener.hostname.as_deref());
                 match (ports.get(&listener.port), places.get(&place)) {
-                    (Some((taken, by)), _) if *taken != name => {
+                    (Some((taken, earlier)), _) if *taken != name => {
                         Err(ListenerProblem::ProtocolConflict {
                             port,
                             protocol: taken,
-                            by: (*by).to_owned(),
+                            by: by(*earlier, stated),
                         })
                     }
-                    (_, Some(by)) => Err(ListenerProblem::HostnameConflict {
-                        by: (*by).to_owned(),
+                    (_, Some(earlier)) => Err(ListenerProblem::HostnameConflict {
+                        by: by(*earlier, stated),
                     }),
                     (Some(_), None) => {
-                        places.insert(place, &listener.name);
+                        places.insert(place, at);
                         Ok(vec![crate::listeners::name(port)])
                     }
                     (None, None) if ports.len() < crate::listeners::MOST_GATEWAY_PORTS => {
-                        ports.insert(listener.port, (name, &listener.name));
-                        places.insert(place, &listener.name);
+                        ports.insert(listener.port, (name, at));
+                        places.insert(place, at);
                         Ok(vec![crate::listeners::name(port)])
+                    }
+                    (None, None) if stated.set.is_some() => {
+                        Err(ListenerProblem::TooManyListeners { port })
                     }
                     (None, None) => Err(ListenerProblem::PortPastSlots { port }),
                 }
             });
             ListenerOutcome {
                 name: listener.name.clone(),
+                set: stated.set.clone(),
                 served,
                 allowed: Allowed {
                     kinds: Vec::new(),
@@ -687,8 +846,26 @@ fn selector_of(
 
 #[cfg(test)]
 mod tests {
-    use super::{GatewayListeners, Namespaces, Requirement, Selector, listeners};
-    use crate::Cluster;
+    use super::{GatewayListeners, ListenerOutcome, Namespaces, Requirement, Selector, Written};
+    use crate::{Cluster, Object};
+
+    /// The outcomes of a Gateway's own listeners, `written`.
+    fn listeners(written: &[GatewayListeners]) -> Vec<ListenerOutcome> {
+        let written: Vec<Written> = written
+            .iter()
+            .map(|listener| Written {
+                listener: listener.clone(),
+                set: None,
+                namespace: "edge".to_owned(),
+            })
+            .collect();
+        let gateway = Object {
+            kind: "Gateway",
+            namespace: "edge".to_owned(),
+            name: "web".to_owned(),
+        };
+        super::listeners(&written, &gateway)
+    }
     use crate::listeners::MOST_GATEWAY_PORTS;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -736,6 +913,55 @@ mod tests {
                 "dns: protocol `UDP` is not one the gateway serves",
             ]
         );
+    }
+
+    /// A ListenerSet's listener on a port past the slots the Gateway's own listeners take is
+    /// refused `TooManyListeners`, the GEP's reason, not the Gateway's `PortUnavailable`.
+    #[test]
+    fn a_listener_sets_port_past_the_slots_is_too_many_listeners() {
+        let gateway = Object {
+            kind: "Gateway",
+            namespace: "edge".to_owned(),
+            name: "web".to_owned(),
+        };
+        let set = Object {
+            kind: "ListenerSet",
+            namespace: "shop".to_owned(),
+            name: "team".to_owned(),
+        };
+        let listener = |name: &str, port: usize| -> GatewayListeners {
+            serde_saphyr::from_str(&format!("{{ name: {name}, port: {port}, protocol: HTTP }}"))
+                .unwrap()
+        };
+        let mut written: Vec<Written> = (0..MOST_GATEWAY_PORTS)
+            .map(|at| Written {
+                listener: listener(&format!("l{at}"), 2000 + at),
+                set: None,
+                namespace: "edge".to_owned(),
+            })
+            .collect();
+        written.push(Written {
+            listener: listener("team", 3000),
+            set: Some(set),
+            namespace: "shop".to_owned(),
+        });
+        let outcomes = super::listeners(&written, &gateway);
+        let last = outcomes.last().unwrap();
+        assert_eq!(
+            last.served
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some(
+                "the data plane serves at most 64 ports of the Gateway API, which the Gateway \
+                 and the ListenerSets before this one take; port 3000 is past them"
+            )
+        );
+        assert!(matches!(
+            last.served,
+            Err(super::ListenerProblem::TooManyListeners { port: 3000 })
+        ));
     }
 
     /// Ports take the data plane's Gateway slots in the order the listeners state them, a

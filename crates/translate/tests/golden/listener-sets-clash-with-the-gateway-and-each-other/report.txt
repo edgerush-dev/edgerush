@@ -1,0 +1,3 @@
+ListenerSet shop/zz-older: listener secure: not accepted: port 80 is taken for http by a listener of Gateway edge/web, which comes first
+ListenerSet shop/zz-older: listener www: not accepted: a listener of Gateway edge/web, which comes first, has its port, protocol and hostname
+ListenerSet blog/aa-younger: listener shop: not accepted: a listener of another ListenerSet attached to the same Gateway, which comes first, has its port, protocol and hostname

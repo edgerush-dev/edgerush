@@ -1,0 +1,23 @@
+listeners:
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  port-8443:
+    address: "0.0.0.0:8443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: shop/secure, names: [secure.example.com] }
+        - { certificate: edge/own, names: [own.example.com] }
+      without_sni: none
+      refused: [blog.example.com]
+routes:
+  - { name: listenerset/shop/team/own-namespace, listeners: [port-8443], hostnames: [{ name: secure.example.com, falls_through: false }], rules: [] }
+  - { name: listenerset/shop/team/granted, listeners: [port-8443], hostnames: [{ name: own.example.com, falls_through: false }], rules: [] }
+upstreams: {}

@@ -1,0 +1,87 @@
+# The Gateway takes ListenerSets of the namespaces its selector matches, shop's: shop's
+# ListenerSet is attached, its listener bound beside the Gateway's own, and an Ingress host
+# it names joins it; blog's is not, and that is said; its own namespace is not taken by a
+# selector that does not match it. One naming another Gateway is another's. A route naming
+# the Gateway attaches to its own listeners alone, not to a ListenerSet's of the name.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  allowedListeners: { namespaces: { from: Selector, selector: { matchLabels: { team: shop } } } }
+  listeners:
+    - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: team, namespace: shop }
+spec:
+  parentRef: { name: web, namespace: edge }
+  listeners:
+    - { name: api, port: 9000, protocol: HTTP, hostname: api.example.com }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: other, namespace: blog }
+spec:
+  parentRef: { name: web, namespace: edge }
+  listeners:
+    - { name: blog, port: 9001, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: own, namespace: edge }
+spec:
+  parentRef: { name: web }
+  listeners:
+    - { name: own, port: 9002, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: elsewhere, namespace: shop }
+spec:
+  parentRef: { name: other, namespace: edge }
+  listeners:
+    - { name: elsewhere, port: 9003, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: web, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: api }]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: shop, labels: { team: shop } }
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: blog }
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: edge }

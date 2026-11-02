@@ -1,0 +1,12 @@
+listeners:
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - { name: gateway/edge/web/http, listeners: [port-80], hostnames: [{ name: www.example.com, falls_through: false }], rules: [] }
+  - { name: listenerset/shop/zz-older/shop, listeners: [port-80], hostnames: [{ name: shop.example.com, falls_through: false }], rules: [] }
+  - { name: listenerset/blog/aa-younger/blog, listeners: [port-80], hostnames: [{ name: blog.example.com, falls_through: false }], rules: [] }
+upstreams: {}

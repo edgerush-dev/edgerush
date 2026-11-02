@@ -502,7 +502,8 @@ impl GatewayApi {
                     keep(&mut self.gateways, on, || start.follows(namespace));
                 }
                 GatewayKind::ListenerSet => {
-                    keep(&mut self.listener_sets, on, || start.follows(scope));
+                    let scope = listener_set_scope(scope, &self.namespace);
+                    keep(&mut self.listener_sets, on, || start.follows(&scope));
                 }
                 GatewayKind::HTTPRoute => keep(&mut self.http_routes, on, || start.follows(scope)),
                 GatewayKind::ReferenceGrant => {
@@ -797,6 +798,20 @@ impl Followed {
             watched: self.watched.clone(),
         }
     }
+}
+
+/// Where ListenerSets are followed: the watch scope, as routes are, and the Gateway's own
+/// namespace, `gateway`, where the scope does not hold it, as a Gateway that takes them
+/// `from: Same` takes them there (04 §1).
+fn listener_set_scope(scope: &[Scope], gateway: &Scope) -> Vec<Scope> {
+    let mut followed = scope.to_vec();
+    if !scope
+        .iter()
+        .any(|part| *part == Scope::Cluster || part == gateway)
+    {
+        followed.push(gateway.clone());
+    }
+    followed
 }
 
 /// The namespaces `scope` watches, where it does not watch the whole cluster: those a

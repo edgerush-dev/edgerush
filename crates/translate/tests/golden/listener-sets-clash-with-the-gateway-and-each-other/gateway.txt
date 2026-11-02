@@ -1,0 +1,6 @@
+listener http: served on port-80, taking HTTPRoute from namespace edge
+listener secure of ListenerSet shop/zz-older: not accepted: port 80 is taken for http by a listener of Gateway edge/web, which comes first
+listener www of ListenerSet shop/zz-older: not accepted: a listener of Gateway edge/web, which comes first, has its port, protocol and hostname
+listener shop of ListenerSet shop/zz-older: served on port-80, taking HTTPRoute from namespace shop
+listener shop of ListenerSet blog/aa-younger: not accepted: a listener of another ListenerSet attached to the same Gateway, which comes first, has its port, protocol and hostname
+listener blog of ListenerSet blog/aa-younger: served on port-80, taking HTTPRoute from namespace blog
