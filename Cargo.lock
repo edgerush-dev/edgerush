@@ -528,6 +528,8 @@ dependencies = [
  "boring",
  "bytes",
  "edgerush-certificates",
+ "edgerush-cluster",
+ "edgerush-cluster-synchronous",
  "edgerush-config",
  "edgerush-control-service",
  "edgerush-ratelimit",

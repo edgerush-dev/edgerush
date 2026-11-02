@@ -13,6 +13,10 @@ publish.workspace = true
 boring.workspace = true
 bytes.workspace = true
 edgerush-certificates.workspace = true
+# The cluster store and its synchronous mode, carried over gRPC (`cluster`): pure crates,
+# their wire here, as prost is allowed only in this crate.
+edgerush-cluster.workspace = true
+edgerush-cluster-synchronous.workspace = true
 edgerush-config.workspace = true
 edgerush-control-service.workspace = true
 edgerush-ratelimit.workspace = true

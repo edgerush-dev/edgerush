@@ -20,6 +20,10 @@ cargo-fuzz = true
 boring = "5.2"
 # A response head keeps the bytes it was read from, as the proxy's does.
 bytes = "1.12"
+# The cluster store's messages and the synchronous mode's value, as the service's wire
+# carries them.
+edgerush-cluster = { path = "../crates/cluster" }
+edgerush-cluster-synchronous = { path = "../crates/cluster-synchronous" }
 # The model and compiler a harness file is read into.
 edgerush-config = { path = "../crates/config" }
 # A nameserver's answers, read as the resolver reads them.
@@ -228,6 +232,12 @@ bench = false
 [[bin]]
 name = "ratelimit_wire"
 path = "fuzz_targets/ratelimit_wire.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cluster_wire"
+path = "fuzz_targets/cluster_wire.rs"
 test = false
 doc = false
 
