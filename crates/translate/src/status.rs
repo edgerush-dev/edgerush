@@ -69,9 +69,9 @@ pub struct ListenerStatus {
     pub attached_routes: i32,
     /// Its conditions.
     pub conditions: Vec<Condition>,
-    /// Whether it is served, what its `Programmed` waits on; or why not
-    /// (`Programmed` false, `Invalid`).
-    pub programmable: Result<(), String>,
+    /// The data plane's listeners it is served on, whose pods' serving them its
+    /// `Programmed` waits on; or why it is not served (`Programmed` false, `Invalid`).
+    pub programmable: Result<Vec<String>, String>,
 }
 
 impl fmt::Display for GatewayStatus {
@@ -206,7 +206,7 @@ pub(crate) fn gateway(
             attached_routes: attached(&listener.name, routes, outcomes),
             conditions: listener_conditions(listener),
             programmable: match &listener.served {
-                Ok(_) => Ok(()),
+                Ok(served) => Ok(served.clone()),
                 Err(problem) => Err(problem.to_string()),
             },
         })

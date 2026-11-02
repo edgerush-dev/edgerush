@@ -1130,3 +1130,45 @@ fn what_is_said_of_a_status_names_the_ingress_and_its_addresses() {
         "{not}"
     );
 }
+
+/// What a data plane says it does not serve of the config it runs is taken into what its
+/// pod runs, as `Programmed` reads it; a stream newly opened says nothing of it yet.
+#[test]
+fn the_listeners_a_data_plane_does_not_serve_reach_what_its_pod_runs() {
+    use edgerush_control_stream::{Held, Listening, Report, Unserved};
+    let peer: SocketAddr = "10.0.0.1:41000".parse().unwrap();
+    let held = Held {
+        config: Some("a-1".to_owned()),
+        certificates: BTreeMap::new(),
+    };
+    let mut runs = Runs::default();
+    runs.offered("a-1", Some(3));
+    let report = Report {
+        running: held.clone(),
+        refused: None,
+        listening: Listening {
+            unserved: vec![Unserved {
+                listener: "port-9100".to_owned(),
+                why: "listener \"port-9100\": address in use".to_owned(),
+            }],
+            draining: vec!["port-8080".to_owned()],
+        },
+    };
+    ran(peer, &Heard::Reported(report)).unwrap().into(&mut runs);
+    let pods = runs.pods();
+    assert_eq!(
+        pods[&peer.ip()].unserved,
+        BTreeMap::from([(
+            "port-9100".to_owned(),
+            "listener \"port-9100\": address in use".to_owned()
+        )])
+    );
+    assert_eq!(pods[&peer.ip()].runs, Some(3));
+    let opened = Heard::Opened {
+        held,
+        version: 1,
+        written: 1,
+    };
+    ran(peer, &opened).unwrap().into(&mut runs);
+    assert!(runs.pods()[&peer.ip()].unserved.is_empty());
+}

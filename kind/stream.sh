@@ -307,6 +307,28 @@ k -n edge get configmap -l gateway.edgerush.dev/acks=edgerush-control -o name | 
 refused_any && fail "a control-plane replica was refused a status of the Gateway API"
 pass "the GatewayClass, the Gateway and the HTTPRoute say they are accepted, the Gateway its address and its route, each of its generation, and the Gateway programmed once its data plane runs it"
 
+# A listener on a port the data plane cannot bind, its own metrics' (03 §10): that
+# listener alone is not programmed, still pending, saying the pod and why; the Gateway and
+# its other listeners are, as the config runs on every pod (04 §6).
+of_listener() { echo "{.status.listeners[?(@.name==\"$1\")].conditions[?(@.type==\"Programmed\")].$2}"; }
+k -n edge patch gateway web --type=json \
+    -p '[{"op":"add","path":"/spec/listeners/-","value":{"name":"taken","port":9100,"protocol":"HTTP"}}]' >/dev/null
+stated False "$(of_listener taken status)" 60 -n edge gateway web ||
+    fail "a listener on a port the data plane cannot bind is not said unprogrammed: $(said_of -n edge gateway web)"
+stated Pending "$(of_listener taken reason)" 5 -n edge gateway web ||
+    fail "a listener the data plane cannot bind is not said pending: $(said_of -n edge gateway web)"
+k -n edge get gateway web -o jsonpath="$(of_listener taken message)" | grep -q '^data plane .*9100' ||
+    fail "a listener the data plane cannot bind does not say the pod and why: $(said_of -n edge gateway web)"
+stated True "$(of_listener http status)" 30 -n edge gateway web ||
+    fail "beside a listener not bound, the others are not said programmed: $(said_of -n edge gateway web)"
+stated True "$(condition Programmed status)" 5 -n edge gateway web ||
+    fail "beside a listener not bound, the Gateway is not said programmed: $(said_of -n edge gateway web)"
+answers route.example 200 5 || fail "beside a listener not bound, the HTTPRoute answers $(status route.example)"
+k -n edge patch gateway web --type=json -p '[{"op":"remove","path":"/spec/listeners/2"}]' >/dev/null
+stated "http alt" '{.status.listeners[*].name}' 30 -n edge gateway web ||
+    fail "the listener taken away is still said: $(said_of -n edge gateway web)"
+pass "a listener on a port its data plane cannot bind alone is not programmed, pending, saying the pod and why; the Gateway and its other listeners are"
+
 k apply -f - >/dev/null <<EOF
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute

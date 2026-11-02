@@ -6,7 +6,7 @@
 //! and other controllers' parents of a route, kept whole; this controller's own parents of
 //! a route that are no longer wanted taken away. Pure: the time is passed in.
 
-use crate::acks::Pods;
+use crate::acks::{Pod, Pods};
 use crate::gateway_api::{GatewayKind, Served, supported};
 use edgerush_gateway_api::gateway::{
     GatewayStatus, GatewayStatusAddresses, GatewayStatusListeners,
@@ -20,6 +20,7 @@ use edgerush_translate::{self as translate, GATEWAY_CONTROLLER, Object};
 use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use k8s_openapi::jiff::Timestamp;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 /// The API group of the Gateway API's kinds.
@@ -161,19 +162,25 @@ pub(crate) fn class(
 }
 
 /// Whether the data plane runs a generation of its Gateway, as its pods say they do: what
-/// the Gateway's `Programmed` says, and each listener's that is served.
+/// the Gateway's `Programmed` says, and each listener's that is served, but where a ready
+/// pod running it does not serve the listener's port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Programmed {
     status: &'static str,
     reason: &'static str,
     message: String,
+    /// The data plane's listeners a ready pod running the generation does not serve, by
+    /// name: the first such pod, and why it says.
+    unserved: BTreeMap<String, (IpAddr, String)>,
 }
 
 impl Programmed {
     /// What it says of `generation`, the Gateway's in the config handed on, its pods
     /// running what `pods` says and `ready` those ready (none known: those `pods` says):
     /// true once every ready pod runs it; false where one refused the latest config; and
-    /// until then unknown, or false once `overdue`, the bound it is waited on past.
+    /// until then unknown, or false once `overdue`, the bound it is waited on past. And the
+    /// listeners of that generation a ready pod running it does not serve: a pod on an
+    /// older one says what it serves of its own config, not of this.
     pub(crate) fn of(
         generation: i64,
         pods: &Pods,
@@ -193,15 +200,23 @@ impl Programmed {
                 status: "False",
                 reason: "Invalid",
                 message: format!("data plane {pod} refused the config: {why}"),
+                unserved: BTreeMap::new(),
             };
         }
-        let running = ready
+        let on_it: Vec<(&IpAddr, &Pod)> = ready
             .iter()
-            .filter(|pod| {
-                pods.get(pod)
-                    .is_some_and(|said| said.runs == Some(generation))
-            })
-            .count();
+            .filter_map(|pod| Some((pod, pods.get(pod)?)))
+            .filter(|(_, said)| said.runs == Some(generation))
+            .collect();
+        let running = on_it.len();
+        let mut unserved = BTreeMap::new();
+        for (pod, said) in &on_it {
+            for (listener, why) in &said.unserved {
+                unserved
+                    .entry(listener.clone())
+                    .or_insert_with(|| (**pod, why.clone()));
+            }
+        }
         let message = format!(
             "{running} of {} data plane pods run generation {generation}",
             ready.len()
@@ -219,11 +234,27 @@ impl Programmed {
                 "Pending"
             },
             message,
+            unserved,
         }
     }
 
     fn wanted(&self) -> Wanted {
         Wanted::new("Programmed", self.status, self.reason, self.message.clone())
+    }
+
+    /// What a Gateway listener served on the data plane's listeners `served_on` says: not
+    /// programmed, still pending, where a ready pod running the generation does not serve
+    /// one, saying that pod and why; else what the Gateway says (04 §6).
+    fn of_listener(&self, served_on: &[String]) -> Wanted {
+        match served_on.iter().find_map(|name| self.unserved.get(name)) {
+            Some((pod, why)) => Wanted::new(
+                "Programmed",
+                "False",
+                "Pending",
+                format!("data plane {pod}: {why}"),
+            ),
+            None => self.wanted(),
+        }
     }
 }
 
@@ -259,7 +290,7 @@ pub(crate) fn gateway(
             let mut conditions: Vec<Wanted> =
                 listener.conditions.iter().map(Wanted::from).collect();
             conditions.push(match &listener.programmable {
-                Ok(()) => programmed.wanted(),
+                Ok(served_on) => programmed.of_listener(served_on),
                 Err(why) => Wanted::new("Programmed", "False", "Invalid", why.clone()),
             });
             let old = live_listeners
