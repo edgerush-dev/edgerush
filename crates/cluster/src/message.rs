@@ -168,6 +168,23 @@ pub enum Message<V> {
         /// The number of the last copy it holds every one up to.
         version: u64,
     },
+    /// A replica's answer to each part of a [`Message::Replicate`] in more than one: it has
+    /// taken, in turn, every part of the copy up to `part`. An owner sends a copy of many parts
+    /// only a few unanswered parts ahead, so that neither end holds more than those of it. How
+    /// far the replica then holds the shard it says, as for any copy, by
+    /// [`Message::Replicated`].
+    Took {
+        /// The shard.
+        shard: ShardId,
+        /// Its term.
+        term: u64,
+        /// The assignment the copy was for.
+        assignment: u64,
+        /// The copy's number.
+        version: u64,
+        /// The part it has every part up to.
+        part: u32,
+    },
     /// A replica's word to the owner its table names that it holds nothing of `shard` from
     /// it: said every heartbeat until it is sent the shard.
     Lacking {

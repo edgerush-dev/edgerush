@@ -18,7 +18,10 @@
 //!   has heard a majority of the voting set within `stop_serving`: a lease. No leader is
 //!   needed to serve; only changing the table waits for one.
 //! - **Replication.** Each owner sends its replicas what changed, every cycle; a copy carries
-//!   its shard term, and a pod refuses one older than it knows.
+//!   its shard term, and a pod refuses one older than it knows. A copy too large for one part
+//!   goes a part at a time, each answered, never more than `window_bytes` of them unanswered
+//!   to one replica, so that what either end holds of it stays within a constant however
+//!   large the shard.
 //! - **Keys.** A key's owner updates it ([`Node::update`]) while it serves the key's shard;
 //!   every pod forgets a key once its time comes, by its own wall clock, and past
 //!   `max_key_bytes` evicts those it may forget soonest.

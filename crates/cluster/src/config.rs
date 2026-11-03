@@ -37,6 +37,11 @@ pub struct Config {
     /// so that what a message carries, and what its receiver holds of one, stays within this
     /// however many keys a shard holds.
     pub part_bytes: u64,
+    /// The most bytes of copies of many parts, by the same count, an owner has unanswered to
+    /// one replica, across its shards: each part goes once its answers leave room for a part
+    /// this size, one always when none is unanswered, so that what either end holds of copies
+    /// in progress stays within this however many keys or shards there are.
+    pub window_bytes: u64,
 }
 
 /// Why a config cannot be used.
@@ -58,7 +63,7 @@ impl Config {
     /// The defaults: heartbeats every 100 ms, a pod stopping after 400 ms without a majority
     /// and taken out after 600 ms, elections spread over 200 ms, copies every 10 ms, 256 shards
     /// with two replicas each, forming waiting 5 s on a pod holding the latest table, no cap
-    /// on keys, and copies in parts of 1 MiB.
+    /// on keys, and copies in parts of 1 MiB, 2 MiB of them unanswered at most.
     #[must_use]
     pub const fn defaults() -> Self {
         Self {
@@ -72,6 +77,7 @@ impl Config {
             form_wait: ms(5_000),
             max_key_bytes: None,
             part_bytes: 1 << 20,
+            window_bytes: 2 << 20,
         }
     }
 

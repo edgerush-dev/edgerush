@@ -175,6 +175,9 @@ pub struct Stats {
     /// Parts of copies and handoffs that carried past `part_bytes`, more than one key among
     /// them: never, however many keys a shard holds.
     pub parts_over: u64,
+    /// The most bytes of copies of many parts any owner had unanswered to one replica, by the
+    /// store's count: never past `window_bytes`, however many keys or shards there are.
+    pub most_unanswered: u64,
     /// Requests counted more than once: a second answer "counted" sent a client for one.
     pub counted_twice: u64,
     /// Requests a client sent that could not reach their pod.
@@ -935,6 +938,10 @@ impl<M: Mode> Sim<M> {
         for (to, message) in out {
             self.send(id, to, message);
         }
+        if let Some(pod) = self.pods.get(&id) {
+            let unanswered = M::store(&pod.node).most_unanswered_bytes();
+            self.stats.most_unanswered = self.stats.most_unanswered.max(unanswered);
+        }
         self.check(id);
     }
 
@@ -1183,6 +1190,7 @@ const fn store_kind<V>(message: &StoreMessage<V>) -> &'static str {
         }
         StoreMessage::Replicate { .. }
         | StoreMessage::Replicated { .. }
+        | StoreMessage::Took { .. }
         | StoreMessage::Lacking { .. } => "replicate",
         StoreMessage::Handoff { .. }
         | StoreMessage::CaughtUp { .. }
