@@ -924,7 +924,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 }
             }
         }
-        accepted.push((object(), rank(&ingress.metadata, 0), translated, taken));
+        accepted.push((object(), rank(&ingress.metadata, 1), translated, taken));
     }
     // Every Ingress in, a host some Ingress secures is served over HTTPS whichever Ingress's
     // route it is, so that both kinds of listener rank the same paths for it; a host none
@@ -1178,7 +1178,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 });
             }
             ranked.push(Ranked {
-                rank: rank(&route.metadata, 1),
+                rank: rank(&route.metadata, 0),
                 object: outcome.route.clone(),
                 routes: translated.routes,
             });
@@ -1318,18 +1318,18 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
 
 /// Where an object's config routes go among all others: oldest first, then by namespace and
 /// name, as Gateway API ranks routes, whichever API each is of (04 §1); an Ingress and an
-/// HTTPRoute alike in all three, the Ingress first, as the one more likely there before.
-/// The order is precedence's last tie-breaker (07 §1).
+/// HTTPRoute alike in all three, the HTTPRoute first, as the rule both share is Gateway
+/// API's (Lucas). The order is precedence's last tie-breaker (07 §1).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Rank {
     created: Option<Time>,
     namespace: String,
     name: String,
-    /// 0 for an Ingress, 1 for an HTTPRoute: the Ingress first.
+    /// 0 for an HTTPRoute, 1 for an Ingress: the HTTPRoute first.
     api: u8,
 }
 
-/// The rank of the object of `metadata`, of API `api` (0 for Ingress, 1 for HTTPRoute).
+/// The rank of the object of `metadata`, of API `api` (0 for HTTPRoute, 1 for Ingress).
 fn rank(metadata: &ObjectMeta, api: u8) -> Rank {
     Rank {
         created: metadata.creation_timestamp.clone(),
