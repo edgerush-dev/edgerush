@@ -78,6 +78,17 @@ struct Heard {
     leased: bool,
 }
 
+/// A copy coming in parts, as far as its parts have come in turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Taking {
+    /// The copy: its shard term, the replica's assignment and its number.
+    copy: (u64, u64, u64),
+    /// The number of the part that comes next in turn.
+    next: u32,
+    /// Of a whole copy, the keys its parts have named: those the last part keeps.
+    named: BTreeSet<u64>,
+}
+
 /// One pod in one life.
 #[derive(Clone, Debug)]
 pub struct Node<V> {
@@ -134,6 +145,11 @@ pub struct Node<V> {
     have: BTreeMap<ShardId, (NodeId, u64, u64, u64)>,
     /// As replica: the latest of its owners' tables it was sent each shard's copies under.
     copied_under: BTreeMap<ShardId, Stamp>,
+    /// As replica: each copy of a shard coming in parts, by the shard and the pod sending it.
+    taking: BTreeMap<(ShardId, NodeId), Taking>,
+    /// As taker: each owner's last changes of a shard coming in parts, by the shard and that
+    /// owner: their shard term and the number of the part that comes next in turn.
+    handing_in: BTreeMap<(ShardId, NodeId), (u64, u32)>,
     /// Shards whose taker has caught up and that it has told the leader so, to whom, on the
     /// move planned from which table, last told when: served here still, until the table names
     /// the taker the owner.
@@ -207,6 +223,8 @@ impl<V: Held> Node<V> {
             next_assignment: 0,
             have: BTreeMap::new(),
             copied_under: BTreeMap::new(),
+            taking: BTreeMap::new(),
+            handing_in: BTreeMap::new(),
             announced: BTreeMap::new(),
             awaiting: BTreeMap::new(),
             handed_in: BTreeMap::new(),
@@ -1130,19 +1148,19 @@ impl<V: Held> Node<V> {
                 .filter(|replica| !had.contains(replica))
             {
                 let assignment = self.assign(id, *replica);
-                out.push((
-                    *replica,
-                    Message::Replicate {
-                        shard: id,
-                        term: shard.term,
-                        assignment,
-                        after: None,
-                        version,
-                        under: table.stamp(),
-                        entries: entries.clone(),
-                        dropped: Vec::new(),
-                    },
-                ));
+                let copy = Message::Replicate {
+                    shard: id,
+                    term: shard.term,
+                    assignment,
+                    after: None,
+                    version,
+                    under: table.stamp(),
+                    entries: entries.clone(),
+                    dropped: Vec::new(),
+                    part: 0,
+                    more: false,
+                };
+                send_in_parts(out, *replica, copy, self.config.part_bytes);
             }
         }
         let still = |(shard, replica): &(ShardId, NodeId)| {
@@ -1221,19 +1239,19 @@ impl<V: Held> Node<V> {
                         assignment = self.assign(shard, *replica);
                     }
                 }
-                out.push((
-                    *replica,
-                    Message::Replicate {
-                        shard,
-                        term: entry.term,
-                        assignment,
-                        after: Some(after),
-                        version,
-                        under: self.committed_stamp(),
-                        entries: entries.clone(),
-                        dropped: dropped.clone(),
-                    },
-                ));
+                let copy = Message::Replicate {
+                    shard,
+                    term: entry.term,
+                    assignment,
+                    after: Some(after),
+                    version,
+                    under: self.committed_stamp(),
+                    entries: entries.clone(),
+                    dropped: dropped.clone(),
+                    part: 0,
+                    more: false,
+                };
+                send_in_parts(out, *replica, copy, self.config.part_bytes);
             }
         }
         // A replica that has said no more for `REPAIR_AFTER` cycles while behind — a copy lost, or its
@@ -1274,19 +1292,19 @@ impl<V: Held> Node<V> {
                         .collect();
                     (Some(acked), self.split(shard, keys.into_iter()))
                 };
-                out.push((
-                    *replica,
-                    Message::Replicate {
-                        shard,
-                        term: entry.term,
-                        assignment,
-                        after,
-                        version,
-                        under: self.committed_stamp(),
-                        entries,
-                        dropped,
-                    },
-                ));
+                let copy = Message::Replicate {
+                    shard,
+                    term: entry.term,
+                    assignment,
+                    after,
+                    version,
+                    under: self.committed_stamp(),
+                    entries,
+                    dropped,
+                    part: 0,
+                    more: false,
+                };
+                send_in_parts(out, *replica, copy, self.config.part_bytes);
             }
         }
     }
@@ -1358,6 +1376,20 @@ impl<V: Held> Node<V> {
         let data = &self.data;
         self.parts_changed
             .retain(|(shard, key), _| data.get(shard).is_some_and(|keys| keys.contains_key(key)));
+        // Copies coming in parts that will not finish: their shard's term gone by, or, for a
+        // replica's, sent by a pod its table no longer names the owner.
+        let table = self.committed.as_deref();
+        let known = |shard: ShardId| {
+            table
+                .and_then(|table| table.shards.get(usize::from(shard)))
+                .map_or(0, |entry| entry.term)
+        };
+        self.taking.retain(|(shard, from), taking| {
+            taking.copy.0 >= known(*shard)
+                && table.is_some_and(|table| table.owner(*shard) == Some(*from))
+        });
+        self.handing_in
+            .retain(|(shard, _), (term, _)| *term >= known(*shard));
         self.evict();
     }
 
@@ -1472,19 +1504,19 @@ impl<V: Held> Node<V> {
             if !self.assignments.contains_key(&copy) {
                 let assignment = self.assign(shard, to);
                 let version = self.versions.get(&shard).copied().unwrap_or(1);
-                out.push((
-                    to,
-                    Message::Replicate {
-                        shard,
-                        term,
-                        assignment,
-                        after: None,
-                        version,
-                        under: table.stamp(),
-                        entries: self.all_of(shard),
-                        dropped: Vec::new(),
-                    },
-                ));
+                let copy = Message::Replicate {
+                    shard,
+                    term,
+                    assignment,
+                    after: None,
+                    version,
+                    under: table.stamp(),
+                    entries: self.all_of(shard),
+                    dropped: Vec::new(),
+                    part: 0,
+                    more: false,
+                };
+                send_in_parts(out, to, copy, self.config.part_bytes);
                 continue;
             }
             let whole = self.acked.get(&copy).is_some_and(|acked| *acked > 0);
@@ -1534,15 +1566,15 @@ impl<V: Held> Node<V> {
                     .copied()
                     .collect();
                 let (entries, dropped) = self.split(shard, keys.into_iter());
-                out.push((
-                    to,
-                    Message::Handoff {
-                        shard,
-                        term: entry.term,
-                        entries,
-                        dropped,
-                    },
-                ));
+                let last = Message::Handoff {
+                    shard,
+                    term: entry.term,
+                    entries,
+                    dropped,
+                    part: 0,
+                    more: false,
+                };
+                send_in_parts(out, to, last, self.config.part_bytes);
             } else if to == self.id && self.handed_in.get(&shard) != Some(&entry.term) {
                 self.awaiting.insert(shard, now);
             }
@@ -1722,7 +1754,42 @@ impl<V: Held> Node<V> {
                 under,
                 entries,
                 dropped,
+                part,
+                more,
             } => {
+                // Each part is taken as it comes, as a copy is; the copy is held, and said
+                // held, only once its last part is in with every part before it, in turn. A
+                // part out of turn, one before it lost, leaves the copy unanswered, and the
+                // repair sends it again.
+                let taking = (shard, from);
+                let copy = (term, assignment, version);
+                let in_turn = part == 0
+                    || self
+                        .taking
+                        .get(&taking)
+                        .is_some_and(|taken| (taken.copy, taken.next) == (copy, part));
+                if part == 0 {
+                    let first = Taking {
+                        copy,
+                        next: 0,
+                        named: BTreeSet::new(),
+                    };
+                    self.taking.insert(taking, first);
+                }
+                match self.taking.get_mut(&taking).filter(|_| in_turn) {
+                    Some(taken) => {
+                        taken.next = part.saturating_add(1);
+                        if after.is_none() {
+                            taken.named.extend(entries.iter().map(|(key, _)| *key));
+                        }
+                    }
+                    None => {
+                        self.taking.remove(&taking);
+                    }
+                }
+                let whole = (!more && in_turn)
+                    .then(|| self.taking.remove(&taking))
+                    .flatten();
                 // It holds the shard without a gap as far as this copy if it is whole, or
                 // follows the last it so held from the same owner in the same assignment; it
                 // says how far in that assignment, either way. A deletion is taken only from a
@@ -1733,7 +1800,8 @@ impl<V: Held> Node<V> {
                 // A whole copy from the owner its table names replaces what it holds of the
                 // shard, keys its owner has since evicted among them, unless it holds a later
                 // copy from it already, which overtook it; one from another, arriving late,
-                // only adds, as it may be older than what it holds.
+                // only adds, as it may be older than what it holds. Each part replaces the keys
+                // it names, and the last drops those no part named.
                 let newer = have.is_none_or(|(owner, had, given, held)| {
                     (owner, had, given) != (from, term, assignment) || held < version
                 });
@@ -1744,7 +1812,12 @@ impl<V: Held> Node<V> {
                         .as_ref()
                         .is_some_and(|table| table.owner(shard) == Some(from));
                 let dropped = if follows { dropped } else { Vec::new() };
-                if self.on_copy(shard, term, entries, &dropped, replace) {
+                if !self.on_copy(shard, term, entries, &dropped, replace) {
+                    self.taking.remove(&taking);
+                } else if let Some(whole) = whole {
+                    if replace {
+                        self.keep_only(shard, &whole.named);
+                    }
                     let latest = self.copied_under.entry(shard).or_default();
                     *latest = (*latest).max(under);
                     let further = have.is_none_or(|(owner, had, given, held)| {
@@ -1824,10 +1897,23 @@ impl<V: Held> Node<V> {
                 term,
                 entries,
                 dropped,
+                part,
+                more,
             } => {
                 // The old owner's last changes: served from now, or as soon as the table names
-                // this pod the owner, if it comes first.
-                if self.on_copy(shard, term, entries, &dropped, false) {
+                // this pod the owner, if they come first; once their last part is in, with
+                // every part before it, in turn. Should a part be lost, it serves without them
+                // once it has waited for them, as when they are lost whole.
+                let handing = (shard, from);
+                let in_turn = part == 0 || self.handing_in.get(&handing) == Some(&(term, part));
+                let taken = self.on_copy(shard, term, entries, &dropped, false);
+                if taken && in_turn && more {
+                    self.handing_in
+                        .insert(handing, (term, part.saturating_add(1)));
+                } else {
+                    self.handing_in.remove(&handing);
+                }
+                if taken && in_turn && !more {
                     self.awaiting.remove(&shard);
                     self.handed_in.insert(shard, term);
                 }
@@ -2021,8 +2107,8 @@ impl<V: Held> Node<V> {
     }
 
     /// A copy of `shard` at shard term `term`: refused if this pod knows the shard under a
-    /// later term, else, if `replace`, what it holds of the shard replaced by `entries`, or
-    /// each key merged with what it holds; the keys `dropped` dropped. Whether it was taken.
+    /// later term, else, if `replace`, each key's value replaced by its value in `entries`, or
+    /// merged with what it holds; the keys `dropped` dropped. Whether it was taken.
     /// Owning the shard — a taker given the old owner's last changes after its replicas were
     /// sent all it held — a key raised or dropped is a change of its own, copied on to its
     /// replicas.
@@ -2044,10 +2130,11 @@ impl<V: Held> Node<V> {
         }
         let mine = entry.is_some_and(|entry| entry.owner == Some(self.id));
         let keys = self.data.entry(shard).or_default();
-        if replace && !mine {
-            keys.clear();
-        }
         for (key, value) in entries {
+            if replace && !mine {
+                keys.insert(key, value);
+                continue;
+            }
             let raised = keys.entry(key).or_default().merge(&value);
             if raised && mine {
                 self.dirty.entry(shard).or_default().insert(key);
@@ -2062,6 +2149,120 @@ impl<V: Held> Node<V> {
         }
         true
     }
+
+    /// Of `shard`, which it does not own, only the keys `named`: what is left of a whole copy
+    /// taken from its owner, all its parts in, the keys the owner has since evicted gone.
+    fn keep_only(&mut self, shard: ShardId, named: &BTreeSet<u64>) {
+        let mine = self
+            .committed
+            .as_ref()
+            .is_some_and(|table| table.owner(shard) == Some(self.id));
+        if let Some(keys) = self.data.get_mut(&shard).filter(|_| !mine) {
+            keys.retain(|key, _| named.contains(key));
+        }
+    }
+}
+
+/// Pushes `message`, a [`Message::Replicate`] or [`Message::Handoff`] with all its keys, to
+/// `to` in parts of at most `most` bytes each by the store's count, at least one key a part;
+/// any other message as it is.
+fn send_in_parts<V: Held>(out: &mut Outbox<V>, to: NodeId, message: Message<V>, most: u64) {
+    match message {
+        Message::Replicate {
+            shard,
+            term,
+            assignment,
+            after,
+            version,
+            under,
+            entries,
+            dropped,
+            ..
+        } => {
+            let parts = cut(entries, dropped, most);
+            let count = parts.len();
+            for (index, (entries, dropped)) in parts.into_iter().enumerate() {
+                out.push((
+                    to,
+                    Message::Replicate {
+                        shard,
+                        term,
+                        assignment,
+                        after,
+                        version,
+                        under,
+                        entries,
+                        dropped,
+                        part: part_number(index),
+                        more: index + 1 < count,
+                    },
+                ));
+            }
+        }
+        Message::Handoff {
+            shard,
+            term,
+            entries,
+            dropped,
+            ..
+        } => {
+            let parts = cut(entries, dropped, most);
+            let count = parts.len();
+            for (index, (entries, dropped)) in parts.into_iter().enumerate() {
+                out.push((
+                    to,
+                    Message::Handoff {
+                        shard,
+                        term,
+                        entries,
+                        dropped,
+                        part: part_number(index),
+                        more: index + 1 < count,
+                    },
+                ));
+            }
+        }
+        other => out.push((to, other)),
+    }
+}
+
+/// A part's number from its place: past `u32::MAX` parts, which a shard's keys never come
+/// near, the number stays there, and the receiver, seeing a part out of turn, answers nothing
+/// rather than hold a copy it may lack part of.
+fn part_number(index: usize) -> u32 {
+    u32::try_from(index).unwrap_or(u32::MAX)
+}
+
+/// A copy's parts, each its keys with their values and the keys it drops.
+type Parts<V> = Vec<(Vec<(u64, Kept<V>)>, Vec<u64>)>;
+
+/// The parts of a copy: its `entries` in order, then the keys `dropped`, each part at most
+/// `most` bytes by the store's count — a key dropped counting as the 8 bytes of its number —
+/// or one key if that one alone passes it; one part, empty, for none, as an empty copy still
+/// says how far the replica holds the shard.
+fn cut<V: Held>(entries: Vec<(u64, Kept<V>)>, dropped: Vec<u64>, most: u64) -> Parts<V> {
+    let mut parts = vec![(Vec::new(), Vec::new())];
+    let mut bytes: u64 = 0;
+    let mut room = |size: u64, parts: &mut Parts<V>| {
+        if bytes > 0 && bytes.saturating_add(size) > most {
+            parts.push((Vec::new(), Vec::new()));
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(size);
+    };
+    for (key, kept) in entries {
+        room(kept.bytes(), &mut parts);
+        if let Some((entries, _)) = parts.last_mut() {
+            entries.push((key, kept));
+        }
+    }
+    for key in dropped {
+        room(8, &mut parts);
+        if let Some((_, dropped)) = parts.last_mut() {
+            dropped.push(key);
+        }
+    }
+    parts
 }
 
 /// Moves the leader asks for at once: sixteen took a rollout of three pods over 1 024
@@ -2234,6 +2435,8 @@ mod tests {
             under: (0, 0),
             entries: vec![(key, Kept::new(Counts::of(5)))],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let _ = node.receive(1, copy(0), ms(2));
         assert_eq!(node.count(key), None, "term 0, below the shard's 1");
@@ -2299,6 +2502,8 @@ mod tests {
                 (keys[2], kept(ms(20_000))),
             ],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let _ = node.receive(1, copy, ms(2));
         // Three keys of 40 bytes, 120 against 100: one evicted brings it to 80, under 90.
@@ -2324,6 +2529,8 @@ mod tests {
             under: (0, 0),
             entries: vec![(key, Kept::new(Counts::of(5)))],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         node.load(other, Counts::of(7));
         let _ = node.receive(3, whole(1), ms(2));
@@ -2348,6 +2555,8 @@ mod tests {
             under: (0, 0),
             entries: vec![(key, Kept::new(Counts::of(5)))],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let next = Message::Replicate {
             shard: 0,
@@ -2358,6 +2567,8 @@ mod tests {
             under: (0, 0),
             entries: vec![(later, Kept::new(Counts::of(1)))],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let _ = node.receive(1, whole.clone(), ms(2));
         let _ = node.receive(1, next, ms(3));
@@ -2393,12 +2604,261 @@ mod tests {
                 Vec::new()
             },
             dropped,
+            part: 0,
+            more: false,
         };
         let _ = node.receive(1, copy(None, 1, Vec::new()), ms(2));
         let _ = node.receive(1, copy(Some(3), 4, vec![other]), ms(3));
         assert_eq!(node.count(other), Some(7), "dropped out of order");
         let _ = node.receive(1, copy(Some(1), 2, vec![key]), ms(4));
         assert_eq!(node.count(key), None);
+    }
+
+    /// The first `count` keys of shard 0.
+    fn keys_in_0(count: usize) -> Vec<u64> {
+        (0..)
+            .filter(|key| shard_of(*key, 4) == 0)
+            .take(count)
+            .collect()
+    }
+
+    /// The parts 1 sends 2 of a whole copy of shard 0 holding `entries`, cut at `most` bytes.
+    fn whole_in_parts(entries: Vec<(u64, Kept<Counts>)>, most: u64) -> Outbox {
+        let whole = Message::Replicate {
+            shard: 0,
+            term: 1,
+            assignment: 1,
+            after: None,
+            version: 1,
+            under: (0, 0),
+            entries,
+            dropped: Vec::new(),
+            part: 0,
+            more: false,
+        };
+        let mut out = Vec::new();
+        send_in_parts(&mut out, 2, whole, most);
+        out
+    }
+
+    /// Of what a pod sent, the numbers of the copies it said it holds.
+    fn said_held(out: &Outbox) -> Vec<u64> {
+        out.iter()
+            .filter_map(|(_, message)| match message {
+                Message::Replicated { version, .. } => Some(*version),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A copy is cut into parts each within the bound, or of one key where that key alone
+    /// passes it, its keys and then its deletions in order, none lost; numbered from 0, only
+    /// the last saying no more follow; an empty copy is one part, empty.
+    #[test]
+    fn a_copy_is_cut_into_parts_within_the_bound() {
+        let entries: Vec<(u64, Kept<Counts>)> = keys_in_0(10)
+            .into_iter()
+            .map(|key| (key, Kept::new(Counts::of(key))))
+            .collect();
+        let size = entries[0].1.bytes();
+        let dropped = vec![7, 8, 9];
+        for most in [1, size, size * 3, size * 3 + 1, u64::MAX] {
+            let parts = cut(entries.clone(), dropped.clone(), most);
+            for (keys, gone) in &parts {
+                let bytes =
+                    keys.iter().map(|(_, kept)| kept.bytes()).sum::<u64>() + 8 * gone.len() as u64;
+                assert!(
+                    bytes <= most || keys.len() + gone.len() == 1,
+                    "{bytes} at {most}"
+                );
+                assert!(!keys.is_empty() || !gone.is_empty(), "an empty part");
+            }
+            let again: Vec<_> = parts.iter().flat_map(|(keys, _)| keys.clone()).collect();
+            assert_eq!(again, entries, "at {most}");
+            let gone: Vec<u64> = parts.iter().flat_map(|(_, gone)| gone.clone()).collect();
+            assert_eq!(gone, dropped, "at {most}");
+        }
+        assert_eq!(
+            cut::<Counts>(Vec::new(), Vec::new(), 1),
+            vec![(Vec::new(), Vec::new())]
+        );
+        let numbered: Vec<(u32, bool)> = whole_in_parts(entries, size * 3)
+            .iter()
+            .map(|(_, message)| match message {
+                Message::Replicate { part, more, .. } => (*part, *more),
+                _ => (u32::MAX, false),
+            })
+            .collect();
+        assert_eq!(numbered, [(0, true), (1, true), (2, true), (3, false)]);
+    }
+
+    /// A whole copy in parts leaves a replica holding what the same copy taken whole would:
+    /// each key at the owner's value, one it held higher among them, and a key the owner has
+    /// since evicted dropped, at the last part only, so that midway no key is lost. It says
+    /// it holds the copy once, at its last part.
+    #[test]
+    fn a_whole_copy_in_parts_ends_as_the_copy_whole_does() {
+        let keys = keys_in_0(4);
+        let entries: Vec<(u64, Kept<Counts>)> = keys[..3]
+            .iter()
+            .map(|key| (*key, Kept::new(Counts::of(5))))
+            .collect();
+        let holding = |node: &mut Node| {
+            node.load(keys[0], Counts::of(9));
+            node.load(keys[3], Counts::of(7));
+        };
+        let mut whole = member();
+        holding(&mut whole);
+        for (_, part) in whole_in_parts(entries.clone(), u64::MAX) {
+            let _ = whole.receive(1, part, ms(2));
+        }
+        let mut parted = member();
+        holding(&mut parted);
+        let parts = whole_in_parts(entries, 1);
+        assert_eq!(parts.len(), 3);
+        let mut said = Vec::new();
+        for (index, (_, part)) in parts.into_iter().enumerate() {
+            said.extend(said_held(&parted.receive(1, part, ms(2))));
+            if index == 0 {
+                assert_eq!(parted.count(keys[0]), Some(5), "not set to the owner's");
+                assert_eq!(parted.count(keys[3]), Some(7), "lost midway");
+            }
+        }
+        for key in &keys {
+            assert_eq!(parted.count(*key), whole.count(*key), "key {key}");
+        }
+        assert_eq!(parted.count(keys[3]), None, "kept, evicted by the owner");
+        assert_eq!(said, [1]);
+    }
+
+    /// A copy with a part lost on the way is not said held, nor are the keys the owner
+    /// evicted dropped: its last part comes out of turn. Sent again whole, it is.
+    #[test]
+    fn a_copy_missing_a_part_is_left_unanswered() {
+        let keys = keys_in_0(4);
+        let entries: Vec<(u64, Kept<Counts>)> = keys[..3]
+            .iter()
+            .map(|key| (*key, Kept::new(Counts::of(5))))
+            .collect();
+        let mut node = member();
+        node.load(keys[3], Counts::of(7));
+        let mut said = Vec::new();
+        for (index, (_, part)) in whole_in_parts(entries.clone(), 1).into_iter().enumerate() {
+            if index != 1 {
+                said.extend(said_held(&node.receive(1, part, ms(2))));
+            }
+        }
+        assert_eq!(said, Vec::<u64>::new());
+        assert_eq!(
+            node.count(keys[3]),
+            Some(7),
+            "dropped by a copy it lacks a part of"
+        );
+        for (_, part) in whole_in_parts(entries, 1) {
+            said.extend(said_held(&node.receive(1, part, ms(3))));
+        }
+        assert_eq!(said, [1]);
+        assert_eq!(node.count(keys[3]), None);
+    }
+
+    /// A copy coming in parts from a pod its table does not name the owner is forgotten at
+    /// the sweep, what it brought kept: one that might never finish holds no keys' names for
+    /// long. The parts after the sweep come out of turn, and the copy is not said held.
+    #[test]
+    fn a_copy_in_parts_from_another_than_the_owner_is_forgotten_at_the_sweep() {
+        let keys = keys_in_0(3);
+        let entries: Vec<(u64, Kept<Counts>)> = keys
+            .iter()
+            .map(|key| (*key, Kept::new(Counts::of(5))))
+            .collect();
+        let finish = |sweep: bool| {
+            let mut node = member();
+            let mut said = Vec::new();
+            for (index, (_, part)) in whole_in_parts(entries.clone(), 1).into_iter().enumerate() {
+                said.extend(said_held(&node.receive(3, part, ms(2))));
+                if index == 0 && sweep {
+                    let _ = node.tick(ms(2));
+                }
+            }
+            (said, node.count(keys[0]))
+        };
+        assert_eq!(finish(false), (vec![1], Some(5)));
+        assert_eq!(finish(true), (Vec::new(), Some(5)));
+    }
+
+    /// A copy of what changed, in parts, is said held as far as its number at its last part
+    /// only, its deletions taken as they come in turn.
+    #[test]
+    fn changes_in_parts_are_said_held_at_their_last_part() {
+        let keys = keys_in_0(3);
+        let mut node = member();
+        for (_, part) in whole_in_parts(vec![(keys[2], Kept::new(Counts::of(1)))], u64::MAX) {
+            let _ = node.receive(1, part, ms(2));
+        }
+        let changes = Message::Replicate {
+            shard: 0,
+            term: 1,
+            assignment: 1,
+            after: Some(1),
+            version: 2,
+            under: (0, 0),
+            entries: keys[..2]
+                .iter()
+                .map(|key| (*key, Kept::new(Counts::of(3))))
+                .collect(),
+            dropped: vec![keys[2]],
+            part: 0,
+            more: false,
+        };
+        let mut parts = Vec::new();
+        send_in_parts(&mut parts, 2, changes, 1);
+        assert_eq!(parts.len(), 3);
+        let said: Vec<Vec<u64>> = parts
+            .into_iter()
+            .map(|(_, part)| said_held(&node.receive(1, part, ms(3))))
+            .collect();
+        assert_eq!(said, [vec![], vec![], vec![2]]);
+        assert_eq!(node.count(keys[2]), None);
+    }
+
+    /// An old owner's last changes in parts are in once their last part is, with every part
+    /// before it, each part's keys taken as it comes; with a part lost, they are not in, and
+    /// the taker waits for them as for changes lost whole.
+    #[test]
+    fn last_changes_in_parts_are_in_only_with_every_part() {
+        let keys = keys_in_0(3);
+        let term = member().committed().map_or(0, |table| table.shards[0].term);
+        let last = Message::Handoff {
+            shard: 0,
+            term,
+            entries: keys
+                .iter()
+                .map(|key| (*key, Kept::new(Counts::of(4))))
+                .collect(),
+            dropped: Vec::new(),
+            part: 0,
+            more: false,
+        };
+        let mut parts = Vec::new();
+        send_in_parts(&mut parts, 2, last, 1);
+        assert_eq!(parts.len(), 3);
+        let mut taker = member();
+        for (index, (_, part)) in parts.iter().cloned().enumerate() {
+            let _ = taker.receive(1, part, ms(2));
+            assert_eq!(taker.handed_in.contains_key(&0), index == 2, "part {index}");
+        }
+        let mut lacking = member();
+        for (index, (_, part)) in parts.into_iter().enumerate() {
+            if index != 1 {
+                let _ = lacking.receive(1, part, ms(2));
+            }
+        }
+        assert!(!lacking.handed_in.contains_key(&0), "in without a part");
+        assert_eq!(
+            lacking.count(keys[2]),
+            Some(4),
+            "a part not taken as it came"
+        );
     }
 
     /// A pod no table names, heard once and then not for two silences — gone, or restarted as
@@ -2626,6 +3086,8 @@ mod tests {
             under: (1, 9),
             entries: vec![(key, Kept::new(Counts::of(7)))],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let said = node.receive(1, copy, ms(2));
         assert!(
@@ -2826,6 +3288,8 @@ mod tests {
             term,
             entries: vec![(key_in(shard), Kept::new(Counts::of(3)))],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let _ = node.receive(1, last, ms(5));
         assert!(
@@ -2851,6 +3315,8 @@ mod tests {
             term: moved.shards[usize::from(shard)].term,
             entries: vec![(key_in(shard), Kept::new(Counts::of(3)))],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let _ = early.receive(1, last, ms(3));
         let _ = early.receive(1, Message::TableReply { table: moved }, ms(4));
@@ -3020,6 +3486,8 @@ mod tests {
             term,
             entries: vec![(key_in(shard), Kept::new(Counts::of(3)))],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let _ = node.receive(1, last, ms(20));
         lease(&mut node, ms(21));
@@ -3420,6 +3888,8 @@ mod tests {
             under: (0, 0),
             entries: vec![(key, Kept::new(Counts::of(5)))],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let _ = node.receive(1, copy(None, 1), ms(2));
         let mut off = table.clone();
@@ -3463,6 +3933,8 @@ mod tests {
             under: (0, 0),
             entries: vec![(key_in(shard), Kept::new(Counts::of(5)))],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let _ = node.receive(1, whole, ms(2));
         let lacking = |out: &Outbox| {
@@ -3534,6 +4006,8 @@ mod tests {
             under: (0, 0),
             entries: vec![(key, Kept::new(Counts::of(count)))],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let _ = node.receive(1, copy(None, 1, 5), ms(2));
         let answer = node.receive(4, copy(Some(1), 2, 7), ms(3));
@@ -3569,6 +4043,8 @@ mod tests {
             under: (0, 0),
             entries: vec![(key, Kept::new(Counts::of(count)))],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let _ = node.receive(1, copy(1, None, 1, 5), ms(2));
         let _ = node.receive(1, copy(1, Some(1), 2, 6), ms(3));

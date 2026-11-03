@@ -32,6 +32,11 @@ pub struct Config {
     /// pod's: past it, at its next sweep, it evicts keys, those it may forget soonest first,
     /// down to nine tenths, the replicas of its own told; none, no cap.
     pub max_key_bytes: Option<u64>,
+    /// The most one part of a copy or a handoff carries, by the store's count of its keys'
+    /// bytes, at least one key a part: a shard's whole copy goes in as many parts as it takes,
+    /// so that what a message carries, and what its receiver holds of one, stays within this
+    /// however many keys a shard holds.
+    pub part_bytes: u64,
 }
 
 /// Why a config cannot be used.
@@ -45,13 +50,15 @@ pub enum ConfigError {
     Shards,
     /// A cycle of nothing.
     Cycle,
+    /// Parts of nothing.
+    PartBytes,
 }
 
 impl Config {
     /// The defaults: heartbeats every 100 ms, a pod stopping after 400 ms without a majority
     /// and taken out after 600 ms, elections spread over 200 ms, copies every 10 ms, 256 shards
-    /// with two replicas each, forming waiting 5 s on a pod holding the latest table, and no
-    /// cap on keys.
+    /// with two replicas each, forming waiting 5 s on a pod holding the latest table, no cap
+    /// on keys, and copies in parts of 1 MiB.
     #[must_use]
     pub const fn defaults() -> Self {
         Self {
@@ -64,6 +71,7 @@ impl Config {
             replicas: 2,
             form_wait: ms(5_000),
             max_key_bytes: None,
+            part_bytes: 1 << 20,
         }
     }
 
@@ -88,6 +96,9 @@ impl Config {
         if self.cycle == 0 {
             return Err(ConfigError::Cycle);
         }
+        if self.part_bytes == 0 {
+            return Err(ConfigError::PartBytes);
+        }
         Ok(())
     }
 }
@@ -107,5 +118,8 @@ mod tests {
         config.stop_serving = ms(400);
         config.shards = 0;
         assert_eq!(config.check(), Err(ConfigError::Shards));
+        config.shards = 256;
+        config.part_bytes = 0;
+        assert_eq!(config.check(), Err(ConfigError::PartBytes));
     }
 }

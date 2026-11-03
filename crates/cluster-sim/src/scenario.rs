@@ -87,6 +87,8 @@ pub struct Shape {
     pub max_key_bytes: Option<u64>,
     /// Replicas each shard has besides its owner.
     pub replicas: usize,
+    /// The most one part of a copy or a handoff carries: small, for copies in many parts.
+    pub part_bytes: u64,
 }
 
 impl Shape {
@@ -104,6 +106,7 @@ impl Shape {
             limit: None,
             max_key_bytes: None,
             replicas: 2,
+            part_bytes: Config::defaults().part_bytes,
         }
     }
 }
@@ -115,6 +118,7 @@ pub fn cluster(seed: u64, shape: Shape) -> (World, Vec<NodeId>) {
     config.shards = shape.shards;
     config.max_key_bytes = shape.max_key_bytes;
     config.replicas = shape.replicas;
+    config.part_bytes = shape.part_bytes;
     let mut world = World::new(seed, config);
     world.set_forwarding(shape.forwarding);
     let pods = world.start_cluster(shape.pods);
@@ -661,6 +665,7 @@ pub fn multi_key(seed: u64, shape: Shape, multi: crate::client::Multi, trouble: 
     config.shards = shape.shards;
     config.max_key_bytes = shape.max_key_bytes;
     config.replicas = shape.replicas;
+    config.part_bytes = shape.part_bytes;
     let mut world = World::new(seed, config);
     world.set_forwarding(shape.forwarding);
     let _pods = world.start_cluster(shape.pods);

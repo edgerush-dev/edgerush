@@ -1016,6 +1016,8 @@ mod tests {
                 },
             )],
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let _ = node.receive(1, last, ms(41));
         let whole: Outbox = (42..=55).flat_map(|at| node.tick(ms(at))).collect();

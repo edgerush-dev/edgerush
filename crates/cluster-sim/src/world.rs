@@ -170,6 +170,11 @@ enum Event<Message> {
 pub struct Stats {
     /// Copies an owner sent a replica again: the same shard, shard term and number.
     pub copies_again: u64,
+    /// Parts of copies and handoffs sent with more to follow: copies in more than one part.
+    pub parts_more: u64,
+    /// Parts of copies and handoffs that carried past `part_bytes`, more than one key among
+    /// them: never, however many keys a shard holds.
+    pub parts_over: u64,
     /// Requests counted more than once: a second answer "counted" sent a client for one.
     pub counted_twice: u64,
     /// Requests a client sent that could not reach their pod.
@@ -288,7 +293,7 @@ pub struct Sim<M: Mode> {
     /// Whether clients have stopped sending.
     clients_stopped: bool,
     /// Every copy sent: owner, replica, shard, shard term and number.
-    copies: BTreeSet<(NodeId, NodeId, ShardId, u64, u64)>,
+    copies: BTreeSet<(NodeId, NodeId, ShardId, u64, u64, u32)>,
     /// Every request a client has been answered "counted" for: the client and its number.
     answered_counted: BTreeSet<(NodeId, u64)>,
     /// Every give-back a client has sent, which it may send more than once.
@@ -776,11 +781,38 @@ impl<M: Mode> Sim<M> {
             shard,
             term,
             version,
+            part,
             ..
         }) = M::as_store(&message)
-            && !self.copies.insert((from, to, *shard, *term, *version))
+            && !self
+                .copies
+                .insert((from, to, *shard, *term, *version, *part))
         {
             self.stats.copies_again += 1;
+        }
+        if let Some(
+            StoreMessage::Replicate {
+                entries,
+                dropped,
+                more,
+                ..
+            }
+            | StoreMessage::Handoff {
+                entries,
+                dropped,
+                more,
+                ..
+            },
+        ) = M::as_store(&message)
+        {
+            let bytes = entries.iter().map(|(_, kept)| kept.bytes()).sum::<u64>()
+                + 8 * dropped.len() as u64;
+            if bytes > self.config.part_bytes && entries.len() + dropped.len() > 1 {
+                self.stats.parts_over += 1;
+            }
+            if *more {
+                self.stats.parts_more += 1;
+            }
         }
         M::on_send(self, from, to, &message);
         let link = self.link(from, to);
@@ -1165,7 +1197,9 @@ fn address(id: NodeId) -> String {
 
 /// About how many bytes a store's message takes on the wire. Members' addresses, a few tens
 /// of bytes each, are left out: under a hundredth of a table at 256 shards, and sizes set when
-/// messages arrive, so that counting them would move every run measured before them.
+/// messages arrive, so that counting them would move every run measured before them. A copy's
+/// part number and whether more follow are within the 32 each message is given; each part of
+/// a copy in parts is a message of its own, with its own.
 fn store_size<V: Held>(message: &StoreMessage<V>) -> u64 {
     // Each key with its value, as the store sizes it, and each key dropped.
     let entries = |entries: &[(u64, edgerush_cluster::Kept<V>)], dropped: &[u64]| {
