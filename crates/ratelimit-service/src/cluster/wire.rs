@@ -343,6 +343,12 @@ pub struct Replicate<W: prost::Message + Default + Debug> {
     /// The keys evicted.
     #[prost(fixed64, repeated, tag = "8")]
     pub dropped: Vec<u64>,
+    /// The part's number in the copy, from 0.
+    #[prost(uint32, tag = "9")]
+    pub part: u32,
+    /// Whether more parts follow.
+    #[prost(bool, tag = "10")]
+    pub more: bool,
 }
 
 /// A replica's answer to a copy.
@@ -388,6 +394,12 @@ pub struct Handoff<W: prost::Message + Default + Debug> {
     /// The keys evicted.
     #[prost(fixed64, repeated, tag = "4")]
     pub dropped: Vec<u64>,
+    /// The part's number, from 0.
+    #[prost(uint32, tag = "5")]
+    pub part: u32,
+    /// Whether more parts follow.
+    #[prost(bool, tag = "6")]
+    pub more: bool,
 }
 
 /// An owner's word to a taker that it has caught up.
@@ -543,6 +555,8 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             under,
             entries,
             dropped,
+            part,
+            more,
         } => Outgoing::Copy(ToCopy {
             from,
             message: Some(Copying::Replicate(Replicate {
@@ -554,6 +568,8 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
                 under: Some(stamp(under)),
                 entries: entries_to_wire(entries),
                 dropped,
+                part,
+                more,
             })),
         }),
         Message::Replicated {
@@ -660,11 +676,15 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             term,
             entries,
             dropped,
+            part,
+            more,
         } => peer(Control::Handoff(Handoff {
             shard: u32::from(shard),
             term,
             entries: entries_to_wire(entries),
             dropped,
+            part,
+            more,
         })),
         Message::CaughtUp {
             shard,
@@ -783,6 +803,8 @@ pub fn from_peer<V: Value>(sent: ToPeer<V::Wire>) -> Result<(NodeId, Message<V>)
             term: handoff.term,
             entries: entries_from(handoff.entries)?,
             dropped: handoff.dropped,
+            part: handoff.part,
+            more: handoff.more,
         },
         Control::CaughtUp(caught) => Message::CaughtUp {
             shard: shard_id(caught.shard)?,
@@ -813,6 +835,8 @@ pub fn from_copy<V: Value>(sent: ToCopy<V::Wire>) -> Result<(NodeId, Message<V>)
             under: stamp_from(copy.under)?,
             entries: entries_from(copy.entries)?,
             dropped: copy.dropped,
+            part: copy.part,
+            more: copy.more,
         },
         Copying::Replicated(answer) => Message::Replicated {
             shard: shard_id(answer.shard)?,
@@ -1306,9 +1330,19 @@ mod tests {
                 stamps(),
                 entries(),
                 prop::collection::vec(any::<u64>(), 0..4),
+                any::<(u32, bool)>(),
             )
                 .prop_map(
-                    |(shard, (term, assignment), after, version, under, entries, dropped)| {
+                    |(
+                        shard,
+                        (term, assignment),
+                        after,
+                        version,
+                        under,
+                        entries,
+                        dropped,
+                        (part, more),
+                    )| {
                         Message::Replicate {
                             shard,
                             term,
@@ -1318,6 +1352,8 @@ mod tests {
                             under,
                             entries,
                             dropped,
+                            part,
+                            more,
                         }
                     }
                 ),
@@ -1336,12 +1372,17 @@ mod tests {
                 any::<u64>(),
                 entries(),
                 prop::collection::vec(any::<u64>(), 0..4),
+                any::<(u32, bool)>(),
             )
-                .prop_map(|(shard, term, entries, dropped)| Message::Handoff {
-                    shard,
-                    term,
-                    entries,
-                    dropped,
+                .prop_map(|(shard, term, entries, dropped, (part, more))| {
+                    Message::Handoff {
+                        shard,
+                        term,
+                        entries,
+                        dropped,
+                        part,
+                        more,
+                    }
                 }),
             (any::<ShardId>(), stamps())
                 .prop_map(|(shard, from)| Message::CaughtUp { shard, from }),
@@ -1509,6 +1550,8 @@ mod tests {
                     forget_at: 0,
                 }],
                 dropped: Vec::new(),
+                part: 0,
+                more: false,
             })),
         };
         assert_eq!(from_peer::<SyncValue>(handoff(None)), Err(Invalid::Missing));
@@ -1616,6 +1659,8 @@ mod tests {
             under: (1, 1),
             entries: (0..300).map(|key| (key, kept.clone())).collect(),
             dropped: Vec::new(),
+            part: 0,
+            more: false,
         };
         let Outgoing::Copy(sent) = wire(2, copy.clone()) else {
             panic!("a copy goes on the copy stream");

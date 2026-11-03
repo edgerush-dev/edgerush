@@ -68,6 +68,71 @@ fn copies_lost_are_repaired_once_the_network_heals() {
     }
 }
 
+/// Copies in many parts, on a lossy network that loses some of them, end as copies whole
+/// would: repaired once it heals, every replica holding its owner's counts, an owner crashing
+/// then losing nothing; with nothing lost, no part is sent twice; and no part carries more
+/// than its bound.
+#[test]
+fn copies_in_parts_are_repaired_and_lose_nothing_on_failover() {
+    // Parts of about two keys: every whole copy of a shard's hundred keys in fifty.
+    let parted = Shape {
+        preload: 100,
+        part_bytes: 100,
+        ..shape()
+    };
+    for seed in SEEDS {
+        let (mut world, _) = scenario::cluster(seed, parted);
+        let before = world.stats.copies_again;
+        world.run_for(ms(1_000));
+        assert_eq!(
+            world.stats.copies_again - before,
+            0,
+            "seed {seed}: sent twice"
+        );
+        world.set_default_link(Link {
+            loss_per_million: 100_000,
+            ..Link::lan()
+        });
+        world.run_for(ms(2_000));
+        world.stop_clients();
+        world.set_default_link(Link::lan());
+        assert!(
+            world.run_while_not(ms(5_000), World::settled).is_some(),
+            "seed {seed}"
+        );
+        world.run_for(ms(1_000));
+        assert_eq!(
+            world.stale_copies(),
+            0,
+            "seed {seed}: copies never repaired"
+        );
+        let owner = world
+            .alive()
+            .find(|pod| Some(*pod) != world.leader())
+            .unwrap();
+        world.crash(owner);
+        assert!(
+            world.run_while_not(ms(5_000), World::settled).is_some(),
+            "seed {seed}"
+        );
+        assert_eq!(
+            world.lost(),
+            0,
+            "seed {seed}: lost on failover after the repair"
+        );
+        assert!(world.stats.parts_more > 0, "seed {seed}: no copy in parts");
+        assert_eq!(
+            world.stats.parts_over, 0,
+            "seed {seed}: parts past the bound"
+        );
+        assert!(
+            world.stats.violations.is_empty(),
+            "{:?}",
+            world.stats.violations
+        );
+    }
+}
+
 /// Past `max_key_bytes`, every pod evicts down within it, owned keys and copies alike, and an
 /// owner's evictions reach its replicas: no replica keeps a key its owner evicted, so one
 /// promoted when the owner crashes brings none of them back at their old counts.

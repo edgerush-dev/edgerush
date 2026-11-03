@@ -2,7 +2,8 @@
 //! links lost one way, loss and jitter, clocks run fast or slow, every pod cut apart — with
 //! never more than one pod down at once, as the store sees it, a new one started in its place.
 //! Over every run: nothing that must never happen does, two pods serve one shard only briefly,
-//! and once the network is whole again the cluster settles (G2).
+//! no part of a copy passes its bound, and once the network is whole again the cluster settles
+//! (G2). `CHAOS_PART_BYTES` runs them with copies in small parts.
 
 #![allow(
     clippy::unwrap_used,
@@ -36,8 +37,15 @@ fn survivable(world: &World, victim: NodeId) -> bool {
 }
 
 fn run(seed: u64) -> Run {
+    // CHAOS_PART_BYTES cuts copies and handoffs into parts that small, so that runs go through
+    // copies in many parts.
+    let part_bytes = std::env::var("CHAOS_PART_BYTES")
+        .ok()
+        .and_then(|bytes| bytes.parse().ok())
+        .unwrap_or(Shape::defaults().part_bytes);
     let shape = Shape {
         shards: 16,
+        part_bytes,
         ..Shape::defaults()
     };
     let (mut world, _) = scenario::cluster(seed, shape);
@@ -170,6 +178,10 @@ fn random_faults_never_break_the_rules_and_the_cluster_always_settles() {
             settled,
         } = run(seed);
         let stats = &world.stats;
+        assert_eq!(
+            stats.parts_over, 0,
+            "seed {seed}: a part of a copy past its bound after {faults:?}"
+        );
         assert!(
             stats.violations.is_empty(),
             "seed {seed}: {:?} after {faults:?}",

@@ -129,7 +129,9 @@ pub enum Message<V> {
     /// A member asks to be let go: its shards handed on, then it may stop.
     Drain,
     /// An owner's copy of what changed in `shard` since its copy numbered `after`, or of all
-    /// it holds if none, to a replica: numbered `version`.
+    /// it holds if none, to a replica: numbered `version`. One part of it: a copy goes in
+    /// parts of at most [`Config::part_bytes`](crate::Config::part_bytes), each numbered the
+    /// same, so that no message grows with the keys a shard holds.
     Replicate {
         /// The shard.
         shard: ShardId,
@@ -148,6 +150,11 @@ pub enum Message<V> {
         /// Keys the owner no longer holds, evicted: dropped by a replica holding the copies
         /// before this one, as a deletion is not to be taken out of order.
         dropped: Vec<u64>,
+        /// The part's number in the copy, from 0.
+        part: u32,
+        /// Whether more parts follow: the copy is held, and said held, only once its last
+        /// part is in with every part before it.
+        more: bool,
     },
     /// A replica's answer to a [`Message::Replicate`]: how far it holds `shard`, under `term`,
     /// without a gap; 0 for not at all.
@@ -169,7 +176,8 @@ pub enum Message<V> {
         /// Its term, as the replica knows it.
         term: u64,
     },
-    /// An owner handing `shard` on stops answering for it and sends everything it holds.
+    /// An owner handing `shard` on stops answering for it and sends everything it holds. One
+    /// part of it, as a [`Message::Replicate`] is.
     Handoff {
         /// The shard.
         shard: ShardId,
@@ -179,6 +187,11 @@ pub enum Message<V> {
         entries: Vec<(u64, Kept<V>)>,
         /// Keys it no longer holds, evicted, that the taker may hold as a replica.
         dropped: Vec<u64>,
+        /// The part's number, from 0.
+        part: u32,
+        /// Whether more parts follow: the changes are in only once the last is, with every
+        /// part before it.
+        more: bool,
     },
     /// From an owner to the taker of `shard`: it has caught up on the move planned from table
     /// `from`; it tells the leader so itself, which only a taker alive can.
