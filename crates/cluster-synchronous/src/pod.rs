@@ -605,6 +605,7 @@ mod tests {
                     committed: node.store().committed_stamp(),
                     fresh: false,
                     sent: now,
+                    wall: 0,
                     hears: vec![(1, now), (2, now), (3, now)],
                     leased: true,
                 };
@@ -713,6 +714,7 @@ mod tests {
                     committed: node.store().committed_stamp(),
                     fresh: false,
                     sent: now,
+                    wall: 0,
                     hears: vec![(1, now), (2, now), (3, now)],
                     leased: true,
                 };
@@ -798,6 +800,7 @@ mod tests {
                     committed: node.store().committed_stamp(),
                     fresh: false,
                     sent: now,
+                    wall: 0,
                     hears: vec![(1, now), (2, now), (3, now)],
                     leased: true,
                 };
@@ -883,6 +886,7 @@ mod tests {
                 committed: table.stamp(),
                 fresh: false,
                 sent: ms(2),
+                wall: 0,
                 hears: vec![(1, ms(2)), (2, ms(2)), (3, ms(2))],
                 leased: true,
             };
@@ -956,6 +960,7 @@ mod tests {
                 committed: table.stamp(),
                 fresh: false,
                 sent: ms(2),
+                wall: 0,
                 hears: vec![(1, ms(2)), (2, ms(2)), (3, ms(2))],
                 leased: true,
             };
@@ -1038,6 +1043,7 @@ mod tests {
                 committed: table.stamp(),
                 fresh: false,
                 sent: ms(2),
+                wall: 0,
                 hears: vec![(1, ms(2)), (2, ms(2)), (3, ms(2))],
                 leased: true,
             };

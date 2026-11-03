@@ -205,6 +205,10 @@ pub struct Heartbeat {
     /// Whether it holds a lease.
     #[prost(bool, tag = "7")]
     pub leased: bool,
+    /// The sender's wall clock when it sent it, in nanoseconds since the Unix epoch: 0 for
+    /// none.
+    #[prost(uint64, tag = "8")]
+    pub wall: u64,
 }
 
 /// Nothing more than what the message is.
@@ -628,6 +632,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             committed,
             fresh,
             sent,
+            wall,
             hears,
             leased,
         } => peer(Control::Heartbeat(Heartbeat {
@@ -641,6 +646,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
                 .map(|(pod, sent)| Heard { pod, sent })
                 .collect(),
             leased,
+            wall,
         })),
         Message::TableRequest => peer(Control::TableRequest(Empty {})),
         Message::TableReply { table } => peer(Control::TableReply(table_to_wire(table))),
@@ -767,6 +773,7 @@ pub fn from_peer<V: Value>(sent: ToPeer<V::Wire>) -> Result<(NodeId, Message<V>)
             committed: stamp_from(beat.committed)?,
             fresh: beat.fresh,
             sent: beat.sent,
+            wall: beat.wall,
             hears: beat
                 .hears
                 .into_iter()
@@ -1331,21 +1338,24 @@ mod tests {
                 prop::option::of(any::<u64>()),
                 stamps(),
                 any::<bool>(),
-                any::<u64>(),
+                any::<(u64, u64)>(),
                 prop::collection::vec(any::<(u64, u64)>(), 0..4),
                 any::<bool>(),
             )
-                .prop_map(|(term, leader, committed, fresh, sent, hears, leased)| {
-                    Message::Heartbeat {
-                        term,
-                        leader,
-                        committed,
-                        fresh,
-                        sent,
-                        hears,
-                        leased,
-                    }
-                }),
+                .prop_map(
+                    |(term, leader, committed, fresh, (sent, wall), hears, leased)| {
+                        Message::Heartbeat {
+                            term,
+                            leader,
+                            committed,
+                            fresh,
+                            sent,
+                            wall,
+                            hears,
+                            leased,
+                        }
+                    },
+                ),
             Just(Message::TableRequest),
             table().prop_map(|table| Message::TableReply { table }),
             (any::<u64>(), stamps())

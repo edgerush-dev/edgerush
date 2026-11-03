@@ -1204,7 +1204,7 @@ fn address(id: NodeId) -> String {
 }
 
 /// About how many bytes a store's message takes on the wire. Members' addresses, a few tens
-/// of bytes each, are left out: under a hundredth of a table at 256 shards, and sizes set when
+/// of bytes each, and a heartbeat's wall clock, eight, are left out: under a hundredth of a table at 256 shards, and sizes set when
 /// messages arrive, so that counting them would move every run measured before them. A copy's
 /// part number and whether more follow are within the 32 each message is given; each part of
 /// a copy in parts is a message of its own, with its own.

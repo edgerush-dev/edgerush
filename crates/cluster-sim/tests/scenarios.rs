@@ -192,6 +192,58 @@ fn a_ready_pod_stays_ready_while_another_goes_quiet() {
     }
 }
 
+/// A pod whose wall clock is off by more than `skew_warning` (250 ms) is told skewed by every
+/// other, by about how far, and tells them skewed the other way; one off by less, or not at
+/// all, is told skewed by none; nor is it once it has drained and been forgotten.
+#[test]
+fn a_pod_whose_wall_clock_is_off_is_told_skewed_by_the_others() {
+    let near = |told: i64, skew: i64| (told - skew).unsigned_abs() <= ms(50);
+    for seed in SEEDS {
+        for skew in [0, ms(100), ms(400)] {
+            for ahead in [true, false] {
+                let skew = i64::try_from(skew).unwrap();
+                let skew = if ahead { skew } else { -skew };
+                let (mut world, pods) = scenario::cluster(seed, shape());
+                world.set_wall_skew(pods[0], skew);
+                world.run_for(ms(1_000));
+                let off = skew.unsigned_abs() > ms(250);
+                let told = |by: edgerush_cluster::NodeId| world.node(by).unwrap().skewed();
+                for other in &pods[1..] {
+                    let by_other = told(*other);
+                    let of_it = told(pods[0]).get(other).copied();
+                    if off {
+                        assert!(
+                            by_other.len() == 1
+                                && by_other.get(&pods[0]).is_some_and(|told| near(*told, skew)),
+                            "seed {seed} skew {skew}: {other} told {by_other:?}"
+                        );
+                        assert!(
+                            of_it.is_some_and(|told| near(told, -skew)),
+                            "seed {seed} skew {skew}: {other} told {of_it:?}"
+                        );
+                    } else {
+                        assert!(
+                            by_other.is_empty() && of_it.is_none(),
+                            "seed {seed} skew {skew}: {other} told {by_other:?}, and {of_it:?}"
+                        );
+                    }
+                }
+                // Drained and forgotten, it is told skewed by none.
+                world.drain(pods[0]);
+                assert!(world.run_while_not(ms(10_000), World::settled).is_some());
+                world.run_for(ms(3_000));
+                for other in &pods[1..] {
+                    let by_other = world.node(*other).unwrap().skewed();
+                    assert!(
+                        by_other.is_empty(),
+                        "seed {seed} skew {skew}: {other} told {by_other:?} once it was gone"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// A ready pod stays ready while shards move to a pod added: only the new pod waits for
 /// them.
 #[test]

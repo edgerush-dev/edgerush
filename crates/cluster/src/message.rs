@@ -24,6 +24,8 @@ pub enum Message<V> {
         fresh: bool,
         /// When it was sent, on the sender's own clock.
         sent: Time,
+        /// The sender's wall clock when it sent it: 0 for none.
+        wall: Time,
         /// The pods it has heard within `stop_serving`, each with when that pod sent the latest
         /// heartbeat it heard, on that pod's clock: so that each knows who hears it, and since
         /// when, timed on its own clock.

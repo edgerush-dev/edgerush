@@ -72,6 +72,8 @@ struct Heard {
     fresh: bool,
     /// When it sent it, on its own clock: echoed back in this pod's heartbeats.
     sent: Time,
+    /// Its wall clock when it sent it: 0 for none.
+    wall: Time,
     /// When this pod sent the latest heartbeat it had heard from this pod, on this pod's
     /// clock, if it heard one lately: what a lease is timed from.
     echo: Option<Time>,
@@ -194,6 +196,9 @@ pub struct Node<V> {
     /// The leader it follows in its term, itself if it leads.
     leader: Option<NodeId>,
     heard: BTreeMap<NodeId, Heard>,
+    /// How far each peer's wall clock is off from its own, ahead if positive, as its latest
+    /// heartbeat with a round trip short enough to tell says.
+    skews: BTreeMap<NodeId, i64>,
     /// Tables, shared rather than copied where they are read: one never changes once made.
     accepted: Option<Arc<Table>>,
     committed: Option<Arc<Table>>,
@@ -296,6 +301,7 @@ impl<V: Held> Node<V> {
             role: Role::Follower,
             leader: None,
             heard: BTreeMap::new(),
+            skews: BTreeMap::new(),
             accepted: None,
             committed: None,
             beat_at: None,
@@ -605,8 +611,38 @@ impl<V: Held> Node<V> {
         for peer in gone {
             self.peers.remove(&peer);
             self.heard.remove(&peer);
+            self.skews.remove(&peer);
             self.accepted_by.remove(&peer);
         }
+    }
+
+    /// The peers whose wall clocks are off from its own by more than `skew_warning`, each by
+    /// how far, ahead if positive, as their heartbeats last told.
+    #[must_use]
+    pub fn skewed(&self) -> BTreeMap<NodeId, i64> {
+        let most = self.config.skew_warning;
+        self.skews
+            .iter()
+            .filter(|(_, skew)| skew.unsigned_abs() > most)
+            .map(|(peer, skew)| (*peer, *skew))
+            .collect()
+    }
+
+    /// How far the wall clock of `heard`'s sender is off from its own, ahead if positive: the
+    /// sender's when it sent it against its own in the middle of the round trip its echo
+    /// measures, the sending somewhere within it. None without an echo or a wall clock, or over
+    /// a round trip longer than two heartbeats, whose middle tells too little.
+    fn skew_of(&self, heard: &Heard) -> Option<i64> {
+        let echo = heard.echo?;
+        if heard.wall == 0 {
+            return None;
+        }
+        let trip = heard.at.checked_sub(echo)?;
+        if trip > self.config.heartbeat.saturating_mul(2) {
+            return None;
+        }
+        let middle = self.wall(echo.saturating_add(trip / 2));
+        i64::try_from(i128::from(heard.wall) - i128::from(middle)).ok()
     }
 
     /// Told to stop: it hands its shards on and leaves the voting set first. Done once
@@ -753,6 +789,7 @@ impl<V: Held> Node<V> {
             committed: self.committed_stamp(),
             fresh: self.committed.is_none(),
             sent: now,
+            wall: self.wall(now),
             hears: self
                 .heard
                 .iter()
@@ -1160,6 +1197,7 @@ impl<V: Held> Node<V> {
             committed,
             fresh,
             sent,
+            wall,
             hears,
             leased,
             ..
@@ -1173,6 +1211,7 @@ impl<V: Held> Node<V> {
             committed,
             fresh,
             sent,
+            wall,
             hears,
             leased,
         };
@@ -1810,6 +1849,7 @@ impl<V: Held> Node<V> {
                 committed,
                 fresh,
                 sent,
+                wall,
                 hears,
                 leased,
             } => {
@@ -1826,6 +1866,7 @@ impl<V: Held> Node<V> {
                         committed,
                         fresh,
                         sent,
+                        wall,
                         echo,
                         leased,
                     },
@@ -2242,6 +2283,9 @@ impl<V: Held> Node<V> {
             .is_some_and(|held| held.sent > heard.sent)
         {
             return;
+        }
+        if let Some(skew) = self.skew_of(&heard) {
+            self.skews.insert(from, skew);
         }
         let Heard {
             at: now,
@@ -3549,6 +3593,7 @@ mod tests {
             committed: (0, 0),
             fresh: true,
             sent: ms(2),
+            wall: 0,
             hears: Vec::new(),
             leased: true,
         };
@@ -3576,6 +3621,7 @@ mod tests {
             committed: (0, 0),
             fresh: false,
             sent,
+            wall: 0,
             hears: Vec::new(),
             leased: true,
         };
@@ -3590,6 +3636,37 @@ mod tests {
             _ => None,
         });
         assert_eq!(echoed, Some(ms(50)));
+    }
+
+    /// A peer's wall clock is told from its heartbeat against the middle of the round trip its
+    /// echo measures: one off by more than `skew_warning` is skewed, one within it is not, and
+    /// a heartbeat over a round trip too long, or with no wall clock, tells nothing.
+    #[test]
+    fn a_peer_whose_wall_clock_is_off_by_more_than_the_warning_is_skewed() {
+        let mut node = member();
+        node.set_wall_offset(i64::try_from(ms(10_000)).unwrap());
+        let beat = |sent, wall, echo| Message::Heartbeat {
+            term: 1,
+            leader: None,
+            committed: (0, 0),
+            fresh: false,
+            sent,
+            wall,
+            hears: vec![(2, echo)],
+            leased: true,
+        };
+        let skew = |time: Time| i64::try_from(time).unwrap();
+        // Its own heartbeat sent at 950 ms echoed at 1 s: its wall clock 10.975 s in between.
+        let _ = node.receive(1, beat(ms(10), ms(11_275), ms(950)), ms(1_000));
+        let _ = node.receive(3, beat(ms(10), ms(10_775), ms(950)), ms(1_000));
+        assert_eq!(node.skewed(), BTreeMap::from([(1, skew(ms(300)))]));
+        // A round trip of three heartbeats, and no wall clock, leave what it had.
+        let _ = node.receive(1, beat(ms(20), ms(10_850), ms(700)), ms(1_000));
+        let _ = node.receive(1, beat(ms(30), 0, ms(990)), ms(1_000));
+        assert_eq!(node.skewed(), BTreeMap::from([(1, skew(ms(300)))]));
+        // Back in step.
+        let _ = node.receive(1, beat(ms(40), ms(11_095), ms(1_090)), ms(1_100));
+        assert!(node.skewed().is_empty());
     }
 
     /// A table from the leader it follows is as good as a heartbeat: just given one, it grants
@@ -3677,6 +3754,7 @@ mod tests {
             committed: (0, 0),
             fresh: false,
             sent: ms(1),
+            wall: 0,
             hears: Vec::new(),
             leased: true,
         };
@@ -3700,6 +3778,7 @@ mod tests {
             committed: (0, 0),
             fresh: false,
             sent: ms(2),
+            wall: 0,
             hears: Vec::new(),
             leased: true,
         };
@@ -3860,6 +3939,7 @@ mod tests {
                 committed: (1, 1),
                 fresh: false,
                 sent: ms(5),
+                wall: 0,
                 hears: vec![(1, ms(5)), (2, ms(5)), (3, ms(5))],
                 leased: true,
             };
@@ -3933,6 +4013,7 @@ mod tests {
                     committed: node.committed_stamp(),
                     fresh: false,
                     sent: now,
+                    wall: 0,
                     hears: vec![(1, now), (2, now), (3, now)],
                     leased: true,
                 };
@@ -4028,6 +4109,7 @@ mod tests {
                     committed: node.committed_stamp(),
                     fresh: false,
                     sent: now,
+                    wall: 0,
                     hears: vec![(1, now), (2, now), (3, now)],
                     leased: true,
                 };
@@ -4113,6 +4195,7 @@ mod tests {
                     committed: node.committed_stamp(),
                     fresh: false,
                     sent: now,
+                    wall: 0,
                     hears: vec![(1, now), (2, now), (3, now)],
                     leased: true,
                 };
@@ -4274,6 +4357,7 @@ mod tests {
                     committed: owner.committed_stamp(),
                     fresh: false,
                     sent: now,
+                    wall: 0,
                     hears: vec![(1, now), (2, now), (3, now)],
                     leased: true,
                 };
@@ -4318,6 +4402,7 @@ mod tests {
                     committed: table.stamp(),
                     fresh: false,
                     sent: now,
+                    wall: 0,
                     hears: vec![(1, now)],
                     leased: true,
                 };
@@ -4377,6 +4462,7 @@ mod tests {
                     committed: owner.committed_stamp(),
                     fresh: false,
                     sent: now,
+                    wall: 0,
                     hears: vec![(1, now), (2, now), (3, now)],
                     leased: true,
                 };
@@ -4436,6 +4522,7 @@ mod tests {
                         committed: owner.committed_stamp(),
                         fresh: false,
                         sent: now,
+                        wall: 0,
                         hears: vec![(1, now), (2, now), (3, now)],
                         leased: true,
                     };
@@ -4836,6 +4923,7 @@ mod tests {
                     committed: node.committed_stamp(),
                     fresh: false,
                     sent: now,
+                    wall: 0,
                     hears: vec![(1, now), (2, now), (3, now)],
                     leased: true,
                 };
@@ -4903,6 +4991,7 @@ mod tests {
                     committed: node.committed_stamp(),
                     fresh: false,
                     sent: now,
+                    wall: 0,
                     hears: vec![(1, now), (2, now), (3, now)],
                     leased: true,
                 };
@@ -4971,6 +5060,7 @@ mod tests {
             committed: (1, 1),
             fresh: false,
             sent: ms(10),
+            wall: 0,
             hears: vec![(1, ms(10)), (2, ms(10)), (3, ms(10))],
             leased: true,
         };
