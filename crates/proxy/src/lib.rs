@@ -142,7 +142,7 @@ pub mod websocket;
 mod websocket;
 
 pub use fields::OverlayFull;
-pub use forwarding::Client;
+pub use forwarding::{Asked, Client};
 pub use hop_by_hop::ConnectionError;
 pub use host::HostError;
 pub use metrics::AcceptPause;

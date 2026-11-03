@@ -243,8 +243,8 @@ pub struct RateLimitServiceTls {
     pub certificate: String,
 }
 
-/// A place where requests come in. Hostnames are to come; until a listener can be told
-/// from another by hostname, each needs an address of its own.
+/// A place where requests come in, at an address of its own. Listeners in Gateway API's
+/// sense that share one's port, told apart by hostname, are its TLS's `shared_by`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -436,6 +436,42 @@ pub struct Tls {
     /// client is served.
     #[serde(default)]
     pub client_validation: Option<ClientValidation>,
+    /// The listeners, in Gateway API's sense, that share this one's port, each by its
+    /// hostnames: a request on a connection made for one of them that is for another's
+    /// host is answered 421 Misdirected Request (03 §3 in the docs). Which one a name is
+    /// for is the most specific hostname covering it, the client's SNI for the connection
+    /// and the request's host for the request; a client that asks for no name is the
+    /// catch-all's, `*`'s. None or one, and nothing is checked.
+    #[serde(default)]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(length(max = crate::compile::MOST_SHARING))
+    )]
+    pub shared_by: Vec<SharingListener>,
+}
+
+/// One of the listeners sharing an `https` listener's port.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SharingListener {
+    /// Its hostnames, none of them another's: Gateway API's listener has one, or `*`
+    /// for none; the hosts an Ingress serves over TLS there are one listener together.
+    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
+    pub hostnames: Vec<SharingHostname>,
+}
+
+/// A hostname of a listener sharing a port.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SharingHostname {
+    /// An exact name, a wildcard (`*.example.com`), or `*`, the catch-all.
+    pub name: String,
+    /// What the `*` of a wildcard name stands for, as a route's hostname says it.
+    /// Required for a wildcard name; without meaning, and ignored, for any other.
+    #[serde(default)]
+    pub wildcard: Option<crate::Wildcard>,
 }
 
 /// A certificate a listener presents, by its name: for every DNS name it carries, or for

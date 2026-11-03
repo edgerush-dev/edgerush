@@ -685,7 +685,7 @@
       ]
     },
     "Listener": {
-      "description": "A place where requests come in. Hostnames are to come; until a listener can be told\nfrom another by hostname, each needs an address of its own.",
+      "description": "A place where requests come in, at an address of its own. Listeners in Gateway API's\nsense that share one's port, told apart by hostname, are its TLS's `shared_by`.",
       "type": "object",
       "properties": {
         "access_log": {
@@ -1599,6 +1599,50 @@
         }
       ]
     },
+    "SharingHostname": {
+      "description": "A hostname of a listener sharing a port.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "An exact name, a wildcard (`*.example.com`), or `*`, the catch-all.",
+          "type": "string"
+        },
+        "wildcard": {
+          "description": "What the `*` of a wildcard name stands for, as a route's hostname says it.\nRequired for a wildcard name; without meaning, and ignored, for any other.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Wildcard"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "SharingListener": {
+      "description": "One of the listeners sharing an `https` listener's port.",
+      "type": "object",
+      "properties": {
+        "hostnames": {
+          "description": "Its hostnames, none of them another's: Gateway API's listener has one, or `*`\nfor none; the hosts an Ingress serves over TLS there are one listener together.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SharingHostname"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "hostnames"
+      ]
+    },
     "SlowStart": {
       "description": "Slow start: an endpoint added to an upstream\nthat keeps an endpoint it had, or passing its checks again after failing them, takes a\nshare rising linearly from a tenth of a full one to all of it over the window.",
       "type": "object",
@@ -1738,6 +1782,15 @@
           "items": {
             "type": "string"
           }
+        },
+        "shared_by": {
+          "description": "The listeners, in Gateway API's sense, that share this one's port, each by its\nhostnames: a request on a connection made for one of them that is for another's\nhost is answered 421 Misdirected Request. Which one a name is\nfor is the most specific hostname covering it, the client's SNI for the connection\nand the request's host for the request; a client that asks for no name is the\ncatch-all's, `*`'s. None or one, and nothing is checked.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SharingListener"
+          },
+          "maxItems": 65
         },
         "without_sni": {
           "description": "The certificate for a client that asks for no name (no SNI): one of\n`certificates`, or `none` to refuse such a client in the handshake. Said on every\nlistener with TLS, so that which one is never left to their order. It holds for the\nlistener's HTTP/3 socket too.",

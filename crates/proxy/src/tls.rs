@@ -33,7 +33,9 @@ use boring::ssl::{
 use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
 use edgerush_certificates::{CertificateError, Identity};
-use edgerush_config::{ClientValidation, CompiledTls, NamedCertificate, PresentedCertificate};
+use edgerush_config::{
+    ClientValidation, CompiledTls, NamedCertificate, PresentedCertificate, SharedListeners,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -270,6 +272,16 @@ impl Tls {
     /// it validates clients as the front was made to.
     pub(crate) fn same_front(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.front, &other.front)
+    }
+
+    /// The listeners sharing its port, where two or more do.
+    pub(crate) fn shared_by(&self) -> Option<&Arc<SharedListeners>> {
+        self.source.shared_by.as_ref()
+    }
+
+    /// Whether this and `other` tell the same listeners apart, or none.
+    pub(crate) fn shares_alike(&self, other: &Self) -> bool {
+        self.source.shared_by == other.source.shared_by
     }
 }
 
@@ -802,6 +814,7 @@ mod tests {
             without_sni: Some(0),
             refused: Vec::new(),
             client_validation: None,
+            shared_by: None,
         };
         let tls = Tls::new(&source).unwrap();
         assert!(tls.is_for(&source));
@@ -810,6 +823,7 @@ mod tests {
             without_sni: Some(0),
             refused: Vec::new(),
             client_validation: None,
+            shared_by: None,
         };
         assert!(!tls.is_for(&other));
     }
@@ -828,6 +842,7 @@ mod tests {
                 without_sni: Some(0),
                 refused: Vec::new(),
                 client_validation: None,
+                shared_by: None,
             })
             .map(|_| ())
         };
@@ -875,6 +890,7 @@ mod tests {
                 without_sni: Some(0),
                 refused: Vec::new(),
                 client_validation: Some(edgerush_config::ClientValidation { authorities }),
+                shared_by: None,
             })
             .map(|_| ())
         };
@@ -932,6 +948,7 @@ mod tests {
                     without_sni,
                     refused: Vec::new(),
                     client_validation: None,
+                    shared_by: None,
                 })
                 .unwrap()
             };
@@ -979,6 +996,7 @@ mod tests {
                 without_sni: None,
                 refused: Vec::new(),
                 client_validation: None,
+                shared_by: None,
             })
             .unwrap();
             let offering = |schemes: &str| {
@@ -1014,6 +1032,7 @@ mod tests {
                 without_sni: None,
                 refused: Vec::new(),
                 client_validation: None,
+                shared_by: None,
             })
             .unwrap();
             for (name, shown) in [("a.test", &wide), ("b.test", &b)] {
@@ -1040,6 +1059,7 @@ mod tests {
                 without_sni: None,
                 refused: Vec::new(),
                 client_validation: None,
+                shared_by: None,
             })
             .unwrap();
             const UNRECOGNIZED_NAME: u64 = 0x100 + 112;
@@ -1077,6 +1097,7 @@ mod tests {
                 client_validation: Some(edgerush_config::ClientValidation {
                     authorities: vec![trusted.chain.clone()],
                 }),
+                shared_by: None,
             })
             .unwrap();
             let showing = |shown: Option<&Certificate>| {
@@ -1114,6 +1135,7 @@ mod tests {
                 without_sni: Some(0),
                 refused: Vec::new(),
                 client_validation: None,
+                shared_by: None,
             };
             let tls = Tls::new(&source).unwrap();
             let mut client = client_config();
@@ -1128,6 +1150,7 @@ mod tests {
                     without_sni: Some(0),
                     refused: Vec::new(),
                     client_validation: None,
+                    shared_by: None,
                 },
             )
             .unwrap();

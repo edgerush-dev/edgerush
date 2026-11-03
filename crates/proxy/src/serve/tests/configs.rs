@@ -204,6 +204,7 @@ pub(super) fn secured(
             .collect(),
         refused: Vec::new(),
         client_validation,
+        shared_by: Vec::new(),
     });
 }
 

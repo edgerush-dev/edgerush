@@ -388,6 +388,9 @@ pub(crate) enum Answer {
     /// A TRACE or OPTIONS that may be forwarded no further, answered by the gateway as its
     /// final recipient ([03 §11](../../docs/03-data-plane.md)).
     MaxForwards,
+    /// For a host of another listener than the one its connection was made for, where
+    /// listeners share the port ([03 §3](../../docs/03-data-plane.md)).
+    Misdirected,
     /// Over its rule's rate limit (experimental).
     RateLimited,
     /// Its rate limits had no place for it to wait in (experimental): the gateway's own
@@ -400,7 +403,7 @@ pub(crate) enum Answer {
 }
 
 impl Answer {
-    const ALL: [Self; 29] = [
+    const ALL: [Self; 30] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -426,6 +429,7 @@ impl Answer {
         Self::Redirected,
         Self::UnknownProtocol,
         Self::MaxForwards,
+        Self::Misdirected,
         Self::RateLimited,
         Self::RateLimitFull,
         Self::RateLimitTimeout,
@@ -462,6 +466,7 @@ impl Answer {
             Self::Redirected => StatusCode::FOUND,
             // OPTIONS is answered 200 in its place.
             Self::MaxForwards => StatusCode::METHOD_NOT_ALLOWED,
+            Self::Misdirected => StatusCode::MISDIRECTED_REQUEST,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         }
     }
@@ -493,6 +498,7 @@ impl Answer {
             Self::Redirected => "redirected",
             Self::UnknownProtocol => "unknown_protocol",
             Self::MaxForwards => "max_forwards",
+            Self::Misdirected => "misdirected",
             Self::RateLimited => "rate_limited",
             Self::RateLimitFull => "rate_limit_full",
             Self::RateLimitTimeout => "rate_limit_timeout",
@@ -549,6 +555,11 @@ impl Answer {
             Self::UnknownProtocol => (Code::Unimplemented, "no protocol but WebSocket is carried"),
             // Not a gRPC call's method; said for completeness.
             Self::MaxForwards => (Code::Unimplemented, "answered here, as the final recipient"),
+            // Another connection, made for the call's host, serves it.
+            Self::Misdirected => (
+                Code::Unavailable,
+                "the call came on a connection made for another host",
+            ),
             Self::RateLimited => (Code::ResourceExhausted, "the call is over its rate limit"),
             Self::RateLimitFull => (
                 Code::Unavailable,
@@ -579,6 +590,7 @@ impl From<Rejection> for Answer {
             Rejection::Edits => Self::Edits,
             Rejection::Protocol => Self::UnknownProtocol,
             Rejection::MaxForwards { .. } => Self::MaxForwards,
+            Rejection::Misdirected => Self::Misdirected,
         }
     }
 }

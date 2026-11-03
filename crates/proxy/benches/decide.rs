@@ -3,7 +3,9 @@
 //! changes, a rewrite, backend — or of a redirect.
 //!
 //! The head is a map with what the core adds kept beside it, as our HTTP/2 and HTTP/3 servers
-//! hand heads over.
+//! hand heads over. The `shared_` cases are on a port listeners share, told apart by
+//! hostname, where each request's host is checked against its connection's SNI (03 §3);
+//! `tls_usual_form` is their usual form on a port of one, which checks nothing.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-proxy --features fuzzing --bench decide`,
 //! see the repository README.
@@ -21,7 +23,7 @@ use edgerush_config::{Compiled, Config, compile};
 use edgerush_proxy::map_head::MapHead;
 use edgerush_proxy::storage::{LIMIT, Storage};
 use edgerush_proxy::upstream::h1::blocks::{Blocks, Sizes};
-use edgerush_proxy::{Client, decide};
+use edgerush_proxy::{Asked, Client, decide};
 use http::request::Parts;
 use http::{HeaderValue, Request};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
@@ -81,6 +83,46 @@ fn peer() -> Client {
 fn shop() -> Compiled {
     let config: Config = serde_saphyr::from_str(SHOP).expect("valid YAML");
     compile(&config).expect("valid config")
+}
+
+/// The same over TLS, on a port two listeners share: the shop's, and a catch-all.
+fn shared() -> Compiled {
+    secured(r#"[{ hostnames: [{ name: shop.example.com }] }, { hostnames: [{ name: "*" }] }]"#)
+}
+
+/// The same over TLS, on a port of its own, which checks nothing.
+fn alone() -> Compiled {
+    secured("[]")
+}
+
+/// The shop over TLS, its port shared by the listeners `shared_by` says.
+fn secured(shared_by: &str) -> Compiled {
+    let yaml = SHOP.replace(
+        "protocol: http, proxy_protocol: off,",
+        &format!("protocol: https, tls: {{ certificates: [shop], without_sni: shop, shared_by: {shared_by} }}, proxy_protocol: off,"),
+    );
+    let mut config: Config = serde_saphyr::from_str(&yaml).expect("valid YAML");
+    let certificate = edgerush_config::Certificate {
+        chain: "C".to_owned(),
+        key: "K".to_owned(),
+    };
+    config.certificates.insert("shop".to_owned(), certificate);
+    compile(&config).expect("valid config")
+}
+
+/// A client whose connection to [`shared`]'s port asked for `name` in its handshake.
+fn asked(name: &str) -> Client {
+    let client = peer();
+    let snapshot = shared();
+    let tls = snapshot
+        .listeners()
+        .first()
+        .and_then(|listener| listener.tls.as_ref());
+    let shared_by = tls
+        .and_then(|tls| tls.shared_by.as_ref())
+        .expect("listeners sharing");
+    client.asked(Asked::new(shared_by, Some(name)));
+    client
 }
 
 /// A request with a browser's worth of headers.
@@ -188,6 +230,26 @@ fn draw() -> u64 {
     shop(),
     peer(),
     mapped(head("/old/orders/42?expand=items", Some("shop.example.com")))
+)]
+#[bench::tls_usual_form(
+    alone(),
+    peer(),
+    mapped(head("/pages/about?lang=en", Some("shop.example.com")))
+)]
+#[bench::shared_usual_form(
+    shared(),
+    asked("shop.example.com"),
+    mapped(head("/pages/about?lang=en", Some("shop.example.com")))
+)]
+#[bench::shared_host_in_the_target(
+    shared(),
+    asked("shop.example.com"),
+    mapped(h2_head("https://shop.example.com/pages/about?lang=en", &[]))
+)]
+#[bench::shared_misdirected(
+    shared(),
+    asked("shop.example.com"),
+    mapped(head("/pages/about?lang=en", Some("other.example.org")))
 )]
 fn request_core(
     snapshot: Compiled,
