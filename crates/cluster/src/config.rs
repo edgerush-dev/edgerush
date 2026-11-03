@@ -42,6 +42,9 @@ pub struct Config {
     /// this size, one always when none is unanswered, so that what either end holds of copies
     /// in progress stays within this however many keys or shards there are.
     pub window_bytes: u64,
+    /// How far a peer's wall clock may be off from a pod's before the pod warns of it: nothing
+    /// corrects for skew, and copies carry wall-clock times taken to agree.
+    pub skew_warning: Time,
 }
 
 /// Why a config cannot be used.
@@ -63,7 +66,8 @@ impl Config {
     /// The defaults: heartbeats every 100 ms, a pod stopping after 400 ms without a majority
     /// and taken out after 600 ms, elections spread over 200 ms, copies every 10 ms, 256 shards
     /// with two replicas each, forming waiting 5 s on a pod holding the latest table, no cap
-    /// on keys, and copies in parts of 1 MiB, 2 MiB of them unanswered at most.
+    /// on keys, copies in parts of 1 MiB, 2 MiB of them unanswered at most, and a warning of a
+    /// peer's wall clock 250 ms off.
     #[must_use]
     pub const fn defaults() -> Self {
         Self {
@@ -78,6 +82,7 @@ impl Config {
             max_key_bytes: None,
             part_bytes: 1 << 20,
             window_bytes: 2 << 20,
+            skew_warning: ms(250),
         }
     }
 

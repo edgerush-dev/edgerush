@@ -12,6 +12,10 @@
 //! A pod told to drain hands its shards on and leaves the voting set, as its store does; once
 //! drained it stops, but first sends what it has queued — the last changes of the shards it
 //! handed on among them — for at most [`STREAMS_IDLE`] (T4d2).
+//!
+//! A peer whose wall clock its store finds off from the pod's past `skew_warning` is told of
+//! in the log, as it goes past and every [`SKEW_TOLD_AGAIN`] while it stays, and counted in
+//! [`StorePod::skewed`] (T4d3): nothing corrects for skew.
 
 use super::link::{CONTROL, Counts, Dial, Dropped, GREET, HELLO, Link, SERVICE, Tasks};
 use super::wire::{self, Empty, Hello, Invalid, Joining, Outgoing, Piece, ToCopy, ToPeer, Value};
@@ -23,6 +27,7 @@ use prost::Message as _;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
@@ -39,6 +44,10 @@ const ASK_SEEDS: Duration = Duration::from_secs(1);
 /// anyway (decided): what is left then, to a peer slow or cut off, is failed over as a crash's
 /// is. Well inside the 30 s Kubernetes grants a pod to stop by default, beside the drain itself.
 pub const STREAMS_IDLE: Duration = Duration::from_secs(5);
+
+/// How often a peer whose wall clock stays off past `skew_warning` is told of again in the
+/// log (decided): once a minute, so that a skew lasting is seen in recent lines.
+pub const SKEW_TOLD_AGAIN: Duration = Duration::from_secs(60);
 
 /// The control plane, as a pod's store names it: no pod's member id.
 pub const CONTROL_PLANE: NodeId = NodeId::MAX;
@@ -66,6 +75,7 @@ pub struct StorePod<V> {
     id: NodeId,
     hello: Arc<Hello>,
     counts: Arc<Counts>,
+    skewed: Arc<AtomicUsize>,
 }
 
 impl<V> Clone for StorePod<V> {
@@ -75,6 +85,7 @@ impl<V> Clone for StorePod<V> {
             id: self.id,
             hello: Arc::clone(&self.hello),
             counts: Arc::clone(&self.counts),
+            skewed: Arc::clone(&self.skewed),
         }
     }
 }
@@ -100,11 +111,13 @@ where
         });
         let (commands, received) = mpsc::channel(RECEIVED_WAITING);
         let counts = Arc::new(Counts::default());
+        let skewed = Arc::new(AtomicUsize::new(0));
         let pod = Self {
             commands: commands.clone(),
             id,
             hello: Arc::clone(&hello),
             counts: Arc::clone(&counts),
+            skewed: Arc::clone(&skewed),
         };
         let running = Running {
             node: Node::new(id, address, config, []),
@@ -118,6 +131,8 @@ where
             counts,
             commands: commands.downgrade(),
             drains: Vec::new(),
+            skews: SkewWarnings::default(),
+            skewed,
         };
         tokio::spawn(running.run(received));
         pod
@@ -133,6 +148,13 @@ where
     #[must_use]
     pub fn dropped(&self) -> Dropped {
         self.counts.dropped()
+    }
+
+    /// How many peers' wall clocks its store finds off from its own past `skew_warning` now:
+    /// zero while all agree.
+    #[must_use]
+    pub fn skewed(&self) -> usize {
+        self.skewed.load(Ordering::Relaxed)
     }
 
     /// Runs `with` on its store, at its time, between messages: to read it or update keys,
@@ -215,6 +237,33 @@ struct Running<V> {
     commands: mpsc::WeakSender<Command<V>>,
     /// Those waiting for it to stop, drained.
     drains: Vec<oneshot::Sender<()>>,
+    skews: SkewWarnings,
+    /// The peers skewed now, as [`StorePod::skewed`] says.
+    skewed: Arc<AtomicUsize>,
+}
+
+/// When each peer whose wall clock is off past `skew_warning` was last told of in the log.
+#[derive(Debug, Default)]
+struct SkewWarnings {
+    told: BTreeMap<NodeId, Instant>,
+}
+
+impl SkewWarnings {
+    /// Of `skewed`, those to tell of at `now`: each as it goes past, and again every
+    /// [`SKEW_TOLD_AGAIN`] while it stays; one back within is forgotten, so that it is told
+    /// of at once should it go past again.
+    fn due(&mut self, skewed: &BTreeMap<NodeId, i64>, now: Instant) -> Vec<(NodeId, i64)> {
+        self.told.retain(|peer, _| skewed.contains_key(peer));
+        let mut due = Vec::new();
+        for (peer, skew) in skewed {
+            let told = self.told.get(peer);
+            if told.is_none_or(|at| now.duration_since(*at) >= SKEW_TOLD_AGAIN) {
+                self.told.insert(*peer, now);
+                due.push((*peer, *skew));
+            }
+        }
+        due
+    }
 }
 
 impl<V: Value + Send + 'static> Running<V>
@@ -246,6 +295,7 @@ where
                     self.send(out);
                     self.follow();
                     self.ask_seeds();
+                    self.warn_skews();
                 }
                 command = received.recv() => match command {
                     None | Some(Command::Stop) => return,
@@ -381,6 +431,20 @@ where
         let peers = self.node.peers();
         self.links.retain(|peer, _| peers.contains(peer));
         self.addresses.retain(|peer, _| peers.contains(peer));
+    }
+
+    /// Tells of the peers whose wall clocks its store finds off past `skew_warning`: in the
+    /// log, as [`SkewWarnings`] has it, and in how many there are.
+    fn warn_skews(&mut self) {
+        let skewed = self.node.skewed();
+        self.skewed.store(skewed.len(), Ordering::Relaxed);
+        for (peer, skew) in self.skews.due(&skewed, Instant::now()) {
+            let way = if skew > 0 { "ahead of" } else { "behind" };
+            eprintln!(
+                "edgerush-ratelimit-service: pod {peer}'s wall clock is {} ms {way} this pod's",
+                skew.unsigned_abs() / 1_000_000
+            );
+        }
     }
 
     /// Asks each seed who answers there, every [`ASK_SEEDS`] while it is no member: the
@@ -676,6 +740,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgerush_cluster::ms;
 
     fn hello(from: NodeId, shards: u32) -> Hello {
         Hello {
@@ -701,7 +766,49 @@ mod tests {
             counts: Arc::default(),
             commands: commands.downgrade(),
             drains: Vec::new(),
+            skews: SkewWarnings::default(),
+            skewed: Arc::default(),
         }
+    }
+
+    #[test]
+    fn the_peers_its_store_finds_skewed_are_counted_and_none_once_back() {
+        let mut running = running();
+        // Its own heartbeat sent at 950 ms echoed at 1 s, and at 1.1 s.
+        let beat = |sent, wall| Message::Heartbeat {
+            term: 0,
+            leader: None,
+            committed: (0, 0),
+            fresh: true,
+            sent,
+            wall,
+            hears: vec![(1, ms(950))],
+            leased: false,
+        };
+        let _ = running.node.receive(2, beat(ms(10), ms(1_275)), ms(1_000));
+        running.warn_skews();
+        assert_eq!(running.skewed.load(Ordering::Relaxed), 1);
+        let _ = running.node.receive(2, beat(ms(20), ms(1_025)), ms(1_100));
+        running.warn_skews();
+        assert_eq!(running.skewed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_peer_skewed_is_told_of_as_it_goes_past_and_every_minute_while_it_stays() {
+        let mut warnings = SkewWarnings::default();
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let skewed = BTreeMap::from([(2, 300_000_000), (3, -400_000_000)]);
+        assert_eq!(
+            warnings.due(&skewed, at(0)),
+            vec![(2, 300_000_000), (3, -400_000_000)]
+        );
+        assert!(warnings.due(&skewed, at(59)).is_empty());
+        // Pod 3 back within: forgotten, and told of at once going past again.
+        let only = BTreeMap::from([(2, 300_000_000)]);
+        assert!(warnings.due(&only, at(59)).is_empty());
+        assert_eq!(warnings.due(&skewed, at(59)), vec![(3, -400_000_000)]);
+        assert_eq!(warnings.due(&skewed, at(60)), vec![(2, 300_000_000)]);
     }
 
     #[test]
