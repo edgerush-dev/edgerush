@@ -467,7 +467,7 @@ impl Pod {
                 }
             }
             // A gathering pod asks its parts under no rule: never answered so.
-            Answer::NotServing | Answer::Admitted(_) | Answer::Limited => {}
+            Answer::NotServing | Answer::Admitted(_) | Answer::Limited { .. } => {}
         }
         self.gather(now, out);
     }
@@ -493,9 +493,12 @@ fn decide(key: u64, kept: &mut Kept<Value>, ask: Ask, wall: Time) -> (Answer, Ch
             Answer::Counted(value.net())
         }
         // Charged only if admitted.
-        (Some(rule), false) => rule
-            .admit(key, value, wall)
-            .map_or(Answer::Limited, Answer::Admitted),
+        (Some(rule), false) => rule.admit(key, value, wall).map_or_else(
+            || Answer::Limited {
+                wait: rule.wait(key, value, wall),
+            },
+            Answer::Admitted,
+        ),
     };
     // Forgettable from when its rule says; under none, never.
     kept.forget_at = ask.rule.map_or(Time::MAX, |rule| {
@@ -509,7 +512,7 @@ fn decide(key: u64, kept: &mut Kept<Value>, ask: Ask, wall: Time) -> (Answer, Ch
         _ if ask.give_back => Some(ask.receipt),
         _ => None,
     };
-    let changed = if matches!(answer, Answer::Limited) {
+    let changed = if matches!(answer, Answer::Limited { .. }) {
         Changed::Nothing
     } else if let (Some(Rule::Rolling { .. }), Some(slot)) = (ask.rule, slot) {
         Changed::Part(slot)
@@ -930,7 +933,7 @@ mod tests {
                 refused.iter().any(|(_, message)| matches!(
                     message,
                     Message::Reply {
-                        answer: Answer::Limited,
+                        answer: Answer::Limited { .. },
                         ..
                     }
                 )),
@@ -1077,9 +1080,11 @@ mod tests {
             answer(node.receive(9, ask(1), ms(3))),
             Some(Answer::Admitted(window))
         );
-        assert_eq!(
-            answer(node.receive(9, ask(2), ms(3))),
-            Some(Answer::Limited)
+        // Refused until its window ends, within the window's length.
+        let refused = answer(node.receive(9, ask(2), ms(3)));
+        assert!(
+            matches!(refused, Some(Answer::Limited { wait }) if wait > 0 && wait <= ms(100)),
+            "{refused:?}"
         );
         assert_eq!(
             node.store().value(key).map(|value| value.net()),

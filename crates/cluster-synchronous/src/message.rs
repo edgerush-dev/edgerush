@@ -2,7 +2,7 @@
 //! beside the store's own messages, which travel inside them.
 
 use crate::{Rule, Value};
-use edgerush_cluster::{NodeId, Stamp, Table};
+use edgerush_cluster::{NodeId, Stamp, Table, Time};
 
 /// One message between pods, or between a client and a pod.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,7 +61,10 @@ pub enum Answer {
     /// Admitted under its rule and charged, with the receipt a give-back of it names.
     Admitted(u64),
     /// Refused under its rule, its limit reached; charged nothing.
-    Limited,
+    Limited {
+        /// How long until the key would admit one, by the owner's wall clock.
+        wait: Time,
+    },
     /// Not this pod's: the table it has, newer than the client's, if it is.
     Elsewhere(Option<Table>),
     /// This pod's, but it is not serving: it has no lease, or is handing the shard on.

@@ -326,6 +326,47 @@ impl Rule {
         }
     }
 
+    /// How long after `at` a request under `key` would be admitted, `value` having just
+    /// refused one at `at`, nothing changing it meanwhile: until the window ends; until enough
+    /// of a rolling window's oldest slots have left it; until the bucket's next request is due,
+    /// less its tolerance. 0 when one would be admitted at `at`.
+    #[must_use]
+    pub fn wait(&self, key: u64, value: &Value, at: Time) -> Time {
+        let until = match (*self, value) {
+            (Self::Window { per, .. }, Value::Count { counted, given, .. }) => {
+                if counted.saturating_sub(*given) < per {
+                    0
+                } else {
+                    self.forget_at(key, value)
+                }
+            }
+            (Self::Rolling { per, window }, Value::Slots(slots)) => {
+                let length = (window / SLOTS).max(1);
+                let net = |(counted, given): &(u64, u64)| counted.saturating_sub(*given);
+                let standing: u64 = slots.values().map(net).sum();
+                // The oldest slots that must leave the window for one more to fit, the last of
+                // them leaving it once its slot number and the window's have passed.
+                let excess = (standing + 1).saturating_sub(per);
+                let mut freed = 0;
+                slots
+                    .iter()
+                    .find_map(|(slot, counts)| {
+                        freed += net(counts);
+                        (excess > 0 && freed >= excess)
+                            .then(|| (slot + SLOTS).saturating_mul(length))
+                    })
+                    .unwrap_or(0)
+            }
+            (Self::Bucket { per, period, burst }, Value::Bucket { due, given }) => {
+                let (interval, tolerance) = Self::interval_and_tolerance(per, period, burst);
+                due.saturating_sub(given.saturating_mul(interval))
+                    .saturating_sub(tolerance)
+            }
+            _ => 0,
+        };
+        until.saturating_sub(at)
+    }
+
     /// Gives back a charge made under `receipt`: for a window, nothing once its window has
     /// passed, as the window's count went with it; for a rolling window, nothing once its slot
     /// has been forgotten; for a bucket, an emission interval off the bucket, which may give
@@ -354,6 +395,49 @@ mod tests {
             window,
             counted,
             given,
+        }
+    }
+
+    /// Refused, a request is admitted once the wait it was told has passed, and not a
+    /// nanosecond before, under each rule.
+    #[test]
+    fn a_refused_request_is_admitted_after_its_wait_and_not_before() {
+        let rules = [
+            Rule::Window {
+                per: 3,
+                window: ms(100),
+            },
+            Rule::Rolling {
+                per: 3,
+                window: ms(100),
+            },
+            Rule::Bucket {
+                per: 3,
+                period: ms(100),
+                burst: 2,
+            },
+        ];
+        for rule in rules {
+            for key in 0..20 {
+                let mut value = Value::default();
+                let mut at = ms(1_000) + key * 7_919;
+                while rule.admit(key, &mut value, at).is_some() {
+                    at += ms(10);
+                }
+                let wait = rule.wait(key, &value, at);
+                assert!(wait > 0, "{rule:?} key {key}: no wait");
+                let mut early = value.clone();
+                assert_eq!(
+                    rule.admit(key, &mut early, at + wait - 1),
+                    None,
+                    "{rule:?} key {key}: admitted before its wait {wait}"
+                );
+                let mut late = value.clone();
+                assert!(
+                    rule.admit(key, &mut late, at + wait).is_some(),
+                    "{rule:?} key {key}: refused after its wait {wait}"
+                );
+            }
         }
     }
 

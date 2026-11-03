@@ -12,6 +12,10 @@
 //! it misses takes its default, and a message the store cannot use — a part it needs missing,
 //! a shard past 16 bits — is refused whole.
 //!
+//! The synchronous mode's own messages between pods — a request forwarded to its key's owner,
+//! a part of one gathered, and their answers — go on the stream apart from copies too, beside
+//! the store's ([`mode_wire`]).
+//!
 //! Every message goes as one or more [`Piece`]s: a shard's whole copy can pass what one gRPC
 //! message may hold, and the store sends it as one message, so the wire cuts it ([`pieces`])
 //! and the receiver puts it together again ([`Joining`]) before the store sees it.
@@ -19,7 +23,9 @@
 use bytes::Bytes;
 use edgerush_cluster::table::{Changes as StoreChanges, Shard as StoreShard, Table as StoreTable};
 use edgerush_cluster::{Held, Kept, Message, NodeId, ShardId, Stamp as StoreStamp};
-use edgerush_cluster_synchronous::Value as SyncValue;
+use edgerush_cluster_synchronous::{
+    Answer as SyncAnswer, Message as SyncMessage, Rule as SyncRule, Value as SyncValue,
+};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
@@ -39,6 +45,12 @@ pub enum Invalid {
     /// A member named twice, in a table or a naming.
     #[error("a member named twice")]
     MemberTwice,
+    /// A mode's message where the store's was asked for.
+    #[error("a mode's message, not the store's")]
+    Mode,
+    /// A request forwarded more times than a byte counts.
+    #[error("a request forwarded past 255 hops")]
+    Hops,
 }
 
 /// A mode's value as the wire carries it: a protobuf message of the mode's own.
@@ -536,6 +548,141 @@ pub enum Control<W: prost::Message + Default + Debug> {
     /// waits behind bulk copies past the time an owner repairs a copy unanswered.
     #[prost(message, tag = "23")]
     Replicated(Replicated),
+    /// The synchronous mode's request, forwarded to its key's owner or asked of it as a part.
+    #[prost(message, tag = "24")]
+    Request(Request),
+    /// Its answer.
+    #[prost(message, tag = "25")]
+    Reply(Reply),
+}
+
+/// The synchronous mode's request under one key.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Request {
+    /// The client, answered whoever answers.
+    #[prost(uint64, tag = "1")]
+    pub client: u64,
+    /// The client's number for it.
+    #[prost(uint64, tag = "2")]
+    pub id: u64,
+    /// The key.
+    #[prost(uint64, tag = "3")]
+    pub key: u64,
+    /// The client's table.
+    #[prost(message, optional, tag = "4")]
+    pub stamp: Option<Stamp>,
+    /// Forwarded this many times already.
+    #[prost(uint32, tag = "5")]
+    pub hops: u32,
+    /// The pod that forwarded it, if one did.
+    #[prost(uint64, optional, tag = "6")]
+    pub via: Option<u64>,
+    /// Whether it gives one back.
+    #[prost(bool, tag = "7")]
+    pub give_back: bool,
+    /// The limit it is held to; none for a plain count.
+    #[prost(message, optional, tag = "8")]
+    pub rule: Option<Rule>,
+    /// For a give-back under a rule, the receipt its charge was answered with.
+    #[prost(uint64, tag = "9")]
+    pub receipt: u64,
+}
+
+/// A limit a request is held to.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+pub struct Rule {
+    /// Which, and its numbers.
+    #[prost(oneof = "Limit", tags = "1, 2, 3")]
+    pub limit: Option<Limit>,
+}
+
+/// A limit's model.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Oneof)]
+pub enum Limit {
+    /// A fixed window.
+    #[prost(message, tag = "1")]
+    Window(WindowLimit),
+    /// A rolling window.
+    #[prost(message, tag = "2")]
+    Rolling(WindowLimit),
+    /// A bucket.
+    #[prost(message, tag = "3")]
+    Bucket(BucketLimit),
+}
+
+/// A window's limit: `per` in each `window`, in nanoseconds.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+pub struct WindowLimit {
+    /// Requests a window.
+    #[prost(uint64, tag = "1")]
+    pub per: u64,
+    /// The window.
+    #[prost(uint64, tag = "2")]
+    pub window: u64,
+}
+
+/// A bucket's limit: `per` every `period`, in nanoseconds, `burst` at once.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+pub struct BucketLimit {
+    /// Requests a period.
+    #[prost(uint64, tag = "1")]
+    pub per: u64,
+    /// The period.
+    #[prost(uint64, tag = "2")]
+    pub period: u64,
+    /// Requests at once from idle.
+    #[prost(uint64, tag = "3")]
+    pub burst: u64,
+}
+
+/// The answer to a [`Request`].
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Reply {
+    /// The client it is for.
+    #[prost(uint64, tag = "1")]
+    pub client: u64,
+    /// The client's number for the request.
+    #[prost(uint64, tag = "2")]
+    pub id: u64,
+    /// The answer.
+    #[prost(message, optional, tag = "3")]
+    pub answer: Option<Answer>,
+}
+
+/// What an owner answers a request.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Answer {
+    /// Which.
+    #[prost(oneof = "Answered", tags = "1, 2, 3, 4, 5")]
+    pub answered: Option<Answered>,
+}
+
+/// What an owner answers, and what it says.
+#[derive(Clone, PartialEq, prost::Oneof)]
+pub enum Answered {
+    /// Counted: the key's count now.
+    #[prost(uint64, tag = "1")]
+    Counted(u64),
+    /// Admitted under its rule, with the receipt a give-back of it names.
+    #[prost(uint64, tag = "2")]
+    Admitted(u64),
+    /// Refused under its rule: how long until the key would admit, in nanoseconds.
+    #[prost(uint64, tag = "3")]
+    Limited(u64),
+    /// Not this pod's: the newer table, if there is one.
+    #[prost(message, tag = "4")]
+    Elsewhere(Elsewhere),
+    /// This pod's, but it is not serving.
+    #[prost(message, tag = "5")]
+    NotServing(Empty),
+}
+
+/// Not this pod's key.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Elsewhere {
+    /// The table the asker should have, newer than its own; none if it is not.
+    #[prost(message, optional, tag = "1")]
+    pub table: Option<Table>,
 }
 
 /// One message on the stream apart from copies.
@@ -547,7 +694,7 @@ pub struct ToPeer<W: prost::Message + Default + Debug> {
     /// What it is.
     #[prost(
         oneof = "Control",
-        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23"
+        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
     )]
     pub message: Option<Control<W>>,
 }
@@ -767,6 +914,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
 /// A message the store cannot use: see [`Invalid`].
 pub fn from_peer<V: Value>(sent: ToPeer<V::Wire>) -> Result<(NodeId, Message<V>), Invalid> {
     let message = match sent.message.ok_or(Invalid::Missing)? {
+        Control::Request(_) | Control::Reply(_) => return Err(Invalid::Mode),
         Control::Heartbeat(beat) => Message::Heartbeat {
             term: beat.term,
             leader: beat.leader,
@@ -909,6 +1057,141 @@ pub fn from_copy<V: Value>(sent: ToCopy<V::Wire>) -> Result<(NodeId, Message<V>)
         },
     };
     Ok((sent.from, message))
+}
+
+/// The synchronous mode's `message`, from `from`, as the wire carries it between pods: the
+/// store's as [`wire`] has it, the mode's own on the stream apart from copies. None for a
+/// request to gather, which a client alone asks, of the pod it reaches.
+pub fn mode_wire(from: NodeId, message: SyncMessage) -> Option<Outgoing<Synchronous>> {
+    let peer = |message| {
+        Outgoing::Peer(ToPeer {
+            from,
+            message: Some(message),
+        })
+    };
+    Some(match message {
+        SyncMessage::Store(message) => wire(from, message),
+        SyncMessage::Request {
+            client,
+            id,
+            key,
+            stamp: asked,
+            hops,
+            via,
+            give_back,
+            rule,
+            receipt,
+        } => peer(Control::Request(Request {
+            client,
+            id,
+            key,
+            stamp: Some(stamp(asked)),
+            hops: u32::from(hops),
+            via,
+            give_back,
+            rule: rule.map(rule_to_wire),
+            receipt,
+        })),
+        SyncMessage::Reply { client, id, answer } => peer(Control::Reply(Reply {
+            client,
+            id,
+            answer: Some(answer_to_wire(answer)),
+        })),
+        SyncMessage::Gather { .. } => return None,
+    })
+}
+
+/// The sender and the synchronous mode's message, from the stream apart from copies.
+///
+/// # Errors
+///
+/// A message the mode or its store cannot use: see [`Invalid`].
+pub fn mode_from_peer(sent: ToPeer<Synchronous>) -> Result<(NodeId, SyncMessage), Invalid> {
+    let from = sent.from;
+    match sent.message {
+        Some(Control::Request(request)) => Ok((from, request_from(request)?)),
+        Some(Control::Reply(reply)) => Ok((
+            from,
+            SyncMessage::Reply {
+                client: reply.client,
+                id: reply.id,
+                answer: answer_from(reply.answer.ok_or(Invalid::Missing)?)?,
+            },
+        )),
+        message => from_peer::<SyncValue>(ToPeer { from, message })
+            .map(|(from, message)| (from, SyncMessage::Store(message))),
+    }
+}
+
+/// The sender and the synchronous mode's message, from the copy stream: the store's alone.
+///
+/// # Errors
+///
+/// A message the store cannot use: see [`Invalid`].
+pub fn mode_from_copy(sent: ToCopy<Synchronous>) -> Result<(NodeId, SyncMessage), Invalid> {
+    from_copy::<SyncValue>(sent).map(|(from, message)| (from, SyncMessage::Store(message)))
+}
+
+fn request_from(request: Request) -> Result<SyncMessage, Invalid> {
+    Ok(SyncMessage::Request {
+        client: request.client,
+        id: request.id,
+        key: request.key,
+        stamp: stamp_from(request.stamp)?,
+        hops: u8::try_from(request.hops).map_err(|_| Invalid::Hops)?,
+        via: request.via,
+        give_back: request.give_back,
+        rule: request.rule.map(rule_from).transpose()?,
+        receipt: request.receipt,
+    })
+}
+
+const fn rule_to_wire(rule: SyncRule) -> Rule {
+    let limit = match rule {
+        SyncRule::Window { per, window } => Limit::Window(WindowLimit { per, window }),
+        SyncRule::Rolling { per, window } => Limit::Rolling(WindowLimit { per, window }),
+        SyncRule::Bucket { per, period, burst } => {
+            Limit::Bucket(BucketLimit { per, period, burst })
+        }
+    };
+    Rule { limit: Some(limit) }
+}
+
+fn rule_from(rule: Rule) -> Result<SyncRule, Invalid> {
+    Ok(match rule.limit.ok_or(Invalid::Missing)? {
+        Limit::Window(WindowLimit { per, window }) => SyncRule::Window { per, window },
+        Limit::Rolling(WindowLimit { per, window }) => SyncRule::Rolling { per, window },
+        Limit::Bucket(BucketLimit { per, period, burst }) => {
+            SyncRule::Bucket { per, period, burst }
+        }
+    })
+}
+
+fn answer_to_wire(answer: SyncAnswer) -> Answer {
+    let answered = match answer {
+        SyncAnswer::Counted(count) => Answered::Counted(count),
+        SyncAnswer::Admitted(receipt) => Answered::Admitted(receipt),
+        SyncAnswer::Limited { wait } => Answered::Limited(wait),
+        SyncAnswer::Elsewhere(table) => Answered::Elsewhere(Elsewhere {
+            table: table.map(table_to_wire),
+        }),
+        SyncAnswer::NotServing => Answered::NotServing(Empty {}),
+    };
+    Answer {
+        answered: Some(answered),
+    }
+}
+
+fn answer_from(answer: Answer) -> Result<SyncAnswer, Invalid> {
+    Ok(match answer.answered.ok_or(Invalid::Missing)? {
+        Answered::Counted(count) => SyncAnswer::Counted(count),
+        Answered::Admitted(receipt) => SyncAnswer::Admitted(receipt),
+        Answered::Limited(wait) => SyncAnswer::Limited { wait },
+        Answered::Elsewhere(elsewhere) => {
+            SyncAnswer::Elsewhere(elsewhere.table.map(table_from).transpose()?)
+        }
+        Answered::NotServing(_) => SyncAnswer::NotServing,
+    })
 }
 
 const fn stamp((term, version): StoreStamp) -> Stamp {
@@ -1480,6 +1763,94 @@ mod tests {
         }
     }
 
+    fn rule() -> impl Strategy<Value = SyncRule> {
+        prop_oneof![
+            any::<(u64, u64)>().prop_map(|(per, window)| SyncRule::Window { per, window }),
+            any::<(u64, u64)>().prop_map(|(per, window)| SyncRule::Rolling { per, window }),
+            any::<(u64, u64, u64)>().prop_map(|(per, period, burst)| SyncRule::Bucket {
+                per,
+                period,
+                burst
+            }),
+        ]
+    }
+
+    fn answer() -> impl Strategy<Value = SyncAnswer> {
+        prop_oneof![
+            any::<u64>().prop_map(SyncAnswer::Counted),
+            any::<u64>().prop_map(SyncAnswer::Admitted),
+            any::<u64>().prop_map(|wait| SyncAnswer::Limited { wait }),
+            prop::option::of(table()).prop_map(SyncAnswer::Elsewhere),
+            Just(SyncAnswer::NotServing),
+        ]
+    }
+
+    /// Every message the synchronous mode's pods send each other, any of its fields.
+    fn mode_message() -> impl Strategy<Value = SyncMessage> {
+        prop_oneof![
+            message().prop_map(SyncMessage::Store),
+            (
+                any::<(u64, u64, u64)>(),
+                stamps(),
+                any::<u8>(),
+                prop::option::of(any::<u64>()),
+                any::<bool>(),
+                prop::option::of(rule()),
+                any::<u64>(),
+            )
+                .prop_map(
+                    |((client, id, key), stamp, hops, via, give_back, rule, receipt)| {
+                        SyncMessage::Request {
+                            client,
+                            id,
+                            key,
+                            stamp,
+                            hops,
+                            via,
+                            give_back,
+                            rule,
+                            receipt,
+                        }
+                    }
+                ),
+            (any::<(u64, u64)>(), answer()).prop_map(|((client, id), answer)| SyncMessage::Reply {
+                client,
+                id,
+                answer
+            }),
+        ]
+    }
+
+    fn mode_through(from: NodeId, message: SyncMessage) -> (NodeId, SyncMessage) {
+        match mode_wire(from, message).unwrap() {
+            Outgoing::Peer(sent) => {
+                let decoded = ToPeer::decode(sent.encode_to_vec().as_slice()).unwrap();
+                mode_from_peer(decoded).unwrap()
+            }
+            Outgoing::Copy(sent) => {
+                let decoded = ToCopy::decode(sent.encode_to_vec().as_slice()).unwrap();
+                mode_from_copy(decoded).unwrap()
+            }
+        }
+    }
+
+    /// The store refuses the mode's messages, and a request to gather, a client's alone, is
+    /// never sent between pods.
+    #[test]
+    fn the_store_refuses_the_modes_messages_and_a_gathering_goes_between_no_pods() {
+        let request = ToPeer::<Synchronous> {
+            from: 1,
+            message: Some(Control::Request(Request::default())),
+        };
+        assert_eq!(from_peer::<SyncValue>(request), Err(Invalid::Mode));
+        let gather = SyncMessage::Gather {
+            client: 9,
+            id: 1,
+            keys: vec![1, 2],
+        };
+        assert!(mode_wire(1, gather).is_none());
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
@@ -1488,6 +1859,29 @@ mod tests {
         #[test]
         fn a_message_comes_through_the_wire_as_it_was_sent(from in any::<u64>(), message in message()) {
             prop_assert_eq!(through(from, message.clone()), (from, message));
+        }
+
+        /// Every message the synchronous mode's pods send each other comes through the wire as
+        /// it was sent, from its sender.
+        #[test]
+        fn a_modes_message_comes_through_the_wire_as_it_was_sent(
+            from in any::<u64>(),
+            message in mode_message(),
+        ) {
+            prop_assert_eq!(mode_through(from, message.clone()), (from, message));
+        }
+
+        /// Any bytes, as the mode's message, are refused or taken without a panic; and what is
+        /// taken comes back the same through an encoding of its own.
+        #[test]
+        fn any_bytes_are_refused_or_taken_by_the_mode_without_a_panic(
+            bytes in prop::collection::vec(any::<u8>(), 0..300),
+        ) {
+            if let Ok(sent) = ToPeer::<Synchronous>::decode(bytes.as_slice())
+                && let Ok((from, message)) = mode_from_peer(sent)
+            {
+                prop_assert_eq!(mode_through(from, message.clone()), (from, message));
+            }
         }
 
         /// Copies go on the copy stream, everything else — their answers too — on the other.

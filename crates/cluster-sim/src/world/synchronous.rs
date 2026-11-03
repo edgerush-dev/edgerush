@@ -106,7 +106,7 @@ impl Sim<Synchronous> {
         if let Message::Reply {
             client,
             id,
-            answer: Answer::Admitted(_) | Answer::Limited,
+            answer: Answer::Admitted(_) | Answer::Limited { .. },
         } = message
         {
             let skew = self.pods.get(&from).map_or(0, |pod| pod.skew);
