@@ -368,6 +368,26 @@ pub struct Replicated {
     pub version: u64,
 }
 
+/// A replica's answer to a part of a copy in more than one.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+pub struct Took {
+    /// The shard.
+    #[prost(uint32, tag = "1")]
+    pub shard: u32,
+    /// Its term.
+    #[prost(uint64, tag = "2")]
+    pub term: u64,
+    /// The assignment.
+    #[prost(uint64, tag = "3")]
+    pub assignment: u64,
+    /// The copy's number.
+    #[prost(uint64, tag = "4")]
+    pub version: u64,
+    /// The part it has every part up to.
+    #[prost(uint32, tag = "5")]
+    pub part: u32,
+}
+
 /// A replica's word that it holds nothing of a shard.
 #[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
 pub struct Lacking {
@@ -490,6 +510,9 @@ pub enum Control<W: prost::Message + Default + Debug> {
     /// A move complete.
     #[prost(message, tag = "21")]
     HandedOff(HandedOff),
+    /// A part of a copy taken.
+    #[prost(message, tag = "22")]
+    Took(Took),
 }
 
 /// One message on the stream apart from copies.
@@ -501,7 +524,7 @@ pub struct ToPeer<W: prost::Message + Default + Debug> {
     /// What it is.
     #[prost(
         oneof = "Control",
-        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
+        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22"
     )]
     pub message: Option<Control<W>>,
 }
@@ -667,6 +690,19 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             latest: Some(stamp(latest)),
         })),
         Message::Drain => peer(Control::Drain(Empty {})),
+        Message::Took {
+            shard,
+            term,
+            assignment,
+            version,
+            part,
+        } => peer(Control::Took(Took {
+            shard: u32::from(shard),
+            term,
+            assignment,
+            version,
+            part,
+        })),
         Message::Lacking { shard, term } => peer(Control::Lacking(Lacking {
             shard: u32::from(shard),
             term,
@@ -794,6 +830,13 @@ pub fn from_peer<V: Value>(sent: ToPeer<V::Wire>) -> Result<(NodeId, Message<V>)
             latest: stamp_from(form.latest)?,
         },
         Control::Drain(_) => Message::Drain,
+        Control::Took(took) => Message::Took {
+            shard: shard_id(took.shard)?,
+            term: took.term,
+            assignment: took.assignment,
+            version: took.version,
+            part: took.part,
+        },
         Control::Lacking(lacking) => Message::Lacking {
             shard: shard_id(lacking.shard)?,
             term: lacking.term,
@@ -1363,6 +1406,15 @@ mod tests {
                     term,
                     assignment,
                     version,
+                }
+            ),
+            (any::<ShardId>(), any::<(u64, u64, u64)>(), any::<u32>()).prop_map(
+                |(shard, (term, assignment, version), part)| Message::Took {
+                    shard,
+                    term,
+                    assignment,
+                    version,
+                    part,
                 }
             ),
             (any::<ShardId>(), any::<u64>())

@@ -133,6 +133,68 @@ fn copies_in_parts_are_repaired_and_lose_nothing_on_failover() {
     }
 }
 
+/// A pod joining a cluster whose every shard takes many parts to copy, over a slow link, is
+/// copied each shard it is to keep only as fast as its parts are answered: with nothing
+/// changing meanwhile, none sent twice, never more than two parts' worth unanswered from one
+/// owner to one pod, every replica holding its owner's counts, and nothing lost when an owner
+/// then crashes.
+#[test]
+fn a_pod_joining_over_a_slow_link_is_copied_each_shard_once() {
+    // Parts of about two keys, a shard's 200 keys in 100, two of them unanswered at most; at
+    // 1 Mbit/s a copy takes a second or more, where a whole copy was sent again every 50 ms
+    // until answered.
+    let parted = Shape {
+        preload: 200,
+        part_bytes: 100,
+        window_bytes: 200,
+        ..shape()
+    };
+    for seed in SEEDS {
+        let (mut world, _) = scenario::cluster(seed, parted);
+        world.set_default_link(Link {
+            bandwidth: 125_000,
+            ..Link::lan()
+        });
+        // Nothing changing meanwhile, every copy is a whole one, sent once.
+        world.stop_clients();
+        let before = world.stats.copies_again;
+        let new = world.add_pod();
+        let ready = world.run_while_not(ms(60_000), |world| scenario::ready(world, new));
+        assert!(ready.is_some(), "seed {seed}: {new} never ready");
+        assert!(
+            world.run_while_not(ms(30_000), World::settled).is_some(),
+            "seed {seed}"
+        );
+        world.run_for(ms(1_000));
+        assert_eq!(
+            world.stats.copies_again - before,
+            0,
+            "seed {seed}: sent twice"
+        );
+        assert!(
+            (1..=200).contains(&world.stats.most_unanswered),
+            "seed {seed}: {} bytes unanswered",
+            world.stats.most_unanswered
+        );
+        assert_eq!(world.stale_copies(), 0, "seed {seed}: copies never in");
+        let owner = world
+            .alive()
+            .find(|pod| Some(*pod) != world.leader())
+            .unwrap();
+        world.crash(owner);
+        assert!(
+            world.run_while_not(ms(10_000), World::settled).is_some(),
+            "seed {seed}"
+        );
+        assert_eq!(world.lost(), 0, "seed {seed}: lost on failover");
+        assert!(
+            world.stats.violations.is_empty(),
+            "{:?}",
+            world.stats.violations
+        );
+    }
+}
+
 /// Past `max_key_bytes`, every pod evicts down within it, owned keys and copies alike, and an
 /// owner's evictions reach its replicas: no replica keeps a key its owner evicted, so one
 /// promoted when the owner crashes brings none of them back at their old counts.

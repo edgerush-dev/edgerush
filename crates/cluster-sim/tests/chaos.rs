@@ -2,8 +2,10 @@
 //! links lost one way, loss and jitter, clocks run fast or slow, every pod cut apart — with
 //! never more than one pod down at once, as the store sees it, a new one started in its place.
 //! Over every run: nothing that must never happen does, two pods serve one shard only briefly,
-//! no part of a copy passes its bound, and once the network is whole again the cluster settles
-//! (G2). `CHAOS_PART_BYTES` runs them with copies in small parts.
+//! no part of a copy passes its bound, nor do an owner's copies unanswered to one pod pass
+//! theirs, and once the network is whole again the cluster settles (G2). `CHAOS_PART_BYTES`
+//! runs them with copies in small parts, and `CHAOS_WINDOW_BYTES` with little of them
+//! unanswered at once.
 
 #![allow(
     clippy::unwrap_used,
@@ -43,9 +45,17 @@ fn run(seed: u64) -> Run {
         .ok()
         .and_then(|bytes| bytes.parse().ok())
         .unwrap_or(Shape::defaults().part_bytes);
+    // CHAOS_WINDOW_BYTES holds that little of copies in many parts unanswered to one pod, so
+    // that runs go through copies paced by their answers: the window full, parts lost and sent
+    // again, while pods crash, drain and are cut apart.
+    let window_bytes = std::env::var("CHAOS_WINDOW_BYTES")
+        .ok()
+        .and_then(|bytes| bytes.parse().ok())
+        .unwrap_or(Shape::defaults().window_bytes);
     let shape = Shape {
         shards: 16,
         part_bytes,
+        window_bytes,
         ..Shape::defaults()
     };
     let (mut world, _) = scenario::cluster(seed, shape);
@@ -161,6 +171,7 @@ fn random_faults_never_break_the_rules_and_the_cluster_always_settles() {
         .unwrap_or(60);
     let mut longest = 0;
     let mut slowest = 0;
+    let mut window_full = 0;
     // CHAOS_SEED runs that one alone, to see a failure again; CHAOS_FROM starts the CHAOS_SEEDS
     // there, for a second machine to run others.
     let only: Option<u64> = std::env::var("CHAOS_SEED")
@@ -182,6 +193,15 @@ fn random_faults_never_break_the_rules_and_the_cluster_always_settles() {
             stats.parts_over, 0,
             "seed {seed}: a part of a copy past its bound after {faults:?}"
         );
+        let config = world.config();
+        assert!(
+            stats.most_unanswered <= config.window_bytes,
+            "seed {seed}: {} bytes unanswered to one pod after {faults:?}",
+            stats.most_unanswered
+        );
+        if stats.most_unanswered.saturating_add(config.part_bytes) > config.window_bytes {
+            window_full += 1;
+        }
         assert!(
             stats.violations.is_empty(),
             "seed {seed}: {:?} after {faults:?}",
@@ -240,4 +260,7 @@ fn random_faults_never_break_the_rules_and_the_cluster_always_settles() {
         longest / 1_000_000,
         slowest / 1_000_000
     );
+    if window_full > 0 {
+        eprintln!("copies paced: the window full in {window_full} of {seeds} runs");
+    }
 }
