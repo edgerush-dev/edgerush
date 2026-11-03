@@ -24,13 +24,13 @@ routes:
     rules:
       - matches: [{ path: { prefix: /api } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
-  - name: ingress/tie/web/tie.example.com
+  - name: httproute/tie/web/http
     listeners: [port-80]
     hostnames: [{ name: "tie.example.com", falls_through: false }]
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: tie/web/http, weight: 1 }] }
-  - name: httproute/tie/web/http
+  - name: ingress/tie/web/tie.example.com
     listeners: [port-80]
     hostnames: [{ name: "tie.example.com", falls_through: false }]
     rules:

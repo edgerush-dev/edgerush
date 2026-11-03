@@ -1,6 +1,6 @@
 # Ingresses and HTTPRoutes on one data plane are ranked as one: their routes go into the
 # config oldest first, then by namespace and name, whichever API each is of, and an Ingress
-# and an HTTPRoute alike in all three, the Ingress first. A match that never takes a request,
+# and an HTTPRoute alike in all three, the HTTPRoute first. A match that never takes a request,
 # as an older object of either API, or an earlier route of the same one, has it the same
 # way on the same listener and host, is said shadowed, with what it asks beyond its path;
 # one that asks more (a header) is not, nor one under a wildcard that claims more hosts than

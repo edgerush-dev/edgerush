@@ -570,7 +570,8 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 let translation = &heard.translations[0];
                 assert_eq!(
                     routes(translation),
-                    ["ingress/shop/web/shop.example", "httproute/shop/web/http"]
+                    // Alike in age, namespace and name: the HTTPRoute first (04 §1).
+                    ["httproute/shop/web/http", "ingress/shop/web/shop.example"]
                 );
                 let report: Vec<String> =
                     translation.report.iter().map(ToString::to_string).collect();
