@@ -324,7 +324,8 @@ async fn owned_by(cluster: &Cluster, ids: &BTreeSet<NodeId>) -> Option<()> {
 async fn three_pods_are_formed_by_the_control_plane_into_one_table() {
     let cluster = Cluster::formed(3).await;
     let ids = (1..=3).collect();
-    let table = cluster.one_table(&ids).await.unwrap();
+    // Read again, as one: tables published as shards move reach the pods a moment apart.
+    let table = within(FORMED, || cluster.one_table(&ids)).await.unwrap();
     assert!((0..SHARDS).all(|shard| table.owner(shard).is_some()));
 }
 
