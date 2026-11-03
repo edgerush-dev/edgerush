@@ -41,6 +41,8 @@ tower-service.workspace = true
 [dev-dependencies]
 edgerush-certificates = { workspace = true, features = ["testing"] }
 proptest.workspace = true
+# "io-util": the socket tests' relays, copying both ways.
+tokio = { workspace = true, features = ["io-util"] }
 
 [lints]
 workspace = true

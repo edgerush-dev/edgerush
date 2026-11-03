@@ -579,7 +579,7 @@ impl CopySender {
 }
 
 /// A channel's receiving end as a stream, which is all tonic needs of a stream's messages.
-struct Received<T>(mpsc::Receiver<T>);
+pub(crate) struct Received<T>(pub(crate) mpsc::Receiver<T>);
 
 impl<T> Stream for Received<T> {
     type Item = T;

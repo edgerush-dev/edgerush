@@ -3,5 +3,9 @@
 //!
 //! - [`wire`]: the store's messages as protobuf, a mode's value with them, and the pieces a
 //!   message too long for one is sent in.
+//! - [`pod`]: a pod of the store on sockets, and its gRPC server.
+//! - [`link`]: what a pod sends to one peer, and how it dials it.
 
+pub mod link;
+pub mod pod;
 pub mod wire;

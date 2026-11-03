@@ -2,8 +2,8 @@
 //! from these structs, and the conversions both ways.
 //!
 //! Pods speak on two streams (`membership-design.md`, "Requirements it found for the real
-//! transport"): copies to replicas, and their answers, on one ([`ToCopy`]); everything else —
-//! heartbeats, tables, votes, handoffs, the control plane's questions — on the other
+//! transport"): copies to replicas on one ([`ToCopy`]); everything else — heartbeats, tables,
+//! votes, handoffs, the control plane's questions, and the answers to copies — on the other
 //! ([`ToPeer`]), so that a pod joining a cluster of many keys, sent a snapshot of each shard
 //! it is to keep, holds up no heartbeat. [`wire`] says which a message goes on.
 //!
@@ -302,6 +302,21 @@ pub struct Form {
     pub latest: Option<Stamp>,
 }
 
+/// What a pod says of itself as each of its streams to another opens, and to a seed it asks
+/// and from one: who it is, where it is reached and how many shards its cluster has.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Hello {
+    /// Its member id.
+    #[prost(uint64, tag = "1")]
+    pub from: u64,
+    /// Where it is reached.
+    #[prost(string, tag = "2")]
+    pub address: String,
+    /// Its cluster's shard count.
+    #[prost(uint32, tag = "3")]
+    pub shards: u32,
+}
+
 /// A key, its value, and when it may be forgotten.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Entry<W: prost::Message + Default + Debug> {
@@ -513,6 +528,10 @@ pub enum Control<W: prost::Message + Default + Debug> {
     /// A part of a copy taken.
     #[prost(message, tag = "22")]
     Took(Took),
+    /// A replica's answer to a copy: here rather than on the copy stream, so that it never
+    /// waits behind bulk copies past the time an owner repairs a copy unanswered.
+    #[prost(message, tag = "23")]
+    Replicated(Replicated),
 }
 
 /// One message on the stream apart from copies.
@@ -524,7 +543,7 @@ pub struct ToPeer<W: prost::Message + Default + Debug> {
     /// What it is.
     #[prost(
         oneof = "Control",
-        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22"
+        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23"
     )]
     pub message: Option<Control<W>>,
 }
@@ -535,9 +554,6 @@ pub enum Copying<W: prost::Message + Default + Debug> {
     /// A copy.
     #[prost(message, tag = "2")]
     Replicate(Replicate<W>),
-    /// Its answer.
-    #[prost(message, tag = "3")]
-    Replicated(Replicated),
 }
 
 /// One message on the copy stream.
@@ -547,7 +563,7 @@ pub struct ToCopy<W: prost::Message + Default + Debug> {
     #[prost(uint64, tag = "1")]
     pub from: u64,
     /// What it is.
-    #[prost(oneof = "Copying", tags = "2, 3")]
+    #[prost(oneof = "Copying", tags = "2")]
     pub message: Option<Copying<W>>,
 }
 
@@ -600,15 +616,12 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             term,
             assignment,
             version,
-        } => Outgoing::Copy(ToCopy {
-            from,
-            message: Some(Copying::Replicated(Replicated {
-                shard: u32::from(shard),
-                term,
-                assignment,
-                version,
-            })),
-        }),
+        } => peer(Control::Replicated(Replicated {
+            shard: u32::from(shard),
+            term,
+            assignment,
+            version,
+        })),
         Message::Heartbeat {
             term,
             leader,
@@ -858,6 +871,12 @@ pub fn from_peer<V: Value>(sent: ToPeer<V::Wire>) -> Result<(NodeId, Message<V>)
             to: handed.to,
             from: stamp_from(handed.from)?,
         },
+        Control::Replicated(answer) => Message::Replicated {
+            shard: shard_id(answer.shard)?,
+            term: answer.term,
+            assignment: answer.assignment,
+            version: answer.version,
+        },
     };
     Ok((sent.from, message))
 }
@@ -880,12 +899,6 @@ pub fn from_copy<V: Value>(sent: ToCopy<V::Wire>) -> Result<(NodeId, Message<V>)
             dropped: copy.dropped,
             part: copy.part,
             more: copy.more,
-        },
-        Copying::Replicated(answer) => Message::Replicated {
-            shard: shard_id(answer.shard)?,
-            term: answer.term,
-            assignment: answer.assignment,
-            version: answer.version,
         },
     };
     Ok((sent.from, message))
@@ -1467,10 +1480,10 @@ mod tests {
             prop_assert_eq!(through(from, message.clone()), (from, message));
         }
 
-        /// Copies and their answers go on the copy stream, everything else on the other.
+        /// Copies go on the copy stream, everything else — their answers too — on the other.
         #[test]
         fn copies_alone_go_on_the_copy_stream(message in message()) {
-            let copy = matches!(message, Message::Replicate { .. } | Message::Replicated { .. });
+            let copy = matches!(message, Message::Replicate { .. });
             prop_assert_eq!(matches!(wire(1, message), Outgoing::Copy(_)), copy);
         }
 
@@ -1538,9 +1551,9 @@ mod tests {
         assert_eq!(from_peer::<SyncValue>(publish), Err(Invalid::Shard));
         let copy = ToCopy::<Synchronous> {
             from: 1,
-            message: Some(Copying::Replicated(Replicated {
+            message: Some(Copying::Replicate(Replicate {
                 shard: past,
-                ..Replicated::default()
+                ..Replicate::default()
             })),
         };
         assert_eq!(from_copy::<SyncValue>(copy), Err(Invalid::Shard));
@@ -1735,5 +1748,63 @@ mod tests {
             .unwrap();
         let decoded = ToCopy::decode(whole.as_slice()).unwrap();
         assert_eq!(from_copy(decoded), Ok((2, copy)));
+    }
+
+    /// A part as large as the store cuts one, of the values costliest to encode — every
+    /// number at its longest — or of keys dropped alone, is one message a receiver takes: the
+    /// service fixes the store's part size, so this holds for every config.
+    #[test]
+    fn a_part_of_the_most_a_part_carries_fits_what_a_receiver_takes() {
+        let most = edgerush_cluster::Config::defaults().part_bytes;
+        let slots = (0..1_000)
+            .map(|slot| (u64::MAX - slot, (u64::MAX, u64::MAX)))
+            .collect();
+        let costliest = [
+            SyncValue::Count {
+                window: u64::MAX,
+                counted: u64::MAX,
+                given: u64::MAX,
+            },
+            SyncValue::Bucket {
+                due: u64::MAX,
+                given: u64::MAX,
+            },
+            SyncValue::Slots(slots),
+        ];
+        let part = |entries: Vec<(u64, Kept<SyncValue>)>, dropped: Vec<u64>| {
+            let Outgoing::Copy(sent) = wire(
+                u64::MAX,
+                Message::Replicate {
+                    shard: u16::MAX,
+                    term: u64::MAX,
+                    assignment: u64::MAX,
+                    after: Some(u64::MAX),
+                    version: u64::MAX,
+                    under: (u64::MAX, u64::MAX),
+                    entries,
+                    dropped,
+                    part: u32::MAX,
+                    more: true,
+                },
+            ) else {
+                panic!("a copy goes on the copy stream");
+            };
+            sent.encoded_len()
+        };
+        for value in costliest {
+            let kept = Kept {
+                value,
+                forget_at: u64::MAX,
+            };
+            let count = most / kept.bytes();
+            let entries = (0..count)
+                .map(|key| (u64::MAX - key, kept.clone()))
+                .collect();
+            let encoded = part(entries, Vec::new());
+            assert!(encoded <= crate::grpc::MAX_MESSAGE, "{encoded} bytes");
+        }
+        let dropped = (0..most / 8).map(|key| u64::MAX - key).collect();
+        let encoded = part(Vec::new(), dropped);
+        assert!(encoded <= crate::grpc::MAX_MESSAGE, "{encoded} bytes");
     }
 }
