@@ -17,14 +17,14 @@ use http::Uri;
 use hyper_util::rt::TokioIo;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio_boring::SslStream;
 use tonic::Status;
@@ -338,6 +338,7 @@ pub(crate) struct Dialler {
     name: Arc<str>,
     tls: watch::Receiver<SslConnector>,
     within: Duration,
+    from: Option<IpAddr>,
 }
 
 impl Dialler {
@@ -353,8 +354,33 @@ impl Dialler {
             name: Arc::from(name),
             tls,
             within,
+            from: None,
         }
     }
+
+    /// Dialling from `from`, the system's choice if `None`.
+    pub(crate) const fn from(mut self, from: Option<IpAddr>) -> Self {
+        self.from = from;
+        self
+    }
+}
+
+/// A connection to `address` (`host:port`), from `from` if given.
+async fn connect(address: &str, from: Option<IpAddr>) -> io::Result<TcpStream> {
+    let Some(from) = from else {
+        return TcpStream::connect(address).await;
+    };
+    let to = tokio::net::lookup_host(address)
+        .await?
+        .find(|to| to.is_ipv4() == from.is_ipv4())
+        .ok_or_else(|| io::Error::other("no address of the dialling one's family"))?;
+    let socket = if from.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.bind(SocketAddr::new(from, 0))?;
+    socket.connect(to).await
 }
 
 type Dialled =
@@ -374,10 +400,11 @@ impl tower_service::Service<Uri> for Dialler {
         let name = self.name.clone();
         let tls = self.tls.borrow().clone();
         let within = self.within;
+        let from = self.from;
         Box::pin(async move {
             let failed = |why: String| io::Error::other(why);
             let dial = async {
-                let socket = TcpStream::connect(&*address).await?;
+                let socket = connect(&address, from).await?;
                 socket.set_nodelay(true)?;
                 let configured = tls.configure().map_err(|error| failed(error.to_string()))?;
                 let secured = tokio_boring::connect(configured, &name, socket)
