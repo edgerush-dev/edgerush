@@ -170,7 +170,7 @@ kind: Role
 metadata: { name: edgerush-control-status, namespace: edge }
 rules:
   - apiGroups: [""]
-    resources: [services]
+    resources: [services, secrets]
     verbs: [list, watch]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
