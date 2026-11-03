@@ -8,8 +8,12 @@
 //! seeds — addresses only, asked who answers there until it is a member. A pod whose cluster
 //! has another shard count is refused, asking or asked, and so is never taken in. A peer the
 //! store forgets has its link dropped.
+//!
+//! A pod told to drain hands its shards on and leaves the voting set, as its store does; once
+//! drained it stops, but first sends what it has queued — the last changes of the shards it
+//! handed on among them — for at most [`STREAMS_IDLE`] (T4d2).
 
-use super::link::{CONTROL, Counts, Dial, Dropped, GREET, HELLO, Link, SERVICE};
+use super::link::{CONTROL, Counts, Dial, Dropped, GREET, HELLO, Link, SERVICE, Tasks};
 use super::wire::{self, Empty, Hello, Invalid, Joining, Outgoing, Piece, ToCopy, ToPeer, Value};
 use crate::grpc::{Boxed, Client, MAX_MESSAGE, Prost, limited};
 use crate::secure::{Caller, refused};
@@ -31,6 +35,11 @@ pub const TICK: Duration = Duration::from_millis(5);
 /// How often a pod that is no member asks its seeds who answers there.
 const ASK_SEEDS: Duration = Duration::from_secs(1);
 
+/// How long a drained pod waits for its streams to send what they hold before it stops
+/// anyway (decided): what is left then, to a peer slow or cut off, is failed over as a crash's
+/// is. Well inside the 30 s Kubernetes grants a pod to stop by default, beside the drain itself.
+pub const STREAMS_IDLE: Duration = Duration::from_secs(5);
+
 /// The control plane, as a pod's store names it: no pod's member id.
 pub const CONTROL_PLANE: NodeId = NodeId::MAX;
 
@@ -46,6 +55,8 @@ enum Command<V> {
     Greeted(Hello),
     Control(Message<V>, oneshot::Sender<Option<Message<V>>>),
     With(Run<V>),
+    /// Drain, and say so by dropping the sender once stopped.
+    Drain(oneshot::Sender<()>),
     Stop,
 }
 
@@ -106,6 +117,7 @@ where
             links: BTreeMap::new(),
             counts,
             commands: commands.downgrade(),
+            drains: Vec::new(),
         };
         tokio::spawn(running.run(received));
         pod
@@ -135,6 +147,23 @@ where
         }));
         self.commands.send(command).await.ok()?;
         answered.await.ok()
+    }
+
+    /// Whether it is ready, as its store has it ([`Node::ready`]): never once it has stopped.
+    pub async fn ready(&self) -> bool {
+        self.with(|node, now| node.ready(now))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Drains it: its store hands its shards on and leaves the voting set, and once drained
+    /// the pod stops, its streams first sending what they hold, for at most
+    /// [`STREAMS_IDLE`]. Returns once it has stopped.
+    pub async fn drain(&self) {
+        let (stopped, stopping) = oneshot::channel();
+        if self.commands.send(Command::Drain(stopped)).await.is_ok() {
+            let _stopped = stopping.await;
+        }
     }
 
     /// Stops it, as a pod gone: its store ticks and answers no more, and its links are
@@ -184,6 +213,8 @@ struct Running<V> {
     counts: Arc<Counts>,
     /// For seeds' answers, which come back as hellos.
     commands: mpsc::WeakSender<Command<V>>,
+    /// Those waiting for it to stop, drained.
+    drains: Vec<oneshot::Sender<()>>,
 }
 
 impl<V: Value + Send + 'static> Running<V>
@@ -240,9 +271,36 @@ where
                         let now = self.now();
                         with(&mut self.node, now);
                     }
+                    Some(Command::Drain(stopped)) => {
+                        self.node.drain();
+                        self.drains.push(stopped);
+                    }
                 },
             }
+            if self.node.drained() {
+                break;
+            }
         }
+        // Its store stopped, nothing more reaches it; what it sent still goes.
+        drop(received);
+        self.stop_drained().await;
+    }
+
+    /// Stops it, drained, once its links have sent what they hold, or after
+    /// [`STREAMS_IDLE`] whatever is left, and then tells those waiting.
+    async fn stop_drained(mut self) {
+        let mut closing: Vec<Tasks> = std::mem::take(&mut self.links)
+            .into_values()
+            .map(Link::close)
+            .collect();
+        let idle = async {
+            for tasks in &mut closing {
+                tasks.ended().await;
+            }
+        };
+        let _late = tokio::time::timeout(STREAMS_IDLE, idle).await;
+        drop(closing);
+        drop(self);
     }
 
     /// Sends `out`, each message to its peer's link, made if it has none: dropped if no
@@ -642,6 +700,7 @@ mod tests {
             links: BTreeMap::new(),
             counts: Arc::default(),
             commands: commands.downgrade(),
+            drains: Vec::new(),
         }
     }
 
