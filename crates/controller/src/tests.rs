@@ -384,22 +384,23 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
     assert_eq!(followed.unlisted(), ["crd referencegrants"]);
 }
 
-/// ListenerSets are followed where routes are, and in the Gateway's own namespace too, as a
-/// Gateway takes them `from: Same` there whatever the scope.
+/// ListenerSets and Secrets are followed where routes are, and in the Gateway's own
+/// namespace too, as a Gateway takes ListenerSets `from: Same` there and its listeners'
+/// certificateRefs there need no grant, whatever the scope.
 #[test]
-fn listener_sets_are_followed_in_the_scope_and_the_gateways_namespace() {
+fn listener_sets_and_secrets_are_followed_in_the_scope_and_the_gateways_namespace() {
     let edge = Scope::Namespace("edge".to_owned());
     let shop = Scope::Namespace("shop".to_owned());
     assert_eq!(
-        listener_set_scope(std::slice::from_ref(&shop), &edge),
+        with_gateway_namespace(std::slice::from_ref(&shop), &edge),
         [shop.clone(), edge.clone()]
     );
     assert_eq!(
-        listener_set_scope(&[shop.clone(), edge.clone()], &edge),
+        with_gateway_namespace(&[shop.clone(), edge.clone()], &edge),
         [shop, edge.clone()]
     );
     assert_eq!(
-        listener_set_scope(&[Scope::Cluster], &edge),
+        with_gateway_namespace(&[Scope::Cluster], &edge),
         [Scope::Cluster]
     );
 }
@@ -868,6 +869,65 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
                     "ingress/shop/web/shop.example"
                 ]
             );
+            controlling.abort();
+        })
+        .await;
+}
+
+/// Secrets are followed in the Gateway's namespace beside the scope's, where its listeners'
+/// certificateRefs of their own namespace are; nothing else is followed there but the
+/// Gateway's own kinds (04 §1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secrets_are_followed_in_the_gateways_namespace_beside_the_scope() {
+    let fake = Fake::start(&["127.0.0.1"], |path| {
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/api/v1/namespaces/edge/secrets?") {
+            page(&[secret("edge", &["secure.example"])])
+        } else {
+            answer(500, "")
+        }
+    })
+    .await;
+    let api = fake.client(
+        &token("controller-gateway-secrets", "secret"),
+        Timing::default(),
+    );
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let plane = gateway_plane();
+            let scope = [Scope::Namespace("shop".to_owned())];
+            let controlling = tokio::task::spawn_local(async move {
+                control(
+                    api,
+                    &scope,
+                    &plane,
+                    Debounce::default(),
+                    None,
+                    None,
+                    acks(),
+                    |_| {},
+                )
+                .await;
+            });
+            let listed = |path: &str| {
+                fake.seen()
+                    .iter()
+                    .any(|seen| seen.path.starts_with(&format!("{path}?")))
+            };
+            until("the Gateway's namespace's Secrets listed", || {
+                listed("/api/v1/namespaces/edge/secrets")
+            })
+            .await;
+            assert!(listed("/api/v1/namespaces/shop/secrets"));
+            for elsewhere in [
+                "/api/v1/namespaces/edge/services",
+                "/apis/networking.k8s.io/v1/namespaces/edge/ingresses",
+            ] {
+                assert!(!listed(elsewhere), "{elsewhere} listed");
+            }
             controlling.abort();
         })
         .await;

@@ -183,7 +183,14 @@ pub async fn control(
         ingress_classes: start.follows(&[Scope::Cluster]),
         ingresses: start.follows(scope),
         services: start.follows(scope),
-        secrets: start.follows(scope),
+        // A Gateway's certificateRefs of its own namespace need no grant, and are read
+        // there whatever the scope (04 §1).
+        secrets: start.follows(&match &plane.gateway {
+            Some(gateway) => {
+                with_gateway_namespace(scope, &Scope::Namespace(gateway.namespace.clone()))
+            }
+            None => scope.to_vec(),
+        }),
         status_service: match &status {
             Some(Addresses::Service { namespace, .. }) => {
                 start.follows(&[Scope::Namespace(namespace.clone())])
@@ -502,7 +509,7 @@ impl GatewayApi {
                     keep(&mut self.gateways, on, || start.follows(namespace));
                 }
                 GatewayKind::ListenerSet => {
-                    let scope = listener_set_scope(scope, &self.namespace);
+                    let scope = with_gateway_namespace(scope, &self.namespace);
                     keep(&mut self.listener_sets, on, || start.follows(&scope));
                 }
                 GatewayKind::HTTPRoute => keep(&mut self.http_routes, on, || start.follows(scope)),
@@ -842,10 +849,11 @@ impl Followed {
     }
 }
 
-/// Where ListenerSets are followed: the watch scope, as routes are, and the Gateway's own
-/// namespace, `gateway`, where the scope does not hold it, as a Gateway that takes them
-/// `from: Same` takes them there (04 §1).
-fn listener_set_scope(scope: &[Scope], gateway: &Scope) -> Vec<Scope> {
+/// Where ListenerSets and Secrets are followed: the watch scope, as routes are, and the
+/// Gateway's own namespace, `gateway`, where the scope does not hold it, as a Gateway that
+/// takes ListenerSets `from: Same` takes them there, and its listeners' certificateRefs of
+/// its own namespace need no grant (04 §1).
+fn with_gateway_namespace(scope: &[Scope], gateway: &Scope) -> Vec<Scope> {
     let mut followed = scope.to_vec();
     if !scope
         .iter()
