@@ -3,7 +3,8 @@
 //! the address it gives. Cutting a pod off is the relays' doing: each drops the connections
 //! of a pod cut off, to it and from it, known by its IP, as pods dial from theirs. The control
 //! plane's `Authority` runs in-process, asking the pods as the controller will. Each scenario
-//! is the simulation's, held to its bound; a rollout's, as T4d2 has it.
+//! is the simulation's, held to its bound; a rollout's, as T4d2 has it. Clients ask the pods'
+//! synchronous mode in-process, through a `StoreClient` (T5a).
 
 #![allow(
     clippy::unwrap_used,
@@ -13,10 +14,12 @@
 )]
 
 use edgerush_cluster::table::shard_of;
-use edgerush_cluster::{Authority, Changed, Config, Kept, Node, NodeId, Table, Time};
-use edgerush_cluster_synchronous::Value;
+use edgerush_cluster::{Authority, Changed, Config, Kept, Node, NodeId, Stamp, Table, Time, ms};
+use edgerush_cluster_synchronous::{Answer, Message as ModeMessage, Rule, Value};
 use edgerush_ratelimit_service::cluster::link::Dial;
-use edgerush_ratelimit_service::cluster::pod::{STREAMS_IDLE, StorePod, StoreServer, TICK, ask};
+use edgerush_ratelimit_service::cluster::pod::{
+    STREAMS_IDLE, StoreClient, StorePod, StoreServer, TICK, ask,
+};
 use edgerush_ratelimit_service::grpc::Client;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -43,6 +46,13 @@ const UNSERVED: Duration = Duration::from_millis(50);
 /// streams never end fails it.
 const DRAINED: Duration = Duration::from_secs(3);
 const _: () = assert!(DRAINED.as_secs() < STREAMS_IDLE.as_secs());
+
+/// How long a client waits for an answer: ample on localhost.
+const ANSWERED: Duration = Duration::from_secs(1);
+
+/// How long a pod gathering a request under several keys waits for its parts before it answers
+/// not counted, as the mode has it (15 ms), and a few ticks more.
+const GATHERED: Duration = Duration::from_millis(15 + 4 * 5);
 
 /// Fewer shards than the store's default, for tests that read every one.
 const SHARDS: u16 = 16;
@@ -115,7 +125,7 @@ impl Relay {
 
 /// A pod running, its server and its relay.
 struct Running {
-    pod: StorePod<Value>,
+    pod: StorePod,
     server: JoinHandle<()>,
     relay: Relay,
 }
@@ -169,7 +179,7 @@ impl Cluster {
         let listener = TcpListener::bind((ip, 0)).await.unwrap();
         let relay = Relay::to(ip, listener.local_addr().unwrap(), self.cut.subscribe()).await;
         let address = relay.address.to_string();
-        let pod = StorePod::<Value>::spawn(id, address.clone(), config, Dial::Plain, seeds);
+        let pod = StorePod::spawn(id, address.clone(), config, Dial::Plain, seeds);
         let server = StoreServer::new(pod.clone());
         let server = tokio::spawn(async move {
             let _ended = tonic::transport::Server::builder()
@@ -200,7 +210,7 @@ impl Cluster {
         cluster
     }
 
-    fn pod(&self, id: NodeId) -> &StorePod<Value> {
+    fn pod(&self, id: NodeId) -> &StorePod {
         &self.pods[&id].pod
     }
 
@@ -243,7 +253,7 @@ impl Cluster {
 }
 
 /// The table `pod` has committed.
-async fn committed(pod: &StorePod<Value>) -> Option<Table> {
+async fn committed(pod: &StorePod) -> Option<Table> {
     pod.with(|node, _| node.committed().cloned())
         .await
         .flatten()
@@ -344,7 +354,7 @@ struct Sampled {
 /// Round after round until `done`, asks each pod `live` holds which shards it serves, and
 /// writes every key of those shards there, counted by the round.
 async fn sample(
-    live: Arc<Mutex<BTreeMap<NodeId, StorePod<Value>>>>,
+    live: Arc<Mutex<BTreeMap<NodeId, StorePod>>>,
     done: watch::Receiver<bool>,
 ) -> Sampled {
     let keys = Arc::new(keys());
@@ -357,7 +367,7 @@ async fn sample(
     while !*done.borrow() {
         round += 1;
         let at = Instant::now();
-        let pods: Vec<StorePod<Value>> = live.lock().unwrap().values().cloned().collect();
+        let pods: Vec<StorePod> = live.lock().unwrap().values().cloned().collect();
         let mut served = BTreeSet::new();
         for pod in pods {
             let keys = Arc::clone(&keys);
@@ -524,6 +534,68 @@ async fn rollout(pods: NodeId, step: usize) {
     assert_eq!(dialled(), before, "old pods dialled once forgotten");
 }
 
+/// Pods 1 to `count`, formed and ready.
+async fn ready(count: NodeId) -> Cluster {
+    let cluster = Cluster::formed(count).await;
+    let ids: BTreeSet<NodeId> = (1..=count).collect();
+    let ready = within(FORMED, || all_ready(&cluster, &ids)).await;
+    assert!(ready.is_some(), "pods not ready within {FORMED:?}");
+    cluster
+}
+
+/// The first key `table` has `owner` own.
+fn key_owned_by(table: &Table, owner: NodeId) -> u64 {
+    (0..)
+        .find(|key| table.owner(shard_of(*key, SHARDS)) == Some(owner))
+        .unwrap()
+}
+
+/// A request under `key` from `client`, numbered `id`, its table `stamp`, held to `rule`.
+const fn request(
+    client: NodeId,
+    id: u64,
+    key: u64,
+    stamp: Stamp,
+    rule: Option<Rule>,
+) -> ModeMessage {
+    ModeMessage::Request {
+        client,
+        id,
+        key,
+        stamp,
+        hops: 0,
+        via: None,
+        give_back: false,
+        rule,
+        receipt: 0,
+    }
+}
+
+/// The answer `client` is given to its request `id`, within `most`.
+async fn answered(client: &mut StoreClient, id: u64, most: Duration) -> Option<Answer> {
+    let answer = async {
+        loop {
+            if let ModeMessage::Reply {
+                id: answered,
+                answer,
+                ..
+            } = client.answer().await?
+                && answered == id
+            {
+                return Some(answer);
+            }
+        }
+    };
+    tokio::time::timeout(most, answer).await.ok().flatten()
+}
+
+/// What `pod` holds counted under `key`, less what was given back.
+async fn held_at(pod: &StorePod, key: u64) -> Option<u64> {
+    pod.with(move |node, _| node.value(key).map(|value| value.net()))
+        .await
+        .flatten()
+}
+
 /// Whether every one of `ids` has committed a table whose every shard is owned by one of
 /// them.
 async fn owned_by(cluster: &Cluster, ids: &BTreeSet<NodeId>) -> Option<()> {
@@ -596,7 +668,7 @@ async fn when_a_follower_crashes_its_keys_are_held_by_their_new_owners() {
         let mut owner = 0;
         let updated = within(FAILOVER, || {
             let leading = cluster.pod(leading).clone();
-            let pods: BTreeMap<NodeId, StorePod<Value>> = cluster
+            let pods: BTreeMap<NodeId, StorePod> = cluster
                 .pods
                 .iter()
                 .map(|(id, running)| (*id, running.pod.clone()))
@@ -712,6 +784,158 @@ async fn a_rollout_of_three_pods_one_at_a_time_leaves_no_shard_unserved_and_lose
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rollout_of_five_pods_two_at_a_time_leaves_no_shard_unserved_and_loses_nothing() {
     rollout(5, 2).await;
+}
+
+/// A request reaching a pod not its key's owner, forwarding on, is forwarded to the owner and
+/// answered back through it: counted once, at the owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_at_a_pod_not_its_keys_owner_is_forwarded_and_counted_once() {
+    let cluster = ready(3).await;
+    let table = committed(cluster.pod(1)).await.unwrap();
+    let key = key_owned_by(&table, 2);
+    cluster.pod(1).set_forwarding(true).await;
+    let mut client = cluster.pod(1).client().await.unwrap();
+    assert!(
+        client
+            .ask(request(client.id(), 1, key, table.stamp(), None))
+            .await
+    );
+    let answer = answered(&mut client, 1, ANSWERED).await;
+    assert_eq!(answer, Some(Answer::Counted(1)));
+    assert_eq!(held_at(cluster.pod(2), key).await, Some(1));
+}
+
+/// Forwarding off, a request reaching a pod not its key's owner is told the key is elsewhere,
+/// with the pod's table if the client's is older, and counted nowhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_at_a_pod_not_its_keys_owner_is_told_elsewhere() {
+    let cluster = ready(3).await;
+    let table = committed(cluster.pod(1)).await.unwrap();
+    let key = key_owned_by(&table, 2);
+    let mut client = cluster.pod(1).client().await.unwrap();
+    client.ask(request(client.id(), 1, key, (0, 0), None)).await;
+    let older = answered(&mut client, 1, ANSWERED).await;
+    assert!(
+        matches!(&older, Some(Answer::Elsewhere(Some(told))) if told.stamp() == table.stamp()),
+        "{older:?}"
+    );
+    client
+        .ask(request(client.id(), 2, key, table.stamp(), None))
+        .await;
+    let same = answered(&mut client, 2, ANSWERED).await;
+    assert_eq!(same, Some(Answer::Elsewhere(None)));
+    assert_eq!(held_at(cluster.pod(2), key).await, None);
+}
+
+/// A request past its key's limit is refused, told how long until the key would admit one:
+/// within the rule's window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_past_its_limit_is_refused_with_how_long_to_wait() {
+    let cluster = ready(3).await;
+    let table = committed(cluster.pod(1)).await.unwrap();
+    let key = key_owned_by(&table, 1);
+    let rule = Rule::Window {
+        per: 1,
+        window: ms(1_000),
+    };
+    let mut client = cluster.pod(1).client().await.unwrap();
+    client
+        .ask(request(client.id(), 1, key, table.stamp(), Some(rule)))
+        .await;
+    let admitted = answered(&mut client, 1, ANSWERED).await;
+    assert!(
+        matches!(admitted, Some(Answer::Admitted(_))),
+        "{admitted:?}"
+    );
+    client
+        .ask(request(client.id(), 2, key, table.stamp(), Some(rule)))
+        .await;
+    let refused = answered(&mut client, 2, ANSWERED).await;
+    assert!(
+        matches!(refused, Some(Answer::Limited { wait }) if wait > 0 && wait <= ms(1_000)),
+        "{refused:?}"
+    );
+}
+
+/// A request under several keys is gathered by the pod it reaches, each part counted at its
+/// key's owner, and answered counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_under_several_keys_is_gathered_and_counted_at_each_owner() {
+    let cluster = ready(3).await;
+    let table = committed(cluster.pod(1)).await.unwrap();
+    let keys: Vec<(NodeId, u64)> = (1..=3)
+        .map(|owner| (owner, key_owned_by(&table, owner)))
+        .collect();
+    let mut client = cluster.pod(1).client().await.unwrap();
+    let gather = ModeMessage::Gather {
+        client: client.id(),
+        id: 1,
+        keys: keys.iter().map(|(_, key)| *key).collect(),
+    };
+    assert!(client.ask(gather).await);
+    let answer = answered(&mut client, 1, ANSWERED).await;
+    assert_eq!(answer, Some(Answer::Counted(0)));
+    for (owner, key) in keys {
+        assert_eq!(held_at(cluster.pod(owner), key).await, Some(1), "key {key}");
+    }
+}
+
+/// A request under several keys, one part's owner crashed: answered not counted once the pod
+/// gathering it has waited for the part, and the parts it counted given back, so that the
+/// owners hold what the client was told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_gathered_with_a_parts_owner_crashed_is_not_counted_and_given_back() {
+    let mut cluster = ready(3).await;
+    let table = committed(cluster.pod(1)).await.unwrap();
+    let keys: Vec<(NodeId, u64)> = (1..=3)
+        .map(|owner| (owner, key_owned_by(&table, owner)))
+        .collect();
+    cluster.crash(3).await;
+    let mut client = cluster.pod(1).client().await.unwrap();
+    let gather = ModeMessage::Gather {
+        client: client.id(),
+        id: 1,
+        keys: keys.iter().map(|(_, key)| *key).collect(),
+    };
+    let asked = Instant::now();
+    client.ask(gather).await;
+    let answer = answered(&mut client, 1, ANSWERED).await;
+    let took = asked.elapsed();
+    assert_eq!(answer, Some(Answer::NotServing));
+    assert!(took <= GATHERED, "answered after {took:?}");
+    let given_back = within(FAILOVER, || async {
+        for (owner, key) in &keys[..2] {
+            if held_at(cluster.pod(*owner), *key).await.unwrap_or(0) != 0 {
+                return None;
+            }
+        }
+        Some(())
+    })
+    .await;
+    assert!(given_back.is_some(), "parts counted not given back");
+}
+
+/// An owner cut off from the others stops serving once it has lost its lease, and says so to a
+/// request under a key its table still has it own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_cut_off_answers_not_serving() {
+    let cluster = ready(3).await;
+    cluster.cut_off(2);
+    // Its lease gone, it is ready no more: shards moving just after forming may leave one
+    // unserved for a moment before that, and served again.
+    let unready = within(FAILOVER, || async {
+        (!cluster.pod(2).ready().await).then_some(())
+    })
+    .await;
+    assert!(unready.is_some(), "pod 2 still ready");
+    let table = committed(cluster.pod(2)).await.unwrap();
+    let key = key_owned_by(&table, 2);
+    let mut client = cluster.pod(2).client().await.unwrap();
+    client
+        .ask(request(client.id(), 1, key, table.stamp(), None))
+        .await;
+    let answer = answered(&mut client, 1, ANSWERED).await;
+    assert_eq!(answer, Some(Answer::NotServing));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -513,7 +513,7 @@ impl Client {
                 )
             }
             // Refused under its rule, charged nothing: what other parts were charged given back.
-            Answer::Limited => {
+            Answer::Limited { .. } => {
                 self.inflight.remove(&id);
                 self.avoiding.remove(&inflight.to);
                 self.misses.remove(&inflight.to);

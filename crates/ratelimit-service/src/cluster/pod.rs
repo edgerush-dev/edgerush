@@ -1,5 +1,6 @@
-//! A pod of the cluster store on sockets (cluster-store-transplant-plan.md, "T4d"): its
-//! [`Node`] owned by one task, ticked every [`TICK`] and on every message, on real time, with
+//! A pod of the cluster store on sockets (cluster-store-transplant-plan.md, "T4d"): the
+//! synchronous mode's [`Pod`], the store's [`Node`] within it, owned by one task, ticked every
+//! [`TICK`] and on every message, on real time, with
 //! what it sends going to its peers through a link each ([`link`](super::link)), and what they send it coming in
 //! on the streams they dial to it, served by a [`StoreServer`].
 //!
@@ -16,13 +17,21 @@
 //! A peer whose wall clock its store finds off from the pod's past `skew_warning` is told of
 //! in the log, as it goes past and every [`SKEW_TOLD_AGAIN`] while it stays, and counted in
 //! [`StorePod::skewed`] (T4d3): nothing corrects for skew.
+//!
+//! Clients ask it through a [`StoreClient`], in-process, as data planes will through a stream
+//! for them (T5c): a request reaching a pod not its key's owner is forwarded one hop to the
+//! owner, when forwarding is on, and answered back through it; a request under several keys
+//! is gathered by the pod it reaches, each part asked of its owner (T5a).
 
 use super::link::{CONTROL, Counts, Dial, Dropped, GREET, HELLO, Link, SERVICE, Tasks};
-use super::wire::{self, Empty, Hello, Invalid, Joining, Outgoing, Piece, ToCopy, ToPeer, Value};
+use super::wire::{
+    self, Empty, Hello, Invalid, Joining, Outgoing, Piece, Synchronous, ToCopy, ToPeer, Value,
+};
 use crate::grpc::{Boxed, Client, MAX_MESSAGE, Prost, limited};
 use crate::secure::{Caller, refused};
 use crate::synchronous::Received;
-use edgerush_cluster::{Config, Message, Node, NodeId, Outbox, Time};
+use edgerush_cluster::{Config, Message, Node, NodeId, Time};
+use edgerush_cluster_synchronous::{Message as ModeMessage, Outbox, Pod, Value as SyncValue};
 use prost::Message as _;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -52,33 +61,48 @@ pub const SKEW_TOLD_AGAIN: Duration = Duration::from_secs(60);
 /// The control plane, as a pod's store names it: no pod's member id.
 pub const CONTROL_PLANE: NodeId = NodeId::MAX;
 
+/// Where clients' ids start, as a pod numbers those asking it: apart from every pod's member
+/// id, as the simulation keeps its clients apart, and below the control plane's.
+pub const CLIENTS: NodeId = 1 << 63;
+
+/// How many answers wait for a client before more are dropped, as messages lost: a client
+/// reading them slowly holds up no pod.
+const ANSWERS_WAITING: usize = 1_024;
+
 /// How many messages received wait for the pod's task, across its streams: past it, each
 /// stream waits to read on, and its sender's queue fills.
 const RECEIVED_WAITING: usize = 64;
 
-/// Something run on a pod's store, in its task.
-type Run<V> = Box<dyn FnOnce(&mut Node<V>, Time) + Send>;
+/// Something run on a pod's mode, its store within, in its task.
+type Run = Box<dyn FnOnce(&mut Pod, Time) + Send>;
 
-enum Command<V> {
-    Receive(NodeId, Message<V>),
+enum Command {
+    Receive(NodeId, ModeMessage),
     Greeted(Hello),
-    Control(Message<V>, oneshot::Sender<Option<Message<V>>>),
-    With(Run<V>),
+    Control(
+        Message<SyncValue>,
+        oneshot::Sender<Option<Message<SyncValue>>>,
+    ),
+    With(Run),
+    /// A client to be answered: its id, and where its answers go.
+    Client(oneshot::Sender<(NodeId, mpsc::Receiver<ModeMessage>)>),
+    /// A client's request.
+    Ask(NodeId, ModeMessage),
     /// Drain, and say so by dropping the sender once stopped.
     Drain(oneshot::Sender<()>),
     Stop,
 }
 
 /// A handle on a pod of the store, running. Cheap to clone.
-pub struct StorePod<V> {
-    commands: mpsc::Sender<Command<V>>,
+pub struct StorePod {
+    commands: mpsc::Sender<Command>,
     id: NodeId,
     hello: Arc<Hello>,
     counts: Arc<Counts>,
     skewed: Arc<AtomicUsize>,
 }
 
-impl<V> Clone for StorePod<V> {
+impl Clone for StorePod {
     fn clone(&self) -> Self {
         Self {
             commands: self.commands.clone(),
@@ -90,10 +114,7 @@ impl<V> Clone for StorePod<V> {
     }
 }
 
-impl<V: Value + Send + 'static> StorePod<V>
-where
-    V::Wire: Send,
-{
+impl StorePod {
     /// Pod `id`, reached at `address`, started with `config`, dialling its peers as `dial`
     /// says and asking `seeds` who answers there until it is a member.
     #[must_use]
@@ -120,7 +141,7 @@ where
             skewed: Arc::clone(&skewed),
         };
         let running = Running {
-            node: Node::new(id, address, config, []),
+            node: Pod::new(id, address, config, []),
             started: Instant::now(),
             hello,
             dial,
@@ -133,6 +154,8 @@ where
             drains: Vec::new(),
             skews: SkewWarnings::default(),
             skewed,
+            clients: BTreeMap::new(),
+            next_client: CLIENTS,
         };
         tokio::spawn(running.run(received));
         pod
@@ -161,14 +184,34 @@ where
     /// the copies going on its next tick. `None` once it has stopped.
     pub async fn with<R: Send + 'static>(
         &self,
-        with: impl FnOnce(&mut Node<V>, Time) -> R + Send + 'static,
+        with: impl FnOnce(&mut Node<SyncValue>, Time) -> R + Send + 'static,
     ) -> Option<R> {
         let (answer, answered) = oneshot::channel();
-        let command = Command::With(Box::new(move |node, now| {
-            let _gone = answer.send(with(node, now));
+        let command = Command::With(Box::new(move |pod, now| {
+            let _gone = answer.send(with(pod.store_mut(), now));
         }));
         self.commands.send(command).await.ok()?;
         answered.await.ok()
+    }
+
+    /// Whether it forwards a request for a key not its own to the owner its table names, one
+    /// hop at most, rather than answer that the key is elsewhere: off as it starts.
+    pub async fn set_forwarding(&self, forwarding: bool) {
+        let command = Command::With(Box::new(move |pod, _| pod.set_forwarding(forwarding)));
+        let _stopped = self.commands.send(command).await;
+    }
+
+    /// A client asking it in-process, answered through the handle: `None` once it has
+    /// stopped.
+    pub async fn client(&self) -> Option<StoreClient> {
+        let (given, giving) = oneshot::channel();
+        self.commands.send(Command::Client(given)).await.ok()?;
+        let (id, answers) = giving.await.ok()?;
+        Some(StoreClient {
+            id,
+            commands: self.commands.clone(),
+            answers,
+        })
     }
 
     /// Whether it is ready, as its store has it ([`Node::ready`]): never once it has stopped.
@@ -203,7 +246,7 @@ where
     }
 
     /// Hands it a message from `from`, waiting while too many wait.
-    async fn receive(&self, from: NodeId, message: Message<V>) -> bool {
+    async fn receive(&self, from: NodeId, message: ModeMessage) -> bool {
         self.commands
             .send(Command::Receive(from, message))
             .await
@@ -211,7 +254,7 @@ where
     }
 
     /// Hands it the control plane's message: its answer, if it has one.
-    async fn control(&self, message: Message<V>) -> Option<Message<V>> {
+    async fn control(&self, message: Message<SyncValue>) -> Option<Message<SyncValue>> {
         let (answer, answered) = oneshot::channel();
         self.commands
             .send(Command::Control(message, answer))
@@ -221,9 +264,39 @@ where
     }
 }
 
-/// The pod's task: its store, and how it reaches its peers.
-struct Running<V> {
-    node: Node<V>,
+/// A client asking a pod in-process, as data planes do through the pod's stream for them
+/// (T5c): what it asks names it, and its answers come back here.
+pub struct StoreClient {
+    id: NodeId,
+    commands: mpsc::Sender<Command>,
+    answers: mpsc::Receiver<ModeMessage>,
+}
+
+impl StoreClient {
+    /// Its id, as what it asks names it.
+    #[must_use]
+    pub const fn id(&self) -> NodeId {
+        self.id
+    }
+
+    /// Asks the pod `message`: a request, or a request to gather, naming this client; anything
+    /// else is dropped. False once the pod has stopped.
+    pub async fn ask(&self, message: ModeMessage) -> bool {
+        self.commands
+            .send(Command::Ask(self.id, message))
+            .await
+            .is_ok()
+    }
+
+    /// Its next answer: `None` once the pod has stopped.
+    pub async fn answer(&mut self) -> Option<ModeMessage> {
+        self.answers.recv().await
+    }
+}
+
+/// The pod's task: its mode and store, and how it reaches its peers and clients.
+struct Running {
+    node: Pod,
     started: Instant,
     hello: Arc<Hello>,
     dial: Dial,
@@ -234,12 +307,15 @@ struct Running<V> {
     links: BTreeMap<NodeId, Link>,
     counts: Arc<Counts>,
     /// For seeds' answers, which come back as hellos.
-    commands: mpsc::WeakSender<Command<V>>,
+    commands: mpsc::WeakSender<Command>,
     /// Those waiting for it to stop, drained.
     drains: Vec<oneshot::Sender<()>>,
     skews: SkewWarnings,
     /// The peers skewed now, as [`StorePod::skewed`] says.
     skewed: Arc<AtomicUsize>,
+    /// The clients asking it, each with where its answers go.
+    clients: BTreeMap<NodeId, mpsc::Sender<ModeMessage>>,
+    next_client: NodeId,
 }
 
 /// When each peer whose wall clock is off past `skew_warning` was last told of in the log.
@@ -266,10 +342,7 @@ impl SkewWarnings {
     }
 }
 
-impl<V: Value + Send + 'static> Running<V>
-where
-    V::Wire: Send,
-{
+impl Running {
     /// Its time, as its store reads it, with its wall clock set from the system's.
     fn now(&mut self) -> Time {
         let now = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(Time::MAX);
@@ -280,11 +353,12 @@ where
             });
         let offset = i128::from(wall) - i128::from(now);
         self.node
+            .store_mut()
             .set_wall_offset(i64::try_from(offset).unwrap_or(i64::MAX));
         now
     }
 
-    async fn run(mut self, mut received: mpsc::Receiver<Command<V>>) {
+    async fn run(mut self, mut received: mpsc::Receiver<Command>) {
         let mut ticks = tokio::time::interval(TICK);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -312,22 +386,35 @@ where
                             }
                         }
                         let now = self.now();
-                        let mut out = self.node.receive(CONTROL_PLANE, message, now);
+                        let mut out =
+                            self.node.receive(CONTROL_PLANE, ModeMessage::Store(message), now);
                         let to_control = out.iter().position(|(to, _)| *to == CONTROL_PLANE);
-                        let _gone = answer.send(to_control.map(|at| out.remove(at).1));
+                        let answered = to_control.and_then(|at| match out.remove(at).1 {
+                            ModeMessage::Store(answered) => Some(answered),
+                            _ => None,
+                        });
+                        let _gone = answer.send(answered);
                         self.send(out);
                     }
                     Some(Command::With(with)) => {
                         let now = self.now();
                         with(&mut self.node, now);
                     }
+                    Some(Command::Client(given)) => self.client(given),
+                    Some(Command::Ask(client, message)) => {
+                        if asks_as(&message, client) {
+                            let now = self.now();
+                            let out = self.node.receive(client, message, now);
+                            self.send(out);
+                        }
+                    }
                     Some(Command::Drain(stopped)) => {
-                        self.node.drain();
+                        self.node.store_mut().drain();
                         self.drains.push(stopped);
                     }
                 },
             }
-            if self.node.drained() {
+            if self.node.store().drained() {
                 break;
             }
         }
@@ -353,10 +440,14 @@ where
         drop(self);
     }
 
-    /// Sends `out`, each message to its peer's link, made if it has none: dropped if no
-    /// address is known for the peer.
-    fn send(&mut self, out: Outbox<V>) {
+    /// Sends `out`, each message to its client, or to its peer's link, made if it has none:
+    /// dropped if no address is known for the peer.
+    fn send(&mut self, out: Outbox) {
         for (to, message) in out {
+            if (CLIENTS..CONTROL_PLANE).contains(&to) {
+                self.answer(to, message);
+                continue;
+            }
             if !self.links.contains_key(&to) {
                 let made = self.addresses.get(&to).and_then(|address| {
                     Link::new(address, &self.hello, &self.dial, &self.counts).ok()
@@ -373,9 +464,36 @@ where
                     }
                 }
             }
-            if let Some(link) = self.links.get(&to) {
-                link.send(&wire::wire(self.hello.from, message));
+            if let (Some(link), Some(outgoing)) = (
+                self.links.get(&to),
+                wire::mode_wire(self.hello.from, message),
+            ) {
+                link.send(&outgoing);
             }
+        }
+    }
+
+    /// Hands `message` to client `client`, if it is still there: dropped past
+    /// [`ANSWERS_WAITING`], as a message lost, and the client forgotten once it is gone.
+    fn answer(&mut self, client: NodeId, message: ModeMessage) {
+        let gone = self.clients.get(&client).is_some_and(|answers| {
+            matches!(
+                answers.try_send(message),
+                Err(mpsc::error::TrySendError::Closed(_))
+            )
+        });
+        if gone {
+            self.clients.remove(&client);
+        }
+    }
+
+    /// A new client: its id, the next from [`CLIENTS`], and where its answers go.
+    fn client(&mut self, given: oneshot::Sender<(NodeId, mpsc::Receiver<ModeMessage>)>) {
+        let id = self.next_client;
+        self.next_client = self.next_client.saturating_add(1);
+        let (answers, answered) = mpsc::channel(ANSWERS_WAITING);
+        if given.send((id, answered)).is_ok() {
+            self.clients.insert(id, answers);
         }
     }
 
@@ -383,7 +501,7 @@ where
     /// from any other id there, a pod restarted at the same address being a new member;
     /// otherwise, from a table or a naming, only an address no other id holds.
     fn learn(&mut self, peer: NodeId, address: &str, heard: bool) {
-        if peer == self.hello.from || peer == CONTROL_PLANE {
+        if peer == self.hello.from || peer >= CLIENTS {
             return;
         }
         let others: Vec<NodeId> = self
@@ -407,7 +525,7 @@ where
             self.links.remove(&peer);
         }
         self.addresses.insert(peer, address.to_owned());
-        self.node.add_peer(peer);
+        self.node.store_mut().add_peer(peer);
     }
 
     fn greeted(&mut self, hello: Hello) {
@@ -417,18 +535,22 @@ where
     /// Keeps the addresses its table names, and lets go of the peers its store has
     /// forgotten.
     fn follow(&mut self) {
-        let members: Vec<(NodeId, String)> = self.node.committed().map_or_else(Vec::new, |table| {
-            table
-                .members
-                .iter()
-                .filter(|(member, address)| self.addresses.get(member) != Some(*address))
-                .map(|(member, address)| (*member, address.clone()))
-                .collect()
-        });
+        let members: Vec<(NodeId, String)> =
+            self.node
+                .store()
+                .committed()
+                .map_or_else(Vec::new, |table| {
+                    table
+                        .members
+                        .iter()
+                        .filter(|(member, address)| self.addresses.get(member) != Some(*address))
+                        .map(|(member, address)| (*member, address.clone()))
+                        .collect()
+                });
         for (member, address) in members {
             self.learn(member, &address, false);
         }
-        let peers = self.node.peers();
+        let peers = self.node.store().peers();
         self.links.retain(|peer, _| peers.contains(peer));
         self.addresses.retain(|peer, _| peers.contains(peer));
     }
@@ -436,7 +558,7 @@ where
     /// Tells of the peers whose wall clocks its store finds off past `skew_warning`: in the
     /// log, as [`SkewWarnings`] has it, and in how many there are.
     fn warn_skews(&mut self) {
-        let skewed = self.node.skewed();
+        let skewed = self.node.store().skewed();
         self.skewed.store(skewed.len(), Ordering::Relaxed);
         for (peer, skew) in self.skews.due(&skewed, Instant::now()) {
             let way = if skew > 0 { "ahead of" } else { "behind" };
@@ -452,6 +574,7 @@ where
     fn ask_seeds(&mut self) {
         let member = self
             .node
+            .store()
             .committed()
             .is_some_and(|table| table.has_member(self.hello.from));
         let due = self
@@ -482,9 +605,23 @@ where
     }
 }
 
+/// Whether `message`, asked by client `client`, is one a client asks, naming it: a request or a
+/// request to gather, not one forwarded.
+const fn asks_as(message: &ModeMessage, client: NodeId) -> bool {
+    match message {
+        ModeMessage::Request {
+            client: asker,
+            via: None,
+            ..
+        }
+        | ModeMessage::Gather { client: asker, .. } => *asker == client,
+        _ => false,
+    }
+}
+
 /// Whether the pod that says `other` may be a peer of the one that says `own`, asking or
 /// asked: of the same shard count, as a pod of another cluster is not (6a), and neither that
-/// pod nor the control plane.
+/// pod nor a client or the control plane.
 fn may_be_peer(own: &Hello, other: &Hello) -> Result<(), Status> {
     if other.shards != own.shards {
         return Err(Status::failed_precondition(format!(
@@ -492,7 +629,7 @@ fn may_be_peer(own: &Hello, other: &Hello) -> Result<(), Status> {
             own.shards, other.shards
         )));
     }
-    if other.from == CONTROL_PLANE || other.from == own.from {
+    if other.from >= CLIENTS || other.from == own.from {
         return Err(Status::invalid_argument("a member id not a peer's"));
     }
     Ok(())
@@ -525,11 +662,11 @@ where
 }
 
 /// The store's service as a gRPC server, in front of its pod.
-pub struct StoreServer<V> {
-    pod: StorePod<V>,
+pub struct StoreServer {
+    pod: StorePod,
 }
 
-impl<V> Clone for StoreServer<V> {
+impl Clone for StoreServer {
     fn clone(&self) -> Self {
         Self {
             pod: self.pod.clone(),
@@ -537,15 +674,15 @@ impl<V> Clone for StoreServer<V> {
     }
 }
 
-impl<V> StoreServer<V> {
+impl StoreServer {
     /// Serves `pod`.
     #[must_use]
-    pub const fn new(pod: StorePod<V>) -> Self {
+    pub const fn new(pod: StorePod) -> Self {
         Self { pod }
     }
 }
 
-impl<V> NamedService for StoreServer<V> {
+impl NamedService for StoreServer {
     const NAME: &'static str = SERVICE;
 }
 
@@ -556,15 +693,12 @@ enum Kind {
     Copy,
 }
 
-struct StreamCall<V> {
-    pod: StorePod<V>,
+struct StreamCall {
+    pod: StorePod,
     kind: Kind,
 }
 
-impl<V: Value + Send + 'static> tonic::server::StreamingService<Piece> for StreamCall<V>
-where
-    V::Wire: Send,
-{
+impl tonic::server::StreamingService<Piece> for StreamCall {
     type Response = Empty;
     type ResponseStream = Received<Result<Empty, Status>>;
     type Future = Boxed<Result<Response<Self::ResponseStream>, Status>>;
@@ -590,15 +724,13 @@ where
 /// Takes the messages on one stream from `from`, each put together from its pieces and handed
 /// to the pod, until the stream ends, or carries a message longer than a receiver takes or
 /// from another sender, which ends it.
-async fn take_all<V: Value + Send + 'static>(
-    pod: StorePod<V>,
+async fn take_all(
+    pod: StorePod,
     kind: Kind,
     from: NodeId,
     mut pieces: Streaming<Piece>,
     ended: mpsc::Sender<Result<Empty, Status>>,
-) where
-    V::Wire: Send,
-{
+) {
     let mut joining = Joining::new(MAX_MESSAGE);
     while let Ok(Some(piece)) = pieces.message().await {
         let encoded = match joining.take(&piece) {
@@ -611,15 +743,15 @@ async fn take_all<V: Value + Send + 'static>(
                 return;
             }
         };
-        let decoded: Result<(NodeId, Message<V>), Invalid> = match kind {
-            Kind::Peer => ToPeer::<V::Wire>::decode(encoded.as_slice())
+        let decoded: Result<(NodeId, ModeMessage), Invalid> = match kind {
+            Kind::Peer => ToPeer::<Synchronous>::decode(encoded.as_slice())
                 .map_err(|_| Invalid::Missing)
-                .and_then(wire::from_peer),
-            Kind::Copy => ToCopy::<V::Wire>::decode(encoded.as_slice())
+                .and_then(wire::mode_from_peer),
+            Kind::Copy => ToCopy::<Synchronous>::decode(encoded.as_slice())
                 .map_err(|_| Invalid::Missing)
-                .and_then(wire::from_copy),
+                .and_then(wire::mode_from_copy),
         };
-        // A message the store cannot use is dropped whole, as a message lost.
+        // A message the mode or its store cannot use is dropped whole, as a message lost.
         let Ok((sender, message)) = decoded else {
             continue;
         };
@@ -637,12 +769,9 @@ async fn take_all<V: Value + Send + 'static>(
     }
 }
 
-struct GreetCall<V>(StorePod<V>);
+struct GreetCall(StorePod);
 
-impl<V: Value + Send + 'static> tonic::server::UnaryService<Hello> for GreetCall<V>
-where
-    V::Wire: Send,
-{
+impl tonic::server::UnaryService<Hello> for GreetCall {
     type Response = Hello;
     type Future = Boxed<Result<Response<Hello>, Status>>;
 
@@ -655,19 +784,16 @@ where
     }
 }
 
-struct ControlCall<V>(StorePod<V>);
+struct ControlCall(StorePod);
 
-impl<V: Value + Send + 'static> tonic::server::UnaryService<ToPeer<V::Wire>> for ControlCall<V>
-where
-    V::Wire: Send,
-{
-    type Response = ToPeer<V::Wire>;
-    type Future = Boxed<Result<Response<ToPeer<V::Wire>>, Status>>;
+impl tonic::server::UnaryService<ToPeer<Synchronous>> for ControlCall {
+    type Response = ToPeer<Synchronous>;
+    type Future = Boxed<Result<Response<ToPeer<Synchronous>>, Status>>;
 
-    fn call(&mut self, request: Request<ToPeer<V::Wire>>) -> Self::Future {
+    fn call(&mut self, request: Request<ToPeer<Synchronous>>) -> Self::Future {
         let pod = self.0.clone();
         Box::pin(async move {
-            let (_, message) = wire::from_peer::<V>(request.into_inner())
+            let (_, message) = wire::from_peer::<SyncValue>(request.into_inner())
                 .map_err(|invalid| Status::invalid_argument(invalid.to_string()))?;
             if !matches!(message, Message::Probe { .. } | Message::Form { .. }) {
                 return Err(Status::invalid_argument("not the control plane's"));
@@ -687,11 +813,7 @@ where
     }
 }
 
-impl<V: Value + Send + 'static> tower_service::Service<http::Request<tonic::body::Body>>
-    for StoreServer<V>
-where
-    V::Wire: Send,
-{
+impl tower_service::Service<http::Request<tonic::body::Body>> for StoreServer {
     type Response = http::Response<tonic::body::Body>;
     type Error = Infallible;
     type Future = Boxed<Result<Self::Response, Infallible>>;
@@ -728,7 +850,8 @@ where
                     grpc.unary(GreetCall(pod), request).await
                 }
                 CONTROL => {
-                    let mut grpc = limited(Prost::<ToPeer<V::Wire>, ToPeer<V::Wire>>::default());
+                    let mut grpc =
+                        limited(Prost::<ToPeer<Synchronous>, ToPeer<Synchronous>>::default());
                     grpc.unary(ControlCall(pod), request).await
                 }
                 _ => Status::unimplemented("no such method").into_http(),
@@ -751,11 +874,11 @@ mod tests {
     }
 
     /// A pod's task as it starts, before it runs.
-    fn running() -> Running<edgerush_cluster_synchronous::Value> {
+    fn running() -> Running {
         let config = Config::defaults();
         let (commands, _) = mpsc::channel(1);
         Running {
-            node: Node::new(1, "pod-1:7000".to_owned(), config, []),
+            node: Pod::new(1, "pod-1:7000".to_owned(), config, []),
             started: Instant::now(),
             hello: Arc::new(hello(1, u32::from(config.shards))),
             dial: Dial::Plain,
@@ -768,6 +891,8 @@ mod tests {
             drains: Vec::new(),
             skews: SkewWarnings::default(),
             skewed: Arc::default(),
+            clients: BTreeMap::new(),
+            next_client: CLIENTS,
         }
     }
 
@@ -785,10 +910,16 @@ mod tests {
             hears: vec![(1, ms(950))],
             leased: false,
         };
-        let _ = running.node.receive(2, beat(ms(10), ms(1_275)), ms(1_000));
+        let _ = running
+            .node
+            .store_mut()
+            .receive(2, beat(ms(10), ms(1_275)), ms(1_000));
         running.warn_skews();
         assert_eq!(running.skewed.load(Ordering::Relaxed), 1);
-        let _ = running.node.receive(2, beat(ms(20), ms(1_025)), ms(1_100));
+        let _ = running
+            .node
+            .store_mut()
+            .receive(2, beat(ms(20), ms(1_025)), ms(1_100));
         running.warn_skews();
         assert_eq!(running.skewed.load(Ordering::Relaxed), 0);
     }
@@ -826,7 +957,39 @@ mod tests {
         // Nor does a naming take another's.
         running.learn(4, "pod-2:7000", false);
         assert!(!running.addresses.contains_key(&4));
-        assert!(running.node.peers().contains(&3));
+        assert!(running.node.store().peers().contains(&3));
+    }
+
+    #[test]
+    fn a_client_asks_only_requests_naming_it_and_not_forwarded() {
+        let request = |client, via| ModeMessage::Request {
+            client,
+            id: 1,
+            key: 7,
+            stamp: (0, 0),
+            hops: 0,
+            via,
+            give_back: false,
+            rule: None,
+            receipt: 0,
+        };
+        let client = CLIENTS + 4;
+        assert!(asks_as(&request(client, None), client));
+        assert!(!asks_as(&request(client + 1, None), client));
+        assert!(!asks_as(&request(client, Some(2)), client));
+        let gather = |asker| ModeMessage::Gather {
+            client: asker,
+            id: 1,
+            keys: vec![7, 8],
+        };
+        assert!(asks_as(&gather(client), client));
+        assert!(!asks_as(&gather(2), client));
+        let reply = ModeMessage::Reply {
+            client,
+            id: 1,
+            answer: edgerush_cluster_synchronous::Answer::Counted(1),
+        };
+        assert!(!asks_as(&reply, client));
     }
 
     #[test]
@@ -837,5 +1000,6 @@ mod tests {
         assert_eq!(other.code(), tonic::Code::FailedPrecondition);
         assert!(may_be_peer(&own, &hello(1, 16)).is_err());
         assert!(may_be_peer(&own, &hello(CONTROL_PLANE, 16)).is_err());
+        assert!(may_be_peer(&own, &hello(CLIENTS, 16)).is_err());
     }
 }
