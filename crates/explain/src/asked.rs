@@ -31,6 +31,10 @@ pub struct Asked {
     pub headers: Vec<(HeaderName, HeaderValue)>,
     /// An extended CONNECT's `:protocol`.
     pub connect_protocol: Option<String>,
+    /// The name its connection's ClientHello asked for, `Some(None)` for none: said for an
+    /// `https` listener whose port listeners share, where it decides whether the request
+    /// is misdirected (03 §3), and for no other.
+    pub sni: Option<Option<String>>,
 }
 
 /// Why a request cannot be made of what was said.
@@ -81,6 +85,16 @@ pub enum Invalid {
     /// A connect protocol on anything but a CONNECT over HTTP/2 or HTTP/3.
     #[error("a connect protocol is for a CONNECT over HTTP/2 or HTTP/3 alone")]
     ConnectProtocol,
+    /// No SNI said for a listener whose port listeners share, which it decides for.
+    #[error(
+        "listeners share the port of listener {0}: say the name its ClientHello asks for, or none"
+    )]
+    SniUnsaid(String),
+    /// An SNI said for a listener whose port no listeners share, which it decides nothing for.
+    #[error(
+        "no listeners share the port of listener {0}: the name a ClientHello asks for decides nothing there"
+    )]
+    SniUnwanted(String),
 }
 
 /// The HTTP version `text` names.
@@ -157,8 +171,9 @@ impl Asked {
     ///
     /// # Errors
     ///
-    /// If its scheme is not the listener's, it asks for HTTP/3 where none is served, or a
-    /// connect protocol where it means nothing.
+    /// If its scheme is not the listener's, it asks for HTTP/3 where none is served, a
+    /// connect protocol where it means nothing, or an SNI where it decides nothing or none
+    /// where it decides.
     pub fn head(&self, listener: &CompiledListener) -> Result<Parts, Invalid> {
         let wanted = match listener.protocol {
             Protocol::Https => Scheme::HTTPS,
@@ -181,6 +196,15 @@ impl Asked {
         let multiplexed = matches!(self.protocol, Version::HTTP_2 | Version::HTTP_3);
         if self.connect_protocol.is_some() && !(multiplexed && self.method == Method::CONNECT) {
             return Err(Invalid::ConnectProtocol);
+        }
+        let shared = listener
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.shared_by.is_some());
+        match (shared, &self.sni) {
+            (true, None) => return Err(Invalid::SniUnsaid(listener.name.clone())),
+            (false, Some(_)) => return Err(Invalid::SniUnwanted(listener.name.clone())),
+            _ => {}
         }
 
         let mut request = Request::builder()
@@ -229,6 +253,7 @@ mod tests {
     const LISTENERS: &str = r#"
 listeners:
   web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
+  shared: { address: "[::]:7443", protocol: https, proxy_protocol: off, tls: { certificates: [site], without_sni: site, shared_by: [{ hostnames: [{ name: a.example.com }] }, { hostnames: [{ name: "*" }] }] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
   secure: { address: "[::]:8443", protocol: https, proxy_protocol: off, tls: { certificates: [site], without_sni: site }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
   quic: { address: "[::]:9443", protocol: https, proxy_protocol: off, tls: { certificates: [site], without_sni: site }, http3: {}, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
 routes: []
@@ -256,6 +281,7 @@ upstreams: {}
             target,
             headers: vec![header_line("X-Debug: 1").unwrap()],
             connect_protocol: None,
+            sni: None,
         }
     }
 
@@ -380,6 +406,36 @@ upstreams: {}
         assert_eq!(
             head("secure", &asked("3", "https://shop.example.com/")).err(),
             Some(Invalid::NoHttp3("secure".to_owned()))
+        );
+    }
+
+    /// The name a connection's ClientHello asked for is said exactly where it decides
+    /// something, an `https` listener whose port listeners share (03 §3): required there, a
+    /// name or none, and refused anywhere else.
+    #[test]
+    fn an_sni_is_said_where_listeners_share_the_port_and_nowhere_else() {
+        let with = |url: &str, sni: Option<Option<&str>>| Asked {
+            sni: sni.map(|sni| sni.map(str::to_owned)),
+            ..asked("1.1", url)
+        };
+        let shared = "https://a.example.com/";
+        assert!(head("shared", &with(shared, Some(Some("a.example.com")))).is_ok());
+        assert!(head("shared", &with(shared, Some(None))).is_ok());
+        assert_eq!(
+            head("shared", &with(shared, None)).err(),
+            Some(Invalid::SniUnsaid("shared".to_owned()))
+        );
+        assert_eq!(
+            head("secure", &with(shared, Some(None))).err(),
+            Some(Invalid::SniUnwanted("secure".to_owned()))
+        );
+        assert_eq!(
+            head(
+                "web",
+                &with("http://a.example.com/", Some(Some("a.example.com")))
+            )
+            .err(),
+            Some(Invalid::SniUnwanted("web".to_owned()))
         );
     }
 

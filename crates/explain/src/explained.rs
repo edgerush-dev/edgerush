@@ -12,6 +12,7 @@ use edgerush_config::{
     Compiled, CompiledLimit, CompiledListener, Config, ConfigError, EncodedSlash, Filter,
     HeaderChanges, MatchId, Matches, PathChange, Protocol, RequestId, Rule, compile_with_matches,
 };
+use edgerush_proxy::Asked as Handshake;
 use edgerush_proxy::{Client, Decision, Rejection, decide_routed};
 use edgerush_router::{Explanation, Failure, Key, Seen, Verdict, Wanted, explain};
 use http::header::{HeaderMap, HeaderValue};
@@ -97,11 +98,17 @@ impl Snapshot {
         };
         let mut walk = None;
         let mut routed = None;
+        let client = Client::new(asked.client);
+        // Said where listeners share the port, and checked so by `head` above.
+        let shared = listener.tls.as_ref().and_then(|tls| tls.shared_by.as_ref());
+        if let (Some(shared), Some(sni)) = (shared, &asked.sni) {
+            client.asked(Handshake::new(shared, sni.as_deref()));
+        }
         let decided = decide_routed(
             compiled,
             listener,
             &mut head,
-            &Client::new(asked.client),
+            &client,
             &mut draw,
             id.as_ref(),
             |request| {
@@ -212,9 +219,14 @@ fn text(
     asked: &Asked,
     outcome: &Explained<'_>,
 ) -> String {
+    let sni = match &asked.sni {
+        None => String::new(),
+        Some(None) => "  no SNI".to_owned(),
+        Some(Some(name)) => format!("  SNI {name}"),
+    };
     let mut lines = vec![
         format!(
-            "{} ({})  {} {}  {}  from {}",
+            "{} ({})  {} {}  {}  from {}{sni}",
             listener.name,
             protocol_name(listener.protocol),
             asked.method,
@@ -734,6 +746,7 @@ tcp_routes:
                 .map(|line| asked::header_line(line).unwrap())
                 .collect(),
             connect_protocol: None,
+            sni: None,
         }
     }
 
@@ -885,6 +898,55 @@ web (http)  GET http://shop.example.com/a/%2e%2e/b  HTTP/1.1  from 203.0.113.7
 
 answer    400 bad_path
 "
+        );
+    }
+
+    /// On an `https` listener whose port listeners share, the connection's SNI is said with
+    /// the request, and a request for another listener's host than the SNI's is refused 421
+    /// before it is routed (03 §3); one for its own listener's host is routed.
+    #[test]
+    fn a_request_misdirected_among_listeners_sharing_a_port_says_so() {
+        let config = r#"
+listeners:
+  secure: { address: "[::]:8443", protocol: https, proxy_protocol: off, tls: { certificates: [site], without_sni: site, shared_by: [{ hostnames: [{ name: a.example.com }] }, { hostnames: [{ name: "*" }] }] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
+routes:
+  - name: a
+    listeners: [secure]
+    hostnames: [{ name: a.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: web, weight: 1 }] }
+upstreams:
+  web: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000"] } }
+"#;
+        let mut config: edgerush_config::Config = serde_saphyr::from_str(config).unwrap();
+        let site = edgerush_config::Certificate {
+            chain: String::new(),
+            key: String::new(),
+        };
+        config.certificates.insert("site".to_owned(), site);
+        let snapshot = Snapshot::new(config).unwrap();
+        let listener = snapshot.listener("secure").unwrap();
+        let mut asked = asked("2", "GET", "https://a.example.com/x", &[]);
+        asked.sni = Some(None);
+        let text = snapshot.explain(listener, &asked).unwrap().text();
+        assert_eq!(
+            text,
+            "\
+secure (https)  GET https://a.example.com/x  HTTP/2  from 203.0.113.7  no SNI
+
+  refused before it is routed
+
+answer    421 misdirected
+"
+        );
+        asked.sni = Some(Some("a.example.com".to_owned()));
+        let text = snapshot.explain(listener, &asked).unwrap().text();
+        assert!(
+            text.starts_with(
+                "secure (https)  GET https://a.example.com/x  HTTP/2  from 203.0.113.7  SNI a.example.com\n\n→ a rule 0 match 0  chosen\n"
+            ),
+            "{text}"
         );
     }
 

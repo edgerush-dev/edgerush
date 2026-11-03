@@ -11,12 +11,14 @@ use crate::connections::Held;
 use crate::downstream::h3::head::Refused;
 use crate::downstream::h3::listener::Common;
 use crate::drain::Drain;
-use crate::forwarding::{Client, Cut};
+use crate::forwarding::{Asked, Client, Cut};
 use crate::storage::{Charge, Storage};
+use edgerush_config::SharedListeners;
 use http::HeaderMap;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::Waker;
 
 /// What each piece quiche holds received data in costs past its bytes: a 56-byte piece and
@@ -82,6 +84,12 @@ pub(crate) struct State {
     /// the connection with requests under way. Requests begun on a path before it keep the
     /// client of their own, and are not told.
     pub(crate) client: Option<Rc<Client>>,
+    /// The listeners sharing its port as they were when it was accepted, where two or more
+    /// do, until the handshake tells which one it was made for.
+    pub(crate) sharing: Option<Arc<SharedListeners>>,
+    /// The one its handshake's name is for, once the handshake is done: every client made
+    /// for its requests carries it (03 §3).
+    pub(crate) asked: Option<Asked>,
 }
 
 impl State {
@@ -139,7 +147,12 @@ impl Slot {
 impl Conn {
     /// A connection quiche has accepted, which drains with `drain` and counts as `held`
     /// among its worker's connections.
-    pub(crate) fn new(quic: quiche::Connection, drain: Rc<Drain>, held: Option<Held>) -> Rc<Self> {
+    pub(crate) fn new(
+        quic: quiche::Connection,
+        sharing: Option<Arc<SharedListeners>>,
+        drain: Rc<Drain>,
+        held: Option<Held>,
+    ) -> Rc<Self> {
         Rc::new(Self {
             state: RefCell::new(State {
                 quic,
@@ -149,6 +162,8 @@ impl Conn {
                 closed: false,
                 heard: 0,
                 client: None,
+                sharing,
+                asked: None,
             }),
             driver: RefCell::new(None),
             stirred: Cell::new(true),

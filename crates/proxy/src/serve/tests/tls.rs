@@ -432,6 +432,110 @@ async fn an_http3_connection_under_a_replaced_client_validation_is_told_to_go() 
         .await;
 }
 
+/// An HTTP/3 listener on a port listeners share, `a.test`'s and `b.test`'s, presenting one
+/// certificate for both.
+fn shared_h3_config(upstream: SocketAddr) -> edgerush_config::Config {
+    let http3 = edgerush_config::Http3 {
+        alt_svc_max_age: 60,
+        force_retry: false,
+    };
+    let mut config = h3_config(upstream, http3);
+    let served = crate::tls::testing::certificate(&["a.test", "b.test"]);
+    config.certificates.insert("web0".to_owned(), served);
+    let tls = config
+        .listeners
+        .get_mut("web")
+        .unwrap()
+        .tls
+        .as_mut()
+        .unwrap();
+    tls.shared_by = ["a.test", "b.test"]
+        .into_iter()
+        .map(|name| edgerush_config::SharingListener {
+            hostnames: vec![edgerush_config::SharingHostname {
+                name: name.to_owned(),
+                wildcard: None,
+            }],
+        })
+        .collect();
+    config
+}
+
+/// Serves `config` over HTTP/3 on a worker of its own, swept as often as the drain tests
+/// need, and says where.
+async fn serving_h3(config: &edgerush_config::Config) -> (SocketAddr, Rc<Worker>) {
+    let limits = H1Limits {
+        sweep: Duration::from_millis(50),
+        ..H1Limits::default()
+    };
+    let proxy = Proxy::new(compile(config).unwrap(), NonZeroUsize::MIN).unwrap();
+    let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let front = socket.local_addr().unwrap();
+    let alone = Forwarding::group(1).remove(0);
+    let serving = Rc::clone(&worker).serve_h3(0, socket, alone).unwrap();
+    // Held by the tasks for as long as the test's set runs.
+    drop(tokio::task::spawn_local(serving));
+    drop(tokio::task::spawn_local(Rc::clone(&worker).maintain()));
+    (front, worker)
+}
+
+/// Over HTTP/3, as over TCP, a request on a connection made for one listener sharing the
+/// port, by QUIC's SNI, for another's host is answered 421, and the connection's others
+/// served (03 §3).
+#[tokio::test]
+async fn a_request_for_another_listeners_host_is_misdirected_over_http3() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::Client;
+            let (upstream, _) = counting_upstream().await;
+            let (front, _worker) = serving_h3(&shared_h3_config(upstream)).await;
+            let mut client = Client::connect(front, "a.test").await;
+            for (authority, status) in [("a.test", "200"), ("b.test", "421"), ("a.test", "200")] {
+                let answer = client.get(authority, "/").await;
+                assert_eq!(answer.final_status(), Some(status), "{authority}");
+            }
+            let mut client = Client::connect(front, "b.test").await;
+            assert_eq!(client.get("b.test", "/").await.final_status(), Some("200"));
+        })
+        .await;
+}
+
+/// A reload that changes the listeners sharing the port tells an HTTP/3 connection made
+/// among those before to go, from the next sweep.
+#[tokio::test]
+async fn an_http3_connection_among_listeners_a_reload_changed_is_told_to_go() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::Client;
+            let (upstream, _) = counting_upstream().await;
+            let mut config = shared_h3_config(upstream);
+            let (front, worker) = serving_h3(&config).await;
+            let mut client = Client::connect(front, "a.test").await;
+            assert_eq!(client.get("a.test", "/").await.final_status(), Some("200"));
+
+            let tls = config
+                .listeners
+                .get_mut("web")
+                .unwrap()
+                .tls
+                .as_mut()
+                .unwrap();
+            tls.shared_by.reverse();
+            worker.proxy().reload(compile(&config).unwrap()).unwrap();
+            let reloaded = tokio::time::Instant::now();
+            client.until(|client| client.goaway.is_some()).await;
+            let took = reloaded.elapsed();
+            assert!(
+                took < worker.limits.sweep + SLACK && took < SHORT.next_request,
+                "told to go {took:?} after the reload"
+            );
+        })
+        .await;
+}
+
 /// New certificates behind the same client validation drain nothing: a connection kept
 /// across the reload, and several sweeps after it, is still served.
 #[tokio::test]

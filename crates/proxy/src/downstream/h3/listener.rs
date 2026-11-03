@@ -750,6 +750,7 @@ fn admit<T: Fn() -> Option<InForce>>(
     }
 
     let (scid, reset) = shared.issuer.borrow_mut().issue().ok()?;
+    let sharing = in_force.tls.shared_by().cloned();
     let accepting = accepting_for(accepting, in_force.tls, &shared.settings)?;
     accepting.config.set_stateless_reset_token(Some(reset));
     let scid = quiche::ConnectionId::from_ref(&scid);
@@ -767,7 +768,7 @@ fn admit<T: Fn() -> Option<InForce>>(
         None => quiche::accept(&scid, None, to, from, &mut accepting.config),
     }
     .ok()?;
-    let conn = Conn::new(quic, in_force.drain, held);
+    let conn = Conn::new(quic, sharing, in_force.drain, held);
     {
         let mut table = shared.table.borrow_mut();
         table.insert(scid.to_vec(), Rc::clone(&conn));
