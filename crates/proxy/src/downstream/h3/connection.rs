@@ -28,7 +28,7 @@ use crate::downstream::h3::listener::{Refusal, Shared};
 use crate::downstream::h3::send::{Unsent, flush};
 use crate::downstream::h3::stream::H3Stream;
 use crate::downstream::h3::writer::{Responder, SendError};
-use crate::forwarding::{Client, Cut};
+use crate::forwarding::{Asked, Client, Cut};
 use crate::grpc::call::Call;
 use crate::interim::Interim;
 use crate::metrics::Answer;
@@ -201,11 +201,11 @@ pub(crate) async fn drive<R, F, B, D, G>(
                 let client = if found.is_empty() {
                     None
                 } else {
-                    Some(conn.with(|state| client_now(proved, &mut state.client)))
+                    Some(conn.with(|state| client_now(proved, state)))
                 };
                 // A head answered 431 here has a record all the same (21 §4).
                 for refusal in driving.refused.drain(..) {
-                    let client = conn.with(|state| client_now(proved, &mut state.client));
+                    let client = conn.with(|state| client_now(proved, state));
                     (shared.refused)(client, refusal);
                 }
                 for request in found.drain(..) {
@@ -524,9 +524,15 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
             h3,
             streams,
             delivering,
+            sharing,
+            asked,
             ..
         } = state;
         let established = driving.handshaking && quic.is_established();
+        // The name its client asked for is known from here, before any request.
+        if established && let Some(sharing) = sharing.take() {
+            *asked = Some(Asked::new(&sharing, quic.server_name()));
+        }
         // HTTP/3 only where the handshake agreed on it: the interop build offers HTTP/0.9
         // as well.
         if established {
@@ -792,13 +798,18 @@ fn send_interim(responder: &mut Responder, interim: &Interim) {
 
 /// Who the requests found now are from: `peer`, the last address proved, which may not be
 /// the one the connection began on (RFC 9000 §9). The client last made is kept while that
-/// stays the same, so that it is not written out again for every request.
-fn client_now(peer: SocketAddr, made: &mut Option<Rc<Client>>) -> Rc<Client> {
-    match made {
+/// stays the same, so that it is not written out again for every request; each made
+/// carries the listener the handshake's name is for, where listeners share the port.
+fn client_now(peer: SocketAddr, state: &mut State) -> Rc<Client> {
+    match &state.client {
         Some(client) if client.peer() == Some(peer) => Rc::clone(client),
         _ => {
-            let client = Rc::new(Client::connected(peer.ip(), peer));
-            *made = Some(Rc::clone(&client));
+            let client = Client::connected(peer.ip(), peer);
+            if let Some(asked) = &state.asked {
+                client.asked(asked.clone());
+            }
+            let client = Rc::new(client);
+            state.client = Some(Rc::clone(&client));
             client
         }
     }

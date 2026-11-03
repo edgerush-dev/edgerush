@@ -72,7 +72,8 @@ pub struct Request {
     /// An extended CONNECT's `:protocol`.
     #[serde(default)]
     pub connect_protocol: Option<String>,
-    /// For a `tls` listener, the name the ClientHello asks for, or `none`.
+    /// For a `tls` listener, or an `https` one whose port listeners share, the name the
+    /// ClientHello asks for, or `none`.
     #[serde(default)]
     pub sni: Option<Sni>,
 }
@@ -238,7 +239,7 @@ pub struct HeaderExpected {
 }
 
 /// The reasons the request core answers a request itself for, as the metrics name them.
-const ANSWERS: [&str; 8] = [
+const ANSWERS: [&str; 9] = [
     "bad_host",
     "bad_path",
     "bad_connection",
@@ -247,6 +248,7 @@ const ANSWERS: [&str; 8] = [
     "no_backend",
     "edits",
     "unknown_protocol",
+    "misdirected",
 ];
 
 /// The reasons a `tcp` or `tls` connection is refused for, as the metrics name them.
@@ -652,7 +654,9 @@ fn asked(request: &Request, snapshot: &Snapshot) -> Result<Asking, Problem> {
                 Some(Sni::Name(SniName { name })) => Ok(Asking::Connection(Some(name.clone()))),
             };
         }
-        Protocol::Http | Protocol::Https => unwanted(&[("sni", request.sni.is_some())])?,
+        Protocol::Http => unwanted(&[("sni", request.sni.is_some())])?,
+        // Whether the listener's port is shared, and so wants it, is the request's to check.
+        Protocol::Https => {}
     }
     let needed = |given: &Option<String>, field| given.clone().ok_or(Problem::Missing(field, kind));
     let (scheme, authority, target) = asked::url(&needed(&request.url, "url")?)?;
@@ -673,9 +677,13 @@ fn asked(request: &Request, snapshot: &Snapshot) -> Result<Asking, Problem> {
         target,
         headers,
         connect_protocol: request.connect_protocol.clone(),
+        sni: request.sni.as_ref().map(|sni| match sni {
+            Sni::Word(NoName::None) => None,
+            Sni::Name(SniName { name }) => Some(name.clone()),
+        }),
     };
     // What only the listener can say of the request: its scheme, HTTP/3, a connect
-    // protocol.
+    // protocol, an SNI.
     asked.head(listener)?;
     Ok(Asking::Request(asked))
 }
@@ -901,6 +909,55 @@ tls_routes:
             })
             .collect();
         assert_eq!(asked, [None, Some("api.example.com".to_owned()), None]);
+    }
+
+    /// A request to an `https` listener whose port listeners share says its connection's
+    /// SNI, a name or none, and it is the request's; one that does not is refused (03 §3).
+    #[test]
+    fn a_request_where_listeners_share_the_port_says_its_sni() {
+        let config = CONFIG.replace(
+            "  db: {",
+            "  secure: { address: \"[::]:8443\", protocol: https, proxy_protocol: off, tls: { certificates: [site], without_sni: site, shared_by: [{ hostnames: [{ name: a.example.com }] }, { hostnames: [{ name: \"*\" }] }] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n  db: {",
+        );
+        let mut config: edgerush_config::Config = serde_saphyr::from_str(&config).unwrap();
+        let site = edgerush_config::Certificate {
+            chain: String::new(),
+            key: String::new(),
+        };
+        config.certificates.insert("site".to_owned(), site);
+        let snapshot = Snapshot::new(config).unwrap();
+        let request = |sni: &str| {
+            format!(
+                "{{ listener: secure, client: 203.0.113.7, protocol: \"2\", method: GET, url: \"https://a.example.com/\", headers: []{sni} }}"
+            )
+        };
+        let refused = "{ answer: misdirected }";
+        let yaml = format!(
+            "tests:\n{}{}",
+            test("named", &request(", sni: { name: b.example.com }"), refused),
+            test("unnamed", &request(", sni: none"), refused),
+        );
+        let prepared = read(yaml.as_bytes()).unwrap().prepare(&snapshot).unwrap();
+        let said: Vec<Option<Option<String>>> = prepared
+            .iter()
+            .map(|test| match &test.asked {
+                Asking::Request(asked) => asked.sni.clone(),
+                Asking::Connection(_) => panic!("a request"),
+            })
+            .collect();
+        assert_eq!(said, [Some(Some("b.example.com".to_owned())), Some(None)]);
+
+        let yaml = format!("tests:\n{}", test("unsaid", &request(""), refused));
+        let mistakes = read(yaml.as_bytes())
+            .unwrap()
+            .prepare(&snapshot)
+            .unwrap_err();
+        let said: Vec<String> = mistakes.iter().map(|mistake| mistake.to_string()).collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("listeners share the port of listener secure"),
+            "{said:?}"
+        );
     }
 
     #[test]

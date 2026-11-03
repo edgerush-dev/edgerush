@@ -23,7 +23,8 @@ Request, every part of it required for an http or https listener:
       --header <'NAME: VALUE'>   A field line, in order: once for each, or not at all
       --connect-protocol <NAME>  An extended CONNECT's protocol, over HTTP/2 or HTTP/3
 
-Connection to a tls listener, one of the two (a tcp listener's takes nothing):
+Connection to a tls listener, or to an https one whose port listeners share, one of the
+two (a tcp listener's takes nothing):
       --sni <NAME>               The name its ClientHello asks for
       --no-sni                   A ClientHello that asks for no name
 
@@ -188,8 +189,18 @@ fn run(options: &Options) -> Result<String, Failed> {
             .find(|(_, given)| *given)
             .map_or(Ok(()), |(flag, _)| Err(Failed::Unwanted(flag, kind)))
     };
+    let named = || match (&options.sni, options.no_sni) {
+        (Some(name), false) => Ok(Some(Some(name.clone()))),
+        (None, true) => Ok(Some(None)),
+        (Some(_), true) => Err(Failed::SniTwice),
+        (None, false) => Ok(None),
+    };
+    // Whether an https listener's port is shared, and so wants one, is the request's to
+    // check.
+    let mut said = None;
     match listener.protocol {
-        Protocol::Http | Protocol::Https => unwanted(&sni)?,
+        Protocol::Http => unwanted(&sni)?,
+        Protocol::Https => said = named()?,
         Protocol::Tcp => {
             unwanted(&http)?;
             unwanted(&sni)?;
@@ -197,13 +208,12 @@ fn run(options: &Options) -> Result<String, Failed> {
         }
         Protocol::Tls => {
             unwanted(&http)?;
-            let name = match (&options.sni, options.no_sni) {
-                (Some(name), false) => Some(name.as_str()),
-                (None, true) => None,
-                (Some(_), true) => return Err(Failed::SniTwice),
-                (None, false) => return Err(Failed::Required("--sni <NAME>' or '--no-sni", kind)),
+            let Some(name) = named()? else {
+                return Err(Failed::Required("--sni <NAME>' or '--no-sni", kind));
             };
-            return Ok(snapshot.explain_connection(listener, name)?.text());
+            return Ok(snapshot
+                .explain_connection(listener, name.as_deref())?
+                .text());
         }
     }
     let required = |given: &Option<String>, flag| given.clone().ok_or(Failed::Required(flag, kind));
@@ -222,6 +232,7 @@ fn run(options: &Options) -> Result<String, Failed> {
             .map(|line| asked::header_line(line))
             .collect::<Result<_, _>>()?,
         connect_protocol: options.connect_protocol.clone(),
+        sni: said,
     };
     Ok(snapshot.explain(listener, &asked)?.text())
 }
@@ -395,6 +406,50 @@ redirect  301 to /open
         assert!(
             text.starts_with("secure (https)  GET https://shop.example.com/"),
             "{text}"
+        );
+    }
+
+    /// An `https` listener whose port listeners share takes the connection's SNI, a name or
+    /// none, and needs it; one whose port none share takes neither (03 §3).
+    #[test]
+    fn an_https_listener_takes_a_name_or_none_where_listeners_share_its_port() {
+        let secure = "  secure: { address: \"[::]:8443\", protocol: https, proxy_protocol: off, tls: { certificates: [site], without_sni: site, shared_by: [{ hostnames: [{ name: shop.example.com }] }, { hostnames: [{ name: \"*\" }] }] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n  alone: { address: \"[::]:9443\", protocol: https, proxy_protocol: off, tls: { certificates: [site], without_sni: site }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n  db: {";
+        let mut https = CONFIG.replace("  db: {", secure);
+        https.push_str("certificates:\n  site: { chain_file: /nowhere/site.pem, key_file: /nowhere/site.key }\n");
+        let run = |test: &str, more: &[&str]| {
+            let mut args = request("secure", "2", "GET", "https://shop.example.com/");
+            args.extend_from_slice(more);
+            explain_on(&https, test, &args)
+        };
+        let (status, text, _) = run("https_named", &["--sni", "other.example.com"]);
+        assert_eq!(status, 0);
+        assert!(
+            text.contains("from 203.0.113.7  SNI other.example.com\n"),
+            "{text}"
+        );
+        assert!(text.ends_with("answer    421 misdirected\n"), "{text}");
+        let (status, text, _) = run("https_unnamed", &["--no-sni"]);
+        assert_eq!(status, 0);
+        assert!(text.contains("from 203.0.113.7  no SNI\n"), "{text}");
+        let (status, _, stderr) = run("https_unsaid", &[]);
+        assert_eq!(status, 2);
+        assert!(
+            stderr.starts_with("error: listeners share the port of listener secure"),
+            "{stderr}"
+        );
+        let (status, _, stderr) = run("https_twice", &["--sni", "a", "--no-sni"]);
+        assert_eq!(status, 2);
+        assert!(
+            stderr.starts_with("error: '--sni' and '--no-sni' are given together"),
+            "{stderr}"
+        );
+        let mut alone = request("alone", "2", "GET", "https://shop.example.com/");
+        alone.push("--no-sni");
+        let (status, _, stderr) = explain_on(&https, "https_alone", &alone);
+        assert_eq!(status, 2);
+        assert!(
+            stderr.starts_with("error: no listeners share the port of listener alone"),
+            "{stderr}"
         );
     }
 
