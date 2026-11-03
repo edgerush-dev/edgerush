@@ -1,5 +1,7 @@
-# The same hosts on a data plane whose Ingress hosts fall through, as Gateway API's do
-# (`ingress.hostFallThrough: true` on its DataPlane, 04 §5).
+# The same hosts on a data plane whose Ingress hosts fall through, as Gateway API's never
+# do (`ingress.hostFallThrough: true` on its DataPlane, 04 §5): a wildcard's paths, and the
+# host-less rule's, stay candidates on the more specific hosts they cover, tried once none
+# of the host's own serves.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: hosts, namespace: shop }
