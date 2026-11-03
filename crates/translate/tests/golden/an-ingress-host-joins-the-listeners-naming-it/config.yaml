@@ -10,6 +10,7 @@ listeners:
         - { certificate: shop/wild, names: [secure.example.com, plain.example.com] }
         - { certificate: shop/shop-tls, names: [shop.example.com] }
       without_sni: none
+      shared_by: [{ hostnames: [{ name: secure.example.com }] }, { hostnames: [{ name: plain.example.com }] }, { hostnames: [{ name: shop.example.com }] }]
   port-80:
     address: "0.0.0.0:80"
     protocol: http

@@ -11,6 +11,7 @@ listeners:
         - { certificate: shop/secure, names: [secure.example.com, www.secure.example.com] }
       without_sni: shop/shop-tls
       refused: [gone.example.com]
+      shared_by: [{ hostnames: [{ name: "*" }] }, { hostnames: [{ name: secure.example.com }, { name: www.secure.example.com }] }]
 routes:
   - name: ingress/shop/web/secure.example.com
     listeners: [port-443]

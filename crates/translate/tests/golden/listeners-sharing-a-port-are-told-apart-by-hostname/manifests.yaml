@@ -1,0 +1,82 @@
+# Listeners in Gateway API's sense that share an HTTPS port are told apart by hostname
+# (`shared_by`), so that a request for another's host than its connection's SNI is answered
+# 421: on port 443 the four of conformance's HTTPSListenerDetectMisdirectedRequests, a
+# catch-all, an exact name, a wildcard and an exact name under it, in the Gateway's order,
+# then the hosts Ingress serves over TLS there, one listener together, each once though
+# two Ingresses serve it, an Ingress wildcard standing for one label; a host a Gateway
+# listener names is that listener's, its Ingress's Secret passed over. A port of one listener tells nothing apart.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      tls: { certificateRefs: [{ name: shop-tls }] }
+    - name: https-with-hostname
+      port: 443
+      protocol: HTTPS
+      hostname: second-example.org
+      tls: { certificateRefs: [{ name: secure }] }
+    - name: https-with-wildcard-hostname
+      port: 443
+      protocol: HTTPS
+      hostname: "*.wildcard.org"
+      tls: { certificateRefs: [{ name: wild }] }
+    - name: https-with-hostname-matching-wildcard
+      port: 443
+      protocol: HTTPS
+      hostname: fourth-example.wildcard.org
+      tls: { certificateRefs: [{ name: secure }] }
+    - name: secure
+      port: 443
+      protocol: HTTPS
+      hostname: secure.example.com
+      tls: { certificateRefs: [{ name: secure }] }
+    - name: alone
+      port: 8443
+      protocol: HTTPS
+      hostname: alone.example.org
+      tls: { certificateRefs: [{ name: secure }] }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: first, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [a.example.com, "*.apps.example.com"], secretName: wild }]
+  rules:
+    - host: a.example.com
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }] }
+    - host: "*.apps.example.com"
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }] }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: second, namespace: shop, creationTimestamp: "2026-01-02T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  tls:
+    - { hosts: [a.example.com], secretName: wild }
+    - { hosts: [secure.example.com, www.secure.example.com], secretName: secure }
+  rules:
+    - host: a.example.com
+      http: { paths: [{ path: /two, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }] }
+    - host: secure.example.com
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }] }
+    - host: www.secure.example.com
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

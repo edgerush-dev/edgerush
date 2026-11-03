@@ -1,0 +1,103 @@
+listeners:
+  port-443:
+    address: "0.0.0.0:443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: shop/shop-tls, names: ["*"] }
+        - { certificate: shop/secure, names: [second-example.org, fourth-example.wildcard.org, secure.example.com, www.secure.example.com] }
+        - { certificate: shop/wild, names: ["*.wildcard.org", "*.apps.example.com", a.example.com] }
+      without_sni: shop/shop-tls
+      shared_by: [{ hostnames: [{ name: "*" }] }, { hostnames: [{ name: second-example.org }] }, { hostnames: [{ name: "*.wildcard.org", wildcard: any_labels }] }, { hostnames: [{ name: fourth-example.wildcard.org }] }, { hostnames: [{ name: secure.example.com }] }, { hostnames: [{ name: "*.apps.example.com", wildcard: one_label }, { name: a.example.com }, { name: www.secure.example.com }] }]
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  port-8443:
+    address: "0.0.0.0:8443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: shop/secure, names: [alone.example.org] }
+      without_sni: none
+routes:
+  - name: ingress/shop/first/*.apps.example.com
+    listeners: [port-443]
+    hostnames: [{ name: "*.apps.example.com", wildcard: one_label, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/first/*.apps.example.com/https-redirect
+    listeners: [port-80]
+    hostnames: [{ name: "*.apps.example.com", wildcard: one_label, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
+        redirect: { status: 308, scheme: https, query: keep }
+  - name: ingress/shop/first/a.example.com
+    listeners: [port-443]
+    hostnames: [{ name: a.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/first/a.example.com/https-redirect
+    listeners: [port-80]
+    hostnames: [{ name: a.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
+        redirect: { status: 308, scheme: https, query: keep }
+  - name: ingress/shop/second/a.example.com
+    listeners: [port-443]
+    hostnames: [{ name: a.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /two } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/second/a.example.com/https-redirect
+    listeners: [port-80]
+    hostnames: [{ name: a.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /two } }]
+        filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
+        redirect: { status: 308, scheme: https, query: keep }
+  - name: ingress/shop/second/secure.example.com
+    listeners: [port-443]
+    hostnames: [{ name: secure.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/second/secure.example.com/https-redirect
+    listeners: [port-80]
+    hostnames: [{ name: secure.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
+        redirect: { status: 308, scheme: https, query: keep }
+  - name: ingress/shop/second/www.secure.example.com
+    listeners: [port-443]
+    hostnames: [{ name: www.secure.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/second/www.secure.example.com/https-redirect
+    listeners: [port-80]
+    hostnames: [{ name: www.secure.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
+        redirect: { status: 308, scheme: https, query: keep }
+  - { name: gateway/shop/web/https-with-hostname, listeners: [port-443], hostnames: [{ name: second-example.org, falls_through: false }], rules: [] }
+  - { name: gateway/shop/web/https-with-wildcard-hostname, listeners: [port-443], hostnames: [{ name: "*.wildcard.org", wildcard: any_labels, falls_through: false }], rules: [] }
+  - { name: gateway/shop/web/https-with-hostname-matching-wildcard, listeners: [port-443], hostnames: [{ name: fourth-example.wildcard.org, falls_through: false }], rules: [] }
+  - { name: gateway/shop/web/secure, listeners: [port-443], hostnames: [{ name: secure.example.com, falls_through: false }], rules: [] }
+  - { name: gateway/shop/web/alone, listeners: [port-8443], hostnames: [{ name: alone.example.org, falls_through: false }], rules: [] }
+upstreams:
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }
