@@ -1,0 +1,6 @@
+listener https: served on port-443, presenting shop/shop-tls, taking HTTPRoute from namespace shop
+listener https-with-hostname: served on port-443, presenting shop/secure, taking HTTPRoute from namespace shop
+listener https-with-wildcard-hostname: served on port-443, presenting shop/wild, taking HTTPRoute from namespace shop
+listener https-with-hostname-matching-wildcard: served on port-443, presenting shop/secure, taking HTTPRoute from namespace shop
+listener secure: served on port-443, presenting shop/secure, taking HTTPRoute from namespace shop
+listener alone: served on port-8443, presenting shop/secure, taking HTTPRoute from namespace shop

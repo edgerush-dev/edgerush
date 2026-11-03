@@ -130,6 +130,8 @@ k -n edge rollout status deploy/edgerush --timeout=120s >/dev/null
 # The data plane on localhost:$port, through a port-forward started afresh after a restart,
 # on a port of its own each time, so that none waits for the last to let its port go; to
 # the pod's port $1, or 80, the Ingress HTTP port, which the Gateway's `http` listener shares.
+# A port that speaks TLS is reached as $2, a name its certificate of the stream's authority
+# carries.
 port=18080
 forward() {
     [ -n "$forward_pid" ] && kill "$forward_pid" 2>/dev/null || true
@@ -137,7 +139,11 @@ forward() {
     k -n edge port-forward deploy/edgerush "$port:${1:-80}" >/dev/null 2>&1 &
     forward_pid=$!
     for _ in $(seq 1 50); do
-        curl -s -o /dev/null "http://127.0.0.1:$port/" && return 0
+        if [ -n "${2:-}" ]; then
+            curl -s -o /dev/null --cacert "$pki/ca.crt" --resolve "$2:$port:127.0.0.1"                 "https://$2:$port/" && return 0
+        else
+            curl -s -o /dev/null "http://127.0.0.1:$port/" && return 0
+        fi
         sleep 0.2
     done
     fail "the data plane could not be reached through a port-forward"
@@ -369,6 +375,66 @@ stated 1 '{.status.attachedListenerSets}' 30 -n edge gateway web ||
 k -n shop delete httproute team >/dev/null
 k -n shop delete listenerset team >/dev/null
 pass "a ListenerSet the Gateway takes adds a listener of its own, a route naming it served there, each said in status"
+
+# Two HTTPS listeners of the Gateway on one port, each with a certificate of its own, are
+# told apart by hostname: a request on a connection made for one, by its SNI, for the
+# other's host is answered 421, over HTTP/1.1 and HTTP/2, and one for its own host is
+# served (03 §3, 04 §2). The certificates are Secrets of shop's, a namespace the control
+# plane watches, which a ReferenceGrant lets the Gateway reach.
+for name in a b; do
+    issue "shared-$name" "$name.example"
+    k -n shop create secret tls "shared-$name" --cert="$pki/shared-$name.crt" \
+        --key="$pki/shared-$name.key" --dry-run=client -o yaml | k apply -f - >/dev/null
+done
+k -n edge patch gateway web --type=json -p '[
+  {"op":"add","path":"/spec/listeners/-","value":{"name":"shared-a","port":8443,"protocol":"HTTPS","hostname":"a.example","allowedRoutes":{"namespaces":{"from":"All"}},"tls":{"certificateRefs":[{"name":"shared-a","namespace":"shop"}]}}},
+  {"op":"add","path":"/spec/listeners/-","value":{"name":"shared-b","port":8443,"protocol":"HTTPS","hostname":"b.example","allowedRoutes":{"namespaces":{"from":"All"}},"tls":{"certificateRefs":[{"name":"shared-b","namespace":"shop"}]}}}
+]' >/dev/null
+k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: shared-certificates, namespace: shop }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: Gateway, namespace: edge }]
+  to: [{ group: "", kind: Secret }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: shared, namespace: shop }
+spec:
+  parentRefs:
+    - { name: web, namespace: edge, sectionName: shared-a }
+    - { name: web, namespace: edge, sectionName: shared-b }
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]
+EOF
+said deploy/edgerush 'listener "port-8443" is on 0.0.0.0:8443' 60 ||
+    fail "the data plane never bound the HTTPS listeners' port: $(k -n edge logs deploy/edgerush | tail -5)"
+stated True "$(of_listener shared-a status)" 60 -n edge gateway web ||
+    fail "the HTTPS listener is not said programmed: $(said_of -n edge gateway web)"
+forward 8443 a.example
+# The status of a request for host $2 on a connection asking for $1, verified against the
+# stream's authority, by curl's options $3.
+over_tls() {
+    curl -s -o /dev/null -w '%{http_code}' --cacert "$pki/ca.crt" --resolve "$1:$port:127.0.0.1" \
+        ${3:-} -H "host: $2" "https://$1:$port/hostname"
+}
+for _ in $(seq 1 150); do
+    [ "$(over_tls a.example a.example)" = 200 ] && break
+    sleep 0.2
+done
+[ "$(over_tls a.example a.example)" = 200 ] || fail "a.example over TLS answers $(over_tls a.example a.example)"
+[ "$(over_tls b.example b.example)" = 200 ] || fail "b.example over TLS answers $(over_tls b.example b.example)"
+for http in --http1.1 --http2; do
+    [ "$(over_tls a.example b.example "$http")" = 421 ] ||
+        fail "b.example on a connection made for a.example, $http, answers $(over_tls a.example b.example "$http")"
+done
+forward
+k -n shop delete httproute shared >/dev/null
+listeners=$(k -n edge get gateway web -o jsonpath='{.spec.listeners[*].name}' | wc -w)
+k -n edge patch gateway web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 1))\"},{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 2))\"}]" >/dev/null
+k -n shop delete referencegrant shared-certificates >/dev/null
+k -n shop delete secret shared-a shared-b >/dev/null
+pass "two HTTPS listeners on one port are told apart: a request for one's host on a connection made for the other is answered 421, over HTTP/1.1 and HTTP/2"
 
 k apply -f - >/dev/null <<EOF
 apiVersion: gateway.networking.k8s.io/v1

@@ -33,8 +33,8 @@ use edgerush_certificates::Identity;
 use edgerush_config::{
     Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, Header, HeaderChanges,
     Hostname, Listener, ListenerCertificate, LoadBalancer, Match, PathMatch, Protocol, Query,
-    Redirect, Route, Rule, Scheme, StatedNames, Upstream, UpstreamProtocol, UpstreamTls,
-    ValueMatch, Wildcard, compile,
+    Redirect, Route, Rule, Scheme, SharingHostname, SharingListener, StatedNames, Upstream,
+    UpstreamProtocol, UpstreamTls, ValueMatch, Wildcard, compile,
 };
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
@@ -1294,6 +1294,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     if let Some(gateway) = &gateway {
         gateway_tls(&mut config, gateway, cluster, &mut report);
     }
+    shared_by(&mut config, gateway.as_ref(), &presented, &ingress_https);
     let route_statuses = status::routes(&http_routes, &report);
     let gateway_status = gateway
         .as_ref()
@@ -1607,6 +1608,79 @@ fn gateway_tls(
         if let Some(name) = without_sni.remove(&listening) {
             tls.without_sni = name;
         }
+    }
+}
+
+/// The listeners sharing each of the data plane's `https` listeners, where two or more do,
+/// so that a request for another's host than its connection's SNI is answered 421 (03 §3,
+/// 04 §2): each Gateway HTTPS listener served there, the Gateway's and its ListenerSets',
+/// in their order (one with no certificate it can use is served nowhere); then the hosts
+/// Ingress serves over TLS there, one listener together (Lucas), those a Gateway listener
+/// names being that listener's.
+fn shared_by(
+    config: &mut Config,
+    gateway: Option<&GatewayOutcome>,
+    presented: &[(String, Certificate, Vec<String>)],
+    ingress_https: &[String],
+) {
+    for (name, listener) in &mut config.listeners {
+        let Some(tls) = listener.tls.as_mut() else {
+            continue;
+        };
+        let gateway_listeners = gateway
+            .iter()
+            .flat_map(|gateway| &gateway.listeners)
+            .filter(|listener| {
+                listener
+                    .served
+                    .as_ref()
+                    .is_ok_and(|serving| serving.contains(name))
+            })
+            .map(|listener| listener.hostname.as_deref());
+        let ingress_hosts = presented
+            .iter()
+            .filter(|_| ingress_https.contains(name))
+            .flat_map(|(_, _, hosts)| hosts.iter().map(String::as_str));
+        let sharing = sharing(gateway_listeners, ingress_hosts);
+        if sharing.len() >= 2 {
+            tls.shared_by = sharing;
+        }
+    }
+}
+
+/// The listeners sharing a port: each Gateway listener's by its hostname, `*` for none,
+/// its wildcard of any labels; then Ingress's hosts, one listener together, its wildcards
+/// of one label. A hostname is one listener's, the first's, whatever else names it again,
+/// so that the data plane never refuses what is said.
+fn sharing<'a>(
+    gateway_listeners: impl Iterator<Item = Option<&'a str>>,
+    ingress_hosts: impl Iterator<Item = &'a str>,
+) -> Vec<SharingListener> {
+    let mut seen = BTreeSet::new();
+    let mut first = |name: &str| seen.insert(name.to_ascii_lowercase());
+    let mut sharing: Vec<SharingListener> = gateway_listeners
+        .map(|hostname| hostname.unwrap_or("*"))
+        .filter(|hostname| first(hostname))
+        .map(|hostname| SharingListener {
+            hostnames: vec![sharing_hostname(hostname, Wildcard::AnyLabels)],
+        })
+        .collect();
+    let hostnames: Vec<SharingHostname> = ingress_hosts
+        .filter(|host| first(host))
+        .map(|host| sharing_hostname(host, Wildcard::OneLabel))
+        .collect();
+    if !hostnames.is_empty() {
+        sharing.push(SharingListener { hostnames });
+    }
+    sharing
+}
+
+/// `name` as a hostname of a listener sharing a port, its wildcard, if it is one, standing
+/// for what `wildcard` says: any labels for Gateway API's, one for Ingress's.
+fn sharing_hostname(name: &str, wildcard: Wildcard) -> SharingHostname {
+    SharingHostname {
+        name: name.to_owned(),
+        wildcard: name.starts_with("*.").then_some(wildcard),
     }
 }
 
@@ -2331,6 +2405,59 @@ fn service_port<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The listeners sharing a port, each hostname the first's that names it, whatever its
+    /// case: a Gateway listener's taken by a later one, or by Ingress, is said once, and an
+    /// Ingress host twice is said once, so that the data plane never refuses the config
+    /// (04 §2). Gateway API's wildcards stand for any labels, Ingress's for one.
+    #[test]
+    fn a_hostname_shared_is_the_first_listeners() {
+        let said = |sharing: Vec<SharingListener>| -> Vec<Vec<(String, Option<Wildcard>)>> {
+            sharing
+                .into_iter()
+                .map(|listener| {
+                    listener
+                        .hostnames
+                        .into_iter()
+                        .map(|hostname| (hostname.name, hostname.wildcard))
+                        .collect()
+                })
+                .collect()
+        };
+        let named = |name: &str, wildcard| (name.to_owned(), wildcard);
+        let gateway = [
+            None,
+            Some("a.example.com"),
+            Some("*.example.com"),
+            Some("A.example.com"),
+        ];
+        let ingress = [
+            "b.example.com",
+            "a.example.com",
+            "*.apps.example.com",
+            "B.example.com",
+        ];
+        assert_eq!(
+            said(sharing(gateway.into_iter(), ingress.into_iter())),
+            [
+                vec![named("*", None)],
+                vec![named("a.example.com", None)],
+                vec![named("*.example.com", Some(Wildcard::AnyLabels))],
+                vec![
+                    named("b.example.com", None),
+                    named("*.apps.example.com", Some(Wildcard::OneLabel)),
+                ],
+            ]
+        );
+        // Nothing of Ingress's but what a Gateway listener names: no listener of its own.
+        assert_eq!(
+            said(sharing(
+                [Some("a.example.com"), None].into_iter(),
+                ["a.example.com"].into_iter()
+            )),
+            [vec![named("a.example.com", None)], vec![named("*", None)]]
+        );
+    }
 
     #[test]
     fn notes_are_what_is_served_as_the_spec_has_it_and_nothing_else() {

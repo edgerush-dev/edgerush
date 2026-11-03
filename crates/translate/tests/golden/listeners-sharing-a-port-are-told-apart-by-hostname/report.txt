@@ -1,0 +1,1 @@
+Ingress shop/second: secure.example.com is served with the certificate of Gateway shop/web's listener secure, which names it, not Secret shop/secure

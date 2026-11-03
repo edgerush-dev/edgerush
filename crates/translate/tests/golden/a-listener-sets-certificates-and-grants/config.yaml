@@ -17,6 +17,7 @@ listeners:
         - { certificate: edge/own, names: [own.example.com] }
       without_sni: none
       refused: [blog.example.com]
+      shared_by: [{ hostnames: [{ name: secure.example.com }] }, { hostnames: [{ name: own.example.com }] }]
 routes:
   - { name: listenerset/shop/team/own-namespace, listeners: [port-8443], hostnames: [{ name: secure.example.com, falls_through: false }], rules: [] }
   - { name: listenerset/shop/team/granted, listeners: [port-8443], hostnames: [{ name: own.example.com, falls_through: false }], rules: [] }
