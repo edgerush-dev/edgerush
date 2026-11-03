@@ -3,7 +3,7 @@
 //! the address it gives. Cutting a pod off is the relays' doing: each drops the connections
 //! of a pod cut off, to it and from it, known by its IP, as pods dial from theirs. The control
 //! plane's `Authority` runs in-process, asking the pods as the controller will. Each scenario
-//! is the simulation's, held to its bound.
+//! is the simulation's, held to its bound; a rollout's, as T4d2 has it.
 
 #![allow(
     clippy::unwrap_used,
@@ -13,10 +13,10 @@
 )]
 
 use edgerush_cluster::table::shard_of;
-use edgerush_cluster::{Authority, Changed, Config, Kept, NodeId, Table, Time};
+use edgerush_cluster::{Authority, Changed, Config, Kept, Node, NodeId, Table, Time};
 use edgerush_cluster_synchronous::Value;
 use edgerush_ratelimit_service::cluster::link::Dial;
-use edgerush_ratelimit_service::cluster::pod::{StorePod, StoreServer, TICK, ask};
+use edgerush_ratelimit_service::cluster::pod::{STREAMS_IDLE, StorePod, StoreServer, TICK, ask};
 use edgerush_ratelimit_service::grpc::Client;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -34,6 +34,15 @@ const FORMED: Duration = Duration::from_secs(3);
 
 /// How long a pod's shards take to fail over once it is gone, as the simulation holds it to.
 const FAILOVER: Duration = Duration::from_secs(1);
+
+/// How long a shard may go unserved in a rollout (decided): under the 50 ms a taker waits for
+/// the old owner's last changes, so that a pod stopping without sending them fails it.
+const UNSERVED: Duration = Duration::from_millis(50);
+
+/// How long a pod told to drain may take to stop: under [`STREAMS_IDLE`], so that one whose
+/// streams never end fails it.
+const DRAINED: Duration = Duration::from_secs(3);
+const _: () = assert!(DRAINED.as_secs() < STREAMS_IDLE.as_secs());
 
 /// Fewer shards than the store's default, for tests that read every one.
 const SHARDS: u16 = 16;
@@ -198,9 +207,14 @@ impl Cluster {
     /// Stops pod `id` as a crash does: its store, its server and every connection to it, its
     /// relay answering what is dialled to it by dropping it, and the API showing it gone.
     async fn crash(&mut self, id: NodeId) {
-        let running = &self.pods[&id];
-        running.pod.stop().await;
-        running.server.abort();
+        self.pod(id).stop().await;
+        self.gone(id);
+    }
+
+    /// Ends pod `id`'s process, its store stopped: its server and every connection to it,
+    /// its relay answering what is dialled to it by dropping it, and the API showing it gone.
+    fn gone(&self, id: NodeId) {
+        self.pods[&id].server.abort();
         self.cut.send_modify(|cut| {
             cut.insert(ip_of(id));
         });
@@ -289,7 +303,7 @@ async fn control_plane(running: Arc<Mutex<BTreeMap<NodeId, String>>>) {
 /// Whether every one of `ids` is ready, as the store has it.
 async fn all_ready(cluster: &Cluster, ids: &BTreeSet<NodeId>) -> Option<()> {
     for id in ids {
-        if !cluster.pod(*id).with(|node, now| node.ready(now)).await? {
+        if !cluster.pod(*id).ready().await {
             return None;
         }
     }
@@ -304,6 +318,210 @@ async fn leader(cluster: &Cluster, ids: &BTreeSet<NodeId>) -> Option<NodeId> {
         }
     }
     None
+}
+
+/// The keys the tests write: eight in every shard.
+fn keys() -> Vec<u64> {
+    (0..u64::from(SHARDS) * 8).collect()
+}
+
+/// A key's value, counted `counted`.
+fn count(counted: u64) -> Value {
+    Value::Count {
+        window: 1,
+        counted,
+        given: 0,
+    }
+}
+
+/// What a rollout's sampling saw: the longest any shard went unserved, and the last count
+/// each key was written with at a pod serving it.
+struct Sampled {
+    unserved: Duration,
+    written: BTreeMap<u64, u64>,
+}
+
+/// Round after round until `done`, asks each pod `live` holds which shards it serves, and
+/// writes every key of those shards there, counted by the round.
+async fn sample(
+    live: Arc<Mutex<BTreeMap<NodeId, StorePod<Value>>>>,
+    done: watch::Receiver<bool>,
+) -> Sampled {
+    let keys = Arc::new(keys());
+    let mut served_at = [Instant::now(); SHARDS as usize];
+    let mut sampled = Sampled {
+        unserved: Duration::ZERO,
+        written: BTreeMap::new(),
+    };
+    let mut round = 0;
+    while !*done.borrow() {
+        round += 1;
+        let at = Instant::now();
+        let pods: Vec<StorePod<Value>> = live.lock().unwrap().values().cloned().collect();
+        let mut served = BTreeSet::new();
+        for pod in pods {
+            let keys = Arc::clone(&keys);
+            let Some((serving, written)) = pod
+                .with(move |node, now| write_served(node, now, &keys, round))
+                .await
+            else {
+                continue;
+            };
+            served.extend(serving);
+            for key in written {
+                sampled.written.insert(key, round);
+            }
+        }
+        for (shard, since) in served_at.iter_mut().enumerate() {
+            if served.contains(&u16::try_from(shard).unwrap()) {
+                *since = at;
+            } else {
+                sampled.unserved = sampled.unserved.max(at - *since);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    sampled
+}
+
+/// The shards `node` serves at `now`, and the keys of `keys` it took, written there counted
+/// `round`.
+fn write_served(
+    node: &mut Node<Value>,
+    now: Time,
+    keys: &[u64],
+    round: u64,
+) -> (Vec<u16>, Vec<u64>) {
+    let serving: Vec<u16> = (0..SHARDS)
+        .filter(|shard| node.serves(*shard, now))
+        .collect();
+    let written = keys
+        .iter()
+        .copied()
+        .filter(|key| serving.contains(&shard_of(*key, SHARDS)))
+        .filter(|key| {
+            node.update(*key, now, |kept: &mut Kept<Value>, _| {
+                kept.value = count(round);
+                kept.forget_at = Time::MAX;
+                ((), Changed::Whole)
+            })
+            .is_some()
+        })
+        .collect();
+    (serving, written)
+}
+
+/// Replaces pods 1 to `pods`, `step` at a time, as a Deployment surging: `step` new pods
+/// started, asking the pods running, and once all are ready, `step` old ones drained, each
+/// gone once it has stopped; keys written throughout at the pods serving them. Held to what
+/// the simulation's rollouts are: no shard unserved but for a handoff's swap, and every key
+/// held after as last written.
+async fn rollout(pods: NodeId, step: usize) {
+    let mut cluster = Cluster::formed(pods).await;
+    let olds: Vec<NodeId> = (1..=pods).collect();
+    let all: BTreeSet<NodeId> = olds.iter().copied().collect();
+    let ready = within(FORMED, || all_ready(&cluster, &all)).await;
+    assert!(ready.is_some(), "pods not ready within {FORMED:?}");
+    let live = Arc::new(Mutex::new(
+        cluster
+            .pods
+            .iter()
+            .map(|(id, running)| (*id, running.pod.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    ));
+    let (done, until_done) = watch::channel(false);
+    let sampling = tokio::spawn(sample(Arc::clone(&live), until_done));
+    let mut next = pods + 1;
+    for going in olds.chunks(step) {
+        let seeds: Vec<String> = live
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|id| cluster.pods[id].relay.address.to_string())
+            .collect();
+        let mut new = BTreeSet::new();
+        for _ in going {
+            cluster.start(next, config(), seeds.clone()).await;
+            live.lock().unwrap().insert(next, cluster.pod(next).clone());
+            new.insert(next);
+            next += 1;
+        }
+        let ready = within(FORMED, || all_ready(&cluster, &new)).await;
+        assert!(ready.is_some(), "pods {new:?} not ready within {FORMED:?}");
+        // Ready as the store has it: holding its share of shards, so that an old pod drained
+        // next has pods to hand on to that have already taken theirs.
+        for id in &new {
+            let table = committed(cluster.pod(*id)).await.unwrap();
+            let share = usize::from(SHARDS) / table.members.len();
+            let held = table.owned_by(*id).count();
+            assert!(
+                held >= share,
+                "pod {id} ready holding {held} of {share} shards"
+            );
+        }
+        let drains: Vec<(NodeId, JoinHandle<()>)> = going
+            .iter()
+            .map(|id| {
+                let pod = cluster.pod(*id).clone();
+                (*id, tokio::spawn(async move { pod.drain().await }))
+            })
+            .collect();
+        for (id, drain) in drains {
+            let stopped = tokio::time::timeout(DRAINED, drain).await;
+            assert!(stopped.is_ok(), "pod {id} not stopped within {DRAINED:?}");
+            cluster.gone(id);
+            live.lock().unwrap().remove(&id);
+        }
+    }
+    let _sent = done.send(true);
+    let sampled = sampling.await.unwrap();
+    assert!(
+        sampled.unserved <= UNSERVED,
+        "a shard unserved for {:?}",
+        sampled.unserved
+    );
+    let news: BTreeSet<NodeId> = live.lock().unwrap().keys().copied().collect();
+    let settled = within(FORMED, || async {
+        let table = cluster.one_table(&news).await?;
+        owned_by(&cluster, &news).await?;
+        table.moves.is_empty().then_some(table)
+    })
+    .await;
+    let table = settled.expect("the new pods' table not settled");
+    for key in keys() {
+        let written = sampled.written.get(&key).copied();
+        assert!(written.is_some(), "key {key} never written");
+        let owner = table.owner(shard_of(key, SHARDS)).unwrap();
+        let held = cluster
+            .pod(owner)
+            .with(move |node, _| node.value(key))
+            .await
+            .flatten();
+        assert_eq!(held, written.map(count), "key {key} at {owner}");
+    }
+    // Gone from every table, the old pods are forgotten, and dialled no more.
+    let forgotten = within(Duration::from_secs(10), || async {
+        for id in &news {
+            let knows = cluster
+                .pod(*id)
+                .with(move |node, _| node.peers().iter().any(|peer| *peer <= pods))
+                .await?;
+            if knows {
+                return None;
+            }
+        }
+        Some(())
+    })
+    .await;
+    assert!(forgotten.is_some(), "old pods not forgotten");
+    let dialled = || -> Vec<u64> {
+        olds.iter()
+            .map(|id| cluster.pods[id].relay.dialled.load(Ordering::Relaxed))
+            .collect()
+    };
+    let before = dialled();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(dialled(), before, "old pods dialled once forgotten");
 }
 
 /// Whether every one of `ids` has committed a table whose every shard is owned by one of
@@ -324,7 +542,8 @@ async fn owned_by(cluster: &Cluster, ids: &BTreeSet<NodeId>) -> Option<()> {
 async fn three_pods_are_formed_by_the_control_plane_into_one_table() {
     let cluster = Cluster::formed(3).await;
     let ids = (1..=3).collect();
-    let table = cluster.one_table(&ids).await.unwrap();
+    // Read again, as one: tables published as shards move reach the pods a moment apart.
+    let table = within(FORMED, || cluster.one_table(&ids)).await.unwrap();
     assert!((0..SHARDS).all(|shard| table.owner(shard).is_some()));
 }
 
@@ -483,6 +702,16 @@ async fn a_pod_cut_off_stops_serving_before_the_others_take_its_shards() {
         stopped < taken,
         "stopped serving at {stopped:?}, its shards taken at {taken:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rollout_of_three_pods_one_at_a_time_leaves_no_shard_unserved_and_loses_nothing() {
+    rollout(3, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rollout_of_five_pods_two_at_a_time_leaves_no_shard_unserved_and_loses_nothing() {
+    rollout(5, 2).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -6,7 +6,8 @@
 //! A message past what its queue holds is dropped and the connection kept; a connection lost
 //! drops what waited for it, and the next is dialled for the next message, backed off. The
 //! store sends again what matters, as it does over the simulation's links, which keep each
-//! sender's order and may lose messages.
+//! sender's order and may lose messages. A link closed sends what waits before its streams
+//! end, as a drained pod's last changes must go (T4d2).
 
 use super::wire::{self, Empty, Hello, Outgoing, PIECE, Piece};
 use crate::grpc::{CALL_TIMEOUT, Error, KEEP_ALIVE, MAX_MESSAGE, Prost};
@@ -130,8 +131,29 @@ impl Queue {
 pub(crate) struct Link {
     rest: Queue,
     copies: Queue,
-    tasks: [JoinHandle<()>; 2],
+    tasks: Tasks,
     counts: Arc<Counts>,
+}
+
+/// A link's tasks, stopped when dropped.
+#[derive(Debug)]
+pub(crate) struct Tasks([JoinHandle<()>; 2]);
+
+impl Tasks {
+    /// Waits for both to end.
+    pub(crate) async fn ended(&mut self) {
+        for task in &mut self.0 {
+            let _ended = task.await;
+        }
+    }
+}
+
+impl Drop for Tasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 impl Link {
@@ -151,7 +173,7 @@ impl Link {
         let hello = Bytes::from(hello.encode_to_vec());
         let (rest, rest_waiting, rest_count) = Queue::new(REST_WAITING);
         let (copies, copies_waiting, copies_count) = Queue::new(COPIES_WAITING);
-        let tasks = [
+        let tasks = Tasks([
             tokio::spawn(send_all(
                 channel(address, dial, from)?,
                 PEER,
@@ -168,7 +190,7 @@ impl Link {
                 copies_count,
                 Arc::clone(counts),
             )),
-        ];
+        ]);
         Ok(Self {
             rest,
             copies,
@@ -190,13 +212,11 @@ impl Link {
             self.counts.full.fetch_add(1, Ordering::Relaxed);
         }
     }
-}
 
-impl Drop for Link {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
+    /// Closes it: each stream sends what waits on it, then ends once the peer has read it all,
+    /// and its task with it. The tasks, stopped if dropped before.
+    pub(crate) fn close(self) -> Tasks {
+        self.tasks
     }
 }
 
@@ -225,7 +245,8 @@ fn channel(address: &str, dial: &Dial, from: Option<IpAddr>) -> Result<Channel, 
 
 /// Sends what `queue` holds on `path` through `channel`, as `hello`, one stream at a time:
 /// opened once something waits, and again after one is lost, backed off if it never opened.
-/// Ends once the link is dropped.
+/// Ends once the link is closed and the stream with what waited has ended, or once the link
+/// is dropped.
 async fn send_all(
     channel: Channel,
     path: &'static str,
@@ -237,17 +258,23 @@ async fn send_all(
     let mut back_off = FIRST_BACK_OFF;
     while let Some(first) = queue.recv().await {
         let (pieces, sent) = mpsc::channel(1);
-        let forward = async {
+        let (queued, taken) = (&mut queue, &waiting);
+        let forward = async move {
             let mut next = Some(first);
             loop {
                 let encoded = match next.take() {
                     Some(encoded) => encoded,
-                    None => match queue.recv().await {
+                    None => match queued.recv().await {
                         Some(encoded) => encoded,
-                        None => return,
+                        // Closed: no more pieces, so the stream ends once the peer has read
+                        // them.
+                        None => {
+                            drop(pieces);
+                            return;
+                        }
                     },
                 };
-                waiting.fetch_sub(encoded.len(), Ordering::AcqRel);
+                taken.fetch_sub(encoded.len(), Ordering::AcqRel);
                 for piece in wire::pieces(encoded, PIECE) {
                     if pieces.send(piece).await.is_err() {
                         // The stream is gone: its call says so.
@@ -256,9 +283,14 @@ async fn send_all(
                 }
             }
         };
+        let call = stream(channel.clone(), path, hello.clone(), Received(sent));
+        tokio::pin!(call);
         let opened = tokio::select! {
-            () = forward => return,
-            opened = stream(channel.clone(), path, hello.clone(), Received(sent)) => opened,
+            () = forward => {
+                let _opened = call.await;
+                return;
+            }
+            opened = &mut call => opened,
         };
         // What waited for a connection lost goes with it.
         while let Ok(encoded) = queue.try_recv() {
