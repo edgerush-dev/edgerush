@@ -14,6 +14,8 @@ use edgerush_config::Certificate;
 use edgerush_control_service::TlsError;
 use edgerush_ratelimit::service::membership::{Agreed, Heartbeat};
 use edgerush_ratelimit::service::{Batch, PodId, Replicas, View};
+use edgerush_ratelimit_service::cluster::link::Dial;
+use edgerush_ratelimit_service::cluster::pod::{StorePod, StoreServer};
 use edgerush_ratelimit_service::grpc::{Client, Error, Server};
 use edgerush_ratelimit_service::pod::{Pod, Timing};
 use edgerush_ratelimit_service::secure::{self, Caller, PodCredentials, PodTls};
@@ -363,6 +365,11 @@ const REPLICATE: &str = "/edgerush.ratelimit.v1.RateLimit/Replicate";
 const HEARTBEAT: &str = "/edgerush.ratelimit.v1.RateLimit/Heartbeat";
 const DECIDE: &str = "/edgerush.ratelimit.v1.RateLimit/Decide";
 const COPY: &str = "/edgerush.ratelimit.v1.RateLimit/Copy";
+const STORE_DECIDE: &str = "/edgerush.cluster.v1.Cluster/Decide";
+const STORE_PEER: &str = "/edgerush.cluster.v1.Cluster/Peer";
+const STORE_COPY: &str = "/edgerush.cluster.v1.Cluster/Copy";
+const STORE_HELLO: &str = "/edgerush.cluster.v1.Cluster/Hello";
+const STORE_CONTROL: &str = "/edgerush.cluster.v1.Cluster/Control";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_mode_lets_each_caller_call_only_its_own_methods() {
@@ -415,6 +422,36 @@ async fn each_mode_lets_each_caller_call_only_its_own_methods() {
         }
         assert_ne!(
             refusal(&mut sync_server, path, None).await,
+            denied,
+            "{path}"
+        );
+    }
+    // The store's: the data planes' stream theirs, every other method the pods'.
+    let store = StorePod::spawn(
+        1,
+        "127.0.0.1:7000".to_owned(),
+        edgerush_cluster::Config::defaults(),
+        Dial::Plain,
+        Vec::new(),
+    );
+    let mut store_server = StoreServer::new(store);
+    for (path, allowed) in [
+        (STORE_DECIDE, Caller::DataPlane),
+        (STORE_PEER, Caller::Pod),
+        (STORE_COPY, Caller::Pod),
+        (STORE_HELLO, Caller::Pod),
+        (STORE_CONTROL, Caller::Pod),
+    ] {
+        for caller in [Caller::DataPlane, Caller::Pod] {
+            let refused = refusal(&mut store_server, path, Some(caller)).await;
+            assert_eq!(
+                refused == denied,
+                caller != allowed,
+                "{path} from {caller:?}"
+            );
+        }
+        assert_ne!(
+            refusal(&mut store_server, path, None).await,
             denied,
             "{path}"
         );

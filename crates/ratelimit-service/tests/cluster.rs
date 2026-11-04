@@ -4,7 +4,8 @@
 //! of a pod cut off, to it and from it, known by its IP, as pods dial from theirs. The control
 //! plane's `Authority` runs in-process, asking the pods as the controller will. Each scenario
 //! is the simulation's, held to its bound; a rollout's, as T4d2 has it. Clients ask the pods'
-//! synchronous mode in-process, through a `StoreClient` (T5a).
+//! synchronous mode in-process, through a `StoreClient` (T5a), and data planes on a stream of
+//! their own (T5c).
 
 #![allow(
     clippy::unwrap_used,
@@ -14,12 +15,15 @@
 )]
 
 use edgerush_cluster::table::shard_of;
-use edgerush_cluster::{Authority, Changed, Config, Kept, Node, NodeId, Stamp, Table, Time, ms};
+use edgerush_cluster::{
+    Authority, Changed, Config, Kept, Message as StoreMessage, Node, NodeId, Stamp, Table, Time, ms,
+};
 use edgerush_cluster_synchronous::{Answer, Message as ModeMessage, Rule, Value};
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::pod::{
-    STREAMS_IDLE, StoreClient, StorePod, StoreServer, TICK, ask,
+    DecideStream, STREAMS_IDLE, StoreClient, StorePod, StoreServer, TICK, ask, decide_stream,
 };
+use edgerush_ratelimit_service::cluster::wire::{asking, told_from};
 use edgerush_ratelimit_service::grpc::Client;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -589,6 +593,32 @@ async fn answered(client: &mut StoreClient, id: u64, most: Duration) -> Option<A
     tokio::time::timeout(most, answer).await.ok().flatten()
 }
 
+/// What a data plane's `stream` is told next, within `most`.
+async fn told(stream: &mut DecideStream, most: Duration) -> Option<ModeMessage> {
+    let next = tokio::time::timeout(most, stream.down.message())
+        .await
+        .ok()?
+        .ok()??;
+    told_from(next).ok()
+}
+
+/// The answer a data plane's `stream` is told to its request `id`, within `most`, the tables
+/// told meanwhile passed over.
+async fn told_answer(stream: &mut DecideStream, id: u64, most: Duration) -> Option<Answer> {
+    let until = Instant::now() + most;
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        match told(stream, left).await? {
+            ModeMessage::Reply {
+                id: answered,
+                answer,
+                ..
+            } if answered == id => return Some(answer),
+            _ => {}
+        }
+    }
+}
+
 /// What `pod` holds counted under `key`, less what was given back.
 async fn held_at(pod: &StorePod, key: u64) -> Option<u64> {
     pod.with(move |node, _| node.value(key).map(|value| value.net()))
@@ -936,6 +966,66 @@ async fn an_owner_cut_off_answers_not_serving() {
         .await;
     let answer = answered(&mut client, 1, ANSWERED).await;
     assert_eq!(answer, Some(Answer::NotServing));
+}
+
+/// A data plane's stream is told the pod's table as it opens, and answered by its own numbers:
+/// a request counted at its owner, and one under several keys gathered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_data_planes_stream_is_told_the_table_and_answered_by_number() {
+    let cluster = ready(3).await;
+    let address = cluster.pods[&1].relay.address.to_string();
+    let mut stream = decide_stream(&address, &Dial::Plain).await.unwrap();
+    let first = told(&mut stream, ANSWERED).await;
+    let Some(ModeMessage::Store(StoreMessage::TableReply { table })) = first else {
+        panic!("first told {first:?}");
+    };
+    let named: BTreeSet<NodeId> = table.members.keys().copied().collect();
+    assert_eq!(named, (1..=3).collect());
+    let key = key_owned_by(&table, 1);
+    // Whoever it names, a request is the stream's own.
+    let asked = asking(request(42, 7, key, table.stamp(), None)).unwrap();
+    stream.up.send(asked).await.unwrap();
+    assert_eq!(
+        told_answer(&mut stream, 7, ANSWERED).await,
+        Some(Answer::Counted(1))
+    );
+    let others: Vec<(NodeId, u64)> = (2..=3)
+        .map(|owner| (owner, key_owned_by(&table, owner)))
+        .collect();
+    let gather = ModeMessage::Gather {
+        client: 0,
+        id: 8,
+        keys: others.iter().map(|(_, key)| *key).collect(),
+    };
+    stream.up.send(asking(gather).unwrap()).await.unwrap();
+    assert_eq!(
+        told_answer(&mut stream, 8, ANSWERED).await,
+        Some(Answer::Counted(0))
+    );
+    for (owner, key) in others {
+        assert_eq!(held_at(cluster.pod(owner), key).await, Some(1), "key {key}");
+    }
+}
+
+/// A table the pod commits reaches the data planes' streams to it: a pod taken in is named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_committed_reaches_the_data_planes_streams() {
+    let mut cluster = ready(3).await;
+    let address = cluster.pods[&1].relay.address.to_string();
+    let mut stream = decide_stream(&address, &Dial::Plain).await.unwrap();
+    let seed = cluster.pods[&1].relay.address.to_string();
+    cluster.start(4, config(), vec![seed]).await;
+    let until = Instant::now() + FORMED;
+    let mut named = false;
+    while !named && Instant::now() < until {
+        let left = until.saturating_duration_since(Instant::now());
+        if let Some(ModeMessage::Store(StoreMessage::TableReply { table })) =
+            told(&mut stream, left).await
+        {
+            named = table.has_member(4);
+        }
+    }
+    assert!(named, "no table naming pod 4 told within {FORMED:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
