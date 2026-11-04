@@ -12,6 +12,7 @@
 //! pod:
 //!   id: 0
 //!   listen: 0.0.0.0:7000
+//!   address: rl-0.rl:7000     # with `store` alone
 //!   metrics: 0.0.0.0:9090     # nowhere when left out
 //!   cycle_ms: 10              # 10 when left out
 //! membership:
@@ -21,6 +22,16 @@
 //!     2: rl-2:7000
 //!   silence_ms: 600           # 600 when left out
 //!   stop_serving_ms: 400      # 400 when left out
+//! store:                      # none when left out
+//!   seeds: [rl-0:7000]        # none when left out
+//!   shards: 256               # each as the store's defaults when left out
+//!   replicas: 2
+//!   heartbeat_ms: 100
+//!   stop_serving_ms: 400
+//!   silence_ms: 600
+//!   election_jitter_ms: 200
+//!   cycle_ms: 10
+//!   skew_warning_ms: 250
 //! keys:
 //!   max_bytes: 268435456      # 256 MiB when left out
 //! tls:                        # served plain, to anyone, when left out
@@ -45,6 +56,11 @@
 //! where `/metrics` shows whether the pod serves, how often and how long it has gone without
 //! a majority and, in the asynchronous mode, what its keys hold.
 //!
+//! `store` is what the pod is to run the cluster store with (`edgerush_cluster`), which
+//! every pod of a cluster is to share, and `pod.address` where the other pods reach it,
+//! needed with `store` and only with it (`edgerush_ratelimit_service::cluster::settings`).
+//! They are checked as the file is read, but neither mode runs the store yet.
+//!
 //! `tls`'s files, relative to the config file's directory unless absolute, are read again
 //! every second, and serve the service with mutual TLS (`edgerush_ratelimit_service::secure`):
 //! the pod presents `certificate` to data planes and to the other pods alike, trusts the
@@ -56,6 +72,7 @@ use boring::ssl::SslConnector;
 use edgerush_config::{ServiceFile, ServiceMode as Mode};
 use edgerush_control_service::reread;
 use edgerush_ratelimit::service::PodId;
+use edgerush_ratelimit_service::cluster::settings::settings;
 use edgerush_ratelimit_service::grpc::{Client, Server};
 use edgerush_ratelimit_service::pod::{Pod, Timing};
 use edgerush_ratelimit_service::scrape;
@@ -129,9 +146,8 @@ fn parsed(yaml: &[u8], directory: &Path) -> Result<Args, String> {
 
 /// What the types cannot check of `file`, and the values of what it leaves out.
 fn checked(file: ServiceFile, directory: &Path) -> Result<Args, String> {
-    let (pod, membership) = (file.pod, file.membership);
     // A cycle of nothing would tick without end.
-    let cycle = pod.cycle_ms.unwrap_or(CYCLE_MS);
+    let cycle = file.pod.cycle_ms.unwrap_or(CYCLE_MS);
     if cycle == 0 {
         return Err("`pod.cycle_ms`: a number of milliseconds, at least 1".to_owned());
     }
@@ -139,6 +155,9 @@ fn checked(file: ServiceFile, directory: &Path) -> Result<Args, String> {
     if max_key_bytes == 0 {
         return Err("`keys.max_bytes`: a number of bytes, at least 1".to_owned());
     }
+    // Nothing runs the store yet, but a file it could not run on is refused now.
+    settings(&file, max_key_bytes).map_err(|error| error.to_string())?;
+    let (pod, membership) = (file.pod, file.membership);
     if !membership.pods.contains_key(&pod.id) {
         return Err("`membership.pods` must name this pod too".to_owned());
     }
@@ -577,6 +596,28 @@ mod tests {
                 (2, "rl-2:7000".to_owned())
             ]
             .into()
+        );
+    }
+
+    #[test]
+    fn a_store_the_pod_could_not_run_on_is_refused_as_the_file_is_read() {
+        let address = sections(", address: rl-0.rl:7000", "");
+        assert!(parsed_from(&format!("{address}store: {{}}\n")).is_ok());
+        assert_eq!(
+            parsed_from(&address).err(),
+            Some("`pod.address` is for the store, and there is no `store` section".to_owned())
+        );
+        assert_eq!(
+            parsed_from(&with("store: {}\n")).err(),
+            Some("`pod.address` is needed with a `store` section".to_owned())
+        );
+        assert_eq!(
+            parsed_from(&format!("{address}store: {{ stop_serving_ms: 500 }}\n")).err(),
+            Some(
+                "`store.stop_serving_ms` 500 must be more than a heartbeat (100 ms) and at \
+                 least 200 ms less than `store.silence_ms` 600"
+                    .to_owned()
+            )
         );
     }
 
