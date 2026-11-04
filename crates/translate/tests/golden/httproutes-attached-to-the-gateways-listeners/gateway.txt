@@ -1,7 +1,7 @@
-listener any: served on port-8080, taking HTTPRoute from every namespace
-listener example: served on port-8080, taking HTTPRoute from every namespace
-listener foo: served on port-8080, taking HTTPRoute from every namespace
-listener abc: served on port-8080, taking HTTPRoute from every namespace
-listener same-only: served on port-8080, taking HTTPRoute from namespace edge
-listener selected: served on port-8080, taking HTTPRoute from namespaces labelled team=shop
+listener any: served on port-8080, taking HTTPRoute, GRPCRoute from every namespace
+listener example: served on port-8080, taking HTTPRoute, GRPCRoute from every namespace
+listener foo: served on port-8080, taking HTTPRoute, GRPCRoute from every namespace
+listener abc: served on port-8080, taking HTTPRoute, GRPCRoute from every namespace
+listener same-only: served on port-8080, taking HTTPRoute, GRPCRoute from namespace edge
+listener selected: served on port-8080, taking HTTPRoute, GRPCRoute from namespaces labelled team=shop
 listener tls-only: served on port-8080, taking no route from every namespace

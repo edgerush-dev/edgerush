@@ -31,10 +31,10 @@
 
 use edgerush_certificates::Identity;
 use edgerush_config::{
-    Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, Header, HeaderChanges,
-    Hostname, Listener, ListenerCertificate, LoadBalancer, Match, PathMatch, Protocol, Query,
-    Redirect, Route, Rule, Scheme, SharingHostname, SharingListener, StatedNames, Upstream,
-    UpstreamProtocol, UpstreamTls, ValueMatch, Wildcard, compile,
+    Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, GrpcMethod, Header,
+    HeaderChanges, Hostname, Listener, ListenerCertificate, LoadBalancer, Match, PathMatch,
+    Protocol, Query, Redirect, Route, Rule, Scheme, SharingHostname, SharingListener, StatedNames,
+    Upstream, UpstreamProtocol, UpstreamTls, ValueMatch, Wildcard, compile,
 };
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
@@ -54,6 +54,7 @@ use std::collections::btree_map::Entry;
 use std::fmt;
 
 pub mod gateway;
+mod grpc_route;
 pub mod http_route;
 pub mod listeners;
 pub mod status;
@@ -289,6 +290,8 @@ pub struct Translation {
     /// Each HTTPRoute that names that Gateway among its parents, and what became of each
     /// such parent.
     pub http_routes: Vec<RouteOutcome>,
+    /// Each GRPCRoute that does, and what became of each such parent.
+    pub grpc_routes: Vec<RouteOutcome>,
     /// What that Gateway's status is to say (04 §6).
     pub gateway_status: Option<GatewayStatus>,
     /// What each of those HTTPRoutes' status is to say of those parents, in their order.
@@ -676,20 +679,23 @@ pub enum Problem {
     /// No listener of the data plane's Gateway is served.
     #[error("none of its listeners is served, so it serves nothing")]
     NoListenerServed,
-    /// A `parentRef` of an HTTPRoute to the data plane's Gateway attaches it to no listener.
+    /// A `parentRef` of a route to the data plane's Gateway attaches it to no listener.
     #[error("not attached to the data plane's Gateway: {0}")]
     NotAttached(NotAttached),
-    /// A rule of an HTTPRoute has what translation cannot take: it answers 500 for every
-    /// request it matches, the rest of the route served (`PartiallyInvalid`).
-    #[error("rule {rule} answers 500 for all it matches: {why}")]
+    /// A rule of a route has what translation cannot take: it answers 500 for every
+    /// request it matches, a GRPCRoute's `UNAVAILABLE` for every call, the rest of the route
+    /// served (`PartiallyInvalid`).
+    #[error("rule {rule} answers {answer} for all it matches: {why}")]
     RuleAnswered {
         /// Its position among the route's rules.
         rule: usize,
+        /// What it answers: `500`, or `UNAVAILABLE`.
+        answer: &'static str,
         /// Why.
         why: String,
     },
-    /// A rule of an HTTPRoute whose matches cannot be built is left out, its requests left
-    /// to the route's other rules, the rest of the route served (`PartiallyInvalid`).
+    /// A rule of a route whose matches cannot be built is left out, its requests left to
+    /// the route's other rules, the rest of the route served (`PartiallyInvalid`).
     #[error("rule {rule} left out: {why}")]
     RuleLeftOut {
         /// Its position among the route's rules.
@@ -697,16 +703,18 @@ pub enum Problem {
         /// Why.
         why: String,
     },
-    /// No rule of an HTTPRoute is served as written: it is not accepted, though those of its
-    /// rules that answer 500 still answer.
+    /// No rule of a route is served as written: it is not accepted, though those of its
+    /// rules that answer 500 (or `UNAVAILABLE`) still answer.
     #[error("no rule is served as written, so it is not accepted")]
     NoRuleServed,
-    /// A backend of an HTTPRoute's rule is invalid: its share of the rule's requests is
-    /// answered 500 (`ResolvedRefs` false).
-    #[error("rule {rule}: a backend's share is answered 500: {why}")]
+    /// A backend of a route's rule is invalid: its share of the rule's requests is answered
+    /// 500, of a GRPCRoute's calls `UNAVAILABLE` (`ResolvedRefs` false).
+    #[error("rule {rule}: a backend's share is answered {answer}: {why}")]
     BackendInvalid {
         /// Its rule's position among the route's rules.
         rule: usize,
+        /// What its share is answered: `500`, or `UNAVAILABLE`.
+        answer: &'static str,
         /// Why.
         why: RefProblem,
     },
@@ -778,14 +786,18 @@ pub enum Problem {
 pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut report = Vec::new();
     let gateway = gateway::outcome(plane, cluster, &mut report);
-    let http_routes = gateway
+    let (http_routes, grpc_routes) = gateway
         .as_ref()
         .map(|gateway| {
-            let routes = cluster.http_routes.iter().map(http_route::Routed::http);
-            http_route::attached(routes.collect(), gateway, cluster)
+            let http = cluster.http_routes.iter().map(http_route::Routed::http);
+            let grpc = cluster.grpc_routes.iter().map(http_route::Routed::grpc);
+            (
+                http_route::attached(http.collect(), gateway, cluster),
+                http_route::attached(grpc.collect(), gateway, cluster),
+            )
         })
         .unwrap_or_default();
-    for outcome in &http_routes {
+    for outcome in http_routes.iter().chain(&grpc_routes) {
         for parent in &outcome.parents {
             if let Err(why) = parent.attached {
                 report.push(Finding {
@@ -793,16 +805,6 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                     problem: Problem::NotAttached(why),
                 });
             }
-        }
-    }
-    if let Some(gateway) = &gateway {
-        // Not translated yet: each that names the Gateway or one of its ListenerSets said so.
-        let routes = cluster.grpc_routes.iter().map(http_route::Routed::grpc);
-        for outcome in http_route::attached(routes.collect(), gateway, cluster) {
-            report.push(Finding {
-                object: outcome.route,
-                problem: Problem::NotSupportedYet("GRPCRoute"),
-            });
         }
     }
     // An Ingress is the data plane's when its class is, and its class is when the
@@ -940,7 +942,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 }
             }
         }
-        accepted.push((object(), rank(&ingress.metadata, 1), translated, taken));
+        accepted.push((object(), rank(&ingress.metadata, 2), translated, taken));
     }
     // Every Ingress in, a host some Ingress secures is served over HTTPS whichever Ingress's
     // route it is, so that both kinds of listener rank the same paths for it; a host none
@@ -1142,59 +1144,39 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             };
             let translated =
                 http_route::translated(route, outcome, gateway, plane, cluster, refused);
-            for (rule, why) in &translated.answered {
-                report.push(Finding {
-                    object: outcome.route.clone(),
-                    problem: Problem::RuleAnswered {
-                        rule: *rule,
-                        why: why.clone(),
-                    },
-                });
-            }
-            for (rule, why) in &translated.left_out {
-                report.push(Finding {
-                    object: outcome.route.clone(),
-                    problem: Problem::RuleLeftOut {
-                        rule: *rule,
-                        why: why.clone(),
-                    },
-                });
-            }
-            for (rule, why) in &translated.invalid {
-                report.push(Finding {
-                    object: outcome.route.clone(),
-                    problem: Problem::BackendInvalid {
-                        rule: *rule,
-                        why: why.clone(),
-                    },
-                });
-            }
-            for (rule, asked) in &translated.retries_capped {
-                report.push(Finding {
-                    object: outcome.route.clone(),
-                    problem: Problem::RetryCapped {
-                        rule: *rule,
-                        asked: *asked,
-                    },
-                });
-            }
-            for (rule, why) in &translated.mirrors_left_off {
-                report.push(Finding {
-                    object: outcome.route.clone(),
-                    problem: Problem::MirrorLeftOff {
-                        rule: *rule,
-                        why: why.clone(),
-                    },
-                });
-            }
-            if translated.answered.len() + translated.left_out.len() == route.spec.rules.len() {
-                report.push(Finding {
-                    object: outcome.route.clone(),
-                    problem: Problem::NoRuleServed,
-                });
-            }
+            rules_said(
+                &mut report,
+                outcome,
+                &translated,
+                route.spec.rules.len(),
+                "500",
+            );
             ranked.push(Ranked {
                 rank: rank(&route.metadata, 0),
+                object: outcome.route.clone(),
+                routes: translated.routes,
+            });
+            upstreams.extend(translated.upstreams);
+        }
+        // Each attached GRPCRoute's rules, as an HTTPRoute's; a call one cannot serve is
+        // answered `UNAVAILABLE`, as the spec has it, where a request is answered 500.
+        for outcome in &grpc_routes {
+            if !outcome.parents.iter().any(|parent| parent.attached.is_ok()) {
+                continue;
+            }
+            let Some(route) = cluster
+                .grpc_routes
+                .iter()
+                .find(|route| Object::of("GRPCRoute", &route.metadata) == outcome.route)
+            else {
+                continue;
+            };
+            let translated =
+                grpc_route::translated(route, outcome, gateway, plane, cluster, refused);
+            let rules = route.spec.rules.as_ref().map_or(0, Vec::len);
+            rules_said(&mut report, outcome, &translated, rules, "UNAVAILABLE");
+            ranked.push(Ranked {
+                rank: rank(&route.metadata, 1),
                 object: outcome.route.clone(),
                 routes: translated.routes,
             });
@@ -1326,26 +1308,82 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         claimed: of_the_class,
         gateway,
         http_routes,
+        grpc_routes,
         gateway_status,
         route_statuses,
         taken,
     }
 }
 
+/// What became of the rules of a route of `rules` rules, translated as `translated` says,
+/// said in `report`; a rule or a backend's share that cannot be served is answered
+/// `answer`.
+fn rules_said(
+    report: &mut Vec<Finding>,
+    outcome: &RouteOutcome,
+    translated: &http_route::Translated,
+    rules: usize,
+    answer: &'static str,
+) {
+    let mut say = |problem| {
+        report.push(Finding {
+            object: outcome.route.clone(),
+            problem,
+        });
+    };
+    for (rule, why) in &translated.answered {
+        say(Problem::RuleAnswered {
+            rule: *rule,
+            answer,
+            why: why.clone(),
+        });
+    }
+    for (rule, why) in &translated.left_out {
+        say(Problem::RuleLeftOut {
+            rule: *rule,
+            why: why.clone(),
+        });
+    }
+    for (rule, why) in &translated.invalid {
+        say(Problem::BackendInvalid {
+            rule: *rule,
+            answer,
+            why: why.clone(),
+        });
+    }
+    for (rule, asked) in &translated.retries_capped {
+        say(Problem::RetryCapped {
+            rule: *rule,
+            asked: *asked,
+        });
+    }
+    for (rule, why) in &translated.mirrors_left_off {
+        say(Problem::MirrorLeftOff {
+            rule: *rule,
+            why: why.clone(),
+        });
+    }
+    if translated.answered.len() + translated.left_out.len() == rules {
+        say(Problem::NoRuleServed);
+    }
+}
+
 /// Where an object's config routes go among all others: oldest first, then by namespace and
-/// name, as Gateway API ranks routes, whichever API each is of (04 §1); an Ingress and an
-/// HTTPRoute alike in all three, the HTTPRoute first, as the rule both share is Gateway
-/// API's (Lucas). The order is precedence's last tie-breaker (07 §1).
+/// name, as Gateway API ranks routes, whichever API each is of (04 §1); an Ingress and a
+/// route of the Gateway API alike in all three, the Gateway API's first, as the rule they
+/// share is its (Lucas), and an HTTPRoute before a GRPCRoute. The order is precedence's
+/// last tie-breaker (07 §1).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Rank {
     created: Option<Time>,
     namespace: String,
     name: String,
-    /// 0 for an HTTPRoute, 1 for an Ingress: the HTTPRoute first.
+    /// 0 for an HTTPRoute, 1 for a GRPCRoute, 2 for an Ingress: in that order.
     api: u8,
 }
 
-/// The rank of the object of `metadata`, of API `api` (0 for HTTPRoute, 1 for Ingress).
+/// The rank of the object of `metadata`, of API `api` (0 for HTTPRoute, 1 for GRPCRoute, 2
+/// for Ingress).
 fn rank(metadata: &ObjectMeta, api: u8) -> Rank {
     Rank {
         created: metadata.creation_timestamp.clone(),
@@ -1446,11 +1484,15 @@ fn matched(route: &Route) -> impl Iterator<Item = (String, &Hostname, String)> +
     })
 }
 
-/// A match as the report says it: its path and how it is matched, `/api (Prefix)`, then its
-/// method, headers and query parameters, these in order of name, as the router takes them
-/// in any order. None for a match of no path.
+/// A match as the report says it: its path and how it is matched, `/api (Prefix)`, a gRPC
+/// method's as the path it stands for, then its method, headers and query parameters, these
+/// in order of name, as the router takes them in any order. None for a match of neither.
 fn described(matched: &Match) -> Option<String> {
-    let mut said = path_said(matched.path.as_ref()?);
+    let mut said = match (&matched.path, &matched.grpc) {
+        (Some(path), _) => path_said(path),
+        (None, Some(grpc)) => grpc_said(grpc)?,
+        (None, None) => return None,
+    };
     if let Some(method) = &matched.method {
         said.push_str(" for ");
         said.push_str(method);
@@ -1493,6 +1535,20 @@ fn path_said(path: &PathMatch) -> String {
         PathMatch::Exact(path) => format!("{path} (Exact)"),
         PathMatch::Regex(path) => format!("{path} (regex)"),
     }
+}
+
+/// A gRPC method match as the report says it: the path it stands for, as the router ranks
+/// it beside paths (07 §1), `/pkg.Svc/Do (Exact)`, `/pkg.Svc (Prefix)`, or, a method in any
+/// service, `/*/Do (gRPC method)`.
+fn grpc_said(grpc: &GrpcMethod) -> Option<String> {
+    Some(match (&grpc.service, &grpc.method) {
+        (Some(service), Some(method)) => {
+            path_said(&PathMatch::Exact(format!("/{service}/{method}")))
+        }
+        (Some(service), None) => path_said(&PathMatch::Prefix(format!("/{service}"))),
+        (None, Some(method)) => format!("/*/{method} (gRPC method)"),
+        (None, None) => return None,
+    })
 }
 
 /// A header's or query parameter's match as the report says it: `x-beta: on`,
@@ -1975,7 +2031,13 @@ fn ingress_routes(
     // API has a missing `backendRef` (04 §2).
     let mut backend_of = |backend: &IngressBackend, host: &str, path: Option<String>| {
         Ok(
-            match backend_upstream(plane, cluster, namespace, backend, service_upstream)? {
+            match backend_upstream(
+                plane,
+                cluster,
+                namespace,
+                backend,
+                (Calls::Http, service_upstream),
+            )? {
                 Ok((name, upstream)) => {
                     upstreams.insert(name.clone(), upstream);
                     Backend {
@@ -2244,16 +2306,27 @@ fn forward(path: PathMatch, backend: Backend) -> Rule {
     }
 }
 
+/// What a route calls its backends with: HTTP, in HTTP/1.1 unless the port's `appProtocol`
+/// says otherwise (an Ingress, an HTTPRoute); or gRPC, in HTTP/2 wherever the port's
+/// `appProtocol` agrees (a GRPCRoute; 04 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Calls {
+    Http,
+    Grpc,
+}
+
 /// The upstream a backend leads to, and its name: one a Service's port, whose endpoints are
 /// followed through its EndpointSlices, or, `by_address`, reached by the Service's own name,
-/// which resolves to its cluster IP. Or what is not there, when its Service, or that port of
-/// it, is not, or it has no cluster IP to be reached by; or why the Ingress is left out.
+/// which resolves to its cluster IP; spoken to as `calls` and the port's `appProtocol` say.
+/// Or what is not there, when its Service, or that port of it, is not, or it has no cluster
+/// IP to be reached by, or its `appProtocol` is not one `calls` can be spoken in; or why the
+/// Ingress is left out.
 fn backend_upstream(
     plane: &Plane,
     cluster: &Cluster,
     namespace: &str,
     backend: &IngressBackend,
-    by_address: bool,
+    (calls, by_address): (Calls, bool),
 ) -> Result<Result<(String, Upstream), RefProblem>, Problem> {
     let Some(backend) = &backend.service else {
         return Err(Problem::NotSupportedYet("a resource backend"));
@@ -2269,39 +2342,62 @@ fn backend_upstream(
     };
     let service = &backend.name;
     let host = format!("{service}.{namespace}.svc.{}", plane.cluster_domain);
-    let (protocol, tls) = match app_protocol {
-        None | Some("kubernetes.io/ws") => (UpstreamProtocol::Http1, None),
-        Some("kubernetes.io/h2c") => (UpstreamProtocol::Http2, None),
-        Some("kubernetes.io/wss") if plane.backend_authorities.is_empty() => {
+    // HTTP/2 in the clear for a port of no `appProtocol` is named apart from the HTTP/1.1
+    // upstream an HTTPRoute or an Ingress reaches the same port by.
+    let mut apart = false;
+    let (protocol, tls) = match (calls, app_protocol) {
+        (Calls::Grpc, None) => {
+            apart = true;
+            (UpstreamProtocol::Http2, None)
+        }
+        // `grpc` and `http2` read as Istio reads them.
+        (Calls::Grpc, Some("kubernetes.io/h2c" | "grpc" | "http2")) => {
+            (UpstreamProtocol::Http2, None)
+        }
+        (Calls::Grpc, Some(other)) => {
             return Ok(Err(RefProblem::new(
                 RefReason::UnsupportedProtocol,
                 format!(
-                    "Service {namespace}/{service} port {port} is kubernetes.io/wss, and the \
+                    "Service {namespace}/{service} port {port} has appProtocol {other}; a \
+                     GRPCRoute's backend is spoken to in HTTP/2 in the clear, on a port of \
+                     none or of kubernetes.io/h2c, grpc or http2"
+                ),
+            )));
+        }
+        (Calls::Http, app_protocol) => match app_protocol {
+            None | Some("kubernetes.io/ws") => (UpstreamProtocol::Http1, None),
+            Some("kubernetes.io/h2c") => (UpstreamProtocol::Http2, None),
+            Some("kubernetes.io/wss") if plane.backend_authorities.is_empty() => {
+                return Ok(Err(RefProblem::new(
+                    RefReason::UnsupportedProtocol,
+                    format!(
+                        "Service {namespace}/{service} port {port} is kubernetes.io/wss, and the \
                      data plane trusts no authorities for TLS to backends"
-                ),
-            )));
-        }
-        // The certificate must carry the Service's own name, as a client inside the
-        // cluster would ask for it.
-        Some("kubernetes.io/wss") => (
-            UpstreamProtocol::Http1,
-            Some(UpstreamTls {
-                server_name: host.clone(),
-                authorities: plane.backend_authorities.clone(),
-                client_certificate: None,
-            }),
-        ),
-        // A protocol the gateway cannot speak makes the backend invalid, as Gateway API has
-        // it (`UnsupportedProtocol`), rather than spoken to in HTTP/1.1 regardless.
-        Some(other) => {
-            return Ok(Err(RefProblem::new(
-                RefReason::UnsupportedProtocol,
-                format!(
-                    "Service {namespace}/{service} port {port} has appProtocol {other}, which \
+                    ),
+                )));
+            }
+            // The certificate must carry the Service's own name, as a client inside the
+            // cluster would ask for it.
+            Some("kubernetes.io/wss") => (
+                UpstreamProtocol::Http1,
+                Some(UpstreamTls {
+                    server_name: host.clone(),
+                    authorities: plane.backend_authorities.clone(),
+                    client_certificate: None,
+                }),
+            ),
+            // A protocol the gateway cannot speak makes the backend invalid, as Gateway API has
+            // it (`UnsupportedProtocol`), rather than spoken to in HTTP/1.1 regardless.
+            Some(other) => {
+                return Ok(Err(RefProblem::new(
+                    RefReason::UnsupportedProtocol,
+                    format!(
+                        "Service {namespace}/{service} port {port} has appProtocol {other}, which \
                      the gateway does not speak"
-                ),
-            )));
-        }
+                    ),
+                )));
+            }
+        },
     };
     // A headless Service's name resolves to its pods, which listen on their own ports, not
     // the Service's.
@@ -2314,7 +2410,7 @@ fn backend_upstream(
             ),
         )));
     }
-    let (name, endpoints) = if by_address {
+    let (mut name, endpoints) = if by_address {
         (
             format!("{namespace}/{service}/{port}/service"),
             Endpoints::Dns(format!("{host}:{number}")),
@@ -2325,6 +2421,9 @@ fn backend_upstream(
             Endpoints::Kubernetes(format!("{host}:{port}")),
         )
     };
+    if apart {
+        name.push_str("/h2c");
+    }
     let upstream = Upstream {
         endpoints,
         protocol,

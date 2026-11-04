@@ -1,4 +1,4 @@
-listener shop-alt: served on port-8080, taking HTTPRoute from namespace shop
-listener shop-secure: served on port-8443, presenting shop/wild, taking HTTPRoute from namespace shop
-listener secure: served on port-443, presenting shop/wild, taking HTTPRoute from namespace shop
-listener plain: served on port-443, presenting shop/wild, taking HTTPRoute from namespace shop
+listener shop-alt: served on port-8080, taking HTTPRoute, GRPCRoute from namespace shop
+listener shop-secure: served on port-8443, presenting shop/wild, taking HTTPRoute, GRPCRoute from namespace shop
+listener secure: served on port-443, presenting shop/wild, taking HTTPRoute, GRPCRoute from namespace shop
+listener plain: served on port-443, presenting shop/wild, taking HTTPRoute, GRPCRoute from namespace shop

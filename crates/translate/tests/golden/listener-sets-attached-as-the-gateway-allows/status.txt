@@ -1,10 +1,10 @@
 Gateway, generation 0: Accepted=True/Accepted
-listener http: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener http: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 attached ListenerSets: 1
 ListenerSet blog/other, generation 0: Accepted=False/NotAllowed (Gateway edge/web takes no ListenerSet of its namespace, as its allowedListeners say); Programmed=False/NotAllowed (Gateway edge/web takes no ListenerSet of its namespace, as its allowedListeners say)
 ListenerSet edge/own, generation 0: Accepted=False/NotAllowed (Gateway edge/web takes no ListenerSet of its namespace, as its allowedListeners say); Programmed=False/NotAllowed (Gateway edge/web takes no ListenerSet of its namespace, as its allowedListeners say)
 ListenerSet shop/team, generation 0: Accepted=True/Accepted
-listener api: HTTPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener api: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 HTTPRoute blog/blog, generation 0, parent ListenerSet other: Accepted=False/NoMatchingParent (the ListenerSet it names is not attached to the Gateway); ResolvedRefs=True/ResolvedRefs
 HTTPRoute shop/team, generation 0, parent ListenerSet team section api: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 HTTPRoute shop/web, generation 0, parent web section api: Accepted=False/NoMatchingParent (no listener the Gateway serves has the name and port it names); ResolvedRefs=True/ResolvedRefs

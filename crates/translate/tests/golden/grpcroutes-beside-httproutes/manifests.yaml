@@ -1,0 +1,131 @@
+# GRPCRoutes beside HTTPRoutes: attached as they are, to HTTP and HTTPS listeners alike,
+# and ranked with them as one, oldest first. A gRPC method match an older HTTPRoute's path
+# has the same way on one host is that route's, and said shadowed, an HTTPRoute's as old,
+# of the same namespace and name, too; the rest of both are served. A Service both reach is two upstreams, in HTTP/1.1 and in HTTP/2. A backend of
+# another namespace is reached where a ReferenceGrant there lets GRPCRoutes of the route's
+# namespace reach it, not one that lets HTTPRoutes alone. A listener that names HTTPRoute
+# alone takes no GRPCRoute; one naming another Gateway is not ours; one of no rules serves
+# nothing, and is not accepted.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP }
+    - name: http-only
+      port: 8081
+      protocol: HTTP
+      allowedRoutes: { kinds: [{ kind: HTTPRoute }] }
+    - name: secure
+      port: 8443
+      protocol: HTTPS
+      hostname: shop.example.com
+      tls: { certificateRefs: [{ name: shop-tls }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: pages, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: http }, { name: web, sectionName: secure }]
+  hostnames: [shop.example.com]
+  rules:
+    - matches: [{ path: { type: Exact, value: /shop.Orders/Get } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { type: PathPrefix, value: /shop.Orders } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: pages, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: http }]
+  hostnames: [shop.example.com]
+  rules:
+    - matches: [{ method: { service: shop.Orders } }]
+      backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: calls, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: http }, { name: web, sectionName: secure }]
+  hostnames: [shop.example.com]
+  rules:
+    - matches: [{ method: { service: shop.Orders, method: Get } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ method: { service: shop.Orders } }]
+      backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: abroad, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: http }]
+  hostnames: [abroad.example.com]
+  rules:
+    - backendRefs:
+        - { name: ledger, namespace: billing, port: 50051 }
+        - { name: levels, namespace: stock, port: 50051 }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: narrow, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: http-only }]
+  rules:
+    - backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: empty, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: http }]
+  hostnames: [empty.example.com]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: elsewhere, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: other }]
+  rules:
+    - backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: grpc-from-shop, namespace: billing }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: GRPCRoute, namespace: shop }]
+  to: [{ group: "", kind: Service }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: http-from-shop, namespace: stock }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: shop }]
+  to: [{ group: "", kind: Service }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: ledger, namespace: billing }
+spec:
+  ports: [{ name: grpc, port: 50051 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: levels, namespace: stock }
+spec:
+  ports: [{ name: grpc, port: 50051 }]

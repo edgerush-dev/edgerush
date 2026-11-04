@@ -1,0 +1,6 @@
+GRPCRoute shop/narrow: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace
+GRPCRoute shop/abroad: rule 0: a backend's share is answered UNAVAILABLE: Service stock/levels is another namespace's, and no ReferenceGrant there lets GRPCRoutes of shop reach it
+GRPCRoute shop/empty: no rule is served as written, so it is not accepted
+GRPCRoute shop/pages: path /shop.Orders (Prefix) on shop.example.com is already HTTPRoute shop/pages's, which comes first
+GRPCRoute shop/calls: path /shop.Orders/Get (Exact) on shop.example.com is already HTTPRoute shop/pages's, which comes first
+GRPCRoute shop/calls: path /shop.Orders (Prefix) on shop.example.com is already HTTPRoute shop/pages's, which comes first

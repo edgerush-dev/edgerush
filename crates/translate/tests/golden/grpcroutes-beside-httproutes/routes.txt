@@ -1,0 +1,8 @@
+HTTPRoute shop/pages, section http: attached to http (shop.example.com)
+HTTPRoute shop/pages, section secure: attached to secure (shop.example.com)
+GRPCRoute shop/pages, section http: attached to http (shop.example.com)
+GRPCRoute shop/abroad, section http: attached to http (abroad.example.com)
+GRPCRoute shop/calls, section http: attached to http (shop.example.com)
+GRPCRoute shop/calls, section secure: attached to secure (shop.example.com)
+GRPCRoute shop/empty, section http: attached to http (empty.example.com)
+GRPCRoute shop/narrow, section http-only: not attached: no listener it names takes its kind from its namespace

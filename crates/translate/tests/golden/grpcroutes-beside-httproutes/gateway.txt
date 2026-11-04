@@ -1,0 +1,3 @@
+listener http: served on port-8080, taking HTTPRoute, GRPCRoute from namespace shop
+listener http-only: served on port-8081, taking HTTPRoute from namespace shop
+listener secure: served on port-8443, presenting shop/shop-tls, taking HTTPRoute, GRPCRoute from namespace shop

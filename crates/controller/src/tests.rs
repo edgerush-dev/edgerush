@@ -579,15 +579,20 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 let translation = &heard.translations[0];
                 assert_eq!(
                     routes(translation),
-                    // Alike in age, namespace and name: the HTTPRoute first (04 §1).
-                    ["httproute/shop/web/http", "ingress/shop/web/shop.example"]
+                    // The GRPCRoute followed is translated, first by name; alike in age,
+                    // namespace and name, the HTTPRoute before the Ingress (04 §1).
+                    [
+                        "grpcroute/shop/calls/http",
+                        "httproute/shop/web/http",
+                        "ingress/shop/web/shop.example"
+                    ]
                 );
                 let report: Vec<String> =
                     translation.report.iter().map(ToString::to_string).collect();
-                // The GRPCRoute followed reaches translation, which does not serve it yet.
+                // Its backend is no Service the cluster has.
                 assert_eq!(
                     report,
-                    ["GRPCRoute shop/calls: not supported yet: GRPCRoute"]
+                    ["GRPCRoute shop/calls: rule 0: a backend's share is answered UNAVAILABLE: Service shop/calls does not exist"]
                 );
             }
             // ListenerSets are listed in the scope routes are, their CRD serving `v1` (this one

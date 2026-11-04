@@ -1,1 +1,1 @@
-listener api: served on port-80, taking HTTPRoute from namespace edge
+listener api: served on port-80, taking HTTPRoute, GRPCRoute from namespace edge

@@ -765,10 +765,10 @@ fn name_of(protocol: Protocol) -> &'static str {
 }
 
 /// The route kinds a listener of `protocol` can take: those whose routes its data plane
-/// listener serves. GRPCRoute joins HTTP and HTTPS with its slice.
+/// listener serves.
 fn kinds_for(protocol: &str) -> &'static [&'static str] {
     match protocol {
-        "HTTP" | "HTTPS" => &["HTTPRoute"],
+        "HTTP" | "HTTPS" => &["HTTPRoute", "GRPCRoute"],
         _ => &[],
     }
 }

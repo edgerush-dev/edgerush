@@ -1,0 +1,67 @@
+# A GRPCRoute's rules: a method match of service and method is the config's gRPC match of
+# both, a service's leading `.` dropped; a service alone, a method alone and a regular
+# expression of either part each as the config has them; headers matched as an
+# HTTPRoute's; a rule of no matches takes every call. Its backends are spoken to in HTTP/2
+# where the port's appProtocol agrees: none, a port of which an HTTPRoute would reach in
+# HTTP/1.1, so named apart; kubernetes.io/h2c, grpc or http2. Another appProtocol makes the
+# backend invalid, its share answered UNAVAILABLE, as is a rule of filters, not supported
+# yet. A match an earlier rule of its own has is said shadowed.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: orders, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [orders.example.com]
+  rules:
+    - matches:
+        - method: { service: shop.Orders, method: Get }
+        - method: { service: .shop.Orders, method: List }
+      backendRefs: [{ name: orders, port: 50051 }]
+    - matches:
+        - method: { service: shop.Orders }
+          headers: [{ name: x-tenant, value: blue }]
+      backendRefs: [{ name: orders, port: 50052 }]
+    - matches: [{ method: { method: Health } }]
+      backendRefs: [{ name: orders, port: 50053 }]
+    - matches:
+        - method: { type: RegularExpression, service: "shop\\.v[0-9]+\\.Orders" }
+        - method: { type: RegularExpression, method: "Watch.*" }
+          headers: [{ name: x-version, type: RegularExpression, value: "v[0-9]+" }]
+      backendRefs: [{ name: orders, port: 50054 }]
+    - filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier: { set: [{ name: x-from, value: gateway }] }
+      matches: [{ method: { service: shop.Admin } }]
+      backendRefs: [{ name: orders, port: 50051 }]
+    - matches: [{ method: { service: shop.Orders, method: Get } }]
+      backendRefs: [{ name: orders, port: 50052 }]
+    - backendRefs:
+        - { name: orders, port: 50051, weight: 3 }
+        - { name: orders, port: 8080 }
+        - { name: orders, port: 8081 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: orders, namespace: shop }
+spec:
+  ports:
+    - { name: grpc, port: 50051 }
+    - { name: h2c, port: 50052, appProtocol: kubernetes.io/h2c }
+    - { name: grpc-named, port: 50053, appProtocol: grpc }
+    - { name: http2, port: 50054, appProtocol: http2 }
+    - { name: ws, port: 8080, appProtocol: kubernetes.io/ws }
+    - { name: web, port: 8081, appProtocol: http }

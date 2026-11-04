@@ -1,0 +1,1 @@
+GRPCRoute shop/orders: attached to http (orders.example.com)

@@ -1,4 +1,4 @@
-listener http: served on port-80, taking HTTPRoute from namespace edge
+listener http: served on port-80, taking HTTPRoute, GRPCRoute from namespace edge
 listener ungranted of ListenerSet blog/other: accepted, serving nothing: no certificateRef of it can be used
-listener own-namespace of ListenerSet shop/team: served on port-8443, presenting shop/secure, taking HTTPRoute from namespace shop
-listener granted of ListenerSet shop/team: served on port-8443, presenting edge/own, taking HTTPRoute from namespace shop
+listener own-namespace of ListenerSet shop/team: served on port-8443, presenting shop/secure, taking HTTPRoute, GRPCRoute from namespace shop
+listener granted of ListenerSet shop/team: served on port-8443, presenting edge/own, taking HTTPRoute, GRPCRoute from namespace shop

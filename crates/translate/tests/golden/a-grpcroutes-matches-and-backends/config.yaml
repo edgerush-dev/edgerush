@@ -1,0 +1,39 @@
+listeners:
+  port-8080:
+    address: "0.0.0.0:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: grpcroute/shop/orders/http
+    listeners: [port-8080]
+    hostnames: [{ name: orders.example.com, falls_through: false }]
+    rules:
+      - matches:
+          - { grpc: { service: shop.Orders, method: Get } }
+          - { grpc: { service: shop.Orders, method: List } }
+        forward: { backends: [{ upstream: shop/orders/grpc/h2c, weight: 1 }] }
+      - matches: [{ grpc: { service: shop.Orders }, headers: [{ name: x-tenant, value: { exact: blue } }] }]
+        forward: { backends: [{ upstream: shop/orders/h2c, weight: 1 }] }
+      - matches: [{ grpc: { method: Health } }]
+        forward: { backends: [{ upstream: shop/orders/grpc-named, weight: 1 }] }
+      - matches:
+          - { path: { regex: '/(?:shop\.v[0-9]+\.Orders)/(?:[^/]+)' } }
+          - { path: { regex: "/(?:[^/]+)/(?:Watch.*)" }, headers: [{ name: x-version, value: { regex: "v[0-9]+" } }] }
+        forward: { backends: [{ upstream: shop/orders/http2, weight: 1 }] }
+      - matches: [{ grpc: { service: shop.Admin } }]
+        forward: { backends: [{ invalid: "not supported yet: a GRPCRoute's filters", weight: 1 }] }
+      - matches: [{ grpc: { service: shop.Orders, method: Get } }]
+        forward: { backends: [{ upstream: shop/orders/h2c, weight: 1 }] }
+      - matches: [{ path: { prefix: / } }]
+        forward:
+          backends:
+            - { upstream: shop/orders/grpc/h2c, weight: 3 }
+            - { invalid: "Service shop/orders port ws has appProtocol kubernetes.io/ws; a GRPCRoute's backend is spoken to in HTTP/2 in the clear, on a port of none or of kubernetes.io/h2c, grpc or http2", weight: 1 }
+            - { invalid: "Service shop/orders port web has appProtocol http; a GRPCRoute's backend is spoken to in HTTP/2 in the clear, on a port of none or of kubernetes.io/h2c, grpc or http2", weight: 1 }
+upstreams:
+  shop/orders/grpc/h2c: { protocol: http2, load_balancer: p2c, endpoints: { kubernetes: "orders.shop.svc.cluster.local:grpc" } }
+  shop/orders/h2c: { protocol: http2, load_balancer: p2c, endpoints: { kubernetes: "orders.shop.svc.cluster.local:h2c" } }
+  shop/orders/grpc-named: { protocol: http2, load_balancer: p2c, endpoints: { kubernetes: "orders.shop.svc.cluster.local:grpc-named" } }
+  shop/orders/http2: { protocol: http2, load_balancer: p2c, endpoints: { kubernetes: "orders.shop.svc.cluster.local:http2" } }

@@ -11,7 +11,8 @@
 //! says, `gateway.txt`, what was made of the data plane's Gateway's listeners, a line each
 //! (none otherwise: the data plane is no Gateway, or names one not there or not ours); and,
 //! where the case says, `routes.txt`, what became of each HTTPRoute's parents of that
-//! Gateway, a line each (none otherwise); and, where the case says, `status.txt`, what the
+//! Gateway, then each GRPCRoute's, a line each (none otherwise); and, where the case says,
+//! `status.txt`, what the
 //! status of that Gateway, each of its listeners and each HTTPRoute's parent of it is to
 //! say, a line each. The report's last lines are the hosts a claim of one API takes from the
 //! other's.
@@ -161,6 +162,7 @@ fn every_case_translates_to_its_config_and_report() {
         let routes: Vec<String> = translation
             .http_routes
             .iter()
+            .chain(&translation.grpc_routes)
             .flat_map(|outcome| {
                 outcome
                     .to_string()
@@ -174,7 +176,7 @@ fn every_case_translates_to_its_config_and_report() {
         } else {
             Vec::new()
         };
-        assert_eq!(routes, expected, "{name}: the HTTPRoutes' parents");
+        assert_eq!(routes, expected, "{name}: the routes' parents");
         let listed = case.join("status.txt");
         if listed.exists() {
             let said: Vec<String> = translation

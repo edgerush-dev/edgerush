@@ -1,2 +1,2 @@
-listener http: served on port-80, taking HTTPRoute from every namespace
-listener api of ListenerSet shop/team: served on port-9000, taking HTTPRoute from namespace shop
+listener http: served on port-80, taking HTTPRoute, GRPCRoute from every namespace
+listener api of ListenerSet shop/team: served on port-9000, taking HTTPRoute, GRPCRoute from namespace shop
