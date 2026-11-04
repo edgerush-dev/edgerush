@@ -1,7 +1,7 @@
 //! A pod of the cluster store on sockets (cluster-store-transplant-plan.md, "T4d"): the
 //! synchronous mode's [`Pod`], the store's [`Node`] within it, owned by one task, ticked every
 //! [`TICK`] and on every message, on real time, with
-//! what it sends going to its peers through a link each ([`link`](super::link)), and what they send it coming in
+//! what it sends going to its peers through a link each ([`link`]), and what they send it coming in
 //! on the streams they dial to it, served by a [`StoreServer`].
 //!
 //! The store names pods by member id; the pod keeps where each is reached, from four places:
@@ -21,17 +21,24 @@
 //! Clients ask it through a [`StoreClient`], in-process, as data planes will through a stream
 //! for them (T5c): a request reaching a pod not its key's owner is forwarded one hop to the
 //! owner, when forwarding is on, and answered back through it; a request under several keys
-//! is gathered by the pod it reaches, each part asked of its owner (T5a).
+//! is gathered by the pod it reaches, each part asked of its owner (T5a). Data planes ask on a
+//! stream of their own, `Decide`, each a client, told the pod's table as it opens and on each
+//! commit ([`decide_stream`], T5c); the pods' methods are the pods' alone, and this one the data
+//! planes'.
 
-use super::link::{CONTROL, Counts, Dial, Dropped, GREET, HELLO, Link, SERVICE, Tasks};
+use super::link::{
+    self, CONTROL, Counts, DECIDE, Dial, Dropped, GREET, HELLO, Link, SERVICE, Tasks,
+};
 use super::wire::{
-    self, Empty, Hello, Invalid, Joining, Outgoing, Piece, Synchronous, ToCopy, ToPeer, Value,
+    self, Asking, Empty, Hello, Invalid, Joining, Outgoing, Piece, Synchronous, Telling, ToCopy,
+    ToPeer, Value,
 };
 use crate::grpc::{Boxed, Client, MAX_MESSAGE, Prost, limited};
 use crate::secure::{Caller, refused};
 use crate::synchronous::Received;
-use edgerush_cluster::{Config, Message, Node, NodeId, Time};
+use edgerush_cluster::{Config, Message, Node, NodeId, Stamp, Time};
 use edgerush_cluster_synchronous::{Message as ModeMessage, Outbox, Pod, Value as SyncValue};
+use http::uri::PathAndQuery;
 use prost::Message as _;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -156,6 +163,7 @@ impl StorePod {
             skewed,
             clients: BTreeMap::new(),
             next_client: CLIENTS,
+            told: (0, 0),
         };
         tokio::spawn(running.run(received));
         pod
@@ -316,6 +324,8 @@ struct Running {
     /// The clients asking it, each with where its answers go.
     clients: BTreeMap<NodeId, mpsc::Sender<ModeMessage>>,
     next_client: NodeId,
+    /// The table last told its clients, by its number.
+    told: Stamp,
 }
 
 /// When each peer whose wall clock is off past `skew_warning` was last told of in the log.
@@ -414,6 +424,7 @@ impl Running {
                     }
                 },
             }
+            self.tell_tables();
             if self.node.store().drained() {
                 break;
             }
@@ -493,7 +504,32 @@ impl Running {
         self.next_client = self.next_client.saturating_add(1);
         let (answers, answered) = mpsc::channel(ANSWERS_WAITING);
         if given.send((id, answered)).is_ok() {
+            // Its first answer is the table, if there is one yet.
+            if let Some(table) = self.node.store().committed() {
+                let _full = answers.try_send(ModeMessage::Store(Message::TableReply {
+                    table: table.clone(),
+                }));
+            }
             self.clients.insert(id, answers);
+        }
+    }
+
+    /// Tells every client the table it has committed, once for each it commits.
+    fn tell_tables(&mut self) {
+        let Some(table) = self.node.store().committed() else {
+            return;
+        };
+        if table.stamp() == self.told {
+            return;
+        }
+        self.told = table.stamp();
+        let table = table.clone();
+        let clients: Vec<NodeId> = self.clients.keys().copied().collect();
+        for client in clients {
+            let told = ModeMessage::Store(Message::TableReply {
+                table: table.clone(),
+            });
+            self.answer(client, told);
         }
     }
 
@@ -661,6 +697,45 @@ where
     Ok(Some(message))
 }
 
+/// A data plane's stream to a pod: what it asks goes up, in order, and what the pod tells it —
+/// its table, and each answer — comes down.
+#[derive(Debug)]
+pub struct DecideStream {
+    /// Requests and requests to gather.
+    pub up: mpsc::Sender<Asking>,
+    /// The pod's table and its answers, as they come.
+    pub down: Streaming<Telling>,
+}
+
+/// Opens a data plane's stream to the pod at `address` (`host:port`), dialled as `dial` says,
+/// pinged as the service's other clients are, and held open for as long as both sides keep
+/// it.
+///
+/// # Errors
+///
+/// When `address` cannot be dialled, or the stream cannot be opened.
+pub async fn decide_stream(address: &str, dial: &Dial) -> Result<DecideStream, crate::grpc::Error> {
+    let channel = link::channel(address, dial, None)?;
+    let mut grpc = tonic::client::Grpc::new(channel)
+        .max_decoding_message_size(MAX_MESSAGE)
+        .max_encoding_message_size(MAX_MESSAGE);
+    grpc.ready()
+        .await
+        .map_err(|error| Status::unavailable(error.to_string()))?;
+    let (up, asked) = mpsc::channel(ANSWERS_WAITING);
+    let response = grpc
+        .streaming(
+            Request::new(Received(asked)),
+            PathAndQuery::from_static(DECIDE),
+            Prost::<Asking, Telling>::default(),
+        )
+        .await?;
+    Ok(DecideStream {
+        up,
+        down: response.into_inner(),
+    })
+}
+
 /// The store's service as a gRPC server, in front of its pod.
 pub struct StoreServer {
     pod: StorePod,
@@ -769,6 +844,64 @@ async fn take_all(
     }
 }
 
+/// A data plane's stream: one client of the pod's.
+struct DecideCall(StorePod);
+
+impl tonic::server::StreamingService<Asking> for DecideCall {
+    type Response = Telling;
+    type ResponseStream = Received<Result<Telling, Status>>;
+    type Future = Boxed<Result<Response<Self::ResponseStream>, Status>>;
+
+    fn call(&mut self, request: Request<Streaming<Asking>>) -> Self::Future {
+        let pod = self.0.clone();
+        Box::pin(async move {
+            let client = pod
+                .client()
+                .await
+                .ok_or_else(|| Status::unavailable("the pod has stopped"))?;
+            let (telling, told) = mpsc::channel(1);
+            tokio::spawn(serve_data_plane(client, request.into_inner(), telling));
+            Ok(Response::new(Received(told)))
+        })
+    }
+}
+
+/// Serves one data plane's stream as `client`: what it asks handed to the pod, and what the
+/// pod tells the client sent down, until either side ends it. Its requests are read only as the
+/// pod takes them, and its answers wait in the client's queue while the data plane reads
+/// slowly.
+async fn serve_data_plane(
+    mut client: StoreClient,
+    mut asked: Streaming<Asking>,
+    telling: mpsc::Sender<Result<Telling, Status>>,
+) {
+    loop {
+        tokio::select! {
+            asking = asked.message() => {
+                let Ok(Some(asking)) = asking else {
+                    return;
+                };
+                // One the mode cannot use is dropped, as a message lost.
+                if let Ok(message) = wire::asked_from(asking, client.id())
+                    && !client.ask(message).await
+                {
+                    return;
+                }
+            }
+            told = client.answer() => {
+                let Some(told) = told else {
+                    return;
+                };
+                if let Some(told) = wire::telling(told)
+                    && telling.send(Ok(told)).await.is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 struct GreetCall(StorePod);
 
 impl tonic::server::UnaryService<Hello> for GreetCall {
@@ -825,7 +958,13 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for StoreServer {
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let pod = self.pod.clone();
         Box::pin(async move {
-            if let Some(status) = refused(&request, Caller::Pod) {
+            // The data planes' stream is theirs; every other method the pods'.
+            let caller = if request.uri().path() == DECIDE {
+                Caller::DataPlane
+            } else {
+                Caller::Pod
+            };
+            if let Some(status) = refused(&request, caller) {
                 return Ok(status.into_http());
             }
             Ok(match request.uri().path() {
@@ -844,6 +983,10 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for StoreServer {
                         kind: Kind::Copy,
                     };
                     grpc.streaming(call, request).await
+                }
+                DECIDE => {
+                    let mut grpc = limited(Prost::<Telling, Asking>::default());
+                    grpc.streaming(DecideCall(pod), request).await
                 }
                 GREET => {
                     let mut grpc = limited(Prost::<Hello, Hello>::default());
@@ -893,6 +1036,7 @@ mod tests {
             skewed: Arc::default(),
             clients: BTreeMap::new(),
             next_client: CLIENTS,
+            told: (0, 0),
         }
     }
 

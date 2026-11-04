@@ -51,6 +51,7 @@ pub(crate) const PEER: &str = "/edgerush.cluster.v1.Cluster/Peer";
 pub(crate) const COPY: &str = "/edgerush.cluster.v1.Cluster/Copy";
 pub(crate) const GREET: &str = "/edgerush.cluster.v1.Cluster/Hello";
 pub(crate) const CONTROL: &str = "/edgerush.cluster.v1.Cluster/Control";
+pub(crate) const DECIDE: &str = "/edgerush.cluster.v1.Cluster/Decide";
 
 /// How a pod's connections to others are made.
 #[derive(Clone, Debug)]
@@ -225,7 +226,7 @@ impl Link {
 /// to a peer wedged is let go; no timeout on a call, which a stream outlives. Dialled from the
 /// IP the pod is reached at, as a pod in Kubernetes does with its only IP, a pod is known by
 /// it to every peer.
-fn channel(address: &str, dial: &Dial, from: Option<IpAddr>) -> Result<Channel, Error> {
+pub(crate) fn channel(address: &str, dial: &Dial, from: Option<IpAddr>) -> Result<Channel, Error> {
     let endpoint = Endpoint::from_shared(format!("http://{address}"))?
         .connect_timeout(CALL_TIMEOUT)
         .local_address(from)

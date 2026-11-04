@@ -16,6 +16,9 @@
 //! a part of one gathered, and their answers — go on the stream apart from copies too, beside
 //! the store's ([`mode_wire`]).
 //!
+//! A data plane asks a pod on a stream of its own ([`Asking`]), and is told its answers and the
+//! pod's table on it ([`Telling`]): plain messages, a table at 256 shards a few KB.
+//!
 //! Every message goes as one or more [`Piece`]s: a shard's whole copy can pass what one gRPC
 //! message may hold, and the store sends it as one message, so the wire cuts it ([`pieces`])
 //! and the receiver puts it together again ([`Joining`]) before the store sees it.
@@ -677,6 +680,56 @@ pub enum Answered {
     NotServing(Empty),
 }
 
+/// What a data plane asks a pod on its stream: a request under one key, or one under several
+/// to gather. The stream names the client, so neither need say who asks.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Asking {
+    /// Which.
+    #[prost(oneof = "Asked", tags = "1, 2")]
+    pub asked: Option<Asked>,
+}
+
+/// What a data plane asks.
+#[derive(Clone, PartialEq, Eq, prost::Oneof)]
+pub enum Asked {
+    /// A request under one key, or a give-back.
+    #[prost(message, tag = "1")]
+    Request(Request),
+    /// A request under several keys, to be counted under all or reported not counted.
+    #[prost(message, tag = "2")]
+    Gather(Gather),
+}
+
+/// A request under several keys.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Gather {
+    /// The data plane's number for it.
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    /// The keys.
+    #[prost(uint64, repeated, tag = "2")]
+    pub keys: Vec<u64>,
+}
+
+/// What a pod tells a data plane on its stream: an answer, or the table it has committed.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Telling {
+    /// Which.
+    #[prost(oneof = "Told", tags = "1, 2")]
+    pub told: Option<Told>,
+}
+
+/// What a pod tells.
+#[derive(Clone, PartialEq, prost::Oneof)]
+pub enum Told {
+    /// Its table, on the stream's opening and on each commit.
+    #[prost(message, tag = "1")]
+    Table(Table),
+    /// An answer, by the data plane's number.
+    #[prost(message, tag = "2")]
+    Reply(Reply),
+}
+
 /// Not this pod's key.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Elsewhere {
@@ -1130,6 +1183,89 @@ pub fn mode_from_peer(sent: ToPeer<Synchronous>) -> Result<(NodeId, SyncMessage)
 /// A message the store cannot use: see [`Invalid`].
 pub fn mode_from_copy(sent: ToCopy<Synchronous>) -> Result<(NodeId, SyncMessage), Invalid> {
     from_copy::<SyncValue>(sent).map(|(from, message)| (from, SyncMessage::Store(message)))
+}
+
+/// What a data plane asks, as the mode's message from `client`, the stream's: whoever the
+/// request says asks, it is the stream's client, and its first hop.
+///
+/// # Errors
+///
+/// A message the mode cannot use: see [`Invalid`].
+pub fn asked_from(asking: Asking, client: NodeId) -> Result<SyncMessage, Invalid> {
+    match asking.asked.ok_or(Invalid::Missing)? {
+        Asked::Request(request) => {
+            let mut message = request_from(request)?;
+            if let SyncMessage::Request {
+                client: asker,
+                hops,
+                via,
+                ..
+            } = &mut message
+            {
+                *asker = client;
+                *hops = 0;
+                *via = None;
+            }
+            Ok(message)
+        }
+        Asked::Gather(gather) => Ok(SyncMessage::Gather {
+            client,
+            id: gather.id,
+            keys: gather.keys,
+        }),
+    }
+}
+
+/// A data plane's `message` as its stream carries it up: a request or a request to gather;
+/// none for anything else.
+#[must_use]
+pub fn asking(message: SyncMessage) -> Option<Asking> {
+    let asked = match message {
+        message @ SyncMessage::Request { .. } => match mode_wire(0, message) {
+            Some(Outgoing::Peer(ToPeer {
+                message: Some(Control::Request(request)),
+                ..
+            })) => Asked::Request(request),
+            _ => return None,
+        },
+        SyncMessage::Gather { id, keys, .. } => Asked::Gather(Gather { id, keys }),
+        _ => return None,
+    };
+    Some(Asking { asked: Some(asked) })
+}
+
+/// What the mode tells a client, as a data plane's stream carries it down: an answer, or a
+/// table; none for anything else.
+#[must_use]
+pub fn telling(message: SyncMessage) -> Option<Telling> {
+    let told = match message {
+        SyncMessage::Reply { client, id, answer } => Told::Reply(Reply {
+            client,
+            id,
+            answer: Some(answer_to_wire(answer)),
+        }),
+        SyncMessage::Store(Message::TableReply { table }) => Told::Table(table_to_wire(table)),
+        _ => return None,
+    };
+    Some(Telling { told: Some(told) })
+}
+
+/// What a pod told, as the mode's message: an answer, or its table.
+///
+/// # Errors
+///
+/// A message the mode cannot use: see [`Invalid`].
+pub fn told_from(telling: Telling) -> Result<SyncMessage, Invalid> {
+    Ok(match telling.told.ok_or(Invalid::Missing)? {
+        Told::Table(table) => SyncMessage::Store(Message::TableReply {
+            table: table_from(table)?,
+        }),
+        Told::Reply(reply) => SyncMessage::Reply {
+            client: reply.client,
+            id: reply.id,
+            answer: answer_from(reply.answer.ok_or(Invalid::Missing)?)?,
+        },
+    })
 }
 
 fn request_from(request: Request) -> Result<SyncMessage, Invalid> {
@@ -1859,6 +1995,64 @@ mod tests {
         #[test]
         fn a_message_comes_through_the_wire_as_it_was_sent(from in any::<u64>(), message in message()) {
             prop_assert_eq!(through(from, message.clone()), (from, message));
+        }
+
+        /// A data plane's request comes up its stream as it was asked, but for whom it names:
+        /// the stream's client, on its first hop.
+        #[test]
+        fn a_data_planes_request_comes_up_its_stream_as_the_streams_client(
+            message in mode_message(),
+            client in any::<u64>(),
+        ) {
+            let Some(asked) = asking(message.clone()) else {
+                let asked = matches!(message, SyncMessage::Request { .. } | SyncMessage::Gather { .. });
+                prop_assert!(!asked);
+                return Ok(());
+            };
+            let decoded = Asking::decode(asked.encode_to_vec().as_slice()).unwrap();
+            let mut expected = message;
+            if let SyncMessage::Request { client: asker, hops, via, .. } = &mut expected {
+                *asker = client;
+                *hops = 0;
+                *via = None;
+            }
+            prop_assert_eq!(asked_from(decoded, client).unwrap(), expected);
+        }
+
+        /// What a pod tells a data plane comes down its stream as it was told: an answer, or a
+        /// table.
+        #[test]
+        fn what_a_pod_tells_comes_down_the_stream_as_it_was_told(
+            message in prop_oneof![
+                mode_message(),
+                table().prop_map(|table| SyncMessage::Store(Message::TableReply { table })),
+            ],
+        ) {
+            let Some(told) = telling(message.clone()) else {
+                let tells = matches!(
+                    message,
+                    SyncMessage::Reply { .. } | SyncMessage::Store(Message::TableReply { .. })
+                );
+                prop_assert!(!tells);
+                return Ok(());
+            };
+            let decoded = Telling::decode(told.encode_to_vec().as_slice()).unwrap();
+            prop_assert_eq!(told_from(decoded).unwrap(), message);
+        }
+
+        /// A request to gather comes up a data plane's stream as the stream's client asked it.
+        #[test]
+        fn a_request_to_gather_comes_up_as_the_streams_client(
+            id in any::<u64>(),
+            keys in prop::collection::vec(any::<u64>(), 0..5),
+            client in any::<u64>(),
+        ) {
+            let gather = SyncMessage::Gather { client: 0, id, keys: keys.clone() };
+            let asked = asking(gather).unwrap();
+            prop_assert_eq!(
+                asked_from(asked, client).unwrap(),
+                SyncMessage::Gather { client, id, keys }
+            );
         }
 
         /// Every message the synchronous mode's pods send each other comes through the wire as
