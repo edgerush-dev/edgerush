@@ -780,7 +780,10 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let gateway = gateway::outcome(plane, cluster, &mut report);
     let http_routes = gateway
         .as_ref()
-        .map(|gateway| http_route::attached(cluster, gateway))
+        .map(|gateway| {
+            let routes = cluster.http_routes.iter().map(http_route::Routed::http);
+            http_route::attached(routes.collect(), gateway, cluster)
+        })
         .unwrap_or_default();
     for outcome in &http_routes {
         for parent in &outcome.parents {
@@ -793,9 +796,11 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         }
     }
     if let Some(gateway) = &gateway {
-        for route in http_route::grpc_naming(cluster, gateway) {
+        // Not translated yet: each that names the Gateway or one of its ListenerSets said so.
+        let routes = cluster.grpc_routes.iter().map(http_route::Routed::grpc);
+        for outcome in http_route::attached(routes.collect(), gateway, cluster) {
             report.push(Finding {
-                object: Object::of("GRPCRoute", &route.metadata),
+                object: outcome.route,
                 problem: Problem::NotSupportedYet("GRPCRoute"),
             });
         }

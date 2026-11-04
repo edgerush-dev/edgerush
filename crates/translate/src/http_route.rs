@@ -1,10 +1,11 @@
-//! HTTPRoutes attached to the data plane's Gateway ([04 §2](../../../docs/04-control-plane.md)):
-//! each `parentRef` to it fitted to the listeners it names, those that take the route's kind
-//! and namespace, and whose hostnames meet the route's; the hostnames each listener is left
-//! with once those of more specific listeners are taken away (listener isolation); the claim
-//! of no rules each listener's hostname makes; each route's rules, a rule with what
-//! translation cannot take answering 500 for all it matches, one whose matches cannot be
-//! built left out; and every host a claim of one API takes from a claim of the other.
+//! Routes attached to the data plane's Gateway ([04 §2](../../../docs/04-control-plane.md)),
+//! of whichever kind: each `parentRef` to it fitted to the listeners it names, those that
+//! take the route's kind and namespace, and whose hostnames meet the route's; the hostnames
+//! each listener is left with once those of more specific listeners are taken away
+//! (listener isolation); the claim of no rules each listener's hostname makes; each
+//! HTTPRoute's rules, a rule with what translation cannot take answering 500 for all it
+//! matches, one whose matches cannot be built left out; and every host a claim of one API
+//! takes from a claim of the other.
 
 use crate::gateway::{GatewayOutcome, ListenerOutcome};
 use crate::{Cluster, Object, Plane, RefProblem, RefReason, backend_upstream, namespace};
@@ -15,10 +16,11 @@ use edgerush_config::{
 };
 use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::{
-    HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesFiltersRequestMirror,
+    HTTPRoute, HTTPRouteRules, HTTPRouteRulesFiltersRequestMirror,
     HTTPRouteRulesFiltersRequestRedirect, HTTPRouteRulesRetry, HTTPRouteRulesTimeouts,
 };
 use k8s_openapi::api::networking::v1::{IngressBackend, IngressServiceBackend, ServiceBackendPort};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -129,12 +131,76 @@ impl fmt::Display for RouteOutcome {
     }
 }
 
-/// Every HTTPRoute that names `gateway` among its parents, oldest first and then by
+/// A route of any kind as attachment reads it: its kind, its metadata, its `parentRefs`
+/// and its hostnames, the fields every route kind has alike, generated apart for each.
+pub(crate) struct Routed<'a> {
+    /// The route's kind, `HTTPRoute` or `GRPCRoute`.
+    kind: &'static str,
+    metadata: &'a ObjectMeta,
+    parents: Vec<ParentRef<'a>>,
+    hostnames: &'a [String],
+}
+
+/// One `parentRef` of a route, of whichever kind.
+pub(crate) struct ParentRef<'a> {
+    group: &'a str,
+    kind: &'a str,
+    name: &'a str,
+    namespace: Option<&'a str>,
+    section_name: Option<&'a str>,
+    port: Option<i32>,
+}
+
+/// The parentRefs of a route of a kind the Gateway API generates apart, each of the same
+/// fields.
+macro_rules! parent_refs {
+    ($refs:expr) => {
+        $refs
+            .iter()
+            .flatten()
+            .map(|parent| ParentRef {
+                group: &parent.group,
+                kind: &parent.kind,
+                name: &parent.name,
+                namespace: parent.namespace.as_deref(),
+                section_name: parent.section_name.as_deref(),
+                port: parent.port,
+            })
+            .collect()
+    };
+}
+
+impl<'a> Routed<'a> {
+    /// An HTTPRoute as attachment reads it.
+    pub(crate) fn http(route: &'a HTTPRoute) -> Self {
+        Self {
+            kind: "HTTPRoute",
+            metadata: &route.metadata,
+            parents: parent_refs!(route.spec.parent_refs),
+            hostnames: route.spec.hostnames.as_deref().unwrap_or_default(),
+        }
+    }
+
+    /// A GRPCRoute as attachment reads it.
+    pub(crate) fn grpc(route: &'a GRPCRoute) -> Self {
+        Self {
+            kind: "GRPCRoute",
+            metadata: &route.metadata,
+            parents: parent_refs!(route.spec.parent_refs),
+            hostnames: route.spec.hostnames.as_deref().unwrap_or_default(),
+        }
+    }
+}
+
+/// Every route of `routes` that names `gateway` among its parents, oldest first and then by
 /// namespace and name, as routes rank, and what became of each such `parentRef`.
-pub(crate) fn attached(cluster: &Cluster, gateway: &GatewayOutcome) -> Vec<RouteOutcome> {
-    let mut routes: Vec<&HTTPRoute> = cluster.http_routes.iter().collect();
+pub(crate) fn attached(
+    mut routes: Vec<Routed<'_>>,
+    gateway: &GatewayOutcome,
+    cluster: &Cluster,
+) -> Vec<RouteOutcome> {
     routes.sort_by_key(|route| {
-        let metadata = &route.metadata;
+        let metadata = route.metadata;
         (
             metadata.creation_timestamp.clone(),
             metadata.namespace.clone(),
@@ -142,67 +208,29 @@ pub(crate) fn attached(cluster: &Cluster, gateway: &GatewayOutcome) -> Vec<Route
         )
     });
     routes
-        .into_iter()
+        .iter()
         .filter_map(|route| {
-            let route_namespace = namespace(&route.metadata);
+            let route_namespace = namespace(route.metadata);
             let parents: Vec<ParentOutcome> = route
-                .spec
-                .parent_refs
+                .parents
                 .iter()
-                .flatten()
                 .filter_map(|parent| Some((parent, parent_of(parent, route_namespace, gateway)?)))
                 .map(|(parent, kind)| ParentOutcome {
                     kind: kind.kind(),
-                    namespace: parent.namespace.clone(),
-                    name: parent.name.clone(),
-                    section_name: parent.section_name.clone(),
+                    namespace: parent.namespace.map(str::to_owned),
+                    name: parent.name.to_owned(),
+                    section_name: parent.section_name.map(str::to_owned),
                     port: parent.port,
                     attached: attach(route, route_namespace, parent, &kind, gateway, cluster),
                 })
                 .collect();
             (!parents.is_empty()).then(|| RouteOutcome {
-                route: Object::of("HTTPRoute", &route.metadata),
+                route: Object::of(route.kind, route.metadata),
                 generation: route.metadata.generation.unwrap_or_default(),
                 parents,
             })
         })
         .collect()
-}
-
-/// Every GRPCRoute that names `gateway` or a ListenerSet naming it among its parents, oldest
-/// first and then by namespace and name: not translated yet, so said as not supported.
-pub(crate) fn grpc_naming<'a>(
-    cluster: &'a Cluster,
-    gateway: &GatewayOutcome,
-) -> Vec<&'a GRPCRoute> {
-    let mut routes: Vec<&GRPCRoute> = cluster
-        .grpc_routes
-        .iter()
-        .filter(|route| {
-            let route_namespace = namespace(&route.metadata);
-            route.spec.parent_refs.iter().flatten().any(|parent| {
-                // The two kinds' parentRefs are the same fields, generated apart.
-                let parent = HTTPRouteParentRefs {
-                    group: parent.group.clone(),
-                    kind: parent.kind.clone(),
-                    name: parent.name.clone(),
-                    namespace: parent.namespace.clone(),
-                    port: parent.port,
-                    section_name: parent.section_name.clone(),
-                };
-                parent_of(&parent, route_namespace, gateway).is_some()
-            })
-        })
-        .collect();
-    routes.sort_by_key(|route| {
-        let metadata = &route.metadata;
-        (
-            metadata.creation_timestamp.clone(),
-            metadata.namespace.clone(),
-            metadata.name.clone(),
-        )
-    });
-    routes
 }
 
 /// A route's parent of the data plane's: its Gateway, or a ListenerSet naming it, which
@@ -223,16 +251,16 @@ impl Parent<'_> {
 
 /// Which of the data plane's parents `parent`, of a route in `route_namespace`, is, if any.
 fn parent_of<'a>(
-    parent: &HTTPRouteParentRefs,
+    parent: &ParentRef<'_>,
     route_namespace: &str,
     gateway: &'a GatewayOutcome,
 ) -> Option<Parent<'a>> {
     if parent.group != GROUP {
         return None;
     }
-    let namespace = parent.namespace.as_deref().unwrap_or(route_namespace);
+    let namespace = parent.namespace.unwrap_or(route_namespace);
     let is = |object: &Object| object.namespace == namespace && object.name == parent.name;
-    match parent.kind.as_str() {
+    match parent.kind {
         "Gateway" if is(&gateway.gateway) => Some(Parent::Gateway),
         "ListenerSet" => gateway
             .sets
@@ -245,9 +273,9 @@ fn parent_of<'a>(
 
 /// The listeners `parent`, which is `kind`, attaches `route` to, or why none.
 fn attach(
-    route: &HTTPRoute,
+    route: &Routed<'_>,
     route_namespace: &str,
-    parent: &HTTPRouteParentRefs,
+    parent: &ParentRef<'_>,
     kind: &Parent<'_>,
     gateway: &GatewayOutcome,
     cluster: &Cluster,
@@ -265,12 +293,7 @@ fn attach(
         .iter()
         .filter(|listener| listener.set.as_ref() == set)
         .filter(accepted)
-        .filter(|l| {
-            parent
-                .section_name
-                .as_ref()
-                .is_none_or(|section| *section == l.name)
-        })
+        .filter(|l| parent.section_name.is_none_or(|section| section == l.name))
         .filter(|l| parent.port.is_none_or(|port| port == i32::from(l.port)))
         .collect();
     if named.is_empty() {
@@ -278,13 +301,13 @@ fn attach(
     }
     let taking: Vec<&ListenerOutcome> = named
         .into_iter()
-        .filter(|l| l.allowed.kinds.contains(&"HTTPRoute"))
+        .filter(|l| l.allowed.kinds.contains(&route.kind))
         .filter(|l| l.allowed.namespaces.allow(route_namespace, cluster))
         .collect();
     if taking.is_empty() {
         return Err(NotAttached::NotAllowedByListeners);
     }
-    let own: &[String] = route.spec.hostnames.as_deref().unwrap_or_default();
+    let own = route.hostnames;
     let mut attachments = Vec::new();
     for listener in taking {
         let met: Vec<String> = if own.is_empty() {
@@ -897,7 +920,7 @@ fn filtered(
                     namespace: to.namespace.as_deref(),
                     port: to.port,
                 };
-                match backend(&reference, route_namespace, plane, cluster) {
+                match backend(&reference, ("HTTPRoute", route_namespace), plane, cluster) {
                     Ok((name, upstream)) => {
                         upstreams.insert(name.clone(), upstream);
                         filters.push(Filter::RequestMirror(Mirror {
@@ -1178,7 +1201,7 @@ fn backends(
             namespace: written.namespace.as_deref(),
             port: written.port,
         };
-        match backend(&reference, route_namespace, plane, cluster) {
+        match backend(&reference, ("HTTPRoute", route_namespace), plane, cluster) {
             Ok((name, upstream)) => {
                 upstreams.insert(name.clone(), upstream);
                 backends.push(Backend {
@@ -1239,7 +1262,7 @@ struct Reference<'a> {
 /// Service of another namespace is reached only where a ReferenceGrant there allows it.
 fn backend(
     written: &Reference<'_>,
-    route_namespace: &str,
+    (route_kind, route_namespace): (&str, &str),
     plane: &Plane,
     cluster: &Cluster,
 ) -> Result<(String, Upstream), RefProblem> {
@@ -1255,7 +1278,7 @@ fn backend(
     let namespace = written.namespace.unwrap_or(route_namespace);
     reachable(
         cluster,
-        ("HTTPRoute", route_namespace),
+        (route_kind, route_namespace),
         ("Service", namespace, written.name),
     )
     .map_err(|why| RefProblem {
