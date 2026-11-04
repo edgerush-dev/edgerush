@@ -3,6 +3,7 @@
 
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
@@ -101,6 +102,37 @@ spec:
         ("gateway.networking.k8s.io", "Gateway")
     );
     assert_eq!(set.spec.listeners[0].allowed_routes.namespaces.from, "Same");
+    // A GRPCRoute's method and header matches are exact, its backends as an HTTPRoute's;
+    // unlike an HTTPRoute's, its CRD gives a rule no match and a route no rule.
+    let route: GRPCRoute = serde_saphyr::from_str(
+        "metadata: { name: calls }
+spec:
+  rules:
+  - matches: [{ method: { service: shop.Orders }, headers: [{ name: tier, value: gold }] }]
+    backendRefs: [{ name: calls, port: 50051 }]
+  - backendRefs: [{ name: calls, port: 50051 }]",
+    )
+    .unwrap();
+    let rules = route.spec.rules.as_ref().unwrap();
+    let matched = &rules[0].matches.as_ref().unwrap()[0];
+    assert_eq!(matched.method.as_ref().unwrap().r#type, "Exact");
+    assert_eq!(matched.headers.as_ref().unwrap()[0].r#type, "Exact");
+    let backend = &rules[0].backend_refs.as_ref().unwrap()[0];
+    assert_eq!(
+        (
+            backend.weight,
+            backend.group.as_str(),
+            backend.kind.as_str()
+        ),
+        (1, "", "Service")
+    );
+    assert!(rules[1].matches.is_none());
+    let route: GRPCRoute = serde_saphyr::from_str(
+        "metadata: { name: calls }
+spec: {}",
+    )
+    .unwrap();
+    assert!(route.spec.rules.is_none());
 }
 
 #[test]
@@ -127,6 +159,10 @@ fn each_kind_is_listed_where_the_api_server_serves_it() {
         at(group, "v1", "gatewayclasses", "GatewayClassList")
     );
     assert_eq!(of::<Gateway>(), at(group, "v1", "gateways", "GatewayList"));
+    assert_eq!(
+        of::<GRPCRoute>(),
+        at(group, "v1", "grpcroutes", "GRPCRouteList")
+    );
     assert_eq!(
         of::<HTTPRoute>(),
         at(group, "v1", "httproutes", "HTTPRouteList")

@@ -5,6 +5,7 @@
 use edgerush_config::compile;
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
@@ -155,6 +156,7 @@ enum Manifest {
     Gateway(Box<Gateway>),
     ListenerSet(Box<ListenerSet>),
     HTTPRoute(Box<HTTPRoute>),
+    GRPCRoute(Box<GRPCRoute>),
     ReferenceGrant(Box<ReferenceGrant>),
     Namespace(Box<Namespace>),
     List {
@@ -175,6 +177,7 @@ impl Manifest {
             Self::Gateway(gateway) => cluster.gateways.push(*gateway),
             Self::ListenerSet(set) => cluster.listener_sets.push(*set),
             Self::HTTPRoute(route) => cluster.http_routes.push(*route),
+            Self::GRPCRoute(route) => cluster.grpc_routes.push(*route),
             Self::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
             Self::Namespace(namespace) => cluster.namespaces.push(*namespace),
             Self::List { items } => {
@@ -476,6 +479,11 @@ metadata: { name: web, namespace: shop }
 spec: { rules: [{ filters: [{ type: ExternalAuth, externalAuth: { protocol: HTTP } }] }] }
 ---
 apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: calls, namespace: shop }
+spec: { rules: [{ matches: [{ method: { service: shop.Orders } }] }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
 kind: ReferenceGrant
 metadata: { name: from-edge, namespace: shop }
 spec: { from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: edge }], to: [{ group: '', kind: Service }] }
@@ -493,9 +501,10 @@ metadata: { name: shop, labels: { team: shop } }
             cluster.gateways.len(),
             cluster.listener_sets.len(),
             cluster.http_routes.len(),
+            cluster.grpc_routes.len(),
             cluster.reference_grants.len(),
             cluster.namespaces.len(),
         );
-        assert_eq!(counts, (1, 1, 1, 1, 1, 1));
+        assert_eq!(counts, (1, 1, 1, 1, 1, 1, 1));
     }
 }

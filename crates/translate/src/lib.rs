@@ -38,6 +38,7 @@ use edgerush_config::{
 };
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
@@ -246,6 +247,8 @@ pub struct Cluster {
     pub listener_sets: Vec<ListenerSet>,
     /// Every HTTPRoute seen.
     pub http_routes: Vec<HTTPRoute>,
+    /// Every GRPCRoute seen.
+    pub grpc_routes: Vec<GRPCRoute>,
     /// Every ReferenceGrant seen.
     pub reference_grants: Vec<ReferenceGrant>,
     /// Every Namespace seen, where the data plane is a Gateway: their labels are what a
@@ -787,6 +790,14 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                     problem: Problem::NotAttached(why),
                 });
             }
+        }
+    }
+    if let Some(gateway) = &gateway {
+        for route in http_route::grpc_naming(cluster, gateway) {
+            report.push(Finding {
+                object: Object::of("GRPCRoute", &route.metadata),
+                problem: Problem::NotSupportedYet("GRPCRoute"),
+            });
         }
     }
     // An Ingress is the data plane's when its class is, and its class is when the

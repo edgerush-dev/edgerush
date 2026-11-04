@@ -106,6 +106,7 @@ rules:
       - gatewayclasses.gateway.networking.k8s.io
       - gateways.gateway.networking.k8s.io
       - listenersets.gateway.networking.k8s.io
+      - grpcroutes.gateway.networking.k8s.io
       - httproutes.gateway.networking.k8s.io
       - referencegrants.gateway.networking.k8s.io
     verbs: [get, list, watch]
@@ -124,7 +125,7 @@ rules:
     resources: [ingresses]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [listenersets, httproutes, referencegrants]
+    resources: [listenersets, grpcroutes, httproutes, referencegrants]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
     resources: [listenersets/status, httproutes/status]
@@ -150,7 +151,7 @@ rules:
     resources: [ingresses]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [listenersets, httproutes, referencegrants]
+    resources: [listenersets, grpcroutes, httproutes, referencegrants]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
     resources: [listenersets/status, httproutes/status]

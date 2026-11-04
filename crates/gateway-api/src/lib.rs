@@ -20,6 +20,8 @@ pub mod gateway;
 #[allow(clippy::doc_lazy_continuation)]
 pub mod gateway_class;
 #[allow(clippy::doc_lazy_continuation)]
+pub mod grpc_route;
+#[allow(clippy::doc_lazy_continuation)]
 pub mod http_route;
 #[allow(clippy::doc_lazy_continuation)]
 pub mod listener_set;

@@ -342,6 +342,7 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
         gateways: None,
         listener_sets: None,
         http_routes: Some(vec![follow_of("httproutes in shop", false, vec![route])]),
+        grpc_routes: None,
         reference_grants: None,
     };
     assert_eq!(gateway_api.served(), None, "a CRD not listed yet");
@@ -472,6 +473,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
             page(&[crd(GatewayKind::Gateway, &["v1"])])
         } else if named(GatewayKind::ListenerSet) {
             page(&[crd(GatewayKind::ListenerSet, &["v1"])])
+        } else if named(GatewayKind::GRPCRoute) {
+            page(&[crd(GatewayKind::GRPCRoute, &["v1"])])
+        } else if path.starts_with(&format!("{gateway_api}grpcroutes?")) {
+            answer(
+                200,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"calls","namespace":"shop"},"spec":{"parentRefs":[{"name":"web","namespace":"edge"}],"hostnames":["grpc.example"],"rules":[{"backendRefs":[{"name":"calls","port":50051}]}]}}]}"#,
+            )
         } else if path.starts_with(&format!("{gateway_api}listenersets?")) {
             answer(
                 200,
@@ -522,6 +530,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
              gateways.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              listenersets.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              httproutes.gateway.networking.k8s.io: {httproutes}; \
+             grpcroutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              referencegrants.gateway.networking.k8s.io: not served at v1 (only v1beta1; Gateway API v1.7.0), \
              so taken as having no objects"
         )
@@ -537,7 +546,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
             .filter(|line| {
                 line.starts_with("waiting on ")
                     && line.contains(
-                        "gatewayclasses in the cluster, gateways in edge, listenersets in the cluster, httproutes in the cluster",
+                        "gatewayclasses in the cluster, gateways in edge, listenersets in the cluster, httproutes in the cluster, grpcroutes in the cluster",
                     )
             })
             .count()
@@ -575,7 +584,11 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 );
                 let report: Vec<String> =
                     translation.report.iter().map(ToString::to_string).collect();
-                assert!(report.is_empty(), "{report:?}");
+                // The GRPCRoute followed reaches translation, which does not serve it yet.
+                assert_eq!(
+                    report,
+                    ["GRPCRoute shop/calls: not supported yet: GRPCRoute"]
+                );
             }
             // ListenerSets are listed in the scope routes are, their CRD serving `v1` (this one
             // is another Gateway's, and so says nothing here).
@@ -584,6 +597,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                     .path
                     .starts_with("/apis/gateway.networking.k8s.io/v1/listenersets?")),
                 "ListenerSets never listed"
+            );
+            // GRPCRoutes likewise, where their CRD serves `v1`.
+            assert!(
+                fake.seen().iter().any(|seen| seen
+                    .path
+                    .starts_with("/apis/gateway.networking.k8s.io/v1/grpcroutes?")),
+                "GRPCRoutes never listed"
             );
             stage.store(1, Ordering::SeqCst);
             until("the CRD's deletion said", || {
@@ -598,6 +618,18 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                         .lines
                         .iter()
                         .any(|line| line == "waiting on httproutes in the cluster")
+            })
+            .await;
+            // The new follow is said waited on before its list goes out: the list counted
+            // below is waited for too, or the follow is stopped before it asks.
+            until("a new follow of HTTPRoutes listed", || {
+                fake.seen()
+                    .iter()
+                    .filter(|seen| {
+                        !seen.path.contains("watch=true") && seen.path.contains("/httproutes?")
+                    })
+                    .count()
+                    == 2
             })
             .await;
             assert_eq!(
@@ -1567,6 +1599,7 @@ status:
         gateways: Some(vec![follow_of("gateways in edge", true, gateways)]),
         listener_sets: None,
         http_routes: Some(vec![follow_of("httproutes", true, routes)]),
+        grpc_routes: None,
         reference_grants: None,
     };
     let heard: Rc<RefCell<Heard>> = Rc::default();

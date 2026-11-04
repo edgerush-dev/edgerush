@@ -13,6 +13,7 @@ use edgerush_config::{
     PathMatch, Query, Redirect, Retry, Route, Rule, Scheme, Timeouts, Upstream, UrlRewrite,
     ValueMatch, ValuePredicate, Wildcard,
 };
+use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::{
     HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesFiltersRequestMirror,
     HTTPRouteRulesFiltersRequestRedirect, HTTPRouteRulesRetry, HTTPRouteRulesTimeouts,
@@ -166,6 +167,42 @@ pub(crate) fn attached(cluster: &Cluster, gateway: &GatewayOutcome) -> Vec<Route
             })
         })
         .collect()
+}
+
+/// Every GRPCRoute that names `gateway` or a ListenerSet naming it among its parents, oldest
+/// first and then by namespace and name: not translated yet, so said as not supported.
+pub(crate) fn grpc_naming<'a>(
+    cluster: &'a Cluster,
+    gateway: &GatewayOutcome,
+) -> Vec<&'a GRPCRoute> {
+    let mut routes: Vec<&GRPCRoute> = cluster
+        .grpc_routes
+        .iter()
+        .filter(|route| {
+            let route_namespace = namespace(&route.metadata);
+            route.spec.parent_refs.iter().flatten().any(|parent| {
+                // The two kinds' parentRefs are the same fields, generated apart.
+                let parent = HTTPRouteParentRefs {
+                    group: parent.group.clone(),
+                    kind: parent.kind.clone(),
+                    name: parent.name.clone(),
+                    namespace: parent.namespace.clone(),
+                    port: parent.port,
+                    section_name: parent.section_name.clone(),
+                };
+                parent_of(&parent, route_namespace, gateway).is_some()
+            })
+        })
+        .collect();
+    routes.sort_by_key(|route| {
+        let metadata = &route.metadata;
+        (
+            metadata.creation_timestamp.clone(),
+            metadata.namespace.clone(),
+            metadata.name.clone(),
+        )
+    });
+    routes
 }
 
 /// A route's parent of the data plane's: its Gateway, or a ListenerSet naming it, which

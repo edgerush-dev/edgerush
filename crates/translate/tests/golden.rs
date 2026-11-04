@@ -25,6 +25,7 @@
 use edgerush_config::{Config, compile};
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
@@ -47,6 +48,7 @@ enum Manifest {
     Gateway(Box<Gateway>),
     ListenerSet(Box<ListenerSet>),
     HTTPRoute(Box<HTTPRoute>),
+    GRPCRoute(Box<GRPCRoute>),
     ReferenceGrant(Box<ReferenceGrant>),
     Namespace(Box<Namespace>),
 }
@@ -70,6 +72,7 @@ fn every_case_translates_to_its_config_and_report() {
                 Manifest::Gateway(gateway) => cluster.gateways.push(*gateway),
                 Manifest::ListenerSet(set) => cluster.listener_sets.push(*set),
                 Manifest::HTTPRoute(route) => cluster.http_routes.push(*route),
+                Manifest::GRPCRoute(route) => cluster.grpc_routes.push(*route),
                 Manifest::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
                 Manifest::Namespace(namespace) => cluster.namespaces.push(*namespace),
             }

@@ -199,7 +199,7 @@ control_said() {
 refused_any() {
     for replica in $(k -n edge get pod -l app=edgerush-control -o name); do
         k -n edge logs "$replica" 2>/dev/null |
-            grep -E "(customresourcedefinitions|gatewayclasses|gateways|listenersets|httproutes|referencegrants).*(403|forbidden)" &&
+            grep -E "(customresourcedefinitions|gatewayclasses|gateways|listenersets|grpcroutes|httproutes|referencegrants).*(403|forbidden)" &&
             return 0
     done
     return 1
@@ -228,6 +228,8 @@ control_said "httproutes.gateway.networking.k8s.io: served at v1 (Gateway API v1
     fail "the control plane never said the Gateway API's CRDs are served"
 control_said "listenersets.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)" 5 ||
     fail "the control plane never said ListenerSets are served"
+control_said "grpcroutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)" 5 ||
+    fail "the control plane never said GRPCRoutes are served"
 sleep 3
 k apply -f - >/dev/null <<EOF
 apiVersion: gateway.networking.k8s.io/v1
