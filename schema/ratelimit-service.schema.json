@@ -27,6 +27,17 @@
       "description": "The pod itself.",
       "$ref": "#/$defs/ServicePod"
     },
+    "store": {
+      "description": "The store's settings, which every pod of a cluster is to share; left out, the pod has\nnone. Nothing runs the store from them yet.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ServiceStore"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "tls": {
       "description": "The files of the pod's mutual TLS, with data planes and with the other pods alike;\nleft out, the pod is served plain, to anyone.",
       "anyOf": [
@@ -121,6 +132,14 @@
       "description": "A service pod: which it is, where it is reached, and its cycle.",
       "type": "object",
       "properties": {
+        "address": {
+          "description": "Where the other pods reach it, `host:port`, as it tells them in its hellos and as it\nasks to join the store. Needed with a `store` section, and only with one.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "cycle_ms": {
           "description": "Milliseconds of a cycle: in the asynchronous mode the data planes', and in the\nsynchronous mode the pod's own, between its copies of what changed. 10 when left\nout.",
           "type": [
@@ -184,6 +203,108 @@
         "authorities",
         "data_plane_id"
       ]
+    },
+    "ServiceStore": {
+      "description": "The store's settings: the pods a new one asks first, and how every pod of the cluster\nwatches the others and shapes it. The service checks the timings against each other.",
+      "type": "object",
+      "properties": {
+        "cycle_ms": {
+          "description": "Milliseconds between an owner's copies of what changed to its replicas. 10 when left\nout.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "maximum": 3600000,
+          "minimum": 1
+        },
+        "election_jitter_ms": {
+          "description": "The most milliseconds a pod waits, beyond `silence_ms`, before it stands for leader:\neach waits a part of it of its own, so that two rarely stand together. 200 when left\nout.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "maximum": 3600000,
+          "minimum": 0
+        },
+        "heartbeat_ms": {
+          "description": "Milliseconds between a pod's heartbeats to every other. 100 when left out.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "maximum": 3600000,
+          "minimum": 1
+        },
+        "replicas": {
+          "description": "Replicas each shard keeps beside its owner, as far as there are pods for them. 2 when\nleft out.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 0
+        },
+        "seeds": {
+          "description": "Pods' addresses, `host:port`, which a pod starting asks who answers there until it is\na member. None when left out.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "shards": {
+          "description": "The number of shards keys are split into, fixed for the cluster's life: a pod of\nanother number does not join. 256 when left out.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "default": null,
+          "maximum": 65535,
+          "minimum": 1
+        },
+        "silence_ms": {
+          "description": "Milliseconds a pod goes unheard before the leader takes it out, or a voting pod takes\nits leader for gone. 600 when left out.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "maximum": 3600000,
+          "minimum": 0
+        },
+        "skew_warning_ms": {
+          "description": "Milliseconds a peer's wall clock may be off from a pod's before the pod warns of it.\n250 when left out.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "maximum": 3600000,
+          "minimum": 0
+        },
+        "stop_serving_ms": {
+          "description": "Milliseconds a pod goes without hearing a majority of the voting pods before it stops\nserving: more than a heartbeat, and two heartbeats less than `silence_ms` at least, so\nthat a pod cut off stops before the others take its shards. 400 when left out.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "maximum": 3600000,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
     }
   }
 }
