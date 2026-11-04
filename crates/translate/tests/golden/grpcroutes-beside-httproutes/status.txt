@@ -1,0 +1,12 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener http: HTTPRoute, GRPCRoute, attached 4: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener http-only: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener secure: HTTPRoute, GRPCRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/pages, generation 0, parent web section http: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/pages, generation 0, parent web section secure: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+GRPCRoute shop/pages, generation 0, parent web section http: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+GRPCRoute shop/abroad, generation 0, parent web section http: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Service stock/levels is another namespace's, and no ReferenceGrant there lets GRPCRoutes of shop reach it)
+GRPCRoute shop/calls, generation 0, parent web section http: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+GRPCRoute shop/calls, generation 0, parent web section secure: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+GRPCRoute shop/empty, generation 0, parent web section http: Accepted=False/UnsupportedValue (no rule is served as written, so it is not accepted); ResolvedRefs=True/ResolvedRefs
+GRPCRoute shop/narrow, generation 0, parent web section http-only: Accepted=False/NotAllowedByListeners (no listener it names takes its kind from its namespace); ResolvedRefs=True/ResolvedRefs

@@ -294,7 +294,8 @@ pub struct Translation {
     pub grpc_routes: Vec<RouteOutcome>,
     /// What that Gateway's status is to say (04 §6).
     pub gateway_status: Option<GatewayStatus>,
-    /// What each of those HTTPRoutes' status is to say of those parents, in their order.
+    /// What each of those routes' status is to say of those parents, in their order, the
+    /// HTTPRoutes' first.
     pub route_statuses: Vec<RouteStatus>,
     /// The hosts a claim of one API takes from a claim of the other, which no longer serves
     /// them: said, so that a move from one API to the other meets no surprise (04).
@@ -1306,10 +1307,12 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         gateway_tls(&mut config, gateway, cluster, &mut report);
     }
     shared_by(&mut config, gateway.as_ref(), &presented, &ingress_https);
-    let route_statuses = status::routes(&http_routes, &report);
+    // Every route's status, of whichever kind, HTTPRoutes first; a listener counts them all.
+    let routes: Vec<RouteOutcome> = http_routes.iter().chain(&grpc_routes).cloned().collect();
+    let route_statuses = status::routes(&routes, &report);
     let gateway_status = gateway
         .as_ref()
-        .map(|gateway| status::gateway(gateway, &route_statuses, &http_routes));
+        .map(|gateway| status::gateway(gateway, &route_statuses, &routes));
     Translation {
         config,
         report,
