@@ -1,0 +1,1 @@
+GRPCRoute shop/calls: attached to http (calls.example.com)

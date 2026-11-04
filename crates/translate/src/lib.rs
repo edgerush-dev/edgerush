@@ -1100,15 +1100,16 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             routes,
         });
     }
-    // Each attached HTTPRoute's rules, each compiled alone, with the listeners it could be
-    // served on, so that one the data plane would refuse is dropped by itself (04 §2).
+    // Each attached route's rules, each compiled alone in a route named for its kind, with
+    // the listeners it could be served on, so that one the data plane would refuse is dropped
+    // by itself (04 §2).
     if let Some(gateway) = &gateway {
-        let refused = |rule: &Rule, upstreams: &BTreeMap<String, Upstream>| {
+        let refused = |kind: &str, rule: &Rule, upstreams: &BTreeMap<String, Upstream>| {
             if !checked_alone {
                 return None;
             }
             let alone = Route {
-                name: "httproute".to_owned(),
+                name: kind.to_owned(),
                 listeners: served_on.keys().cloned().collect(),
                 hostnames: vec![http_route::claim("*")],
                 rules: vec![rule.clone()],
@@ -1142,8 +1143,14 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             else {
                 continue;
             };
-            let translated =
-                http_route::translated(route, outcome, gateway, plane, cluster, refused);
+            let translated = http_route::translated(
+                route,
+                outcome,
+                gateway,
+                plane,
+                cluster,
+                |rule, upstreams| refused("httproute", rule, upstreams),
+            );
             rules_said(
                 &mut report,
                 outcome,
@@ -1171,8 +1178,14 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             else {
                 continue;
             };
-            let translated =
-                grpc_route::translated(route, outcome, gateway, plane, cluster, refused);
+            let translated = grpc_route::translated(
+                route,
+                outcome,
+                gateway,
+                plane,
+                cluster,
+                |rule, upstreams| refused("grpcroute", rule, upstreams),
+            );
             let rules = route.spec.rules.as_ref().map_or(0, Vec::len);
             rules_said(&mut report, outcome, &translated, rules, "UNAVAILABLE");
             ranked.push(Ranked {

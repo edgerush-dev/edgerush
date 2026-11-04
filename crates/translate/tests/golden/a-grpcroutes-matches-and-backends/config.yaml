@@ -23,7 +23,7 @@ routes:
           - { path: { regex: "/(?:[^/]+)/(?:Watch.*)" }, headers: [{ name: x-version, value: { regex: "v[0-9]+" } }] }
         forward: { backends: [{ upstream: shop/orders/http2, weight: 1 }] }
       - matches: [{ grpc: { service: shop.Admin } }]
-        forward: { backends: [{ invalid: "not supported yet: a GRPCRoute's filters", weight: 1 }] }
+        forward: { backends: [{ invalid: "not supported yet: a backend's filters", weight: 1 }] }
       - matches: [{ grpc: { service: shop.Orders, method: Get } }]
         forward: { backends: [{ upstream: shop/orders/h2c, weight: 1 }] }
       - matches: [{ path: { prefix: / } }]

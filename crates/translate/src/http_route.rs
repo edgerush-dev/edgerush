@@ -16,8 +16,8 @@ use edgerush_config::{
 };
 use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::{
-    HTTPRoute, HTTPRouteRules, HTTPRouteRulesFiltersRequestMirror,
-    HTTPRouteRulesFiltersRequestRedirect, HTTPRouteRulesRetry, HTTPRouteRulesTimeouts,
+    HTTPRoute, HTTPRouteRules, HTTPRouteRulesFilters, HTTPRouteRulesFiltersRequestRedirect,
+    HTTPRouteRulesRetry, HTTPRouteRulesTimeouts,
 };
 use k8s_openapi::api::networking::v1::{IngressBackend, IngressServiceBackend, ServiceBackendPort};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -625,8 +625,8 @@ pub(crate) fn translated(
         let taken = match unsupported(rule) {
             Some(why) => Err(why),
             None => filtered(
-                rule,
-                route_namespace,
+                rule.filters.iter().flatten().map(written),
+                ("HTTPRoute", route_namespace),
                 plane,
                 cluster,
                 &mut upstreams,
@@ -865,20 +865,133 @@ fn unsupported(rule: &HTTPRouteRules) -> Option<String> {
 /// A rule's filters as the config has them: those done to a request or its answer, in the
 /// order written, and a redirect.
 #[derive(Debug)]
-struct Filtered {
-    filters: Vec<Filter>,
-    redirect: Option<Redirect>,
+pub(crate) struct Filtered {
+    pub(crate) filters: Vec<Filter>,
+    pub(crate) redirect: Option<Redirect>,
 }
 
-/// A rule's filters as the config has them, the upstreams its mirrors copy to put in
-/// `upstreams` and the mirrors whose backend is not there or not permitted left off and said
-/// in `left_off`, as the spec has them not configured; or why translation cannot take them.
-/// A request's header changes beside a redirect are left out, as nothing goes upstream for
-/// them to change and nothing a client sees differs; a mirror beside one cannot be, as its
-/// upstream would be sent nothing ([18 §2](../../../docs/18-redirects-and-rewrites.md)).
-fn filtered(
-    rule: &HTTPRouteRules,
-    route_namespace: &str,
+/// A filter of a route of either kind as translation reads it, before its mirror's backend
+/// is looked up.
+pub(crate) enum Written<'a> {
+    /// A filter done as written: a change to the request's or the answer's headers, or a URL
+    /// rewrite.
+    Done(Filter),
+    /// A mirror of the share of requests said to the backend referred to.
+    Mirror(Reference<'a>, Fraction),
+    /// A redirect.
+    Redirect(Redirect),
+}
+
+/// An HTTPRoute's filter as translation reads it, or why translation cannot take it.
+fn written(filter: &HTTPRouteRulesFilters) -> Result<Written<'_>, String> {
+    let missing = || no_settings(&filter.r#type);
+    match filter.r#type.as_str() {
+        "RequestHeaderModifier" => {
+            let changes = filter
+                .request_header_modifier
+                .as_ref()
+                .ok_or_else(missing)?;
+            Ok(Written::Done(Filter::RequestHeaderModifier(
+                header_changes(
+                    changes.set.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.add.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.remove.iter().flatten(),
+                ),
+            )))
+        }
+        "ResponseHeaderModifier" => {
+            let changes = filter
+                .response_header_modifier
+                .as_ref()
+                .ok_or_else(missing)?;
+            Ok(Written::Done(Filter::ResponseHeaderModifier(
+                header_changes(
+                    changes.set.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.add.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.remove.iter().flatten(),
+                ),
+            )))
+        }
+        "RequestRedirect" => {
+            let written = filter.request_redirect.as_ref().ok_or_else(missing)?;
+            Ok(Written::Redirect(redirected(written)?))
+        }
+        "URLRewrite" => {
+            let written = filter.url_rewrite.as_ref().ok_or_else(missing)?;
+            let path = written
+                .path
+                .as_ref()
+                .map(|path| {
+                    path_change(
+                        &path.r#type,
+                        path.replace_full_path.as_deref(),
+                        path.replace_prefix_match.as_deref(),
+                    )
+                })
+                .transpose()?;
+            Ok(Written::Done(Filter::UrlRewrite(UrlRewrite {
+                host: written.hostname.clone(),
+                path,
+            })))
+        }
+        "RequestMirror" => {
+            let written = filter.request_mirror.as_ref().ok_or_else(missing)?;
+            let fraction = mirrored(
+                written.percent,
+                written
+                    .fraction
+                    .as_ref()
+                    .map(|fraction| (fraction.numerator, fraction.denominator)),
+            )?;
+            let to = &written.backend_ref;
+            let reference = Reference {
+                group: &to.group,
+                kind: &to.kind,
+                name: &to.name,
+                namespace: to.namespace.as_deref(),
+                port: to.port,
+            };
+            Ok(Written::Mirror(reference, fraction))
+        }
+        "CORS" => Err("not supported yet: CORS".to_owned()),
+        "ExtensionRef" => {
+            let extension = filter.extension_ref.as_ref().ok_or_else(missing)?;
+            Err(no_extension(
+                &extension.group,
+                &extension.kind,
+                &extension.name,
+            ))
+        }
+        other => Err(not_read(other)),
+    }
+}
+
+/// Why a filter that has none of its type's settings cannot be taken.
+pub(crate) fn no_settings(kind: &str) -> String {
+    format!("a {kind} filter of no settings")
+}
+
+/// Why an `ExtensionRef` filter cannot be taken: EdgeRush has no filter of another API.
+pub(crate) fn no_extension(group: &str, kind: &str, name: &str) -> String {
+    format!("a filter of {group}/{kind} {name} is not one EdgeRush has")
+}
+
+/// Why a filter of a type the route's kind does not have cannot be taken.
+pub(crate) fn not_read(kind: &str) -> String {
+    format!("a filter of type `{kind}` is not one translation reads")
+}
+
+/// A rule's filters, `written` as translation reads them, as the config has them, its mirrors'
+/// backends reached as `route`'s (its kind and namespace) are: the upstreams its mirrors copy
+/// to put in `upstreams` and the mirrors whose backend is not there or not permitted left off
+/// and said in `left_off`, as the spec has them not configured; or why translation cannot
+/// take them, the first filter's that it cannot. A request's header changes beside a redirect
+/// are left out, as nothing goes upstream for them to change and nothing a client sees
+/// differs; a mirror beside one cannot be, as its upstream would be sent nothing
+/// ([18 §2](../../../docs/18-redirects-and-rewrites.md)).
+pub(crate) fn filtered<'a>(
+    written: impl Iterator<Item = Result<Written<'a>, String>>,
+    route: (&str, &str),
     plane: &Plane,
     cluster: &Cluster,
     upstreams: &mut BTreeMap<String, Upstream>,
@@ -886,65 +999,12 @@ fn filtered(
 ) -> Result<Filtered, String> {
     let mut filters = Vec::new();
     let mut redirect = None;
-    for written in rule.filters.iter().flatten() {
-        let missing = || format!("a {} filter of no settings", written.r#type);
-        match written.r#type.as_str() {
-            "RequestHeaderModifier" => {
-                let changes = written
-                    .request_header_modifier
-                    .as_ref()
-                    .ok_or_else(missing)?;
-                filters.push(Filter::RequestHeaderModifier(header_changes(
-                    changes.set.iter().flatten().map(|h| (&h.name, &h.value)),
-                    changes.add.iter().flatten().map(|h| (&h.name, &h.value)),
-                    changes.remove.iter().flatten(),
-                )));
-            }
-            "ResponseHeaderModifier" => {
-                let changes = written
-                    .response_header_modifier
-                    .as_ref()
-                    .ok_or_else(missing)?;
-                filters.push(Filter::ResponseHeaderModifier(header_changes(
-                    changes.set.iter().flatten().map(|h| (&h.name, &h.value)),
-                    changes.add.iter().flatten().map(|h| (&h.name, &h.value)),
-                    changes.remove.iter().flatten(),
-                )));
-            }
-            "RequestRedirect" => {
-                let written = written.request_redirect.as_ref().ok_or_else(missing)?;
-                redirect = Some(redirected(written)?);
-            }
-            "URLRewrite" => {
-                let written = written.url_rewrite.as_ref().ok_or_else(missing)?;
-                let path = written
-                    .path
-                    .as_ref()
-                    .map(|path| {
-                        path_change(
-                            &path.r#type,
-                            path.replace_full_path.as_deref(),
-                            path.replace_prefix_match.as_deref(),
-                        )
-                    })
-                    .transpose()?;
-                filters.push(Filter::UrlRewrite(UrlRewrite {
-                    host: written.hostname.clone(),
-                    path,
-                }));
-            }
-            "RequestMirror" => {
-                let written = written.request_mirror.as_ref().ok_or_else(missing)?;
-                let fraction = mirrored(written)?;
-                let to = &written.backend_ref;
-                let reference = Reference {
-                    group: &to.group,
-                    kind: &to.kind,
-                    name: &to.name,
-                    namespace: to.namespace.as_deref(),
-                    port: to.port,
-                };
-                match backend(&reference, ("HTTPRoute", route_namespace), plane, cluster) {
+    for written in written {
+        match written? {
+            Written::Done(filter) => filters.push(filter),
+            Written::Redirect(written) => redirect = Some(written),
+            Written::Mirror(reference, fraction) => {
+                match backend(&reference, route, plane, cluster) {
                     Ok((name, upstream)) => {
                         upstreams.insert(name.clone(), upstream);
                         filters.push(Filter::RequestMirror(Mirror {
@@ -954,19 +1014,6 @@ fn filtered(
                     }
                     Err(why) => left_off.push(why),
                 }
-            }
-            "CORS" => return Err("not supported yet: CORS".to_owned()),
-            "ExtensionRef" => {
-                let extension = written.extension_ref.as_ref().ok_or_else(missing)?;
-                return Err(format!(
-                    "a filter of {}/{} {} is not one EdgeRush has",
-                    extension.group, extension.kind, extension.name
-                ));
-            }
-            other => {
-                return Err(format!(
-                    "a filter of type `{other}` is not one translation reads"
-                ));
             }
         }
     }
@@ -984,8 +1031,12 @@ fn filtered(
     Ok(Filtered { filters, redirect })
 }
 
-/// The share of requests a mirror copies: its percent, its fraction, or every one.
-fn mirrored(written: &HTTPRouteRulesFiltersRequestMirror) -> Result<Fraction, String> {
+/// The share of requests a mirror copies: its percent, its fraction (numerator, denominator),
+/// or every one.
+pub(crate) fn mirrored(
+    percent: Option<i32>,
+    fraction: Option<(i32, i32)>,
+) -> Result<Fraction, String> {
     let share = |numerator: i32, denominator: i32| match (
         u32::try_from(numerator),
         u32::try_from(denominator),
@@ -996,15 +1047,15 @@ fn mirrored(written: &HTTPRouteRulesFiltersRequestMirror) -> Result<Fraction, St
         }),
         _ => Err(format!("a mirror of {numerator} in {denominator}")),
     };
-    match (written.percent, &written.fraction) {
+    match (percent, fraction) {
         (Some(percent), _) => share(percent, 100),
-        (None, Some(fraction)) => share(fraction.numerator, fraction.denominator),
+        (None, Some((numerator, denominator))) => share(numerator, denominator),
         (None, None) => share(1, 1),
     }
 }
 
 /// Header changes as the config has them.
-fn header_changes<'a>(
+pub(crate) fn header_changes<'a>(
     set: impl Iterator<Item = (&'a String, &'a String)>,
     add: impl Iterator<Item = (&'a String, &'a String)>,
     remove: impl Iterator<Item = &'a String>,

@@ -4,8 +4,8 @@
 # HTTPRoute's; a rule of no matches takes every call. Its backends are spoken to in HTTP/2
 # where the port's appProtocol agrees: none, a port of which an HTTPRoute would reach in
 # HTTP/1.1, so named apart; kubernetes.io/h2c, grpc or http2. Another appProtocol makes the
-# backend invalid, its share answered UNAVAILABLE, as is a rule of filters, not supported
-# yet. A match an earlier rule of its own has is said shadowed.
+# backend invalid, its share answered UNAVAILABLE, as is a rule of a backend's filters, not
+# supported yet. A match an earlier rule of its own has is said shadowed.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
@@ -42,11 +42,13 @@ spec:
         - method: { type: RegularExpression, method: "Watch.*" }
           headers: [{ name: x-version, type: RegularExpression, value: "v[0-9]+" }]
       backendRefs: [{ name: orders, port: 50054 }]
-    - filters:
-        - type: RequestHeaderModifier
-          requestHeaderModifier: { set: [{ name: x-from, value: gateway }] }
-      matches: [{ method: { service: shop.Admin } }]
-      backendRefs: [{ name: orders, port: 50051 }]
+    - matches: [{ method: { service: shop.Admin } }]
+      backendRefs:
+        - name: orders
+          port: 50051
+          filters:
+            - type: RequestHeaderModifier
+              requestHeaderModifier: { set: [{ name: x-from, value: gateway }] }
     - matches: [{ method: { service: shop.Orders, method: Get } }]
       backendRefs: [{ name: orders, port: 50052 }]
     - backendRefs:

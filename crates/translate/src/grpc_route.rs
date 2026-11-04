@@ -1,16 +1,20 @@
 //! GRPCRoutes attached to the data plane's Gateway ([04 §2](../../../docs/04-control-plane.md)),
 //! attached as HTTPRoutes are (`http_route`): each rule's matches, the method a call names
-//! and the headers it carries, every call where it has none; its backends, spoken to in
-//! HTTP/2; a rule with what translation cannot take answering `UNAVAILABLE` for every call it
-//! matches, one whose matches cannot be built left out.
+//! and the headers it carries, every call where it has none; its filters, as an HTTPRoute's
+//! of their type; its backends, spoken to in HTTP/2; a rule with what translation cannot
+//! take answering `UNAVAILABLE` for every call it matches, one whose matches cannot be built
+//! left out.
 
 use crate::gateway::GatewayOutcome;
 use crate::http_route::{
-    Reference, RouteOutcome, Translated, answering, backends, config_routes, predicate,
+    Filtered, Reference, RouteOutcome, Translated, Written, answering, backends, config_routes,
+    filtered, header_changes, mirrored, no_extension, no_settings, not_read, predicate,
 };
 use crate::{Cluster, Plane, namespace};
-use edgerush_config::{Forward, GrpcMethod, Match, PathMatch, Rule, Upstream};
-use edgerush_gateway_api::grpc_route::{GRPCRoute, GRPCRouteRules, GRPCRouteRulesMatchesMethod};
+use edgerush_config::{Filter, Forward, GrpcMethod, Match, PathMatch, Rule, Upstream};
+use edgerush_gateway_api::grpc_route::{
+    GRPCRoute, GRPCRouteRules, GRPCRouteRulesFilters, GRPCRouteRulesMatchesMethod,
+};
 use std::collections::BTreeMap;
 
 /// The rules of `route`, attached as `outcome` says, translated for the listeners of
@@ -40,12 +44,28 @@ pub(crate) fn translated(
         };
         let mut upstreams = BTreeMap::new();
         let mut invalid = Vec::new();
-        let unsupported = unsupported(rule);
-        let compiled = match &unsupported {
-            Some(why) => answering(matches.clone(), why),
-            None => Rule {
+        let mut left_off = Vec::new();
+        let taken = match unsupported(rule) {
+            Some(why) => Err(why),
+            None => filtered(
+                rule.filters.iter().flatten().map(written),
+                ("GRPCRoute", route_namespace),
+                plane,
+                cluster,
+                &mut upstreams,
+                &mut left_off,
+            ),
+        };
+        if taken.is_err() {
+            upstreams.clear();
+            left_off.clear();
+        }
+        // A GRPCRoute has no redirect, so its filters are all done to the call.
+        let compiled = match &taken {
+            Err(why) => answering(matches.clone(), why),
+            Ok(Filtered { filters, .. }) => Rule {
                 matches: matches.clone(),
-                filters: Vec::new(),
+                filters: filters.clone(),
                 forward: Some(Forward {
                     backends: backends(
                         rule.backend_refs.iter().flatten().map(|written| {
@@ -83,11 +103,16 @@ pub(crate) fn translated(
             }
             continue;
         }
-        match unsupported {
-            Some(why) => translated.answered.push((at, why)),
-            None => translated
-                .invalid
-                .extend(invalid.into_iter().map(|why| (at, why))),
+        match taken {
+            Err(why) => translated.answered.push((at, why)),
+            Ok(_) => {
+                translated
+                    .invalid
+                    .extend(invalid.into_iter().map(|why| (at, why)));
+                translated
+                    .mirrors_left_off
+                    .extend(left_off.into_iter().map(|why| (at, why)));
+            }
         }
         translated.upstreams.extend(upstreams);
         rules.push(compiled);
@@ -171,15 +196,71 @@ fn method_match(
     }
 }
 
-/// What of a rule, beyond its matches and backends, translation cannot take yet, if anything.
-fn unsupported(rule: &GRPCRouteRules) -> Option<String> {
-    if rule
-        .filters
-        .as_ref()
-        .is_some_and(|filters| !filters.is_empty())
-    {
-        return Some("not supported yet: a GRPCRoute's filters".to_owned());
+/// A GRPCRoute's filter as translation reads it, as an HTTPRoute's of its type is, or why
+/// translation cannot take it.
+fn written(filter: &GRPCRouteRulesFilters) -> Result<Written<'_>, String> {
+    let missing = || no_settings(&filter.r#type);
+    match filter.r#type.as_str() {
+        "RequestHeaderModifier" => {
+            let changes = filter
+                .request_header_modifier
+                .as_ref()
+                .ok_or_else(missing)?;
+            Ok(Written::Done(Filter::RequestHeaderModifier(
+                header_changes(
+                    changes.set.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.add.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.remove.iter().flatten(),
+                ),
+            )))
+        }
+        "ResponseHeaderModifier" => {
+            let changes = filter
+                .response_header_modifier
+                .as_ref()
+                .ok_or_else(missing)?;
+            Ok(Written::Done(Filter::ResponseHeaderModifier(
+                header_changes(
+                    changes.set.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.add.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.remove.iter().flatten(),
+                ),
+            )))
+        }
+        "RequestMirror" => {
+            let written = filter.request_mirror.as_ref().ok_or_else(missing)?;
+            let fraction = mirrored(
+                written.percent,
+                written
+                    .fraction
+                    .as_ref()
+                    .map(|fraction| (fraction.numerator, fraction.denominator)),
+            )?;
+            let to = &written.backend_ref;
+            let reference = Reference {
+                group: &to.group,
+                kind: &to.kind,
+                name: &to.name,
+                namespace: to.namespace.as_deref(),
+                port: to.port,
+            };
+            Ok(Written::Mirror(reference, fraction))
+        }
+        "ExtensionRef" => {
+            let extension = filter.extension_ref.as_ref().ok_or_else(missing)?;
+            Err(no_extension(
+                &extension.group,
+                &extension.kind,
+                &extension.name,
+            ))
+        }
+        other => Err(not_read(other)),
     }
+}
+
+/// What of a rule, beyond its matches, filters and backends, translation cannot take yet, if
+/// anything.
+fn unsupported(rule: &GRPCRouteRules) -> Option<String> {
     rule.backend_refs
         .iter()
         .flatten()
