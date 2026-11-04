@@ -9,8 +9,8 @@
 //! [`Debounce::quiet`], and never more than [`Debounce::most`] after the first it waits on
 //! (04 §2). Each translation is whole, of everything followed, and pure
 //! ([`edgerush_translate`]); the follows and the waiting are all that is not. It writes the
-//! status of the data plane's GatewayClass, its Gateway and each HTTPRoute of that Gateway
-//! as the config handed on serves them, merged with what each says now as the spec has it;
+//! status of the data plane's GatewayClass, its Gateway and each route of that Gateway
+//! (HTTPRoute or GRPCRoute) as the config handed on serves them, merged with what each says now as the spec has it;
 //! where it is asked to, each Ingress's likewise (04 §6), [`status`]. The admission
 //! webhook's reviews are read, the Ingress each asks about judged alone, and answered by
 //! [`admission`] (04 §3).
@@ -154,7 +154,7 @@ pub enum Said<'a> {
 /// `status`, it writes each Ingress's status to say the addresses it gives as the config
 /// handed on serves the Ingress, where it says otherwise. It writes that of the data
 /// plane's GatewayClass, its Gateway (those addresses among it, or none without `status`)
-/// and each HTTPRoute that names or named that Gateway likewise, always. With `leading`,
+/// and each HTTPRoute and GRPCRoute that names or named that Gateway likewise, always. With `leading`,
 /// only while it says this replica leads, every status that says otherwise written as it
 /// comes to (02 §3).
 /// Runs for as long as it is polled, its follows ended with it. For a thread and runtime of
@@ -553,7 +553,7 @@ struct Handed {
     gateway: Object,
     /// Its status.
     status: GatewayStatus,
-    /// That of each HTTPRoute that names it.
+    /// That of each route, of either kind, that names it.
     routes: Vec<RouteStatus>,
 }
 
@@ -572,8 +572,8 @@ impl Handed {
 impl GatewayApi {
     /// Writes, one at a time, each status that says other than `handed` has it: that of
     /// the data plane's Gateway's class, of the Gateway, `addresses` among it, of each
-    /// ListenerSet naming it, and of each HTTPRoute followed, whether or not it still names
-    /// the Gateway or one of those ListenerSets.
+    /// ListenerSet naming it, and of each route followed, HTTPRoute or GRPCRoute, whether or
+    /// not it still names the Gateway or one of those ListenerSets.
     async fn write_statuses(
         &self,
         api: &ApiServer,
@@ -684,30 +684,41 @@ impl GatewayApi {
                     .map(|set| set.set.clone()),
             )
             .collect();
-        let routes = self.http_routes.as_deref().map(objects).unwrap_or_default();
-        for route in &routes {
+        // A GRPCRoute's status is merged and written as an HTTPRoute's, of one type in the
+        // spec (gateway_status::as_http).
+        let http_routes = self.http_routes.as_deref().map(objects).unwrap_or_default();
+        let grpc_routes = self.grpc_routes.as_deref().map(objects).unwrap_or_default();
+        let routes = http_routes
+            .iter()
+            .map(|route| ("HTTPRoute", &route.metadata, route.status.clone()))
+            .chain(grpc_routes.iter().map(|route| {
+                let status = route.status.as_ref().map(gateway_status::as_http);
+                ("GRPCRoute", &route.metadata, status)
+            }));
+        for (kind, metadata, live) in routes {
             let object = Object {
-                kind: "HTTPRoute",
-                namespace: route.metadata.namespace.clone().unwrap_or_default(),
-                name: route.metadata.name.clone().unwrap_or_default(),
+                kind,
+                namespace: metadata.namespace.clone().unwrap_or_default(),
+                name: metadata.name.clone().unwrap_or_default(),
             };
             let wanted = handed.routes.iter().find(|wanted| wanted.route == object);
             let status = gateway_status::route(
-                route.status.as_ref(),
+                live.as_ref(),
                 &object.namespace,
                 &parents_of_ours,
                 wanted,
                 now,
             );
-            if route.status.clone().unwrap_or_default() != status {
-                let version = route
-                    .metadata
-                    .resource_version
-                    .as_deref()
-                    .unwrap_or_default();
-                let result = api
-                    .replace_status::<HTTPRoute>(&object.namespace, &object.name, version, &status)
-                    .await;
+            if live.unwrap_or_default() != status {
+                let version = metadata.resource_version.as_deref().unwrap_or_default();
+                let (namespace, name) = (&object.namespace, &object.name);
+                let result = if kind == "GRPCRoute" {
+                    api.replace_status::<GRPCRoute>(namespace, name, version, &status)
+                        .await
+                } else {
+                    api.replace_status::<HTTPRoute>(namespace, name, version, &status)
+                        .await
+                };
                 said(Said::GatewayApiStatus {
                     object: &object,
                     written: result.as_ref().map(|_| ()),

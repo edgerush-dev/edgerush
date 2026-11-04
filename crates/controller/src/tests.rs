@@ -1557,11 +1557,35 @@ status:
       conditions: []",
     )
     .unwrap();
+    // A GRPCRoute's written as an HTTPRoute's: one served, and one that named the Gateway
+    // once, read through the HTTPRoute's shape and merged.
+    let calls: GRPCRoute = serde_saphyr::from_str(
+        "metadata: { name: calls, namespace: shop, generation: 4, resourceVersion: '9' }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]",
+    )
+    .unwrap();
+    let gone: GRPCRoute = serde_saphyr::from_str(
+        "metadata: { name: gone, namespace: shop, generation: 1, resourceVersion: '10' }
+spec: { parentRefs: [{ name: elsewhere, namespace: edge }] }
+status:
+  parents:
+    - controllerName: example.com/other
+      parentRef: { group: gateway.networking.k8s.io, kind: Gateway, name: elsewhere, namespace: edge, sectionName: grpc, port: 9090 }
+      conditions: [{ type: Accepted, status: 'True', reason: Accepted, message: '', lastTransitionTime: '2026-10-01T00:00:00Z', observedGeneration: 1 }]
+    - controllerName: edgerush.dev/gateway-controller
+      parentRef: { group: gateway.networking.k8s.io, kind: Gateway, name: web, namespace: edge }
+      conditions: [{ type: Accepted, status: 'True', reason: Accepted, message: '', lastTransitionTime: '2026-10-01T00:00:00Z', observedGeneration: 1 }]",
+    )
+    .unwrap();
     let known = [
         "/apis/gateway.networking.k8s.io/v1/gatewayclasses/edgerush/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/edge/gateways/web/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/httproutes/app/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/httproutes/old/status",
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/grpcroutes/calls/status",
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/grpcroutes/gone/status",
     ];
     let fake = Fake::start_by_method(&["127.0.0.1"], move |method, path| {
         if method == "PUT" && known.contains(&path) {
@@ -1580,6 +1604,7 @@ status:
         gateway_classes: vec![class.clone()],
         gateways: vec![gateway.clone()],
         http_routes: vec![app.clone(), old.clone()],
+        grpc_routes: vec![calls.clone(), gone.clone()],
         ..Cluster::default()
     };
     let translation = translate(&gateway_plane(), &cluster);
@@ -1595,18 +1620,19 @@ status:
             )
         })
         .collect();
-    let following = |classes: Vec<GatewayClass>, gateways: Vec<Gateway>, routes| GatewayApi {
-        crds: Vec::new(),
-        namespaces: Vec::new(),
-        namespace: Scope::Namespace("edge".to_owned()),
-        last: Some(served.clone()),
-        gateway_classes: Some(vec![follow_of("gatewayclasses", true, classes)]),
-        gateways: Some(vec![follow_of("gateways in edge", true, gateways)]),
-        listener_sets: None,
-        http_routes: Some(vec![follow_of("httproutes", true, routes)]),
-        grpc_routes: None,
-        reference_grants: None,
-    };
+    let following =
+        |classes: Vec<GatewayClass>, gateways: Vec<Gateway>, routes, grpc_routes| GatewayApi {
+            crds: Vec::new(),
+            namespaces: Vec::new(),
+            namespace: Scope::Namespace("edge".to_owned()),
+            last: Some(served.clone()),
+            gateway_classes: Some(vec![follow_of("gatewayclasses", true, classes)]),
+            gateways: Some(vec![follow_of("gateways in edge", true, gateways)]),
+            listener_sets: None,
+            http_routes: Some(vec![follow_of("httproutes", true, routes)]),
+            grpc_routes: Some(vec![follow_of("grpcroutes", true, grpc_routes)]),
+            reference_grants: None,
+        };
     let heard: Rc<RefCell<Heard>> = Rc::default();
     let said = hear(&heard);
     let addresses = gateway_status::addresses(&[status::address("192.0.2.10")]);
@@ -1615,6 +1641,7 @@ status:
         vec![class.clone()],
         vec![gateway.clone()],
         vec![app.clone(), old.clone()],
+        vec![calls.clone(), gone.clone()],
     )
     .write_statuses(&api, &handed, &addresses, &programmed, &said)
     .await;
@@ -1625,6 +1652,8 @@ status:
             "status of Gateway edge/web",
             "status of HTTPRoute shop/app",
             "status of HTTPRoute shop/old",
+            "status of GRPCRoute shop/calls",
+            "status of GRPCRoute shop/gone",
         ]
     );
     let bodies: Vec<serde_json::Value> = fake
@@ -1644,7 +1673,7 @@ status:
     assert_eq!(status(0)["conditions"][1]["type"], "SupportedVersion");
     assert_eq!(status(0)["conditions"][1]["status"], "True");
     assert_eq!(status(1)["addresses"][0]["value"], "192.0.2.10");
-    assert_eq!(status(1)["listeners"][0]["attachedRoutes"], 1);
+    assert_eq!(status(1)["listeners"][0]["attachedRoutes"], 2);
     assert_eq!(status(1)["conditions"][0]["observedGeneration"], 2);
     assert_eq!(
         status(2)["parents"][0]["controllerName"],
@@ -1659,16 +1688,42 @@ status:
         status(3)["parents"][0]["controllerName"],
         "example.com/other"
     );
+    assert_eq!(
+        fake.seen()[4].path,
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/grpcroutes/calls/status"
+    );
+    assert_eq!(bodies[4]["kind"], "GRPCRoute");
+    assert_eq!(
+        status(4)["parents"][0]["controllerName"],
+        GATEWAY_CONTROLLER
+    );
+    assert_eq!(
+        status(4)["parents"][0]["conditions"][0]["observedGeneration"],
+        4
+    );
+    // Another controller's parent kept whole, its section and port among it.
+    assert_eq!(
+        status(5)["parents"],
+        serde_json::to_value(&gone.status.as_ref().unwrap().parents[..1]).unwrap()
+    );
     // Read back as written, every status says what it should: nothing more is written.
     let (mut class, mut gateway, mut app, mut old) = (class, gateway, app, old);
+    let (mut calls, mut gone) = (calls, gone);
     class.status = serde_json::from_value(bodies[0]["status"].clone()).unwrap();
     gateway.status = serde_json::from_value(bodies[1]["status"].clone()).unwrap();
     app.status = serde_json::from_value(bodies[2]["status"].clone()).unwrap();
     old.status = serde_json::from_value(bodies[3]["status"].clone()).unwrap();
-    following(vec![class], vec![gateway], vec![app, old])
-        .write_statuses(&api, &handed, &addresses, &programmed, &said)
-        .await;
-    assert_eq!(fake.seen().len(), 4, "a status written again");
+    calls.status = serde_json::from_value(bodies[4]["status"].clone()).unwrap();
+    gone.status = serde_json::from_value(bodies[5]["status"].clone()).unwrap();
+    following(
+        vec![class],
+        vec![gateway],
+        vec![app, old],
+        vec![calls, gone],
+    )
+    .write_statuses(&api, &handed, &addresses, &programmed, &said)
+    .await;
+    assert_eq!(fake.seen().len(), 6, "a status written again");
 }
 
 #[test]
