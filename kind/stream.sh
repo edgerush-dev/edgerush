@@ -29,7 +29,9 @@
 #     them, whichever API each is of: the older takes the requests, the other is said
 #     shadowed;
 #     an HTTPRoute's redirect that states only a host sends the client to the listener's
-#     port;
+#     port; a GRPCRoute's method is called through the data plane, served by agnhost's
+#     gRPC health server, another method and any once the route is gone answered
+#     UNIMPLEMENTED, and the route says it is accepted;
 #   - the Ingress's status says the data plane's Service's address;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
@@ -530,6 +532,83 @@ location=$(curl -s -o /dev/null -w '%{redirect_url}' -H 'host: moved.example' "h
 forward
 k -n shop delete httproute moved >/dev/null
 pass "an HTTPRoute's redirect of a host alone sends the client there on the listener's port"
+
+# A GRPCRoute: a call of the method it matches is served by its backend, a port of no
+# appProtocol spoken to in HTTP/2 in the clear; a method it does not match, and any once it
+# is deleted, is answered UNIMPLEMENTED, as a call no route serves is; and the route says
+# it is accepted and resolved, of its generation (04 §2, §6).
+k apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: health, namespace: shop }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: health } }
+  template:
+    metadata: { labels: { app: health } }
+    spec:
+      containers:
+        - name: health
+          image: $AGNHOST
+          args: ["grpc-health-checking", "--port=5000"]
+          ports: [{ name: grpc, containerPort: 5000 }]
+          readinessProbe: { grpc: { port: 5000 }, periodSeconds: 1 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: health, namespace: shop }
+spec:
+  selector: { app: health }
+  ports: [{ name: grpc, port: 5000, targetPort: grpc }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: health, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [grpc.example]
+  rules:
+    - matches: [{ method: { service: grpc.health.v1.Health, method: Check } }]
+      backendRefs: [{ name: health, port: 5000 }]
+EOF
+k -n shop rollout status deploy/health --timeout=120s >/dev/null
+grpc=target/kind/grpc
+rm -rf "$grpc" && mkdir -p "$grpc"
+# A health request of no service named, which agnhost says SERVING of: its frame of five
+# bytes, an empty message.
+printf '\0\0\0\0\0' > "$grpc/request"
+# A call of method $1 of the health service, over HTTP/2 by prior knowledge: the bytes of
+# its answer's messages, then its grpc-status, as `00 00 00 00 02 08 01 grpc-status: 0`.
+called() {
+    curl -s -v --http2-prior-knowledge -H 'host: grpc.example' \
+        -H 'content-type: application/grpc' -H 'te: trailers' \
+        --data-binary @"$grpc/request" -o "$grpc/answer" \
+        "http://127.0.0.1:$port/grpc.health.v1.Health/$1" 2>"$grpc/said" || true
+    echo "$(od -An -tx1 "$grpc/answer" | xargs) $(grep -o 'grpc-status: [0-9]*' "$grpc/said")" | xargs
+}
+# Waits up to $3 seconds for a call of method $1 to come back as $2.
+calls() {
+    for _ in $(seq 1 $(($3 * 5))); do
+        [ "$(called "$1")" = "$2" ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+calls Check "00 00 00 00 02 08 01 grpc-status: 0" 30 ||
+    fail "the GRPCRoute's method is not served: $(called Check)"
+calls Watch "grpc-status: 12" 5 ||
+    fail "a method the GRPCRoute does not match comes back as $(called Watch)"
+stated "True True" '{.status.parents[0].conditions[?(@.type=="Accepted")].status} {.status.parents[0].conditions[?(@.type=="ResolvedRefs")].status}' \
+    30 -n shop grpcroute health || fail "the GRPCRoute says $(said_of -n shop grpcroute health)"
+generation=$(k -n shop get grpcroute health -o jsonpath='{.metadata.generation}')
+stated "$generation" '{.status.parents[0].conditions[?(@.type=="Accepted")].observedGeneration}' \
+    5 -n shop grpcroute health ||
+    fail "the GRPCRoute's status is not of generation $generation: $(said_of -n shop grpcroute health)"
+refused_any && fail "a control-plane replica was refused something of a GRPCRoute"
+k -n shop delete grpcroute health >/dev/null
+calls Check "grpc-status: 12" 30 || fail "the GRPCRoute deleted, its method comes back as $(called Check)"
+k -n shop delete deploy/health service/health >/dev/null
+pass "a GRPCRoute's method is served by its backend over HTTP/2, another answered UNIMPLEMENTED, and the route says it is accepted"
 
 # What the Ingress's status says, its first address.
 says() { k -n shop get ingress web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }
