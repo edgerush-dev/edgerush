@@ -1,0 +1,1 @@
+TLSRoute shop/api: attached to api (api.example.com); other (api.example.com)

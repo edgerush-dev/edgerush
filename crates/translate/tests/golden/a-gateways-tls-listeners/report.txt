@@ -1,0 +1,7 @@
+Gateway shop/web: listener again: not accepted: listener passthrough, which comes first, has its port, protocol and hostname
+Gateway shop/web: listener terminated: not accepted: TLS mode `Terminate` is not served: a TLS listener passes its connections through
+Gateway shop/web: listener kinds: takes no route of kind gateway.networking.k8s.io/TCPRoute, gateway.networking.k8s.io/HTTPRoute
+Gateway shop/web: listener secure: a certificate cannot be used: Secret shop/not-there does not exist
+Gateway shop/web: listener secure: accepted, serving nothing: no certificateRef of it can be used
+Gateway shop/web: listener beside-http: not accepted: port 8080 is taken for http by listener http, which comes first
+HTTPRoute shop/pages: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace

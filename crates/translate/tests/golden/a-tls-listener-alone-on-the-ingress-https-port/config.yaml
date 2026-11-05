@@ -1,0 +1,24 @@
+listeners:
+  port-443:
+    address: "0.0.0.0:443"
+    protocol: tls
+    proxy_protocol: off
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: ingress/shop/shop/shop.example.com
+    listeners: [port-80]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+tls_routes:
+  - { name: tlsroute/shop/api/api, listeners: [port-443], hostnames: [{ name: api.example.com, falls_through: false }], backends: [{ upstream: shop/api/tls, weight: 1 }] }
+  - { name: gateway/shop/web/api, listeners: [port-443], hostnames: [{ name: api.example.com, falls_through: false }], backends: [{ invalid: "no TLSRoute takes api.example.com on listener api", weight: 1 }] }
+upstreams:
+  shop/api/tls: { load_balancer: p2c, endpoints: { kubernetes: "api.shop.svc.cluster.local:tls" } }
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

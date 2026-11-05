@@ -5,7 +5,7 @@
 
 use crate::asked::{self, Asked, Invalid};
 use crate::explained::Snapshot;
-use edgerush_config::Protocol;
+use edgerush_config::{CompiledListener, Protocol};
 use edgerush_proxy::Decision;
 use http::StatusCode;
 use serde::Deserialize;
@@ -382,7 +382,8 @@ pub struct Prepared {
 pub enum Asking {
     /// A request, to an `http` or `https` listener.
     Request(Asked),
-    /// A connection, to a `tcp` or `tls` listener, with the name its ClientHello asks for:
+    /// A connection, to a `tcp` or `tls` listener or one an `https` listener passes
+    /// through, with the name its ClientHello asks for:
     /// always `None` for `tcp`.
     Connection(Option<String>),
 }
@@ -418,7 +419,7 @@ impl TestFile {
                 wrong(problem);
             }
             if let Some(listener) = snapshot.listener(&test.request.listener) {
-                for problem in for_listener(test, listener.protocol) {
+                for problem in for_listener(test, listener) {
                     wrong(problem);
                 }
             }
@@ -563,15 +564,33 @@ fn kind(protocol: Protocol) -> &'static str {
     }
 }
 
-/// What is wrong with a test for a listener of `protocol`: a request's has a rule beside
-/// its route; a connection's has a route alone, is forwarded or refused, and has no answer,
-/// mirrors or rate limits of HTTP's.
-fn for_listener(test: &Test, protocol: Protocol) -> Vec<Problem> {
+/// A connection an `https` listener passes through, as the problems name it.
+const PASSED: &str = "a name passed through by an https";
+
+/// The SNI of `request`, a name or none, where `listener` is an `https` one that passes it
+/// through: then the test is of a connection, carried as a `tls` listener's is (17 §2).
+fn passed(request: &Request, listener: &CompiledListener) -> Option<Option<String>> {
+    let sni = request.sni.as_ref().map(|sni| match sni {
+        Sni::Word(NoName::None) => None,
+        Sni::Name(SniName { name }) => Some(name.clone()),
+    })?;
+    let https = listener.protocol == Protocol::Https;
+    (https && listener.carries(sni.as_deref())).then_some(sni)
+}
+
+/// What is wrong with a test for `listener`: a request's has a rule beside its route; a
+/// connection's has a route alone, is forwarded or refused, and has no answer, mirrors or
+/// rate limits of HTTP's.
+fn for_listener(test: &Test, listener: &CompiledListener) -> Vec<Problem> {
     let expect = &test.expect;
     let mut problems = Vec::new();
-    let kind = kind(protocol);
-    match protocol {
-        Protocol::Http | Protocol::Https => {
+    let (connection, kind) = match listener.protocol {
+        Protocol::Https if passed(&test.request, listener).is_some() => (true, PASSED),
+        Protocol::Http | Protocol::Https => (false, kind(listener.protocol)),
+        Protocol::Tcp | Protocol::Tls => (true, kind(listener.protocol)),
+    };
+    match connection {
+        false => {
             let routed = expect.forward.is_some() || expect.redirect.is_some();
             if expect.route.is_some() != expect.rule.is_some() {
                 problems.push(Problem::RouteAndRule);
@@ -582,7 +601,7 @@ fn for_listener(test: &Test, protocol: Protocol) -> Vec<Problem> {
                 problems.push(Problem::Unwanted("refused", kind));
             }
         }
-        Protocol::Tcp | Protocol::Tls => {
+        true => {
             let unwanted = [
                 ("rule", expect.rule.is_some()),
                 ("redirect", expect.redirect.is_some()),
@@ -655,8 +674,16 @@ fn asked(request: &Request, snapshot: &Snapshot) -> Result<Asking, Problem> {
             };
         }
         Protocol::Http => unwanted(&[("sni", request.sni.is_some())])?,
-        // Whether the listener's port is shared, and so wants it, is the request's to check.
-        Protocol::Https => {}
+        // A name the listener passes through is carried, as a `tls` listener's is; whether
+        // its port is shared, and so wants one, is otherwise the request's to check.
+        Protocol::Https => {
+            if let Some(sni) = passed(request, listener) {
+                return match http.iter().find(|(_, given)| *given) {
+                    Some((field, _)) => Err(Problem::Unwanted(field, PASSED)),
+                    None => Ok(Asking::Connection(sni)),
+                };
+            }
+        }
     }
     let needed = |given: &Option<String>, field| given.clone().ok_or(Problem::Missing(field, kind));
     let (scheme, authority, target) = asked::url(&needed(&request.url, "url")?)?;
@@ -956,6 +983,56 @@ tls_routes:
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(
             said[0].contains("listeners share the port of listener secure"),
+            "{said:?}"
+        );
+    }
+
+    /// A test whose SNI an `https` listener passes through is of a connection, carried as a
+    /// `tls` listener's is, and takes nothing of a request's; one whose SNI is served is of
+    /// a request, as ever.
+    #[test]
+    fn a_test_of_a_name_passed_through_is_of_a_connection() {
+        let config = CONFIG.replace(
+            "  db: {",
+            "  shared: { address: \"[::]:8443\", protocol: https, proxy_protocol: off, tls: { certificates: [], without_sni: none, shared_by: [{ hostnames: [{ name: \"*\" }] }, { hostnames: [{ name: api.example.net }], passes_through: true }] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n  db: {",
+        );
+        let snapshot = Snapshot::new(serde_saphyr::from_str(&config).unwrap()).unwrap();
+        let yaml = format!(
+            "tests:\n{}{}",
+            test(
+                "passed",
+                "{ listener: shared, sni: { name: api.example.net } }",
+                "{ refused: no_route }"
+            ),
+            test(
+                "served",
+                "{ listener: shared, client: 203.0.113.7, protocol: \"2\", method: GET, url: \"https://www.example.net/\", headers: [], sni: { name: www.example.net } }",
+                "{ answer: no_route }"
+            ),
+        );
+        let prepared = read(yaml.as_bytes()).unwrap().prepare(&snapshot).unwrap();
+        assert!(matches!(
+            &prepared[0].asked,
+            Asking::Connection(Some(name)) if name == "api.example.net"
+        ));
+        assert!(matches!(&prepared[1].asked, Asking::Request(_)));
+
+        let yaml = format!(
+            "tests:\n{}",
+            test(
+                "passed",
+                "{ listener: shared, client: 203.0.113.7, sni: { name: api.example.net } }",
+                "{ refused: no_route }"
+            )
+        );
+        let mistakes = read(yaml.as_bytes())
+            .unwrap()
+            .prepare(&snapshot)
+            .unwrap_err();
+        let said: Vec<String> = mistakes.iter().map(|mistake| mistake.to_string()).collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("client does not apply to a name passed through by an https listener"),
             "{said:?}"
         );
     }

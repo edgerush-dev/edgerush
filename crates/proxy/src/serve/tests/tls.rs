@@ -456,6 +456,7 @@ fn shared_h3_config(upstream: SocketAddr) -> edgerush_config::Config {
                 name: name.to_owned(),
                 wildcard: None,
             }],
+            passes_through: false,
         })
         .collect();
     config
@@ -665,6 +666,7 @@ fn shared_to(
                 name: (*name).to_owned(),
                 wildcard: None,
             }],
+            passes_through: false,
         })
         .collect();
     compile(&config).unwrap()
@@ -1445,6 +1447,271 @@ async fn an_http2_connection_over_tls_the_server_closes_ends_with_a_closure_aler
             }
             assert_eq!(at, wire.len(), "records cut short");
             assert_eq!(last, Some(21), "the last record is no alert");
+        })
+        .await;
+}
+
+/// `web`, serving everything to `upstream` over HTTPS with `served` beside the TLS route
+/// `api`, for `api.test`, to `passed`, its port shared by `sharing`: each a hostname (`*`
+/// for none, `*.` a wildcard) and whether that listener passes its connections through.
+fn passing_beside(
+    upstream: SocketAddr,
+    passed: SocketAddr,
+    served: &edgerush_config::Certificate,
+    sharing: &[(&str, bool)],
+) -> Config {
+    let mut config = everything_config(upstream);
+    secured(&mut config, vec![served.clone()], None);
+    let tls = config
+        .listeners
+        .get_mut("web")
+        .unwrap()
+        .tls
+        .as_mut()
+        .unwrap();
+    tls.shared_by = sharing
+        .iter()
+        .map(|(name, passes_through)| edgerush_config::SharingListener {
+            hostnames: vec![edgerush_config::SharingHostname {
+                name: (*name).to_owned(),
+                wildcard: name
+                    .starts_with("*.")
+                    .then_some(edgerush_config::Wildcard::AnyLabels),
+            }],
+            passes_through: *passes_through,
+        })
+        .collect();
+    config.tls_routes.push(
+        serde_saphyr::from_str(
+            "{ name: api, listeners: [web], hostnames: [{ name: api.test, falls_through: true }], backends: [{ upstream: passed, weight: 1 }] }",
+        )
+        .unwrap(),
+    );
+    config.upstreams.insert(
+        "passed".to_owned(),
+        serde_saphyr::from_str(&format!(
+            "{{ load_balancer: p2c, endpoints: {{ listed: [\"{passed}\"] }} }}"
+        ))
+        .unwrap(),
+    );
+    config
+}
+
+/// What a TLS client that asks for no name is answered for `GET /` over HTTPS through
+/// `front`, by its status line.
+async fn served_without_a_name(front: SocketAddr) -> String {
+    use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
+    let stream = TcpStream::connect(front).await.unwrap();
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+    connector.set_verify(SslVerifyMode::NONE);
+    let mut config = connector.build().configure().unwrap();
+    config.set_use_server_name_indication(false);
+    config.set_verify_hostname(false);
+    let mut secured = within(tokio_boring::connect(config, "none.test", stream))
+        .await
+        .unwrap();
+    status_for(&mut secured, "www.test").await
+}
+
+/// On a port an `https` listener shares with one that passes its connections through, a
+/// connection whose SNI is for the passing listener is carried to its TLS route's
+/// backend, whose own handshake it is: the ClientHello went on unchanged. One for
+/// another's name, or for none where no catch-all passes through, is handshaken here and
+/// served (17 §2).
+#[tokio::test]
+async fn a_shared_port_carries_the_names_passed_through_and_serves_the_rest() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::tls::testing::certificate;
+            let (upstream, _) = counting_upstream().await;
+            let passed = tls_backend("passed").await;
+            let served = certificate(&["www.test", "api.test"]);
+            let config = passing_beside(
+                upstream,
+                passed,
+                &served,
+                &[("*", false), ("api.test", true)],
+            );
+            let (front, worker) = serving_compiled(compile(&config).unwrap()).await;
+            assert_eq!(
+                told_over_tls(front, Some("API.test")).await.as_deref(),
+                Some("passed")
+            );
+            tunnel_ended(&worker, "web", "closed").await;
+            let mut client = tls_client(front, "www.test", None, |_| {}).await.unwrap();
+            assert_eq!(status_for(&mut client, "www.test").await, "HTTP/1.1 200 OK");
+            assert_eq!(served_without_a_name(front).await, "HTTP/1.1 200 OK");
+        })
+        .await;
+}
+
+/// Where the catch-all passes its connections through, a name no other listener is for
+/// is carried, and closed where no TLS route takes it, and so is a ClientHello that asks
+/// for no name; a more specific listener's name is served.
+#[tokio::test]
+async fn a_name_passed_through_that_no_route_takes_is_closed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::tls::testing::certificate;
+            let (upstream, _) = counting_upstream().await;
+            let passed = tls_backend("passed").await;
+            let served = certificate(&["www.test"]);
+            let config = passing_beside(
+                upstream,
+                passed,
+                &served,
+                &[("www.test", false), ("*", true)],
+            );
+            let (front, worker) = serving_compiled(compile(&config).unwrap()).await;
+            assert_eq!(
+                told_over_tls(front, Some("api.test")).await.as_deref(),
+                Some("passed")
+            );
+            assert_eq!(told_over_tls(front, Some("other.test")).await, None);
+            tunnel_ended(&worker, "web", "refused").await;
+            assert_eq!(told_over_tls(front, None).await, None);
+            let line = "edgerush_listener_tunnels_total{listener=\"web\",outcome=\"refused\"} 2\n";
+            until(|| worker.proxy().metrics().contains(line)).await;
+            let mut client = tls_client(front, "www.test", None, |_| {}).await.unwrap();
+            assert_eq!(status_for(&mut client, "www.test").await, "HTTP/1.1 200 OK");
+        })
+        .await;
+}
+
+/// On a shared port a ClientHello the reader refuses is closed, never handshaken: one
+/// after an alert, which BoringSSL would read past, and bytes that are no TLS at all
+/// (17 §3). Each is counted refused.
+#[tokio::test]
+async fn a_client_hello_the_reader_refuses_is_closed_on_a_shared_port() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::tls::testing::certificate;
+            let (upstream, _) = counting_upstream().await;
+            let passed = tls_backend("passed").await;
+            let served = certificate(&["www.test"]);
+            let config = passing_beside(
+                upstream,
+                passed,
+                &served,
+                &[("*", false), ("api.test", true)],
+            );
+            let (front, worker) = serving_compiled(compile(&config).unwrap()).await;
+            // A warning close_notify alert, then a whole ClientHello.
+            let mut alerted = [21, 3, 1, 0, 2, 1, 0].to_vec();
+            alerted.extend_from_slice(super::passthrough::HELLO);
+            for sent in [&alerted[..], b"GET / HTTP/1.1\r\nhost: www.test\r\n\r\n"] {
+                let mut client = TcpStream::connect(front).await.unwrap();
+                client.write_all(sent).await.unwrap();
+                let mut answer = Vec::new();
+                let _ended = within(client.read_to_end(&mut answer)).await;
+                assert!(answer.is_empty(), "{answer:?}");
+            }
+            let line = "edgerush_listener_tunnels_total{listener=\"web\",outcome=\"refused\"} 2\n";
+            until(|| worker.proxy().metrics().contains(line)).await;
+        })
+        .await;
+}
+
+/// Over HTTP/2, on a connection served for one listener whose certificate carries a name
+/// another passes through, a stream for that name is answered 421, so that the client
+/// makes a connection of its own for it, which is carried; the connection's others are
+/// served (Q-t4).
+#[tokio::test]
+async fn a_request_for_a_host_passed_through_is_misdirected_over_http2() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::tls::testing::certificate;
+            let (upstream, _) = counting_upstream().await;
+            let passed = tls_backend("passed").await;
+            let served = certificate(&["www.test", "api.test"]);
+            let config = passing_beside(
+                upstream,
+                passed,
+                &served,
+                &[("*", false), ("api.test", true)],
+            );
+            let (front, _worker) = serving_compiled(compile(&config).unwrap()).await;
+            let offered: &[u8] = b"\x02h2";
+            let stream = tls_client(front, "www.test", Some(offered), |_| {})
+                .await
+                .unwrap();
+            let (mut send, connection) = within(::h2::client::handshake(stream)).await.unwrap();
+            let _driving = tokio::task::spawn_local(connection);
+            for (authority, status) in [
+                ("www.test", StatusCode::OK),
+                ("api.test", StatusCode::MISDIRECTED_REQUEST),
+                ("www.test", StatusCode::OK),
+            ] {
+                let request = Request::get(format!("https://{authority}/"))
+                    .body(())
+                    .unwrap();
+                let (answer, _) = send.send_request(request, true).unwrap();
+                assert_eq!(
+                    within(answer).await.unwrap().status(),
+                    status,
+                    "{authority}"
+                );
+            }
+        })
+        .await;
+}
+
+/// On a shared port whose listener reads a PROXY header, the header comes off first and
+/// the ClientHello after it is read for its name: carried, the backend's handshake is
+/// whole; served, the handshake is ours.
+#[tokio::test]
+async fn a_shared_port_reads_its_proxy_header_before_the_client_hello() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::tls::testing::certificate;
+            use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
+            let (upstream, _) = counting_upstream().await;
+            let passed = tls_backend("passed").await;
+            let served = certificate(&["www.test"]);
+            let mut config = passing_beside(
+                upstream,
+                passed,
+                &served,
+                &[("*", false), ("api.test", true)],
+            );
+            config.listeners.get_mut("web").unwrap().proxy_protocol =
+                Some(edgerush_config::ListenerProxyProtocol::Senders(vec![
+                    "127.0.0.0/8".to_owned(),
+                ]));
+            let (front, _worker) = serving_compiled(compile(&config).unwrap()).await;
+            let after_header = |name: &'static str| async move {
+                let mut stream = TcpStream::connect(front).await.unwrap();
+                stream
+                    .write_all(b"PROXY TCP4 192.0.2.1 192.0.2.2 1234 443\r\n")
+                    .await
+                    .unwrap();
+                let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+                connector.set_verify(SslVerifyMode::NONE);
+                let config = connector
+                    .build()
+                    .configure()
+                    .unwrap()
+                    .verify_hostname(false);
+                within(tokio_boring::connect(config, name, stream))
+                    .await
+                    .unwrap()
+            };
+            let mut carried = after_header("api.test").await;
+            let mut told = String::new();
+            let _ended = within(carried.read_to_string(&mut told)).await;
+            assert_eq!(told, "passed");
+            let mut secured = after_header("www.test").await;
+            assert_eq!(
+                status_for(&mut secured, "www.test").await,
+                "HTTP/1.1 200 OK"
+            );
         })
         .await;
 }

@@ -24,7 +24,8 @@ Request, every part of it required for an http or https listener:
       --connect-protocol <NAME>  An extended CONNECT's protocol, over HTTP/2 or HTTP/3
 
 Connection to a tls listener, or to an https one whose port listeners share, one of the
-two (a tcp listener's takes nothing):
+two (a tcp listener's takes nothing; one whose name an https listener passes through,
+carried as a tls listener's, takes nothing else):
       --sni <NAME>               The name its ClientHello asks for
       --no-sni                   A ClientHello that asks for no name
 
@@ -200,7 +201,21 @@ fn run(options: &Options) -> Result<String, Failed> {
     let mut said = None;
     match listener.protocol {
         Protocol::Http => unwanted(&sni)?,
-        Protocol::Https => said = named()?,
+        Protocol::Https => {
+            said = named()?;
+            // A name the listener passes through is carried, as a `tls` listener's is.
+            if let Some(name) = &said
+                && listener.carries(name.as_deref())
+            {
+                let passed = "a name passed through by an https";
+                if let Some((flag, _)) = http.iter().find(|(_, given)| *given) {
+                    return Err(Failed::Unwanted(flag, passed));
+                }
+                return Ok(snapshot
+                    .explain_connection(listener, name.as_deref())?
+                    .text());
+            }
+        }
         Protocol::Tcp => {
             unwanted(&http)?;
             unwanted(&sni)?;
@@ -392,6 +407,34 @@ redirect  301 to /open
 "
             ),
             "{text}"
+        );
+    }
+
+    /// A name an `https` listener passes through is a connection, explained as a `tls`
+    /// listener's is, and takes nothing of a request's.
+    #[test]
+    fn a_name_an_https_listener_passes_through_is_explained_as_a_connection() {
+        let secure = "  secure: { address: \"[::]:8443\", protocol: https, proxy_protocol: off, tls: { certificates: [site], without_sni: site, shared_by: [{ hostnames: [{ name: \"*\" }] }, { hostnames: [{ name: api.example.net }], passes_through: true }] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n  db: {";
+        let mut https = CONFIG.replace("  db: {", secure);
+        https.push_str("tls_routes:\n  - { name: carried, listeners: [secure], hostnames: [{ name: api.example.net, falls_through: true }], backends: [{ upstream: fallback, weight: 1 }] }\n");
+        https.push_str("certificates:\n  site: { chain_file: /nowhere/site.pem, key_file: /nowhere/site.key }\n");
+        let args = ["--listener", "secure", "--sni", "api.example.net"];
+        let (status, text, stderr) = explain_on(&https, "passed", &args);
+        assert_eq!((status, stderr.as_str()), (0, ""));
+        assert!(
+            text.starts_with("secure (https)  SNI api.example.net\n"),
+            "{text}"
+        );
+        assert!(text.contains("\nroute     carried\n"), "{text}");
+        let mut asked = request("secure", "2", "GET", "https://api.example.net/");
+        asked.extend_from_slice(&["--sni", "api.example.net"]);
+        let (status, _, stderr) = explain_on(&https, "passed_request", &asked);
+        assert_eq!(status, 2);
+        assert!(
+            stderr.starts_with(
+                "error: '--client' does not apply to a name passed through by an https listener"
+            ),
+            "{stderr}"
         );
     }
 

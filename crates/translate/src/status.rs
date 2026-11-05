@@ -373,7 +373,9 @@ fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
                 ListenerProblem::ProtocolConflict { .. } => "ProtocolConflict",
                 ListenerProblem::PortPastSlots { .. } => "PortUnavailable",
                 ListenerProblem::TooManyListeners { .. } => "TooManyListeners",
-                ListenerProblem::TlsMode(_) | ListenerProblem::NoCertificate => "UnsupportedValue",
+                ListenerProblem::TlsMode(_)
+                | ListenerProblem::PassthroughOnly(_)
+                | ListenerProblem::NoCertificate => "UnsupportedValue",
             };
             conditions.push(Condition::new(
                 "Accepted",
@@ -462,9 +464,13 @@ pub(crate) fn routes(outcomes: &[RouteOutcome], report: &[Finding]) -> Vec<Route
 }
 
 /// A route's conditions for one parent: `Accepted`, `ResolvedRefs` and, where some of its
-/// rules are served as written and some not, `PartiallyInvalid`.
+/// rules are served as written and some not, `PartiallyInvalid`. A TLSRoute not of the
+/// shape the `v1` API gives one is not accepted, as an HTTPRoute none of whose rules is
+/// served is not; its backends' shares closed are its unresolved references.
 fn parent_conditions(parent: &ParentOutcome, said: &[&Problem]) -> Vec<Condition> {
-    let no_rule = said.iter().any(|p| matches!(p, Problem::NoRuleServed));
+    let not_accepted = said
+        .iter()
+        .find(|p| matches!(p, Problem::NoRuleServed | Problem::TlsRouteRefused(_)));
     let accepted = match parent.attached {
         Err(why) => {
             let reason = match why {
@@ -474,18 +480,17 @@ fn parent_conditions(parent: &ParentOutcome, said: &[&Problem]) -> Vec<Condition
             };
             Condition::new("Accepted", false, reason, why.to_string())
         }
-        Ok(_) if no_rule => Condition::new(
-            "Accepted",
-            false,
-            "UnsupportedValue",
-            Problem::NoRuleServed.to_string(),
-        ),
+        Ok(_) if let Some(refused) = not_accepted => {
+            Condition::new("Accepted", false, "UnsupportedValue", refused.to_string())
+        }
         Ok(_) => Condition::new("Accepted", true, "Accepted", String::new()),
     };
     let unresolved: Vec<&RefProblem> = said
         .iter()
         .filter_map(|p| match p {
-            Problem::BackendInvalid { why, .. } | Problem::MirrorLeftOff { why, .. } => Some(why),
+            Problem::BackendInvalid { why, .. }
+            | Problem::MirrorLeftOff { why, .. }
+            | Problem::ConnectionsClosed(why) => Some(why),
             _ => None,
         })
         .collect();

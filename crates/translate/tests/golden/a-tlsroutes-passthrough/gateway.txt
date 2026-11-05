@@ -1,0 +1,5 @@
+listener wild: served on port-8443, taking TLSRoute from namespace shop
+listener api: served on port-8443, taking TLSRoute from namespace shop
+listener idle: served on port-8443, taking TLSRoute from namespace shop
+listener open: served on port-9443, taking TLSRoute from namespace shop
+listener narrow: served on port-8443, taking TLSRoute from namespace shop

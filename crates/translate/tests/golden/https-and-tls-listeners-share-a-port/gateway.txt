@@ -1,0 +1,5 @@
+listener api: served on port-443, taking TLSRoute from namespace shop
+listener https: served on port-443, presenting shop/wild, taking HTTPRoute, GRPCRoute from namespace shop
+listener tunnels: served on port-443, taking TLSRoute from namespace shop
+listener www: served on port-443, presenting shop/secure, taking HTTPRoute, GRPCRoute from namespace shop
+listener again: not accepted: listener api, which comes first, has its port, protocol and hostname

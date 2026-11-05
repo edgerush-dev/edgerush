@@ -107,6 +107,7 @@ rules:
       - gateways.gateway.networking.k8s.io
       - listenersets.gateway.networking.k8s.io
       - grpcroutes.gateway.networking.k8s.io
+      - tlsroutes.gateway.networking.k8s.io
       - httproutes.gateway.networking.k8s.io
       - referencegrants.gateway.networking.k8s.io
     verbs: [get, list, watch]
@@ -125,10 +126,10 @@ rules:
     resources: [ingresses]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [listenersets, grpcroutes, httproutes, referencegrants]
+    resources: [listenersets, grpcroutes, httproutes, referencegrants, tlsroutes]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [listenersets/status, grpcroutes/status, httproutes/status]
+    resources: [listenersets/status, grpcroutes/status, httproutes/status, tlsroutes/status]
     verbs: [update]
   - apiGroups: [""]
     resources: [services, secrets]
@@ -151,10 +152,10 @@ rules:
     resources: [ingresses]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [listenersets, grpcroutes, httproutes, referencegrants]
+    resources: [listenersets, grpcroutes, httproutes, referencegrants, tlsroutes]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [listenersets/status, grpcroutes/status, httproutes/status]
+    resources: [listenersets/status, grpcroutes/status, httproutes/status, tlsroutes/status]
     verbs: [update]
   - apiGroups: [""]
     resources: [services, secrets]

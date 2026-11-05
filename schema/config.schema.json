@@ -769,7 +769,7 @@
           "default": null
         },
         "tunnel_idle_seconds": {
-          "description": "How long, in seconds, a `tcp` or `tls` listener's tunnel may carry nothing either\nway before both its ends are closed. An hour unless said otherwise,\nas HAProxy's `timeout tunnel` is set in practice: what a tunnel carries (a database's\nconnection, a long poll) can be quiet for long. For those listeners only.",
+          "description": "How long, in seconds, a `tcp` or `tls` listener's tunnel may carry nothing either\nway before both its ends are closed. An hour unless said otherwise,\nas HAProxy's `timeout tunnel` is set in practice: what a tunnel carries (a database's\nconnection, a long poll) can be quiet for long. For those listeners only, and an\n`https` one that passes connections through.",
           "type": [
             "integer",
             "null"
@@ -1636,6 +1636,11 @@
             "$ref": "#/$defs/SharingHostname"
           },
           "minItems": 1
+        },
+        "passes_through": {
+          "description": "Whether it passes its connections through (Gateway API's TLS listener in\n`Passthrough` mode): one whose SNI is for it is carried by the `tls_routes` that\nname this listener, not handshaken, and none covering it closes\nit. Not said, it is served here.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false,
@@ -1784,7 +1789,7 @@
           }
         },
         "shared_by": {
-          "description": "The listeners, in Gateway API's sense, that share this one's port, each by its\nhostnames: a request on a connection made for one of them that is for another's\nhost is answered 421 Misdirected Request. Which one a name is\nfor is the most specific hostname covering it, the client's SNI for the connection\nand the request's host for the request; a client that asks for no name is the\ncatch-all's, `*`'s. None or one, and nothing is checked.",
+          "description": "The listeners, in Gateway API's sense, that share this one's port, each by its\nhostnames: a request on a connection made for one of them that is for another's\nhost is answered 421 Misdirected Request. Which one a name is\nfor is the most specific hostname covering it, the client's SNI for the connection\nand the request's host for the request; a client that asks for no name is the\ncatch-all's, `*`'s. None or one, and nothing is checked, unless one passes its\nconnections through: then a connection whose SNI is for that one is carried, not\nhandshaken.",
           "type": "array",
           "default": [],
           "items": {
@@ -1825,7 +1830,7 @@
           "minItems": 1
         },
         "listeners": {
-          "description": "The names of the `tls` listeners it is for.",
+          "description": "The names of the listeners it is for: `tls` ones, and `https` ones that pass\nconnections through, for the names they pass.",
           "type": "array",
           "items": {
             "type": "string"

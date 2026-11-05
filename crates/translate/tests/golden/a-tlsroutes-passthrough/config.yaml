@@ -1,0 +1,53 @@
+listeners:
+  port-8443: { address: "0.0.0.0:8443", protocol: tls, proxy_protocol: off }
+  port-9443: { address: "0.0.0.0:9443", protocol: tls, proxy_protocol: off }
+routes: []
+tls_routes:
+  - name: tlsroute/shop/anywhere/open
+    listeners: [port-9443]
+    hostnames: [{ name: db.example.org, falls_through: false }, { name: "*.example.net", wildcard: any_labels, falls_through: false }]
+    backends: [{ upstream: shop/web/https, weight: 1 }]
+  - name: tlsroute/shop/api/api
+    listeners: [port-8443]
+    hostnames: [{ name: api.example.com, falls_through: false }]
+    backends:
+      - { upstream: blog/db/postgres, weight: 1 }
+      - { invalid: "Service stock/levels is another namespace's, and no ReferenceGrant there lets TLSRoutes of shop reach it", weight: 1 }
+  - name: tlsroute/shop/api/open
+    listeners: [port-9443]
+    hostnames: [{ name: api.example.com, falls_through: false }]
+    backends:
+      - { upstream: blog/db/postgres, weight: 1 }
+      - { invalid: "Service stock/levels is another namespace's, and no ReferenceGrant there lets TLSRoutes of shop reach it", weight: 1 }
+  - name: tlsroute/shop/wide/narrow
+    listeners: [port-8443]
+    hostnames: [{ name: db.example.com, falls_through: false }]
+    backends: [{ upstream: shop/web/https, weight: 1 }]
+  - name: tlsroute/shop/weighted/wild
+    listeners: [port-8443]
+    hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: false }]
+    backends: [{ upstream: shop/web/https, weight: 3 }, { invalid: Service shop/gone does not exist, weight: 1 }]
+  - name: tlsroute/shop/later/wild
+    listeners: [port-8443]
+    hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: false }, { name: shop.example.com, falls_through: false }]
+    backends: [{ upstream: shop/secure/https/tcp, weight: 1 }]
+  - name: gateway/shop/web/wild
+    listeners: [port-8443]
+    hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: false }]
+    backends: [{ invalid: "no TLSRoute takes *.example.com on listener wild", weight: 1 }]
+  - name: gateway/shop/web/api
+    listeners: [port-8443]
+    hostnames: [{ name: api.example.com, falls_through: false }]
+    backends: [{ invalid: no TLSRoute takes api.example.com on listener api, weight: 1 }]
+  - name: gateway/shop/web/idle
+    listeners: [port-8443]
+    hostnames: [{ name: idle.example.com, falls_through: false }]
+    backends: [{ invalid: no TLSRoute takes idle.example.com on listener idle, weight: 1 }]
+  - name: gateway/shop/web/narrow
+    listeners: [port-8443]
+    hostnames: [{ name: db.example.com, falls_through: false }]
+    backends: [{ invalid: no TLSRoute takes db.example.com on listener narrow, weight: 1 }]
+upstreams:
+  blog/db/postgres: { load_balancer: p2c, endpoints: { kubernetes: "db.blog.svc.cluster.local:postgres" } }
+  shop/secure/https/tcp: { load_balancer: p2c, endpoints: { kubernetes: "secure.shop.svc.cluster.local:https" } }
+  shop/web/https: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:https" } }

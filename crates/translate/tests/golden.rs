@@ -11,7 +11,7 @@
 //! says, `gateway.txt`, what was made of the data plane's Gateway's listeners, a line each
 //! (none otherwise: the data plane is no Gateway, or names one not there or not ours); and,
 //! where the case says, `routes.txt`, what became of each HTTPRoute's parents of that
-//! Gateway, then each GRPCRoute's, a line each (none otherwise); and, where the case says,
+//! Gateway, then each GRPCRoute's, then each TLSRoute's, a line each (none otherwise); and, where the case says,
 //! `status.txt`, what the
 //! status of that Gateway, each of its listeners and each HTTPRoute's parent of it is to
 //! say, a line each. The report's last lines are the hosts a claim of one API takes from the
@@ -30,6 +30,7 @@ use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
+use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_translate::{Cluster, Plane, translate};
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
@@ -50,6 +51,7 @@ enum Manifest {
     ListenerSet(Box<ListenerSet>),
     HTTPRoute(Box<HTTPRoute>),
     GRPCRoute(Box<GRPCRoute>),
+    TLSRoute(Box<TLSRoute>),
     ReferenceGrant(Box<ReferenceGrant>),
     Namespace(Box<Namespace>),
 }
@@ -74,6 +76,7 @@ fn every_case_translates_to_its_config_and_report() {
                 Manifest::ListenerSet(set) => cluster.listener_sets.push(*set),
                 Manifest::HTTPRoute(route) => cluster.http_routes.push(*route),
                 Manifest::GRPCRoute(route) => cluster.grpc_routes.push(*route),
+                Manifest::TLSRoute(route) => cluster.tls_routes.push(*route),
                 Manifest::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
                 Manifest::Namespace(namespace) => cluster.namespaces.push(*namespace),
             }
@@ -163,6 +166,7 @@ fn every_case_translates_to_its_config_and_report() {
             .http_routes
             .iter()
             .chain(&translation.grpc_routes)
+            .chain(&translation.tls_routes)
             .flat_map(|outcome| {
                 outcome
                     .to_string()

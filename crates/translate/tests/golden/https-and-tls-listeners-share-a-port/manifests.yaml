@@ -1,0 +1,76 @@
+# HTTPS and TLS Passthrough listeners share port 443, told apart by hostname (Q-t1): one
+# data-plane `https` listener, whichever comes first, the TLS listeners its sharers that pass their connections
+# through, their TLSRoutes on it. The most specific listener hostname takes a name, either
+# way: a TLS api.example.com within the HTTPS *.example.com, an HTTPS
+# www.secure.example.com within the TLS *.secure.example.com; a route's hostname wholly
+# within a more specific listener's is taken from it, of either kind. One hostname on both
+# is a conflict, the later refused. A host an Ingress serves over TLS there that a TLS
+# listener names is passed through to it, said; the Ingress's others are served.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: api, port: 443, protocol: TLS, hostname: api.example.com, tls: { mode: Passthrough } }
+    - { name: https, port: 443, protocol: HTTPS, hostname: "*.example.com", tls: { certificateRefs: [{ name: wild }] } }
+    - { name: tunnels, port: 443, protocol: TLS, hostname: "*.secure.example.com", tls: { mode: Passthrough } }
+    - { name: www, port: 443, protocol: HTTPS, hostname: www.secure.example.com, tls: { certificateRefs: [{ name: secure }] } }
+    - { name: again, port: 443, protocol: HTTPS, hostname: api.example.com, tls: { certificateRefs: [{ name: wild }] } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: pages, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: https }]
+  hostnames: ["*.example.com", api.example.com]
+  rules:
+    - backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: { name: api, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: api }]
+  hostnames: [api.example.com]
+  rules:
+    - backendRefs: [{ name: api, port: 8443 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: { name: tunnels, namespace: shop, creationTimestamp: "2026-01-02T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: tunnels }]
+  hostnames: ["*.secure.example.com", www.secure.example.com]
+  rules:
+    - backendRefs: [{ name: api, port: 8443 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: site, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [api.example.com, shop.example.com], secretName: wild }]
+  rules:
+    - host: api.example.com
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }] }
+    - host: shop.example.com
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api, namespace: shop }
+spec:
+  ports: [{ name: tls, port: 8443 }]

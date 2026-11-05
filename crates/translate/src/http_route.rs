@@ -19,6 +19,7 @@ use edgerush_gateway_api::http_route::{
     HTTPRoute, HTTPRouteRules, HTTPRouteRulesFilters, HTTPRouteRulesFiltersRequestRedirect,
     HTTPRouteRulesRetry, HTTPRouteRulesTimeouts,
 };
+use edgerush_gateway_api::tls_route::TLSRoute;
 use k8s_openapi::api::networking::v1::{IngressBackend, IngressServiceBackend, ServiceBackendPort};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
@@ -189,6 +190,16 @@ impl<'a> Routed<'a> {
             metadata: &route.metadata,
             parents: parent_refs!(route.spec.parent_refs),
             hostnames: route.spec.hostnames.as_deref().unwrap_or_default(),
+        }
+    }
+
+    /// A TLSRoute as attachment reads it.
+    pub(crate) fn tls(route: &'a TLSRoute) -> Self {
+        Self {
+            kind: "TLSRoute",
+            metadata: &route.metadata,
+            parents: parent_refs!(route.spec.parent_refs),
+            hostnames: &route.spec.hostnames,
         }
     }
 }
@@ -422,9 +433,9 @@ fn within(theirs: &str, hostname: &str) -> bool {
     }
 }
 
-/// The claim of no rules each accepted listener's hostname makes, so that no less specific
-/// claim serves it (listener isolation): `gateway/<namespace>/<name>/<listener>`, on the
-/// data plane's listeners that serve it.
+/// The claim of no rules each accepted HTTP or HTTPS listener's hostname makes, so that no
+/// less specific claim serves it (listener isolation): `gateway/<namespace>/<name>/<listener>`,
+/// on the data plane's listeners that serve it.
 pub(crate) fn claims(gateway: &GatewayOutcome) -> Vec<Route> {
     gateway
         .listeners
@@ -432,6 +443,10 @@ pub(crate) fn claims(gateway: &GatewayOutcome) -> Vec<Route> {
         .filter_map(|listener| {
             let served = listener.served.as_ref().ok()?;
             let hostname = listener.hostname.as_ref()?;
+            // A TLS listener's hosts are the SNI router's: an HTTP route is never for it.
+            if listener.passes_through {
+                return None;
+            }
             // Named after whose listener it is: names are unique within a Gateway or a
             // ListenerSet alone.
             let stater = listener.set.as_ref().unwrap_or(&gateway.gateway);
@@ -726,6 +741,24 @@ pub(crate) fn translated(
 /// The config routes of the rules `rules` of a route attached as `outcome` says, one for each
 /// listener of `gateway` that serves an attachment with hostnames left, those its claims:
 /// `<kind>/<namespace>/<name>/<listener>`, the kind in lower case.
+/// The config's name for a route's attachment to a listener:
+/// `<kind>/<namespace>/<name>/<listener>`, a ListenerSet's listener named with its set, as a
+/// listener's name is unique within its Gateway or ListenerSet alone.
+pub(crate) fn attachment_name(
+    kind: &str,
+    outcome: &RouteOutcome,
+    attachment: &Attachment,
+) -> String {
+    let on = match &attachment.set {
+        Some(set) => format!("{}/{}/{}", set.namespace, set.name, attachment.listener),
+        None => attachment.listener.clone(),
+    };
+    format!(
+        "{kind}/{}/{}/{on}",
+        outcome.route.namespace, outcome.route.name
+    )
+}
+
 pub(crate) fn config_routes(
     kind: &str,
     outcome: &RouteOutcome,
@@ -746,15 +779,7 @@ pub(crate) fn config_routes(
             let (Ok(served), false) = (&listener.served, attachment.hostnames.is_empty()) else {
                 continue;
             };
-            // A listener's name is unique within its Gateway or ListenerSet alone.
-            let on = match &attachment.set {
-                Some(set) => format!("{}/{}/{}", set.namespace, set.name, attachment.listener),
-                None => attachment.listener.clone(),
-            };
-            let name = format!(
-                "{kind}/{}/{}/{on}",
-                outcome.route.namespace, outcome.route.name
-            );
+            let name = attachment_name(kind, outcome, attachment);
             if routes.iter().any(|known| known.name == name) {
                 continue;
             }
@@ -1376,10 +1401,10 @@ fn backend(
         }),
         resource: None,
     };
-    let calls = if route_kind == "GRPCRoute" {
-        Calls::Grpc
-    } else {
-        Calls::Http
+    let calls = match route_kind {
+        "GRPCRoute" => Calls::Grpc,
+        "TLSRoute" => Calls::Tunnel,
+        _ => Calls::Http,
     };
     match backend_upstream(plane, cluster, namespace, &reference, (calls, false)) {
         Ok(Ok(found)) => Ok(found),

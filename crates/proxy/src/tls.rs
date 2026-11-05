@@ -108,6 +108,10 @@ struct Certificates {
     keys: Vec<Key>,
     /// The one for a client that asks for no name; none, and such a client is refused.
     without_sni: Option<usize>,
+    /// The listeners sharing the port, where one passes its connections through: a name
+    /// that is for one of those is refused as none answers for it. Over TCP it never comes
+    /// to a handshake, carried before; over QUIC, which carries nothing through, it would.
+    passed: Option<Arc<SharedListeners>>,
 }
 
 impl std::fmt::Debug for Tls {
@@ -350,7 +354,13 @@ fn choose_by_name(
                 .get(at)
                 .is_some_and(|key| offered.can_use(*key))
         };
-        let chosen = match ssl.servername(NameType::HOST_NAME) {
+        let asked = ssl.servername(NameType::HOST_NAME);
+        let passed = certificates
+            .passed
+            .as_ref()
+            .is_some_and(|shared| shared.passes_through(asked));
+        let chosen = match asked {
+            _ if passed => None,
             Some(asked) => certificates.names.choose(asked, usable),
             None => certificates.without_sni,
         };
@@ -434,6 +444,11 @@ impl Certificates {
             contexts,
             keys,
             without_sni: source.without_sni,
+            passed: source
+                .shared_by
+                .as_ref()
+                .filter(|shared| shared.passes_some())
+                .map(Arc::clone),
         })
     }
 }
@@ -979,6 +994,55 @@ mod tests {
                     "{name:?}"
                 );
             }
+        }
+
+        /// A name a listener sharing the port passes through is refused over QUIC with
+        /// unrecognized_name, whatever certificate carries it: QUIC carries nothing
+        /// through, and the name is not served here (17 §2). The others are served.
+        #[test]
+        fn a_name_passed_through_is_refused_over_quic() {
+            let yaml = r#"
+listeners:
+  web: { address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [], without_sni: none, shared_by: [{ hostnames: [{ name: "*" }] }, { hostnames: [{ name: passed.test }], passes_through: true }] } }
+routes: []
+upstreams: {}
+"#;
+            let config: edgerush_config::Config = serde_saphyr::from_str(yaml).unwrap();
+            let compiled = edgerush_config::compile(&config).unwrap();
+            let shared_by = compiled.listeners()[0]
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.shared_by.clone());
+            assert!(shared_by.is_some());
+            let both = certificate(&["served.test", "passed.test"]);
+            let tls = Tls::new(&CompiledTls {
+                certificates: vec![presented("both", both.clone())],
+                without_sni: None,
+                refused: Vec::new(),
+                client_validation: None,
+                shared_by,
+            })
+            .unwrap();
+            let client = |name: &str| {
+                quiche::connect(
+                    Some(name),
+                    &id(0xc1, 16),
+                    client_addr(),
+                    server_addr(),
+                    &mut client_config(),
+                )
+                .unwrap()
+            };
+            let pipe = handshake(client("served.test"), &mut worker_config(&tls));
+            assert!(pipe.server.is_established());
+            assert_eq!(pipe.client.peer_cert(), Some(&der(&both)[..]));
+            const UNRECOGNIZED_NAME: u64 = 0x100 + 112;
+            let pipe = handshake(client("Passed.test"), &mut worker_config(&tls));
+            assert!(!pipe.server.is_established());
+            assert_eq!(
+                pipe.client.peer_error().map(|error| error.error_code),
+                Some(UNRECOGNIZED_NAME)
+            );
         }
 
         /// Over QUIC as over TCP, of two certificates for one name a client is given the

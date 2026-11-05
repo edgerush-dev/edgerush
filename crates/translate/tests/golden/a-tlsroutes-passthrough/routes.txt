@@ -1,0 +1,7 @@
+TLSRoute shop/anywhere, section open: attached to open (db.example.org, *.example.net)
+TLSRoute shop/api: attached to wild (no hostname left); api (api.example.com); open (api.example.com)
+TLSRoute shop/nameless, section open: attached to open (*)
+TLSRoute shop/two-rules, section open: attached to open (two.example.org)
+TLSRoute shop/wide, section narrow: attached to narrow (db.example.com)
+TLSRoute shop/weighted, section wild: attached to wild (*.example.com)
+TLSRoute shop/later, section wild: attached to wild (*.example.com, shop.example.com)

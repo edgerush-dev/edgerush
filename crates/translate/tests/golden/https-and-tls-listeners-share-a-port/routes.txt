@@ -1,0 +1,3 @@
+HTTPRoute shop/pages, section https: attached to https (*.example.com)
+TLSRoute shop/api, section api: attached to api (api.example.com)
+TLSRoute shop/tunnels, section tunnels: attached to tunnels (*.secure.example.com)
