@@ -696,11 +696,13 @@ impl GatewayApi {
                     .map(|set| set.set.clone()),
             )
             .collect();
-        // A GRPCRoute's status and a TLSRoute's are merged and written as an HTTPRoute's, of
-        // one type in the spec (gateway_status::grpc_as_http, tls_as_http).
+        // A GRPCRoute's, a TLSRoute's and a TCPRoute's status are merged and written as an
+        // HTTPRoute's, of one type in the spec (gateway_status::grpc_as_http, tls_as_http,
+        // tcp_as_http).
         let http_routes = self.http_routes.as_deref().map(objects).unwrap_or_default();
         let grpc_routes = self.grpc_routes.as_deref().map(objects).unwrap_or_default();
         let tls_routes = self.tls_routes.as_deref().map(objects).unwrap_or_default();
+        let tcp_routes = self.tcp_routes.as_deref().map(objects).unwrap_or_default();
         let routes = http_routes
             .iter()
             .map(|route| ("HTTPRoute", &route.metadata, route.status.clone()))
@@ -711,6 +713,10 @@ impl GatewayApi {
             .chain(tls_routes.iter().map(|route| {
                 let status = route.status.as_ref().map(gateway_status::tls_as_http);
                 ("TLSRoute", &route.metadata, status)
+            }))
+            .chain(tcp_routes.iter().map(|route| {
+                let status = route.status.as_ref().map(gateway_status::tcp_as_http);
+                ("TCPRoute", &route.metadata, status)
             }));
         for (kind, metadata, live) in routes {
             let object = Object {
@@ -736,6 +742,10 @@ impl GatewayApi {
                     }
                     "TLSRoute" => {
                         api.replace_status::<TLSRoute>(namespace, name, version, &status)
+                            .await
+                    }
+                    "TCPRoute" => {
+                        api.replace_status::<TCPRoute>(namespace, name, version, &status)
                             .await
                     }
                     _ => {

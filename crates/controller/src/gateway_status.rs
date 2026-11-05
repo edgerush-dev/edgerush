@@ -22,6 +22,9 @@ use edgerush_gateway_api::http_route::{
 use edgerush_gateway_api::listener_set::{
     ListenerSetStatus, ListenerSetStatusListeners, ListenerSetStatusListenersSupportedKinds,
 };
+use edgerush_gateway_api::tcp_route::{
+    TCPRouteStatus, TCPRouteStatusParents, TCPRouteStatusParentsParentRef,
+};
 use edgerush_gateway_api::tls_route::{
     TLSRouteStatus, TLSRouteStatusParents, TLSRouteStatusParentsParentRef,
 };
@@ -490,6 +493,13 @@ as_http!(
     TLSRouteStatus,
     TLSRouteStatusParents,
     TLSRouteStatusParentsParentRef
+);
+as_http!(
+    /// A TCPRoute's status as an HTTPRoute's.
+    tcp_as_http,
+    TCPRouteStatus,
+    TCPRouteStatusParents,
+    TCPRouteStatusParentsParentRef
 );
 
 /// What the status of a route of `namespace`, of any kind, is to say, as `wanted` has it of its
