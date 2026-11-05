@@ -1,8 +1,8 @@
 //! Where a connection to a `tcp` or `tls` listener goes and why
 //! ([22 §4](../../../docs/22-explain-and-test.md)): a `tcp` listener's one route; a `tls`
-//! listener's by the name its ClientHello asks for, chosen as the passthrough path chooses
-//! it ([`L4::route`]), every route for the name listed as the router crate's walk ranks
-//! them, which is held to that choice.
+//! listener's, and one an `https` listener passes through, by the name its ClientHello
+//! asks for, chosen as the passthrough path chooses it ([`L4::route`]), every route for the
+//! name listed as the router crate's walk ranks them, which is held to that choice.
 
 use crate::explained::{Snapshot, Unexplained, field, protocol_name, verdict};
 use edgerush_config::{Backend, CompiledListener, L4, L4Route};
@@ -24,19 +24,21 @@ pub struct Connected<'s> {
 }
 
 impl Snapshot {
-    /// Decides a connection to `listener`, a `tcp` or `tls` one, whose ClientHello asks for
-    /// `sni`: as the passthrough path decides it, with the walk beside.
+    /// Decides a connection to `listener`, a `tcp` or `tls` one, or an `https` one that
+    /// passes it through, whose ClientHello asks for `sni`: as the passthrough path decides
+    /// it, with the walk beside.
     ///
     /// # Errors
     ///
-    /// For a listener that is not `tcp` or `tls`, or a walk that disagrees with the route
-    /// chosen.
+    /// For a listener that does not carry such a connection, or a walk that disagrees with
+    /// the route chosen.
     pub fn explain_connection<'s>(
         &'s self,
         listener: &'s CompiledListener,
         sni: Option<&str>,
     ) -> Result<Connected<'s>, Unexplained> {
-        let Some(l4) = &listener.l4 else {
+        let carried = listener.l4.as_ref().filter(|_| listener.carries(sni));
+        let Some(l4) = carried else {
             return Err(Unexplained::NotPassthrough(
                 listener.name.clone(),
                 protocol_name(listener.protocol),
@@ -198,6 +200,7 @@ listeners:
   gone: { address: "[::]:5433", protocol: tcp, proxy_protocol: off }
   sni: { address: "[::]:443", protocol: tls, proxy_protocol: off }
   web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  shared: { address: "[::]:8443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [], without_sni: none, shared_by: [{ hostnames: [{ name: "*" }] }, { hostnames: [{ name: "*.example.net", wildcard: any_labels }], passes_through: true }] } }
 routes: []
 tcp_routes:
   - { name: postgres, listeners: [db], backends: [{ upstream: pg, weight: 1 }] }
@@ -207,6 +210,7 @@ tls_routes:
   - { name: api, listeners: [sni], hostnames: [{ name: api.example.com, falls_through: true }], backends: [{ upstream: api, weight: 3 }, { upstream: api-canary, weight: 1 }] }
   - { name: kept, listeners: [sni], hostnames: [{ name: "*.example.org", wildcard: one_label, falls_through: false }], backends: [{ upstream: api, weight: 0 }] }
   - { name: org, listeners: [sni], hostnames: [{ name: www.example.org, falls_through: true }], backends: [{ upstream: api, weight: 1 }] }
+  - { name: passed, listeners: [shared], hostnames: [{ name: api.example.net, falls_through: true }], backends: [{ upstream: api, weight: 1 }] }
 upstreams:
   api: { load_balancer: p2c, endpoints: { listed: [] } }
   api-canary: { load_balancer: p2c, endpoints: { listed: [] } }
@@ -341,6 +345,44 @@ refused   no_backend
         let none = snapshot.explain_connection(sni, None).unwrap();
         assert_eq!((none.route(), none.refused()), (None, Some("no_route")));
         assert!(none.backends().is_empty());
+    }
+
+    /// An `https` listener's connection whose name is for a listener sharing its port that
+    /// passes its connections through is carried, and explained as a `tls` listener's is;
+    /// one for another listener's name, or for none, is handshaken and takes requests.
+    #[test]
+    fn an_https_listener_carries_the_names_it_passes_through() {
+        assert_eq!(
+            explained("shared", Some("api.example.net")),
+            "\
+shared (https)  SNI api.example.net
+
+→ passed  chosen
+
+route     passed
+backends  api (weight 1)
+"
+        );
+        assert_eq!(
+            explained("shared", Some("www.example.net")),
+            "\
+shared (https)  SNI www.example.net
+
+  no route is for this name
+  1 route for other hosts
+
+refused   no_route
+"
+        );
+        let snapshot = snapshot();
+        let shared = snapshot.listener("shared").unwrap();
+        for sni in [Some("www.example.com"), None] {
+            assert_eq!(
+                snapshot.explain_connection(shared, sni).err(),
+                Some(Unexplained::NotPassthrough("shared".to_owned(), "https")),
+                "{sni:?}"
+            );
+        }
     }
 
     #[test]

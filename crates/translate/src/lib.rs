@@ -1848,6 +1848,7 @@ fn sharing<'a>(
         .filter(|hostname| first(hostname))
         .map(|hostname| SharingListener {
             hostnames: vec![sharing_hostname(hostname, Wildcard::AnyLabels)],
+            passes_through: false,
         })
         .collect();
     let hostnames: Vec<SharingHostname> = ingress_hosts
@@ -1855,7 +1856,10 @@ fn sharing<'a>(
         .map(|host| sharing_hostname(host, Wildcard::OneLabel))
         .collect();
     if !hostnames.is_empty() {
-        sharing.push(SharingListener { hostnames });
+        sharing.push(SharingListener {
+            hostnames,
+            passes_through: false,
+        });
     }
     sharing
 }

@@ -53,7 +53,8 @@ pub struct TcpRoute {
 pub struct TlsRoute {
     /// Unique among every kind of route.
     pub name: String,
-    /// The names of the `tls` listeners it is for.
+    /// The names of the listeners it is for: `tls` ones, and `https` ones that pass
+    /// connections through, for the names they pass.
     #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub listeners: Vec<String>,
     /// The names served, matched against the SNI as a request's host is against an HTTP

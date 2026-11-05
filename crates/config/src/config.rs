@@ -263,7 +263,8 @@ pub struct Listener {
     /// How long, in seconds, a `tcp` or `tls` listener's tunnel may carry nothing either
     /// way before both its ends are closed (17 in the docs). An hour unless said otherwise,
     /// as HAProxy's `timeout tunnel` is set in practice: what a tunnel carries (a database's
-    /// connection, a long poll) can be quiet for long. For those listeners only.
+    /// connection, a long poll) can be quiet for long. For those listeners only, and an
+    /// `https` one that passes connections through.
     #[serde(default)]
     #[cfg_attr(
         feature = "schema",
@@ -441,7 +442,9 @@ pub struct Tls {
     /// host is answered 421 Misdirected Request (03 §3 in the docs). Which one a name is
     /// for is the most specific hostname covering it, the client's SNI for the connection
     /// and the request's host for the request; a client that asks for no name is the
-    /// catch-all's, `*`'s. None or one, and nothing is checked.
+    /// catch-all's, `*`'s. None or one, and nothing is checked, unless one passes its
+    /// connections through: then a connection whose SNI is for that one is carried, not
+    /// handshaken.
     #[serde(default)]
     #[cfg_attr(
         feature = "schema",
@@ -459,6 +462,12 @@ pub struct SharingListener {
     /// for none; the hosts an Ingress serves over TLS there are one listener together.
     #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub hostnames: Vec<SharingHostname>,
+    /// Whether it passes its connections through (Gateway API's TLS listener in
+    /// `Passthrough` mode): one whose SNI is for it is carried by the `tls_routes` that
+    /// name this listener, not handshaken (17 §2 in the docs), and none covering it closes
+    /// it. Not said, it is served here.
+    #[serde(default)]
+    pub passes_through: bool,
 }
 
 /// A hostname of a listener sharing a port.

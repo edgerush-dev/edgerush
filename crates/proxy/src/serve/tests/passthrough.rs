@@ -411,7 +411,7 @@ async fn a_tunnel_is_drained_once_a_reload_takes_its_route_away() {
 }
 
 /// A ClientHello asking for `api.example.com`, as BoringSSL sends one: the fuzz target's seed.
-const HELLO: &[u8] = include_bytes!("../../../../../fuzz/seeds/tls_hello/named");
+pub(super) const HELLO: &[u8] = include_bytes!("../../../../../fuzz/seeds/tls_hello/named");
 
 /// A TLS tunnel is known by its route among its listener's: one open across a reload that
 /// takes another route away, and moves its own to another place, is left alone; once a

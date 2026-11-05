@@ -1,5 +1,5 @@
-//! The connections of a `tcp` or `tls` listener, carried to a backend rather than served
-//! (17).
+//! The connections of a `tcp` or `tls` listener, and those an `https` listener passes
+//! through, carried to a backend rather than served (17).
 
 use super::logged::Passing;
 use super::{Connection, Ends, Worker, balance_of, connect_within};
@@ -27,21 +27,31 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 
+/// What a carried connection's route is found by.
+pub(super) enum RouteBy {
+    /// Its listener's one route: a `tcp` listener's.
+    Listener,
+    /// The name its ClientHello asks for, still to be read: a `tls` listener's.
+    Name,
+    /// The name its ClientHello asked for, read already into the block that comes with
+    /// it as what the client has sent: one an `https` listener passes through.
+    Read(String),
+}
+
 impl Worker {
-    /// Carries a connection of a `tcp` or `tls` listener to a backend of its route, byte for
-    /// byte, and counts how it ended ([17 §4](../../docs/17-tcp-and-tls-passthrough.md)),
-    /// and logs it if its listener logs.
-    /// `by_name`: the route is the one whose hostnames cover the name the ClientHello asks
-    /// for, rather than the listener's one route. `ends`: the connection's as a sender's
+    /// Carries a connection of a `tcp` or `tls` listener, or one an `https` listener passes
+    /// through, to a backend of its route, byte for byte, and counts how it ended
+    /// ([17 §4](../../docs/17-tcp-and-tls-passthrough.md)), and logs it if its listener
+    /// logs. `by`: what its route is found by. `ends`: the connection's as a sender's
     /// header named them, which a backend that asks is told of; none, and they are the
-    /// socket's own. `after`: what the client sent after a PROXY header, read with it,
-    /// which goes first. `due`: the end of the stretch from accept in which the ClientHello
+    /// socket's own. `after`: what the client has sent already, read after a PROXY header
+    /// or with the ClientHello, which goes first. `due`: the end of the stretch from accept in which the ClientHello
     /// must come.
     pub(super) async fn pass_through(
         self: Rc<Self>,
         connection: Connection,
         mut client: TcpStream,
-        by_name: bool,
+        by: RouteBy,
         ends: Option<Ends>,
         after: Option<Block>,
         due: Instant,
@@ -52,20 +62,40 @@ impl Worker {
             .carry_through(
                 &connection,
                 &mut client,
-                by_name,
+                by,
                 ends,
                 after,
                 due,
                 logging.as_deref_mut(),
             )
             .await;
+        self.tunnel_ended(listener, ended, logging);
+        drop(connection);
+    }
+
+    /// Counts how a connection carried, or to be, ended, and logs it.
+    fn tunnel_ended(&self, listener: usize, ended: Tunnel, logging: Option<Box<Passing>>) {
         if let Some(counters) = self.proxy.metrics.listener(listener) {
             counters.tunnel(ended);
         }
         if let Some(logging) = logging {
-            logging.ended(&self, ended);
+            logging.ended(self, ended);
         }
-        drop(connection);
+    }
+
+    /// Counts and logs a connection of an `https` listener that passes some through,
+    /// closed before it was found to be passed or served: its ClientHello refused, or not
+    /// read (17 §2).
+    pub(super) fn unsorted(
+        &self,
+        listener: usize,
+        client: &TcpStream,
+        ends: Option<&Ends>,
+        due: Instant,
+        ended: Tunnel,
+    ) {
+        let logging = self.passing(listener, client, ends, due);
+        self.tunnel_ended(listener, ended, logging);
     }
 
     /// A record for a connection of `listener` from `client`, if the listener logs: from
@@ -110,44 +140,48 @@ impl Worker {
         &self,
         connection: &Connection,
         client: &mut TcpStream,
-        by_name: bool,
+        by: RouteBy,
         ends: Option<Ends>,
         after: Option<Block>,
         due: Instant,
         mut logging: Option<&mut Passing>,
     ) -> Tunnel {
-        let (name, hello) = if by_name {
-            let mut block = match after {
-                Some(block) => block,
-                None => match self.blocks.borrow_mut().take() {
+        let (name, hello) = match by {
+            RouteBy::Name => {
+                let mut block = match self.hello_block(after) {
                     Ok(block) => block,
-                    Err(_) => return Tunnel::Exhausted,
-                },
-            };
-            match self.read_hello(client, &mut block, due).await {
-                Ok(name) => {
-                    if let Some(logging) = &mut logging {
-                        logging.named(&name);
+                    Err(ended) => return ended,
+                };
+                // Asking for no name, it asks for no route.
+                match self.read_hello(client, &mut block, due).await {
+                    Ok(Some(name)) => (Some(name), Some(block)),
+                    Ok(None) => {
+                        self.blocks.borrow_mut().give(block);
+                        return Tunnel::Refused;
                     }
-                    (Some(name), Some(block))
-                }
-                Err(ended) => {
-                    self.blocks.borrow_mut().give(block);
-                    return ended;
+                    Err(ended) => {
+                        self.blocks.borrow_mut().give(block);
+                        return ended;
+                    }
                 }
             }
-        } else {
-            // Bytes that came with a header go first; an empty block is given back.
-            let after = after.and_then(|block| {
-                if block.is_empty() {
-                    self.blocks.borrow_mut().give(block);
-                    None
-                } else {
-                    Some(block)
-                }
-            });
-            (None, after)
+            RouteBy::Read(name) => (Some(name), after),
+            RouteBy::Listener => {
+                // Bytes that came with a header go first; an empty block is given back.
+                let after = after.and_then(|block| {
+                    if block.is_empty() {
+                        self.blocks.borrow_mut().give(block);
+                        None
+                    } else {
+                        Some(block)
+                    }
+                });
+                (None, after)
+            }
         };
+        if let (Some(logging), Some(name)) = (&mut logging, &name) {
+            logging.named(name);
+        }
         let routed = self.pass_route(connection.listener, name.as_deref(), logging.as_deref_mut());
         // Held until the tunnel closes: it is load on its backend for as long as it is open.
         let (endpoint, idle, _counted, route) = match routed {
@@ -328,24 +362,34 @@ impl Worker {
         Ok((Arc::clone(identity), compiled.tunnel_idle, counted, drain))
     }
 
+    /// The block a ClientHello is read into: the one that holds what came after a PROXY
+    /// header, which is its start, or one of the worker's.
+    pub(super) fn hello_block(&self, after: Option<Block>) -> Result<Block, Tunnel> {
+        match after {
+            Some(block) => Ok(block),
+            None => self
+                .blocks
+                .borrow_mut()
+                .take()
+                .map_err(|_| Tunnel::Exhausted),
+        }
+    }
+
     /// Reads a TLS client's ClientHello into `into`, by `due`, the end of the first-request
-    /// stretch, and within [`hello::LIMIT`], for the host name it asks for (17 §3). What
-    /// `into` already holds is the start of it.
-    async fn read_hello(
+    /// stretch, and within [`hello::LIMIT`], for the host name it asks for, if any (17 §3).
+    /// What `into` already holds is the start of it.
+    pub(super) async fn read_hello(
         &self,
         client: &mut TcpStream,
         into: &mut Block,
         due: Instant,
-    ) -> Result<String, Tunnel> {
+    ) -> Result<Option<String>, Tunnel> {
         let mut alarm = Alarm::new(&self.timers, None);
         std::future::poll_fn(|cx| {
             loop {
                 match hello::read(into.data()) {
-                    Hello::Whole(Some(name)) => return Poll::Ready(Ok(name)),
-                    // Asking for no name, it asks for no route.
-                    Hello::Whole(None) | Hello::Refused(_) => {
-                        return Poll::Ready(Err(Tunnel::Refused));
-                    }
+                    Hello::Whole(name) => return Poll::Ready(Ok(name)),
+                    Hello::Refused(_) => return Poll::Ready(Err(Tunnel::Refused)),
                     Hello::More => {}
                 }
                 let mut read = ReadBuf::new(into.room());

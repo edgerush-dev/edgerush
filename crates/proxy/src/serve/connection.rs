@@ -1,6 +1,7 @@
 //! A client's connection, from its accept to its close: its PROXY header, its TLS, and the
 //! HTTP it turns out to speak, over TCP or over QUIC.
 
+use super::passthrough::RouteBy;
 use super::{Connection, Ends, Worker, serve_h1, serve_h2, serve_tls};
 use crate::downstream::detect::{Protocol, detect};
 use crate::downstream::h3::listener::Forwarding;
@@ -8,13 +9,13 @@ use crate::downstream::h3::{self, listener as h3_listener};
 use crate::drain::Drain;
 use crate::forwarding::Client;
 use crate::linger::{self, Lent, linger};
-use crate::metrics::ProxyHeader;
+use crate::metrics::{ProxyHeader, Tunnel};
 use crate::proxy_protocol::{self, Header as Said, Read as HeaderRead};
 use crate::request_body::RequestBody;
 use crate::timers::Alarm;
 use crate::tls::Tls;
 use crate::upstream::h1::blocks::Block;
-use edgerush_config::L4;
+use edgerush_config::{CompiledListener, L4};
 use http::Request;
 use std::cell::Cell;
 use std::future::{Future, poll_fn};
@@ -26,6 +27,17 @@ use std::task::Poll;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::Instant;
+
+/// What a connection's listener does with it, as `serve_connection` finds it in the config
+/// it is accepted under.
+struct Settled {
+    /// Its TLS, for an `https` listener.
+    tls: Option<Arc<Tls>>,
+    /// Carried, its route found so.
+    passthrough: Option<RouteBy>,
+    /// Sorted by its ClientHello, carried or served.
+    sorts: bool,
+}
 
 impl Worker {
     /// Serves the connections that come in on `socket` as those of the listener at
@@ -76,7 +88,7 @@ impl Worker {
     pub async fn serve_connection(self: Rc<Self>, listener: usize, stream: TcpStream) {
         // Worth having, not worth refusing a connection over.
         let _unset = stream.set_nodelay(true);
-        let (tls, passthrough, reads_header, drain) = {
+        let (tls, passthrough, sorts, reads_header, drain) = {
             let snapshot = self.proxy.current.load();
             let compiled = snapshot.listener(listener);
             // The TLS of the config the connection came in under, which it keeps to its end,
@@ -86,24 +98,41 @@ impl Worker {
             let drain = self.drain_for(listener, tls.as_ref());
             // A `tcp` or `tls` listener's connections are carried, not served (17).
             let passthrough = compiled
+                .filter(|compiled| compiled.protocol != edgerush_config::Protocol::Https)
                 .and_then(|compiled| compiled.l4.as_ref())
-                .map(|l4| matches!(l4, L4::Tls(_)));
+                .map(|l4| match l4 {
+                    L4::Tcp(_) => RouteBy::Listener,
+                    L4::Tls(_) => RouteBy::Name,
+                });
+            // An `https` listener that passes some through tells them by their ClientHello.
+            let sorts = compiled.is_some_and(CompiledListener::sorts_by_hello);
             let reads_header = compiled.is_some_and(|compiled| compiled.proxy_senders.is_some());
-            (tls, passthrough, reads_header, drain)
+            (tls, passthrough, sorts, reads_header, drain)
         };
         // A connection that starts with a PROXY header is served, or carried, after it, in a
         // future of its own: boxed, and settled first, so that nothing here is held across
         // the wait for it and no other connection's future is the larger for it (14 §3).
         if reads_header {
-            return Box::pin(self.after_header(listener, stream, tls, passthrough, drain)).await;
+            let settled = Settled {
+                tls,
+                passthrough,
+                sorts,
+            };
+            return Box::pin(self.after_header(listener, stream, settled, drain)).await;
         }
-        if let Some(by_name) = passthrough {
+        if let Some(by) = passthrough {
             let connection = Connection::open(Rc::clone(&self), listener, drain);
             let due = Instant::now() + self.deadlines.first_request;
             // Its own ends, asked of the socket only if a backend is to be told of them.
             return self
-                .pass_through(connection, stream, by_name, None, None, due)
+                .pass_through(connection, stream, by, None, None, due)
                 .await;
+        }
+        // Boxed, as TLS is: only a listener that passes some through has one to read.
+        if sorts {
+            let connection = Connection::open(Rc::clone(&self), listener, drain);
+            let due = Instant::now() + self.deadlines.first_request;
+            return Box::pin(self.sort(connection, stream, tls, None, None, due)).await;
         }
         let connection = Rc::new(Connection::open(Rc::clone(&self), listener, drain));
         // Who the upstream is told the client is, written once for all its requests. Gone
@@ -200,17 +229,83 @@ impl Worker {
         }
     }
 
+    /// A connection of an `https` listener that passes some through, sorted by its
+    /// ClientHello, read by `due` into a block (17 §2): carried if the listener its SNI is
+    /// for passes its connections through, its route found by that name; otherwise
+    /// handshaken with `tls`, what was read going first, as what follows a PROXY header
+    /// does. One the reader refuses is closed, never handshaken (17 §3). `ends` and
+    /// `after`: as a PROXY header said them, and what came after it.
+    async fn sort(
+        self: &Rc<Self>,
+        connection: Connection,
+        mut stream: TcpStream,
+        tls: Option<Arc<Tls>>,
+        ends: Option<Ends>,
+        after: Option<Block>,
+        due: Instant,
+    ) {
+        let listener = connection.listener;
+        let mut block = match self.hello_block(after) {
+            Ok(block) => block,
+            Err(ended) => return self.unsorted(listener, &stream, ends.as_ref(), due, ended),
+        };
+        let name = match self.read_hello(&mut stream, &mut block, due).await {
+            Ok(name) => name,
+            Err(ended) => {
+                self.blocks.borrow_mut().give(block);
+                return self.unsorted(listener, &stream, ends.as_ref(), due, ended);
+            }
+        };
+        let carried = self
+            .proxy
+            .current
+            .load()
+            .listener(listener)
+            .is_some_and(|compiled| compiled.carries(name.as_deref()));
+        if carried {
+            // Passed through: carried as a `tls` listener's, the ClientHello first. A
+            // ClientHello that asks for no name is carried only where the catch-all passes
+            // through, and closed there, as no route takes it.
+            let Some(name) = name else {
+                self.blocks.borrow_mut().give(block);
+                return self.unsorted(listener, &stream, ends.as_ref(), due, Tunnel::Refused);
+            };
+            let by = RouteBy::Read(name);
+            return Rc::clone(self)
+                .pass_through(connection, stream, by, ends, Some(block), due)
+                .await;
+        }
+        // Gone only if the client already is.
+        let Ok(peer) = stream.peer_addr() else {
+            self.blocks.borrow_mut().give(block);
+            return;
+        };
+        let (mut lent, back) = Lent::new(stream);
+        // What was read is the start of what the handshake reads.
+        let length = block.len();
+        lent.read_first(block.take_frame(0..length, length));
+        self.blocks.borrow_mut().give(block);
+        let client = ends.map_or(peer, |ends| ends.client);
+        let client = Rc::new(Client::connected(client.ip(), peer));
+        self.serve_settled(Rc::new(connection), tls, client, lent, back, due)
+            .await;
+    }
+
     /// Serves or carries a connection of a listener with senders after the PROXY header it
-    /// starts with (20 §3), its ends as a believed header names them. `tls` and
-    /// `passthrough` are its listener's, as `serve_connection` found them.
+    /// starts with (20 §3), its ends as a believed header names them. `settled`: its
+    /// listener's, as `serve_connection` found them.
     async fn after_header(
         self: &Rc<Self>,
         listener: usize,
         mut stream: TcpStream,
-        tls: Option<Arc<Tls>>,
-        passthrough: Option<bool>,
+        settled: Settled,
         drain: Rc<Drain>,
     ) {
+        let Settled {
+            tls,
+            passthrough,
+            sorts,
+        } = settled;
         // From accept to the first request: one stretch, the header included.
         let due = Instant::now() + self.deadlines.first_request;
         let connection = Connection::open(Rc::clone(self), listener, drain);
@@ -234,9 +329,14 @@ impl Worker {
         };
         // Its ends as a sender named them; none, and they are its own, the socket's, which
         // a tunnel asks for only if a backend is to be told of them.
-        if let Some(by_name) = passthrough {
+        if let Some(by) = passthrough {
             return Rc::clone(self)
-                .pass_through(connection, stream, by_name, said, Some(after), due)
+                .pass_through(connection, stream, by, said, Some(after), due)
+                .await;
+        }
+        if sorts {
+            return self
+                .sort(connection, stream, tls, said, Some(after), due)
                 .await;
         }
         let (mut lent, back) = Lent::new(stream);
