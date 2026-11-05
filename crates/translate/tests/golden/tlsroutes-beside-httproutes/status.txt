@@ -1,0 +1,6 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener http: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener passthrough: TLSRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/pages, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TLSRoute shop/api, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TLSRoute shop/wrong, generation 0, parent web section http: Accepted=False/NotAllowedByListeners (no listener it names takes its kind from its namespace); ResolvedRefs=True/ResolvedRefs
