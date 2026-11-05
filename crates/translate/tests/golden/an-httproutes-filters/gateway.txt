@@ -1,2 +1,2 @@
-listener http: served on port-8080, taking HTTPRoute from every namespace
-listener low: served on port-80, taking HTTPRoute from every namespace
+listener http: served on port-8080, taking HTTPRoute, GRPCRoute from every namespace
+listener low: served on port-80, taking HTTPRoute, GRPCRoute from every namespace

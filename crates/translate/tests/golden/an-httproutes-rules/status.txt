@@ -1,5 +1,5 @@
 Gateway, generation 0: Accepted=True/Accepted
-listener http: HTTPRoute, attached 3: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener http: HTTPRoute, GRPCRoute, attached 3: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 HTTPRoute shop/guarded, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs; PartiallyInvalid=True/UnsupportedValue (Dropped Rule: rule 0 answers 500 for all it matches: a filter of example.com/Login staff is not one EdgeRush has)
 HTTPRoute shop/nothing-left, generation 0, parent web: Accepted=False/UnsupportedValue (no rule is served as written, so it is not accepted); ResolvedRefs=True/ResolvedRefs
 HTTPRoute shop/odd-kind, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=False/InvalidKind (a backend of kind example.com/Other is not one translation reads)

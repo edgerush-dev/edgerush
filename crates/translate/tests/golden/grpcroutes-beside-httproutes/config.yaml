@@ -1,0 +1,80 @@
+listeners:
+  port-8080:
+    address: "0.0.0.0:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  port-8081:
+    address: "0.0.0.0:8081"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  port-8443:
+    address: "0.0.0.0:8443"
+    protocol: https
+    proxy_protocol: off
+    tls: { certificates: [{ certificate: shop/shop-tls, names: [shop.example.com] }], without_sni: none }
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: httproute/shop/pages/http
+    listeners: [port-8080]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { exact: /shop.Orders/Get } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+      - matches: [{ path: { prefix: /shop.Orders } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: httproute/shop/pages/secure
+    listeners: [port-8443]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { exact: /shop.Orders/Get } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+      - matches: [{ path: { prefix: /shop.Orders } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: grpcroute/shop/pages/http
+    listeners: [port-8080]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ grpc: { service: shop.Orders } }]
+        forward: { backends: [{ upstream: shop/web/http/h2c, weight: 1 }] }
+  - name: grpcroute/shop/abroad/http
+    listeners: [port-8080]
+    hostnames: [{ name: abroad.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward:
+          backends:
+            - { upstream: billing/ledger/grpc/h2c, weight: 1 }
+            - { invalid: "Service stock/levels is another namespace's, and no ReferenceGrant there lets GRPCRoutes of shop reach it", weight: 1 }
+  - name: grpcroute/shop/calls/http
+    listeners: [port-8080]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ grpc: { service: shop.Orders, method: Get } }]
+        forward: { backends: [{ upstream: shop/web/http/h2c, weight: 1 }] }
+      - matches: [{ grpc: { service: shop.Orders } }]
+        forward: { backends: [{ upstream: shop/web/http/h2c, weight: 1 }] }
+  - name: grpcroute/shop/calls/secure
+    listeners: [port-8443]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ grpc: { service: shop.Orders, method: Get } }]
+        forward: { backends: [{ upstream: shop/web/http/h2c, weight: 1 }] }
+      - matches: [{ grpc: { service: shop.Orders } }]
+        forward: { backends: [{ upstream: shop/web/http/h2c, weight: 1 }] }
+  - name: gateway/shop/web/secure
+    listeners: [port-8443]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules: []
+upstreams:
+  billing/ledger/grpc/h2c: { protocol: http2, load_balancer: p2c, endpoints: { kubernetes: "ledger.billing.svc.cluster.local:grpc" } }
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }
+  shop/web/http/h2c: { protocol: http2, load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

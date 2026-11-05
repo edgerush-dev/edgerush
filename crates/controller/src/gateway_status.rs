@@ -1,5 +1,5 @@
 //! Gateway API status ([04 §6](../../../docs/04-control-plane.md)): what translation says
-//! the data plane's GatewayClass, Gateway and HTTPRoutes are to say, merged with what each
+//! the data plane's GatewayClass, Gateway and routes are to say, merged with what each
 //! says now as the spec has a controller write it. Each condition of the generation it
 //! says of, its `lastTransitionTime` kept while its status holds; a condition whose
 //! `observedGeneration` is newer left as it is; condition types not this controller's,
@@ -13,6 +13,9 @@ use edgerush_gateway_api::gateway::{
     GatewayStatusListenersSupportedKinds,
 };
 use edgerush_gateway_api::gateway_class::GatewayClassStatus;
+use edgerush_gateway_api::grpc_route::{
+    GRPCRouteStatus, GRPCRouteStatusParents, GRPCRouteStatusParentsParentRef,
+};
 use edgerush_gateway_api::http_route::{
     HTTPRouteStatus, HTTPRouteStatusParents, HTTPRouteStatusParentsParentRef,
 };
@@ -426,7 +429,47 @@ pub(crate) fn addresses(addresses: &[IngressLoadBalancerIngress]) -> Vec<Gateway
         .collect()
 }
 
-/// What the status of an HTTPRoute of `namespace` is to say, as `wanted` has it of its
+/// A GRPCRoute's status as an HTTPRoute's: the spec has one type for both, `RouteStatus`,
+/// of which the generated types are copies, so that each is merged as the other is and
+/// written as the same JSON. Taken apart whole, so that a field one gains and the other not
+/// stops this building.
+pub(crate) fn as_http(status: &GRPCRouteStatus) -> HTTPRouteStatus {
+    let GRPCRouteStatus { parents } = status;
+    HTTPRouteStatus {
+        parents: parents
+            .iter()
+            .map(|parent| {
+                let GRPCRouteStatusParents {
+                    conditions,
+                    controller_name,
+                    parent_ref,
+                } = parent;
+                let GRPCRouteStatusParentsParentRef {
+                    group,
+                    kind,
+                    name,
+                    namespace,
+                    port,
+                    section_name,
+                } = parent_ref;
+                HTTPRouteStatusParents {
+                    conditions: conditions.clone(),
+                    controller_name: controller_name.clone(),
+                    parent_ref: HTTPRouteStatusParentsParentRef {
+                        group: group.clone(),
+                        kind: kind.clone(),
+                        name: name.clone(),
+                        namespace: namespace.clone(),
+                        port: *port,
+                        section_name: section_name.clone(),
+                    },
+                }
+            })
+            .collect(),
+    }
+}
+
+/// What the status of a route of `namespace`, an HTTPRoute or a GRPCRoute, is to say, as `wanted` has it of its
 /// parents that are `parents_of_ours`, the data plane's Gateway and the ListenerSets naming
 /// it, merged with `live`: none wanted where it no longer names one. Other controllers'
 /// parents, and this controller's of other Gateways (other data planes'), are kept whole;

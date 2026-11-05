@@ -1,0 +1,40 @@
+listeners:
+  port-8080:
+    address: "0.0.0.0:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: grpcroute/shop/calls/http
+    listeners: [port-8080]
+    hostnames: [{ name: calls.example.com, falls_through: false }]
+    rules:
+      - matches: [{ grpc: { service: shop.Calls, method: Headers } }]
+        filters:
+          - { type: request_header_modifier, set: [{ name: x-a, value: "1" }], add: [{ name: x-b, value: "2" }], remove: [x-c] }
+          - { type: response_header_modifier, set: [{ name: x-d, value: "3" }], add: [], remove: [] }
+        forward: { backends: [{ upstream: shop/orders/grpc/h2c, weight: 1 }] }
+      - matches: [{ grpc: { service: shop.Calls, method: Mirrored } }]
+        filters:
+          - { type: request_mirror, upstream: shop/shadow/grpc/h2c, fraction: { numerator: 1, denominator: 1 } }
+          - { type: request_mirror, upstream: shop/shadow/h2c, fraction: { numerator: 20, denominator: 100 } }
+        forward: { backends: [{ upstream: shop/orders/grpc/h2c, weight: 1 }] }
+      - matches: [{ grpc: { service: shop.Calls, method: Granted } }]
+        filters: [{ type: request_mirror, upstream: books/shadow/grpc/h2c, fraction: { numerator: 1, denominator: 3 } }]
+        forward: { backends: [{ upstream: shop/orders/grpc/h2c, weight: 1 }] }
+      - matches: [{ grpc: { service: shop.Calls, method: LeftOff } }]
+        forward: { backends: [{ upstream: shop/orders/grpc/h2c, weight: 1 }] }
+      - matches: [{ grpc: { service: shop.Calls, method: Extension } }]
+        forward: { backends: [{ invalid: "a filter of auth.example.com/Check strict is not one EdgeRush has", weight: 1 }] }
+      - matches: [{ grpc: { service: shop.Calls, method: Rewritten } }]
+        forward: { backends: [{ invalid: "a filter of type `URLRewrite` is not one translation reads", weight: 1 }] }
+      - matches: [{ grpc: { service: shop.Calls, method: Bare } }]
+        forward: { backends: [{ invalid: "a RequestMirror filter of no settings", weight: 1 }] }
+      - matches: [{ grpc: { service: shop.Calls, method: Host } }]
+        forward: { backends: [{ invalid: "the data plane would refuse it: route `grpcroute`, rules[0], filters[0]: header `host` is the gateway's own and cannot be modified", weight: 1 }] }
+upstreams:
+  books/shadow/grpc/h2c: { protocol: http2, load_balancer: p2c, endpoints: { kubernetes: "shadow.books.svc.cluster.local:grpc" } }
+  shop/orders/grpc/h2c: { protocol: http2, load_balancer: p2c, endpoints: { kubernetes: "orders.shop.svc.cluster.local:grpc" } }
+  shop/shadow/grpc/h2c: { protocol: http2, load_balancer: p2c, endpoints: { kubernetes: "shadow.shop.svc.cluster.local:grpc" } }
+  shop/shadow/h2c: { protocol: http2, load_balancer: p2c, endpoints: { kubernetes: "shadow.shop.svc.cluster.local:h2c" } }

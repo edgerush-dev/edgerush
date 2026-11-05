@@ -1,33 +1,37 @@
-//! HTTPRoutes attached to the data plane's Gateway ([04 §2](../../../docs/04-control-plane.md)):
-//! each `parentRef` to it fitted to the listeners it names, those that take the route's kind
-//! and namespace, and whose hostnames meet the route's; the hostnames each listener is left
-//! with once those of more specific listeners are taken away (listener isolation); the claim
-//! of no rules each listener's hostname makes; each route's rules, a rule with what
-//! translation cannot take answering 500 for all it matches, one whose matches cannot be
-//! built left out; and every host a claim of one API takes from a claim of the other.
+//! Routes attached to the data plane's Gateway ([04 §2](../../../docs/04-control-plane.md)),
+//! of whichever kind: each `parentRef` to it fitted to the listeners it names, those that
+//! take the route's kind and namespace, and whose hostnames meet the route's; the hostnames
+//! each listener is left with once those of more specific listeners are taken away
+//! (listener isolation); the claim of no rules each listener's hostname makes; each
+//! HTTPRoute's rules, a rule with what translation cannot take answering 500 for all it
+//! matches, one whose matches cannot be built left out; and every host a claim of one API
+//! takes from a claim of the other.
 
 use crate::gateway::{GatewayOutcome, ListenerOutcome};
-use crate::{Cluster, Object, Plane, RefProblem, RefReason, backend_upstream, namespace};
+use crate::{Calls, Cluster, Object, Plane, RefProblem, RefReason, backend_upstream, namespace};
 use edgerush_config::{
     Backend, Filter, Forward, Fraction, Header, HeaderChanges, Hostname, Match, Mirror, PathChange,
     PathMatch, Query, Redirect, Retry, Route, Rule, Scheme, Timeouts, Upstream, UrlRewrite,
     ValueMatch, ValuePredicate, Wildcard,
 };
+use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::{
-    HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesFiltersRequestMirror,
-    HTTPRouteRulesFiltersRequestRedirect, HTTPRouteRulesRetry, HTTPRouteRulesTimeouts,
+    HTTPRoute, HTTPRouteRules, HTTPRouteRulesFilters, HTTPRouteRulesFiltersRequestRedirect,
+    HTTPRouteRulesRetry, HTTPRouteRulesTimeouts,
 };
 use k8s_openapi::api::networking::v1::{IngressBackend, IngressServiceBackend, ServiceBackendPort};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 use std::fmt;
 
 /// The API group of the Gateway API's kinds.
 const GROUP: &str = "gateway.networking.k8s.io";
 
-/// What became of an HTTPRoute that names the data plane's Gateway among its parents.
+/// What became of a route, an HTTPRoute or a GRPCRoute, that names the data plane's
+/// Gateway among its parents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteOutcome {
-    /// The HTTPRoute.
+    /// The route.
     pub route: Object,
     /// Its generation: what its status says of.
     pub generation: i64,
@@ -36,8 +40,8 @@ pub struct RouteOutcome {
     pub parents: Vec<ParentOutcome>,
 }
 
-/// One `parentRef` of an HTTPRoute to the data plane's Gateway, or to a ListenerSet naming
-/// it, and what became of it.
+/// One `parentRef` of a route to the data plane's Gateway, or to a ListenerSet naming it,
+/// and what became of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentOutcome {
     /// The parent's kind: `Gateway` or `ListenerSet`.
@@ -54,7 +58,7 @@ pub struct ParentOutcome {
     pub attached: Result<Vec<Attachment>, NotAttached>,
 }
 
-/// An HTTPRoute attached to one listener.
+/// A route attached to one listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment {
     /// The listener.
@@ -79,7 +83,7 @@ pub enum NotAttached {
     SetNotAttached,
     /// Every listener it names refuses the route's kind or namespace
     /// (`NotAllowedByListeners`).
-    #[error("no listener it names takes an HTTPRoute from its namespace")]
+    #[error("no listener it names takes its kind from its namespace")]
     NotAllowedByListeners,
     /// The route's hostnames meet those of no listener that takes it
     /// (`NoMatchingListenerHostname`).
@@ -128,12 +132,76 @@ impl fmt::Display for RouteOutcome {
     }
 }
 
-/// Every HTTPRoute that names `gateway` among its parents, oldest first and then by
+/// A route of any kind as attachment reads it: its kind, its metadata, its `parentRefs`
+/// and its hostnames, the fields every route kind has alike, generated apart for each.
+pub(crate) struct Routed<'a> {
+    /// The route's kind, `HTTPRoute` or `GRPCRoute`.
+    kind: &'static str,
+    metadata: &'a ObjectMeta,
+    parents: Vec<ParentRef<'a>>,
+    hostnames: &'a [String],
+}
+
+/// One `parentRef` of a route, of whichever kind.
+pub(crate) struct ParentRef<'a> {
+    group: &'a str,
+    kind: &'a str,
+    name: &'a str,
+    namespace: Option<&'a str>,
+    section_name: Option<&'a str>,
+    port: Option<i32>,
+}
+
+/// The parentRefs of a route of a kind the Gateway API generates apart, each of the same
+/// fields.
+macro_rules! parent_refs {
+    ($refs:expr) => {
+        $refs
+            .iter()
+            .flatten()
+            .map(|parent| ParentRef {
+                group: &parent.group,
+                kind: &parent.kind,
+                name: &parent.name,
+                namespace: parent.namespace.as_deref(),
+                section_name: parent.section_name.as_deref(),
+                port: parent.port,
+            })
+            .collect()
+    };
+}
+
+impl<'a> Routed<'a> {
+    /// An HTTPRoute as attachment reads it.
+    pub(crate) fn http(route: &'a HTTPRoute) -> Self {
+        Self {
+            kind: "HTTPRoute",
+            metadata: &route.metadata,
+            parents: parent_refs!(route.spec.parent_refs),
+            hostnames: route.spec.hostnames.as_deref().unwrap_or_default(),
+        }
+    }
+
+    /// A GRPCRoute as attachment reads it.
+    pub(crate) fn grpc(route: &'a GRPCRoute) -> Self {
+        Self {
+            kind: "GRPCRoute",
+            metadata: &route.metadata,
+            parents: parent_refs!(route.spec.parent_refs),
+            hostnames: route.spec.hostnames.as_deref().unwrap_or_default(),
+        }
+    }
+}
+
+/// Every route of `routes` that names `gateway` among its parents, oldest first and then by
 /// namespace and name, as routes rank, and what became of each such `parentRef`.
-pub(crate) fn attached(cluster: &Cluster, gateway: &GatewayOutcome) -> Vec<RouteOutcome> {
-    let mut routes: Vec<&HTTPRoute> = cluster.http_routes.iter().collect();
+pub(crate) fn attached(
+    mut routes: Vec<Routed<'_>>,
+    gateway: &GatewayOutcome,
+    cluster: &Cluster,
+) -> Vec<RouteOutcome> {
     routes.sort_by_key(|route| {
-        let metadata = &route.metadata;
+        let metadata = route.metadata;
         (
             metadata.creation_timestamp.clone(),
             metadata.namespace.clone(),
@@ -141,26 +209,24 @@ pub(crate) fn attached(cluster: &Cluster, gateway: &GatewayOutcome) -> Vec<Route
         )
     });
     routes
-        .into_iter()
+        .iter()
         .filter_map(|route| {
-            let route_namespace = namespace(&route.metadata);
+            let route_namespace = namespace(route.metadata);
             let parents: Vec<ParentOutcome> = route
-                .spec
-                .parent_refs
+                .parents
                 .iter()
-                .flatten()
                 .filter_map(|parent| Some((parent, parent_of(parent, route_namespace, gateway)?)))
                 .map(|(parent, kind)| ParentOutcome {
                     kind: kind.kind(),
-                    namespace: parent.namespace.clone(),
-                    name: parent.name.clone(),
-                    section_name: parent.section_name.clone(),
+                    namespace: parent.namespace.map(str::to_owned),
+                    name: parent.name.to_owned(),
+                    section_name: parent.section_name.map(str::to_owned),
                     port: parent.port,
                     attached: attach(route, route_namespace, parent, &kind, gateway, cluster),
                 })
                 .collect();
             (!parents.is_empty()).then(|| RouteOutcome {
-                route: Object::of("HTTPRoute", &route.metadata),
+                route: Object::of(route.kind, route.metadata),
                 generation: route.metadata.generation.unwrap_or_default(),
                 parents,
             })
@@ -186,16 +252,16 @@ impl Parent<'_> {
 
 /// Which of the data plane's parents `parent`, of a route in `route_namespace`, is, if any.
 fn parent_of<'a>(
-    parent: &HTTPRouteParentRefs,
+    parent: &ParentRef<'_>,
     route_namespace: &str,
     gateway: &'a GatewayOutcome,
 ) -> Option<Parent<'a>> {
     if parent.group != GROUP {
         return None;
     }
-    let namespace = parent.namespace.as_deref().unwrap_or(route_namespace);
+    let namespace = parent.namespace.unwrap_or(route_namespace);
     let is = |object: &Object| object.namespace == namespace && object.name == parent.name;
-    match parent.kind.as_str() {
+    match parent.kind {
         "Gateway" if is(&gateway.gateway) => Some(Parent::Gateway),
         "ListenerSet" => gateway
             .sets
@@ -208,9 +274,9 @@ fn parent_of<'a>(
 
 /// The listeners `parent`, which is `kind`, attaches `route` to, or why none.
 fn attach(
-    route: &HTTPRoute,
+    route: &Routed<'_>,
     route_namespace: &str,
-    parent: &HTTPRouteParentRefs,
+    parent: &ParentRef<'_>,
     kind: &Parent<'_>,
     gateway: &GatewayOutcome,
     cluster: &Cluster,
@@ -228,12 +294,7 @@ fn attach(
         .iter()
         .filter(|listener| listener.set.as_ref() == set)
         .filter(accepted)
-        .filter(|l| {
-            parent
-                .section_name
-                .as_ref()
-                .is_none_or(|section| *section == l.name)
-        })
+        .filter(|l| parent.section_name.is_none_or(|section| section == l.name))
         .filter(|l| parent.port.is_none_or(|port| port == i32::from(l.port)))
         .collect();
     if named.is_empty() {
@@ -241,13 +302,13 @@ fn attach(
     }
     let taking: Vec<&ListenerOutcome> = named
         .into_iter()
-        .filter(|l| l.allowed.kinds.contains(&"HTTPRoute"))
+        .filter(|l| l.allowed.kinds.contains(&route.kind))
         .filter(|l| l.allowed.namespaces.allow(route_namespace, cluster))
         .collect();
     if taking.is_empty() {
         return Err(NotAttached::NotAllowedByListeners);
     }
-    let own: &[String] = route.spec.hostnames.as_deref().unwrap_or_default();
+    let own = route.hostnames;
     let mut attachments = Vec::new();
     for listener in taking {
         let met: Vec<String> = if own.is_empty() {
@@ -432,7 +493,7 @@ impl fmt::Display for Taken {
 }
 
 /// A route's object, from its name: `Ingress shop/web`, `Gateway edge/web listener api`,
-/// `ListenerSet shop/team listener api`, `HTTPRoute shop/web`.
+/// `ListenerSet shop/team listener api`, `HTTPRoute shop/web`, `GRPCRoute shop/calls`.
 fn described(route: &str) -> String {
     let mut parts = route.splitn(4, '/');
     let (api, namespace, name, rest) = (parts.next(), parts.next(), parts.next(), parts.next());
@@ -447,6 +508,7 @@ fn described(route: &str) -> String {
             rest.unwrap_or_default()
         ),
         (Some("httproute"), Some(namespace), Some(name)) => format!("HTTPRoute {namespace}/{name}"),
+        (Some("grpcroute"), Some(namespace), Some(name)) => format!("GRPCRoute {namespace}/{name}"),
         _ => route.to_owned(),
     }
 }
@@ -455,7 +517,7 @@ fn described(route: &str) -> String {
 fn api(route: &Route) -> Option<&'static str> {
     if route.name.starts_with("ingress/") {
         Some("Ingress")
-    } else if ["gateway/", "listenerset/", "httproute/"]
+    } else if ["gateway/", "listenerset/", "httproute/", "grpcroute/"]
         .iter()
         .any(|prefix| route.name.starts_with(prefix))
     {
@@ -517,9 +579,9 @@ fn takes(ours: &Hostname, theirs: &Hostname) -> bool {
     }
 }
 
-/// What an HTTPRoute's rules come to: its config routes, one for each listener it is attached
-/// to, and the upstreams they lead to; the rules left out, each with why; the rules that
-/// answer 500 for all they match, each with why; the backends answered 500, each with why;
+/// What a route's rules come to: its config routes, one for each listener it is attached to,
+/// and the upstreams they lead to; the rules left out, each with why; the rules that answer
+/// for all they match, each with why; the backends whose share is answered, each with why;
 /// and the mirrors left off, each with why.
 #[derive(Debug, Default)]
 pub(crate) struct Translated {
@@ -563,8 +625,8 @@ pub(crate) fn translated(
         let taken = match unsupported(rule) {
             Some(why) => Err(why),
             None => filtered(
-                rule,
-                route_namespace,
+                rule.filters.iter().flatten().map(written),
+                ("HTTPRoute", route_namespace),
                 plane,
                 cluster,
                 &mut upstreams,
@@ -603,12 +665,20 @@ pub(crate) fn translated(
                 filters: filters.clone(),
                 forward: Some(Forward {
                     backends: backends(
-                        rule,
-                        route_namespace,
+                        rule.backend_refs.iter().flatten().map(|written| {
+                            let reference = Reference {
+                                group: &written.group,
+                                kind: &written.kind,
+                                name: &written.name,
+                                namespace: written.namespace.as_deref(),
+                                port: written.port,
+                            };
+                            (written.weight, reference)
+                        }),
+                        ("HTTPRoute", route_namespace),
                         plane,
                         cluster,
-                        &mut upstreams,
-                        &mut invalid,
+                        (&mut upstreams, &mut invalid),
                     ),
                     timeouts: settings.timeouts.clone(),
                     retry: settings.retry.clone(),
@@ -647,9 +717,22 @@ pub(crate) fn translated(
         translated.upstreams.extend(upstreams);
         rules.push(compiled);
     }
-    if rules.is_empty() {
-        return translated;
+    if !rules.is_empty() {
+        translated.routes = config_routes("httproute", outcome, gateway, &rules);
     }
+    translated
+}
+
+/// The config routes of the rules `rules` of a route attached as `outcome` says, one for each
+/// listener of `gateway` that serves an attachment with hostnames left, those its claims:
+/// `<kind>/<namespace>/<name>/<listener>`, the kind in lower case.
+pub(crate) fn config_routes(
+    kind: &str,
+    outcome: &RouteOutcome,
+    gateway: &GatewayOutcome,
+    rules: &[Rule],
+) -> Vec<Route> {
+    let mut routes: Vec<Route> = Vec::new();
     for parent in &outcome.parents {
         let Ok(attachments) = &parent.attached else {
             continue;
@@ -669,13 +752,13 @@ pub(crate) fn translated(
                 None => attachment.listener.clone(),
             };
             let name = format!(
-                "httproute/{}/{}/{on}",
+                "{kind}/{}/{}/{on}",
                 outcome.route.namespace, outcome.route.name
             );
-            if translated.routes.iter().any(|known| known.name == name) {
+            if routes.iter().any(|known| known.name == name) {
                 continue;
             }
-            translated.routes.push(Route {
+            routes.push(Route {
                 name,
                 listeners: served.clone(),
                 hostnames: attachment.hostnames.iter().map(|h| claim(h)).collect(),
@@ -687,11 +770,12 @@ pub(crate) fn translated(
             });
         }
     }
-    translated
+    routes
 }
 
-/// A rule that answers 500 for every request its matches take, saying why.
-fn answering(matches: Vec<Match>, why: &str) -> Rule {
+/// A rule that answers 500 for every request its matches take, a call `UNAVAILABLE`,
+/// saying why.
+pub(crate) fn answering(matches: Vec<Match>, why: &str) -> Rule {
     Rule {
         matches,
         filters: Vec::new(),
@@ -781,20 +865,133 @@ fn unsupported(rule: &HTTPRouteRules) -> Option<String> {
 /// A rule's filters as the config has them: those done to a request or its answer, in the
 /// order written, and a redirect.
 #[derive(Debug)]
-struct Filtered {
-    filters: Vec<Filter>,
-    redirect: Option<Redirect>,
+pub(crate) struct Filtered {
+    pub(crate) filters: Vec<Filter>,
+    pub(crate) redirect: Option<Redirect>,
 }
 
-/// A rule's filters as the config has them, the upstreams its mirrors copy to put in
-/// `upstreams` and the mirrors whose backend is not there or not permitted left off and said
-/// in `left_off`, as the spec has them not configured; or why translation cannot take them.
-/// A request's header changes beside a redirect are left out, as nothing goes upstream for
-/// them to change and nothing a client sees differs; a mirror beside one cannot be, as its
-/// upstream would be sent nothing ([18 §2](../../../docs/18-redirects-and-rewrites.md)).
-fn filtered(
-    rule: &HTTPRouteRules,
-    route_namespace: &str,
+/// A filter of a route of either kind as translation reads it, before its mirror's backend
+/// is looked up.
+pub(crate) enum Written<'a> {
+    /// A filter done as written: a change to the request's or the answer's headers, or a URL
+    /// rewrite.
+    Done(Filter),
+    /// A mirror of the share of requests said to the backend referred to.
+    Mirror(Reference<'a>, Fraction),
+    /// A redirect.
+    Redirect(Redirect),
+}
+
+/// An HTTPRoute's filter as translation reads it, or why translation cannot take it.
+fn written(filter: &HTTPRouteRulesFilters) -> Result<Written<'_>, String> {
+    let missing = || no_settings(&filter.r#type);
+    match filter.r#type.as_str() {
+        "RequestHeaderModifier" => {
+            let changes = filter
+                .request_header_modifier
+                .as_ref()
+                .ok_or_else(missing)?;
+            Ok(Written::Done(Filter::RequestHeaderModifier(
+                header_changes(
+                    changes.set.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.add.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.remove.iter().flatten(),
+                ),
+            )))
+        }
+        "ResponseHeaderModifier" => {
+            let changes = filter
+                .response_header_modifier
+                .as_ref()
+                .ok_or_else(missing)?;
+            Ok(Written::Done(Filter::ResponseHeaderModifier(
+                header_changes(
+                    changes.set.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.add.iter().flatten().map(|h| (&h.name, &h.value)),
+                    changes.remove.iter().flatten(),
+                ),
+            )))
+        }
+        "RequestRedirect" => {
+            let written = filter.request_redirect.as_ref().ok_or_else(missing)?;
+            Ok(Written::Redirect(redirected(written)?))
+        }
+        "URLRewrite" => {
+            let written = filter.url_rewrite.as_ref().ok_or_else(missing)?;
+            let path = written
+                .path
+                .as_ref()
+                .map(|path| {
+                    path_change(
+                        &path.r#type,
+                        path.replace_full_path.as_deref(),
+                        path.replace_prefix_match.as_deref(),
+                    )
+                })
+                .transpose()?;
+            Ok(Written::Done(Filter::UrlRewrite(UrlRewrite {
+                host: written.hostname.clone(),
+                path,
+            })))
+        }
+        "RequestMirror" => {
+            let written = filter.request_mirror.as_ref().ok_or_else(missing)?;
+            let fraction = mirrored(
+                written.percent,
+                written
+                    .fraction
+                    .as_ref()
+                    .map(|fraction| (fraction.numerator, fraction.denominator)),
+            )?;
+            let to = &written.backend_ref;
+            let reference = Reference {
+                group: &to.group,
+                kind: &to.kind,
+                name: &to.name,
+                namespace: to.namespace.as_deref(),
+                port: to.port,
+            };
+            Ok(Written::Mirror(reference, fraction))
+        }
+        "CORS" => Err("not supported yet: CORS".to_owned()),
+        "ExtensionRef" => {
+            let extension = filter.extension_ref.as_ref().ok_or_else(missing)?;
+            Err(no_extension(
+                &extension.group,
+                &extension.kind,
+                &extension.name,
+            ))
+        }
+        other => Err(not_read(other)),
+    }
+}
+
+/// Why a filter that has none of its type's settings cannot be taken.
+pub(crate) fn no_settings(kind: &str) -> String {
+    format!("a {kind} filter of no settings")
+}
+
+/// Why an `ExtensionRef` filter cannot be taken: EdgeRush has no filter of another API.
+pub(crate) fn no_extension(group: &str, kind: &str, name: &str) -> String {
+    format!("a filter of {group}/{kind} {name} is not one EdgeRush has")
+}
+
+/// Why a filter of a type the route's kind does not have cannot be taken.
+pub(crate) fn not_read(kind: &str) -> String {
+    format!("a filter of type `{kind}` is not one translation reads")
+}
+
+/// A rule's filters, `written` as translation reads them, as the config has them, its mirrors'
+/// backends reached as `route`'s (its kind and namespace) are: the upstreams its mirrors copy
+/// to put in `upstreams` and the mirrors whose backend is not there or not permitted left off
+/// and said in `left_off`, as the spec has them not configured; or why translation cannot
+/// take them, the first filter's that it cannot. A request's header changes beside a redirect
+/// are left out, as nothing goes upstream for them to change and nothing a client sees
+/// differs; a mirror beside one cannot be, as its upstream would be sent nothing
+/// ([18 §2](../../../docs/18-redirects-and-rewrites.md)).
+pub(crate) fn filtered<'a>(
+    written: impl Iterator<Item = Result<Written<'a>, String>>,
+    route: (&str, &str),
     plane: &Plane,
     cluster: &Cluster,
     upstreams: &mut BTreeMap<String, Upstream>,
@@ -802,65 +999,12 @@ fn filtered(
 ) -> Result<Filtered, String> {
     let mut filters = Vec::new();
     let mut redirect = None;
-    for written in rule.filters.iter().flatten() {
-        let missing = || format!("a {} filter of no settings", written.r#type);
-        match written.r#type.as_str() {
-            "RequestHeaderModifier" => {
-                let changes = written
-                    .request_header_modifier
-                    .as_ref()
-                    .ok_or_else(missing)?;
-                filters.push(Filter::RequestHeaderModifier(header_changes(
-                    changes.set.iter().flatten().map(|h| (&h.name, &h.value)),
-                    changes.add.iter().flatten().map(|h| (&h.name, &h.value)),
-                    changes.remove.iter().flatten(),
-                )));
-            }
-            "ResponseHeaderModifier" => {
-                let changes = written
-                    .response_header_modifier
-                    .as_ref()
-                    .ok_or_else(missing)?;
-                filters.push(Filter::ResponseHeaderModifier(header_changes(
-                    changes.set.iter().flatten().map(|h| (&h.name, &h.value)),
-                    changes.add.iter().flatten().map(|h| (&h.name, &h.value)),
-                    changes.remove.iter().flatten(),
-                )));
-            }
-            "RequestRedirect" => {
-                let written = written.request_redirect.as_ref().ok_or_else(missing)?;
-                redirect = Some(redirected(written)?);
-            }
-            "URLRewrite" => {
-                let written = written.url_rewrite.as_ref().ok_or_else(missing)?;
-                let path = written
-                    .path
-                    .as_ref()
-                    .map(|path| {
-                        path_change(
-                            &path.r#type,
-                            path.replace_full_path.as_deref(),
-                            path.replace_prefix_match.as_deref(),
-                        )
-                    })
-                    .transpose()?;
-                filters.push(Filter::UrlRewrite(UrlRewrite {
-                    host: written.hostname.clone(),
-                    path,
-                }));
-            }
-            "RequestMirror" => {
-                let written = written.request_mirror.as_ref().ok_or_else(missing)?;
-                let fraction = mirrored(written)?;
-                let to = &written.backend_ref;
-                let reference = Reference {
-                    group: &to.group,
-                    kind: &to.kind,
-                    name: &to.name,
-                    namespace: to.namespace.as_deref(),
-                    port: to.port,
-                };
-                match backend(&reference, route_namespace, plane, cluster) {
+    for written in written {
+        match written? {
+            Written::Done(filter) => filters.push(filter),
+            Written::Redirect(written) => redirect = Some(written),
+            Written::Mirror(reference, fraction) => {
+                match backend(&reference, route, plane, cluster) {
                     Ok((name, upstream)) => {
                         upstreams.insert(name.clone(), upstream);
                         filters.push(Filter::RequestMirror(Mirror {
@@ -870,19 +1014,6 @@ fn filtered(
                     }
                     Err(why) => left_off.push(why),
                 }
-            }
-            "CORS" => return Err("not supported yet: CORS".to_owned()),
-            "ExtensionRef" => {
-                let extension = written.extension_ref.as_ref().ok_or_else(missing)?;
-                return Err(format!(
-                    "a filter of {}/{} {} is not one EdgeRush has",
-                    extension.group, extension.kind, extension.name
-                ));
-            }
-            other => {
-                return Err(format!(
-                    "a filter of type `{other}` is not one translation reads"
-                ));
             }
         }
     }
@@ -900,8 +1031,12 @@ fn filtered(
     Ok(Filtered { filters, redirect })
 }
 
-/// The share of requests a mirror copies: its percent, its fraction, or every one.
-fn mirrored(written: &HTTPRouteRulesFiltersRequestMirror) -> Result<Fraction, String> {
+/// The share of requests a mirror copies: its percent, its fraction (numerator, denominator),
+/// or every one.
+pub(crate) fn mirrored(
+    percent: Option<i32>,
+    fraction: Option<(i32, i32)>,
+) -> Result<Fraction, String> {
     let share = |numerator: i32, denominator: i32| match (
         u32::try_from(numerator),
         u32::try_from(denominator),
@@ -912,15 +1047,15 @@ fn mirrored(written: &HTTPRouteRulesFiltersRequestMirror) -> Result<Fraction, St
         }),
         _ => Err(format!("a mirror of {numerator} in {denominator}")),
     };
-    match (written.percent, &written.fraction) {
+    match (percent, fraction) {
         (Some(percent), _) => share(percent, 100),
-        (None, Some(fraction)) => share(fraction.numerator, fraction.denominator),
+        (None, Some((numerator, denominator))) => share(numerator, denominator),
         (None, None) => share(1, 1),
     }
 }
 
 /// Header changes as the config has them.
-fn header_changes<'a>(
+pub(crate) fn header_changes<'a>(
     set: impl Iterator<Item = (&'a String, &'a String)>,
     add: impl Iterator<Item = (&'a String, &'a String)>,
     remove: impl Iterator<Item = &'a String>,
@@ -1120,28 +1255,21 @@ fn milliseconds(written: &str) -> Result<u64, String> {
     Ok(total)
 }
 
-/// A rule's backends as the config has them, their upstreams put in `upstreams` and those
-/// answered 500 said in `invalid`.
-fn backends(
-    rule: &HTTPRouteRules,
-    route_namespace: &str,
+/// A rule's backends as the config has them, `written` each with its weight, named by a
+/// route of the kind and namespace `route`; their upstreams put in `upstreams` and those
+/// whose share is answered said in `invalid`.
+pub(crate) fn backends<'a>(
+    written: impl Iterator<Item = (i32, Reference<'a>)>,
+    route: (&str, &str),
     plane: &Plane,
     cluster: &Cluster,
-    upstreams: &mut BTreeMap<String, Upstream>,
-    invalid: &mut Vec<RefProblem>,
+    (upstreams, invalid): (&mut BTreeMap<String, Upstream>, &mut Vec<RefProblem>),
 ) -> Vec<Backend> {
     let mut backends = Vec::new();
-    for written in rule.backend_refs.iter().flatten() {
+    for (weight, reference) in written {
         // The schema holds a weight to 0–1,000,000.
-        let weight = u32::try_from(written.weight).unwrap_or_default();
-        let reference = Reference {
-            group: &written.group,
-            kind: &written.kind,
-            name: &written.name,
-            namespace: written.namespace.as_deref(),
-            port: written.port,
-        };
-        match backend(&reference, route_namespace, plane, cluster) {
+        let weight = u32::try_from(weight).unwrap_or_default();
+        match backend(&reference, route, plane, cluster) {
             Ok((name, upstream)) => {
                 upstreams.insert(name.clone(), upstream);
                 backends.push(Backend {
@@ -1160,7 +1288,8 @@ fn backends(
             }
         }
     }
-    // A rule of no backend answers 500, as the spec has it: one invalid backend says why.
+    // A rule of no backend answers 500, a call `UNAVAILABLE`, as the spec has it: one
+    // invalid backend says why.
     if backends.is_empty() {
         backends.push(Backend {
             upstream: None,
@@ -1172,7 +1301,12 @@ fn backends(
 }
 
 /// A header's or query parameter's match, or why it is not one translation reads.
-fn predicate(name: &str, kind: &str, value: &str, what: &str) -> Result<ValuePredicate, String> {
+pub(crate) fn predicate(
+    name: &str,
+    kind: &str,
+    value: &str,
+    what: &str,
+) -> Result<ValuePredicate, String> {
     let value = match kind {
         "Exact" => ValueMatch::Exact(value.to_owned()),
         "RegularExpression" => ValueMatch::Regex(value.to_owned()),
@@ -1189,20 +1323,21 @@ fn predicate(name: &str, kind: &str, value: &str, what: &str) -> Result<ValuePre
 }
 
 /// A backend a route names: for a request to go to, or a mirror to copy it to.
-struct Reference<'a> {
-    group: &'a str,
-    kind: &'a str,
-    name: &'a str,
-    namespace: Option<&'a str>,
-    port: Option<i32>,
+pub(crate) struct Reference<'a> {
+    pub(crate) group: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) namespace: Option<&'a str>,
+    pub(crate) port: Option<i32>,
 }
 
 /// The upstream a backend leads to, by name, as an Ingress backend of the same Service and
-/// port does; or why it is invalid: its share answered 500, or a mirror to it left off. A
-/// Service of another namespace is reached only where a ReferenceGrant there allows it.
+/// port does, spoken to as the referring route's kind calls (a GRPCRoute in HTTP/2); or why
+/// it is invalid: its share answered, or a mirror to it left off. A Service of another
+/// namespace is reached only where a ReferenceGrant there allows it.
 fn backend(
     written: &Reference<'_>,
-    route_namespace: &str,
+    (route_kind, route_namespace): (&str, &str),
     plane: &Plane,
     cluster: &Cluster,
 ) -> Result<(String, Upstream), RefProblem> {
@@ -1218,7 +1353,7 @@ fn backend(
     let namespace = written.namespace.unwrap_or(route_namespace);
     reachable(
         cluster,
-        ("HTTPRoute", route_namespace),
+        (route_kind, route_namespace),
         ("Service", namespace, written.name),
     )
     .map_err(|why| RefProblem {
@@ -1241,7 +1376,12 @@ fn backend(
         }),
         resource: None,
     };
-    match backend_upstream(plane, cluster, namespace, &reference, false) {
+    let calls = if route_kind == "GRPCRoute" {
+        Calls::Grpc
+    } else {
+        Calls::Http
+    };
+    match backend_upstream(plane, cluster, namespace, &reference, (calls, false)) {
         Ok(Ok(found)) => Ok(found),
         Ok(Err(missing)) => Err(missing),
         Err(problem) => Err(RefProblem {

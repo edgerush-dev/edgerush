@@ -146,11 +146,11 @@ fn listener_line(f: &mut fmt::Formatter<'_>, listener: &ListenerStatus) -> fmt::
     Ok(())
 }
 
-/// What an HTTPRoute's status is to say for each of its parents that is the data plane's
-/// Gateway.
+/// What a route's status, an HTTPRoute's or a GRPCRoute's, is to say for each of its parents
+/// that is the data plane's Gateway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteStatus {
-    /// The HTTPRoute.
+    /// The route, its kind among it.
     pub route: Object,
     /// The generation it says of.
     pub generation: i64,
@@ -158,7 +158,7 @@ pub struct RouteStatus {
     pub parents: Vec<ParentStatus>,
 }
 
-/// What an HTTPRoute's status is to say of one of its parents.
+/// What a route's status is to say of one of its parents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentStatus {
     /// The parent's kind: `Gateway` or `ListenerSet`.

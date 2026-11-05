@@ -1,6 +1,6 @@
 listener kinds-mixed: served on port-8080, taking HTTPRoute from namespace edge
 listener kinds-none-carried: served on port-8080, taking no route from namespace edge
-listener every-namespace: served on port-8080, taking HTTPRoute from every namespace
-listener selected: served on port-8080, taking HTTPRoute from namespaces labelled team=shop, stage in (live, canary), !frozen
-listener unreadable-operator: served on port-8080, taking HTTPRoute from no namespace
-listener unreadable-from: served on port-8080, taking HTTPRoute from no namespace
+listener every-namespace: served on port-8080, taking HTTPRoute, GRPCRoute from every namespace
+listener selected: served on port-8080, taking HTTPRoute, GRPCRoute from namespaces labelled team=shop, stage in (live, canary), !frozen
+listener unreadable-operator: served on port-8080, taking HTTPRoute, GRPCRoute from no namespace
+listener unreadable-from: served on port-8080, taking HTTPRoute, GRPCRoute from no namespace

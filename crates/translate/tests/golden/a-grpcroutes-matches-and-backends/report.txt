@@ -1,0 +1,4 @@
+GRPCRoute shop/orders: rule 4 answers UNAVAILABLE for all it matches: not supported yet: a backend's filters
+GRPCRoute shop/orders: rule 6: a backend's share is answered UNAVAILABLE: Service shop/orders port ws has appProtocol kubernetes.io/ws; a GRPCRoute's backend is spoken to in HTTP/2 in the clear, on a port of none or of kubernetes.io/h2c, grpc or http2
+GRPCRoute shop/orders: rule 6: a backend's share is answered UNAVAILABLE: Service shop/orders port web has appProtocol http; a GRPCRoute's backend is spoken to in HTTP/2 in the clear, on a port of none or of kubernetes.io/h2c, grpc or http2
+GRPCRoute shop/orders: path /shop.Orders/Get (Exact) on orders.example.com is already an earlier rule's of its own

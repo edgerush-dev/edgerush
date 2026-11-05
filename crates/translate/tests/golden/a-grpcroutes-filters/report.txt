@@ -1,0 +1,7 @@
+GRPCRoute shop/calls: rule 4 answers UNAVAILABLE for all it matches: a filter of auth.example.com/Check strict is not one EdgeRush has
+GRPCRoute shop/calls: rule 5 answers UNAVAILABLE for all it matches: a filter of type `URLRewrite` is not one translation reads
+GRPCRoute shop/calls: rule 6 answers UNAVAILABLE for all it matches: a RequestMirror filter of no settings
+GRPCRoute shop/calls: rule 7 answers UNAVAILABLE for all it matches: the data plane would refuse it: route `grpcroute`, rules[0], filters[0]: header `host` is the gateway's own and cannot be modified
+GRPCRoute shop/calls: rule 3: a mirror is left off, the rule served without it: Service shop/gone does not exist
+GRPCRoute shop/calls: rule 3: a mirror is left off, the rule served without it: Service blog/shadow is another namespace's, and no ReferenceGrant there lets GRPCRoutes of shop reach it
+GRPCRoute shop/calls: rule 3: a mirror is left off, the rule served without it: Service shop/shadow port web has appProtocol http; a GRPCRoute's backend is spoken to in HTTP/2 in the clear, on a port of none or of kubernetes.io/h2c, grpc or http2

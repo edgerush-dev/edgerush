@@ -1,1 +1,1 @@
-listener https: served on port-443, presenting shop/shop-tls, taking HTTPRoute from namespace shop
+listener https: served on port-443, presenting shop/shop-tls, taking HTTPRoute, GRPCRoute from namespace shop

@@ -1,0 +1,117 @@
+# A GRPCRoute's filters, as an HTTPRoute's of their type: changes to the call's and the
+# answer's headers, in the order written; mirrors, each copying its share of the calls,
+# every one unless it says a percent or a fraction, to its backend, reached as a backend
+# of the route is (in HTTP/2, another namespace's where a ReferenceGrant from GRPCRoutes
+# allows it). A mirror whose backend is not there, not permitted, or not one spoken to in
+# HTTP/2 is left off and said, the rule served without it. An ExtensionRef, a type a
+# GRPCRoute does not have, a filter of no settings and a header the data plane will not
+# change each answer UNAVAILABLE for all the rule matches.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: calls, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [calls.example.com]
+  rules:
+    - matches: [{ method: { service: shop.Calls, method: Headers } }]
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set: [{ name: x-a, value: "1" }]
+            add: [{ name: x-b, value: "2" }]
+            remove: [x-c]
+        - type: ResponseHeaderModifier
+          responseHeaderModifier: { set: [{ name: x-d, value: "3" }] }
+      backendRefs: [{ name: orders, port: 50051 }]
+    - matches: [{ method: { service: shop.Calls, method: Mirrored } }]
+      filters:
+        - type: RequestMirror
+          requestMirror: { backendRef: { name: shadow, port: 50051 } }
+        - type: RequestMirror
+          requestMirror: { backendRef: { name: shadow, port: 50052 }, percent: 20 }
+      backendRefs: [{ name: orders, port: 50051 }]
+    - matches: [{ method: { service: shop.Calls, method: Granted } }]
+      filters:
+        - type: RequestMirror
+          requestMirror: { backendRef: { name: shadow, namespace: books, port: 50051 }, fraction: { numerator: 1, denominator: 3 } }
+      backendRefs: [{ name: orders, port: 50051 }]
+    - matches: [{ method: { service: shop.Calls, method: LeftOff } }]
+      filters:
+        - type: RequestMirror
+          requestMirror: { backendRef: { name: gone, port: 50051 } }
+        - type: RequestMirror
+          requestMirror: { backendRef: { name: shadow, namespace: blog, port: 50051 } }
+        - type: RequestMirror
+          requestMirror: { backendRef: { name: shadow, port: 8081 } }
+      backendRefs: [{ name: orders, port: 50051 }]
+    - matches: [{ method: { service: shop.Calls, method: Extension } }]
+      filters:
+        - type: ExtensionRef
+          extensionRef: { group: auth.example.com, kind: Check, name: strict }
+      backendRefs: [{ name: orders, port: 50051 }]
+    - matches: [{ method: { service: shop.Calls, method: Rewritten } }]
+      filters: [{ type: URLRewrite }]
+      backendRefs: [{ name: orders, port: 50051 }]
+    - matches: [{ method: { service: shop.Calls, method: Bare } }]
+      filters: [{ type: RequestMirror }]
+      backendRefs: [{ name: orders, port: 50051 }]
+    - matches: [{ method: { service: shop.Calls, method: Host } }]
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier: { set: [{ name: Host, value: other.example.com }] }
+      backendRefs: [{ name: orders, port: 50051 }]
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: { name: from-shop, namespace: books }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: GRPCRoute, namespace: shop }]
+  to: [{ group: "", kind: Service }]
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: { name: from-shop, namespace: blog }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: shop }]
+  to: [{ group: "", kind: Service }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: orders, namespace: shop }
+spec:
+  ports: [{ name: grpc, port: 50051 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: shadow, namespace: shop }
+spec:
+  ports:
+    - { name: grpc, port: 50051 }
+    - { name: h2c, port: 50052, appProtocol: kubernetes.io/h2c }
+    - { name: web, port: 8081, appProtocol: http }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: shadow, namespace: books }
+spec:
+  ports: [{ name: grpc, port: 50051 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: shadow, namespace: blog }
+spec:
+  ports: [{ name: grpc, port: 50051 }]

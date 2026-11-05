@@ -6,6 +6,7 @@
 use crate::ApiError;
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
@@ -123,6 +124,10 @@ impl Kind for ListenerSet {
 }
 
 impl Kind for HTTPRoute {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for GRPCRoute {
     const NAMESPACED: bool = true;
 }
 
