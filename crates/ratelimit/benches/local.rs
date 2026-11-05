@@ -2,7 +2,8 @@
 //! for an existing key): a worker deciding on a key it holds a handle to, admitted and
 //! refused, among a thousand other keys; under two and three limits; and meeting a key it
 //! holds no handle to, in a registry of a hundred thousand: found, and made. And the same
-//! decision by a synchronous owner, which marks the keys it changes.
+//! decision by a synchronous owner, which marks the keys it changes; and under a fixed
+//! window, admitted and refused.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-ratelimit --bench local`, see the
 //! repository README.
@@ -12,7 +13,7 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_ratelimit::local::{Decision, Handles, Local};
+use edgerush_ratelimit::local::{Decision, Handles, Local, Window};
 use edgerush_ratelimit::service::{Contract, Keyed};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
@@ -91,6 +92,33 @@ fn decide(setup: (Worker, Contract)) -> (Decision, Worker) {
     (decision, worker)
 }
 
+/// A worker holding handles to a thousand windows of `limit` a second and `KEY`'s, each
+/// asked about once, at the time the decision measured is made.
+fn held_window(limit: u64) -> (Worker, Window) {
+    let n = |n| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
+    let window = Window {
+        limit: n(limit),
+        window: n(1_000 * MS),
+    };
+    let mut worker: Worker = Box::new((Local::new(hasher(), 4), Handles::new(hasher())));
+    let keys = (0..1_000).map(|k| format!("api/0\0key-{k}").into_bytes());
+    for key in keys.chain([KEY.to_vec()]) {
+        let (local, handles) = &mut *worker;
+        local.decide(handles, &[(&key, window)], MS);
+    }
+    (worker, window)
+}
+
+#[library_benchmark]
+#[bench::admitted(held_window(100))]
+#[bench::refused(held_window(1))]
+fn decide_window(setup: (Worker, Window)) -> (Decision, Worker) {
+    let (mut worker, window) = setup;
+    let (local, handles) = &mut *worker;
+    let decision = local.decide(handles, black_box(&[(KEY, window)]), black_box(MS));
+    (decision, worker)
+}
+
 #[library_benchmark]
 #[bench::two(held(100), 2)]
 #[bench::three(held(100), 3)]
@@ -128,5 +156,8 @@ fn first_meeting(setup: (Worker, Contract)) -> (Decision, Worker) {
     (decision, worker)
 }
 
-library_benchmark_group!(name = local; benchmarks = decide, decide_all, first_meeting);
+library_benchmark_group!(
+    name = local;
+    benchmarks = decide, decide_window, decide_all, first_meeting
+);
 main!(library_benchmark_groups = local);

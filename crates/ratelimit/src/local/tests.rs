@@ -1,10 +1,11 @@
-//! Local mode's limiter against the reference bucket it keeps (`reference::TokenBucket`),
-//! and its registry: keys made, shared, forgotten and evicted.
+//! Local mode's limiter against the references it keeps (`reference::TokenBucket`, and
+//! `reference::FixedWindow` aligned to the clock), and its registry: keys made, shared,
+//! forgotten and evicted.
 
 #![cfg(not(loom))]
 
 use super::*;
-use crate::reference::{Model, TokenBucket};
+use crate::reference::{Alignment, FixedWindow, Model, TokenBucket};
 use crate::service::FixedState;
 use proptest::prelude::*;
 use std::collections::HashMap;
@@ -474,7 +475,7 @@ fn every_key_a_filter_takes_is_copied_as_it_stands() {
 /// A key for the set a worker's handles and the registry's shards keep their keys in
 /// (`key_set`, #111).
 fn held_key(name: &[u8]) -> Arc<Key> {
-    Arc::new(Key::new(name.into(), contract(10, SECOND, 10), 0))
+    Arc::new(Key::new(name.into(), contract(10, SECOND, 10).into(), 0, 0))
 }
 
 proptest! {
@@ -586,4 +587,258 @@ fn an_enormous_limit_refuses_none_with_a_clock_behind() {
     let c = contract(u64::MAX / 4, SECOND, u64::MAX / 4);
     assert!(one(&local, &mut handles, b"k", c, 1_000));
     assert!((0..100).all(|_| one(&local, &mut handles, b"k", c, 0)));
+}
+
+fn window(limit: u64, window: u64) -> Window {
+    let n = |n| NonZeroU64::new(n).unwrap();
+    Window {
+        limit: n(limit),
+        window: n(window),
+    }
+}
+
+/// How far `key`'s windows are shifted in `local`: where its first window after 0 starts
+/// is the window less this.
+fn offset(local: &Local<FixedState>, key: &[u8], window: u64) -> u64 {
+    local.hasher.hash_one(key) % window
+}
+
+/// Decides one request under `key`'s window alone.
+fn one_in(
+    local: &Local<FixedState>,
+    handles: &mut Handles<FixedState>,
+    key: &[u8],
+    w: Window,
+    now: u64,
+) -> bool {
+    local.decide(handles, &[(key, w)], now) == Decision::Admit
+}
+
+#[test]
+fn a_window_admits_its_limit_in_each_of_its_windows() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let w = window(3, SECOND);
+    let start = SECOND - offset(&local, b"k", SECOND);
+    let admitted = |handles: &mut Handles<FixedState>, now| {
+        (0..5)
+            .filter(|_| one_in(&local, handles, b"k", w, now))
+            .count()
+    };
+    assert_eq!(admitted(&mut handles, start), 3);
+    assert_eq!(
+        admitted(&mut handles, start + SECOND - 1),
+        0,
+        "the window's last moment"
+    );
+    assert_eq!(admitted(&mut handles, start + SECOND), 3, "the next window");
+}
+
+#[test]
+fn a_window_refusal_waits_until_its_window_ends() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let w = window(1, SECOND);
+    let start = SECOND - offset(&local, b"k", SECOND);
+    assert!(one_in(&local, &mut handles, b"k", w, start));
+    let Decision::Refuse { position: 0, wait } =
+        local.decide(&mut handles, &[(b"k", w)], start + 300 * MS)
+    else {
+        panic!("refused");
+    };
+    assert_eq!(wait, 700 * MS);
+    assert!(one_in(
+        &local,
+        &mut handles,
+        b"k",
+        w,
+        start + 300 * MS + wait
+    ));
+}
+
+/// Keys' windows are shifted by their hashes, so that their boundaries spread: two keys
+/// whose offsets differ end their windows apart.
+#[test]
+fn keys_windows_end_at_their_own_offsets() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let w = window(1, SECOND);
+    let (a, b) = (offset(&local, b"a", SECOND), offset(&local, b"b", SECOND));
+    assert_ne!(a, b, "the test needs keys of different offsets");
+    for (key, off) in [(&b"a"[..], a), (&b"b"[..], b)] {
+        let end = 2 * SECOND - off;
+        assert!(one_in(&local, &mut handles, key, w, end - 1));
+        assert!(!one_in(&local, &mut handles, key, w, end - 1));
+        assert!(one_in(&local, &mut handles, key, w, end));
+    }
+}
+
+#[test]
+fn a_give_back_takes_one_off_its_own_window_only() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let w = window(1, SECOND);
+    let start = SECOND - offset(&local, b"k", SECOND);
+    assert!(one_in(&local, &mut handles, b"k", w, start));
+    local.give_back(&mut handles, &[(b"k", w)], start + MS);
+    assert!(
+        one_in(&local, &mut handles, b"k", w, start + 2 * MS),
+        "given back"
+    );
+    // Given back in the next window, the charge from the one before is nothing to it.
+    local.give_back(&mut handles, &[(b"k", w)], start + SECOND);
+    assert!(one_in(&local, &mut handles, b"k", w, start + SECOND));
+    assert!(!one_in(&local, &mut handles, b"k", w, start + SECOND));
+}
+
+#[test]
+fn a_quiet_window_is_forgotten_once_it_counts_none() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let w = window(5, SECOND);
+    let start = SECOND - offset(&local, b"k", SECOND);
+    assert!(one_in(&local, &mut handles, b"k", w, start));
+    assert_eq!(
+        local.sweep(start + SECOND - 1, 0).forgotten,
+        0,
+        "still counting"
+    );
+    assert_eq!(local.sweep(start + SECOND, 0).forgotten, 1);
+}
+
+/// A key unused for as many windows as its windows' numbers take to come round is a fresh
+/// one, not the window it last counted in: its word's number is the same as the window's.
+#[test]
+fn a_window_unused_while_its_numbers_come_round_is_fresh() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let w = window(1, MS);
+    let start = MS - offset(&local, b"k", MS);
+    assert!(one_in(&local, &mut handles, b"k", w, start));
+    let round = (NUMBER_MASK + 1) * MS;
+    assert!(one_in(&local, &mut handles, b"k", w, start + round));
+    // The same under two keys, which a decision looks at before charging either.
+    let both = [(&b"a"[..], w), (&b"b"[..], w)];
+    assert_eq!(local.decide(&mut handles, &both, 0), Decision::Admit);
+    assert_eq!(local.decide(&mut handles, &both, round), Decision::Admit);
+}
+
+#[test]
+fn a_window_and_a_bucket_charge_all_or_none() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let both: [(&[u8], Limit); 2] = [
+        (b"b", contract(1, SECOND, 1).into()),
+        (b"w", window(2, 10 * SECOND).into()),
+    ];
+    assert_eq!(local.decide(&mut handles, &both, 0), Decision::Admit);
+    assert!(matches!(
+        local.decide(&mut handles, &both, 0),
+        Decision::Refuse { position: 0, .. }
+    ));
+    // The refusal charged the window nothing: one of its two is left.
+    let w = window(2, 10 * SECOND);
+    assert!(one_in(&local, &mut handles, b"w", w, 0));
+    assert!(!one_in(&local, &mut handles, b"w", w, 0));
+}
+
+#[test]
+fn a_windows_count_saturates_in_its_bits() {
+    assert_eq!(Span::count(Span::word(7, COUNT_MASK + 5), 7), COUNT_MASK);
+    assert_eq!(Span::count(Span::word(7, 3), 8), 0, "another window's");
+}
+
+/// Eviction takes the keys that will count none soonest first: a window's time is to its
+/// end while it counts, none once it counts none.
+#[test]
+fn a_window_is_counting_until_its_end() {
+    let local = local();
+    let w = window(5, SECOND);
+    let start = SECOND - offset(&local, b"k", SECOND);
+    let key = local.find_or_make(b"k", w.into(), start);
+    assert_eq!(key.full_in(start), 0, "counted none");
+    assert!(key.charge(start));
+    assert_eq!(key.full_in(start + 400 * MS), 600 * MS);
+    assert_eq!(key.full_in(start + SECOND), 0);
+}
+
+#[test]
+fn windows_are_never_copied() {
+    let local = Local::tracking(FixedState::default(), 1);
+    let mut handles = Handles::new(FixedState::default());
+    assert!(one_in(&local, &mut handles, b"k", window(5, SECOND), 0));
+    assert!(local.copies(&handles.take_changed(), 0).is_empty());
+    assert!(local.copies_of(0, |_| true).is_empty());
+}
+
+/// Times that go back as well as forward, as several workers' clocks do: each is a gap from
+/// the one before, at least 0.
+fn wandering(window: u64, gaps: &[i64]) -> Vec<u64> {
+    let mut now: i64 = 0;
+    let span = i64::try_from(window).unwrap();
+    gaps.iter()
+        .map(|gap| {
+            now = (now + gap * span / 100).max(0);
+            u64::try_from(now).unwrap()
+        })
+        .collect()
+}
+
+proptest! {
+    /// A key's window decides as the reference's aligned to the clock, shifted by the key's
+    /// offset, and a refusal waits until the reference would admit, a clock behind the key's
+    /// last charge decided as of that charge, as the reference has it.
+    #[test]
+    fn one_window_decides_as_the_reference(
+        limit in 1_u64..20,
+        window_ms in 1_u64..2_000,
+        gaps in proptest::collection::vec(-30_i64..150, 1..300),
+    ) {
+        let w = window(limit, window_ms * MS);
+        let local = local();
+        let mut handles = Handles::new(FixedState::default());
+        let off = offset(&local, b"k", w.window.get());
+        let mut reference = FixedWindow::new(w.limit, w.window, Alignment::Clock);
+        let mut last = 0;
+        for now in wandering(w.window.get(), &gaps) {
+            let shifted = now + off;
+            let expected = reference.decide(shifted);
+            match local.decide(&mut handles, &[(b"k", w)], now) {
+                Decision::Admit => {
+                    prop_assert!(expected, "admitted at {}", now);
+                    last = last.max(now);
+                }
+                Decision::Refuse { wait, .. } => {
+                    prop_assert!(!expected, "refused at {}", now);
+                    let retry = reference.retry_at(shifted).unwrap();
+                    prop_assert_eq!(wait, retry - (now.max(last) + off), "at {}", now);
+                }
+            }
+        }
+    }
+
+    /// Two windows on two keys, decided together, as the references are: all or none.
+    #[test]
+    fn two_windows_decide_as_the_references_together(
+        limits in (1_u64..10, 1_u64..10),
+        windows_ms in (1_u64..500, 1_u64..500),
+        gaps in proptest::collection::vec(-30_i64..150, 1..300),
+    ) {
+        let (a, b) = (window(limits.0, windows_ms.0 * MS), window(limits.1, windows_ms.1 * MS));
+        let local = local();
+        let mut handles = Handles::new(FixedState::default());
+        let (off_a, off_b) = (offset(&local, b"a", a.window.get()), offset(&local, b"b", b.window.get()));
+        let mut ref_a = FixedWindow::new(a.limit, a.window, Alignment::Clock);
+        let mut ref_b = FixedWindow::new(b.limit, b.window, Alignment::Clock);
+        let keys = [(&b"a"[..], a), (&b"b"[..], b)];
+        for now in wandering(a.window.get().min(b.window.get()), &gaps) {
+            let expected = ref_a.admits(now + off_a) && ref_b.admits(now + off_b);
+            if expected {
+                ref_a.charge(now + off_a);
+                ref_b.charge(now + off_b);
+            }
+            let admitted = local.decide(&mut handles, &keys, now) == Decision::Admit;
+            prop_assert_eq!(admitted, expected, "at {}", now);
+        }
+    }
 }

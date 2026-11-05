@@ -1,8 +1,8 @@
 //! Local mode (06 §4): each data-plane process limits on what it sees alone, with no
 //! rate-limiting service and nothing shared with other processes.
 //!
-//! A key is one 64-bit atomic, its bucket's arrival time as GCRA keeps it (governor's way),
-//! in a registry the process's workers share. A worker keeps its own handles to the keys it
+//! A key is one 64-bit atomic — its bucket's arrival time as GCRA keeps it (governor's way),
+//! or its fixed window's number and count — in a registry the process's workers share. A worker keeps its own handles to the keys it
 //! has met, so that a decision takes no lock: it reads the key's word and swaps in the
 //! charged one. A request under several limits is admitted only if every one has room, read
 //! first and charged after: two racing on the last room of a limit may both be admitted, a
@@ -13,7 +13,8 @@
 //!
 //! Times are nanoseconds from any origin the caller keeps to, as everywhere in the crate.
 //! A bucket's arrival time is kept in units of 1/65,536 of a request's interval, modulo
-//! 2^63; the top bit of the word marks a key forgotten.
+//! 2^63; a window's number modulo 2^23 above its count in 40 bits. The top bit of the word
+//! marks a key forgotten.
 
 mod key_set;
 mod sync;
@@ -27,6 +28,7 @@ pub use crate::service::Contract;
 
 use key_set::{KeySet, SLOT_BYTES};
 use std::hash::BuildHasher;
+use std::num::NonZeroU64;
 use sync::{Arc, AtomicBool, AtomicU64, Ordering, RwLock};
 
 /// The tables a worker's handles are split into, by bits of each key's hash: each doubles
@@ -45,6 +47,13 @@ const CLOSED: u64 = 1 << 63;
 /// The most of a bucket kept: past it, a bucket is this big. Keeps the tolerance far within
 /// [`AHEAD_BELOW`].
 const MOST_BURST: u64 = 1 << 40;
+/// A window's count: the word's low bits, saturating there.
+const COUNT_BITS: u32 = 40;
+const COUNT_MASK: u64 = (1 << COUNT_BITS) - 1;
+/// A window's number, modulo the bits between the count and the top bit: enough that a word
+/// is never mistaken for one of a window as many later, which a key unused for longer than
+/// a window is never read as.
+const NUMBER_MASK: u64 = (1 << (63 - COUNT_BITS)) - 1;
 /// How many shards the registry has: a worker meeting a key it holds no handle to takes one
 /// shard's lock, and the sweep takes each in turn. A few under loom, which tracks each lock.
 const SHARDS: usize = if cfg!(loom) { 2 } else { 256 };
@@ -107,13 +116,97 @@ impl Rate {
     }
 }
 
-/// One key: its bucket's arrival time, and when it was last asked for.
+/// A fixed window's contract: at most `limit` requests in each window of a key, its
+/// windows shifted by an offset from its hash so that keys' boundaries spread (06 §3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Window {
+    /// Requests a window.
+    pub limit: NonZeroU64,
+    /// The window, in nanoseconds.
+    pub window: NonZeroU64,
+}
+
+/// What a key is held to: a bucket or a fixed window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limit {
+    /// A bucket, by GCRA.
+    Bucket(Contract),
+    /// A fixed window.
+    FixedWindow(Window),
+}
+
+impl From<Contract> for Limit {
+    fn from(contract: Contract) -> Self {
+        Self::Bucket(contract)
+    }
+}
+
+impl From<Window> for Limit {
+    fn from(window: Window) -> Self {
+        Self::FixedWindow(window)
+    }
+}
+
+/// A fixed window's arithmetic: times to windows' numbers, and a number and count to a
+/// word and back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Span {
+    limit: u64,
+    window: u64,
+    /// How far the key's windows are shifted: below the window.
+    offset: u64,
+}
+
+impl Span {
+    fn new(window: Window, hash: u64) -> Self {
+        Self {
+            limit: window.limit.get(),
+            window: window.window.get(),
+            offset: hash % window.window.get(),
+        }
+    }
+
+    /// The number of the window `at` is in.
+    fn number(&self, at: u64) -> u64 {
+        at.saturating_add(self.offset) / self.window
+    }
+
+    /// The word holding `count` in window `number`.
+    fn word(number: u64, count: u64) -> u64 {
+        ((number & NUMBER_MASK) << COUNT_BITS) | count.min(COUNT_MASK)
+    }
+
+    /// What `word` counted in window `number`: none if it holds another window.
+    fn count(word: u64, number: u64) -> u64 {
+        if (word >> COUNT_BITS) & NUMBER_MASK == number & NUMBER_MASK {
+            word & COUNT_MASK
+        } else {
+            0
+        }
+    }
+
+    /// Nanoseconds from `at` until its window ends.
+    fn left(&self, at: u64) -> u64 {
+        self.window - at.saturating_add(self.offset) % self.window
+    }
+}
+
+/// How a key's word is read.
+#[derive(Debug)]
+enum Held {
+    Bucket(Rate),
+    Window(Span),
+}
+
+/// One key: its bucket's arrival time or its window's count, and when it was last asked
+/// for.
 #[derive(Debug)]
 pub struct Key {
     key: Box<[u8]>,
-    contract: Contract,
-    rate: Rate,
-    /// The arrival time in units, the top bit set once the key is closed.
+    contract: Limit,
+    held: Held,
+    /// The arrival time in units, or the window's number and count; the top bit set once
+    /// the key is closed.
     word: AtomicU64,
     /// The latest time a request was charged under it, moved before the charge lands.
     last: AtomicU64,
@@ -133,22 +226,39 @@ enum Look {
 }
 
 impl Key {
-    fn new(key: Box<[u8]>, contract: Contract, now: u64) -> Self {
-        let rate = Rate::new(contract);
+    fn new(key: Box<[u8]>, contract: Limit, hash: u64, now: u64) -> Self {
+        let (held, word) = match contract {
+            Limit::Bucket(contract) => {
+                let rate = Rate::new(contract);
+                (Held::Bucket(rate), rate.units(now))
+            }
+            Limit::FixedWindow(window) => {
+                let span = Span::new(window, hash);
+                (Held::Window(span), Span::word(span.number(now), 0))
+            }
+        };
         Self {
             key,
             contract,
-            rate,
-            word: AtomicU64::new(rate.units(now)),
+            held,
+            word: AtomicU64::new(word),
             last: AtomicU64::new(now),
             changed: AtomicBool::new(false),
         }
     }
 
     /// One request's charge at `now` given back: the bucket a request's room fuller, never
-    /// fuller than full. False if the key was closed.
+    /// fuller than full; a window's count one less while it is the window charged. False if
+    /// the key was closed.
     fn give_back(&self, now: u64) -> bool {
-        let now_units = self.rate.units(now);
+        match &self.held {
+            Held::Bucket(rate) => self.bucket_give_back(rate, now),
+            Held::Window(span) => self.window_give_back(span, now),
+        }
+    }
+
+    fn bucket_give_back(&self, rate: &Rate, now: u64) -> bool {
+        let now_units = rate.units(now);
         loop {
             let word = self.word.load(Ordering::Acquire);
             if word & CLOSED != 0 {
@@ -170,6 +280,35 @@ impl Key {
         }
     }
 
+    fn window_give_back(&self, span: &Span, now: u64) -> bool {
+        loop {
+            let word = self.word.load(Ordering::Acquire);
+            if word & CLOSED != 0 {
+                return false;
+            }
+            if self.idle(now) {
+                return true;
+            }
+            let number = span.number(now.max(self.last.load(Ordering::Relaxed)));
+            let count = Span::count(word, number);
+            if count == 0 {
+                return true;
+            }
+            if self
+                .word
+                .compare_exchange_weak(
+                    word,
+                    Span::word(number, count - 1),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
     /// Marks it changed where `tracking`: true if this is its first change since its last
     /// copy, for the change's connection to gather it. Always a swap, never a look first: a
     /// look could see the mark a copy has just cleared and gather nothing, while the copy
@@ -178,26 +317,38 @@ impl Key {
         tracking && !self.changed.swap(true, Ordering::AcqRel)
     }
 
+    /// Its bucket's contract: none for a window, which no owner copies.
+    fn bucket(&self) -> Option<Contract> {
+        match self.contract {
+            Limit::Bucket(contract) => Some(contract),
+            Limit::FixedWindow(_) => None,
+        }
+    }
+
     /// Its state as a copy at `now`, marked unchanged first, so that a change made while it
     /// is read marks it again, for the next copy. A swap, as the change's mark is: whichever
     /// comes second sees the other, so a change is in this copy or marked for the next.
-    fn copy(&self, now: u64) -> Copy {
+    /// None for a window.
+    fn copy(&self, now: u64) -> Option<Copy> {
+        let contract = self.bucket()?;
         self.changed.swap(false, Ordering::AcqRel);
-        Copy {
+        Some(Copy {
             key: self.key.clone(),
-            contract: self.contract,
+            contract,
             full_in: self.full_in(now),
-        }
+        })
     }
 
     /// At least as full as one full in `full_in` nanoseconds from `now`: an owner's copy
     /// taken in. Never emptier (#88): a copy from an owner the view has moved on from can
     /// arrive after this pod has charged the key as its new owner, and would erase those
-    /// charges; of the two, the fuller holds.
+    /// charges; of the two, the fuller holds. A window is left as it is: no owner copies one.
     fn set_full_in(&self, full_in: u64, now: u64) {
-        let now_units = self.rate.units(now);
-        let copied = self
-            .rate
+        let Held::Bucket(rate) = &self.held else {
+            return;
+        };
+        let now_units = rate.units(now);
+        let copied = rate
             .units(now.saturating_add(full_in))
             .wrapping_sub(now_units)
             & MASK;
@@ -225,14 +376,23 @@ impl Key {
         self.word.load(Ordering::Acquire) & CLOSED != 0
     }
 
-    /// Whether, at `now`, the key went unused for longer than its bucket takes to refill:
-    /// full, whatever its word says once its clock has come round. Sound because a charge
-    /// moves the last use before it lands ([`charge_from`]): a word read is never older than
-    /// the last use read after it.
+    /// How long a key goes unused before it is fresh whatever its word says: its bucket's
+    /// refill, or its window.
+    fn refill(&self) -> u64 {
+        match &self.held {
+            Held::Bucket(rate) => rate.refill,
+            Held::Window(span) => span.window,
+        }
+    }
+
+    /// Whether, at `now`, the key went unused for longer than its bucket takes to refill or
+    /// than its window: fresh, whatever its word says once its clock or its windows' numbers
+    /// have come round. Sound because a charge moves the last use before it lands
+    /// ([`charge_from`]): a word read is never older than the last use read after it.
     ///
     /// [`charge_from`]: Self::charge_from
     fn idle(&self, now: u64) -> bool {
-        now.saturating_sub(self.last.load(Ordering::Relaxed)) > self.rate.refill
+        now.saturating_sub(self.last.load(Ordering::Relaxed)) > self.refill()
     }
 
     /// The arrival time as of `now` (units `now_units`) from `word`: as it is, unless the key
@@ -249,23 +409,50 @@ impl Key {
             return Look::Closed;
         }
         let last = self.last.load(Ordering::Relaxed);
-        if now.saturating_sub(last) > self.rate.refill {
-            let now_units = self.rate.units(now);
-            return self.fits(word, now_units, now_units);
+        match &self.held {
+            Held::Bucket(rate) => {
+                if now.saturating_sub(last) > rate.refill {
+                    let now_units = rate.units(now);
+                    return Self::fits(rate, word, now_units, now_units);
+                }
+                Self::fits(rate, word, word, rate.units(now.max(last)))
+            }
+            Held::Window(span) => Self::window_look(span, word, last, now),
         }
-        self.fits(word, word, self.rate.units(now.max(last)))
+    }
+
+    /// The same for a window, its word and last use read as `word` and `last`.
+    fn window_look(span: &Span, word: u64, last: u64, now: u64) -> Look {
+        let at = now.max(last);
+        let count = if now.saturating_sub(last) > span.window {
+            0
+        } else {
+            Span::count(word, span.number(at))
+        };
+        Self::window_fits(span, word, count, at)
     }
 
     /// Whether a request at `now_units` fits, the bucket's arrival time `arrival` as of then.
-    fn fits(&self, word: u64, arrival: u64, now_units: u64) -> Look {
+    fn fits(rate: &Rate, word: u64, arrival: u64, now_units: u64) -> Look {
         let ahead = Rate::ahead(arrival, now_units);
-        if ahead > self.rate.tolerance {
+        if ahead > rate.tolerance {
             return Look::Full {
-                wait: self.rate.nanos(ahead - self.rate.tolerance),
+                wait: rate.nanos(ahead - rate.tolerance),
             };
         }
         let from = if ahead > 0 { arrival } else { now_units };
         Look::Fits { word, from }
+    }
+
+    /// Whether a request at `at` fits a window that has counted `count`: `from` is the count
+    /// it charges from.
+    fn window_fits(span: &Span, word: u64, count: u64, at: u64) -> Look {
+        if count >= span.limit {
+            return Look::Full {
+                wait: span.left(at),
+            };
+        }
+        Look::Fits { word, from: count }
     }
 
     /// The word a charge at `now` (units `now_units`) is to replace, and the time in units it
@@ -277,7 +464,7 @@ impl Key {
     /// A request whose clock is behind the key's last charge, as one worker's can be behind
     /// another's, is decided as of that charge (#108): taken at its own time, it would see
     /// the charge as still to come, the bucket emptier than it is by the refill between.
-    fn word_to_charge(&self, now: u64, now_units: u64) -> Option<(u64, u64)> {
+    fn word_to_charge(&self, rate: &Rate, now: u64, now_units: u64) -> Option<(u64, u64)> {
         loop {
             let word = self.word.load(Ordering::Acquire);
             if word & CLOSED != 0 {
@@ -285,9 +472,9 @@ impl Key {
             }
             let last = self.last.load(Ordering::Relaxed);
             if last > now {
-                return Some((word, self.rate.units(last)));
+                return Some((word, rate.units(last)));
             }
-            if now - last <= self.rate.refill {
+            if now - last <= rate.refill {
                 return Some((word, now_units));
             }
             if self
@@ -300,18 +487,41 @@ impl Key {
         }
     }
 
-    /// Replaces `word` with a request charged from `from` at `now`, false if the word
-    /// changed. The last use moves first, so that a worker reading the charge reads a last
-    /// use at least as recent, and never takes the key for idle and charges over it.
-    fn charge_from(&self, word: u64, from: u64, now: u64) -> bool {
+    /// A window's word a charge at `now` is to replace, the time it is decided at, and what
+    /// the window has counted then; `None` if the key was closed. As a bucket's
+    /// ([`word_to_charge`](Self::word_to_charge)): decided as of the last charge if `now` is
+    /// behind it, and an idle key's word first made a fresh window's before a charge moves
+    /// its last use, so that no worker reads a word from before the idle spell, its number
+    /// perhaps come round, beside a recent last use.
+    fn window_to_charge(&self, span: &Span, now: u64) -> Option<(u64, u64, u64)> {
+        loop {
+            let word = self.word.load(Ordering::Acquire);
+            if word & CLOSED != 0 {
+                return None;
+            }
+            let last = self.last.load(Ordering::Relaxed);
+            let at = now.max(last);
+            if now.saturating_sub(last) <= span.window {
+                return Some((word, at, Span::count(word, span.number(at))));
+            }
+            let fresh = Span::word(span.number(now), 0);
+            if self
+                .word
+                .compare_exchange(word, fresh, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some((fresh, now, 0));
+            }
+        }
+    }
+
+    /// Replaces `word` with `charged`, a charge at `now`, false if the word changed. The last
+    /// use moves first, so that a worker reading the charge reads a last use at least as
+    /// recent, and never takes the key for idle and charges over it.
+    fn charge_from(&self, word: u64, charged: u64, now: u64) -> bool {
         self.last.fetch_max(now, Ordering::Relaxed);
         self.word
-            .compare_exchange(
-                word,
-                from.wrapping_add(UNITS) & MASK,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .compare_exchange(word, charged, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
@@ -319,14 +529,39 @@ impl Key {
     /// one key a tenth more instructions (Callgrind).
     #[inline]
     fn take(&self, now: u64) -> Look {
-        let now_units = self.rate.units(now);
+        match &self.held {
+            Held::Bucket(rate) => self.bucket_take(rate, now),
+            Held::Window(span) => self.window_take(span, now),
+        }
+    }
+
+    #[inline]
+    fn bucket_take(&self, rate: &Rate, now: u64) -> Look {
+        let now_units = rate.units(now);
         loop {
-            let Some((word, at)) = self.word_to_charge(now, now_units) else {
+            let Some((word, at)) = self.word_to_charge(rate, now, now_units) else {
                 return Look::Closed;
             };
-            match self.fits(word, word, at) {
+            match Self::fits(rate, word, word, at) {
                 Look::Fits { word, from } => {
-                    if self.charge_from(word, from, now) {
+                    if self.charge_from(word, from.wrapping_add(UNITS) & MASK, now) {
+                        return Look::Fits { word, from };
+                    }
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn window_take(&self, span: &Span, now: u64) -> Look {
+        loop {
+            let Some((word, at, count)) = self.window_to_charge(span, now) else {
+                return Look::Closed;
+            };
+            match Self::window_fits(span, word, count, at) {
+                Look::Fits { word, from } => {
+                    let charged = Span::word(span.number(at), from + 1);
+                    if self.charge_from(word, charged, now) {
                         return Look::Fits { word, from };
                     }
                 }
@@ -337,20 +572,36 @@ impl Key {
 
     /// One request at `now` charged, whether it fits or not: false if the key was closed.
     fn charge(&self, now: u64) -> bool {
-        let now_units = self.rate.units(now);
+        match &self.held {
+            Held::Bucket(rate) => {
+                let now_units = rate.units(now);
+                loop {
+                    let Some((word, at)) = self.word_to_charge(rate, now, now_units) else {
+                        return false;
+                    };
+                    let from = if Rate::ahead(word, at) > 0 { word } else { at };
+                    if self.charge_from(word, from.wrapping_add(UNITS) & MASK, now) {
+                        return true;
+                    }
+                }
+            }
+            Held::Window(span) => self.window_charge(span, now),
+        }
+    }
+
+    fn window_charge(&self, span: &Span, now: u64) -> bool {
         loop {
-            let Some((word, at)) = self.word_to_charge(now, now_units) else {
+            let Some((word, at, count)) = self.window_to_charge(span, now) else {
                 return false;
             };
-            let from = if Rate::ahead(word, at) > 0 { word } else { at };
-            if self.charge_from(word, from, now) {
+            if self.charge_from(word, Span::word(span.number(at), count + 1), now) {
                 return true;
             }
         }
     }
 
-    /// Closes it if, at `now`, its bucket is full and nothing used it for `quiet`: true if
-    /// it did.
+    /// Closes it if, at `now`, its bucket is full or its window has counted none, and
+    /// nothing used it for `quiet`: true if it did.
     fn close_if_forgettable(&self, now: u64, quiet: u64) -> bool {
         let word = self.word.load(Ordering::Acquire);
         if word & CLOSED != 0 {
@@ -359,8 +610,7 @@ impl Key {
         if now.saturating_sub(self.last.load(Ordering::Relaxed)) < quiet {
             return false;
         }
-        let now_units = self.rate.units(now);
-        if Rate::ahead(self.arrival(word, now, now_units), now_units) > 0 {
+        if self.full_in_from(word, now) > 0 {
             return false;
         }
         // Lost to a request just made, the key stays: it is in use.
@@ -369,12 +619,27 @@ impl Key {
             .is_ok()
     }
 
-    /// Nanoseconds from `now` until its bucket is full.
+    /// Nanoseconds from `now` until its bucket is full or its window has counted none.
     fn full_in(&self, now: u64) -> u64 {
-        let word = self.word.load(Ordering::Acquire) & MASK;
-        let now_units = self.rate.units(now);
-        self.rate
-            .nanos(Rate::ahead(self.arrival(word, now, now_units), now_units))
+        self.full_in_from(self.word.load(Ordering::Acquire) & MASK, now)
+    }
+
+    /// The same, its word read as `word`.
+    fn full_in_from(&self, word: u64, now: u64) -> u64 {
+        match &self.held {
+            Held::Bucket(rate) => {
+                let now_units = rate.units(now);
+                rate.nanos(Rate::ahead(self.arrival(word, now, now_units), now_units))
+            }
+            Held::Window(span) => {
+                let at = now.max(self.last.load(Ordering::Relaxed));
+                if self.idle(now) || Span::count(word, span.number(at)) == 0 {
+                    0
+                } else {
+                    span.left(at)
+                }
+            }
+        }
     }
 
     fn close(&self) {
@@ -478,40 +743,41 @@ impl<S: BuildHasher + Clone> Local<S> {
 
     /// Gives one request's charge back under each of `keys` at `now`: a request admitted
     /// under them and then refused under another owner's limit, so charged under none.
-    pub fn give_back<K: AsRef<[u8]>>(
+    pub fn give_back<K: AsRef<[u8]>, L: core::marker::Copy + Into<Limit>>(
         &self,
         handles: &mut Handles<S>,
-        keys: &[(K, Contract)],
+        keys: &[(K, L)],
         now: u64,
     ) {
-        for (key, contract) in keys {
-            charge_one(self, handles, key.as_ref(), *contract, now, Key::give_back);
-        }
+        charge_each(self, handles, keys, now, Key::give_back);
     }
 
-    /// The state at `now` of `changed`, keys workers' decisions changed, closed keys left
-    /// out. A key is gathered by one worker at a time — the first to change it since its
-    /// last copy — so each comes once.
+    /// The state at `now` of `changed`, keys workers' decisions changed, closed keys and
+    /// windows left out. A key is gathered by one worker at a time — the first to change it
+    /// since its last copy — so each comes once.
     #[must_use]
     pub fn copies(&self, changed: &[Shared], now: u64) -> Vec<Copy> {
         changed
             .iter()
             .filter(|key| !key.closed())
-            .map(|key| key.copy(now))
+            .filter_map(|key| key.copy(now))
             .collect()
     }
 
-    /// The state at `now` of every key held whose name `keep` takes, closed keys left out
-    /// and change marks left as they are: what a pod hands another taken into the view,
+    /// The state at `now` of every bucket held whose name `keep` takes, closed keys left
+    /// out and change marks left as they are: what a pod hands another taken into the view,
     /// apart from the cycle's copies of what changed.
     pub fn copies_of(&self, now: u64, keep: impl Fn(&[u8]) -> bool) -> Vec<Copy> {
         let mut copies = Vec::new();
         for shard in &self.shards {
             for key in read(shard).iter() {
-                if !key.closed() && keep(&key.key) {
+                if let Some(contract) = key.bucket()
+                    && !key.closed()
+                    && keep(&key.key)
+                {
                     copies.push(Copy {
                         key: key.key.clone(),
-                        contract: key.contract,
+                        contract,
                         full_in: key.full_in(now),
                     });
                 }
@@ -525,7 +791,7 @@ impl<S: BuildHasher + Clone> Local<S> {
     /// the owner. A copy never makes a key emptier: the fuller of the two holds.
     pub fn install(&self, copies: &[Copy], now: u64) {
         for copy in copies {
-            self.find_or_make(&copy.key, copy.contract, now)
+            self.find_or_make(&copy.key, copy.contract.into(), now)
                 .set_full_in(copy.full_in, now);
         }
     }
@@ -570,7 +836,7 @@ impl<S: BuildHasher + Clone> Local<S> {
 
     /// The live key of `key` under `contract`, made at `now`, full, if there is none; one
     /// closed or under another contract is replaced.
-    fn find_or_make(&self, key: &[u8], contract: Contract, now: u64) -> Arc<Key> {
+    fn find_or_make(&self, key: &[u8], contract: Limit, now: u64) -> Arc<Key> {
         let hash = self.hasher.hash_one(key);
         let shard = self.shard(hash);
         if let Some(found) = read(shard).get_hashed(hash, key)
@@ -588,7 +854,7 @@ impl<S: BuildHasher + Clone> Local<S> {
             self.holding
                 .fetch_sub(key_bytes(key, self.workers), Ordering::Relaxed);
         }
-        let made = Arc::new(Key::new(key.into(), contract, now));
+        let made = Arc::new(Key::new(key.into(), contract, hash, now));
         set.replace_hashed(hash, Arc::clone(&made));
         self.holding
             .fetch_add(key_bytes(key, self.workers), Ordering::Relaxed);
@@ -598,10 +864,10 @@ impl<S: BuildHasher + Clone> Local<S> {
     /// Decides a request at `now` under `keys`, each with its contract, through a worker's
     /// `handles`: admitted and charged under all of them, or refused and charged under
     /// none.
-    pub fn decide<K: AsRef<[u8]>>(
+    pub fn decide<K: AsRef<[u8]>, L: core::marker::Copy + Into<Limit>>(
         &self,
         handles: &mut Handles<S>,
-        keys: &[(K, Contract)],
+        keys: &[(K, L)],
         now: u64,
     ) -> Decision {
         self.decide_saying(handles, keys, now).0
@@ -610,15 +876,15 @@ impl<S: BuildHasher + Clone> Local<S> {
     /// The same, saying with a refusal which of `keys` had no room, bit `n` for the `n`th of
     /// the first 64: as the decision read them, which the keys need not bear out a moment
     /// later, refilled or forgotten. Zero with an admission.
-    pub fn decide_saying<K: AsRef<[u8]>>(
+    pub fn decide_saying<K: AsRef<[u8]>, L: core::marker::Copy + Into<Limit>>(
         &self,
         handles: &mut Handles<S>,
-        keys: &[(K, Contract)],
+        keys: &[(K, L)],
         now: u64,
     ) -> (Decision, u64) {
         if let [(key, contract)] = keys {
             return loop {
-                let taken = handles.with_key(self, key.as_ref(), *contract, now, |held| {
+                let taken = handles.with_key(self, key.as_ref(), (*contract).into(), now, |held| {
                     let look = held.take(now);
                     let first = matches!(look, Look::Fits { .. }) && held.mark(self.tracking);
                     (look, first)
@@ -639,7 +905,8 @@ impl<S: BuildHasher + Clone> Local<S> {
         let mut refused = 0;
         for (position, (key, contract)) in keys.iter().enumerate() {
             let wait = loop {
-                match handles.with_key(self, key.as_ref(), *contract, now, |held| held.look(now)) {
+                let contract = (*contract).into();
+                match handles.with_key(self, key.as_ref(), contract, now, |held| held.look(now)) {
                     Look::Fits { .. } => break None,
                     Look::Full { wait } => break Some(wait),
                     Look::Closed => handles.forget(key.as_ref()),
@@ -659,9 +926,7 @@ impl<S: BuildHasher + Clone> Local<S> {
         if let Some((position, wait)) = longest {
             return (Decision::Refuse { position, wait }, refused);
         }
-        for (key, contract) in keys {
-            charge_one(self, handles, key.as_ref(), *contract, now, Key::charge);
-        }
+        charge_each(self, handles, keys, now, Key::charge);
         (Decision::Admit, 0)
     }
 
@@ -791,45 +1056,57 @@ impl<S: BuildHasher + Clone> Handles<S> {
         &mut self,
         local: &Local<S>,
         key: &[u8],
-        contract: Contract,
+        contract: Limit,
         now: u64,
-        act: impl Fn(&Key) -> R,
+        act: impl FnOnce(&Key) -> R,
     ) -> R {
         let hash = self.set.hash(key);
-        if let Some(found) = self.set.get_hashed(hash, key)
-            && found.contract == contract
-        {
-            return act(found);
-        }
+        let held: &Key = match self.set.get_hashed(hash, key) {
+            Some(found) if found.contract == contract => found,
+            _ => self.made(local, key, hash, contract, now),
+        };
+        act(held)
+    }
+
+    /// The key of `key` found or made in `local`, its handle kept. Apart from
+    /// [`with_key`](Self::with_key) so that `act` is called in one place: called in two, it
+    /// is a call the compiler no longer inlines once it holds a window's path beside a
+    /// bucket's, a sixth more instructions to a bucket's decision (Callgrind).
+    #[cold]
+    #[inline(never)]
+    fn made(&mut self, local: &Local<S>, key: &[u8], hash: u64, contract: Limit, now: u64) -> &Key {
         let made = local.find_or_make(key, contract, now);
-        let done = act(&made);
-        self.set.replace_hashed(hash, made);
-        done
+        self.set.replace_hashed(hash, made)
     }
 }
 
-/// `change` applied to `key` at `now` through `handles` until it lands on a live key, and
-/// the key gathered if that was its first change since its last copy.
-fn charge_one<S: BuildHasher + Clone>(
+/// `change` applied to each of `keys` at `now` through `handles` until it lands on a live
+/// key, and the key gathered if that was its first change since its last copy. All the keys
+/// in one function, and `change` a type of its own, not a function pointer: the compiler no
+/// longer inlines this once a key holds a window's path beside a bucket's, and called for
+/// each key, it costs a decision under three keys an eighth more instructions (Callgrind).
+fn charge_each<S: BuildHasher + Clone, K: AsRef<[u8]>, L: core::marker::Copy + Into<Limit>>(
     local: &Local<S>,
     handles: &mut Handles<S>,
-    key: &[u8],
-    contract: Contract,
+    keys: &[(K, L)],
     now: u64,
-    change: fn(&Key, u64) -> bool,
+    change: impl Fn(&Key, u64) -> bool,
 ) {
-    loop {
-        let (done, first) = handles.with_key(local, key, contract, now, |held| {
-            let done = change(held, now);
-            (done, done && held.mark(local.tracking))
-        });
-        if done {
-            if first {
-                handles.gather(key);
+    for (key, contract) in keys {
+        let (key, contract) = (key.as_ref(), (*contract).into());
+        loop {
+            let (done, first) = handles.with_key(local, key, contract, now, |held| {
+                let done = change(held, now);
+                (done, done && held.mark(local.tracking))
+            });
+            if done {
+                if first {
+                    handles.gather(key);
+                }
+                break;
             }
-            return;
+            handles.forget(key);
         }
-        handles.forget(key);
     }
 }
 
