@@ -472,7 +472,7 @@ pub(crate) fn routes(outcomes: &[RouteOutcome], report: &[Finding]) -> Vec<Route
 fn parent_conditions(parent: &ParentOutcome, said: &[&Problem]) -> Vec<Condition> {
     let not_accepted = said
         .iter()
-        .find(|p| matches!(p, Problem::NoRuleServed | Problem::TlsRouteRefused(_)));
+        .find(|p| matches!(p, Problem::NoRuleServed | Problem::RouteRefused(_)));
     let accepted = match parent.attached {
         Err(why) => {
             let reason = match why {

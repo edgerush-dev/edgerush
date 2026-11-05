@@ -1,0 +1,9 @@
+TCPRoute shop/old-shape: it has 2 rules, where the v1 API has a TCPRoute of exactly one, so it is not accepted
+TCPRoute shop/weighted: a backend's share of connections is closed: Service shop/not-there does not exist
+TCPRoute shop/weighted: a backend's share of connections is closed: a backend of kind /ConfigMap is not one translation reads
+TCPRoute shop/weighted: a backend's share of connections is closed: Service other/secret is another namespace's, and no ReferenceGrant there lets TCPRoutes of shop reach it
+TCPRoute shop/by-port: port-9300 is served by TCPRoute shop/elder, which comes first
+TCPRoute shop/attach-all: port-9300 is served by TCPRoute shop/elder, which comes first
+TCPRoute shop/attach-all: port-9301 is served by TCPRoute shop/by-section, which comes first
+TCPRoute shop/attach-all: port-9302 is served by TCPRoute shop/by-both, which comes first
+TCPRoute shop/attach-all: port-9303 is served by TCPRoute shop/weighted, which comes first

@@ -170,6 +170,7 @@ fn every_case_translates_to_its_config_and_report() {
             .iter()
             .chain(&translation.grpc_routes)
             .chain(&translation.tls_routes)
+            .chain(&translation.tcp_routes)
             .flat_map(|outcome| {
                 outcome
                     .to_string()

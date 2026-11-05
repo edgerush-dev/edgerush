@@ -1414,7 +1414,7 @@ fn backend(
     };
     let calls = match route_kind {
         "GRPCRoute" => Calls::Grpc,
-        "TLSRoute" => Calls::Tunnel,
+        "TLSRoute" | "TCPRoute" => Calls::Tunnel,
         _ => Calls::Http,
     };
     match backend_upstream(plane, cluster, namespace, &reference, (calls, false)) {

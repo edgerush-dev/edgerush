@@ -607,14 +607,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 );
                 let report: Vec<String> =
                     translation.report.iter().map(ToString::to_string).collect();
-                // Its backend is no Service the cluster has; the TLSRoute followed reaches
-                // translation, and the Gateway has no TLS listener to take it; the TCPRoute
-                // reaches it too, which does not serve it yet.
+                // Its backend is no Service the cluster has; the TLSRoute and the TCPRoute
+                // followed reach translation, and the Gateway has no listener to take either.
                 assert_eq!(
                     report,
                     [
                         "TLSRoute shop/api: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
-                        "TCPRoute shop/db: not supported yet: TCPRoute",
+                        "TCPRoute shop/db: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
                         "GRPCRoute shop/calls: rule 0: a backend's share is answered UNAVAILABLE: Service shop/calls does not exist"
                     ]
                 );

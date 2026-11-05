@@ -1,5 +1,6 @@
-# TCPRoutes, not translated yet: one naming the data plane's Gateway is said not supported,
-# its HTTPRoute neighbour served all the same; one naming another Gateway is not said.
+# A TCPRoute naming a listener that is not TCP is not allowed there, as conformance has it
+# (TCPRouteInvalidNonTCPListener), its HTTPRoute neighbour served all the same; one naming
+# another Gateway is not said.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
@@ -18,7 +19,7 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: TCPRoute
 metadata: { name: db, namespace: shop }
 spec:
-  parentRefs: [{ name: web, namespace: edge }]
+  parentRefs: [{ name: web, namespace: edge, sectionName: http }]
   rules:
     - backendRefs: [{ name: web, port: 5432 }]
 ---

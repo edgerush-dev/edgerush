@@ -1,10 +1,10 @@
 # A Gateway's TCP listeners: each served on a `tcp` listener of the data plane, distinct by
-# port alone, its hostname not read, so a second on a port is refused; until a TCPRoute
+# port alone, its hostname not read, so a second on a port is refused; where no TCPRoute
 # serves one, its connections are closed, its port bound all the same (Q-c2). On a port it
 # states for TCP and for HTTP or TLS as well, none of them is accepted, nor bound (Q-c1).
 # The kinds a TCP listener names that it cannot take are said. On the Ingress HTTP port, a
 # TCP listener has it, and an Ingress asked for over plain HTTP is left out, said. A
-# TCPRoute is not served yet.
+# TCPRoute on one serves it in place of the claim.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
