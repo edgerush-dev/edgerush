@@ -466,9 +466,10 @@ pub(crate) fn routes(outcomes: &[RouteOutcome], report: &[Finding]) -> Vec<Route
 }
 
 /// A route's conditions for one parent: `Accepted`, `ResolvedRefs` and, where some of its
-/// rules are served as written and some not, `PartiallyInvalid`. A TLSRoute not of the
-/// shape the `v1` API gives one is not accepted, as an HTTPRoute none of whose rules is
-/// served is not; its backends' shares closed are its unresolved references.
+/// rules are served as written and some not, `PartiallyInvalid`. A TLSRoute or a TCPRoute
+/// not of the shape the `v1` API gives one is not accepted, as an HTTPRoute none of whose
+/// rules is served is not; its backends' shares closed are its unresolved references; a
+/// TCPRoute whose listener an older one serves stays accepted, as conformance has it.
 fn parent_conditions(parent: &ParentOutcome, said: &[&Problem]) -> Vec<Condition> {
     let not_accepted = said
         .iter()

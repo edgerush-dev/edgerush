@@ -1576,12 +1576,13 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             config.listeners.insert(name, alone);
         }
     }
-    // Every route's status, of whichever kind, HTTPRoutes first, then GRPCRoutes and
-    // TLSRoutes; a listener counts them all.
+    // Every route's status, of whichever kind, HTTPRoutes first, then GRPCRoutes,
+    // TLSRoutes and TCPRoutes; a listener counts them all.
     let routes: Vec<RouteOutcome> = http_routes
         .iter()
         .chain(&grpc_routes)
         .chain(&tls_routes)
+        .chain(&tcp_routes)
         .cloned()
         .collect();
     let route_statuses = status::routes(&routes, &report);
