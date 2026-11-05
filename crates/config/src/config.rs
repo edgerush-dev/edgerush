@@ -221,6 +221,14 @@ pub struct RateLimitService {
     /// out, as the pods are then served.
     #[serde(default)]
     pub tls: Option<RateLimitServiceTls>,
+    /// The secret the synchronous mode's keys are hashed under, as 32 hex digits: the same on
+    /// every data plane, so that each sends a client's key to the pod that owns it, and kept
+    /// from clients, so that none can choose a key to share another's count
+    /// ([06 §4](../../../docs/06-rate-limiting.md)). Needed by the synchronous mode, and taken
+    /// by no other; never shown.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = r"^[0-9a-fA-F]{32}$")))]
+    pub key_secret: Option<String>,
 }
 
 /// Mutual TLS to the rate-limiting service's pods: whom to trust to vouch for them, which

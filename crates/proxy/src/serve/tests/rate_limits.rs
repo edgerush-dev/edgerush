@@ -184,6 +184,7 @@ fn limited(mut config: Config, service: &[String]) -> Config {
             poll_quiet_keys: None,
             schedule_keys: None,
             tls: None,
+            key_secret: None,
         }),
     });
     config

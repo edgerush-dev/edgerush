@@ -7,7 +7,7 @@
 use super::{Failed, KeyedBy, Limited, Refused, Usage, with_keys};
 use edgerush_config::CompiledLimit;
 use edgerush_ratelimit::local::{Decision, HANDLE_PARTS, Handles, Limit, Local};
-use edgerush_ratelimit::service::{Contract, Keyed};
+use edgerush_ratelimit::service::Keyed;
 use std::cell::RefCell;
 use std::hash::{BuildHasher, RandomState};
 use std::rc::{Rc, Weak as RcWeak};
@@ -214,10 +214,10 @@ impl LocalLimiter {
         )
     }
 
-    /// Decides a request under `keys`, each with its contract, all at once: admitted under
+    /// Decides a request under `keys`, each with its limit, all at once: admitted under
     /// all, or refused by the key that waits longest, by its place among them, and charged
     /// under none.
-    pub(crate) fn decide_keys(&self, keys: &[(Vec<u8>, Contract)]) -> Decision {
+    pub(crate) fn decide_keys(&self, keys: &[(Vec<u8>, Limit)]) -> Decision {
         let now = self.process.now();
         self.process
             .local

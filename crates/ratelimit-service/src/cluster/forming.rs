@@ -12,6 +12,7 @@
 //! A naming is written to the file before any pod is told of it: one sent and not kept could be
 //! named again, under the same generation, to other pods.
 
+use super::link::Dial;
 use super::pod::{TICK, ask};
 use crate::grpc::{Client, Error};
 use edgerush_cluster::{Authority, Config, Message, Naming, NodeId, Time};
@@ -164,6 +165,8 @@ pub struct Forming {
     /// The member each address runs, from its first answer.
     members: BTreeMap<String, NodeId>,
     clients: BTreeMap<String, Client>,
+    /// How it dials the pods: plain, unless told otherwise.
+    dial: Dial,
     /// Addresses with no member yet, being asked who they are, and when each was last asked.
     asking: BTreeSet<String>,
     asked: BTreeMap<String, Time>,
@@ -188,9 +191,16 @@ impl Forming {
             heartbeat: config.heartbeat,
             members: BTreeMap::new(),
             clients: BTreeMap::new(),
+            dial: Dial::Plain,
             asking: BTreeSet::new(),
             asked: BTreeMap::new(),
         })
+    }
+
+    /// The same, dialling the pods as `dial` says: with TLS, as a pod, for pods served so.
+    #[must_use]
+    pub fn dialling(self, dial: Dial) -> Self {
+        Self { dial, ..self }
     }
 
     /// The generation last named, 0 for none.
@@ -270,7 +280,10 @@ impl Forming {
     ) {
         let client = match self.clients.get(address) {
             Some(client) => client.clone(),
-            None => match Client::new(address) {
+            None => match match &self.dial {
+                Dial::Plain => Client::new(address),
+                Dial::Secured(tls) => Client::secured(address, tls.clone()),
+            } {
                 Ok(client) => {
                     self.clients.insert(address.to_owned(), client.clone());
                     client
