@@ -29,6 +29,7 @@ use edgerush_ratelimit_service::cluster::pod::{
 };
 use edgerush_ratelimit_service::cluster::wire::{Asking, asking, told_from};
 use edgerush_ratelimit_service::grpc::Client;
+use edgerush_ratelimit_service::scrape;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -36,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -1488,4 +1490,111 @@ async fn an_address_answering_nothing_still_runs_and_is_waited_on() {
             "pod {id} formed"
         );
     }
+}
+
+/// `GET path` of the listener at `address`, as a probe or a scrape asks: the status and the
+/// body, if it answers.
+async fn get(address: SocketAddr, path: &str) -> Option<(u16, String)> {
+    let mut stream = TcpStream::connect(address).await.ok()?;
+    let asked = format!("GET {path} HTTP/1.1\r\nhost: pod\r\nconnection: close\r\n\r\n");
+    stream.write_all(asked.as_bytes()).await.ok()?;
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).await.ok()?;
+    let answer = String::from_utf8(answer).ok()?;
+    let status = answer.split(' ').nth(1)?.parse().ok()?;
+    let body = answer.split_once("\r\n\r\n")?.1.to_owned();
+    Some((status, body))
+}
+
+/// A pod's readiness and scrape are served as its store has them: not ready before forming,
+/// ready once formed, and not ready once cut off, its lease lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pods_readiness_and_scrape_are_served_as_its_store_has_them() {
+    let mut cluster = Cluster::new();
+    let addresses = unformed(&mut cluster, 1..=3).await;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let at = listener.local_addr().unwrap();
+    tokio::spawn(scrape::serve_store(listener, cluster.pod(1).clone()));
+    assert_eq!(get(at, "/ready").await.map(|(status, _)| status), Some(503));
+    let (status, scraped) = get(at, "/metrics").await.unwrap();
+    assert_eq!(status, 200);
+    assert!(
+        scraped.contains("edgerush_rate_limit_pod_serving 0\n"),
+        "{scraped}"
+    );
+    assert!(
+        scraped.contains("edgerush_rate_limit_table_term 0\n"),
+        "{scraped}"
+    );
+    let file = naming_file("ready");
+    let task = forming(&file, &addresses);
+    let ready = within(FORMED, || async {
+        (get(at, "/ready").await? == (200, "ready\n".to_owned())).then_some(())
+    })
+    .await;
+    assert!(ready.is_some(), "not ready within {FORMED:?}");
+    let (_, scraped) = get(at, "/metrics").await.unwrap();
+    assert!(
+        scraped.contains("edgerush_rate_limit_pod_serving 1\n"),
+        "{scraped}"
+    );
+    let term: u64 = scraped
+        .lines()
+        .find_map(|line| line.strip_prefix("edgerush_rate_limit_table_term "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(generation_of(term), 1, "{scraped}");
+    cluster.cut_off(1);
+    let unready = within(FAILOVER, || async {
+        (get(at, "/ready").await?.0 == 503).then_some(())
+    })
+    .await;
+    task.abort();
+    assert!(
+        unready.is_some(),
+        "still ready, cut off, after {FAILOVER:?}"
+    );
+    assert_eq!(get(at, "/live").await.map(|(status, _)| status), Some(404));
+}
+
+/// What a pod's scrape shows is its store's: one leader among the pods, each the table it has
+/// committed, a key counted at its owner held there, and its counters as its store keeps them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_a_pods_scrape_shows_is_its_stores() {
+    let cluster = ready(3).await;
+    let ids: BTreeSet<NodeId> = (1..=3).collect();
+    let table = cluster.one_table(&ids).await.unwrap();
+    let mut leaders = 0;
+    for id in &ids {
+        let observed = cluster.pod(*id).observed().await.unwrap();
+        assert!(observed.ready, "pod {id}");
+        assert_eq!(observed.table, table.stamp(), "pod {id}");
+        assert_eq!(observed.keys, 0, "pod {id}");
+        assert_eq!(observed.max_key_bytes, config().max_key_bytes, "pod {id}");
+        leaders += u32::from(observed.leader);
+    }
+    let leader = leader(&cluster, &ids).await.unwrap();
+    assert!(cluster.pod(leader).observed().await.unwrap().leader);
+    assert_eq!(leaders, 1);
+    let key = key_owned_by(&table, 2);
+    let mut client = cluster.pod(2).client().await.unwrap();
+    client
+        .ask(request(client.id(), 1, key, table.stamp(), None))
+        .await;
+    assert_eq!(
+        answered(&mut client, 1, ANSWERED).await,
+        Some(Answer::Counted(1))
+    );
+    let owner = cluster.pod(2).observed().await.unwrap();
+    assert_eq!(owner.keys, 1);
+    assert!(owner.key_bytes > 0);
+    let held = cluster
+        .pod(2)
+        .with(|node, _| (node.key_bytes(), node.forgotten(), node.evicted()))
+        .await
+        .unwrap();
+    assert_eq!((owner.key_bytes, owner.forgotten, owner.evicted), held);
+    assert_eq!(owner.skewed, cluster.pod(2).skewed());
+    assert_eq!(owner.dropped, cluster.pod(2).dropped());
 }

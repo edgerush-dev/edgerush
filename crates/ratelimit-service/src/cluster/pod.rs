@@ -100,6 +100,31 @@ enum Command {
     Stop,
 }
 
+/// What a store pod's scrape shows of it (`crate::scrape`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Observed {
+    /// Whether it is ready, as its store has it.
+    pub ready: bool,
+    /// Whether it leads.
+    pub leader: bool,
+    /// The number of the table it has committed, `(0, 0)` for none.
+    pub table: Stamp,
+    /// Keys it holds, owned and copies.
+    pub keys: u64,
+    /// About the bytes they take.
+    pub key_bytes: u64,
+    /// What those bytes are capped at, if anything.
+    pub max_key_bytes: Option<u64>,
+    /// Keys forgotten, their time come.
+    pub forgotten: u64,
+    /// Keys evicted past the cap.
+    pub evicted: u64,
+    /// Peers whose wall clocks are off past `skew_warning` now.
+    pub skewed: usize,
+    /// What its sending has dropped.
+    pub dropped: Dropped,
+}
+
 /// A handle on a pod of the store, running. Cheap to clone.
 pub struct StorePod {
     commands: mpsc::Sender<Command>,
@@ -186,6 +211,24 @@ impl StorePod {
     #[must_use]
     pub fn skewed(&self) -> usize {
         self.skewed.load(Ordering::Relaxed)
+    }
+
+    /// What its scrape shows of it, read at once between messages: `None` once it has stopped.
+    pub async fn observed(&self) -> Option<Observed> {
+        let (skewed, dropped) = (self.skewed(), self.dropped());
+        self.with(move |node, now| Observed {
+            ready: node.ready(now),
+            leader: node.is_leader(),
+            table: node.committed_stamp(),
+            keys: u64::try_from(node.key_count()).unwrap_or(u64::MAX),
+            key_bytes: node.key_bytes(),
+            max_key_bytes: node.config().max_key_bytes,
+            forgotten: node.forgotten(),
+            evicted: node.evicted(),
+            skewed,
+            dropped,
+        })
+        .await
     }
 
     /// Runs `with` on its store, at its time, between messages: to read it or update keys,
