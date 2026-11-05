@@ -19,6 +19,7 @@ use edgerush_gateway_api::http_route::{
     HTTPRoute, HTTPRouteRules, HTTPRouteRulesFilters, HTTPRouteRulesFiltersRequestRedirect,
     HTTPRouteRulesRetry, HTTPRouteRulesTimeouts,
 };
+use edgerush_gateway_api::tls_route::TLSRoute;
 use k8s_openapi::api::networking::v1::{IngressBackend, IngressServiceBackend, ServiceBackendPort};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
@@ -189,6 +190,16 @@ impl<'a> Routed<'a> {
             metadata: &route.metadata,
             parents: parent_refs!(route.spec.parent_refs),
             hostnames: route.spec.hostnames.as_deref().unwrap_or_default(),
+        }
+    }
+
+    /// A TLSRoute as attachment reads it.
+    pub(crate) fn tls(route: &'a TLSRoute) -> Self {
+        Self {
+            kind: "TLSRoute",
+            metadata: &route.metadata,
+            parents: parent_refs!(route.spec.parent_refs),
+            hostnames: &route.spec.hostnames,
         }
     }
 }

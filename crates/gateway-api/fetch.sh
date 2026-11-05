@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 VERSION="${1:?usage: fetch.sh <release, such as v1.7.0>}"
-KINDS=(gatewayclasses gateways grpcroutes httproutes listenersets referencegrants)
+KINDS=(gatewayclasses gateways grpcroutes httproutes listenersets referencegrants tlsroutes)
 BASE="https://raw.githubusercontent.com/kubernetes-sigs/gateway-api/${VERSION}/config/crd/standard"
 
 for kind in "${KINDS[@]}"; do
