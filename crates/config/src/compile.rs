@@ -1897,7 +1897,8 @@ fn l4_listeners<'a>(
     listeners
 }
 
-/// A passthrough route's backends: 1 to 16, of upstreams that take plain bytes.
+/// A passthrough route's backends: 1 to 16, of upstreams that take plain bytes, or invalid,
+/// refusing their share of connections by closing them, as TLSRoute has it (17 §4).
 fn l4_backends(
     config: &Config,
     backends: &[Backend],
@@ -1917,10 +1918,15 @@ fn l4_backends(
             backend: Some(at),
             ..place.clone()
         };
-        // A connection has no status to be answered with: an invalid backend is an HTTP
-        // rule's.
-        if backend.invalid.is_some() {
-            errors.push(place.problem(Problem::InvalidBackendOfTunnel));
+        if let Some(reason) = &backend.invalid {
+            // Neither both nor neither: said once, by `upstream_of`.
+            if backend.upstream.is_some() {
+                let _ = upstream_of(backend, &place, errors);
+            } else if reason.is_empty() {
+                errors.push(place.problem(Problem::InvalidBackendWithoutReason));
+            } else {
+                resolved.push((Err(reason.clone()), backend.weight));
+            }
             continue;
         }
         let Some(name) = upstream_of(backend, &place, errors) else {
@@ -1936,9 +1942,9 @@ fn l4_backends(
         if speaks_more {
             errors.push(place.problem(Problem::PassthroughUpstream(name.to_owned())));
         }
-        resolved.push((id, backend.weight));
+        resolved.push((Ok(id), backend.weight));
     }
-    WeightedBackends::new(resolved)
+    WeightedBackends::with_invalid(resolved)
 }
 
 /// What gRPC servers enforce by default between a client's PINGs: five minutes.
@@ -2926,10 +2932,6 @@ pub enum Problem {
     /// An invalid backend that does not say why.
     #[error("an `invalid` backend says why it is invalid")]
     InvalidBackendWithoutReason,
-    /// An invalid backend of a TCP or TLS route, whose connections have no status to be
-    /// answered with.
-    #[error("an `invalid` backend is for HTTP rules only")]
-    InvalidBackendOfTunnel,
     /// The gRPC method match names no service or method, or not in their form.
     #[error("gRPC service `{service}` and method `{method}` are not names a call could have")]
     GrpcMethod {
@@ -5757,17 +5759,13 @@ routes: []
 tcp_routes: [{ name: t, listeners: [db], backends: [{ invalid: gone, weight: 1 }] }]
 upstreams: {}
 ";
-        let refused: Vec<String> = compile(&config(tunnel))
-            .unwrap_err()
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        assert!(
-            refused
-                .iter()
-                .any(|problem| problem.ends_with("an `invalid` backend is for HTTP rules only")),
-            "{refused:?}"
-        );
+        // A tunnel's invalid backend refuses its share of connections, by closing them.
+        let compiled = compile(&config(tunnel)).unwrap();
+        let Some(L4::Tcp(route)) = compiled.listeners[0].l4.as_ref() else {
+            panic!("a tcp listener's route");
+        };
+        assert_eq!(route.backends.pick(0), Some(Destination::Invalid(0)));
+        assert_eq!(route.backends.reason(0), Some("gone"));
     }
 
     /// Slow start states its window, of at least a millisecond; left out, there is none.

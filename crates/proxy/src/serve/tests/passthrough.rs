@@ -208,8 +208,8 @@ async fn a_tunnel_with_the_longest_idle_bound_carries_and_stays_open() {
         .await;
 }
 
-/// A backend that cannot be reached, or an upstream with no endpoint, closes the
-/// client's connection, counted by why.
+/// A backend that cannot be reached, an upstream with no endpoint, or an invalid backend,
+/// closes the client's connection, counted by why.
 #[tokio::test]
 async fn a_tunnel_with_no_backend_to_reach_is_closed() {
     let local = tokio::task::LocalSet::new();
@@ -230,6 +230,15 @@ async fn a_tunnel_with_no_backend_to_reach_is_closed() {
             assert!(scrape.contains(line), "{scrape}");
 
             let yaml = tcp_to(gone, "").replace(&format!("[\"{gone}\"]"), "[]");
+            let (front, worker) = passing(&yaml).await;
+            let mut client = TcpStream::connect(front).await.unwrap();
+            assert!(closed_after(&mut client).await < SLACK);
+            tunnel_ended(&worker, "db", "no_backend").await;
+
+            let yaml = tcp_to(gone, "").replace(
+                "{ upstream: up, weight: 1 }",
+                "{ invalid: \"Service shop/gone does not exist\", weight: 1 }",
+            );
             let (front, worker) = passing(&yaml).await;
             let mut client = TcpStream::connect(front).await.unwrap();
             assert!(closed_after(&mut client).await < SLACK);

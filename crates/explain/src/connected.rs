@@ -96,13 +96,14 @@ impl<'s> Connected<'s> {
     }
 
     /// Why the connection is refused, by the name the metrics give it: `no_route` for one
-    /// no route is for, `no_backend` for a route with no backend that has a share of its
-    /// connections; `None` for one that goes on.
+    /// no route is for, `no_backend` for a route with no valid backend that has a share of
+    /// its connections; `None` for one that goes on, if only to the share an invalid backend
+    /// refuses.
     #[must_use]
     pub fn refused(&self) -> Option<&'static str> {
         match self.route {
             None => Some("no_route"),
-            Some(route) if route.backends.pick(0).is_none() => Some("no_backend"),
+            Some(route) if route.backends.upstreams().next().is_none() => Some("no_backend"),
             Some(_) => None,
         }
     }
@@ -194,11 +195,13 @@ mod tests {
     const CONFIG: &str = r#"
 listeners:
   db: { address: "[::]:5432", protocol: tcp, proxy_protocol: off }
+  gone: { address: "[::]:5433", protocol: tcp, proxy_protocol: off }
   sni: { address: "[::]:443", protocol: tls, proxy_protocol: off }
   web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes: []
 tcp_routes:
   - { name: postgres, listeners: [db], backends: [{ upstream: pg, weight: 1 }] }
+  - { name: missing, listeners: [gone], backends: [{ invalid: "Service shop/pg does not exist", weight: 1 }] }
 tls_routes:
   - { name: rest, listeners: [sni], hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: true }], backends: [{ upstream: api, weight: 1 }] }
   - { name: api, listeners: [sni], hostnames: [{ name: api.example.com, falls_through: true }], backends: [{ upstream: api, weight: 3 }, { upstream: api-canary, weight: 1 }] }
@@ -298,6 +301,18 @@ sni (tls)  SNI a.example.org
   3 routes for other hosts
 
 route     kept
+refused   no_backend
+"
+        );
+        // A route whose one backend is invalid refuses every connection.
+        assert_eq!(
+            explained("gone", None),
+            "\
+gone (tcp)
+
+→ missing  the listener's one route
+
+route     missing
 refused   no_backend
 "
         );

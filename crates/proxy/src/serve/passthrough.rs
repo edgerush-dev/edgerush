@@ -301,9 +301,8 @@ impl Worker {
         let Some((through, route)) = route else {
             return Err(Tunnel::Refused);
         };
-        // A backend with no endpoint refuses its share of connections, as TLSRoute has
-        // it for a backend that cannot be used.
-        // A TCP or TLS route has no invalid backend: the config is refused with one.
+        // An invalid backend, and one with no endpoint, refuses its share of connections,
+        // as TLSRoute has it for a backend that cannot be used.
         let picked = match route.backends.pick(random()) {
             Some(Destination::Upstream(upstream)) => Some(upstream),
             Some(Destination::Invalid(_)) | None => None,
