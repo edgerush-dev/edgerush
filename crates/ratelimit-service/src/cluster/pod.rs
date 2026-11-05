@@ -672,29 +672,32 @@ fn may_be_peer(own: &Hello, other: &Hello) -> Result<(), Status> {
 }
 
 /// Asks the pod at `address` the control plane's `message` (`Probe` or `Form`), as the
-/// controller does: its answer, if it has one.
+/// controller does: the member id of the pod that answered, which every answer carries, and
+/// its answer, if it has one.
 ///
 /// # Errors
 ///
-/// When the call fails or its answer cannot be used.
+/// When the call fails or its answer cannot be used, and for a message that is not the
+/// control plane's.
 pub async fn ask<V: Value>(
     client: &Client,
     message: Message<V>,
-) -> Result<Option<Message<V>>, crate::grpc::Error>
+) -> Result<(NodeId, Option<Message<V>>), crate::grpc::Error>
 where
     V::Wire: Send + 'static,
 {
     let Outgoing::Peer(asked) = wire::wire(CONTROL_PLANE, message) else {
-        return Ok(None);
+        return Err(Status::invalid_argument("not the control plane's").into());
     };
     let answer: ToPeer<V::Wire> = client.call(asked, CONTROL).await?;
+    let from = answer.from;
     if answer.message.is_none() {
-        return Ok(None);
+        return Ok((from, None));
     }
     // An answer the store cannot use, as the service's others are refused (`crate::wire`).
     let (_, message) = wire::from_peer::<V>(answer)
         .map_err(|invalid| Status::invalid_argument(invalid.to_string()))?;
-    Ok(Some(message))
+    Ok((from, Some(message)))
 }
 
 /// A data plane's stream to a pod: what it asks goes up, in order, and what the pod tells it —
