@@ -1224,7 +1224,14 @@ async fn a_data_plane_behind_is_told_elsewhere_and_asks_the_owner_named() {
         .await;
     assert_eq!(plane.answer(to, id).await, Some(Answer::Counted(1)));
     assert_eq!(held_at(cluster.pod(2), key).await, Some(1));
-    assert_eq!(held_at(cluster.pod(1), key).await, None);
+    // Counted at the owner alone: the pod told first holds nothing of its own, only, as one of
+    // the shard's replicas, a copy of the owner's count once that comes.
+    let shard = &table.shards[usize::from(shard_of(key, SHARDS))];
+    let held = held_at(cluster.pod(1), key).await;
+    assert!(
+        held.is_none() || (shard.replicas.contains(&1) && held == Some(1)),
+        "pod 1 holds {held:?}"
+    );
 }
 
 /// A data plane that cannot reach a key's owner — its stream down or its breaker open — asks
@@ -1245,7 +1252,14 @@ async fn a_key_whose_owner_is_out_of_reach_is_forwarded_and_counted_once() {
         .await;
     assert_eq!(plane.answer(to, id).await, Some(Answer::Counted(1)));
     assert_eq!(held_at(cluster.pod(2), key).await, Some(1));
-    assert_eq!(held_at(cluster.pod(to), key).await, None);
+    // Counted at the owner alone: the pod forwarding it holds nothing of its own, only, as one
+    // of the shard's replicas, a copy of the owner's count once that comes.
+    let shard = &plane.plane.table().unwrap().shards[usize::from(shard_of(key, SHARDS))];
+    let held = held_at(cluster.pod(to), key).await;
+    assert!(
+        held.is_none() || (shard.replicas.contains(&to) && held == Some(1)),
+        "pod {to} holds {held:?}"
+    );
 }
 
 /// A charge given back by a data plane, with the receipt it was admitted with, is credited at
