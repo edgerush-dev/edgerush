@@ -89,6 +89,14 @@ pub struct LimitMatch {
 pub enum Model {
     /// A token bucket: requests at `rate` on average, at most `burst` at once.
     Bucket(Bucket),
+    /// At most `limit` requests in each `window`, the count starting again as each ends:
+    /// a whole window's worth may come at once, and two windows' worth across a boundary.
+    /// Each key's windows are shifted by an offset of its own, so that keys' boundaries
+    /// spread. In local mode only, for now.
+    FixedWindow(Window),
+    /// At most `limit` requests in any span of `window`, counted to a thousandth of it. In
+    /// no mode yet; never in local mode, nor with `when_unreachable: local`.
+    RollingWindow(Window),
 }
 
 /// A token bucket's numbers.
@@ -108,9 +116,26 @@ pub struct Bucket {
     pub burst: u64,
 }
 
+/// A window's numbers.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Window {
+    /// Requests a window.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub limit: u64,
+    /// The window: a whole number and `ms`, `s`, `m`, `h` or `d`, as `500ms`, `1m`, `1d`.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = WINDOW_PATTERN)))]
+    pub window: String,
+}
+
 /// What a rate looks like.
 #[cfg(feature = "schema")]
 const RATE_PATTERN: &str = "^[1-9][0-9]*/(s|min|h|d)$";
+
+/// What a window looks like.
+#[cfg(feature = "schema")]
+const WINDOW_PATTERN: &str = "^[1-9][0-9]*(ms|s|m|h|d)$";
 
 /// What a limit's name looks like: printable ASCII, at least one character.
 #[cfg(feature = "schema")]
@@ -132,18 +157,61 @@ pub struct CompiledLimit {
     /// as written — which every key of its carries: a limit changed counts apart from the
     /// one it replaces, afresh, and never mixed with it while pods take the change (06 §2).
     pub definition: [u8; 8],
-    /// When it applies, its key and its rate: requests a window.
+    /// When it applies, its key and its count: requests a window.
     pub rule: Rule,
-    /// Its rate as it was written, `100/s`: for telling a person.
-    pub rate: String,
-    /// Its rate's count: the requests its window holds.
+    /// Its count: the requests its window holds.
     pub count: NonZeroU64,
-    /// The window its rate is a number of requests in, in nanoseconds.
+    /// The window its count is of, in nanoseconds: a bucket's rate's unit, or a window.
     pub window: NonZeroU64,
-    /// The whole bucket.
-    pub burst: NonZeroU64,
+    /// Its model, with what is the model's alone.
+    pub model: CompiledModel,
     /// Whether it only counts and reports, never refusing (06 §2).
     pub dry_run: bool,
+}
+
+/// A limit's model, compiled: what it holds beyond its count and window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompiledModel {
+    /// A token bucket.
+    Bucket {
+        /// Its rate as it was written, `100/s`: for telling a person.
+        rate: String,
+        /// The whole bucket.
+        burst: NonZeroU64,
+    },
+    /// A fixed window.
+    FixedWindow {
+        /// Its window as it was written, `1m`: for telling a person.
+        window: String,
+    },
+    /// A rolling window, which no mode decides yet.
+    RollingWindow {
+        /// Its window as it was written, `1m`: for telling a person.
+        window: String,
+    },
+}
+
+impl CompiledModel {
+    /// Its name in the file.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Bucket { .. } => "bucket",
+            Self::FixedWindow { .. } => "fixed_window",
+            Self::RollingWindow { .. } => "rolling_window",
+        }
+    }
+}
+
+impl CompiledLimit {
+    /// The most a key of it admits at once: its bucket, or its window's count.
+    #[must_use]
+    pub fn room(&self) -> NonZeroU64 {
+        match &self.model {
+            CompiledModel::Bucket { burst, .. } => *burst,
+            CompiledModel::FixedWindow { .. } | CompiledModel::RollingWindow { .. } => self.count,
+        }
+    }
 }
 
 /// The engine's limits, compiled: by name, and those over every request.
@@ -172,6 +240,23 @@ fn window(unit: &str) -> Option<u64> {
         "d" => Some(86_400 * SECOND),
         _ => None,
     }
+}
+
+/// A window as a whole number and a unit, in nanoseconds: at least one, and within what
+/// the clock holds.
+fn window_length(text: &str) -> Option<NonZeroU64> {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    let (count, unit) = text.split_at(digits);
+    let unit = match unit {
+        "ms" => 1_000_000,
+        "s" => 1_000_000_000,
+        "m" => 60_000_000_000,
+        "h" => 3_600_000_000_000,
+        "d" => 86_400_000_000_000,
+        _ => return None,
+    };
+    let count: u64 = count.parse().ok()?;
+    NonZeroU64::new(count.checked_mul(unit)?)
 }
 
 /// A rate as `count/unit`: so many requests a window, both at least one.
@@ -216,22 +301,14 @@ pub(crate) fn compile_limits(
         if let Some(problem) = key_refused {
             errors.push(place.problem(problem));
         }
-        let Model::Bucket(bucket) = &limit.model;
-        let rate = rate(&bucket.rate);
-        if rate.is_none() {
-            errors.push(place.problem(Problem::LimitRate(bucket.rate.clone())));
-        }
-        let burst = NonZeroU64::new(bucket.burst);
-        if burst.is_none() {
-            errors.push(place.problem(Problem::LimitBurstZero));
-        }
+        let numbers = model(&limit.model, &place, errors);
         let matches = limit.matches.clone().unwrap_or_default();
         let plain = PlainRule {
             name: limit.name.clone(),
             methods: matches.methods,
             path_prefix: matches.path_prefix,
             key: Key::Field(limit.key.clone()),
-            limit: Count::Count(rate.map_or(1, |(count, _)| count.get())),
+            limit: Count::Count(numbers.as_ref().map_or(1, |(count, _, _)| count.get())),
         };
         let rule = if key_ok {
             plain
@@ -249,7 +326,7 @@ pub(crate) fn compile_limits(
         } else {
             None
         };
-        if let (Some(rule), Some((count, window)), Some(burst)) = (rule, rate, burst)
+        if let (Some(rule), Some((count, window, model))) = (rule, numbers)
             && errors.len() == before
         {
             let compiled = CompiledLimit {
@@ -258,10 +335,9 @@ pub(crate) fn compile_limits(
                 position: by_name.len(),
                 definition: definition(limit),
                 rule,
-                rate: bucket.rate.clone(),
                 count,
                 window,
-                burst,
+                model,
                 dry_run: limit.dry_run,
             };
             by_name.insert(limit.name.clone(), Arc::new(compiled));
@@ -270,6 +346,60 @@ pub(crate) fn compile_limits(
     let place = Place::of(Object::Limits);
     let global = named(&limits.global.rate_limits, &by_name, &place, errors);
     CompiledLimits { by_name, global }
+}
+
+/// The name a window model has in the file.
+fn window_name(model: &Model) -> &'static str {
+    if matches!(model, Model::FixedWindow(_)) {
+        "fixed_window"
+    } else {
+        "rolling_window"
+    }
+}
+
+/// `model`'s count, window and what is its alone, if they are as they should be; the
+/// problems found pushed to `errors` at `place`.
+fn model(
+    model: &Model,
+    place: &Place,
+    errors: &mut Vec<ConfigError>,
+) -> Option<(NonZeroU64, NonZeroU64, CompiledModel)> {
+    match model {
+        Model::Bucket(bucket) => {
+            let rate = rate(&bucket.rate);
+            if rate.is_none() {
+                errors.push(place.problem(Problem::LimitRate(bucket.rate.clone())));
+            }
+            let burst = NonZeroU64::new(bucket.burst);
+            if burst.is_none() {
+                errors.push(place.problem(Problem::LimitBurstZero));
+            }
+            let ((count, window), burst) = (rate?, burst?);
+            let rate = bucket.rate.clone();
+            Some((count, window, CompiledModel::Bucket { rate, burst }))
+        }
+        Model::FixedWindow(numbers) | Model::RollingWindow(numbers) => {
+            let name = window_name(model);
+            let count = NonZeroU64::new(numbers.limit);
+            if count.is_none() {
+                errors.push(place.problem(Problem::LimitCountZero(name)));
+            }
+            let length = window_length(&numbers.window);
+            if length.is_none() {
+                errors.push(place.problem(Problem::LimitWindow {
+                    model: name,
+                    window: numbers.window.clone(),
+                }));
+            }
+            let window = numbers.window.clone();
+            let compiled = if matches!(model, Model::FixedWindow(_)) {
+                CompiledModel::FixedWindow { window }
+            } else {
+                CompiledModel::RollingWindow { window }
+            };
+            Some((count?, length?, compiled))
+        }
+    }
 }
 
 /// The digest of what defines `limit` apart from its name, the same on every data plane
@@ -296,10 +426,18 @@ fn definition(limit: &Limit) -> [u8; 8] {
         None => feed(b""),
     }
     feed(limit.key.as_bytes());
-    let Model::Bucket(bucket) = &limit.model;
-    feed(b"bucket");
-    feed(bucket.rate.as_bytes());
-    feed(&bucket.burst.to_le_bytes());
+    match &limit.model {
+        Model::Bucket(bucket) => {
+            feed(b"bucket");
+            feed(bucket.rate.as_bytes());
+            feed(&bucket.burst.to_le_bytes());
+        }
+        Model::FixedWindow(window) | Model::RollingWindow(window) => {
+            feed(window_name(&limit.model).as_bytes());
+            feed(&window.limit.to_le_bytes());
+            feed(window.window.as_bytes());
+        }
+    }
     hash.to_le_bytes()
 }
 
@@ -347,8 +485,9 @@ impl CompiledLimits {
     }
 
     /// The limits a route rule's requests are under — the data plane's, its route's, its
-    /// own — each once, in the order a decision takes them: the smallest bucket first, the
-    /// limit most likely at its edge, ties going to the most specific (06 §4). Names with no
+    /// own — each once, in the order a decision takes them: the smallest room first, a
+    /// bucket's or a window's count, the limit most likely at its edge, ties going to the
+    /// most specific (06 §4). Names with no
     /// limit are problems at `route_place` and `rule_place`.
     pub(crate) fn for_rule(
         &self,
@@ -373,7 +512,7 @@ impl CompiledLimits {
                 }
             }
         }
-        levelled.sort_by_key(|(level, limit)| (limit.burst, *level));
+        levelled.sort_by_key(|(level, limit)| (limit.room(), *level));
         levelled.into_iter().map(|(_, limit)| limit).collect()
     }
 }
@@ -409,6 +548,28 @@ mod tests {
         assert_ne!(methods("GET"), methods("POST"));
         // Fields kept apart: the same bytes split otherwise are not one condition.
         assert_ne!(methods("GET, POST"), methods("GETP, OST"));
+    }
+
+    /// A window's model is in its digest, its count and its window as written: a change of
+    /// model, even to the same numbers, counts afresh.
+    #[test]
+    fn a_windows_model_and_numbers_are_digested() {
+        let limit = |yaml: &str| -> Limit { serde_saphyr::from_str(yaml).unwrap() };
+        let digest = |model: &str| {
+            definition(&limit(&format!(
+                "{{ name: a, key: client, model: {{ {model} }} }}"
+            )))
+        };
+        let fixed = digest("fixed_window: { limit: 10, window: 1s }");
+        for other in [
+            "fixed_window: { limit: 11, window: 1s }",
+            "fixed_window: { limit: 10, window: 2s }",
+            "fixed_window: { limit: 10, window: 1000ms }",
+            "rolling_window: { limit: 10, window: 1s }",
+            "bucket: { rate: 10/s, burst: 10 }",
+        ] {
+            assert_ne!(fixed, digest(other), "{other}");
+        }
     }
 
     #[test]

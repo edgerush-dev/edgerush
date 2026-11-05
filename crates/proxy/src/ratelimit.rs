@@ -20,7 +20,10 @@ use crate::ProxyError;
 use crate::forwarding::Requester;
 use crate::request::NoTables;
 use boring::ssl::SslConnector;
-use edgerush_config::{Compiled, CompiledLimit, CompiledRateLimitService, CompiledRateLimiting};
+use edgerush_config::{
+    Compiled, CompiledLimit, CompiledModel, CompiledRateLimitService, CompiledRateLimiting,
+};
+use edgerush_ratelimit::local::{Limit, Window};
 use edgerush_ratelimit::service::pooled::{
     self, Entry, Handle, Local as PooledLocal, Outcome as Pooled, Registry,
 };
@@ -1068,18 +1071,52 @@ impl std::fmt::Debug for Limiter {
     }
 }
 
+/// What a mode holds a key to, made from its limit and the count the request came out
+/// with: a bucket's contract, or local mode's bucket or window.
+pub(crate) trait Held: Copy {
+    /// `limit`'s, at `count` a window; none for a model the mode does not decide, which its
+    /// config was refused for (`edgerush_config`'s `LimitModelUnsupported`).
+    fn of(limit: &CompiledLimit, count: NonZeroU64) -> Option<Self>;
+}
+
+impl Held for Contract {
+    fn of(limit: &CompiledLimit, count: NonZeroU64) -> Option<Self> {
+        let CompiledModel::Bucket { burst, .. } = limit.model else {
+            return None;
+        };
+        Some(Self {
+            limit: count,
+            window: limit.window,
+            burst,
+        })
+    }
+}
+
+impl Held for Limit {
+    fn of(limit: &CompiledLimit, count: NonZeroU64) -> Option<Self> {
+        match limit.model {
+            CompiledModel::Bucket { .. } => Contract::of(limit, count).map(Self::Bucket),
+            CompiledModel::FixedWindow { .. } => Some(Self::FixedWindow(Window {
+                limit: count,
+                window: limit.window,
+            })),
+            CompiledModel::RollingWindow { .. } => None,
+        }
+    }
+}
+
 /// Calls `then` with the keys of a request from `client` under
 /// those of `limits` that `limited` marks, bit `n` for the `n`th: each the limit's name,
-/// a zero and the key's value, with its contract, put together in a worker's buffers,
+/// a zero and the key's value, with what it is held to, put together in a worker's buffers,
 /// `keys` and `contracts`, whichever mode decides them. A limit the request has no key for
 /// is left out, as one whose number came out below one: it lets the request through.
-pub(crate) fn with_keys<R>(
+pub(crate) fn with_keys<R, H: Held>(
     keys: &RefCell<Vec<Vec<u8>>>,
-    contracts: &RefCell<Vec<Contract>>,
+    contracts: &RefCell<Vec<H>>,
     limits: &[Arc<CompiledLimit>],
     limited: u64,
     client: KeyedBy<'_>,
-    then: impl FnOnce(&[(&[u8], Contract)]) -> R,
+    then: impl FnOnce(&[(&[u8], H)]) -> R,
 ) -> R {
     let mut keys = keys.borrow_mut();
     let mut contracts = contracts.borrow_mut();
@@ -1097,7 +1134,7 @@ pub(crate) fn with_keys<R>(
         let Outcome::Applies { key, limit: count } = limit.rule.counted(&context, &NoTables) else {
             continue;
         };
-        let Some(count) = NonZeroU64::new(count) else {
+        let Some(held) = NonZeroU64::new(count).and_then(|count| H::of(limit, count)) else {
             continue;
         };
         if keys.len() <= used {
@@ -1107,11 +1144,7 @@ pub(crate) fn with_keys<R>(
             continue;
         };
         key_into(buffer, &limit.name, limit.definition, key);
-        contracts.push(Contract {
-            limit: count,
-            window: limit.window,
-            burst: limit.burst,
-        });
+        contracts.push(held);
         used += 1;
     }
     // The usual few at once without a list made for them.
@@ -1122,7 +1155,7 @@ pub(crate) fn with_keys<R>(
         ([a, b, c], [ca, cb, cc]) => then(&[(a, *ca), (b, *cb), (c, *cc)]),
         ([a, b, c, d], [ca, cb, cc, cd]) => then(&[(a, *ca), (b, *cb), (c, *cc), (d, *cd)]),
         (many, contracts) => {
-            let parts: Vec<(&[u8], Contract)> = many
+            let parts: Vec<(&[u8], H)> = many
                 .iter()
                 .map(Vec::as_slice)
                 .zip(contracts.iter().copied())
