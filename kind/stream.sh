@@ -31,7 +31,10 @@
 #     an HTTPRoute's redirect that states only a host sends the client to the listener's
 #     port; a GRPCRoute's method is called through the data plane, served by agnhost's
 #     gRPC health server, another method and any once the route is gone answered
-#     UNIMPLEMENTED, and the route says it is accepted;
+#     UNIMPLEMENTED, and the route says it is accepted; on a port a TLS Passthrough
+#     listener shares with an HTTPS one, a TLSRoute's name is carried to its backend,
+#     whose own certificate the client is shown, a name of the TLS listener's no route
+#     takes is closed, and the HTTPS listener's name served, the route said accepted;
 #   - the Ingress's status says the data plane's Service's address;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
@@ -201,7 +204,7 @@ control_said() {
 refused_any() {
     for replica in $(k -n edge get pod -l app=edgerush-control -o name); do
         k -n edge logs "$replica" 2>/dev/null |
-            grep -E "(customresourcedefinitions|gatewayclasses|gateways|listenersets|grpcroutes|httproutes|referencegrants).*(403|forbidden)" &&
+            grep -E "(customresourcedefinitions|gatewayclasses|gateways|listenersets|grpcroutes|tlsroutes|httproutes|referencegrants).*(403|forbidden)" &&
             return 0
     done
     return 1
@@ -232,6 +235,8 @@ control_said "listenersets.gateway.networking.k8s.io: served at v1 (Gateway API 
     fail "the control plane never said ListenerSets are served"
 control_said "grpcroutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)" 5 ||
     fail "the control plane never said GRPCRoutes are served"
+control_said "tlsroutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)" 5 ||
+    fail "the control plane never said TLSRoutes are served"
 sleep 3
 k apply -f - >/dev/null <<EOF
 apiVersion: gateway.networking.k8s.io/v1
@@ -609,6 +614,107 @@ k -n shop delete grpcroute health >/dev/null
 calls Check "grpc-status: 12" 30 || fail "the GRPCRoute deleted, its method comes back as $(called Check)"
 k -n shop delete deploy/health service/health >/dev/null
 pass "a GRPCRoute's method is served by its backend over HTTP/2, another answered UNIMPLEMENTED, and the route says it is accepted"
+
+# A TLS Passthrough listener and an HTTPS one share port 8443, told apart by SNI (04 §2,
+# 17 §2): a name a TLSRoute takes is carried to its backend, agnhost's netexec over TLS,
+# whose handshake the client makes, shown the backend's own certificate; a name under the
+# TLS listener's that no route takes is closed, not answered with an alert; the HTTPS
+# listener's name is handshaken by the data plane and served. The TLSRoute says it is
+# accepted and resolved, of its generation, which writing it needs tlsroutes/status.
+issue tunnel one.tunnel.example
+issue secure a.example
+k -n shop create secret tls tunnel --cert="$pki/tunnel.crt" --key="$pki/tunnel.key" \
+    --dry-run=client -o yaml | k apply -f - >/dev/null
+k -n edge create secret tls secure --cert="$pki/secure.crt" --key="$pki/secure.key" \
+    --dry-run=client -o yaml | k apply -f - >/dev/null
+k apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: tunnel, namespace: shop }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: tunnel } }
+  template:
+    metadata: { labels: { app: tunnel } }
+    spec:
+      containers:
+        - name: tunnel
+          image: $AGNHOST
+          args: ["netexec", "--http-port=8443", "--tls-cert-file=/tls/tls.crt", "--tls-private-key-file=/tls/tls.key"]
+          ports: [{ name: https, containerPort: 8443 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8443, scheme: HTTPS }, periodSeconds: 1 }
+          volumeMounts: [{ name: tls, mountPath: /tls, readOnly: true }]
+      volumes: [{ name: tls, secret: { secretName: tunnel } }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: tunnel, namespace: shop }
+spec:
+  selector: { app: tunnel }
+  ports: [{ name: https, port: 8443, targetPort: https }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: { name: tunnel, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: tunnels }]
+  hostnames: [one.tunnel.example]
+  rules: [{ backendRefs: [{ name: tunnel, port: 8443 }] }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: secure, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: secure }]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]
+EOF
+k -n edge patch gateway web --type=json -p '[
+  {"op":"add","path":"/spec/listeners/-","value":{"name":"secure","port":8443,"protocol":"HTTPS","hostname":"a.example","allowedRoutes":{"namespaces":{"from":"All"}},"tls":{"certificateRefs":[{"name":"secure"}]}}},
+  {"op":"add","path":"/spec/listeners/-","value":{"name":"tunnels","port":8443,"protocol":"TLS","hostname":"*.tunnel.example","allowedRoutes":{"namespaces":{"from":"All"}},"tls":{"mode":"Passthrough"}}}
+]' >/dev/null
+k -n shop rollout status deploy/tunnel --timeout=120s >/dev/null
+said deploy/edgerush 'listener "port-8443" is on 0.0.0.0:8443' 60 ||
+    fail "the data plane never bound the shared port: $(k -n edge logs deploy/edgerush | tail -5)"
+stated True "$(of_listener tunnels status)" 60 -n edge gateway web ||
+    fail "the TLS listener is not said programmed: $(said_of -n edge gateway web)"
+forward 8443 a.example
+# What a client asking for $1 is told for /hostname, verified against the stream's
+# authority; its error, where it has no answer, in $pki/said.
+told_as() {
+    curl -sS --cacert "$pki/ca.crt" --resolve "$1:$port:127.0.0.1" "https://$1:$port/hostname" \
+        2>"$pki/said" || true
+}
+for _ in $(seq 1 150); do
+    case "$(told_as one.tunnel.example)" in tunnel-*) break ;; esac
+    sleep 0.2
+done
+case "$(told_as one.tunnel.example)" in
+    tunnel-*) ;;
+    *) fail "one.tunnel.example is not carried to its backend: $(told_as one.tunnel.example) $(cat "$pki/said")" ;;
+esac
+[ -z "$(told_as two.tunnel.example)" ] ||
+    fail "two.tunnel.example, which no TLSRoute takes, is answered"
+grep -qi "alert\|unrecognized" "$pki/said" &&
+    fail "two.tunnel.example is refused in a handshake rather than closed: $(cat "$pki/said")"
+[ "$(over_tls a.example a.example)" = 200 ] ||
+    fail "the HTTPS listener's a.example answers $(over_tls a.example a.example)"
+stated "True True" '{.status.parents[0].conditions[?(@.type=="Accepted")].status} {.status.parents[0].conditions[?(@.type=="ResolvedRefs")].status}' \
+    30 -n shop tlsroute tunnel || fail "the TLSRoute says $(said_of -n shop tlsroute tunnel)"
+generation=$(k -n shop get tlsroute tunnel -o jsonpath='{.metadata.generation}')
+stated "$generation" '{.status.parents[0].conditions[?(@.type=="Accepted")].observedGeneration}' \
+    5 -n shop tlsroute tunnel ||
+    fail "the TLSRoute's status is not of generation $generation: $(said_of -n shop tlsroute tunnel)"
+stated 1 '{.status.listeners[?(@.name=="tunnels")].attachedRoutes}' 5 -n edge gateway web ||
+    fail "the TLS listener does not count its route: $(said_of -n edge gateway web)"
+refused_any && fail "a control-plane replica was refused something of a TLSRoute"
+forward
+k -n shop delete tlsroute tunnel >/dev/null
+k -n shop delete httproute secure >/dev/null
+listeners=$(k -n edge get gateway web -o jsonpath='{.spec.listeners[*].name}' | wc -w)
+k -n edge patch gateway web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 1))\"},{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 2))\"}]" >/dev/null
+k -n shop delete deploy/tunnel service/tunnel secret/tunnel >/dev/null
+k -n edge delete secret secure >/dev/null
+pass "on a port TLS Passthrough and HTTPS listeners share, a TLSRoute's name is carried to its backend's own TLS, a name no route takes closed, the HTTPS listener's served, and the route says it is accepted"
 
 # What the Ingress's status says, its first address.
 says() { k -n shop get ingress web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }

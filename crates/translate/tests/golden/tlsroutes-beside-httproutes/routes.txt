@@ -1,0 +1,3 @@
+HTTPRoute shop/pages: attached to http (shop.example.com)
+TLSRoute shop/api: attached to passthrough (api.example.com)
+TLSRoute shop/wrong, section http: not attached: no listener it names takes its kind from its namespace

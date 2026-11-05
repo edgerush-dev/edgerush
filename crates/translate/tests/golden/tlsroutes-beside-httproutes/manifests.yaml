@@ -1,0 +1,64 @@
+# TLSRoutes beside HTTPRoutes: each kind attached to the listeners that take it, of a
+# parentRef naming none, one naming the HTTP listener not allowed there; the TLSRoute's
+# connections passed through to its backend, the HTTPRoute's requests served as ever. A
+# TLSRoute naming another Gateway is not said.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+    - name: passthrough
+      port: 8443
+      protocol: TLS
+      tls: { mode: Passthrough }
+      allowedRoutes: { namespaces: { from: All } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: { name: api, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [api.example.com]
+  rules:
+    - backendRefs: [{ name: web, port: 443 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: { name: wrong, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: http }]
+  hostnames: [api.example.com]
+  rules:
+    - backendRefs: [{ name: web, port: 443 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: { name: elsewhere, namespace: shop }
+spec:
+  parentRefs: [{ name: other, namespace: edge }]
+  hostnames: [api.example.com]
+  rules:
+    - backendRefs: [{ name: web, port: 443 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: pages, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [shop.example.com]
+  rules:
+    - backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }, { name: https, port: 443 }]

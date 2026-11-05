@@ -1,0 +1,13 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener wild: TLSRoute, attached 3: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener api: TLSRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener idle: TLSRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener open: TLSRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener narrow: TLSRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TLSRoute shop/anywhere, generation 0, parent web section open: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TLSRoute shop/api, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Service stock/levels is another namespace's, and no ReferenceGrant there lets TLSRoutes of shop reach it)
+TLSRoute shop/nameless, generation 0, parent web section open: Accepted=False/UnsupportedValue (it has no hostname, where the v1 API has a TLSRoute of at least one, so it is not accepted); ResolvedRefs=True/ResolvedRefs
+TLSRoute shop/two-rules, generation 0, parent web section open: Accepted=False/UnsupportedValue (it has 2 rules, where the v1 API has a TLSRoute of exactly one, so it is not accepted); ResolvedRefs=True/ResolvedRefs
+TLSRoute shop/wide, generation 0, parent web section narrow: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TLSRoute shop/weighted, generation 0, parent web section wild: Accepted=True/Accepted; ResolvedRefs=False/BackendNotFound (Service shop/gone does not exist)
+TLSRoute shop/later, generation 0, parent web section wild: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

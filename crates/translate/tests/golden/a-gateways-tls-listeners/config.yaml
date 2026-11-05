@@ -1,0 +1,28 @@
+listeners:
+  port-8080:
+    address: "0.0.0.0:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  port-8443:
+    address: "0.0.0.0:8443"
+    protocol: tls
+    proxy_protocol: off
+  port-9444:
+    address: "0.0.0.0:9444"
+    protocol: tls
+    proxy_protocol: off
+  port-9445:
+    address: "0.0.0.0:9445"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls: { certificates: [], without_sni: none, refused: [], shared_by: [{ hostnames: [{ name: db.example.com }], passes_through: true }] }
+routes: []
+tls_routes:
+  - { name: gateway/shop/web/passthrough, listeners: [port-8443], hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: false }], backends: [{ invalid: "no TLSRoute takes *.example.com on listener passthrough", weight: 1 }] }
+  - { name: gateway/shop/web/other, listeners: [port-8443], hostnames: [{ name: api.other.com, falls_through: false }], backends: [{ invalid: "no TLSRoute takes api.other.com on listener other", weight: 1 }] }
+  - { name: gateway/shop/web/beside-https, listeners: [port-9445], hostnames: [{ name: db.example.com, falls_through: false }], backends: [{ invalid: "no TLSRoute takes db.example.com on listener beside-https", weight: 1 }] }
+upstreams: {}

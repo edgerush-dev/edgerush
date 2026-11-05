@@ -1,0 +1,51 @@
+listeners:
+  port-443:
+    address: "0.0.0.0:443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: shop/shop-tls, names: [shop.example.com] }
+      without_sni: none
+      refused: [api.example.com]
+      shared_by: [{ hostnames: [{ name: api.example.com }], passes_through: true }, { hostnames: [{ name: shop.example.com }] }]
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  port-8443:
+    address: "0.0.0.0:8443"
+    protocol: tls
+    proxy_protocol: off
+routes:
+  - name: ingress/shop/shop/shop.example.com
+    listeners: [port-443]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/shop/shop.example.com/https-redirect
+    listeners: [port-80]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: max-age=30 }] }]
+        redirect: { status: 308, scheme: https, query: keep }
+  - name: ingress/shop/plain/api.example.com
+    listeners: [port-80]
+    hostnames: [{ name: api.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+tls_routes:
+  - { name: tlsroute/shop/api/api, listeners: [port-443], hostnames: [{ name: api.example.com, falls_through: false }], backends: [{ upstream: shop/api/tls, weight: 1 }] }
+  - { name: tlsroute/shop/api/other, listeners: [port-8443], hostnames: [{ name: api.example.com, falls_through: false }], backends: [{ upstream: shop/api/tls, weight: 1 }] }
+  - { name: gateway/shop/web/api, listeners: [port-443], hostnames: [{ name: api.example.com, falls_through: false }], backends: [{ invalid: "no TLSRoute takes api.example.com on listener api", weight: 1 }] }
+  - { name: gateway/shop/web/other, listeners: [port-8443], hostnames: [{ name: api.example.com, falls_through: false }], backends: [{ invalid: "no TLSRoute takes api.example.com on listener other", weight: 1 }] }
+upstreams:
+  shop/api/tls: { load_balancer: p2c, endpoints: { kubernetes: "api.shop.svc.cluster.local:tls" } }
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

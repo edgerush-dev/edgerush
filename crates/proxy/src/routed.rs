@@ -116,20 +116,20 @@ fn routes_of<'a>(
                 );
             }
         }
-        None => {
-            for &route in &listener.http_routes {
-                let Some(name) = config.route_name(route) else {
-                    continue;
-                };
-                for rule in config.rules_of(route) {
-                    if let Outcome::Forward { backends, .. } = &rule.outcome {
-                        found.extend(
-                            backends
-                                .upstreams()
-                                .map(|upstream| (Through::Http(route), name, upstream)),
-                        );
-                    }
-                }
+        None => {}
+    }
+    // None for a `tcp` or `tls` listener; an `https` one that passes some through has both.
+    for &route in &listener.http_routes {
+        let Some(name) = config.route_name(route) else {
+            continue;
+        };
+        for rule in config.rules_of(route) {
+            if let Outcome::Forward { backends, .. } = &rule.outcome {
+                found.extend(
+                    backends
+                        .upstreams()
+                        .map(|upstream| (Through::Http(route), name, upstream)),
+                );
             }
         }
     }
@@ -199,6 +199,31 @@ upstreams:
     const DB: usize = 0;
     const SNI: usize = 1;
     const WEB: usize = 2;
+
+    /// An `https` listener that passes some names through has a key for each of its HTTP
+    /// routes and of its TLS routes: a reload that takes either away drains what it carries.
+    #[test]
+    fn an_https_listener_that_passes_some_through_has_both_kinds_of_route() {
+        let yaml = format!(
+            r#"
+listeners:
+  web: {{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [], without_sni: none, shared_by: [{{ hostnames: [{{ name: "*" }}] }}, {{ hostnames: [{{ name: api.test }}], passes_through: true }}] }} }}
+routes: [{http}]
+tls_routes: [{tls}]
+{UPSTREAMS}"#,
+            http = http("chat", "/chat", "one"),
+            tls = tls("api", "api.test", "two").replace("[sni]", "[web]"),
+        );
+        let compiled = compile(&serde_saphyr::from_str::<Config>(&yaml).unwrap()).unwrap();
+        let routed = Routed::reconcile(
+            &compiled,
+            &[Some("web".to_owned()), None],
+            &Routed::default(),
+            &Keys::default(),
+        );
+        assert!(routed.key(0, Through::Http(0), ONE).is_some());
+        assert!(routed.key(0, Through::Tls(0), TWO).is_some());
+    }
 
     /// A reload that keeps a listener, a route of it and an upstream that route lists keeps
     /// their key, whatever else it changes: weights, hostnames, other rules and routes, and

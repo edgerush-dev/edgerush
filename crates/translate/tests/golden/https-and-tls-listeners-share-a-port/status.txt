@@ -1,0 +1,9 @@
+Gateway, generation 0: Accepted=True/ListenersNotValid (listeners not accepted: again)
+listener api: TLSRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener https: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener tunnels: TLSRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener www: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener again: no kind, attached 0: Accepted=False/HostnameConflict (listener api, which comes first, has its port, protocol and hostname); Conflicted=True/HostnameConflict (listener api, which comes first, has its port, protocol and hostname); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (listener api, which comes first, has its port, protocol and hostname)
+HTTPRoute shop/pages, generation 0, parent web section https: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TLSRoute shop/api, generation 0, parent web section api: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TLSRoute shop/tunnels, generation 0, parent web section tunnels: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

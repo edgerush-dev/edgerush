@@ -900,6 +900,38 @@ upstreams:
         assert_eq!(Rejection::Misdirected.reason(), "misdirected");
     }
 
+    /// A request on a connection made for a listener sharing the port that serves it, for
+    /// a host a listener that passes its connections through is for, is misdirected: 421,
+    /// which a client sends again on a connection of its own, and that one is carried. Over
+    /// HTTP/2 a certificate for both names lets a client reuse the one for the other.
+    #[test]
+    fn a_request_for_a_host_passed_through_is_misdirected() {
+        let yaml = SHOP.replace(
+            "tls: { certificates: [secure], without_sni: secure }",
+            r#"tls: { certificates: [secure], without_sni: secure, shared_by: [{ hostnames: [{ name: "*" }] }, { hostnames: [{ name: api.example.com }], passes_through: true }] }"#,
+        );
+        let shop = compile(&shop_config(&yaml)).unwrap();
+        let secure = shop
+            .listeners()
+            .iter()
+            .find(|l| l.name == "secure")
+            .unwrap();
+        let shared = secure.tls.as_ref().unwrap().shared_by.as_ref().unwrap();
+        let decided = |host: &str| {
+            let client = peer();
+            client.asked(Asked::new(shared, Some("shop.example.com")));
+            let mut head = head("/v1", &[("host", host)]);
+            decide(&shop, secure, &mut head, &client, &mut || 0, None).map(|decision| {
+                shop.upstream(forwarding(decision).upstream)
+                    .unwrap()
+                    .name
+                    .clone()
+            })
+        };
+        assert_eq!(decided("shop.example.com"), Ok("search".to_owned()));
+        assert_eq!(decided("API.example.com"), Err(Rejection::Misdirected));
+    }
+
     /// What routing was given: host, path, query, method, and the `Host` and
     /// `X-Forwarded-For` fields.
     type Routed = (String, String, String, Method, Vec<String>, Vec<String>);

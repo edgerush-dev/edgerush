@@ -1,0 +1,4 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener api: TLSRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener other: TLSRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TLSRoute shop/api, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

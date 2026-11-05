@@ -1,0 +1,5 @@
+TLSRoute shop/api: a backend's share of connections is closed: Service stock/levels is another namespace's, and no ReferenceGrant there lets TLSRoutes of shop reach it
+TLSRoute shop/nameless: it has no hostname, where the v1 API has a TLSRoute of at least one, so it is not accepted
+TLSRoute shop/two-rules: it has 2 rules, where the v1 API has a TLSRoute of exactly one, so it is not accepted
+TLSRoute shop/weighted: a backend's share of connections is closed: Service shop/gone does not exist
+TLSRoute shop/later: *.example.com on port-8443 is served by TLSRoute shop/weighted, which comes first

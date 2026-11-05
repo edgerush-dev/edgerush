@@ -1,0 +1,53 @@
+# A Gateway's TLS listeners: in Passthrough mode each is served on a `tls` listener of the
+# data plane, its certificateRefs not read (ignored, as the spec has it), several on one
+# port told apart by hostname, one of an earlier's hostname refused; in Terminate mode not
+# accepted and taking no route; before an HTTPS listener on one port served on its `https`
+# listener, its name passed through even where that one has no certificate it can use;
+# beside an HTTP one a conflict. The kinds a TLS listener names that it cannot take are
+# said. An HTTPRoute naming a TLS listener is not allowed there.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP }
+    - name: passthrough
+      port: 8443
+      protocol: TLS
+      hostname: "*.example.com"
+      tls: { mode: Passthrough, certificateRefs: [{ name: not-there }] }
+    - { name: other, port: 8443, protocol: TLS, hostname: api.other.com, tls: { mode: Passthrough } }
+    - { name: again, port: 8443, protocol: TLS, hostname: "*.example.com", tls: { mode: Passthrough } }
+    - name: terminated
+      port: 9443
+      protocol: TLS
+      tls: { mode: Terminate, certificateRefs: [{ name: not-there }] }
+    - name: kinds
+      port: 9444
+      protocol: TLS
+      tls: { mode: Passthrough }
+      allowedRoutes: { kinds: [{ kind: TCPRoute }, { kind: TLSRoute }, { kind: HTTPRoute }] }
+    - { name: beside-https, port: 9445, protocol: TLS, hostname: db.example.com, tls: { mode: Passthrough } }
+    - { name: secure, port: 9445, protocol: HTTPS, tls: { certificateRefs: [{ name: not-there }] } }
+    - { name: beside-http, port: 8080, protocol: TLS, hostname: db.example.com, tls: { mode: Passthrough } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: pages, namespace: shop }
+spec:
+  parentRefs: [{ name: web, sectionName: passthrough }]
+  rules:
+    - backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }, { name: https, port: 443 }]

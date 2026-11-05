@@ -13,7 +13,7 @@ use crate::route::{
 };
 use crate::{
     AccessLog, Backend, Certificate, ClientValidation, Config, DnsName, DnsNameError, Endpoints,
-    Forwarding, HealthCheck, Http3, Keepalive, KubernetesService, ListenerProxyProtocol,
+    Forwarding, HealthCheck, Http3, Keepalive, KubernetesService, Listener, ListenerProxyProtocol,
     LoadBalancer, Probe, Protocol, ProxyProtocolVersion, RateLimitMode, RequestId, Rule,
     ServiceName, ServiceNameError, SharingListener, SlowStart, UpstreamProtocol,
 };
@@ -303,10 +303,12 @@ pub struct CompiledListener {
     /// The routes that are for it, by their positions, as a [`RuleId`] gives them; none for
     /// a `tcp` or `tls` listener, whose routes are its `l4`.
     pub http_routes: Vec<usize>,
-    /// Where a `tcp` or `tls` listener's connections go; `None` for an HTTP listener.
+    /// Where a `tcp` or `tls` listener's connections go, and those an `https` listener
+    /// passes through ([`CompiledListener::carries`]); `None` for any other HTTP listener.
     pub l4: Option<L4>,
     /// How long a tunnel of this listener's may carry nothing before it is closed: an hour
-    /// unless its config says otherwise. Only a `tcp` or `tls` listener has tunnels.
+    /// unless its config says otherwise. Only a `tcp` or `tls` listener, or an `https` one
+    /// that passes connections through, has tunnels.
     pub tunnel_idle: Duration,
     /// What it tells upstreams of a request's client; nothing for a `tcp` or `tls`
     /// listener, which carries no requests.
@@ -319,6 +321,36 @@ pub struct CompiledListener {
     pub proxy_senders: Option<TrustedProxies>,
     /// Where its access log goes; `None` for a listener that logs nothing.
     pub access_log: Option<AccessLog>,
+}
+
+impl CompiledListener {
+    /// Whether its connections are told apart by their ClientHello before anything else is
+    /// done with them: an `https` listener's that passes some through (17 §2 in the docs).
+    /// A `tls` listener's are read for their route alone.
+    #[must_use]
+    pub fn sorts_by_hello(&self) -> bool {
+        self.protocol == Protocol::Https && self.l4.is_some()
+    }
+
+    /// Whether a connection whose ClientHello asks for `name`, or for none, is carried
+    /// rather than served: every one of a `tcp` or `tls` listener's; of an `https` one's,
+    /// those for a listener sharing its port that passes its connections through, found as
+    /// [`SharedListeners::of`] finds it. Never allocates.
+    #[must_use]
+    pub fn carries(&self, name: Option<&str>) -> bool {
+        match self.protocol {
+            Protocol::Tcp | Protocol::Tls => true,
+            Protocol::Https => {
+                self.l4.is_some()
+                    && self
+                        .tls
+                        .as_ref()
+                        .and_then(|tls| tls.shared_by.as_deref())
+                        .is_some_and(|shared| shared.passes_through(name))
+            }
+            Protocol::Http => false,
+        }
+    }
 }
 
 /// What an HTTP listener tells its upstreams of a request's client, compiled.
@@ -986,10 +1018,10 @@ pub struct SharedListeners {
 }
 
 impl SharedListeners {
-    /// The listeners, if two or more share the port and fit; `None` otherwise, for which
-    /// nothing is checked.
+    /// The listeners, if two or more share the port, or one passes its connections
+    /// through, and they fit; `None` otherwise, for which nothing is checked.
     fn new(stated: &[SharingListener]) -> Option<Self> {
-        if stated.len() < 2 {
+        if stated.len() < 2 && !stated.iter().any(|sharing| sharing.passes_through) {
             return None;
         }
         let mut claims = Vec::new();
@@ -1028,6 +1060,31 @@ impl SharedListeners {
             None => self.catch_all,
         }
     }
+
+    /// Whether one of them passes its connections through.
+    #[must_use]
+    pub fn passes_some(&self) -> bool {
+        self.stated.iter().any(|sharing| sharing.passes_through)
+    }
+
+    /// Whether a connection whose client asks for `name` (SNI), or for none, is for a
+    /// listener that passes its connections through (17 §2 in the docs). Never allocates.
+    #[must_use]
+    pub fn passes_through(&self, name: Option<&str>) -> bool {
+        self.of(name)
+            .and_then(|at| self.stated.get(usize::from(at)))
+            .is_some_and(|sharing| sharing.passes_through)
+    }
+}
+
+/// Whether `listener` is an `https` one that passes some of its connections through: one
+/// of the listeners sharing its port does (17 §2 in the docs).
+fn passes_some(listener: &Listener) -> bool {
+    listener.protocol == Protocol::Https
+        && listener
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.shared_by.iter().any(|sharing| sharing.passes_through))
 }
 
 impl PartialEq for SharedListeners {
@@ -1351,7 +1408,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             errors.push(Place::listener(name).problem(Problem::Http3NeedsTls));
         }
         match (listener.protocol, listener.tunnel_idle_seconds) {
-            (Protocol::Http | Protocol::Https, Some(_)) => {
+            (Protocol::Http | Protocol::Https, Some(_)) if !passes_some(listener) => {
                 errors.push(Place::listener(name).problem(Problem::TunnelIdleUnwanted));
             }
             (_, Some(0)) => {
@@ -1854,12 +1911,16 @@ fn l4_routes<'a>(
                     errors.push(Place::listener(name).problem(Problem::TcpRoutes(routes.len())));
                 }
             }
-            Protocol::Tls => {
+            // An `https` listener's are those it passes through; none takes a name it
+            // passes, and that name's connections are closed, as a `tls` listener's.
+            Protocol::Tls | Protocol::Https
+                if listener.protocol == Protocol::Tls || passes_some(listener) =>
+            {
                 let (routes, hosts) = tls.remove(name.as_str()).unwrap_or_default();
                 let hosts = HostIndex::new(hosts, |members: Vec<usize>| members);
                 compiled.insert(name.as_str(), L4::Tls(SniRouter { routes, hosts }));
             }
-            Protocol::Http | Protocol::Https => {}
+            Protocol::Tls | Protocol::Http | Protocol::Https => {}
         }
     }
     (compiled, sni)
@@ -1884,6 +1945,14 @@ fn l4_listeners<'a>(
             Some(_) if listeners.contains(&name.as_str()) => {
                 errors.push(place.problem(Problem::ListenerTwice(name.clone())));
             }
+            // An `https` listener takes the connections it passes through by name.
+            Some(listener) if kind == Protocol::Tls && listener.protocol == Protocol::Https => {
+                if passes_some(listener) {
+                    listeners.push(name);
+                } else {
+                    errors.push(place.problem(Problem::NothingPassedThrough(name.clone())));
+                }
+            }
             Some(listener) if listener.protocol != kind => {
                 errors.push(place.problem(Problem::WrongListener {
                     kind: if kind == Protocol::Tcp { "TCP" } else { "TLS" },
@@ -1897,7 +1966,8 @@ fn l4_listeners<'a>(
     listeners
 }
 
-/// A passthrough route's backends: 1 to 16, of upstreams that take plain bytes.
+/// A passthrough route's backends: 1 to 16, of upstreams that take plain bytes, or invalid,
+/// refusing their share of connections by closing them, as TLSRoute has it (17 §4).
 fn l4_backends(
     config: &Config,
     backends: &[Backend],
@@ -1917,10 +1987,15 @@ fn l4_backends(
             backend: Some(at),
             ..place.clone()
         };
-        // A connection has no status to be answered with: an invalid backend is an HTTP
-        // rule's.
-        if backend.invalid.is_some() {
-            errors.push(place.problem(Problem::InvalidBackendOfTunnel));
+        if let Some(reason) = &backend.invalid {
+            // Neither both nor neither: said once, by `upstream_of`.
+            if backend.upstream.is_some() {
+                let _ = upstream_of(backend, &place, errors);
+            } else if reason.is_empty() {
+                errors.push(place.problem(Problem::InvalidBackendWithoutReason));
+            } else {
+                resolved.push((Err(reason.clone()), backend.weight));
+            }
             continue;
         }
         let Some(name) = upstream_of(backend, &place, errors) else {
@@ -1936,9 +2011,9 @@ fn l4_backends(
         if speaks_more {
             errors.push(place.problem(Problem::PassthroughUpstream(name.to_owned())));
         }
-        resolved.push((id, backend.weight));
+        resolved.push((Ok(id), backend.weight));
     }
-    WeightedBackends::new(resolved)
+    WeightedBackends::with_invalid(resolved)
 }
 
 /// What gRPC servers enforce by default between a client's PINGs: five minutes.
@@ -2644,7 +2719,9 @@ pub enum Problem {
     #[error("`http3` is for protocol `https`")]
     Http3NeedsTls,
     /// A tunnel's idle bound on a listener that makes no tunnels.
-    #[error("`tunnel_idle_seconds` is for protocols `tcp` and `tls`")]
+    #[error(
+        "`tunnel_idle_seconds` is for protocols `tcp` and `tls`, and for an `https` listener that passes connections through"
+    )]
     TunnelIdleUnwanted,
     /// A tunnel that could never carry anything.
     #[error("`tunnel_idle_seconds` must be at least 1")]
@@ -2703,6 +2780,11 @@ pub enum Problem {
         /// What the listener speaks.
         protocol: &'static str,
     },
+    /// A TLS route for an `https` listener none of whose sharers passes through.
+    #[error(
+        "a TLS route can be for `https` listener `{0}` only where a listener sharing its port passes its connections through"
+    )]
+    NothingPassedThrough(String),
     /// A `tcp` listener without exactly one TCP route.
     #[error("a `tcp` listener needs exactly one TCP route; it has {0}")]
     TcpRoutes(usize),
@@ -2926,10 +3008,6 @@ pub enum Problem {
     /// An invalid backend that does not say why.
     #[error("an `invalid` backend says why it is invalid")]
     InvalidBackendWithoutReason,
-    /// An invalid backend of a TCP or TLS route, whose connections have no status to be
-    /// answered with.
-    #[error("an `invalid` backend is for HTTP rules only")]
-    InvalidBackendOfTunnel,
     /// The gRPC method match names no service or method, or not in their form.
     #[error("gRPC service `{service}` and method `{method}` are not names a call could have")]
     GrpcMethod {
@@ -4808,6 +4886,103 @@ upstreams:
         assert_eq!(backends.upstreams().collect::<Vec<_>>(), [UpstreamId(1)]);
     }
 
+    /// An `https` listener among whose sharers one passes its connections through carries
+    /// those whose SNI is for that one, by its TLS routes, and serves the rest: the most
+    /// specific listener hostname decides, and a client that asks for no name is the
+    /// catch-all's (17 §2). A TLS route can be for such a listener alone among the `https`
+    /// ones, and a tunnel's idle bound with it; a TCP route never can.
+    #[test]
+    fn an_https_listener_carries_the_names_a_passing_sharer_is_for() {
+        let api = "tls_routes: [{ name: api, listeners: [l], hostnames: [{ name: api.example.com, falls_through: true }], backends: [{ upstream: up, weight: 1 }] }]";
+        let https = |shared_by: &str, extra: &str, routes: &str| {
+            let yaml = format!(
+                r#"
+listeners:
+  l: {{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [c], without_sni: c, shared_by: [{shared_by}] }}{extra} }}
+routes: []
+{routes}
+upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
+"#
+            );
+            compile(&with_certificates(config(&yaml), &["c"])).map_err(|errors| {
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>()
+            })
+        };
+        let passing = r#"{ hostnames: [{ name: "*.example.com", wildcard: any_labels }] }, { hostnames: [{ name: api.example.com }], passes_through: true }"#;
+        let compiled = https(passing, ", tunnel_idle_seconds: 60", api).unwrap();
+        let l = &compiled.listeners[0];
+        assert!(l.sorts_by_hello());
+        assert_eq!(l.tunnel_idle, Duration::from_secs(60));
+        for (name, carried) in [
+            (Some("api.example.com"), true),
+            (Some("API.example.com."), true),
+            (Some("www.example.com"), false),
+            (Some("elsewhere.test"), false),
+            (None, false),
+        ] {
+            assert_eq!(l.carries(name), carried, "{name:?}");
+        }
+        let routed =
+            l.l4.as_ref()
+                .and_then(|l4| l4.route(Some("api.example.com")));
+        assert_eq!(routed.map(|(_, route)| route.name.as_str()), Some("api"));
+        // The catch-all passed through, and with it a client that asks for no name, beside
+        // a more specific name served.
+        let catch_all = r#"{ hostnames: [{ name: www.example.com }] }, { hostnames: [{ name: "*" }], passes_through: true }"#;
+        let compiled = https(catch_all, "", api).unwrap();
+        let l = &compiled.listeners[0];
+        for (name, carried) in [
+            (Some("www.example.com"), false),
+            (Some("api.example.com"), true),
+            (Some("elsewhere.test"), true),
+            (None, true),
+        ] {
+            assert_eq!(l.carries(name), carried, "{name:?}");
+        }
+        // One sharer alone, passing: its names carried, the rest served.
+        let alone = "{ hostnames: [{ name: api.example.com }], passes_through: true }";
+        let compiled = https(alone, "", api).unwrap();
+        let l = &compiled.listeners[0];
+        assert!(l.carries(Some("api.example.com")));
+        assert!(!l.carries(Some("www.example.com")) && !l.carries(None));
+        // Passing, with no TLS route: what it passes through is closed, as a `tls`
+        // listener's is with none.
+        let compiled = https(passing, "", "").unwrap();
+        let l = &compiled.listeners[0];
+        assert!(l.carries(Some("api.example.com")));
+        assert!(
+            l.l4.as_ref()
+                .unwrap()
+                .route(Some("api.example.com"))
+                .is_none()
+        );
+        // None passing: neither a TLS route nor a tunnel's idle bound is for it, and
+        // nothing is carried.
+        let served =
+            r#"{ hostnames: [{ name: "*" }] }, { hostnames: [{ name: api.example.com }] }"#;
+        assert_eq!(
+            https(served, ", tunnel_idle_seconds: 60", api)
+                .err()
+                .unwrap(),
+            [
+                "listener `l`: `tunnel_idle_seconds` is for protocols `tcp` and `tls`, and for an `https` listener that passes connections through",
+                "route `api`: a TLS route can be for `https` listener `l` only where a listener sharing its port passes its connections through",
+            ]
+        );
+        let compiled = https(served, "", "").unwrap();
+        assert!(!compiled.listeners[0].sorts_by_hello());
+        assert!(!compiled.listeners[0].carries(Some("api.example.com")));
+        let tcp =
+            "tcp_routes: [{ name: db, listeners: [l], backends: [{ upstream: up, weight: 1 }] }]";
+        assert_eq!(
+            https(passing, "", tcp).err().unwrap(),
+            ["route `db`: a TCP route cannot be for listener `l`, which is `https`"]
+        );
+    }
+
     /// A route goes only to listeners of its kind, a `tcp` listener has exactly one, a
     /// passthrough listener presents no certificate, and a passthrough route has 1 to 16
     /// backends that take plain bytes and a name no other route has.
@@ -4940,7 +5115,9 @@ upstreams:
                 ),
                 "routes: []"
             ),
-            ["listener `w`: `tunnel_idle_seconds` is for protocols `tcp` and `tls`"]
+            [
+                "listener `w`: `tunnel_idle_seconds` is for protocols `tcp` and `tls`, and for an `https` listener that passes connections through"
+            ]
         );
         assert_eq!(
             refused(
@@ -5757,17 +5934,13 @@ routes: []
 tcp_routes: [{ name: t, listeners: [db], backends: [{ invalid: gone, weight: 1 }] }]
 upstreams: {}
 ";
-        let refused: Vec<String> = compile(&config(tunnel))
-            .unwrap_err()
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        assert!(
-            refused
-                .iter()
-                .any(|problem| problem.ends_with("an `invalid` backend is for HTTP rules only")),
-            "{refused:?}"
-        );
+        // A tunnel's invalid backend refuses its share of connections, by closing them.
+        let compiled = compile(&config(tunnel)).unwrap();
+        let Some(L4::Tcp(route)) = compiled.listeners[0].l4.as_ref() else {
+            panic!("a tcp listener's route");
+        };
+        assert_eq!(route.backends.pick(0), Some(Destination::Invalid(0)));
+        assert_eq!(route.backends.reason(0), Some("gone"));
     }
 
     /// Slow start states its window, of at least a millisecond; left out, there is none.

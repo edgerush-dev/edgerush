@@ -1,0 +1,8 @@
+# The shared data plane, as the Gateway shop/web, its Ingress hosts not redirected to
+# HTTPS: what is told apart here is HTTPS and TLS listeners, not plain HTTP.
+ingress_class: edge
+gateway: shop/web
+cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+ingress_https_redirect: false
+ingress_https_redirect_max_age: 30
