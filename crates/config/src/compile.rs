@@ -5,7 +5,7 @@
 #[cfg(test)]
 use crate::backends::Destination;
 use crate::backends::{UpstreamId, WeightedBackends};
-use crate::limits::{CompiledLimit, compile_limits};
+use crate::limits::{CompiledLimit, CompiledModel, compile_limits};
 use crate::route::{
     EncodedSlash, Filter, Forward, Fraction, GrpcMethod, HeaderChanges, Hostname, Match,
     PathChange, PathMatch, Query, Redirect, Route, RulePaths, Scheme, UrlRewrite, ValueMatch,
@@ -660,18 +660,40 @@ fn rule_limits(
     limits
 }
 
+/// The mode, as a refusal says it, if `rate_limiting` cannot run `model`. Local mode keeps a
+/// key in one word, which holds no rolling window's slots, and `when_unreachable: local`
+/// decides from local mode's keys (06 §3); the synchronous mode's service has no windows yet,
+/// and the asynchronous mode's windows are designed later. Off runs none, and refuses none.
+fn unsupported_in(
+    model: &CompiledModel,
+    rate_limiting: &CompiledRateLimiting,
+) -> Option<&'static str> {
+    match (model, rate_limiting) {
+        (CompiledModel::Bucket { .. }, _)
+        | (_, CompiledRateLimiting::Off)
+        | (CompiledModel::FixedWindow { .. }, CompiledRateLimiting::Local { .. }) => None,
+        (CompiledModel::RollingWindow { .. }, CompiledRateLimiting::Local { .. }) => {
+            Some("in local mode")
+        }
+        (_, CompiledRateLimiting::Synchronous(_)) => Some("in the synchronous mode yet"),
+        (_, CompiledRateLimiting::Asynchronous(_)) => Some("in the asynchronous mode"),
+    }
+}
+
 /// `limit`'s bucket, if it refills in under two of the service's cycles: the copies the data
 /// planes decide from run up to a cycle and a message behind the owner's bucket, and one
 /// that refills within about that refuses clients within their rate (06 §4).
 fn bucket_under_two_cycles(limit: &CompiledLimit, cycle: Duration) -> Option<Problem> {
-    let burst = u128::from(limit.burst.get());
+    let CompiledModel::Bucket { rate, burst } = &limit.model else {
+        return None;
+    };
     let window = u128::from(limit.window.get());
     // Two cycles' worth of the rate, in requests times the window: the burst times the window
     // is to be no less.
     let needed = 2 * cycle.as_nanos() * u128::from(limit.count.get());
-    (burst * window < needed).then(|| Problem::LimitBurstUnderTwoCycles {
-        burst: limit.burst.get(),
-        rate: limit.rate.clone(),
+    (u128::from(burst.get()) * window < needed).then(|| Problem::LimitBurstUnderTwoCycles {
+        burst: burst.get(),
+        rate: rate.clone(),
         cycle_ms: cycle.as_millis(),
         least: needed.div_ceil(window),
     })
@@ -1481,6 +1503,13 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         .and_then(|limiting| limiting.experimental_header_keys)
         .unwrap_or(false);
     let engine = compile_limits(config.limits.as_ref(), header_keys, &mut errors);
+    for limit in engine.all() {
+        if let Some(mode) = unsupported_in(&limit.model, &rate_limiting) {
+            let model = limit.model.name();
+            let problem = Problem::LimitModelUnsupported { model, mode };
+            errors.push(Place::of(Object::Limit(limit.name.clone())).problem(problem));
+        }
+    }
     if let CompiledRateLimiting::Asynchronous(service) = &rate_limiting {
         for limit in engine.all() {
             if let Some(problem) = bucket_under_two_cycles(&limit, service.cycle) {
@@ -2878,6 +2907,27 @@ pub enum Problem {
     /// A bucket of nothing.
     #[error("`model.bucket.burst` is 0: at least 1")]
     LimitBurstZero,
+    /// A window of no requests.
+    #[error("`model.{0}.limit` is 0: at least 1")]
+    LimitCountZero(&'static str),
+    /// A window that is not one.
+    #[error(
+        "`model.{model}.window`: `{window}` is not a window: a whole number of at least 1 and `ms`, `s`, `m`, `h` or `d`, under 213,503 days"
+    )]
+    LimitWindow {
+        /// The model's name.
+        model: &'static str,
+        /// The window as it was written.
+        window: String,
+    },
+    /// A model the mode does not run.
+    #[error("`model`: `{model}` is not supported {mode}")]
+    LimitModelUnsupported {
+        /// The model's name.
+        model: &'static str,
+        /// The mode, as `in local mode`.
+        mode: &'static str,
+    },
     /// A bucket that refills in under two of the rate-limiting service's cycles.
     #[error(
         "`model.bucket.burst` is {burst}: at `{rate}` it refills in under two of `rate_limiting.service`'s {cycle_ms} ms cycles: at least {least}"
@@ -6498,7 +6548,11 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
         assert!(redirecting.is_empty(), "not even the data plane's");
         let writes = &compiled.rules[0][0].limits[1];
         assert_eq!(writes.window.get(), 60_000_000_000);
-        assert_eq!(writes.burst.get(), 100);
+        assert!(
+            matches!(&writes.model, CompiledModel::Bucket { burst, .. } if burst.get() == 100),
+            "{:?}",
+            writes.model
+        );
         let (alone, _, _) = limited("", "", "", LIMITS, true).unwrap();
         assert_eq!(alone, ["wide"]);
         let (none, _, _) = limited("", "", "", "limits: []", false).unwrap();
@@ -6694,6 +6748,140 @@ rate_limiting: {{ mode: local{switch} }}
             limited("", "", "", &twice, true).unwrap_err(),
             ["limit `k`: another limit has the same name"]
         );
+    }
+
+    /// A config in `mode` — the rate-limiting section, none for off — under one limit `k` of
+    /// `model`: compiled, or the problems.
+    fn in_mode(mode: &str, model: &str) -> Result<Compiled, Vec<String>> {
+        let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{}}\n{mode}\n");
+        let mut config = config(&yaml);
+        let limits = format!("limits: [{{ name: k, key: client, model: {model} }}]");
+        config.limits = Some(serde_saphyr::from_str(&limits).unwrap());
+        compile(&config).map_err(|errors| errors.iter().map(ToString::to_string).collect())
+    }
+
+    const LOCAL: &str = "rate_limiting: { mode: local }";
+
+    /// A window's numbers are checked as a bucket's are: a limit of at least 1, a window of a
+    /// whole number and a unit that the clock holds in nanoseconds.
+    #[test]
+    fn a_window_is_checked() {
+        let window = |text: &str| {
+            in_mode(
+                LOCAL,
+                &format!("{{ fixed_window: {{ limit: 10, window: {text} }} }}"),
+            )
+            .map(|compiled| compiled.limits()[0].window.get())
+        };
+        for (text, nanos) in [
+            ("500ms", 500_000_000),
+            ("1s", 1_000_000_000),
+            ("1m", 60_000_000_000),
+            ("2h", 7_200_000_000_000),
+            ("1d", 86_400_000_000_000),
+            ("213503d", 213_503 * 86_400_000_000_000),
+        ] {
+            assert_eq!(window(text), Ok(nanos), "{text}");
+        }
+        for text in [
+            "1min", "0s", "1.5s", "s", "m1", "-1s", "1 s", "1S", "213504d",
+        ] {
+            assert_eq!(
+                window(text),
+                Err(vec![format!(
+                    "limit `k`: `model.fixed_window.window`: `{text}` is not a window: a whole number of at least 1 and `ms`, `s`, `m`, `h` or `d`, under 213,503 days"
+                )]),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            in_mode(LOCAL, "{ fixed_window: { limit: 0, window: 1s } }").unwrap_err(),
+            ["limit `k`: `model.fixed_window.limit` is 0: at least 1"]
+        );
+        // Each model takes only its own fields.
+        let parse = |model: &str| {
+            let limits = format!("limits: [{{ name: k, key: client, model: {model} }}]");
+            serde_saphyr::from_str::<crate::Limits>(&limits).map(|_| ())
+        };
+        assert!(parse("{ fixed_window: { limit: 1, window: 1s } }").is_ok());
+        assert!(parse("{ fixed_window: { limit: 1, window: 1s, burst: 1 } }").is_err());
+        assert!(parse("{ bucket: { rate: 1/s, burst: 1, window: 1s } }").is_err());
+        assert!(parse("{ fixed_window: { limit: 1 } }").is_err());
+    }
+
+    /// Each mode takes the models it can run, and a limit of another is refused naming it:
+    /// local mode keeps no rolling window, nor does `when_unreachable: local`, the
+    /// synchronous mode has no windows until its service runs the store, and the asynchronous
+    /// mode's are designed later. Off runs none and refuses none.
+    #[test]
+    fn each_mode_takes_the_models_it_runs() {
+        let service = r#"service: { addresses: ["rl-0:7000"] }"#;
+        let synchronous = format!(
+            "rate_limiting: {{ mode: synchronous, {service}, experimental_fewer_pods: true, {WAITS} }}"
+        );
+        let falling_back =
+            synchronous.replace("when_unreachable: allow", "when_unreachable: local");
+        let asynchronous = format!("rate_limiting: {{ mode: asynchronous, {service} }}");
+        let bucket = "{ bucket: { rate: 10/s, burst: 10 } }";
+        let fixed = "{ fixed_window: { limit: 10, window: 1m } }";
+        let rolling = "{ rolling_window: { limit: 10, window: 1m } }";
+        let refused = |model: &str, mode: &str| {
+            Err(vec![format!(
+                "limit `k`: `model`: `{model}` is not supported {mode}"
+            )])
+        };
+        let sync = "in the synchronous mode yet";
+        let not_async = "in the asynchronous mode";
+        for (mode, model, expected) in [
+            ("", bucket, Ok(())),
+            ("", fixed, Ok(())),
+            ("", rolling, Ok(())),
+            (LOCAL, bucket, Ok(())),
+            (LOCAL, fixed, Ok(())),
+            (LOCAL, rolling, refused("rolling_window", "in local mode")),
+            (&synchronous, bucket, Ok(())),
+            (&synchronous, fixed, refused("fixed_window", sync)),
+            (&synchronous, rolling, refused("rolling_window", sync)),
+            (&falling_back, bucket, Ok(())),
+            (&falling_back, fixed, refused("fixed_window", sync)),
+            (&falling_back, rolling, refused("rolling_window", sync)),
+            (&asynchronous, bucket, Ok(())),
+            (&asynchronous, fixed, refused("fixed_window", not_async)),
+            (&asynchronous, rolling, refused("rolling_window", not_async)),
+        ] {
+            assert_eq!(in_mode(mode, model).map(|_| ()), expected, "{mode} {model}");
+        }
+    }
+
+    /// A window's room is its count: a window of 3 is decided before a bucket of 5.
+    #[test]
+    fn a_window_is_ordered_by_its_count() {
+        let limits = r"
+limits:
+  - { name: bucket, key: client, model: { bucket: { rate: 100/s, burst: 5 } } }
+  - { name: window, key: client, model: { fixed_window: { limit: 3, window: 1s } } }
+";
+        let yaml = format!(
+            r#"
+listeners: {{ web: {{ address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }} }}
+routes:
+  - name: api
+    listeners: [web]
+    hostnames: [{{ name: a.example.com, falls_through: true }}]
+    rules:
+      - {{ matches: [{{ path: {{ prefix: /api }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}] }}, rate_limits: [bucket, window] }}
+upstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
+{LOCAL}"#
+        );
+        let mut config = config(&yaml);
+        config.limits = Some(serde_saphyr::from_str(limits).unwrap());
+        let compiled = compile(&config).unwrap();
+        let names: Vec<&str> = compiled.rules[0][0]
+            .limits
+            .iter()
+            .map(|limit| limit.name.as_str())
+            .collect();
+        assert_eq!(names, ["window", "bucket"]);
     }
 
     /// A health check says everything it does, and nothing that cannot work.

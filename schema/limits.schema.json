@@ -138,7 +138,55 @@
           "required": [
             "bucket"
           ]
+        },
+        {
+          "description": "At most `limit` requests in each `window`, the count starting again as each ends:\na whole window's worth may come at once, and two windows' worth across a boundary.\nEach key's windows are shifted by an offset of its own, so that keys' boundaries\nspread. In local mode only, for now.",
+          "type": "object",
+          "properties": {
+            "fixed_window": {
+              "$ref": "#/$defs/Window"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "fixed_window"
+          ]
+        },
+        {
+          "description": "At most `limit` requests in any span of `window`, counted to a thousandth of it. In\nno mode yet; never in local mode, nor with `when_unreachable: local`.",
+          "type": "object",
+          "properties": {
+            "rolling_window": {
+              "$ref": "#/$defs/Window"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "rolling_window"
+          ]
         }
+      ]
+    },
+    "Window": {
+      "description": "A window's numbers.",
+      "type": "object",
+      "properties": {
+        "limit": {
+          "description": "Requests a window.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "window": {
+          "description": "The window: a whole number and `ms`, `s`, `m`, `h` or `d`, as `500ms`, `1m`, `1d`.",
+          "type": "string",
+          "pattern": "^[1-9][0-9]*(ms|s|m|h|d)$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "limit",
+        "window"
       ]
     }
   }

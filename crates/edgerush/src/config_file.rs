@@ -569,7 +569,10 @@ limits_file: '{limits_file}'
     /// The bucket of the first limit of the first rule.
     fn burst(compiled: &Compiled) -> u64 {
         let id = edgerush_config::RuleId { route: 0, rule: 0 };
-        compiled.rule(id).unwrap().limits[0].burst.get()
+        match compiled.rule(id).unwrap().limits[0].model {
+            edgerush_config::CompiledModel::Bucket { burst, .. } => burst.get(),
+            ref other => panic!("not a bucket: {other:?}"),
+        }
     }
 
     /// The limits are read from the file the config names, relative to its directory, and a

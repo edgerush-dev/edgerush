@@ -1,0 +1,4 @@
+limits:
+  - { name: daily, key: client, model: { fixed_window: { limit: 10, window: 1d } } }
+  - { name: rolling, key: client, model: { rolling_window: { limit: 100, window: 1m } } }
+  - { name: burst, key: client, model: { bucket: { rate: 10/s, burst: 20 } } }

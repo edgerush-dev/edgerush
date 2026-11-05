@@ -80,24 +80,23 @@ impl<S: BuildHasher, const PARTS: usize> KeySet<S, PARTS> {
             .map(|held| &held.key)
     }
 
-    /// Holds `key`, whose name's hash is `hash`, in place of any of its name.
-    pub(super) fn replace_hashed(&mut self, hash: u64, key: Arc<Key>) {
-        let added =
-            match self
-                .part_mut(hash)
-                .entry(hash, |held| held.key.key == key.key, |held| held.hash)
-            {
-                Entry::Occupied(mut found) => {
-                    found.get_mut().key = key;
-                    false
-                }
-                Entry::Vacant(room) => {
-                    room.insert(Held { hash, key });
-                    true
-                }
-            };
-        if added {
-            self.len += 1;
+    /// Holds `key`, whose name's hash is `hash`, in place of any of its name: the key as held.
+    pub(super) fn replace_hashed(&mut self, hash: u64, key: Arc<Key>) -> &Arc<Key> {
+        // The part by its field, not `part_mut`, so that the count can change beside it.
+        match self.parts[Self::part_of(hash)].entry(
+            hash,
+            |held| held.key.key == key.key,
+            |held| held.hash,
+        ) {
+            Entry::Occupied(found) => {
+                let held = found.into_mut();
+                held.key = key;
+                &held.key
+            }
+            Entry::Vacant(room) => {
+                self.len += 1;
+                &room.insert(Held { hash, key }).into_mut().key
+            }
         }
     }
 
