@@ -38,10 +38,12 @@ pub(super) fn runs_rate_limits(config: &Compiled, supported: bool) -> Result<(),
     }
     let cycle = u64::try_from(service.cycle.as_nanos()).unwrap_or(u64::MAX);
     for limit in config.limits() {
-        let contract = edgerush_ratelimit::service::Contract {
-            limit: limit.count,
-            window: limit.window,
-            burst: limit.burst,
+        // A window is refused in this mode as the config is compiled.
+        let Some(contract) = <edgerush_ratelimit::service::Contract as crate::ratelimit::Held>::of(
+            limit,
+            limit.count,
+        ) else {
+            continue;
         };
         if !edgerush_ratelimit::service::pooled::fits(contract, cycle) {
             return Err(ProxyError::LimitTooLarge(limit.name.clone()));

@@ -5,7 +5,7 @@
 //! What was read is compiled under a config whose one forwarding rule names every limit the
 //! file holds. Whatever it is given, reading must not fail, nor compiling, and a refusal
 //! must be told without failing. A config that compiles puts the rule under each limit
-//! once, the smallest bucket first; one that does not is refused with at least one problem.
+//! once, the smallest room first; one that does not is refused with at least one problem.
 //!
 //! `cargo fuzz run limits corpus/limits seeds/limits`.
 
@@ -55,7 +55,7 @@ fuzz_target!(|data: &[u8]| {
                 assert!(
                     limits[..at]
                         .iter()
-                        .all(|before| before.burst <= limit.burst),
+                        .all(|before| before.room() <= limit.room()),
                     "out of order"
                 );
             }

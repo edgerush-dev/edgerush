@@ -9,8 +9,9 @@
 
 use crate::asked::{Asked, Invalid};
 use edgerush_config::{
-    Compiled, CompiledLimit, CompiledListener, Config, ConfigError, EncodedSlash, Filter,
-    HeaderChanges, MatchId, Matches, PathChange, Protocol, RequestId, Rule, compile_with_matches,
+    Compiled, CompiledLimit, CompiledListener, CompiledModel, Config, ConfigError, EncodedSlash,
+    Filter, HeaderChanges, MatchId, Matches, PathChange, Protocol, RequestId, Rule,
+    compile_with_matches,
 };
 use edgerush_proxy::Asked as Handshake;
 use edgerush_proxy::{Client, Decision, Rejection, decide_routed};
@@ -385,10 +386,18 @@ fn text(
                 let under: Vec<String> = limits_under(forward)
                     .map(|limit| {
                         let dry_run = if limit.dry_run { ", a dry run" } else { "" };
-                        format!(
-                            "{} ({}, a bucket of {}{dry_run})",
-                            limit.name, limit.rate, limit.burst
-                        )
+                        let model = match &limit.model {
+                            CompiledModel::Bucket { rate, burst } => {
+                                format!("{rate}, a bucket of {burst}")
+                            }
+                            CompiledModel::FixedWindow { window } => {
+                                format!("{} in each {window} window", limit.count)
+                            }
+                            CompiledModel::RollingWindow { window } => {
+                                format!("{} in any {window}", limit.count)
+                            }
+                        };
+                        format!("{} ({model}{dry_run})", limit.name)
                     })
                     .collect();
                 let under = if under.is_empty() {
@@ -1080,6 +1089,30 @@ rate_limiting: { mode: asynchronous, service: { addresses: ["rl-0:7000"] } }
         assert!(
             text.contains(
                 "limits    per-client (100/s, a bucket of 100); rate limiting is off, none enforced"
+            ),
+            "{text}"
+        );
+        // Windows say their count and their window as written; off, a rolling one too.
+        let mut windows: edgerush_config::Config = serde_saphyr::from_str(&yaml.replace(
+            r#"rate_limiting: { mode: asynchronous, service: { addresses: ["rl-0:7000"] } }"#,
+            "",
+        ))
+        .unwrap();
+        windows.limits = Some(
+            serde_saphyr::from_str(
+                "limits:
+  - { name: per-client, key: client, model: { fixed_window: { limit: 1000, window: 1m } } }
+  - { name: writes, key: client, model: { rolling_window: { limit: 10, window: 1h } } }
+",
+            )
+            .unwrap(),
+        );
+        let snapshot = Snapshot::new(windows).unwrap();
+        let listener = snapshot.listener("web").unwrap();
+        let text = snapshot.explain(listener, &asked).unwrap().text();
+        assert!(
+            text.contains(
+                "limits    writes (10 in any 1h), per-client (1000 in each 1m window); rate limiting is off, none enforced"
             ),
             "{text}"
         );

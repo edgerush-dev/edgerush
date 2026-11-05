@@ -1,7 +1,7 @@
 //! Every interleaving of local mode's limiter, under loom
 //! (`RUSTFLAGS="--cfg loom" cargo test --release -p edgerush-ratelimit --lib loom`): workers
 //! racing on a key's last room, requests under two limits, and the sweep closing a key a
-//! request is using.
+//! request is using; each for a bucket and for a fixed window.
 
 #![cfg(loom)]
 
@@ -29,17 +29,25 @@ fn contract(limit: u64, burst: u64) -> Contract {
     }
 }
 
+/// `limit` in each second's window.
+fn window(limit: u64) -> Window {
+    Window {
+        limit: NonZeroU64::new(limit).unwrap(),
+        window: NonZeroU64::new(1_000 * MS).unwrap(),
+    }
+}
+
 /// Decides, on a thread of its own with handles of its own, a request under `keys`.
-fn request(
+fn request<L: core::marker::Copy + Into<Limit> + Send + 'static>(
     local: &Arc<Local<FixedState>>,
     keys: &'static [&'static [u8]],
-    c: Contract,
+    c: L,
     now: u64,
 ) -> loom::thread::JoinHandle<bool> {
     let local = Arc::clone(local);
     loom::thread::spawn(move || {
         let mut handles = Handles::new(FixedState::default());
-        let keys: Vec<(&[u8], Contract)> = keys.iter().map(|key| (*key, c)).collect();
+        let keys: Vec<(&[u8], L)> = keys.iter().map(|key| (*key, c)).collect();
         local.decide(&mut handles, &keys, now) == Decision::Admit
     })
 }
@@ -134,5 +142,67 @@ fn loom_a_change_racing_its_copy_is_copied_now_or_next() {
             both_in_copy || again == 1,
             "copied {copies:?}, gathered again {again}"
         );
+    });
+}
+
+/// A window's last room asked for by two workers at once: exactly one gets it.
+#[test]
+fn loom_a_windows_last_room_goes_to_one_of_two() {
+    model(|| {
+        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let one = request(&local, &[b"k"], window(1), 0);
+        let other = request(&local, &[b"k"], window(1), 0);
+        let admitted = [one.join().unwrap(), other.join().unwrap()];
+        assert_eq!(admitted.iter().filter(|a| **a).count(), 1, "{admitted:?}");
+    });
+}
+
+/// The same for a window gone idle, a fresh one's room: neither worker may take the key for
+/// idle from its last use while the other's charge is already in its word.
+#[test]
+fn loom_an_idle_windows_one_room_goes_to_one_of_two() {
+    model(|| {
+        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let mut handles = Handles::new(FixedState::default());
+        let w = window(1);
+        assert_eq!(local.decide(&mut handles, &[(b"k", w)], 0), Decision::Admit);
+        let one = request(&local, &[b"k"], w, 2_000 * MS);
+        let other = request(&local, &[b"k"], w, 2_000 * MS);
+        let admitted = [one.join().unwrap(), other.join().unwrap()];
+        assert_eq!(admitted.iter().filter(|a| **a).count(), 1, "{admitted:?}");
+    });
+}
+
+/// Two requests under the same two windows, decided in opposite orders: never both refused.
+#[test]
+fn loom_two_windows_racing_never_refuse_both() {
+    model(|| {
+        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let one = request(&local, &[b"a", b"b"], window(1), 0);
+        let other = request(&local, &[b"b", b"a"], window(1), 0);
+        let admitted = [one.join().unwrap(), other.join().unwrap()];
+        assert!(admitted.iter().any(|a| *a), "both refused");
+    });
+}
+
+/// The sweep forgetting a window that counts none while a worker decides a request under
+/// it: the request is admitted, and what the registry counts is what it holds.
+#[test]
+fn loom_a_window_forgotten_under_a_request_admits_it() {
+    model(|| {
+        let local = Arc::new(Local::new(FixedState::default(), 1));
+        let w = window(1);
+        let mut handles = Handles::new(FixedState::default());
+        assert_eq!(local.decide(&mut handles, &[(b"k", w)], 0), Decision::Admit);
+        let worker = {
+            let local = Arc::clone(&local);
+            loom::thread::spawn(move || {
+                local.decide(&mut handles, &[(b"k", w)], 2_000 * MS) == Decision::Admit
+            })
+        };
+        local.sweep(2_000 * MS, 500 * MS);
+        assert!(worker.join().unwrap(), "refused though counting none");
+        let held = u64::try_from(local.key_count()).unwrap() * key_bytes(b"k", 1);
+        assert_eq!(local.holding(), held);
     });
 }

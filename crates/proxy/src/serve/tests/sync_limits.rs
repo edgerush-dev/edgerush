@@ -256,7 +256,7 @@ fn keys_of(config: &Config) -> Vec<(String, Vec<u8>)> {
     let every = u64::MAX >> (64 - rule.limits.len());
     let keys = crate::ratelimit::with_keys(
         &RefCell::new(Vec::new()),
-        &RefCell::new(Vec::new()),
+        &RefCell::new(Vec::<edgerush_ratelimit::service::Contract>::new()),
         &rule.limits,
         every,
         client.into(),

@@ -6,7 +6,7 @@
 
 use super::{Failed, KeyedBy, Limited, Refused, Usage, with_keys};
 use edgerush_config::CompiledLimit;
-use edgerush_ratelimit::local::{Decision, HANDLE_PARTS, Handles, Local};
+use edgerush_ratelimit::local::{Decision, HANDLE_PARTS, Handles, Limit, Local};
 use edgerush_ratelimit::service::{Contract, Keyed};
 use std::cell::RefCell;
 use std::hash::{BuildHasher, RandomState};
@@ -114,7 +114,7 @@ pub(crate) struct LocalLimiter {
     index: usize,
     handles: RefCell<Handles<Keyed>>,
     keys: RefCell<Vec<Vec<u8>>>,
-    contracts: RefCell<Vec<Contract>>,
+    contracts: RefCell<Vec<Limit>>,
 }
 
 impl LocalLimiter {
