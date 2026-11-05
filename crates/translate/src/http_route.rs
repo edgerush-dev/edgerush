@@ -744,6 +744,24 @@ pub(crate) fn translated(
 /// The config routes of the rules `rules` of a route attached as `outcome` says, one for each
 /// listener of `gateway` that serves an attachment with hostnames left, those its claims:
 /// `<kind>/<namespace>/<name>/<listener>`, the kind in lower case.
+/// The config's name for a route's attachment to a listener:
+/// `<kind>/<namespace>/<name>/<listener>`, a ListenerSet's listener named with its set, as a
+/// listener's name is unique within its Gateway or ListenerSet alone.
+pub(crate) fn attachment_name(
+    kind: &str,
+    outcome: &RouteOutcome,
+    attachment: &Attachment,
+) -> String {
+    let on = match &attachment.set {
+        Some(set) => format!("{}/{}/{}", set.namespace, set.name, attachment.listener),
+        None => attachment.listener.clone(),
+    };
+    format!(
+        "{kind}/{}/{}/{on}",
+        outcome.route.namespace, outcome.route.name
+    )
+}
+
 pub(crate) fn config_routes(
     kind: &str,
     outcome: &RouteOutcome,
@@ -764,15 +782,7 @@ pub(crate) fn config_routes(
             let (Ok(served), false) = (&listener.served, attachment.hostnames.is_empty()) else {
                 continue;
             };
-            // A listener's name is unique within its Gateway or ListenerSet alone.
-            let on = match &attachment.set {
-                Some(set) => format!("{}/{}/{}", set.namespace, set.name, attachment.listener),
-                None => attachment.listener.clone(),
-            };
-            let name = format!(
-                "{kind}/{}/{}/{on}",
-                outcome.route.namespace, outcome.route.name
-            );
+            let name = attachment_name(kind, outcome, attachment);
             if routes.iter().any(|known| known.name == name) {
                 continue;
             }
@@ -1394,10 +1404,10 @@ fn backend(
         }),
         resource: None,
     };
-    let calls = if route_kind == "GRPCRoute" {
-        Calls::Grpc
-    } else {
-        Calls::Http
+    let calls = match route_kind {
+        "GRPCRoute" => Calls::Grpc,
+        "TLSRoute" => Calls::Tunnel,
+        _ => Calls::Http,
     };
     match backend_upstream(plane, cluster, namespace, &reference, (calls, false)) {
         Ok(Ok(found)) => Ok(found),

@@ -34,7 +34,7 @@ use edgerush_config::{
     Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, GrpcMethod, Header,
     HeaderChanges, Hostname, Listener, ListenerCertificate, LoadBalancer, Match, PathMatch,
     Protocol, Query, Redirect, Route, Rule, Scheme, SharingHostname, SharingListener, StatedNames,
-    Upstream, UpstreamProtocol, UpstreamTls, ValueMatch, Wildcard, compile,
+    TlsRoute, Upstream, UpstreamProtocol, UpstreamTls, ValueMatch, Wildcard, compile,
 };
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
@@ -59,6 +59,7 @@ mod grpc_route;
 pub mod http_route;
 pub mod listeners;
 pub mod status;
+mod tls_route;
 
 pub use gateway::{
     Allowed, GatewayOutcome, ListenerOutcome, ListenerProblem, Namespaces, Requirement, Selector,
@@ -295,6 +296,8 @@ pub struct Translation {
     pub http_routes: Vec<RouteOutcome>,
     /// Each GRPCRoute that does, and what became of each such parent.
     pub grpc_routes: Vec<RouteOutcome>,
+    /// Each TLSRoute that does, and what became of each such parent.
+    pub tls_routes: Vec<RouteOutcome>,
     /// What that Gateway's status is to say (04 §6).
     pub gateway_status: Option<GatewayStatus>,
     /// What each of those routes' status is to say of those parents, in their order, the
@@ -722,6 +725,25 @@ pub enum Problem {
         /// Why.
         why: RefProblem,
     },
+    /// A TLSRoute not of the shape the `v1` API gives one, as one written through an older
+    /// version may be: not accepted.
+    #[error("{0}, so it is not accepted")]
+    TlsRouteRefused(String),
+    /// A TLSRoute's backend is invalid: its share of connections is closed, as the spec has
+    /// it (`ResolvedRefs` false).
+    #[error("a backend's share of connections is closed: {0}")]
+    ConnectionsClosed(RefProblem),
+    /// A TLSRoute's hostname on a data-plane listener that an earlier TLSRoute has there
+    /// too: the earlier serves it, as the one rule ranks them (04 §2).
+    #[error("{hostname} on {listener} is served by {by}, which comes first")]
+    HostnameTaken {
+        /// The hostname.
+        hostname: String,
+        /// The data plane's listener.
+        listener: String,
+        /// The route that serves it.
+        by: Object,
+    },
     /// A mirror of an HTTPRoute's rule is left off, its backend not there or not permitted,
     /// and the rule served without it, as the spec has it (`ResolvedRefs` false).
     #[error("rule {rule}: a mirror is left off, the rule served without it: {why}")]
@@ -790,18 +812,20 @@ pub enum Problem {
 pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut report = Vec::new();
     let gateway = gateway::outcome(plane, cluster, &mut report);
-    let (http_routes, grpc_routes) = gateway
+    let (http_routes, grpc_routes, tls_routes) = gateway
         .as_ref()
         .map(|gateway| {
             let http = cluster.http_routes.iter().map(http_route::Routed::http);
             let grpc = cluster.grpc_routes.iter().map(http_route::Routed::grpc);
+            let tls = cluster.tls_routes.iter().map(http_route::Routed::tls);
             (
                 http_route::attached(http.collect(), gateway, cluster),
                 http_route::attached(grpc.collect(), gateway, cluster),
+                http_route::attached(tls.collect(), gateway, cluster),
             )
         })
         .unwrap_or_default();
-    for outcome in http_routes.iter().chain(&grpc_routes) {
+    for outcome in http_routes.iter().chain(&grpc_routes).chain(&tls_routes) {
         for parent in &outcome.parents {
             if let Err(why) = parent.attached {
                 report.push(Finding {
@@ -809,17 +833,6 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                     problem: Problem::NotAttached(why),
                 });
             }
-        }
-    }
-    // TLSRoutes are followed and not translated yet: each that names the data plane's
-    // Gateway, or a ListenerSet naming it, is said.
-    if let Some(gateway) = &gateway {
-        let tls = cluster.tls_routes.iter().map(http_route::Routed::tls);
-        for outcome in http_route::attached(tls.collect(), gateway, cluster) {
-            report.push(Finding {
-                object: outcome.route,
-                problem: Problem::NotSupportedYet("TLSRoute"),
-            });
         }
     }
     // An Ingress is the data plane's when its class is, and its class is when the
@@ -1213,6 +1226,72 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     }
     ranked.sort_by(|a, b| a.rank.cmp(&b.rank));
     let (mut routes, shadowed) = in_order(ranked);
+    // Each attached TLSRoute's passthrough routes, oldest first, then by namespace and
+    // name: of two on one listener whose hostnames are the same, the first takes it, as
+    // the data plane's SNI router ranks them, and the other is said (04 §2).
+    let mut passthrough = Vec::new();
+    let mut tunnel_upstreams = BTreeMap::new();
+    if let Some(gateway) = &gateway {
+        let mut ranked: Vec<(Rank, Object, Vec<TlsRoute>)> = Vec::new();
+        for outcome in &tls_routes {
+            if !outcome.parents.iter().any(|parent| parent.attached.is_ok()) {
+                continue;
+            }
+            let Some(route) = cluster
+                .tls_routes
+                .iter()
+                .find(|route| Object::of("TLSRoute", &route.metadata) == outcome.route)
+            else {
+                continue;
+            };
+            let translated = tls_route::translated(route, outcome, gateway, plane, cluster);
+            if let Some(why) = translated.refused {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::TlsRouteRefused(why),
+                });
+                continue;
+            }
+            for why in translated.invalid {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::ConnectionsClosed(why),
+                });
+            }
+            tunnel_upstreams.extend(translated.upstreams);
+            ranked.push((
+                rank(&route.metadata, 0),
+                outcome.route.clone(),
+                translated.routes,
+            ));
+        }
+        ranked.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut taken: BTreeMap<(String, String), Object> = BTreeMap::new();
+        for (_, object, routes) in ranked {
+            for route in &routes {
+                for listener in &route.listeners {
+                    for hostname in &route.hostnames {
+                        let place = (listener.clone(), hostname.name.clone());
+                        match taken.get(&place) {
+                            Some(by) => report.push(Finding {
+                                object: object.clone(),
+                                problem: Problem::HostnameTaken {
+                                    hostname: hostname.name.clone(),
+                                    listener: listener.clone(),
+                                    by: by.clone(),
+                                },
+                            }),
+                            None => {
+                                taken.insert(place, object.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            passthrough.extend(routes);
+        }
+        passthrough.extend(tls_route::claims(gateway));
+    }
     // Each listener hostname of the Gateway is claimed, so that nothing less specific serves
     // it (04 §2, listener isolation).
     if let Some(gateway) = &gateway {
@@ -1244,6 +1323,8 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         })
         .collect();
     upstreams.retain(|name, _| used.contains(name));
+    // A passthrough route's upstreams, each led to by one of them.
+    upstreams.extend(tunnel_upstreams);
     // A host a Gateway HTTPS listener names on the listener Ingress's TLS hosts share is
     // served there with that listener's certificate: the Ingress's Secret for it is passed
     // over, and said (04 §2).
@@ -1317,6 +1398,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             &ingress_https,
         )
     };
+    config.tls_routes = passthrough;
     if let Some(gateway) = &gateway {
         gateway_tls(&mut config, gateway, cluster, &mut report);
     }
@@ -1339,6 +1421,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         gateway,
         http_routes,
         grpc_routes,
+        tls_routes,
         gateway_status,
         route_statuses,
         taken,
@@ -2337,12 +2420,16 @@ fn forward(path: PathMatch, backend: Backend) -> Rule {
 }
 
 /// What a route calls its backends with: HTTP, in HTTP/1.1 unless the port's `appProtocol`
-/// says otherwise (an Ingress, an HTTPRoute); or gRPC, in HTTP/2 wherever the port's
-/// `appProtocol` agrees (a GRPCRoute; 04 §2).
+/// says otherwise (an Ingress, an HTTPRoute); gRPC, in HTTP/2 wherever the port's
+/// `appProtocol` agrees (a GRPCRoute; 04 §2); or nothing but the client's bytes (a
+/// TLSRoute).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Calls {
     Http,
     Grpc,
+    /// Bytes as they come, a TLSRoute's (17): in the clear over TCP, whatever the port's
+    /// `appProtocol`, which says what the client's TLS carries.
+    Tunnel,
 }
 
 /// The upstream a backend leads to, and its name: one a Service's port, whose endpoints are
@@ -2375,7 +2462,15 @@ fn backend_upstream(
     // HTTP/2 in the clear for a port of no `appProtocol` is named apart from the HTTP/1.1
     // upstream an HTTPRoute or an Ingress reaches the same port by.
     let mut apart = false;
+    let mut tunnel_apart = false;
     let (protocol, tls) = match (calls, app_protocol) {
+        // Named apart from the HTTP upstream of the same port wherever that one speaks
+        // HTTP/2 or TLS, or the port says a protocol HTTP routes cannot reach it by.
+        (Calls::Tunnel, None | Some("kubernetes.io/ws")) => (UpstreamProtocol::Http1, None),
+        (Calls::Tunnel, Some(_)) => {
+            tunnel_apart = true;
+            (UpstreamProtocol::Http1, None)
+        }
         (Calls::Grpc, None) => {
             apart = true;
             (UpstreamProtocol::Http2, None)
@@ -2453,6 +2548,9 @@ fn backend_upstream(
     };
     if apart {
         name.push_str("/h2c");
+    }
+    if tunnel_apart {
+        name.push_str("/tcp");
     }
     let upstream = Upstream {
         endpoints,

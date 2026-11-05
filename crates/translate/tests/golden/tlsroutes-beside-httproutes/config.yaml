@@ -5,6 +5,7 @@ listeners:
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate
+  port-8443: { address: "0.0.0.0:8443", protocol: tls, proxy_protocol: off }
 routes:
   - name: httproute/shop/pages/http
     listeners: [port-8080]
@@ -12,5 +13,11 @@ routes:
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+tls_routes:
+  - name: tlsroute/shop/api/passthrough
+    listeners: [port-8443]
+    hostnames: [{ name: api.example.com, falls_through: false }]
+    backends: [{ upstream: shop/web/https, weight: 1 }]
 upstreams:
   shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }
+  shop/web/https: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:https" } }

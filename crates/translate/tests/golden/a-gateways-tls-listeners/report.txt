@@ -6,4 +6,3 @@ Gateway shop/web: listener secure: accepted, serving nothing: no certificateRef 
 Gateway shop/web: listener beside-https: not accepted: port 9445 is taken for https by listener secure, which comes first: TLS and HTTPS listeners on one port are not supported yet
 Gateway shop/web: listener beside-http: not accepted: port 8080 is taken for http by listener http, which comes first
 HTTPRoute shop/pages: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace
-TLSRoute shop/api: not supported yet: TLSRoute

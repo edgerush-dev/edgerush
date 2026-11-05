@@ -21,4 +21,7 @@ listeners:
     request_id: generate
     tls: { certificates: [], without_sni: none, refused: [] }
 routes: []
+tls_routes:
+  - { name: gateway/shop/web/passthrough, listeners: [port-8443], hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: false }], backends: [{ invalid: "no TLSRoute takes *.example.com on listener passthrough", weight: 1 }] }
+  - { name: gateway/shop/web/other, listeners: [port-8443], hostnames: [{ name: api.other.com, falls_through: false }], backends: [{ invalid: "no TLSRoute takes api.other.com on listener other", weight: 1 }] }
 upstreams: {}

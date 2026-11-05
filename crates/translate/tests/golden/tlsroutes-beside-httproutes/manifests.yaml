@@ -1,5 +1,7 @@
-# TLSRoutes, not translated yet: one naming the data plane's Gateway is said not supported,
-# its HTTPRoute neighbour served all the same; one naming another Gateway is not said.
+# TLSRoutes beside HTTPRoutes: each kind attached to the listeners that take it, of a
+# parentRef naming none, one naming the HTTP listener not allowed there; the TLSRoute's
+# connections passed through to its backend, the HTTPRoute's requests served as ever. A
+# TLSRoute naming another Gateway is not said.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
@@ -13,12 +15,26 @@ spec:
   gatewayClassName: edgerush
   listeners:
     - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+    - name: passthrough
+      port: 8443
+      protocol: TLS
+      tls: { mode: Passthrough }
+      allowedRoutes: { namespaces: { from: All } }
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: TLSRoute
 metadata: { name: api, namespace: shop }
 spec:
   parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [api.example.com]
+  rules:
+    - backendRefs: [{ name: web, port: 443 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: { name: wrong, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: http }]
   hostnames: [api.example.com]
   rules:
     - backendRefs: [{ name: web, port: 443 }]
