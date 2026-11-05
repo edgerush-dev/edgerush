@@ -1,0 +1,3 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener api: TLSRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener other: TLSRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

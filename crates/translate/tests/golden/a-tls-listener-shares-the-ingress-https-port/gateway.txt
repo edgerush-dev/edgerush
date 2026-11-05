@@ -1,0 +1,2 @@
+listener api: served on port-443, taking TLSRoute from namespace shop
+listener other: served on port-8443, taking TLSRoute from namespace shop

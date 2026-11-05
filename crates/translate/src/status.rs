@@ -370,8 +370,7 @@ fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
                     "UnsupportedProtocol"
                 }
                 ListenerProblem::HostnameConflict { .. } => "HostnameConflict",
-                ListenerProblem::ProtocolConflict { .. }
-                | ListenerProblem::BesideHttpsNotYet { .. } => "ProtocolConflict",
+                ListenerProblem::ProtocolConflict { .. } => "ProtocolConflict",
                 ListenerProblem::PortPastSlots { .. } => "PortUnavailable",
                 ListenerProblem::TooManyListeners { .. } => "TooManyListeners",
                 ListenerProblem::TlsMode(_)
@@ -386,9 +385,7 @@ fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
             ));
             if matches!(
                 problem,
-                ListenerProblem::HostnameConflict { .. }
-                    | ListenerProblem::ProtocolConflict { .. }
-                    | ListenerProblem::BesideHttpsNotYet { .. }
+                ListenerProblem::HostnameConflict { .. } | ListenerProblem::ProtocolConflict { .. }
             ) {
                 conditions.push(Condition::new(
                     "Conflicted",

@@ -33,7 +33,8 @@ pub struct GatewayOutcome {
     /// ListenerSet attached to it, in precedence (04 §2).
     pub listeners: Vec<ListenerOutcome>,
     /// The ports its accepted listeners state, and the protocol each is bound for: the data
-    /// plane's listeners.
+    /// plane's listeners. A port HTTPS and TLS listeners share is bound for HTTPS, passing
+    /// the TLS ones' names through (17 §2).
     pub ports: BTreeMap<u16, Protocol>,
     /// Each ListenerSet naming it as its parent, in precedence: those it takes, whose
     /// listeners are among `listeners`, and those it does not.
@@ -78,6 +79,10 @@ pub struct ListenerOutcome {
     pub hostname: Option<String>,
     /// Its port.
     pub port: u16,
+    /// Whether it passes its connections through, a TLS listener in `Passthrough` mode:
+    /// carried by its TLS routes rather than served, on a port it may share with HTTPS
+    /// listeners (17 §2).
+    pub passes_through: bool,
     /// An HTTPS listener's certificates that can be used, by the config's names for them,
     /// `<namespace>/<Secret>`, in the order its `certificateRefs` list them.
     pub certificates: Vec<String>,
@@ -297,22 +302,6 @@ pub enum ListenerProblem {
     /// that does not claim `TLSRouteModeTerminate`).
     #[error("TLS mode `{0}` is not served: a TLS listener passes its connections through")]
     PassthroughOnly(String),
-    /// A TLS listener on a port an HTTPS listener before it has, or the other way round:
-    /// the two are distinct by hostname, and the data plane does not serve both on one port
-    /// yet (`ProtocolConflict`).
-    #[error(
-        "port {port} is taken for {protocol} by {by}, which comes first: TLS and HTTPS \
-         listeners on one port are not supported yet"
-    )]
-    BesideHttpsNotYet {
-        /// The port.
-        port: u16,
-        /// The protocol it is taken for, as the data plane's config writes it.
-        protocol: &'static str,
-        /// The listener that has it, as said: by name within one resource, by whose it is
-        /// beyond.
-        by: String,
-    },
     /// A listener before it states its port for another protocol, and has the port: that
     /// one is accepted, this not (`ProtocolConflict`).
     #[error("port {port} is taken for {protocol} by {by}, which comes first")]
@@ -411,13 +400,18 @@ pub(crate) fn outcome(
     written.extend(theirs);
     let mut listeners = listeners(&written, &object);
     // Bound as long as one listener on them is accepted: one whose certificates cannot be
-    // used too, which keeps its port refusing its hostname (04 §2).
-    let ports: BTreeMap<u16, Protocol> = listeners
-        .iter()
-        .zip(&written)
-        .filter(|(listener, _)| listener.served.is_ok())
-        .filter_map(|(listener, written)| Some((listener.port, protocol(&written.listener).ok()?)))
-        .collect();
+    // used too, which keeps its port refusing its hostname (04 §2). For HTTPS where an HTTPS
+    // listener shares the port with TLS ones.
+    let mut ports: BTreeMap<u16, Protocol> = BTreeMap::new();
+    for (listener, written) in listeners.iter().zip(&written) {
+        let (Ok(_), Ok(protocol)) = (&listener.served, protocol(&written.listener)) else {
+            continue;
+        };
+        let bound = ports.entry(listener.port).or_insert(protocol);
+        if protocol == Protocol::Https {
+            *bound = Protocol::Https;
+        }
+    }
     for (listener, written) in listeners.iter_mut().zip(&written) {
         // Said of the Gateway or the ListenerSet that states it, whose namespace its
         // Secrets and routes are taken from, and whose ReferenceGrants are asked.
@@ -683,16 +677,18 @@ pub(crate) struct Written {
 /// each attached ListenerSet's. A protocol not taken is refused first, and plays no part in
 /// what conflicts (the spec: a listener of a protocol not supported is not accepted, and
 /// the rules of distinctness are for those that are); then the first listener on a port
-/// takes it for its protocol, and a later one stating it for another, or in a place an
-/// earlier one has (port, protocol and hostname), is refused, as the spec has a conflicting
-/// listener refused in precedence and conformance pins it; each other is served by the
+/// takes it for its protocol, HTTPS and TLS together, which share a port told apart by
+/// hostname, and a later one stating it for another, or in a place an earlier one has
+/// (port, protocol and hostname, HTTPS and TLS as one), is refused, as the spec has a
+/// conflicting listener refused in precedence and conformance pins it; each other is served by the
 /// data plane's listener bound to its port, a port past the data plane's slots refused for
 /// every listener on it. An earlier listener of another resource is said by whose it is,
 /// never by name, as nothing of a parent or a sibling is told a ListenerSet (GEP-1713).
 pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOutcome> {
-    // Each port taken, by the protocol and the listener that took it; each place, by the
-    // listener in it: only those accepted, by their place in `written`.
-    let mut ports: BTreeMap<i32, (&'static str, usize)> = BTreeMap::new();
+    // Each port taken, by the protocols it is for, the protocol of the listener that took
+    // it and that listener; each place, by the listener in it: only those accepted, by
+    // their place in `written`.
+    let mut ports: BTreeMap<i32, (&'static str, &'static str, usize)> = BTreeMap::new();
     let mut places: BTreeMap<(i32, &'static str, Option<&str>), usize> = BTreeMap::new();
     let by = |earlier: usize, now: &Written| {
         let earlier = &written[earlier];
@@ -713,18 +709,20 @@ pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOu
             let port = u16::try_from(listener.port).unwrap_or_default();
             let served = protocol(listener).and_then(|protocol| {
                 let name = name_of(protocol);
-                let place = (listener.port, name, listener.hostname.as_deref());
+                // HTTPS and TLS share a port, one data-plane listener reading each
+                // ClientHello (Q-t1): one hostname on both is a conflict of hostnames.
+                let family = if protocol == Protocol::Tls {
+                    "https"
+                } else {
+                    name
+                };
+                let place = (listener.port, family, listener.hostname.as_deref());
                 match (ports.get(&listener.port), places.get(&place)) {
-                    (Some((taken, earlier)), _) if *taken != name => {
-                        let (protocol, by) = (*taken, by(*earlier, stated));
-                        // Distinct by hostname as the spec has them, but not yet served on
-                        // one data-plane listener.
-                        let beside_https =
-                            matches!((protocol, name), ("https", "tls") | ("tls", "https"));
-                        Err(if beside_https {
-                            ListenerProblem::BesideHttpsNotYet { port, protocol, by }
-                        } else {
-                            ListenerProblem::ProtocolConflict { port, protocol, by }
+                    (Some((taken, protocol, earlier)), _) if *taken != family => {
+                        Err(ListenerProblem::ProtocolConflict {
+                            port,
+                            protocol,
+                            by: by(*earlier, stated),
                         })
                     }
                     (_, Some(earlier)) => Err(ListenerProblem::HostnameConflict {
@@ -735,7 +733,7 @@ pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOu
                         Ok(vec![crate::listeners::name(port)])
                     }
                     (None, None) if ports.len() < crate::listeners::MOST_GATEWAY_PORTS => {
-                        ports.insert(listener.port, (name, at));
+                        ports.insert(listener.port, (family, name, at));
                         places.insert(place, at);
                         Ok(vec![crate::listeners::name(port)])
                     }
@@ -756,6 +754,7 @@ pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOu
                 },
                 hostname: listener.hostname.clone(),
                 port,
+                passes_through: listener.protocol == "TLS",
                 certificates: Vec::new(),
                 certificate_problems: Vec::new(),
             }

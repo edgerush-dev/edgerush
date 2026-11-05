@@ -4,6 +4,6 @@ listener other: served on port-8443, taking TLSRoute from namespace shop
 listener again: not accepted: listener passthrough, which comes first, has its port, protocol and hostname
 listener terminated: not accepted: TLS mode `Terminate` is not served: a TLS listener passes its connections through
 listener kinds: served on port-9444, taking TLSRoute from namespace shop
+listener beside-https: served on port-9445, taking TLSRoute from namespace shop
 listener secure: accepted, serving nothing: no certificateRef of it can be used
-listener beside-https: not accepted: port 9445 is taken for https by listener secure, which comes first: TLS and HTTPS listeners on one port are not supported yet
 listener beside-http: not accepted: port 8080 is taken for http by listener http, which comes first

@@ -40,7 +40,7 @@ pub(crate) fn bound(plane: &Plane, ports: &BTreeMap<u16, Protocol>) -> BTreeMap<
 
 /// The data plane's listener on `port`, speaking `protocol`, with the settings its
 /// settings give the port.
-fn listener(plane: &Plane, port: u16, protocol: Protocol) -> Listener {
+pub(crate) fn listener(plane: &Plane, port: u16, protocol: Protocol) -> Listener {
     let settings = plane.ports.get(&port);
     let address: IpAddr = match plane.ip_family {
         IpFamily::Ipv4 => Ipv4Addr::UNSPECIFIED.into(),

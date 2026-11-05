@@ -394,6 +394,16 @@ pub enum TlsProblem {
         /// Its listener naming the host.
         listener: String,
     },
+    /// A host a Gateway TLS listener names on the listener Ingress's TLS hosts share:
+    /// passed through to that listener's routes, never served over TLS by the Ingress.
+    PassedThrough {
+        /// The host.
+        host: String,
+        /// The Gateway.
+        gateway: Object,
+        /// Its listener naming the host.
+        listener: String,
+    },
     /// A host an older Ingress states another Secret for, which is the one served.
     Taken {
         /// The host.
@@ -468,6 +478,15 @@ impl fmt::Display for TlsFinding {
                 f,
                 "{object}: {host} is served with the certificate of {gateway}'s listener \
                  {listener}, which names it, not Secret {secret}"
+            ),
+            TlsProblem::PassedThrough {
+                host,
+                gateway,
+                listener,
+            } => write!(
+                f,
+                "{object}: {host} is passed through by {gateway}'s TLS listener {listener}, \
+                 which names it, and not served over TLS here"
             ),
             TlsProblem::Taken {
                 host,
@@ -868,6 +887,13 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         .as_ref()
         .map(|gateway| gateway.ports.clone())
         .unwrap_or_default();
+    // A Gateway's port of TLS listeners alone that is Ingress's HTTPS port is shared with
+    // Ingress's TLS hosts (Q-t6, 04 §2): bound for HTTPS, the TLS listeners' names passed
+    // through, and put back to `tls` below where no Ingress is served there.
+    let shares_ingress_https = ports.get(&plane.ingress_https_port) == Some(&Protocol::Tls);
+    if shares_ingress_https {
+        ports.insert(plane.ingress_https_port, Protocol::Https);
+    }
     let mut implicit = Vec::new();
     for (port, protocol) in [
         (plane.ingress_http_port, Protocol::Http),
@@ -989,7 +1015,12 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     // it is served on, its protocol and its name: an Ingress host joins every one, as well
     // as being served on Ingress's own ports (04 §2).
     let mut joins: BTreeMap<String, Vec<(String, Protocol, String)>> = BTreeMap::new();
-    for listener in gateway.iter().flat_map(|gateway| &gateway.listeners) {
+    // A TLS listener's hosts are carried, never served: no Ingress host joins one.
+    let serving = gateway
+        .iter()
+        .flat_map(|gateway| &gateway.listeners)
+        .filter(|listener| !listener.passes_through);
+    for listener in serving {
         let (Some(hostname), Ok(serving)) = (&listener.hostname, &listener.served) else {
             continue;
         };
@@ -1352,6 +1383,40 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             }
         }
     }
+    // A host a Gateway TLS listener names on the listener Ingress's TLS hosts share is that
+    // listener's, passed through to its routes: the Ingress never serves it over TLS, and
+    // that is said, naming both (Q-t1, 04 §2).
+    let passing = gateway
+        .iter()
+        .flat_map(|gateway| &gateway.listeners)
+        .filter(|listener| listener.passes_through);
+    for listener in passing {
+        let (Some(hostname), Ok(serving)) = (&listener.hostname, &listener.served) else {
+            continue;
+        };
+        if !serving.iter().any(|on| ingress_https.contains(on)) {
+            continue;
+        }
+        for (_, _, hosts) in &mut presented {
+            let Some(at) = hosts
+                .iter()
+                .position(|named| named.eq_ignore_ascii_case(hostname))
+            else {
+                continue;
+            };
+            let host = hosts.remove(at);
+            if let (Some((object, ..)), Some(gateway)) = (stated.get(&host), &gateway) {
+                tls.push(TlsFinding {
+                    object: object.clone(),
+                    problem: TlsProblem::PassedThrough {
+                        host,
+                        gateway: gateway.gateway.clone(),
+                        listener: listener.name.clone(),
+                    },
+                });
+            }
+        }
+    }
     presented.retain(|(_, _, hosts)| !hosts.is_empty());
     // Beside a Gateway listener of no hostname presenting a certificate, which answers every
     // name no other does, Ingress refuses none of the hosts it serves over plain HTTP alone:
@@ -1403,6 +1468,20 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         gateway_tls(&mut config, gateway, cluster, &mut report);
     }
     shared_by(&mut config, gateway.as_ref(), &presented, &ingress_https);
+    // Ingress's HTTPS port shared for it with a Gateway's TLS listeners, and no Ingress
+    // served there: its listener passes every connection through, as a `tls` one, closing
+    // what no TLS route takes rather than refusing it in a handshake.
+    if shares_ingress_https {
+        let name = listeners::name(plane.ingress_https_port);
+        let used = config
+            .routes
+            .iter()
+            .any(|route| route.listeners.contains(&name));
+        if !used {
+            let alone = listeners::listener(plane, plane.ingress_https_port, Protocol::Tls);
+            config.listeners.insert(name, alone);
+        }
+    }
     // Every route's status, of whichever kind, HTTPRoutes first; a listener counts them all.
     let routes: Vec<RouteOutcome> = http_routes.iter().chain(&grpc_routes).cloned().collect();
     let route_statuses = status::routes(&routes, &report);
@@ -1821,34 +1900,36 @@ fn shared_by(
                     .as_ref()
                     .is_ok_and(|serving| serving.contains(name))
             })
-            .map(|listener| listener.hostname.as_deref());
+            .map(|listener| (listener.hostname.as_deref(), listener.passes_through));
         let ingress_hosts = presented
             .iter()
             .filter(|_| ingress_https.contains(name))
             .flat_map(|(_, _, hosts)| hosts.iter().map(String::as_str));
         let sharing = sharing(gateway_listeners, ingress_hosts);
-        if sharing.len() >= 2 {
+        // One that passes through is said alone too: its names are carried.
+        if sharing.len() >= 2 || sharing.iter().any(|sharer| sharer.passes_through) {
             tls.shared_by = sharing;
         }
     }
 }
 
 /// The listeners sharing a port: each Gateway listener's by its hostname, `*` for none,
-/// its wildcard of any labels; then Ingress's hosts, one listener together, its wildcards
-/// of one label. A hostname is one listener's, the first's, whatever else names it again,
-/// so that the data plane never refuses what is said.
+/// its wildcard of any labels, and whether it passes its connections through; then
+/// Ingress's hosts, one listener together, its wildcards of one label. A hostname is one
+/// listener's, the first's, whatever else names it again, so that the data plane never
+/// refuses what is said.
 fn sharing<'a>(
-    gateway_listeners: impl Iterator<Item = Option<&'a str>>,
+    gateway_listeners: impl Iterator<Item = (Option<&'a str>, bool)>,
     ingress_hosts: impl Iterator<Item = &'a str>,
 ) -> Vec<SharingListener> {
     let mut seen = BTreeSet::new();
     let mut first = |name: &str| seen.insert(name.to_ascii_lowercase());
     let mut sharing: Vec<SharingListener> = gateway_listeners
-        .map(|hostname| hostname.unwrap_or("*"))
-        .filter(|hostname| first(hostname))
-        .map(|hostname| SharingListener {
+        .map(|(hostname, passes_through)| (hostname.unwrap_or("*"), passes_through))
+        .filter(|(hostname, _)| first(hostname))
+        .map(|(hostname, passes_through)| SharingListener {
             hostnames: vec![sharing_hostname(hostname, Wildcard::AnyLabels)],
-            passes_through: false,
+            passes_through,
         })
         .collect();
     let hostnames: Vec<SharingHostname> = ingress_hosts
@@ -2685,7 +2766,10 @@ mod tests {
             "B.example.com",
         ];
         assert_eq!(
-            said(sharing(gateway.into_iter(), ingress.into_iter())),
+            said(sharing(
+                gateway.into_iter().map(|hostname| (hostname, false)),
+                ingress.into_iter()
+            )),
             [
                 vec![named("*", None)],
                 vec![named("a.example.com", None)],
@@ -2697,13 +2781,19 @@ mod tests {
             ]
         );
         // Nothing of Ingress's but what a Gateway listener names: no listener of its own.
-        assert_eq!(
-            said(sharing(
-                [Some("a.example.com"), None].into_iter(),
-                ["a.example.com"].into_iter()
-            )),
-            [vec![named("a.example.com", None)], vec![named("*", None)]]
-        );
+        // So too where that listener passes its connections through, which is said of it.
+        for passes_through in [false, true] {
+            let sharing = sharing(
+                [(Some("a.example.com"), passes_through), (None, false)].into_iter(),
+                ["a.example.com"].into_iter(),
+            );
+            let passing: Vec<bool> = sharing.iter().map(|sharer| sharer.passes_through).collect();
+            assert_eq!(passing, [passes_through, false]);
+            assert_eq!(
+                said(sharing),
+                [vec![named("a.example.com", None)], vec![named("*", None)]]
+            );
+        }
     }
 
     #[test]

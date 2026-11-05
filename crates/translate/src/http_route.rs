@@ -11,8 +11,8 @@ use crate::gateway::{GatewayOutcome, ListenerOutcome};
 use crate::{Calls, Cluster, Object, Plane, RefProblem, RefReason, backend_upstream, namespace};
 use edgerush_config::{
     Backend, Filter, Forward, Fraction, Header, HeaderChanges, Hostname, Match, Mirror, PathChange,
-    PathMatch, Protocol, Query, Redirect, Retry, Route, Rule, Scheme, Timeouts, Upstream,
-    UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
+    PathMatch, Query, Redirect, Retry, Route, Rule, Scheme, Timeouts, Upstream, UrlRewrite,
+    ValueMatch, ValuePredicate, Wildcard,
 };
 use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::{
@@ -444,10 +444,7 @@ pub(crate) fn claims(gateway: &GatewayOutcome) -> Vec<Route> {
             let served = listener.served.as_ref().ok()?;
             let hostname = listener.hostname.as_ref()?;
             // A TLS listener's hosts are the SNI router's: an HTTP route is never for it.
-            if !matches!(
-                gateway.ports.get(&listener.port),
-                Some(Protocol::Http | Protocol::Https)
-            ) {
+            if listener.passes_through {
                 return None;
             }
             // Named after whose listener it is: names are unique within a Gateway or a

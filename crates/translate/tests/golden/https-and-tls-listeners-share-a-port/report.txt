@@ -1,0 +1,6 @@
+Gateway shop/web: listener again: not accepted: listener api, which comes first, has its port, protocol and hostname
+Ingress shop/site: api.example.com is passed through by Gateway shop/web's TLS listener api, which names it, and not served over TLS here
+Ingress shop/site claims api.example.com, taking it from HTTPRoute shop/pages's *.example.com, which does not fall through
+Ingress shop/site claims api.example.com, taking it from Gateway shop/web listener https's *.example.com, which does not fall through
+Ingress shop/site claims shop.example.com, taking it from HTTPRoute shop/pages's *.example.com, which does not fall through
+Ingress shop/site claims shop.example.com, taking it from Gateway shop/web listener https's *.example.com, which does not fall through

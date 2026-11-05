@@ -1,7 +1,8 @@
 # A Gateway's TLS listeners: in Passthrough mode each is served on a `tls` listener of the
 # data plane, its certificateRefs not read (ignored, as the spec has it), several on one
 # port told apart by hostname, one of an earlier's hostname refused; in Terminate mode not
-# accepted and taking no route; beside an HTTPS listener on one port not served yet, and
+# accepted and taking no route; before an HTTPS listener on one port served on its `https`
+# listener, its name passed through even where that one has no certificate it can use;
 # beside an HTTP one a conflict. The kinds a TLS listener names that it cannot take are
 # said. An HTTPRoute naming a TLS listener is not allowed there.
 apiVersion: gateway.networking.k8s.io/v1
@@ -33,8 +34,8 @@ spec:
       protocol: TLS
       tls: { mode: Passthrough }
       allowedRoutes: { kinds: [{ kind: TCPRoute }, { kind: TLSRoute }, { kind: HTTPRoute }] }
-    - { name: secure, port: 9445, protocol: HTTPS, tls: { certificateRefs: [{ name: not-there }] } }
     - { name: beside-https, port: 9445, protocol: TLS, hostname: db.example.com, tls: { mode: Passthrough } }
+    - { name: secure, port: 9445, protocol: HTTPS, tls: { certificateRefs: [{ name: not-there }] } }
     - { name: beside-http, port: 8080, protocol: TLS, hostname: db.example.com, tls: { mode: Passthrough } }
 ---
 apiVersion: gateway.networking.k8s.io/v1

@@ -104,9 +104,7 @@ pub(crate) fn claims(gateway: &GatewayOutcome) -> Vec<TlsRoute> {
     gateway
         .listeners
         .iter()
-        .filter(|listener| {
-            gateway.ports.get(&listener.port) == Some(&edgerush_config::Protocol::Tls)
-        })
+        .filter(|listener| listener.passes_through)
         .filter_map(|listener| {
             let served = listener.served.as_ref().ok()?;
             let hostname = listener.hostname.as_ref()?;
