@@ -43,7 +43,7 @@ pub mod message;
 pub mod node;
 pub mod table;
 
-pub use authority::Authority;
+pub use authority::{Authority, Naming};
 pub use config::{Config, ConfigError};
 pub use kept::{Held, Kept};
 pub use message::{Message, Stamp};

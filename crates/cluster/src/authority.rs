@@ -31,6 +31,18 @@ struct Reported {
     voting: Vec<NodeId>,
 }
 
+/// The control plane's last naming, kept across its restarts: the generation, 0 for none, the
+/// pods named to form it, with their addresses, and the latest table any of them had then.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Naming {
+    /// The generation last named.
+    pub generation: u64,
+    /// The pods named, with their addresses.
+    pub named: BTreeMap<NodeId, String>,
+    /// The latest table any of them had then.
+    pub latest: Stamp,
+}
+
 /// The control plane, as far as forming the cluster goes.
 #[derive(Clone, Debug)]
 pub struct Authority {
@@ -88,6 +100,29 @@ impl Authority {
         self.needed_since = None;
         self.asked_at = None;
         self.named_at = None;
+    }
+
+    /// For the pods started with `config`, the control plane started again with what it kept of
+    /// its last naming: as [`restart`](Self::restart) leaves it.
+    #[must_use]
+    pub fn resumed(config: &Config, naming: Naming) -> Self {
+        Self {
+            generation: naming.generation,
+            named: naming.named,
+            latest: naming.latest,
+            ..Self::new(config)
+        }
+    }
+
+    /// What it is to keep where it outlives the control plane, written before anyone is told
+    /// of a naming: its last.
+    #[must_use]
+    pub fn naming(&self) -> Naming {
+        Naming {
+            generation: self.generation,
+            named: self.named.clone(),
+            latest: self.latest,
+        }
     }
 
     /// The generation last named, 0 for none.
@@ -605,6 +640,60 @@ mod tests {
             &mut authority,
             20,
             40,
+            &[4, 5, 6],
+            &[(&[4, 5, 6], (0, 0), &[])],
+        );
+        assert_eq!(authority.generation(), 2);
+    }
+
+    /// What it keeps of its naming comes back whole in one resumed from it.
+    #[test]
+    fn a_naming_kept_comes_back_whole() {
+        let mut authority = Authority::new(&Config::defaults());
+        assert_eq!(authority.naming(), Naming::default());
+        let _ = run(
+            &mut authority,
+            1,
+            4,
+            &[1, 2, 3],
+            &[(&[1, 2, 3], (first_term(0), 5), &[])],
+        );
+        let naming = authority.naming();
+        assert_eq!(naming.generation, 1);
+        assert_eq!(naming.named, running(&[1, 2, 3]));
+        assert_eq!(naming.latest, (first_term(0), 5));
+        let resumed = Authority::resumed(&Config::defaults(), naming.clone());
+        assert_eq!(resumed.naming(), naming);
+    }
+
+    /// Resumed in a process of its own from what the last one kept, it does as one restarted
+    /// does: waits on the formation it named, never names that generation again, and names the
+    /// next above it once no pod running has a table whose voting set mostly runs.
+    #[test]
+    fn resumed_from_its_naming_it_waits_on_it_and_names_only_above_it() {
+        let mut first = Authority::new(&Config::defaults());
+        let _ = run(&mut first, 1, 4, &[1, 2, 3], &[(&[1, 2, 3], (0, 0), &[])]);
+        assert_eq!(first.generation(), 1);
+        let mut authority = Authority::resumed(&Config::defaults(), first.naming());
+        let pods = [1, 2, 3, 4, 5];
+        let out = run(&mut authority, 4, 30, &pods, &[(&pods, (0, 0), &[])]);
+        assert_eq!(
+            authority.generation(),
+            1,
+            "named another while the first may form"
+        );
+        assert!(
+            named(&out)
+                .iter()
+                .all(|(to, generation, _)| *generation == 1 && *to <= 3),
+            "told another of generation 1: {:?}",
+            named(&out)
+        );
+        let mut authority = Authority::resumed(&Config::defaults(), authority.naming());
+        let _ = run(
+            &mut authority,
+            30,
+            60,
             &[4, 5, 6],
             &[(&[4, 5, 6], (0, 0), &[])],
         );

@@ -5,7 +5,8 @@
 //! plane's `Authority` runs in-process, asking the pods as the controller will. Each scenario
 //! is the simulation's, held to its bound; a rollout's, as T4d2 has it. Clients ask the pods'
 //! synchronous mode in-process, through a `StoreClient` (T5a), and data planes on a stream of
-//! their own (T5c), as a data plane drives them by its `Plane` (T6a).
+//! their own (T5c), as a data plane drives them by its `Plane` (T6a); and pods formed by
+//! `Forming`, as the bench's example program forms them (T6b).
 
 #![allow(
     clippy::unwrap_used,
@@ -16,9 +17,11 @@
 
 use edgerush_cluster::table::shard_of;
 use edgerush_cluster::{
-    Authority, Changed, Config, Kept, Message as StoreMessage, Node, NodeId, Stamp, Table, Time, ms,
+    Authority, Changed, Config, Kept, Message as StoreMessage, Node, NodeId, Stamp, Table, Time,
+    generation_of, ms,
 };
 use edgerush_cluster_synchronous::{Answer, Message as ModeMessage, Rule, Value};
+use edgerush_ratelimit_service::cluster::forming::{self, Forming};
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::plane::{Plane, Told};
 use edgerush_ratelimit_service::cluster::pod::{
@@ -29,6 +32,7 @@ use edgerush_ratelimit_service::grpc::Client;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -84,6 +88,10 @@ fn dropped(cut: &BTreeSet<IpAddr>, ip: IpAddr, from: IpAddr) -> bool {
 /// A relay in front of one pod.
 struct Relay {
     address: SocketAddr,
+    /// Where it relays to: its pod's listener, another's once the pod is restarted in place.
+    /// Each change, or a mark of one, closes what it relays, as a process ending closes its
+    /// connections.
+    target: watch::Sender<SocketAddr>,
     /// The connections it has been dialled from pods, taken or dropped.
     dialled: Arc<AtomicU64>,
     task: JoinHandle<()>,
@@ -97,6 +105,7 @@ impl Relay {
         let address = listener.local_addr().unwrap();
         let dialled = Arc::new(AtomicU64::new(0));
         let counted = Arc::clone(&dialled);
+        let (target, targeted) = watch::channel(to);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut inbound, from)) = listener.accept().await else {
@@ -109,6 +118,8 @@ impl Relay {
                     continue;
                 }
                 let mut cut = cut.clone();
+                let mut targeted = targeted.clone();
+                let to = *targeted.borrow_and_update();
                 tokio::spawn(async move {
                     let Ok(mut outbound) = TcpStream::connect(to).await else {
                         return;
@@ -116,12 +127,14 @@ impl Relay {
                     tokio::select! {
                         _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
                         _ = cut.wait_for(|cut| dropped(cut, ip, from.ip())) => {}
+                        _ = targeted.changed() => {}
                     }
                 });
             }
         });
         Self {
             address,
+            target,
             dialled,
             task,
         }
@@ -193,6 +206,38 @@ impl Cluster {
         });
         self.pods.insert(id, Running { pod, server, relay });
         address
+    }
+
+    /// Restarts pod `id` in place as member `new`, as a StatefulSet's pod restarts: its
+    /// process ended and another started behind the same address, asking no seeds, its relay
+    /// passing connections to the new one; not shown running.
+    async fn restart_in_place(&mut self, id: NodeId, new: NodeId) {
+        let old = self.pods.remove(&id).unwrap();
+        old.pod.stop().await;
+        old.server.abort();
+        let listener = TcpListener::bind((ip_of(id), 0)).await.unwrap();
+        old.relay
+            .target
+            .send_replace(listener.local_addr().unwrap());
+        let address = old.relay.address.to_string();
+        let pod = StorePod::spawn(new, address, config(), Dial::Plain, Vec::new());
+        let server = StoreServer::new(pod.clone());
+        let server = tokio::spawn(async move {
+            let _ended = tonic::transport::Server::builder()
+                .serve_with_incoming(server, TcpIncoming::from(listener))
+                .await;
+        });
+        let relay = old.relay;
+        self.pods.insert(new, Running { pod, server, relay });
+    }
+
+    /// Ends pod `id` with its relay, as a pod deleted: its address refuses connections.
+    async fn delete(&mut self, id: NodeId) {
+        let old = self.pods.remove(&id).unwrap();
+        old.pod.stop().await;
+        old.server.abort();
+        old.relay.task.abort();
+        old.relay.target.send_modify(|_| {});
     }
 
     /// Starts pods 1 to `count`, shown running together, and waits for the control plane to
@@ -304,7 +349,7 @@ async fn control_plane(running: Arc<Mutex<BTreeMap<NodeId, String>>>) {
                         .clone();
                     let answering = answering.clone();
                     tokio::spawn(async move {
-                        if let Ok(Some(answer)) = ask::<Value>(&client, message).await {
+                        if let Ok((_, Some(answer))) = ask::<Value>(&client, message).await {
                             let _ended = answering.send((to, answer));
                         }
                     });
@@ -1278,4 +1323,155 @@ async fn a_charge_given_back_with_its_receipt_is_credited_at_the_owner() {
     let id = plane.ask(3, |plane, id| plane.request(id, key, rule)).await;
     let again = plane.answer(3, id).await;
     assert!(matches!(again, Some(Answer::Admitted(_))), "{again:?}");
+}
+
+/// A naming file of the scratch directory's, for one test.
+fn naming_file(name: &str) -> PathBuf {
+    let directory = std::env::temp_dir().join(format!("edgerush-forming-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let file = directory.join(name);
+    let _ = std::fs::remove_file(&file);
+    file
+}
+
+/// Pods `ids` started, not shown running to the harness's control plane, which forms nothing
+/// of them: their addresses, for `Forming` to form.
+async fn unformed(cluster: &mut Cluster, ids: std::ops::RangeInclusive<NodeId>) -> Vec<String> {
+    let mut addresses = Vec::new();
+    for id in ids {
+        addresses.push(cluster.launch(id, config(), Vec::new()).await);
+    }
+    addresses
+}
+
+/// `Forming` from the file at `file`, run on its own against `addresses`.
+fn forming(file: &Path, addresses: &[String]) -> JoinHandle<()> {
+    let forming = Forming::new(&config(), file.to_owned()).unwrap();
+    let addresses = addresses.to_vec();
+    tokio::spawn(async move {
+        forming.run(addresses).await.unwrap();
+    })
+}
+
+/// The generation of the table every pod of `ids` has, if they have one and the same.
+async fn formed_generation(cluster: &Cluster, ids: &BTreeSet<NodeId>) -> Option<u64> {
+    cluster
+        .one_table(ids)
+        .await
+        .map(|table| generation_of(table.term))
+}
+
+/// Pods at the addresses it is given, nothing kept, are formed by `Forming` into the first
+/// generation, which it keeps in its file, the pods it named with the addresses they gave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forming_names_the_pods_at_its_addresses_and_keeps_the_naming() {
+    let mut cluster = Cluster::new();
+    let addresses = unformed(&mut cluster, 1..=3).await;
+    let file = naming_file("first");
+    let task = forming(&file, &addresses);
+    let ids: BTreeSet<NodeId> = (1..=3).collect();
+    let formed = within(FORMED, || formed_generation(&cluster, &ids)).await;
+    task.abort();
+    assert_eq!(formed, Some(1), "not formed within {FORMED:?}");
+    let kept = forming::read(&file).unwrap().unwrap();
+    assert_eq!(kept.generation, 1);
+    let named: BTreeMap<NodeId, String> = (1..=3).zip(addresses).collect();
+    assert_eq!(kept.named, named);
+}
+
+/// Stopped and started again from its file, `Forming` names nothing new of a cluster that
+/// runs: its pods keep the generation it formed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forming_resumed_from_its_file_names_nothing_new() {
+    let mut cluster = Cluster::new();
+    let addresses = unformed(&mut cluster, 1..=3).await;
+    let file = naming_file("resumed");
+    let task = forming(&file, &addresses);
+    let ids: BTreeSet<NodeId> = (1..=3).collect();
+    let formed = within(FORMED, || formed_generation(&cluster, &ids)).await;
+    task.abort();
+    assert_eq!(formed, Some(1));
+    let task = forming(&file, &addresses);
+    // Several heartbeats of asking each pod and hearing it holds the table named.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    task.abort();
+    assert_eq!(forming::read(&file).unwrap().unwrap().generation, 1);
+    assert_eq!(formed_generation(&cluster, &ids).await, Some(1));
+}
+
+/// Every pod gone and new ones started in their place, `Forming` started again from its file
+/// names the next generation: above the one before, which no pod running holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pods_all_replaced_are_formed_above_the_generation_kept() {
+    let mut cluster = Cluster::new();
+    let addresses = unformed(&mut cluster, 1..=3).await;
+    let file = naming_file("replaced");
+    let task = forming(&file, &addresses);
+    let ids: BTreeSet<NodeId> = (1..=3).collect();
+    let formed = within(FORMED, || formed_generation(&cluster, &ids)).await;
+    task.abort();
+    assert_eq!(formed, Some(1));
+    for id in 1..=3 {
+        cluster.crash(id).await;
+    }
+    let addresses = unformed(&mut cluster, 4..=6).await;
+    let task = forming(&file, &addresses);
+    let ids: BTreeSet<NodeId> = (4..=6).collect();
+    let formed = within(FORMED, || formed_generation(&cluster, &ids)).await;
+    task.abort();
+    assert_eq!(formed, Some(2), "not formed again within {FORMED:?}");
+    assert_eq!(forming::read(&file).unwrap().unwrap().generation, 2);
+}
+
+/// As `Forming` runs, a pod deleted, its address refusing, runs no longer, and pods restarted
+/// in place, their addresses answering as new members, run as those: formed again, the new
+/// members alone, with the one deleted left out rather than waited on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_address_refusing_runs_nothing_and_one_answering_anew_runs_its_new_member() {
+    let mut cluster = Cluster::new();
+    let addresses = unformed(&mut cluster, 1..=3).await;
+    let file = naming_file("in-place");
+    let task = forming(&file, &addresses);
+    let ids: BTreeSet<NodeId> = (1..=3).collect();
+    let formed = within(FORMED, || formed_generation(&cluster, &ids)).await;
+    assert_eq!(formed, Some(1));
+    cluster.delete(3).await;
+    cluster.restart_in_place(1, 7).await;
+    cluster.restart_in_place(2, 8).await;
+    let ids: BTreeSet<NodeId> = [7, 8].into();
+    // A refusal is heard within some seconds on Windows, then forming as at first.
+    let formed = within(FORMED * 3, || formed_generation(&cluster, &ids)).await;
+    task.abort();
+    assert_eq!(formed, Some(2), "not formed again of 7 and 8");
+    let kept = forming::read(&file).unwrap().unwrap();
+    let named: BTreeMap<NodeId, String> = [7, 8].into_iter().zip(addresses).collect();
+    assert_eq!(kept.named, named);
+}
+
+/// An address that answers nothing but does not refuse — its pod cut off — still runs: with the
+/// others restarted in place, `Forming` waits on the pod cut off, which may hold the cluster's
+/// latest table, rather than form a cluster without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_address_answering_nothing_still_runs_and_is_waited_on() {
+    let mut cluster = Cluster::new();
+    let addresses = unformed(&mut cluster, 1..=3).await;
+    let file = naming_file("cut-off");
+    let task = forming(&file, &addresses);
+    let ids: BTreeSet<NodeId> = (1..=3).collect();
+    let formed = within(FORMED, || formed_generation(&cluster, &ids)).await;
+    assert_eq!(formed, Some(1));
+    cluster.cut_off(3);
+    cluster.restart_in_place(1, 7).await;
+    cluster.restart_in_place(2, 8).await;
+    // Long past forming 7 and 8 had pod 3 been taken as gone (the test above: within a second
+    // or two of a refusal).
+    tokio::time::sleep(FORMED * 2).await;
+    task.abort();
+    assert_eq!(forming::read(&file).unwrap().unwrap().generation, 1);
+    for id in [7, 8] {
+        assert!(
+            committed(cluster.pod(id)).await.is_none(),
+            "pod {id} formed"
+        );
+    }
 }
