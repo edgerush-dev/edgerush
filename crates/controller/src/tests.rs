@@ -344,6 +344,7 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
         http_routes: Some(vec![follow_of("httproutes in shop", false, vec![route])]),
         grpc_routes: None,
         tls_routes: None,
+        tcp_routes: None,
         reference_grants: None,
     };
     assert_eq!(gateway_api.served(), None, "a CRD not listed yet");
@@ -488,6 +489,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 200,
                 r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"api","namespace":"shop"},"spec":{"parentRefs":[{"name":"web","namespace":"edge"}],"hostnames":["api.example"],"rules":[{"backendRefs":[{"name":"api","port":8443}]}]}}]}"#,
             )
+        } else if named(GatewayKind::TCPRoute) {
+            page(&[crd(GatewayKind::TCPRoute, &["v1"])])
+        } else if path.starts_with(&format!("{gateway_api}tcproutes?")) {
+            answer(
+                200,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"db","namespace":"shop"},"spec":{"parentRefs":[{"name":"web","namespace":"edge"}],"rules":[{"backendRefs":[{"name":"db","port":5432}]}]}}]}"#,
+            )
         } else if path.starts_with(&format!("{gateway_api}listenersets?")) {
             answer(
                 200,
@@ -540,6 +548,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
              httproutes.gateway.networking.k8s.io: {httproutes}; \
              grpcroutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              tlsroutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
+             tcproutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              referencegrants.gateway.networking.k8s.io: not served at v1 (only v1beta1; Gateway API v1.7.0), \
              so taken as having no objects"
         )
@@ -555,7 +564,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
             .filter(|line| {
                 line.starts_with("waiting on ")
                     && line.contains(
-                        "gatewayclasses in the cluster, gateways in edge, listenersets in the cluster, httproutes in the cluster, grpcroutes in the cluster, tlsroutes in the cluster",
+                        "gatewayclasses in the cluster, gateways in edge, listenersets in the cluster, httproutes in the cluster, grpcroutes in the cluster, tlsroutes in the cluster, tcproutes in the cluster",
                     )
             })
             .count()
@@ -599,11 +608,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 let report: Vec<String> =
                     translation.report.iter().map(ToString::to_string).collect();
                 // Its backend is no Service the cluster has; the TLSRoute followed reaches
-                // translation, and the Gateway has no TLS listener to take it.
+                // translation, and the Gateway has no TLS listener to take it; the TCPRoute
+                // reaches it too, which does not serve it yet.
                 assert_eq!(
                     report,
                     [
                         "TLSRoute shop/api: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
+                        "TCPRoute shop/db: not supported yet: TCPRoute",
                         "GRPCRoute shop/calls: rule 0: a backend's share is answered UNAVAILABLE: Service shop/calls does not exist"
                     ]
                 );
@@ -629,6 +640,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                     .path
                     .starts_with("/apis/gateway.networking.k8s.io/v1/tlsroutes?")),
                 "TLSRoutes never listed"
+            );
+            // TCPRoutes likewise.
+            assert!(
+                fake.seen().iter().any(|seen| seen
+                    .path
+                    .starts_with("/apis/gateway.networking.k8s.io/v1/tcproutes?")),
+                "TCPRoutes never listed"
             );
             stage.store(1, Ordering::SeqCst);
             until("the CRD's deletion said", || {
@@ -1666,6 +1684,7 @@ spec:
                 http_routes: Some(vec![follow_of("httproutes", true, routes)]),
                 grpc_routes: Some(vec![follow_of("grpcroutes", true, grpc_routes)]),
                 tls_routes: Some(vec![follow_of("tlsroutes", true, tls_routes)]),
+                tcp_routes: None,
                 reference_grants: None,
             }
         };

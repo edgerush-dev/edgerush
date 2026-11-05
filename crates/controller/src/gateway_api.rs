@@ -31,19 +31,22 @@ pub enum GatewayKind {
     GRPCRoute,
     /// `TLSRoute`.
     TLSRoute,
+    /// `TCPRoute`.
+    TCPRoute,
     /// `ReferenceGrant`.
     ReferenceGrant,
 }
 
 impl GatewayKind {
     /// Every kind followed, in the order said.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::GatewayClass,
         Self::Gateway,
         Self::ListenerSet,
         Self::HTTPRoute,
         Self::GRPCRoute,
         Self::TLSRoute,
+        Self::TCPRoute,
         Self::ReferenceGrant,
     ];
 
@@ -57,6 +60,7 @@ impl GatewayKind {
             Self::HTTPRoute => "httproutes.gateway.networking.k8s.io",
             Self::GRPCRoute => "grpcroutes.gateway.networking.k8s.io",
             Self::TLSRoute => "tlsroutes.gateway.networking.k8s.io",
+            Self::TCPRoute => "tcproutes.gateway.networking.k8s.io",
             Self::ReferenceGrant => "referencegrants.gateway.networking.k8s.io",
         }
     }
@@ -126,6 +130,7 @@ impl GatewayKind {
             Self::HTTPRoute => "HTTPRoute",
             Self::GRPCRoute => "GRPCRoute",
             Self::TLSRoute => "TLSRoute",
+            Self::TCPRoute => "TCPRoute",
             Self::ReferenceGrant => "ReferenceGrant",
         }
     }
@@ -268,6 +273,7 @@ mod tests {
                 "httproutes.gateway.networking.k8s.io",
                 "grpcroutes.gateway.networking.k8s.io",
                 "tlsroutes.gateway.networking.k8s.io",
+                "tcproutes.gateway.networking.k8s.io",
                 "referencegrants.gateway.networking.k8s.io",
             ]
         );

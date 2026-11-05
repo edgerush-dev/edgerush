@@ -28,4 +28,6 @@ pub mod listener_set;
 #[allow(clippy::doc_lazy_continuation)]
 pub mod reference_grant;
 #[allow(clippy::doc_lazy_continuation)]
+pub mod tcp_route;
+#[allow(clippy::doc_lazy_continuation)]
 pub mod tls_route;

@@ -30,6 +30,7 @@ use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
+use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_translate::{Cluster, Plane, translate};
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
@@ -52,6 +53,7 @@ enum Manifest {
     HTTPRoute(Box<HTTPRoute>),
     GRPCRoute(Box<GRPCRoute>),
     TLSRoute(Box<TLSRoute>),
+    TCPRoute(Box<TCPRoute>),
     ReferenceGrant(Box<ReferenceGrant>),
     Namespace(Box<Namespace>),
 }
@@ -77,6 +79,7 @@ fn every_case_translates_to_its_config_and_report() {
                 Manifest::HTTPRoute(route) => cluster.http_routes.push(*route),
                 Manifest::GRPCRoute(route) => cluster.grpc_routes.push(*route),
                 Manifest::TLSRoute(route) => cluster.tls_routes.push(*route),
+                Manifest::TCPRoute(route) => cluster.tcp_routes.push(*route),
                 Manifest::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
                 Manifest::Namespace(namespace) => cluster.namespaces.push(*namespace),
             }

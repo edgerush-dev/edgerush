@@ -42,6 +42,7 @@ use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
+use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{
@@ -254,6 +255,8 @@ pub struct Cluster {
     pub grpc_routes: Vec<GRPCRoute>,
     /// Every TLSRoute seen.
     pub tls_routes: Vec<TLSRoute>,
+    /// Every TCPRoute seen.
+    pub tcp_routes: Vec<TCPRoute>,
     /// Every ReferenceGrant seen.
     pub reference_grants: Vec<ReferenceGrant>,
     /// Every Namespace seen, where the data plane is a Gateway: their labels are what a
@@ -852,6 +855,17 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                     problem: Problem::NotAttached(why),
                 });
             }
+        }
+    }
+    // TCPRoutes are followed and not translated yet: each that names the data plane's
+    // Gateway, or a ListenerSet naming it, is said.
+    if let Some(gateway) = &gateway {
+        let tcp = cluster.tcp_routes.iter().map(http_route::Routed::tcp);
+        for outcome in http_route::attached(tcp.collect(), gateway, cluster) {
+            report.push(Finding {
+                object: outcome.route,
+                problem: Problem::NotSupportedYet("TCPRoute"),
+            });
         }
     }
     // An Ingress is the data plane's when its class is, and its class is when the
