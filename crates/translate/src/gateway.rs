@@ -292,6 +292,27 @@ pub enum ListenerProblem {
     /// one have.
     #[error("TLS mode `{0}` is not one an HTTPS listener takes")]
     TlsMode(String),
+    /// A TLS listener of a mode other than `Passthrough`: the gateway terminates TLS on
+    /// HTTPS listeners alone (`UnsupportedValue`, as conformance has it of an implementation
+    /// that does not claim `TLSRouteModeTerminate`).
+    #[error("TLS mode `{0}` is not served: a TLS listener passes its connections through")]
+    PassthroughOnly(String),
+    /// A TLS listener on a port an HTTPS listener before it has, or the other way round:
+    /// the two are distinct by hostname, and the data plane does not serve both on one port
+    /// yet (`ProtocolConflict`).
+    #[error(
+        "port {port} is taken for {protocol} by {by}, which comes first: TLS and HTTPS \
+         listeners on one port are not supported yet"
+    )]
+    BesideHttpsNotYet {
+        /// The port.
+        port: u16,
+        /// The protocol it is taken for, as the data plane's config writes it.
+        protocol: &'static str,
+        /// The listener that has it, as said: by name within one resource, by whose it is
+        /// beyond.
+        by: String,
+    },
     /// A listener before it states its port for another protocol, and has the port: that
     /// one is accepted, this not (`ProtocolConflict`).
     #[error("port {port} is taken for {protocol} by {by}, which comes first")]
@@ -395,9 +416,7 @@ pub(crate) fn outcome(
         .iter()
         .zip(&written)
         .filter(|(listener, _)| listener.served.is_ok())
-        .filter_map(|(listener, written)| {
-            Some((listener.port, protocol(&written.listener.protocol).ok()?))
-        })
+        .filter_map(|(listener, written)| Some((listener.port, protocol(&written.listener).ok()?)))
         .collect();
     for (listener, written) in listeners.iter_mut().zip(&written) {
         // Said of the Gateway or the ListenerSet that states it, whose namespace its
@@ -484,10 +503,7 @@ fn certificates(
     (kind, stater_namespace): (&'static str, &str),
     cluster: &Cluster,
 ) {
-    let mode = written
-        .tls
-        .as_ref()
-        .map_or("Terminate", |tls| tls.mode.as_str());
+    let mode = tls_mode(written);
     if mode != "Terminate" {
         listener.served = Err(ListenerProblem::TlsMode(mode.to_owned()));
         return;
@@ -695,15 +711,20 @@ pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOu
             let listener = &stated.listener;
             // The schema holds a port to 1–65535.
             let port = u16::try_from(listener.port).unwrap_or_default();
-            let served = protocol(&listener.protocol).and_then(|protocol| {
+            let served = protocol(listener).and_then(|protocol| {
                 let name = name_of(protocol);
                 let place = (listener.port, name, listener.hostname.as_deref());
                 match (ports.get(&listener.port), places.get(&place)) {
                     (Some((taken, earlier)), _) if *taken != name => {
-                        Err(ListenerProblem::ProtocolConflict {
-                            port,
-                            protocol: taken,
-                            by: by(*earlier, stated),
+                        let (protocol, by) = (*taken, by(*earlier, stated));
+                        // Distinct by hostname as the spec has them, but not yet served on
+                        // one data-plane listener.
+                        let beside_https =
+                            matches!((protocol, name), ("https", "tls") | ("tls", "https"));
+                        Err(if beside_https {
+                            ListenerProblem::BesideHttpsNotYet { port, protocol, by }
+                        } else {
+                            ListenerProblem::ProtocolConflict { port, protocol, by }
                         })
                     }
                     (_, Some(earlier)) => Err(ListenerProblem::HostnameConflict {
@@ -743,12 +764,16 @@ pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOu
 }
 
 /// The protocol of the data plane's listeners that serve a Gateway listener's, if one is
-/// taken.
-fn protocol(written: &str) -> Result<Protocol, ListenerProblem> {
-    match written {
+/// taken: a TLS listener's in `Passthrough` mode alone, whose `certificateRefs` are not read
+/// (the spec: ignored in that mode).
+fn protocol(written: &GatewayListeners) -> Result<Protocol, ListenerProblem> {
+    match written.protocol.as_str() {
         "HTTP" => Ok(Protocol::Http),
         "HTTPS" => Ok(Protocol::Https),
-        "TLS" => Err(ListenerProblem::NotSupportedYet("TLS")),
+        "TLS" => match tls_mode(written) {
+            "Passthrough" => Ok(Protocol::Tls),
+            other => Err(ListenerProblem::PassthroughOnly(other.to_owned())),
+        },
         "TCP" => Err(ListenerProblem::NotSupportedYet("TCP")),
         other => Err(ListenerProblem::UnsupportedProtocol(other.to_owned())),
     }
@@ -764,11 +789,21 @@ fn name_of(protocol: Protocol) -> &'static str {
     }
 }
 
+/// A listener's TLS mode: `Terminate` where it states none, as its schema defaults it.
+fn tls_mode(written: &GatewayListeners) -> &str {
+    written
+        .tls
+        .as_ref()
+        .map_or("Terminate", |tls| tls.mode.as_str())
+}
+
 /// The route kinds a listener of `protocol` can take: those whose routes its data plane
-/// listener serves.
+/// listener serves. One not accepted, a TLS listener not in `Passthrough` mode among them,
+/// says it supports none (status).
 fn kinds_for(protocol: &str) -> &'static [&'static str] {
     match protocol {
         "HTTP" | "HTTPS" => &["HTTPRoute", "GRPCRoute"],
+        "TLS" => &["TLSRoute"],
         _ => &[],
     }
 }

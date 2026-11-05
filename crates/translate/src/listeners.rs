@@ -49,6 +49,8 @@ fn listener(plane: &Plane, port: u16, protocol: Protocol) -> Listener {
         IpFamily::Ipv6 | IpFamily::Dual => Ipv6Addr::UNSPECIFIED.into(),
     };
     let https = protocol == Protocol::Https;
+    // A passthrough listener reads no request: none of the HTTP listeners' settings is its.
+    let http = matches!(protocol, Protocol::Http | Protocol::Https);
     Listener {
         address: SocketAddr::new(address, port),
         protocol,
@@ -65,19 +67,19 @@ fn listener(plane: &Plane, port: u16, protocol: Protocol) -> Listener {
             .and_then(|settings| settings.http3)
             .filter(|_| https),
         tunnel_idle_seconds: None,
-        forwarding: Some(
+        forwarding: http.then(|| {
             settings
                 .and_then(|settings| settings.forwarding.clone())
                 .unwrap_or_else(|| Forwarding {
                     trusted_proxies: Vec::new(),
                     trusted_only_headers: TRUSTED_ONLY_HEADERS.map(str::to_owned).to_vec(),
-                }),
-        ),
-        request_id: Some(
+                })
+        }),
+        request_id: http.then(|| {
             settings
                 .and_then(|settings| settings.request_id)
-                .unwrap_or(RequestId::Generate),
-        ),
+                .unwrap_or(RequestId::Generate)
+        }),
         proxy_protocol: Some(
             settings
                 .and_then(|settings| settings.proxy_protocol.clone())

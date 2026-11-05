@@ -1,0 +1,1 @@
+HTTPRoute shop/pages, section passthrough: not attached: no listener it names takes its kind from its namespace

@@ -11,8 +11,8 @@ use crate::gateway::{GatewayOutcome, ListenerOutcome};
 use crate::{Calls, Cluster, Object, Plane, RefProblem, RefReason, backend_upstream, namespace};
 use edgerush_config::{
     Backend, Filter, Forward, Fraction, Header, HeaderChanges, Hostname, Match, Mirror, PathChange,
-    PathMatch, Query, Redirect, Retry, Route, Rule, Scheme, Timeouts, Upstream, UrlRewrite,
-    ValueMatch, ValuePredicate, Wildcard,
+    PathMatch, Protocol, Query, Redirect, Retry, Route, Rule, Scheme, Timeouts, Upstream,
+    UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
 };
 use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::{
@@ -433,9 +433,9 @@ fn within(theirs: &str, hostname: &str) -> bool {
     }
 }
 
-/// The claim of no rules each accepted listener's hostname makes, so that no less specific
-/// claim serves it (listener isolation): `gateway/<namespace>/<name>/<listener>`, on the
-/// data plane's listeners that serve it.
+/// The claim of no rules each accepted HTTP or HTTPS listener's hostname makes, so that no
+/// less specific claim serves it (listener isolation): `gateway/<namespace>/<name>/<listener>`,
+/// on the data plane's listeners that serve it.
 pub(crate) fn claims(gateway: &GatewayOutcome) -> Vec<Route> {
     gateway
         .listeners
@@ -443,6 +443,13 @@ pub(crate) fn claims(gateway: &GatewayOutcome) -> Vec<Route> {
         .filter_map(|listener| {
             let served = listener.served.as_ref().ok()?;
             let hostname = listener.hostname.as_ref()?;
+            // A TLS listener's hosts are the SNI router's: an HTTP route is never for it.
+            if !matches!(
+                gateway.ports.get(&listener.port),
+                Some(Protocol::Http | Protocol::Https)
+            ) {
+                return None;
+            }
             // Named after whose listener it is: names are unique within a Gateway or a
             // ListenerSet alone.
             let stater = listener.set.as_ref().unwrap_or(&gateway.gateway);
