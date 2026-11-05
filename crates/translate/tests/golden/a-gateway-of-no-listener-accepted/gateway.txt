@@ -1,1 +1,1 @@
-listener tcp: not accepted: not supported yet: TCP listeners
+listener dns: not accepted: protocol `UDP` is not one the gateway serves

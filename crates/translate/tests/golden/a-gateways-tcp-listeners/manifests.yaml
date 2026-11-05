@@ -1,0 +1,55 @@
+# A Gateway's TCP listeners: each served on a `tcp` listener of the data plane, distinct by
+# port alone, its hostname not read, so a second on a port is refused; until a TCPRoute
+# serves one, its connections are closed, its port bound all the same (Q-c2). On a port it
+# states for TCP and for HTTP or TLS as well, none of them is accepted, nor bound (Q-c1).
+# The kinds a TCP listener names that it cannot take are said. On the Ingress HTTP port, a
+# TCP listener has it, and an Ingress asked for over plain HTTP is left out, said. A
+# TCPRoute is not served yet.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: db, port: 5432, protocol: TCP, hostname: db.example.com }
+    - { name: db-again, port: 5432, protocol: TCP }
+    - { name: http, port: 8080, protocol: HTTP }
+    - { name: mixed-http, port: 9000, protocol: HTTP, hostname: a.example.com }
+    - { name: mixed-tls, port: 9000, protocol: TLS, hostname: b.example.com, tls: { mode: Passthrough } }
+    - { name: mixed-tcp, port: 9000, protocol: TCP }
+    - name: kinds
+      port: 6379
+      protocol: TCP
+      allowedRoutes: { kinds: [{ kind: TCPRoute }, { kind: HTTPRoute }] }
+    - { name: on-ingress, port: 80, protocol: TCP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: { name: postgres, namespace: shop }
+spec:
+  parentRefs: [{ name: web, sectionName: db }]
+  rules:
+    - backendRefs: [{ name: web, port: 5432 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }, { name: postgres, port: 5432 }]

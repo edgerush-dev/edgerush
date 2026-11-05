@@ -60,6 +60,7 @@ mod grpc_route;
 pub mod http_route;
 pub mod listeners;
 pub mod status;
+mod tcp_route;
 mod tls_route;
 
 pub use gateway::{
@@ -670,8 +671,13 @@ pub enum Problem {
     Refused(String),
     /// The Ingress HTTP port is a Gateway listener's of another protocol, so its hosts
     /// cannot be served over plain HTTP.
-    #[error("port {0}, where Ingress is served over plain HTTP, is bound for HTTPS")]
-    HttpPortTaken(u16),
+    #[error("port {port}, where Ingress is served over plain HTTP, is bound for {bound}")]
+    HttpPortTaken {
+        /// The port.
+        port: u16,
+        /// What it is bound for, as `bound_for` says it.
+        bound: &'static str,
+    },
     /// The data plane's IngressClass is not there, so no Ingress is its.
     #[error("not among the objects, so no Ingress of the class is translated")]
     ClassMissing,
@@ -1478,6 +1484,11 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         )
     };
     config.tls_routes = passthrough;
+    // Each accepted TCP listener's one route: until TCPRoutes are served, its claim, which
+    // closes every connection (Q-c2).
+    if let Some(gateway) = &gateway {
+        config.tcp_routes = tcp_route::claims(gateway);
+    }
     if let Some(gateway) = &gateway {
         gateway_tls(&mut config, gateway, cluster, &mut report);
     }
@@ -2050,6 +2061,20 @@ fn ingress_listeners(
     )
 }
 
+/// What the data plane's listener on `port` is bound for, as a finding says it: `plain HTTP`,
+/// `HTTPS`, `TCP` or `TLS`.
+fn bound_for(bound: &BTreeMap<String, Listener>, port: u16) -> &'static str {
+    match bound
+        .get(&listeners::name(port))
+        .map(|listener| listener.protocol)
+    {
+        Some(Protocol::Http) | None => "plain HTTP",
+        Some(Protocol::Https) => "HTTPS",
+        Some(Protocol::Tcp) => "TCP",
+        Some(Protocol::Tls) => "TLS",
+    }
+}
+
 /// An object without a namespace is in `default`, as Kubernetes takes it.
 fn namespace(metadata: &ObjectMeta) -> &str {
     metadata.namespace.as_deref().unwrap_or("default")
@@ -2344,7 +2369,12 @@ fn ingress_routes(
     for host in by_host.keys() {
         let mut listeners = http.clone();
         match tls_hosts.get(host.as_str()) {
-            None if http.is_empty() => return Err(Problem::HttpPortTaken(plane.ingress_http_port)),
+            None if http.is_empty() => {
+                return Err(Problem::HttpPortTaken {
+                    port: plane.ingress_http_port,
+                    bound: bound_for(bound, plane.ingress_http_port),
+                });
+            }
             None => {}
             Some(None) => {
                 unsecured.push((host.clone(), "its TLS entry names no Secret".to_owned()));
@@ -2372,8 +2402,9 @@ fn ingress_routes(
                         Some(format!("Secret {namespace}/{secret} does not cover {host}"))
                     }
                     Ok(_) if https.is_empty() => Some(format!(
-                        "port {}, where Ingress TLS hosts are served, is bound for plain HTTP",
-                        plane.ingress_https_port
+                        "port {}, where Ingress TLS hosts are served, is bound for {}",
+                        plane.ingress_https_port,
+                        bound_for(bound, plane.ingress_https_port)
                     )),
                     Ok((certificate, _)) => {
                         let name = format!("{namespace}/{secret}");

@@ -1,0 +1,22 @@
+listeners:
+  port-80: { address: "0.0.0.0:80", protocol: tcp, proxy_protocol: off }
+  port-5432: { address: "0.0.0.0:5432", protocol: tcp, proxy_protocol: off }
+  port-6379: { address: "0.0.0.0:6379", protocol: tcp, proxy_protocol: off }
+  port-8080:
+    address: "0.0.0.0:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes: []
+tcp_routes:
+  - name: gateway/shop/web/db
+    listeners: [port-5432]
+    backends: [{ invalid: no TCPRoute serves listener db, weight: 1 }]
+  - name: gateway/shop/web/kinds
+    listeners: [port-6379]
+    backends: [{ invalid: no TCPRoute serves listener kinds, weight: 1 }]
+  - name: gateway/shop/web/on-ingress
+    listeners: [port-80]
+    backends: [{ invalid: no TCPRoute serves listener on-ingress, weight: 1 }]
+upstreams: {}

@@ -1,0 +1,8 @@
+listener db: served on port-5432, taking TCPRoute from namespace shop
+listener db-again: not accepted: listener db, which comes first, has its port, protocol and hostname
+listener http: served on port-8080, taking HTTPRoute, GRPCRoute from namespace shop
+listener mixed-http: not accepted: its Gateway states port 9000 for TCP and for HTTP, HTTPS or TLS, which the spec does not let share a port: no listener of it there is accepted
+listener mixed-tls: not accepted: its Gateway states port 9000 for TCP and for HTTP, HTTPS or TLS, which the spec does not let share a port: no listener of it there is accepted
+listener mixed-tcp: not accepted: its Gateway states port 9000 for TCP and for HTTP, HTTPS or TLS, which the spec does not let share a port: no listener of it there is accepted
+listener kinds: served on port-6379, taking TCPRoute from namespace shop
+listener on-ingress: served on port-80, taking TCPRoute from namespace shop
