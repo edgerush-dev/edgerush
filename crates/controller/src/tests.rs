@@ -1552,7 +1552,9 @@ spec: { controllerName: edgerush.dev/gateway-controller }",
         "metadata: { name: web, namespace: edge, generation: 2, resourceVersion: '6' }
 spec:
   gatewayClassName: edgerush
-  listeners: [{ name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }]",
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+    - { name: tls, port: 8443, protocol: TLS, tls: { mode: Passthrough }, allowedRoutes: { namespaces: { from: All } } }",
     )
     .unwrap();
     let app: HTTPRoute = serde_saphyr::from_str(
@@ -1599,6 +1601,15 @@ status:
       conditions: [{ type: Accepted, status: 'True', reason: Accepted, message: '', lastTransitionTime: '2026-10-01T00:00:00Z', observedGeneration: 1 }]",
     )
     .unwrap();
+    // A TLSRoute's written as an HTTPRoute's too.
+    let tunnel: TLSRoute = serde_saphyr::from_str(
+        "metadata: { name: tunnel, namespace: shop, generation: 5, resourceVersion: '11' }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: tls }]
+  hostnames: [db.example.com]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]",
+    )
+    .unwrap();
     let known = [
         "/apis/gateway.networking.k8s.io/v1/gatewayclasses/edgerush/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/edge/gateways/web/status",
@@ -1606,6 +1617,7 @@ status:
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/httproutes/old/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/grpcroutes/calls/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/grpcroutes/gone/status",
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/tlsroutes/tunnel/status",
     ];
     let fake = Fake::start_by_method(&["127.0.0.1"], move |method, path| {
         if method == "PUT" && known.contains(&path) {
@@ -1625,6 +1637,7 @@ status:
         gateways: vec![gateway.clone()],
         http_routes: vec![app.clone(), old.clone()],
         grpc_routes: vec![calls.clone(), gone.clone()],
+        tls_routes: vec![tunnel.clone()],
         ..Cluster::default()
     };
     let translation = translate(&gateway_plane(), &cluster);
@@ -1641,18 +1654,20 @@ status:
         })
         .collect();
     let following =
-        |classes: Vec<GatewayClass>, gateways: Vec<Gateway>, routes, grpc_routes| GatewayApi {
-            crds: Vec::new(),
-            namespaces: Vec::new(),
-            namespace: Scope::Namespace("edge".to_owned()),
-            last: Some(served.clone()),
-            gateway_classes: Some(vec![follow_of("gatewayclasses", true, classes)]),
-            gateways: Some(vec![follow_of("gateways in edge", true, gateways)]),
-            listener_sets: None,
-            http_routes: Some(vec![follow_of("httproutes", true, routes)]),
-            grpc_routes: Some(vec![follow_of("grpcroutes", true, grpc_routes)]),
-            tls_routes: None,
-            reference_grants: None,
+        |classes: Vec<GatewayClass>, gateways: Vec<Gateway>, routes, grpc_routes, tls_routes| {
+            GatewayApi {
+                crds: Vec::new(),
+                namespaces: Vec::new(),
+                namespace: Scope::Namespace("edge".to_owned()),
+                last: Some(served.clone()),
+                gateway_classes: Some(vec![follow_of("gatewayclasses", true, classes)]),
+                gateways: Some(vec![follow_of("gateways in edge", true, gateways)]),
+                listener_sets: None,
+                http_routes: Some(vec![follow_of("httproutes", true, routes)]),
+                grpc_routes: Some(vec![follow_of("grpcroutes", true, grpc_routes)]),
+                tls_routes: Some(vec![follow_of("tlsroutes", true, tls_routes)]),
+                reference_grants: None,
+            }
         };
     let heard: Rc<RefCell<Heard>> = Rc::default();
     let said = hear(&heard);
@@ -1663,6 +1678,7 @@ status:
         vec![gateway.clone()],
         vec![app.clone(), old.clone()],
         vec![calls.clone(), gone.clone()],
+        vec![tunnel.clone()],
     )
     .write_statuses(&api, &handed, &addresses, &programmed, &said)
     .await;
@@ -1675,6 +1691,7 @@ status:
             "status of HTTPRoute shop/old",
             "status of GRPCRoute shop/calls",
             "status of GRPCRoute shop/gone",
+            "status of TLSRoute shop/tunnel",
         ]
     );
     let bodies: Vec<serde_json::Value> = fake
@@ -1695,6 +1712,7 @@ status:
     assert_eq!(status(0)["conditions"][1]["status"], "True");
     assert_eq!(status(1)["addresses"][0]["value"], "192.0.2.10");
     assert_eq!(status(1)["listeners"][0]["attachedRoutes"], 2);
+    assert_eq!(status(1)["listeners"][1]["attachedRoutes"], 1);
     assert_eq!(status(1)["conditions"][0]["observedGeneration"], 2);
     assert_eq!(
         status(2)["parents"][0]["controllerName"],
@@ -1727,24 +1745,36 @@ status:
         status(5)["parents"],
         serde_json::to_value(&gone.status.as_ref().unwrap().parents[..1]).unwrap()
     );
+    assert_eq!(
+        fake.seen()[6].path,
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/tlsroutes/tunnel/status"
+    );
+    assert_eq!(bodies[6]["kind"], "TLSRoute");
+    assert_eq!(status(6)["parents"][0]["parentRef"]["sectionName"], "tls");
+    assert_eq!(
+        status(6)["parents"][0]["conditions"][0]["observedGeneration"],
+        5
+    );
     // Read back as written, every status says what it should: nothing more is written.
     let (mut class, mut gateway, mut app, mut old) = (class, gateway, app, old);
-    let (mut calls, mut gone) = (calls, gone);
+    let (mut calls, mut gone, mut tunnel) = (calls, gone, tunnel);
     class.status = serde_json::from_value(bodies[0]["status"].clone()).unwrap();
     gateway.status = serde_json::from_value(bodies[1]["status"].clone()).unwrap();
     app.status = serde_json::from_value(bodies[2]["status"].clone()).unwrap();
     old.status = serde_json::from_value(bodies[3]["status"].clone()).unwrap();
     calls.status = serde_json::from_value(bodies[4]["status"].clone()).unwrap();
     gone.status = serde_json::from_value(bodies[5]["status"].clone()).unwrap();
+    tunnel.status = serde_json::from_value(bodies[6]["status"].clone()).unwrap();
     following(
         vec![class],
         vec![gateway],
         vec![app, old],
         vec![calls, gone],
+        vec![tunnel],
     )
     .write_statuses(&api, &handed, &addresses, &programmed, &said)
     .await;
-    assert_eq!(fake.seen().len(), 6, "a status written again");
+    assert_eq!(fake.seen().len(), 7, "a status written again");
 }
 
 #[test]
