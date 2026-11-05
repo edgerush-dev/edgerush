@@ -5,7 +5,7 @@
 //! plane's `Authority` runs in-process, asking the pods as the controller will. Each scenario
 //! is the simulation's, held to its bound; a rollout's, as T4d2 has it. Clients ask the pods'
 //! synchronous mode in-process, through a `StoreClient` (T5a), and data planes on a stream of
-//! their own (T5c).
+//! their own (T5c), as a data plane drives them by its `Plane` (T6a).
 
 #![allow(
     clippy::unwrap_used,
@@ -20,10 +20,11 @@ use edgerush_cluster::{
 };
 use edgerush_cluster_synchronous::{Answer, Message as ModeMessage, Rule, Value};
 use edgerush_ratelimit_service::cluster::link::Dial;
+use edgerush_ratelimit_service::cluster::plane::{Plane, Told};
 use edgerush_ratelimit_service::cluster::pod::{
     DecideStream, STREAMS_IDLE, StoreClient, StorePod, StoreServer, TICK, ask, decide_stream,
 };
-use edgerush_ratelimit_service::cluster::wire::{asking, told_from};
+use edgerush_ratelimit_service::cluster::wire::{Asking, asking, told_from};
 use edgerush_ratelimit_service::grpc::Client;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -1093,4 +1094,188 @@ async fn a_pod_gone_is_no_longer_dialled_once_forgotten() {
         after - before,
         crashed_at.elapsed()
     );
+}
+
+/// The secret the tests' data planes hash keys under.
+const SECRET: [u64; 2] = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
+
+/// A data plane on the store's streams, driven by its `Plane` as the proxy's workers are to
+/// drive theirs (T6a): a stream to each member it asks, at the address its table gives, opened
+/// when first needed, and whatever comes down read through the plane.
+struct DataPlane {
+    plane: Plane,
+    streams: BTreeMap<NodeId, DecideStream>,
+    next: u64,
+}
+
+impl DataPlane {
+    /// One that has learnt the table from the pod at `seed`, as from `service.addresses`.
+    async fn from_seed(seed: &str) -> Self {
+        let mut stream = decide_stream(seed, &Dial::Plain).await.unwrap();
+        let mut plane = Plane::new(SECRET);
+        let first = tokio::time::timeout(ANSWERED, stream.down.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(plane.told(first), Ok(Told::Table));
+        assert!(plane.table().is_some(), "no table from the seed");
+        Self::with(plane)
+    }
+
+    const fn with(plane: Plane) -> Self {
+        Self {
+            plane,
+            streams: BTreeMap::new(),
+            next: 1,
+        }
+    }
+
+    /// The key of a client of `owner`'s, as the data plane hashes it.
+    fn key_of(&self, owner: NodeId) -> u64 {
+        (0..)
+            .map(|n| self.plane.key(format!("api\0client-{n}").as_bytes()))
+            .find(|key| self.plane.owner(*key) == Some(owner))
+            .unwrap()
+    }
+
+    /// Sends member `to` what `make` makes of the plane and a number of its own: that number.
+    async fn ask(&mut self, to: NodeId, make: impl FnOnce(&Plane, u64) -> Option<Asking>) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        let asking = make(&self.plane, id).unwrap();
+        if !self.streams.contains_key(&to) {
+            let address = self.plane.address(to).unwrap().to_owned();
+            let stream = decide_stream(&address, &Dial::Plain).await.unwrap();
+            self.streams.insert(to, stream);
+        }
+        self.streams[&to].up.send(asking).await.unwrap();
+        id
+    }
+
+    /// The answer member `from` gives request `id`, within [`ANSWERED`]: what else it tells
+    /// meanwhile read by the plane, its tables taken in.
+    async fn answer(&mut self, from: NodeId, id: u64) -> Option<Answer> {
+        let until = Instant::now() + ANSWERED;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            let stream = self.streams.get_mut(&from)?;
+            let told = tokio::time::timeout(left, stream.down.message())
+                .await
+                .ok()?
+                .ok()??;
+            if let Told::Answer {
+                id: answered,
+                answer,
+            } = self.plane.told(told).ok()?
+                && answered == id
+            {
+                return Some(answer);
+            }
+        }
+    }
+}
+
+/// A data plane given a seed learns the table, and asks each key of its owner at the address
+/// the table gives: counted there, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_data_plane_learns_the_table_from_a_seed_and_asks_each_key_of_its_owner() {
+    let cluster = ready(3).await;
+    let seed = cluster.pods[&1].relay.address.to_string();
+    let mut plane = DataPlane::from_seed(&seed).await;
+    for owner in 1..=3 {
+        let key = plane.key_of(owner);
+        let to = plane.plane.through(key, |_| false).unwrap();
+        assert_eq!(to, owner);
+        let id = plane
+            .ask(to, |plane, id| plane.request(id, key, None))
+            .await;
+        assert_eq!(plane.answer(to, id).await, Some(Answer::Counted(1)));
+        assert_eq!(held_at(cluster.pod(owner), key).await, Some(1), "key {key}");
+    }
+}
+
+/// A data plane whose table is behind asks a key of the pod its table names, is told the key is
+/// elsewhere and the later table, and asks the owner that one names: counted there alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_data_plane_behind_is_told_elsewhere_and_asks_the_owner_named() {
+    let cluster = ready(3).await;
+    let table = committed(cluster.pod(1)).await.unwrap();
+    // A table before the pods', every shard pod 1's.
+    let mut behind = table.clone();
+    behind.version -= 1;
+    for shard in &mut behind.shards {
+        shard.owner = Some(1);
+    }
+    let mut stale = Plane::new(SECRET);
+    assert!(stale.learn(behind));
+    let mut plane = DataPlane::with(stale);
+    let mut later = Plane::new(SECRET);
+    assert!(later.learn(table.clone()));
+    let key = DataPlane::with(later).key_of(2);
+    assert_eq!(plane.plane.owner(key), Some(1));
+    let id = plane.ask(1, |plane, id| plane.request(id, key, None)).await;
+    assert_eq!(plane.answer(1, id).await, Some(Answer::Elsewhere(None)));
+    assert_eq!(plane.plane.stamp(), table.stamp());
+    let to = plane.plane.through(key, |_| false).unwrap();
+    assert_eq!(to, 2);
+    let id = plane
+        .ask(to, |plane, id| plane.request(id, key, None))
+        .await;
+    assert_eq!(plane.answer(to, id).await, Some(Answer::Counted(1)));
+    assert_eq!(held_at(cluster.pod(2), key).await, Some(1));
+    assert_eq!(held_at(cluster.pod(1), key).await, None);
+}
+
+/// A data plane that cannot reach a key's owner — its stream down or its breaker open — asks
+/// another pod, the one the key picks, which forwards it: counted once, at the owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_whose_owner_is_out_of_reach_is_forwarded_and_counted_once() {
+    let cluster = ready(3).await;
+    for id in 1..=3 {
+        cluster.pod(id).set_forwarding(true).await;
+    }
+    let seed = cluster.pods[&1].relay.address.to_string();
+    let mut plane = DataPlane::from_seed(&seed).await;
+    let key = plane.key_of(2);
+    let to = plane.plane.through(key, |member| member == 2).unwrap();
+    assert_ne!(to, 2);
+    let id = plane
+        .ask(to, |plane, id| plane.request(id, key, None))
+        .await;
+    assert_eq!(plane.answer(to, id).await, Some(Answer::Counted(1)));
+    assert_eq!(held_at(cluster.pod(2), key).await, Some(1));
+    assert_eq!(held_at(cluster.pod(to), key).await, None);
+}
+
+/// A charge given back by a data plane, with the receipt it was admitted with, is credited at
+/// the key's owner: the key admits again within its window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_charge_given_back_with_its_receipt_is_credited_at_the_owner() {
+    let cluster = ready(3).await;
+    let seed = cluster.pods[&1].relay.address.to_string();
+    let mut plane = DataPlane::from_seed(&seed).await;
+    let key = plane.key_of(3);
+    let rule = Some(Rule::Window {
+        per: 1,
+        window: ms(60_000),
+    });
+    let id = plane.ask(3, |plane, id| plane.request(id, key, rule)).await;
+    let Some(Answer::Admitted(receipt)) = plane.answer(3, id).await else {
+        panic!("not admitted");
+    };
+    let id = plane.ask(3, |plane, id| plane.request(id, key, rule)).await;
+    let refused = plane.answer(3, id).await;
+    assert!(
+        matches!(refused, Some(Answer::Limited { .. })),
+        "{refused:?}"
+    );
+    let id = plane
+        .ask(3, |plane, id| plane.give_back(id, key, rule, receipt))
+        .await;
+    let given = plane.answer(3, id).await;
+    assert!(matches!(given, Some(Answer::Counted(_))), "{given:?}");
+    let id = plane.ask(3, |plane, id| plane.request(id, key, rule)).await;
+    let again = plane.answer(3, id).await;
+    assert!(matches!(again, Some(Answer::Admitted(_))), "{again:?}");
 }

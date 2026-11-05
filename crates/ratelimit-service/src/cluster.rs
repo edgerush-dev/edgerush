@@ -6,8 +6,11 @@
 //! - [`pod`]: a pod of the store on sockets, and its gRPC server.
 //! - [`link`]: what a pod sends to one peer, and how it dials it.
 //! - [`settings`]: what a pod runs the store with, from its file, and its member id.
+//! - [`plane`]: the data planes' side: their keys, the table they learn, whom a key is asked
+//!   of, and what goes up and comes down their stream.
 
 pub mod link;
+pub mod plane;
 pub mod pod;
 pub mod settings;
 pub mod wire;
