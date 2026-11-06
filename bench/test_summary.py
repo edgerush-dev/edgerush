@@ -94,6 +94,17 @@ class WsBench(unittest.TestCase):
             row = next(line for line in table(directory).splitlines() if "ws-busy" in line)
             self.assertIn("| 100 | 3 | 0.25 | 1.50 |", row)
 
+    def test_wsbenchs_http_line_counts_429s_others_and_failures_as_not_2xx(self):
+        line = ('{"wsbench": "http", "ok": 900, "refused": 60, "other": 30, "failed": 10, '
+                '"seconds": 10, "rate": 99.0, "p50": 0.25, "p99": 1.5, "p99.9": 2.0, '
+                '"resident_met": 0, "resident_missed": 0}\n')
+        self.assertEqual(summary.generator(line)["requests"], 1000)
+        with tempfile.TemporaryDirectory() as name:
+            directory = pathlib.Path(name)
+            (directory / "ours.1.keys-h1.out").write_text(line)
+            row = next(line for line in table(directory).splitlines() if "keys-h1" in line)
+            self.assertIn("| 99 | 100 | 0.25 | 1.50 |", row)
+
 
 if __name__ == "__main__":
     unittest.main()

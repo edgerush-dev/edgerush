@@ -54,11 +54,19 @@ def oha(text):
 
 
 def wsbench(result):
-    """bench/wsbench's line: messages echoed, and their latency in milliseconds."""
+    """bench/wsbench's line, and the latency in milliseconds: messages echoed, or, from
+    `wsbench http`, requests answered 200, 429 (`refused`) and otherwise. A 429 is counted
+    among those not 2xx, as oha's and h2load's are; a failed connection is too."""
+    if result["wsbench"] == "http":
+        good = result["ok"]
+        bad = result["refused"] + result["other"] + result["failed"]
+    else:
+        good = result["messages"]
+        bad = result["failed"]
     return {
-        "requests": result["messages"] + result["failed"],
+        "requests": good + bad,
         "rate": result["rate"],
-        "bad": result["failed"],
+        "bad": bad,
         "p50": result["p50"],
         "p99": result["p99"],
         "p99.9": result["p99.9"],
