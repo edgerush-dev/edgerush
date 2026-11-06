@@ -10,12 +10,12 @@
 //! ```yaml
 //! mode: asynchronous          # or synchronous; asynchronous when left out
 //! pod:
-//!   id: 0
+//!   id: 0                     # the asynchronous mode's
 //!   listen: 0.0.0.0:7000
 //!   address: rl-0.rl:7000     # with `store` alone
 //!   metrics: 0.0.0.0:9090     # nowhere when left out
-//!   cycle_ms: 10              # 10 when left out
-//! membership:
+//!   cycle_ms: 10              # the asynchronous mode's; 10 when left out
+//! membership:                 # the asynchronous mode's
 //!   pods:
 //!     0: rl-0:7000
 //!     1: rl-1:7000
@@ -41,8 +41,9 @@
 //!   data_plane_id: spiffe://cluster.local/ns/edge/sa/edge
 //! ```
 //!
-//! A pod serves one mode. `pod.cycle_ms` is the data planes' cycle in the asynchronous mode,
-//! and in the synchronous mode the pod's own, between its copies of what changed.
+//! A pod serves one mode. The asynchronous mode needs `pod.id` and `membership`, and
+//! `pod.cycle_ms` is its data planes' cycle; the synchronous mode, on the store, refuses all
+//! three, as it would not read them.
 //!
 //! `membership.pods` names every service pod, this one too: the members among which a
 //! majority agrees which of them serve (`edgerush_ratelimit::service::membership`).
@@ -54,7 +55,7 @@
 //! the pods, and leaves a pod that has gone out of reach for longer. `keys.max_bytes` is what
 //! its keys may hold, past which the least recently changed are evicted; `pod.metrics`,
 //! where `/metrics` shows whether the pod serves, how often and how long it has gone without
-//! a majority and, in the asynchronous mode, what its keys hold.
+//! a majority, and what its keys hold.
 //!
 //! `store` is what the pod runs the cluster store with (`edgerush_cluster`), which every pod
 //! of a cluster is to share, and `pod.address` where the other pods reach it, needed with
@@ -72,7 +73,7 @@
 //! and any other is refused. It dials the other pods checking theirs for its own ID.
 
 use boring::ssl::SslConnector;
-use edgerush_config::{ServiceFile, ServiceMode as Mode};
+use edgerush_config::{ServiceFile, ServiceMembership, ServiceMode as Mode};
 use edgerush_control_service::reread;
 use edgerush_ratelimit::service::PodId;
 use edgerush_ratelimit_service::cluster::link::Dial;
@@ -112,18 +113,34 @@ const USAGE: &str = "usage: edgerush-ratelimit-service --config <file>";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
-    mode: Mode,
-    id: PodId,
     listen: SocketAddr,
-    pods: BTreeMap<PodId, String>,
-    cycle: Duration,
     max_key_bytes: u64,
     metrics: Option<SocketAddr>,
-    silence: Duration,
-    stop_serving: Duration,
     tls: Option<PodFiles>,
-    /// What the synchronous mode runs the store with.
-    store: Option<Settings>,
+    serves: Serves,
+}
+
+/// The mode a pod serves, with what it serves it on.
+#[derive(Debug, PartialEq, Eq)]
+enum Serves {
+    Asynchronous {
+        id: PodId,
+        pods: BTreeMap<PodId, String>,
+        cycle: Duration,
+        silence: Duration,
+        stop_serving: Duration,
+    },
+    /// The store, with what it runs it with.
+    Synchronous(Settings),
+}
+
+impl Serves {
+    fn mode(&self) -> Mode {
+        match self {
+            Self::Asynchronous { .. } => Mode::Asynchronous,
+            Self::Synchronous(_) => Mode::Synchronous,
+        }
+    }
 }
 
 /// The config file the command line names: `--config <file>`, and nothing else.
@@ -153,24 +170,61 @@ fn parsed(yaml: &[u8], directory: &Path) -> Result<Args, String> {
 
 /// What the types cannot check of `file`, and the values of what it leaves out.
 fn checked(file: ServiceFile, directory: &Path) -> Result<Args, String> {
-    // A cycle of nothing would tick without end.
-    let cycle = file.pod.cycle_ms.unwrap_or(CYCLE_MS);
-    if cycle == 0 {
-        return Err("`pod.cycle_ms`: a number of milliseconds, at least 1".to_owned());
-    }
     let max_key_bytes = file.keys.max_bytes.unwrap_or(MAX_KEY_BYTES);
     if max_key_bytes == 0 {
         return Err("`keys.max_bytes`: a number of bytes, at least 1".to_owned());
     }
     let store = settings(&file, max_key_bytes).map_err(|error| error.to_string())?;
-    let mode = file.mode.unwrap_or(Mode::Asynchronous);
-    if mode == Mode::Synchronous && store.is_none() {
-        return Err(
-            "the synchronous mode runs on the store: it needs `store` and `pod.address`".to_owned(),
-        );
+    let tls = file.tls.map(|tls| PodFiles {
+        certificate: directory.join(tls.certificate),
+        key: directory.join(tls.key),
+        authorities: directory.join(tls.authorities),
+        data_plane: tls.data_plane_id,
+    });
+    let pod = file.pod;
+    let serves = match file.mode.unwrap_or(Mode::Asynchronous) {
+        Mode::Synchronous => {
+            // Said, each would be ignored, as if it did something.
+            let asynchronous = [
+                ("pod.id", pod.id.is_some()),
+                ("pod.cycle_ms", pod.cycle_ms.is_some()),
+                ("membership", file.membership.is_some()),
+            ];
+            if let Some((field, _)) = asynchronous.iter().find(|(_, said)| *said) {
+                return Err(format!(
+                    "`{field}` is the asynchronous mode's: the synchronous mode runs on the store"
+                ));
+            }
+            Serves::Synchronous(store.ok_or(
+                "the synchronous mode runs on the store: it needs `store` and `pod.address`",
+            )?)
+        }
+        Mode::Asynchronous => asynchronous(pod.id, pod.cycle_ms, file.membership)?,
+    };
+    Ok(Args {
+        listen: pod.listen,
+        max_key_bytes,
+        metrics: pod.metrics,
+        tls,
+        serves,
+    })
+}
+
+/// The asynchronous mode's pod: its `id` among the `membership`'s pods, and its timings.
+fn asynchronous(
+    id: Option<PodId>,
+    cycle: Option<u64>,
+    membership: Option<ServiceMembership>,
+) -> Result<Serves, String> {
+    let (Some(id), Some(membership)) = (id, membership) else {
+        return Err("the asynchronous mode needs `pod.id` and `membership`".to_owned());
+    };
+    // A cycle of nothing would tick without end.
+    let cycle = cycle.unwrap_or(CYCLE_MS);
+    if cycle == 0 {
+        return Err("`pod.cycle_ms`: a number of milliseconds, at least 1".to_owned());
     }
-    let (pod, membership) = (file.pod, file.membership);
-    if !membership.pods.contains_key(&pod.id) {
+    if !membership.pods.contains_key(&id) {
         return Err("`membership.pods` must name this pod too".to_owned());
     }
     let silence = membership.silence_ms.unwrap_or(SILENCE_MS);
@@ -188,31 +242,19 @@ fn checked(file: ServiceFile, directory: &Path) -> Result<Args, String> {
              {silence}"
         ));
     }
-    let tls = file.tls.map(|tls| PodFiles {
-        certificate: directory.join(tls.certificate),
-        key: directory.join(tls.key),
-        authorities: directory.join(tls.authorities),
-        data_plane: tls.data_plane_id,
-    });
-    Ok(Args {
-        mode,
-        id: pod.id,
-        listen: pod.listen,
+    Ok(Serves::Asynchronous {
+        id,
         pods: membership.pods,
         cycle: Duration::from_millis(cycle),
-        max_key_bytes,
-        metrics: pod.metrics,
         silence: Duration::from_millis(silence),
         stop_serving: Duration::from_millis(stop_serving),
-        tls,
-        store,
     })
 }
 
 /// A synchronous pod answers on one thread: a stream's decisions and its connection's writes
 /// share it, so that the asks one read brings in are answered in one write, where a
 /// connection on another thread would take the answers a few at a time as they are decided.
-/// Its sweep has a thread of its own. The asynchronous pod keeps a thread a core.
+/// The asynchronous pod keeps a thread a core.
 fn runtime(mode: Mode) -> std::io::Result<tokio::runtime::Runtime> {
     match mode {
         Mode::Synchronous => tokio::runtime::Builder::new_current_thread()
@@ -230,7 +272,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let runtime = match runtime(args.mode) {
+    let runtime = match runtime(args.serves.mode()) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("edgerush-ratelimit-service: no runtime: {error}");
@@ -247,78 +289,82 @@ fn main() -> ExitCode {
 }
 
 async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let members = args.pods.keys().copied().collect();
+    let tls = match &args.tls {
+        Some(files) => Some(secured(files.clone()).await?),
+        None => None,
+    };
+    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    let dialling = tls.as_ref().map(|(_, dialling)| dialling.clone());
+    let serving = tls.map(|(serving, _)| serving);
+    let (id, pods, cycle, silence, stop_serving) = match args.serves {
+        Serves::Asynchronous {
+            id,
+            pods,
+            cycle,
+            silence,
+            stop_serving,
+        } => (id, pods, cycle, silence, stop_serving),
+        Serves::Synchronous(store) => {
+            let id = member_id()?;
+            let dial = match &dialling {
+                Some(dialling) => Dial::Secured(dialling.clone()),
+                None => Dial::Plain,
+            };
+            let address = store.address.clone();
+            let pod = StorePod::spawn(id, store.address, store.config, dial, store.seeds);
+            // Always on (decided): a data plane out of reach of a key's owner asks another pod.
+            pod.set_forwarding(true).await;
+            if let Some(at) = args.metrics {
+                let listener = tokio::net::TcpListener::bind(at).await?;
+                eprintln!("edgerush-ratelimit-service: metrics and readiness on {at}");
+                tokio::spawn(scrape::serve_store(listener, pod.clone()));
+            }
+            eprintln!(
+                "edgerush-ratelimit-service: synchronous pod, member {id}, on {}, reached at {address}",
+                args.listen
+            );
+            // Told to stop, it hands its shards on while it still serves, and stops once
+            // drained.
+            let draining = pod.clone();
+            let drained = async move {
+                stopped().await;
+                eprintln!("edgerush-ratelimit-service: draining");
+                draining.drain().await;
+            };
+            serve_on(listener, serving, StoreServer::new(pod), drained).await?;
+            return Ok(());
+        }
+    };
+    let members = pods.keys().copied().collect();
     // A new life at every start: the time it began, which no earlier life shares.
     let incarnation = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(1, |since| {
             u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
         });
-    let tls = match &args.tls {
-        Some(files) => Some(secured(files.clone()).await?),
-        None => None,
-    };
     let mut peers = BTreeMap::new();
-    for (id, address) in &args.pods {
-        if *id != args.id {
-            let client = match &tls {
-                Some((_, dialling)) => Client::secured(address, dialling.clone())?,
+    for (pod, address) in &pods {
+        if *pod != id {
+            let client = match &dialling {
+                Some(dialling) => Client::secured(address, dialling.clone())?,
                 None => Client::new(address)?,
             };
-            peers.insert(*id, client);
+            peers.insert(*pod, client);
         }
-    }
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    let dialling = tls.as_ref().map(|(_, dialling)| dialling.clone());
-    let serving = tls.map(|(serving, _)| serving);
-    if args.mode == Mode::Synchronous {
-        let store = args
-            .store
-            .ok_or("the synchronous mode runs on the store, and the file has none")?;
-        let id = member_id()?;
-        let dial = match &dialling {
-            Some(dialling) => Dial::Secured(dialling.clone()),
-            None => Dial::Plain,
-        };
-        let address = store.address.clone();
-        let pod = StorePod::spawn(id, store.address, store.config, dial, store.seeds);
-        // Always on (decided): a data plane out of reach of a key's owner asks another pod.
-        pod.set_forwarding(true).await;
-        if let Some(at) = args.metrics {
-            let listener = tokio::net::TcpListener::bind(at).await?;
-            eprintln!("edgerush-ratelimit-service: metrics and readiness on {at}");
-            tokio::spawn(scrape::serve_store(listener, pod.clone()));
-        }
-        eprintln!(
-            "edgerush-ratelimit-service: synchronous pod, member {id}, on {}, reached at {address}",
-            args.listen
-        );
-        // Told to stop, it hands its shards on while it still serves, and stops once drained.
-        let draining = pod.clone();
-        let drained = async move {
-            stopped().await;
-            eprintln!("edgerush-ratelimit-service: draining");
-            draining.drain().await;
-        };
-        serve_on(listener, serving, StoreServer::new(pod), drained).await?;
-        return Ok(());
     }
     let timing = Timing {
-        silence: args.silence,
-        stop_serving: args.stop_serving,
-        ..Timing::with_cycle(args.cycle)
+        silence,
+        stop_serving,
+        ..Timing::with_cycle(cycle)
     };
-    let pod = Pod::spawn(args.id, members, incarnation, timing, peers);
+    let pod = Pod::spawn(id, members, incarnation, timing, peers);
     pod.set_capacity(args.max_key_bytes).await;
     if let Some(address) = args.metrics {
         let listener = tokio::net::TcpListener::bind(address).await?;
         eprintln!("edgerush-ratelimit-service: metrics on {address}");
         tokio::spawn(scrape::serve(listener, pod.clone(), args.max_key_bytes));
     }
-    eprintln!(
-        "edgerush-ratelimit-service: pod {} on {}",
-        args.id, args.listen
-    );
+    eprintln!("edgerush-ratelimit-service: pod {id} on {}", args.listen);
     serve_on(listener, serving, Server::new(pod), stopped()).await?;
     Ok(())
 }
@@ -505,31 +551,49 @@ mod tests {
         assert_eq!(flavor(Mode::Asynchronous), RuntimeFlavor::MultiThread);
     }
 
+    /// An asynchronous pod's cycle, silence and time to stop serving.
+    fn timings(args: Args) -> (Duration, Duration, Duration) {
+        match args.serves {
+            Serves::Asynchronous {
+                cycle,
+                silence,
+                stop_serving,
+                ..
+            } => (cycle, silence, stop_serving),
+            Serves::Synchronous(_) => panic!("a synchronous pod"),
+        }
+    }
+
     #[test]
     fn the_mode_is_asynchronous_unless_said() {
-        assert_eq!(parsed_from(&with("")).unwrap().mode, Mode::Asynchronous);
+        assert_eq!(
+            parsed_from(&with("")).unwrap().serves.mode(),
+            Mode::Asynchronous
+        );
         let said = parsed_from(&with("mode: eventual\n")).unwrap_err();
         assert!(said.contains("eventual"), "{said}");
         // The synchronous mode runs on the store, and is refused without it.
+        let synchronous = |pod: &str, more: &str| {
+            format!("mode: synchronous\npod: {{ listen: 0.0.0.0:7000{pod} }}\n{more}")
+        };
         assert_eq!(
-            parsed_from(&with("mode: synchronous\n")),
+            parsed_from(&synchronous("", "")),
             Err(
                 "the synchronous mode runs on the store: it needs `store` and `pod.address`"
                     .to_owned()
             )
         );
-        let synchronous = |pod: &str| {
-            format!(
-                "mode: synchronous\n{}store: {{}}\n",
-                sections(&format!(", address: rl-0.rl:7000{pod}"), "")
-            )
+        let on_store =
+            |pod: &str| synchronous(&format!(", address: rl-0.rl:7000{pod}"), "store: {}\n");
+        let parsed = parsed_from(&on_store("")).unwrap();
+        assert_eq!(parsed.serves.mode(), Mode::Synchronous);
+        let Serves::Synchronous(store) = parsed.serves else {
+            panic!("an asynchronous pod")
         };
-        let parsed = parsed_from(&synchronous("")).unwrap();
-        assert_eq!(parsed.mode, Mode::Synchronous);
-        assert_eq!(parsed.store.unwrap().address, "rl-0.rl:7000");
+        assert_eq!(store.address, "rl-0.rl:7000");
         // Either mode serves its metrics.
         assert_eq!(
-            parsed_from(&synchronous(", metrics: 127.0.0.1:9090"))
+            parsed_from(&on_store(", metrics: 127.0.0.1:9090"))
                 .unwrap()
                 .metrics,
             Some("127.0.0.1:9090".parse().unwrap())
@@ -537,10 +601,51 @@ mod tests {
     }
 
     #[test]
+    fn each_mode_takes_only_what_it_reads() {
+        // The asynchronous mode's pod is one of its membership's.
+        for asynchronous in [
+            "pod: { listen: 0.0.0.0:7000 }\nmembership: { pods: { 0: rl-0:7000 } }\n",
+            "pod: { id: 0, listen: 0.0.0.0:7000 }\n",
+        ] {
+            assert_eq!(
+                parsed_from(asynchronous),
+                Err("the asynchronous mode needs `pod.id` and `membership`".to_owned()),
+                "{asynchronous}"
+            );
+        }
+        // The synchronous mode's is the store's, which gives it an id and runs to its own
+        // timings: what the asynchronous mode reads in their place is refused.
+        let on_store = "mode: synchronous\nstore: {}\n";
+        for (field, file) in [
+            (
+                "pod.id",
+                "pod: { id: 0, listen: 0.0.0.0:7000, address: rl-0.rl:7000 }\n",
+            ),
+            (
+                "pod.cycle_ms",
+                "pod: { listen: 0.0.0.0:7000, address: rl-0.rl:7000, cycle_ms: 10 }\n",
+            ),
+            (
+                "membership",
+                "pod: { listen: 0.0.0.0:7000, address: rl-0.rl:7000 }\n\
+                 membership: { pods: { 0: rl-0:7000 } }\n",
+            ),
+        ] {
+            assert_eq!(
+                parsed_from(&format!("{on_store}{file}")),
+                Err(format!(
+                    "`{field}` is the asynchronous mode's: the synchronous mode runs on the store"
+                )),
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
     fn a_pod_stops_serving_after_a_while_without_a_majority_before_it_is_taken_out() {
-        let plain = parsed_from(&with("")).unwrap();
+        let (_, silence, stop_serving) = timings(parsed_from(&with("")).unwrap());
         assert_eq!(
-            (plain.silence, plain.stop_serving),
+            (silence, stop_serving),
             (Duration::from_millis(600), Duration::from_millis(400))
         );
         let timed = |silence: &str, stop: &str| {
@@ -549,14 +654,14 @@ mod tests {
                 &format!(", silence_ms: {silence}, stop_serving_ms: {stop}"),
             ))
         };
-        let said = timed("2000", "1000").unwrap();
+        let (_, silence, stop_serving) = timings(timed("2000", "1000").unwrap());
         assert_eq!(
-            (said.silence, said.stop_serving),
+            (silence, stop_serving),
             (Duration::from_millis(2_000), Duration::from_millis(1_000))
         );
         // Two heartbeats to spare, exactly, is enough.
-        let said = timed("600", "400").unwrap();
-        assert_eq!(said.stop_serving, Duration::from_millis(400));
+        let (_, _, stop_serving) = timings(timed("600", "400").unwrap());
+        assert_eq!(stop_serving, Duration::from_millis(400));
         for (silence, stop) in [
             ("500", "500"),
             ("500", "600"),
@@ -583,10 +688,10 @@ mod tests {
     fn a_cycle_is_a_millisecond_at_least() {
         let cycle = |ms: &str| parsed_from(&sections(&format!(", cycle_ms: {ms}"), ""));
         assert_eq!(
-            parsed_from(&with("")).unwrap().cycle,
+            timings(parsed_from(&with("")).unwrap()).0,
             Duration::from_millis(10)
         );
-        assert_eq!(cycle("1").unwrap().cycle, Duration::from_millis(1));
+        assert_eq!(timings(cycle("1").unwrap()).0, Duration::from_millis(1));
         assert_eq!(
             cycle("0"),
             Err("`pod.cycle_ms`: a number of milliseconds, at least 1".to_owned())
@@ -624,10 +729,12 @@ mod tests {
         );
         let three = "pod: { id: 1, listen: 0.0.0.0:7000 }\n\
                      membership: { pods: { 0: rl-0:7000, 1: rl-1:7000, 2: rl-2:7000 } }\n";
-        let said = parsed_from(three).unwrap();
-        assert_eq!(said.id, 1);
+        let Serves::Asynchronous { id, pods, .. } = parsed_from(three).unwrap().serves else {
+            panic!("a synchronous pod")
+        };
+        assert_eq!(id, 1);
         assert_eq!(
-            said.pods,
+            pods,
             [
                 (0, "rl-0:7000".to_owned()),
                 (1, "rl-1:7000".to_owned()),

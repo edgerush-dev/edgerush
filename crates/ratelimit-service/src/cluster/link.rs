@@ -12,21 +12,34 @@
 use super::wire::{self, Empty, Hello, Outgoing, PIECE, Piece};
 use crate::grpc::{CALL_TIMEOUT, Error, KEEP_ALIVE, MAX_MESSAGE, Prost};
 use crate::secure::{self, Dialler};
-use crate::synchronous::Received;
 use boring::ssl::SslConnector;
 use bytes::Bytes;
+use futures_core::Stream;
 use http::uri::PathAndQuery;
 use prost::Message as _;
 use std::fmt::Debug;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tonic::Request;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
+
+/// A channel's receiving end as a stream, which is all tonic needs of a stream's messages.
+pub(crate) struct Received<T>(pub(crate) mpsc::Receiver<T>);
+
+impl<T> Stream for Received<T> {
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        self.get_mut().0.poll_recv(cx)
+    }
+}
 
 /// The most bytes of copies that wait for one peer (decided): the 2 MiB of copies in parts
 /// the store has unanswered to a pod at most, and room for some cycles' copies of one part,
