@@ -34,7 +34,10 @@
 #     UNIMPLEMENTED, and the route says it is accepted; on a port a TLS Passthrough
 #     listener shares with an HTTPS one, a TLSRoute's name is carried to its backend,
 #     whose own certificate the client is shown, a name of the TLS listener's no route
-#     takes is closed, and the HTTPS listener's name served, the route said accepted;
+#     takes is closed, and the HTTPS listener's name served, the route said accepted; a
+#     TCP listener's connections are carried to its oldest TCPRoute's backend, a newer
+#     route accepted and counted but reached only once the older is gone, and every
+#     connection closed with none;
 #   - the Ingress's status says the data plane's Service's address;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
@@ -717,6 +720,131 @@ k -n edge patch gateway web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec
 k -n shop delete deploy/tunnel service/tunnel secret/tunnel >/dev/null
 k -n edge delete secret secure >/dev/null
 pass "on a port TLS Passthrough and HTTPS listeners share, a TLSRoute's name is carried to its backend's own TLS, a name no route takes closed, the HTTPS listener's served, and the route says it is accepted"
+
+# A TCP listener of its own port (04 §2, 17 §1): its connections are carried to the backend
+# of its oldest TCPRoute, agnhost's netexec, whatever they say; a newer TCPRoute on it is
+# accepted and counted, and never reached, as conformance has it, until the older is gone;
+# with none, every connection is closed. The routes say they are accepted and resolved, of
+# their generation, which writing them needs tcproutes/status.
+k apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: older, namespace: shop }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: older } }
+  template:
+    metadata: { labels: { app: older } }
+    spec:
+      containers:
+        - name: older
+          image: $AGNHOST
+          args: ["netexec", "--http-port=8080"]
+          ports: [{ name: plain, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 1 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: older, namespace: shop }
+spec:
+  selector: { app: older }
+  ports: [{ name: plain, port: 8080, targetPort: plain }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: newer, namespace: shop }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: newer } }
+  template:
+    metadata: { labels: { app: newer } }
+    spec:
+      containers:
+        - name: newer
+          image: $AGNHOST
+          args: ["netexec", "--http-port=8080"]
+          ports: [{ name: plain, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 1 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: newer, namespace: shop }
+spec:
+  selector: { app: newer }
+  ports: [{ name: plain, port: 8080, targetPort: plain }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: { name: older, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: tcp }]
+  rules: [{ backendRefs: [{ name: older, port: 8080 }] }]
+EOF
+k -n edge patch gateway web --type=json -p '[
+  {"op":"add","path":"/spec/listeners/-","value":{"name":"tcp","port":9300,"protocol":"TCP","allowedRoutes":{"namespaces":{"from":"All"}}}}
+]' >/dev/null
+k -n shop rollout status deploy/older --timeout=120s >/dev/null
+k -n shop rollout status deploy/newer --timeout=120s >/dev/null
+said deploy/edgerush 'listener "port-9300" is on 0.0.0.0:9300' 60 ||
+    fail "the data plane never bound the TCP listener's port: $(k -n edge logs deploy/edgerush | tail -5)"
+forward 9300
+# What a connection to the TCP listener is answered for /hostname: the pod that serves it.
+carried() { curl -s --max-time 3 "http://127.0.0.1:$port/hostname" || true; }
+for _ in $(seq 1 150); do
+    case "$(carried)" in older-*) break ;; esac
+    sleep 0.2
+done
+case "$(carried)" in
+    older-*) ;;
+    *) fail "the TCP listener's connections are not carried to its TCPRoute's backend: $(carried)" ;;
+esac
+# Made a second after, so that the cluster has it newer.
+sleep 1
+k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: { name: newer, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: tcp }]
+  rules: [{ backendRefs: [{ name: newer, port: 8080 }] }]
+EOF
+stated 2 '{.status.listeners[?(@.name=="tcp")].attachedRoutes}' 30 -n edge gateway web ||
+    fail "the TCP listener does not count both its routes: $(said_of -n edge gateway web)"
+for route in older newer; do
+    stated "True True" '{.status.parents[0].conditions[?(@.type=="Accepted")].status} {.status.parents[0].conditions[?(@.type=="ResolvedRefs")].status}' \
+        30 -n shop tcproute "$route" || fail "the TCPRoute $route says $(said_of -n shop tcproute "$route")"
+    generation=$(k -n shop get tcproute "$route" -o jsonpath='{.metadata.generation}')
+    stated "$generation" '{.status.parents[0].conditions[?(@.type=="Accepted")].observedGeneration}' \
+        5 -n shop tcproute "$route" ||
+        fail "the TCPRoute $route's status is not of generation $generation: $(said_of -n shop tcproute "$route")"
+done
+for _ in $(seq 1 20); do
+    case "$(carried)" in
+        older-*) ;;
+        *) fail "a connection is not carried to the older TCPRoute's backend: $(carried)" ;;
+    esac
+done
+refused_any && fail "a control-plane replica was refused something of a TCPRoute"
+k -n shop delete tcproute older >/dev/null
+for _ in $(seq 1 150); do
+    case "$(carried)" in newer-*) break ;; esac
+    sleep 0.2
+done
+case "$(carried)" in
+    newer-*) ;;
+    *) fail "the older TCPRoute deleted, the newer's backend is not reached: $(carried)" ;;
+esac
+k -n shop delete tcproute newer >/dev/null
+for _ in $(seq 1 150); do
+    [ -z "$(carried)" ] && break
+    sleep 0.2
+done
+[ -z "$(carried)" ] || fail "with no TCPRoute, a connection is answered: $(carried)"
+forward
+listeners=$(k -n edge get gateway web -o jsonpath='{.spec.listeners[*].name}' | wc -w)
+k -n edge patch gateway web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 1))\"}]" >/dev/null
+k -n shop delete deploy/older service/older deploy/newer service/newer >/dev/null
+pass "a TCP listener's connections are carried to its oldest TCPRoute's backend, a newer route accepted and counted and reached only once the older is gone, and closed with none"
 
 # What the Ingress's status says, its first address.
 says() { k -n shop get ingress web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }
