@@ -18,9 +18,10 @@ impl Mode for Synchronous {
     type Message = Message;
     type Client = Client;
 
-    fn pod(id: NodeId, config: Config, peers: Vec<NodeId>, forwarding: bool) -> Pod {
+    fn pod(id: NodeId, config: Config, peers: Vec<NodeId>, forwarding: bool, decides: bool) -> Pod {
         let mut pod = Pod::new(id, super::address(id), config, peers);
         pod.set_forwarding(forwarding);
+        pod.set_forwarder_decides(decides);
         pod
     }
 
@@ -132,6 +133,24 @@ impl Sim<Synchronous> {
         for pod in self.pods.values_mut() {
             pod.node.set_forwarding(forwarding);
         }
+    }
+
+    /// Whether pods started from now, forwarding, decide a request they would forward from
+    /// their copy, its owner unheard.
+    pub fn set_forwarder_decides(&mut self, decides: bool) {
+        self.forwarder_decides = decides;
+        for pod in self.pods.values_mut() {
+            pod.node.set_forwarder_decides(decides);
+        }
+    }
+
+    /// Requests every pod decided from its copy, their owner unheard.
+    #[must_use]
+    pub fn decided_from_copy(&self) -> u64 {
+        self.pods
+            .values()
+            .map(|pod| pod.node.decided_from_copy())
+            .sum()
     }
     /// A client under `keys`, a request every `interval`, each refused after `deadline`.
     pub fn add_client(&mut self, keys: Vec<u64>, interval: Time, deadline: Time) -> NodeId {

@@ -643,6 +643,71 @@ async fn the_keys_of_an_owner_that_stops_go_to_the_next() {
         .await;
 }
 
+/// An owner that stops and is not taken out — the pods slow to — has its key decided, with
+/// the store set to, by the replica its asks go through once it has gone unheard for
+/// `stop_serving`, from that replica's copy: the key held to its bucket, what the owner
+/// admitted counted, where a store not set to leaves it to `when_unreachable` throughout.
+#[tokio::test]
+async fn a_replica_decides_the_keys_of_an_owner_gone_unheard_with_the_store_set_to() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for decides in [false, true] {
+                let mut listeners = Vec::new();
+                for _ in 0..3 {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let address = listener.local_addr().unwrap().to_string();
+                    listeners.push((listener, address));
+                }
+                let store = Store::formed(listeners, &holding_config(), None).await;
+                for pod in &store.pods {
+                    pod.pod.set_forwarder_decides(decides).await;
+                }
+                let (upstream, _) = counting_upstream().await;
+                let config = synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 5)],
+                    &store.addresses(),
+                    200,
+                    "deny",
+                );
+                let (_, key) = keys_of(&config).remove(0);
+                let owner = store.owner_of(&key).await;
+                let (_proxy, mut sends) = serving(&config, 1).await;
+                assert_eq!(statuses(&send_round(&mut sends, 2).await), [200, 200]);
+                // Copied to the replicas within a cycle or two.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                store.stop(owner).await;
+                let stopped = Instant::now();
+                let mut after = Vec::new();
+                while stopped.elapsed() < Duration::from_millis(1_500) {
+                    after.extend(statuses(&send_round(&mut sends, 1).await));
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let decided: Vec<u16> = after.iter().copied().filter(|s| *s != 503).collect();
+                if decides {
+                    // Three left of the five, then refused: the owner's two counted.
+                    assert!(decided.len() >= 4, "{after:?}");
+                    assert_eq!(decided[..4], [200, 200, 200, 429], "{after:?}");
+                    assert!(decided[4..].iter().all(|s| *s == 429), "{after:?}");
+                    let decided_from_copy: u64 = {
+                        let mut sum = 0;
+                        for (at, pod) in store.pods.iter().enumerate() {
+                            if at != owner {
+                                sum += pod.pod.observed().await.unwrap().decided_from_copy;
+                            }
+                        }
+                        sum
+                    };
+                    assert_eq!(decided_from_copy, u64::try_from(decided.len()).unwrap());
+                } else {
+                    assert!(decided.is_empty(), "decided with the owner gone: {after:?}");
+                }
+            }
+        })
+        .await;
+}
+
 /// A seed that does not answer opens its breaker after `failures` timeouts in a row: from
 /// then on its requests are decided by `when_unreachable` at once, nothing asked of it, and
 /// the metrics say so, by its address.

@@ -122,6 +122,8 @@ pub struct Observed {
     pub skewed: usize,
     /// What its sending has dropped.
     pub dropped: Dropped,
+    /// Requests it decided from its copy, their owner unheard.
+    pub decided_from_copy: u64,
 }
 
 /// A handle on a pod of the store, running. Cheap to clone.
@@ -215,17 +217,21 @@ impl StorePod {
     /// What its scrape shows of it, read at once between messages: `None` once it has stopped.
     pub async fn observed(&self) -> Option<Observed> {
         let (skewed, dropped) = (self.skewed(), self.dropped());
-        self.with(move |node, now| Observed {
-            ready: node.ready(now),
-            leader: node.is_leader(),
-            table: node.committed_stamp(),
-            keys: u64::try_from(node.key_count()).unwrap_or(u64::MAX),
-            key_bytes: node.key_bytes(),
-            max_key_bytes: node.config().max_key_bytes,
-            forgotten: node.forgotten(),
-            evicted: node.evicted(),
-            skewed,
-            dropped,
+        self.with_pod(move |pod, now| {
+            let node = pod.store();
+            Observed {
+                ready: node.ready(now),
+                leader: node.is_leader(),
+                table: node.committed_stamp(),
+                keys: u64::try_from(node.key_count()).unwrap_or(u64::MAX),
+                key_bytes: node.key_bytes(),
+                max_key_bytes: node.config().max_key_bytes,
+                forgotten: node.forgotten(),
+                evicted: node.evicted(),
+                skewed,
+                dropped,
+                decided_from_copy: pod.decided_from_copy(),
+            }
         })
         .await
     }
@@ -236,9 +242,18 @@ impl StorePod {
         &self,
         with: impl FnOnce(&mut Node<SyncValue>, Time) -> R + Send + 'static,
     ) -> Option<R> {
+        self.with_pod(move |pod, now| with(pod.store_mut(), now))
+            .await
+    }
+
+    /// Runs `with` on the mode's pod, as [`with`](Self::with) on its store.
+    async fn with_pod<R: Send + 'static>(
+        &self,
+        with: impl FnOnce(&mut Pod, Time) -> R + Send + 'static,
+    ) -> Option<R> {
         let (answer, answered) = oneshot::channel();
         let command = Command::With(Box::new(move |pod, now| {
-            let _gone = answer.send(with(pod.store_mut(), now));
+            let _gone = answer.send(with(pod, now));
         }));
         self.commands.send(command).await.ok()?;
         answered.await.ok()
@@ -248,6 +263,14 @@ impl StorePod {
     /// hop at most, rather than answer that the key is elsewhere: off as it starts.
     pub async fn set_forwarding(&self, forwarding: bool) {
         let command = Command::With(Box::new(move |pod, _| pod.set_forwarding(forwarding)));
+        let _stopped = self.commands.send(command).await;
+    }
+
+    /// Whether, forwarding, it decides a data plane's request itself from its copy when it is
+    /// a replica of the key's shard holding its lease and has not heard the owner for
+    /// `stop_serving`: off as it starts.
+    pub async fn set_forwarder_decides(&self, decides: bool) {
+        let command = Command::With(Box::new(move |pod, _| pod.set_forwarder_decides(decides)));
         let _stopped = self.commands.send(command).await;
     }
 

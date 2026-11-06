@@ -62,6 +62,8 @@ pub struct Report {
     pub moved_to_gone: u64,
     /// The most one key's window was admitted beyond the limit by the store.
     pub overshoot_peak: u64,
+    /// Requests pods decided from their copies, their owner unheard.
+    pub decided_from_copy: u64,
 }
 
 /// The shape of a run.
@@ -79,6 +81,8 @@ pub struct Shape {
     pub deadline: Time,
     /// Whether pods forward requests for shards not theirs.
     pub forwarding: bool,
+    /// Whether, forwarding, they decide a request from their copy, its owner unheard.
+    pub forwarder_decides: bool,
     /// Keys preloaded in every shard once the cluster has formed: for moves that carry many.
     pub preload: u64,
     /// The limit clients hold every key to, and whether `when_unreachable` admits.
@@ -104,6 +108,7 @@ impl Shape {
             rate: 200,
             deadline: ms(20),
             forwarding: false,
+            forwarder_decides: false,
             preload: 0,
             limit: None,
             max_key_bytes: None,
@@ -125,6 +130,7 @@ pub fn cluster(seed: u64, shape: Shape) -> (World, Vec<NodeId>) {
     config.window_bytes = shape.window_bytes;
     let mut world = World::new(seed, config);
     world.set_forwarding(shape.forwarding);
+    world.set_forwarder_decides(shape.forwarder_decides);
     let pods = world.start_cluster(shape.pods);
     let _formed = world.run_while_not(ms(10_000), World::settled);
     world.preload(shape.preload);
@@ -169,6 +175,7 @@ pub fn report(name: &'static str, world: &World, took: Option<Time>) -> Report {
         overshoot: world.overshoot(),
         moved_to_gone: stats.moved_to_gone,
         overshoot_peak: world.overshoot_peak(),
+        decided_from_copy: world.decided_from_copy(),
     }
 }
 
@@ -673,6 +680,7 @@ pub fn multi_key(seed: u64, shape: Shape, multi: crate::client::Multi, trouble: 
     config.window_bytes = shape.window_bytes;
     let mut world = World::new(seed, config);
     world.set_forwarding(shape.forwarding);
+    world.set_forwarder_decides(shape.forwarder_decides);
     let _pods = world.start_cluster(shape.pods);
     let _formed = world.run_while_not(ms(10_000), World::settled);
     if let Some((limit, allow)) = shape.limit {
