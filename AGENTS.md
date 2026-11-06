@@ -7,8 +7,8 @@ adds what an agent tends to trip over here.
 ## The project
 
 EdgeRush is a Kubernetes-native API gateway in Rust, at an early stage: the data plane runs
-from a YAML file, rate limiting runs experimentally, and Kubernetes and the control plane
-are not built yet.
+from a YAML file or from the control plane, which serves a cluster's Ingresses and Gateway
+API objects; rate limiting runs; the operator is not built yet.
 [README.md](README.md) has what works, how to build (BoringSSL needs cmake and libclang,
 and NASM on Windows) and the layout of the crates.
 
