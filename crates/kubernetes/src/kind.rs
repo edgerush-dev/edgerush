@@ -10,6 +10,7 @@ use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
+use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
@@ -133,6 +134,10 @@ impl Kind for GRPCRoute {
 }
 
 impl Kind for TLSRoute {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for TCPRoute {
     const NAMESPACED: bool = true;
 }
 

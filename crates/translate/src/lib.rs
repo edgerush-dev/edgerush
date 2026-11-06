@@ -34,7 +34,7 @@ use edgerush_config::{
     Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, GrpcMethod, Header,
     HeaderChanges, Hostname, Listener, ListenerCertificate, LoadBalancer, Match, PathMatch,
     Protocol, Query, Redirect, Route, Rule, Scheme, SharingHostname, SharingListener, StatedNames,
-    TlsRoute, Upstream, UpstreamProtocol, UpstreamTls, ValueMatch, Wildcard, compile,
+    TcpRoute, TlsRoute, Upstream, UpstreamProtocol, UpstreamTls, ValueMatch, Wildcard, compile,
 };
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
@@ -42,6 +42,7 @@ use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
+use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{
@@ -59,6 +60,7 @@ mod grpc_route;
 pub mod http_route;
 pub mod listeners;
 pub mod status;
+mod tcp_route;
 mod tls_route;
 
 pub use gateway::{
@@ -254,6 +256,8 @@ pub struct Cluster {
     pub grpc_routes: Vec<GRPCRoute>,
     /// Every TLSRoute seen.
     pub tls_routes: Vec<TLSRoute>,
+    /// Every TCPRoute seen.
+    pub tcp_routes: Vec<TCPRoute>,
     /// Every ReferenceGrant seen.
     pub reference_grants: Vec<ReferenceGrant>,
     /// Every Namespace seen, where the data plane is a Gateway: their labels are what a
@@ -298,6 +302,8 @@ pub struct Translation {
     pub grpc_routes: Vec<RouteOutcome>,
     /// Each TLSRoute that does, and what became of each such parent.
     pub tls_routes: Vec<RouteOutcome>,
+    /// Each TCPRoute that does, and what became of each such parent.
+    pub tcp_routes: Vec<RouteOutcome>,
     /// What that Gateway's status is to say (04 §6).
     pub gateway_status: Option<GatewayStatus>,
     /// What each of those routes' status is to say of those parents, in their order, the
@@ -667,8 +673,13 @@ pub enum Problem {
     Refused(String),
     /// The Ingress HTTP port is a Gateway listener's of another protocol, so its hosts
     /// cannot be served over plain HTTP.
-    #[error("port {0}, where Ingress is served over plain HTTP, is bound for HTTPS")]
-    HttpPortTaken(u16),
+    #[error("port {port}, where Ingress is served over plain HTTP, is bound for {bound}")]
+    HttpPortTaken {
+        /// The port.
+        port: u16,
+        /// What it is bound for, as `bound_for` says it.
+        bound: &'static str,
+    },
     /// The data plane's IngressClass is not there, so no Ingress is its.
     #[error("not among the objects, so no Ingress of the class is translated")]
     ClassMissing,
@@ -744,12 +755,12 @@ pub enum Problem {
         /// Why.
         why: RefProblem,
     },
-    /// A TLSRoute not of the shape the `v1` API gives one, as one written through an older
-    /// version may be: not accepted.
+    /// A TLSRoute or a TCPRoute not of the shape the `v1` API gives one, as one written
+    /// through an older version may be: not accepted.
     #[error("{0}, so it is not accepted")]
-    TlsRouteRefused(String),
-    /// A TLSRoute's backend is invalid: its share of connections is closed, as the spec has
-    /// it (`ResolvedRefs` false).
+    RouteRefused(String),
+    /// A TLSRoute's or a TCPRoute's backend is invalid: its share of connections is closed,
+    /// as the spec has it (`ResolvedRefs` false).
     #[error("a backend's share of connections is closed: {0}")]
     ConnectionsClosed(RefProblem),
     /// A TLSRoute's hostname on a data-plane listener that an earlier TLSRoute has there
@@ -758,6 +769,16 @@ pub enum Problem {
     HostnameTaken {
         /// The hostname.
         hostname: String,
+        /// The data plane's listener.
+        listener: String,
+        /// The route that serves it.
+        by: Object,
+    },
+    /// A TCPRoute attached to a data-plane listener an earlier TCPRoute is attached to: the
+    /// earlier serves it, as the one rule ranks them (04 §2), and this one stays accepted,
+    /// as conformance has it.
+    #[error("{listener} is served by {by}, which comes first")]
+    ListenerTaken {
         /// The data plane's listener.
         listener: String,
         /// The route that serves it.
@@ -831,20 +852,27 @@ pub enum Problem {
 pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut report = Vec::new();
     let gateway = gateway::outcome(plane, cluster, &mut report);
-    let (http_routes, grpc_routes, tls_routes) = gateway
+    let (http_routes, grpc_routes, tls_routes, tcp_routes) = gateway
         .as_ref()
         .map(|gateway| {
             let http = cluster.http_routes.iter().map(http_route::Routed::http);
             let grpc = cluster.grpc_routes.iter().map(http_route::Routed::grpc);
             let tls = cluster.tls_routes.iter().map(http_route::Routed::tls);
+            let tcp = cluster.tcp_routes.iter().map(http_route::Routed::tcp);
             (
                 http_route::attached(http.collect(), gateway, cluster),
                 http_route::attached(grpc.collect(), gateway, cluster),
                 http_route::attached(tls.collect(), gateway, cluster),
+                http_route::attached(tcp.collect(), gateway, cluster),
             )
         })
         .unwrap_or_default();
-    for outcome in http_routes.iter().chain(&grpc_routes).chain(&tls_routes) {
+    for outcome in http_routes
+        .iter()
+        .chain(&grpc_routes)
+        .chain(&tls_routes)
+        .chain(&tcp_routes)
+    {
         for parent in &outcome.parents {
             if let Err(why) = parent.attached {
                 report.push(Finding {
@@ -1279,7 +1307,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             if let Some(why) = translated.refused {
                 report.push(Finding {
                     object: outcome.route.clone(),
-                    problem: Problem::TlsRouteRefused(why),
+                    problem: Problem::RouteRefused(why),
                 });
                 continue;
             }
@@ -1322,6 +1350,71 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             passthrough.extend(routes);
         }
         passthrough.extend(tls_route::claims(gateway));
+    }
+    // Each attached TCPRoute's TCP routes, oldest first, then by namespace and name: a
+    // data-plane listener's one route is the first's, as conformance has it, each later
+    // one said; a listener none serves is claimed, its connections closed (04 §2, Q-c2).
+    let mut tcp: Vec<TcpRoute> = Vec::new();
+    if let Some(gateway) = &gateway {
+        let mut ranked: Vec<(Rank, Object, Vec<TcpRoute>)> = Vec::new();
+        for outcome in &tcp_routes {
+            if !outcome.parents.iter().any(|parent| parent.attached.is_ok()) {
+                continue;
+            }
+            let Some(route) = cluster
+                .tcp_routes
+                .iter()
+                .find(|route| Object::of("TCPRoute", &route.metadata) == outcome.route)
+            else {
+                continue;
+            };
+            let translated = tcp_route::translated(route, outcome, gateway, plane, cluster);
+            if let Some(why) = translated.refused {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::RouteRefused(why),
+                });
+                continue;
+            }
+            for why in translated.invalid {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::ConnectionsClosed(why),
+                });
+            }
+            tunnel_upstreams.extend(translated.upstreams);
+            ranked.push((
+                rank(&route.metadata, 0),
+                outcome.route.clone(),
+                translated.routes,
+            ));
+        }
+        ranked.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut taken: BTreeMap<String, Object> = BTreeMap::new();
+        for (_, object, routes) in ranked {
+            for route in routes {
+                if let Some((listener, by)) = route
+                    .listeners
+                    .iter()
+                    .find_map(|listener| taken.get(listener).map(|by| (listener, by)))
+                {
+                    report.push(Finding {
+                        object: object.clone(),
+                        problem: Problem::ListenerTaken {
+                            listener: listener.clone(),
+                            by: by.clone(),
+                        },
+                    });
+                    continue;
+                }
+                for listener in &route.listeners {
+                    taken.insert(listener.clone(), object.clone());
+                }
+                tcp.push(route);
+            }
+        }
+        let served: Vec<String> = taken.into_keys().collect();
+        tcp.extend(tcp_route::claims(gateway, &served));
     }
     // Each listener hostname of the Gateway is claimed, so that nothing less specific serves
     // it (04 §2, listener isolation).
@@ -1464,6 +1557,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         )
     };
     config.tls_routes = passthrough;
+    config.tcp_routes = tcp;
     if let Some(gateway) = &gateway {
         gateway_tls(&mut config, gateway, cluster, &mut report);
     }
@@ -1482,12 +1576,13 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             config.listeners.insert(name, alone);
         }
     }
-    // Every route's status, of whichever kind, HTTPRoutes first, then GRPCRoutes and
-    // TLSRoutes; a listener counts them all.
+    // Every route's status, of whichever kind, HTTPRoutes first, then GRPCRoutes,
+    // TLSRoutes and TCPRoutes; a listener counts them all.
     let routes: Vec<RouteOutcome> = http_routes
         .iter()
         .chain(&grpc_routes)
         .chain(&tls_routes)
+        .chain(&tcp_routes)
         .cloned()
         .collect();
     let route_statuses = status::routes(&routes, &report);
@@ -1507,6 +1602,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         http_routes,
         grpc_routes,
         tls_routes,
+        tcp_routes,
         gateway_status,
         route_statuses,
         taken,
@@ -2036,6 +2132,20 @@ fn ingress_listeners(
     )
 }
 
+/// What the data plane's listener on `port` is bound for, as a finding says it: `plain HTTP`,
+/// `HTTPS`, `TCP` or `TLS`.
+fn bound_for(bound: &BTreeMap<String, Listener>, port: u16) -> &'static str {
+    match bound
+        .get(&listeners::name(port))
+        .map(|listener| listener.protocol)
+    {
+        Some(Protocol::Http) | None => "plain HTTP",
+        Some(Protocol::Https) => "HTTPS",
+        Some(Protocol::Tcp) => "TCP",
+        Some(Protocol::Tls) => "TLS",
+    }
+}
+
 /// An object without a namespace is in `default`, as Kubernetes takes it.
 fn namespace(metadata: &ObjectMeta) -> &str {
     metadata.namespace.as_deref().unwrap_or("default")
@@ -2330,7 +2440,12 @@ fn ingress_routes(
     for host in by_host.keys() {
         let mut listeners = http.clone();
         match tls_hosts.get(host.as_str()) {
-            None if http.is_empty() => return Err(Problem::HttpPortTaken(plane.ingress_http_port)),
+            None if http.is_empty() => {
+                return Err(Problem::HttpPortTaken {
+                    port: plane.ingress_http_port,
+                    bound: bound_for(bound, plane.ingress_http_port),
+                });
+            }
             None => {}
             Some(None) => {
                 unsecured.push((host.clone(), "its TLS entry names no Secret".to_owned()));
@@ -2358,8 +2473,9 @@ fn ingress_routes(
                         Some(format!("Secret {namespace}/{secret} does not cover {host}"))
                     }
                     Ok(_) if https.is_empty() => Some(format!(
-                        "port {}, where Ingress TLS hosts are served, is bound for plain HTTP",
-                        plane.ingress_https_port
+                        "port {}, where Ingress TLS hosts are served, is bound for {}",
+                        plane.ingress_https_port,
+                        bound_for(bound, plane.ingress_https_port)
                     )),
                     Ok((certificate, _)) => {
                         let name = format!("{namespace}/{secret}");

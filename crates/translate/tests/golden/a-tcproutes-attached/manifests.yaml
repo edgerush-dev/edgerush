@@ -1,0 +1,119 @@
+# TCPRoutes attached to a Gateway's TCP listeners by port, by sectionName, by both and by
+# neither, as conformance has them: each listener served by its oldest route, a later one
+# on it said and left accepted (TCPRouteMultipleRoutesAttachment), a listener none serves
+# closing its connections. Backends share connections by weight, a weight of 0 never
+# picked, an invalid one's share closed: missing, of a kind not served, or in another
+# namespace with no ReferenceGrant from TCPRoute; one with a grant reached. A port's
+# appProtocol is not read, the upstream named apart from the HTTP one. A route of two
+# rules, which only an older version writes, is not accepted.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: one, port: 9300, protocol: TCP }
+    - { name: two, port: 9301, protocol: TCP }
+    - { name: three, port: 9302, protocol: TCP }
+    - { name: weighted, port: 9303, protocol: TCP }
+    - { name: http, port: 8080, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: { name: elder, namespace: shop, creationTimestamp: "2025-06-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: one }]
+  rules:
+    - backendRefs: [{ name: db, port: 5432 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: { name: by-port, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, port: 9300 }]
+  rules:
+    - backendRefs: [{ name: cache, port: 6379 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: { name: by-section, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: two }]
+  rules:
+    - backendRefs: [{ name: db, port: 5432 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: { name: by-both, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: three, port: 9302 }]
+  rules:
+    - backendRefs: [{ name: cache, port: 6379 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: { name: weighted, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: weighted }]
+  rules:
+    - backendRefs:
+        - { name: db, port: 5432, weight: 70 }
+        - { name: cache, port: 6379, weight: 30 }
+        - { name: vault, namespace: other, port: 8200, weight: 0 }
+        - { name: not-there, port: 1, weight: 10 }
+        - { group: "", kind: ConfigMap, name: settings, port: 1, weight: 5 }
+        - { name: secret, namespace: other, port: 8200, weight: 5 }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: { name: attach-all, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web }]
+  rules:
+    - backendRefs: [{ name: db, port: 5432 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: { name: old-shape, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: two }]
+  rules:
+    - backendRefs: [{ name: db, port: 5432 }]
+    - backendRefs: [{ name: cache, port: 6379 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: from-shop, namespace: other }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: TCPRoute, namespace: shop }]
+  to: [{ group: "", kind: Service, name: vault }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: db, namespace: shop }
+spec:
+  ports: [{ name: postgres, port: 5432, appProtocol: postgresql }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: cache, namespace: shop }
+spec:
+  ports: [{ name: redis, port: 6379 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: vault, namespace: other }
+spec:
+  ports: [{ name: api, port: 8200 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: secret, namespace: other }
+spec:
+  ports: [{ name: api, port: 8200 }]

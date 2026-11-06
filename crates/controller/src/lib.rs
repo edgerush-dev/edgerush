@@ -24,6 +24,7 @@ use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
+use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_kubernetes::{ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow};
 use edgerush_translate::{
@@ -458,6 +459,7 @@ struct GatewayApi {
     http_routes: Option<Vec<Follow<HTTPRoute>>>,
     grpc_routes: Option<Vec<Follow<GRPCRoute>>>,
     tls_routes: Option<Vec<Follow<TLSRoute>>>,
+    tcp_routes: Option<Vec<Follow<TCPRoute>>>,
     reference_grants: Option<Vec<Follow<ReferenceGrant>>>,
 }
 
@@ -484,6 +486,7 @@ impl GatewayApi {
             http_routes: None,
             grpc_routes: None,
             tls_routes: None,
+            tcp_routes: None,
             reference_grants: None,
         }
     }
@@ -501,8 +504,8 @@ impl GatewayApi {
 
     /// Follows each kind `served` says is served, in `scope` (GatewayClasses in the
     /// cluster, Gateways in the data plane's Gateway's namespace; ListenerSets, HTTPRoutes,
-    /// GRPCRoutes, TLSRoutes and ReferenceGrants in `scope`), and stops following each it
-    /// says is not.
+    /// GRPCRoutes, TLSRoutes, TCPRoutes and ReferenceGrants in `scope`), and stops following
+    /// each it says is not.
     fn follow(&mut self, served: &[(GatewayKind, Served)], start: &mut Start<'_>, scope: &[Scope]) {
         for (kind, served) in served {
             let on = served.is_served();
@@ -523,6 +526,7 @@ impl GatewayApi {
                 GatewayKind::HTTPRoute => keep(&mut self.http_routes, on, || start.follows(scope)),
                 GatewayKind::GRPCRoute => keep(&mut self.grpc_routes, on, || start.follows(scope)),
                 GatewayKind::TLSRoute => keep(&mut self.tls_routes, on, || start.follows(scope)),
+                GatewayKind::TCPRoute => keep(&mut self.tcp_routes, on, || start.follows(scope)),
                 GatewayKind::ReferenceGrant => {
                     keep(&mut self.reference_grants, on, || start.follows(scope));
                 }
@@ -547,6 +551,7 @@ impl GatewayApi {
             .chain(unlisted(self.http_routes.as_deref().unwrap_or_default()))
             .chain(unlisted(self.grpc_routes.as_deref().unwrap_or_default()))
             .chain(unlisted(self.tls_routes.as_deref().unwrap_or_default()))
+            .chain(unlisted(self.tcp_routes.as_deref().unwrap_or_default()))
             .chain(unlisted(
                 self.reference_grants.as_deref().unwrap_or_default(),
             ))
@@ -691,11 +696,13 @@ impl GatewayApi {
                     .map(|set| set.set.clone()),
             )
             .collect();
-        // A GRPCRoute's status and a TLSRoute's are merged and written as an HTTPRoute's, of
-        // one type in the spec (gateway_status::grpc_as_http, tls_as_http).
+        // A GRPCRoute's, a TLSRoute's and a TCPRoute's status are merged and written as an
+        // HTTPRoute's, of one type in the spec (gateway_status::grpc_as_http, tls_as_http,
+        // tcp_as_http).
         let http_routes = self.http_routes.as_deref().map(objects).unwrap_or_default();
         let grpc_routes = self.grpc_routes.as_deref().map(objects).unwrap_or_default();
         let tls_routes = self.tls_routes.as_deref().map(objects).unwrap_or_default();
+        let tcp_routes = self.tcp_routes.as_deref().map(objects).unwrap_or_default();
         let routes = http_routes
             .iter()
             .map(|route| ("HTTPRoute", &route.metadata, route.status.clone()))
@@ -706,6 +713,10 @@ impl GatewayApi {
             .chain(tls_routes.iter().map(|route| {
                 let status = route.status.as_ref().map(gateway_status::tls_as_http);
                 ("TLSRoute", &route.metadata, status)
+            }))
+            .chain(tcp_routes.iter().map(|route| {
+                let status = route.status.as_ref().map(gateway_status::tcp_as_http);
+                ("TCPRoute", &route.metadata, status)
             }));
         for (kind, metadata, live) in routes {
             let object = Object {
@@ -731,6 +742,10 @@ impl GatewayApi {
                     }
                     "TLSRoute" => {
                         api.replace_status::<TLSRoute>(namespace, name, version, &status)
+                            .await
+                    }
+                    "TCPRoute" => {
+                        api.replace_status::<TCPRoute>(namespace, name, version, &status)
                             .await
                     }
                     _ => {
@@ -877,6 +892,7 @@ impl Followed {
             http_routes: of(gateway_api.and_then(|g| g.http_routes.as_ref())),
             grpc_routes: of(gateway_api.and_then(|g| g.grpc_routes.as_ref())),
             tls_routes: of(gateway_api.and_then(|g| g.tls_routes.as_ref())),
+            tcp_routes: of(gateway_api.and_then(|g| g.tcp_routes.as_ref())),
             reference_grants: of(gateway_api.and_then(|g| g.reference_grants.as_ref())),
             namespaces: gateway_api
                 .map(|g| objects(&g.namespaces))

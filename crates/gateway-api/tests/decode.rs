@@ -7,6 +7,7 @@ use edgerush_gateway_api::grpc_route::GRPCRoute;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
+use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use k8s_openapi::{ListableResource, Resource};
 
@@ -160,6 +161,30 @@ spec: {}",
     )
     .unwrap();
     assert!(route.spec.hostnames.is_empty() && route.spec.rules.is_empty());
+    // A TCPRoute's one rule holds backends alone, defaulted as a TLSRoute's; it has no
+    // hostnames.
+    let route: TCPRoute = serde_saphyr::from_str(
+        "metadata: { name: db }
+spec:
+  rules: [{ backendRefs: [{ name: db, port: 5432 }] }]",
+    )
+    .unwrap();
+    let backend = &route.spec.rules[0].backend_refs[0];
+    assert_eq!(
+        (
+            backend.weight,
+            backend.group.as_str(),
+            backend.kind.as_str(),
+            backend.port
+        ),
+        (1, "", "Service", Some(5432))
+    );
+    let route: TCPRoute = serde_saphyr::from_str(
+        "metadata: { name: db }
+spec: {}",
+    )
+    .unwrap();
+    assert!(route.spec.rules.is_empty());
 }
 
 #[test]
@@ -205,6 +230,10 @@ fn each_kind_is_listed_where_the_api_server_serves_it() {
     assert_eq!(
         of::<TLSRoute>(),
         at(group, "v1", "tlsroutes", "TLSRouteList")
+    );
+    assert_eq!(
+        of::<TCPRoute>(),
+        at(group, "v1", "tcproutes", "TCPRouteList")
     );
     assert_eq!(HTTPRoute::API_VERSION, "gateway.networking.k8s.io/v1");
 }

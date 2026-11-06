@@ -1,0 +1,13 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener one: TCPRoute, attached 3: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener two: TCPRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener three: TCPRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener weighted: TCPRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener http: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TCPRoute shop/elder, generation 0, parent web section one: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TCPRoute shop/by-both, generation 0, parent web section three port 9302: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TCPRoute shop/by-port, generation 0, parent web port 9300: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TCPRoute shop/by-section, generation 0, parent web section two: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TCPRoute shop/old-shape, generation 0, parent web section two: Accepted=False/UnsupportedValue (it has 2 rules, where the v1 API has a TCPRoute of exactly one, so it is not accepted); ResolvedRefs=True/ResolvedRefs
+TCPRoute shop/weighted, generation 0, parent web section weighted: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Service shop/not-there does not exist; a backend of kind /ConfigMap is not one translation reads; Service other/secret is another namespace's, and no ReferenceGrant there lets TCPRoutes of shop reach it)
+TCPRoute shop/attach-all, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

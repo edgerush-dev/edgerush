@@ -1,0 +1,6 @@
+Gateway shop/web: listener db-again: not accepted: listener db, which comes first, has its port, protocol and hostname
+Gateway shop/web: listener mixed-http: not accepted: its Gateway states port 9000 for TCP and for HTTP, HTTPS or TLS, which the spec does not let share a port: no listener of it there is accepted
+Gateway shop/web: listener mixed-tls: not accepted: its Gateway states port 9000 for TCP and for HTTP, HTTPS or TLS, which the spec does not let share a port: no listener of it there is accepted
+Gateway shop/web: listener mixed-tcp: not accepted: its Gateway states port 9000 for TCP and for HTTP, HTTPS or TLS, which the spec does not let share a port: no listener of it there is accepted
+Gateway shop/web: listener kinds: takes no route of kind gateway.networking.k8s.io/HTTPRoute
+Ingress shop/web: port 80, where Ingress is served over plain HTTP, is bound for TCP

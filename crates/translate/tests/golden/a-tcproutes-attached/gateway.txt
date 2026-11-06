@@ -1,0 +1,5 @@
+listener one: served on port-9300, taking TCPRoute from namespace shop
+listener two: served on port-9301, taking TCPRoute from namespace shop
+listener three: served on port-9302, taking TCPRoute from namespace shop
+listener weighted: served on port-9303, taking TCPRoute from namespace shop
+listener http: served on port-8080, taking HTTPRoute, GRPCRoute from namespace shop

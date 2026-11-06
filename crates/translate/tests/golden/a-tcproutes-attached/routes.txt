@@ -1,0 +1,7 @@
+TCPRoute shop/elder, section one: attached to one (*)
+TCPRoute shop/by-both, section three, port 9302: attached to three (*)
+TCPRoute shop/by-port, port 9300: attached to one (*)
+TCPRoute shop/by-section, section two: attached to two (*)
+TCPRoute shop/old-shape, section two: attached to two (*)
+TCPRoute shop/weighted, section weighted: attached to weighted (*)
+TCPRoute shop/attach-all: attached to one (*); two (*); three (*); weighted (*)

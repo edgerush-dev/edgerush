@@ -16,7 +16,7 @@ use edgerush_gateway_api::gateway::{
 };
 use edgerush_gateway_api::listener_set::ListenerSet;
 use k8s_openapi::serde_json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// The API group of the Gateway API's kinds.
@@ -276,9 +276,6 @@ pub enum ListenerProblem {
     /// A protocol the gateway never serves (the spec's `UnsupportedProtocol`).
     #[error("protocol `{0}` is not one the gateway serves")]
     UnsupportedProtocol(String),
-    /// A protocol whose listeners translation does not take yet (`UnsupportedProtocol`).
-    #[error("not supported yet: {0} listeners")]
-    NotSupportedYet(&'static str),
     /// A listener before it has its port, protocol and hostname, so the two could not be
     /// told apart: that one is accepted, this not (`HostnameConflict`).
     #[error("{by}, which comes first, has its port, protocol and hostname")]
@@ -302,6 +299,18 @@ pub enum ListenerProblem {
     /// that does not claim `TLSRouteModeTerminate`).
     #[error("TLS mode `{0}` is not served: a TLS listener passes its connections through")]
     PassthroughOnly(String),
+    /// Its Gateway or ListenerSet states its port for TCP and for HTTP, HTTPS or TLS, which
+    /// the spec counts not distinct and has none of accepted (`ProtocolConflict`, Q-c1).
+    #[error(
+        "its {kind} states port {port} for TCP and for HTTP, HTTPS or TLS, which the spec does \
+         not let share a port: no listener of it there is accepted"
+    )]
+    NotDistinct {
+        /// The port.
+        port: u16,
+        /// `Gateway` or `ListenerSet`.
+        kind: &'static str,
+    },
     /// A listener before it states its port for another protocol, and has the port: that
     /// one is accepted, this not (`ProtocolConflict`).
     #[error("port {port} is taken for {protocol} by {by}, which comes first")]
@@ -684,7 +693,33 @@ pub(crate) struct Written {
 /// data plane's listener bound to its port, a port past the data plane's slots refused for
 /// every listener on it. An earlier listener of another resource is said by whose it is,
 /// never by name, as nothing of a parent or a sibling is told a ListenerSet (GEP-1713).
+///
+/// A TCP listener is distinct by port alone (the spec): its `hostname`, which its schema
+/// forbids, is not read. Where one resource's listeners state a port for TCP and for HTTP,
+/// HTTPS or TLS, none of them on it is accepted, as the spec has it (Q-c1), and, refused,
+/// they take no port: a later resource's listener there is judged as any (Q-c1b), so that
+/// one team's ListenerSet never keeps a port from another's.
 pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOutcome> {
+    // The ports each resource (the Gateway's own listeners, `None`, or a ListenerSet's)
+    // states for TCP and for HTTP, HTTPS or TLS.
+    let not_distinct: BTreeSet<(Option<&Object>, i32)> = {
+        let mut stated: BTreeMap<(Option<&Object>, i32), (bool, bool)> = BTreeMap::new();
+        for listener in written {
+            let (tcp, other) = stated
+                .entry((listener.set.as_ref(), listener.listener.port))
+                .or_default();
+            match listener.listener.protocol.as_str() {
+                "TCP" => *tcp = true,
+                "HTTP" | "HTTPS" | "TLS" => *other = true,
+                _ => {}
+            }
+        }
+        stated
+            .into_iter()
+            .filter(|(_, (tcp, other))| *tcp && *other)
+            .map(|(place, _)| place)
+            .collect()
+    };
     // Each port taken, by the protocols it is for, the protocol of the listener that took
     // it and that listener; each place, by the listener in it: only those accepted, by
     // their place in `written`.
@@ -707,7 +742,18 @@ pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOu
             let listener = &stated.listener;
             // The schema holds a port to 1–65535.
             let port = u16::try_from(listener.port).unwrap_or_default();
+            let set = stated.set.as_ref();
             let served = protocol(listener).and_then(|protocol| {
+                if not_distinct.contains(&(set, listener.port)) {
+                    return Err(ListenerProblem::NotDistinct {
+                        port,
+                        kind: if set.is_some() {
+                            "ListenerSet"
+                        } else {
+                            "Gateway"
+                        },
+                    });
+                }
                 let name = name_of(protocol);
                 // HTTPS and TLS share a port, one data-plane listener reading each
                 // ClientHello (Q-t1): one hostname on both is a conflict of hostnames.
@@ -716,7 +762,11 @@ pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOu
                 } else {
                     name
                 };
-                let place = (listener.port, family, listener.hostname.as_deref());
+                let hostname = listener
+                    .hostname
+                    .as_deref()
+                    .filter(|_| protocol != Protocol::Tcp);
+                let place = (listener.port, family, hostname);
                 match (ports.get(&listener.port), places.get(&place)) {
                     (Some((taken, protocol, earlier)), _) if *taken != family => {
                         Err(ListenerProblem::ProtocolConflict {
@@ -752,7 +802,10 @@ pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOu
                     invalid_kinds: Vec::new(),
                     namespaces: Namespaces::None,
                 },
-                hostname: listener.hostname.clone(),
+                hostname: listener
+                    .hostname
+                    .clone()
+                    .filter(|_| listener.protocol != "TCP"),
                 port,
                 passes_through: listener.protocol == "TLS",
                 certificates: Vec::new(),
@@ -773,7 +826,7 @@ fn protocol(written: &GatewayListeners) -> Result<Protocol, ListenerProblem> {
             "Passthrough" => Ok(Protocol::Tls),
             other => Err(ListenerProblem::PassthroughOnly(other.to_owned())),
         },
-        "TCP" => Err(ListenerProblem::NotSupportedYet("TCP")),
+        "TCP" => Ok(Protocol::Tcp),
         other => Err(ListenerProblem::UnsupportedProtocol(other.to_owned())),
     }
 }
@@ -803,6 +856,7 @@ fn kinds_for(protocol: &str) -> &'static [&'static str] {
     match protocol {
         "HTTP" | "HTTPS" => &["HTTPRoute", "GRPCRoute"],
         "TLS" => &["TLSRoute"],
+        "TCP" => &["TCPRoute"],
         _ => &[],
     }
 }
@@ -972,6 +1026,117 @@ mod tests {
         );
     }
 
+    /// A TCP listener is distinct by port alone, its hostname not read; where one resource
+    /// states a port for TCP and for HTTP, HTTPS or TLS, none of its listeners there is
+    /// accepted (the spec, Q-c1); an earlier resource's listener there keeps it, as GEP-1713
+    /// has the first kept, and a later's is judged as any, the refused taking no port (Q-c1b).
+    #[test]
+    fn listeners_beside_a_tcp_listener_on_its_port_are_not_accepted() {
+        let gateway = Object {
+            kind: "Gateway",
+            namespace: "edge".to_owned(),
+            name: "web".to_owned(),
+        };
+        let set = |name: &str| Object {
+            kind: "ListenerSet",
+            namespace: "shop".to_owned(),
+            name: name.to_owned(),
+        };
+        let written: Vec<Written> = [
+            (None, "{ name: g-http, port: 80, protocol: HTTP }"),
+            (None, "{ name: g-tcp, port: 80, protocol: TCP }"),
+            (
+                None,
+                "{ name: g-web, port: 8080, protocol: HTTP, hostname: a.example.com }",
+            ),
+            (
+                None,
+                "{ name: g-db, port: 5432, protocol: TCP, hostname: db.example.com }",
+            ),
+            (None, "{ name: g-db2, port: 5432, protocol: TCP }"),
+            (
+                None,
+                "{ name: g-sni, port: 7000, protocol: TLS, tls: { mode: Passthrough } }",
+            ),
+            (None, "{ name: g-raw, port: 7000, protocol: TCP }"),
+            (None, "{ name: g-secure, port: 7443, protocol: HTTPS }"),
+            (None, "{ name: g-raw2, port: 7443, protocol: TCP }"),
+            (
+                Some("one"),
+                "{ name: one-80, port: 80, protocol: HTTP, hostname: b.example.com }",
+            ),
+            (Some("one"), "{ name: one-8080, port: 8080, protocol: TCP }"),
+            (
+                Some("one"),
+                "{ name: one-8080h, port: 8080, protocol: HTTP, hostname: d.example.com }",
+            ),
+            (
+                Some("one"),
+                "{ name: one-9000, port: 9000, protocol: HTTPS, hostname: e.example.com }",
+            ),
+            (
+                Some("one"),
+                "{ name: one-9000t, port: 9000, protocol: TCP }",
+            ),
+            (Some("two"), "{ name: two-9000, port: 9000, protocol: TCP }"),
+            (
+                Some("two"),
+                "{ name: two-8080, port: 8080, protocol: HTTP, hostname: c.example.com }",
+            ),
+        ]
+        .iter()
+        .map(|(of, yaml)| Written {
+            listener: serde_saphyr::from_str(yaml).unwrap(),
+            set: of.map(set),
+            namespace: of.map_or("edge", |_| "shop").to_owned(),
+        })
+        .collect();
+        let outcomes = super::listeners(&written, &gateway);
+        let said: Vec<String> = outcomes
+            .iter()
+            .map(|o| match &o.served {
+                Ok(on) => format!("{}: {}", o.name, on.join(", ")),
+                Err(why) => format!("{}: {why}", o.name),
+            })
+            .collect();
+        let gateway_s = |port: u16| {
+            format!(
+                "its Gateway states port {port} for TCP and for HTTP, HTTPS or TLS, which the \
+                 spec does not let share a port: no listener of it there is accepted"
+            )
+        };
+        let set_s = |port: u16| {
+            format!(
+                "its ListenerSet states port {port} for TCP and for HTTP, HTTPS or TLS, which the \
+                 spec does not let share a port: no listener of it there is accepted"
+            )
+        };
+        assert_eq!(
+            said,
+            [
+                format!("g-http: {}", gateway_s(80)),
+                format!("g-tcp: {}", gateway_s(80)),
+                "g-web: port-8080".to_owned(),
+                "g-db: port-5432".to_owned(),
+                "g-db2: listener g-db, which comes first, has its port, protocol and hostname"
+                    .to_owned(),
+                format!("g-sni: {}", gateway_s(7000)),
+                format!("g-raw: {}", gateway_s(7000)),
+                format!("g-secure: {}", gateway_s(7443)),
+                format!("g-raw2: {}", gateway_s(7443)),
+                "one-80: port-80".to_owned(),
+                format!("one-8080: {}", set_s(8080)),
+                format!("one-8080h: {}", set_s(8080)),
+                format!("one-9000: {}", set_s(9000)),
+                format!("one-9000t: {}", set_s(9000)),
+                "two-9000: port-9000".to_owned(),
+                "two-8080: port-8080".to_owned(),
+            ]
+        );
+        // A TCP listener's hostname is not read: none claimed, none intersected.
+        assert_eq!(outcomes[3].hostname, None);
+    }
+
     /// A ListenerSet's listener on a port past the slots the Gateway's own listeners take is
     /// refused `TooManyListeners`, the GEP's reason, not the Gateway's `PortUnavailable`.
     #[test]
@@ -1067,7 +1232,7 @@ mod tests {
         // A listener refused for another reason takes no slot.
         let mut unsupported = written[..MOST_GATEWAY_PORTS].to_vec();
         unsupported[0] =
-            serde_saphyr::from_str("{ name: tcp, port: 4000, protocol: TCP }").unwrap();
+            serde_saphyr::from_str("{ name: dns, port: 4000, protocol: UDP }").unwrap();
         unsupported.push(listener("fits", 3000));
         let outcomes = listeners(&unsupported);
         assert!(outcomes.last().unwrap().served.is_ok());

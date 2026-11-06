@@ -366,11 +366,11 @@ fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
     match &listener.served {
         Err(problem) if !problem.accepted() => {
             let reason = match problem {
-                ListenerProblem::UnsupportedProtocol(_) | ListenerProblem::NotSupportedYet(_) => {
-                    "UnsupportedProtocol"
-                }
+                ListenerProblem::UnsupportedProtocol(_) => "UnsupportedProtocol",
                 ListenerProblem::HostnameConflict { .. } => "HostnameConflict",
-                ListenerProblem::ProtocolConflict { .. } => "ProtocolConflict",
+                ListenerProblem::ProtocolConflict { .. } | ListenerProblem::NotDistinct { .. } => {
+                    "ProtocolConflict"
+                }
                 ListenerProblem::PortPastSlots { .. } => "PortUnavailable",
                 ListenerProblem::TooManyListeners { .. } => "TooManyListeners",
                 ListenerProblem::TlsMode(_)
@@ -385,7 +385,9 @@ fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
             ));
             if matches!(
                 problem,
-                ListenerProblem::HostnameConflict { .. } | ListenerProblem::ProtocolConflict { .. }
+                ListenerProblem::HostnameConflict { .. }
+                    | ListenerProblem::ProtocolConflict { .. }
+                    | ListenerProblem::NotDistinct { .. }
             ) {
                 conditions.push(Condition::new(
                     "Conflicted",
@@ -464,13 +466,14 @@ pub(crate) fn routes(outcomes: &[RouteOutcome], report: &[Finding]) -> Vec<Route
 }
 
 /// A route's conditions for one parent: `Accepted`, `ResolvedRefs` and, where some of its
-/// rules are served as written and some not, `PartiallyInvalid`. A TLSRoute not of the
-/// shape the `v1` API gives one is not accepted, as an HTTPRoute none of whose rules is
-/// served is not; its backends' shares closed are its unresolved references.
+/// rules are served as written and some not, `PartiallyInvalid`. A TLSRoute or a TCPRoute
+/// not of the shape the `v1` API gives one is not accepted, as an HTTPRoute none of whose
+/// rules is served is not; its backends' shares closed are its unresolved references; a
+/// TCPRoute whose listener an older one serves stays accepted, as conformance has it.
 fn parent_conditions(parent: &ParentOutcome, said: &[&Problem]) -> Vec<Condition> {
     let not_accepted = said
         .iter()
-        .find(|p| matches!(p, Problem::NoRuleServed | Problem::TlsRouteRefused(_)));
+        .find(|p| matches!(p, Problem::NoRuleServed | Problem::RouteRefused(_)));
     let accepted = match parent.attached {
         Err(why) => {
             let reason = match why {

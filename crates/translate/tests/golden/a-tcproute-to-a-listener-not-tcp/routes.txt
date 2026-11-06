@@ -1,0 +1,2 @@
+HTTPRoute shop/pages: attached to http (shop.example.com)
+TCPRoute shop/db, section http: not attached: no listener it names takes its kind from its namespace

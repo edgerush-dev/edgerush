@@ -10,7 +10,7 @@
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 
 /// Each kind's CRD in `crds/`, the version read, and the module written from it.
-const KINDS: [(&str, &str, &str); 7] = [
+const KINDS: [(&str, &str, &str); 8] = [
     (
         "gateway.networking.k8s.io_gatewayclasses.yaml",
         "v1",
@@ -40,6 +40,11 @@ const KINDS: [(&str, &str, &str); 7] = [
         "gateway.networking.k8s.io_referencegrants.yaml",
         "v1",
         "reference_grant.rs",
+    ),
+    (
+        "gateway.networking.k8s.io_tcproutes.yaml",
+        "v1",
+        "tcp_route.rs",
     ),
     (
         "gateway.networking.k8s.io_tlsroutes.yaml",

@@ -1,0 +1,82 @@
+listeners:
+  port-8080:
+    address: 0.0.0.0:8080
+    protocol: http
+    forwarding:
+      trusted_proxies: []
+      trusted_only_headers:
+      - Forwarded
+      - X-Real-IP
+      - X-Forwarded-*
+    request_id: generate
+    proxy_protocol: 'off'
+  port-9300:
+    address: 0.0.0.0:9300
+    protocol: tcp
+    proxy_protocol: 'off'
+  port-9301:
+    address: 0.0.0.0:9301
+    protocol: tcp
+    proxy_protocol: 'off'
+  port-9302:
+    address: 0.0.0.0:9302
+    protocol: tcp
+    proxy_protocol: 'off'
+  port-9303:
+    address: 0.0.0.0:9303
+    protocol: tcp
+    proxy_protocol: 'off'
+routes: []
+tcp_routes:
+- name: tcproute/shop/elder/one
+  listeners:
+  - port-9300
+  backends:
+  - upstream: shop/db/postgres/tcp
+    weight: 1
+- name: tcproute/shop/by-both/three
+  listeners:
+  - port-9302
+  backends:
+  - upstream: shop/cache/redis
+    weight: 1
+- name: tcproute/shop/by-section/two
+  listeners:
+  - port-9301
+  backends:
+  - upstream: shop/db/postgres/tcp
+    weight: 1
+- name: tcproute/shop/weighted/weighted
+  listeners:
+  - port-9303
+  backends:
+  - upstream: shop/db/postgres/tcp
+    weight: 70
+  - upstream: shop/cache/redis
+    weight: 30
+  - upstream: other/vault/api
+    weight: 0
+  - invalid: Service shop/not-there does not exist
+    weight: 10
+  - invalid: a backend of kind /ConfigMap is not one translation reads
+    weight: 5
+  - invalid: Service other/secret is another namespace's, and no ReferenceGrant there lets TCPRoutes of
+      shop reach it
+    weight: 5
+tls_routes: []
+upstreams:
+  other/vault/api:
+    endpoints:
+      kubernetes: vault.other.svc.cluster.local:api
+    protocol: http1
+    load_balancer: p2c
+  shop/cache/redis:
+    endpoints:
+      kubernetes: cache.shop.svc.cluster.local:redis
+    protocol: http1
+    load_balancer: p2c
+  shop/db/postgres/tcp:
+    endpoints:
+      kubernetes: db.shop.svc.cluster.local:postgres
+    protocol: http1
+    load_balancer: p2c

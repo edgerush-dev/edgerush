@@ -344,6 +344,7 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
         http_routes: Some(vec![follow_of("httproutes in shop", false, vec![route])]),
         grpc_routes: None,
         tls_routes: None,
+        tcp_routes: None,
         reference_grants: None,
     };
     assert_eq!(gateway_api.served(), None, "a CRD not listed yet");
@@ -488,6 +489,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 200,
                 r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"api","namespace":"shop"},"spec":{"parentRefs":[{"name":"web","namespace":"edge"}],"hostnames":["api.example"],"rules":[{"backendRefs":[{"name":"api","port":8443}]}]}}]}"#,
             )
+        } else if named(GatewayKind::TCPRoute) {
+            page(&[crd(GatewayKind::TCPRoute, &["v1"])])
+        } else if path.starts_with(&format!("{gateway_api}tcproutes?")) {
+            answer(
+                200,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"db","namespace":"shop"},"spec":{"parentRefs":[{"name":"web","namespace":"edge"}],"rules":[{"backendRefs":[{"name":"db","port":5432}]}]}}]}"#,
+            )
         } else if path.starts_with(&format!("{gateway_api}listenersets?")) {
             answer(
                 200,
@@ -540,6 +548,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
              httproutes.gateway.networking.k8s.io: {httproutes}; \
              grpcroutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              tlsroutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
+             tcproutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              referencegrants.gateway.networking.k8s.io: not served at v1 (only v1beta1; Gateway API v1.7.0), \
              so taken as having no objects"
         )
@@ -555,7 +564,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
             .filter(|line| {
                 line.starts_with("waiting on ")
                     && line.contains(
-                        "gatewayclasses in the cluster, gateways in edge, listenersets in the cluster, httproutes in the cluster, grpcroutes in the cluster, tlsroutes in the cluster",
+                        "gatewayclasses in the cluster, gateways in edge, listenersets in the cluster, httproutes in the cluster, grpcroutes in the cluster, tlsroutes in the cluster, tcproutes in the cluster",
                     )
             })
             .count()
@@ -598,12 +607,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 );
                 let report: Vec<String> =
                     translation.report.iter().map(ToString::to_string).collect();
-                // Its backend is no Service the cluster has; the TLSRoute followed reaches
-                // translation, and the Gateway has no TLS listener to take it.
+                // Its backend is no Service the cluster has; the TLSRoute and the TCPRoute
+                // followed reach translation, and the Gateway has no listener to take either.
                 assert_eq!(
                     report,
                     [
                         "TLSRoute shop/api: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
+                        "TCPRoute shop/db: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
                         "GRPCRoute shop/calls: rule 0: a backend's share is answered UNAVAILABLE: Service shop/calls does not exist"
                     ]
                 );
@@ -629,6 +639,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                     .path
                     .starts_with("/apis/gateway.networking.k8s.io/v1/tlsroutes?")),
                 "TLSRoutes never listed"
+            );
+            // TCPRoutes likewise.
+            assert!(
+                fake.seen().iter().any(|seen| seen
+                    .path
+                    .starts_with("/apis/gateway.networking.k8s.io/v1/tcproutes?")),
+                "TCPRoutes never listed"
             );
             stage.store(1, Ordering::SeqCst);
             until("the CRD's deletion said", || {
@@ -1554,7 +1571,8 @@ spec:
   gatewayClassName: edgerush
   listeners:
     - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
-    - { name: tls, port: 8443, protocol: TLS, tls: { mode: Passthrough }, allowedRoutes: { namespaces: { from: All } } }",
+    - { name: tls, port: 8443, protocol: TLS, tls: { mode: Passthrough }, allowedRoutes: { namespaces: { from: All } } }
+    - { name: tcp, port: 5432, protocol: TCP, allowedRoutes: { namespaces: { from: All } } }",
     )
     .unwrap();
     let app: HTTPRoute = serde_saphyr::from_str(
@@ -1610,6 +1628,14 @@ spec:
   rules: [{ backendRefs: [{ name: web, port: 80 }] }]",
     )
     .unwrap();
+    // And a TCPRoute's.
+    let db: TCPRoute = serde_saphyr::from_str(
+        "metadata: { name: db, namespace: shop, generation: 6, resourceVersion: '12' }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: tcp }]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]",
+    )
+    .unwrap();
     let known = [
         "/apis/gateway.networking.k8s.io/v1/gatewayclasses/edgerush/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/edge/gateways/web/status",
@@ -1618,6 +1644,7 @@ spec:
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/grpcroutes/calls/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/grpcroutes/gone/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/tlsroutes/tunnel/status",
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/tcproutes/db/status",
     ];
     let fake = Fake::start_by_method(&["127.0.0.1"], move |method, path| {
         if method == "PUT" && known.contains(&path) {
@@ -1638,6 +1665,7 @@ spec:
         http_routes: vec![app.clone(), old.clone()],
         grpc_routes: vec![calls.clone(), gone.clone()],
         tls_routes: vec![tunnel.clone()],
+        tcp_routes: vec![db.clone()],
         ..Cluster::default()
     };
     let translation = translate(&gateway_plane(), &cluster);
@@ -1653,22 +1681,27 @@ spec:
             )
         })
         .collect();
-    let following =
-        |classes: Vec<GatewayClass>, gateways: Vec<Gateway>, routes, grpc_routes, tls_routes| {
-            GatewayApi {
-                crds: Vec::new(),
-                namespaces: Vec::new(),
-                namespace: Scope::Namespace("edge".to_owned()),
-                last: Some(served.clone()),
-                gateway_classes: Some(vec![follow_of("gatewayclasses", true, classes)]),
-                gateways: Some(vec![follow_of("gateways in edge", true, gateways)]),
-                listener_sets: None,
-                http_routes: Some(vec![follow_of("httproutes", true, routes)]),
-                grpc_routes: Some(vec![follow_of("grpcroutes", true, grpc_routes)]),
-                tls_routes: Some(vec![follow_of("tlsroutes", true, tls_routes)]),
-                reference_grants: None,
-            }
-        };
+    let following = |classes: Vec<GatewayClass>,
+                     gateways: Vec<Gateway>,
+                     routes,
+                     grpc_routes,
+                     tls_routes,
+                     tcp_routes| {
+        GatewayApi {
+            crds: Vec::new(),
+            namespaces: Vec::new(),
+            namespace: Scope::Namespace("edge".to_owned()),
+            last: Some(served.clone()),
+            gateway_classes: Some(vec![follow_of("gatewayclasses", true, classes)]),
+            gateways: Some(vec![follow_of("gateways in edge", true, gateways)]),
+            listener_sets: None,
+            http_routes: Some(vec![follow_of("httproutes", true, routes)]),
+            grpc_routes: Some(vec![follow_of("grpcroutes", true, grpc_routes)]),
+            tls_routes: Some(vec![follow_of("tlsroutes", true, tls_routes)]),
+            tcp_routes: Some(vec![follow_of("tcproutes", true, tcp_routes)]),
+            reference_grants: None,
+        }
+    };
     let heard: Rc<RefCell<Heard>> = Rc::default();
     let said = hear(&heard);
     let addresses = gateway_status::addresses(&[status::address("192.0.2.10")]);
@@ -1679,6 +1712,7 @@ spec:
         vec![app.clone(), old.clone()],
         vec![calls.clone(), gone.clone()],
         vec![tunnel.clone()],
+        vec![db.clone()],
     )
     .write_statuses(&api, &handed, &addresses, &programmed, &said)
     .await;
@@ -1692,6 +1726,7 @@ spec:
             "status of GRPCRoute shop/calls",
             "status of GRPCRoute shop/gone",
             "status of TLSRoute shop/tunnel",
+            "status of TCPRoute shop/db",
         ]
     );
     let bodies: Vec<serde_json::Value> = fake
@@ -1713,6 +1748,7 @@ spec:
     assert_eq!(status(1)["addresses"][0]["value"], "192.0.2.10");
     assert_eq!(status(1)["listeners"][0]["attachedRoutes"], 2);
     assert_eq!(status(1)["listeners"][1]["attachedRoutes"], 1);
+    assert_eq!(status(1)["listeners"][2]["attachedRoutes"], 1);
     assert_eq!(status(1)["conditions"][0]["observedGeneration"], 2);
     assert_eq!(
         status(2)["parents"][0]["controllerName"],
@@ -1755,9 +1791,19 @@ spec:
         status(6)["parents"][0]["conditions"][0]["observedGeneration"],
         5
     );
+    assert_eq!(
+        fake.seen()[7].path,
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/tcproutes/db/status"
+    );
+    assert_eq!(bodies[7]["kind"], "TCPRoute");
+    assert_eq!(status(7)["parents"][0]["parentRef"]["sectionName"], "tcp");
+    assert_eq!(
+        status(7)["parents"][0]["conditions"][0]["observedGeneration"],
+        6
+    );
     // Read back as written, every status says what it should: nothing more is written.
     let (mut class, mut gateway, mut app, mut old) = (class, gateway, app, old);
-    let (mut calls, mut gone, mut tunnel) = (calls, gone, tunnel);
+    let (mut calls, mut gone, mut tunnel, mut db) = (calls, gone, tunnel, db);
     class.status = serde_json::from_value(bodies[0]["status"].clone()).unwrap();
     gateway.status = serde_json::from_value(bodies[1]["status"].clone()).unwrap();
     app.status = serde_json::from_value(bodies[2]["status"].clone()).unwrap();
@@ -1765,16 +1811,18 @@ spec:
     calls.status = serde_json::from_value(bodies[4]["status"].clone()).unwrap();
     gone.status = serde_json::from_value(bodies[5]["status"].clone()).unwrap();
     tunnel.status = serde_json::from_value(bodies[6]["status"].clone()).unwrap();
+    db.status = serde_json::from_value(bodies[7]["status"].clone()).unwrap();
     following(
         vec![class],
         vec![gateway],
         vec![app, old],
         vec![calls, gone],
         vec![tunnel],
+        vec![db],
     )
     .write_statuses(&api, &handed, &addresses, &programmed, &said)
     .await;
-    assert_eq!(fake.seen().len(), 7, "a status written again");
+    assert_eq!(fake.seen().len(), 8, "a status written again");
 }
 
 #[test]
