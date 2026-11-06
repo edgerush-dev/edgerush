@@ -68,7 +68,9 @@ impl<S: BuildHasher, const PARTS: usize> KeySet<S, PARTS> {
         &mut self.parts[Self::part_of(hash)]
     }
 
-    /// The key of `name`, if held.
+    /// The key of `name`, if held: the tests' way in, the registry and handles hashing once
+    /// for [`get_hashed`](Self::get_hashed).
+    #[cfg(test)]
     pub(super) fn get(&self, name: &[u8]) -> Option<&Arc<Key>> {
         self.get_hashed(self.hash(name), name)
     }
