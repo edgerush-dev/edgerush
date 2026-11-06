@@ -1,0 +1,1 @@
+listener http: served on port-8080, taking HTTPRoute, GRPCRoute from namespace shop

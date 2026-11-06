@@ -1,0 +1,103 @@
+# BackendTLSPolicies over an Ingress's backends, as over a route's: a covered port reached
+# over TLS as the policy asks, the same upstream as the HTTPRoute's to it; a covered
+# kubernetes.io/wss port by the policy's CA and hostname in place of the data plane's
+# backend_authorities and the Service's name; a wss port no policy covers as ever; and a
+# path to a port whose policy fails, answered 500.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: pages, namespace: shop }
+spec:
+  parentRefs: [{ name: web }]
+  hostnames: [route.example.com]
+  rules:
+    - backendRefs: [{ name: web, port: 443 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 443 } } } }
+          - { path: /chat, pathType: Prefix, backend: { service: { name: chat, port: { name: wss } } } }
+          - { path: /plain-chat, pathType: Prefix, backend: { service: { name: plain-chat, port: { name: wss } } } }
+          - { path: /failing, pathType: Prefix, backend: { service: { name: failing, port: { number: 443 } } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: tls, namespace: shop }
+spec:
+  targetRefs:
+    - { group: "", kind: Service, name: web }
+    - { group: "", kind: Service, name: chat }
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+    hostname: web.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: failing, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: failing }]
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: not-there }]
+    hostname: failing.shop.example
+---
+# The test certificate of the Secret shop-tls, a CA of its own.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: ca, namespace: shop }
+data:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+    DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+    MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+    hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+    /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+    vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+    AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+    RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+    MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+    -----END CERTIFICATE-----
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: chat, namespace: shop }
+spec:
+  ports: [{ name: wss, port: 443, appProtocol: kubernetes.io/wss }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: plain-chat, namespace: shop }
+spec:
+  ports: [{ name: wss, port: 443, appProtocol: kubernetes.io/wss }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: failing, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]

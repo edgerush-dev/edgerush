@@ -1,0 +1,153 @@
+listeners:
+  port-8080:
+    address: 0.0.0.0:8080
+    protocol: http
+    forwarding:
+      trusted_proxies: []
+      trusted_only_headers:
+      - Forwarded
+      - X-Real-IP
+      - X-Forwarded-*
+    request_id: generate
+    proxy_protocol: 'off'
+routes:
+- name: httproute/shop/pages/http
+  listeners:
+  - port-8080
+  hostnames:
+  - name: shop.example.com
+    falls_through: false
+  rules:
+  - matches:
+    - path:
+        prefix: /admin
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/web/admin
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /other
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/other/https
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/web/https
+        weight: 1
+    rate_limits: []
+  rate_limits: []
+tcp_routes: []
+tls_routes: []
+upstreams:
+  shop/other/https:
+    endpoints:
+      kubernetes: other.shop.svc.cluster.local:https
+    protocol: http1
+    tls:
+      server_name: younger.shop.example
+      verified_names: []
+      authorities:
+      - '-----BEGIN CERTIFICATE-----
+
+        MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+
+        DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+
+        MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+
+        hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+
+        /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+
+        vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+
+        AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+
+        RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+
+        MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+
+        -----END CERTIFICATE-----
+
+        '
+    load_balancer: p2c
+  shop/web/admin:
+    endpoints:
+      kubernetes: web.shop.svc.cluster.local:admin
+    protocol: http1
+    tls:
+      server_name: sectioned.shop.example
+      verified_names: []
+      authorities:
+      - '-----BEGIN CERTIFICATE-----
+
+        MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+
+        DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+
+        MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+
+        hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+
+        /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+
+        vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+
+        AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+
+        RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+
+        MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+
+        -----END CERTIFICATE-----
+
+        '
+    load_balancer: p2c
+  shop/web/https:
+    endpoints:
+      kubernetes: web.shop.svc.cluster.local:https
+    protocol: http1
+    tls:
+      server_name: elder.shop.example
+      verified_names: []
+      authorities:
+      - '-----BEGIN CERTIFICATE-----
+
+        MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+
+        DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+
+        MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+
+        hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+
+        /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+
+        vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+
+        AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+
+        RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+
+        MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+
+        -----END CERTIFICATE-----
+
+        '
+    load_balancer: p2c

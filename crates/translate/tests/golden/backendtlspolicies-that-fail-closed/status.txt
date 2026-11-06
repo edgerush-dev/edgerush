@@ -1,0 +1,4 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener http: HTTPRoute, GRPCRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/pages, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+GRPCRoute shop/calls, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=False/BackendNotFound (Service shop/gone does not exist)

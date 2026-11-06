@@ -4,6 +4,7 @@
 //! own and its listener's met, its connections sent to the backends in proportion to their
 //! weights, an invalid backend's share closed, as the spec has it (Lucas).
 
+use crate::backend_tls::Policies;
 use crate::gateway::GatewayOutcome;
 use crate::http_route::{Reference, RouteOutcome, attachment_name, backends, claim};
 use crate::{Cluster, Plane, RefProblem, namespace};
@@ -32,6 +33,7 @@ pub(crate) fn translated(
     gateway: &GatewayOutcome,
     plane: &Plane,
     cluster: &Cluster,
+    policies: &Policies<'_>,
 ) -> Translated {
     let mut translated = Translated::default();
     let rules = &route.spec.rules;
@@ -64,6 +66,7 @@ pub(crate) fn translated(
         ("TLSRoute", route_namespace),
         plane,
         cluster,
+        policies,
         (&mut upstreams, &mut invalid),
     );
     for parent in &outcome.parents {

@@ -1,0 +1,170 @@
+listeners:
+  port-8080:
+    address: 0.0.0.0:8080
+    protocol: http
+    forwarding:
+      trusted_proxies: []
+      trusted_only_headers:
+      - Forwarded
+      - X-Real-IP
+      - X-Forwarded-*
+    request_id: generate
+    proxy_protocol: 'off'
+routes:
+- name: grpcroute/shop/calls/http
+  listeners:
+  - port-8080
+  hostnames:
+  - name: calls.example.com
+    falls_through: false
+  rules:
+  - matches:
+    - path:
+        prefix: /
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - invalid: 'Service shop/missing port https is covered by BackendTLSPolicy shop/missing, whose TLS
+          cannot be had: ConfigMap shop/not-there does not exist'
+        weight: 1
+      - invalid: Service shop/gone does not exist
+        weight: 1
+    rate_limits: []
+  rate_limits: []
+- name: httproute/shop/pages/http
+  listeners:
+  - port-8080
+  hostnames:
+  - name: shop.example.com
+    falls_through: false
+  rules:
+  - matches:
+    - path:
+        prefix: /missing
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - invalid: 'Service shop/missing port https is covered by BackendTLSPolicy shop/missing, whose TLS
+          cannot be had: ConfigMap shop/not-there does not exist'
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /keyless
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - invalid: 'Service shop/keyless port https is covered by BackendTLSPolicy shop/keyless, whose TLS
+          cannot be had: ConfigMap shop/keyless has no ca.crt'
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /malformed
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - invalid: 'Service shop/malformed port https is covered by BackendTLSPolicy shop/malformed, whose
+          TLS cannot be had: ConfigMap shop/malformed''s ca.crt is not PEM certificates'
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /secret
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - invalid: 'Service shop/secret port https is covered by BackendTLSPolicy shop/secret, whose TLS
+          cannot be had: a CA certificate ref to a Secret, where a ConfigMap is read'
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /half
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - invalid: 'Service shop/half port https is covered by BackendTLSPolicy shop/half, whose TLS cannot
+          be had: ConfigMap shop/not-there does not exist'
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /unknown
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - invalid: 'Service shop/unknown port https is covered by BackendTLSPolicy shop/unknown, whose TLS
+          cannot be had: wellKnownCACertificates example.com/roots is not one the gateway knows'
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /system
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - invalid: 'Service shop/system port https is covered by BackendTLSPolicy shop/system, whose TLS
+          cannot be had: the system''s CA certificates are not supported yet'
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /address
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - invalid: 'Service shop/address port https is covered by BackendTLSPolicy shop/address, whose TLS
+          cannot be had: hostname 10.0.0.1 is not a host name'
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /san
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - invalid: 'Service shop/san port https is covered by BackendTLSPolicy shop/san, whose TLS cannot
+          be had: subject alternative name "no scheme" is not a URI'
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/plain/https
+        weight: 1
+    rate_limits: []
+  rate_limits: []
+tcp_routes: []
+tls_routes: []
+upstreams:
+  shop/plain/https:
+    endpoints:
+      kubernetes: plain.shop.svc.cluster.local:https
+    protocol: http1
+    load_balancer: p2c

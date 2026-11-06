@@ -496,6 +496,8 @@ fn parent_conditions(parent: &ParentOutcome, said: &[&Problem]) -> Vec<Condition
             | Problem::ConnectionsClosed(why) => Some(why),
             _ => None,
         })
+        // A share a BackendTLSPolicy fails closed is resolved: the policy's status says why.
+        .filter(|problem| problem.reason != RefReason::FailedClosed)
         .collect();
     // The reason of the gravest, a grant missing first, as a listener says it; every one
     // in the message.

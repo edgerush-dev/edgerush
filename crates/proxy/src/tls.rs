@@ -465,22 +465,10 @@ fn authorities_of(source: &CompiledTls) -> Result<Option<Vec<X509>>, TlsError> {
 /// The certificates of the authorities trusted to vouch for clients or for an upstream's
 /// endpoints, read.
 pub(crate) fn authorities(pems: &[String]) -> Result<Vec<X509>, TlsError> {
-    let mut read = Vec::new();
-    for (index, pem) in pems.iter().enumerate() {
-        let certificates =
-            X509::stack_from_pem(pem.as_bytes()).map_err(|error| TlsError::Authority {
-                index,
-                reason: error.to_string(),
-            })?;
-        if certificates.is_empty() {
-            return Err(TlsError::Authority {
-                index,
-                reason: "no certificate in it".to_owned(),
-            });
-        }
-        read.extend(certificates);
-    }
-    Ok(read)
+    edgerush_certificates::authorities(pems).map_err(|error| TlsError::Authority {
+        index: error.index,
+        reason: error.reason,
+    })
 }
 
 /// Has a context refuse a client that does not show a certificate `authorities` vouch

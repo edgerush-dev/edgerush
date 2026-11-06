@@ -1,0 +1,2 @@
+listener http: served on port-8080, taking HTTPRoute, GRPCRoute from namespace shop
+listener raw: served on port-9000, taking TCPRoute from namespace shop

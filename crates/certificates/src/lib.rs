@@ -44,6 +44,41 @@ pub enum CertificateError {
     Mismatch,
 }
 
+/// Why the certificates of an authority to trust cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("authority {index}: not a PEM certificate: {reason}")]
+pub struct AuthorityError {
+    /// Its position among the authorities.
+    pub index: usize,
+    /// What was wrong with it.
+    pub reason: String,
+}
+
+/// Reads the certificates, in PEM, of authorities to trust, as the data plane reads them
+/// for its clients and its upstreams: each one certificate or more.
+///
+/// # Errors
+///
+/// An [`AuthorityError`] for the first that is not PEM certificates, or holds none.
+pub fn authorities(pems: &[String]) -> Result<Vec<X509>, AuthorityError> {
+    let mut read = Vec::new();
+    for (index, pem) in pems.iter().enumerate() {
+        let certificates =
+            X509::stack_from_pem(pem.as_bytes()).map_err(|error| AuthorityError {
+                index,
+                reason: error.to_string(),
+            })?;
+        if certificates.is_empty() {
+            return Err(AuthorityError {
+                index,
+                reason: "no certificate in it".to_owned(),
+            });
+        }
+        read.extend(certificates);
+    }
+    Ok(read)
+}
+
 impl Identity {
     /// Reads `certificate`.
     ///
@@ -213,5 +248,32 @@ mod tests {
         };
         assert_eq!(error(mismatched), Some(CertificateError::Mismatch));
         assert!(error(good).is_none());
+    }
+
+    /// Authorities are each one certificate or more, read together; the first that is not
+    /// PEM certificates, or holds none, is refused by its place among them.
+    #[test]
+    fn authorities_are_each_one_certificate_or_more() {
+        let one = certificate(&["a.test"]).chain;
+        let two = format!("{one}{}", certificate(&["b.test"]).chain);
+        assert_eq!(authorities(&[one.clone(), two]).unwrap().len(), 3);
+        for (unreadable, index) in [
+            (vec![one.clone(), "not a certificate".to_owned()], 1),
+            (vec![String::new()], 0),
+            (
+                vec![
+                    one.clone(),
+                    one,
+                    "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n"
+                        .to_owned(),
+                ],
+                2,
+            ),
+        ] {
+            assert_eq!(
+                authorities(&unreadable).err().map(|error| error.index),
+                Some(index)
+            );
+        }
     }
 }

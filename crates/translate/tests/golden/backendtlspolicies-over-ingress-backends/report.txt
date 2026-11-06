@@ -1,0 +1,2 @@
+BackendTLSPolicy shop/failing: the connections it covers fail: ConfigMap shop/not-there does not exist
+Ingress shop/web: path /failing (Prefix) on shop.example.com is answered 500: Service shop/failing port https is covered by BackendTLSPolicy shop/failing, whose TLS cannot be had: ConfigMap shop/not-there does not exist

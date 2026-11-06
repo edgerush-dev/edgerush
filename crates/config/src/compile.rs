@@ -2123,7 +2123,8 @@ const KEEPALIVE_FLOOR_SECONDS: u64 = 300;
 /// Whether `name` is a host name as a certificate names one: labels of letters, digits and
 /// hyphens, none empty, none starting or ending with a hyphen. No port, no wildcard, and
 /// not an address.
-fn is_host_name(name: &str) -> bool {
+#[must_use]
+pub fn is_host_name(name: &str) -> bool {
     let label = |label: &str| {
         !label.is_empty()
             && label.len() <= 63
@@ -2141,7 +2142,8 @@ fn is_host_name(name: &str) -> bool {
 
 /// Whether `name` is a DNS name a certificate can be checked for: a host name, or a
 /// wildcard of a whole leftmost label over a host name of at least two labels.
-fn is_dns_name(name: &str) -> bool {
+#[must_use]
+pub fn is_dns_name(name: &str) -> bool {
     match name.strip_prefix("*.") {
         Some(base) => base.contains('.') && is_host_name(base),
         None => is_host_name(name),
@@ -2150,7 +2152,8 @@ fn is_dns_name(name: &str) -> bool {
 
 /// Whether `uri` is a URI as a certificate carries one: a scheme (a letter, then letters,
 /// digits, `+`, `-` or `.`), a colon, and something after it, with no space or control.
-fn is_uri(uri: &str) -> bool {
+#[must_use]
+pub fn is_uri(uri: &str) -> bool {
     let Some((scheme, rest)) = uri.split_once(':') else {
         return false;
     };

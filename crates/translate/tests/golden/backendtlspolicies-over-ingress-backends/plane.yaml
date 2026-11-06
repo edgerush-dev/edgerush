@@ -1,7 +1,8 @@
-# The data plane, as the Gateway edge/web.
+# The data plane, as the Gateway shop/web, trusting one authority for TLS to backends.
 ingress_class: edge
-gateway: edge/web
+gateway: shop/web
 cluster_domain: cluster.local
 ingress_hosts_fall_through: false
 ingress_https_redirect: true
 ingress_https_redirect_max_age: 30
+backend_authorities: ["CA"]

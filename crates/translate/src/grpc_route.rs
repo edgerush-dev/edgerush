@@ -5,6 +5,7 @@
 //! take answering `UNAVAILABLE` for every call it matches, one whose matches cannot be built
 //! left out.
 
+use crate::backend_tls::Policies;
 use crate::gateway::GatewayOutcome;
 use crate::http_route::{
     Filtered, Reference, RouteOutcome, Translated, Written, answering, backends, config_routes,
@@ -29,6 +30,7 @@ pub(crate) fn translated(
     gateway: &GatewayOutcome,
     plane: &Plane,
     cluster: &Cluster,
+    policies: &Policies<'_>,
     refused: impl Fn(&Rule, &BTreeMap<String, Upstream>) -> Option<String>,
 ) -> Translated {
     let mut translated = Translated::default();
@@ -52,6 +54,7 @@ pub(crate) fn translated(
                 ("GRPCRoute", route_namespace),
                 plane,
                 cluster,
+                policies,
                 &mut upstreams,
                 &mut left_off,
             ),
@@ -81,6 +84,7 @@ pub(crate) fn translated(
                         ("GRPCRoute", route_namespace),
                         plane,
                         cluster,
+                        policies,
                         (&mut upstreams, &mut invalid),
                     ),
                     timeouts: None,

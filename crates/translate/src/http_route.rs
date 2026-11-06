@@ -7,6 +7,7 @@
 //! matches, one whose matches cannot be built left out; and every host a claim of one API
 //! takes from a claim of the other.
 
+use crate::backend_tls::Policies;
 use crate::gateway::{GatewayOutcome, ListenerOutcome};
 use crate::{Calls, Cluster, Object, Plane, RefProblem, RefReason, backend_upstream, namespace};
 use edgerush_config::{
@@ -632,6 +633,7 @@ pub(crate) fn translated(
     gateway: &GatewayOutcome,
     plane: &Plane,
     cluster: &Cluster,
+    policies: &Policies<'_>,
     refused: impl Fn(&Rule, &BTreeMap<String, Upstream>) -> Option<String>,
 ) -> Translated {
     let mut translated = Translated::default();
@@ -655,6 +657,7 @@ pub(crate) fn translated(
                 ("HTTPRoute", route_namespace),
                 plane,
                 cluster,
+                policies,
                 &mut upstreams,
                 &mut left_off,
             )
@@ -704,6 +707,7 @@ pub(crate) fn translated(
                         ("HTTPRoute", route_namespace),
                         plane,
                         cluster,
+                        policies,
                         (&mut upstreams, &mut invalid),
                     ),
                     timeouts: settings.timeouts.clone(),
@@ -1030,6 +1034,7 @@ pub(crate) fn filtered<'a>(
     route: (&str, &str),
     plane: &Plane,
     cluster: &Cluster,
+    policies: &Policies<'_>,
     upstreams: &mut BTreeMap<String, Upstream>,
     left_off: &mut Vec<RefProblem>,
 ) -> Result<Filtered, String> {
@@ -1040,7 +1045,7 @@ pub(crate) fn filtered<'a>(
             Written::Done(filter) => filters.push(filter),
             Written::Redirect(written) => redirect = Some(written),
             Written::Mirror(reference, fraction) => {
-                match backend(&reference, route, plane, cluster) {
+                match backend(&reference, route, plane, cluster, policies) {
                     Ok((name, upstream)) => {
                         upstreams.insert(name.clone(), upstream);
                         filters.push(Filter::RequestMirror(Mirror {
@@ -1299,13 +1304,14 @@ pub(crate) fn backends<'a>(
     route: (&str, &str),
     plane: &Plane,
     cluster: &Cluster,
+    policies: &Policies<'_>,
     (upstreams, invalid): (&mut BTreeMap<String, Upstream>, &mut Vec<RefProblem>),
 ) -> Vec<Backend> {
     let mut backends = Vec::new();
     for (weight, reference) in written {
         // The schema holds a weight to 0–1,000,000.
         let weight = u32::try_from(weight).unwrap_or_default();
-        match backend(&reference, route, plane, cluster) {
+        match backend(&reference, route, plane, cluster, policies) {
             Ok((name, upstream)) => {
                 upstreams.insert(name.clone(), upstream);
                 backends.push(Backend {
@@ -1376,6 +1382,7 @@ fn backend(
     (route_kind, route_namespace): (&str, &str),
     plane: &Plane,
     cluster: &Cluster,
+    policies: &Policies<'_>,
 ) -> Result<(String, Upstream), RefProblem> {
     if !(written.group.is_empty() && written.kind == "Service") {
         return Err(RefProblem {
@@ -1417,7 +1424,14 @@ fn backend(
         "TLSRoute" | "TCPRoute" => Calls::Tunnel,
         _ => Calls::Http,
     };
-    match backend_upstream(plane, cluster, namespace, &reference, (calls, false)) {
+    match backend_upstream(
+        plane,
+        cluster,
+        policies,
+        namespace,
+        &reference,
+        (calls, false),
+    ) {
         Ok(Ok(found)) => Ok(found),
         Ok(Err(missing)) => Err(missing),
         Err(problem) => Err(RefProblem {

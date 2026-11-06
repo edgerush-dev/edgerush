@@ -29,6 +29,7 @@
 //! answering 500 by itself, one whose matches cannot be built left out.
 //! Every host a claim of one API takes from the other's is said.
 
+use backend_tls::{Outcome, Policies};
 use edgerush_certificates::Identity;
 use edgerush_config::{
     Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, GrpcMethod, Header,
@@ -56,6 +57,7 @@ use std::collections::BTreeSet;
 use std::collections::btree_map::Entry;
 use std::fmt;
 
+mod backend_tls;
 pub mod gateway;
 mod grpc_route;
 pub mod http_route;
@@ -602,6 +604,10 @@ pub enum RefReason {
     /// Of something translation does not take, such as an ExternalName Service
     /// (`UnsupportedValue`, a reason of the controller's own).
     Unsupported,
+    /// Resolved, and covered by a BackendTLSPolicy whose TLS cannot be had: its connections
+    /// fail closed. Said, and never the route's `ResolvedRefs`, as the policy's own status
+    /// says why.
+    FailedClosed,
 }
 
 /// A reference that cannot be followed, and why.
@@ -768,6 +774,26 @@ pub enum Problem {
     /// as the spec has it (`ResolvedRefs` false).
     #[error("a backend's share of connections is closed: {0}")]
     ConnectionsClosed(RefProblem),
+    /// A BackendTLSPolicy's target that another, which comes first, covers.
+    #[error("covers nothing of {target}: {by} covers it, and comes first")]
+    PolicyConflicted {
+        /// The target, as it is written.
+        target: String,
+        /// The policy that covers it.
+        by: Object,
+    },
+    /// A BackendTLSPolicy's target that is not there, or not a Service.
+    #[error("covers nothing of {target}: {why}")]
+    PolicyTargetNotFound {
+        /// The target, as it is written.
+        target: String,
+        /// Why.
+        why: String,
+    },
+    /// A BackendTLSPolicy whose TLS cannot be had, so that what it covers fails its
+    /// connections.
+    #[error("the connections it covers fail: {0}")]
+    PolicyFailing(String),
     /// A TLSRoute's hostname on a data-plane listener that an earlier TLSRoute has there
     /// too: the earlier serves it, as the one rule ranks them (04 §2).
     #[error("{hostname} on {listener} is served by {by}, which comes first")]
@@ -887,14 +913,44 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             }
         }
     }
-    // BackendTLSPolicies are followed and not translated yet: each is said, where the data
-    // plane is a Gateway.
-    if gateway.is_some() {
-        for policy in &cluster.backend_tls_policies {
+    // Each BackendTLSPolicy chosen where it covers, before any backend is translated; what
+    // keeps one from covering, or what it asks from being had, is said.
+    let policies = Policies::of(cluster);
+    for outcome in &policies.outcomes {
+        let object = Object::of("BackendTLSPolicy", &outcome.policy.metadata);
+        let mut say = |problem| {
             report.push(Finding {
-                object: Object::of("BackendTLSPolicy", &policy.metadata),
-                problem: Problem::NotSupportedYet("BackendTLSPolicy"),
+                object: object.clone(),
+                problem,
             });
+        };
+        for (target, came_to) in &outcome.targets {
+            match came_to {
+                backend_tls::Target::Covers => {}
+                backend_tls::Target::Conflicted(by) => say(Problem::PolicyConflicted {
+                    target: target.clone(),
+                    by: by.clone(),
+                }),
+                backend_tls::Target::NotFound(why) => say(Problem::PolicyTargetNotFound {
+                    target: target.clone(),
+                    why: why.clone(),
+                }),
+            }
+        }
+        match &outcome.asked {
+            Ok(_) => {}
+            Err(_)
+                if outcome
+                    .policy
+                    .spec
+                    .validation
+                    .well_known_ca_certificates
+                    .is_some()
+                    && outcome.invalid.is_none() =>
+            {
+                say(Problem::NotSupportedYet("the system's CA certificates"));
+            }
+            Err(why) => say(Problem::PolicyFailing(why.clone())),
         }
     }
     // An Ingress is the data plane's when its class is, and its class is when the
@@ -980,7 +1036,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     for ingress in ingresses {
         let object = || Object::of("Ingress", &ingress.metadata);
         let dated = ingress.metadata.creation_timestamp.is_some();
-        let translated = match ingress_routes(plane, cluster, &bound, ingress) {
+        let translated = match ingress_routes(plane, cluster, &policies, &bound, ingress) {
             Ok(translated) => translated,
             Err(problem) => {
                 report.push(Finding {
@@ -1251,6 +1307,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 gateway,
                 plane,
                 cluster,
+                &policies,
                 |rule, upstreams| refused("httproute", rule, upstreams),
             );
             rules_said(
@@ -1286,6 +1343,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 gateway,
                 plane,
                 cluster,
+                &policies,
                 |rule, upstreams| refused("grpcroute", rule, upstreams),
             );
             let rules = route.spec.rules.as_ref().map_or(0, Vec::len);
@@ -1318,7 +1376,8 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             else {
                 continue;
             };
-            let translated = tls_route::translated(route, outcome, gateway, plane, cluster);
+            let translated =
+                tls_route::translated(route, outcome, gateway, plane, cluster, &policies);
             if let Some(why) = translated.refused {
                 report.push(Finding {
                     object: outcome.route.clone(),
@@ -1383,7 +1442,8 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             else {
                 continue;
             };
-            let translated = tcp_route::translated(route, outcome, gateway, plane, cluster);
+            let translated =
+                tcp_route::translated(route, outcome, gateway, plane, cluster, &policies);
             if let Some(why) = translated.refused {
                 report.push(Finding {
                     object: outcome.route.clone(),
@@ -2270,6 +2330,7 @@ struct IngressRoutes {
 fn ingress_routes(
     plane: &Plane,
     cluster: &Cluster,
+    policies: &Policies<'_>,
     bound: &BTreeMap<String, Listener>,
     ingress: &Ingress,
 ) -> Result<IngressRoutes, Problem> {
@@ -2364,6 +2425,7 @@ fn ingress_routes(
             match backend_upstream(
                 plane,
                 cluster,
+                policies,
                 namespace,
                 backend,
                 (Calls::Http, service_upstream),
@@ -2664,6 +2726,7 @@ pub(crate) enum Calls {
 fn backend_upstream(
     plane: &Plane,
     cluster: &Cluster,
+    policies: &Policies<'_>,
     namespace: &str,
     backend: &IngressBackend,
     (calls, by_address): (Calls, bool),
@@ -2673,6 +2736,7 @@ fn backend_upstream(
     };
     let ServicePort {
         label: port,
+        name: port_name,
         number,
         app_protocol,
         headless,
@@ -2682,13 +2746,43 @@ fn backend_upstream(
     };
     let service = &backend.name;
     let host = format!("{service}.{namespace}.svc.{}", plane.cluster_domain);
+    // A TLSRoute's or a TCPRoute's connections are carried as they come: no policy covers
+    // them (04 §2). A policy whose TLS cannot be had fails the connections it covers, never
+    // leaving them in the clear; its own status says why, not the route's.
+    let policy = policies.covering(namespace, service, port_name);
+    let covered = match (calls, policy) {
+        (Calls::Tunnel, _) | (_, None) => None,
+        (_, Some(Outcome { asked: Ok(tls), .. })) => Some(tls),
+        (
+            _,
+            Some(Outcome {
+                asked: Err(why),
+                policy,
+                ..
+            }),
+        ) => {
+            return Ok(Err(RefProblem::new(
+                RefReason::FailedClosed,
+                format!(
+                    "Service {namespace}/{service} port {port} is covered by {}, whose TLS \
+                     cannot be had: {why}",
+                    Object::of("BackendTLSPolicy", &policy.metadata)
+                ),
+            )));
+        }
+    };
     // HTTP/2 in the clear for a port of no `appProtocol` is named apart from the HTTP/1.1
     // upstream an HTTPRoute or an Ingress reaches the same port by.
     let mut apart = false;
     let mut tunnel_apart = false;
     let (protocol, tls) = match (calls, app_protocol) {
         // Named apart from the HTTP upstream of the same port wherever that one speaks
-        // HTTP/2 or TLS, or the port says a protocol HTTP routes cannot reach it by.
+        // HTTP/2 or TLS, or the port says a protocol HTTP routes cannot reach it by: a
+        // policy's TLS among them.
+        (Calls::Tunnel, None | Some("kubernetes.io/ws")) if policy.is_some() => {
+            tunnel_apart = true;
+            (UpstreamProtocol::Http1, None)
+        }
         (Calls::Tunnel, None | Some("kubernetes.io/ws")) => (UpstreamProtocol::Http1, None),
         (Calls::Tunnel, Some(_)) => {
             tunnel_apart = true;
@@ -2715,7 +2809,9 @@ fn backend_upstream(
         (Calls::Http, app_protocol) => match app_protocol {
             None | Some("kubernetes.io/ws") => (UpstreamProtocol::Http1, None),
             Some("kubernetes.io/h2c") => (UpstreamProtocol::Http2, None),
-            Some("kubernetes.io/wss") if plane.backend_authorities.is_empty() => {
+            Some("kubernetes.io/wss")
+                if plane.backend_authorities.is_empty() && covered.is_none() =>
+            {
                 return Ok(Err(RefProblem::new(
                     RefReason::UnsupportedProtocol,
                     format!(
@@ -2749,6 +2845,9 @@ fn backend_upstream(
             }
         },
     };
+    // A policy's TLS in place of none, or of the data plane's `backend_authorities` and the
+    // Service's name over a `wss` port: the protocol is still the port's and the route's.
+    let tls = covered.cloned().or(tls);
     // A headless Service's name resolves to its pods, which listen on their own ports, not
     // the Service's.
     if by_address && headless {
@@ -2772,7 +2871,7 @@ fn backend_upstream(
         )
     };
     if apart {
-        name.push_str("/h2c");
+        name.push_str(if tls.is_some() { "/h2" } else { "/h2c" });
     }
     if tunnel_apart {
         name.push_str("/tcp");
@@ -2795,6 +2894,8 @@ struct ServicePort<'a> {
     /// As EndpointSlices know it: its name, or, for a Service's only port left unnamed, its
     /// number (03 §6).
     label: String,
+    /// Its name, if it has one.
+    name: Option<&'a str>,
     /// Its number, which the Service's cluster IP is reached on.
     number: i32,
     /// Its `appProtocol`.
@@ -2864,6 +2965,7 @@ fn service_port<'a>(
     };
     Ok(Ok(ServicePort {
         label: name,
+        name: port.name.as_deref().filter(|name| !name.is_empty()),
         number: port.port,
         app_protocol: port.app_protocol.as_deref(),
         headless: spec.and_then(|spec| spec.cluster_ip.as_deref()) == Some("None"),

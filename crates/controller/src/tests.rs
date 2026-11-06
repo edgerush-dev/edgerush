@@ -623,13 +623,16 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 let report: Vec<String> =
                     translation.report.iter().map(ToString::to_string).collect();
                 // Its backend is no Service the cluster has; the TLSRoute and the TCPRoute
-                // followed reach translation, and the Gateway has no listener to take either.
+                // followed reach translation, and the Gateway has no listener to take either;
+                // the BackendTLSPolicy and the ConfigMap it names reach it too, the CA read
+                // and found no certificate, so that the HTTPRoute's backend fails closed.
                 assert_eq!(
                     report,
                     [
                         "TLSRoute shop/api: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
                         "TCPRoute shop/db: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
-                        "BackendTLSPolicy shop/tls: not supported yet: BackendTLSPolicy",
+                        "BackendTLSPolicy shop/tls: the connections it covers fail: ConfigMap shop/ca's ca.crt is not PEM certificates",
+                        "HTTPRoute shop/web: rule 0: a backend's share is answered 500: Service shop/web port http is covered by BackendTLSPolicy shop/tls, whose TLS cannot be had: ConfigMap shop/ca's ca.crt is not PEM certificates",
                         "GRPCRoute shop/calls: rule 0: a backend's share is answered UNAVAILABLE: Service shop/calls does not exist"
                     ]
                 );
