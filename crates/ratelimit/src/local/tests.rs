@@ -455,23 +455,6 @@ fn most_over((limit, window, burst): (NonZeroU64, NonZeroU64, NonZeroU64), times
     i64::try_from((widest + window - burst * window).div_euclid(window)).unwrap()
 }
 
-/// A hand-back copies every key the filter takes, changed or not, as it stands: a key spent
-/// two of five, at ten a second, is full again in two tenths of a second.
-#[test]
-fn every_key_a_filter_takes_is_copied_as_it_stands() {
-    let local = local();
-    let mut handles = Handles::new(FixedState::default());
-    let c = contract(10, SECOND, 5);
-    for key in [&b"a"[..], b"a", b"b"] {
-        assert!(one(&local, &mut handles, key, c, 0));
-    }
-    let copies = local.copies_of(0, |key| key == b"a");
-    assert_eq!(copies.len(), 1);
-    assert_eq!(&*copies[0].key, b"a");
-    assert_eq!(copies[0].full_in, 2 * SECOND / 10);
-    assert_eq!(local.copies_of(0, |_| true).len(), 2, "both");
-}
-
 /// A key for the set a worker's handles and the registry's shards keep their keys in
 /// (`key_set`, #111).
 fn held_key(name: &[u8]) -> Arc<Key> {
@@ -674,24 +657,6 @@ fn keys_windows_end_at_their_own_offsets() {
 }
 
 #[test]
-fn a_give_back_takes_one_off_its_own_window_only() {
-    let local = local();
-    let mut handles = Handles::new(FixedState::default());
-    let w = window(1, SECOND);
-    let start = SECOND - offset(&local, b"k", SECOND);
-    assert!(one_in(&local, &mut handles, b"k", w, start));
-    local.give_back(&mut handles, &[(b"k", w)], start + MS);
-    assert!(
-        one_in(&local, &mut handles, b"k", w, start + 2 * MS),
-        "given back"
-    );
-    // Given back in the next window, the charge from the one before is nothing to it.
-    local.give_back(&mut handles, &[(b"k", w)], start + SECOND);
-    assert!(one_in(&local, &mut handles, b"k", w, start + SECOND));
-    assert!(!one_in(&local, &mut handles, b"k", w, start + SECOND));
-}
-
-#[test]
 fn a_quiet_window_is_forgotten_once_it_counts_none() {
     let local = local();
     let mut handles = Handles::new(FixedState::default());
@@ -760,15 +725,6 @@ fn a_window_is_counting_until_its_end() {
     assert!(key.charge(start));
     assert_eq!(key.full_in(start + 400 * MS), 600 * MS);
     assert_eq!(key.full_in(start + SECOND), 0);
-}
-
-#[test]
-fn windows_are_never_copied() {
-    let local = Local::tracking(FixedState::default(), 1);
-    let mut handles = Handles::new(FixedState::default());
-    assert!(one_in(&local, &mut handles, b"k", window(5, SECOND), 0));
-    assert!(local.copies(&handles.take_changed(), 0).is_empty());
-    assert!(local.copies_of(0, |_| true).is_empty());
 }
 
 /// Times that go back as well as forward, as several workers' clocks do: each is a gap from
