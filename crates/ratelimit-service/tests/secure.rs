@@ -19,7 +19,6 @@ use edgerush_ratelimit_service::cluster::pod::{StorePod, StoreServer};
 use edgerush_ratelimit_service::grpc::{Client, Error, Server};
 use edgerush_ratelimit_service::pod::{Pod, Timing};
 use edgerush_ratelimit_service::secure::{self, Caller, PodCredentials, PodTls};
-use edgerush_ratelimit_service::synchronous::{self, SyncPod, SyncServer};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -363,8 +362,6 @@ where
 const EXCHANGE: &str = "/edgerush.ratelimit.v1.RateLimit/Exchange";
 const REPLICATE: &str = "/edgerush.ratelimit.v1.RateLimit/Replicate";
 const HEARTBEAT: &str = "/edgerush.ratelimit.v1.RateLimit/Heartbeat";
-const DECIDE: &str = "/edgerush.ratelimit.v1.RateLimit/Decide";
-const COPY: &str = "/edgerush.ratelimit.v1.RateLimit/Copy";
 const STORE_DECIDE: &str = "/edgerush.cluster.v1.Cluster/Decide";
 const STORE_PEER: &str = "/edgerush.cluster.v1.Cluster/Peer";
 const STORE_COPY: &str = "/edgerush.cluster.v1.Cluster/Copy";
@@ -382,15 +379,6 @@ async fn each_mode_lets_each_caller_call_only_its_own_methods() {
         BTreeMap::new(),
     );
     let mut server = Server::new(pod);
-    let sync = SyncPod::spawn(
-        0,
-        vec![0],
-        1,
-        synchronous::Timing::with_copy(Duration::from_millis(10)),
-        BTreeMap::new(),
-    )
-    .unwrap();
-    let mut sync_server = SyncServer::new(sync);
     for (path, allowed) in [
         (EXCHANGE, Caller::DataPlane),
         (REPLICATE, Caller::Pod),
@@ -406,25 +394,6 @@ async fn each_mode_lets_each_caller_call_only_its_own_methods() {
         }
         // Served plain, a request says no caller, and anyone may call anything.
         assert_ne!(refusal(&mut server, path, None).await, denied, "{path}");
-    }
-    for (path, allowed) in [
-        (DECIDE, Caller::DataPlane),
-        (COPY, Caller::Pod),
-        (HEARTBEAT, Caller::Pod),
-    ] {
-        for caller in [Caller::DataPlane, Caller::Pod] {
-            let refused = refusal(&mut sync_server, path, Some(caller)).await;
-            assert_eq!(
-                refused == denied,
-                caller != allowed,
-                "{path} from {caller:?}"
-            );
-        }
-        assert_ne!(
-            refusal(&mut sync_server, path, None).await,
-            denied,
-            "{path}"
-        );
     }
     // The store's: the data planes' stream theirs, every other method the pods'.
     let store = StorePod::spawn(

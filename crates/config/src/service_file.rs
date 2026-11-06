@@ -1,9 +1,9 @@
 //! What a pod of the rate-limiting service reads from its config file
 //! ([06 §4](../../../docs/06-rate-limiting.md)): the mode it serves, the pod itself, the pods
-//! it agrees with, the store's settings, what its keys may hold and the files its mutual TLS
-//! is read from. Each
-//! setting left out has its value, which the service gives it; the service checks what the
-//! types cannot, such as a pod's timings against each other.
+//! it agrees with in the asynchronous mode, the store's settings, what its keys may hold and
+//! the files its mutual TLS is read from. Each setting left out has its value, which the
+//! service gives it; the service checks what the types cannot, such as a pod's timings
+//! against each other, and what each mode needs and does not read.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -25,10 +25,12 @@ pub struct ServiceFile {
     pub mode: Option<ServiceMode>,
     /// The pod itself.
     pub pod: ServicePod,
-    /// The pods among which a majority agrees which of them serve.
-    pub membership: ServiceMembership,
+    /// The pods among which a majority agrees which of them serve: needed by the
+    /// asynchronous mode, and refused by the synchronous one, which runs on the store.
+    #[serde(default)]
+    pub membership: Option<ServiceMembership>,
     /// The store's settings, which every pod of a cluster is to share; left out, the pod has
-    /// none. Nothing runs the store from them yet.
+    /// none. The synchronous mode runs on them, and needs them.
     #[serde(default)]
     pub store: Option<ServiceStore>,
     /// What the pod's keys may hold; left out, each has its value.
@@ -57,8 +59,11 @@ pub enum ServiceMode {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ServicePod {
-    /// Which of the `membership`'s pods this one is.
-    pub id: u32,
+    /// Which of the `membership`'s pods this one is: needed by the asynchronous mode, and
+    /// refused by the synchronous one, where a pod takes a member id of its own each time it
+    /// starts.
+    #[serde(default)]
+    pub id: Option<u32>,
     /// Where it serves data planes and the other pods, `host:port`.
     pub listen: SocketAddr,
     /// Where the other pods reach it, `host:port`, as it tells them in its hellos and as it
@@ -70,9 +75,8 @@ pub struct ServicePod {
     /// left out.
     #[serde(default)]
     pub metrics: Option<SocketAddr>,
-    /// Milliseconds of a cycle: in the asynchronous mode the data planes', and in the
-    /// synchronous mode the pod's own, between its copies of what changed. 10 when left
-    /// out.
+    /// Milliseconds of the data planes' cycle, in the asynchronous mode alone (the
+    /// synchronous mode's store has `store.cycle_ms`). 10 when left out.
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub cycle_ms: Option<u64>,
@@ -236,17 +240,17 @@ tls:
             ServiceFile {
                 mode: Some(ServiceMode::Synchronous),
                 pod: ServicePod {
-                    id: 1,
+                    id: Some(1),
                     listen: "0.0.0.0:7000".parse().unwrap(),
                     address: Some("rl-1:7000".to_owned()),
                     metrics: Some("0.0.0.0:9090".parse().unwrap()),
                     cycle_ms: Some(5),
                 },
-                membership: ServiceMembership {
+                membership: Some(ServiceMembership {
                     pods: [(0, "rl-0:7000".to_owned()), (1, "rl-1:7000".to_owned())].into(),
                     silence_ms: Some(2_000),
                     stop_serving_ms: Some(1_000),
-                },
+                }),
                 store: Some(ServiceStore {
                     seeds: vec!["rl-0:7000".to_owned(), "rl-2:7000".to_owned()],
                     shards: Some(64),
@@ -277,14 +281,18 @@ tls:
         assert_eq!(file.mode, None);
         assert_eq!((file.pod.metrics, file.pod.cycle_ms), (None, None));
         assert_eq!((file.pod.address, file.store), (None, None));
+        let membership = file.membership.unwrap();
         assert_eq!(
-            (file.membership.silence_ms, file.membership.stop_serving_ms),
+            (membership.silence_ms, membership.stop_serving_ms),
             (None, None)
         );
         assert_eq!(file.keys, ServiceKeys::default());
         assert_eq!(file.tls, None);
         let file = read(&format!("{LEAST}store: {{}}\n")).unwrap();
         assert_eq!(file.store, Some(ServiceStore::default()));
+        // The pod's id and the membership too: which mode needs them the service says.
+        let file = read("pod: { listen: 0.0.0.0:7000 }\n").unwrap();
+        assert_eq!((file.pod.id, file.membership), (None, None));
     }
 
     #[test]
@@ -295,10 +303,9 @@ tls:
             "pod: { id: 0, listen: 0.0.0.0:7000, port: 7000 }\nmembership: { pods: { 0: rl-0:7000 } }\n".to_owned(),
             // A mode the service does not serve.
             format!("{LEAST}mode: local\n"),
-            // The pod, or the pods it agrees with, not said.
+            // The pod, or where it listens, not said.
             "membership: { pods: { 0: rl-0:7000 } }\n".to_owned(),
-            "pod: { id: 0, listen: 0.0.0.0:7000 }\n".to_owned(),
-            "pod: { listen: 0.0.0.0:7000 }\nmembership: { pods: { 0: rl-0:7000 } }\n".to_owned(),
+            "pod: { id: 0 }\nmembership: { pods: { 0: rl-0:7000 } }\n".to_owned(),
             // Not an address.
             "pod: { id: 0, listen: nowhere }\nmembership: { pods: { 0: rl-0:7000 } }\n".to_owned(),
             // The store's: one it does not know, the control plane's own, a count of shards

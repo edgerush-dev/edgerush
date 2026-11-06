@@ -9,13 +9,10 @@
 //! - [`pod`]: a service pod running, on real time.
 //! - [`scrape`]: its metrics, at `/metrics`.
 //! - [`secure`]: mutual TLS, and who may call what.
-//! - [`synchronous`]: the synchronous mode's pod, apart from all of the above but the
-//!   codec, the view and the heartbeats it shares.
 
 pub mod cluster;
 pub mod grpc;
 pub mod pod;
 pub mod scrape;
 pub mod secure;
-pub mod synchronous;
 pub mod wire;

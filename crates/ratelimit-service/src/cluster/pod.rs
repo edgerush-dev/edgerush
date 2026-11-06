@@ -27,7 +27,7 @@
 //! planes'.
 
 use super::link::{
-    self, CONTROL, Counts, DECIDE, Dial, Dropped, GREET, HELLO, Link, SERVICE, Tasks,
+    self, CONTROL, Counts, DECIDE, Dial, Dropped, GREET, HELLO, Link, Received, SERVICE, Tasks,
 };
 use super::wire::{
     self, Asking, Empty, Hello, Invalid, Joining, Outgoing, Piece, Synchronous, Telling, ToCopy,
@@ -35,7 +35,6 @@ use super::wire::{
 };
 use crate::grpc::{Boxed, Client, MAX_MESSAGE, Prost, limited};
 use crate::secure::{Caller, refused};
-use crate::synchronous::Received;
 use edgerush_cluster::{Config, Message, Node, NodeId, Stamp, Time};
 use edgerush_cluster_synchronous::{Message as ModeMessage, Outbox, Pod, Value as SyncValue};
 use http::uri::PathAndQuery;

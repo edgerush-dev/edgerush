@@ -53,12 +53,12 @@ change takes over without dropping a request.
   mode, `off` (limits checked, none enforced) unless it says otherwise:
   - `local`: each proxy process limits on what it sees, with no service to run.
   - `synchronous`: the key's owner in the rate-limiting service
-    (`edgerush-ratelimit-service`, its file saying `mode: synchronous`, three pods or more,
-    optionally over mutual TLS) decides every request, its key hashed under a secret every
+    (`edgerush-ratelimit-service`, its file saying `mode: synchronous`, its pods forming a
+    cluster store, optionally over mutual TLS) decides every request, its key hashed under a secret every
     data plane shares (`service.key_secret`). A request waits for its owner at most a stated
     time, and what happens while an owner is out of reach is stated too: allow, deny, or
-    the data plane's own buckets until it answers. The pods copy their keys to one
-    another, so a pod's keys carry on when it leaves.
+    the data plane's own buckets until it answers. Each key's owner copies it to the key's
+    replicas, so a pod's keys carry on when it leaves.
   - `asynchronous`: each process decides every request from its own copy of each key,
     waiting on no one, and shares what it admitted through the service every cycle; a
     burst on a key it has not heard of yet may overshoot a little.
@@ -359,16 +359,16 @@ crates/kubernetes  EdgeRush's client of the Kubernetes API (`edgerush-kubernetes
 crates/ratelimit   rate limiting (`edgerush-ratelimit`): pure, no I/O; the admission models as
                    reference implementations behind one interface, an example that runs the same
                    clients through each (`cargo run -p edgerush-ratelimit --example timelines`),
-                   local mode's limiter, the synchronous mode's owner, and the asynchronous
-                   mode's protocol as two state machines
+                   local mode's limiter, and the asynchronous mode's protocol as two state
+                   machines
 crates/ratelimit-sim
                    the rate-limit simulator (`edgerush-ratelimit-sim`): ways of limiting one key
                    across pods run against the contract, deterministic, no I/O; side by side
                    with `cargo run --release -p edgerush-ratelimit-sim --example compare`
 crates/ratelimit-service
                    the rate-limiting service (`edgerush-ratelimit-service`): service pods, in the
-                   synchronous or the asynchronous mode, over gRPC, the asynchronous mode's client,
-                   and the `edgerush-ratelimit-service` binary
+                   synchronous mode on the cluster store or the asynchronous mode, over gRPC, the
+                   asynchronous mode's client, and the `edgerush-ratelimit-service` binary
 crates/proxy       the data plane (`edgerush-proxy`): listeners, TLS, our HTTP/1 server and client,
                    HTTP/2 on h2, HTTP/3 on quiche, upstream pools and the request core between them,
                    and each rate-limiting mode's side of the data plane

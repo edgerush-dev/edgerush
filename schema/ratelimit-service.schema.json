@@ -9,8 +9,15 @@
       "$ref": "#/$defs/ServiceKeys"
     },
     "membership": {
-      "description": "The pods among which a majority agrees which of them serve.",
-      "$ref": "#/$defs/ServiceMembership"
+      "description": "The pods among which a majority agrees which of them serve: needed by the\nasynchronous mode, and refused by the synchronous one, which runs on the store.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ServiceMembership"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "mode": {
       "description": "The rate-limiting mode the pod serves: a pod serves one. Asynchronous when left out.",
@@ -28,7 +35,7 @@
       "$ref": "#/$defs/ServicePod"
     },
     "store": {
-      "description": "The store's settings, which every pod of a cluster is to share; left out, the pod has\nnone. Nothing runs the store from them yet.",
+      "description": "The store's settings, which every pod of a cluster is to share; left out, the pod has\nnone. The synchronous mode runs on them, and needs them.",
       "anyOf": [
         {
           "$ref": "#/$defs/ServiceStore"
@@ -52,8 +59,7 @@
   },
   "additionalProperties": false,
   "required": [
-    "pod",
-    "membership"
+    "pod"
   ],
   "$defs": {
     "ServiceKeys": {
@@ -141,7 +147,7 @@
           "default": null
         },
         "cycle_ms": {
-          "description": "Milliseconds of a cycle: in the asynchronous mode the data planes', and in the\nsynchronous mode the pod's own, between its copies of what changed. 10 when left\nout.",
+          "description": "Milliseconds of the data planes' cycle, in the asynchronous mode alone (the\nsynchronous mode's store has `store.cycle_ms`). 10 when left out.",
           "type": [
             "integer",
             "null"
@@ -151,9 +157,13 @@
           "minimum": 1
         },
         "id": {
-          "description": "Which of the `membership`'s pods this one is.",
-          "type": "integer",
+          "description": "Which of the `membership`'s pods this one is: needed by the asynchronous mode, and\nrefused by the synchronous one, where a pod takes a member id of its own each time it\nstarts.",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint32",
+          "default": null,
           "minimum": 0
         },
         "listen": {
@@ -171,7 +181,6 @@
       },
       "additionalProperties": false,
       "required": [
-        "id",
         "listen"
       ]
     },

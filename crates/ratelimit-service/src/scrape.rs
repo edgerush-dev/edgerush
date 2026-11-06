@@ -1,13 +1,12 @@
 //! A service pod's metrics, served at `/metrics` where `--metrics` says, in the text format
 //! a data plane's scrape uses: whether it serves, and how often and how long it has gone
-//! without hearing a majority (06 §4), in either mode; and for the asynchronous mode's
-//! pod, what its keys hold against what they may (06 §8). A pod of the store (`cluster`)
+//! without hearing a majority (06 §4), and what its keys hold against what they may (06 §8),
+//! for the asynchronous mode's pod. A pod of the store (`cluster`), the synchronous mode's,
 //! shows its own: whether it serves, its keys, its peers' clocks, what it dropped and the table
 //! it follows; and says at `/ready` whether it is ready, for a readiness probe.
 
 use crate::cluster::pod::{Observed, StorePod};
 use crate::pod::{Pod, Usage};
-use crate::synchronous::SyncPod;
 use bytes::Bytes;
 use edgerush_ratelimit::service::membership::Sight;
 use edgerush_telemetry::{Exposition, Kind};
@@ -63,15 +62,6 @@ pub fn render(usage: Usage, max_key_bytes: u64, serving: bool, sight: Sight) -> 
     scrape.finish()
 }
 
-/// The text of a synchronous pod's scrape: whether it is `serving`, and how it hears the
-/// others, as `sight` says.
-#[must_use]
-pub fn render_synchronous(serving: bool, sight: Sight) -> String {
-    let mut scrape = Exposition::new();
-    hearing(&mut scrape, serving, sight);
-    scrape.finish()
-}
-
 /// Whether a pod serves, and how often and how long it has gone without a majority.
 fn hearing(scrape: &mut Exposition, serving: bool, sight: Sight) {
     let name = "edgerush_rate_limit_pod_serving";
@@ -109,21 +99,6 @@ pub async fn serve(listener: TcpListener, pod: Pod, max_key_bytes: u64) {
                 return Said::Stopped;
             };
             Said::Scrape(render(usage, max_key_bytes, serving, sight))
-        }
-    })
-    .await;
-}
-
-/// Serves a synchronous `pod`'s scrape on `listener` for as long as it runs, as [`serve`]
-/// serves an asynchronous pod's.
-pub async fn serve_synchronous(listener: TcpListener, pod: SyncPod) {
-    serve_with(listener, move |asked| {
-        let pod = pod.clone();
-        async move {
-            match asked {
-                Asked::Metrics => Said::Scrape(render_synchronous(pod.view().1, pod.sight())),
-                Asked::Ready => Said::NotHere,
-            }
         }
     })
     .await;
@@ -308,20 +283,6 @@ where
 mod tests {
     use super::*;
     use crate::cluster::link::Dropped;
-
-    #[test]
-    fn a_synchronous_scrape_says_whether_the_pod_serves_and_how_it_hears() {
-        let scrape = render_synchronous(false, Sight::default());
-        for line in [
-            "edgerush_rate_limit_pod_serving 0\n",
-            "edgerush_rate_limit_majority_lost_total 0\n",
-            "edgerush_rate_limit_majority_regained_total 0\n",
-            "edgerush_rate_limit_without_majority_seconds_total 0\n",
-        ] {
-            assert!(scrape.contains(line), "{line}{scrape}");
-        }
-        assert!(!scrape.contains("key_bytes"), "{scrape}");
-    }
 
     #[test]
     fn a_scrape_says_what_the_keys_hold_against_their_bound() {

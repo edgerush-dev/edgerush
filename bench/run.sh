@@ -156,8 +156,7 @@ repo=$(dirname "$here")
 # The service's example program that forms the synchronous mode's store, for ours-sync
 # (cargo build --release -p edgerush-ratelimit-service --example form).
 : "${RL_FORM:=$repo/target/release/examples/form}"
-# The rate-limiting service's cycle, in milliseconds: the data planes' and the pod's alike
-# (the synchronous pod's between its copies of what changed).
+# The asynchronous mode's cycle, in milliseconds: the data planes' and the pod's alike.
 : "${RL_CYCLE_MS:=10}"
 # The per-client limit of every rate-limited variant: RL_RATE (`64000/s`) with a bucket of
 # RL_BURST. The asynchronous mode refuses a limit whose burst and two cycles' refill pass
@@ -767,7 +766,7 @@ PY
         return
     fi
     if [ "$1" = sync-mode ]; then
-        printf 'rate_limiting: { mode: synchronous%s, service: { addresses: ["127.0.0.1:7001"], key_secret: 0123456789abcdef0123456789abcdef }, synchronous: { timeout_ms: %s, when_unreachable: %s, breaker: { failures: 5, probe_after_ms: 1000 } }, experimental_fewer_pods: true }\nlimits_file: %s\n' \
+        printf 'rate_limiting: { mode: synchronous%s, service: { addresses: ["127.0.0.1:7001"], key_secret: 0123456789abcdef0123456789abcdef }, synchronous: { timeout_ms: %s, when_unreachable: %s, breaker: { failures: 5, probe_after_ms: 1000 } } }\nlimits_file: %s\n' \
             "${RL_MAX_KEY_BYTES:+, max_key_bytes: $RL_MAX_KEY_BYTES}" "$RL_SYNC_TIMEOUT_MS" \
             "$RL_SYNC_UNREACHABLE" "$run-limits.yaml" >>"$config.rl"
         return
@@ -787,13 +786,13 @@ rl_form_pid=
 # store, reached at that address, its readiness at 127.0.0.1:9101.
 rl_service_config() {
     if [ "$1" = synchronous ]; then
-        printf 'mode: %s\npod: { id: 0, listen: 127.0.0.1:%s, address: 127.0.0.1:%s, metrics: 127.0.0.1:9101, cycle_ms: %s }\n' \
-            "$1" "$2" "$2" "$RL_CYCLE_MS"
+        printf 'mode: %s\npod: { listen: 127.0.0.1:%s, address: 127.0.0.1:%s, metrics: 127.0.0.1:9101 }\n' \
+            "$1" "$2" "$2"
         printf 'store: {}\n'
     else
         printf 'mode: %s\npod: { id: 0, listen: 127.0.0.1:%s, cycle_ms: %s }\n' "$1" "$2" "$RL_CYCLE_MS"
+        printf 'membership: { pods: { 0: 127.0.0.1:%s } }\n' "$2"
     fi
-    printf 'membership: { pods: { 0: 127.0.0.1:%s } }\n' "$2"
     if [ -n "$RL_MAX_KEY_BYTES" ]; then
         printf 'keys: { max_bytes: %s }\n' "$RL_MAX_KEY_BYTES"
     fi

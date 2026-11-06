@@ -307,16 +307,10 @@ fn synchronous_in(
         })
         .collect();
     config.limits = Some(serde_saphyr::from_str(&format!("limits:\n{written}")).unwrap());
-    // Fewer than three pods, as most tests run, only as development allows.
-    let fewer = if addresses.len() < 3 {
-        ", experimental_fewer_pods: true"
-    } else {
-        ""
-    };
     let addresses: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
     config.rate_limiting = Some(
         serde_saphyr::from_str(&format!(
-            "{{ mode: synchronous, service: {{ addresses: [{}], key_secret: {SECRET} }}, synchronous: {{ timeout_ms: {timeout_ms}, when_unreachable: {when_unreachable}, breaker: {{ failures: 5, probe_after_ms: 1000 }} }}{fewer} }}",
+            "{{ mode: synchronous, service: {{ addresses: [{}], key_secret: {SECRET} }}, synchronous: {{ timeout_ms: {timeout_ms}, when_unreachable: {when_unreachable}, breaker: {{ failures: 5, probe_after_ms: 1000 }} }} }}",
             addresses.join(", ")
         ))
         .unwrap(),
@@ -1510,7 +1504,6 @@ async fn a_reload_lets_go_of_the_old_limiter_and_its_streams() {
                 service: None,
                 synchronous: None,
                 experimental_header_keys: None,
-                experimental_fewer_pods: None,
             });
             proxy.reload(compile(&local_mode).unwrap()).unwrap();
             while !relay.has_ended(1) {
