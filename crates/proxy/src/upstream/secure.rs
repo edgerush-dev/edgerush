@@ -3,7 +3,9 @@
 //!
 //! Made once for each upstream when a config arrives and kept by a later config with the
 //! same TLS, as a listener's is. Only the authorities the config names are trusted — not
-//! the machine's — and the endpoint's certificate must carry the configured server name.
+//! the machine's — and the endpoint's certificate must carry the configured server name,
+//! or, where the config names others to verify, one of those among its subject alternative
+//! names, the server name then asked for alone.
 //! An HTTP/2 upstream must agree on `h2` in the handshake: one that does not is a failed
 //! connection, never one spoken to in HTTP/1.1 instead (15 §5).
 
@@ -12,10 +14,12 @@ use crate::tls::TlsError;
 use crate::upstream::dial::Counted;
 use crate::upstream::h1::pool::Close;
 use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
+use boring::x509::X509Ref;
 use boring::x509::store::X509StoreBuilder;
-use edgerush_config::{CompiledUpstreamTls, UpstreamProtocol};
+use edgerush_config::{CompiledUpstreamTls, UpstreamProtocol, VerifiedName};
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_boring::SslStream;
@@ -29,6 +33,39 @@ pub(crate) struct Secure {
     /// What it was made from, which a later snapshot's is compared with.
     source: CompiledUpstreamTls,
     protocol: UpstreamProtocol,
+    /// `source`'s verified names, shared with each handshake's check of them.
+    verified_names: Arc<[VerifiedName]>,
+}
+
+/// Whether `certificate` carries one of `names` among its subject alternative names.
+fn carries(certificate: &X509Ref, names: &[VerifiedName]) -> bool {
+    let Some(alternatives) = certificate.subject_alt_names() else {
+        return false;
+    };
+    names.iter().any(|name| {
+        alternatives.iter().any(|alternative| match name {
+            VerifiedName::Dns(reference) => alternative
+                .dnsname()
+                .is_some_and(|presented| dns_matches(presented, reference)),
+            VerifiedName::Uri(reference) => alternative.uri() == Some(reference.as_str()),
+        })
+    })
+}
+
+/// Whether a certificate's DNS name `presented` is `reference`, letters' case aside: a
+/// wildcard of a whole leftmost label over two or more labels matches one label in its
+/// place (RFC 6125 §6.4.3); so a `reference` that is itself a wildcard, its `*` a label
+/// as any, matches only the same wildcard.
+fn dns_matches(presented: &str, reference: &str) -> bool {
+    match presented.strip_prefix("*.") {
+        Some(base) => {
+            base.contains('.')
+                && reference.split_once('.').is_some_and(|(label, rest)| {
+                    !label.is_empty() && rest.eq_ignore_ascii_case(base)
+                })
+        }
+        None => presented.eq_ignore_ascii_case(reference),
+    }
 }
 
 impl std::fmt::Debug for Secure {
@@ -83,6 +120,7 @@ impl Secure {
             connector: builder.build(),
             source: source.clone(),
             protocol,
+            verified_names: source.verified_names.clone().into(),
         })
     }
 
@@ -109,10 +147,23 @@ impl Secure {
         S: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug,
     {
         let refused = |why: String| io::Error::new(io::ErrorKind::ConnectionRefused, why);
-        let configured = self
+        let mut configured = self
             .connector
             .configure()
             .map_err(|error| refused(error.to_string()))?;
+        // Names checked in place of the server name, which is then asked for alone: the
+        // endpoint's own certificate, once its chain is trusted, must carry one of them.
+        if !self.verified_names.is_empty() {
+            configured.set_verify_hostname(false);
+            let names = Arc::clone(&self.verified_names);
+            configured.set_verify_callback(SslVerifyMode::PEER, move |trusted, context| {
+                trusted
+                    && (context.error_depth() != 0
+                        || context
+                            .current_cert()
+                            .is_some_and(|leaf| carries(leaf, &names)))
+            });
+        }
         let secured = tokio_boring::connect(configured, &self.source.server_name, socket)
             .await
             .map_err(|error| refused(format!("{error:?}")))?;
@@ -202,5 +253,79 @@ impl AsyncWrite for Socket {
             Self::Plain(socket) => Pin::new(socket).poll_shutdown(cx),
             Self::Secured(socket) => Pin::new(socket).poll_shutdown(cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VerifiedName, carries, dns_matches};
+    use boring::x509::X509;
+
+    /// A certificate's DNS name is the reference, case aside, or a wildcard of one whole
+    /// leftmost label over at least two labels standing for exactly one; a reference that
+    /// is a wildcard is matched by that wildcard alone.
+    #[test]
+    fn a_dns_name_matches_as_rfc_6125_has_it() {
+        for (presented, reference) in [
+            ("backend.test", "backend.test"),
+            ("Backend.TEST", "backend.test"),
+            ("*.zone.test", "a.zone.test"),
+            ("*.Zone.test", "A.zone.TEST"),
+            ("*.zone.test", "*.zone.test"),
+        ] {
+            assert!(
+                dns_matches(presented, reference),
+                "{presented} for {reference}"
+            );
+        }
+        for (presented, reference) in [
+            ("backend.test", "other.test"),
+            ("backend.test", "a.backend.test"),
+            ("*.zone.test", "zone.test"),
+            ("*.zone.test", "a.b.zone.test"),
+            ("*.zone.test", ".zone.test"),
+            // Over a single label, a wildcard stands for nothing.
+            ("*.test", "a.test"),
+            // A partial wildcard is not one.
+            ("a*.zone.test", "ab.zone.test"),
+            ("a.zone.test", "*.zone.test"),
+            ("*.other.test", "*.zone.test"),
+        ] {
+            assert!(
+                !dns_matches(presented, reference),
+                "{presented} for {reference}"
+            );
+        }
+    }
+
+    /// A certificate carries a name among its subject alternative names: a DNS name as
+    /// `dns_matches` has it, a URI exactly; its subject's common name never counts.
+    #[test]
+    fn a_certificate_carries_its_alternative_names_alone() {
+        let leaf = |names: &[&str]| {
+            X509::from_pem(crate::tls::testing::certificate(names).chain.as_bytes()).unwrap()
+        };
+        let dns = |name: &str| VerifiedName::Dns(name.to_owned());
+        let uri = |name: &str| VerifiedName::Uri(name.to_owned());
+        let shown = leaf(&["web.test", "*.zone.test", "spiffe://cluster/ns/shop/sa/web"]);
+        assert!(carries(&shown, &[dns("web.test")]));
+        assert!(carries(&shown, &[dns("a.zone.test")]));
+        assert!(carries(&shown, &[uri("spiffe://cluster/ns/shop/sa/web")]));
+        assert!(carries(
+            &shown,
+            &[dns("other.test"), uri("spiffe://cluster/ns/shop/sa/web")]
+        ));
+        assert!(!carries(&shown, &[dns("other.test")]));
+        assert!(!carries(
+            &shown,
+            &[uri("spiffe://cluster/ns/shop/sa/other")]
+        ));
+        assert!(!carries(&shown, &[uri("SPIFFE://cluster/ns/shop/sa/web")]));
+        // A DNS name is not a URI, nor a URI a DNS name.
+        assert!(!carries(&shown, &[uri("web.test")]));
+        assert!(!carries(&shown, &[dns("spiffe://cluster/ns/shop/sa/web")]));
+        assert!(!carries(&shown, &[]));
+        // A certificate of no alternative names, its subject `none`, carries nothing.
+        assert!(!carries(&leaf(&[]), &[dns("none")]));
     }
 }

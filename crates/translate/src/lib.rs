@@ -2729,6 +2729,7 @@ fn backend_upstream(
                 UpstreamProtocol::Http1,
                 Some(UpstreamTls {
                     server_name: host.clone(),
+                    verified_names: Vec::new(),
                     authorities: plane.backend_authorities.clone(),
                     client_certificate: None,
                 }),

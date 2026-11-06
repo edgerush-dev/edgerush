@@ -169,6 +169,92 @@ async fn an_upstream_that_is_not_who_it_should_be_is_not_spoken_to() {
         .await;
 }
 
+/// An upstream's certificate is checked for the names its TLS verifies in place of the
+/// server name, which is then asked for alone: one of them carried among its alternative
+/// names, a DNS name or a URI, is enough, in either protocol; none of them, and it is not
+/// spoken to, though it carry the server name.
+#[tokio::test]
+async fn an_upstream_is_checked_for_its_verified_names_in_place_of_its_server_name() {
+    use edgerush_config::VerifiedName::{Dns, Uri};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let certificate = crate::tls::testing::certificate(&[
+                "sni.test",
+                "*.zone.test",
+                "spiffe://cluster/ns/shop/sa/web",
+            ]);
+            let checked = |names: Vec<edgerush_config::VerifiedName>| {
+                let mut tls = trusting("sni.test", &certificate);
+                tls.verified_names = names;
+                tls
+            };
+            for protocol in [UpstreamProtocol::Http1, UpstreamProtocol::Http2] {
+                let upstream = tls_upstream(&certificate, Agrees::Either).await;
+                for (names, answered) in [
+                    (vec![Dns("a.zone.test".to_owned())], "200"),
+                    (
+                        vec![Uri("spiffe://cluster/ns/shop/sa/web".to_owned())],
+                        "200",
+                    ),
+                    (
+                        vec![
+                            Dns("other.test".to_owned()),
+                            Uri("spiffe://cluster/ns/shop/sa/web".to_owned()),
+                        ],
+                        "200",
+                    ),
+                    // The server name carried counts for nothing once others are named.
+                    (vec![Dns("other.test".to_owned())], "502"),
+                    (
+                        vec![Uri("spiffe://cluster/ns/shop/sa/other".to_owned())],
+                        "502",
+                    ),
+                    (vec![Dns("a.b.zone.test".to_owned())], "502"),
+                ] {
+                    let front =
+                        serving_worker_to_tls(upstream, protocol, checked(names.clone())).await;
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    assert!(
+                        answer.starts_with(&format!("HTTP/1.1 {answered} ")),
+                        "{protocol:?} {names:?}: {answer}"
+                    );
+                }
+            }
+            // The server name is what is asked for, the verified names never; a certificate
+            // an authority issued, which carries no server name, is checked for them as its
+            // own alone, the authority's carrying none.
+            let authority = edgerush_certificates::testing::Authority::new("backends");
+            let issued = authority.issue(&["a.zone.test"]);
+            let upstream = tls_upstream_asked_for(&issued, "sni.test").await;
+            let front = serving_worker_to_tls(
+                upstream,
+                UpstreamProtocol::Http1,
+                edgerush_config::UpstreamTls {
+                    server_name: "sni.test".to_owned(),
+                    verified_names: vec![Dns("a.zone.test".to_owned())],
+                    authorities: vec![authority.pem()],
+                    client_certificate: None,
+                },
+            )
+            .await;
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+            // Trusted as ever: a stranger's certificate carrying every name is not spoken to.
+            let stranger = crate::tls::testing::certificate(&["sni.test", "a.zone.test"]);
+            let upstream = tls_upstream(&stranger, Agrees::Either).await;
+            let front = serving_worker_to_tls(
+                upstream,
+                UpstreamProtocol::Http1,
+                checked(vec![Dns("a.zone.test".to_owned())]),
+            )
+            .await;
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
+        })
+        .await;
+}
+
 /// An HTTP/2 upstream that does not agree on `h2` in the handshake is a failed
 /// connection, never one spoken to in HTTP/1.1 instead.
 #[tokio::test]
@@ -230,6 +316,7 @@ fn a_reload_keeps_the_tls_to_an_upstream_that_has_not_changed() {
 
     let unusable = edgerush_config::UpstreamTls {
         server_name: "backend.test".to_owned(),
+        verified_names: Vec::new(),
         authorities: vec![
             "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n".to_owned(),
         ],
