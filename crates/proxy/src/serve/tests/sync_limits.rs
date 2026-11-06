@@ -1594,3 +1594,63 @@ async fn a_key_whose_owner_is_cut_off_from_the_data_plane_is_forwarded() {
         })
         .await;
 }
+
+/// A key whose owner is gone, not yet failed over, is forwarded through a pod that serves,
+/// and times out there: no failure of that pod's, whose breaker stays closed for its own keys,
+/// while the gone owner's opens.
+#[tokio::test]
+async fn a_timeout_forwarding_to_an_owner_gone_opens_no_breaker_but_the_owners() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut listeners = Vec::new();
+            for _ in 0..3 {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap().to_string();
+                listeners.push((listener, address));
+            }
+            // Slow to take a pod out, so that the one stopped keeps its shards.
+            let store = Store::formed(listeners, &holding_config(), None).await;
+            let (upstream, _) = counting_upstream().await;
+            let config = with_breaker(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 100)],
+                    &store.addresses(),
+                    200,
+                    "deny",
+                ),
+                2,
+                60_000,
+            );
+            let (_, key) = keys_of(&config).remove(0);
+            let owner = store.owner_of(&key).await;
+            let (proxy, mut sends) = serving(&config, 1).await;
+            // The worker's table in, from its first request.
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            store.stop(owner).await;
+            assert_eq!(statuses(&send_round(&mut sends, 4).await), [503; 4]);
+            let scrape = proxy.metrics();
+            let open = |address: &str| {
+                metric(
+                    &scrape,
+                    &format!(r#"edgerush_rate_limit_owner_breaker_open{{pod="{address}"}}"#),
+                )
+            };
+            assert_eq!(open(&store.pods[owner].address), Some(1), "{scrape}");
+            let forwarders: Vec<&ServedPod> = (0..3)
+                .filter(|at| *at != owner)
+                .map(|at| &store.pods[at])
+                .collect();
+            let timed_out: u64 = forwarders
+                .iter()
+                .filter_map(|pod| metric(&scrape, &asks(&pod.address, "timed_out")))
+                .sum();
+            assert!(timed_out >= 2, "forwarded and timed out: {scrape}");
+            for pod in forwarders {
+                assert_ne!(open(&pod.address), Some(1), "{}: {scrape}", pod.address);
+            }
+        })
+        .await;
+}

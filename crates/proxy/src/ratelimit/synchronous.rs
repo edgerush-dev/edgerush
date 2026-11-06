@@ -103,6 +103,19 @@ enum Ended {
     Broken = 2,
     /// Answered as not serving: not ready, not failing.
     NotServing = 3,
+    /// Timed out, sent to a pod only to be forwarded: counted as timed out, but no failure of
+    /// that pod's.
+    ForwardedTimedOut = 4,
+}
+
+impl Ended {
+    /// Its place among an owner's counts: a forwarded ask's timeout is a timeout.
+    const fn counted(self) -> usize {
+        match self {
+            Self::ForwardedTimedOut => Self::TimedOut as usize,
+            how => how as usize,
+        }
+    }
 }
 
 impl Process {
@@ -200,7 +213,7 @@ impl Process {
 
     /// Counts an ask of `member` that ended as `how`, and tells its breaker.
     fn asked(&self, member: &Member, how: Ended) {
-        member.asks.local()[how as usize].inc();
+        member.asks.local()[how.counted()].inc();
         match how {
             Ended::Answered => member.breaker.answered(),
             Ended::TimedOut | Ended::Broken => {
@@ -208,7 +221,7 @@ impl Process {
                     .breaker
                     .failed(self.now(), self.config.breaker_failures);
             }
-            Ended::NotServing => {}
+            Ended::NotServing | Ended::ForwardedTimedOut => {}
         }
     }
 
@@ -892,8 +905,13 @@ impl SyncLimiter {
                     .waiting
                     .borrow_mut()
                     .insert(id, (generation, Waiter::Asked(answered)));
+                let forwarded = matches!(
+                    to,
+                    To::Member(member) if self.plane.borrow().owner(part.key) != Some(member)
+                );
                 part.sent = Some(Sent {
                     to,
+                    forwarded,
                     stream,
                     id,
                     generation,
@@ -1033,6 +1051,8 @@ struct Part {
 /// Where a key was sent, and its answer to come.
 struct Sent {
     to: To,
+    /// Whether it went to a member that is not the key's owner, only to be forwarded.
+    forwarded: bool,
     stream: Rc<Stream>,
     id: u64,
     generation: u64,
@@ -1104,8 +1124,17 @@ impl Asked {
                     unreached = Some(Undecided::Unavailable);
                     out_of_reach.push(part);
                 }
+                // A timeout says nothing of a pod that was only to forward the ask: its owner
+                // may be the one gone, failing over (decided). Counted, but not against its
+                // breaker; a pod truly hung opens its breaker by its own keys' timeouts. A
+                // seed's counts: before a table, nothing says it is not the owner.
                 Err(_) => {
-                    self.limiter.asked(sent.to, Ended::TimedOut);
+                    let how = if sent.forwarded {
+                        Ended::ForwardedTimedOut
+                    } else {
+                        Ended::TimedOut
+                    };
+                    self.limiter.asked(sent.to, how);
                     unreached = Some(Undecided::Timeout);
                     given_up.push((sent, part.key, part.held.rule));
                     out_of_reach.push(part);
