@@ -1665,6 +1665,42 @@ spec:
   rules: [{ backendRefs: [{ name: web, port: 80 }] }]",
     )
     .unwrap();
+    // A BackendTLSPolicy the HTTPRoute reaches, its one CA certificate ref of a kind none
+    // can be: its status says so of the Gateway.
+    let tls: BackendTLSPolicy = serde_saphyr::from_str(
+        "metadata: { name: tls, namespace: shop, generation: 7, resourceVersion: '13' }
+spec:
+  targetRefs: [{ group: '', kind: Service, name: web }]
+  validation:
+    hostname: web.shop.example
+    caCertificateRefs: [{ group: '', kind: Secret, name: ca }]",
+    )
+    .unwrap();
+    // One no route reaches whose status holds an ancestor of ours: it is taken away, another
+    // controller's kept.
+    let old_tls: BackendTLSPolicy = serde_saphyr::from_str(
+        "metadata: { name: old-tls, namespace: shop, generation: 1, resourceVersion: '14' }
+spec:
+  targetRefs: [{ group: '', kind: Service, name: elsewhere }]
+  validation: { hostname: elsewhere.shop.example, wellKnownCACertificates: System }
+status:
+  ancestors:
+    - controllerName: edgerush.dev/gateway-controller
+      ancestorRef: { group: gateway.networking.k8s.io, kind: Gateway, name: web, namespace: edge }
+      conditions: [{ type: Accepted, status: 'True', reason: Accepted, message: '', lastTransitionTime: '2026-10-01T00:00:00Z', observedGeneration: 1 }]
+    - controllerName: example.com/other
+      ancestorRef: { group: gateway.networking.k8s.io, kind: Gateway, name: elsewhere, namespace: edge }
+      conditions: []",
+    )
+    .unwrap();
+    // And one no route reaches with no status: none is written.
+    let quiet: BackendTLSPolicy = serde_saphyr::from_str(
+        "metadata: { name: quiet, namespace: shop, generation: 1, resourceVersion: '15' }
+spec:
+  targetRefs: [{ group: '', kind: Service, name: elsewhere }]
+  validation: { hostname: elsewhere.shop.example, wellKnownCACertificates: System }",
+    )
+    .unwrap();
     let known = [
         "/apis/gateway.networking.k8s.io/v1/gatewayclasses/edgerush/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/edge/gateways/web/status",
@@ -1674,6 +1710,8 @@ spec:
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/grpcroutes/gone/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/tlsroutes/tunnel/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/tcproutes/db/status",
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/backendtlspolicies/tls/status",
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/backendtlspolicies/old-tls/status",
     ];
     let fake = Fake::start_by_method(&["127.0.0.1"], move |method, path| {
         if method == "PUT" && known.contains(&path) {
@@ -1695,6 +1733,7 @@ spec:
         grpc_routes: vec![calls.clone(), gone.clone()],
         tls_routes: vec![tunnel.clone()],
         tcp_routes: vec![db.clone()],
+        backend_tls_policies: vec![tls.clone(), old_tls.clone(), quiet.clone()],
         ..Cluster::default()
     };
     let translation = translate(&gateway_plane(), &cluster);
@@ -1715,7 +1754,8 @@ spec:
                      routes,
                      grpc_routes,
                      tls_routes,
-                     tcp_routes| {
+                     tcp_routes,
+                     policies| {
         GatewayApi {
             crds: Vec::new(),
             namespaces: Vec::new(),
@@ -1729,7 +1769,7 @@ spec:
             tls_routes: Some(vec![follow_of("tlsroutes", true, tls_routes)]),
             tcp_routes: Some(vec![follow_of("tcproutes", true, tcp_routes)]),
             reference_grants: None,
-            backend_tls_policies: None,
+            backend_tls_policies: Some(vec![follow_of("backendtlspolicies", true, policies)]),
             config_maps: None,
         }
     };
@@ -1744,6 +1784,7 @@ spec:
         vec![calls.clone(), gone.clone()],
         vec![tunnel.clone()],
         vec![db.clone()],
+        vec![tls.clone(), old_tls.clone(), quiet.clone()],
     )
     .write_statuses(&api, &handed, &addresses, &programmed, &said)
     .await;
@@ -1758,6 +1799,8 @@ spec:
             "status of GRPCRoute shop/gone",
             "status of TLSRoute shop/tunnel",
             "status of TCPRoute shop/db",
+            "status of BackendTLSPolicy shop/tls",
+            "status of BackendTLSPolicy shop/old-tls",
         ]
     );
     let bodies: Vec<serde_json::Value> = fake
@@ -1832,9 +1875,56 @@ spec:
         status(7)["parents"][0]["conditions"][0]["observedGeneration"],
         6
     );
+    assert_eq!(
+        fake.seen()[8].path,
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/backendtlspolicies/tls/status"
+    );
+    assert_eq!(bodies[8]["kind"], "BackendTLSPolicy");
+    assert_eq!(
+        bodies[8]["apiVersion"], "gateway.networking.k8s.io/v1",
+        "written as of the version followed"
+    );
+    assert_eq!(
+        status(8)["ancestors"],
+        serde_json::json!([{
+            "ancestorRef": {
+                "group": "gateway.networking.k8s.io",
+                "kind": "Gateway",
+                "name": "web",
+                "namespace": "edge",
+            },
+            "conditions": status(8)["ancestors"][0]["conditions"].clone(),
+            "controllerName": GATEWAY_CONTROLLER,
+        }])
+    );
+    let conditions: Vec<(&str, &str, &str, i64)> = status(8)["ancestors"][0]["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["type"].as_str().unwrap(),
+                c["status"].as_str().unwrap(),
+                c["reason"].as_str().unwrap(),
+                c["observedGeneration"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        conditions,
+        [
+            ("Accepted", "False", "NoValidCACertificate", 7),
+            ("ResolvedRefs", "False", "InvalidKind", 7),
+        ]
+    );
+    assert_eq!(
+        status(9)["ancestors"],
+        serde_json::to_value(&old_tls.status.as_ref().unwrap().ancestors[1..]).unwrap()
+    );
     // Read back as written, every status says what it should: nothing more is written.
     let (mut class, mut gateway, mut app, mut old) = (class, gateway, app, old);
     let (mut calls, mut gone, mut tunnel, mut db) = (calls, gone, tunnel, db);
+    let (mut tls, mut old_tls) = (tls, old_tls);
     class.status = serde_json::from_value(bodies[0]["status"].clone()).unwrap();
     gateway.status = serde_json::from_value(bodies[1]["status"].clone()).unwrap();
     app.status = serde_json::from_value(bodies[2]["status"].clone()).unwrap();
@@ -1843,6 +1933,8 @@ spec:
     gone.status = serde_json::from_value(bodies[5]["status"].clone()).unwrap();
     tunnel.status = serde_json::from_value(bodies[6]["status"].clone()).unwrap();
     db.status = serde_json::from_value(bodies[7]["status"].clone()).unwrap();
+    tls.status = serde_json::from_value(bodies[8]["status"].clone()).unwrap();
+    old_tls.status = serde_json::from_value(bodies[9]["status"].clone()).unwrap();
     following(
         vec![class],
         vec![gateway],
@@ -1850,10 +1942,11 @@ spec:
         vec![calls, gone],
         vec![tunnel],
         vec![db],
+        vec![tls, old_tls, quiet],
     )
     .write_statuses(&api, &handed, &addresses, &programmed, &said)
     .await;
-    assert_eq!(fake.seen().len(), 8, "a status written again");
+    assert_eq!(fake.seen().len(), 10, "a status written again");
 }
 
 #[test]

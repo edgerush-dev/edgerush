@@ -29,7 +29,8 @@ use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_kubernetes::{ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow};
 use edgerush_translate::{
-    Cluster, GatewayName, GatewayStatus, Object, Plane, RouteStatus, Translation, translate,
+    Cluster, GatewayName, GatewayStatus, Object, Plane, PolicyStatus, RouteStatus, Translation,
+    translate,
 };
 use gateway_status::Programmed;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
@@ -583,6 +584,8 @@ struct Handed {
     status: GatewayStatus,
     /// That of each route, of either kind, that names it.
     routes: Vec<RouteStatus>,
+    /// That of each BackendTLSPolicy a route of it reaches.
+    policies: Vec<PolicyStatus>,
 }
 
 impl Handed {
@@ -593,6 +596,7 @@ impl Handed {
             gateway: gateway.gateway.clone(),
             status: translation.gateway_status.clone()?,
             routes: translation.route_statuses.clone(),
+            policies: translation.policy_statuses.clone(),
         })
     }
 }
@@ -600,8 +604,9 @@ impl Handed {
 impl GatewayApi {
     /// Writes, one at a time, each status that says other than `handed` has it: that of
     /// the data plane's Gateway's class, of the Gateway, `addresses` among it, of each
-    /// ListenerSet naming it, and of each route followed, HTTPRoute, GRPCRoute or TLSRoute,
-    /// whether or not it still names the Gateway or one of those ListenerSets.
+    /// ListenerSet naming it, of each route followed, HTTPRoute, GRPCRoute, TLSRoute or
+    /// TCPRoute, whether or not it still names the Gateway or one of those ListenerSets, and
+    /// of each BackendTLSPolicy followed, whether or not a route of the Gateway reaches it.
     async fn write_statuses(
         &self,
         api: &ApiServer,
@@ -769,6 +774,48 @@ impl GatewayApi {
                             .await
                     }
                 };
+                said(Said::GatewayApiStatus {
+                    object: &object,
+                    written: result.as_ref().map(|_| ()),
+                });
+            }
+        }
+        let policies = self
+            .backend_tls_policies
+            .as_deref()
+            .map(objects)
+            .unwrap_or_default();
+        for policy in &policies {
+            let object = Object {
+                kind: "BackendTLSPolicy",
+                namespace: policy.metadata.namespace.clone().unwrap_or_default(),
+                name: policy.metadata.name.clone().unwrap_or_default(),
+            };
+            let wanted = handed
+                .policies
+                .iter()
+                .find(|wanted| wanted.policy == object);
+            let status = gateway_status::policy(
+                policy.status.as_ref(),
+                &object.namespace,
+                &handed.gateway,
+                wanted,
+                now,
+            );
+            if policy.status.clone().unwrap_or_default() != status {
+                let version = policy
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .unwrap_or_default();
+                let result = api
+                    .replace_status::<BackendTLSPolicy>(
+                        &object.namespace,
+                        &object.name,
+                        version,
+                        &status,
+                    )
+                    .await;
                 said(Said::GatewayApiStatus {
                     object: &object,
                     written: result.as_ref().map(|_| ()),
