@@ -6,7 +6,8 @@ rate limiting with no external store to run.
 
 **Status: the data plane runs, and the control plane runs it in a cluster; the operator is
 next.** The proxy serves traffic from a YAML file, the development harness, or from a
-control plane that translates Ingresses in a cluster and streams the config to it. Rate
+control plane that translates a cluster's Ingresses and Gateway API objects and streams the
+config to it. Rate
 limiting runs, each pod on its own or through EdgeRush's rate-limiting service. Not for
 production. A hobby project with no timelines.
 
@@ -69,9 +70,14 @@ change takes over without dropping a request.
   IngressClasses, Ingresses, Services and Secrets and translates them each time they
   change: Ingresses' rules and default backends, paths of every type, Services' ports
   spoken to as their `appProtocol` says, TLS from Secrets, and plain HTTP redirected to
-  HTTPS for the hosts an Ingress secures. It streams each config to its data planes over
-  gRPC and mutual TLS, writes each Ingress's status (replicas elect one writer by a
-  Lease), and serves an admission webhook that refuses an Ingress it could not translate.
+  HTTPS for the hosts an Ingress secures. Where the Gateway API's CRDs are installed, it
+  serves its data plane's Gateway beside them, from one data plane: the Gateway's
+  listeners and the ListenerSets it takes, HTTPRoutes, GRPCRoutes, TLSRoutes and
+  TCPRoutes, ReferenceGrants, and BackendTLSPolicies, their CA certificates from
+  ConfigMaps or the system's. It streams each config to its data planes over gRPC and
+  mutual TLS, writes the status of each Ingress and Gateway API object (replicas elect one
+  writer by a Lease; a Gateway is `Programmed` once its data plane's pods run it), and
+  serves an admission webhook that refuses an Ingress it could not translate.
 - **`edgerush proxy --control-plane`**, a data plane taking its config from that stream.
   Nothing is served until the first config runs; with the control plane gone, it serves
   on, and dials again.
@@ -88,9 +94,11 @@ change takes over without dropping a request.
 - **Default-deny egress:** an address discovered or resolved is never sent to if it is
   loopback, link-local, multicast, the pod's own, the API server's, or one of the gateway's
   own pods, which the control plane names (`--own-name`).
-- Tested end to end in kind (`kind/stream.sh`), the control plane gone and back among it.
+- Tested end to end in kind (`kind/stream.sh`): each route kind, and the control plane
+  gone and back.
 
-**Not yet:** the operator, Gateway API, ingress-nginx's annotations, authentication.
+**Not yet:** the operator, and with it Gateway API's conformance runs; ingress-nginx's
+annotations; authentication; CORS.
 
 ## Trying it
 

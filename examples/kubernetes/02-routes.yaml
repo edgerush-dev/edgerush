@@ -1,5 +1,6 @@
-# NOT IMPLEMENTED. Both objects would be served by the data plane "payments-api":
-# the Ingress selects it by class, the HTTPRoute attaches to its Gateway.
+# Both objects are served by the data plane "payments-api": the Ingress selects it by
+# class, the HTTPRoute attaches to its Gateway. The control plane translates them today;
+# the data plane is 01-planes.yaml's, which needs the operator (not built yet).
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
