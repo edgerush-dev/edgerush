@@ -1157,6 +1157,15 @@
           "default": null,
           "minimum": 1
         },
+        "key_secret": {
+          "description": "The secret the synchronous mode's keys are hashed under, as 32 hex digits: the same on\nevery data plane, so that each sends a client's key to the pod that owns it, and kept\nfrom clients, so that none can choose a key to share another's count. Needed by the synchronous mode, and taken\nby no other; never shown.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "pattern": "^[0-9a-fA-F]{32}$"
+        },
         "poll_quiet_keys": {
           "description": "Whether a key with nothing to report is polled every cycle while in use, to keep its\ncopy fresh. Off, a quiet key's copy is as fresh as its last answer until it has\nsomething to report again: messages grow with the keys admitting, not with all those\nin use. On,\na key counts as in use for its refill time after its last request, so under a limit\nrefilling over an hour or a day every key of every client seen in that time is polled\nevery cycle: each cycle's messages and work grow with them, millions of keys every\n10 ms. Off when left out, the faster.",
           "type": [

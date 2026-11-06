@@ -65,6 +65,8 @@ nix.workspace = true
 edgerush-certificates = { workspace = true, features = ["testing"] }
 # A fake API server, for the namespaces followed.
 edgerush-kubernetes = { workspace = true, features = ["testing"] }
+# The store's settings and tables, for the synchronous mode's pods formed under test.
+edgerush-cluster.workspace = true
 # The engine's clients and its either-version server, for tests only: what talks to the
 # proxy as a client would, upstreams that speak both versions, and a second oracle for
 # EdgeRush's own HTTP/1 client (`upstream::h1::differential`).

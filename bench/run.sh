@@ -153,6 +153,9 @@ repo=$(dirname "$here")
 : "${WSBENCH:=$here/wsbench/target/release/wsbench}"
 # The `ratelimit` scenario's service pod, on the backend's CPUs.
 : "${RL_SERVICE:=$repo/target/release/edgerush-ratelimit-service}"
+# The service's example program that forms the synchronous mode's store, for ours-sync
+# (cargo build --release -p edgerush-ratelimit-service --example form).
+: "${RL_FORM:=$repo/target/release/examples/form}"
 # The rate-limiting service's cycle, in milliseconds: the data planes' and the pod's alike
 # (the synchronous pod's between its copies of what changed).
 : "${RL_CYCLE_MS:=10}"
@@ -764,7 +767,7 @@ PY
         return
     fi
     if [ "$1" = sync-mode ]; then
-        printf 'rate_limiting: { mode: synchronous%s, service: { addresses: ["127.0.0.1:7001"] }, synchronous: { timeout_ms: %s, when_unreachable: %s, breaker: { failures: 5, probe_after_ms: 1000 } }, experimental_fewer_pods: true }\nlimits_file: %s\n' \
+        printf 'rate_limiting: { mode: synchronous%s, service: { addresses: ["127.0.0.1:7001"], key_secret: 0123456789abcdef0123456789abcdef }, synchronous: { timeout_ms: %s, when_unreachable: %s, breaker: { failures: 5, probe_after_ms: 1000 } }, experimental_fewer_pods: true }\nlimits_file: %s\n' \
             "${RL_MAX_KEY_BYTES:+, max_key_bytes: $RL_MAX_KEY_BYTES}" "$RL_SYNC_TIMEOUT_MS" \
             "$RL_SYNC_UNREACHABLE" "$run-limits.yaml" >>"$config.rl"
         return
@@ -775,12 +778,21 @@ PY
 }
 
 # The service's one pod, for `ratelimit`; and, when an ours-sync variant is to run, a
-# second pod of its own serving the synchronous mode, since a pod serves one mode.
+# second pod of its own serving the synchronous mode, since a pod serves one mode, its store
+# formed by the example program, which runs beside it.
 rl_pid=
 rl_sync_pid=
-# A lone pod's config file, serving mode $1 on 127.0.0.1:$2.
+rl_form_pid=
+# A lone pod's config file, serving mode $1 on 127.0.0.1:$2: the synchronous mode's on the
+# store, reached at that address, its readiness at 127.0.0.1:9101.
 rl_service_config() {
-    printf 'mode: %s\npod: { id: 0, listen: 127.0.0.1:%s, cycle_ms: %s }\n' "$1" "$2" "$RL_CYCLE_MS"
+    if [ "$1" = synchronous ]; then
+        printf 'mode: %s\npod: { id: 0, listen: 127.0.0.1:%s, address: 127.0.0.1:%s, metrics: 127.0.0.1:9101, cycle_ms: %s }\n' \
+            "$1" "$2" "$2" "$RL_CYCLE_MS"
+        printf 'store: {}\n'
+    else
+        printf 'mode: %s\npod: { id: 0, listen: 127.0.0.1:%s, cycle_ms: %s }\n' "$1" "$2" "$RL_CYCLE_MS"
+    fi
     printf 'membership: { pods: { 0: 127.0.0.1:%s } }\n' "$2"
     if [ -n "$RL_MAX_KEY_BYTES" ]; then
         printf 'keys: { max_bytes: %s }\n' "$RL_MAX_KEY_BYTES"
@@ -793,10 +805,22 @@ start_rl_service() {
     rl_pid=$!
     case " $VARIANTS " in
     *" ours-sync "*)
+        [ -x "$RL_FORM" ] || { echo "no forming program at $RL_FORM: build it first" >&2; exit 2; }
         rl_service_config synchronous 7001 >"$OUT/rl-sync-service.yaml"
         taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --config "$OUT/rl-sync-service.yaml" \
             2>>"$OUT/rl-sync-service.log" &
         rl_sync_pid=$!
+        # Formed afresh each run, its naming file new.
+        rm -f "$OUT/rl-sync-naming"
+        taskset -c "$BACKEND_CPUS" "$RL_FORM" "$OUT/rl-sync-service.yaml" "$OUT/rl-sync-naming" \
+            127.0.0.1:7001 2>>"$OUT/rl-sync-form.log" &
+        rl_form_pid=$!
+        local tries=0
+        until curl -sf http://127.0.0.1:9101/ready >/dev/null; do
+            tries=$((tries + 1))
+            [ "$tries" -lt 100 ] || { echo "the synchronous pod never became ready" >&2; exit 2; }
+            sleep 0.1
+        done
         ;;
     esac
     sleep 2
@@ -804,11 +828,11 @@ start_rl_service() {
 
 stop_rl_service() {
     local pid
-    for pid in $rl_pid $rl_sync_pid; do
+    for pid in $rl_form_pid $rl_pid $rl_sync_pid; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
-    rl_pid= rl_sync_pid=
+    rl_pid= rl_sync_pid= rl_form_pid=
 }
 
 # Redis, for `ratelimit`, if envoy-rl or kong-rl is to run, and envoy-rl's service in front

@@ -54,7 +54,8 @@ change takes over without dropping a request.
   - `local`: each proxy process limits on what it sees, with no service to run.
   - `synchronous`: the key's owner in the rate-limiting service
     (`edgerush-ratelimit-service`, its file saying `mode: synchronous`, three pods or more,
-    optionally over mutual TLS) decides every request. A request waits for its owner at most a stated
+    optionally over mutual TLS) decides every request, its key hashed under a secret every
+    data plane shares (`service.key_secret`). A request waits for its owner at most a stated
     time, and what happens while an owner is out of reach is stated too: allow, deny, or
     the data plane's own buckets until it answers. The pods copy their keys to one
     another, so a pod's keys carry on when it leaves.

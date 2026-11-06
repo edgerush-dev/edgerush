@@ -9,8 +9,13 @@
 
 use super::wire::{self, Asking, Invalid, Telling};
 use edgerush_cluster::table::shard_of;
-use edgerush_cluster::{Message as StoreMessage, NodeId, Stamp, Table, Time};
-use edgerush_cluster_synchronous::{Answer, Message, Rule};
+use edgerush_cluster::{Message as StoreMessage, Stamp, Table};
+/// What a data plane names, asks and is told in the store's terms, for its side to use with
+/// these pieces: a member's id, a time in nanoseconds, the limit a key is held to and an
+/// owner's answer.
+pub use edgerush_cluster::{NodeId, Time};
+use edgerush_cluster_synchronous::Message;
+pub use edgerush_cluster_synchronous::{Answer, Rule};
 use edgerush_ratelimit::service::Keyed;
 use std::hash::{BuildHasher, Hasher};
 

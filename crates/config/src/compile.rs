@@ -141,8 +141,10 @@ pub enum CompiledRateLimiting {
 /// The synchronous mode, checked: its owners, and how a request waits for them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledSynchronous {
-    /// The address of each of the service's pods, the first being pod 0.
+    /// The addresses a data plane first asks for the service's table: its seeds.
     pub addresses: Vec<String>,
+    /// What its keys are hashed under, as every data plane hashes them.
+    pub key_secret: KeySecret,
     /// How long a request waits for its owners' answers.
     pub timeout: Duration,
     /// What decides a request whose owner does not answer in time.
@@ -155,6 +157,31 @@ pub struct CompiledSynchronous {
     pub max_key_bytes: u64,
     /// Mutual TLS to the pods, if they are reached so.
     pub tls: Option<CompiledServiceTls>,
+}
+
+/// The 128 bits the synchronous mode's keys are hashed under (`rate_limiting.service.key_secret`),
+/// as the hash takes them: never shown, its `Debug` saying only that it is there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct KeySecret(pub [u64; 2]);
+
+impl std::fmt::Debug for KeySecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KeySecret(..)")
+    }
+}
+
+impl KeySecret {
+    /// The secret `written` holds, if it is 32 hex digits.
+    #[must_use]
+    pub fn parse(written: &str) -> Option<Self> {
+        if written.len() != 32 || !written.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let bits = u128::from_str_radix(written, 16).ok()?;
+        let high = u64::try_from(bits >> 64).ok()?;
+        let low = u64::try_from(bits & u128::from(u64::MAX)).ok()?;
+        Some(Self([high, low]))
+    }
 }
 
 /// Mutual TLS to the rate-limiting service's pods, the certificate shown found by its name.
@@ -662,8 +689,9 @@ fn rule_limits(
 
 /// The mode, as a refusal says it, if `rate_limiting` cannot run `model`. Local mode keeps a
 /// key in one word, which holds no rolling window's slots, and `when_unreachable: local`
-/// decides from local mode's keys (06 §3); the synchronous mode's service has no windows yet,
-/// and the asynchronous mode's windows are designed later. Off runs none, and refuses none.
+/// decides from local mode's keys (06 §3, #204); the synchronous mode's store runs both
+/// windows, and the asynchronous mode's windows are designed later. Off runs none, and refuses
+/// none.
 fn unsupported_in(
     model: &CompiledModel,
     rate_limiting: &CompiledRateLimiting,
@@ -671,11 +699,17 @@ fn unsupported_in(
     match (model, rate_limiting) {
         (CompiledModel::Bucket { .. }, _)
         | (_, CompiledRateLimiting::Off)
-        | (CompiledModel::FixedWindow { .. }, CompiledRateLimiting::Local { .. }) => None,
+        | (
+            CompiledModel::FixedWindow { .. },
+            CompiledRateLimiting::Local { .. } | CompiledRateLimiting::Synchronous(_),
+        ) => None,
         (CompiledModel::RollingWindow { .. }, CompiledRateLimiting::Local { .. }) => {
             Some("in local mode")
         }
-        (_, CompiledRateLimiting::Synchronous(_)) => Some("in the synchronous mode yet"),
+        (CompiledModel::RollingWindow { .. }, CompiledRateLimiting::Synchronous(waiting)) => {
+            (waiting.when_unreachable == crate::WhenUnreachable::Local)
+                .then_some("with `when_unreachable: local`, which decides as local mode does")
+        }
         (_, CompiledRateLimiting::Asynchronous(_)) => Some("in the asynchronous mode"),
     }
 }
@@ -774,6 +808,17 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
             errors
                 .push(place.problem(Problem::RateLimitServiceTooFewPods(service.addresses.len())));
         }
+        // Said wrong, it is not said back: a refusal is logged.
+        match (&service.key_secret, mode == RateLimitMode::Synchronous) {
+            (None, true) => errors.push(place.problem(Problem::RateLimitServiceKeySecretMissing)),
+            (Some(written), true) if KeySecret::parse(written).is_none() => {
+                errors.push(place.problem(Problem::RateLimitServiceKeySecret));
+            }
+            (Some(_), false) => {
+                errors.push(place.problem(Problem::RateLimitServiceSynchronousOnly("key_secret")))
+            }
+            _ => {}
+        }
         if mode == RateLimitMode::Synchronous {
             // The synchronous mode has no cycle of the data plane's and no levers: each
             // would be ignored, as if it did something.
@@ -828,10 +873,17 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
     match mode {
         RateLimitMode::Off => CompiledRateLimiting::Off,
         RateLimitMode::Local => CompiledRateLimiting::Local { max_key_bytes },
-        RateLimitMode::Synchronous => match (service, &limiting.synchronous) {
-            (Some(service), Some(waiting)) => {
+        RateLimitMode::Synchronous => match (
+            service,
+            &limiting.synchronous,
+            service
+                .and_then(|service| service.key_secret.as_deref())
+                .and_then(KeySecret::parse),
+        ) {
+            (Some(service), Some(waiting), Some(key_secret)) => {
                 CompiledRateLimiting::Synchronous(CompiledSynchronous {
                     addresses: service.addresses.clone(),
+                    key_secret,
                     timeout: Duration::from_millis(waiting.timeout_ms),
                     when_unreachable: waiting.when_unreachable,
                     breaker_failures: waiting.breaker.failures,
@@ -2970,6 +3022,17 @@ pub enum Problem {
     /// The pods' ID, to check them by, that is not a SPIFFE ID.
     #[error("`rate_limiting.service.tls`: `pod_id` `{0}` is no SPIFFE ID (`spiffe://…`)")]
     RateLimitServicePodId(String),
+    /// The synchronous mode with no secret to hash its keys under.
+    #[error(
+        "`rate_limiting.service.key_secret` is needed by mode `synchronous`: 32 hex digits every data plane shares"
+    )]
+    RateLimitServiceKeySecretMissing,
+    /// A secret not written as 32 hex digits; what it says is not said back.
+    #[error("`rate_limiting.service.key_secret` must be 32 hex digits")]
+    RateLimitServiceKeySecret,
+    /// A field of the service only the synchronous mode has.
+    #[error("`rate_limiting.service.{0}` is for mode `synchronous`")]
+    RateLimitServiceSynchronousOnly(&'static str),
     /// A mode that needs the service, with none.
     #[error("`rate_limiting`: mode `{0}` needs `service`")]
     RateLimitingServiceMissing(&'static str),
@@ -6099,7 +6162,7 @@ upstreams: {}
         );
         assert_eq!(
             with(&format!(
-                r#"rate_limiting: {{ mode: synchronous, max_key_bytes: 1000, service: {{ addresses: ["rl-0:7000", "rl-1:7000", "rl-2:7000"] }}, {WAITS} }}"#
+                r#"rate_limiting: {{ mode: synchronous, max_key_bytes: 1000, service: {{ addresses: ["rl-0:7000", "rl-1:7000", "rl-2:7000"], key_secret: {SECRET} }}, {WAITS} }}"#
             )),
             Ok(CompiledRateLimiting::Synchronous(CompiledSynchronous {
                 addresses: vec![
@@ -6107,6 +6170,7 @@ upstreams: {}
                     "rl-1:7000".to_owned(),
                     "rl-2:7000".to_owned(),
                 ],
+                key_secret: KeySecret([0x0011_2233_4455_6677, 0x8899_aabb_ccdd_eeff]),
                 timeout: Duration::from_millis(20),
                 when_unreachable: crate::WhenUnreachable::Allow,
                 breaker_failures: 5,
@@ -6141,11 +6205,22 @@ rate_limiting: {{ {section} }}
             let addresses: Vec<String> = (0..count)
                 .map(|pod| format!(r#""rl-{pod}:7000""#))
                 .collect();
-            format!("service: {{ addresses: [{}] }}", addresses.join(", "))
+            format!(
+                "service: {{ addresses: [{}]{{secret}} }}",
+                addresses.join(", ")
+            )
         };
+        // The synchronous mode's service has its secret; the asynchronous mode's takes none.
+        let synchronous =
+            |count: usize| pods(count).replace("{secret}", &format!(", key_secret: {SECRET}"));
+        let pods = |count: usize| pods(count).replace("{secret}", "");
         for count in [1, 2] {
             assert_eq!(
-                with(&format!("mode: synchronous, {}, {WAITS}", pods(count))).unwrap_err(),
+                with(&format!(
+                    "mode: synchronous, {}, {WAITS}",
+                    synchronous(count)
+                ))
+                .unwrap_err(),
                 [format!(
                     "the data plane: `rate_limiting.service`: {count} of `addresses`, where the synchronous mode needs three to fail over, or `rate_limiting.experimental_fewer_pods`"
                 )]
@@ -6153,21 +6228,24 @@ rate_limiting: {{ {section} }}
             assert_eq!(
                 with(&format!(
                     "mode: synchronous, {}, {WAITS}, experimental_fewer_pods: true",
-                    pods(count)
+                    synchronous(count)
                 )),
                 Ok(())
             );
             assert!(
                 with(&format!(
                     "mode: synchronous, {}, {WAITS}, experimental_fewer_pods: false",
-                    pods(count)
+                    synchronous(count)
                 ))
                 .is_err()
             );
         }
         for count in [3, 4, 5] {
             assert_eq!(
-                with(&format!("mode: synchronous, {}, {WAITS}", pods(count))),
+                with(&format!(
+                    "mode: synchronous, {}, {WAITS}",
+                    synchronous(count)
+                )),
                 Ok(())
             );
         }
@@ -6191,6 +6269,78 @@ rate_limiting: {{ {section} }}
     /// How a request waits for its owner, as a synchronous data plane is to say it.
     const WAITS: &str = "synchronous: { timeout_ms: 20, when_unreachable: allow, breaker: { failures: 5, probe_after_ms: 1000 } }";
 
+    /// A secret the synchronous mode's keys are hashed under.
+    const SECRET: &str = "00112233445566778899aabbccddeeff";
+
+    /// The synchronous mode needs its secret, 32 hex digits and nothing else, and says so
+    /// without saying back what was written; no other mode takes one.
+    #[test]
+    fn the_synchronous_mode_needs_its_key_secret_and_no_other_takes_one() {
+        let with = |section: &str| {
+            let yaml = format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{}}\nrate_limiting: {{ {section} }}\n"
+            );
+            compile(&config(&yaml))
+                .map(|compiled| match compiled.rate_limiting() {
+                    CompiledRateLimiting::Synchronous(synchronous) => Some(synchronous.key_secret),
+                    _ => None,
+                })
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let synchronous = |secret: &str| {
+            format!(
+                r#"mode: synchronous, service: {{ addresses: ["rl:7000"]{secret} }}, experimental_fewer_pods: true, {WAITS}"#
+            )
+        };
+        assert_eq!(
+            with(&synchronous(&format!(", key_secret: {SECRET}"))),
+            Ok(Some(KeySecret([
+                0x0011_2233_4455_6677,
+                0x8899_aabb_ccdd_eeff
+            ])))
+        );
+        assert_eq!(
+            with(&synchronous(
+                ", key_secret: 00112233445566778899AABBCCDDEEFF"
+            )),
+            Ok(Some(KeySecret([
+                0x0011_2233_4455_6677,
+                0x8899_aabb_ccdd_eeff
+            ]))),
+            "either case"
+        );
+        assert_eq!(
+            with(&synchronous("")).unwrap_err(),
+            [
+                "the data plane: `rate_limiting.service.key_secret` is needed by mode `synchronous`: 32 hex digits every data plane shares"
+            ]
+        );
+        for written in [
+            "0011223344556677889",
+            "00112233445566778899aabbccddeef",
+            "00112233445566778899aabbccddeeff0",
+            "+0112233445566778899aabbccddeeff",
+            "g0112233445566778899aabbccddeeff",
+            "",
+        ] {
+            let refused = with(&synchronous(&format!(r#", key_secret: "{written}""#))).unwrap_err();
+            assert_eq!(
+                refused,
+                ["the data plane: `rate_limiting.service.key_secret` must be 32 hex digits"],
+                "{written}"
+            );
+        }
+        assert_eq!(
+            with(&format!(
+                r#"mode: asynchronous, service: {{ addresses: ["rl:7000"], key_secret: {SECRET} }}"#
+            ))
+            .unwrap_err(),
+            ["the data plane: `rate_limiting.service.key_secret` is for mode `synchronous`"]
+        );
+        let secret = KeySecret::parse(SECRET).unwrap();
+        assert_eq!(format!("{secret:?}"), "KeySecret(..)", "never shown");
+    }
+
     /// The service's pods' ID, as a data plane checks them for it.
     const POD_ID: &str = "spiffe://cluster.local/ns/edge/sa/rl";
 
@@ -6204,8 +6354,13 @@ rate_limiting: {{ {section} }}
                 r#"listeners: {{}}
 routes: []
 upstreams: {{}}
-rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls} }}{synchronous} }}
+rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}{secret} }}{synchronous} }}
 "#,
+                secret = if mode == "synchronous" {
+                    format!(", key_secret: {SECRET}")
+                } else {
+                    String::new()
+                },
                 synchronous = if mode == "synchronous" {
                     format!(", experimental_fewer_pods: true, {WAITS}")
                 } else {
@@ -6273,7 +6428,11 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls} }}{syn
                 .map(|_| ())
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
-        let service = r#"service: { addresses: ["rl-0:7000", "rl-1:7000", "rl-2:7000"] }"#;
+        let plain = r#"service: { addresses: ["rl-0:7000", "rl-1:7000", "rl-2:7000"] }"#;
+        let service = format!(
+            r#"service: {{ addresses: ["rl-0:7000", "rl-1:7000", "rl-2:7000"], key_secret: {SECRET} }}"#
+        );
+        let service = service.as_str();
         assert_eq!(
             with(&format!("mode: synchronous, {service}, {WAITS}")),
             Ok(())
@@ -6282,7 +6441,7 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls} }}{syn
             with(&format!("mode: synchronous, {service}")).unwrap_err(),
             ["the data plane: `rate_limiting`: mode `synchronous` needs `synchronous`"]
         );
-        for (mode, more) in [("off", ""), ("local", ""), ("asynchronous", service)] {
+        for (mode, more) in [("off", ""), ("local", ""), ("asynchronous", plain)] {
             let more = if more.is_empty() {
                 String::new()
             } else {
@@ -6318,7 +6477,7 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls} }}{syn
             ("schedule_keys", "true"),
         ] {
             let service = format!(
-                r#"service: {{ addresses: ["rl-0:7000", "rl-1:7000", "rl-2:7000"], {field}: {value} }}"#
+                r#"service: {{ addresses: ["rl-0:7000", "rl-1:7000", "rl-2:7000"], key_secret: {SECRET}, {field}: {value} }}"#
             );
             assert_eq!(
                 with(&format!("mode: synchronous, {service}, {WAITS}")).unwrap_err(),
@@ -6811,13 +6970,13 @@ rate_limiting: {{ mode: local{switch} }}
 
     /// Each mode takes the models it can run, and a limit of another is refused naming it:
     /// local mode keeps no rolling window, nor does `when_unreachable: local`, the
-    /// synchronous mode has no windows until its service runs the store, and the asynchronous
-    /// mode's are designed later. Off runs none and refuses none.
+    /// synchronous mode's store runs both windows, and the asynchronous mode's are designed
+    /// later. Off runs none and refuses none.
     #[test]
     fn each_mode_takes_the_models_it_runs() {
         let service = r#"service: { addresses: ["rl-0:7000"] }"#;
         let synchronous = format!(
-            "rate_limiting: {{ mode: synchronous, {service}, experimental_fewer_pods: true, {WAITS} }}"
+            r#"rate_limiting: {{ mode: synchronous, service: {{ addresses: ["rl-0:7000"], key_secret: {SECRET} }}, experimental_fewer_pods: true, {WAITS} }}"#
         );
         let falling_back =
             synchronous.replace("when_unreachable: allow", "when_unreachable: local");
@@ -6830,7 +6989,8 @@ rate_limiting: {{ mode: local{switch} }}
                 "limit `k`: `model`: `{model}` is not supported {mode}"
             )])
         };
-        let sync = "in the synchronous mode yet";
+        let falling_back_locally =
+            "with `when_unreachable: local`, which decides as local mode does";
         let not_async = "in the asynchronous mode";
         for (mode, model, expected) in [
             ("", bucket, Ok(())),
@@ -6840,11 +7000,15 @@ rate_limiting: {{ mode: local{switch} }}
             (LOCAL, fixed, Ok(())),
             (LOCAL, rolling, refused("rolling_window", "in local mode")),
             (&synchronous, bucket, Ok(())),
-            (&synchronous, fixed, refused("fixed_window", sync)),
-            (&synchronous, rolling, refused("rolling_window", sync)),
+            (&synchronous, fixed, Ok(())),
+            (&synchronous, rolling, Ok(())),
             (&falling_back, bucket, Ok(())),
-            (&falling_back, fixed, refused("fixed_window", sync)),
-            (&falling_back, rolling, refused("rolling_window", sync)),
+            (&falling_back, fixed, Ok(())),
+            (
+                &falling_back,
+                rolling,
+                refused("rolling_window", falling_back_locally),
+            ),
             (&asynchronous, bucket, Ok(())),
             (&asynchronous, fixed, refused("fixed_window", not_async)),
             (&asynchronous, rolling, refused("rolling_window", not_async)),

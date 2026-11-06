@@ -1,92 +1,131 @@
 //! The synchronous mode's rate limits (06 §4): every request decided by the owners of its
-//! keys in the rate-limiting service. Each worker holds its own stream to each service pod
-//! (`edgerush_ratelimit_service::synchronous`): a request's keys go to their owners as the
-//! pods' view has them, those of different owners asked in parallel, and the answers come
-//! back to the worker that asked, with no thread between. Admitted under all, or refused,
-//! the owners that admitted given their charges back; an owner that does not answer in
-//! time, or whose stream breaks, leaves the request to `when_unreachable`.
+//! keys in the rate-limiting service's store (`edgerush_ratelimit_service::cluster`). Each
+//! worker holds its own streams to the service's pods and its own copy of the store's table
+//! (`cluster::plane::Plane`): a request's keys are each hashed under the secret every data
+//! plane shares and asked of the member the table names their owner, all at once, and the
+//! answers come back to the worker that asked, with no thread between. Admitted under all, or
+//! refused, the owners that admitted given their charges back.
 //!
-//! The process keeps a breaker for each owner, which its workers share: after `failures`
-//! in a row it opens, and every worker decides that owner's keys by `when_unreachable` at
-//! once, asking nothing. A thread of the process's own probes it after `probe_after`,
-//! opening a stream of its own: the pod's view, sent first on every stream, closes it.
+//! A worker first asks the pods at `service.addresses`, its seeds, for the table, and then
+//! reaches each member at the address the table gives it. A key whose owner says it is
+//! elsewhere is asked of the owner the newer table names; one whose owner is not serving, or
+//! that never reached its owner — the stream to it down, or its breaker open — goes through
+//! another member, chosen by the key, which forwards it. One unanswered in time leaves the
+//! request to `when_unreachable`, and is never asked again: it may have been counted.
+//!
+//! The process keeps a breaker for each member, which its workers share: after `failures` in
+//! a row it opens, and every worker sends that member's keys through another at once. A
+//! thread of the process's own probes it after `probe_after`, opening a stream of its own: the
+//! member's table, told first on every stream, closes it.
 //!
 //! With `when_unreachable: local`, the keys of the owners out of reach are decided from the
-//! process's own buckets, as local mode decides (`super::local`): each made full when first
-//! met without its owner and kept from one outage to the next until the sweep, on the probe
+//! process's own keys, as local mode decides (`super::local`): each made full when first met
+//! without its owner and kept from one outage to the next until the sweep, on the probe
 //! thread, forgets it full and idle. Nothing is charged there while the owners answer.
 
 use super::local::{LocalLimiter, Process as LocalKeys, SWEEP};
 use super::{Awaited, Failed, KeyedBy, Later, Limited, Refusal, Undecided, Usage, with_keys};
 use boring::ssl::SslConnector;
-use edgerush_config::{CompiledLimit, CompiledSynchronous, WhenUnreachable};
-use edgerush_ratelimit::local::Decision;
-use edgerush_ratelimit::service::{Contract, Decided, PodId, View, longest};
-use edgerush_ratelimit_service::grpc::Error;
-use edgerush_ratelimit_service::synchronous::wire;
-use edgerush_ratelimit_service::synchronous::{decide_stream, is_not_serving};
+use edgerush_config::{CompiledLimit, CompiledModel, CompiledSynchronous, WhenUnreachable};
+use edgerush_ratelimit::local::{Decision, Limit};
+use edgerush_ratelimit::service::{Decided, longest};
+use edgerush_ratelimit_service::cluster::link::Dial;
+use edgerush_ratelimit_service::cluster::plane::{
+    Answer, Due, GIVE_BACK_AGAIN, GIVE_BACK_LATER, Giving, NodeId, Plane, Rule, Told,
+};
+use edgerush_ratelimit_service::cluster::pod::decide_stream;
+use edgerush_ratelimit_service::cluster::wire::{self, Asking, Telling};
 use edgerush_telemetry::{Counter, Sharded};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
 
-/// How many messages may wait for a stream while it is opened: past them, a request is
-/// left to `when_unreachable`, as if the owner did not answer.
+/// How many messages may wait for a stream while it is opened: past them, a key is sent
+/// another way, as if its stream were down.
 const QUEUED: usize = 1_024;
 
-/// How long a probe waits for an owner's view: to connect and to hear from it.
+/// How long a probe waits for a member's table: to connect and to hear from it.
 const PROBE_WAIT: Duration = Duration::from_secs(1);
 
 /// How often the probe thread looks for breakers due a probe, at most: probes come no
 /// later than this after their time.
 const PROBE_LOOK: Duration = Duration::from_millis(50);
 
-/// The process's side of the synchronous mode: the config its workers ask by, a breaker
-/// for each owner, and what is counted of them.
+/// How many times one key of a request is sent at most: its owner, then the owner a newer
+/// table names, or another member for one not serving or out of reach. Past it, the key is
+/// out of reach.
+const SENDS_A_KEY: u8 = 4;
+
+/// The process's side of the synchronous mode: the config its workers ask by, each seed and
+/// member of the store they have met with its breaker, and what is counted of them.
 #[derive(Debug)]
 pub(crate) struct Process {
     config: CompiledSynchronous,
-    /// Each owner's, by its place among the addresses.
-    breakers: Box<[Arc<Breaker>]>,
-    /// What each worker's asks of each owner came to: answered, timed out, stream broken.
-    asks: Box<[Arc<OwnerAsks>]>,
+    /// Each seed and member its workers have met, by the address it is reached at: a worker
+    /// looks here only when it first meets one, and holds its own handle from then on, so
+    /// that an ask takes no lock.
+    members: Mutex<BTreeMap<String, Arc<Member>>>,
     /// Requests left to `when_unreachable`: let on, refused, and decided locally.
     unreachable: Arc<Sharded<[Counter; 3]>>,
-    /// The process's own buckets, with `when_unreachable: local`.
+    /// The process's own keys, with `when_unreachable: local`.
     local: Option<Arc<LocalKeys>>,
     /// The clock its breakers' times are read by, kept across a reload with them.
     start: Instant,
     /// What its streams dial the pods with, if with TLS.
     tls: Option<watch::Receiver<SslConnector>>,
+    workers: NonZeroUsize,
 }
 
-/// What a process's workers' asks of one owner came to.
+/// A seed or a member of the store, as a process's workers share it: where it is reached,
+/// the member there if a table has named it, its breaker, and what was asked of it.
+#[derive(Debug)]
+struct Member {
+    address: String,
+    id: Option<NodeId>,
+    breaker: Arc<Breaker>,
+    asks: Arc<OwnerAsks>,
+}
+
+/// What a process's workers' asks of one member came to.
 type OwnerAsks = Sharded<[Counter; 4]>;
 
-/// How an ask of an owner ended.
+/// How an ask of a member ended.
 #[derive(Clone, Copy)]
 enum Ended {
     Answered = 0,
     TimedOut = 1,
     Broken = 2,
-    /// Refused as not serving: not ready, not failing.
+    /// Answered as not serving: not ready, not failing.
     NotServing = 3,
+    /// Timed out, sent to a pod only to be forwarded: counted as timed out, but no failure of
+    /// that pod's.
+    ForwardedTimedOut = 4,
+}
+
+impl Ended {
+    /// Its place among an owner's counts: a forwarded ask's timeout is a timeout.
+    const fn counted(self) -> usize {
+        match self {
+            Self::ForwardedTimedOut => Self::TimedOut as usize,
+            how => how as usize,
+        }
+    }
 }
 
 impl Process {
     /// The process's synchronous mode for `config`, with `workers` workers, and the thread
-    /// that probes its owners' open breakers, which calls `failed` if it panics.
+    /// that probes its members' open breakers, which calls `failed` if it panics.
     ///
-    /// A reload carries an outage's state across from the `running` one: the breaker of
-    /// each owner whose address is still listed, whatever else changed, and the process's
-    /// own buckets while `when_unreachable` stays `local`, within the new cap; so that
-    /// tuning a setting mid-outage neither closes the breakers nor hands out fresh buckets.
+    /// A reload carries an outage's state across from the `running` one: every member met,
+    /// its breaker with it, whatever else changed, and the process's own keys while
+    /// `when_unreachable` stays `local`, within the new cap; so that tuning a setting
+    /// mid-outage neither closes the breakers nor hands out fresh buckets.
     pub(crate) fn start(
         config: CompiledSynchronous,
         workers: NonZeroUsize,
@@ -94,26 +133,7 @@ impl Process {
         running: Option<&Self>,
         tls: Option<SslConnector>,
     ) -> std::io::Result<Arc<Self>> {
-        let kept = |address: &String| {
-            let running = running?;
-            let at = running.config.addresses.iter().position(|a| a == address)?;
-            Some((
-                Arc::clone(running.breakers.get(at)?),
-                Arc::clone(running.asks.get(at)?),
-            ))
-        };
-        let (breakers, asks): (Vec<Arc<Breaker>>, Vec<Arc<OwnerAsks>>) = config
-            .addresses
-            .iter()
-            .map(|address| {
-                kept(address).unwrap_or_else(|| {
-                    (
-                        Arc::new(Breaker::default()),
-                        Arc::new(Sharded::new(workers)),
-                    )
-                })
-            })
-            .unzip();
+        let members = running.map_or_else(BTreeMap::new, |running| running.members().clone());
         let local = (config.when_unreachable == WhenUnreachable::Local).then(|| {
             match running.and_then(|running| running.local.as_ref()) {
                 Some(local) => {
@@ -124,8 +144,7 @@ impl Process {
             }
         });
         let process = Arc::new(Self {
-            breakers: breakers.into_boxed_slice(),
-            asks: asks.into_boxed_slice(),
+            members: Mutex::new(members),
             unreachable: running.map_or_else(
                 || Arc::new(Sharded::new(workers)),
                 |running| Arc::clone(&running.unreachable),
@@ -135,6 +154,7 @@ impl Process {
             config,
             // Fixed for its life: a reload that changes it starts another.
             tls: tls.map(|tls| watch::channel(tls).1),
+            workers,
         });
         let probed = Arc::downgrade(&process);
         std::thread::Builder::new()
@@ -152,30 +172,60 @@ impl Process {
         u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
-    /// Counts an ask of the owner at `pod` that ended as `how`, and tells its breaker.
-    fn asked(&self, pod: usize, how: Ended) {
-        if let Some(asks) = self.asks.get(pod) {
-            asks.local()[how as usize].inc();
-        }
-        if let Some(breaker) = self.breakers.get(pod) {
-            match how {
-                Ended::Answered => breaker.answered(),
-                Ended::TimedOut | Ended::Broken => {
-                    breaker.failed(self.now(), self.config.breaker_failures);
-                }
-                Ended::NotServing => {}
+    /// The seeds and members met, a lock poisoned taken as it was: what it guards is a map
+    /// whose every change is one insert.
+    fn members(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Arc<Member>>> {
+        self.members.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whom `address` reaches, as the workers share it — a seed, with no `id`, or member `id`
+    /// — met now if not before. A seed's pod named a member keeps the seed's breaker; another
+    /// member at an address, the pod there restarted, starts with a breaker of its own
+    /// (decided: one a member).
+    fn member_at(&self, address: &str, id: Option<NodeId>) -> Arc<Member> {
+        let mut members = self.members();
+        let (breaker, asks) = match members.get(address) {
+            Some(found) if id.is_none() || found.id == id => return Arc::clone(found),
+            Some(found) if found.id.is_none() => {
+                (Arc::clone(&found.breaker), Arc::clone(&found.asks))
             }
+            _ => (
+                Arc::new(Breaker::default()),
+                Arc::new(Sharded::new(self.workers)),
+            ),
+        };
+        let member = Arc::new(Member {
+            address: address.to_owned(),
+            id,
+            breaker,
+            asks,
+        });
+        members.insert(address.to_owned(), Arc::clone(&member));
+        member
+    }
+
+    /// What its streams dial with.
+    fn dial(&self) -> Dial {
+        self.tls
+            .as_ref()
+            .map_or(Dial::Plain, |tls| Dial::Secured(tls.clone()))
+    }
+
+    /// Counts an ask of `member` that ended as `how`, and tells its breaker.
+    fn asked(&self, member: &Member, how: Ended) {
+        member.asks.local()[how.counted()].inc();
+        match how {
+            Ended::Answered => member.breaker.answered(),
+            Ended::TimedOut | Ended::Broken => {
+                member
+                    .breaker
+                    .failed(self.now(), self.config.breaker_failures);
+            }
+            Ended::NotServing | Ended::ForwardedTimedOut => {}
         }
     }
 
-    /// Whether the owner at `pod` is not to be asked: its breaker open.
-    fn shut_out(&self, pod: usize) -> bool {
-        self.breakers
-            .get(pod)
-            .is_some_and(|breaker| breaker.is_open())
-    }
-
-    /// What its own buckets hold, in bytes, how many there are, and how many were evicted;
+    /// What its own keys hold, in bytes, how many there are, and how many were evicted;
     /// nothing without `when_unreachable: local`.
     pub(crate) fn usage(&self) -> Usage {
         self.local
@@ -183,34 +233,39 @@ impl Process {
             .map_or_else(Usage::default, |local| local.usage())
     }
 
-    /// What its owners' asks came to, their breakers, and what was left to
-    /// `when_unreachable`, as metrics.
+    /// What its members' asks came to, their breakers, and what was left to
+    /// `when_unreachable`, as metrics: each member labelled by its address, which a pod keeps
+    /// for its life, rather than its id, new each life.
     pub(crate) fn render_stats(&self) -> String {
+        let members: Vec<Arc<Member>> = self.members().values().cloned().collect();
         let mut out = String::from("# TYPE edgerush_rate_limit_owner_asks_total counter\n");
         let outcomes = ["answered", "timed_out", "broken", "not_serving"];
-        for (pod, asks) in self.asks.iter().enumerate() {
+        for member in &members {
             for (at, outcome) in outcomes.iter().enumerate() {
-                let count: u64 = asks.sum(|counters| counters[at].get());
+                let count: u64 = member.asks.sum(|counters| counters[at].get());
                 let _ = writeln!(
                     out,
-                    "edgerush_rate_limit_owner_asks_total{{pod=\"{pod}\",outcome=\"{outcome}\"}} {count}"
+                    "edgerush_rate_limit_owner_asks_total{{pod=\"{}\",outcome=\"{outcome}\"}} {count}",
+                    member.address
                 );
             }
         }
         out.push_str("# TYPE edgerush_rate_limit_owner_breaker_open gauge\n");
-        for (pod, breaker) in self.breakers.iter().enumerate() {
+        for member in &members {
             let _ = writeln!(
                 out,
-                "edgerush_rate_limit_owner_breaker_open{{pod=\"{pod}\"}} {}",
-                u8::from(breaker.is_open())
+                "edgerush_rate_limit_owner_breaker_open{{pod=\"{}\"}} {}",
+                member.address,
+                u8::from(member.breaker.is_open())
             );
         }
         out.push_str("# TYPE edgerush_rate_limit_owner_breaker_trips_total counter\n");
-        for (pod, breaker) in self.breakers.iter().enumerate() {
+        for member in &members {
             let _ = writeln!(
                 out,
-                "edgerush_rate_limit_owner_breaker_trips_total{{pod=\"{pod}\"}} {}",
-                breaker.trips.load(Ordering::Relaxed)
+                "edgerush_rate_limit_owner_breaker_trips_total{{pod=\"{}\"}} {}",
+                member.address,
+                member.breaker.trips.load(Ordering::Relaxed)
             );
         }
         out.push_str("# TYPE edgerush_rate_limit_unreachable_total counter\n");
@@ -225,7 +280,7 @@ impl Process {
     }
 }
 
-/// An owner's breaker, which a process's workers share: a few atomics, read on every ask
+/// A member's breaker, which a process's workers share: a few atomics, read on every ask
 /// and written only on failures and on the first answer after them.
 #[derive(Debug, Default)]
 struct Breaker {
@@ -243,7 +298,7 @@ impl Breaker {
         self.opened.load(Ordering::Relaxed) != 0
     }
 
-    /// An answer: the count of failures starts again. Read first, so that a healthy owner's
+    /// An answer: the count of failures starts again. Read first, so that a healthy member's
     /// answers write nothing every worker would share.
     fn answered(&self) {
         if self.failures.load(Ordering::Relaxed) != 0 {
@@ -286,19 +341,19 @@ impl Breaker {
             .is_ok()
     }
 
-    /// The owner heard from: closed.
+    /// The member heard from: closed.
     fn close(&self) {
         self.failures.store(0, Ordering::Relaxed);
         self.opened.store(0, Ordering::Relaxed);
     }
 }
 
-/// Probes the open breakers of `process`'s owners, each `probe_after` after it opened or
+/// Probes the open breakers of `process`'s members, each `probe_after` after it opened or
 /// was last probed, for as long as the process is kept; tells `failed` if it panics, as
-/// the other rate-limiting threads do (03 §2). A probe opens a stream to the owner and
-/// waits for its view: heard, the breaker closes; not, it waits another `probe_after`.
-/// With `when_unreachable: local`, it sweeps the process's own buckets every [`SWEEP`]
-/// too, as local mode's thread does.
+/// the other rate-limiting threads do (03 §2). A probe opens a stream to the member and
+/// waits for its table: heard, the breaker closes; not, it waits another `probe_after`.
+/// With `when_unreachable: local`, it sweeps the process's own keys every [`SWEEP`] too, as
+/// local mode's thread does.
 fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
     struct Watch(Option<Failed>);
     impl Drop for Watch {
@@ -334,32 +389,27 @@ fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
             }
             let probe_after = u64::try_from(held.config.probe_after.as_nanos()).unwrap_or(u64::MAX);
             let now = held.now();
-            for (pod, breaker) in held.breakers.iter().enumerate() {
-                let opened = breaker.opened.load(Ordering::Relaxed);
+            let members: Vec<Arc<Member>> = held.members().values().cloned().collect();
+            for member in members {
+                let opened = member.breaker.opened.load(Ordering::Relaxed);
                 if opened == 0 || now.saturating_sub(opened - 1) < probe_after {
                     continue;
                 }
                 // Due again only after another period, heard from or not; not this thread's to
                 // probe if another closed or probed it meanwhile.
-                if !breaker.rearm(opened, now) {
+                if !member.breaker.rearm(opened, now) {
                     continue;
                 }
-                let Some(address) = held.config.addresses.get(pod).cloned() else {
-                    continue;
-                };
-                let tls = held.tls.clone();
-                let probed = std::sync::Arc::downgrade(&held);
+                let dial = held.dial();
                 tokio::spawn(async move {
                     let heard = tokio::time::timeout(PROBE_WAIT, async {
-                        let mut stream = decide_stream(&address, tls.as_ref()).await.ok()?;
+                        let mut stream = decide_stream(&member.address, &dial).await.ok()?;
                         let first = stream.down.message().await.ok()??;
-                        matches!(first.message, Some(wire::FromOwner::View(_))).then_some(())
+                        matches!(first.told, Some(wire::Told::Table(_))).then_some(())
                     })
                     .await;
-                    if let (Ok(Some(())), Some(process)) = (heard, probed.upgrade())
-                        && let Some(breaker) = process.breakers.get(pod)
-                    {
-                        breaker.close();
+                    if let Ok(Some(())) = heard {
+                        member.breaker.close();
                     }
                 });
             }
@@ -367,65 +417,63 @@ fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
     });
 }
 
-/// Keys with their contracts, kept where they may be needed again.
-type Kept = Vec<(Vec<u8>, Contract)>;
-
 /// An owner's answer, or why there is none.
-type Answer = Result<wire::Decided, Gone>;
+type Answered = Result<Answer, Gone>;
 
-/// Why an owner will not answer an ask.
-#[derive(Clone, Copy, Debug)]
+/// Why a pod will not answer an ask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Gone {
-    /// Its stream broke, or could not be opened.
+    /// Its connection broke with the ask on it, which may have reached the pod.
     Broken,
-    /// It refused the stream as not serving: the view has not taken it in, in its present
-    /// life, and its keys are for their next owner meanwhile.
-    NotServing,
+    /// Its connection never opened, the ask still waiting for it: it never reached the pod.
+    Unreached,
 }
 
-/// How long a worker waits before trying again a pod that refused it as not serving.
-const NOT_SERVING_RETRY: Duration = Duration::from_millis(250);
+impl Gone {
+    /// Why the asks on a connection that was `link` are gone, the connection let go of.
+    const fn of(link: &Link) -> Self {
+        match link {
+            Link::Opening(..) => Self::Unreached,
+            Link::Down | Link::Up(..) => Self::Broken,
+        }
+    }
+}
 
-/// A worker's connection to a pod, as it stands: each one opened has a number of its own,
-/// its generation, so that an old connection let go of, whose end comes later, touches
-/// only what is its own and never the one that replaced it.
+/// A worker's stream to one pod, in one of three states.
 enum Link {
     /// Not open: the next message opens it.
     Down,
     /// Being opened, with what is to go up once it is.
-    Opening(u64, Vec<wire::Upstream>),
+    Opening(u64, Vec<Asking>),
     /// Open.
-    Up(u64, mpsc::Sender<wire::Upstream>),
+    Up(u64, mpsc::Sender<Asking>),
 }
 
-/// What waits on an owner's answer, by the number of the ask.
+/// What waits on a pod's answer, by the number of the ask.
 enum Waiter {
-    /// A request.
-    Asked(oneshot::Sender<Answer>),
-    /// A request that gave up on it and was refused: an admission that comes late is
-    /// given back, under these keys.
-    GivenUp(Kept),
+    /// An ask: a request's key, or a give-back.
+    Asked(oneshot::Sender<Answered>),
+    /// A request's key that gave up on it and was refused: an admission that comes late is
+    /// given back, under this rule.
+    GivenUp(u64, Rule),
 }
 
-/// A worker's stream to one service pod, and what waits on its answers, each with the
+/// A worker's stream to one pod, by its address, and what waits on its answers, each with the
 /// generation of the connection it was sent on.
 struct Stream {
     address: String,
-    tls: Option<watch::Receiver<SslConnector>>,
+    dial: Dial,
     link: RefCell<Link>,
     /// The generation the next connection opened gets.
     next: Cell<u64>,
     waiting: RefCell<HashMap<u64, (u64, Waiter)>>,
-    /// The pod refused it as not serving, and has not opened a stream since: its keys go
-    /// to their next owner.
-    not_serving: Cell<bool>,
 }
 
 impl Stream {
     /// Sends `message` up, opening the stream first if it is not open: the generation of
     /// the connection it went on, or none if it cannot go — the stream broke, or too much
-    /// waits for it.
-    fn send(self: &Rc<Self>, message: wire::Upstream, view: &Rc<RefCell<View>>) -> Option<u64> {
+    /// waits for it — so that it never reached the pod.
+    fn send(self: &Rc<Self>, message: Asking, limiter: &Weak<SyncLimiter>) -> Option<u64> {
         let mut link = self.link.borrow_mut();
         match &mut *link {
             Link::Up(generation, up) => match up.try_send(message) {
@@ -449,11 +497,7 @@ impl Stream {
             Link::Down => {
                 let generation = self.opening();
                 *link = Link::Opening(generation, vec![message]);
-                tokio::task::spawn_local(open(
-                    Rc::downgrade(self),
-                    Rc::downgrade(view),
-                    generation,
-                ));
+                tokio::task::spawn_local(open(Rc::downgrade(self), limiter.clone(), generation));
                 Some(generation)
             }
         }
@@ -466,17 +510,8 @@ impl Stream {
         generation
     }
 
-    /// Lets go of the stream, if it is open or opening, and of what waits on it: its owner's
-    /// breaker is open.
-    fn shut(&self) {
-        let was = std::mem::replace(&mut *self.link.borrow_mut(), Link::Down);
-        if let Link::Opening(generation, _) | Link::Up(generation, _) = was {
-            self.broke(generation, Gone::Broken);
-        }
-    }
-
-    /// Hands every request waiting on the connection of `generation` the news that its
-    /// owner will not answer on it, and `why`; those that gave up on it hear no more.
+    /// Hands every ask waiting on the connection of `generation` the news that its pod will
+    /// not answer on it, and `why`; those that gave up on it hear no more.
     fn broke(&self, generation: u64, why: Gone) {
         let mut waiting = self.waiting.borrow_mut();
         let gone: Vec<u64> = waiting
@@ -496,8 +531,17 @@ impl Stream {
         }
     }
 
-    /// Lets go of the connection of `generation`, which ended: the stream is down if it is
-    /// still the one it has, and what waited on it is told `why`.
+    /// Lets go of the stream, if it is open or opening, and of what waits on it: its pod's
+    /// breaker is open.
+    fn shut(&self) {
+        let was = std::mem::replace(&mut *self.link.borrow_mut(), Link::Down);
+        if let Link::Opening(generation, _) | Link::Up(generation, _) = was {
+            self.broke(generation, Gone::of(&was));
+        }
+    }
+
+    /// Lets go of the connection of `generation`, which ended, or never opened as `why` says:
+    /// the stream is down if it is still the one it has, and what waited on it is told.
     fn ended(&self, generation: u64, why: Gone) {
         let mut link = self.link.borrow_mut();
         if let Link::Opening(current, _) | Link::Up(current, _) = &*link
@@ -508,42 +552,19 @@ impl Stream {
         drop(link);
         self.broke(generation, why);
     }
-
-    /// The pod refused the connection of `generation` as not serving: marked so, its keys
-    /// go to their next owner, and what waited on it is asked of them; tried again in the
-    /// background a little later, a stream opening there clearing the mark.
-    fn refused(self: &Rc<Self>, generation: u64, view: &Weak<RefCell<View>>) {
-        self.not_serving.set(true);
-        self.ended(generation, Gone::NotServing);
-        let (stream, view) = (Rc::downgrade(self), view.clone());
-        tokio::task::spawn_local(async move {
-            tokio::time::sleep(NOT_SERVING_RETRY).await;
-            let Some(held) = stream.upgrade() else {
-                return;
-            };
-            let mut link = held.link.borrow_mut();
-            if !matches!(*link, Link::Down) {
-                return;
-            }
-            let generation = held.opening();
-            *link = Link::Opening(generation, Vec::new());
-            drop(link);
-            tokio::task::spawn_local(open(stream, view, generation));
-        });
-    }
 }
 
 /// Opens the connection of `generation` for `stream`, sends what waited for it, and hands
-/// out its answers and the pods' view until it ends, or the worker lets go of it. A
-/// connection the worker let go of while it was being opened is closed at once.
-async fn open(stream: Weak<Stream>, view: Weak<RefCell<View>>, generation: u64) {
-    let Some((address, tls)) = stream
+/// out its answers and the tables it is told, through `limiter`'s plane, until it ends or the
+/// worker lets go of it.
+async fn open(stream: Weak<Stream>, limiter: Weak<SyncLimiter>, generation: u64) {
+    let Some((address, dial)) = stream
         .upgrade()
-        .map(|stream| (stream.address.clone(), stream.tls.clone()))
+        .map(|stream| (stream.address.clone(), stream.dial.clone()))
     else {
         return;
     };
-    let opened = decide_stream(&address, tls.as_ref()).await;
+    let opened = decide_stream(&address, &dial).await;
     let Some(held) = stream.upgrade() else {
         return;
     };
@@ -562,7 +583,6 @@ async fn open(stream: Weak<Stream>, view: Weak<RefCell<View>>, generation: u64) 
                 return;
             };
             drop(link);
-            held.not_serving.set(false);
             for message in queued {
                 if opened.up.try_send(message).is_err() {
                     break;
@@ -570,78 +590,97 @@ async fn open(stream: Weak<Stream>, view: Weak<RefCell<View>>, generation: u64) 
             }
             opened.down
         }
-        Err(Error::Status(status)) if is_not_serving(&status) => {
-            held.refused(generation, &view);
-            return;
-        }
         Err(_) => {
-            held.ended(generation, Gone::Broken);
+            held.ended(generation, Gone::Unreached);
             return;
         }
     };
     drop(held);
     loop {
         let message = down.message().await;
-        let Some(held) = stream.upgrade() else {
+        let (Some(held), Some(worker)) = (stream.upgrade(), limiter.upgrade()) else {
             return;
         };
-        match message {
-            Ok(Some(wire::Downstream {
-                message: Some(wire::FromOwner::Decided(decided)),
-            })) => {
-                let waiter = held
-                    .waiting
-                    .borrow_mut()
-                    .remove(&decided.id)
-                    .map(|(_, waiter)| waiter);
-                match waiter {
-                    Some(Waiter::Asked(asked)) => {
-                        let _gone = asked.send(Ok(decided));
-                    }
-                    // Admitted after its request gave up and was refused: given back.
-                    Some(Waiter::GivenUp(keys)) if decided.admitted => {
-                        if let Some(view) = view.upgrade() {
-                            let _lost = held.send(give_back_of(keys), &view);
-                        }
-                    }
-                    Some(Waiter::GivenUp(_)) | None => {}
-                }
-            }
-            Ok(Some(wire::Downstream {
-                message: Some(wire::FromOwner::View(said)),
-            })) => {
-                // The latest the pods agreed, whichever stream says it first.
-                if let Some(view) = view.upgrade() {
-                    let said = View::from(said);
-                    let mut view = view.borrow_mut();
-                    if said.epoch > view.epoch {
-                        *view = said;
-                    }
-                }
-            }
-            Ok(Some(wire::Downstream { message: None })) => {}
-            Err(status) if is_not_serving(&status) => {
-                held.refused(generation, &view);
-                return;
-            }
+        let told: Telling = match message {
+            Ok(Some(told)) => told,
             Ok(None) | Err(_) => {
                 held.ended(generation, Gone::Broken);
                 return;
             }
+        };
+        // A message it cannot use is passed over, as a pod's of another release might send.
+        let Ok(Told::Answer { id, answer }) = worker.plane.borrow_mut().told(told) else {
+            continue;
+        };
+        let waiter = held
+            .waiting
+            .borrow_mut()
+            .remove(&id)
+            .map(|(_, waiter)| waiter);
+        match (waiter, answer) {
+            (Some(Waiter::Asked(asked)), answer) => {
+                let _gone = asked.send(Ok(answer));
+            }
+            // Admitted after its request gave up and was refused: given back.
+            (Some(Waiter::GivenUp(key, rule)), Answer::Admitted(receipt)) => {
+                worker.give_back(key, rule, receipt);
+            }
+            (Some(Waiter::GivenUp(..)) | None, _) => {}
         }
     }
 }
 
-/// A worker's limiter in the synchronous mode: its streams to the service's pods, the view
-/// it reads owners from, and its buffers for a request's keys.
+/// What a key is held to in the synchronous mode: the store's rule, which its owner decides
+/// by, and the same limit as local mode keeps it, for `when_unreachable: local`; none for a
+/// rolling window, which local mode does not keep and its config refuses with it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeldTo {
+    rule: Rule,
+    local: Option<Limit>,
+}
+
+impl super::Held for HeldTo {
+    fn of(limit: &CompiledLimit, count: NonZeroU64) -> Option<Self> {
+        let (per, window) = (count.get(), limit.window.get());
+        let rule = match limit.model {
+            CompiledModel::Bucket { burst, .. } => Rule::Bucket {
+                per,
+                period: window,
+                burst: burst.get(),
+            },
+            CompiledModel::FixedWindow { .. } => Rule::Window { per, window },
+            CompiledModel::RollingWindow { .. } => Rule::Rolling { per, window },
+        };
+        Some(Self {
+            rule,
+            local: <Limit as super::Held>::of(limit, count),
+        })
+    }
+}
+
+/// Whom a key is sent to: a member the table names, or, with no table yet, a seed, by its
+/// place among them, which forwards it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum To {
+    Member(NodeId),
+    Seed(usize),
+}
+
+/// A worker's limiter in the synchronous mode: its streams to the service's pods, the table
+/// it routes by, the seeds and members it has met, and its buffers for a request's keys.
 pub(crate) struct SyncLimiter {
     process: Arc<Process>,
-    streams: Vec<Rc<Stream>>,
-    view: Rc<RefCell<View>>,
+    plane: RefCell<Plane>,
+    /// By address: a seed's, and each member's the table gives.
+    streams: RefCell<HashMap<String, Rc<Stream>>>,
+    /// Each seed, as the process shares it, in the order the config gives them.
+    seeds: Vec<Arc<Member>>,
+    /// Each member met, as the process shares it.
+    members: RefCell<HashMap<NodeId, Arc<Member>>>,
     next: Cell<u64>,
     keys: RefCell<Vec<Vec<u8>>>,
-    contracts: RefCell<Vec<Contract>>,
-    /// Its handles on the process's own buckets, with `when_unreachable: local`.
+    contracts: RefCell<Vec<HeldTo>>,
+    /// Its handles on the process's own keys, with `when_unreachable: local`.
     local: Option<Rc<LocalLimiter>>,
 }
 
@@ -652,49 +691,44 @@ impl std::fmt::Debug for SyncLimiter {
 }
 
 impl SyncLimiter {
-    /// A worker's limiter on `process`: a stream to each pod, all of them opened now, and
-    /// every pod taken to serve until the pods say otherwise. Every pod's, not only those a
-    /// key has needed: the pods' view comes down each, so that a worker whose owners go
-    /// still hears from the rest where their keys went.
+    /// A worker's limiter on `process`: a stream to each seed opened now, for the table, which
+    /// each of them tells as the stream opens.
     pub(crate) fn new(process: Arc<Process>, index: usize) -> Rc<Self> {
-        let streams: Vec<Rc<Stream>> = process
-            .config
-            .addresses
-            .iter()
-            .map(|address| {
-                Rc::new(Stream {
-                    address: address.clone(),
-                    tls: process.tls.clone(),
-                    link: RefCell::new(Link::Opening(0, Vec::new())),
-                    next: Cell::new(1),
-                    waiting: RefCell::new(HashMap::new()),
-                    not_serving: Cell::new(false),
-                })
-            })
-            .collect();
-        let pods = (0..process.config.addresses.len())
-            .filter_map(|pod| PodId::try_from(pod).ok())
-            .collect();
-        let view = Rc::new(RefCell::new(View { epoch: 0, pods }));
-        for stream in &streams {
-            tokio::task::spawn_local(open(Rc::downgrade(stream), Rc::downgrade(&view), 0));
-        }
         let local = process
             .local
             .as_ref()
             .map(|local| LocalLimiter::new(Arc::clone(local), index));
-        Rc::new(Self {
+        let seeds = process
+            .config
+            .addresses
+            .iter()
+            .map(|seed| process.member_at(seed, None))
+            .collect();
+        let limiter = Rc::new(Self {
+            plane: RefCell::new(Plane::new(process.config.key_secret.0)),
             process,
-            streams,
-            view,
+            streams: RefCell::new(HashMap::new()),
+            seeds,
+            members: RefCell::new(HashMap::new()),
             next: Cell::new(0),
             keys: RefCell::new(Vec::new()),
             contracts: RefCell::new(Vec::new()),
             local,
-        })
+        });
+        for seed in &limiter.process.config.addresses {
+            let stream = limiter.stream(seed);
+            let generation = stream.opening();
+            *stream.link.borrow_mut() = Link::Opening(generation, Vec::new());
+            tokio::task::spawn_local(open(
+                Rc::downgrade(&stream),
+                Rc::downgrade(&limiter),
+                generation,
+            ));
+        }
+        limiter
     }
 
-    /// What its process's own buckets hold, as [`Process::usage`] says.
+    /// What its process's own keys hold, as [`Process::usage`] says.
     pub(crate) fn usage(&self) -> Usage {
         self.process.usage()
     }
@@ -704,8 +738,97 @@ impl SyncLimiter {
         Arc::ptr_eq(&self.process, process)
     }
 
+    /// Its stream to the pod at `address`, made, not opened, if it has none.
+    fn stream(&self, address: &str) -> Rc<Stream> {
+        Rc::clone(
+            self.streams
+                .borrow_mut()
+                .entry(address.to_owned())
+                .or_insert_with(|| {
+                    Rc::new(Stream {
+                        address: address.to_owned(),
+                        dial: self.process.dial(),
+                        link: RefCell::new(Link::Down),
+                        next: Cell::new(0),
+                        waiting: RefCell::new(HashMap::new()),
+                    })
+                }),
+        )
+    }
+
+    /// Member `id`, as the process shares it, if its table gives it an address: looked up in
+    /// the process the first time only.
+    fn member(&self, id: NodeId) -> Option<Arc<Member>> {
+        if let Some(member) = self.members.borrow().get(&id) {
+            return Some(Arc::clone(member));
+        }
+        let address = self.plane.borrow().address(id)?.to_owned();
+        let member = self.process.member_at(&address, Some(id));
+        self.members.borrow_mut().insert(id, Arc::clone(&member));
+        Some(member)
+    }
+
+    /// Whether member `id`'s breaker is open: its keys go another way.
+    fn shut_out(&self, id: NodeId) -> bool {
+        self.member(id)
+            .is_some_and(|member| self.passed_over(&member))
+    }
+
+    /// Whether `member`'s breaker is open: its keys go another way, and the worker lets go of
+    /// its stream to it, which may be hung, so that the next it opens there is afresh.
+    fn passed_over(&self, member: &Member) -> bool {
+        let open = member.breaker.is_open();
+        if open && let Some(stream) = self.streams.borrow().get(&member.address) {
+            stream.shut();
+        }
+        open
+    }
+
+    /// Whom to send `key` to and where it is reached: its owner unless `avoid` names it or its
+    /// breaker is open, else another member chosen by the key; with no table yet, a seed chosen
+    /// by the key among those not in `avoid_seeds` and with their breakers closed. None when
+    /// none is left.
+    fn route(&self, key: u64, avoid: &[NodeId], avoid_seeds: &[usize]) -> Option<(To, String)> {
+        let plane = self.plane.borrow();
+        if plane.table().is_none() {
+            let open = || {
+                self.seeds
+                    .iter()
+                    .enumerate()
+                    .filter(|(at, seed)| !avoid_seeds.contains(at) && !self.passed_over(seed))
+            };
+            let count = u64::try_from(open().count())
+                .ok()
+                .filter(|count| *count > 0)?;
+            let (at, seed) = open().nth(usize::try_from(key % count).ok()?)?;
+            return Some((To::Seed(at), seed.address.clone()));
+        }
+        let to = plane.through(key, |member| {
+            avoid.contains(&member) || self.shut_out(member)
+        })?;
+        Some((To::Member(to), plane.address(to)?.to_owned()))
+    }
+
+    /// Counts an ask of `to` that ended as `how`.
+    fn asked(&self, to: To, how: Ended) {
+        let member = match to {
+            To::Member(id) => self.member(id),
+            To::Seed(at) => self.seeds.get(at).cloned(),
+        };
+        if let Some(member) = member {
+            self.process.asked(&member, how);
+        }
+    }
+
+    /// The next number to ask by.
+    fn number(&self) -> u64 {
+        let id = self.next.get();
+        self.next.set(id.wrapping_add(1));
+        id
+    }
+
     /// Asks the owners about a request from `client` under those of `limits` that
-    /// `limited` marks: each owner about its keys, all at once, the decision to come.
+    /// `limited` marks: each key of its owner, all at once, the decision to come.
     pub(crate) fn decide_all<'f>(
         self: &Rc<Self>,
         limits: &[Arc<CompiledLimit>],
@@ -728,126 +851,111 @@ impl SyncLimiter {
         )
     }
 
-    /// Sends each owner its part of a request under `keys`, to be answered by `until`.
-    fn ask(self: &Rc<Self>, keys: &[(&[u8], Contract)], until: tokio::time::Instant) -> Asked {
-        // Which owner each key has, as the view has it, around one not serving.
-        let owners: Vec<Option<usize>> =
-            keys.iter().map(|(key, _)| self.route(key, None)).collect();
-        let mut parts: Vec<Part> = Vec::new();
-        for (at, owner) in owners.iter().enumerate() {
-            match parts.iter_mut().find(|part| part.pod == *owner) {
-                Some(part) => part.positions.push(at),
-                None => parts.push(Part {
-                    pod: *owner,
-                    positions: vec![at],
-                    kept: Vec::new(),
-                    answer: None,
-                }),
-            }
-        }
-        for part in &mut parts {
-            // Kept for as long as they may be needed again: given back to an owner when
-            // another refuses, or when it admits too late; asked of the next owner when it
-            // is not serving; decided locally when it is out of reach.
-            part.kept = part
-                .positions
-                .iter()
-                .filter_map(|at| keys.get(*at))
-                .map(|(key, contract)| (key.to_vec(), *contract))
-                .collect();
-            self.send_part(part);
-        }
+    /// Sends each of `keys` to its owner, to be answered by `until`.
+    fn ask(self: &Rc<Self>, keys: &[(&[u8], HeldTo)], until: tokio::time::Instant) -> Asked {
+        let parts = keys
+            .iter()
+            .enumerate()
+            .map(|(position, (bytes, held))| {
+                let mut part = Part {
+                    position,
+                    key: self.plane.borrow().key(bytes),
+                    held: *held,
+                    bytes: bytes.to_vec(),
+                    avoid: Vec::new(),
+                    avoid_seeds: Vec::new(),
+                    sends: 0,
+                    sent: None,
+                };
+                self.send_part(&mut part);
+                part
+            })
+            .collect();
         Asked {
             limiter: Rc::clone(self),
-            parts: parts.into(),
+            parts,
             until,
         }
     }
 
-    /// The pod that decides `key`: its owner in the view or, the owner not serving, the next,
-    /// if that one is; never `refusing`, the pod that has just refused it as not serving.
-    /// None when the view names no pod this data plane has an address for.
-    fn route(&self, key: &[u8], refusing: Option<usize>) -> Option<usize> {
-        let usable = |pod: Option<PodId>| {
-            pod.and_then(|pod| usize::try_from(pod).ok())
-                .filter(|pod| *pod < self.streams.len())
-        };
-        let ready = |pod: &usize| !self.streams[*pod].not_serving.get() && Some(*pod) != refusing;
-        let (owner, next) = self.view.borrow().owners(key);
-        let (owner, next) = (usable(owner), usable(next));
-        match owner {
-            Some(pod) if ready(&pod) => Some(pod),
-            Some(pod) => next
-                .filter(ready)
-                .or((Some(pod) != refusing).then_some(pod)),
-            None => None,
-        }
-    }
-
-    /// Asks the part's pod about its keys, registering the answer to come on the connection
-    /// the ask went on; no answer when it could not be asked.
+    /// Sends `part` to whom its key routes to, and again another way each time that cannot
+    /// reach its pod — its stream down or too full — counting that against the member: sent,
+    /// or out of reach, every member passed over or [`SENDS_A_KEY`] spent.
     fn send_part(self: &Rc<Self>, part: &mut Part) {
-        let Some(pod) = part.pod else {
-            return;
-        };
-        // Its breaker open, its keys are decided at once by `when_unreachable`, and the
-        // worker lets go of its stream, which may be hung: the next is opened afresh.
-        if self.process.shut_out(pod) {
-            self.streams[pod].shut();
-            return;
-        }
-        let id = self.next.get();
-        self.next.set(id.wrapping_add(1));
-        let sent: Vec<wire::Key> = part
-            .kept
-            .iter()
-            .map(|(key, contract)| wire::Key {
-                key: key.clone(),
-                contract: Some((*contract).into()),
-            })
-            .collect();
-        let (answered, answer) = oneshot::channel();
-        let stream = &self.streams[pod];
-        let decide = wire::Upstream {
-            message: Some(wire::ToOwner::Decide(wire::Decide { id, keys: sent })),
-        };
-        // Registered once sent, on the connection it went on: nothing else runs on the
-        // worker in between, so its answer cannot come first.
-        match stream.send(decide, &self.view) {
-            Some(generation) => {
+        part.sent = None;
+        while part.sends < SENDS_A_KEY {
+            let Some((to, address)) = self.route(part.key, &part.avoid, &part.avoid_seeds) else {
+                return;
+            };
+            part.sends += 1;
+            let id = self.number();
+            let Some(asking) = self
+                .plane
+                .borrow()
+                .request(id, part.key, Some(part.held.rule))
+            else {
+                return;
+            };
+            let (answered, answer) = oneshot::channel();
+            let stream = self.stream(&address);
+            // Registered once sent, on the connection it went on: nothing else runs on the
+            // worker in between, so its answer cannot come first.
+            if let Some(generation) = stream.send(asking, &Rc::downgrade(self)) {
                 stream
                     .waiting
                     .borrow_mut()
                     .insert(id, (generation, Waiter::Asked(answered)));
-                part.answer = Some((id, generation, answer));
+                let forwarded = matches!(
+                    to,
+                    To::Member(member) if self.plane.borrow().owner(part.key) != Some(member)
+                );
+                part.sent = Some(Sent {
+                    to,
+                    forwarded,
+                    stream,
+                    id,
+                    generation,
+                    answer,
+                });
+                return;
             }
-            None => self.process.asked(pod, Ended::Broken),
+            // It never reached the pod: sent another way, to be forwarded (membership-design).
+            self.asked(to, Ended::Broken);
+            match to {
+                To::Member(member) => part.avoid.push(member),
+                To::Seed(at) => part.avoid_seeds.push(at),
+            }
         }
     }
 
-    /// The keys of `part`, refused as not serving by `refusing`, asked again of their next
-    /// owners: a part for each, and one with no pod for those that have none.
-    fn ask_again(self: &Rc<Self>, part: Part, refusing: usize) -> Vec<Part> {
-        let mut parts: Vec<Part> = Vec::new();
-        for (position, kept) in part.positions.into_iter().zip(part.kept) {
-            let pod = self.route(&kept.0, Some(refusing));
-            match parts.iter_mut().find(|again| again.pod == pod) {
-                Some(again) => {
-                    again.positions.push(position);
-                    again.kept.push(kept);
-                }
-                None => parts.push(Part {
-                    pod,
-                    positions: vec![position],
-                    kept: vec![kept],
-                    answer: None,
-                }),
-            }
-        }
-        for again in &mut parts {
-            self.send_part(again);
-        }
-        parts
+    /// Gives back one charged under `key` and `rule`, answered with `receipt`, to the key's
+    /// owner as the table names it then: sent again at [`GIVE_BACK_AGAIN`] and [`GIVE_BACK_LATER`]
+    /// while unanswered, three sends at most (T6a), on a task of the worker's own.
+    fn give_back(self: &Rc<Self>, key: u64, rule: Rule, receipt: u64) {
+        tokio::task::spawn_local(give_back(Rc::downgrade(self), key, rule, receipt));
+    }
+
+    /// Sends the give-back of `key` once: its answer to come, if it could be sent.
+    fn send_give_back(
+        self: &Rc<Self>,
+        key: u64,
+        rule: Rule,
+        receipt: u64,
+    ) -> Option<oneshot::Receiver<Answered>> {
+        let (_, address) = self.route(key, &[], &[])?;
+        let id = self.number();
+        let asking = self
+            .plane
+            .borrow()
+            .give_back(id, key, Some(rule), receipt)?;
+        let stream = self.stream(&address);
+        let generation = stream.send(asking, &Rc::downgrade(self))?;
+        let (answered, answer) = oneshot::channel();
+        stream
+            .waiting
+            .borrow_mut()
+            .insert(id, (generation, Waiter::Asked(answered)));
+        Some(answer)
     }
 
     /// Which of `limits` refused a request from `client` under those `limited` marks, and
@@ -888,44 +996,73 @@ impl SyncLimiter {
             },
         )
     }
+}
 
-    /// Gives one request's charge under `keys` back to the owner at `pod`.
-    fn give_back(&self, pod: usize, keys: Kept) {
-        if let Some(stream) = self.streams.get(pod) {
-            let _lost = stream.send(give_back_of(keys), &self.view);
+/// Gives back one charged under `key` and `rule` with `receipt`, for `limiter`'s worker:
+/// sent, then sent again while unanswered as [`Giving`] says, until answered or dropped.
+async fn give_back(limiter: Weak<SyncLimiter>, key: u64, rule: Rule, receipt: u64) {
+    let Some(held) = limiter.upgrade() else {
+        return;
+    };
+    let mut giving = Giving::sent(held.process.now());
+    let mut answer = held.send_give_back(key, rule, receipt);
+    let mut wait = GIVE_BACK_AGAIN;
+    drop(held);
+    loop {
+        let waited = Duration::from_nanos(wait);
+        let answered = match &mut answer {
+            Some(answer) => matches!(tokio::time::timeout(waited, answer).await, Ok(Ok(Ok(_)))),
+            None => {
+                tokio::time::sleep(waited).await;
+                false
+            }
+        };
+        if answered {
+            return;
+        }
+        let Some(held) = limiter.upgrade() else {
+            return;
+        };
+        match giving.due(held.process.now()) {
+            Due::Again => {
+                answer = held.send_give_back(key, rule, receipt);
+                wait = GIVE_BACK_LATER;
+            }
+            Due::Waiting => {}
+            Due::Dropped => return,
         }
     }
 }
 
-/// The message that gives one request's charge under `keys` back.
-fn give_back_of(keys: Kept) -> wire::Upstream {
-    let keys = keys
-        .into_iter()
-        .map(|(key, contract)| wire::Key {
-            key,
-            contract: Some(contract.into()),
-        })
-        .collect();
-    wire::Upstream {
-        message: Some(wire::ToOwner::GiveBack(wire::GiveBack { keys })),
-    }
+/// One key of a request: its place among the request's keys, the store's key, what it is held
+/// to and its bytes, for the process's own keys; the members and seeds passed over for it, its
+/// sends, and where it went last, its answer to come.
+struct Part {
+    position: usize,
+    key: u64,
+    held: HeldTo,
+    bytes: Vec<u8>,
+    avoid: Vec<NodeId>,
+    avoid_seeds: Vec<usize>,
+    sends: u8,
+    sent: Option<Sent>,
 }
 
-/// One owner's part of a request: its keys' places among the request's, the keys with
-/// their contracts where they may be needed again, and its answer to come; no pod, or no
-/// answer, for a part that could not be asked.
-struct Part {
-    pod: Option<usize>,
-    positions: Vec<usize>,
-    kept: Kept,
-    /// The ask's number, the generation of the connection it went on, and its answer.
-    answer: Option<(u64, u64, oneshot::Receiver<Answer>)>,
+/// Where a key was sent, and its answer to come.
+struct Sent {
+    to: To,
+    /// Whether it went to a member that is not the key's owner, only to be forwarded.
+    forwarded: bool,
+    stream: Rc<Stream>,
+    id: u64,
+    generation: u64,
+    answer: oneshot::Receiver<Answered>,
 }
 
 /// A request asked of its owners, waiting on their answers.
 pub(crate) struct Asked {
     limiter: Rc<SyncLimiter>,
-    parts: std::collections::VecDeque<Part>,
+    parts: VecDeque<Part>,
     until: tokio::time::Instant,
 }
 
@@ -934,53 +1071,73 @@ impl Asked {
     /// admitted if all admitted; otherwise, some owner out of reach, as `when_unreachable`
     /// says.
     pub(crate) async fn decided(mut self) -> Result<Decided, Undecided> {
-        let mut admitted = Vec::new();
+        let mut admitted: Vec<(u64, Rule, u64)> = Vec::new();
         let mut refused_by = Vec::new();
         let mut unreached = None;
-        // The keys of the owners out of reach, with their places among the request's.
-        let mut out_of_reach: Vec<(Vec<usize>, Kept)> = Vec::new();
+        // The keys out of reach, with their places among the request's.
+        let mut out_of_reach: Vec<Part> = Vec::new();
         // The asks given up on: their answers may come yet.
-        let mut given_up = Vec::new();
-        let process = Arc::clone(&self.limiter.process);
+        let mut given_up: Vec<(Sent, u64, Rule)> = Vec::new();
         while let Some(mut part) = self.parts.pop_front() {
-            let (Some(pod), Some((id, generation, mut answer))) = (part.pod, part.answer.take())
-            else {
+            let Some(mut sent) = part.sent.take() else {
                 unreached = Some(Undecided::Unavailable);
-                out_of_reach.push((part.positions, part.kept));
+                out_of_reach.push(part);
                 continue;
             };
-            match tokio::time::timeout_at(self.until, &mut answer).await {
-                Ok(Ok(Ok(decided))) if decided.admitted => {
-                    process.asked(pod, Ended::Answered);
-                    admitted.push((part.pod, part.kept));
-                }
-                Ok(Ok(Ok(decided))) => {
-                    process.asked(pod, Ended::Answered);
-                    // A refusal stays one: a place outside the keys asked, as only a faulty
-                    // pod sends, is taken for the first of them.
-                    let at = usize::try_from(decided.position).unwrap_or(usize::MAX);
-                    if let Some(&position) =
-                        part.positions.get(at).or_else(|| part.positions.first())
-                    {
-                        refused_by.push((position, decided.wait_ns));
+            match tokio::time::timeout_at(self.until, &mut sent.answer).await {
+                Ok(Ok(Ok(answer))) => {
+                    self.limiter.asked(sent.to, ended_by(&answer));
+                    match answer {
+                        Answer::Admitted(receipt) => {
+                            admitted.push((part.key, part.held.rule, receipt));
+                        }
+                        // Asked under a rule, an owner charges or refuses; a plain count is
+                        // not asked by data planes, and is taken as charged, nothing to give
+                        // back by.
+                        Answer::Counted(_) => admitted.push((part.key, part.held.rule, 0)),
+                        Answer::Limited { wait } => refused_by.push((part.position, wait)),
+                        // Its table taken in as it was told: asked of the owner it names.
+                        Answer::Elsewhere(_) => self.again(part, &mut unreached, &mut out_of_reach),
+                        Answer::NotServing => {
+                            match sent.to {
+                                To::Member(member) => part.avoid.push(member),
+                                To::Seed(at) => part.avoid_seeds.push(at),
+                            }
+                            self.again(part, &mut unreached, &mut out_of_reach);
+                        }
                     }
                 }
-                // Not ready: its keys asked of their next owners, as if it had gone.
-                Ok(Ok(Err(Gone::NotServing))) => {
-                    process.asked(pod, Ended::NotServing);
-                    let again = self.limiter.ask_again(part, pod);
-                    self.parts.extend(again);
+                // Its stream never opened: it never reached the pod, and goes another way, to be
+                // forwarded (membership-design).
+                Ok(Ok(Err(Gone::Unreached))) => {
+                    self.limiter.asked(sent.to, Ended::Broken);
+                    match sent.to {
+                        To::Member(member) => part.avoid.push(member),
+                        To::Seed(at) => part.avoid_seeds.push(at),
+                    }
+                    self.again(part, &mut unreached, &mut out_of_reach);
                 }
-                Ok(Ok(Err(Gone::Broken))) | Ok(Err(_)) => {
-                    process.asked(pod, Ended::Broken);
+                // Its stream broke with the ask on it: it may have reached the pod, and is
+                // not asked again.
+                Ok(Ok(Err(Gone::Broken)) | Err(_)) => {
+                    self.limiter.asked(sent.to, Ended::Broken);
                     unreached = Some(Undecided::Unavailable);
-                    out_of_reach.push((part.positions, part.kept));
+                    out_of_reach.push(part);
                 }
+                // A timeout says nothing of a pod that was only to forward the ask: its owner
+                // may be the one gone, failing over (decided). Counted, but not against its
+                // breaker; a pod truly hung opens its breaker by its own keys' timeouts. A
+                // seed's counts: before a table, nothing says it is not the owner.
                 Err(_) => {
-                    process.asked(pod, Ended::TimedOut);
+                    let how = if sent.forwarded {
+                        Ended::ForwardedTimedOut
+                    } else {
+                        Ended::TimedOut
+                    };
+                    self.limiter.asked(sent.to, how);
                     unreached = Some(Undecided::Timeout);
-                    given_up.push((pod, id, generation, answer, part.kept.clone()));
-                    out_of_reach.push((part.positions, part.kept));
+                    given_up.push((sent, part.key, part.held.rule));
+                    out_of_reach.push(part);
                 }
             }
         }
@@ -990,24 +1147,20 @@ impl Asked {
         // the last of them giving up and this, so an answer already in is found here and
         // any later one by the stream.
         let refused = !matches!(&decision, Ok(decided) if decided.admitted);
-        for (pod, id, generation, mut answer, keys) in given_up {
-            let Some(stream) = self.limiter.streams.get(pod) else {
-                continue;
-            };
-            match answer.try_recv() {
-                Ok(Ok(decided)) => {
-                    stream.waiting.borrow_mut().remove(&id);
-                    if refused && decided.admitted {
-                        self.limiter.give_back(pod, keys);
+        for (mut sent, key, rule) in given_up {
+            match sent.answer.try_recv() {
+                Ok(Ok(Answer::Admitted(receipt))) => {
+                    if refused {
+                        self.limiter.give_back(key, rule, receipt);
                     }
                 }
-                Ok(Err(_)) | Err(oneshot::error::TryRecvError::Closed) => {}
+                Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {}
                 Err(oneshot::error::TryRecvError::Empty) => {
-                    let mut waiting = stream.waiting.borrow_mut();
+                    let mut waiting = sent.stream.waiting.borrow_mut();
                     if refused {
-                        waiting.insert(id, (generation, Waiter::GivenUp(keys)));
+                        waiting.insert(sent.id, (sent.generation, Waiter::GivenUp(key, rule)));
                     } else {
-                        waiting.remove(&id);
+                        waiting.remove(&sent.id);
                     }
                 }
             }
@@ -1015,24 +1168,36 @@ impl Asked {
         decision
     }
 
-    /// The decision from what the owners said: `admitted` by those that admitted, with
-    /// their keys; `refused_by`, the refusals; and `unreached`, why some did not answer, the
-    /// keys of those `out_of_reach`.
+    /// Sends `part` again, to be waited on with the rest; out of reach if it cannot be.
+    fn again(
+        &mut self,
+        mut part: Part,
+        unreached: &mut Option<Undecided>,
+        out_of_reach: &mut Vec<Part>,
+    ) {
+        self.limiter.send_part(&mut part);
+        if part.sent.is_some() {
+            self.parts.push_back(part);
+        } else {
+            *unreached = Some(Undecided::Unavailable);
+            out_of_reach.push(part);
+        }
+    }
+
+    /// The decision from what the owners said: `admitted` by those that admitted, each key
+    /// with its rule and receipt; `refused_by`, the refusals; and `unreached`, why some did not
+    /// answer, those keys `out_of_reach`.
     fn decide(
         &self,
-        admitted: Vec<(Option<usize>, Kept)>,
+        admitted: Vec<(u64, Rule, u64)>,
         refused_by: Vec<(usize, u64)>,
         unreached: Option<Undecided>,
-        out_of_reach: Vec<(Vec<usize>, Kept)>,
+        out_of_reach: Vec<Part>,
     ) -> Result<Decided, Undecided> {
         let process = &self.limiter.process;
-        let give_back = |admitted: Vec<(Option<usize>, Kept)>| {
-            for (pod, keys) in admitted {
-                if let Some(pod) = pod
-                    && !keys.is_empty()
-                {
-                    self.limiter.give_back(pod, keys);
-                }
+        let give_back = |admitted: Vec<(u64, Rule, u64)>| {
+            for (key, rule, receipt) in admitted {
+                self.limiter.give_back(key, rule, receipt);
             }
         };
         if !refused_by.is_empty() {
@@ -1058,14 +1223,12 @@ impl Asked {
             }
             WhenUnreachable::Local if let Some(local) = &self.limiter.local => {
                 process.unreachable.local()[2].inc();
-                let (positions, keys): (Vec<usize>, Kept) = out_of_reach.into_iter().fold(
-                    (Vec::new(), Vec::new()),
-                    |(mut positions, mut keys), (more_positions, more_keys)| {
-                        positions.extend(more_positions);
-                        keys.extend(more_keys);
-                        (positions, keys)
-                    },
-                );
+                // Each with local mode's limit: a rolling window has none, and its config is
+                // refused with `local`.
+                let (positions, keys): (Vec<usize>, Vec<(Vec<u8>, Limit)>) = out_of_reach
+                    .into_iter()
+                    .filter_map(|part| Some((part.position, (part.bytes, part.held.local?))))
+                    .unzip();
                 match local.decide_keys(&keys) {
                     Decision::Admit => Ok(Decided {
                         admitted: true,
@@ -1084,7 +1247,7 @@ impl Asked {
                     }
                 }
             }
-            // `local` with no buckets of its own is not made: refused as `deny` is.
+            // `local` with no keys of its own is not made: refused as `deny` is.
             WhenUnreachable::Deny | WhenUnreachable::Local => {
                 process.unreachable.local()[1].inc();
                 give_back(admitted);
@@ -1094,16 +1257,25 @@ impl Asked {
     }
 }
 
+/// How an answer ends an ask, for its member's breaker.
+const fn ended_by(answer: &Answer) -> Ended {
+    match answer {
+        Answer::NotServing => Ended::NotServing,
+        _ => Ended::Answered,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Breaker, Process};
-    use edgerush_config::{CompiledSynchronous, WhenUnreachable};
+    use edgerush_config::{CompiledSynchronous, KeySecret, WhenUnreachable};
     use std::num::NonZeroUsize;
     use std::time::Duration;
 
     fn config(timeout_ms: u64) -> CompiledSynchronous {
         CompiledSynchronous {
             addresses: vec!["127.0.0.1:1".to_owned()],
+            key_secret: KeySecret([1, 2]),
             timeout: Duration::from_millis(timeout_ms),
             when_unreachable: WhenUnreachable::Deny,
             breaker_failures: 1,
@@ -1113,57 +1285,55 @@ mod tests {
         }
     }
 
-    /// A refusal is never taken for an admission: one naming a place outside the keys its
-    /// owner was asked about, as only a faulty pod sends, refuses by the first of them.
-    #[tokio::test]
-    async fn a_refusal_at_a_place_out_of_range_still_refuses() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let process =
-                    Process::start(config(100), NonZeroUsize::MIN, None, None, None).unwrap();
-                let limiter = super::SyncLimiter::new(process, 0);
-                let (answered, answer) = tokio::sync::oneshot::channel();
-                let asked = super::Asked {
-                    limiter,
-                    parts: vec![super::Part {
-                        pod: Some(0),
-                        positions: vec![3],
-                        kept: Vec::new(),
-                        answer: Some((1, 0, answer)),
-                    }]
-                    .into(),
-                    until: tokio::time::Instant::now() + Duration::from_secs(5),
-                };
-                let decided = edgerush_ratelimit_service::synchronous::wire::Decided {
-                    id: 1,
-                    admitted: false,
-                    position: 9,
-                    wait_ns: 7,
-                };
-                answered.send(Ok(decided)).unwrap();
-                let decided = asked.decided().await.unwrap();
-                assert!(!decided.admitted);
-                assert_eq!(&*decided.refused_by, [(3, 7)]);
-            })
-            .await;
-    }
-
     /// A process that carries another's breakers carries the clock their times were read
-    /// by: a breaker opened before the reload is probed when it is due, not as late again
-    /// as the old process had run.
+    /// by, and every member met: a breaker opened before the reload is probed when it is
+    /// due, not as late again as the old process had run.
     #[test]
     fn breakers_carried_across_keep_their_clock() {
         let one = NonZeroUsize::MIN;
         let before = Process::start(config(20), one, None, None, None).unwrap();
         std::thread::sleep(Duration::from_millis(50));
-        before.breakers[0].failed(before.now(), 1);
+        let member = before.member_at("rl-0:7000", Some(7));
+        member.breaker.failed(before.now(), 1);
         let after = Process::start(config(30), one, None, Some(&before), None).unwrap();
-        assert!(after.breakers[0].is_open(), "carried");
+        assert!(
+            after.member_at("rl-0:7000", Some(7)).breaker.is_open(),
+            "carried"
+        );
         assert!(
             after.now() >= 50_000_000,
             "read by the same clock: {}",
             after.now()
+        );
+    }
+
+    /// A member met is the same handle for every worker, and its metrics are labelled by its
+    /// address. A seed's pod, once a table names it, keeps the seed's breaker; another member
+    /// at the address, its pod restarted, starts with a breaker of its own.
+    #[test]
+    fn a_member_is_shared_and_shown_by_its_address() {
+        let process = Process::start(config(20), NonZeroUsize::MIN, None, None, None).unwrap();
+        let seed = process.member_at("rl-0:7000", None);
+        seed.breaker.failed(process.now(), 1);
+        let named = process.member_at("rl-0:7000", Some(7));
+        assert!(named.breaker.is_open(), "the seed's breaker, its pod named");
+        let again = process.member_at("rl-0:7000", Some(7));
+        assert!(std::sync::Arc::ptr_eq(&named, &again));
+        assert!(std::sync::Arc::ptr_eq(
+            &named,
+            &process.member_at("rl-0:7000", None)
+        ));
+        let stats = process.render_stats();
+        assert!(
+            stats.contains("edgerush_rate_limit_owner_breaker_open{pod=\"rl-0:7000\"} 1\n"),
+            "{stats}"
+        );
+        let restarted = process.member_at("rl-0:7000", Some(8));
+        assert!(!restarted.breaker.is_open(), "a breaker of its own");
+        let stats = process.render_stats();
+        assert!(
+            stats.contains("edgerush_rate_limit_owner_breaker_open{pod=\"rl-0:7000\"} 0\n"),
+            "{stats}"
         );
     }
 
@@ -1209,5 +1379,69 @@ mod tests {
         let breaker = Breaker::default();
         breaker.failed(0, 1);
         assert!(breaker.is_open());
+    }
+
+    /// Each model goes to the store as its own rule, at the limit's numbers, with local
+    /// mode's limit beside it for `when_unreachable: local`: none for a rolling window.
+    #[test]
+    fn a_limit_is_held_at_the_store_by_its_own_model() {
+        use super::{HeldTo, Rule};
+        let mut config: edgerush_config::Config = serde_saphyr::from_str(
+            r#"
+listeners: { web: { address: "127.0.0.1:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
+routes:
+  - name: api
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules: [{ matches: [{ path: { prefix: / } }], forward: { backends: [{ upstream: u, weight: 1 }] }, rate_limits: [b, f, r] }]
+upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
+"#,
+        )
+        .unwrap();
+        config.limits = Some(
+            serde_saphyr::from_str(
+                "limits:
+  - { name: b, key: client, model: { bucket: { rate: 10/s, burst: 20 } } }
+  - { name: f, key: client, model: { fixed_window: { limit: 3, window: 1m } } }
+  - { name: r, key: client, model: { rolling_window: { limit: 7, window: 1h } } }
+",
+            )
+            .unwrap(),
+        );
+        let compiled = edgerush_config::compile(&config).unwrap();
+        let rule = compiled
+            .rule(edgerush_config::RuleId { route: 0, rule: 0 })
+            .unwrap();
+        let held = |name: &str| {
+            let limit = rule.limits.iter().find(|limit| limit.name == name).unwrap();
+            <HeldTo as crate::ratelimit::Held>::of(limit, limit.count).unwrap()
+        };
+        assert_eq!(
+            held("b").rule,
+            Rule::Bucket {
+                per: 10,
+                period: 1_000_000_000,
+                burst: 20
+            }
+        );
+        assert_eq!(
+            held("f").rule,
+            Rule::Window {
+                per: 3,
+                window: 60_000_000_000
+            }
+        );
+        assert_eq!(
+            held("r").rule,
+            Rule::Rolling {
+                per: 7,
+                window: 3_600_000_000_000
+            }
+        );
+        assert!(held("b").local.is_some() && held("f").local.is_some());
+        assert!(
+            held("r").local.is_none(),
+            "local mode keeps no rolling window"
+        );
     }
 }
