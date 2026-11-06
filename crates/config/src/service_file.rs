@@ -157,6 +157,13 @@ pub struct ServiceStore {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(max = STORE_MOST_MS)))]
     pub skew_warning_ms: Option<u64>,
+    /// Whether a pod a data plane asks about a key whose owner it has not heard for
+    /// `stop_serving_ms` decides the key itself, from its copy, rather than forward the ask to
+    /// an owner it cannot reach: so that an owner gone has its keys held to their limits while
+    /// a replica takes over, the charges lost if another replica takes them. A replica only,
+    /// holding its own lease. False when left out.
+    #[serde(default)]
+    pub forwarder_decides: Option<bool>,
 }
 
 /// What a service pod's keys may hold.
@@ -227,6 +234,7 @@ store:
   election_jitter_ms: 100
   cycle_ms: 20
   skew_warning_ms: 500
+  forwarder_decides: true
 keys:
   max_bytes: 1048576
 tls:
@@ -261,6 +269,7 @@ tls:
                     election_jitter_ms: Some(100),
                     cycle_ms: Some(20),
                     skew_warning_ms: Some(500),
+                    forwarder_decides: Some(true),
                 }),
                 keys: ServiceKeys {
                     max_bytes: Some(1 << 20),

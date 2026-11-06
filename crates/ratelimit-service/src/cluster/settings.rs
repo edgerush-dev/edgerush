@@ -19,6 +19,8 @@ pub struct Settings {
     pub seeds: Vec<String>,
     /// What every pod of the cluster is to share.
     pub config: Config,
+    /// Whether it decides a key it would forward from its copy, its owner unheard.
+    pub forwarder_decides: bool,
 }
 
 /// Why a file's store settings cannot be used, each naming the setting.
@@ -125,6 +127,7 @@ pub fn settings(file: &ServiceFile, max_key_bytes: u64) -> Result<Option<Setting
         address: address.clone(),
         seeds: store.seeds.clone(),
         config,
+        forwarder_decides: store.forwarder_decides.unwrap_or(false),
     }))
 }
 
@@ -176,6 +179,7 @@ mod tests {
                     max_key_bytes: Some(1 << 20),
                     ..Config::defaults()
                 },
+                forwarder_decides: false,
             }
         );
     }
@@ -184,11 +188,12 @@ mod tests {
     fn each_setting_said_is_the_stores() {
         let store = "seeds: [rl-1:7000, rl-2:7000], shards: 64, replicas: 1, heartbeat_ms: 50, \
                      stop_serving_ms: 200, silence_ms: 300, election_jitter_ms: 100, \
-                     cycle_ms: 20, skew_warning_ms: 500";
+                     cycle_ms: 20, skew_warning_ms: 500, forwarder_decides: true";
         let settings = settings(&file(ADDRESS, Some(store)), 1 << 30)
             .unwrap()
             .unwrap();
         assert_eq!(settings.seeds, ["rl-1:7000", "rl-2:7000"]);
+        assert!(settings.forwarder_decides);
         assert_eq!(
             settings.config,
             Config {

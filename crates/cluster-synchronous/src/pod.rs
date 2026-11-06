@@ -44,6 +44,10 @@ pub struct Pod {
     node: Store,
     /// Whether it forwards a request for a shard not its own to its owner.
     forwarding: bool,
+    /// Whether it decides a request it would forward from its copy, the owner unheard.
+    forwarder_decides: bool,
+    /// Requests it decided from its copy, their owner unheard.
+    decided_from_copy: u64,
     /// Requests under several keys it gathers, by client and the client's number.
     gathering: BTreeMap<(NodeId, u64), Gathering>,
     /// Parts it has asked of other owners for them: the part's number, to its request and key,
@@ -70,6 +74,8 @@ impl Pod {
         Self {
             node: Store::new(id, address, config, peers),
             forwarding: false,
+            forwarder_decides: false,
+            decided_from_copy: 0,
             gathering: BTreeMap::new(),
             parts: BTreeMap::new(),
             giving: BTreeMap::new(),
@@ -93,6 +99,20 @@ impl Pod {
     /// at most one hop, rather than answer [`Answer::Elsewhere`].
     pub const fn set_forwarding(&mut self, forwarding: bool) {
         self.forwarding = forwarding;
+    }
+
+    /// Whether a request from a data plane it would forward it decides itself from its copy,
+    /// as the owner would, when its table names it a replica of the key's shard, it holds its
+    /// lease and it has not heard the owner for `stop_serving` ([`Store::update_copy`]): so
+    /// that an owner gone has its keys held to their limits while it is failed over.
+    pub const fn set_forwarder_decides(&mut self, decides: bool) {
+        self.forwarder_decides = decides;
+    }
+
+    /// Requests it decided from its copy, their owner unheard.
+    #[must_use]
+    pub const fn decided_from_copy(&self) -> u64 {
+        self.decided_from_copy
     }
 
     /// Parts it counted, gathering requests under several keys, for requests it then reported
@@ -189,9 +209,16 @@ impl Pod {
         now: Time,
         out: &mut Outbox,
     ) {
-        let decided = self
+        let mut decided = self
             .node
             .update(key, now, |kept, wall| decide(key, kept, ask, wall));
+        if decided.is_none() && self.forwarder_decides && self.forwarding && hops == 0 {
+            // A request it would forward: decided from its copy, its owner unheard.
+            decided = self
+                .node
+                .update_copy(key, now, |kept, wall| decide(key, kept, ask, wall));
+            self.decided_from_copy += u64::from(decided.is_some());
+        }
         let answer = if let Some(answer) = decided {
             answer
         } else {
@@ -1097,5 +1124,111 @@ mod tests {
             answer(node.receive(9, ask(3), ms(3))),
             Some(Answer::Admitted(window + 1))
         );
+    }
+
+    /// A replica set to decide forwards a data plane's request while it hears the key's owner,
+    /// and once it has not for `stop_serving`, decides it from its copy as the owner would —
+    /// admitted, refused, a give-back credited — sending the owner nothing; set not to, it
+    /// forwards it still.
+    #[test]
+    fn a_forwarder_decides_from_its_copy_once_the_owner_is_unheard() {
+        let mut node = member();
+        node.set_forwarding(true);
+        let table = node.store().committed().cloned().unwrap();
+        let shard = (0..4).find(|shard| table.owner(*shard) == Some(1)).unwrap();
+        let key = key_in(shard);
+        let beat = |node: &mut Pod, from: NodeId, now: Time| {
+            let beat = StoreMessage::Heartbeat {
+                term: 1,
+                leader: Some(1),
+                committed: table.stamp(),
+                fresh: false,
+                sent: now,
+                wall: 0,
+                hears: vec![(1, now), (2, now), (3, now)],
+                leased: true,
+            };
+            let _ = node.receive(from, beat, now);
+        };
+        beat(&mut node, 1, ms(2));
+        beat(&mut node, 3, ms(2));
+        // The owner then unheard, the third pod still heard.
+        beat(&mut node, 3, ms(300));
+        let rule = Rule::Window {
+            per: 1,
+            window: ms(10_000),
+        };
+        let ask = |id, give_back, receipt| Message::Request {
+            client: 1_000_000,
+            id,
+            key,
+            stamp: table.stamp(),
+            hops: 0,
+            via: None,
+            give_back,
+            rule: Some(rule),
+            receipt,
+        };
+        let forwarded = |out: &Outbox| {
+            out.iter()
+                .any(|(to, message)| *to == 1 && matches!(message, Message::Request { .. }))
+        };
+        let answer = |out: &Outbox| {
+            out.iter().find_map(|(to, message)| match message {
+                Message::Reply { answer, .. } if *to == 1_000_000 => Some(answer.clone()),
+                _ => None,
+            })
+        };
+        let mut off = node.clone();
+        node.set_forwarder_decides(true);
+        let heard = node.receive(9, ask(1, false, 0), ms(3));
+        assert!(
+            forwarded(&heard),
+            "its owner heard, not forwarded: {heard:?}"
+        );
+        assert_eq!(answer(&heard), None);
+        let window = rule.window_of(key, ms(420));
+        let admitted = node.receive(9, ask(2, false, 0), ms(420));
+        assert_eq!(answer(&admitted), Some(Answer::Admitted(window)));
+        assert!(!forwarded(&admitted), "{admitted:?}");
+        let refused = node.receive(9, ask(3, false, 0), ms(421));
+        assert!(
+            matches!(answer(&refused), Some(Answer::Limited { wait }) if wait > 0),
+            "{refused:?}"
+        );
+        let back = node.receive(9, ask(4, true, window), ms(422));
+        assert!(
+            matches!(answer(&back), Some(Answer::Counted(_))),
+            "{back:?}"
+        );
+        assert_eq!(node.count(key), Some(0));
+        // A request another pod forwarded is the owner's alone: told it is elsewhere.
+        let forwarded_here = Message::Request {
+            client: 1_000_000,
+            id: 5,
+            key,
+            stamp: table.stamp(),
+            hops: 1,
+            via: Some(3),
+            give_back: false,
+            rule: Some(rule),
+            receipt: 0,
+        };
+        let elsewhere = node.receive(3, forwarded_here, ms(423));
+        assert!(
+            elsewhere.iter().any(|(_, message)| matches!(
+                message,
+                Message::Reply {
+                    answer: Answer::Elsewhere(_),
+                    ..
+                }
+            )),
+            "{elsewhere:?}"
+        );
+        assert_eq!(node.count(key), Some(0));
+        assert_eq!(node.decided_from_copy(), 3);
+        let still = off.receive(9, ask(2, false, 0), ms(420));
+        assert!(forwarded(&still), "set not to, not forwarded: {still:?}");
+        assert_eq!(off.decided_from_copy(), 0);
     }
 }

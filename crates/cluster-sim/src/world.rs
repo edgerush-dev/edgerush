@@ -30,8 +30,15 @@ pub trait Mode: Sized {
     type Client: Clone + Debug;
 
     /// Pod `id`, new, knowing how to reach `peers`, forwarding requests for shards not its own
-    /// if `forwarding`, as the mode does.
-    fn pod(id: NodeId, config: Config, peers: Vec<NodeId>, forwarding: bool) -> Self::Pod;
+    /// if `forwarding`, as the mode does, and deciding those it would forward from its copy,
+    /// their owner unheard, if `decides`.
+    fn pod(
+        id: NodeId,
+        config: Config,
+        peers: Vec<NodeId>,
+        forwarding: bool,
+        decides: bool,
+    ) -> Self::Pod;
     /// A pod's store.
     fn store(pod: &Self::Pod) -> &Node<Self::Value>;
     /// A pod's store, to change.
@@ -269,6 +276,7 @@ pub struct Sim<M: Mode> {
     /// The time between samples of who serves each shard.
     pub sample: Time,
     forwarding: bool,
+    forwarder_decides: bool,
     /// What it measured.
     pub stats: Stats,
     /// Admissions per key, as clients were told.
@@ -341,6 +349,7 @@ impl<M: Mode> Sim<M> {
             tick: ms(5),
             sample: ms(1),
             forwarding: false,
+            forwarder_decides: false,
             stats: Stats::default(),
             truth: BTreeMap::new(),
             asked: BTreeSet::new(),
@@ -454,7 +463,8 @@ impl<M: Mode> Sim<M> {
     }
 
     fn spawn(&mut self, id: NodeId, config: Config, peers: impl IntoIterator<Item = NodeId>) {
-        let node = M::pod(id, config, peers.into_iter().collect(), self.forwarding);
+        let peers = peers.into_iter().collect();
+        let node = M::pod(id, config, peers, self.forwarding, self.forwarder_decides);
         // A clock started anywhere in its first second.
         let offset = self.rng.below(ms(1_000));
         self.pods.insert(

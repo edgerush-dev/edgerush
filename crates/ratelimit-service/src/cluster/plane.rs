@@ -116,15 +116,26 @@ impl Plane {
     }
 
     /// The member to ask about `key`: its owner, unless `avoid` says the owner is out of reach
-    /// (its stream down, its breaker open, or it said it is not serving); then another member
-    /// not avoided, to forward it. The other is chosen by the key, not at random, so that an
-    /// owner's keys spread over the rest rather than falling on one. None with no table, or
-    /// with every member avoided.
+    /// (its stream down, its breaker open, or it said it is not serving); then, to forward it,
+    /// one of its shard's replicas not avoided, holding a copy it may decide the key from while
+    /// its owner is failed over; else another member not avoided. Each is chosen by the key,
+    /// not at random, so that an owner's keys spread over those it may go through rather than
+    /// falling on one. None with no table, or with every member avoided.
     pub fn through(&self, key: u64, avoid: impl Fn(NodeId) -> bool) -> Option<NodeId> {
         let table = self.table.as_ref()?;
         if let Some(owner) = self.owner(key).filter(|owner| !avoid(*owner)) {
             return Some(owner);
         }
+        let shard = table
+            .shards
+            .get(usize::from(shard_of(key, shard_count(table))));
+        let replicas = || {
+            shard
+                .into_iter()
+                .flat_map(|shard| &shard.replicas)
+                .copied()
+                .filter(|replica| !avoid(*replica))
+        };
         // The owner, if any, is avoided here, so among none of these.
         let others = || {
             table
@@ -133,12 +144,7 @@ impl Plane {
                 .copied()
                 .filter(|member| !avoid(*member))
         };
-        let count = u64::try_from(others().count())
-            .ok()
-            .filter(|count| *count > 0)?;
-        // The key is already a keyed hash, its bits spread: below `count`, a usize's count.
-        let at = usize::try_from(key % count).ok()?;
-        others().nth(at)
+        chosen_by(key, replicas).or_else(|| chosen_by(key, others))
     }
 
     /// The request `id` under `key`, held to `rule` if it has one, as the stream carries it up.
@@ -205,6 +211,16 @@ impl Plane {
     }
 }
 
+/// The one of `among` that `key` chooses, if there is any.
+fn chosen_by<I: Iterator<Item = NodeId>>(key: u64, among: impl Fn() -> I) -> Option<NodeId> {
+    let count = u64::try_from(among().count())
+        .ok()
+        .filter(|count| *count > 0)?;
+    // The key is already a keyed hash, its bits spread: below `count`, a usize's count.
+    let at = usize::try_from(key % count).ok()?;
+    among().nth(at)
+}
+
 /// Its shard count: every table of a cluster has the same, below `u16::MAX` (`Config`).
 fn shard_count(table: &Table) -> u16 {
     u16::try_from(table.shards.len()).unwrap_or(u16::MAX)
@@ -268,7 +284,7 @@ mod tests {
     use super::*;
     use edgerush_cluster::table::{Shard, first};
     use proptest::prelude::*;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     const SECRET: [u64; 2] = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
     const SHARDS: u16 = 64;
@@ -339,28 +355,45 @@ mod tests {
         assert_eq!(plane.address(4), None);
     }
 
+    /// A key whose owner is out of reach goes through one of its shard's replicas reached,
+    /// which holds its copy, chosen by the key so that the owner's keys spread over them; with
+    /// none reached, through another member, spread likewise.
     #[test]
-    fn an_owner_out_of_reach_has_its_keys_spread_over_the_others_reached() {
-        let plane = plane(&[1, 2, 3, 4]);
-        let mut through = BTreeMap::new();
+    fn an_owner_out_of_reach_has_its_keys_spread_over_its_shards_replicas_reached() {
+        let members: BTreeMap<NodeId, String> = (1..=5)
+            .map(|member| (member, format!("rl-{member}:7000")))
+            .collect();
+        let mut plane = Plane::new(SECRET);
+        assert!(plane.learn(first(&members, SHARDS, 2, 1)));
+        let table = plane.table().unwrap().clone();
+        let (mut replicas, mut rest) = (BTreeMap::new(), BTreeMap::new());
         let mut key = 0;
         for _ in 0..400 {
             key = key_of(&plane, 1, key + 1);
-            let other = plane.through(key, |member| member == 1).unwrap();
-            *through.entry(other).or_insert(0) += 1;
+            let shard = &table.shards[usize::from(shard_of(key, SHARDS))];
+            let through = plane.through(key, |member| member == 1).unwrap();
+            assert!(shard.replicas.contains(&through), "{through} not a replica");
+            *replicas.entry(through).or_insert(0) += 1;
             // The same key the same way, every time.
-            assert_eq!(plane.through(key, |member| member == 1), Some(other));
+            assert_eq!(plane.through(key, |member| member == 1), Some(through));
+            // One replica avoided too, the other.
+            let other = plane.through(key, |member| member == 1 || member == through);
+            assert!(
+                other.is_some_and(|other| other != through && shard.replicas.contains(&other)),
+                "{other:?}"
+            );
+            let gone = |member: NodeId| member == 1 || shard.replicas.contains(&member);
+            let beyond = plane.through(key, gone).unwrap();
+            assert!(!gone(beyond), "{beyond}");
+            *rest.entry(beyond).or_insert(0) += 1;
         }
-        assert_eq!(
-            through.keys().copied().collect::<BTreeSet<_>>(),
-            [2, 3, 4].into()
-        );
-        for (other, count) in &through {
-            assert!(*count > 60, "{other} took {count} of 400");
+        for spread in [&replicas, &rest] {
+            assert_eq!(spread.len(), 2, "{spread:?}");
+            for (member, count) in spread {
+                assert!(*count > 120, "{member} took {count} of 400");
+            }
         }
-        // Never one avoided too; none when every one is.
-        let key = key_of(&plane, 1, 0);
-        assert_eq!(plane.through(key, |member| member != 3), Some(3));
+        // None when every one is avoided.
         assert_eq!(plane.through(key, |_| true), None);
     }
 

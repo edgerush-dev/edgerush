@@ -32,6 +32,7 @@
 //!   election_jitter_ms: 200
 //!   cycle_ms: 10
 //!   skew_warning_ms: 250
+//!   forwarder_decides: false  # a replica decides an unheard owner's keys from its copy
 //! keys:
 //!   max_bytes: 268435456      # 256 MiB when left out
 //! tls:                        # served plain, to anyone, when left out
@@ -314,6 +315,7 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let pod = StorePod::spawn(id, store.address, store.config, dial, store.seeds);
             // Always on (decided): a data plane out of reach of a key's owner asks another pod.
             pod.set_forwarding(true).await;
+            pod.set_forwarder_decides(store.forwarder_decides).await;
             if let Some(at) = args.metrics {
                 let listener = tokio::net::TcpListener::bind(at).await?;
                 eprintln!("edgerush-ratelimit-service: metrics and readiness on {at}");

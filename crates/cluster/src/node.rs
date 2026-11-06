@@ -491,6 +491,34 @@ impl<V: Held> Node<V> {
         Some(result)
     }
 
+    /// Updates its copy of `key` as [`update`](Self::update) updates an owner's, if its table
+    /// names it a replica of the key's shard, it holds its lease, and it has not heard the
+    /// shard's owner within `stop_serving` — by when an owner dead, or cut off from the
+    /// majority, has stopped serving: for a mode that decides a key from a copy while its owner
+    /// is failed over. What `change` changes is copied to nobody, and lost if another replica
+    /// takes the shard. `None`, and nothing called, otherwise.
+    pub fn update_copy<R>(
+        &mut self,
+        key: u64,
+        now: Time,
+        change: impl FnOnce(&mut Kept<V>, Time) -> (R, Changed),
+    ) -> Option<R> {
+        let shard = shard_of(key, self.config.shards);
+        let table = self.committed.as_ref()?;
+        let entry = table.shards.get(usize::from(shard))?;
+        let owner = entry.owner?;
+        if !entry.replicas.contains(&self.id)
+            || !self.leased(table, now)
+            || self.heard_within(owner, now, self.config.stop_serving)
+        {
+            return None;
+        }
+        let wall = self.wall(now);
+        let kept = self.data.entry(shard).or_default().entry(key).or_default();
+        let (result, _) = change(kept, wall);
+        Some(result)
+    }
+
     /// The value it holds for `key`, owned or a copy.
     #[must_use]
     pub fn value(&self, key: u64) -> Option<V> {
@@ -3993,6 +4021,56 @@ mod tests {
                 .any(|(to, message)| *to == 3 && matches!(message, Message::Handoff { .. })),
             "the taker never sent the last changes: {out:?}"
         );
+    }
+
+    /// A replica updates its copy of a key only once it has not heard the shard's owner for
+    /// `stop_serving`, holding its own lease, and marks nothing to copy; not a key of a shard
+    /// it owns, nor once cut off.
+    #[test]
+    fn a_replica_updates_its_copy_only_with_the_owner_unheard_and_its_lease_held() {
+        let mut node = member();
+        let table = node.committed().cloned().unwrap();
+        let theirs = (0..4).find(|shard| table.owner(*shard) == Some(1));
+        let mine = (0..4).find(|shard| table.owner(*shard) == Some(2));
+        let (Some(theirs), Some(mine)) = (theirs, mine) else {
+            panic!("pods 1 and 2 do not both own a shard");
+        };
+        assert!(table.shards[usize::from(theirs)].replicas.contains(&2));
+        let (key, own) = (key_in(theirs), key_in(mine));
+        let beat = |node: &mut Node, from: NodeId, now: Time| {
+            let beat = Message::Heartbeat {
+                term: 1,
+                leader: Some(1),
+                committed: (1, 1),
+                fresh: false,
+                sent: now,
+                wall: 0,
+                hears: vec![(1, now), (2, now), (3, now)],
+                leased: true,
+            };
+            let _ = node.receive(from, beat, now);
+        };
+        let add = |kept: &mut Kept<Counts>, _| {
+            kept.value.add(0);
+            ((), Changed::Whole)
+        };
+        assert_eq!(node.update_copy(key, ms(2), add), None, "with no lease");
+        beat(&mut node, 1, ms(5));
+        beat(&mut node, 3, ms(5));
+        assert_eq!(node.update_copy(key, ms(6), add), None, "its owner heard");
+        // The owner unheard since, the third pod still heard: past `stop_serving` 415 ms on.
+        beat(&mut node, 3, ms(300));
+        assert_eq!(node.update_copy(key, ms(405), add), None, "400 ms unheard");
+        assert_eq!(node.update_copy(key, ms(420), add), Some(()));
+        assert_eq!(node.count(key), Some(1));
+        assert!(
+            !node.dirty.values().any(|keys| keys.contains(&key)),
+            "a copy's change marked to copy"
+        );
+        assert_eq!(node.update_copy(own, ms(420), add), None, "a key it owns");
+        // Cut off: no lease.
+        assert_eq!(node.update_copy(key, ms(900), add), None, "cut off");
+        assert_eq!(node.count(key), Some(1));
     }
 
     /// A taker the table names the owner of a shard moved to it by plan serves it only once it

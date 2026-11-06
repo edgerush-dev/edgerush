@@ -138,6 +138,46 @@ fn faults_overshoot_boundedly_and_never_shave() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// An owner crashing, pods forwarding, under every rule: a replica deciding the requests it
+/// would forward from its copy, once the owner has gone unheard, leaves fewer of them to
+/// `when_unreachable` than one forwarding them to an owner gone, and still holds its keys to
+/// the rule — no more beyond it than [`PEAK`], nothing refused within it.
+#[test]
+fn a_forwarder_deciding_from_its_copy_holds_a_crashed_owners_keys_to_the_rule() {
+    let mut wrong = Vec::new();
+    for rule in RULES {
+        for seed in 1..=3 {
+            let shape = Shape {
+                forwarding: true,
+                ..limited(rule, false)
+            };
+            let off = scenario::crash_follower(seed, shape);
+            let decides = Shape {
+                forwarder_decides: true,
+                ..shape
+            };
+            let on = scenario::crash_follower(seed, decides);
+            assert!(off.violations.is_empty(), "{off:?}");
+            assert!(on.violations.is_empty(), "{on:?}");
+            assert_eq!(off.decided_from_copy, 0, "{}", line(&off));
+            if on.decided_from_copy == 0
+                || on.refused >= off.refused
+                || on.limited == 0
+                || on.overshoot_peak > PEAK
+                || on.shaved > 0
+            {
+                wrong.push(format!(
+                    "{rule:?} seed {seed}: decided from copies {}, on {} | off {}",
+                    on.decided_from_copy,
+                    line(&on),
+                    line(&off)
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Requests under two keys, split, a part refused under a window: the other part's charge is
 /// given back, so the owners end holding what clients were told.
 #[test]
