@@ -2118,6 +2118,7 @@ fn config_of(
         upstreams,
         data_plane: DataPlane::default(),
         rate_limiting: None,
+        system_authorities: Vec::new(),
         certificates: presented
             .iter()
             .map(|(name, certificate, _)| (name.clone(), certificate.clone()))
@@ -2731,6 +2732,7 @@ fn backend_upstream(
                     server_name: host.clone(),
                     verified_names: Vec::new(),
                     authorities: plane.backend_authorities.clone(),
+                    well_known_authorities: None,
                     client_certificate: None,
                 }),
             ),

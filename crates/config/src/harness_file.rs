@@ -92,6 +92,8 @@ impl HarnessFile {
             upstreams: self.upstreams,
             data_plane: self.data_plane,
             rate_limiting: self.rate_limiting,
+            // The harness reads no system's store: an upstream of a file lists its own.
+            system_authorities: Vec::new(),
             certificates: read,
             limits,
         }

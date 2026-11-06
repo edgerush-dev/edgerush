@@ -37,6 +37,12 @@ pub struct Config {
     /// checks them.
     #[serde(default)]
     pub rate_limiting: Option<RateLimiting>,
+    /// The certificates, in PEM, of the authorities the control plane's own system trusts:
+    /// those an upstream's TLS trusts where it says `well_known_authorities: system`
+    /// (BackendTLSPolicy's `wellKnownCACertificates`), carried once for all of them, and
+    /// only while one does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_authorities: Vec<String>,
     /// The certificates listeners and upstreams name, by name: a resource of their own
     /// ([07 §1](../../../docs/07-config-and-dsl.md)), which reaches a data plane apart from
     /// the rest of its config and is never read with it, so that no file a config is read
@@ -744,9 +750,14 @@ pub struct UpstreamTls {
     /// BackendTLSPolicy's `subjectAltNames` has it. None, and `server_name` is checked.
     #[serde(default)]
     pub verified_names: Vec<VerifiedName>,
-    /// The certificates, in PEM, of the authorities trusted to vouch for it.
-    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
+    /// The certificates, in PEM, of the authorities trusted to vouch for it, unless
+    /// `well_known_authorities` names those trusted: one of the two, never both.
+    #[serde(default)]
     pub authorities: Vec<String>,
+    /// The authorities trusted to vouch for it, by a well-known name, in place of
+    /// `authorities`.
+    #[serde(default)]
+    pub well_known_authorities: Option<WellKnownAuthorities>,
     /// The name of the certificate the data plane shows an endpoint that asks who it is
     /// (mTLS); none, and it shows nothing.
     #[serde(default)]
@@ -765,6 +776,15 @@ pub enum VerifiedName {
     Dns(String),
     /// A URI, such as a SPIFFE ID, matched exactly.
     Uri(String),
+}
+
+/// Authorities an upstream's TLS may trust by a well-known name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WellKnownAuthorities {
+    /// Those the control plane's own system trusts: the config's `system_authorities`.
+    System,
 }
 
 /// What an upstream is spoken to in. Unsaid, it is HTTP/1.1, as for a Kubernetes Service

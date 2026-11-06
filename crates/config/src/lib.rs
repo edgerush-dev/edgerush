@@ -40,7 +40,7 @@ pub use config::{
     LoadBalancer, Probe, Protocol, ProxyProtocolVersion, RateLimitBreaker, RateLimitMode,
     RateLimitService, RateLimitServiceTls, RateLimitSynchronous, RateLimiting, RequestId,
     SharingHostname, SharingListener, SlowStart, StatedNames, Tls, Upstream, UpstreamProtocol,
-    UpstreamTls, VerifiedName, WhenUnreachable,
+    UpstreamTls, VerifiedName, WellKnownAuthorities, WhenUnreachable,
 };
 pub use dns::{DnsName, DnsNameError};
 pub use harness_file::{CertificateFiles, HarnessFile};

@@ -1955,12 +1955,12 @@
       "type": "object",
       "properties": {
         "authorities": {
-          "description": "The certificates, in PEM, of the authorities trusted to vouch for it.",
+          "description": "The certificates, in PEM, of the authorities trusted to vouch for it, unless\n`well_known_authorities` names those trusted: one of the two, never both.",
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
-          },
-          "minItems": 1
+          }
         },
         "client_certificate": {
           "description": "The name of the certificate the data plane shows an endpoint that asks who it is\n(mTLS); none, and it shows nothing.",
@@ -1981,12 +1981,23 @@
           "items": {
             "$ref": "#/$defs/VerifiedName"
           }
+        },
+        "well_known_authorities": {
+          "description": "The authorities trusted to vouch for it, by a well-known name, in place of\n`authorities`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WellKnownAuthorities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,
       "required": [
-        "server_name",
-        "authorities"
+        "server_name"
       ]
     },
     "ValueMatch": {
@@ -2067,6 +2078,16 @@
           "required": [
             "uri"
           ]
+        }
+      ]
+    },
+    "WellKnownAuthorities": {
+      "description": "Authorities an upstream's TLS may trust by a well-known name.",
+      "oneOf": [
+        {
+          "description": "Those the control plane's own system trusts: the config's `system_authorities`.",
+          "type": "string",
+          "const": "system"
         }
       ]
     },

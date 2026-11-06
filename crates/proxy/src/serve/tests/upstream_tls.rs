@@ -234,6 +234,7 @@ async fn an_upstream_is_checked_for_its_verified_names_in_place_of_its_server_na
                     server_name: "sni.test".to_owned(),
                     verified_names: vec![Dns("a.zone.test".to_owned())],
                     authorities: vec![authority.pem()],
+                    well_known_authorities: None,
                     client_certificate: None,
                 },
             )
@@ -251,6 +252,47 @@ async fn an_upstream_is_checked_for_its_verified_names_in_place_of_its_server_na
             .await;
             let answer = h1_answer(front, CLOSING_GET).await;
             assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
+        })
+        .await;
+}
+
+/// An upstream whose TLS trusts the system's authorities is spoken to when they vouch for
+/// it, whichever of them does, in either protocol; when they do not, it is not, though its
+/// own certificate be named nowhere else.
+#[tokio::test]
+async fn an_upstream_may_trust_the_systems_authorities() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let certificate = crate::tls::testing::certificate(&["backend.test"]);
+            let another = crate::tls::testing::certificate(&["another.test"]);
+            let stranger = crate::tls::testing::certificate(&["backend.test"]);
+            let system = edgerush_config::UpstreamTls {
+                server_name: "backend.test".to_owned(),
+                verified_names: Vec::new(),
+                authorities: Vec::new(),
+                well_known_authorities: Some(edgerush_config::WellKnownAuthorities::System),
+                client_certificate: None,
+            };
+            for protocol in [UpstreamProtocol::Http1, UpstreamProtocol::Http2] {
+                let upstream = tls_upstream(&certificate, Agrees::Either).await;
+                for (bundle, answered) in [
+                    (
+                        vec![another.chain.clone(), certificate.chain.clone()],
+                        "200",
+                    ),
+                    (vec![another.chain.clone(), stranger.chain.clone()], "502"),
+                ] {
+                    let mut config = everything_config(upstream);
+                    config.system_authorities = bundle;
+                    let front = serving_worker_to_tls_with(protocol, system.clone(), config).await;
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    assert!(
+                        answer.starts_with(&format!("HTTP/1.1 {answered} ")),
+                        "{protocol:?}: {answer}"
+                    );
+                }
+            }
         })
         .await;
 }
@@ -274,6 +316,34 @@ async fn an_http2_upstream_that_will_not_agree_on_h2_is_not_spoken_to_in_http1()
             assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
         })
         .await;
+}
+
+/// An upstream trusting the system's authorities keeps what its connections were secured
+/// with while the config's system authorities stay the same, and is secured anew when they
+/// change.
+#[test]
+fn a_reload_secures_anew_an_upstream_whose_system_authorities_changed() {
+    let secured = |bundle: &[&edgerush_config::Certificate]| {
+        let mut config = everything_config("127.0.0.1:9".parse().unwrap());
+        config.system_authorities = bundle.iter().map(|root| root.chain.clone()).collect();
+        config.upstreams.get_mut("up").unwrap().tls = Some(edgerush_config::UpstreamTls {
+            server_name: "backend.test".to_owned(),
+            verified_names: Vec::new(),
+            authorities: Vec::new(),
+            well_known_authorities: Some(edgerush_config::WellKnownAuthorities::System),
+            client_certificate: None,
+        });
+        compile(&config).unwrap()
+    };
+    let first = crate::tls::testing::certificate(&["backend.test"]);
+    let second = crate::tls::testing::certificate(&["backend.test"]);
+    let connector = |proxy: &Proxy| Arc::clone(proxy.current.load().secure[0].as_ref().unwrap());
+    let proxy = Proxy::new(secured(&[&first]), NonZeroUsize::MIN).unwrap();
+    let before = connector(&proxy);
+    proxy.reload(secured(&[&first])).unwrap();
+    assert!(Arc::ptr_eq(&before, &connector(&proxy)), "built again");
+    proxy.reload(secured(&[&first, &second])).unwrap();
+    assert!(!Arc::ptr_eq(&before, &connector(&proxy)), "kept");
 }
 
 /// A config whose upstream TLS is the config before's keeps what connections were
@@ -320,6 +390,7 @@ fn a_reload_keeps_the_tls_to_an_upstream_that_has_not_changed() {
         authorities: vec![
             "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n".to_owned(),
         ],
+        well_known_authorities: None,
         client_certificate: None,
     };
     let refused = proxy.reload(secured(unusable));

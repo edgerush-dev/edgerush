@@ -2,8 +2,9 @@
 //! must be, whom to trust to say so, and what to speak once connected.
 //!
 //! Made once for each upstream when a config arrives and kept by a later config with the
-//! same TLS, as a listener's is. Only the authorities the config names are trusted — not
-//! the machine's — and the endpoint's certificate must carry the configured server name,
+//! same TLS, as a listener's is. Only the authorities the config names are trusted — the
+//! system's among them where an upstream trusts those, which the config carries, never the
+//! machine's — and the endpoint's certificate must carry the configured server name,
 //! or, where the config names others to verify, one of those among its subject alternative
 //! names, the server name then asked for alone.
 //! An HTTP/2 upstream must agree on `h2` in the handshake: one that does not is a failed
@@ -15,7 +16,7 @@ use crate::upstream::dial::Counted;
 use crate::upstream::h1::pool::Close;
 use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
 use boring::x509::X509Ref;
-use boring::x509::store::X509StoreBuilder;
+use boring::x509::store::{X509Store, X509StoreBuilder};
 use edgerush_config::{CompiledUpstreamTls, UpstreamProtocol, VerifiedName};
 use std::io;
 use std::pin::Pin;
@@ -77,8 +78,38 @@ impl std::fmt::Debug for Secure {
     }
 }
 
+/// The authorities upstreams trust, each set read once for all the upstreams a config
+/// gives that same set, as it gives every upstream that trusts the system's authorities,
+/// which run to a hundred and more, one shared copy of them.
+#[derive(Default)]
+pub(crate) struct Stores {
+    read: Vec<(Arc<[String]>, X509Store)>,
+}
+
+impl Stores {
+    /// The store of `authorities`, read unless they are the very ones read before.
+    fn of(&mut self, authorities: &Arc<[String]>) -> Result<X509Store, TlsError> {
+        let setup = |error: boring::error::ErrorStack| TlsError::Setup(error.to_string());
+        if let Some((_, store)) = self
+            .read
+            .iter()
+            .find(|(read, _)| Arc::ptr_eq(read, authorities))
+        {
+            return Ok(store.clone());
+        }
+        let mut trusted = X509StoreBuilder::new().map_err(setup)?;
+        for authority in crate::tls::authorities(authorities)? {
+            trusted.add_cert(authority).map_err(setup)?;
+        }
+        let store = trusted.build();
+        self.read.push((Arc::clone(authorities), store.clone()));
+        Ok(store)
+    }
+}
+
 impl Secure {
-    /// What `source` secures connections spoken to in `protocol` with.
+    /// What `source` secures connections spoken to in `protocol` with, its authorities
+    /// taken from `stores`.
     ///
     /// # Errors
     ///
@@ -87,6 +118,7 @@ impl Secure {
     pub(crate) fn new(
         source: &CompiledUpstreamTls,
         protocol: UpstreamProtocol,
+        stores: &mut Stores,
     ) -> Result<Self, TlsError> {
         let setup = |error: boring::error::ErrorStack| TlsError::Setup(error.to_string());
         let mut builder = SslConnector::builder(SslMethod::tls()).map_err(setup)?;
@@ -95,13 +127,9 @@ impl Secure {
             .map_err(setup)?;
         builder.set_curves_list(GROUPS).map_err(setup)?;
         builder.set_verify(SslVerifyMode::PEER);
-        let mut trusted = X509StoreBuilder::new().map_err(setup)?;
-        for authority in crate::tls::authorities(&source.authorities)? {
-            trusted.add_cert(authority).map_err(setup)?;
-        }
         // Only these: the machine's own store, which the builder loaded, is not consulted.
         builder
-            .set_verify_cert_store(trusted.build())
+            .set_verify_cert_store(stores.of(&source.authorities)?)
             .map_err(setup)?;
         if let Some(certificate) = &source.client_certificate {
             let identity = crate::tls::identity(certificate)?;
@@ -258,8 +286,28 @@ impl AsyncWrite for Socket {
 
 #[cfg(test)]
 mod tests {
-    use super::{VerifiedName, carries, dns_matches};
+    use super::{Stores, VerifiedName, carries, dns_matches};
     use boring::x509::X509;
+    use std::sync::Arc;
+
+    /// Upstreams given the very same authorities, as every one trusting the system's is,
+    /// share one read of them; what cannot be read is refused, and nothing kept of it.
+    #[test]
+    fn the_same_authorities_are_read_once() {
+        let pem = |name: &str| crate::tls::testing::certificate(&[name]).chain;
+        let system: Arc<[String]> = vec![pem("a.test"), pem("b.test")].into();
+        let mut stores = Stores::default();
+        stores.of(&system).unwrap();
+        stores.of(&Arc::clone(&system)).unwrap();
+        assert_eq!(stores.read.len(), 1);
+        let unreadable: Arc<[String]> = vec!["not a certificate".to_owned()].into();
+        assert!(stores.of(&unreadable).is_err());
+        assert_eq!(
+            stores.read.len(),
+            1,
+            "something kept of what could not be read"
+        );
+    }
 
     /// A certificate's DNS name is the reference, case aside, or a wildcard of one whole
     /// leftmost label over at least two labels standing for exactly one; a reference that

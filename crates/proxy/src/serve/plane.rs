@@ -12,7 +12,7 @@ use crate::routed::Routed;
 use crate::tls::Tls;
 use crate::upstream::balancing::Carry;
 use crate::upstream::destination::{Aside, Destinations, Keys, Retiring, ReuseIdentity};
-use crate::upstream::secure::Secure;
+use crate::upstream::secure::{Secure, Stores};
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRateLimiting, MOST_LISTENERS};
 use edgerush_discovery::{Endpoints, SERVICE_NAME_LABEL, zone_of};
@@ -352,6 +352,7 @@ impl Snapshot {
             .iter()
             .map(|limit| metrics.limit_slot(&limit.name))
             .collect();
+        let mut stores = Stores::default();
         let secure: Vec<Option<Arc<Secure>>> = config
             .upstreams()
             .iter()
@@ -365,7 +366,7 @@ impl Snapshot {
                     .find(|kept| kept.is_for(source, upstream.protocol));
                 match kept {
                     Some(kept) => Ok(Some(Arc::clone(kept))),
-                    None => Secure::new(source, upstream.protocol)
+                    None => Secure::new(source, upstream.protocol, &mut stores)
                         .map(|secure| Some(Arc::new(secure)))
                         .map_err(|error| ProxyError::UpstreamTls {
                             upstream: upstream.name.clone(),
