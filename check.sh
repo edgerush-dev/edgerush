@@ -29,6 +29,15 @@ fi
 say "fmt"
 cargo fmt --check
 
+say "bench scripts"
+# The Python that runs the benchmarks and reads their results (bench/, bench/ratelimit/)
+# has tests of its own, and nothing else runs them: a script that reads a result wrongly
+# is otherwise found only when a run's table comes out short. Standard library only, and
+# a few seconds. Two runs, as bench/ is not a package and discovery does not go down into
+# bench/ratelimit/.
+python3 -m unittest discover -s bench -p 'test_*.py'
+python3 -m unittest discover -s bench/ratelimit -p 'test_*.py'
+
 say "dependencies"
 # Advisories, licences, sources and crates in two versions (deny.toml), for the workspace's
 # lock file and fuzz/'s. Both are checked against the one file, and each is told not to

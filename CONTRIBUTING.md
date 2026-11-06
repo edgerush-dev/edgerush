@@ -30,12 +30,12 @@ wants cmake and libclang, and NASM as well on Windows. Then
 ./check.sh
 ```
 
-runs every check the project has (formatting, the dependencies' advisories and licences,
-clippy, a build without test features, the tests, the docs, and the benchmarks and fuzz
-targets building) and stops at the first that fails. A pull request is ready when it
-passes. Judge it by its exit status, not by reading the output. CI runs the same script on
-Linux, the platform EdgeRush is for. It builds on Windows too, which works for development
-but is not a recommended path.
+runs every check the project has (formatting, the benchmark scripts' tests, the
+dependencies' advisories and licences, clippy, a build without test features, the tests,
+the docs, and the benchmarks and fuzz targets building) and stops at the first that fails.
+A pull request is ready when it passes. Judge it by its exit status, not by reading the
+output. CI runs the same script on Linux, the platform EdgeRush is for. It builds on
+Windows too, which works for development but is not a recommended path.
 
 ## What a change needs
 
