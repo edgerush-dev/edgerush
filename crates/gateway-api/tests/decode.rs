@@ -1,6 +1,7 @@
 //! What the types read: an object of the experimental channel, with a value and fields the
 //! standard channel lacks, and one without a field its schema requires.
 
+use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::grpc_route::GRPCRoute;
@@ -185,6 +186,36 @@ spec: {}",
     )
     .unwrap();
     assert!(route.spec.rules.is_empty());
+    // A BackendTLSPolicy's target and validation, its CA references defaulted as the spec
+    // has them; its options a map.
+    let policy: BackendTLSPolicy = serde_saphyr::from_str(
+        "metadata: { name: tls }
+spec:
+  targetRefs: [{ group: '', kind: Service, name: web, sectionName: https }]
+  validation:
+    caCertificateRefs: [{ group: '', kind: ConfigMap, name: ca }]
+    hostname: web.example
+    subjectAltNames: [{ type: URI, uri: 'spiffe://cluster/web' }]
+  options: { example.com/x: y }",
+    )
+    .unwrap();
+    let target = &policy.spec.target_refs[0];
+    assert_eq!(
+        (target.kind.as_str(), target.section_name.as_deref()),
+        ("Service", Some("https"))
+    );
+    let validation = &policy.spec.validation;
+    assert_eq!(validation.hostname, "web.example");
+    assert_eq!(
+        validation.ca_certificate_refs.as_ref().unwrap()[0].name,
+        "ca"
+    );
+    let san = &validation.subject_alt_names.as_ref().unwrap()[0];
+    assert_eq!(
+        (san.r#type.as_str(), san.uri.as_deref()),
+        ("URI", Some("spiffe://cluster/web"))
+    );
+    assert_eq!(policy.spec.options.unwrap()["example.com/x"], "y");
 }
 
 #[test]
@@ -234,6 +265,10 @@ fn each_kind_is_listed_where_the_api_server_serves_it() {
     assert_eq!(
         of::<TCPRoute>(),
         at(group, "v1", "tcproutes", "TCPRouteList")
+    );
+    assert_eq!(
+        of::<BackendTLSPolicy>(),
+        at(group, "v1", "backendtlspolicies", "BackendTLSPolicyList")
     );
     assert_eq!(HTTPRoute::API_VERSION, "gateway.networking.k8s.io/v1");
 }

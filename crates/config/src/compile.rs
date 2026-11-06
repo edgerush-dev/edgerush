@@ -15,7 +15,8 @@ use crate::{
     AccessLog, Backend, Certificate, ClientValidation, Config, DnsName, DnsNameError, Endpoints,
     Forwarding, HealthCheck, Http3, Keepalive, KubernetesService, Listener, ListenerProxyProtocol,
     LoadBalancer, Probe, Protocol, ProxyProtocolVersion, RateLimitMode, RequestId, Rule,
-    ServiceName, ServiceNameError, SharingListener, SlowStart, UpstreamProtocol,
+    ServiceName, ServiceNameError, SharingListener, SlowStart, UpstreamProtocol, VerifiedName,
+    WellKnownAuthorities,
 };
 use edgerush_filters::forwarding::{ForwardingError, HeaderNames, TrustedProxies};
 use edgerush_filters::{
@@ -1159,10 +1160,14 @@ impl Eq for SharedListeners {}
 /// TLS to an upstream's endpoints, the certificate it shows found by its name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CompiledUpstreamTls {
-    /// The name asked for (SNI), and the one an endpoint's certificate must carry.
+    /// The name asked for (SNI), and the one an endpoint's certificate must carry unless
+    /// `verified_names` says others.
     pub server_name: String,
-    /// The certificates, in PEM, of the authorities trusted to vouch for it.
-    pub authorities: Vec<String>,
+    /// The names checked in place of `server_name`, if any.
+    pub verified_names: Vec<VerifiedName>,
+    /// The certificates, in PEM, of the authorities trusted to vouch for it: the config's
+    /// system authorities themselves, shared, where it trusts those.
+    pub authorities: Arc<[String]>,
     /// What the data plane shows an endpoint that asks who it is (mTLS), if anything.
     pub client_certificate: Option<NamedCertificate>,
 }
@@ -1211,6 +1216,8 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         .enumerate()
         .map(|(position, name)| (name.as_str(), UpstreamId(position)))
         .collect();
+    // One copy of the system's authorities, shared by every upstream that trusts them.
+    let system_authorities: Arc<[String]> = config.system_authorities.as_slice().into();
     let upstreams = config
         .upstreams
         .iter()
@@ -1234,7 +1241,11 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             // A certificate not found is refused below, and nothing is compiled.
             tls: upstream.tls.as_ref().map(|tls| CompiledUpstreamTls {
                 server_name: tls.server_name.clone(),
-                authorities: tls.authorities.clone(),
+                verified_names: tls.verified_names.clone(),
+                authorities: match tls.well_known_authorities {
+                    Some(WellKnownAuthorities::System) => Arc::clone(&system_authorities),
+                    None => tls.authorities.as_slice().into(),
+                },
                 client_certificate: tls
                     .client_certificate
                     .as_deref()
@@ -1349,12 +1360,34 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             }
         }
         if let Some(tls) = &upstream.tls {
-            if tls.authorities.is_empty() {
-                errors.push(Place::upstream(name).problem(Problem::NoAuthority));
+            let problem = match tls.well_known_authorities {
+                None if tls.authorities.is_empty() => Some(Problem::NoAuthority),
+                Some(_) if !tls.authorities.is_empty() => Some(Problem::AuthoritiesTwice),
+                Some(WellKnownAuthorities::System) if config.system_authorities.is_empty() => {
+                    Some(Problem::NoSystemAuthorities)
+                }
+                None | Some(WellKnownAuthorities::System) => None,
+            };
+            if let Some(problem) = problem {
+                errors.push(Place::upstream(name).problem(problem));
             }
             if !is_host_name(&tls.server_name) {
                 let problem = Problem::ServerName(tls.server_name.clone());
                 errors.push(Place::upstream(name).problem(problem));
+            }
+            for verified in &tls.verified_names {
+                let problem = match verified {
+                    VerifiedName::Dns(dns) if !is_dns_name(dns) => {
+                        Some(Problem::VerifiedName(dns.clone()))
+                    }
+                    VerifiedName::Uri(uri) if !is_uri(uri) => {
+                        Some(Problem::VerifiedUri(uri.clone()))
+                    }
+                    VerifiedName::Dns(_) | VerifiedName::Uri(_) => None,
+                };
+                if let Some(problem) = problem {
+                    errors.push(Place::upstream(name).problem(problem));
+                }
             }
             if let Some(shown) = &tls.client_certificate
                 && !config.certificates.contains_key(shown)
@@ -2090,7 +2123,8 @@ const KEEPALIVE_FLOOR_SECONDS: u64 = 300;
 /// Whether `name` is a host name as a certificate names one: labels of letters, digits and
 /// hyphens, none empty, none starting or ending with a hyphen. No port, no wildcard, and
 /// not an address.
-fn is_host_name(name: &str) -> bool {
+#[must_use]
+pub fn is_host_name(name: &str) -> bool {
     let label = |label: &str| {
         !label.is_empty()
             && label.len() <= 63
@@ -2104,6 +2138,32 @@ fn is_host_name(name: &str) -> bool {
         && name.len() <= 253
         && name.split('.').all(label)
         && name.parse::<std::net::IpAddr>().is_err()
+}
+
+/// Whether `name` is a DNS name a certificate can be checked for: a host name, or a
+/// wildcard of a whole leftmost label over a host name of at least two labels.
+#[must_use]
+pub fn is_dns_name(name: &str) -> bool {
+    match name.strip_prefix("*.") {
+        Some(base) => base.contains('.') && is_host_name(base),
+        None => is_host_name(name),
+    }
+}
+
+/// Whether `uri` is a URI as a certificate carries one: a scheme (a letter, then letters,
+/// digits, `+`, `-` or `.`), a colon, and something after it, with no space or control.
+#[must_use]
+pub fn is_uri(uri: &str) -> bool {
+    let Some((scheme, rest)) = uri.split_once(':') else {
+        return false;
+    };
+    let mut letters = scheme.bytes();
+    letters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && letters.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+        && !rest.is_empty()
+        && uri.bytes().all(|b| b.is_ascii_graphic())
 }
 
 /// Whether `address` is a host and a port as a URI's authority writes them, which is what
@@ -2868,6 +2928,13 @@ pub enum Problem {
     /// TLS to an upstream that trusts nobody.
     #[error("`tls` needs an authority to trust")]
     NoAuthority,
+    /// TLS to an upstream that names its authorities both ways.
+    #[error("`tls` names `authorities` and `well_known_authorities` both")]
+    AuthoritiesTwice,
+    /// TLS to an upstream that trusts the system's authorities where the config carries
+    /// none.
+    #[error("`tls` trusts the system's authorities, and the config carries none")]
+    NoSystemAuthorities,
     /// PINGs for an upstream that is not spoken to in HTTP/2.
     #[error("`keepalive` is for an upstream spoken to in HTTP/2")]
     KeepaliveNeedsHttp2,
@@ -3067,6 +3134,13 @@ pub enum Problem {
     /// TLS to an upstream whose server is not named by a host name.
     #[error("server name `{0}` is not a host name")]
     ServerName(String),
+    /// A DNS name an upstream's certificate is checked for that is neither a host name nor
+    /// a wildcard of one.
+    #[error("verified name `{0}` is neither a host name nor a wildcard of one")]
+    VerifiedName(String),
+    /// A URI an upstream's certificate is checked for that has no scheme, or a space.
+    #[error("verified URI `{0}` is not a URI of a scheme")]
+    VerifiedUri(String),
     /// Another route has the same name.
     #[error("another route has the same name")]
     DuplicateName,
@@ -5596,7 +5670,7 @@ upstreams:
         .unwrap();
         let tls = compiled.upstreams[0].tls.as_ref().unwrap();
         assert_eq!(tls.server_name, "backend.internal");
-        assert_eq!(tls.authorities, ["CA"]);
+        assert_eq!(*tls.authorities, ["CA"]);
 
         let problems = |tls: &str| -> Vec<String> {
             compile(&with(tls))
@@ -5605,10 +5679,16 @@ upstreams:
                 .map(ToString::to_string)
                 .collect()
         };
-        assert_eq!(
-            problems(r#"{ server_name: backend.internal, authorities: [] }"#),
-            ["upstream `u`: `tls` needs an authority to trust"]
-        );
+        for none in [
+            r#"{ server_name: backend.internal, authorities: [] }"#,
+            "{ server_name: backend.internal }",
+        ] {
+            assert_eq!(
+                problems(none),
+                ["upstream `u`: `tls` needs an authority to trust"],
+                "{none}"
+            );
+        }
         for name in [
             "\"\"",
             "\"backend.internal:443\"",
@@ -5625,9 +5705,129 @@ upstreams:
                 )]
             );
         }
-        // Both are said.
-        let yaml = "listeners: {}\nroutes: []\nupstreams: { u: { load_balancer: p2c, endpoints: { listed: [] }, tls: { server_name: a.b } } }\n";
+        // The server's name is said.
+        let yaml = "listeners: {}\nroutes: []\nupstreams: { u: { load_balancer: p2c, endpoints: { listed: [] }, tls: { authorities: [CA] } } }\n";
         assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
+    }
+
+    /// An upstream's TLS may trust the system's authorities in place of its own, those the
+    /// config carries once for all such upstreams; never both, and never where the config
+    /// carries none.
+    #[test]
+    fn an_upstream_may_trust_the_systems_authorities() {
+        let with = |system: &str, tls: &str| {
+            config(&format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{ a: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, tls: {tls} }}, b: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, tls: {{ server_name: b.internal, well_known_authorities: system }} }}, c: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, tls: {{ server_name: c.internal, authorities: [OWN] }} }} }}\nsystem_authorities: {system}\n"
+            ))
+        };
+        let compiled = compile(&with(
+            "[ROOT1, ROOT2]",
+            "{ server_name: a.internal, well_known_authorities: system }",
+        ))
+        .unwrap();
+        let authorities = |at: usize| &compiled.upstreams[at].tls.as_ref().unwrap().authorities;
+        assert_eq!(**authorities(0), ["ROOT1", "ROOT2"]);
+        assert!(Arc::ptr_eq(authorities(0), authorities(1)), "one copy");
+        assert_eq!(**authorities(2), ["OWN"]);
+
+        let problems = |system: &str, tls: &str| -> Vec<String> {
+            compile(&with(system, tls))
+                .unwrap_err()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(
+            problems(
+                "[ROOT]",
+                "{ server_name: a.internal, authorities: [OWN], well_known_authorities: system }"
+            ),
+            ["upstream `a`: `tls` names `authorities` and `well_known_authorities` both"]
+        );
+        assert_eq!(
+            problems(
+                "[]",
+                "{ server_name: a.internal, well_known_authorities: system }"
+            ),
+            [
+                "upstream `a`: `tls` trusts the system's authorities, and the config carries none",
+                "upstream `b`: `tls` trusts the system's authorities, and the config carries none",
+            ]
+        );
+        let unknown = "listeners: {}\nroutes: []\nupstreams: { u: { load_balancer: p2c, endpoints: { listed: [] }, tls: { server_name: u.internal, well_known_authorities: web } } }\nsystem_authorities: [ROOT]\n";
+        assert!(serde_saphyr::from_str::<Config>(unknown).is_err());
+    }
+
+    /// The names an upstream's certificate is checked for in place of its server name are
+    /// DNS names, a wildcard of one whole leftmost label among them, or URIs of a scheme;
+    /// each that is neither is said.
+    #[test]
+    fn an_upstreams_verified_names_are_dns_names_or_uris() {
+        let with = |names: &str| {
+            config(&format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, tls: {{ server_name: sni.internal, verified_names: {names}, authorities: [\"CA\"] }} }} }}\n"
+            ))
+        };
+        let compiled = compile(&with(
+            r#"[{ dns: backend.internal }, { dns: "*.zone.internal" }, { uri: "spiffe://cluster/ns/shop/sa/web" }]"#,
+        ))
+        .unwrap();
+        let tls = compiled.upstreams[0].tls.as_ref().unwrap();
+        assert_eq!(
+            tls.verified_names,
+            [
+                VerifiedName::Dns("backend.internal".to_owned()),
+                VerifiedName::Dns("*.zone.internal".to_owned()),
+                VerifiedName::Uri("spiffe://cluster/ns/shop/sa/web".to_owned()),
+            ]
+        );
+        assert!(
+            compile(&with("[]")).unwrap().upstreams[0]
+                .tls
+                .as_ref()
+                .unwrap()
+                .verified_names
+                .is_empty()
+        );
+        let problems = |names: &str| -> Vec<String> {
+            compile(&with(names))
+                .unwrap_err()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        for dns in [
+            "\"\"",
+            "\"*.internal\"",
+            "\"a.*.internal\"",
+            "\"f*.zone.internal\"",
+            "\"10.0.0.1\"",
+            "\"a b\"",
+        ] {
+            assert_eq!(
+                problems(&format!("[{{ dns: {dns} }}]")),
+                [format!(
+                    "upstream `u`: verified name `{}` is neither a host name nor a wildcard of one",
+                    dns.trim_matches('"')
+                )]
+            );
+        }
+        for uri in [
+            "\"\"",
+            "\"spiffe\"",
+            "\"spiffe:\"",
+            "\"1x://a\"",
+            "\"spiffe://a b\"",
+            "\"://a\"",
+        ] {
+            assert_eq!(
+                problems(&format!("[{{ uri: {uri} }}]")),
+                [format!(
+                    "upstream `u`: verified URI `{}` is not a URI of a scheme",
+                    uri.trim_matches('"')
+                )]
+            );
+        }
     }
 
     /// A match states its path or its gRPC method: one of them, and not both.

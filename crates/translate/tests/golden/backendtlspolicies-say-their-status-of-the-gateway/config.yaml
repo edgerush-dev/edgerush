@@ -1,0 +1,154 @@
+listeners:
+  port-8080:
+    address: 0.0.0.0:8080
+    protocol: http
+    forwarding:
+      trusted_proxies: []
+      trusted_only_headers:
+      - Forwarded
+      - X-Real-IP
+      - X-Forwarded-*
+    request_id: generate
+    proxy_protocol: 'off'
+  port-9000:
+    address: 0.0.0.0:9000
+    protocol: tcp
+    proxy_protocol: 'off'
+routes:
+- name: httproute/shop/pages/http
+  listeners:
+  - port-8080
+  hostnames:
+  - name: shop.example.com
+    falls_through: false
+  rules:
+  - matches:
+    - path:
+        prefix: /api
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/api/https
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /web
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/web/https
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /full
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - invalid: 'Service shop/full port https is covered by BackendTLSPolicy shop/full, whose TLS cannot
+          be had: its status holds 16 ancestors already, none of them Gateway shop/web, so it cannot be
+          implemented there'
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /room
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/room/https
+        weight: 1
+    rate_limits: []
+  rate_limits: []
+tcp_routes:
+- name: tcproute/shop/carried/raw
+  listeners:
+  - port-9000
+  backends:
+  - upstream: shop/tunneled/https/tcp
+    weight: 1
+tls_routes: []
+upstreams:
+  shop/api/https:
+    endpoints:
+      kubernetes: api.shop.svc.cluster.local:https
+    protocol: http1
+    tls:
+      server_name: api.shop.example
+      verified_names: []
+      authorities:
+      - '-----BEGIN CERTIFICATE-----
+
+        MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+
+        DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+
+        MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+
+        hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+
+        /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+
+        vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+
+        AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+
+        RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+
+        MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+
+        -----END CERTIFICATE-----
+
+        '
+    load_balancer: p2c
+  shop/room/https:
+    endpoints:
+      kubernetes: room.shop.svc.cluster.local:https
+    protocol: http1
+    tls:
+      server_name: room.shop.example
+      verified_names: []
+      authorities:
+      - '-----BEGIN CERTIFICATE-----
+
+        MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+
+        DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+
+        MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+
+        hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+
+        /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+
+        vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+
+        AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+
+        RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+
+        MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+
+        -----END CERTIFICATE-----
+
+        '
+    load_balancer: p2c
+  shop/tunneled/https/tcp:
+    endpoints:
+      kubernetes: tunneled.shop.svc.cluster.local:https
+    protocol: http1
+    load_balancer: p2c
+  shop/web/https:
+    endpoints:
+      kubernetes: web.shop.svc.cluster.local:https
+    protocol: http1
+    load_balancer: p2c

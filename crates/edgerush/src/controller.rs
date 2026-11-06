@@ -67,9 +67,13 @@ With --webhook-listen, it serves the admission webhook there, HTTPS, reviews POS
 translate into something the data plane accepts. Its certificate and key are read again
 every second; until the IngressClasses are listed it answers 503, which the API server
 takes as an outage, admitting the Ingress where the webhook fails open.
+A BackendTLSPolicy's `wellKnownCACertificates: System` trusts the authorities its own
+system does, read as it starts: the PEM file SSL_CERT_FILE names, else the system's bundle,
+/etc/ssl/certs/ca-certificates.crt, /etc/ssl/cert.pem or /etc/pki/tls/certs/ca-bundle.crt,
+the first there is. With none, the backends of such a policy fail closed.
 Runs until Ctrl-C, or SIGTERM on Unix, and then exits 0; exits 2 when the command line, the
-data plane's settings or the stream's or the webhook's certificates cannot be used, or it is
-not in a cluster.
+data plane's settings, the system's authorities or the stream's or the webhook's
+certificates cannot be used, or it is not in a cluster.
 
 Options:
       --data-plane <FILE>    The data plane's settings, in YAML, as `edgerush validate`
@@ -136,6 +140,11 @@ pub(crate) fn command(
     let started = read::<Plane>(&options.data_plane)
         .map_err(|failed| failed.to_string())
         .and_then(|plane| {
+            let plane = Plane {
+                system_authorities: crate::system_authorities::read()
+                    .map_err(|error| format!("the system's authorities: {error}"))?,
+                ..plane
+            };
             let stream = match &options.stream {
                 Some(stream) => Some(runtime.block_on(credentials(stream))?),
                 None => None,

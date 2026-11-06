@@ -18,6 +18,7 @@
 use acks::{Pods, REPORT_LABEL};
 use edgerush_config::ServiceName;
 use edgerush_config::{ConfigError, compile};
+use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::grpc_route::GRPCRoute;
@@ -28,7 +29,8 @@ use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_kubernetes::{ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow};
 use edgerush_translate::{
-    Cluster, GatewayName, GatewayStatus, Object, Plane, RouteStatus, Translation, translate,
+    Cluster, GatewayName, GatewayStatus, Object, Plane, PolicyStatus, RouteStatus, Translation,
+    translate,
 };
 use gateway_status::Programmed;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
@@ -461,6 +463,10 @@ struct GatewayApi {
     tls_routes: Option<Vec<Follow<TLSRoute>>>,
     tcp_routes: Option<Vec<Follow<TCPRoute>>>,
     reference_grants: Option<Vec<Follow<ReferenceGrant>>>,
+    backend_tls_policies: Option<Vec<Follow<BackendTLSPolicy>>>,
+    /// The ConfigMaps of the watch scope, followed while BackendTLSPolicies are, for the
+    /// CA certificates they name (04 §2).
+    config_maps: Option<Vec<Follow<ConfigMap>>>,
 }
 
 impl GatewayApi {
@@ -488,6 +494,8 @@ impl GatewayApi {
             tls_routes: None,
             tcp_routes: None,
             reference_grants: None,
+            backend_tls_policies: None,
+            config_maps: None,
         }
     }
 
@@ -504,8 +512,9 @@ impl GatewayApi {
 
     /// Follows each kind `served` says is served, in `scope` (GatewayClasses in the
     /// cluster, Gateways in the data plane's Gateway's namespace; ListenerSets, HTTPRoutes,
-    /// GRPCRoutes, TLSRoutes, TCPRoutes and ReferenceGrants in `scope`), and stops following
-    /// each it says is not.
+    /// GRPCRoutes, TLSRoutes, TCPRoutes, ReferenceGrants and BackendTLSPolicies in `scope`,
+    /// with the ConfigMaps there while BackendTLSPolicies are), and stops following each it
+    /// says is not.
     fn follow(&mut self, served: &[(GatewayKind, Served)], start: &mut Start<'_>, scope: &[Scope]) {
         for (kind, served) in served {
             let on = served.is_served();
@@ -529,6 +538,10 @@ impl GatewayApi {
                 GatewayKind::TCPRoute => keep(&mut self.tcp_routes, on, || start.follows(scope)),
                 GatewayKind::ReferenceGrant => {
                     keep(&mut self.reference_grants, on, || start.follows(scope));
+                }
+                GatewayKind::BackendTLSPolicy => {
+                    keep(&mut self.backend_tls_policies, on, || start.follows(scope));
+                    keep(&mut self.config_maps, on, || start.follows(scope));
                 }
             }
         }
@@ -555,6 +568,10 @@ impl GatewayApi {
             .chain(unlisted(
                 self.reference_grants.as_deref().unwrap_or_default(),
             ))
+            .chain(unlisted(
+                self.backend_tls_policies.as_deref().unwrap_or_default(),
+            ))
+            .chain(unlisted(self.config_maps.as_deref().unwrap_or_default()))
     }
 }
 
@@ -567,6 +584,8 @@ struct Handed {
     status: GatewayStatus,
     /// That of each route, of either kind, that names it.
     routes: Vec<RouteStatus>,
+    /// That of each BackendTLSPolicy a route of it reaches.
+    policies: Vec<PolicyStatus>,
 }
 
 impl Handed {
@@ -577,6 +596,7 @@ impl Handed {
             gateway: gateway.gateway.clone(),
             status: translation.gateway_status.clone()?,
             routes: translation.route_statuses.clone(),
+            policies: translation.policy_statuses.clone(),
         })
     }
 }
@@ -584,8 +604,9 @@ impl Handed {
 impl GatewayApi {
     /// Writes, one at a time, each status that says other than `handed` has it: that of
     /// the data plane's Gateway's class, of the Gateway, `addresses` among it, of each
-    /// ListenerSet naming it, and of each route followed, HTTPRoute, GRPCRoute or TLSRoute,
-    /// whether or not it still names the Gateway or one of those ListenerSets.
+    /// ListenerSet naming it, of each route followed, HTTPRoute, GRPCRoute, TLSRoute or
+    /// TCPRoute, whether or not it still names the Gateway or one of those ListenerSets, and
+    /// of each BackendTLSPolicy followed, whether or not a route of the Gateway reaches it.
     async fn write_statuses(
         &self,
         api: &ApiServer,
@@ -759,6 +780,48 @@ impl GatewayApi {
                 });
             }
         }
+        let policies = self
+            .backend_tls_policies
+            .as_deref()
+            .map(objects)
+            .unwrap_or_default();
+        for policy in &policies {
+            let object = Object {
+                kind: "BackendTLSPolicy",
+                namespace: policy.metadata.namespace.clone().unwrap_or_default(),
+                name: policy.metadata.name.clone().unwrap_or_default(),
+            };
+            let wanted = handed
+                .policies
+                .iter()
+                .find(|wanted| wanted.policy == object);
+            let status = gateway_status::policy(
+                policy.status.as_ref(),
+                &object.namespace,
+                &handed.gateway,
+                wanted,
+                now,
+            );
+            if policy.status.clone().unwrap_or_default() != status {
+                let version = policy
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .unwrap_or_default();
+                let result = api
+                    .replace_status::<BackendTLSPolicy>(
+                        &object.namespace,
+                        &object.name,
+                        version,
+                        &status,
+                    )
+                    .await;
+                said(Said::GatewayApiStatus {
+                    object: &object,
+                    written: result.as_ref().map(|_| ()),
+                });
+            }
+        }
     }
 }
 
@@ -894,6 +957,8 @@ impl Followed {
             tls_routes: of(gateway_api.and_then(|g| g.tls_routes.as_ref())),
             tcp_routes: of(gateway_api.and_then(|g| g.tcp_routes.as_ref())),
             reference_grants: of(gateway_api.and_then(|g| g.reference_grants.as_ref())),
+            backend_tls_policies: of(gateway_api.and_then(|g| g.backend_tls_policies.as_ref())),
+            config_maps: of(gateway_api.and_then(|g| g.config_maps.as_ref())),
             namespaces: gateway_api
                 .map(|g| objects(&g.namespaces))
                 .unwrap_or_default(),

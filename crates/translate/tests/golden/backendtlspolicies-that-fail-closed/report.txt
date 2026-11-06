@@ -1,0 +1,21 @@
+BackendTLSPolicy shop/address: the connections it covers fail: hostname 10.0.0.1 is not a host name
+BackendTLSPolicy shop/half: the connections it covers fail: ConfigMap shop/not-there does not exist
+BackendTLSPolicy shop/keyless: the connections it covers fail: ConfigMap shop/keyless has no ca.crt
+BackendTLSPolicy shop/malformed: the connections it covers fail: ConfigMap shop/malformed's ca.crt is not PEM certificates
+BackendTLSPolicy shop/missing: the connections it covers fail: ConfigMap shop/not-there does not exist
+BackendTLSPolicy shop/san: the connections it covers fail: subject alternative name "no scheme" is not a URI
+BackendTLSPolicy shop/secret: the connections it covers fail: a CA certificate ref to a Secret, where a ConfigMap is read
+BackendTLSPolicy shop/system: the connections it covers fail: the control plane found no system CA certificates
+BackendTLSPolicy shop/unknown: the connections it covers fail: wellKnownCACertificates example.com/roots is not one the gateway knows
+HTTPRoute shop/pages: rule 0: a backend's share is answered 500: Service shop/missing port https is covered by BackendTLSPolicy shop/missing, whose TLS cannot be had: ConfigMap shop/not-there does not exist
+HTTPRoute shop/pages: rule 1: a backend's share is answered 500: Service shop/keyless port https is covered by BackendTLSPolicy shop/keyless, whose TLS cannot be had: ConfigMap shop/keyless has no ca.crt
+HTTPRoute shop/pages: rule 2: a backend's share is answered 500: Service shop/malformed port https is covered by BackendTLSPolicy shop/malformed, whose TLS cannot be had: ConfigMap shop/malformed's ca.crt is not PEM certificates
+HTTPRoute shop/pages: rule 3: a backend's share is answered 500: Service shop/secret port https is covered by BackendTLSPolicy shop/secret, whose TLS cannot be had: a CA certificate ref to a Secret, where a ConfigMap is read
+HTTPRoute shop/pages: rule 4: a backend's share is answered 500: Service shop/half port https is covered by BackendTLSPolicy shop/half, whose TLS cannot be had: ConfigMap shop/not-there does not exist
+HTTPRoute shop/pages: rule 5: a backend's share is answered 500: Service shop/unknown port https is covered by BackendTLSPolicy shop/unknown, whose TLS cannot be had: wellKnownCACertificates example.com/roots is not one the gateway knows
+HTTPRoute shop/pages: rule 6: a backend's share is answered 500: Service shop/system port https is covered by BackendTLSPolicy shop/system, whose TLS cannot be had: the control plane found no system CA certificates
+HTTPRoute shop/pages: rule 7: a backend's share is answered 500: Service shop/address port https is covered by BackendTLSPolicy shop/address, whose TLS cannot be had: hostname 10.0.0.1 is not a host name
+HTTPRoute shop/pages: rule 8: a backend's share is answered 500: Service shop/san port https is covered by BackendTLSPolicy shop/san, whose TLS cannot be had: subject alternative name "no scheme" is not a URI
+HTTPRoute shop/pages: rule 9: a mirror is left off, the rule served without it: Service shop/missing port https is covered by BackendTLSPolicy shop/missing, whose TLS cannot be had: ConfigMap shop/not-there does not exist
+GRPCRoute shop/calls: rule 0: a backend's share is answered UNAVAILABLE: Service shop/missing port https is covered by BackendTLSPolicy shop/missing, whose TLS cannot be had: ConfigMap shop/not-there does not exist
+GRPCRoute shop/calls: rule 0: a backend's share is answered UNAVAILABLE: Service shop/gone does not exist

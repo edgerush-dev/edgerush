@@ -16,6 +16,8 @@
 
 // The CRDs' own prose continues list items without indenting them.
 #[allow(clippy::doc_lazy_continuation)]
+pub mod backend_tls_policy;
+#[allow(clippy::doc_lazy_continuation)]
 pub mod gateway;
 #[allow(clippy::doc_lazy_continuation)]
 pub mod gateway_class;

@@ -13,17 +13,19 @@
 //! where the case says, `routes.txt`, what became of each HTTPRoute's parents of that
 //! Gateway, then each GRPCRoute's, then each TLSRoute's, a line each (none otherwise); and, where the case says,
 //! `status.txt`, what the
-//! status of that Gateway, each of its listeners and each HTTPRoute's parent of it is to
-//! say, a line each. The report's last lines are the hosts a claim of one API takes from the
+//! status of that Gateway, each of its listeners, each route's parent of it and each
+//! BackendTLSPolicy of it as an ancestor is to say, a line each. The report's last lines are the hosts a claim of one API takes from the
 //! other's.
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
-//! the objects of `tests/golden/shared.yaml` go with every case's. Every namespace is
+//! the control plane's system trusts no authority, unless the case has `system.pem`, the
+//! certificates it does; the objects of `tests/golden/shared.yaml` go with every case's. Every namespace is
 //! watched, unless the case lists those that are in `watched.txt`, a line each.
 //! Every config translated must also pass the data plane's own `compile`, and, written as
 //! YAML as the control plane writes it, read back the same; and the Ingresses it says it
 //! served must be those its config's routes are of.
 
 use edgerush_config::{Config, compile};
+use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::grpc_route::GRPCRoute;
@@ -33,7 +35,7 @@ use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_translate::{Cluster, Plane, translate};
-use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use serde::Deserialize;
 use std::fs;
@@ -55,6 +57,8 @@ enum Manifest {
     TLSRoute(Box<TLSRoute>),
     TCPRoute(Box<TCPRoute>),
     ReferenceGrant(Box<ReferenceGrant>),
+    BackendTLSPolicy(Box<BackendTLSPolicy>),
+    ConfigMap(Box<ConfigMap>),
     Namespace(Box<Namespace>),
 }
 
@@ -81,6 +85,8 @@ fn every_case_translates_to_its_config_and_report() {
                 Manifest::TLSRoute(route) => cluster.tls_routes.push(*route),
                 Manifest::TCPRoute(route) => cluster.tcp_routes.push(*route),
                 Manifest::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
+                Manifest::BackendTLSPolicy(policy) => cluster.backend_tls_policies.push(*policy),
+                Manifest::ConfigMap(map) => cluster.config_maps.push(*map),
                 Manifest::Namespace(namespace) => cluster.namespaces.push(*namespace),
             }
         }
@@ -98,11 +104,15 @@ fn every_case_translates_to_its_config_and_report() {
     for case in cases {
         let name = case.file_name().unwrap().to_string_lossy().into_owned();
         let own = case.join("plane.yaml");
-        let plane = if own.exists() {
+        let mut plane: Plane = if own.exists() {
             serde_saphyr::from_str(&read(&own)).unwrap()
         } else {
             shared.clone()
         };
+        let system = case.join("system.pem");
+        if system.exists() {
+            plane.system_authorities = vec![read(&system)];
+        }
         // Every case has the objects every cluster of the tests has: an IngressClass `edge`
         // that names this controller.
         let manifests = format!(
@@ -192,6 +202,7 @@ fn every_case_translates_to_its_config_and_report() {
                 .iter()
                 .map(ToString::to_string)
                 .chain(translation.route_statuses.iter().map(ToString::to_string))
+                .chain(translation.policy_statuses.iter().map(ToString::to_string))
                 .flat_map(|said| said.lines().map(str::to_owned).collect::<Vec<_>>())
                 .collect();
             let expected: Vec<String> = read(&listed).lines().map(str::to_owned).collect();

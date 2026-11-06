@@ -1,0 +1,232 @@
+# BackendTLSPolicies whose TLS cannot be had: each backend they cover answered 500, a
+# call UNAVAILABLE, a mirror left off, never spoken to in the clear, and the routes' refs
+# still resolved, as each policy's own status says why: a ConfigMap that is not there, one
+# with no ca.crt, one whose ca.crt is no certificate, a Secret where a ConfigMap is read,
+# one valid ref beside an invalid one, a well-known name the gateway does not know, the
+# system's certificates where the control plane found none, a hostname that is an address
+# and a subject alternative name that is not of its type. A Service no policy covers is
+# reached as ever; one that is not there leaves the GRPCRoute's refs unresolved, said alone.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: pages, namespace: shop }
+spec:
+  parentRefs: [{ name: web }]
+  hostnames: [shop.example.com]
+  rules:
+    - matches: [{ path: { type: PathPrefix, value: /missing } }]
+      backendRefs: [{ name: missing, port: 443 }]
+    - matches: [{ path: { type: PathPrefix, value: /keyless } }]
+      backendRefs: [{ name: keyless, port: 443 }]
+    - matches: [{ path: { type: PathPrefix, value: /malformed } }]
+      backendRefs: [{ name: malformed, port: 443 }]
+    - matches: [{ path: { type: PathPrefix, value: /secret } }]
+      backendRefs: [{ name: secret, port: 443 }]
+    - matches: [{ path: { type: PathPrefix, value: /half } }]
+      backendRefs: [{ name: half, port: 443 }]
+    - matches: [{ path: { type: PathPrefix, value: /unknown } }]
+      backendRefs: [{ name: unknown, port: 443 }]
+    - matches: [{ path: { type: PathPrefix, value: /system } }]
+      backendRefs: [{ name: system, port: 443 }]
+    - matches: [{ path: { type: PathPrefix, value: /address } }]
+      backendRefs: [{ name: address, port: 443 }]
+    - matches: [{ path: { type: PathPrefix, value: /san } }]
+      backendRefs: [{ name: san, port: 443 }]
+    - filters:
+        - type: RequestMirror
+          requestMirror: { backendRef: { name: missing, port: 443 } }
+      backendRefs: [{ name: plain, port: 443 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: calls, namespace: shop }
+spec:
+  parentRefs: [{ name: web }]
+  hostnames: [calls.example.com]
+  rules:
+    - backendRefs: [{ name: missing, port: 443 }, { name: gone, port: 443 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: missing, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: missing }]
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: not-there }]
+    hostname: missing.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: keyless, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: keyless }]
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: keyless }]
+    hostname: keyless.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: malformed, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: malformed }]
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: malformed }]
+    hostname: malformed.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: secret, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: secret }]
+  validation:
+    caCertificateRefs: [{ group: "", kind: Secret, name: shop-tls }]
+    hostname: secret.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: half, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: half }]
+  validation:
+    caCertificateRefs:
+      - { group: "", kind: ConfigMap, name: ca }
+      - { group: "", kind: ConfigMap, name: not-there }
+    hostname: half.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: unknown, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: unknown }]
+  validation:
+    wellKnownCACertificates: example.com/roots
+    hostname: unknown.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: system, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: system }]
+  validation:
+    wellKnownCACertificates: System
+    hostname: system.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: address, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: address }]
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+    hostname: 10.0.0.1
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: san, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: san }]
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+    hostname: san.shop.example
+    subjectAltNames: [{ type: URI, uri: "no scheme" }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: keyless, namespace: shop }
+data: { ca.pem: "the wrong key" }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: malformed, namespace: shop }
+data: { ca.crt: "not a certificate" }
+---
+# The test certificate of the Secret shop-tls, a CA of its own.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: ca, namespace: shop }
+data:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+    DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+    MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+    hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+    /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+    vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+    AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+    RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+    MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+    -----END CERTIFICATE-----
+---
+apiVersion: v1
+kind: Service
+metadata: { name: missing, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: keyless, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: malformed, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: secret, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: half, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: unknown, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: system, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: address, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: san, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: plain, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]

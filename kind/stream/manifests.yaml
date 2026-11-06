@@ -109,6 +109,7 @@ rules:
       - grpcroutes.gateway.networking.k8s.io
       - tlsroutes.gateway.networking.k8s.io
       - tcproutes.gateway.networking.k8s.io
+      - backendtlspolicies.gateway.networking.k8s.io
       - httproutes.gateway.networking.k8s.io
       - referencegrants.gateway.networking.k8s.io
     verbs: [get, list, watch]
@@ -127,13 +128,13 @@ rules:
     resources: [ingresses]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [listenersets, grpcroutes, httproutes, referencegrants, tlsroutes, tcproutes]
+    resources: [listenersets, grpcroutes, httproutes, referencegrants, tlsroutes, tcproutes, backendtlspolicies]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [listenersets/status, grpcroutes/status, httproutes/status, tlsroutes/status, tcproutes/status]
+    resources: [listenersets/status, grpcroutes/status, httproutes/status, tlsroutes/status, tcproutes/status, backendtlspolicies/status]
     verbs: [update]
   - apiGroups: [""]
-    resources: [services, secrets]
+    resources: [services, secrets, configmaps]
     verbs: [list, watch]
   - apiGroups: [networking.k8s.io]
     resources: [ingresses/status]
@@ -153,13 +154,13 @@ rules:
     resources: [ingresses]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [listenersets, grpcroutes, httproutes, referencegrants, tlsroutes, tcproutes]
+    resources: [listenersets, grpcroutes, httproutes, referencegrants, tlsroutes, tcproutes, backendtlspolicies]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [listenersets/status, grpcroutes/status, httproutes/status, tlsroutes/status, tcproutes/status]
+    resources: [listenersets/status, grpcroutes/status, httproutes/status, tlsroutes/status, tcproutes/status, backendtlspolicies/status]
     verbs: [update]
   - apiGroups: [""]
-    resources: [services, secrets]
+    resources: [services, secrets, configmaps]
     verbs: [list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

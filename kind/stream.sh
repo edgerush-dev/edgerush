@@ -37,7 +37,11 @@
 #     takes is closed, and the HTTPS listener's name served, the route said accepted; a
 #     TCP listener's connections are carried to its oldest TCPRoute's backend, a newer
 #     route accepted and counted but reached only once the older is gone, and every
-#     connection closed with none;
+#     connection closed with none; an HTTPRoute's backend that a BackendTLSPolicy covers is
+#     reached over TLS, verified by a ConfigMap's authority and the policy's hostname, a
+#     wrong hostname or authority, the ConfigMap's change taken in, or a ConfigMap not
+#     there answered 5xx, and the policy says so of the Gateway, and nothing once no route
+#     reaches it;
 #   - the Ingress's status says the data plane's Service's address;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
@@ -207,7 +211,7 @@ control_said() {
 refused_any() {
     for replica in $(k -n edge get pod -l app=edgerush-control -o name); do
         k -n edge logs "$replica" 2>/dev/null |
-            grep -E "(customresourcedefinitions|gatewayclasses|gateways|listenersets|grpcroutes|tlsroutes|tcproutes|httproutes|referencegrants).*(403|forbidden)" &&
+            grep -E "(customresourcedefinitions|gatewayclasses|gateways|listenersets|grpcroutes|tlsroutes|tcproutes|httproutes|referencegrants|backendtlspolicies|configmaps).*(403|forbidden)" &&
             return 0
     done
     return 1
@@ -242,6 +246,8 @@ control_said "tlsroutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.
     fail "the control plane never said TLSRoutes are served"
 control_said "tcproutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)" 5 ||
     fail "the control plane never said TCPRoutes are served"
+control_said "backendtlspolicies.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)" 5 ||
+    fail "the control plane never said BackendTLSPolicies are served"
 sleep 3
 k apply -f - >/dev/null <<EOF
 apiVersion: gateway.networking.k8s.io/v1
@@ -845,6 +851,134 @@ listeners=$(k -n edge get gateway web -o jsonpath='{.spec.listeners[*].name}' | 
 k -n edge patch gateway web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 1))\"}]" >/dev/null
 k -n shop delete deploy/older service/older deploy/newer service/newer >/dev/null
 pass "a TCP listener's connections are carried to its oldest TCPRoute's backend, a newer route accepted and counted and reached only once the older is gone, and closed with none"
+
+# A BackendTLSPolicy (04 §2, §6): an HTTPRoute's backend, agnhost's netexec over TLS of a
+# certificate the stream's authority made for secured.shop.example, is reached over TLS,
+# verified against that authority as a ConfigMap's ca.crt has it and by the policy's
+# hostname; a hostname its certificate does not carry is answered 5xx, never in the clear,
+# and so is another authority once the ConfigMap holds it, the change taken in without a
+# restart; a ref to a ConfigMap not there fails closed too. The policy says it is accepted
+# and resolved of the Gateway, of its generation, or why not, which writing it needs
+# backendtlspolicies/status; once no route of the Gateway reaches it, it says nothing of it.
+issue secured secured.shop.example
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+    -subj "/CN=another authority" -keyout "$pki/another.key" -out "$pki/another.crt" 2>/dev/null
+k -n shop create secret tls secured --cert="$pki/secured.crt" --key="$pki/secured.key" \
+    --dry-run=client -o yaml | k apply -f - >/dev/null
+# The ConfigMap of the backend's authority, holding $1's certificate.
+authority() {
+    k -n shop create configmap backend-ca --from-file=ca.crt="$pki/$1.crt" \
+        --dry-run=client -o yaml | k apply -f - >/dev/null
+}
+authority ca
+k apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: secured, namespace: shop }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: secured } }
+  template:
+    metadata: { labels: { app: secured } }
+    spec:
+      containers:
+        - name: secured
+          image: $AGNHOST
+          args: ["netexec", "--http-port=8443", "--tls-cert-file=/tls/tls.crt", "--tls-private-key-file=/tls/tls.key"]
+          ports: [{ name: https, containerPort: 8443 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8443, scheme: HTTPS }, periodSeconds: 1 }
+          volumeMounts: [{ name: tls, mountPath: /tls, readOnly: true }]
+      volumes: [{ name: tls, secret: { secretName: secured } }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: secured, namespace: shop }
+spec:
+  selector: { app: secured }
+  ports: [{ name: https, port: 8443, targetPort: https }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: secured, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: secured }]
+  validation:
+    hostname: secured.shop.example
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: backend-ca }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: secured, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: http }]
+  hostnames: [secured.example]
+  rules: [{ backendRefs: [{ name: secured, port: 8443 }] }]
+EOF
+k -n shop rollout status deploy/secured --timeout=120s >/dev/null
+# What a request for secured.example is answered: the pod's name where it is served, then
+# the status.
+reached() {
+    curl -s --max-time 5 -w ' %{http_code}' -H "host: secured.example" \
+        "http://127.0.0.1:$port/hostname" || true
+}
+# Waits up to $2 seconds for `reached` to match the pattern $1.
+reaches() {
+    for _ in $(seq 1 $(($2 * 5))); do
+        # shellcheck disable=SC2254
+        case "$(reached)" in $1) return 0 ;; esac
+        sleep 0.2
+    done
+    return 1
+}
+reaches 'secured-* 200' 60 ||
+    fail "the BackendTLSPolicy's backend is not reached over TLS: $(reached)"
+# The jsonpath of the policy's first ancestor's condition of type $1, its field $2.
+of_ancestor() { echo "{.status.ancestors[0].conditions[?(@.type==\"$1\")].$2}"; }
+stated "True True" "$(of_ancestor Accepted status) $(of_ancestor ResolvedRefs status)" \
+    30 -n shop backendtlspolicy secured ||
+    fail "the BackendTLSPolicy says $(said_of -n shop backendtlspolicy secured)"
+stated "edgerush.dev/gateway-controller Gateway edge web" \
+    '{.status.ancestors[*].controllerName} {.status.ancestors[*].ancestorRef.kind} {.status.ancestors[*].ancestorRef.namespace} {.status.ancestors[*].ancestorRef.name}' \
+    5 -n shop backendtlspolicy secured ||
+    fail "the BackendTLSPolicy's ancestor is not the Gateway's alone: $(said_of -n shop backendtlspolicy secured)"
+generation=$(k -n shop get backendtlspolicy secured -o jsonpath='{.metadata.generation}')
+stated "$generation" "$(of_ancestor Accepted observedGeneration)" 5 -n shop backendtlspolicy secured ||
+    fail "the BackendTLSPolicy's status is not of generation $generation: $(said_of -n shop backendtlspolicy secured)"
+# A hostname the backend's certificate does not carry.
+k -n shop patch backendtlspolicy secured --type=merge \
+    -p '{"spec":{"validation":{"hostname":"wrong.shop.example"}}}' >/dev/null
+reaches '* 5[0-9][0-9]' 60 ||
+    fail "a hostname the backend's certificate does not carry is not answered 5xx: $(reached)"
+generation=$(k -n shop get backendtlspolicy secured -o jsonpath='{.metadata.generation}')
+stated "True $generation" "$(of_ancestor Accepted status) $(of_ancestor Accepted observedGeneration)" \
+    30 -n shop backendtlspolicy secured ||
+    fail "the BackendTLSPolicy's status is not of generation $generation: $(said_of -n shop backendtlspolicy secured)"
+k -n shop patch backendtlspolicy secured --type=merge \
+    -p '{"spec":{"validation":{"hostname":"secured.shop.example"}}}' >/dev/null
+reaches 'secured-* 200' 60 || fail "its hostname given back, the backend is not reached: $(reached)"
+# Another authority in the ConfigMap, taken in as it is changed.
+authority another
+reaches '* 5[0-9][0-9]' 60 ||
+    fail "the ConfigMap holding another authority, the backend is not answered 5xx: $(reached)"
+authority ca
+reaches 'secured-* 200' 60 ||
+    fail "the ConfigMap's authority given back, the backend is not reached: $(reached)"
+# A ref to a ConfigMap not there: no CA certificate the policy can use, so closed.
+k -n shop patch backendtlspolicy secured --type=json \
+    -p '[{"op":"replace","path":"/spec/validation/caCertificateRefs/0/name","value":"missing"}]' >/dev/null
+stated "False NoValidCACertificate False InvalidCACertificateRef" \
+    "$(of_ancestor Accepted status) $(of_ancestor Accepted reason) $(of_ancestor ResolvedRefs status) $(of_ancestor ResolvedRefs reason)" \
+    30 -n shop backendtlspolicy secured ||
+    fail "a policy of a ConfigMap not there says $(said_of -n shop backendtlspolicy secured)"
+reaches '* 5[0-9][0-9]' 60 || fail "a policy of a ConfigMap not there is not answered 5xx: $(reached)"
+refused_any && fail "a control-plane replica was refused something of a BackendTLSPolicy"
+# No route of the Gateway reaching it, the policy says nothing of the Gateway.
+k -n shop delete httproute secured >/dev/null
+stated "" '{.status.ancestors[*].controllerName}' 30 -n shop backendtlspolicy secured ||
+    fail "a policy no route reaches still says $(said_of -n shop backendtlspolicy secured)"
+k -n shop delete backendtlspolicy secured >/dev/null
+k -n shop delete deploy/secured service/secured secret/secured configmap/backend-ca >/dev/null
+pass "a BackendTLSPolicy's backend is reached over TLS by its ConfigMap's authority and its hostname, a wrong hostname or authority answered 5xx, the ConfigMap's change taken in, and the policy says so of the Gateway"
 
 # What the Ingress's status says, its first address.
 says() { k -n shop get ingress web -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }

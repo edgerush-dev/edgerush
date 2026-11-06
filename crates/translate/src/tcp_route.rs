@@ -6,6 +6,7 @@
 //! until one is, a route that closes every connection, so that the port is bound as every
 //! accepted listener's is (Lucas, Q-c2).
 
+use crate::backend_tls::Policies;
 use crate::gateway::GatewayOutcome;
 use crate::http_route::{Reference, RouteOutcome, attachment_name, backends};
 use crate::{Cluster, Plane, RefProblem, namespace};
@@ -33,6 +34,7 @@ pub(crate) fn translated(
     gateway: &GatewayOutcome,
     plane: &Plane,
     cluster: &Cluster,
+    policies: &Policies<'_>,
 ) -> Translated {
     let mut translated = Translated::default();
     let rules = &route.spec.rules;
@@ -60,6 +62,7 @@ pub(crate) fn translated(
         ("TCPRoute", route_namespace),
         plane,
         cluster,
+        policies,
         (&mut upstreams, &mut invalid),
     );
     for parent in &outcome.parents {

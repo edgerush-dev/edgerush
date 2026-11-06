@@ -1,0 +1,5 @@
+BackendTLSPolicy shop/younger: covers nothing of Service shop/web: BackendTLSPolicy shop/elder covers it, and comes first
+BackendTLSPolicy shop/sectioned-twin: covers nothing of Service shop/web port admin: BackendTLSPolicy shop/sectioned covers it, and comes first
+BackendTLSPolicy shop/stray: covers nothing of Service shop/gone: it does not exist
+BackendTLSPolicy shop/stray: covers nothing of Service shop/web port missing: the Service has no port of that name
+BackendTLSPolicy shop/stray: covers nothing of Gateway shop/web: it is of group "gateway.networking.k8s.io" and kind Gateway, where a policy covers core Services alone

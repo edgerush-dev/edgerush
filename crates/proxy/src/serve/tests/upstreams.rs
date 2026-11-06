@@ -323,11 +323,40 @@ pub(super) async fn tls_upstream_asking(
     agrees: Agrees,
     clients: Option<&edgerush_config::Certificate>,
 ) -> SocketAddr {
+    tls_upstream_with(certificate, agrees, clients, None).await
+}
+
+/// The same as `tls_upstream`, refusing in the handshake a client that asks for any name
+/// but `asked` (SNI).
+pub(super) async fn tls_upstream_asked_for(
+    certificate: &edgerush_config::Certificate,
+    asked: &'static str,
+) -> SocketAddr {
+    tls_upstream_with(certificate, Agrees::Either, None, Some(asked)).await
+}
+
+async fn tls_upstream_with(
+    certificate: &edgerush_config::Certificate,
+    agrees: Agrees,
+    clients: Option<&edgerush_config::Certificate>,
+    asked: Option<&'static str>,
+) -> SocketAddr {
     use boring::pkey::PKey;
-    use boring::ssl::{AlpnError, SslAcceptor, SslMethod, SslVerifyMode, select_next_proto};
+    use boring::ssl::{
+        AlpnError, NameType, SniError, SslAcceptor, SslMethod, SslVerifyMode, select_next_proto,
+    };
     use boring::x509::X509;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+    if let Some(asked) = asked {
+        builder.set_servername_callback(move |ssl, _| {
+            if ssl.servername(NameType::HOST_NAME) == Some(asked) {
+                Ok(())
+            } else {
+                Err(SniError::ALERT_FATAL)
+            }
+        });
+    }
     if let Some(clients) = clients {
         let mut trusted = boring::x509::store::X509StoreBuilder::new().unwrap();
         trusted

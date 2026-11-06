@@ -1951,16 +1951,16 @@
       ]
     },
     "UpstreamTls": {
-      "description": "TLS to an upstream's endpoints: whom they are expected to be, and whom to trust to say\nso (Gateway API's BackendTLSPolicy: a hostname and CA certificates).",
+      "description": "TLS to an upstream's endpoints: whom they are expected to be, and whom to trust to say\nso (Gateway API's BackendTLSPolicy: a hostname, subject alternative names and CA\ncertificates).",
       "type": "object",
       "properties": {
         "authorities": {
-          "description": "The certificates, in PEM, of the authorities trusted to vouch for it.",
+          "description": "The certificates, in PEM, of the authorities trusted to vouch for it, unless\n`well_known_authorities` names those trusted: one of the two, never both.",
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
-          },
-          "minItems": 1
+          }
         },
         "client_certificate": {
           "description": "The name of the certificate the data plane shows an endpoint that asks who it is\n(mTLS); none, and it shows nothing.",
@@ -1971,14 +1971,33 @@
           "default": null
         },
         "server_name": {
-          "description": "The name asked for (SNI), and the one an endpoint's certificate must carry: a host\nname, not an address, and with no wildcard or port.",
+          "description": "The name asked for (SNI), and the one an endpoint's certificate must carry unless\n`verified_names` says others: a host name, not an address, and with no wildcard or\nport.",
           "type": "string"
+        },
+        "verified_names": {
+          "description": "The names an endpoint's certificate is checked for in place of `server_name`, which\nis then asked for alone: one of them among its subject alternative names, as\nBackendTLSPolicy's `subjectAltNames` has it. None, and `server_name` is checked.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/VerifiedName"
+          }
+        },
+        "well_known_authorities": {
+          "description": "The authorities trusted to vouch for it, by a well-known name, in place of\n`authorities`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WellKnownAuthorities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,
       "required": [
-        "server_name",
-        "authorities"
+        "server_name"
       ]
     },
     "ValueMatch": {
@@ -2029,6 +2048,47 @@
       "required": [
         "name",
         "value"
+      ]
+    },
+    "VerifiedName": {
+      "description": "A name an upstream's endpoint must carry among its certificate's subject alternative\nnames.",
+      "oneOf": [
+        {
+          "description": "A DNS name: a host name, which a certificate's own wildcard of a whole leftmost\nlabel matches, as RFC 6125 has it; or a wildcard name (`*.example.com`), which only\nthat same wildcard matches. Letters' case does not count.",
+          "type": "object",
+          "properties": {
+            "dns": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "dns"
+          ]
+        },
+        {
+          "description": "A URI, such as a SPIFFE ID, matched exactly.",
+          "type": "object",
+          "properties": {
+            "uri": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "uri"
+          ]
+        }
+      ]
+    },
+    "WellKnownAuthorities": {
+      "description": "Authorities an upstream's TLS may trust by a well-known name.",
+      "oneOf": [
+        {
+          "description": "Those the control plane's own system trusts: the config's `system_authorities`.",
+          "type": "string",
+          "const": "system"
+        }
       ]
     },
     "WhenUnreachable": {

@@ -734,3 +734,154 @@ fn programmed_once_every_ready_pod_runs_the_generation_and_false_once_overdue_or
         "True"
     );
 }
+
+/// A policy's ancestor as status holds it, `namespace`/`name` by `controller`.
+fn ancestor(
+    controller: &str,
+    namespace: Option<&str>,
+    name: &str,
+) -> BackendTLSPolicyStatusAncestors {
+    BackendTLSPolicyStatusAncestors {
+        ancestor_ref: BackendTLSPolicyStatusAncestorsAncestorRef {
+            group: Some(GROUP.to_owned()),
+            kind: Some("Gateway".to_owned()),
+            name: name.to_owned(),
+            namespace: namespace.map(str::to_owned),
+            port: None,
+            section_name: None,
+        },
+        conditions: vec![condition("Accepted", "True", "Accepted", 1, 10)],
+        controller_name: controller.to_owned(),
+    }
+}
+
+/// What translation says of the policy `shop/tls`.
+fn wanted_policy(generation: i64) -> translate::PolicyStatus {
+    translate::PolicyStatus {
+        policy: Object {
+            kind: "BackendTLSPolicy",
+            namespace: "shop".to_owned(),
+            name: "tls".to_owned(),
+        },
+        generation,
+        conditions: vec![
+            said("Accepted", true, "Accepted"),
+            said("ResolvedRefs", true, "ResolvedRefs"),
+        ],
+    }
+}
+
+#[test]
+fn a_policys_ancestor_of_ours_is_written_in_its_place_beside_every_other_kept_whole() {
+    let theirs = ancestor("example.com/other", Some("edge"), "web");
+    let another_plane = ancestor(GATEWAY_CONTROLLER, Some("edge"), "other");
+    let mut ours = ancestor(GATEWAY_CONTROLLER, Some("edge"), "web");
+    ours.conditions
+        .push(condition("Example", "True", "Example", 1, 10));
+    let live = BackendTLSPolicyStatus {
+        ancestors: vec![theirs.clone(), ours, another_plane.clone()],
+    };
+    let status = policy(Some(&live), "shop", &web(), Some(&wanted_policy(2)), at(50));
+    assert_eq!(status.ancestors.len(), 3);
+    assert_eq!(status.ancestors[0], theirs, "another controller's changed");
+    assert_eq!(
+        status.ancestors[2], another_plane,
+        "another data plane's changed or moved"
+    );
+    let ours = &status.ancestors[1];
+    assert_eq!(ours.controller_name, GATEWAY_CONTROLLER);
+    assert_eq!(
+        (
+            ours.ancestor_ref.namespace.as_deref(),
+            ours.ancestor_ref.name.as_str()
+        ),
+        (Some("edge"), "web")
+    );
+    assert_eq!(
+        seen(&ours.conditions),
+        [
+            ("Accepted".to_owned(), "True".to_owned(), 10),
+            ("Example".to_owned(), "True".to_owned(), 10),
+            ("ResolvedRefs".to_owned(), "True".to_owned(), 50),
+        ]
+    );
+    assert_eq!(ours.conditions[0].observed_generation, Some(2));
+    // A policy no route of the Gateway reaches has no ancestor of ours, the rest kept.
+    let gone = policy(Some(&live), "shop", &web(), None, at(60));
+    assert_eq!(gone.ancestors, [theirs, another_plane]);
+}
+
+#[test]
+fn a_policys_ancestor_of_ours_is_added_after_the_rest_where_its_status_has_room() {
+    let others = |n: usize| BackendTLSPolicyStatus {
+        ancestors: (0..n)
+            .map(|n| ancestor("example.com/other", Some("edge"), &format!("gateway-{n}")))
+            .collect(),
+    };
+    let roomy = others(MOST_ANCESTORS - 1);
+    let status = policy(
+        Some(&roomy),
+        "shop",
+        &web(),
+        Some(&wanted_policy(2)),
+        at(50),
+    );
+    assert_eq!(status.ancestors.len(), MOST_ANCESTORS);
+    assert_eq!(status.ancestors[..MOST_ANCESTORS - 1], roomy.ancestors[..]);
+    assert_eq!(
+        status.ancestors[MOST_ANCESTORS - 1].controller_name,
+        GATEWAY_CONTROLLER
+    );
+    let full = others(MOST_ANCESTORS);
+    let status = policy(Some(&full), "shop", &web(), Some(&wanted_policy(2)), at(50));
+    assert_eq!(status, full);
+    assert_eq!(
+        policy(None, "shop", &web(), Some(&wanted_policy(2)), at(50))
+            .ancestors
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_policys_ancestor_of_its_own_namespace_is_ours_written_either_way_and_once() {
+    // A policy of the Gateway's own namespace whose status names it with no group, kind or
+    // namespace, and names it twice.
+    let mut bare = ancestor(GATEWAY_CONTROLLER, None, "web");
+    bare.ancestor_ref.group = None;
+    bare.ancestor_ref.kind = None;
+    let live = BackendTLSPolicyStatus {
+        ancestors: vec![bare.clone(), bare],
+    };
+    let status = policy(Some(&live), "edge", &web(), Some(&wanted_policy(2)), at(50));
+    assert_eq!(status.ancestors.len(), 1);
+    let ours = &status.ancestors[0];
+    assert_eq!(
+        ours.conditions[0].last_transition_time,
+        Time(at(10)),
+        "taken for another ancestor"
+    );
+    assert_eq!(ours.ancestor_ref.group.as_deref(), Some(GROUP));
+    assert_eq!(ours.ancestor_ref.namespace.as_deref(), Some("edge"));
+    // Of another namespace, the same bare ancestor is not ours.
+    let elsewhere = policy(Some(&live), "shop", &web(), None, at(50));
+    assert_eq!(elsewhere, live);
+}
+
+/// Two data planes whose Gateways a policy's status holds each write it as it is: neither
+/// finds the other's write moved its own, so they settle.
+#[test]
+fn two_data_planes_writing_a_policys_status_in_turn_settle() {
+    let other = Object {
+        kind: "Gateway",
+        namespace: "edge".to_owned(),
+        name: "other".to_owned(),
+    };
+    let wanted = wanted_policy(2);
+    let by_web = policy(None, "shop", &web(), Some(&wanted), at(50));
+    let by_other = policy(Some(&by_web), "shop", &other, Some(&wanted), at(51));
+    let again = policy(Some(&by_other), "shop", &web(), Some(&wanted), at(52));
+    assert_eq!(again, by_other, "the first wrote it again");
+    let again = policy(Some(&again), "shop", &other, Some(&wanted), at(53));
+    assert_eq!(again, by_other, "the second wrote it again");
+}

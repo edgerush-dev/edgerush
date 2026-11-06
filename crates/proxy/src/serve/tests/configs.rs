@@ -126,7 +126,9 @@ pub(super) fn trusting(
 ) -> edgerush_config::UpstreamTls {
     edgerush_config::UpstreamTls {
         server_name: server_name.to_owned(),
+        verified_names: Vec::new(),
         authorities: vec![authority.chain.clone()],
+        well_known_authorities: None,
         client_certificate: None,
     }
 }

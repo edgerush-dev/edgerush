@@ -4,6 +4,7 @@
 //! Lease its replicas elect a leader by ([02 §3](../../../docs/02-architecture.md)).
 
 use crate::ApiError;
+use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::grpc_route::GRPCRoute;
@@ -142,6 +143,10 @@ impl Kind for TCPRoute {
 }
 
 impl Kind for ReferenceGrant {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for BackendTLSPolicy {
     const NAMESPACED: bool = true;
 }
 

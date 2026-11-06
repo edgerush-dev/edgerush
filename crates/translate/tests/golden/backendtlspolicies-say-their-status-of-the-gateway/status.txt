@@ -1,0 +1,7 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener http: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener raw: TCPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/pages, generation 0, parent web section http: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TCPRoute shop/carried, generation 0, parent web section raw: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+BackendTLSPolicy shop/partly, generation 3: Accepted=False/TargetNotFound (covers nothing of Service shop/gone: it does not exist); ResolvedRefs=True/ResolvedRefs
+BackendTLSPolicy shop/room, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

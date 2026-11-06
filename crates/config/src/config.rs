@@ -37,6 +37,12 @@ pub struct Config {
     /// checks them.
     #[serde(default)]
     pub rate_limiting: Option<RateLimiting>,
+    /// The certificates, in PEM, of the authorities the control plane's own system trusts:
+    /// those an upstream's TLS trusts where it says `well_known_authorities: system`
+    /// (BackendTLSPolicy's `wellKnownCACertificates`), carried once for all of them, and
+    /// only while one does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_authorities: Vec<String>,
     /// The certificates listeners and upstreams name, by name: a resource of their own
     /// ([07 §1](../../../docs/07-config-and-dsl.md)), which reaches a data plane apart from
     /// the rest of its config and is never read with it, so that no file a config is read
@@ -729,21 +735,56 @@ pub struct Keepalive {
 }
 
 /// TLS to an upstream's endpoints: whom they are expected to be, and whom to trust to say
-/// so (Gateway API's BackendTLSPolicy: a hostname and CA certificates).
+/// so (Gateway API's BackendTLSPolicy: a hostname, subject alternative names and CA
+/// certificates).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamTls {
-    /// The name asked for (SNI), and the one an endpoint's certificate must carry: a host
-    /// name, not an address, and with no wildcard or port.
+    /// The name asked for (SNI), and the one an endpoint's certificate must carry unless
+    /// `verified_names` says others: a host name, not an address, and with no wildcard or
+    /// port.
     pub server_name: String,
-    /// The certificates, in PEM, of the authorities trusted to vouch for it.
-    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
+    /// The names an endpoint's certificate is checked for in place of `server_name`, which
+    /// is then asked for alone: one of them among its subject alternative names, as
+    /// BackendTLSPolicy's `subjectAltNames` has it. None, and `server_name` is checked.
+    #[serde(default)]
+    pub verified_names: Vec<VerifiedName>,
+    /// The certificates, in PEM, of the authorities trusted to vouch for it, unless
+    /// `well_known_authorities` names those trusted: one of the two, never both.
+    #[serde(default)]
     pub authorities: Vec<String>,
+    /// The authorities trusted to vouch for it, by a well-known name, in place of
+    /// `authorities`.
+    #[serde(default)]
+    pub well_known_authorities: Option<WellKnownAuthorities>,
     /// The name of the certificate the data plane shows an endpoint that asks who it is
     /// (mTLS); none, and it shows nothing.
     #[serde(default)]
     pub client_certificate: Option<String>,
+}
+
+/// A name an upstream's endpoint must carry among its certificate's subject alternative
+/// names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum VerifiedName {
+    /// A DNS name: a host name, which a certificate's own wildcard of a whole leftmost
+    /// label matches, as RFC 6125 has it; or a wildcard name (`*.example.com`), which only
+    /// that same wildcard matches. Letters' case does not count.
+    Dns(String),
+    /// A URI, such as a SPIFFE ID, matched exactly.
+    Uri(String),
+}
+
+/// Authorities an upstream's TLS may trust by a well-known name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WellKnownAuthorities {
+    /// Those the control plane's own system trusts: the config's `system_authorities`.
+    System,
 }
 
 /// What an upstream is spoken to in. Unsaid, it is HTTP/1.1, as for a Kubernetes Service

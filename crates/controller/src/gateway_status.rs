@@ -4,10 +4,16 @@
 //! says of, its `lastTransitionTime` kept while its status holds; a condition whose
 //! `observedGeneration` is newer left as it is; condition types not this controller's,
 //! and other controllers' parents of a route, kept whole; this controller's own parents of
-//! a route that are no longer wanted taken away. Pure: the time is passed in.
+//! a route that are no longer wanted taken away. A BackendTLSPolicy's ancestor of this
+//! controller's is written where its status holds it, every other ancestor kept whole and in
+//! place. Pure: the time is passed in.
 
 use crate::acks::{Pod, Pods};
 use crate::gateway_api::{GatewayKind, Served, supported};
+use edgerush_gateway_api::backend_tls_policy::{
+    BackendTLSPolicyStatus, BackendTLSPolicyStatusAncestors,
+    BackendTLSPolicyStatusAncestorsAncestorRef,
+};
 use edgerush_gateway_api::gateway::{
     GatewayStatus, GatewayStatusAddresses, GatewayStatusListeners,
     GatewayStatusListenersSupportedKinds,
@@ -41,6 +47,9 @@ const GROUP: &str = "gateway.networking.k8s.io";
 /// The most parents a route's status holds, as its CRD has it.
 const MOST_PARENTS: usize = 32;
 
+/// The most ancestors a policy's status holds, as its CRD has it.
+const MOST_ANCESTORS: usize = 16;
+
 /// The condition types this controller writes on a GatewayClass.
 const CLASS_TYPES: [&str; 2] = ["Accepted", "SupportedVersion"];
 /// On a Gateway.
@@ -51,6 +60,8 @@ const LISTENER_TYPES: [&str; 4] = ["Accepted", "Conflicted", "ResolvedRefs", "Pr
 const PARENT_TYPES: [&str; 3] = ["Accepted", "ResolvedRefs", "PartiallyInvalid"];
 /// On a ListenerSet.
 const SET_TYPES: [&str; 2] = ["Accepted", "Programmed"];
+/// On a policy's ancestor.
+const ANCESTOR_TYPES: [&str; 2] = ["Accepted", "ResolvedRefs"];
 
 /// A condition to write.
 struct Wanted {
@@ -565,6 +576,67 @@ pub(crate) fn route(
         }
     }
     HTTPRouteStatus { parents }
+}
+
+/// What the status of a BackendTLSPolicy of `namespace` is to say, as `wanted` has it of the
+/// data plane's Gateway, `gateway`, merged with `live`: nothing of the Gateway where no route
+/// of it reaches the policy. Every ancestor that is not this controller's of `gateway`, other
+/// controllers' and this controller's of other data planes' Gateways, is kept whole where it
+/// is. This controller's of `gateway` is written in the place of the first the status holds,
+/// any others taken away, or after the rest where the status holds none and has room for it;
+/// it stays where it is, so that another writer doing likewise never finds it moved.
+pub(crate) fn policy(
+    live: Option<&BackendTLSPolicyStatus>,
+    namespace: &str,
+    gateway: &Object,
+    wanted: Option<&translate::PolicyStatus>,
+    now: Timestamp,
+) -> BackendTLSPolicyStatus {
+    let live_ancestors = live
+        .map(|status| status.ancestors.as_slice())
+        .unwrap_or_default();
+    let ours = |ancestor: &BackendTLSPolicyStatusAncestors| {
+        let to = &ancestor.ancestor_ref;
+        ancestor.controller_name == GATEWAY_CONTROLLER
+            && to.group.as_deref().unwrap_or(GROUP) == GROUP
+            && to.kind.as_deref().unwrap_or("Gateway") == "Gateway"
+            && to.namespace.as_deref().unwrap_or(namespace) == gateway.namespace
+            && to.name == gateway.name
+    };
+    let made =
+        |old: &[Condition], wanted: &translate::PolicyStatus| BackendTLSPolicyStatusAncestors {
+            ancestor_ref: BackendTLSPolicyStatusAncestorsAncestorRef {
+                group: Some(GROUP.to_owned()),
+                kind: Some("Gateway".to_owned()),
+                name: gateway.name.clone(),
+                namespace: Some(gateway.namespace.clone()),
+                port: None,
+                section_name: None,
+            },
+            conditions: merged(
+                old,
+                wanted.conditions.iter().map(Wanted::from).collect(),
+                &ANCESTOR_TYPES,
+                wanted.generation,
+                now,
+            ),
+            controller_name: GATEWAY_CONTROLLER.to_owned(),
+        };
+    let mut wanted = wanted;
+    let mut ancestors = Vec::new();
+    for ancestor in live_ancestors {
+        if !ours(ancestor) {
+            ancestors.push(ancestor.clone());
+        } else if let Some(wanted) = wanted.take() {
+            ancestors.push(made(&ancestor.conditions, wanted));
+        }
+    }
+    if let Some(wanted) = wanted
+        && ancestors.len() < MOST_ANCESTORS
+    {
+        ancestors.push(made(&[], wanted));
+    }
+    BackendTLSPolicyStatus { ancestors }
 }
 
 /// Whether two `parentRef`s of a route of `namespace` name one parent, written alike: their

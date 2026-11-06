@@ -1,0 +1,70 @@
+# A BackendTLSPolicy whose wellKnownCACertificates is System: the Services it covers are
+# spoken to over TLS trusting the authorities the control plane's own system trusts, carried
+# once with the config for every upstream that trusts them: an HTTPRoute's backend, its
+# mirror's and an Ingress's path.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: pages, namespace: shop }
+spec:
+  parentRefs: [{ name: web, sectionName: http }]
+  hostnames: [shop.example.com]
+  rules:
+    - filters:
+        - type: RequestMirror
+          requestMirror: { backendRef: { name: mirror, port: 443 } }
+      backendRefs: [{ name: web, port: 443 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: site, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: site.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: site, port: { number: 443 } } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: public, namespace: shop }
+spec:
+  targetRefs:
+    - { group: "", kind: Service, name: web }
+    - { group: "", kind: Service, name: mirror }
+    - { group: "", kind: Service, name: site }
+  validation:
+    wellKnownCACertificates: System
+    hostname: web.shop.example
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: mirror, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: site, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]

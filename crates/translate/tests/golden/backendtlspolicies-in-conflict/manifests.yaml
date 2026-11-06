@@ -1,0 +1,111 @@
+# BackendTLSPolicies covering the same Service: the older takes it, the younger conflicted
+# there and still covering the other Service it names; one naming a port takes that port
+# from one naming the whole Service, both covering what they take; of two naming the same
+# port at the same moment, the first by name takes it; and targets that are not there, or
+# not Services, are said, covering nothing.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: pages, namespace: shop }
+spec:
+  parentRefs: [{ name: web }]
+  hostnames: [shop.example.com]
+  rules:
+    - matches: [{ path: { type: PathPrefix, value: /admin } }]
+      backendRefs: [{ name: web, port: 8443 }]
+    - matches: [{ path: { type: PathPrefix, value: /other } }]
+      backendRefs: [{ name: other, port: 443 }]
+    - backendRefs: [{ name: web, port: 443 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: elder, namespace: shop, creationTimestamp: "2025-01-01T00:00:00Z" }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: web }]
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+    hostname: elder.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: younger, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  targetRefs:
+    - { group: "", kind: Service, name: web }
+    - { group: "", kind: Service, name: other }
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+    hostname: younger.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: sectioned, namespace: shop, creationTimestamp: "2026-06-01T00:00:00Z" }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: web, sectionName: admin }]
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+    hostname: sectioned.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: sectioned-twin, namespace: shop, creationTimestamp: "2026-06-01T00:00:00Z" }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: web, sectionName: admin }]
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+    hostname: twin.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: stray, namespace: shop, creationTimestamp: "2026-07-01T00:00:00Z" }
+spec:
+  targetRefs:
+    - { group: "", kind: Service, name: gone }
+    - { group: "", kind: Service, name: web, sectionName: missing }
+    - { group: gateway.networking.k8s.io, kind: Gateway, name: web }
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+    hostname: stray.shop.example
+---
+# The test certificate of the Secret shop-tls, a CA of its own.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: ca, namespace: shop }
+data:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+    DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+    MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+    hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+    /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+    vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+    AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+    RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+    MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+    -----END CERTIFICATE-----
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }, { name: admin, port: 8443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: other, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
