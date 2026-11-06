@@ -4,7 +4,8 @@
 # kubernetes.io/h2c in HTTP/2 over TLS; a Service that both an HTTPRoute and a GRPCRoute
 # reach, over HTTP/1.1 and HTTP/2 over TLS, the latter named apart, its subject alternative
 # names checked in place of its hostname; and a TCPRoute's backend of a covered port, carried
-# as it comes, named apart from the upstream over TLS.
+# as it comes, named apart from the upstream over TLS. The control plane's system trusts
+# authorities, which no upstream here trusts, and the config carries none of them.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }

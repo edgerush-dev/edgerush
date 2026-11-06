@@ -1308,6 +1308,108 @@ spec:
     Ok(())
 }
 
+/// A BackendTLSPolicy's `wellKnownCACertificates: System` trusts the authorities of the file
+/// `SSL_CERT_FILE` names, which `validate` reads as the controller does; a file named that
+/// cannot be read stops either at the start.
+#[test]
+fn the_systems_authorities_are_those_ssl_cert_file_names() -> io::Result<()> {
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("system-authorities");
+    if root.exists() {
+        std::fs::remove_dir_all(&root)?;
+    }
+    std::fs::create_dir_all(&root)?;
+    let data_plane = root.join("data-plane.yaml");
+    std::fs::write(
+        &data_plane,
+        "ingress_class: edge\ngateway: shop/web\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\ningress_https_redirect_max_age: 30\n",
+    )?;
+    let manifests = root.join("manifests.yaml");
+    std::fs::write(
+        &manifests,
+        "apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata: { name: edge }
+spec: { controller: edgerush.dev/ingress-controller }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec: { controllerName: edgerush.dev/gateway-controller }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners: [{ name: http, port: 8080, protocol: HTTP }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: pages, namespace: shop }
+spec:
+  parentRefs: [{ name: web }]
+  rules: [{ backendRefs: [{ name: web, port: 443 }] }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: public, namespace: shop }
+spec:
+  targetRefs: [{ group: \"\", kind: Service, name: web }]
+  validation: { wellKnownCACertificates: System, hostname: web.shop.example }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec: { ports: [{ name: https, port: 443 }] }
+",
+    )?;
+    let bundle = root.join("bundle.pem");
+    std::fs::write(
+        &bundle,
+        edgerush_certificates::testing::certificate(&["root.test"]).chain,
+    )?;
+    let missing = root.join("not-there.pem");
+    let run = |command: &[&str], bundle: &std::path::Path| {
+        let mut args = command.to_vec();
+        args.extend([
+            "--data-plane",
+            data_plane.to_str().expect("a path that is text"),
+        ]);
+        Command::new(env!("CARGO_BIN_EXE_edgerush"))
+            .args(args)
+            .env_remove("KUBERNETES_SERVICE_HOST")
+            .env_remove("KUBERNETES_SERVICE_PORT")
+            .env("SSL_CERT_FILE", bundle)
+            .output()
+    };
+    let validate = [
+        "validate",
+        "--from-manifests",
+        manifests.to_str().expect("a path that is text"),
+    ];
+    let output = run(&validate, &bundle)?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with(
+            "1 routes and 1 upstreams translated; 0 left out; 0 paths without their backend;"
+        ),
+        "{output:?}"
+    );
+    let unreadable = format!(
+        "error: the system's authorities: {} cannot be read",
+        missing.display()
+    );
+    for command in [&validate[..], &["controller"]] {
+        let output = run(command, &missing)?;
+        assert_eq!(output.status.code(), Some(2), "{command:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).starts_with(&unreadable),
+            "{command:?}: {output:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The config of [`config`] with no upstream to reach: for the commands that only read it.
 fn config_text() -> String {
     config("127.0.0.1:1", "up", None)

@@ -17,7 +17,8 @@
 //! say, a line each. The report's last lines are the hosts a claim of one API takes from the
 //! other's.
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
-//! the objects of `tests/golden/shared.yaml` go with every case's. Every namespace is
+//! the control plane's system trusts no authority, unless the case has `system.pem`, the
+//! certificates it does; the objects of `tests/golden/shared.yaml` go with every case's. Every namespace is
 //! watched, unless the case lists those that are in `watched.txt`, a line each.
 //! Every config translated must also pass the data plane's own `compile`, and, written as
 //! YAML as the control plane writes it, read back the same; and the Ingresses it says it
@@ -103,11 +104,15 @@ fn every_case_translates_to_its_config_and_report() {
     for case in cases {
         let name = case.file_name().unwrap().to_string_lossy().into_owned();
         let own = case.join("plane.yaml");
-        let plane = if own.exists() {
+        let mut plane: Plane = if own.exists() {
             serde_saphyr::from_str(&read(&own)).unwrap()
         } else {
             shared.clone()
         };
+        let system = case.join("system.pem");
+        if system.exists() {
+            plane.system_authorities = vec![read(&system)];
+        }
         // Every case has the objects every cluster of the tests has: an IngressClass `edge`
         // that names this controller.
         let manifests = format!(

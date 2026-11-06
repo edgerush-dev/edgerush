@@ -3,9 +3,9 @@
 # still resolved, as each policy's own status says why: a ConfigMap that is not there, one
 # with no ca.crt, one whose ca.crt is no certificate, a Secret where a ConfigMap is read,
 # one valid ref beside an invalid one, a well-known name the gateway does not know, the
-# system's certificates (not supported yet), a hostname that is an address and a subject
-# alternative name that is not of its type. A Service no policy covers is reached as ever;
-# one that is not there leaves the GRPCRoute's refs unresolved, said alone.
+# system's certificates where the control plane found none, a hostname that is an address
+# and a subject alternative name that is not of its type. A Service no policy covers is
+# reached as ever; one that is not there leaves the GRPCRoute's refs unresolved, said alone.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }

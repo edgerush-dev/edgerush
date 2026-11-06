@@ -8,8 +8,10 @@
 //! can be had or not: one that cannot fails its backends' connections closed, never leaving
 //! them spoken to in the clear.
 
-use crate::{Cluster, Object, namespace};
-use edgerush_config::{UpstreamTls, VerifiedName, is_dns_name, is_host_name, is_uri};
+use crate::{Cluster, Object, Plane, namespace};
+use edgerush_config::{
+    UpstreamTls, VerifiedName, WellKnownAuthorities, is_dns_name, is_host_name, is_uri,
+};
 use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -35,8 +37,6 @@ pub(crate) struct Outcome<'a> {
     /// The TLS it asks for, or why that cannot be had, which fails the connections to what
     /// it covers.
     pub(crate) asked: Result<UpstreamTls, String>,
-    /// Why it is invalid as a whole, if it is: what it asks is not something to ask.
-    pub(crate) invalid: Option<String>,
     /// Its targets, as each is written, and what each came to.
     pub(crate) targets: Vec<(String, Target)>,
 }
@@ -53,8 +53,8 @@ pub(crate) enum Target {
 }
 
 impl<'a> Policies<'a> {
-    /// The policies of `cluster`, each chosen where it covers.
-    pub(crate) fn of(cluster: &'a Cluster) -> Self {
+    /// The policies of `cluster`, each chosen where it covers, for the data plane `plane`.
+    pub(crate) fn of(plane: &Plane, cluster: &'a Cluster) -> Self {
         let mut policies: Vec<&BackendTLSPolicy> = cluster.backend_tls_policies.iter().collect();
         policies.sort_by(|a, b| {
             (
@@ -104,11 +104,9 @@ impl<'a> Policies<'a> {
                 };
                 targets.push((written, came_to));
             }
-            let (asked, invalid) = asked(cluster, policy);
             chosen.outcomes.push(Outcome {
                 policy,
-                asked,
-                invalid,
+                asked: asked(plane, cluster, policy),
                 targets,
             });
         }
@@ -165,11 +163,13 @@ fn covered(
     }
 }
 
-/// The TLS `policy` asks for, or why it cannot be had; and why it is invalid, if it is.
+/// The TLS `policy` asks for, or why it cannot be had. The system's CA certificates are
+/// those `plane` trusts, carried with the config.
 fn asked(
+    plane: &Plane,
     cluster: &Cluster,
     policy: &BackendTLSPolicy,
-) -> (Result<UpstreamTls, String>, Option<String>) {
+) -> Result<UpstreamTls, String> {
     let validation = &policy.spec.validation;
     let in_namespace = namespace(&policy.metadata);
     let refs = validation
@@ -184,23 +184,26 @@ fn asked(
             Err(problem) => unresolved.push(problem),
         }
     }
-    let invalid = invalid(policy, refs.is_empty());
-    let asked = if let Some(why) = &invalid {
-        Err(why.clone())
+    if let Some(why) = invalid(policy, refs.is_empty()) {
+        Err(why)
     } else if !unresolved.is_empty() {
         Err(unresolved.join("; "))
-    } else if validation.well_known_ca_certificates.is_some() {
-        Err("the system's CA certificates are not supported yet".to_owned())
+    } else if validation.well_known_ca_certificates.is_some() && plane.system_authorities.is_empty()
+    {
+        Err("the control plane found no system CA certificates".to_owned())
     } else {
         Ok(UpstreamTls {
             server_name: validation.hostname.clone(),
             verified_names: verified_names(policy),
             authorities,
-            well_known_authorities: None,
+            // A valid policy's well-known CA certificates are `System`'s.
+            well_known_authorities: validation
+                .well_known_ca_certificates
+                .as_ref()
+                .map(|_| WellKnownAuthorities::System),
             client_certificate: None,
         })
-    };
-    (asked, invalid)
+    }
 }
 
 /// The CA certificates, in PEM, of `reference`, a CA certificate ref of a policy of

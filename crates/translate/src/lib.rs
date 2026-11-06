@@ -35,7 +35,8 @@ use edgerush_config::{
     Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, GrpcMethod, Header,
     HeaderChanges, Hostname, Listener, ListenerCertificate, LoadBalancer, Match, PathMatch,
     Protocol, Query, Redirect, Route, Rule, Scheme, SharingHostname, SharingListener, StatedNames,
-    TcpRoute, TlsRoute, Upstream, UpstreamProtocol, UpstreamTls, ValueMatch, Wildcard, compile,
+    TcpRoute, TlsRoute, Upstream, UpstreamProtocol, UpstreamTls, ValueMatch, WellKnownAuthorities,
+    Wildcard, compile,
 };
 use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use edgerush_gateway_api::gateway::Gateway;
@@ -130,6 +131,13 @@ pub struct Plane {
     /// a backend is answered 500.
     #[serde(default)]
     pub backend_authorities: Vec<String>,
+    /// The certificates, in PEM, of the authorities the control plane's own system trusts,
+    /// which a BackendTLSPolicy's `wellKnownCACertificates: System` asks to be trusted
+    /// ([04 §2](../../../docs/04-control-plane.md)): read by the control plane from its
+    /// system as it starts, never from the settings. None, and such a policy's backends
+    /// fail closed.
+    #[serde(skip)]
+    pub system_authorities: Vec<String>,
     /// The data plane's own settings, as its config states them
     /// ([07 §1](../../../docs/07-config-and-dsl.md)), written into every config as they are.
     #[serde(default)]
@@ -915,7 +923,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     }
     // Each BackendTLSPolicy chosen where it covers, before any backend is translated; what
     // keeps one from covering, or what it asks from being had, is said.
-    let policies = Policies::of(cluster);
+    let policies = Policies::of(plane, cluster);
     for outcome in &policies.outcomes {
         let object = Object::of("BackendTLSPolicy", &outcome.policy.metadata);
         let mut say = |problem| {
@@ -937,20 +945,8 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 }),
             }
         }
-        match &outcome.asked {
-            Ok(_) => {}
-            Err(_)
-                if outcome
-                    .policy
-                    .spec
-                    .validation
-                    .well_known_ca_certificates
-                    .is_some()
-                    && outcome.invalid.is_none() =>
-            {
-                say(Problem::NotSupportedYet("the system's CA certificates"));
-            }
-            Err(why) => say(Problem::PolicyFailing(why.clone())),
+        if let Err(why) = &outcome.asked {
+            say(Problem::PolicyFailing(why.clone()));
         }
     }
     // An Ingress is the data plane's when its class is, and its class is when the
@@ -1021,6 +1017,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         &[],
         &[],
         &[],
+        &[],
     ))
     .is_ok();
     // The certificates every `https` listener presents, each for its hosts alone, in the
@@ -1060,6 +1057,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 &translated.certificates,
                 &[],
                 &ingress_https,
+                &plane.system_authorities,
             );
             if let Err(problems) = compile(&alone) {
                 let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
@@ -1280,6 +1278,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 &[],
                 &[],
                 &[],
+                &plane.system_authorities,
             ))
             .err()
             .map(|problems| {
@@ -1629,6 +1628,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             &presented,
             &refused,
             &ingress_https,
+            &plane.system_authorities,
         )
     };
     config.tls_routes = passthrough;
@@ -2144,7 +2144,8 @@ fn https_on(config: &mut Config, port: u16) -> impl Iterator<Item = &mut edgerus
 
 /// A config of these listeners, routes and upstreams, and nothing else but `presented`:
 /// certificates the listener `ingress_https` names, if it is `https`, presents for the hosts
-/// stated with them, after any it names itself; and the host names it refuses.
+/// stated with them, after any it names itself; the host names it refuses; and `system`, the
+/// authorities the control plane's system trusts, while an upstream trusts them.
 fn config_of(
     mut listeners: BTreeMap<String, Listener>,
     routes: Vec<Route>,
@@ -2152,6 +2153,7 @@ fn config_of(
     presented: &[(String, Certificate, Vec<String>)],
     refused: &[String],
     ingress_https: &[String],
+    system: &[String],
 ) -> Config {
     // Ingress's certificates and the hosts it refuses go on the listener its TLS hosts are
     // served on alone, the one `presented` and `refused` are for.
@@ -2170,6 +2172,14 @@ fn config_of(
                 }));
         }
     }
+    // Carried only while an upstream trusts them: they are a bundle of every root the
+    // system has, sent with each config.
+    let trusts_system = upstreams.values().any(|upstream| {
+        upstream
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.well_known_authorities == Some(WellKnownAuthorities::System))
+    });
     Config {
         listeners,
         routes,
@@ -2178,7 +2188,11 @@ fn config_of(
         upstreams,
         data_plane: DataPlane::default(),
         rate_limiting: None,
-        system_authorities: Vec::new(),
+        system_authorities: if trusts_system {
+            system.to_vec()
+        } else {
+            Vec::new()
+        },
         certificates: presented
             .iter()
             .map(|(name, certificate, _)| (name.clone(), certificate.clone()))

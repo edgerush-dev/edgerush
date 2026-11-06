@@ -12,6 +12,8 @@ publish.workspace = true
 interop = ["edgerush-proxy/interop"]
 
 [dependencies]
+# The system's authorities, read as the data plane will read them.
+edgerush-certificates.workspace = true
 edgerush-config.workspace = true
 # The config stream `edgerush controller` serves, and the offers it sends.
 edgerush-control-service.workspace = true

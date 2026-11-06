@@ -121,7 +121,7 @@ routes:
     forward:
       backends:
       - invalid: 'Service shop/system port https is covered by BackendTLSPolicy shop/system, whose TLS
-          cannot be had: the system''s CA certificates are not supported yet'
+          cannot be had: the control plane found no system CA certificates'
         weight: 1
     rate_limits: []
   - matches:

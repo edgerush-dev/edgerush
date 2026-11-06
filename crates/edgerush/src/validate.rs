@@ -28,10 +28,13 @@ Translates Kubernetes manifests as the control plane would for one data plane, c
 config as the data plane would, and says what was left out and why, without a cluster.
 Ingresses of another class, or of none, are another data plane's: they are counted, not
 translated.
+A BackendTLSPolicy's `wellKnownCACertificates: System` trusts the authorities this machine
+does, read as `edgerush controller` reads its own system's.
 Exits 0 when everything was translated and the config compiles, notes aside (a retry's
 attempts taken as the data plane's most), 1 when something was left out, a path's backend
 is not there, a host or entry `tls` lists is not served as listed, a path is shadowed by
-another Ingress's or the config would be refused, and 2 when the files could not be read.
+another Ingress's or the config would be refused, and 2 when the files or the system's
+authorities could not be read.
 
 Options:
       --from-manifests <PATH>  Manifests in YAML: a file, or a directory read for every
@@ -145,6 +148,8 @@ pub(crate) enum Failed {
     },
     #[error("{} holds no .yaml or .yml file", .0.display())]
     NoManifests(PathBuf),
+    #[error("the system's authorities: {0}")]
+    SystemAuthorities(#[from] crate::system_authorities::Error),
 }
 
 /// A manifest of a kind translation reads, a `List` of them, or anything else, passed over.
@@ -204,7 +209,10 @@ impl Manifest {
 /// Translates and compiles. The text, and whether nothing was left out, without its
 /// backend, nothing of a `tls` left unserved and no path shadowed, and the config compiles.
 fn run(options: &Options) -> Result<(String, bool), Failed> {
-    let plane: Plane = read(&options.data_plane)?;
+    let plane = Plane {
+        system_authorities: crate::system_authorities::read()?,
+        ..read(&options.data_plane)?
+    };
     let mut cluster = Cluster {
         secrets_assumed: !options.check_secrets,
         ..Cluster::default()
