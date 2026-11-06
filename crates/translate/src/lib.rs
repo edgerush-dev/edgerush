@@ -36,6 +36,7 @@ use edgerush_config::{
     Protocol, Query, Redirect, Route, Rule, Scheme, SharingHostname, SharingListener, StatedNames,
     TcpRoute, TlsRoute, Upstream, UpstreamProtocol, UpstreamTls, ValueMatch, Wildcard, compile,
 };
+use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::grpc_route::GRPCRoute;
@@ -44,7 +45,7 @@ use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
-use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{
     Ingress, IngressBackend, IngressClass, IngressServiceBackend,
 };
@@ -260,6 +261,10 @@ pub struct Cluster {
     pub tcp_routes: Vec<TCPRoute>,
     /// Every ReferenceGrant seen.
     pub reference_grants: Vec<ReferenceGrant>,
+    /// Every BackendTLSPolicy seen.
+    pub backend_tls_policies: Vec<BackendTLSPolicy>,
+    /// Every ConfigMap seen, for the CA certificates BackendTLSPolicies name.
+    pub config_maps: Vec<ConfigMap>,
     /// Every Namespace seen, where the data plane is a Gateway: their labels are what a
     /// listener's selector of namespaces matches.
     pub namespaces: Vec<Namespace>,
@@ -880,6 +885,16 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                     problem: Problem::NotAttached(why),
                 });
             }
+        }
+    }
+    // BackendTLSPolicies are followed and not translated yet: each is said, where the data
+    // plane is a Gateway.
+    if gateway.is_some() {
+        for policy in &cluster.backend_tls_policies {
+            report.push(Finding {
+                object: Object::of("BackendTLSPolicy", &policy.metadata),
+                problem: Problem::NotSupportedYet("BackendTLSPolicy"),
+            });
         }
     }
     // An Ingress is the data plane's when its class is, and its class is when the

@@ -35,11 +35,13 @@ pub enum GatewayKind {
     TCPRoute,
     /// `ReferenceGrant`.
     ReferenceGrant,
+    /// `BackendTLSPolicy`.
+    BackendTLSPolicy,
 }
 
 impl GatewayKind {
     /// Every kind followed, in the order said.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::GatewayClass,
         Self::Gateway,
         Self::ListenerSet,
@@ -48,6 +50,7 @@ impl GatewayKind {
         Self::TLSRoute,
         Self::TCPRoute,
         Self::ReferenceGrant,
+        Self::BackendTLSPolicy,
     ];
 
     /// The name of its CRD.
@@ -62,6 +65,7 @@ impl GatewayKind {
             Self::TLSRoute => "tlsroutes.gateway.networking.k8s.io",
             Self::TCPRoute => "tcproutes.gateway.networking.k8s.io",
             Self::ReferenceGrant => "referencegrants.gateway.networking.k8s.io",
+            Self::BackendTLSPolicy => "backendtlspolicies.gateway.networking.k8s.io",
         }
     }
 }
@@ -132,6 +136,7 @@ impl GatewayKind {
             Self::TLSRoute => "TLSRoute",
             Self::TCPRoute => "TCPRoute",
             Self::ReferenceGrant => "ReferenceGrant",
+            Self::BackendTLSPolicy => "BackendTLSPolicy",
         }
     }
 }
@@ -275,6 +280,7 @@ mod tests {
                 "tlsroutes.gateway.networking.k8s.io",
                 "tcproutes.gateway.networking.k8s.io",
                 "referencegrants.gateway.networking.k8s.io",
+                "backendtlspolicies.gateway.networking.k8s.io",
             ]
         );
     }

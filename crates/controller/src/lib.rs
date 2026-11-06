@@ -18,6 +18,7 @@
 use acks::{Pods, REPORT_LABEL};
 use edgerush_config::ServiceName;
 use edgerush_config::{ConfigError, compile};
+use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::grpc_route::GRPCRoute;
@@ -461,6 +462,10 @@ struct GatewayApi {
     tls_routes: Option<Vec<Follow<TLSRoute>>>,
     tcp_routes: Option<Vec<Follow<TCPRoute>>>,
     reference_grants: Option<Vec<Follow<ReferenceGrant>>>,
+    backend_tls_policies: Option<Vec<Follow<BackendTLSPolicy>>>,
+    /// The ConfigMaps of the watch scope, followed while BackendTLSPolicies are, for the
+    /// CA certificates they name (04 §2).
+    config_maps: Option<Vec<Follow<ConfigMap>>>,
 }
 
 impl GatewayApi {
@@ -488,6 +493,8 @@ impl GatewayApi {
             tls_routes: None,
             tcp_routes: None,
             reference_grants: None,
+            backend_tls_policies: None,
+            config_maps: None,
         }
     }
 
@@ -504,8 +511,9 @@ impl GatewayApi {
 
     /// Follows each kind `served` says is served, in `scope` (GatewayClasses in the
     /// cluster, Gateways in the data plane's Gateway's namespace; ListenerSets, HTTPRoutes,
-    /// GRPCRoutes, TLSRoutes, TCPRoutes and ReferenceGrants in `scope`), and stops following
-    /// each it says is not.
+    /// GRPCRoutes, TLSRoutes, TCPRoutes, ReferenceGrants and BackendTLSPolicies in `scope`,
+    /// with the ConfigMaps there while BackendTLSPolicies are), and stops following each it
+    /// says is not.
     fn follow(&mut self, served: &[(GatewayKind, Served)], start: &mut Start<'_>, scope: &[Scope]) {
         for (kind, served) in served {
             let on = served.is_served();
@@ -529,6 +537,10 @@ impl GatewayApi {
                 GatewayKind::TCPRoute => keep(&mut self.tcp_routes, on, || start.follows(scope)),
                 GatewayKind::ReferenceGrant => {
                     keep(&mut self.reference_grants, on, || start.follows(scope));
+                }
+                GatewayKind::BackendTLSPolicy => {
+                    keep(&mut self.backend_tls_policies, on, || start.follows(scope));
+                    keep(&mut self.config_maps, on, || start.follows(scope));
                 }
             }
         }
@@ -555,6 +567,10 @@ impl GatewayApi {
             .chain(unlisted(
                 self.reference_grants.as_deref().unwrap_or_default(),
             ))
+            .chain(unlisted(
+                self.backend_tls_policies.as_deref().unwrap_or_default(),
+            ))
+            .chain(unlisted(self.config_maps.as_deref().unwrap_or_default()))
     }
 }
 
@@ -894,6 +910,8 @@ impl Followed {
             tls_routes: of(gateway_api.and_then(|g| g.tls_routes.as_ref())),
             tcp_routes: of(gateway_api.and_then(|g| g.tcp_routes.as_ref())),
             reference_grants: of(gateway_api.and_then(|g| g.reference_grants.as_ref())),
+            backend_tls_policies: of(gateway_api.and_then(|g| g.backend_tls_policies.as_ref())),
+            config_maps: of(gateway_api.and_then(|g| g.config_maps.as_ref())),
             namespaces: gateway_api
                 .map(|g| objects(&g.namespaces))
                 .unwrap_or_default(),

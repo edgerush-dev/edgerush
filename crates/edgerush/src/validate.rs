@@ -3,6 +3,7 @@
 //! the data plane's settings, and saying what translating them came to, with no cluster.
 
 use edgerush_config::compile;
+use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::grpc_route::GRPCRoute;
@@ -12,7 +13,7 @@ use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_translate::{Cluster, Plane, Translation, translate};
-use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -162,6 +163,8 @@ enum Manifest {
     TLSRoute(Box<TLSRoute>),
     TCPRoute(Box<TCPRoute>),
     ReferenceGrant(Box<ReferenceGrant>),
+    BackendTLSPolicy(Box<BackendTLSPolicy>),
+    ConfigMap(Box<ConfigMap>),
     Namespace(Box<Namespace>),
     List {
         items: Vec<Manifest>,
@@ -185,6 +188,8 @@ impl Manifest {
             Self::TLSRoute(route) => cluster.tls_routes.push(*route),
             Self::TCPRoute(route) => cluster.tcp_routes.push(*route),
             Self::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
+            Self::BackendTLSPolicy(policy) => cluster.backend_tls_policies.push(*policy),
+            Self::ConfigMap(map) => cluster.config_maps.push(*map),
             Self::Namespace(namespace) => cluster.namespaces.push(*namespace),
             Self::List { items } => {
                 for item in items {
@@ -504,6 +509,16 @@ kind: ReferenceGrant
 metadata: { name: from-edge, namespace: shop }
 spec: { from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: edge }], to: [{ group: '', kind: Service }] }
 ---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: tls, namespace: shop }
+spec: { targetRefs: [{ group: '', kind: Service, name: web }], validation: { caCertificateRefs: [{ group: '', kind: ConfigMap, name: ca }], hostname: web.example } }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: ca, namespace: shop }
+data: { ca.crt: x }
+---
 apiVersion: v1
 kind: Namespace
 metadata: { name: shop, labels: { team: shop } }
@@ -521,8 +536,10 @@ metadata: { name: shop, labels: { team: shop } }
             cluster.tls_routes.len(),
             cluster.tcp_routes.len(),
             cluster.reference_grants.len(),
+            cluster.backend_tls_policies.len(),
+            cluster.config_maps.len(),
             cluster.namespaces.len(),
         );
-        assert_eq!(counts, (1, 1, 1, 1, 1, 1, 1, 1, 1));
+        assert_eq!(counts, (1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1));
     }
 }

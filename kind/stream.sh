@@ -207,7 +207,7 @@ control_said() {
 refused_any() {
     for replica in $(k -n edge get pod -l app=edgerush-control -o name); do
         k -n edge logs "$replica" 2>/dev/null |
-            grep -E "(customresourcedefinitions|gatewayclasses|gateways|listenersets|grpcroutes|tlsroutes|tcproutes|httproutes|referencegrants).*(403|forbidden)" &&
+            grep -E "(customresourcedefinitions|gatewayclasses|gateways|listenersets|grpcroutes|tlsroutes|tcproutes|httproutes|referencegrants|backendtlspolicies|configmaps).*(403|forbidden)" &&
             return 0
     done
     return 1
@@ -242,6 +242,8 @@ control_said "tlsroutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.
     fail "the control plane never said TLSRoutes are served"
 control_said "tcproutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)" 5 ||
     fail "the control plane never said TCPRoutes are served"
+control_said "backendtlspolicies.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)" 5 ||
+    fail "the control plane never said BackendTLSPolicies are served"
 sleep 3
 k apply -f - >/dev/null <<EOF
 apiVersion: gateway.networking.k8s.io/v1

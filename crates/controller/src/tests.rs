@@ -346,6 +346,8 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
         tls_routes: None,
         tcp_routes: None,
         reference_grants: None,
+        backend_tls_policies: None,
+        config_maps: None,
     };
     assert_eq!(gateway_api.served(), None, "a CRD not listed yet");
     let unlisted: Vec<String> = gateway_api.unlisted().collect();
@@ -496,6 +498,18 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 200,
                 r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"db","namespace":"shop"},"spec":{"parentRefs":[{"name":"web","namespace":"edge"}],"rules":[{"backendRefs":[{"name":"db","port":5432}]}]}}]}"#,
             )
+        } else if named(GatewayKind::BackendTLSPolicy) {
+            page(&[crd(GatewayKind::BackendTLSPolicy, &["v1"])])
+        } else if path.starts_with(&format!("{gateway_api}backendtlspolicies?")) {
+            answer(
+                200,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"tls","namespace":"shop"},"spec":{"targetRefs":[{"group":"","kind":"Service","name":"web"}],"validation":{"caCertificateRefs":[{"group":"","kind":"ConfigMap","name":"ca"}],"hostname":"web.example"}}}]}"#,
+            )
+        } else if path.starts_with("/api/v1/configmaps?") {
+            answer(
+                200,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"ca","namespace":"shop"},"data":{"ca.crt":"-----BEGIN CERTIFICATE-----"}}]}"#,
+            )
         } else if path.starts_with(&format!("{gateway_api}listenersets?")) {
             answer(
                 200,
@@ -550,7 +564,8 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
              tlsroutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              tcproutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              referencegrants.gateway.networking.k8s.io: not served at v1 (only v1beta1; Gateway API v1.7.0), \
-             so taken as having no objects"
+             so taken as having no objects; \
+             backendtlspolicies.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)"
         )
     };
     let served_line = crd_lines("served at v1 (Gateway API v1.7.0)");
@@ -614,6 +629,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                     [
                         "TLSRoute shop/api: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
                         "TCPRoute shop/db: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
+                        "BackendTLSPolicy shop/tls: not supported yet: BackendTLSPolicy",
                         "GRPCRoute shop/calls: rule 0: a backend's share is answered UNAVAILABLE: Service shop/calls does not exist"
                     ]
                 );
@@ -647,6 +663,16 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                     .starts_with("/apis/gateway.networking.k8s.io/v1/tcproutes?")),
                 "TCPRoutes never listed"
             );
+            // BackendTLSPolicies likewise, and the ConfigMaps with them.
+            for listed in [
+                "/apis/gateway.networking.k8s.io/v1/backendtlspolicies?",
+                "/api/v1/configmaps?",
+            ] {
+                assert!(
+                    fake.seen().iter().any(|seen| seen.path.starts_with(listed)),
+                    "{listed} never listed"
+                );
+            }
             stage.store(1, Ordering::SeqCst);
             until("the CRD's deletion said", || {
                 said_of(&heard.borrow(), &missing_line) == 1
@@ -1700,6 +1726,8 @@ spec:
             tls_routes: Some(vec![follow_of("tlsroutes", true, tls_routes)]),
             tcp_routes: Some(vec![follow_of("tcproutes", true, tcp_routes)]),
             reference_grants: None,
+            backend_tls_policies: None,
+            config_maps: None,
         }
     };
     let heard: Rc<RefCell<Heard>> = Rc::default();
