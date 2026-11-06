@@ -1424,6 +1424,14 @@ fn backend(
         "TLSRoute" | "TCPRoute" => Calls::Tunnel,
         _ => Calls::Http,
     };
+    // A port a policy may cover, which its status then says of the Gateway: none covers a
+    // TLSRoute's or a TCPRoute's backend (04 §2).
+    if calls != Calls::Tunnel
+        && let Some(service) = &reference.service
+        && let Ok(Ok(found)) = crate::service_port(cluster, namespace, service)
+    {
+        policies.reach(namespace, written.name, found.name);
+    }
     match backend_upstream(
         plane,
         cluster,

@@ -1,0 +1,200 @@
+# What a BackendTLSPolicy's status says of the data plane's Gateway, its ancestor where a
+# route of it reaches a target of the policy: a target not there said beside one reached;
+# none said of a policy reached only by another Gateway's route, by a TCPRoute's backend, or
+# on a port it does not name; and a policy whose status holds 16 ancestors already, none of
+# them this Gateway, unimplementable here: its backend answered 500, nothing said in its
+# status. One of 16 among which this Gateway's entry is already is said as ever.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP }
+    - { name: raw, port: 9000, protocol: TCP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: other, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: pages, namespace: shop }
+spec:
+  parentRefs: [{ name: web, sectionName: http }]
+  hostnames: [shop.example.com]
+  rules:
+    - matches: [{ path: { type: PathPrefix, value: /api } }]
+      backendRefs: [{ name: api, port: 443 }]
+    - matches: [{ path: { type: PathPrefix, value: /web } }]
+      backendRefs: [{ name: web, port: 443 }]
+    - matches: [{ path: { type: PathPrefix, value: /full } }]
+      backendRefs: [{ name: full, port: 443 }]
+    - matches: [{ path: { type: PathPrefix, value: /room } }]
+      backendRefs: [{ name: room, port: 443 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: elsewhere, namespace: shop }
+spec:
+  parentRefs: [{ name: other }]
+  rules:
+    - backendRefs: [{ name: unreached, port: 443 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: { name: carried, namespace: shop }
+spec:
+  parentRefs: [{ name: web, sectionName: raw }]
+  rules:
+    - backendRefs: [{ name: tunneled, port: 443 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: partly, namespace: shop, generation: 3 }
+spec:
+  targetRefs:
+    - { group: "", kind: Service, name: api }
+    - { group: "", kind: Service, name: gone }
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+    hostname: api.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: admin-only, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: web, sectionName: admin }]
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+    hostname: admin.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: unreached, namespace: shop }
+spec:
+  targetRefs:
+    - { group: "", kind: Service, name: unreached }
+    - { group: "", kind: Service, name: tunneled }
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+    hostname: unreached.shop.example
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: full, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: full }]
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+    hostname: full.shop.example
+status:
+  ancestors:
+    - { ancestorRef: { name: gw-1 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-2 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-3 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-4 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-5 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-6 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-7 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-8 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-9 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-10 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-11 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-12 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-13 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-14 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-15 }, controllerName: example.com/other, conditions: [] }
+    # This Gateway, as another controller's: not this one's entry.
+    - { ancestorRef: { name: web }, controllerName: example.com/other, conditions: [] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: { name: room, namespace: shop }
+spec:
+  targetRefs: [{ group: "", kind: Service, name: room }]
+  validation:
+    caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+    hostname: room.shop.example
+status:
+  ancestors:
+    - { ancestorRef: { name: gw-1 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-2 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-3 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-4 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-5 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-6 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-7 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-8 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-9 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-10 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-11 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-12 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-13 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-14 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { name: gw-15 }, controllerName: example.com/other, conditions: [] }
+    - { ancestorRef: { namespace: shop, name: web }, controllerName: edgerush.dev/gateway-controller, conditions: [] }
+---
+# The test certificate of the Secret shop-tls, a CA of its own.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: ca, namespace: shop }
+data:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+    DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+    MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+    hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+    /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+    vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+    AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+    RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+    MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+    -----END CERTIFICATE-----
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }, { name: admin, port: 8443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: full, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: room, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: unreached, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: tunneled, namespace: shop }
+spec:
+  ports: [{ name: https, port: 443 }]

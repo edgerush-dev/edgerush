@@ -1,0 +1,7 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener http: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/pages, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+BackendTLSPolicy shop/elder, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+BackendTLSPolicy shop/younger, generation 0: Accepted=False/Conflicted (covers nothing of Service shop/web: BackendTLSPolicy shop/elder covers it, and comes first); ResolvedRefs=True/ResolvedRefs
+BackendTLSPolicy shop/sectioned, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+BackendTLSPolicy shop/sectioned-twin, generation 0: Accepted=False/Conflicted (covers nothing of Service shop/web port admin: BackendTLSPolicy shop/sectioned covers it, and comes first); ResolvedRefs=True/ResolvedRefs

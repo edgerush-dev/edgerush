@@ -1,0 +1,8 @@
+Gateway, generation 0: Accepted=True/Accepted
+listener http: HTTPRoute, GRPCRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener raw: TCPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/pages, generation 0, parent web section http: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+GRPCRoute shop/calls, generation 0, parent web section http: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+TCPRoute shop/carried, generation 0, parent web section raw: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+BackendTLSPolicy shop/api-tls, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+BackendTLSPolicy shop/tls, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

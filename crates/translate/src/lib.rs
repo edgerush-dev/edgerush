@@ -73,7 +73,8 @@ pub use gateway::{
 };
 pub use http_route::{Attachment, NotAttached, ParentOutcome, RouteOutcome, Taken};
 pub use status::{
-    Condition, GatewayStatus, ListenerSetStatus, ListenerStatus, ParentStatus, RouteStatus,
+    Condition, GatewayStatus, ListenerSetStatus, ListenerStatus, ParentStatus, PolicyStatus,
+    RouteStatus,
 };
 
 /// The controller an IngressClass names to be served by EdgeRush (02 §2).
@@ -324,6 +325,9 @@ pub struct Translation {
     /// What each of those routes' status is to say of those parents, in their order, the
     /// HTTPRoutes' first.
     pub route_statuses: Vec<RouteStatus>,
+    /// What each BackendTLSPolicy's status is to say of that Gateway, where a route of it
+    /// reaches a target of the policy, oldest first, then by namespace and name.
+    pub policy_statuses: Vec<PolicyStatus>,
     /// The hosts a claim of one API takes from a claim of the other, which no longer serves
     /// them: said, so that a move from one API to the other meets no surprise (04).
     pub taken: Vec<Taken>,
@@ -932,7 +936,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 problem,
             });
         };
-        for (target, came_to) in &outcome.targets {
+        for (target, came_to, _) in &outcome.targets {
             match came_to {
                 backend_tls::Target::Covers => {}
                 backend_tls::Target::Conflicted(by) => say(Problem::PolicyConflicted {
@@ -1664,6 +1668,11 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let gateway_status = gateway
         .as_ref()
         .map(|gateway| status::gateway(gateway, &route_statuses, &routes));
+    let policy_statuses = if gateway.is_some() {
+        policies.statuses()
+    } else {
+        Vec::new()
+    };
     Translation {
         config,
         report,
@@ -1680,6 +1689,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         tcp_routes,
         gateway_status,
         route_statuses,
+        policy_statuses,
         taken,
     }
 }

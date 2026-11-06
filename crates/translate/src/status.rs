@@ -23,7 +23,12 @@ pub struct Condition {
 }
 
 impl Condition {
-    fn new(kind: &'static str, status: bool, reason: &'static str, message: String) -> Self {
+    pub(crate) fn new(
+        kind: &'static str,
+        status: bool,
+        reason: &'static str,
+        message: String,
+    ) -> Self {
         Self {
             kind,
             status,
@@ -196,6 +201,25 @@ impl fmt::Display for RouteStatus {
             conditions(f, &parent.conditions)?;
         }
         Ok(())
+    }
+}
+
+/// What a BackendTLSPolicy's status is to say of the data plane's Gateway, its ancestor
+/// where a route of it reaches a target of the policy ([04 §6](../../../docs/04-control-plane.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyStatus {
+    /// The policy.
+    pub policy: Object,
+    /// The generation it says of.
+    pub generation: i64,
+    /// Its conditions: `Accepted`, then `ResolvedRefs`.
+    pub conditions: Vec<Condition>,
+}
+
+impl fmt::Display for PolicyStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}, generation {}: ", self.policy, self.generation)?;
+        conditions(f, &self.conditions)
     }
 }
 

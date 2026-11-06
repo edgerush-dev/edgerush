@@ -13,8 +13,8 @@
 //! where the case says, `routes.txt`, what became of each HTTPRoute's parents of that
 //! Gateway, then each GRPCRoute's, then each TLSRoute's, a line each (none otherwise); and, where the case says,
 //! `status.txt`, what the
-//! status of that Gateway, each of its listeners and each HTTPRoute's parent of it is to
-//! say, a line each. The report's last lines are the hosts a claim of one API takes from the
+//! status of that Gateway, each of its listeners, each route's parent of it and each
+//! BackendTLSPolicy of it as an ancestor is to say, a line each. The report's last lines are the hosts a claim of one API takes from the
 //! other's.
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
 //! the control plane's system trusts no authority, unless the case has `system.pem`, the
@@ -202,6 +202,7 @@ fn every_case_translates_to_its_config_and_report() {
                 .iter()
                 .map(ToString::to_string)
                 .chain(translation.route_statuses.iter().map(ToString::to_string))
+                .chain(translation.policy_statuses.iter().map(ToString::to_string))
                 .flat_map(|said| said.lines().map(str::to_owned).collect::<Vec<_>>())
                 .collect();
             let expected: Vec<String> = read(&listed).lines().map(str::to_owned).collect();

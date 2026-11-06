@@ -1,0 +1,3 @@
+BackendTLSPolicy shop/full: the connections it covers fail: its status holds 16 ancestors already, none of them Gateway shop/web, so it cannot be implemented there
+BackendTLSPolicy shop/partly: covers nothing of Service shop/gone: it does not exist
+HTTPRoute shop/pages: rule 2: a backend's share is answered 500: Service shop/full port https is covered by BackendTLSPolicy shop/full, whose TLS cannot be had: its status holds 16 ancestors already, none of them Gateway shop/web, so it cannot be implemented there

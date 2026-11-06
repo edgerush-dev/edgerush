@@ -2,3 +2,12 @@ Gateway, generation 0: Accepted=True/Accepted
 listener http: HTTPRoute, GRPCRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 HTTPRoute shop/pages, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 GRPCRoute shop/calls, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=False/BackendNotFound (Service shop/gone does not exist)
+BackendTLSPolicy shop/address, generation 0: Accepted=False/Invalid (hostname 10.0.0.1 is not a host name); ResolvedRefs=True/ResolvedRefs
+BackendTLSPolicy shop/half, generation 0: Accepted=True/Accepted; ResolvedRefs=False/InvalidCACertificateRef (ConfigMap shop/not-there does not exist)
+BackendTLSPolicy shop/keyless, generation 0: Accepted=False/NoValidCACertificate (none of its CA certificate refs can be used); ResolvedRefs=False/InvalidCACertificateRef (ConfigMap shop/keyless has no ca.crt)
+BackendTLSPolicy shop/malformed, generation 0: Accepted=False/NoValidCACertificate (none of its CA certificate refs can be used); ResolvedRefs=False/InvalidCACertificateRef (ConfigMap shop/malformed's ca.crt is not PEM certificates)
+BackendTLSPolicy shop/missing, generation 0: Accepted=False/NoValidCACertificate (none of its CA certificate refs can be used); ResolvedRefs=False/InvalidCACertificateRef (ConfigMap shop/not-there does not exist)
+BackendTLSPolicy shop/san, generation 0: Accepted=False/Invalid (subject alternative name "no scheme" is not a URI); ResolvedRefs=True/ResolvedRefs
+BackendTLSPolicy shop/secret, generation 0: Accepted=False/NoValidCACertificate (none of its CA certificate refs can be used); ResolvedRefs=False/InvalidKind (a CA certificate ref to a Secret, where a ConfigMap is read)
+BackendTLSPolicy shop/system, generation 0: Accepted=False/NoValidCACertificate (the control plane found no system CA certificates); ResolvedRefs=True/ResolvedRefs
+BackendTLSPolicy shop/unknown, generation 0: Accepted=False/Invalid (wellKnownCACertificates example.com/roots is not one the gateway knows); ResolvedRefs=True/ResolvedRefs
