@@ -1,0 +1,2 @@
+Ingress shop/site claims shop.example.com, taking it from HTTPRoute shop/pages's *.example.com, which does not fall through
+Ingress shop/site claims shop.example.com, taking it from Gateway shop/web listener https's *.example.com, which does not fall through

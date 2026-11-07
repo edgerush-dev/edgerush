@@ -24,7 +24,7 @@ use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use k8s_openapi::api::networking::v1::{IngressBackend, IngressServiceBackend, ServiceBackendPort};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// The API group of the Gateway API's kinds.
@@ -554,12 +554,22 @@ fn api(route: &Route) -> Option<&'static str> {
     }
 }
 
-/// Every host a claim of one API takes from a claim of the other among `routes`.
+/// Every host a claim of one API takes from a claim of the other among `routes`, where the
+/// router ranks the two together: on a listener they share. Each taking is said once,
+/// though an object's config routes on several listeners may each take it.
 pub(crate) fn taken(routes: &[Route]) -> Vec<Taken> {
     let mut found = Vec::new();
+    let mut said = BTreeSet::new();
     for by in routes {
         for from in routes {
             if api(by).is_none() || api(from).is_none() || api(by) == api(from) {
+                continue;
+            }
+            if !by
+                .listeners
+                .iter()
+                .any(|listener| from.listeners.contains(listener))
+            {
                 continue;
             }
             for hostname in &by.hostnames {
@@ -571,7 +581,7 @@ pub(crate) fn taken(routes: &[Route]) -> Vec<Taken> {
                             from: from.name.clone(),
                             from_hostname: theirs.name.clone(),
                         };
-                        if !found.contains(&taken) {
+                        if said.insert(taken.to_string()) {
                             found.push(taken);
                         }
                     }
@@ -1508,8 +1518,8 @@ fn granted(
 
 #[cfg(test)]
 mod tests {
-    use super::{claim, intersection, milliseconds, takes, within};
-    use edgerush_config::{Hostname, Wildcard};
+    use super::{claim, intersection, milliseconds, taken, takes, within};
+    use edgerush_config::{Hostname, Route, Wildcard};
 
     #[test]
     fn durations_are_read_as_gep_2257_has_them() {
@@ -1633,5 +1643,59 @@ mod tests {
             &ingress("shop.example.com", None),
             &claim("*.example.com")
         ));
+    }
+
+    /// A route of `name` on `listeners`, claiming `hostname`.
+    fn on(name: &str, listeners: &[&str], hostname: &str) -> Route {
+        Route {
+            name: name.to_owned(),
+            listeners: listeners
+                .iter()
+                .map(|&listener| listener.to_owned())
+                .collect(),
+            hostnames: vec![claim(hostname)],
+            rules: Vec::new(),
+            rate_limits: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_host_is_taken_only_on_a_listener_shared_and_said_once() {
+        let site = "ingress/shop/site/shop.example.com";
+        let redirect = "ingress/shop/site/shop.example.com/https-redirect";
+        let said = |routes: &[Route]| -> Vec<String> {
+            taken(routes).iter().map(ToString::to_string).collect()
+        };
+        let pages = "HTTPRoute shop/pages's *.example.com";
+        let once = [format!(
+            "Ingress shop/site claims shop.example.com, taking it from {pages}, which does not fall through"
+        )];
+        // The redirect, on the plain HTTP port, meets no route there.
+        assert_eq!(
+            said(&[
+                on("httproute/shop/pages/https", &["port-443"], "*.example.com"),
+                on(site, &["port-443"], "shop.example.com"),
+                on(redirect, &["port-80"], "shop.example.com"),
+            ]),
+            once
+        );
+        // The HTTPRoute on both ports: taken on each, said once.
+        assert_eq!(
+            said(&[
+                on("httproute/shop/pages/http", &["port-80"], "*.example.com"),
+                on("httproute/shop/pages/https", &["port-443"], "*.example.com"),
+                on(site, &["port-443"], "shop.example.com"),
+                on(redirect, &["port-80"], "shop.example.com"),
+            ]),
+            once
+        );
+        // Routes on no listener in common take nothing from each other.
+        assert_eq!(
+            said(&[
+                on("httproute/shop/pages/https", &["port-443"], "*.example.com"),
+                on(redirect, &["port-80"], "shop.example.com"),
+            ]),
+            Vec::<String>::new()
+        );
     }
 }
