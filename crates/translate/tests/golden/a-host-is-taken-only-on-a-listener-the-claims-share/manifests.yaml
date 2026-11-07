@@ -1,0 +1,42 @@
+# A host is taken only between claims the router ranks together, on a listener they share,
+# and each taking is said once. The Ingress's TLS host shop.example.com takes it from the
+# HTTPRoute's *.example.com on the HTTPS port they share; its HTTPS redirect, on the plain
+# HTTP port, takes nothing from a route that is not there.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: https, port: 443, protocol: HTTPS, hostname: "*.example.com", tls: { certificateRefs: [{ name: wild }] } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: pages, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: https }]
+  hostnames: ["*.example.com"]
+  rules:
+    - backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: site, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [shop.example.com], secretName: wild }]
+  rules:
+    - host: shop.example.com
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

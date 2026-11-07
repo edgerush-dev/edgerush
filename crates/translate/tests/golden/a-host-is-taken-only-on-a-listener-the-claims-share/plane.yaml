@@ -1,0 +1,7 @@
+# The shared data plane, as the Gateway shop/web, its Ingress hosts redirected to HTTPS.
+ingress_class: edge
+gateway: shop/web
+cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+ingress_https_redirect: true
+ingress_https_redirect_max_age: 30

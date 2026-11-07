@@ -1148,8 +1148,9 @@ spec:
     );
     std::fs::remove_file(manifests.join("gone.yml"))?;
 
-    // The data plane a Gateway whose listener claims `*.example.com`: the Ingress's
-    // shop.example.com takes that host from it, which is said, and validate exits 1.
+    // The data plane a Gateway whose listener claims `*.example.com` on the port Ingress's
+    // `http` is bound to: the Ingress's shop.example.com takes that host from it there, which
+    // is said, and validate exits 1.
     std::fs::write(
         manifests.join("gateway.yml"),
         "apiVersion: gateway.networking.k8s.io/v1
@@ -1162,7 +1163,7 @@ kind: Gateway
 metadata: { name: web, namespace: edge }
 spec:
   gatewayClassName: edgerush
-  listeners: [{ name: wild, port: 8080, protocol: HTTP, hostname: \"*.example.com\" }]
+  listeners: [{ name: wild, port: 80, protocol: HTTP, hostname: \"*.example.com\" }]
 ",
     )?;
     let gateway_plane = root.join("gateway-data-plane.yaml");

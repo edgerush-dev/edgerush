@@ -1,0 +1,163 @@
+listeners:
+  port-443:
+    address: 0.0.0.0:443
+    protocol: https
+    tls:
+      certificates:
+      - certificate: shop/wild
+        names:
+        - "*.example.com"
+        - shop.example.com
+      without_sni: none
+      refused: []
+      client_validation: null
+      shared_by:
+      - hostnames:
+        - name: "*.example.com"
+          wildcard: any_labels
+        passes_through: false
+      - hostnames:
+        - name: shop.example.com
+          wildcard: null
+        passes_through: false
+    http3: null
+    tunnel_idle_seconds: null
+    forwarding:
+      trusted_proxies: []
+      trusted_only_headers:
+      - Forwarded
+      - X-Real-IP
+      - X-Forwarded-*
+    request_id: generate
+    proxy_protocol: "off"
+    access_log: null
+  port-80:
+    address: 0.0.0.0:80
+    protocol: http
+    tls: null
+    http3: null
+    tunnel_idle_seconds: null
+    forwarding:
+      trusted_proxies: []
+      trusted_only_headers:
+      - Forwarded
+      - X-Real-IP
+      - X-Forwarded-*
+    request_id: generate
+    proxy_protocol: "off"
+    access_log: null
+routes:
+- name: httproute/shop/pages/https
+  listeners:
+  - port-443
+  hostnames:
+  - name: "*.example.com"
+    wildcard: any_labels
+    falls_through: false
+  rules:
+  - matches:
+    - path:
+        prefix: /
+      grpc: null
+      method: null
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/web/http
+        invalid: null
+        weight: 1
+      timeouts: null
+      retry: null
+    redirect: null
+    paths: null
+    rate_limits: []
+  rate_limits: []
+- name: ingress/shop/site/shop.example.com
+  listeners:
+  - port-443
+  hostnames:
+  - name: shop.example.com
+    wildcard: null
+    falls_through: false
+  rules:
+  - matches:
+    - path:
+        prefix: /
+      grpc: null
+      method: null
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/web/http
+        invalid: null
+        weight: 1
+      timeouts: null
+      retry: null
+    redirect: null
+    paths: null
+    rate_limits: []
+  rate_limits: []
+- name: ingress/shop/site/shop.example.com/https-redirect
+  listeners:
+  - port-80
+  hostnames:
+  - name: shop.example.com
+    wildcard: null
+    falls_through: false
+  rules:
+  - matches:
+    - path:
+        prefix: /
+      grpc: null
+      method: null
+      headers: []
+      query: []
+    filters:
+    - type: response_header_modifier
+      set:
+      - name: cache-control
+        value: max-age=30
+      add: []
+      remove: []
+    forward: null
+    redirect:
+      status: 308
+      scheme: https
+      host: null
+      port: null
+      path: null
+      query: keep
+    paths: null
+    rate_limits: []
+  rate_limits: []
+- name: gateway/shop/web/https
+  listeners:
+  - port-443
+  hostnames:
+  - name: "*.example.com"
+    wildcard: any_labels
+    falls_through: false
+  rules: []
+  rate_limits: []
+tcp_routes: []
+tls_routes: []
+upstreams:
+  shop/web/http:
+    endpoints:
+      kubernetes: web.shop.svc.cluster.local:http
+    protocol: http1
+    tls: null
+    keepalive: null
+    health_check: null
+    load_balancer: p2c
+    slow_start: null
+    proxy_protocol: null
+data_plane:
+  set_aside_ms: null
+  experimental_unrestricted_egress: null
+  own_service: null
+rate_limiting: null
