@@ -23,7 +23,7 @@
 //! Unix has; a single worker has the port to itself and needs nothing of the kind, so
 //! that is the shape the harness runs in on Windows.
 
-use crate::bind::{Port, datagrams, listen};
+use crate::bind::{Port, Refused, datagrams, listen, listen_both};
 use crate::config_file::Problems;
 use crate::config_file::{ConfigFile, Rejected};
 use crate::essential::{Ended, Essential, Told};
@@ -1645,20 +1645,25 @@ fn opened(
     let mut sockets = Vec::with_capacity(workers.get());
     for _ in 0..workers.get() {
         let what = format!("listener \"{}\"", listener.name);
-        let socket = open(what, listener.listens_on, port)?;
-        listener.listens_on = socket.local_addr().unwrap_or(listener.listens_on);
-        // HTTP/3 on the port TCP has: what `Alt-Svc` will tell clients (16 §5).
-        let udp = if listener.http3 {
-            let what = format!("listener \"{}\" (HTTP/3)", listener.name);
-            let address = listener.listens_on;
-            Some(datagrams(address, port).map_err(|error| Failure::Listen {
-                what,
-                address,
-                error,
-            })?)
+        let asked = listener.listens_on;
+        let (socket, udp) = if listener.http3 {
+            let (socket, udp) = listen_both(asked, port).map_err(|refused| match refused {
+                Refused::Tcp(error) => Failure::Listen {
+                    what,
+                    address: asked,
+                    error,
+                },
+                Refused::Udp(address, error) => Failure::Listen {
+                    what: format!("listener \"{}\" (HTTP/3)", listener.name),
+                    address,
+                    error,
+                },
+            })?;
+            (socket, Some(udp))
         } else {
-            None
+            (open(what, asked, port)?, None)
         };
+        listener.listens_on = socket.local_addr().unwrap_or(asked);
         sockets.push((socket, udp));
     }
     Ok(sockets)
@@ -2067,6 +2072,44 @@ upstreams: {{}}
             return false;
         };
         read > 5 && answer[0] & 0x80 != 0 && answer[1..5] == [0; 4]
+    }
+
+    fn with_http3(address: SocketAddr) -> Bound {
+        Bound {
+            name: "secure".to_owned(),
+            slot: 0,
+            draining: None,
+            http3_draining: None,
+            address,
+            listens_on: address,
+            http3: true,
+        }
+    }
+
+    /// A listener whose HTTP/3 cannot have its port is refused as HTTP/3, at that port.
+    #[test]
+    fn a_listener_whose_udp_port_is_taken_is_refused_for_http3() {
+        let taken = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let named = taken.local_addr().unwrap();
+        let refused = opened(&mut with_http3(named), NonZeroUsize::MIN, Port::Own).unwrap_err();
+        let Failure::Listen { what, address, .. } = refused else {
+            panic!("not refused a socket: {refused}");
+        };
+        assert_eq!(what, "listener \"secure\" (HTTP/3)");
+        assert_eq!(address, named);
+    }
+
+    /// One whose TCP port is taken is refused as the listener, HTTP/3 or not.
+    #[test]
+    fn a_listener_whose_tcp_port_is_taken_is_refused_for_itself() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let named = taken.local_addr().unwrap();
+        let refused = opened(&mut with_http3(named), NonZeroUsize::MIN, Port::Own).unwrap_err();
+        let Failure::Listen { what, address, .. } = refused else {
+            panic!("not refused a socket: {refused}");
+        };
+        assert_eq!(what, "listener \"secure\"");
+        assert_eq!(address, named);
     }
 
     /// HTTP/3 turned on again while its drain from being turned off is under way waits for
