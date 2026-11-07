@@ -740,7 +740,7 @@ impl Worker {
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use crate::bind::{Port, datagrams, listen};
+    use crate::bind::{Port, datagrams, listen, listen_both};
     use edgerush_config::{Compiled, Config, compile};
     use edgerush_proxy::connections::QUIC_MOST;
     use std::io::{Read, Write};
@@ -1106,9 +1106,9 @@ upstreams:
         let mut address: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut sockets = Vec::new();
         for _ in 0..count {
-            let tcp = listen(address, port).unwrap();
+            let (tcp, udp) = listen_both(address, port).unwrap();
             address = tcp.local_addr().unwrap();
-            sockets.push((tcp, Some(datagrams(address, port).unwrap())));
+            sockets.push((tcp, Some(udp)));
         }
         let api = "  api: { address: \"127.0.0.1:2\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }";
         let opened = edgerush_proxy::Opened {

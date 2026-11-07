@@ -64,6 +64,60 @@ pub(crate) fn datagrams(address: SocketAddr, port: Port) -> io::Result<UdpSocket
     Ok(socket.into())
 }
 
+/// Ports drawn for a listener with HTTP/3 before a UDP bind refused on each is given up
+/// on. A drawn port lands in a range the host keeps from UDP with a chance of some 5% on
+/// Windows (it reserves blocks for Hyper-V and WSL), so all 8 draws fail about once in
+/// 25 billion tries.
+const DRAWS: usize = 8;
+
+/// Which of a listener's two sockets could not be opened.
+#[derive(Debug)]
+pub(crate) enum Refused {
+    /// The TCP listener, on the address asked for.
+    Tcp(io::Error),
+    /// HTTP/3's UDP socket, on the address the TCP listener was given.
+    Udp(SocketAddr, io::Error),
+}
+
+/// A TCP listener on `address` and HTTP/3's UDP socket on the port it was given (16 §5), as
+/// [`listen`] and [`datagrams`] open them. Where `address` leaves the port to the operating
+/// system, one whose UDP is refused — taken, or in a range the host excludes from UDP — is
+/// let go and another drawn, up to [`DRAWS`] times: any port was asked for, so long as both
+/// sockets have it. A port named is tried once.
+pub(crate) fn listen_both(
+    address: SocketAddr,
+    port: Port,
+) -> Result<(TcpListener, UdpSocket), Refused> {
+    listen_both_with(address, port, datagrams)
+}
+
+fn listen_both_with(
+    address: SocketAddr,
+    port: Port,
+    mut udp: impl FnMut(SocketAddr, Port) -> io::Result<UdpSocket>,
+) -> Result<(TcpListener, UdpSocket), Refused> {
+    let draws = if address.port() == 0 { DRAWS } else { 1 };
+    // Held until a pair is found, so that no draw is given a port refused before it.
+    let mut refused = Vec::new();
+    loop {
+        let tcp = listen(address, port).map_err(Refused::Tcp)?;
+        let given = tcp.local_addr().map_err(Refused::Tcp)?;
+        match udp(given, port) {
+            Ok(udp) => return Ok((tcp, udp)),
+            Err(error)
+                if refused.len() + 1 < draws
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                refused.push(tcp);
+            }
+            Err(error) => return Err(Refused::Udp(given, error)),
+        }
+    }
+}
+
 #[cfg(unix)]
 fn share(socket: &Socket) -> io::Result<()> {
     socket.set_reuse_port(true)
@@ -182,6 +236,120 @@ mod tests {
         assert_eq!(
             datagrams(address, Port::Own).unwrap_err().kind(),
             io::ErrorKind::AddrInUse
+        );
+    }
+
+    fn local() -> SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+
+    /// A UDP bind refused as Windows refuses a port in a range it excludes.
+    fn excluded() -> io::Error {
+        io::Error::from(io::ErrorKind::PermissionDenied)
+    }
+
+    #[test]
+    fn a_listener_with_http3_has_one_port_for_both() {
+        let (tcp, udp) = listen_both(local(), Port::Own).unwrap();
+        assert_eq!(tcp.local_addr().unwrap(), udp.local_addr().unwrap());
+    }
+
+    #[test]
+    fn a_port_left_to_the_system_whose_udp_is_refused_is_drawn_again() {
+        let mut asked = Vec::new();
+        let (tcp, udp) = listen_both_with(local(), Port::Own, |address, port| {
+            asked.push(address.port());
+            if asked.len() == 1 {
+                Err(excluded())
+            } else {
+                datagrams(address, port)
+            }
+        })
+        .unwrap();
+        assert_eq!(asked.len(), 2);
+        assert_ne!(asked[0], asked[1]);
+        assert_eq!(tcp.local_addr().unwrap().port(), asked[1]);
+        assert_eq!(udp.local_addr().unwrap().port(), asked[1]);
+    }
+
+    /// A port refused is held while the next is drawn, so that the system cannot hand it
+    /// out again, whatever order it hands ports out in.
+    #[test]
+    fn a_port_refused_is_held_while_another_is_drawn() {
+        let mut refused: Option<SocketAddr> = None;
+        let mut held = None;
+        listen_both_with(local(), Port::Own, |address, port| match refused {
+            None => {
+                refused = Some(address);
+                Err(excluded())
+            }
+            Some(first) => {
+                held = Some(listen(first, Port::Own).map(drop).map_err(|e| e.kind()));
+                datagrams(address, port)
+            }
+        })
+        .unwrap();
+        assert_eq!(held, Some(Err(io::ErrorKind::AddrInUse)));
+    }
+
+    #[test]
+    fn a_port_whose_udp_is_taken_is_drawn_again_too() {
+        let mut asked = 0;
+        listen_both_with(local(), Port::Own, |address, port| {
+            asked += 1;
+            if asked == 1 {
+                Err(io::Error::from(io::ErrorKind::AddrInUse))
+            } else {
+                datagrams(address, port)
+            }
+        })
+        .unwrap();
+        assert_eq!(asked, 2);
+    }
+
+    #[test]
+    fn a_port_named_is_not_drawn_again() {
+        let taken = UdpSocket::bind(local()).unwrap();
+        let named = taken.local_addr().unwrap();
+        let mut asked = 0;
+        let refused = listen_both_with(named, Port::Own, |address, port| {
+            asked += 1;
+            datagrams(address, port)
+        })
+        .unwrap_err();
+        assert_eq!(asked, 1);
+        let Refused::Udp(at, error) = refused else {
+            panic!("the TCP listener was refused: {refused:?}");
+        };
+        assert_eq!(at, named);
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn drawing_ends_after_its_draws() {
+        let mut asked = 0;
+        let refused = listen_both_with(local(), Port::Own, |_, _| {
+            asked += 1;
+            Err(excluded())
+        })
+        .unwrap_err();
+        assert_eq!(asked, DRAWS);
+        assert!(
+            matches!(refused, Refused::Udp(_, error) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn a_refusal_another_port_would_not_mend_is_not_drawn_again() {
+        let mut asked = 0;
+        let refused = listen_both_with(local(), Port::Own, |_, _| {
+            asked += 1;
+            Err(io::Error::from(io::ErrorKind::AddrNotAvailable))
+        })
+        .unwrap_err();
+        assert_eq!(asked, 1);
+        assert!(
+            matches!(refused, Refused::Udp(_, error) if error.kind() == io::ErrorKind::AddrNotAvailable)
         );
     }
 
