@@ -266,10 +266,29 @@ fn escaped(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&bytes[from..]);
 }
 
+/// `seconds` since the Unix epoch in RFC 3339, in UTC, to the second, as a log line says a
+/// time: `2026-10-04T09:12:33Z`.
+#[must_use]
+pub fn utc(seconds: u64) -> String {
+    let mut out = Vec::new();
+    to_the_second(&mut out, seconds);
+    out.push(b'Z');
+    // Digits and punctuation: ASCII, so nothing is lost.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Appends `ms` since the Unix epoch in RFC 3339, in UTC, to the millisecond:
 /// `2026-10-04T09:12:33.123Z`.
 fn time(out: &mut Vec<u8>, ms: u64) {
-    let seconds = ms / 1000;
+    to_the_second(out, ms / 1000);
+    out.push(b'.');
+    three(out, ms);
+    out.push(b'Z');
+}
+
+/// Appends `seconds` since the Unix epoch in RFC 3339, in UTC, up to its seconds:
+/// `2026-10-04T09:12:33`.
+fn to_the_second(out: &mut Vec<u8>, seconds: u64) {
     let (year, month, day) = civil(seconds / 86_400);
     let of_day = seconds % 86_400;
     // Four digits up to the year 9999, the last RFC 3339 has; after it, whatever it is.
@@ -289,9 +308,6 @@ fn time(out: &mut Vec<u8>, ms: u64) {
     two(out, of_day / 60 % 60);
     out.push(b':');
     two(out, of_day % 60);
-    out.push(b'.');
-    three(out, ms);
-    out.push(b'Z');
 }
 
 /// The year, month and day of the `days`th day after 1970-01-01, by Howard Hinnant's
@@ -663,6 +679,7 @@ mod tests {
                 "{ms}"
             );
         }
+        assert_eq!(utc(951_868_799), "2000-02-29T23:59:59Z");
     }
 
     /// The date, day by day from the epoch, as the Gregorian calendar has it.
@@ -708,6 +725,15 @@ mod tests {
         #[test]
         fn every_day_is_the_calendar_s(days in 0u64..200_000) {
             prop_assert_eq!(civil(days), walked(days));
+        }
+
+        /// A time to the second is the same time, cut at its seconds.
+        #[test]
+        fn a_time_to_the_second_is_the_time_cut_short(seconds in 0u64..253_402_300_800) {
+            let mut out = Vec::new();
+            time(&mut out, seconds * 1000);
+            let written = String::from_utf8(out).unwrap();
+            prop_assert_eq!(utc(seconds), format!("{}Z", &written[..19]));
         }
 
         /// Every part of a time where it belongs, up to the last year RFC 3339 has.

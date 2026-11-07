@@ -298,9 +298,11 @@ dependencies = [
 name = "edgerush-controller"
 version = "0.0.0"
 dependencies = [
+ "edgerush-certificates",
  "edgerush-config",
  "edgerush-gateway-api",
  "edgerush-kubernetes",
+ "edgerush-telemetry",
  "edgerush-translate",
  "k8s-openapi",
  "serde",

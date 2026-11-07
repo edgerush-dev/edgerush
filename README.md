@@ -228,6 +228,7 @@ translation is reported on stderr as `validate` reports it. The rest is chosen b
 | `--status-service edge/edgerush`, or `--status-address 192.0.2.10` once for each | What each Ingress served says in its status: that Service's addresses, or these. Each Ingress of the class not served says none. |
 | `--leader-lease edge/edgerush-control` | Replicas elect the one that writes status by this Lease. |
 | `--webhook-listen [::]:8443 --webhook-certificate tls.crt --webhook-key tls.key` | Serve the admission webhook, HTTPS, reviews `POST`ed to `/validate`: an Ingress of the class that would not translate alone is refused, with why. |
+| `--metrics [::]:9090` | Serve the controller's own metrics, plain HTTP at `/metrics`: when each certificate handed to the data plane expires, `edgerush_certificate_expiry_timestamp_seconds`. Every replica serves them. |
 
 A data plane dials the stream with
 `edgerush proxy --control-plane edgerush-control.edge.svc:9443 --certificate tls.crt --key tls.key --authorities ca.crt`.

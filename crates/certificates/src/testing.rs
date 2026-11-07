@@ -30,6 +30,33 @@ pub fn certificate(names: &[&str]) -> Certificate {
     written(&builder.build(), &key)
 }
 
+/// A self-signed certificate for `names`, with its key, valid from `not_before` to
+/// `not_after`, in seconds since the Unix epoch, its subject's common name `common_name`,
+/// or no subject at all for none: for tests of what is said of its dates.
+#[must_use]
+pub fn dated(
+    names: &[&str],
+    common_name: Option<&str>,
+    not_before: i64,
+    not_after: i64,
+) -> Certificate {
+    let key = key();
+    let subject = match common_name {
+        Some(name) => subject(name),
+        None => X509NameBuilder::new().unwrap().build(),
+    };
+    let mut builder = builder(&subject, &subject, &key);
+    builder
+        .set_not_before(&Asn1Time::from_unix(not_before).unwrap())
+        .unwrap();
+    builder
+        .set_not_after(&Asn1Time::from_unix(not_after).unwrap())
+        .unwrap();
+    alternatives(&mut builder, names, None);
+    builder.sign(&key, MessageDigest::sha256()).unwrap();
+    written(&builder.build(), &key)
+}
+
 /// The same, of an RSA key of 2048 bits in place of an ECDSA key on P-256: for tests of a
 /// listener that holds both kinds for one name.
 #[must_use]

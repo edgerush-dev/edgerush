@@ -12,6 +12,8 @@ publish.workspace = true
 interop = ["edgerush-proxy/interop"]
 
 [dependencies]
+# The control plane's metrics text, handed to its listener without a copy.
+bytes.workspace = true
 # The system's authorities, read as the data plane will read them.
 edgerush-certificates.workspace = true
 edgerush-config.workspace = true
