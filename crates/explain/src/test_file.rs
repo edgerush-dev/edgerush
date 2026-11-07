@@ -239,14 +239,16 @@ pub struct HeaderExpected {
 }
 
 /// The reasons the request core answers a request itself for, as the metrics name them.
-const ANSWERS: [&str; 9] = [
+const ANSWERS: [&str; 11] = [
     "bad_host",
     "bad_path",
     "bad_connection",
     "bad_target",
     "no_route",
     "no_backend",
+    "invalid_backend",
     "edits",
+    "max_forwards",
     "unknown_protocol",
     "misdirected",
 ];
@@ -718,6 +720,8 @@ fn asked(request: &Request, snapshot: &Snapshot) -> Result<Asking, Problem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgerush_proxy::{ConnectionError, HostError, Rejection};
+    use edgerush_router::NormaliseError;
     use http::{Method, Version};
 
     const CONFIG: &str = r#"
@@ -826,6 +830,55 @@ tls_routes:
                 mistakes(&[test("a", REQUEST, expect)]),
                 [(2, said)],
                 "{expect}"
+            );
+        }
+    }
+
+    /// One of each reason the request core answers a request for.
+    fn every_rejection() -> Vec<Rejection> {
+        let every = vec![
+            Rejection::Host(HostError::Missing),
+            Rejection::Path(NormaliseError::NotAbsolute),
+            Rejection::Connection(ConnectionError::Malformed),
+            Rejection::Target,
+            Rejection::NoRoute,
+            Rejection::NoBackend,
+            Rejection::InvalidBackend,
+            Rejection::Edits,
+            Rejection::MaxForwards { options: true },
+            Rejection::MaxForwards { options: false },
+            Rejection::Protocol,
+            Rejection::Misdirected,
+        ];
+        // A rejection added fails to build here: list it above as well.
+        for rejection in &every {
+            match rejection {
+                Rejection::Host(_)
+                | Rejection::Path(_)
+                | Rejection::Connection(_)
+                | Rejection::Target
+                | Rejection::NoRoute
+                | Rejection::NoBackend
+                | Rejection::InvalidBackend
+                | Rejection::Edits
+                | Rejection::MaxForwards { .. }
+                | Rejection::Protocol
+                | Rejection::Misdirected => {}
+            }
+        }
+        every
+    }
+
+    #[test]
+    fn every_answer_the_request_core_gives_can_be_expected() {
+        for rejection in every_rejection() {
+            let reason = rejection.reason();
+            let expect = format!("{{ answer: {reason} }}");
+            let yaml = format!("tests:\n{}", test("a", REQUEST, &expect));
+            let file = read(yaml.as_bytes()).unwrap();
+            assert!(
+                file.prepare(&snapshot()).is_ok(),
+                "{rejection:?} answers as {reason}, which a test cannot expect"
             );
         }
     }
