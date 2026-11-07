@@ -174,6 +174,7 @@ repo=$(dirname "$here")
 # RL_MAX_KEY_BYTES, the bytes their keys may hold, the proxy's and the service pod's alike
 # (256 MiB each when unset). Keys quiet for twice the limit's refill time are dropped, so a
 # run with resident keys wants RL_RATE and RL_BURST refilling slower than it lasts.
+: "${RL_MAX_KEY_BYTES:=}"
 # The envoy-rl variant's service, envoyproxy/ratelimit, and its Redis: in Docker on the
 # backend's CPUs, as EdgeRush's service pod runs there, with host networking. Its knobs:
 # RLS_PIPELINE_WINDOW (the time it gathers commands to Redis for, `150us`; empty for none,
