@@ -388,6 +388,14 @@ async fn leader(cluster: &Cluster, ids: &BTreeSet<NodeId>) -> Option<NodeId> {
     None
 }
 
+/// The pod of `ids` that leads, once one says so: pods that have committed one table may
+/// still be electing a leader.
+async fn elected(cluster: &Cluster, ids: &BTreeSet<NodeId>) -> NodeId {
+    within(FORMED, || leader(cluster, ids))
+        .await
+        .expect("no leader elected in time")
+}
+
 /// The keys the tests write: eight in every shard.
 fn keys() -> Vec<u64> {
     (0..u64::from(SHARDS) * 8).collect()
@@ -728,7 +736,7 @@ async fn when_the_leader_crashes_the_pods_left_lead_and_own_its_shards() {
     let _shared = ALONE.read().await;
     let mut cluster = Cluster::formed(3).await;
     let ids: BTreeSet<NodeId> = (1..=3).collect();
-    let crashed = leader(&cluster, &ids).await.unwrap();
+    let crashed = elected(&cluster, &ids).await;
     cluster.crash(crashed).await;
     let left: BTreeSet<NodeId> = ids.into_iter().filter(|id| *id != crashed).collect();
     let failed_over = within(FAILOVER, || async {
@@ -746,7 +754,7 @@ async fn when_a_follower_crashes_its_keys_are_held_by_their_new_owners() {
     let ids: BTreeSet<NodeId> = (1..=3).collect();
     let ready = within(FORMED, || all_ready(&cluster, &ids)).await;
     assert!(ready.is_some(), "pods not ready within {FORMED:?}");
-    let leading = leader(&cluster, &ids).await.unwrap();
+    let leading = elected(&cluster, &ids).await;
     let crashed = *ids.iter().find(|id| **id != leading).unwrap();
     // A key in every shard, each counted at its owner, once that owner serves it.
     let keys: Vec<u64> = (0..u64::from(SHARDS) * 8).collect();
@@ -829,7 +837,7 @@ async fn a_pod_cut_off_stops_serving_before_the_others_take_its_shards() {
     // Ready, each owning its share.
     let ready = within(FORMED, || all_ready(&cluster, &ids)).await;
     assert!(ready.is_some(), "pods not ready within {FORMED:?}");
-    let leading = leader(&cluster, &ids).await.unwrap();
+    let leading = elected(&cluster, &ids).await;
     let cut = *ids.iter().find(|id| **id != leading).unwrap();
     let table = committed(cluster.pod(leading)).await.unwrap();
     let shards: Vec<u16> = table.owned_by(cut).collect();
@@ -1595,6 +1603,7 @@ async fn what_a_pods_scrape_shows_is_its_stores() {
     let cluster = ready(3).await;
     let ids: BTreeSet<NodeId> = (1..=3).collect();
     let table = cluster.one_table(&ids).await.unwrap();
+    let leader = elected(&cluster, &ids).await;
     let mut leaders = 0;
     for id in &ids {
         let observed = cluster.pod(*id).observed().await.unwrap();
@@ -1604,7 +1613,6 @@ async fn what_a_pods_scrape_shows_is_its_stores() {
         assert_eq!(observed.max_key_bytes, config().max_key_bytes, "pod {id}");
         leaders += u32::from(observed.leader);
     }
-    let leader = leader(&cluster, &ids).await.unwrap();
     assert!(cluster.pod(leader).observed().await.unwrap().leader);
     assert_eq!(leaders, 1);
     let key = key_owned_by(&table, 2);
