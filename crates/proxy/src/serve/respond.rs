@@ -61,7 +61,7 @@ fn dry_runs(rule: &CompiledRule) -> u64 {
 
 /// A worker's limiter, in the mode its config enforces limits in.
 enum Limiting {
-    /// Shared through the rate-limiting service (experimental).
+    /// Shared through the rate-limiting service.
     Asynchronous(Rc<Limiter>),
     /// The process's own.
     Local(Rc<LocalLimiter>),

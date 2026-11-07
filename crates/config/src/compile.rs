@@ -135,7 +135,7 @@ pub enum CompiledRateLimiting {
     },
     /// The key's owner in the service decides every request.
     Synchronous(CompiledSynchronous),
-    /// Each process from its copies, sharing through the service (experimental).
+    /// Each process from its copies, sharing through the service.
     Asynchronous(CompiledRateLimitService),
 }
 
@@ -204,7 +204,7 @@ impl CompiledRateLimiting {
     }
 }
 
-/// The rate-limiting service, checked (experimental).
+/// The rate-limiting service, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledRateLimitService {
     /// The address of each pod, the first being pod 0.

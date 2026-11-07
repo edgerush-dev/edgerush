@@ -391,14 +391,14 @@ pub(crate) enum Answer {
     /// For a host of another listener than the one its connection was made for, where
     /// listeners share the port ([03 §3](../../docs/03-data-plane.md)).
     Misdirected,
-    /// Over its rule's rate limit (experimental).
+    /// Over its rule's rate limit.
     RateLimited,
-    /// Its rate limits had no place for it to wait in (experimental): the gateway's own
+    /// Its rate limits had no place for it to wait in: the gateway's own
     /// trouble, never over a limit, as are the two after it.
     RateLimitFull,
-    /// Its time to wait on its rate limits ran out, wherever it was waiting (experimental).
+    /// Its time to wait on its rate limits ran out, wherever it was waiting.
     RateLimitTimeout,
-    /// No rate-limiting thread to decide it: never started, or gone (experimental).
+    /// No rate-limiting thread to decide it: never started, or gone.
     RateLimitUnavailable,
 }
 

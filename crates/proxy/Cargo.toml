@@ -30,7 +30,7 @@ edgerush-discovery.workspace = true
 # The list and watch of the namespaces discovered upstreams are in.
 edgerush-kubernetes.workspace = true
 edgerush-filters.workspace = true
-# Rules' rate limits (experimental): each worker a data plane of the rate-limiting
+# Rules' rate limits: each worker a data plane of the rate-limiting
 # service's protocol, reaching the service through that crate's gRPC client.
 edgerush-ratelimit.workspace = true
 edgerush-ratelimit-service.workspace = true
