@@ -13964,13 +13964,19 @@ fn delayed_ack_goes_with_what_is_sent() {
 #[test]
 /// EdgeRush: an ACK alone is sent once its delay is up.
 fn delayed_ack_is_sent_when_its_delay_is_up() {
-    // 6 ms advertised: the ACK waits 1 ms.
-    let mut pipe = delayed_ack_pipe(6);
+    // 25 ms advertised: the ACK waits 20 ms, as in the tests above. Whether it
+    // has gone out is a matter of the clock when the server is asked, so the
+    // wait is room for the thread to be held up on a busy machine between the
+    // packet and the look: 1 ms was not. When it is due is exact.
+    let mut pipe = delayed_ack_pipe(25);
 
     one_packet_to_server(&mut pipe, b"a");
     assert!(server_frames(&mut pipe).is_empty());
 
+    let space = &pipe.server.pkt_num_spaces[packet::Epoch::Application];
+    let first = space.first_unacked_ack_eliciting.unwrap();
     let due = pipe.server.timeout_instant().unwrap();
+    assert_eq!(due, first + Duration::from_millis(20));
     assert_eq!(Some(due), pipe.server.delayed_ack_timer());
     std::thread::sleep(due.saturating_duration_since(Instant::now()));
     pipe.server.on_timeout();
