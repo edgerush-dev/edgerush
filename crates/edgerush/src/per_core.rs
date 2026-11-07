@@ -825,6 +825,19 @@ upstreams:
         }
     }
 
+    /// The scrape once it holds `line`, or the last one taken in ten seconds: an answer is
+    /// counted when it goes, so it can reach the client before the count is made.
+    fn scraped(proxy: &Proxy, line: &str) -> String {
+        let began = Instant::now();
+        loop {
+            let scrape = proxy.metrics();
+            if scrape.contains(line) || began.elapsed() > Duration::from_secs(10) {
+                return scrape;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Sends a request and reads the whole answer — of the worker's own, so without a
     /// body — leaving the connection ready for the next: the status line of the answer.
     fn request(connection: &mut std::net::TcpStream) -> String {
@@ -1161,8 +1174,8 @@ upstreams:
         // No route of `api`'s: the data plane's own 404, counted as the listener's.
         assert_eq!(request(&mut connection), "HTTP/1.1 404 Not Found");
         assert_eq!(loads.now(), [1]);
-        let scrape = proxy.metrics();
         let counted = "edgerush_listener_responses_total{listener=\"api\",class=\"4xx\"} 1\n";
+        let scrape = scraped(&proxy, counted);
         assert!(scrape.contains(counted), "{scrape}");
         assert!(negotiates(address), "no version negotiation");
     }
