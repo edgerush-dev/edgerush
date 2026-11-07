@@ -9,6 +9,8 @@
 //!
 //! Reading does no I/O and asks no clock: an expired certificate is read as any other.
 
+use boring::asn1::{Asn1Time, Asn1TimeRef};
+use boring::nid::Nid;
 use boring::pkey::{PKey, Private};
 use boring::x509::{X509, X509Ref};
 use edgerush_config::Certificate;
@@ -148,9 +150,47 @@ pub fn spiffe_id(certificate: &X509Ref) -> Option<String> {
     (!domain.is_empty() && !domain.starts_with('/')).then(|| id.to_owned())
 }
 
+/// When a certificate is valid, by its own dates, in seconds since the Unix epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Validity {
+    /// Its notBefore: valid from then.
+    pub not_before: i64,
+    /// Its notAfter: valid until then, and expired after it.
+    pub not_after: i64,
+}
+
+/// When `certificate` is valid, as its dates say; none where BoringSSL cannot read them.
+/// What is said of a certificate out of date is said by whoever has a clock.
+#[must_use]
+pub fn validity(certificate: &X509Ref) -> Option<Validity> {
+    let epoch = Asn1Time::from_unix(0).ok()?;
+    let since = |time: &Asn1TimeRef| {
+        epoch
+            .diff(time)
+            .ok()
+            .map(|diff| i64::from(diff.days) * 86_400 + i64::from(diff.secs))
+    };
+    Some(Validity {
+        not_before: since(certificate.not_before())?,
+        not_after: since(certificate.not_after())?,
+    })
+}
+
+/// The common name of `certificate`'s subject, which says which it is where its names are
+/// many: its last where it has more than one, the most specific, as Go's `x509` reads it;
+/// none where it names none, or not as text.
+#[must_use]
+pub fn common_name(certificate: &X509Ref) -> Option<String> {
+    let entry = certificate
+        .subject_name()
+        .entries_by_nid(Nid::COMMONNAME)
+        .last()?;
+    entry.data().as_utf8().ok().map(|name| name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::testing::certificate;
+    use super::testing::{certificate, dated};
     use super::*;
 
     #[test]
@@ -190,6 +230,59 @@ mod tests {
                 "https://elsewhere.test/",
             ]),
             None
+        );
+    }
+
+    /// Its dates are read as the seconds since the Unix epoch they stand for, whether or not
+    /// they are past: reading asks no clock.
+    #[test]
+    fn a_certificate_says_when_it_is_valid() {
+        for (from, to) in [
+            (1_700_000_000, 1_800_000_000),
+            (0, 86_399),
+            (1_000_000_000, 1_000_000_001),
+            (2_000_000_000, 4_102_444_800),
+        ] {
+            let read = Identity::read(&dated(&["a.test"], Some("a.test"), from, to)).unwrap();
+            assert_eq!(
+                validity(&read.leaf),
+                Some(Validity {
+                    not_before: from,
+                    not_after: to
+                }),
+                "{from}..{to}"
+            );
+        }
+    }
+
+    /// The subject's common name, its last where it has more than one, as the most specific;
+    /// none where the subject names none.
+    #[test]
+    fn a_certificate_says_its_common_name() {
+        let named = |name| {
+            common_name(
+                &Identity::read(&dated(&["a.test"], name, 0, 1))
+                    .unwrap()
+                    .leaf,
+            )
+        };
+        assert_eq!(
+            named(Some("shop.example.com")),
+            Some("shop.example.com".to_owned())
+        );
+        assert_eq!(named(None), None);
+        let mut subject = boring::x509::X509NameBuilder::new().unwrap();
+        for name in ["example", "shop.example.com"] {
+            subject
+                .append_entry_by_nid(boring::nid::Nid::COMMONNAME, name)
+                .unwrap();
+        }
+        let subject = subject.build();
+        let mut two = X509::builder().unwrap();
+        two.set_subject_name(&subject).unwrap();
+        assert_eq!(
+            common_name(&two.build()),
+            Some("shop.example.com".to_owned())
         );
     }
 

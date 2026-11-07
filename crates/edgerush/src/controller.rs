@@ -5,7 +5,9 @@
 //! as `validate` says it, and with `--write-config` written to a file.
 
 use crate::validate::{described, read};
+use bytes::Bytes;
 use edgerush_config::Certificate;
+use edgerush_control_service::metrics;
 use edgerush_control_service::webhook::{self, Bounds};
 use edgerush_control_service::{
     CertificateFiles, Credentials, Files, FilesError, Heard, SslAcceptor, acceptor, reread, serve,
@@ -14,6 +16,7 @@ use edgerush_control_service::{
 use edgerush_control_stream::{Offer, OfferError, Versions};
 use edgerush_controller::acks::{Pods, Reporter, Runs};
 use edgerush_controller::admission::{self, Asked};
+use edgerush_controller::expiry::Expiry;
 use edgerush_controller::lease::{self, elect};
 use edgerush_controller::status::{Addresses, address};
 use edgerush_controller::{Acks, Debounce, Reports, Said, control};
@@ -42,6 +45,7 @@ Usage: edgerush controller --data-plane <FILE> [--namespace <NAME>]... [--write-
          [--status-service <NAMESPACE>/<NAME> | --status-address <ADDRESS>...]
          [--leader-lease <NAMESPACE>/<NAME>]
          [--webhook-listen <ADDRESS> --webhook-certificate <FILE> --webhook-key <FILE>]
+         [--metrics <ADDRESS>]
 
 Runs a control plane for one data plane, in a cluster: follows the IngressClasses,
 Ingresses, Services and Secrets of its scope through the API server, found as a pod finds
@@ -71,6 +75,10 @@ A BackendTLSPolicy's `wellKnownCACertificates: System` trusts the authorities it
 system does, read as it starts: the PEM file SSL_CERT_FILE names, else the system's bundle,
 /etc/ssl/certs/ca-certificates.crt, /etc/ssl/cert.pem or /etc/pki/tls/certs/ca-bundle.crt,
 the first there is. With none, the backends of such a policy fail closed.
+A certificate handed to the data plane expired or not yet valid is served as any other,
+and said on stderr, once for each version of it handed out, by the leader alone where
+replicas elect one, and again by each new leader. With --metrics, every replica serves its
+own metrics there, plain HTTP, at /metrics: when each certificate handed out expires.
 Runs until Ctrl-C, or SIGTERM on Unix, and then exits 0; exits 2 when the command line, the
 data plane's settings, the system's authorities or the stream's or the webhook's
 certificates cannot be used, or it is not in a cluster.
@@ -114,6 +122,7 @@ Options:
       --webhook-certificate <FILE>
                              The webhook's certificate, then its intermediates
       --webhook-key <FILE>   Its private key
+      --metrics <ADDRESS>    Serve /metrics on ADDRESS, such as [::]:9090
   -h, --help                 Print help
 ";
 
@@ -234,6 +243,13 @@ pub(crate) fn command(
         }
         _ => None,
     };
+    let metrics = match options.metrics {
+        Some(address) => match std::net::TcpListener::bind(address) {
+            Ok(listener) => Some(listener),
+            Err(error) => return writeln!(stderr, "error: {address}: {error}").map_or(1, |()| 1),
+        },
+        None => None,
+    };
     let stopped = tokio::task::LocalSet::new().block_on(
         &runtime,
         control_until(
@@ -243,6 +259,7 @@ pub(crate) fn command(
             Listeners {
                 stream: serving,
                 webhook: hooking,
+                metrics,
             },
             elector,
             told_to_stop(),
@@ -264,6 +281,15 @@ fn started_at() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| {
             u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Now, in seconds since the Unix epoch: a clock before the epoch counts from it.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
         })
 }
 
@@ -315,6 +341,8 @@ struct Options {
     /// The Lease a leader is elected by, as its namespace and name, if one is.
     leader: Option<(String, String)>,
     webhook: Option<Box<Webhook>>,
+    /// Where its own metrics are served, if they are.
+    metrics: Option<SocketAddr>,
 }
 
 /// The config stream, as the command line gives it.
@@ -357,6 +385,8 @@ enum UsageError {
     LeaderLease(String),
     #[error("'--webhook-listen {0}' is not an address and a port, such as [::]:8443")]
     WebhookListen(String),
+    #[error("'--metrics {0}' is not an address and a port, such as [::]:9090")]
+    Metrics(String),
     #[error("'--webhook-listen', '--webhook-certificate' and '--webhook-key' are given together")]
     WebhookTogether,
     #[error("'--own-name {0}': {1}")]
@@ -379,6 +409,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut webhook_listen = None;
     let mut webhook_certificate = None;
     let mut webhook_key = None;
+    let mut metrics = None;
     let mut status_addresses = Vec::new();
     let mut own_names: Vec<String> = Vec::new();
     let mut scope = Vec::new();
@@ -399,6 +430,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             "--webhook-certificate" => "--webhook-certificate",
             "--webhook-key" => "--webhook-key",
             "--own-name" => "--own-name",
+            "--metrics" => "--metrics",
             _ => return Err(UsageError::Unexpected(arg)),
         };
         let value = args.next().ok_or(UsageError::NoValue(option))?;
@@ -457,6 +489,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                 }
                 continue;
             }
+            "--metrics" => {
+                let address = value.parse().map_err(|_| UsageError::Metrics(value))?;
+                if metrics.replace(address).is_some() {
+                    return Err(UsageError::Twice(option));
+                }
+                continue;
+            }
             "--data-plane" => &mut data_plane,
             "--certificate" => &mut certificate,
             "--key" => &mut key,
@@ -510,6 +549,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         status,
         leader,
         webhook,
+        metrics,
     })))
 }
 
@@ -580,6 +620,8 @@ struct Listeners {
     stream: Option<Serving>,
     /// The admission webhook, if it is served.
     webhook: Option<Hooking>,
+    /// The control plane's own metrics, if they are served.
+    metrics: Option<std::net::TcpListener>,
 }
 
 /// Runs the control plane through `api` until `stop` is done, serving what `listeners`
@@ -657,6 +699,40 @@ async fn control_until(
     };
     let scope = options.scope;
     let mut tasks = Vec::new();
+    // The dates of the certificates handed out (04 §2, 08 §1): every replica keeps them
+    // for its gauge, and the leader says those out of date.
+    let expiry = Rc::new(RefCell::new(Expiry::new()));
+    let (exposed, exposition) = watch::channel(Bytes::from(expiry.borrow().exposition()));
+    let mut measured = None;
+    if let Some(listener) = listeners.metrics {
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        let (stopping, stopped) = oneshot::channel::<()>();
+        measured = Some((
+            stopping,
+            tokio::spawn(metrics::serve(
+                listener,
+                exposition,
+                metrics::DEADLINE,
+                async move {
+                    let _ = stopped.await;
+                },
+            )),
+        ));
+    }
+    if let Some(mut told) = leading.clone() {
+        let (held, telling) = (Rc::clone(&expiry), Rc::clone(&say));
+        tasks.push(tokio::task::spawn_local(async move {
+            while told.changed().await.is_ok() {
+                if *told.borrow_and_update() {
+                    for line in held.borrow().led(unix_now()) {
+                        telling(&line);
+                    }
+                }
+            }
+        }));
+    }
+    let leads = leading.clone();
     let mut served = None;
     let offering = match listeners.stream {
         Some(serving) => {
@@ -757,6 +833,19 @@ async fn control_until(
                     };
                 }
                 telling(&text);
+                if let Said::Translated(translation) = &said {
+                    // Without an election, this replica is the only one, and leads.
+                    let leading = leads.as_ref().is_none_or(|leads| *leads.borrow());
+                    let out_of_date = expiry.borrow_mut().take(
+                        &translation.config.certificates,
+                        unix_now(),
+                        leading,
+                    );
+                    exposed.send_replace(Bytes::from(expiry.borrow().exposition()));
+                    for line in out_of_date {
+                        telling(&line);
+                    }
+                }
             },
         )
         .await;
@@ -767,6 +856,10 @@ async fn control_until(
         if let Ok(Err(error)) = server.await {
             say(&format!("error: {error}"));
         }
+    }
+    if let Some((stopping, server)) = measured {
+        let _ = stopping.send(());
+        let _ended = server.await;
     }
     if let Some((stopping, ended)) = hooked {
         let _ = stopping.send(());

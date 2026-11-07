@@ -26,6 +26,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             status: None,
             leader: None,
             webhook: None,
+            metrics: None,
         })))
     );
     assert_eq!(
@@ -51,6 +52,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             status: None,
             leader: None,
             webhook: None,
+            metrics: None,
         })))
     );
     assert_eq!(parsed(&["--help"]), Ok(Parsed::Help));
@@ -211,6 +213,7 @@ async fn run_until(
         status: None,
         leader: None,
         webhook: None,
+        metrics: None,
     };
     let stop = {
         let lines = Rc::clone(&lines);
@@ -261,6 +264,7 @@ async fn each_translation_is_said_and_written_as_a_harness_file() {
         Listeners {
             stream: None,
             webhook: None,
+            metrics: None,
         },
         |lines| lines.iter().any(|line| line.starts_with("written to ")),
     )
@@ -310,6 +314,7 @@ async fn a_config_the_data_plane_would_refuse_is_said_and_not_written() {
         Listeners {
             stream: None,
             webhook: None,
+            metrics: None,
         },
         |lines| lines.iter().any(|line| line.contains("listener `port-80`")),
     )
@@ -355,6 +360,7 @@ fn the_stream_is_given_whole_or_not_at_all() {
             status: None,
             leader: None,
             webhook: None,
+            metrics: None,
         })))
     );
     // Each of the four left out.
@@ -454,6 +460,7 @@ fn the_webhook_is_given_whole_or_not_at_all() {
                     key: PathBuf::from("k"),
                 },
             })),
+            metrics: None,
         })))
     );
     // Each of the three left out.
@@ -745,6 +752,7 @@ async fn the_webhook_answers_reviews_and_its_certificate_replaced_serves_the_nex
         Listeners {
             stream: None,
             webhook: Some(hooking),
+            metrics: None,
         },
         move |_| {
             if hold.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -971,6 +979,7 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
         Listeners {
             stream: Some(serving),
             webhook: None,
+            metrics: None,
         },
         |lines| runs(lines) == 2,
     )
@@ -1171,4 +1180,158 @@ fn the_listeners_a_data_plane_does_not_serve_reach_what_its_pod_runs() {
     };
     ran(peer, &opened).unwrap().into(&mut runs);
     assert!(runs.pods()[&peer.ip()].unserved.is_empty());
+}
+
+/// `--metrics` is an address and a port, given once.
+#[test]
+fn metrics_are_served_where_given() {
+    match parsed(&["--data-plane", "p", "--metrics", "[::]:9090"]) {
+        Ok(Parsed::Control(options)) => {
+            assert_eq!(options.metrics, Some("[::]:9090".parse().unwrap()));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        parsed(&["--data-plane", "p", "--metrics", "9090"]),
+        Err(UsageError::Metrics("9090".to_owned()))
+    );
+    assert_eq!(
+        parsed(&["--metrics", "[::]:1", "--metrics", "[::]:2"]),
+        Err(UsageError::Twice("--metrics"))
+    );
+}
+
+/// A fake API server as [`cluster`]'s, its Ingress securing `shop.example` with Secret
+/// `shop/tls`, which holds `certificate`.
+async fn secured_cluster(certificate: &Certificate) -> Fake {
+    let mut secret: k8s_openapi::api::core::v1::Secret = serde_json::from_str(
+        r#"{"metadata":{"name":"tls","namespace":"shop"},"type":"kubernetes.io/tls"}"#,
+    )
+    .unwrap();
+    secret.data = Some(BTreeMap::from([
+        (
+            "tls.crt".to_owned(),
+            k8s_openapi::ByteString(certificate.chain.clone().into_bytes()),
+        ),
+        (
+            "tls.key".to_owned(),
+            k8s_openapi::ByteString(certificate.key.clone().into_bytes()),
+        ),
+    ]));
+    let secret = serde_json::to_string(&secret).unwrap();
+    Fake::start(&["127.0.0.1"], move |path| {
+        if path.contains("watch=true") {
+            return Answer {
+                status: 200,
+                chunks: vec!["\n".into()],
+                pause: Duration::from_secs(60),
+            };
+        }
+        let list = |kind: &str, version: &str, item: &str| {
+            answer(
+                200,
+                &format!(
+                    r#"{{"apiVersion":"{version}","kind":"{kind}List","metadata":{{"resourceVersion":"5"}},"items":[{item}]}}"#
+                ),
+            )
+        };
+        match path.split('?').next().unwrap_or_default() {
+            "/apis/networking.k8s.io/v1/ingressclasses" => list(
+                "IngressClass",
+                "networking.k8s.io/v1",
+                r#"{"metadata":{"name":"edge"},"spec":{"controller":"edgerush.dev/ingress-controller"}}"#,
+            ),
+            "/apis/networking.k8s.io/v1/ingresses" => list(
+                "Ingress",
+                "networking.k8s.io/v1",
+                r#"{"metadata":{"name":"web","namespace":"shop"},"spec":{"ingressClassName":"edge","tls":[{"hosts":["shop.example"],"secretName":"tls"}],"rules":[{"host":"shop.example","http":{"paths":[{"path":"/","pathType":"Prefix","backend":{"service":{"name":"web","port":{"number":80}}}}]}}]}}"#,
+            ),
+            "/api/v1/services" => list(
+                "Service",
+                "v1",
+                r#"{"metadata":{"name":"web","namespace":"shop"},"spec":{"ports":[{"name":"http","port":80}]}}"#,
+            ),
+            "/api/v1/secrets" => list("Secret", "v1", &secret),
+            _ => answer(500, ""),
+        }
+    })
+    .await
+}
+
+/// A certificate handed out expired is still handed out, and said, by its name, common name
+/// and expiry, once; and `/metrics` says when it expires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_certificate_handed_out_expired_is_said_and_its_expiry_scraped() {
+    use std::io::{Read as _, Write as _};
+    // 2017-07-14T02:40:00Z.
+    let expired = edgerush_certificates::testing::dated(
+        &["shop.example"],
+        Some("shop.example"),
+        1_000_000_000,
+        1_500_000_000,
+    );
+    let fake = secured_cluster(&expired).await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    // Scraped from a thread of its own, until the certificate is there.
+    let scraped: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+    let scraping = Arc::clone(&scraped);
+    let scraper = std::thread::spawn(move || {
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < until {
+            if let Ok(mut stream) = std::net::TcpStream::connect(address) {
+                let asked = stream.write_all(
+                    b"GET /metrics HTTP/1.1\r\nhost: metrics.test\r\nconnection: close\r\n\r\n",
+                );
+                let mut answer = String::new();
+                if asked.is_ok()
+                    && stream.read_to_string(&mut answer).is_ok()
+                    && answer.contains("certificate=\"shop/tls\"")
+                {
+                    *scraping.lock().unwrap() = Some(answer);
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    let waiting = Arc::clone(&scraped);
+    let lines = run_until(
+        &fake,
+        "controller-expiry",
+        &plane(),
+        None,
+        Listeners {
+            stream: None,
+            webhook: None,
+            metrics: Some(listener),
+        },
+        move |lines| {
+            lines.iter().any(|line| line.contains("expired at"))
+                && waiting.lock().unwrap().is_some()
+        },
+    )
+    .await;
+    scraper.join().unwrap();
+    let said: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains("expired at"))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            "certificate shop/tls (common name shop.example) expired at 2017-07-14T02:40:00Z: it \
+          is served, and clients will refuse it"
+        ],
+        "{lines:?}"
+    );
+    let scraped = scraped.lock().unwrap().take().unwrap();
+    assert!(scraped.starts_with("HTTP/1.1 200 OK\r\n"), "{scraped}");
+    assert!(
+        scraped.contains(
+            "\nedgerush_certificate_expiry_timestamp_seconds{certificate=\"shop/tls\",\
+             common_name=\"shop.example\"} 1500000000\n"
+        ),
+        "{scraped}"
+    );
 }

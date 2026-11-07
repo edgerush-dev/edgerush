@@ -8,10 +8,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Each certificate handed out read for its dates, and the gauge of them written (08 §1).
+edgerush-certificates.workspace = true
 edgerush-config.workspace = true
 # The Gateway API kinds followed.
 edgerush-gateway-api.workspace = true
 edgerush-kubernetes.workspace = true
+edgerush-telemetry.workspace = true
 edgerush-translate.workspace = true
 k8s-openapi.workspace = true
 # The admission webhook's reviews, read (04 §3).

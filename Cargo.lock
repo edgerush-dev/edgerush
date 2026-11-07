@@ -263,6 +263,7 @@ name = "edgerush"
 version = "0.0.0"
 dependencies = [
  "boring",
+ "bytes",
  "edgerush-certificates",
  "edgerush-config",
  "edgerush-control-service",
@@ -377,6 +378,7 @@ dependencies = [
  "edgerush-config",
  "edgerush-gateway-api",
  "edgerush-kubernetes",
+ "edgerush-telemetry",
  "edgerush-translate",
  "k8s-openapi",
  "proptest",

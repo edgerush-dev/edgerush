@@ -48,6 +48,7 @@ use tokio::time::Instant;
 
 pub mod acks;
 pub mod admission;
+pub mod expiry;
 pub mod gateway_api;
 mod gateway_status;
 pub mod lease;
