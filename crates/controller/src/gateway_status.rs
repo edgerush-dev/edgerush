@@ -516,9 +516,11 @@ as_http!(
 /// What the status of a route of `namespace`, of any kind, is to say, as `wanted` has it of its
 /// parents that are `parents_of_ours`, the data plane's Gateway and the ListenerSets naming
 /// it, merged with `live`: none wanted where it no longer names one. Other controllers'
-/// parents, and this controller's of other Gateways (other data planes'), are kept whole;
-/// this controller's of `parents_of_ours` are those wanted, in their order, after them, as
-/// many as the status can hold.
+/// parents, and this controller's of other Gateways (other data planes'), are kept whole
+/// where they are. This controller's of `parents_of_ours` are those wanted: each written in
+/// the place of the first the status holds for its parent, any others for it taken away, or
+/// after the rest, in their order, as many as the status can hold. They stay where they are,
+/// so that another writer doing likewise never finds them moved.
 pub(crate) fn route(
     live: Option<&HTTPRouteStatus>,
     namespace: &str,
@@ -539,41 +541,54 @@ pub(crate) fn route(
                     && to.name == ours.name
             })
     };
-    let mut parents: Vec<HTTPRouteStatusParents> = live_parents
-        .iter()
-        .filter(|parent| !ours(parent))
-        .cloned()
-        .collect();
-    if let Some(wanted) = wanted {
-        for parent in &wanted.parents {
-            if parents.len() >= MOST_PARENTS {
-                break;
-            }
-            let parent_ref = HTTPRouteStatusParentsParentRef {
-                group: Some(GROUP.to_owned()),
-                kind: Some(parent.kind.to_owned()),
-                name: parent.name.clone(),
-                namespace: parent.namespace.clone(),
-                port: parent.port,
-                section_name: parent.section_name.clone(),
-            };
-            let old = live_parents
-                .iter()
-                .find(|old| ours(old) && same(&old.parent_ref, &parent_ref, namespace))
-                .map(|old| old.conditions.as_slice())
-                .unwrap_or_default();
-            parents.push(HTTPRouteStatusParents {
-                conditions: merged(
-                    old,
-                    parent.conditions.iter().map(Wanted::from).collect(),
-                    &PARENT_TYPES,
-                    wanted.generation,
-                    now,
-                ),
-                controller_name: GATEWAY_CONTROLLER.to_owned(),
-                parent_ref,
-            });
+    let (generation, wanted) = wanted.map_or((0, &[][..]), |wanted| {
+        (wanted.generation, wanted.parents.as_slice())
+    });
+    let made = |old: &[Condition],
+                parent_ref: HTTPRouteStatusParentsParentRef,
+                parent: &translate::ParentStatus| HTTPRouteStatusParents {
+        conditions: merged(
+            old,
+            parent.conditions.iter().map(Wanted::from).collect(),
+            &PARENT_TYPES,
+            generation,
+            now,
+        ),
+        controller_name: GATEWAY_CONTROLLER.to_owned(),
+        parent_ref,
+    };
+    let mut wanted: Vec<Option<(HTTPRouteStatusParentsParentRef, &translate::ParentStatus)>> =
+        wanted
+            .iter()
+            .map(|parent| {
+                let parent_ref = HTTPRouteStatusParentsParentRef {
+                    group: Some(GROUP.to_owned()),
+                    kind: Some(parent.kind.to_owned()),
+                    name: parent.name.clone(),
+                    namespace: parent.namespace.clone(),
+                    port: parent.port,
+                    section_name: parent.section_name.clone(),
+                };
+                Some((parent_ref, parent))
+            })
+            .collect();
+    let mut parents = Vec::new();
+    for old in live_parents {
+        if !ours(old) {
+            parents.push(old.clone());
+        } else if let Some(slot) = wanted.iter_mut().find(|slot| {
+            slot.as_ref()
+                .is_some_and(|(parent_ref, _)| same(&old.parent_ref, parent_ref, namespace))
+        }) && let Some((parent_ref, parent)) = slot.take()
+        {
+            parents.push(made(&old.conditions, parent_ref, parent));
         }
+    }
+    for (parent_ref, parent) in wanted.into_iter().flatten() {
+        if parents.len() >= MOST_PARENTS {
+            break;
+        }
+        parents.push(made(&[], parent_ref, parent));
     }
     HTTPRouteStatus { parents }
 }

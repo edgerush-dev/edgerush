@@ -465,13 +465,13 @@ fn wanted_route(generation: i64) -> RouteStatus {
 }
 
 #[test]
-fn a_routes_parents_are_ours_of_our_gateway_beside_every_other_kept_whole() {
+fn a_routes_parents_are_ours_of_our_gateway_in_place_beside_every_other_kept_whole() {
     let theirs = parent("example.com/other", Some("edge"), "web");
     let another_plane = parent(GATEWAY_CONTROLLER, Some("edge"), "other");
     let live = HTTPRouteStatus {
         parents: vec![
-            parent(GATEWAY_CONTROLLER, Some("edge"), "web"),
             theirs.clone(),
+            parent(GATEWAY_CONTROLLER, Some("edge"), "web"),
             another_plane.clone(),
         ],
     };
@@ -485,10 +485,10 @@ fn a_routes_parents_are_ours_of_our_gateway_beside_every_other_kept_whole() {
     assert_eq!(status.parents.len(), 3);
     assert_eq!(status.parents[0], theirs, "another controller's changed");
     assert_eq!(
-        status.parents[1], another_plane,
-        "another data plane's changed"
+        status.parents[2], another_plane,
+        "another data plane's changed or moved"
     );
-    let ours = &status.parents[2];
+    let ours = &status.parents[1];
     assert_eq!(ours.controller_name, GATEWAY_CONTROLLER);
     assert_eq!(ours.parent_ref.name, "web");
     assert_eq!(
@@ -501,6 +501,76 @@ fn a_routes_parents_are_ours_of_our_gateway_beside_every_other_kept_whole() {
     // A route that no longer names the Gateway has no parent of ours there, the rest kept.
     let gone = route(Some(&live), "shop", &[web()], None, at(60));
     assert_eq!(gone.parents, [theirs, another_plane]);
+}
+
+/// Two data planes whose Gateways are both parents of a route each write its status as it
+/// is: neither finds the other's write moved its own, so they settle.
+#[test]
+fn two_data_planes_writing_a_routes_status_in_turn_settle() {
+    let other = Object {
+        kind: "Gateway",
+        namespace: "edge".to_owned(),
+        name: "other".to_owned(),
+    };
+    let of_web = wanted_route(2);
+    let mut of_other = wanted_route(2);
+    of_other.parents[0].name = "other".to_owned();
+    let by_web = route(None, "shop", &[web()], Some(&of_web), at(50));
+    let by_other = route(
+        Some(&by_web),
+        "shop",
+        std::slice::from_ref(&other),
+        Some(&of_other),
+        at(51),
+    );
+    let again = route(Some(&by_other), "shop", &[web()], Some(&of_web), at(52));
+    assert_eq!(again, by_other, "the first wrote it again");
+    let again = route(Some(&again), "shop", &[other], Some(&of_other), at(53));
+    assert_eq!(again, by_other, "the second wrote it again");
+}
+
+/// A parent of ours the status does not hold yet goes after the rest, one it holds staying
+/// in its place.
+#[test]
+fn a_routes_new_parent_of_ours_goes_after_the_rest() {
+    let set = Object {
+        kind: "ListenerSet",
+        namespace: "shop".to_owned(),
+        name: "team".to_owned(),
+    };
+    let theirs = parent("example.com/other", Some("edge"), "web");
+    let live = HTTPRouteStatus {
+        parents: vec![
+            parent(GATEWAY_CONTROLLER, Some("edge"), "web"),
+            theirs.clone(),
+        ],
+    };
+    let mut wanted = wanted_route(2);
+    let mut of_set = wanted.parents[0].clone();
+    of_set.kind = "ListenerSet";
+    of_set.namespace = None;
+    of_set.name = "team".to_owned();
+    wanted.parents.insert(0, of_set);
+    let status = route(Some(&live), "shop", &[web(), set], Some(&wanted), at(50));
+    let names: Vec<(&str, &str)> = status
+        .parents
+        .iter()
+        .map(|p| (p.controller_name.as_str(), p.parent_ref.name.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            (GATEWAY_CONTROLLER, "web"),
+            ("example.com/other", "web"),
+            (GATEWAY_CONTROLLER, "team"),
+        ]
+    );
+    assert_eq!(status.parents[1], theirs);
+    assert_eq!(
+        status.parents[0].conditions[0].last_transition_time,
+        Time(at(10)),
+        "the Gateway's taken for a new parent"
+    );
 }
 
 /// A ListenerSet's status is of its own listeners, its `Programmed` the config's while one
@@ -601,10 +671,13 @@ fn a_routes_parent_of_a_listener_set_is_ours_and_said_of_its_kind() {
 
 #[test]
 fn a_parent_of_the_routes_own_namespace_is_the_same_written_either_way() {
-    // A route of the Gateway's own namespace whose status names it with no namespace, and
-    // whose parentRef now names it with its namespace.
+    // A route of the Gateway's own namespace whose status names it with no namespace, twice,
+    // and whose parentRef now names it with its namespace.
     let live = HTTPRouteStatus {
-        parents: vec![parent(GATEWAY_CONTROLLER, None, "web")],
+        parents: vec![
+            parent(GATEWAY_CONTROLLER, None, "web"),
+            parent(GATEWAY_CONTROLLER, None, "web"),
+        ],
     };
     let wanted = wanted_route(2);
     let status = route(Some(&live), "edge", &[web()], Some(&wanted), at(50));
