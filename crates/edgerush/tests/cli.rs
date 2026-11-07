@@ -914,6 +914,30 @@ fn a_second_signal_while_draining_exits_at_once() -> io::Result<()> {
     Ok(())
 }
 
+/// A second signal that arrives just after the first, before the first has been acted on,
+/// is not lost: every signal stays listened for between one and the next.
+#[cfg(unix)]
+#[test]
+fn a_second_signal_on_the_heels_of_the_first_is_heard() -> io::Result<()> {
+    let (up, arrived, _release) = held_upstream()?;
+    let file = scratch("stopped-twice-at-once.yaml");
+    std::fs::write(&file, config("127.0.0.1:0", "up", Some(up)))?;
+    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
+    let web = harness.address_after("listener \"web\" is on ");
+    harness.wait_for("1 worker, thread-per-core");
+
+    let mut under_way = TcpStream::connect(web)?;
+    under_way.write_all(b"GET / HTTP/1.1\r\nhost: harness.test\r\n\r\n")?;
+    arrived
+        .recv_timeout(PATIENCE)
+        .expect("the request reached the upstream");
+    harness.signals(&["TERM", "INT"])?;
+    let said = harness.wait_for("stopped while draining");
+    assert_eq!(said, "stopped while draining: 1 connections cut off");
+    assert_eq!(harness.exited()?.code(), Some(0));
+    Ok(())
+}
+
 /// A second worker wants a second socket on the one port, which is `SO_REUSEPORT` and is
 /// not everywhere. One worker asks nothing of the kernel and runs anywhere.
 #[cfg(not(unix))]
@@ -1589,6 +1613,23 @@ impl Harness {
             .arg(self.process.id().to_string())
             .status()?;
         assert!(status.success(), "kill -{name} failed");
+        Ok(())
+    }
+
+    /// Sends the process the signals named, in order, from one shell's own `kill`, so that
+    /// they arrive microseconds apart rather than a process start apart.
+    #[cfg(unix)]
+    fn signals(&self, names: &[&str]) -> io::Result<()> {
+        let kills: Vec<String> = names
+            .iter()
+            .map(|name| format!("kill -{name} $0"))
+            .collect();
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(kills.join(" && "))
+            .arg(self.process.id().to_string())
+            .status()?;
+        assert!(status.success(), "{kills:?} failed");
         Ok(())
     }
 

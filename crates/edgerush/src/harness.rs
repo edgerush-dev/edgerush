@@ -1404,6 +1404,13 @@ fn drained(
 fn signals(stopping: Sender<Told>, reopen: impl Fn() + Send + 'static) -> io::Result<()> {
     let runtime = Builder::new_current_thread().enable_io().build()?;
     let entered = runtime.enter();
+    // Each is listened for from here on, between one signal and the next too. A listener
+    // made afresh after each signal would miss one sent just after it: a second signal,
+    // which is to exit at once, would go unheard.
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    #[cfg(not(unix))]
+    let mut interrupt = tokio::signal::windows::ctrl_c()?;
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     #[cfg(unix)]
@@ -1411,37 +1418,34 @@ fn signals(stopping: Sender<Told>, reopen: impl Fn() + Send + 'static) -> io::Re
     #[cfg(not(unix))]
     drop(reopen);
     drop(entered);
-    // Ctrl-C is listened for from the first poll of what waits for it, on that thread.
-    let (listening, listens) = mpsc::channel();
     thread::Builder::new()
         .name("signals".to_owned())
         .spawn(move || {
             runtime.block_on(async move {
                 loop {
-                    let mut interrupt = std::pin::pin!(tokio::signal::ctrl_c());
-                    let told = std::future::poll_fn(|cx| {
+                    std::future::poll_fn(|cx| {
                         #[cfg(unix)]
                         while let std::task::Poll::Ready(Some(())) = rotate.poll_recv(cx) {
                             reopen();
                         }
+                        // A signal no longer listened for is one that is not heard; the
+                        // others still are, and so is being killed.
                         #[cfg(unix)]
-                        if terminate.poll_recv(cx).is_ready() {
-                            return std::task::Poll::Ready(Ok(()));
+                        if let std::task::Poll::Ready(Some(())) = terminate.poll_recv(cx) {
+                            return std::task::Poll::Ready(());
                         }
-                        let polled = interrupt.as_mut().poll(cx);
-                        let _listening = listening.send(());
-                        polled
+                        if let std::task::Poll::Ready(Some(())) = interrupt.poll_recv(cx) {
+                            return std::task::Poll::Ready(());
+                        }
+                        std::task::Poll::Pending
                     })
                     .await;
-                    // A signal that cannot be listened for is one that is not heard; the
-                    // others still are, and so is being killed.
-                    if told.is_err() || stopping.send(Told::Stop).is_err() {
+                    if stopping.send(Told::Stop).is_err() {
                         return;
                     }
                 }
             });
         })?;
-    let _listening = listens.recv();
     Ok(())
 }
 
