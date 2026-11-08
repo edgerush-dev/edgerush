@@ -327,7 +327,7 @@ crates/certificates
                    translation admits are read by the same code; no I/O
 crates/cluster     the rate-limiting service's cluster store (`edgerush-cluster`): an elected
                    table of shard owners, leases, copies to replicas and handoffs, for any value
-                   that merges; pure, no I/O, used by nothing yet
+                   that merges; pure, no I/O; the service's synchronous mode runs on it
 crates/cluster-asynchronous
                    the asynchronous mode on the cluster store (`edgerush-cluster-asynchronous`):
                    the owner's state of a key as the store's value, merged by the larger of
@@ -340,7 +340,7 @@ crates/cluster-sim the cluster's simulation (`edgerush-cluster-sim`): the store'
 crates/cluster-synchronous
                    the synchronous mode on the cluster store (`edgerush-cluster-synchronous`):
                    each request decided by its key's owner, give-backs and requests under
-                   several keys; pure, no I/O, used by nothing yet
+                   several keys; pure, no I/O; the service runs it
 crates/config      the config model and its compilation (`edgerush-config`): pure, format-free
 crates/control-service
                    the config stream over gRPC and mutual TLS (`edgerush-control-service`):
