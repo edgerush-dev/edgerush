@@ -185,7 +185,10 @@ fn the_class_says_whether_every_kinds_release_is_supported() {
 fn wanted_gateway() -> translate::GatewayStatus {
     translate::GatewayStatus {
         generation: 4,
-        conditions: vec![said("Accepted", true, "Accepted")],
+        conditions: vec![
+            said("Accepted", true, "Accepted"),
+            said("ResolvedRefs", false, "ListenersNotResolved"),
+        ],
         programmable: true,
         listeners: vec![
             ListenerStatus {
@@ -220,7 +223,10 @@ fn a_gateway_says_its_listeners_as_wanted_and_keeps_what_is_not_ours() {
     let live = GatewayStatus {
         addresses: None,
         attached_listener_sets: Some(3),
-        conditions: Some(vec![condition("Accepted", "True", "Accepted", 3, 10)]),
+        conditions: Some(vec![
+            condition("Accepted", "True", "Accepted", 3, 10),
+            condition("ResolvedRefs", "True", "ResolvedRefs", 3, 10),
+        ]),
         listeners: Some(vec![
             GatewayStatusListeners {
                 attached_routes: 1,
@@ -253,8 +259,10 @@ fn a_gateway_says_its_listeners_as_wanted_and_keeps_what_is_not_ours() {
         seen(status.conditions.as_deref().unwrap()),
         [
             ("Accepted".to_owned(), "True".to_owned(), 10),
+            ("ResolvedRefs".to_owned(), "False".to_owned(), 50),
             ("Programmed".to_owned(), "Unknown".to_owned(), 50),
-        ]
+        ],
+        "the Gateway's own ResolvedRefs is ours, its old one replaced"
     );
     let listeners = status.listeners.unwrap();
     let names: Vec<&str> = listeners.iter().map(|l| l.name.as_str()).collect();

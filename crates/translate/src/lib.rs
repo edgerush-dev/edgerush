@@ -858,6 +858,13 @@ pub enum Problem {
         /// Why.
         why: String,
     },
+    /// The client certificate the data plane's Gateway names for backends cannot be used
+    /// (its `ResolvedRefs` false): every backend reached over TLS is reached without one,
+    /// as the spec leaves the Gateway accepted (04 §2).
+    #[error(
+        "its client certificate cannot be used, and backends are reached over TLS without one: {0}"
+    )]
+    ClientCertificate(String),
     /// A host an Ingress serves over plain HTTP alone is a Gateway HTTPS listener's
     /// hostname: served over HTTPS by that listener's certificate, no longer refused over TLS
     /// (04 §2). A note: a move from Ingress to Gateway API, as it is meant to be made.
@@ -1639,6 +1646,9 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     config.tcp_routes = tcp;
     if let Some(gateway) = &gateway {
         gateway_tls(&mut config, gateway, cluster, &mut report);
+        if let Some(Ok(name)) = &gateway.client_certificate {
+            client_certificate(&mut config, name, cluster);
+        }
     }
     shared_by(&mut config, gateway.as_ref(), &presented, &ingress_https);
     // Ingress's HTTPS port shared for it with a Gateway's TLS listeners, and no Ingress
@@ -2059,6 +2069,37 @@ fn gateway_tls(
         if let Some(name) = without_sni.remove(&listening) {
             tls.without_sni = name;
         }
+    }
+}
+
+/// The data plane's Gateway's client certificate, `name`, shown by every upstream reached
+/// over TLS, whichever API's backend it is, Ingress's included, as the data plane is that
+/// Gateway to every backend (04 §2); carried with the config only while one is.
+fn client_certificate(config: &mut Config, name: &str, cluster: &Cluster) {
+    let mut shown = false;
+    for tls in config.upstreams.values_mut().filter_map(|u| u.tls.as_mut()) {
+        tls.client_certificate = Some(name.to_owned());
+        shown = true;
+    }
+    if !shown {
+        return;
+    }
+    let certificate = if cluster.secrets_assumed {
+        // Named, and not looked at: what it holds is the cluster's.
+        Some(Certificate {
+            chain: String::new(),
+            key: String::new(),
+        })
+    } else {
+        name.split_once('/').and_then(|(namespace, secret)| {
+            secret_certificate(cluster, namespace, secret)
+                .ok()
+                .map(|(certificate, _)| certificate)
+        })
+    };
+    // Read once already, when the Gateway's outcome was.
+    if let Some(certificate) = certificate {
+        config.certificates.insert(name.to_owned(), certificate);
     }
 }
 
@@ -3377,5 +3418,39 @@ spec: { ports: [{ name: http, port: 80 }] }
             problems[0].starts_with("the data plane: `set_aside_ms` is 0"),
             "{problems:?}"
         );
+    }
+
+    /// The Gateway's client certificate is shown by each upstream reached over TLS, and
+    /// carried with the config only while one is.
+    #[test]
+    fn a_client_certificate_is_carried_only_while_shown() {
+        let config = |upstreams: &str| -> Config {
+            serde_saphyr::from_str(&format!(
+                "listeners: {{}}\nroutes: []\nupstreams:\n{upstreams}"
+            ))
+            .unwrap()
+        };
+        let plain = "  plain: { load_balancer: p2c, endpoints: { listed: [] } }\n";
+        let secure = "  secure: { load_balancer: p2c, endpoints: { listed: [] }, tls: { server_name: backend.internal, authorities: [\"CA\"] } }\n";
+        let assumed = Cluster {
+            secrets_assumed: true,
+            ..Cluster::default()
+        };
+
+        let mut clear = config(plain);
+        client_certificate(&mut clear, "shop/client", &assumed);
+        assert!(clear.upstreams["plain"].tls.is_none());
+        assert!(clear.certificates.is_empty());
+
+        let mut both = config(&format!("{plain}{secure}"));
+        client_certificate(&mut both, "shop/client", &assumed);
+        let shown = both.upstreams["secure"].tls.as_ref().unwrap();
+        assert_eq!(shown.client_certificate.as_deref(), Some("shop/client"));
+        assert!(both.upstreams["plain"].tls.is_none());
+        assert_eq!(
+            both.certificates.keys().collect::<Vec<_>>(),
+            ["shop/client"]
+        );
+        assert!(compile(&both).is_ok());
     }
 }

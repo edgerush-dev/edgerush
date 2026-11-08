@@ -1,4 +1,4 @@
-Gateway, generation 0: Accepted=True/Accepted
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener wild: TLSRoute, attached 3: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener api: TLSRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener idle: TLSRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

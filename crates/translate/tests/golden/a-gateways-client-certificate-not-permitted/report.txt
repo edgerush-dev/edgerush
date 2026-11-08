@@ -1,0 +1,1 @@
+Gateway shop/web: its client certificate cannot be used, and backends are reached over TLS without one: Secret certs/client is another namespace's, and no ReferenceGrant there lets Gateways of shop reach it

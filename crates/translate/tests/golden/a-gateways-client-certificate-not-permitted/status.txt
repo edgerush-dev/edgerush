@@ -1,0 +1,4 @@
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Secret certs/client is another namespace's, and no ReferenceGrant there lets Gateways of shop reach it)
+listener http: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/pages, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+BackendTLSPolicy shop/tls, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

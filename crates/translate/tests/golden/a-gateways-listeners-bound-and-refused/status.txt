@@ -1,4 +1,4 @@
-Gateway, generation 0: Accepted=True/ListenersNotValid (listeners not accepted: secure, dns, second)
+Gateway, generation 0: Accepted=True/ListenersNotValid (listeners not accepted: secure, dns, second); ResolvedRefs=False/ListenersNotResolved (listeners with refs not resolved: unsigned)
 listener http: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener elsewhere: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener plain-on-secure: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

@@ -39,6 +39,11 @@ pub struct GatewayOutcome {
     /// Each ListenerSet naming it as its parent, in precedence: those it takes, whose
     /// listeners are among `listeners`, and those it does not.
     pub sets: Vec<SetOutcome>,
+    /// The client certificate it shows every backend it reaches over TLS
+    /// (`spec.tls.backend.clientCertificateRef`), by the config's name for it,
+    /// `<namespace>/<Secret>`; or why it cannot be used, which leaves those backends reached
+    /// without one (04 §2). None where it names none.
+    pub client_certificate: Option<Result<String, RefProblem>>,
 }
 
 /// A ListenerSet naming the data plane's Gateway as its parent.
@@ -485,13 +490,67 @@ pub(crate) fn outcome(
             problem: Problem::NoListenerServed,
         });
     }
+    let client_certificate = client_certificate(gateway, &named.namespace, cluster);
+    if let Some(Err(why)) = &client_certificate {
+        report.push(Finding {
+            object: object.clone(),
+            problem: Problem::ClientCertificate(why.why.clone()),
+        });
+    }
     Some(GatewayOutcome {
         gateway: object,
         generation: gateway.metadata.generation.unwrap_or_default(),
         listeners,
         ports,
         sets,
+        client_certificate,
     })
+}
+
+/// The client certificate `gateway`, of `namespace`, shows backends it reaches over TLS, if
+/// it names one, by the config's name for it: a Secret of its namespace, or of one whose
+/// ReferenceGrant lets Gateways of `namespace` reach it, asked first, as the spec has
+/// `RefNotPermitted` before `InvalidClientCertificateRef`; holding a certificate and key the
+/// data plane can use, read as a listener's are (04 §2). Or why it cannot be used.
+fn client_certificate(
+    gateway: &Gateway,
+    namespace: &str,
+    cluster: &Cluster,
+) -> Option<Result<String, RefProblem>> {
+    let reference = gateway
+        .spec
+        .tls
+        .as_ref()?
+        .backend
+        .as_ref()?
+        .client_certificate_ref
+        .as_ref()?;
+    let in_namespace = reference.namespace.as_deref().unwrap_or(namespace);
+    let name = &reference.name;
+    let kind = if reference.group.is_empty() {
+        reference.kind.clone()
+    } else {
+        format!("{}/{}", reference.group, reference.kind)
+    };
+    if let Err(why) = reachable(
+        cluster,
+        ("Gateway", namespace),
+        (kind.as_str(), in_namespace, name),
+    ) {
+        return Some(Err(RefProblem::new(RefReason::NotPermitted, why)));
+    }
+    if !(reference.group.is_empty() && reference.kind == "Secret") {
+        return Some(Err(RefProblem::new(
+            RefReason::InvalidKind,
+            format!("a clientCertificateRef of kind {kind} is not one translation reads"),
+        )));
+    }
+    if !cluster.secrets_assumed
+        && let Err(why) = secret_certificate(cluster, in_namespace, name)
+    {
+        return Some(Err(RefProblem::new(RefReason::NotFound, why)));
+    }
+    Some(Ok(format!("{in_namespace}/{name}")))
 }
 
 /// An HTTPS listener's certificates, put in `listener`: each of its `certificateRefs` that
@@ -1318,6 +1377,116 @@ mod tests {
         assert!(
             !selected.allow("unseen", &cluster),
             "a namespace not seen has no labels to match"
+        );
+    }
+
+    /// A Gateway's `clientCertificateRef` is asked first whether it may be reached, as the
+    /// spec has `RefNotPermitted` before `InvalidClientCertificateRef`; then whether it is a
+    /// Secret; then whether the Secret holds a certificate and key the data plane can use,
+    /// unless Secrets are assumed.
+    #[test]
+    fn a_client_certificate_is_granted_then_of_its_kind_then_usable() {
+        use crate::RefReason::{InvalidKind, NotFound, NotPermitted};
+        use edgerush_gateway_api::gateway::Gateway;
+        use k8s_openapi::api::core::v1::Secret;
+
+        // The tests' Secrets of namespace shop, and shop-tls again in namespace certs.
+        let mut secrets: Vec<Secret> = include_str!("../tests/golden/shared.yaml")
+            .split("\n---\n")
+            .filter(|doc| doc.contains("\nkind: Secret\n"))
+            .map(|doc| serde_saphyr::from_str(doc).unwrap())
+            .collect();
+        let mut elsewhere = secrets
+            .iter()
+            .find(|secret| secret.metadata.name.as_deref() == Some("shop-tls"))
+            .unwrap()
+            .clone();
+        elsewhere.metadata.namespace = Some("certs".to_owned());
+        secrets.push(elsewhere);
+        let grant = serde_saphyr::from_str(
+            "metadata: { name: gateways-of-shop, namespace: certs }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: Gateway, namespace: shop }]
+  to: [{ group: \"\", kind: Secret, name: shop-tls }]
+",
+        )
+        .unwrap();
+        let cluster = Cluster {
+            secrets,
+            reference_grants: vec![grant],
+            ..Cluster::default()
+        };
+        let of = |tls: &str, cluster: &Cluster| {
+            let gateway: Gateway = serde_saphyr::from_str(&format!(
+                "metadata: {{ name: web, namespace: shop }}
+spec: {{ gatewayClassName: edgerush, listeners: []{tls} }}
+"
+            ))
+            .unwrap();
+            super::client_certificate(&gateway, "shop", cluster)
+                .map(|came_to| came_to.map_err(|problem| problem.reason))
+        };
+        let reference = |reference: &str| {
+            format!(", tls: {{ backend: {{ clientCertificateRef: {reference} }} }}")
+        };
+        let ok = |name: &str| Some(Ok(name.to_owned()));
+
+        assert_eq!(of("", &cluster), None);
+        assert_eq!(of(", tls: { backend: {} }", &cluster), None);
+        for (written, came_to) in [
+            ("{ name: shop-tls }", ok("shop/shop-tls")),
+            ("{ name: shop-tls, namespace: shop }", ok("shop/shop-tls")),
+            ("{ name: shop-tls, namespace: certs }", ok("certs/shop-tls")),
+            ("{ name: other, namespace: certs }", Some(Err(NotPermitted))),
+            (
+                "{ name: shop-tls, namespace: blog }",
+                Some(Err(NotPermitted)),
+            ),
+            // Of a kind the grant does not name: not permitted, before its kind is asked.
+            (
+                "{ kind: ConfigMap, name: shop-tls, namespace: certs }",
+                Some(Err(NotPermitted)),
+            ),
+            (
+                "{ kind: ConfigMap, name: shop-tls }",
+                Some(Err(InvalidKind)),
+            ),
+            (
+                "{ group: example.com, kind: Secret, name: shop-tls }",
+                Some(Err(InvalidKind)),
+            ),
+            ("{ name: absent }", Some(Err(NotFound))),
+            ("{ name: keyless }", Some(Err(NotFound))),
+            ("{ name: mismatched }", Some(Err(NotFound))),
+        ] {
+            assert_eq!(of(&reference(written), &cluster), came_to, "{written}");
+        }
+
+        // A namespace not watched: no grant there can be seen.
+        let unwatched = Cluster {
+            watched: Some(vec!["shop".to_owned()]),
+            ..cluster.clone()
+        };
+        assert_eq!(
+            of(
+                &reference("{ name: shop-tls, namespace: certs }"),
+                &unwatched
+            ),
+            Some(Err(NotPermitted))
+        );
+
+        // Assumed, a Secret is taken as named, not looked at; a grant is still asked.
+        let assumed = Cluster {
+            secrets_assumed: true,
+            ..cluster.clone()
+        };
+        assert_eq!(
+            of(&reference("{ name: absent }"), &assumed),
+            ok("shop/absent")
+        );
+        assert_eq!(
+            of(&reference("{ name: shop-tls, namespace: blog }"), &assumed),
+            Some(Err(NotPermitted))
         );
     }
 }

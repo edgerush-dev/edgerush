@@ -1,4 +1,4 @@
-Gateway, generation 0: Accepted=True/Accepted
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener http: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 HTTPRoute shop/pages, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 BackendTLSPolicy shop/elder, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

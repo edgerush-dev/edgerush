@@ -1,4 +1,4 @@
-Gateway, generation 0: Accepted=True/Accepted
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=False/ListenersNotResolved (listeners with refs not resolved: kinds, wild-unusable, unusable, denied)
 listener catch-all: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener exact: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener wild: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

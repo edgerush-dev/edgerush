@@ -1,4 +1,4 @@
-Gateway, generation 0: Accepted=True/Accepted
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener one: TCPRoute, attached 3: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener two: TCPRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener three: TCPRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

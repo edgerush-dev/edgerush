@@ -1,4 +1,4 @@
-Gateway, generation 0: Accepted=True/Accepted
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=False/ListenersNotResolved (listeners with refs not resolved: tls-only)
 listener any: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener example: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener foo: HTTPRoute, GRPCRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
