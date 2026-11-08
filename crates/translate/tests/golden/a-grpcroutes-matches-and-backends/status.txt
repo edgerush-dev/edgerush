@@ -1,3 +1,3 @@
-Gateway, generation 0: Accepted=True/Accepted
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener http: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 GRPCRoute shop/orders, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=False/UnsupportedProtocol (Service shop/orders port ws has appProtocol kubernetes.io/ws; a GRPCRoute's backend is spoken to in HTTP/2 in the clear, on a port of none or of kubernetes.io/h2c, grpc or http2; Service shop/orders port web has appProtocol http; a GRPCRoute's backend is spoken to in HTTP/2 in the clear, on a port of none or of kubernetes.io/h2c, grpc or http2); PartiallyInvalid=True/UnsupportedValue (Dropped Rule: rule 4 answers UNAVAILABLE for all it matches: not supported yet: a backend's filters)

@@ -1,4 +1,4 @@
-Gateway, generation 4: Accepted=True/Accepted
+Gateway, generation 4: Accepted=True/Accepted; ResolvedRefs=False/ListenersNotResolved (listeners with refs not resolved: unwatched, ungranted)
 listener http: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener unwatched: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Secret blog/cert is in blog, which the control plane does not watch, so no ReferenceGrant there can be seen); Programmed=False/Invalid (no certificateRef of it can be used)
 listener ungranted: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Secret news/cert is another namespace's, and no ReferenceGrant there lets Gateways of edge reach it); Programmed=False/Invalid (no certificateRef of it can be used)

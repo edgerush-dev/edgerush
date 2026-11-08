@@ -1,4 +1,4 @@
-Gateway, generation 0: Accepted=True/Accepted
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=False/ListenersNotResolved (listeners with refs not resolved: kinds-mixed, kinds-none-carried)
 listener kinds-mixed: HTTPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/InvalidRouteKinds (takes no route of kind gateway.networking.k8s.io/InvalidRoute, example.com/HTTPRoute)
 listener kinds-none-carried: no kind, attached 0: Accepted=True/Accepted; ResolvedRefs=False/InvalidRouteKinds (takes no route of kind gateway.networking.k8s.io/TLSRoute)
 listener every-namespace: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

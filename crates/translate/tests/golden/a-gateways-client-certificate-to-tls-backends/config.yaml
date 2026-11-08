@@ -1,0 +1,136 @@
+listeners:
+  port-80:
+    address: 0.0.0.0:80
+    protocol: http
+    forwarding:
+      trusted_proxies: []
+      trusted_only_headers:
+      - Forwarded
+      - X-Real-IP
+      - X-Forwarded-*
+    request_id: generate
+    proxy_protocol: 'off'
+  port-8080:
+    address: 0.0.0.0:8080
+    protocol: http
+    forwarding:
+      trusted_proxies: []
+      trusted_only_headers:
+      - Forwarded
+      - X-Real-IP
+      - X-Forwarded-*
+    request_id: generate
+    proxy_protocol: 'off'
+routes:
+- name: httproute/shop/pages/http
+  listeners:
+  - port-8080
+  hostnames:
+  - name: route.example.com
+    falls_through: false
+  rules:
+  - matches:
+    - path:
+        prefix: /
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/web/https
+        weight: 1
+    rate_limits: []
+  rate_limits: []
+- name: ingress/shop/web/shop.example.com
+  listeners:
+  - port-80
+  hostnames:
+  - name: shop.example.com
+    falls_through: false
+  rules:
+  - matches:
+    - path:
+        prefix: /
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/web/https
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /chat
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/chat/wss
+        weight: 1
+    rate_limits: []
+  - matches:
+    - path:
+        prefix: /plain
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/plain/http
+        weight: 1
+    rate_limits: []
+  rate_limits: []
+tcp_routes: []
+tls_routes: []
+upstreams:
+  shop/chat/wss:
+    endpoints:
+      kubernetes: chat.shop.svc.cluster.local:wss
+    protocol: http1
+    tls:
+      server_name: chat.shop.svc.cluster.local
+      verified_names: []
+      authorities:
+      - CA
+      client_certificate: certs/client
+    load_balancer: p2c
+  shop/plain/http:
+    endpoints:
+      kubernetes: plain.shop.svc.cluster.local:http
+    protocol: http1
+    load_balancer: p2c
+  shop/web/https:
+    endpoints:
+      kubernetes: web.shop.svc.cluster.local:https
+    protocol: http1
+    tls:
+      server_name: web.shop.example
+      verified_names: []
+      authorities:
+      - '-----BEGIN CERTIFICATE-----
+
+        MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+
+        DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+
+        MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+
+        hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+
+        /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+
+        vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+
+        AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+
+        RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+
+        MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+
+        -----END CERTIFICATE-----
+
+        '
+      client_certificate: certs/client
+    load_balancer: p2c

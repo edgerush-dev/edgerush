@@ -294,13 +294,52 @@ pub(crate) fn gateway(
                 .any(|c| c.kind == "Accepted" && c.status)
         })
         .count();
+    let resolved = gateway_resolved(gateway, &listeners);
     GatewayStatus {
         generation: gateway.generation,
-        conditions: vec![accepted],
+        conditions: vec![accepted, resolved],
         programmable: listeners.iter().any(|l| l.programmable.is_ok()),
         listeners,
         attached_listener_sets: i32::try_from(attached).unwrap_or(i32::MAX),
         listener_sets,
+    }
+}
+
+/// The Gateway's own `ResolvedRefs`, as the spec has it: false where its client certificate
+/// for backends cannot be used, `RefNotPermitted` where a grant is missing, else
+/// `InvalidClientCertificateRef`; else false `ListenersNotResolved` where one of its own
+/// `listeners` has refs it cannot resolve; else true.
+fn gateway_resolved(gateway: &GatewayOutcome, listeners: &[ListenerStatus]) -> Condition {
+    if let Some(Err(problem)) = &gateway.client_certificate {
+        let reason = if problem.reason == RefReason::NotPermitted {
+            "RefNotPermitted"
+        } else {
+            "InvalidClientCertificateRef"
+        };
+        return Condition::new("ResolvedRefs", false, reason, problem.why.clone());
+    }
+    let unresolved: Vec<&str> = listeners
+        .iter()
+        .filter(|listener| {
+            listener
+                .conditions
+                .iter()
+                .any(|c| c.kind == "ResolvedRefs" && !c.status)
+        })
+        .map(|listener| listener.name.as_str())
+        .collect();
+    if unresolved.is_empty() {
+        Condition::new("ResolvedRefs", true, "ResolvedRefs", String::new())
+    } else {
+        Condition::new(
+            "ResolvedRefs",
+            false,
+            "ListenersNotResolved",
+            format!(
+                "listeners with refs not resolved: {}",
+                unresolved.join(", ")
+            ),
+        )
     }
 }
 

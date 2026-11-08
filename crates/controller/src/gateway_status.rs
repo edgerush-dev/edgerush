@@ -53,7 +53,7 @@ const MOST_ANCESTORS: usize = 16;
 /// The condition types this controller writes on a GatewayClass.
 const CLASS_TYPES: [&str; 2] = ["Accepted", "SupportedVersion"];
 /// On a Gateway.
-const GATEWAY_TYPES: [&str; 2] = ["Accepted", "Programmed"];
+const GATEWAY_TYPES: [&str; 3] = ["Accepted", "ResolvedRefs", "Programmed"];
 /// On a Gateway's listener.
 const LISTENER_TYPES: [&str; 4] = ["Accepted", "Conflicted", "ResolvedRefs", "Programmed"];
 /// On a route's parent.

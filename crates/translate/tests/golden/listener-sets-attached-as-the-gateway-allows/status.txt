@@ -1,4 +1,4 @@
-Gateway, generation 0: Accepted=True/Accepted
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener http: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 attached ListenerSets: 1
 ListenerSet blog/other, generation 0: Accepted=False/NotAllowed (Gateway edge/web takes no ListenerSet of its namespace, as its allowedListeners say); Programmed=False/NotAllowed (Gateway edge/web takes no ListenerSet of its namespace, as its allowedListeners say)

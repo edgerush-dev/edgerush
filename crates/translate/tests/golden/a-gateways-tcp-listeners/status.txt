@@ -1,4 +1,4 @@
-Gateway, generation 0: Accepted=True/ListenersNotValid (listeners not accepted: db-again, mixed-http, mixed-tls, mixed-tcp)
+Gateway, generation 0: Accepted=True/ListenersNotValid (listeners not accepted: db-again, mixed-http, mixed-tls, mixed-tcp); ResolvedRefs=False/ListenersNotResolved (listeners with refs not resolved: kinds)
 listener db: TCPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener db-again: no kind, attached 0: Accepted=False/HostnameConflict (listener db, which comes first, has its port, protocol and hostname); Conflicted=True/HostnameConflict (listener db, which comes first, has its port, protocol and hostname); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (listener db, which comes first, has its port, protocol and hostname)
 listener http: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
