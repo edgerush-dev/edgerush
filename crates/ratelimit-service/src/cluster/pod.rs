@@ -80,6 +80,12 @@ const ANSWERS_WAITING: usize = 1_024;
 /// stream waits to read on, and its sender's queue fills.
 const RECEIVED_WAITING: usize = 64;
 
+/// How many messages wait to be written to a data plane's stream: room for the answers of
+/// several turns of the pod's task, so that they go out together, a write for many. One at a
+/// time, every answer cost a write of its own, and the pod reached a third of the old pod's
+/// rate at three keys a request (#253).
+const TELLING_WAITING: usize = 64;
+
 /// Something run on a pod's mode, its store within, in its task.
 type Run = Box<dyn FnOnce(&mut Pod, Time) + Send>;
 
@@ -983,26 +989,40 @@ impl tonic::server::StreamingService<Asking> for DecideCall {
                 .client()
                 .await
                 .ok_or_else(|| Status::unavailable("the pod has stopped"))?;
-            let (telling, told) = mpsc::channel(1);
-            tokio::spawn(serve_data_plane(client, request.into_inner(), telling));
-            Ok(Response::new(Received(told)))
+            Ok(Response::new(data_plane_stream(
+                client,
+                request.into_inner(),
+            )))
         })
     }
+}
+
+/// A data plane's stream served as `client`, `asked` what it asks: what is to be written to
+/// it, at most [`TELLING_WAITING`] waiting.
+fn data_plane_stream<A>(client: StoreClient, asked: A) -> Received<Result<Telling, Status>>
+where
+    A: futures_core::Stream<Item = Result<Asking, Status>> + Unpin + Send + 'static,
+{
+    let (telling, told) = mpsc::channel(TELLING_WAITING);
+    tokio::spawn(serve_data_plane(client, asked, telling));
+    Received(told)
 }
 
 /// Serves one data plane's stream as `client`: what it asks handed to the pod, and what the
 /// pod tells the client sent down, until either side ends it. Its requests are read only as the
 /// pod takes them, and its answers wait in the client's queue while the data plane reads
 /// slowly.
-async fn serve_data_plane(
+async fn serve_data_plane<A>(
     mut client: StoreClient,
-    mut asked: Streaming<Asking>,
+    mut asked: A,
     telling: mpsc::Sender<Result<Telling, Status>>,
-) {
+) where
+    A: futures_core::Stream<Item = Result<Asking, Status>> + Unpin,
+{
     loop {
         tokio::select! {
-            asking = asked.message() => {
-                let Ok(Some(asking)) = asking else {
+            asking = std::future::poll_fn(|cx| std::pin::Pin::new(&mut asked).poll_next(cx)) => {
+                let Some(Ok(asking)) = asking else {
                     return;
                 };
                 // One the mode cannot use is dropped, as a message lost.
@@ -1218,6 +1238,49 @@ mod tests {
             assert_eq!(client.answer().await, Some(reply(round)), "round {round}");
             assert_eq!(client.answer().await, Some(told_table(10 + round)));
         }
+    }
+
+    /// A data plane that asks nothing more: its stream of asks never ends.
+    struct Quiet;
+
+    impl futures_core::Stream for Quiet {
+        type Item = Result<Asking, Status>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    /// Every answer waiting for a data plane is handed to its stream's writer at once, before
+    /// the writer takes any: the answers of one turn of the pod's go out in one write, not one
+    /// write each (#253).
+    #[tokio::test]
+    async fn a_data_planes_answers_waiting_are_handed_to_its_writer_together() {
+        let mut running = running();
+        let (given, giving) = oneshot::channel();
+        running.client(given);
+        let (id, told) = giving.await.unwrap();
+        let (commands, _commands) = mpsc::channel(1);
+        let client = StoreClient { id, commands, told };
+        let waiting = u64::try_from(TELLING_WAITING).unwrap();
+        for answer in 0..waiting {
+            running.answer(id, reply(answer));
+        }
+        let Received(written) = data_plane_stream(client, Quiet);
+        let handed = tokio::time::timeout(Duration::from_secs(1), async {
+            while written.len() < TELLING_WAITING {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            handed.is_ok(),
+            "{} of {TELLING_WAITING} answers handed to the writer",
+            written.len()
+        );
     }
 
     #[test]
