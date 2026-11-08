@@ -132,6 +132,10 @@ impl Relay {
                     let Ok(mut outbound) = TcpStream::connect(to).await else {
                         return;
                     };
+                    // As the pods' own sockets are: Nagle's algorithm against a delayed ACK
+                    // holds a small message back for up to 40 ms on Linux.
+                    let _nodelay = inbound.set_nodelay(true);
+                    let _nodelay = outbound.set_nodelay(true);
                     tokio::select! {
                         _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
                         _ = cut.wait_for(|cut| dropped(cut, ip, from.ip())) => {}
@@ -147,6 +151,12 @@ impl Relay {
             task,
         }
     }
+}
+
+/// A pod's server's connections from `listener`, without Nagle's algorithm, as the service's
+/// own listener takes them.
+fn incoming(listener: TcpListener) -> TcpIncoming {
+    TcpIncoming::from(listener).with_nodelay(Some(true))
 }
 
 /// A pod running, its server and its relay.
@@ -209,7 +219,7 @@ impl Cluster {
         let server = StoreServer::new(pod.clone());
         let server = tokio::spawn(async move {
             let _ended = tonic::transport::Server::builder()
-                .serve_with_incoming(server, TcpIncoming::from(listener))
+                .serve_with_incoming(server, incoming(listener))
                 .await;
         });
         self.pods.insert(id, Running { pod, server, relay });
@@ -232,7 +242,7 @@ impl Cluster {
         let server = StoreServer::new(pod.clone());
         let server = tokio::spawn(async move {
             let _ended = tonic::transport::Server::builder()
-                .serve_with_incoming(server, TcpIncoming::from(listener))
+                .serve_with_incoming(server, incoming(listener))
                 .await;
         });
         let relay = old.relay;
