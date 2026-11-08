@@ -1001,36 +1001,57 @@ impl SyncLimiter {
 /// Gives back one charged under `key` and `rule` with `receipt`, for `limiter`'s worker:
 /// sent, then sent again while unanswered as [`Giving`] says, until answered or dropped.
 async fn give_back(limiter: Weak<SyncLimiter>, key: u64, rule: Rule, receipt: u64) {
-    let Some(held) = limiter.upgrade() else {
+    giving_back(|| {
+        let held = limiter.upgrade()?;
+        Some(held.send_give_back(key, rule, receipt))
+    })
+    .await;
+}
+
+/// Sends a give-back with `send`, then sends it again while unanswered as [`Giving`] says,
+/// until answered, dropped, or `send` finds its worker gone (`None`). `send` gives the answer
+/// to come, if the give-back could be sent. An answer that comes as a failure (its stream
+/// broken or never opened) counts as none: the give-back is sent again when it is due, not
+/// at once, so that a failing stream does not use up its sends.
+async fn giving_back(mut send: impl FnMut() -> Option<Option<oneshot::Receiver<Answered>>>) {
+    let start = tokio::time::Instant::now();
+    // Read by the clock the waits run on, so that a wait over finds the give-back due.
+    let since = |at: tokio::time::Instant| {
+        u64::try_from(at.duration_since(start).as_nanos()).unwrap_or(u64::MAX)
+    };
+    let mut giving = Giving::sent(since(start));
+    let Some(mut answer) = send() else {
         return;
     };
-    let mut giving = Giving::sent(held.process.now());
-    let mut answer = held.send_give_back(key, rule, receipt);
-    let mut wait = GIVE_BACK_AGAIN;
-    drop(held);
+    let mut wait = Duration::from_nanos(GIVE_BACK_AGAIN);
+    let mut until = start + wait;
     loop {
-        let waited = Duration::from_nanos(wait);
-        let answered = match &mut answer {
-            Some(answer) => matches!(tokio::time::timeout(waited, answer).await, Ok(Ok(Ok(_)))),
-            None => {
-                tokio::time::sleep(waited).await;
-                false
-            }
-        };
-        if answered {
-            return;
+        match &mut answer {
+            Some(waiting) => match tokio::time::timeout_at(until, waiting).await {
+                Ok(Ok(Ok(_))) => return,
+                // An answer come is never awaited again (tokio panics): the rest of the wait
+                // goes by without it.
+                Ok(_) => {
+                    answer = None;
+                    continue;
+                }
+                Err(_) => {}
+            },
+            None => tokio::time::sleep_until(until).await,
         }
-        let Some(held) = limiter.upgrade() else {
-            return;
-        };
-        match giving.due(held.process.now()) {
+        let now = tokio::time::Instant::now();
+        match giving.due(since(now)) {
             Due::Again => {
-                answer = held.send_give_back(key, rule, receipt);
-                wait = GIVE_BACK_LATER;
+                let Some(sent) = send() else {
+                    return;
+                };
+                answer = sent;
+                wait = Duration::from_nanos(GIVE_BACK_LATER);
             }
             Due::Waiting => {}
             Due::Dropped => return,
         }
+        until = now + wait;
     }
 }
 
@@ -1267,10 +1288,14 @@ const fn ended_by(answer: &Answer) -> Ended {
 
 #[cfg(test)]
 mod tests {
-    use super::{Breaker, Process};
+    use super::{Answered, Breaker, Gone, Process, giving_back};
     use edgerush_config::{CompiledSynchronous, KeySecret, WhenUnreachable};
+    use edgerush_ratelimit_service::cluster::plane::{
+        Answer, GIVE_BACK_AGAIN, GIVE_BACK_LATER, GIVE_BACK_SENDS,
+    };
     use std::num::NonZeroUsize;
     use std::time::Duration;
+    use tokio::sync::oneshot;
 
     fn config(timeout_ms: u64) -> CompiledSynchronous {
         CompiledSynchronous {
@@ -1443,5 +1468,65 @@ upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
             held("r").local.is_none(),
             "local mode keeps no rolling window"
         );
+    }
+
+    /// A give-back's answer that comes 10 ms after it is sent, other than answered: its
+    /// stream broken with the give-back on it, never opened, or the stream's end of the answer
+    /// dropped. Coming partway through the wait, not at once, it tells a wait carried on from a
+    /// wait begun again.
+    fn failing(how: usize) -> oneshot::Receiver<Answered> {
+        let (answered, answer) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            match how {
+                0 => assert!(answered.send(Err(Gone::Broken)).is_ok()),
+                1 => assert!(answered.send(Err(Gone::Unreached)).is_ok()),
+                _ => drop(answered),
+            }
+        });
+        answer
+    }
+
+    /// A give-back whose answer comes as a failure before it is due again is not waited on
+    /// again, which panics its task (#248), and is sent again when it is due, not before.
+    #[tokio::test(start_paused = true)]
+    async fn a_give_back_whose_stream_breaks_is_sent_again_when_due() {
+        for how in 0..3 {
+            let start = tokio::time::Instant::now();
+            let mut sends = Vec::new();
+            giving_back(|| {
+                sends.push(start.elapsed());
+                if sends.len() == 1 {
+                    return Some(Some(failing(how)));
+                }
+                let (answered, answer) = oneshot::channel();
+                answered.send(Ok(Answer::Counted(0))).unwrap();
+                Some(Some(answer))
+            })
+            .await;
+            assert_eq!(
+                sends,
+                [Duration::ZERO, Duration::from_nanos(GIVE_BACK_AGAIN)],
+                "failure {how}"
+            );
+        }
+    }
+
+    /// A give-back whose every answer fails at once is still sent only when due, and dropped
+    /// after its last send has waited as long as one unanswered would.
+    #[tokio::test(start_paused = true)]
+    async fn a_give_back_whose_every_stream_breaks_is_dropped_when_due() {
+        let start = tokio::time::Instant::now();
+        let mut sends = Vec::new();
+        giving_back(|| {
+            sends.push(start.elapsed());
+            Some(Some(failing(0)))
+        })
+        .await;
+        let again = Duration::from_nanos(GIVE_BACK_AGAIN);
+        let later = Duration::from_nanos(GIVE_BACK_LATER);
+        assert_eq!(sends, [Duration::ZERO, again, again + later]);
+        assert_eq!(GIVE_BACK_SENDS, 3);
+        assert_eq!(start.elapsed(), again + later * 2, "dropped when due");
     }
 }
