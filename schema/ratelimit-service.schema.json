@@ -240,7 +240,7 @@
           "minimum": 0
         },
         "forwarder_decides": {
-          "description": "Whether a pod a data plane asks about a key whose owner it has not heard for\n`stop_serving_ms` decides the key itself, from its copy, rather than forward the ask to\nan owner it cannot reach: so that an owner gone has its keys held to their limits while\na replica takes over, the charges lost if another replica takes them. A replica only,\nholding its own lease. False when left out.",
+          "description": "Whether a pod a data plane asks about a key whose owner it has not heard for\n`stop_serving_ms` decides the key itself, from its copy, rather than forward the ask to\nan owner it cannot reach: so that an owner gone has its keys held to their limits while\na replica takes over, the charges lost if another replica takes them. A replica only,\nholding its own lease. True when left out.",
           "type": [
             "boolean",
             "null"

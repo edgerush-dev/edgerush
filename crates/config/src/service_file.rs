@@ -161,7 +161,7 @@ pub struct ServiceStore {
     /// `stop_serving_ms` decides the key itself, from its copy, rather than forward the ask to
     /// an owner it cannot reach: so that an owner gone has its keys held to their limits while
     /// a replica takes over, the charges lost if another replica takes them. A replica only,
-    /// holding its own lease. False when left out.
+    /// holding its own lease. True when left out.
     #[serde(default)]
     pub forwarder_decides: Option<bool>,
 }
