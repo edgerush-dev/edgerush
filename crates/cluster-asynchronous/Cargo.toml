@@ -1,0 +1,18 @@
+[package]
+name = "edgerush-cluster-asynchronous"
+description = "EdgeRush's asynchronous rate-limiting mode on the cluster store: the owner's state of a key as a store value, merged by the larger of each part, and its applying of data planes' batches; pure, no I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+edgerush-cluster.workspace = true
+edgerush-ratelimit.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

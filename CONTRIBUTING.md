@@ -57,7 +57,7 @@ The code is held to a few rules. Lints enforce what they can; review holds the r
   is used, with a comment saying why. Libraries return typed errors (`thiserror`).
 - The pure crates, `edgerush-router`, `edgerush-config`, `edgerush-filters`,
   `edgerush-ratelimit`, `edgerush-ratelimit-sim`, `edgerush-cluster`,
-  `edgerush-cluster-synchronous`, `edgerush-cluster-sim` and `edgerush-rules`, do no I/O: no sockets, clocks,
+  `edgerush-cluster-asynchronous`, `edgerush-cluster-synchronous`, `edgerush-cluster-sim` and `edgerush-rules`, do no I/O: no sockets, clocks,
   randomness or async runtime. Those are passed in, which keeps the crates deterministic
   and easy to test.
 - On the request path: no locks, no allocation that can be avoided, no string formatting,

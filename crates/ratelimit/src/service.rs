@@ -69,7 +69,7 @@ pub const MOST_UNACKNOWLEDGED: usize = 32;
 /// kept in use; one that comes back says in its next batch which of its batches it saw
 /// applied, and a fresh record starts from there. Never under the refill time, so that data
 /// planes told they share a key stay told so while they poll it.
-const RECORD_KEPT: u64 = 10 * 60 * 1_000_000_000;
+pub const RECORD_KEPT: u64 = 10 * 60 * 1_000_000_000;
 
 /// A data plane: one worker of one EdgeRush pod, in one life of it. A restarted worker is a
 /// new data plane, with a new id.

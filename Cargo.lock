@@ -303,6 +303,15 @@ name = "edgerush-cluster"
 version = "0.0.0"
 
 [[package]]
+name = "edgerush-cluster-asynchronous"
+version = "0.0.0"
+dependencies = [
+ "edgerush-cluster",
+ "edgerush-ratelimit",
+ "proptest",
+]
+
+[[package]]
 name = "edgerush-cluster-sim"
 version = "0.0.0"
 dependencies = [
