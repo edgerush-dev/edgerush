@@ -11,8 +11,10 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fmt::Debug;
 
+mod asynchronous;
 mod synchronous;
 
+pub use asynchronous::{Asynchronous, CYCLE, Plane};
 pub use synchronous::Synchronous;
 
 /// A rate-limiting mode as the world runs it: its pods over their stores, the messages they
@@ -27,7 +29,7 @@ pub trait Mode: Sized {
     /// What its pods and clients send, the store's among it.
     type Message: Clone + Debug + From<StoreMessage<Self::Value>>;
     /// One of its clients, standing for a data plane.
-    type Client: Clone + Debug;
+    type Client;
 
     /// Pod `id`, new, knowing how to reach `peers`, forwarding requests for shards not its own
     /// if `forwarding`, as the mode does, and deciding those it would forward from its copy,
@@ -70,8 +72,8 @@ pub trait Mode: Sized {
     fn client_check(world: &mut Sim<Self>, id: NodeId);
     /// Client `client` told its request `id` could not reach `pod`.
     fn client_unreachable(world: &mut Sim<Self>, client: NodeId, id: u64, pod: NodeId);
-    /// `message` reaching client `id`.
-    fn deliver_to_client(world: &mut Sim<Self>, id: NodeId, message: Self::Message);
+    /// `message` from `from` reaching client `id`.
+    fn deliver_to_client(world: &mut Sim<Self>, from: NodeId, id: NodeId, message: Self::Message);
 }
 
 /// How long a drained pod's process goes on before it ends: longer than any request's deadline,
@@ -883,7 +885,7 @@ impl<M: Mode> Sim<M> {
             return;
         }
         if to >= CLIENT_BASE {
-            M::deliver_to_client(self, to, message);
+            M::deliver_to_client(self, from, to, message);
             return;
         }
         let now = self.now;

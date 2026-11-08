@@ -12,7 +12,12 @@ edgerush-cluster.workspace = true
 edgerush-ratelimit.workspace = true
 
 [dev-dependencies]
+iai-callgrind.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "batch"
+harness = false
 
 [lints]
 workspace = true

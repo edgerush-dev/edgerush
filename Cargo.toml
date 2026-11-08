@@ -34,6 +34,7 @@ boring = "5.2"
 bytes = "1.12"
 edgerush-certificates = { path = "crates/certificates" }
 edgerush-cluster = { path = "crates/cluster" }
+edgerush-cluster-asynchronous = { path = "crates/cluster-asynchronous" }
 edgerush-cluster-synchronous = { path = "crates/cluster-synchronous" }
 edgerush-config = { path = "crates/config" }
 edgerush-control-service = { path = "crates/control-service" }
@@ -162,6 +163,9 @@ debug = 0
 # check.sh on Windows, optimised under 3 (43 s of it compiling). Overflow checks and debug
 # assertions stay on, as everywhere in this profile.
 [profile.dev.package.edgerush-cluster]
+opt-level = 3
+
+[profile.dev.package.edgerush-cluster-asynchronous]
 opt-level = 3
 
 [profile.dev.package.edgerush-cluster-synchronous]
