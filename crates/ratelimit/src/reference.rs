@@ -553,6 +553,19 @@ pub struct BucketState {
     last: u64,
 }
 
+impl BucketState {
+    /// The larger of each part of the two: a bucket charged at least as far as either, as of
+    /// the later of their times. Copies of one bucket, under the same terms, merged in any
+    /// order and any number of times end the same.
+    #[must_use]
+    pub fn larger(self, other: Self) -> Self {
+        Self {
+            arrival: self.arrival.max(other.arrival),
+            last: self.last.max(other.last),
+        }
+    }
+}
+
 impl Model for TokenBucket {
     /// Room for one more: the arrival time no further ahead than the bucket allows. The
     /// same as `remaining(now) > 0`, without its division; it is on the request path.

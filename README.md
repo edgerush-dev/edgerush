@@ -328,6 +328,11 @@ crates/certificates
 crates/cluster     the rate-limiting service's cluster store (`edgerush-cluster`): an elected
                    table of shard owners, leases, copies to replicas and handoffs, for any value
                    that merges; pure, no I/O, used by nothing yet
+crates/cluster-asynchronous
+                   the asynchronous mode on the cluster store (`edgerush-cluster-asynchronous`):
+                   the owner's state of a key as the store's value, merged by the larger of
+                   each part, and its applying of data planes' batches; pure, no I/O, used by
+                   nothing yet
 crates/cluster-sim the cluster's simulation (`edgerush-cluster-sim`): the store's pods over a
                    network that delays, loses and cuts, with clients standing for data planes,
                    seeded and deterministic; its scenarios and chaos runs are its tests, and

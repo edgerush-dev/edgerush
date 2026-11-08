@@ -32,7 +32,7 @@ and NASM on Windows) and the layout of the crates.
 - The code cites design documents ("03 §6", "15 §3") that are not in this repository. If
   you cannot read one, do not guess what it says; ask.
 - The pure crates (`router`, `config`, `filters`, `ratelimit`, `ratelimit-sim`, `cluster`,
-  `cluster-synchronous`, `cluster-sim`, `rules`, `translate`) do no I/O: clocks, sockets and randomness are passed in.
+  `cluster-asynchronous`, `cluster-synchronous`, `cluster-sim`, `rules`, `translate`) do no I/O: clocks, sockets and randomness are passed in.
 - `schema/config.schema.json` is made from the config model's types and their rustdoc. A
   change to either changes it: write it again with
   `EDGERUSH_WRITE_SCHEMA=1 cargo test -p edgerush --test schema` and commit it with the
