@@ -884,6 +884,29 @@ async fn a_rollout_of_five_pods_two_at_a_time_leaves_no_shard_unserved_and_loses
     rollout(5, 2).await;
 }
 
+/// Told to stop with no pod left to take their shards — a lone pod, or every pod at once as
+/// deleting the service does — pods stop within [`DRAINED`], not at their grace period's kill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pods_none_is_left_to_take_from_stop_when_told() {
+    let _shared = ALONE.read().await;
+    for count in [1, 3] {
+        let cluster = ready(count).await;
+        let drains: Vec<(NodeId, JoinHandle<()>)> = (1..=count)
+            .map(|id| {
+                let pod = cluster.pod(id).clone();
+                (id, tokio::spawn(async move { pod.drain().await }))
+            })
+            .collect();
+        for (id, drain) in drains {
+            let stopped = tokio::time::timeout(DRAINED, drain).await;
+            assert!(
+                stopped.is_ok(),
+                "pod {id} of {count} not stopped within {DRAINED:?}"
+            );
+        }
+    }
+}
+
 /// A request reaching a pod not its key's owner, forwarding on, is forwarded to the owner and
 /// answered back through it: counted once, at the owner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

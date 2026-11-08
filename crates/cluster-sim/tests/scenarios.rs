@@ -351,6 +351,52 @@ fn deploys_refuse_and_lose_nothing() {
     }
 }
 
+/// Told to stop with no pod left to take their shards — every pod at once, as deleting the
+/// service or scaling it to zero does, or the last of a scale-down one at a time — pods stop
+/// drained, soon, rather than killed at the end of their grace period.
+#[test]
+fn pods_none_is_left_to_take_from_stop_drained() {
+    let soon = ms(1_000);
+    for seed in SEEDS {
+        let (mut world, pods) = scenario::cluster(seed, five());
+        for pod in &pods {
+            world.drain(*pod);
+        }
+        let took = world.run_while_not(ms(10_000), |world| {
+            pods.iter().all(|pod| !world.is_alive(*pod))
+        });
+        assert!(
+            took.is_some_and(|took| took <= soon),
+            "seed {seed}: {took:?}"
+        );
+        assert!(
+            world.stopped.iter().all(|(_, _, drained)| *drained),
+            "seed {seed}: {:?}",
+            world.stopped
+        );
+
+        let (mut world, pods) = scenario::cluster(seed, five());
+        for pod in pods.iter().rev() {
+            world.drain(*pod);
+            let _gone = world.run_while_not(ms(10_000), |world| !world.is_alive(*pod));
+        }
+        assert!(
+            world.stopped.len() == pods.len()
+                && world.stopped.iter().all(|(_, _, drained)| *drained),
+            "seed {seed}: {:?}",
+            world.stopped
+        );
+        let took = match world.stopped.as_slice() {
+            [.., (_, before, _), (_, last, _)] => Some(*last - *before),
+            _ => None,
+        };
+        assert!(
+            took.is_some_and(|took| took <= soon),
+            "seed {seed}: {took:?}"
+        );
+    }
+}
+
 /// Goal B: a pod or the leader cut off, heartbeats lost one way, pods cut apart from each
 /// other, a zone of two pods, the leader among them, cut from the other three, and a pod cut
 /// off as it drains: never two owners for longer than a view change spreading, and settled
