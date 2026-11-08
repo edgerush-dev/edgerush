@@ -1871,8 +1871,17 @@ impl<V: Held> Node<V> {
         let me = self.id;
         self.awaiting
             .retain(|shard, _| table.owner(*shard) == Some(me));
-        self.handed_in.retain(|shard, _| {
-            table.move_of(*shard) == Some(me) || table.owner(*shard) == Some(me)
+        // Last changes under a term newer than this table's for their shard came first, from a
+        // table not yet applied: a taker behind may apply tables between that name it neither
+        // mover nor owner (#281). Once the tables catch up with their term, the shard handed
+        // to another, they go.
+        self.handed_in.retain(|shard, term| {
+            table.move_of(*shard) == Some(me)
+                || table.owner(*shard) == Some(me)
+                || table
+                    .shards
+                    .get(usize::from(*shard))
+                    .is_some_and(|entry| *term > entry.term)
         });
     }
 
@@ -4193,6 +4202,36 @@ mod tests {
         let _ = early.receive(1, Message::TableReply { table: moved }, ms(4));
         lease(&mut early, ms(5));
         assert!(early.serves(shard, ms(5)), "waited for what it had");
+        // Another, further behind (#281): the last changes reaching it before it has the table
+        // asking for the move, and a table between that does not name it yet applied first.
+        // Served as soon as the table naming it the owner is, with them.
+        let mut behind = member();
+        let Some(mut between) = behind.committed().cloned() else {
+            panic!("no table");
+        };
+        between.version = 2;
+        let mut asking = between.clone();
+        asking.version = 3;
+        asking.moves = vec![(shard, 2, asking.stamp())];
+        let Some(mut handed) = table::moved(&asking, shard, 2) else {
+            panic!("not moved");
+        };
+        handed.version = 4;
+        let last = Message::Handoff {
+            shard,
+            term: handed.shards[usize::from(shard)].term,
+            entries: vec![(key_in(shard), Kept::new(Counts::of(3)))],
+            dropped: Vec::new(),
+            part: 0,
+            more: false,
+        };
+        let _ = behind.receive(1, last, ms(2));
+        for (at, table) in [(3, between), (4, asking), (5, handed)] {
+            let _ = behind.receive(1, Message::TableReply { table }, ms(at));
+        }
+        lease(&mut behind, ms(6));
+        assert!(behind.serves(shard, ms(6)), "dropped what it had, behind");
+        assert_eq!(behind.count(key_in(shard)), Some(3));
         // Another, its last changes never coming: served after the wait.
         let mut waiting = member();
         let _ = waiting.receive(1, Message::TableReply { table: moving }, ms(2));
@@ -4204,6 +4243,45 @@ mod tests {
         lease(&mut waiting, ms(60));
         let _ = waiting.tick(ms(60));
         assert!(waiting.serves(shard, ms(60)), "never served without them");
+    }
+
+    /// Last changes that came first, under a term the tables then give the shard with another
+    /// owner, are not kept: the move they were for was dropped, the shard handed elsewhere.
+    #[test]
+    fn last_changes_that_came_first_go_once_the_shard_is_handed_to_another() {
+        let mut node = member();
+        let Some(table) = node.committed().cloned() else {
+            panic!("no table");
+        };
+        let Some(shard) = (0..4).find(|shard| table.owner(*shard) == Some(1)) else {
+            panic!("pod 1 owns nothing");
+        };
+        let mut asking = table;
+        asking.version = 2;
+        asking.moves = vec![(shard, 3, asking.stamp())];
+        let Some(mut elsewhere) = table::moved(&asking, shard, 3) else {
+            panic!("not moved");
+        };
+        elsewhere.version = 3;
+        let last = Message::Handoff {
+            shard,
+            term: elsewhere.shards[usize::from(shard)].term,
+            entries: vec![(key_in(shard), Kept::new(Counts::of(3)))],
+            dropped: Vec::new(),
+            part: 0,
+            more: false,
+        };
+        let _ = node.receive(1, last, ms(2));
+        let _ = node.receive(1, Message::TableReply { table: asking }, ms(3));
+        assert!(
+            node.handed_in.contains_key(&shard),
+            "dropped before its table"
+        );
+        let _ = node.receive(1, Message::TableReply { table: elsewhere }, ms(4));
+        assert!(
+            !node.handed_in.contains_key(&shard),
+            "kept, the shard handed to another"
+        );
     }
 
     /// The handoff's waits are five copy cycles, as long as the cycle is configured: at a
