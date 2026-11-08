@@ -35,7 +35,7 @@ use super::wire::{
 };
 use crate::grpc::{Boxed, Client, MAX_MESSAGE, Prost, limited};
 use crate::secure::{Caller, refused};
-use edgerush_cluster::{Config, Message, Node, NodeId, Stamp, Time};
+use edgerush_cluster::{Config, Message, Node, NodeId, Stamp, Table, Time};
 use edgerush_cluster_synchronous::{Message as ModeMessage, Outbox, Pod, Value as SyncValue};
 use http::uri::PathAndQuery;
 use prost::Message as _;
@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tonic::server::NamedService;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -72,7 +72,8 @@ pub const CONTROL_PLANE: NodeId = NodeId::MAX;
 pub const CLIENTS: NodeId = 1 << 63;
 
 /// How many answers wait for a client before more are dropped, as messages lost: a client
-/// reading them slowly holds up no pod.
+/// reading them slowly holds up no pod. Tables do not wait among them: a client is told only
+/// the newest (#252).
 const ANSWERS_WAITING: usize = 1_024;
 
 /// How many messages received wait for the pod's task, across its streams: past it, each
@@ -90,8 +91,8 @@ enum Command {
         oneshot::Sender<Option<Message<SyncValue>>>,
     ),
     With(Run),
-    /// A client to be answered: its id, and where its answers go.
-    Client(oneshot::Sender<(NodeId, mpsc::Receiver<ModeMessage>)>),
+    /// A client to be answered: its id, and where what it is told goes.
+    Client(oneshot::Sender<(NodeId, Told)>),
     /// A client's request.
     Ask(NodeId, ModeMessage),
     /// Drain, and say so by dropping the sender once stopped.
@@ -279,11 +280,11 @@ impl StorePod {
     pub async fn client(&self) -> Option<StoreClient> {
         let (given, giving) = oneshot::channel();
         self.commands.send(Command::Client(given)).await.ok()?;
-        let (id, answers) = giving.await.ok()?;
+        let (id, told) = giving.await.ok()?;
         Some(StoreClient {
             id,
             commands: self.commands.clone(),
-            answers,
+            told,
         })
     }
 
@@ -342,7 +343,22 @@ impl StorePod {
 pub struct StoreClient {
     id: NodeId,
     commands: mpsc::Sender<Command>,
+    told: Told,
+}
+
+/// Where a pod's task sends what it tells one client: its answers, in order, and beside them
+/// the newest table it was sent, which takes the place of one not yet told (#252). A pod commits
+/// tables in bursts while shards move — fifteen in ten milliseconds as one drains — and a client
+/// needs only the last: told every one, in line with its answers, it found them late.
+struct ToClient {
+    answers: mpsc::Sender<ModeMessage>,
+    table: watch::Sender<Option<Table>>,
+}
+
+/// A client's side of [`ToClient`].
+struct Told {
     answers: mpsc::Receiver<ModeMessage>,
+    table: watch::Receiver<Option<Table>>,
 }
 
 impl StoreClient {
@@ -361,9 +377,28 @@ impl StoreClient {
             .is_ok()
     }
 
-    /// Its next answer: `None` once the pod has stopped.
+    /// What it is told next: an answer, or the newest table it was sent, if it has not been
+    /// told that one. An answer waiting goes first, so that tables delay none; a table waits
+    /// only while answers do, a client behind meanwhile told a newer one by any pod it asks
+    /// for a key that has moved ([`Answer::Elsewhere`]). `None` once the pod has stopped.
+    ///
+    /// Cancel-safe, as a stream serving the client needs it to be: a table is taken only in
+    /// the poll that returns it.
+    ///
+    /// [`Answer::Elsewhere`]: edgerush_cluster_synchronous::Answer::Elsewhere
     pub async fn answer(&mut self) -> Option<ModeMessage> {
-        self.answers.recv().await
+        loop {
+            tokio::select! {
+                biased;
+                answer = self.told.answers.recv() => return answer,
+                changed = self.told.table.changed() => {
+                    changed.ok()?;
+                    if let Some(table) = self.told.table.borrow_and_update().clone() {
+                        return Some(ModeMessage::Store(Message::TableReply { table }));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -386,8 +421,8 @@ struct Running {
     skews: SkewWarnings,
     /// The peers skewed now, as [`StorePod::skewed`] says.
     skewed: Arc<AtomicUsize>,
-    /// The clients asking it, each with where its answers go.
-    clients: BTreeMap<NodeId, mpsc::Sender<ModeMessage>>,
+    /// The clients asking it, each with where what it tells them goes.
+    clients: BTreeMap<NodeId, ToClient>,
     next_client: NodeId,
     /// The table last told its clients, by its number.
     told: Stamp,
@@ -549,37 +584,58 @@ impl Running {
         }
     }
 
-    /// Hands `message` to client `client`, if it is still there: dropped past
-    /// [`ANSWERS_WAITING`], as a message lost, and the client forgotten once it is gone.
+    /// Hands `message` to client `client`, if it is still there, and forgets the client once
+    /// it is gone: a table in place of an older one it has not been told, and never after a
+    /// newer; anything else after its answers so far, dropped past [`ANSWERS_WAITING`], as a
+    /// message lost.
     fn answer(&mut self, client: NodeId, message: ModeMessage) {
-        let gone = self.clients.get(&client).is_some_and(|answers| {
-            matches!(
-                answers.try_send(message),
+        let Some(to) = self.clients.get(&client) else {
+            return;
+        };
+        let gone = match message {
+            ModeMessage::Store(Message::TableReply { table }) => {
+                to.table.send_if_modified(|held| {
+                    let newer = held
+                        .as_ref()
+                        .is_none_or(|held| table.stamp() > held.stamp());
+                    if newer {
+                        *held = Some(table);
+                    }
+                    newer
+                });
+                to.table.is_closed()
+            }
+            message => matches!(
+                to.answers.try_send(message),
                 Err(mpsc::error::TrySendError::Closed(_))
-            )
-        });
+            ),
+        };
         if gone {
             self.clients.remove(&client);
         }
     }
 
-    /// A new client: its id, the next from [`CLIENTS`], and where its answers go.
-    fn client(&mut self, given: oneshot::Sender<(NodeId, mpsc::Receiver<ModeMessage>)>) {
+    /// A new client: its id, the next from [`CLIENTS`], and where what it is told goes, the
+    /// table to tell it first if there is one yet.
+    fn client(&mut self, given: oneshot::Sender<(NodeId, Told)>) {
         let id = self.next_client;
         self.next_client = self.next_client.saturating_add(1);
         let (answers, answered) = mpsc::channel(ANSWERS_WAITING);
-        if given.send((id, answered)).is_ok() {
-            // Its first answer is the table, if there is one yet.
-            if let Some(table) = self.node.store().committed() {
-                let _full = answers.try_send(ModeMessage::Store(Message::TableReply {
-                    table: table.clone(),
-                }));
+        let (table, tables) = watch::channel(None);
+        let told = Told {
+            answers: answered,
+            table: tables,
+        };
+        if given.send((id, told)).is_ok() {
+            if let Some(committed) = self.node.store().committed() {
+                table.send_replace(Some(committed.clone()));
             }
-            self.clients.insert(id, answers);
+            self.clients.insert(id, ToClient { answers, table });
         }
     }
 
-    /// Tells every client the table it has committed, once for each it commits.
+    /// Tells every client the table it has committed, as it commits one: in place of an older
+    /// one the client has not yet been told.
     fn tell_tables(&mut self) {
         let Some(table) = self.node.store().committed() else {
             return;
@@ -1105,6 +1161,62 @@ mod tests {
             clients: BTreeMap::new(),
             next_client: CLIENTS,
             told: (0, 0),
+        }
+    }
+
+    /// A table numbered `version`, in term 1.
+    fn table(version: u64) -> Table {
+        Table {
+            term: 1,
+            version,
+            members: BTreeMap::new(),
+            voting: Vec::new(),
+            draining: Vec::new(),
+            shards: Vec::new(),
+            moves: Vec::new(),
+        }
+    }
+
+    fn told_table(version: u64) -> ModeMessage {
+        ModeMessage::Store(Message::TableReply {
+            table: table(version),
+        })
+    }
+
+    fn reply(id: u64) -> ModeMessage {
+        ModeMessage::Reply {
+            client: CLIENTS,
+            id,
+            answer: edgerush_cluster_synchronous::Answer::Counted(id),
+        }
+    }
+
+    /// A client that has not read is told the newest of the tables sent it, once, never an
+    /// older one after it, and every answer waiting before it: a burst of commits costs its
+    /// answers no wait behind tables it would only replace (#252).
+    #[tokio::test]
+    async fn a_client_is_told_its_answers_first_and_the_newest_table_only() {
+        let mut running = running();
+        let (given, giving) = oneshot::channel();
+        running.client(given);
+        let (id, told) = giving.await.unwrap();
+        let (commands, _) = mpsc::channel(1);
+        let mut client = StoreClient { id, commands, told };
+        let next = Duration::from_millis(50);
+        for version in [2, 3, 1] {
+            running.answer(id, told_table(version));
+        }
+        running.answer(id, reply(1));
+        assert_eq!(client.answer().await, Some(reply(1)));
+        assert_eq!(client.answer().await, Some(told_table(3)));
+        let more = tokio::time::timeout(next, client.answer()).await;
+        assert!(more.is_err(), "told {more:?} after the newest table");
+        // A table and an answer both waiting: the answer, every time.
+        for round in 0..20 {
+            running.answer(id, told_table(10 + round));
+            running.answer(id, reply(round));
+            assert_eq!(client.answer().await, Some(reply(round)), "round {round}");
+            assert_eq!(client.answer().await, Some(told_table(10 + round)));
         }
     }
 
