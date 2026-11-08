@@ -680,7 +680,9 @@ impl<V: Held> Node<V> {
     }
 
     /// Whether it may now stop without anyone noticing: told to drain, and its table has it
-    /// owning nothing, voting nowhere and leading nobody — or it never was a member.
+    /// owning nothing, voting nowhere and leading nobody — or it never was a member. Or with
+    /// no one to notice: its table has every member draining, itself among them, so nobody
+    /// is left to take what it holds, and waiting would only end in its grace period's kill.
     #[must_use]
     pub fn drained(&self) -> bool {
         if !self.draining {
@@ -692,10 +694,17 @@ impl<V: Held> Node<V> {
         if !table.has_member(self.id) {
             return true;
         }
-        table.is_draining(self.id)
-            && table.owned_by(self.id).next().is_none()
-            && !table.votes(self.id)
-            && !self.is_leader()
+        if !table.is_draining(self.id) {
+            return false;
+        }
+        let none_to_take = table
+            .members
+            .keys()
+            .all(|member| table.is_draining(*member));
+        none_to_take
+            || (table.owned_by(self.id).next().is_none()
+                && !table.votes(self.id)
+                && !self.is_leader())
     }
 
     /// Its stamp for the table it has accepted, `(0, 0)` for none.
@@ -2848,6 +2857,32 @@ mod tests {
                 node.committed().map(|table| &table.members),
                 Some(&named(&[1, 2, 3, 4]))
             );
+        }
+    }
+
+    /// Told to stop, a pod whose table has every member draining, itself among them, has no
+    /// one to hand its shards to: it is drained, owning some still. One member not draining
+    /// can take them, and it waits for that; so it does while its own draining is uncommitted.
+    #[test]
+    fn a_pod_no_member_is_left_to_take_from_is_drained() {
+        for (members, draining, drained) in [
+            (vec![2], vec![2], true),
+            (vec![1, 2, 3], vec![1, 2, 3], true),
+            (vec![2], vec![], false),
+            (vec![1, 2, 3], vec![2, 3], false),
+            (vec![1, 2, 3], vec![1, 3], false),
+        ] {
+            let mut node = Node::new(2, address(2), config(), [1, 3]);
+            let mut table = table::first(&named(&members), 4, 2, 1);
+            table.draining.clone_from(&draining);
+            let _ = node.receive(1, Message::TableReply { table }, ms(1));
+            node.drain();
+            assert!(
+                node.committed()
+                    .is_some_and(|table| table.owned_by(2).next().is_some()),
+                "{members:?} {draining:?}: owns nothing"
+            );
+            assert_eq!(node.drained(), drained, "{members:?} {draining:?}");
         }
     }
 
