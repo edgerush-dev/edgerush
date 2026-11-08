@@ -32,7 +32,7 @@
 //!   election_jitter_ms: 200
 //!   cycle_ms: 10
 //!   skew_warning_ms: 250
-//!   forwarder_decides: false  # a replica decides an unheard owner's keys from its copy
+//!   forwarder_decides: true   # a replica decides an unheard owner's keys from its copy
 //! keys:
 //!   max_bytes: 268435456      # 256 MiB when left out
 //! tls:                        # served plain, to anyone, when left out
