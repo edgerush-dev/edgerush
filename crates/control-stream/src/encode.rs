@@ -11,12 +11,6 @@
 //! stream is refused if that falls outside either end's window: a data plane older than
 //! the control plane still writes for, or a control plane older than the data plane still
 //! reads.
-//!
-//! Each end has a window: the versions from [`OLDEST_CONFIG_VERSION`] to its own
-//! [`CONFIG_VERSION`]. A config is written at the older of the two ends' versions, and a
-//! stream is refused if that falls outside either end's window: a data plane older than
-//! the control plane still writes for, or a control plane older than the data plane still
-//! reads.
 
 use edgerush_config::Config;
 
