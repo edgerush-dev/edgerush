@@ -159,6 +159,11 @@ harness = false
 required-features = ["fuzzing"]
 
 [[bench]]
+name = "udp_sessions"
+harness = false
+required-features = ["fuzzing"]
+
+[[bench]]
 name = "websocket"
 harness = false
 required-features = ["fuzzing"]
