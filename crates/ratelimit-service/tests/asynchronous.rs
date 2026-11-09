@@ -311,13 +311,36 @@ async fn told(stream: &mut ExchangeStream, most: Duration) -> Option<Message> {
 }
 
 /// The answers a data plane's `stream` is told next, within `most`, the tables told meanwhile
-/// passed over.
-async fn answers(stream: &mut ExchangeStream, most: Duration) -> Option<Answers> {
+/// passed over: the pod's own, or an owner's relayed.
+async fn answers(stream: &mut ExchangeStream, most: Duration) -> Option<Told> {
     let until = Instant::now() + most;
     loop {
         let left = until.saturating_duration_since(Instant::now());
-        if let Message::Answers(answers) = told(stream, left).await? {
-            return Some(answers);
+        match told(stream, left).await? {
+            Message::Answers(answers) => return Some(Told::Own(answers)),
+            Message::Relayed { owner, answers, .. } => {
+                return Some(Told::Relayed { owner, answers });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Answers a data plane is told.
+#[derive(Debug)]
+enum Told {
+    /// The pod's own.
+    Own(Answers),
+    /// An owner's, relayed by the pod.
+    Relayed { owner: NodeId, answers: Answers },
+}
+
+impl Told {
+    /// The pod's own answers; a panic if they were relayed.
+    fn own(self) -> Answers {
+        match self {
+            Self::Own(answers) => answers,
+            Self::Relayed { .. } => panic!("relayed, not the pod's own: {self:?}"),
         }
     }
 }
@@ -346,7 +369,7 @@ async fn a_batch_on_a_data_planes_stream_is_applied_answered_and_copied() {
     let key = key_owned_by(&table, 1);
     let sent = batch(table.stamp(), key, 1, 3);
     stream.up.send(batch_to_wire(sent)).await.unwrap();
-    let answered = answers(&mut stream, ANSWERED).await.unwrap();
+    let answered = answers(&mut stream, ANSWERED).await.unwrap().own();
     assert_eq!(answered.life, 1_001);
     assert_eq!(answered.made, 5, "said back");
     assert_eq!(answered.entries.len(), 1);
@@ -374,22 +397,28 @@ async fn a_batch_at_a_pod_not_its_keys_owner_is_forwarded_and_answered_through_i
     let key = key_owned_by(&table, 1);
     let sent = batch(table.stamp(), key, 1, 4);
     stream.up.send(batch_to_wire(sent.clone())).await.unwrap();
-    // The forwarder's own, then the owner's relayed: each numbered in its pod's life.
-    let mut told: BTreeMap<u64, Answers> = BTreeMap::new();
+    // The forwarder's own, and the owner's relayed with the owner, each numbered in its pod's
+    // life, in either order.
+    let (mut own, mut relayed) = (None, None);
     for _ in 0..2 {
-        let answered = answers(&mut stream, ANSWERED).await.unwrap();
-        told.insert(answered.life, answered);
+        match answers(&mut stream, ANSWERED).await.unwrap() {
+            Told::Own(answers) => own = Some(answers),
+            Told::Relayed { owner, answers } => relayed = Some((owner, answers)),
+        }
     }
-    let own = &told[&1_002];
+    let own = own.unwrap();
+    assert_eq!(own.life, 1_002);
     assert!(own.entries.is_empty() && own.unserved.is_empty(), "{own:?}");
-    let relayed = &told[&1_001];
+    let (owner, relayed) = relayed.unwrap();
+    assert_eq!(owner, 1, "relayed as the owner's");
+    assert_eq!(relayed.life, 1_001);
     assert_eq!(relayed.made, 5);
     assert_eq!(relayed.entries.len(), 1);
     assert_eq!(relayed.entries[0].answered.applied, 1);
     assert_eq!(counted_at(cluster.pod(1), key).await, Some(4));
     let (mut direct, _) = opened(&cluster, 1).await;
     direct.up.send(batch_to_wire(sent)).await.unwrap();
-    let again = answers(&mut direct, ANSWERED).await.unwrap();
+    let again = answers(&mut direct, ANSWERED).await.unwrap().own();
     assert_eq!(again.entries[0].answered.applied, 1);
     assert_eq!(
         counted_at(cluster.pod(1), key).await,
@@ -409,7 +438,7 @@ async fn a_batch_behind_the_pods_table_is_answered_with_it() {
         .send(batch_to_wire(batch((0, 0), key, 1, 1)))
         .await
         .unwrap();
-    let answered = answers(&mut stream, ANSWERED).await.unwrap();
+    let answered = answers(&mut stream, ANSWERED).await.unwrap().own();
     assert_eq!(answered.table.map(|told| told.stamp()), Some(table.stamp()));
 }
 
