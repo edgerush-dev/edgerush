@@ -14,7 +14,7 @@ use edgerush_config::HarnessFile;
 use edgerush_control_service::{Credentials, Heard, acceptor, serve};
 use edgerush_control_stream::{Listening, Offer, Versions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
@@ -414,6 +414,100 @@ listeners:
     let counted = "edgerush_listener_responses_total{listener=\"api\",class=\"2xx\"} 1\n";
     assert!(scrape.contains(counted), "{scrape}");
     Ok(())
+}
+
+/// A `udp` listener is served beside a TCP-based one on the same port, as a config may
+/// have it (24 §2); taken away, it drains, the TCP listener left alone; and added again on
+/// that port, which the TCP listener keeps, it is served: TCP and UDP ports are not one.
+#[test]
+fn proxy_serves_a_udp_listener_beside_a_tcp_one_and_follows_it() -> io::Result<()> {
+    let (one, echo) = (upstream("one")?, udp_echo()?);
+    // A port free over both TCP and UDP, which both listeners are given: drawn again where
+    // the host keeps the TCP port's number from UDP, as Windows keeps ranges of it.
+    let shared = (0..8)
+        .find_map(|_| {
+            let tcp = TcpListener::bind("127.0.0.1:0").ok()?;
+            let address = tcp.local_addr().ok()?;
+            UdpSocket::bind(address).ok().map(|_| address)
+        })
+        .expect("a port free over TCP and UDP");
+    let with = |dns: bool| {
+        let mut yaml = config(&shared.to_string(), "up", Some(one)).replace(
+            "upstreams:\n",
+            &format!(
+                "upstreams:\n  echo: {{ protocol: udp, load_balancer: p2c, endpoints: {{ listed: [\"{echo}\"] }} }}\n"
+            ),
+        );
+        if dns {
+            yaml = yaml.replace(
+                "listeners:\n",
+                "udp_routes: [{ name: dns, listeners: [dns], backends: [{ upstream: echo, weight: 1 }] }]\nlisteners:\n",
+            );
+            yaml.push_str(&format!(
+                "  dns: {{ address: \"{shared}\", protocol: udp }}\n"
+            ));
+        }
+        yaml
+    };
+    let file = scratch("udp.yaml");
+    std::fs::write(&file, with(true))?;
+    let metrics = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let args = [
+        "--config",
+        &file,
+        "--workers",
+        "1",
+        "--metrics",
+        &metrics.to_string(),
+    ];
+    let mut harness = Harness::start(&args)?;
+    let on = format!("listener \"dns\" is on {shared}, over UDP");
+    assert_eq!(harness.wait_for("listener \"dns\" is on "), on);
+    harness.wait_for("1 worker, thread-per-core");
+    assert!(get(shared, "/")?.contains("x-upstream: one"));
+    assert_eq!(udp_exchange(shared, b"over UDP")?, b"over UDP");
+    // A session, counted as a connection accepted.
+    let accepted = "edgerush_listener_connections_accepted_total{listener=\"dns\"} 1\n";
+    let scrape = get(metrics, "/metrics")?;
+    assert!(scrape.contains(accepted), "{scrape}");
+
+    // Taken away: it drains, its session ended, and the TCP listener is left alone.
+    std::fs::write(&file, with(false))?;
+    harness.wait_for("listener \"dns\" has drained");
+    assert!(get(shared, "/")?.contains("x-upstream: one"));
+
+    // Back on the port the TCP listener keeps: served, not held off until a restart.
+    std::fs::write(&file, with(true))?;
+    // Said once the reload has been.
+    assert_eq!(harness.wait_for("listener \"dns\" is on "), on);
+    assert_eq!(udp_exchange(shared, b"again")?, b"again");
+    assert!(get(shared, "/")?.contains("x-upstream: one"));
+    Ok(())
+}
+
+/// What `to` answers a datagram `datagram` with, from a socket of the test's own.
+fn udp_exchange(to: SocketAddr, datagram: &[u8]) -> io::Result<Vec<u8>> {
+    let client = UdpSocket::bind("127.0.0.1:0")?;
+    client.connect(to)?;
+    client.set_read_timeout(Some(PATIENCE))?;
+    client.send(datagram)?;
+    let mut buffer = vec![0; 1 << 16];
+    let len = client.recv(&mut buffer)?;
+    buffer.truncate(len);
+    Ok(buffer)
+}
+
+/// Starts a UDP upstream that answers every datagram with itself.
+fn udp_echo() -> io::Result<SocketAddr> {
+    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    let address = socket.local_addr()?;
+    thread::spawn(move || {
+        let mut buffer = vec![0; 1 << 16];
+        while let Ok((len, from)) = socket.recv_from(&mut buffer) {
+            let _sent = socket.send_to(&buffer[..len], from);
+        }
+    });
+    Ok(address)
 }
 
 /// HTTP/3 turned on for a listener a config keeps is served on its port as that config

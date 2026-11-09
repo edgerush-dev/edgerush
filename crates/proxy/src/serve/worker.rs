@@ -170,6 +170,7 @@ impl Worker {
             limiter_said: LimiterSaid::default(),
             watcher: Rc::default(),
             files,
+            udp_buffer: std::cell::OnceCell::new(),
         })
     }
 

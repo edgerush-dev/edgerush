@@ -70,6 +70,13 @@ pub struct Session<T> {
 impl<T> Session<T> {
     /// Where its datagrams go: picked by its first.
     #[must_use]
+    #[cfg_attr(
+        not(any(test, feature = "fuzzing")),
+        expect(
+            dead_code,
+            reason = "a session's access log record names it (24 §8, step 3b)"
+        )
+    )]
     pub fn backend(&self) -> Destination {
         self.backend
     }
@@ -176,6 +183,13 @@ impl<T> Sessions<T> {
     /// Ends `client`'s session before its idle bound, as a refused one ends: handed back,
     /// for the caller to drop, which gives its room back. The client's next datagram makes
     /// a new one.
+    #[cfg_attr(
+        not(any(test, feature = "fuzzing")),
+        expect(
+            dead_code,
+            reason = "the refused end ends a session so (24 §8, step 3b)"
+        )
+    )]
     pub fn end(&mut self, client: &Client) -> Option<Session<T>> {
         let session = self.by_client.remove(client)?;
         self.deadlines.remove(session.deadline);
@@ -208,14 +222,25 @@ impl<T> Sessions<T> {
         }
     }
 
+    /// Ends every session, as a listener taken away ends them: each handed to `each`, with
+    /// its client.
+    pub fn end_every(&mut self, mut each: impl FnMut(Client, Session<T>)) {
+        for (client, session) in self.by_client.drain() {
+            each(client, session);
+        }
+        self.deadlines = Heap::default();
+    }
+
     /// How many sessions there are.
     #[must_use]
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn len(&self) -> usize {
         self.by_client.len()
     }
 
     /// Whether there are none.
     #[must_use]
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn is_empty(&self) -> bool {
         self.by_client.is_empty()
     }
@@ -413,6 +438,26 @@ mod tests {
         assert!(sessions.end(&client(1)).is_some());
         assert_eq!(loads.now(), [0]);
         assert!(datagram(&mut sessions, client(2), start, &backends, 0).is_ok());
+    }
+
+    #[test]
+    fn ending_every_session_hands_each_over_and_gives_their_room_back() {
+        let (mut sessions, loads) = sessions(3);
+        let backends = backends(&[1]);
+        let start = Instant::now();
+        for port in 1..=3 {
+            assert!(datagram(&mut sessions, client(port), start, &backends, 0).is_ok());
+        }
+        let mut handed = Vec::new();
+        sessions.end_every(|client, _| handed.push(client.peer.port()));
+        handed.sort_unstable();
+        assert_eq!(handed, [1, 2, 3]);
+        assert!(sessions.is_empty());
+        assert_eq!(loads.now(), [0]);
+        assert_eq!(sessions.soonest(), None, "no idle bound is left to come");
+        // The table goes on as new: a client is given a session again, and its bound comes.
+        assert!(datagram(&mut sessions, client(1), start, &backends, 0).is_ok());
+        assert_eq!(ended(&mut sessions, start + IDLE), [client(1)]);
     }
 
     #[test]

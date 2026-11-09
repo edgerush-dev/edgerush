@@ -181,6 +181,36 @@ impl AsyncWrite for Counted {
     }
 }
 
+/// A UDP socket on `any`, an endpoint's family's unspecified address with no port, for a
+/// `udp` listener's session to connect with (24 §3).
+///
+/// # Errors
+///
+/// [`Unconnected::Short`], whatever the cause: nothing of the endpoint is asked yet.
+pub(crate) fn udp_socket(any: SocketAddr) -> Result<std::net::UdpSocket, Unconnected> {
+    if refused_by_a_test() {
+        return Err(Unconnected::Short(io::ErrorKind::OutOfMemory.into()));
+    }
+    std::net::UdpSocket::bind(any).map_err(Unconnected::Short)
+}
+
+/// Connects a session's `socket` to `endpoint`. Nothing is sent, but the kernel finds a
+/// route and a local address to it, which fails as a TCP connect's would.
+///
+/// # Errors
+///
+/// [`Unconnected`], saying whose the failure is, as [`connect_failed`] tells it.
+pub(crate) fn udp_connect(
+    socket: &std::net::UdpSocket,
+    endpoint: SocketAddr,
+) -> Result<(), Unconnected> {
+    #[cfg(test)]
+    if UNREACHABLE.with_borrow(|unreachable| unreachable.contains(&endpoint)) {
+        return Err(connect_failed(io::ErrorKind::NetworkUnreachable.into()));
+    }
+    socket.connect(endpoint).map_err(connect_failed)
+}
+
 /// Never, outside the tests.
 #[cfg(not(test))]
 const fn refused_by_a_test() -> bool {
@@ -222,6 +252,26 @@ pub(crate) fn hold_connects(address: SocketAddr, held: Option<std::time::Duratio
     HELD.with_borrow_mut(|holding| match held {
         Some(held) => holding.insert(address, held),
         None => holding.remove(&address),
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The endpoints a UDP connect this thread makes cannot reach.
+    static UNREACHABLE: std::cell::RefCell<std::collections::HashSet<SocketAddr>> =
+        std::cell::RefCell::default();
+}
+
+/// Has every UDP connect this thread makes to `address` find no route to it, or none from
+/// now on: what a loopback cannot be made into.
+#[cfg(test)]
+pub(crate) fn unreachable(address: SocketAddr, unreachable: bool) {
+    UNREACHABLE.with_borrow_mut(|addresses| {
+        if unreachable {
+            addresses.insert(address);
+        } else {
+            addresses.remove(&address);
+        }
     });
 }
 

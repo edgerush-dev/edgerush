@@ -177,6 +177,79 @@ impl Quic {
     ];
 }
 
+/// How a `udp` listener's session ended ([24 §6](../../docs/24-udp-proxying.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionEnd {
+    /// Nothing either way for the listener's idle bound.
+    Idle,
+    /// Its endpoint refused a datagram (ICMP port unreachable).
+    Refused,
+    /// Its listener was taken away, or the worker drained.
+    Drained,
+}
+
+impl SessionEnd {
+    /// The name this is counted under.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Refused => "refused",
+            Self::Drained => "drained",
+        }
+    }
+
+    /// Every one of them, for a scrape that shows a series whether it has happened or not.
+    const ALL: [Self; 3] = [Self::Idle, Self::Refused, Self::Drained];
+}
+
+/// Why a `udp` listener dropped a datagram, nothing sent to its client
+/// ([24 §4](../../docs/24-udp-proxying.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dropped {
+    /// No UDP route serves the listener.
+    NoRoute,
+    /// An invalid backend's share, an upstream with no endpoint, or a route with no
+    /// backend that has a share.
+    InvalidBackend,
+    /// A new client's, its worker having no room for another connection, or its listener
+    /// holding its share (03 §9).
+    NoRoom,
+    /// A new client's, the worker having no socket for its session: its own shortage.
+    Exhausted,
+    /// A new client's, its endpoint not to be reached: set aside.
+    Unreachable,
+    /// Longer than the buffer it was read into: never carried cut.
+    Truncated,
+    /// Either way, the socket it was to go out of had no room for it.
+    SendFull,
+}
+
+impl Dropped {
+    /// The name this is counted under.
+    fn name(self) -> &'static str {
+        match self {
+            Self::NoRoute => "no_route",
+            Self::InvalidBackend => "invalid_backend",
+            Self::NoRoom => "no_room",
+            Self::Exhausted => "exhausted",
+            Self::Unreachable => "unreachable",
+            Self::Truncated => "truncated",
+            Self::SendFull => "send_full",
+        }
+    }
+
+    /// Every one of them, for a scrape that shows a series whether it has happened or not.
+    const ALL: [Self; 7] = [
+        Self::NoRoute,
+        Self::InvalidBackend,
+        Self::NoRoom,
+        Self::Exhausted,
+        Self::Unreachable,
+        Self::Truncated,
+        Self::SendFull,
+    ];
+}
+
 /// Why a listener stopped accepting, its next connections left in the kernel's backlog
 /// ([03 §9](../../docs/03-data-plane.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -613,6 +686,8 @@ pub(crate) struct ListenerCounters {
     grpc: [Counter; NAMES.len()],
     quic: [Counter; Quic::ALL.len()],
     tunnels: [Counter; Tunnel::ALL.len()],
+    sessions: [Counter; SessionEnd::ALL.len()],
+    dropped: [Counter; Dropped::ALL.len()],
     proxy_headers: [Counter; ProxyHeader::ALL.len()],
 }
 
@@ -628,6 +703,8 @@ impl ListenerCounters {
             &self.grpc[..],
             &self.quic[..],
             &self.tunnels[..],
+            &self.sessions[..],
+            &self.dropped[..],
             &self.proxy_headers[..],
         ];
         for counter in arrays.into_iter().flatten() {
@@ -671,6 +748,20 @@ impl ListenerCounters {
     /// A tunnel of the listener's ended so.
     pub(crate) fn tunnel(&self, ended: Tunnel) {
         if let Some(counter) = self.tunnels.get(ended as usize) {
+            counter.inc();
+        }
+    }
+
+    /// A session of the listener's ended so.
+    pub(crate) fn session(&self, ended: SessionEnd) {
+        if let Some(counter) = self.sessions.get(ended as usize) {
+            counter.inc();
+        }
+    }
+
+    /// The listener dropped a datagram, for `why`.
+    pub(crate) fn dropped(&self, why: Dropped) {
+        if let Some(counter) = self.dropped.get(why as usize) {
             counter.inc();
         }
     }
@@ -1279,6 +1370,31 @@ impl Metrics {
                 scrape.sample(name, &labels, series.sum(count));
             }
         }
+        let name = "edgerush_listener_udp_sessions_total";
+        let help = "Sessions of udp listeners, by how they ended: idle, refused by their \
+                    endpoint, or drained.";
+        scrape.family(name, Kind::Counter, help);
+        for (listener, series) in listeners() {
+            for ended in SessionEnd::ALL {
+                let labels = [("listener", listener.as_str()), ("outcome", ended.name())];
+                let count = |shard: &ListenerCounters| {
+                    shard.sessions.get(ended as usize).map_or(0, Counter::get)
+                };
+                scrape.sample(name, &labels, series.sum(count));
+            }
+        }
+        let name = "edgerush_listener_udp_datagrams_dropped_total";
+        let help = "Datagrams of udp listeners dropped, nothing sent to the client, by why.";
+        scrape.family(name, Kind::Counter, help);
+        for (listener, series) in listeners() {
+            for why in Dropped::ALL {
+                let labels = [("listener", listener.as_str()), ("reason", why.name())];
+                let count = |shard: &ListenerCounters| {
+                    shard.dropped.get(why as usize).map_or(0, Counter::get)
+                };
+                scrape.sample(name, &labels, series.sum(count));
+            }
+        }
         let name = "edgerush_listener_proxy_headers_total";
         let help = "PROXY protocol headers read at the start of connections, by what came of \
                     them: a sender's used, or left the connection's own ends in use; a \
@@ -1731,6 +1847,9 @@ mod tests {
         web.quic(Quic::Forwarded);
         web.quic(Quic::Forwarded);
         web.quic(Quic::Retry);
+        web.session(SessionEnd::Idle);
+        web.dropped(Dropped::SendFull);
+        web.dropped(Dropped::SendFull);
         let upstream = metrics.upstream(cart).unwrap();
         upstream.requests.inc();
         upstream.responded(StatusCode::OK);
@@ -1752,6 +1871,12 @@ mod tests {
             "edgerush_listener_quic_datagrams_total{listener=\"web\",event=\"retry\"} 1\n",
             "edgerush_listener_quic_datagrams_total{listener=\"admin\",event=\"version_negotiation\"} 0\n",
             "edgerush_listener_quic_datagrams_total{listener=\"web\",event=\"no_room\"} 0\n",
+            "edgerush_listener_udp_sessions_total{listener=\"web\",outcome=\"idle\"} 1\n",
+            "edgerush_listener_udp_sessions_total{listener=\"admin\",outcome=\"refused\"} 0\n",
+            "edgerush_listener_udp_sessions_total{listener=\"web\",outcome=\"drained\"} 0\n",
+            "edgerush_listener_udp_datagrams_dropped_total{listener=\"web\",reason=\"send_full\"} 2\n",
+            "edgerush_listener_udp_datagrams_dropped_total{listener=\"web\",reason=\"no_route\"} 0\n",
+            "edgerush_listener_udp_datagrams_dropped_total{listener=\"admin\",reason=\"unreachable\"} 0\n",
             "edgerush_listener_time_to_response_head_seconds_bucket{listener=\"web\",le=\"0.0005\"} 1\n",
             "edgerush_listener_time_to_response_head_seconds_bucket{listener=\"web\",le=\"0.001\"} 2\n",
             "edgerush_listener_time_to_response_head_seconds_bucket{listener=\"web\",le=\"+Inf\"} 2\n",
@@ -1790,6 +1915,8 @@ mod tests {
         let listener = metrics.listener(2).unwrap();
         listener.responded(StatusCode::OK, 1_000);
         listener.quic(Quic::Negotiation);
+        listener.session(SessionEnd::Drained);
+        listener.dropped(Dropped::NoRoom);
         metrics.listen(2);
         let scrape = metrics.render(&named, &[], &[]);
         assert!(
@@ -1799,6 +1926,8 @@ mod tests {
         let listener = metrics.listener(2).unwrap();
         assert_eq!(listener.head_time.counts().sum::<u64>(), 0);
         assert!(listener.quic.iter().all(|counter| counter.get() == 0));
+        assert!(listener.sessions.iter().all(|counter| counter.get() == 0));
+        assert!(listener.dropped.iter().all(|counter| counter.get() == 0));
     }
 
     #[test]
