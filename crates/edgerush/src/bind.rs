@@ -44,9 +44,10 @@ pub(crate) fn listen(address: SocketAddr, port: Port) -> io::Result<TcpListener>
     Ok(socket.into())
 }
 
-/// A UDP socket on `address` for HTTP/3, ready to be handed to the runtime: IPv4 as well on
-/// an IPv6 address, as [`listen`] does, and one of a group on a shared port, where the
-/// kernel deals datagrams out by a hash of their addresses (16 §3).
+/// A UDP socket on `address`, for HTTP/3 or a `udp` listener, ready to be handed to the
+/// runtime: IPv4 as well on an IPv6 address, as [`listen`] does, and one of a group on a
+/// shared port, where the kernel deals datagrams out by a hash of their addresses (16 §3,
+/// 24 §3).
 pub(crate) fn datagrams(address: SocketAddr, port: Port) -> io::Result<UdpSocket> {
     let socket = Socket::new(
         Domain::for_address(address),

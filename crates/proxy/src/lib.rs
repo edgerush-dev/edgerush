@@ -128,11 +128,11 @@ pub mod timers;
 mod timers;
 mod tls;
 mod tunnel;
-// Built for its tests and its benchmark alone until the worker serves `udp` listeners
-// (24 §8 in the docs, step 3).
+// Private, save when the fuzz targets are being built: the session table's benchmark is
+// built with them.
 #[cfg(feature = "fuzzing")]
 pub mod udp;
-#[cfg(all(test, not(feature = "fuzzing")))]
+#[cfg(not(feature = "fuzzing"))]
 mod udp;
 // Private, save when the fuzz targets are being built: they are a crate of their own and
 // cannot otherwise reach what they drive.

@@ -16,6 +16,7 @@
 //! the pool of upstream connections to come, above all.
 
 mod connection;
+mod datagrams;
 mod exchange;
 mod kubernetes;
 mod logged;
@@ -522,6 +523,8 @@ pub struct Worker {
     watcher: Rc<watched::Watcher>,
     /// Its open files, client connections and upstream sockets, held to its share (03 §9).
     files: Rc<crate::descriptors::Descriptors>,
+    /// What its `udp` listeners read datagrams into, made by the first it serves (24 §4).
+    udp_buffer: std::cell::OnceCell<Rc<RefCell<Box<[u8]>>>>,
 }
 
 /// The client validation a listener's connections were accepted under on a worker, and the
@@ -1280,9 +1283,6 @@ pub enum ProxyError {
         /// What is wrong with them.
         error: TlsError,
     },
-    /// A `udp` listener, which the data plane does not serve yet.
-    #[error("listener `{0}`: a `udp` listener is not served yet")]
-    UdpUnserved(String),
     /// BoringSSL could not give the keys the data plane makes at start.
     #[error("no random keys to be had: {0}")]
     Random(String),

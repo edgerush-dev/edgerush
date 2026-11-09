@@ -29,26 +29,6 @@ fn filed_under(proxy: &Proxy, upstream: usize) -> u64 {
         .key()
 }
 
-/// A config with a `udp` listener, which the data plane does not serve yet, is refused at
-/// start and at a reload, and the config running is kept.
-#[test]
-fn a_udp_listener_is_refused_until_it_is_served() {
-    let with_udp = || {
-        let yaml = "listeners: { dns: { address: \"127.0.0.1:0\", protocol: udp } }\nroutes: []\nudp_routes: [{ name: dns, listeners: [dns], backends: [{ upstream: dns, weight: 1 }] }]\nupstreams: { dns: { load_balancer: p2c, endpoints: { listed: [\"127.0.0.1:1\"] }, protocol: udp } }\n";
-        let config: Config = serde_saphyr::from_str(yaml).unwrap();
-        compile(&config).unwrap()
-    };
-    let refused = Err(ProxyError::UdpUnserved("dns".to_owned()));
-    assert_eq!(
-        Proxy::new(with_udp(), NonZeroUsize::MIN).map(|_| ()),
-        refused
-    );
-    let proxy = Proxy::new(upstreams(&[("web", "127.0.0.1:1")]), NonZeroUsize::MIN).unwrap();
-    let running = Arc::clone(&proxy.current.load().config);
-    assert_eq!(proxy.reload(with_udp()), refused);
-    assert!(Arc::ptr_eq(&proxy.current.load().config, &running));
-}
-
 /// Reconciling happens where a config is published, so a real reload keeps what has
 /// not changed and retires what has gone — not only the reconciler asked on its own.
 #[test]

@@ -500,12 +500,13 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         .transpose()?;
 
     for listener in &bound {
-        let also = if listener.http3 { ", HTTP/3 too" } else { "" };
         say(
             stderr,
             format_args!(
-                "listener \"{}\" is on {}{also}",
-                listener.name, listener.listens_on
+                "listener \"{}\" is on {}{}",
+                listener.name,
+                listener.listens_on,
+                listener.also()
             ),
         );
     }
@@ -885,7 +886,8 @@ fn report(reporting: Option<&tokio::sync::watch::Sender<Served>>, listeners: &Li
 /// that drained, and its warnings.
 #[derive(Debug, Default)]
 struct Reloaded {
-    opened: Vec<(String, SocketAddr, bool)>,
+    /// Each with what [`Bound::also`] says of it.
+    opened: Vec<(String, SocketAddr, &'static str)>,
     drained: Vec<String>,
     /// What else changed of the listeners' sockets, as it is said.
     said: Vec<String>,
@@ -914,8 +916,7 @@ impl Reloaded {
         for name in &self.drained {
             say(stderr, format_args!("listener \"{name}\" has drained"));
         }
-        for (name, address, http3) in &self.opened {
-            let also = if *http3 { ", HTTP/3 too" } else { "" };
+        for (name, address, also) in &self.opened {
             say(
                 stderr,
                 format_args!("listener \"{name}\" is on {address}{also}"),
@@ -1104,7 +1105,8 @@ impl Listening<'_> {
                     gone.name == listener.name
                         || (listener.address.port() != 0
                             && (gone.address == listener.address
-                                || gone.listens_on == listener.address))
+                                || gone.listens_on == listener.address)
+                            && gone.clashes_with(listener))
                 })
             })
             .cloned()
@@ -1199,6 +1201,7 @@ impl Listening<'_> {
             let held = bound.iter().find(|bound| {
                 listener.address.port() != 0
                     && (bound.address == listener.address || bound.listens_on == listener.address)
+                    && bound.clashes_with(listener)
             });
             if let Some(holder) = held {
                 if goes(holder) {
@@ -1260,7 +1263,7 @@ impl Listening<'_> {
                 .extend(self.workers.add(*slot, &added.name, sockets));
             reloaded
                 .opened
-                .push((added.name.clone(), added.listens_on, added.http3));
+                .push((added.name.clone(), added.listens_on, added.also()));
             added.slot = *slot;
             listeners.unserved.remove(&added.name);
             listeners.bound.push(added);
@@ -1623,6 +1626,8 @@ struct Bound {
     listens_on: SocketAddr,
     /// It serves HTTP/3 as well, on the same port over UDP.
     http3: bool,
+    /// A `udp` listener, whose one socket is UDP's (24 §3).
+    udp: bool,
 }
 
 impl From<&edgerush_config::CompiledListener> for Bound {
@@ -1635,6 +1640,31 @@ impl From<&edgerush_config::CompiledListener> for Bound {
             address: listener.address,
             listens_on: listener.address,
             http3: listener.http3.is_some(),
+            udp: listener.protocol == edgerush_config::Protocol::Udp,
+        }
+    }
+}
+
+impl Bound {
+    /// Whether its sockets and `other`'s, on one address, would be on one port of one
+    /// transport: TCP for every listener but a `udp` one, UDP for that one and for HTTP/3,
+    /// draining HTTP/3 among it. A `udp` listener and a TCP-based one share an address
+    /// (24 §2).
+    fn clashes_with(&self, other: &Self) -> bool {
+        let tcp = |bound: &Self| !bound.udp;
+        let udp = |bound: &Self| bound.udp || bound.http3 || bound.http3_draining.is_some();
+        (tcp(self) && tcp(other)) || (udp(self) && udp(other))
+    }
+
+    /// What is said of it after its address: the transport it is on, where that is not
+    /// TCP's alone.
+    fn also(&self) -> &'static str {
+        if self.udp {
+            ", over UDP"
+        } else if self.http3 {
+            ", HTTP/3 too"
+        } else {
+            ""
         }
     }
 }
@@ -1650,6 +1680,16 @@ fn opened(
     for _ in 0..workers.get() {
         let what = format!("listener \"{}\"", listener.name);
         let asked = listener.listens_on;
+        if listener.udp {
+            let socket = datagrams(asked, port).map_err(|error| Failure::Listen {
+                what,
+                address: asked,
+                error,
+            })?;
+            listener.listens_on = socket.local_addr().unwrap_or(asked);
+            sockets.push(Sockets::Datagrams(socket));
+            continue;
+        }
         let (socket, udp) = if listener.http3 {
             let (socket, udp) = listen_both(asked, port).map_err(|refused| match refused {
                 Refused::Tcp(error) => Failure::Listen {
@@ -1668,7 +1708,7 @@ fn opened(
             (open(what, asked, port)?, None)
         };
         listener.listens_on = socket.local_addr().unwrap_or(asked);
-        sockets.push((socket, udp));
+        sockets.push(Sockets::Stream(socket, udp));
     }
     Ok(sockets)
 }
@@ -2087,6 +2127,7 @@ upstreams: {{}}
             address,
             listens_on: address,
             http3: true,
+            udp: false,
         }
     }
 

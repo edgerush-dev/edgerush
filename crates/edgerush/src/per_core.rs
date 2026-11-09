@@ -103,11 +103,20 @@ struct Added {
     /// The listener's slot ([`Proxy::listeners`]).
     slot: usize,
     name: String,
-    tcp: std::net::TcpListener,
-    /// Its UDP socket, where it serves HTTP/3, and the worker's share of its QUIC inboxes.
-    udp: Option<(std::net::UdpSocket, Forwarding)>,
+    sockets: Posted,
     /// Where the worker says whether it serves them.
     said: std::sync::mpsc::Sender<Result<(), String>>,
+}
+
+/// A worker's sockets for a listener added, as [`Sockets`] are, with the worker's share of
+/// an HTTP/3 listener's QUIC inboxes.
+#[derive(Debug)]
+enum Posted {
+    Stream(
+        std::net::TcpListener,
+        Option<(std::net::UdpSocket, Forwarding)>,
+    ),
+    Datagrams(std::net::UdpSocket),
 }
 
 /// The workers that run, for the main loop: what they hold, where to tell each of a
@@ -133,12 +142,15 @@ impl Workers {
         let mut forwarding = Forwarding::group(sockets.len()).into_iter();
         let mut posted = 0;
         let mut failed = Vec::new();
-        for (position, (worker, (tcp, udp))) in self.changing.iter().zip(sockets).enumerate() {
+        for (position, (worker, sockets)) in self.changing.iter().zip(sockets).enumerate() {
+            let sockets = match sockets {
+                Sockets::Stream(tcp, udp) => Posted::Stream(tcp, udp.zip(forwarding.next())),
+                Sockets::Datagrams(udp) => Posted::Datagrams(udp),
+            };
             let added = Added {
                 slot,
                 name: name.to_owned(),
-                tcp,
-                udp: udp.zip(forwarding.next()),
+                sockets,
                 said: said.clone(),
             };
             match worker.send(Change::Add(added)) {
@@ -357,8 +369,14 @@ struct Worker {
     tell: std::sync::mpsc::Sender<Told>,
 }
 
-/// A worker's sockets for one listener: TCP, and UDP where the listener serves HTTP/3.
-pub(crate) type Sockets = (std::net::TcpListener, Option<std::net::UdpSocket>);
+/// A worker's sockets for one listener.
+#[derive(Debug)]
+pub(crate) enum Sockets {
+    /// A listener over TCP, and its UDP socket where it serves HTTP/3.
+    Stream(std::net::TcpListener, Option<std::net::UdpSocket>),
+    /// A `udp` listener's socket ([24 §3](../../../docs/24-udp-proxying.md)).
+    Datagrams(std::net::UdpSocket),
+}
 
 /// Starts a worker on a thread of its own for every entry of `sockets` — the sockets of
 /// every listener, in the order of the listeners — all serving the one `proxy`, each
@@ -417,11 +435,19 @@ pub(crate) fn start(
         let entered = runtime.enter();
         let mut streams = Vec::with_capacity(sockets.len());
         let mut datagrams = Vec::new();
-        for (listener, (tcp, udp)) in sockets.into_iter().enumerate() {
-            streams.push(TcpListener::from_std(tcp)?);
+        let mut udp_listeners = Vec::new();
+        for (listener, sockets) in sockets.into_iter().enumerate() {
             let share = forwarding.get_mut(listener).and_then(Iterator::next);
-            if let (Some(udp), Some(share)) = (udp, share) {
-                datagrams.push((listener, UdpSocket::from_std(udp)?, share));
+            match sockets {
+                Sockets::Stream(tcp, udp) => {
+                    streams.push((listener, TcpListener::from_std(tcp)?));
+                    if let (Some(udp), Some(share)) = (udp, share) {
+                        datagrams.push((listener, UdpSocket::from_std(udp)?, share));
+                    }
+                }
+                Sockets::Datagrams(udp) => {
+                    udp_listeners.push((listener, UdpSocket::from_std(udp)?));
+                }
             }
         }
         let sockets = streams;
@@ -467,13 +493,28 @@ pub(crate) fn start(
                     running: Rc::new(running),
                     tell: tell.clone(),
                 };
-                for (listener, socket) in sockets.into_iter().enumerate() {
+                for (listener, socket) in sockets {
                     local.spawn_local(worker.accepting(listener, name(listener), socket));
+                }
+                for (listener, socket) in udp_listeners {
+                    match Rc::clone(&worker.plane).serve_udp(listener, socket) {
+                        Ok(serving) => {
+                            let what = format!("datagrams on listener \"{}\"", name(listener));
+                            local.spawn_local(worker.serving_udp(listener, what, serving));
+                        }
+                        Err(error) => {
+                            let listener = name(listener).to_owned();
+                            let _told = ready.send(Err(NotStarted::Udp { listener, error }));
+                            thread.finished();
+                            return;
+                        }
+                    }
                 }
                 for (listener, socket, share) in datagrams {
                     match Rc::clone(&worker.plane).serve_h3(listener, socket, share) {
                         Ok(serving) => {
-                            local.spawn_local(worker.serving_h3(listener, name(listener), serving));
+                            let what = format!("HTTP/3 on listener \"{}\"", name(listener));
+                            local.spawn_local(worker.serving_udp(listener, what, serving));
                         }
                         Err(error) => {
                             let listener = name(listener).to_owned();
@@ -517,6 +558,8 @@ pub(crate) enum NotStarted {
     Runtime(#[from] io::Error),
     #[error("listener \"{listener}\" cannot serve HTTP/3: {error}")]
     Http3 { listener: String, error: io::Error },
+    #[error("listener \"{listener}\" cannot be served: {error}")]
+    Udp { listener: String, error: io::Error },
 }
 
 impl Worker {
@@ -541,16 +584,16 @@ impl Worker {
         }
     }
 
-    /// `serving`, HTTP/3 on the listener `name` whose slot is `slot`, watched as
-    /// [`Worker::accepting`] is.
-    fn serving_h3(
+    /// `serving`, `what` on a UDP socket of the listener whose slot is `slot` — HTTP/3, or
+    /// a `udp` listener's datagrams — watched as [`Worker::accepting`] is.
+    fn serving_udp(
         &self,
         slot: usize,
-        name: &str,
+        what: String,
         serving: impl Future<Output = ()> + 'static,
     ) -> impl Future<Output = ()> + 'static {
         let task = self.running.task(slot, Socket::Udp);
-        let what = format!("worker {}'s HTTP/3 on listener \"{name}\"", self.position);
+        let what = format!("worker {}'s {what}", self.position);
         let essential = Essential::new(what, &self.tell);
         let plane = Rc::clone(&self.plane);
         async move {
@@ -641,11 +684,10 @@ impl Worker {
                 Change::Add(Added {
                     slot,
                     name,
-                    tcp,
-                    udp,
+                    sockets,
                     said,
                 }) => {
-                    let _gone = said.send(self.listen(slot, &name, tcp, udp));
+                    let _gone = said.send(self.listen(slot, &name, sockets));
                 }
                 Change::Stop(slot) => {
                     self.plane.stop(slot);
@@ -668,22 +710,28 @@ impl Worker {
         }
     }
 
-    /// Accepts on `tcp` as the listener `name` whose slot is `slot`, and serves HTTP/3 on
-    /// `udp` if there is one, beside what it serves already: the first even if the second
-    /// cannot be, so that no connection the kernel gives this worker waits unaccepted.
-    fn listen(
-        &self,
-        slot: usize,
-        name: &str,
-        tcp: std::net::TcpListener,
-        udp: Option<(std::net::UdpSocket, Forwarding)>,
-    ) -> Result<(), String> {
+    /// Serves `sockets` as the listener `name` whose slot is `slot`, beside what it serves
+    /// already: accepting on a TCP socket, and serving HTTP/3 on its UDP one if there is
+    /// one — the first even if the second cannot be, so that no connection the kernel gives
+    /// this worker waits unaccepted — or a `udp` listener's datagrams.
+    fn listen(&self, slot: usize, name: &str, sockets: Posted) -> Result<(), String> {
         let position = self.position;
         let cannot = |what: &str, error: io::Error| {
             format!("worker {position} cannot {what} listener \"{name}\": {error}")
         };
         // The slot's own drain from now on: one a listener before it had was started.
         self.plane.open(slot);
+        let (tcp, udp) = match sockets {
+            Posted::Stream(tcp, udp) => (tcp, udp),
+            Posted::Datagrams(udp) => {
+                let serving = UdpSocket::from_std(udp)
+                    .and_then(|udp| Rc::clone(&self.plane).serve_udp(slot, udp))
+                    .map_err(|error| cannot("serve", error))?;
+                let what = format!("datagrams on listener \"{name}\"");
+                let _detached = tokio::task::spawn_local(self.serving_udp(slot, what, serving));
+                return Ok(());
+            }
+        };
         let socket = TcpListener::from_std(tcp).map_err(|error| cannot("accept on", error))?;
         let _detached = tokio::task::spawn_local(self.accepting(slot, name, socket));
         match udp {
@@ -708,7 +756,8 @@ impl Worker {
                 let position = self.position;
                 format!("worker {position} cannot serve HTTP/3 on listener \"{name}\": {error}")
             })?;
-        let _detached = tokio::task::spawn_local(self.serving_h3(slot, name, serving));
+        let what = format!("HTTP/3 on listener \"{name}\"");
+        let _detached = tokio::task::spawn_local(self.serving_udp(slot, what, serving));
         Ok(())
     }
 
@@ -798,7 +847,7 @@ upstreams:
         for _ in 0..count {
             let socket = listen(address, Port::Shared).unwrap();
             address = socket.local_addr().unwrap();
-            sockets.push(vec![(socket, None)]);
+            sockets.push(vec![Sockets::Stream(socket, None)]);
         }
         let (tell, told) = std::sync::mpsc::channel();
         let loads = start(
@@ -932,7 +981,7 @@ upstreams:
         for name in &names {
             let socket = listen("127.0.0.1:0".parse().unwrap(), Port::Own).unwrap();
             addresses.insert(name.clone(), socket.local_addr().unwrap());
-            sockets.push((socket, None));
+            sockets.push(Sockets::Stream(socket, None));
         }
         // What ends while a test runs is not what it looks at.
         let (tell, _told) = std::sync::mpsc::channel();
@@ -1102,7 +1151,7 @@ upstreams:
         for _ in 0..count {
             let socket = listen(web, port).unwrap();
             web = socket.local_addr().unwrap();
-            sockets.push(vec![(socket, None)]);
+            sockets.push(vec![Sockets::Stream(socket, None)]);
         }
         let (tell, told) = std::sync::mpsc::channel();
         let running = start(
@@ -1121,7 +1170,7 @@ upstreams:
         for _ in 0..count {
             let (tcp, udp) = listen_both(address, port).unwrap();
             address = tcp.local_addr().unwrap();
-            sockets.push((tcp, Some(udp)));
+            sockets.push(Sockets::Stream(tcp, Some(udp)));
         }
         let api = "  api: { address: \"127.0.0.1:2\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }";
         let opened = edgerush_proxy::Opened {

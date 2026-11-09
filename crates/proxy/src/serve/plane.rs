@@ -52,19 +52,6 @@ pub(super) fn runs_rate_limits(config: &Compiled, supported: bool) -> Result<(),
     Ok(())
 }
 
-/// Refuses a config with a `udp` listener, which the data plane does not serve yet (24 §8):
-/// rather than take a config it would not carry out.
-pub(super) fn serves_listeners(config: &Compiled) -> Result<(), ProxyError> {
-    match config
-        .listeners()
-        .iter()
-        .find(|listener| listener.protocol == edgerush_config::Protocol::Udp)
-    {
-        Some(listener) => Err(ProxyError::UdpUnserved(listener.name.clone())),
-        None => Ok(()),
-    }
-}
-
 /// The namespaces `config`'s discovered upstreams are in, and the data plane's own
 /// Service's, whose slices say its zone.
 fn namespaces_of(config: &Compiled) -> BTreeSet<String> {
@@ -294,7 +281,6 @@ impl Snapshot {
         logs: Vec<Option<Sink>>,
     ) -> Result<(Self, Retiring), ProxyError> {
         runs_rate_limits(&config, edgerush_ratelimit::service::pooled::supported())?;
-        serves_listeners(&config)?;
         // Kept for the same config, made again by endpoints found.
         let service_tls = match previous {
             Some(previous) if Arc::ptr_eq(&previous.config, &config) => {

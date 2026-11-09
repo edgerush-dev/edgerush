@@ -48,16 +48,19 @@ k8s-openapi.workspace = true
 hyper-util = { workspace = true, optional = true }
 memchr.workspace = true
 quiche.workspace = true
+# A send asked of the kernel itself on a socket the runtime has not yet heard is writable:
+# a `udp` listener's session's first datagram (24 §4). On Linux, sending a run of QUIC
+# datagrams in one call for the kernel to cut apart (UDP GSO), which needs a control
+# message that neither std nor tokio can send.
+socket2.workspace = true
 thiserror.workspace = true
 # "sync": what an HTTP/2 upstream connection and its requests wait on each other with.
 tokio = { workspace = true, features = ["sync"] }
 tokio-boring.workspace = true
 
-# Sending a run of QUIC datagrams in one call for the kernel to cut apart (UDP GSO), which
-# needs a control message that neither std nor tokio can send; and, for a wildcard HTTP/3
-# bind, reading a datagram's real destination and replying from it (IP_PKTINFO, via `nix`).
+# For a wildcard HTTP/3 or `udp` bind, reading a datagram's real destination and replying
+# from it (IP_PKTINFO).
 [target.'cfg(target_os = "linux")'.dependencies]
-socket2.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
@@ -160,6 +163,11 @@ required-features = ["fuzzing"]
 
 [[bench]]
 name = "udp_sessions"
+harness = false
+required-features = ["fuzzing"]
+
+[[bench]]
+name = "udp_path"
 harness = false
 required-features = ["fuzzing"]
 
