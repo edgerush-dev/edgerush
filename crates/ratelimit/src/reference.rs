@@ -554,6 +554,25 @@ pub struct BucketState {
 }
 
 impl BucketState {
+    /// The state of a bucket arriving at `arrival`, 0 for none, last charged at `last`: as a
+    /// wire carries it.
+    #[must_use]
+    pub const fn from_parts(arrival: u128, last: u64) -> Self {
+        Self { arrival, last }
+    }
+
+    /// Its arrival time, 0 for none, as [`from_parts`](Self::from_parts) takes it.
+    #[must_use]
+    pub const fn arrival(self) -> u128 {
+        self.arrival
+    }
+
+    /// When it was last charged, as [`from_parts`](Self::from_parts) takes it.
+    #[must_use]
+    pub const fn last(self) -> u64 {
+        self.last
+    }
+
     /// The larger of each part of the two: a bucket charged at least as far as either, as of
     /// the later of their times. Copies of one bucket, under the same terms, merged in any
     /// order and any number of times end the same.

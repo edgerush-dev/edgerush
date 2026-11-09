@@ -163,6 +163,101 @@ impl Value {
         changed |= self.planes.retire(kept) > 0;
         changed
     }
+
+    /// The value in its parts, as a wire carries it.
+    #[must_use]
+    pub fn parts(&self) -> Parts {
+        Parts {
+            contract: self.contract,
+            bucket: self.bucket,
+            counted: self.counted,
+            planes: self
+                .planes
+                .iter()
+                .map(|(plane, record)| PlaneParts {
+                    plane,
+                    applied: record.applied,
+                    admitted: record.last_admitted.get(),
+                    waiting: record.waiting.as_deref().map_or_else(Vec::new, |waiting| {
+                        waiting
+                            .iter()
+                            .map(|(sequence, tally)| (*sequence, tally.count, tally.at))
+                            .collect()
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    /// The value from its parts, as a wire carried them: `None` if they could not have come
+    /// from a value — a data plane given twice, a batch waiting twice, or more batches waiting
+    /// than a data plane may have out ([`MOST_UNACKNOWLEDGED`]).
+    #[must_use]
+    pub fn from_parts(parts: Parts) -> Option<Self> {
+        let Parts {
+            contract,
+            bucket,
+            counted,
+            mut planes,
+        } = parts;
+        planes.sort_by_key(|plane| plane.plane);
+        if planes.windows(2).any(|two| two[0].plane == two[1].plane) {
+            return None;
+        }
+        let mut records = Vec::with_capacity(planes.len());
+        for plane in planes {
+            let mut waiting: Vec<(u64, Tally)> = plane
+                .waiting
+                .into_iter()
+                .map(|(sequence, count, at)| (sequence, Tally { count, at }))
+                .collect();
+            waiting.sort_by_key(|(sequence, _)| *sequence);
+            if waiting.len() > MOST_UNACKNOWLEDGED
+                || waiting.windows(2).any(|two| two[0].0 == two[1].0)
+            {
+                return None;
+            }
+            let record = Record {
+                applied: plane.applied,
+                waiting: (!waiting.is_empty()).then(|| Box::new(waiting)),
+                last_admitted: plane.admitted.map_or_else(Admitted::default, Admitted::at),
+            };
+            records.push((plane.plane, record));
+        }
+        Some(Self {
+            contract,
+            bucket,
+            counted,
+            planes: Records(records),
+        })
+    }
+}
+
+/// A [`Value`] in its parts, as a wire carries it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Parts {
+    /// The contract it is kept under; `None` for a key never made.
+    pub contract: Option<Contract>,
+    /// Its bucket's state, by the wall clock.
+    pub bucket: BucketState,
+    /// Hits applied, each once.
+    pub counted: u64,
+    /// What it knows of each data plane admitting the key.
+    pub planes: Vec<PlaneParts>,
+}
+
+/// What a [`Value`] knows of one data plane, in its parts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlaneParts {
+    /// The data plane.
+    pub plane: PlaneId,
+    /// The highest of its batches applied, every one before it too.
+    pub applied: u64,
+    /// When it last admitted the key, by the wall clock, if it has.
+    pub admitted: Option<u64>,
+    /// Batches that came ahead of one still missing: `(sequence, count, at)`, `at` when their
+    /// hits are charged as of, by the wall clock.
+    pub waiting: Vec<(u64, u64, u64)>,
 }
 
 impl Held for Value {
@@ -604,6 +699,56 @@ mod tests {
                 }
             }
         }
+
+        /// Every copy an owner sends, batches waiting among them, is itself again from its
+        /// parts, in whatever order the wire gives its records and batches.
+        #[test]
+        fn a_value_is_itself_again_from_its_parts(
+            steps in proptest::collection::vec((0u64..4, step(), 0u64..30 * MS), 1..60),
+        ) {
+            for copy in history(&steps) {
+                let mut parts = copy.parts();
+                parts.planes.reverse();
+                for plane in &mut parts.planes {
+                    plane.waiting.reverse();
+                }
+                prop_assert_eq!(Value::from_parts(parts), Some(copy));
+            }
+        }
+    }
+
+    /// Parts no value could have had are refused: a data plane twice, a batch waiting twice,
+    /// more batches waiting than a data plane may have out.
+    #[test]
+    fn parts_no_value_could_have_are_refused() {
+        let plane = |plane, waiting: Vec<(u64, u64, u64)>| PlaneParts {
+            plane,
+            applied: 1,
+            admitted: Some(5),
+            waiting,
+        };
+        let parts = |planes| Parts {
+            contract: Some(contract()),
+            bucket: BucketState::default(),
+            counted: 3,
+            planes,
+        };
+        assert!(
+            Value::from_parts(parts(vec![plane(1, vec![(3, 1, 4)]), plane(2, vec![])])).is_some()
+        );
+        assert_eq!(
+            Value::from_parts(parts(vec![plane(1, vec![]), plane(1, vec![])])),
+            None
+        );
+        assert_eq!(
+            Value::from_parts(parts(vec![plane(1, vec![(3, 1, 4), (3, 2, 4)])])),
+            None
+        );
+        let most = u64::try_from(MOST_UNACKNOWLEDGED).unwrap();
+        let full: Vec<_> = (3..3 + most).map(|sequence| (sequence, 1, 4)).collect();
+        assert!(Value::from_parts(parts(vec![plane(1, full.clone())])).is_some());
+        let over: Vec<_> = (3..4 + most).map(|sequence| (sequence, 1, 4)).collect();
+        assert_eq!(Value::from_parts(parts(vec![plane(1, over)])), None);
     }
 
     /// A record the owner has retired, still held in a replica's older copy, does not come

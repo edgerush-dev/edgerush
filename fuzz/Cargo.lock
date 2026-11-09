@@ -244,6 +244,14 @@ name = "edgerush-cluster"
 version = "0.0.0"
 
 [[package]]
+name = "edgerush-cluster-asynchronous"
+version = "0.0.0"
+dependencies = [
+ "edgerush-cluster",
+ "edgerush-ratelimit",
+]
+
+[[package]]
 name = "edgerush-cluster-synchronous"
 version = "0.0.0"
 dependencies = [
@@ -450,6 +458,7 @@ dependencies = [
  "bytes",
  "edgerush-certificates",
  "edgerush-cluster",
+ "edgerush-cluster-asynchronous",
  "edgerush-cluster-synchronous",
  "edgerush-config",
  "edgerush-control-service",

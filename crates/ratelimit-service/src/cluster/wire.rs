@@ -14,7 +14,8 @@
 //!
 //! The synchronous mode's own messages between pods — a request forwarded to its key's owner,
 //! a part of one gathered, and their answers — go on the stream apart from copies too, beside
-//! the store's ([`mode_wire`]).
+//! the store's ([`mode_wire`]); the asynchronous mode's — entries forwarded to their owner,
+//! and its answers relayed back — likewise ([`asynchronous`]).
 //!
 //! A data plane asks a pod on a stream of its own ([`Asking`]), and is told its answers and the
 //! pod's table on it ([`Telling`]): plain messages, a table at 256 shards a few KB.
@@ -31,6 +32,8 @@ use edgerush_cluster_synchronous::{
 };
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+
+pub mod asynchronous;
 
 /// Why a message on the wire cannot be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -54,6 +57,13 @@ pub enum Invalid {
     /// A request forwarded more times than a byte counts.
     #[error("a request forwarded past 255 hops")]
     Hops,
+    /// An asynchronous entry or value the mode cannot use.
+    #[error("an entry the mode cannot use: {0}")]
+    Entry(crate::wire::Invalid),
+    /// An asynchronous value no owner could have held: a data plane or a batch given twice,
+    /// or more batches waiting than a data plane may have out.
+    #[error("a value no owner could have held")]
+    Value,
 }
 
 /// A mode's value as the wire carries it: a protobuf message of the mode's own.
@@ -557,6 +567,12 @@ pub enum Control<W: prost::Message + Default + Debug> {
     /// Its answer.
     #[prost(message, tag = "25")]
     Reply(Reply),
+    /// The asynchronous mode's entries forwarded to their keys' owner.
+    #[prost(message, tag = "26")]
+    Forwarded(asynchronous::Forwarded),
+    /// The owner's answers to them, relayed back.
+    #[prost(message, tag = "27")]
+    Relayed(asynchronous::Relayed),
 }
 
 /// The synchronous mode's request under one key.
@@ -747,7 +763,7 @@ pub struct ToPeer<W: prost::Message + Default + Debug> {
     /// What it is.
     #[prost(
         oneof = "Control",
-        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
+        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27"
     )]
     pub message: Option<Control<W>>,
 }
@@ -967,7 +983,9 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
 /// A message the store cannot use: see [`Invalid`].
 pub fn from_peer<V: Value>(sent: ToPeer<V::Wire>) -> Result<(NodeId, Message<V>), Invalid> {
     let message = match sent.message.ok_or(Invalid::Missing)? {
-        Control::Request(_) | Control::Reply(_) => return Err(Invalid::Mode),
+        Control::Request(_) | Control::Reply(_) | Control::Forwarded(_) | Control::Relayed(_) => {
+            return Err(Invalid::Mode);
+        }
         Control::Heartbeat(beat) => Message::Heartbeat {
             term: beat.term,
             leader: beat.leader,

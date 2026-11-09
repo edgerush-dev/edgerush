@@ -13,6 +13,7 @@ use crate::message::{Answer, Answers, Batch, Entry, Message, Outbox, Unserved, W
 use crate::{Store, Value, apply};
 use edgerush_cluster::table::shard_of;
 use edgerush_cluster::{Config, NodeId, Time};
+use edgerush_ratelimit::service::Report;
 use std::collections::BTreeMap;
 
 /// One pod of the asynchronous mode in one life: its store, and the batches it answers.
@@ -26,6 +27,29 @@ pub struct Pod {
     life: u64,
     /// The answers it has given in this life.
     answered: u64,
+    /// What it has answered unserved in this life, by why.
+    turned_away: TurnedAway,
+}
+
+/// The entries a pod has answered unserved, nothing of them applied, and the hits they
+/// carried, by why (#159): for an overshoot after a pod paused or a table moved to be read off
+/// the pod that turned the hits away. Those hits are not lost: the data plane sends them again
+/// to the owner its table names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurnedAway {
+    /// Of keys its table names another pod the owner of, or none.
+    pub elsewhere: Turned,
+    /// Of keys its table names it the owner of, while it is not serving.
+    pub not_serving: Turned,
+}
+
+/// Entries turned away, and their hits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Turned {
+    /// Entries.
+    pub entries: u64,
+    /// The hits they reported.
+    pub hits: u64,
 }
 
 impl Pod {
@@ -44,6 +68,7 @@ impl Pod {
             cycle: cycle.max(1),
             life: 0,
             answered: 0,
+            turned_away: TurnedAway::default(),
         }
     }
 
@@ -52,6 +77,12 @@ impl Pod {
     /// numbering again. 0, the default, leaves its answers unnumbered, each taken as it comes.
     pub const fn set_life(&mut self, life: u64) {
         self.life = life;
+    }
+
+    /// What it has answered unserved in this life, by why.
+    #[must_use]
+    pub const fn turned_away(&self) -> TurnedAway {
+        self.turned_away
     }
 
     /// Its store.
@@ -120,10 +151,21 @@ impl Pod {
                     key: entry.key,
                     answered,
                 }),
-                None => unserved.push(Unserved {
-                    key: entry.key,
-                    why: self.why_not(entry.key),
-                }),
+                None => {
+                    let why = self.why_not(entry.key);
+                    let turned = match why {
+                        Why::Elsewhere => &mut self.turned_away.elsewhere,
+                        Why::NotServing => &mut self.turned_away.not_serving,
+                    };
+                    turned.entries = turned.entries.saturating_add(1);
+                    if let Report::Hits { count, .. } = entry.report {
+                        turned.hits = turned.hits.saturating_add(count);
+                    }
+                    unserved.push(Unserved {
+                        key: entry.key,
+                        why,
+                    });
+                }
             }
         }
         let table = self
@@ -293,6 +335,14 @@ mod tests {
         }
     }
 
+    fn poll(key: u64) -> Entry {
+        Entry {
+            key,
+            contract: contract(),
+            report: Report::Poll,
+        }
+    }
+
     fn batch(stamp: Stamp, made: u64, entries: Vec<Entry>) -> Batch {
         Batch {
             from: PLANE,
@@ -329,6 +379,17 @@ mod tests {
         assert_eq!(pod.value(theirs), None);
         assert_eq!(answers.made, 5, "said back");
         assert_eq!(answers.table, None, "the data plane's table is the pod's");
+        let turned = Turned {
+            entries: 1,
+            hits: 4,
+        };
+        assert_eq!(
+            pod.turned_away(),
+            TurnedAway {
+                elsewhere: turned,
+                not_serving: Turned::default()
+            }
+        );
     }
 
     /// An owner without its lease applies nothing and says it is not serving.
@@ -346,6 +407,19 @@ mod tests {
             }]
         );
         assert_eq!(pod.value(own), None);
+        // A poll turned away too counts an entry and no hits.
+        let _ = pod.batch(batch(first().stamp(), 0, vec![poll(own)]), ms(4));
+        let turned = Turned {
+            entries: 2,
+            hits: 3,
+        };
+        assert_eq!(
+            pod.turned_away(),
+            TurnedAway {
+                elsewhere: Turned::default(),
+                not_serving: turned
+            }
+        );
     }
 
     /// Those admitting lately are counted by the pod's cycle: a data plane that admitted
@@ -504,12 +578,7 @@ mod tests {
         let mut pod = member();
         lease(&mut pod, ms(2));
         let own = key_of(1);
-        let poll = Entry {
-            key: own,
-            contract: contract(),
-            report: Report::Poll,
-        };
-        let answers = pod.batch(batch(first().stamp(), 0, vec![poll]), ms(3));
+        let answers = pod.batch(batch(first().stamp(), 0, vec![poll(own)]), ms(3));
         assert_eq!(answers.entries.len(), 1);
         assert_eq!(answers.entries[0].answered.behind, 0, "a full bucket");
         assert_eq!(pod.value(own).as_ref().map(Value::counted), Some(0));

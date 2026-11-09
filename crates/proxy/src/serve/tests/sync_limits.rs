@@ -694,7 +694,7 @@ async fn a_replica_decides_the_keys_of_an_owner_gone_unheard_with_the_store_set_
                         let mut sum = 0;
                         for (at, pod) in store.pods.iter().enumerate() {
                             if at != owner {
-                                sum += pod.pod.observed().await.unwrap().decided_from_copy;
+                                sum += pod.pod.observed().await.unwrap().mode.decided_from_copy;
                             }
                         }
                         sum

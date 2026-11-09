@@ -720,7 +720,9 @@ proptest! {
                     kept.set_behind(now, behind);
                 }
             }
-            state = kept.state();
+            // And carried as its parts, as a wire does.
+            state = BucketState::from_parts(kept.state().arrival(), kept.state().last());
+            prop_assert_eq!(state, kept.state());
             let kept = TokenBucket::from_state(limit, window, capacity, state);
             for at in [now, now + 1, now + 500, now + 5000] {
                 prop_assert_eq!(kept.admits(at), whole.admits(at));
