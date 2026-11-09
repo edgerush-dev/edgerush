@@ -6,8 +6,8 @@
 //! messages, refused alike; its key is the store's, 64 bits.
 //!
 //! A data plane sends its batches up its stream ([`Batch`]), and is told down it the answers
-//! — the pod's own and those it relays — and the pod's table as it commits one
-//! ([`Answering`]).
+//! — the pod's own, and an owner's it relays, with the owner — and the pod's table as it
+//! commits one ([`Answering`]).
 
 use super::{
     Control, Invalid, Outgoing, Stamp, Table, ToCopy, ToPeer, Value, from_copy, from_peer, stamp,
@@ -257,11 +257,12 @@ pub struct Relayed {
     pub owner: u64,
 }
 
-/// What a pod tells a data plane on its stream: answers, or the table it has committed.
+/// What a pod tells a data plane on its stream: its answers, an owner's it relays, or the
+/// table it has committed.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Answering {
     /// Which.
-    #[prost(oneof = "Answered", tags = "1, 2")]
+    #[prost(oneof = "Answered", tags = "1, 2, 3")]
     pub answered: Option<Answered>,
 }
 
@@ -271,9 +272,13 @@ pub enum Answered {
     /// Its table, on the stream's opening and on each commit.
     #[prost(message, tag = "1")]
     Table(Table),
-    /// Answers to a batch: the pod's, or an owner's it relays.
+    /// The pod's answers to a batch.
     #[prost(message, tag = "2")]
     Answers(Answers),
+    /// An owner's answers to entries the pod forwarded, relayed: the data plane takes them as
+    /// that owner's.
+    #[prost(message, tag = "3")]
+    Relayed(Relayed),
 }
 
 fn entry_to_wire(entry: AsyncEntry) -> Entry {
@@ -457,14 +462,21 @@ pub fn mode_from_copy(sent: ToCopy<Asynchronous>) -> Result<(NodeId, AsyncMessag
     from_copy::<AsyncValue>(sent).map(|(from, message)| (from, AsyncMessage::Store(message)))
 }
 
-/// What the mode tells a client, as a data plane's stream carries it down: answers, the pod's
-/// own or relayed, or a table; none for anything else.
+/// What the mode tells a client, as a data plane's stream carries it down: the pod's answers,
+/// an owner's relayed with the owner, or a table; none for anything else.
 #[must_use]
 pub fn answering(message: AsyncMessage) -> Option<Answering> {
     let answered = match message {
-        AsyncMessage::Answers(answers) | AsyncMessage::Relayed { answers, .. } => {
-            Answered::Answers(answers_to_wire(answers))
-        }
+        AsyncMessage::Answers(answers) => Answered::Answers(answers_to_wire(answers)),
+        AsyncMessage::Relayed {
+            client,
+            owner,
+            answers,
+        } => Answered::Relayed(Relayed {
+            client,
+            answers: Some(answers_to_wire(answers)),
+            owner,
+        }),
         AsyncMessage::Store(Message::TableReply { table }) => Answered::Table(table_to_wire(table)),
         _ => return None,
     };
@@ -473,7 +485,8 @@ pub fn answering(message: AsyncMessage) -> Option<Answering> {
     })
 }
 
-/// What a pod told a data plane, as the mode's message: answers, or its table.
+/// What a pod told a data plane, as the mode's message: its answers, an owner's relayed, or
+/// its table.
 ///
 /// # Errors
 ///
@@ -484,6 +497,11 @@ pub fn answered_from(answering: Answering) -> Result<AsyncMessage, Invalid> {
             table: table_from(table)?,
         }),
         Answered::Answers(answers) => AsyncMessage::Answers(answers_from(answers)?),
+        Answered::Relayed(relayed) => AsyncMessage::Relayed {
+            client: relayed.client,
+            owner: relayed.owner,
+            answers: answers_from(relayed.answers.ok_or(Invalid::Missing)?)?,
+        },
     })
 }
 
@@ -673,23 +691,20 @@ mod tests {
             prop_assert_eq!(mode_through(from, relayed.clone()), (from, relayed));
         }
 
-        /// What a pod tells a data plane comes down its stream as answers or a table: the
-        /// owner's relayed as answers too.
+        /// What a pod tells a data plane comes down its stream as it was told: its answers,
+        /// an owner's relayed with the owner, or a table.
         #[test]
         fn answers_come_down_the_stream_as_they_were_told(
             answers in answers(),
-            client in any::<u64>(),
+            (client, owner) in any::<(u64, u64)>(),
         ) {
             for told in [
                 AsyncMessage::Answers(answers.clone()),
-                AsyncMessage::Relayed { client, owner: 2, answers: answers.clone() },
+                AsyncMessage::Relayed { client, owner, answers: answers.clone() },
             ] {
-                let sent = answering(told).unwrap();
+                let sent = answering(told.clone()).unwrap();
                 let decoded = Answering::decode(sent.encode_to_vec().as_slice()).unwrap();
-                prop_assert_eq!(
-                    answered_from(decoded),
-                    Ok(AsyncMessage::Answers(answers.clone()))
-                );
+                prop_assert_eq!(answered_from(decoded), Ok(told));
             }
             let table = AsyncMessage::Store(Message::TableReply { table: table() });
             let sent = answering(table.clone()).unwrap();
@@ -708,6 +723,21 @@ mod tests {
                 prop_assert_eq!(mode_through(from, message.clone()), (from, message));
             }
         }
+    }
+
+    /// What a pod tells a data plane, missing what it is, is refused: nothing told, or a
+    /// relayed answer without its answers.
+    #[test]
+    fn a_word_down_the_stream_missing_its_answers_is_refused() {
+        assert_eq!(answered_from(Answering::default()), Err(Invalid::Missing));
+        let relayed = Answering {
+            answered: Some(Answered::Relayed(Relayed {
+                client: 1,
+                answers: None,
+                owner: 2,
+            })),
+        };
+        assert_eq!(answered_from(relayed), Err(Invalid::Missing));
     }
 
     /// A batch and its answers go between a data plane and a pod alone, never between pods.
