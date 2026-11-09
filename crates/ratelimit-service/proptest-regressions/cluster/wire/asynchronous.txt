@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4ce3e32ba30dab6f71e6b2b1981552c3bd2b9649f208717532568103970d2266 # shrinks to value = Value { contract: None, bucket: BucketState { arrival: 18446744073709551616, last: 0 }, counted: 0, planes: Records([]) }

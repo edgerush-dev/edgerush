@@ -138,7 +138,7 @@ pub fn render_store(observed: Observed) -> String {
     let help = "Requests from data planes the pod decided from its copy of the key, the key's \
                 owner unheard for the store's stop_serving_ms, rather than forward them.";
     scrape.family(name, Kind::Counter, help);
-    scrape.sample(name, &[], observed.decided_from_copy);
+    scrape.sample(name, &[], observed.mode.decided_from_copy);
     let name = "edgerush_rate_limit_peers_skewed";
     let help = "Peers whose wall clocks are off from the pod's past the store's skew warning.";
     scrape.family(name, Kind::Gauge, help);
@@ -288,6 +288,7 @@ where
 mod tests {
     use super::*;
     use crate::cluster::link::Dropped;
+    use crate::cluster::mode::DecidedFromCopy;
 
     #[test]
     fn a_scrape_says_what_the_keys_hold_against_their_bound() {
@@ -335,7 +336,9 @@ mod tests {
                 lost: 2,
                 too_long: 1,
             },
-            decided_from_copy: 6,
+            mode: DecidedFromCopy {
+                decided_from_copy: 6,
+            },
         };
         let scrape = render_store(observed);
         for line in [

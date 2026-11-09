@@ -17,8 +17,8 @@ pub mod value;
 
 pub use message::{Answer, Answers, Batch, Entry, Message, Outbox, Unserved, Why};
 pub use owner::{Answered, apply};
-pub use pod::Pod;
-pub use value::Value;
+pub use pod::{Pod, Turned, TurnedAway};
+pub use value::{Parts, PlaneParts, Value};
 
 /// The store as this mode keeps it.
 pub type Store = edgerush_cluster::Node<Value>;

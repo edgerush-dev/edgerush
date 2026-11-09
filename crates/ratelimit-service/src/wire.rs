@@ -346,8 +346,42 @@ pub(crate) fn contract(contract: Option<Contract>) -> Result<service::Contract, 
     })
 }
 
+/// The protocol's report as the wire carries it.
+pub(crate) const fn report_to_wire(report: service::Report) -> Report {
+    match report {
+        service::Report::Hits {
+            sequence,
+            count,
+            seen,
+            age,
+        } => Report::Hits(Hits {
+            sequence,
+            count,
+            seen,
+            age_ns: age,
+        }),
+        service::Report::Poll => Report::Poll(Poll {}),
+    }
+}
+
+/// The protocol's report from the wire's, which must be there: hits numbered from 1, and only
+/// earlier ones seen applied, as a report saying it or a later one was would have the owner
+/// skip every report to come.
+pub(crate) fn report(report: Option<Report>) -> Result<service::Report, Invalid> {
+    Ok(match report.ok_or(Invalid::NoReport)? {
+        Report::Hits(hits) if hits.seen >= hits.sequence => return Err(Invalid::ReportNumbers),
+        Report::Hits(hits) => service::Report::Hits {
+            sequence: hits.sequence,
+            count: hits.count,
+            seen: hits.seen,
+            age: hits.age_ns,
+        },
+        Report::Poll(_) => service::Report::Poll,
+    })
+}
+
 /// `behind` in 64 bits, the most they hold beyond.
-fn narrow(behind: u128) -> u64 {
+pub(crate) fn narrow(behind: u128) -> u64 {
     u64::try_from(behind).unwrap_or(u64::MAX)
 }
 
@@ -361,20 +395,7 @@ impl From<service::Batch> for Batch {
                 .map(|entry| Entry {
                     key: entry.key.into_vec(),
                     contract: Some(entry.contract.into()),
-                    report: Some(match entry.report {
-                        service::Report::Hits {
-                            sequence,
-                            count,
-                            seen,
-                            age,
-                        } => Report::Hits(Hits {
-                            sequence,
-                            count,
-                            seen,
-                            age_ns: age,
-                        }),
-                        service::Report::Poll => Report::Poll(Poll {}),
-                    }),
+                    report: Some(report_to_wire(entry.report)),
                 })
                 .collect(),
             made_ns: batch.made,
@@ -390,24 +411,10 @@ impl TryFrom<Batch> for service::Batch {
             .entries
             .into_iter()
             .map(|entry| {
-                let report = match entry.report.ok_or(Invalid::NoReport)? {
-                    // Numbered from 1, and only earlier ones seen applied: a report saying
-                    // it or a later one was would have the pod skip every report to come.
-                    Report::Hits(hits) if hits.seen >= hits.sequence => {
-                        return Err(Invalid::ReportNumbers);
-                    }
-                    Report::Hits(hits) => service::Report::Hits {
-                        sequence: hits.sequence,
-                        count: hits.count,
-                        seen: hits.seen,
-                        age: hits.age_ns,
-                    },
-                    Report::Poll(_) => service::Report::Poll,
-                };
                 Ok(service::Entry {
                     key: entry.key.into_boxed_slice(),
                     contract: contract(entry.contract)?,
-                    report,
+                    report: report(entry.report)?,
                 })
             })
             .collect::<Result<_, Invalid>>()?;
