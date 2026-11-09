@@ -1,126 +1,55 @@
-//! The asynchronous mode as the world runs it: its clients are data planes — today's
-//! `DataPlane`, unchanged — deciding every request from their own copies and reporting their
-//! hits in batches, every cycle, to each key's owner as the table names it; its pods apply them
-//! on the store and answer with the buckets.
-//!
-//! Today's data plane routes by the view, which the store has none of: here it is given a view
-//! of one stand-in pod, and its client does what A3 brings into the data planes themselves. It
-//! splits each batch the data plane makes for that pod by the owner its table names for each
-//! key, and hands every answer back as the stand-in's: a pod answers only the keys it serves
-//! under its lease, so an answer is its owner's as it stood, where today's data plane drops one
-//! from a pod its view no longer names. An owner that has left a batch unanswered for four
-//! cycles has that key's entries sent through one of the shard's replicas too, chosen by the
-//! key, which forwards them, until the owner answers directly again. An owner moved is found
-//! by the data plane's sending again, after four cycles, rather than at once as a view's change
-//! has it.
+//! The asynchronous mode as the world runs it: its clients are data planes — the proxy's
+//! participant (`pooled::Participant`), routed by the table it was told (`Routed`) — deciding
+//! every request from their own copies and reporting their hits in batches, every cycle, to
+//! each key's owner as the table names it; its pods apply them on the store and answer with
+//! the buckets. A data plane runs as the proxy runs it: one exchange in flight to each pod, an
+//! exchange unanswered for 300 ms taken as failed, only the keys that need it visited each
+//! cycle, quiet keys not polled. An owner that has left a batch unanswered for four cycles
+//! has its keys' entries sent through one of the shard's replicas too, which forwards them,
+//! until the owner answers directly again.
 
 use super::{Event, Mode, Sim, address, store_kind, store_size};
 use edgerush_cluster::Message as StoreMessage;
-use edgerush_cluster::table::{Table, shard_of};
 use edgerush_cluster::{Config, Node, NodeId, Time, ms};
-use edgerush_cluster_asynchronous::{Answers, Batch, Entry, Message, Pod, Value};
-use edgerush_ratelimit::service::{self, Contract, DataPlane, Decision, View};
+use edgerush_cluster_asynchronous::{Answers, Message, Pod, Routed, Value};
+use edgerush_ratelimit::service::pooled::{Decision, Levers, Participant};
+use edgerush_ratelimit::service::{Contract, Keyed};
 use std::collections::BTreeMap;
 
 /// The time between a data plane's batches.
 pub const CYCLE: Time = ms(10);
 
-/// How long an owner leaves a batch unanswered before its keys are sent through another pod
-/// too: four cycles, as long as a data plane waits to send a batch again.
-const UNANSWERED: Time = 4 * CYCLE;
+/// How long a data plane waits for an exchange's answer before taking it as failed: the
+/// proxy's.
+const EXCHANGE_TIMEOUT: Time = ms(300);
 
-/// The one pod today's data plane is told of, standing for whichever owns each key.
-const STAND_IN: service::PodId = 0;
+/// What every data plane hashes its keys under, as the proxy's share `key_secret`.
+const SECRET: [u64; 2] = [1, 2];
 
 /// The asynchronous mode: data planes decide, owners apply.
 #[derive(Clone, Copy, Debug)]
 pub struct Asynchronous;
 
-/// A data plane as the world runs it: today's, under keys it shares with the others.
+/// A data plane as the world runs it: the proxy's participant, under keys it shares with the
+/// others.
 pub struct Plane {
-    data: DataPlane,
+    data: Participant<Keyed, Routed>,
     /// The keys it takes requests under, in turn.
     keys: Vec<u64>,
     next: usize,
     contract: Contract,
     interval: Time,
-    /// The table it has learnt, from answers and the store's replies.
-    table: Option<Table>,
-    shards: u16,
-    /// Pods it asks, in turn, when it has no owner to send to.
-    asked: usize,
     /// When each key's requests were admitted, by the world's clock.
     admitted: BTreeMap<u64, Vec<Time>>,
     /// Requests it decided, and refused.
     requests: u64,
     refused: u64,
-    /// Since when each pod has left a batch unanswered, cleared by its next direct answer.
-    waiting: BTreeMap<NodeId, Time>,
 }
 
-impl Plane {
-    /// The owner its table names for `key`.
-    fn owner(&self, key: u64) -> Option<NodeId> {
-        self.table
-            .as_ref()
-            .and_then(|table| table.owner(shard_of(key, self.shards)))
-    }
-
-    /// The pod to send `key` through as well as to its owner at `now`, if its owner has left a
-    /// batch unanswered for four cycles: one of its shard's other replicas, chosen by the key,
-    /// as the synchronous mode's data plane chooses (`Plane::through`), to be forwarded. Sent
-    /// both ways, a batch is applied once, by its number.
-    fn through(&self, key: u64, now: Time) -> Option<NodeId> {
-        let owner = self.owner(key)?;
-        let since = self.waiting.get(&owner).copied()?;
-        if now.saturating_sub(since) < UNANSWERED {
-            return None;
-        }
-        let table = self.table.as_ref()?;
-        let shard = table.shards.get(usize::from(shard_of(key, self.shards)))?;
-        let others: Vec<NodeId> = shard
-            .replicas
-            .iter()
-            .copied()
-            .filter(|replica| *replica != owner)
-            .collect();
-        let index = usize::try_from(key % others.len().max(1) as u64).unwrap_or(0);
-        others.get(index).copied()
-    }
-
-    /// Takes `table` if later than its own.
-    fn learn(&mut self, table: Table) {
-        if self
-            .table
-            .as_ref()
-            .is_none_or(|held| held.stamp() < table.stamp())
-        {
-            self.table = Some(table);
-        }
-    }
-
-    /// The next pod to ask when it has no owner to send to: its table's members in turn, or
-    /// with none, the pods alive.
-    fn someone(&mut self, pods: &[NodeId]) -> Option<NodeId> {
-        let members: Vec<NodeId> = self
-            .table
-            .as_ref()
-            .map(|table| table.members.keys().copied().collect())
-            .filter(|members: &Vec<NodeId>| !members.is_empty())
-            .unwrap_or_else(|| pods.to_vec());
-        let pod = members.get(self.asked % members.len().max(1)).copied();
-        self.asked += 1;
-        pod
-    }
-}
-
-/// A key's bytes as today's data plane holds it, and back: the store's key, little-endian.
+/// A key's bytes as a client sends it: the world's key, little-endian. The data plane hashes
+/// them into the store's key.
 fn bytes_of(key: u64) -> [u8; 8] {
     key.to_le_bytes()
-}
-
-fn key_of(bytes: &[u8]) -> Option<u64> {
-    Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 impl Mode for Asynchronous {
@@ -221,29 +150,36 @@ impl Sim<Asynchronous> {
     /// `count` data planes, each taking `rate` requests a second, spread in turn over `keys`
     /// shared by all, every key held to `contract`; each knowing the latest table, as a data
     /// plane is told it when its stream to a pod opens.
+    ///
+    /// # Panics
+    ///
+    /// Where 128-bit atomics are not native, which the participant needs.
+    #[expect(
+        clippy::expect_used,
+        reason = "the simulation runs only where the proxy's participant does"
+    )]
     pub fn add_planes(&mut self, count: u64, keys: &[u64], rate: u64, contract: Contract) {
         let interval = 1_000_000_000 / rate.max(1);
         let table = self.table().cloned();
         for _ in 0..count {
             let id = self.next_client;
             self.next_client += 1;
-            let view = View {
-                epoch: 1,
-                pods: vec![STAND_IN],
-            };
+            let mut data =
+                Participant::new(id, CYCLE, Routed::new(table.clone()), Keyed::new(SECRET))
+                    .expect("native 128-bit atomics");
+            data.set_one_in_flight(true);
+            data.set_exchange_timeout(EXCHANGE_TIMEOUT);
+            data.set_levers(Levers { poll_quiet: false });
+            data.set_scheduled(true);
             let plane = Plane {
-                data: DataPlane::new(id, CYCLE, view),
+                data,
                 keys: keys.to_vec(),
                 next: usize::try_from(self.rng.below(keys.len() as u64)).unwrap_or(0),
                 contract,
                 interval,
-                table: table.clone(),
-                shards: self.config.shards,
-                asked: 0,
                 admitted: BTreeMap::new(),
                 requests: 0,
                 refused: 0,
-                waiting: BTreeMap::new(),
             };
             self.clients.insert(id, plane);
             self.asked.extend(keys.iter().copied());
@@ -265,13 +201,23 @@ impl Sim<Asynchronous> {
     }
 
     /// Hits the data planes gave up reporting, their batches older than a refill time unseen
-    /// applied (`DataPlane::forgiven`).
+    /// applied (`Participant::forgiven`).
     #[must_use]
     pub fn forgiven(&self) -> u64 {
         self.clients
             .values()
             .map(|plane| plane.data.forgiven())
             .sum()
+    }
+
+    /// The pods data plane `id` has, by now, left a batch unanswered for four cycles
+    /// (`Participant::unanswered`).
+    #[must_use]
+    pub fn unanswered(&self, id: NodeId) -> Vec<NodeId> {
+        self.clients
+            .get(&id)
+            .map(|plane| plane.data.unanswered(self.now).collect())
+            .unwrap_or_default()
     }
 
     /// When each key's requests were admitted, every data plane's together, in order.
@@ -289,6 +235,9 @@ impl Sim<Asynchronous> {
         all
     }
 
+    /// A request reaches data plane `id`, under its next key: decided from its copy. One
+    /// deferred, as a worker does when its key's count is full, is refused, as `ratelimit-sim`
+    /// takes it of a data plane.
     fn on_request(&mut self, id: NodeId) {
         if self.clients_stopped {
             return;
@@ -301,112 +250,51 @@ impl Sim<Asynchronous> {
         if let Some(&key) = plane.keys.get(plane.next % plane.keys.len().max(1)) {
             plane.next += 1;
             plane.requests += 1;
-            match plane.data.decide(&bytes_of(key), plane.contract, now) {
+            let bytes = bytes_of(key);
+            match plane.data.decide_all(&[(&bytes, plane.contract)], now) {
                 Decision::Admit => plane.admitted.entry(key).or_default().push(now),
-                Decision::Refuse => plane.refused += 1,
+                Decision::Refuse | Decision::Defer => plane.refused += 1,
             }
         }
         self.stats.sent += 1;
         self.schedule(now + interval, Event::ClientSend(id));
     }
 
-    /// A data plane's cycle: its batch for the stand-in split by the owner its table names for
-    /// each key; a batch for no owner, or an empty one asking for the table, to a pod in turn.
+    /// A data plane's cycle: its batches, each to the pod the participant routed it to.
     fn on_cycle(&mut self, id: NodeId) {
         let now = self.now;
-        let pods = self.live_pods();
         let Some(plane) = self.clients.get_mut(&id) else {
             return;
         };
         plane.data.on_cycle(now);
-        let stamp = plane.table.as_ref().map_or((0, 0), Table::stamp);
-        let mut sends: Vec<(NodeId, Batch)> = Vec::new();
-        for (_, batch) in plane.data.take_outgoing() {
-            let mut by_owner: BTreeMap<Option<NodeId>, Vec<Entry>> = BTreeMap::new();
-            for entry in batch.entries {
-                let Some(key) = key_of(&entry.key) else {
-                    continue;
-                };
-                let entry = Entry {
-                    key,
-                    contract: entry.contract,
-                    report: entry.report,
-                };
-                if let Some(through) = plane.through(key, now) {
-                    by_owner.entry(Some(through)).or_default().push(entry);
-                }
-                by_owner.entry(plane.owner(key)).or_default().push(entry);
-            }
-            if by_owner.is_empty() {
-                by_owner.insert(None, Vec::new());
-            }
-            for (owner, entries) in by_owner {
-                let Some(to) = owner.or_else(|| plane.someone(&pods)) else {
-                    continue;
-                };
-                if !entries.is_empty() {
-                    plane.waiting.entry(to).or_insert(now);
-                }
-                sends.push((
-                    to,
-                    Batch {
-                        from: id,
-                        stamp,
-                        made: batch.made,
-                        entries,
-                    },
-                ));
-            }
-        }
+        let sends = plane.data.take_outgoing();
         for (to, batch) in sends {
             self.send(id, to, Message::Batch(batch));
         }
         self.schedule(now + CYCLE, Event::ClientCheck(id));
     }
 
-    /// Pod `from`'s answers reach a data plane, its own or relayed: the table taken if later,
-    /// then the answers handed on as the stand-in's. A pod answering directly is no longer
-    /// waited on.
+    /// Pod `from`'s message reaches a data plane: its own answers, answers relayed from their
+    /// owner, or a table.
     fn on_answers(&mut self, from: NodeId, id: NodeId, message: Message) {
         let now = self.now;
         let Some(plane) = self.clients.get_mut(&id) else {
             return;
         };
-        let answers = match message {
-            Message::Answers(answers) => {
-                plane.waiting.remove(&from);
-                answers
-            }
-            Message::Relayed { answers, .. } => answers,
+        let reply = match message {
+            Message::Answers(answers) => Routed::reply(from, None, answers),
+            Message::Relayed { owner, answers, .. } => Routed::reply(owner, Some(from), answers),
             Message::Store(StoreMessage::TableReply { table }) => {
-                plane.learn(table);
+                plane.data.on_routing(Routed::new(Some(table)), now);
                 return;
             }
             _ => return,
         };
-        if let Some(table) = answers.table {
-            plane.learn(table);
+        plane.data.on_reply(reply, now);
+        // Answered, what waited for the exchange goes now, as the proxy sends it.
+        let sends = plane.data.take_outgoing();
+        for (to, batch) in sends {
+            self.send(id, to, Message::Batch(batch));
         }
-        let entries = answers
-            .entries
-            .iter()
-            .map(|answer| service::Answer {
-                key: Box::from(bytes_of(answer.key)),
-                behind: answer.answered.behind,
-                applied: answer.answered.applied,
-                others: answer.answered.others,
-            })
-            .collect();
-        plane.data.on_answers(
-            service::Answers {
-                from: STAND_IN,
-                entries,
-                view: None,
-                life: answers.life,
-                number: answers.number,
-                made: answers.made,
-            },
-            now,
-        );
     }
 }

@@ -331,9 +331,9 @@ crates/cluster     the rate-limiting service's cluster store (`edgerush-cluster`
 crates/cluster-asynchronous
                    the asynchronous mode on the cluster store (`edgerush-cluster-asynchronous`):
                    the owner's state of a key as the store's value, merged by the larger of
-                   each part, and the mode's pod applying data planes' batches and answering
-                   them; pure, no I/O, run by the cluster's simulation and the service's
-                   socket tests, not yet by the binary
+                   each part, the mode's pod applying data planes' batches and answering
+                   them, and the data planes' routing by the table; pure, no I/O, run by the
+                   cluster's simulation and the service's socket tests, not yet by the binary
 crates/cluster-sim the cluster's simulation (`edgerush-cluster-sim`): the store's pods over a
                    network that delays, loses and cuts, with clients standing for data planes,
                    in the synchronous mode and the asynchronous, seeded and deterministic; its scenarios and chaos runs are its tests, and

@@ -6,7 +6,8 @@
 
 use super::*;
 use crate::service::{
-    Answer, DataPlane, ENTRY_BYTES, FixedState, Keyed, MOST_UNACKNOWLEDGED, PIECE_BYTES, ServicePod,
+    Answer, DataPlane, ENTRY_BYTES, FixedState, Keyed, MOST_UNACKNOWLEDGED, PIECE_BYTES, PodId,
+    ServicePod,
 };
 use proptest::prelude::*;
 use std::collections::VecDeque;
@@ -699,7 +700,7 @@ fn reports_racing_admissions_count_each_once() {
                 .fold((0, 0), |(a, f), (admitted, full)| (a + admitted, f + full));
             (admitted, full, sent)
         });
-        let tracked = &participant.keys[key];
+        let tracked = participant.keys.get(key).unwrap();
         let fields = entry.snapshot();
         assert!(fields.unreported <= most, "never past its most");
         assert_eq!(
@@ -1166,12 +1167,12 @@ fn an_evicted_entry_sends_its_holders_to_the_new_one() {
     let old = participant.entries(&[(key, c)]).remove(0);
     assert!(old.take(Op::Admit, 0).0.done());
     assert!(
-        !close_if_quiet(&participant.keys[key]),
+        !close_if_quiet(participant.keys.get(key).unwrap()),
         "an admission not drained"
     );
     // Drained into the ledger: nothing left in the word to lose.
     participant.drain(key, 0);
-    assert!(close_if_quiet(&participant.keys[key]));
+    assert!(close_if_quiet(participant.keys.get(key).unwrap()));
     assert_eq!(decide(&[&old], 0).local, Local::Ask);
     participant.keys.remove(key);
     participant.ensure(key, c, 0);
@@ -1857,8 +1858,9 @@ fn a_key_untouched_for_the_cycle_numbers_range_gets_a_new_share() {
     }
 }
 
-/// The participant finds a key by a handle to its entry, holding no copy of its bytes; a
-/// key whose contract changed is found by its new entry, not the closed one.
+/// The participant keeps a key by its hash, holding no copy of its bytes beside its entry's,
+/// and finds it by its bytes or its hash alike; a key whose contract changed is found by
+/// its new entry, not the closed one.
 #[test]
 fn the_participant_keeps_a_key_once() {
     let mut participant = participant();
@@ -1866,9 +1868,11 @@ fn the_participant_keeps_a_key_once() {
     participant.ensure(key, contract(100, 10), 0);
     for c in [contract(100, 10), contract(100, 11)] {
         participant.ensure(key, c, 0);
-        let (handle, tracked) = participant.keys.get_key_value(key).unwrap();
-        assert!(Arc::ptr_eq(handle.entry(), &tracked.entry));
-        assert_eq!(tracked.entry.terms.contract, c);
+        let entry = Arc::clone(&participant.keys.get(key).unwrap().entry);
+        assert_eq!(entry.terms.contract, c);
+        let hash = participant.hash(key);
+        let by_hash = participant.keys.by_hash_mut(hash).unwrap();
+        assert!(Arc::ptr_eq(&by_hash.entry, &entry));
     }
     assert_eq!(participant.key_count(), 1);
 }
@@ -1907,13 +1911,14 @@ fn keys_chosen_to_share_a_shard_spread_under_another_processs_hash() {
     assert!(shards.len() > 180, "{} shards", shards.len());
 }
 
-/// A key's slot in the participant's table takes 80 bytes, the table holding up to twice
-/// the room its keys take: the batches it has not seen acknowledged, which between cycles
-/// it almost never has, kept apart behind a pointer, and when its copy was last heard of
-/// in eight bytes.
+/// A key's slot in the participant's table takes 72 bytes routed by today's pods, 80 by the
+/// store's, whose pod ids are twice as long, the table holding up to twice the room its keys
+/// take: the batches it has not seen acknowledged, which between cycles it almost never has,
+/// kept apart behind a pointer, and when its copy was last heard of in eight bytes.
 #[test]
 fn a_keys_slot_is_small() {
-    assert_eq!(size_of::<(Handle, Tracked)>(), 80);
+    assert_eq!(size_of::<Tracked<PodId>>(), 72);
+    assert_eq!(size_of::<Tracked<u64>>(), 80);
 }
 
 /// When a key's copy was last heard of, kept in eight bytes, reads back as it was set:
@@ -2086,7 +2091,7 @@ fn replay(schedule: &[(Event, u64)]) {
                             left.min(allowance.saturating_sub(at.spent))
                         })
                     });
-                let got = pooled.participant.keys.get(*key).map(|tracked| {
+                let got = pooled.participant.keys.get(key).map(|tracked| {
                     let entry = &tracked.entry;
                     let fields =
                         word::advanced(&entry.terms.bucket, entry.snapshot(), entry.advance(), now);
@@ -2534,7 +2539,7 @@ fn a_participant_keeps_a_bounded_number_of_reports_out() {
         participant.on_cycle(now);
         let _lost = participant.take_outgoing();
     }
-    let tracked = &participant.keys[key];
+    let tracked = participant.keys.get(key).unwrap();
     assert_eq!(tracked.unacknowledged.as_slice().len(), MOST_UNACKNOWLEDGED);
     assert_eq!(tracked.unsent, 50 - MOST_UNACKNOWLEDGED as u64, "waiting");
     for cycle in 51..=60 {
@@ -2545,7 +2550,7 @@ fn a_participant_keeps_a_bounded_number_of_reports_out() {
         }
     }
     assert_eq!(pod.counted(key), Some(50));
-    assert!(participant.keys[key].unacknowledged.is_empty());
+    assert!(participant.keys.get(key).unwrap().unacknowledged.is_empty());
 }
 
 /// Scheduled, an entry replaced by a changed contract is kept by its eviction time until
