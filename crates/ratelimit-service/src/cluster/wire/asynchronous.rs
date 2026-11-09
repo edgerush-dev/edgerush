@@ -252,6 +252,9 @@ pub struct Relayed {
     /// The owner's answers.
     #[prost(message, optional, tag = "2")]
     pub answers: Option<Answers>,
+    /// The owner that answered.
+    #[prost(uint64, tag = "3")]
+    pub owner: u64,
 }
 
 /// What a pod tells a data plane on its stream: answers, or the table it has committed.
@@ -403,9 +406,14 @@ pub fn mode_wire(from: NodeId, message: AsyncMessage) -> Option<Outgoing<Asynchr
             via,
             batch: Some(batch_to_wire(batch)),
         })),
-        AsyncMessage::Relayed { client, answers } => peer(Control::Relayed(Relayed {
+        AsyncMessage::Relayed {
+            client,
+            owner,
+            answers,
+        } => peer(Control::Relayed(Relayed {
             client,
             answers: Some(answers_to_wire(answers)),
+            owner,
         })),
         AsyncMessage::Batch(_) | AsyncMessage::Answers(_) => return None,
     })
@@ -431,6 +439,7 @@ pub fn mode_from_peer(sent: ToPeer<Asynchronous>) -> Result<(NodeId, AsyncMessag
             from,
             AsyncMessage::Relayed {
                 client: relayed.client,
+                owner: relayed.owner,
                 answers: answers_from(relayed.answers.ok_or(Invalid::Missing)?)?,
             },
         )),
@@ -654,13 +663,13 @@ mod tests {
         #[test]
         fn forwarded_and_relayed_come_through_the_wire_as_they_were_sent(
             from in any::<u64>(),
-            (client, via) in any::<(u64, u64)>(),
+            (client, via, owner) in any::<(u64, u64, u64)>(),
             batch in batches(),
             answers in answers(),
         ) {
             let forwarded = AsyncMessage::Forwarded { client, via, batch };
             prop_assert_eq!(mode_through(from, forwarded.clone()), (from, forwarded));
-            let relayed = AsyncMessage::Relayed { client, answers };
+            let relayed = AsyncMessage::Relayed { client, owner, answers };
             prop_assert_eq!(mode_through(from, relayed.clone()), (from, relayed));
         }
 
@@ -673,7 +682,7 @@ mod tests {
         ) {
             for told in [
                 AsyncMessage::Answers(answers.clone()),
-                AsyncMessage::Relayed { client, answers: answers.clone() },
+                AsyncMessage::Relayed { client, owner: 2, answers: answers.clone() },
             ] {
                 let sent = answering(told).unwrap();
                 let decoded = Answering::decode(sent.encode_to_vec().as_slice()).unwrap();

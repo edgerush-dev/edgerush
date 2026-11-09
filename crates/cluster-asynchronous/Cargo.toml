@@ -19,5 +19,9 @@ proptest.workspace = true
 name = "batch"
 harness = false
 
+[[bench]]
+name = "cycle"
+harness = false
+
 [lints]
 workspace = true

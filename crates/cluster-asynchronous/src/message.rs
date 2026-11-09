@@ -32,6 +32,9 @@ pub enum Message {
     Relayed {
         /// The data plane.
         client: NodeId,
+        /// The owner that answered: whose life and number the answers carry, and whose keys
+        /// they are about.
+        owner: NodeId,
         /// The owner's answers.
         answers: Answers,
     },

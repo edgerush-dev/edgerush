@@ -291,6 +291,7 @@ mod tests {
             },
             AsyncMessage::Relayed {
                 client,
+                owner: 2,
                 answers: answers.clone(),
             },
             AsyncMessage::Answers(answers),

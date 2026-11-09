@@ -117,11 +117,28 @@ impl Pod {
             Message::Batch(batch) => self.forward(from, batch, now),
             Message::Forwarded { client, via, batch } => {
                 let answers = self.batch(batch, now);
-                vec![(via, Message::Relayed { client, answers })]
+                let owner = self.node.id();
+                vec![(
+                    via,
+                    Message::Relayed {
+                        client,
+                        owner,
+                        answers,
+                    },
+                )]
             }
-            Message::Relayed { client, answers } => {
-                vec![(client, Message::Relayed { client, answers })]
-            }
+            Message::Relayed {
+                client,
+                owner,
+                answers,
+            } => vec![(
+                client,
+                Message::Relayed {
+                    client,
+                    owner,
+                    answers,
+                },
+            )],
             Message::Store(message) => from_store(self.node.receive(from, message, now)),
             Message::Answers(_) => Outbox::new(),
         }
@@ -543,10 +560,20 @@ mod tests {
             ),
         };
         let out = pod.receive(3, forwarded, ms(3));
-        let [(to, Message::Relayed { client, answers })] = &out[..] else {
+        let [
+            (
+                to,
+                Message::Relayed {
+                    client,
+                    owner,
+                    answers,
+                },
+            ),
+        ] = &out[..]
+        else {
             panic!("{out:?}");
         };
-        assert_eq!((*to, *client), (3, PLANE));
+        assert_eq!((*to, *client, *owner), (3, PLANE, pod.store().id()));
         assert_eq!(answers.entries.len(), 1);
         assert_eq!(answers.entries[0].key, own);
         assert_eq!(
@@ -566,6 +593,7 @@ mod tests {
         let answers = pod.batch(batch((0, 0), 0, Vec::new()), ms(3));
         let relayed = Message::Relayed {
             client: PLANE,
+            owner: 2,
             answers: answers.clone(),
         };
         let out = pod.receive(2, relayed.clone(), ms(4));

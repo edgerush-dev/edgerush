@@ -17,21 +17,27 @@
 //! No I/O: the time is passed in; the transport's messages are the caller's to carry.
 
 pub(super) mod chunked;
+mod keys;
+mod routing;
 mod sync;
 mod word;
 
 #[cfg(test)]
 mod loom_tests;
 #[cfg(test)]
+mod routing_tests;
+#[cfg(test)]
 mod tests;
 
+pub use routing::{Replied, Reply, Routing};
 pub use word::fits;
 
 use super::{
-    Answers, Batch, Contract, Entry as BatchEntry, MOST_UNACKNOWLEDGED, PlaneId, PodId, Queued,
+    Answers, Batch, Contract, Entry as BatchEntry, MOST_UNACKNOWLEDGED, PlaneId, Queued,
     RESEND_AFTER_CYCLES, Report, Room, Unseen, View, encoded_entry_bytes, longest,
 };
 use chunked::MinHeap;
+use keys::Keys;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::sync::{Arc, RwLock};
@@ -794,9 +800,9 @@ pub fn waits<'a>(entries: &'a [&'a Entry], now: u64) -> impl Iterator<Item = (us
 
 /// What the transport keeps of a key besides its entry: the protocol's bookkeeping, which
 /// no worker touches.
-struct Tracked {
+struct Tracked<P> {
     entry: Arc<Entry>,
-    owner: Option<PodId>,
+    owner: Option<P>,
     sent: u64,
     seen: u64,
     /// Batches sent and not yet seen applied.
@@ -814,7 +820,7 @@ struct Tracked {
     left_out: bool,
 }
 
-impl Tracked {
+impl<P> Tracked<P> {
     /// Its ledger's hits, as a report numbered after the last, sent at `now`: `None` if
     /// there are none, or [`MOST_UNACKNOWLEDGED`] are out already and they wait.
     fn report_unsent(&mut self, now: u64, spare: &mut Spare) -> Option<BatchEntry> {
@@ -980,8 +986,8 @@ fn idle_at(entry: &Entry) -> u64 {
         .saturating_add(1)
 }
 
-fn key_bytes(key: &[u8], workers: u64) -> u64 {
-    let tracked = size_of::<(Handle, Tracked)>() + 1;
+fn key_bytes<P>(key: &[u8], workers: u64) -> u64 {
+    let tracked = size_of::<Tracked<P>>() + 1;
     let handle = (size_of::<Handle>() + 1) as u64;
     entry_bytes(key) + tracked as u64 + handle * (1 + workers)
 }
@@ -993,33 +999,41 @@ pub fn entry_bytes(key: &[u8]) -> u64 {
     (2 * size_of::<usize>() + size_of::<Entry>() + key.len() + size_of::<Due>()) as u64
 }
 
-/// The process's side of the protocol: one participant, its keys shared with its workers.
-pub struct Participant<S> {
+/// The process's side of the protocol: one participant, its keys shared with its workers,
+/// reaching the service's pods by `R`: today's by the view unless said.
+pub struct Participant<S, R: Routing = View> {
     id: PlaneId,
     /// The workers that may hold a handle to each entry, which its bytes count.
     workers: u64,
     registry: Arc<Registry<S>>,
     cycle: u64,
-    view: View,
-    /// By a handle to the key's entry, so that the key's bytes are kept once, in it.
-    keys: HashMap<Handle, Tracked, S>,
+    routing: R,
+    /// What its keys are hashed by, as `keys` hashes them: for a visit to hash one while
+    /// they are walked.
+    hasher: S,
+    /// By each key's hash, so that the key's bytes are kept once, in its entry.
+    keys: Keys<S, R::Pod>,
     /// Batches numbered, over every key: a key made again numbers its own from here, past
     /// every number an earlier life of it used.
     numbered: u64,
     /// A hold settled or a count drained on a key requests wait on.
     wake: bool,
     /// What is to go to each pod.
-    queued: BTreeMap<PodId, Queued>,
+    queued: BTreeMap<R::Pod, Queued>,
     /// With one exchange in flight to a pod at a time: the pods that have one, since when.
     one_in_flight: bool,
-    sending: BTreeMap<PodId, u64>,
+    sending: BTreeMap<R::Pod, u64>,
     /// The number of the latest exchange started with each pod: with one in flight, the
     /// one whose answer or failure ends it.
-    latest: BTreeMap<PodId, u64>,
+    latest: BTreeMap<R::Pod, u64>,
     exchanges: u64,
     /// The answer whose buckets were last taken from each pod: an answer's are taken only
     /// if it is later.
-    taken: BTreeMap<PodId, LastTaken>,
+    taken: BTreeMap<R::Pod, LastTaken>,
+    /// Since when each pod has left a batch unanswered, sent with entries: cleared by its
+    /// next reply of its own, a relayed one not. Past four cycles, its keys go through
+    /// another pod as well ([`Routing::through`]).
+    unanswered: BTreeMap<R::Pod, u64>,
     /// Answers whose buckets were not taken, a later one from the pod taken already.
     late: u64,
     levers: Levers,
@@ -1089,12 +1103,15 @@ impl Ord for Due {
 }
 
 /// What visiting a key in a cycle reads and writes besides the key.
-struct Visit<'a> {
+struct Visit<'a, S, R: Routing> {
     now: u64,
     resend_after: u64,
     poll_quiet: bool,
-    sending: &'a BTreeMap<PodId, u64>,
-    queued: &'a mut BTreeMap<PodId, Queued>,
+    hasher: &'a S,
+    routing: &'a R,
+    unanswered: &'a BTreeMap<R::Pod, u64>,
+    sending: &'a BTreeMap<R::Pod, u64>,
+    queued: &'a mut BTreeMap<R::Pod, Queued>,
     numbered: &'a mut u64,
     /// Hits given up without being seen applied, all told ([`Participant::forgiven`]).
     forgiven: &'a mut u64,
@@ -1107,7 +1124,21 @@ struct Visit<'a> {
     keys_left_out: u64,
 }
 
-impl Visit<'_> {
+impl<S: BuildHasher, R: Routing> Visit<'_, S, R> {
+    /// The pod to send `tracked`'s key through as well as to `owner` at `now`: the
+    /// routing's, once `owner` has left a batch unanswered for as long as a report waits to
+    /// be sent again. Sent both ways, a report is applied once, by its number.
+    fn through(&self, tracked: &Tracked<R::Pod>, owner: R::Pod) -> Option<R::Pod> {
+        let since = self.unanswered.get(&owner)?;
+        if self.now.saturating_sub(*since) < self.resend_after {
+            return None;
+        }
+        let hash = keys::hash(self.hasher, &tracked.entry.key);
+        self.routing
+            .through(hash, owner)
+            .filter(|through| *through != owner)
+    }
+
     /// The cycle's work on one key, as `DataPlane::on_cycle` does it on each: its count
     /// drained into the ledger, its reports sent or sent again, a poll if it is in use with
     /// nothing to report. Whether it needs visiting at the next cycle too: a ledger it could
@@ -1115,7 +1146,7 @@ impl Visit<'_> {
     /// acknowledged; a poll due every cycle. A key its owner's piece
     /// has no room for is treated as one whose owner is busy: what it has not sent stays in
     /// its ledger, unnumbered, and reports due to go again stay due.
-    fn key(&mut self, tracked: &mut Tracked) -> bool {
+    fn key(&mut self, tracked: &mut Tracked<R::Pod>) -> bool {
         let now = self.now;
         // What was admitted drained into the ledger, every key's, with an owner to send it
         // to or not, so that no count fills.
@@ -1128,15 +1159,22 @@ impl Visit<'_> {
         let Some(owner) = tracked.owner else {
             return false;
         };
+        let free = |pod: &R::Pod| !self.sending.contains_key(pod);
+        let through = self.through(tracked, owner).filter(free);
         // Its owner has an exchange in flight: what is admitted stays in the ledger, and
-        // the exchange's answer refreshes the copy.
-        if self.sending.contains_key(&owner) {
+        // the exchange's answer refreshes the copy; but for an owner gone unanswered, whose
+        // key goes through another pod meanwhile.
+        let (to, also) = if free(&owner) {
+            (owner, through)
+        } else if let Some(through) = through {
+            (through, None)
+        } else {
             return true;
-        }
+        };
         // Ages count back from now, as the batch its entries join is made: every batch waiting
         // was made at a time this data plane was given, and time does not go back.
         let mut entries = Vec::new();
-        let mut room = self.queued.get(&owner).map_or_else(Room::new, Queued::room);
+        let mut room = self.queued.get(&to).map_or_else(Room::new, Queued::room);
         let bytes = encoded_entry_bytes(key.len());
         let mut left_out = false;
         for unseen in tracked.unacknowledged.as_mut_slice() {
@@ -1189,7 +1227,13 @@ impl Visit<'_> {
                 .get()
                 .is_none_or(|heard| now - heard >= self.resend_after);
         if !entries.is_empty() {
-            let queued = self.queued.entry(owner).or_default().at(now);
+            if let Some(also) = also {
+                let queued = self.queued.entry(also).or_default().at(now);
+                for entry in &entries {
+                    queued.push_entry(entry.clone());
+                }
+            }
+            let queued = self.queued.entry(to).or_default().at(now);
             for entry in entries {
                 queued.push_entry(entry);
             }
@@ -1204,7 +1248,7 @@ impl Visit<'_> {
     fn listed(
         &mut self,
         handle: Handle,
-        tracked: &mut Tracked,
+        tracked: &mut Tracked<R::Pod>,
         scheduled: bool,
         left_out: &mut Vec<Handle>,
         next: &mut Vec<Handle>,
@@ -1221,41 +1265,28 @@ impl Visit<'_> {
 }
 
 /// `handle`'s key, if it is still the one the handle was made for.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "a handle hashes and compares by its entry's key, which never changes"
-)]
-fn listed<'a, S: BuildHasher>(
-    keys: &'a mut HashMap<Handle, Tracked, S>,
+fn listed<'a, S: BuildHasher, P>(
+    keys: &'a mut Keys<S, P>,
     handle: &Handle,
-) -> Option<&'a mut Tracked> {
-    keys.get_mut(&*handle.0.key)
+) -> Option<&'a mut Tracked<P>> {
+    keys.get_mut(&handle.0.key)
         .filter(|tracked| Arc::ptr_eq(&tracked.entry, &handle.0))
 }
 
-/// Queues `key` to be visited at the next cycle, unless it is already.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "a handle hashes and compares by its entry's key, which never changes"
-)]
-fn queue<S: BuildHasher>(
-    keys: &mut HashMap<Handle, Tracked, S>,
-    runnable: &mut Vec<Handle>,
-    key: &[u8],
-) {
-    if let Some(tracked) = keys.get_mut(key)
-        && !tracked.queued
-    {
+/// Queues `tracked` to be visited at the next cycle, unless it is already.
+fn queue<P>(tracked: &mut Tracked<P>, runnable: &mut Vec<Handle>) {
+    if !tracked.queued {
         tracked.queued = true;
         runnable.push(Handle::new(Arc::clone(&tracked.entry)));
     }
 }
 
-impl<S: BuildHasher + Clone> Participant<S> {
-    /// The participant `id` sending every `cycle` nanoseconds, knowing the service as
-    /// `view`, its maps hashed by `hasher`; `None` without native 128-bit atomics.
+impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
+    /// The participant `id` sending every `cycle` nanoseconds, reaching the service by
+    /// `routing`, its maps and keys hashed by `hasher`; `None` without native 128-bit
+    /// atomics.
     #[must_use]
-    pub fn new(id: PlaneId, cycle: u64, view: View, hasher: S) -> Option<Self> {
+    pub fn new(id: PlaneId, cycle: u64, routing: R, hasher: S) -> Option<Self> {
         if !supported() {
             return None;
         }
@@ -1264,8 +1295,9 @@ impl<S: BuildHasher + Clone> Participant<S> {
             workers: 1,
             registry: Arc::new(Registry::new(hasher.clone())),
             cycle: cycle.max(1),
-            view,
-            keys: HashMap::with_hasher(hasher),
+            routing,
+            hasher: hasher.clone(),
+            keys: Keys::new(hasher),
             numbered: 0,
             wake: false,
             queued: BTreeMap::new(),
@@ -1274,6 +1306,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             latest: BTreeMap::new(),
             exchanges: 0,
             taken: BTreeMap::new(),
+            unanswered: BTreeMap::new(),
             late: 0,
             levers: Levers::default(),
             last_now: 0,
@@ -1314,7 +1347,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
     pub fn on_signals(&mut self, entries: impl IntoIterator<Item = Arc<Entry>>) {
         for entry in entries {
             entry.unclaim_signal();
-            if let Some(tracked) = self.keys.get_mut(&*entry.key)
+            if let Some(tracked) = self.keys.get_mut(&entry.key)
                 && Arc::ptr_eq(&tracked.entry, &entry)
                 && !tracked.queued
             {
@@ -1339,7 +1372,34 @@ impl<S: BuildHasher + Clone> Participant<S> {
     }
 
     fn run(&mut self, key: &[u8]) {
-        queue(&mut self.keys, &mut self.runnable, key);
+        if let Some(tracked) = self.keys.get_mut(key) {
+            queue(tracked, &mut self.runnable);
+        }
+    }
+
+    /// The hash of the key of `bytes`: what the keys are kept by, and what the cluster
+    /// store's batches and answers name the key by. Under a keyed hasher, alike on every
+    /// data plane sharing its key.
+    #[must_use]
+    pub fn hash(&self, bytes: &[u8]) -> u64 {
+        self.keys.hash(bytes)
+    }
+
+    /// The routing it holds.
+    #[must_use]
+    pub fn routing(&self) -> &R {
+        &self.routing
+    }
+
+    /// The pods that have left a batch unanswered, by `now`, for as long as a report waits
+    /// to be sent again — four cycles — their keys going through another pod as well
+    /// where the routing names one.
+    pub fn unanswered(&self, now: u64) -> impl Iterator<Item = R::Pod> + '_ {
+        let after = RESEND_AFTER_CYCLES * self.cycle;
+        self.unanswered
+            .iter()
+            .filter(move |(_, since)| now.saturating_sub(**since) >= after)
+            .map(|(pod, _)| *pod)
     }
 
     /// Its id.
@@ -1379,7 +1439,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
 
     /// Exchange `exchange` with `pod` failed. Over if it is the one in flight; one given up
     /// already leaves the one that followed it in flight.
-    pub fn exchanged(&mut self, pod: PodId, exchange: u64) {
+    pub fn exchanged(&mut self, pod: R::Pod, exchange: u64) {
         if self.latest.get(&pod) == Some(&exchange) {
             self.sending.remove(&pod);
         }
@@ -1436,7 +1496,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
     pub fn entries(&self, keys: &[(&[u8], Contract)]) -> Vec<Arc<Entry>> {
         keys.iter()
             .filter_map(|(key, contract)| {
-                let tracked = self.keys.get(*key)?;
+                let tracked = self.keys.get(key)?;
                 (tracked.entry.terms.contract == *contract).then(|| Arc::clone(&tracked.entry))
             })
             .collect()
@@ -1476,12 +1536,12 @@ impl<S: BuildHasher + Clone> Participant<S> {
         if entry.snapshot().closed
             || self
                 .keys
-                .get(&*entry.key)
+                .get(&entry.key)
                 .is_some_and(|tracked| Arc::ptr_eq(&tracked.entry, &entry))
         {
             return;
         }
-        if let Some(old) = self.keys.remove(&*entry.key) {
+        if let Some(old) = self.keys.remove(&entry.key) {
             close(&old.entry);
             self.forget(&entry.key);
         }
@@ -1492,7 +1552,9 @@ impl<S: BuildHasher + Clone> Participant<S> {
     /// which its eviction time keeps until it comes or is dropped, and which counts as stale
     /// meanwhile.
     fn forget(&mut self, key: &[u8]) {
-        self.holding = self.holding.saturating_sub(key_bytes(key, self.workers));
+        self.holding = self
+            .holding
+            .saturating_sub(key_bytes::<R::Pod>(key, self.workers));
         if self.scheduled {
             self.stale += entry_bytes(key);
         }
@@ -1500,16 +1562,12 @@ impl<S: BuildHasher + Clone> Participant<S> {
 
     /// Drops the eviction times of entries no longer kept, freeing the entries: a pass over
     /// every key's, made only past the cap, as eviction's own is.
-    #[expect(
-        clippy::mutable_key_type,
-        reason = "a handle hashes and compares by its entry's key, which never changes"
-    )]
     fn drop_stale(&mut self) {
         let keys = &self.keys;
         let mut freed = 0;
         self.evictions.retain(|due| {
             let kept = keys
-                .get(&*due.entry.key)
+                .get(&due.entry.key)
                 .is_some_and(|tracked| Arc::ptr_eq(&tracked.entry, &due.entry));
             if !kept {
                 freed += entry_bytes(&due.entry.key);
@@ -1522,7 +1580,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
 
     /// Keeps `entry`, a live entry of a key not kept, from now on.
     fn track(&mut self, entry: Arc<Entry>) {
-        let owner = self.view.owners(&entry.key).0;
+        let owner = self.routing.owner(&entry.key, self.keys.hash(&entry.key));
         let tracked = Tracked {
             entry,
             owner,
@@ -1536,7 +1594,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             left_out: false,
         };
         self.registry.insert(Arc::clone(&tracked.entry));
-        self.holding += key_bytes(&tracked.entry.key, self.workers);
+        self.holding += key_bytes::<R::Pod>(&tracked.entry.key, self.workers);
         if self.scheduled {
             let at = idle_at(&tracked.entry);
             self.evictions.push(Due {
@@ -1545,8 +1603,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             });
         }
         let key = tracked.entry.key.clone();
-        self.keys
-            .insert(Handle::new(Arc::clone(&tracked.entry)), tracked);
+        self.keys.insert(tracked);
         self.run(&key);
     }
 
@@ -1615,6 +1672,9 @@ impl<S: BuildHasher + Clone> Participant<S> {
             now,
             resend_after,
             poll_quiet: self.levers.poll_quiet,
+            hasher: &self.hasher,
+            routing: &self.routing,
+            unanswered: &self.unanswered,
             sending: &self.sending,
             queued: &mut self.queued,
             numbered: &mut self.numbered,
@@ -1643,12 +1703,13 @@ impl<S: BuildHasher + Clone> Participant<S> {
                     tracked.left_out = true;
                 }
             }
-            for (handle, tracked) in &mut self.keys {
+            for tracked in self.keys.iter_mut() {
                 if std::mem::take(&mut tracked.left_out) {
                     continue;
                 }
                 visits += 1;
-                visit.listed(handle.clone(), tracked, scheduled, &mut left_out, &mut next);
+                let handle = Handle::new(Arc::clone(&tracked.entry));
+                visit.listed(handle, tracked, scheduled, &mut left_out, &mut next);
             }
             for handle in &left_out {
                 if let Some(tracked) = listed(&mut self.keys, handle) {
@@ -1671,11 +1732,10 @@ impl<S: BuildHasher + Clone> Participant<S> {
         self.next_runnable = std::mem::replace(&mut self.runnable, next);
         self.next_runnable.clear();
         self.wake |= wake;
-        if cut_off && !self.view.pods.is_empty() {
-            let at = usize::try_from(self.polls).unwrap_or(0) % self.view.pods.len();
+        if cut_off && let Some(pod) = self.routing.polled(self.polls) {
             self.polls += 1;
-            if !self.sending.contains_key(&self.view.pods[at]) {
-                self.queued.entry(self.view.pods[at]).or_default().at(now);
+            if !self.sending.contains_key(&pod) {
+                self.queued.entry(pod).or_default().at(now);
             }
         }
         if self.scheduled {
@@ -1683,11 +1743,11 @@ impl<S: BuildHasher + Clone> Participant<S> {
         } else {
             let mut freed = 0;
             let (registry, workers) = (&self.registry, self.workers);
-            self.keys.retain(|_, tracked| {
+            self.keys.retain(|tracked| {
                 let evict = tracked.idle(now) && close_if_quiet(tracked);
                 if evict {
                     registry.remove(&tracked.entry);
-                    freed += key_bytes(&tracked.entry.key, workers);
+                    freed += key_bytes::<R::Pod>(&tracked.entry.key, workers);
                 }
                 !evict
             });
@@ -1707,7 +1767,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             // of reach.
             let mut used: Vec<(u64, Box<[u8]>)> = self
                 .keys
-                .values()
+                .iter()
                 .map(|t| {
                     let used = t.entry.last_request.load(Ordering::Relaxed);
                     (used, t.entry.key.clone())
@@ -1718,7 +1778,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 if self.holding <= target {
                     break;
                 }
-                let Some(tracked) = self.keys.remove(&*key) else {
+                let Some(tracked) = self.keys.remove(&key) else {
                     continue;
                 };
                 let unreported = close(&tracked.entry).unreported;
@@ -1751,7 +1811,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             };
             let kept = self
                 .keys
-                .get(&*due.entry.key)
+                .get(&due.entry.key)
                 .filter(|tracked| Arc::ptr_eq(&tracked.entry, &due.entry));
             let Some(tracked) = kept else {
                 self.stale = self.stale.saturating_sub(entry_bytes(&due.entry.key));
@@ -1761,8 +1821,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 self.registry.remove(&tracked.entry);
                 self.holding = self
                     .holding
-                    .saturating_sub(key_bytes(&due.entry.key, self.workers));
-                self.keys.remove(&*due.entry.key);
+                    .saturating_sub(key_bytes::<R::Pod>(&due.entry.key, self.workers));
+                self.keys.remove(&due.entry.key);
             } else {
                 let at = idle_at(&due.entry).max(now + self.cycle);
                 self.evictions.push(Due {
@@ -1773,48 +1833,55 @@ impl<S: BuildHasher + Clone> Participant<S> {
         }
     }
 
-    /// A service pod's answers to the latest exchange started with it reach it at `now`,
-    /// as `DataPlane::on_answers`: each copy rebased on the owner's bucket and charged with
-    /// what the owner has not seen, in one compare-and-swap with the admissions it races.
-    pub fn on_answers(&mut self, answers: Answers, now: u64) {
-        let exchange = self.latest.get(&answers.from).copied().unwrap_or(0);
-        self.on_answers_to(exchange, answers, now);
+    /// A pod's reply to the latest exchange started with the pod it came through — `from`
+    /// itself, or the pod it was relayed through — reaches it at `now`.
+    pub fn on_reply(&mut self, reply: Reply<R>, now: u64) {
+        let through = reply.via.unwrap_or(reply.from);
+        let exchange = self.latest.get(&through).copied().unwrap_or(0);
+        self.on_reply_to(exchange, reply, now);
     }
 
-    /// A service pod's answers to exchange `exchange` ([`Self::take_exchanges`]) reach it
-    /// at `now`. Their buckets rebase the copies only if the pod handled their batch after
+    /// A pod's reply to exchange `exchange` ([`Self::take_exchanges`]) reaches it at `now`,
+    /// as `DataPlane::on_answers` takes answers: each copy rebased on the owner's bucket and
+    /// charged with what the owner has not seen, in one compare-and-swap with the admissions
+    /// it races. Their buckets rebase the copies only if the pod handled their batch after
     /// that of the answers last taken from it, so the copies never go back to an older
     /// bucket: in one life of the pod, if their number is higher; from another life, if
     /// their exchange started after every exchange started by the time the life last taken
     /// was first heard from, since lives of a pod never serve at once. Answers from
     /// the same life not taken still acknowledge reports, which stays true; another life's
     /// do not, so that the reports go to the life serving, which ignores those its copy
-    /// holds already.
-    pub fn on_answers_to(&mut self, exchange: u64, answers: Answers, now: u64) {
-        if self.latest.get(&answers.from) == Some(&exchange) {
-            self.sending.remove(&answers.from);
+    /// holds already. A reply of the pod's own ends the exchange and its wait
+    /// ([`Self::unanswered`]); one relayed ends neither, the pod it came through having
+    /// answered for itself.
+    pub fn on_reply_to(&mut self, exchange: u64, reply: Reply<R>, now: u64) {
+        if reply.via.is_none() {
+            if self.latest.get(&reply.from) == Some(&exchange) {
+                self.sending.remove(&reply.from);
+            }
+            self.unanswered.remove(&reply.from);
         }
-        let last = self.taken.get(&answers.from);
-        let same_life = last.is_some_and(|last| last.life == answers.life);
+        let last = self.taken.get(&reply.from);
+        let same_life = last.is_some_and(|last| last.life == reply.life);
         let current = match last {
             // Unnumbered: taken as it comes.
-            _ if answers.life == 0 => true,
+            _ if reply.life == 0 => true,
             None => true,
-            Some(last) if same_life => later(answers.number, last.number),
+            Some(last) if same_life => later(reply.number, last.number),
             Some(last) => later(exchange, last.fence),
         };
         let acknowledges = current || same_life;
         if current {
-            if answers.life != 0 {
+            if reply.life != 0 {
                 let fence = match last {
                     Some(last) if same_life => last.fence,
-                    _ => self.latest.get(&answers.from).copied().unwrap_or(exchange),
+                    _ => self.latest.get(&reply.from).copied().unwrap_or(exchange),
                 };
                 self.taken.insert(
-                    answers.from,
+                    reply.from,
                     LastTaken {
-                        life: answers.life,
-                        number: answers.number,
+                        life: reply.life,
+                        number: reply.number,
                         fence,
                     },
                 );
@@ -1822,23 +1889,23 @@ impl<S: BuildHasher + Clone> Participant<S> {
         } else {
             self.late += 1;
         }
-        self.take_answers(answers, current, acknowledges, now);
+        self.take_reply(reply, current, acknowledges, now);
     }
 
-    /// `answers` taken, their buckets too if `current`, their acknowledgements if
+    /// `reply` taken, its buckets too if `current`, its acknowledgements if
     /// `acknowledges`.
-    fn take_answers(&mut self, answers: Answers, current: bool, acknowledges: bool, now: u64) {
-        let Answers {
+    fn take_reply(&mut self, reply: Reply<R>, current: bool, acknowledges: bool, now: u64) {
+        let Reply {
             from,
             entries,
-            view,
+            routing,
             made,
             ..
-        } = answers;
+        } = reply;
         self.last_now = now;
         let made = super::taken_as_of(made, self.cycle, now);
         for answer in entries {
-            let Some(tracked) = self.keys.get_mut(&*answer.key) else {
+            let Some(tracked) = self.keys.by_hash_mut(answer.key) else {
                 continue;
             };
             // Only the owner it sends to: an answer from an owner that has gone is stale.
@@ -1872,29 +1939,34 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 })
             });
             tracked.heard = Heard::at(now);
-            queue(&mut self.keys, &mut self.runnable, &answer.key);
+            queue(tracked, &mut self.runnable);
         }
-        if let Some(view) = view {
-            self.on_view(view, now);
+        if let Some(routing) = routing {
+            self.on_routing(routing, now);
         }
     }
 
-    /// The service's pods change at `now`, as `DataPlane::on_view`.
-    pub fn on_view(&mut self, view: View, now: u64) {
-        if view.epoch <= self.view.epoch {
+    /// The service's pods change at `now`, as `DataPlane::on_view`, if `routing` is later
+    /// than the one it holds: each key whose owner moved has what it has not seen applied
+    /// queued to its new owner at once. A pod the routing names no longer is waited on no
+    /// more.
+    pub fn on_routing(&mut self, routing: R, now: u64) {
+        if !routing.later(&self.routing) {
             return;
         }
-        self.view = view;
-        for (handle, tracked) in &mut self.keys {
+        self.routing = routing;
+        let routing = &self.routing;
+        self.unanswered.retain(|pod, _| routing.names(*pod));
+        for (hash, tracked) in self.keys.hashed_mut() {
             let key = &tracked.entry.key;
-            let owner = self.view.owners(key).0;
+            let owner = routing.owner(key, hash);
             if owner == tracked.owner {
                 continue;
             }
             tracked.owner = owner;
             if self.scheduled && !tracked.queued {
                 tracked.queued = true;
-                self.runnable.push(handle.clone());
+                self.runnable.push(Handle::new(Arc::clone(&tracked.entry)));
             }
             let Some(owner) = owner else {
                 continue;
@@ -1923,7 +1995,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             .filter_map(move |(at, (key, contract))| {
                 let tracked = self
                     .keys
-                    .get(*key)
+                    .get(key)
                     .filter(|t| t.entry.terms.contract == *contract)?;
                 Some((at, tracked.entry.wait(now)?))
             })
@@ -1936,7 +2008,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
     }
 
     /// Messages to send, as `DataPlane::take_outgoing`.
-    pub fn take_outgoing(&mut self) -> Vec<(PodId, Batch)> {
+    pub fn take_outgoing(&mut self) -> Vec<(R::Pod, R::Batch)> {
         self.take_exchanges()
             .into_iter()
             .map(|(pod, _, batch)| (pod, batch))
@@ -1944,26 +2016,34 @@ impl<S: BuildHasher + Clone> Participant<S> {
     }
 
     /// Messages to send, each starting an exchange with its pod, numbered: its answers are
-    /// taken under that number ([`Self::on_answers_to`]), and its failure said under it
-    /// ([`Self::exchanged`]).
-    pub fn take_exchanges(&mut self) -> Vec<(PodId, u64, Batch)> {
+    /// taken under that number ([`Self::on_reply_to`]), and its failure said under it
+    /// ([`Self::exchanged`]). A pod sent entries is waited on from now, unless it was already
+    /// ([`Self::unanswered`]).
+    pub fn take_exchanges(&mut self) -> Vec<(R::Pod, u64, R::Batch)> {
         let batches = if self.one_in_flight {
             self.take_outgoing_to_idle()
         } else {
             self.take_outgoing_to_all()
         };
+        let hasher = &self.hasher;
         batches
             .into_iter()
             .map(|(pod, batch)| {
                 self.exchanges = self.exchanges.wrapping_add(1);
                 self.latest.insert(pod, self.exchanges);
+                if !batch.entries.is_empty() {
+                    self.unanswered.entry(pod).or_insert(self.last_now);
+                }
+                let batch = self
+                    .routing
+                    .batch(pod, batch, |bytes| keys::hash(hasher, bytes));
                 (pod, self.exchanges, batch)
             })
             .collect()
     }
 
     /// A piece of what is to go to each pod; the rest kept for the next.
-    fn take_outgoing_to_all(&mut self) -> Vec<(PodId, Batch)> {
+    fn take_outgoing_to_all(&mut self) -> Vec<(R::Pod, Batch)> {
         let id = self.id;
         let batches = self
             .queued
@@ -1977,8 +2057,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
     /// With one exchange in flight, a piece of what is to go to each pod with none, each now
     /// with one; the rest kept until theirs is over. Called with `now` given by the last cycle's time
     /// that `on_cycle` saw, as the start of each exchange.
-    fn take_outgoing_to_idle(&mut self) -> Vec<(PodId, Batch)> {
-        let pods: Vec<PodId> = self
+    fn take_outgoing_to_idle(&mut self) -> Vec<(R::Pod, Batch)> {
+        let pods: Vec<R::Pod> = self
             .queued
             .keys()
             .filter(|pod| !self.sending.contains_key(pod))
@@ -1999,10 +2079,31 @@ impl<S: BuildHasher + Clone> Participant<S> {
     }
 }
 
+impl<S: BuildHasher + Clone> Participant<S, View> {
+    /// Today's pod's answers to the latest exchange started with it reach it at `now`
+    /// ([`Self::on_reply`]).
+    pub fn on_answers(&mut self, answers: Answers, now: u64) {
+        let reply = Reply::of(answers, |bytes| self.hash(bytes));
+        self.on_reply(reply, now);
+    }
+
+    /// Today's pod's answers to exchange `exchange` reach it at `now`
+    /// ([`Self::on_reply_to`]).
+    pub fn on_answers_to(&mut self, exchange: u64, answers: Answers, now: u64) {
+        let reply = Reply::of(answers, |bytes| self.hash(bytes));
+        self.on_reply_to(exchange, reply, now);
+    }
+
+    /// Today's pods change at `now` ([`Self::on_routing`]).
+    pub fn on_view(&mut self, view: View, now: u64) {
+        self.on_routing(view, now);
+    }
+}
+
 /// Closes `tracked`'s entry if nothing was admitted since the last report and nothing is
 /// held, in one compare-and-swap: a take after it fails and asks, and none before it is
 /// lost. Whether it closed.
-fn close_if_quiet(tracked: &Tracked) -> bool {
+fn close_if_quiet<P>(tracked: &Tracked<P>) -> bool {
     let entry = &tracked.entry;
     let mut current = entry.word.load(Ordering::Acquire);
     loop {
