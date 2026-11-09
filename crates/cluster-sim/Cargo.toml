@@ -9,7 +9,12 @@ publish.workspace = true
 
 [dependencies]
 edgerush-cluster.workspace = true
+edgerush-cluster-asynchronous.workspace = true
 edgerush-cluster-synchronous.workspace = true
+edgerush-ratelimit.workspace = true
+
+[dev-dependencies]
+edgerush-ratelimit-sim = { path = "../ratelimit-sim" }
 
 [lints]
 workspace = true

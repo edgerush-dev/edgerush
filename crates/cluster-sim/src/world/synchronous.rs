@@ -83,7 +83,7 @@ impl Mode for Synchronous {
         world.on_unreachable(client, id, pod);
     }
 
-    fn deliver_to_client(world: &mut Sim<Self>, id: NodeId, message: Message) {
+    fn deliver_to_client(world: &mut Sim<Self>, _: NodeId, id: NodeId, message: Message) {
         world.deliver_to_client(id, message);
     }
 }
