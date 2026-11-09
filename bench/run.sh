@@ -772,55 +772,57 @@ PY
             "$RL_SYNC_UNREACHABLE" "$run-limits.yaml" >>"$config.rl"
         return
     fi
-    printf 'rate_limiting: { mode: asynchronous%s, service: { addresses: ["127.0.0.1:7000"], cycle_ms: %s%s } }\nlimits_file: %s\n' \
+    printf 'rate_limiting: { mode: asynchronous%s, service: { addresses: ["127.0.0.1:7000"], key_secret: 0123456789abcdef0123456789abcdef, cycle_ms: %s%s } }\nlimits_file: %s\n' \
         "${RL_MAX_KEY_BYTES:+, max_key_bytes: $RL_MAX_KEY_BYTES}" "$RL_CYCLE_MS" "$sharing" \
         "$run-limits.yaml" >>"$config.rl"
 }
 
-# The service's one pod, for `ratelimit`; and, when an ours-sync variant is to run, a
-# second pod of its own serving the synchronous mode, since a pod serves one mode, its store
-# formed by the example program, which runs beside it.
+# The service's pods, for `ratelimit`: one serving the asynchronous mode and, when an
+# ours-sync variant is to run, a second of its own serving the synchronous mode, since a pod
+# serves one mode; each on the store, formed by the example program, which runs beside it.
 rl_pid=
-rl_sync_pid=
 rl_form_pid=
-# A lone pod's config file, serving mode $1 on 127.0.0.1:$2: the synchronous mode's on the
-# store, reached at that address, its readiness at 127.0.0.1:9101.
+rl_sync_pid=
+rl_sync_form_pid=
+# A lone pod's config file, serving mode $1 on the store on 127.0.0.1:$2, reached at that
+# address, its readiness at 127.0.0.1:$3; the asynchronous mode's with its data planes' cycle.
 rl_service_config() {
-    if [ "$1" = synchronous ]; then
-        printf 'mode: %s\npod: { listen: 127.0.0.1:%s, address: 127.0.0.1:%s, metrics: 127.0.0.1:9101 }\n' \
-            "$1" "$2" "$2"
-        printf 'store: {}\n'
-    else
-        printf 'mode: %s\npod: { id: 0, listen: 127.0.0.1:%s, cycle_ms: %s }\n' "$1" "$2" "$RL_CYCLE_MS"
-        printf 'membership: { pods: { 0: 127.0.0.1:%s } }\n' "$2"
-    fi
+    local cycle=
+    [ "$1" = asynchronous ] && cycle=", cycle_ms: $RL_CYCLE_MS"
+    printf 'mode: %s\npod: { listen: 127.0.0.1:%s, address: 127.0.0.1:%s, metrics: 127.0.0.1:%s%s }\n' \
+        "$1" "$2" "$2" "$3" "$cycle"
+    printf 'store: {}\n'
     if [ -n "$RL_MAX_KEY_BYTES" ]; then
         printf 'keys: { max_bytes: %s }\n' "$RL_MAX_KEY_BYTES"
     fi
 }
+# A lone pod of mode $1 on port $2, ready at port $3, its files named $4, started and its
+# store formed afresh, its naming file new; once it is ready, its pid and forming's in
+# rl_started.
+rl_start_pod() {
+    rl_service_config "$1" "$2" "$3" >"$OUT/$4.yaml"
+    taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --config "$OUT/$4.yaml" 2>>"$OUT/$4.log" &
+    local pod=$!
+    rm -f "$OUT/$4-naming"
+    taskset -c "$BACKEND_CPUS" "$RL_FORM" "$OUT/$4.yaml" "$OUT/$4-naming" "127.0.0.1:$2" \
+        2>>"$OUT/$4-form.log" &
+    rl_started="$pod $!"
+    local tries=0
+    until curl -sf "http://127.0.0.1:$3/ready" >/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -lt 100 ] || { echo "the $1 pod never became ready" >&2; exit 2; }
+        sleep 0.1
+    done
+}
 start_rl_service() {
     [ -x "$RL_SERVICE" ] || { echo "no service at $RL_SERVICE: build it first" >&2; exit 2; }
-    rl_service_config asynchronous 7000 >"$OUT/rl-service.yaml"
-    taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --config "$OUT/rl-service.yaml" 2>>"$OUT/rl-service.log" &
-    rl_pid=$!
+    [ -x "$RL_FORM" ] || { echo "no forming program at $RL_FORM: build it first" >&2; exit 2; }
+    rl_start_pod asynchronous 7000 9100 rl-service
+    read -r rl_pid rl_form_pid <<<"$rl_started"
     case " $VARIANTS " in
     *" ours-sync "*)
-        [ -x "$RL_FORM" ] || { echo "no forming program at $RL_FORM: build it first" >&2; exit 2; }
-        rl_service_config synchronous 7001 >"$OUT/rl-sync-service.yaml"
-        taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --config "$OUT/rl-sync-service.yaml" \
-            2>>"$OUT/rl-sync-service.log" &
-        rl_sync_pid=$!
-        # Formed afresh each run, its naming file new.
-        rm -f "$OUT/rl-sync-naming"
-        taskset -c "$BACKEND_CPUS" "$RL_FORM" "$OUT/rl-sync-service.yaml" "$OUT/rl-sync-naming" \
-            127.0.0.1:7001 2>>"$OUT/rl-sync-form.log" &
-        rl_form_pid=$!
-        local tries=0
-        until curl -sf http://127.0.0.1:9101/ready >/dev/null; do
-            tries=$((tries + 1))
-            [ "$tries" -lt 100 ] || { echo "the synchronous pod never became ready" >&2; exit 2; }
-            sleep 0.1
-        done
+        rl_start_pod synchronous 7001 9101 rl-sync-service
+        read -r rl_sync_pid rl_sync_form_pid <<<"$rl_started"
         ;;
     esac
     sleep 2
@@ -828,11 +830,11 @@ start_rl_service() {
 
 stop_rl_service() {
     local pid
-    for pid in $rl_form_pid $rl_pid $rl_sync_pid; do
+    for pid in $rl_form_pid $rl_sync_form_pid $rl_pid $rl_sync_pid; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
-    rl_pid= rl_sync_pid= rl_form_pid=
+    rl_pid= rl_form_pid= rl_sync_pid= rl_sync_form_pid=
 }
 
 # Redis, for `ratelimit`, if envoy-rl or kong-rl is to run, and envoy-rl's service in front

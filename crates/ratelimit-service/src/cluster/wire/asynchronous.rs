@@ -13,6 +13,7 @@ use super::{
     Control, Invalid, Outgoing, Stamp, Table, ToCopy, ToPeer, Value, from_copy, from_peer, stamp,
     stamp_from, table_from, table_to_wire, wire,
 };
+use crate::grpc::MAX_MESSAGE;
 use crate::wire::{Contract, Report, contract, narrow, report, report_to_wire};
 use edgerush_cluster::{Message, NodeId};
 use edgerush_cluster_asynchronous::{
@@ -306,6 +307,13 @@ pub fn batch_to_wire(batch: AsyncBatch) -> Batch {
         made_ns: batch.made,
         entries: batch.entries.into_iter().map(entry_to_wire).collect(),
     }
+}
+
+/// Whether `batch` is longer than a stream's message may be ([`MAX_MESSAGE`]): sent, it would
+/// end the stream rather than go.
+#[must_use]
+pub fn too_long(batch: &Batch) -> bool {
+    prost::Message::encoded_len(batch) > MAX_MESSAGE
 }
 
 /// A data plane's batch from the wire: refused whole if any entry cannot be used.

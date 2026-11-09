@@ -133,7 +133,7 @@ fn proxy_starts_its_rate_limits_before_it_serves() -> io::Result<()> {
         "        forward:",
         "        rate_limits: [per-client]\n        forward:",
     ) + &format!(
-        "rate_limiting: {{ mode: asynchronous, service: {{ addresses: [\"127.0.0.1:1\"] }} }}\nlimits_file: '{limits}'\n"
+        "rate_limiting: {{ mode: asynchronous, service: {{ addresses: [\"127.0.0.1:1\"], key_secret: 00112233445566778899aabbccddeeff }} }}\nlimits_file: '{limits}'\n"
     );
     std::fs::write(&file, limited)?;
     let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;

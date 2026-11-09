@@ -14,8 +14,10 @@ UPSTREAM_IP = f"{FRONT}.5"
 # Where the load comes from as instances see it: the host, the front network's gateway.
 CLIENT_IP = f"{FRONT}.1"
 REDIS_IP, RATELIMIT_IP = f"{BACK}.2", f"{BACK}.3"
-# EdgeRush's rate-limiting service: three pods, and where the binaries built on the host are.
+# EdgeRush's rate-limiting service: three pods of its store, the program that forms them, and
+# where the binaries built on the host are.
 SERVICE_IPS = [f"{BACK}.{4 + pod}" for pod in range(3)]
+FORM_IP = f"{BACK}.7"
 BINARIES = os.environ.get("RLH_BIN", "/home/claude/rlh-bin")
 
 IMAGES = {
@@ -524,7 +526,7 @@ routes:
         rate_limits: [per-client]
 upstreams:
   up: { load_balancer: p2c, endpoints: { listed: ["%(upstream)s:80"] } }
-rate_limiting: { mode: asynchronous, service: { pods: [%(pods)s], cycle_ms: 10%(sharing)s } }
+rate_limiting: { mode: asynchronous, service: { addresses: [%(pods)s], key_secret: 0123456789abcdef0123456789abcdef, cycle_ms: 10%(sharing)s } }
 limits_file: limits.yaml
 """
 
@@ -537,17 +539,18 @@ EDGERUSH_LIMITS = """limits:
 
 
 def build_edgerush(n, workers=1, sharing="", cpus=None):
-    """EdgeRush with the rate-limiting service: three service pods, and proxies of
-    `workers` workers each on as many CPUs (or `cpus`), each proxy one participant of the
-    service, its workers deciding from the entries it keeps; `sharing` is more of the
-    service's settings (", poll_quiet_keys: true", say)."""
-    pods = ", ".join(f"{pod}: {SERVICE_IPS[pod]}:7000" for pod in range(3))
+    """EdgeRush with the rate-limiting service: three pods of its store, formed by the
+    service's example program as the controller will, and proxies of `workers` workers each
+    on as many CPUs (or `cpus`), each proxy one participant of the service, its workers
+    deciding from the entries it keeps; `sharing` is more of the service's settings
+    (", poll_quiet_keys: true", say)."""
     services = {}
     files = {}
     for pod in range(3):
         files[f"rl{pod}.yaml"] = (
-            f"pod: {{ id: {pod}, listen: 0.0.0.0:7000, cycle_ms: 10 }}\n"
-            f"membership: {{ pods: {{ {pods} }} }}\n"
+            "mode: asynchronous\n"
+            f"pod: {{ listen: 0.0.0.0:7000, address: {SERVICE_IPS[pod]}:7000, cycle_ms: 10 }}\n"
+            "store: {}\n"
         )
         services[f"rl{pod}"] = {
             "image": IMAGES["edgerush"],
@@ -556,6 +559,16 @@ def build_edgerush(n, workers=1, sharing="", cpus=None):
             "volumes": [f"{BINARIES}:/opt/bin:ro", f"./rl{pod}.yaml:/etc/rl.yaml:ro"],
             "networks": {"back": {"ipv4_address": SERVICE_IPS[pod]}},
         }
+    # The store's settings from one pod's file, which they all share; its naming kept for the
+    # run's life alone.
+    services["rlform"] = {
+        "image": IMAGES["edgerush"],
+        "container_name": f"{PROJECT}-rlform",
+        "command": ["/opt/bin/form", "/etc/rl.yaml", "/tmp/naming"]
+        + [f"{ip}:7000" for ip in SERVICE_IPS],
+        "volumes": [f"{BINARIES}:/opt/bin:ro", "./rl0.yaml:/etc/rl.yaml:ro"],
+        "networks": {"back": {"ipv4_address": FORM_IP}},
+    }
     for i in range(n):
         services[f"gw{i + 1}"] = gateway(
             i,
@@ -577,26 +590,6 @@ def build_edgerush(n, workers=1, sharing="", cpus=None):
     return services, files
 
 
-def fnv1a(data):
-    h = 0xcbf29ce484222325
-    for byte in data:
-        h ^= byte
-        h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
-    return h
-
-
-def mix(x):
-    x = ((x ^ (x >> 30)) * 0xbf58476d1ce4e5b9) & 0xFFFFFFFFFFFFFFFF
-    x = ((x ^ (x >> 27)) * 0x94d049bb133111eb) & 0xFFFFFFFFFFFFFFFF
-    return x ^ (x >> 31)
-
-
-def service_owner(pods=(0, 1, 2)):
-    """The service pod owning the load's key — the limit's name, a zero, and the client's
-    address, the host's — as `edgerush_ratelimit::service::View::owners` ranks them."""
-    address = bytes(int(octet) for octet in CLIENT_IP.split("."))
-    h = fnv1a(b"per-client" + bytes([0]) + address)
-    return max(pods, key=lambda pod: (mix(h ^ mix(pod + 1)), pod))
 
 
 SYSTEMS = {

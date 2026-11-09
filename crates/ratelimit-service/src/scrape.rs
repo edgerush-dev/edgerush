@@ -1,13 +1,15 @@
 //! A service pod's metrics, served at `/metrics` where `--metrics` says, in the text format
 //! a data plane's scrape uses: whether it serves, and how often and how long it has gone
 //! without hearing a majority (06 §4), and what its keys hold against what they may (06 §8),
-//! for the asynchronous mode's pod. A pod of the store (`cluster`), the synchronous mode's,
-//! shows its own: whether it serves, its keys, its peers' clocks, what it dropped and the table
+//! for the pod by the view. A pod of the store (`cluster`), either mode's, shows its own: whether
+//! it serves, its keys, what its mode counts, its peers' clocks, what it dropped and the table
 //! it follows; and says at `/ready` whether it is ready, for a readiness probe.
 
+use crate::cluster::mode::{DecidedFromCopy, Mode};
 use crate::cluster::pod::{Observed, StorePod};
 use crate::pod::{Pod, Usage};
 use bytes::Bytes;
+use edgerush_cluster_asynchronous::TurnedAway;
 use edgerush_ratelimit::service::membership::Sight;
 use edgerush_telemetry::{Exposition, Kind};
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
@@ -104,10 +106,51 @@ pub async fn serve(listener: TcpListener, pod: Pod, max_key_bytes: u64) {
     .await;
 }
 
+/// What a store pod's mode counts of itself, as its scrape shows it.
+pub trait Counted {
+    /// Its families and samples, added to `scrape`.
+    fn render(&self, scrape: &mut Exposition);
+}
+
+impl Counted for DecidedFromCopy {
+    fn render(&self, scrape: &mut Exposition) {
+        let name = "edgerush_rate_limit_decided_from_copy_total";
+        let help = "Requests from data planes the pod decided from its copy of the key, the \
+                    key's owner unheard for the store's stop_serving_ms, rather than forward \
+                    them.";
+        scrape.family(name, Kind::Counter, help);
+        scrape.sample(name, &[], self.decided_from_copy);
+    }
+}
+
+impl Counted for TurnedAway {
+    fn render(&self, scrape: &mut Exposition) {
+        let whys = [
+            ("elsewhere", self.elsewhere),
+            ("not_serving", self.not_serving),
+        ];
+        let name = "edgerush_rate_limit_turned_away_entries_total";
+        let help = "Entries of data planes' batches the pod applied none of, by why: its table \
+                    names another pod their key's owner, or none; or names it, while it is not \
+                    serving. Each data plane sends them again to the owner its table names.";
+        scrape.family(name, Kind::Counter, help);
+        for (why, turned) in whys {
+            scrape.sample(name, &[("why", why)], turned.entries);
+        }
+        let name = "edgerush_rate_limit_turned_away_hits_total";
+        let help = "The hits those entries reported, by why.";
+        scrape.family(name, Kind::Counter, help);
+        for (why, turned) in whys {
+            scrape.sample(name, &[("why", why)], turned.hits);
+        }
+    }
+}
+
 /// The text of a store pod's scrape, of what `observed` says of it: whether it serves, its keys
-/// against their cap, its peers' clocks, what its sending dropped, and the table it follows.
+/// against their cap, what its mode counts, its peers' clocks, what its sending dropped, and
+/// the table it follows.
 #[must_use]
-pub fn render_store(observed: Observed) -> String {
+pub fn render_store<C: Counted>(observed: Observed<C>) -> String {
     let mut scrape = Exposition::new();
     let name = "edgerush_rate_limit_pod_serving";
     let help = "1 while the pod serves data planes: its table names it and it holds its lease.";
@@ -134,11 +177,7 @@ pub fn render_store(observed: Observed) -> String {
     let help = "Keys forgotten, their time come: full again, or their window over.";
     scrape.family(name, Kind::Counter, help);
     scrape.sample(name, &[], observed.forgotten);
-    let name = "edgerush_rate_limit_decided_from_copy_total";
-    let help = "Requests from data planes the pod decided from its copy of the key, the key's \
-                owner unheard for the store's stop_serving_ms, rather than forward them.";
-    scrape.family(name, Kind::Counter, help);
-    scrape.sample(name, &[], observed.mode.decided_from_copy);
+    observed.mode.render(&mut scrape);
     let name = "edgerush_rate_limit_peers_skewed";
     let help = "Peers whose wall clocks are off from the pod's past the store's skew warning.";
     scrape.family(name, Kind::Gauge, help);
@@ -177,7 +216,7 @@ pub fn render_store(observed: Observed) -> String {
 /// Serves a store `pod`'s scrape on `listener` for as long as it runs, as [`serve`] serves an
 /// asynchronous pod's, and its readiness: `GET /ready`, 200 while its store has it ready and
 /// 503 while not, for a readiness probe.
-pub async fn serve_store(listener: TcpListener, pod: StorePod) {
+pub async fn serve_store<M: Mode<Counted: Counted>>(listener: TcpListener, pod: StorePod<M>) {
     serve_with(listener, move |asked| {
         let pod = pod.clone();
         async move {
@@ -288,7 +327,7 @@ where
 mod tests {
     use super::*;
     use crate::cluster::link::Dropped;
-    use crate::cluster::mode::DecidedFromCopy;
+    use edgerush_cluster_asynchronous::Turned;
 
     #[test]
     fn a_scrape_says_what_the_keys_hold_against_their_bound() {
@@ -363,9 +402,38 @@ mod tests {
         assert!(!scrape.contains("majority"), "{scrape}");
     }
 
+    /// An asynchronous pod's scrape says the entries it turned away and their hits, by why,
+    /// and nothing of the synchronous mode's copies.
+    #[test]
+    fn an_asynchronous_pods_scrape_says_what_it_turned_away_by_why() {
+        let scrape = render_store(Observed {
+            mode: TurnedAway {
+                elsewhere: Turned {
+                    entries: 3,
+                    hits: 7,
+                },
+                not_serving: Turned {
+                    entries: 1,
+                    hits: 2,
+                },
+            },
+            ..Observed::default()
+        });
+        for line in [
+            "edgerush_rate_limit_turned_away_entries_total{why=\"elsewhere\"} 3\n",
+            "edgerush_rate_limit_turned_away_entries_total{why=\"not_serving\"} 1\n",
+            "edgerush_rate_limit_turned_away_hits_total{why=\"elsewhere\"} 7\n",
+            "edgerush_rate_limit_turned_away_hits_total{why=\"not_serving\"} 2\n",
+            "edgerush_rate_limit_pod_serving 0\n",
+        ] {
+            assert!(scrape.contains(line), "{line}{scrape}");
+        }
+        assert!(!scrape.contains("decided_from_copy"), "{scrape}");
+    }
+
     #[test]
     fn a_store_pod_leading_not_ready_with_no_cap_or_table_says_so() {
-        let scrape = render_store(Observed {
+        let scrape = render_store(Observed::<DecidedFromCopy> {
             leader: true,
             ..Observed::default()
         });

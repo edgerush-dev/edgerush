@@ -499,7 +499,7 @@ impl Limiter {
     }
 
     /// Whether it is a limiter of the process thread `hub`. The thread is kept while the
-    /// service's pods, cycle and levers are; a change of what its keys may hold is taken as
+    /// service's seeds, secret, cycle and levers are; a change of what its keys may hold is taken as
     /// it is ([`Hub::set_capacity`]).
     pub(crate) fn is_on(&self, hub: &Arc<Hub>) -> bool {
         Arc::ptr_eq(&self.hub, hub)

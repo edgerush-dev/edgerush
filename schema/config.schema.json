@@ -1160,11 +1160,11 @@
       ]
     },
     "RateLimitService": {
-      "description": "The rate-limiting service: its pods, and in the asynchronous mode how often each process\nsends them what it admitted and its levers, which the synchronous mode does not take.",
+      "description": "The rate-limiting service: where a data plane first finds its store, the secret keys are\nhashed under, and in the asynchronous mode how often each process sends the owners what it\nadmitted and its levers, which the synchronous mode does not take.",
       "type": "object",
       "properties": {
         "addresses": {
-          "description": "The address (`host:port`) of each of its pods, the first being pod 0.",
+          "description": "The addresses (`host:port`) a data plane first asks for the store's table, its seeds:\nany of the service's pods, or a name that reaches them. The pods themselves are reached\nat the addresses the table gives.",
           "type": "array",
           "items": {
             "type": "string"
@@ -1182,7 +1182,7 @@
           "minimum": 1
         },
         "key_secret": {
-          "description": "The secret the synchronous mode's keys are hashed under, as 32 hex digits: the same on\nevery data plane, so that each sends a client's key to the pod that owns it, and kept\nfrom clients, so that none can choose a key to share another's count. Needed by the synchronous mode, and taken\nby no other; never shown.",
+          "description": "The secret keys are hashed under, as 32 hex digits: the same on every data plane, so\nthat each sends a client's key to the pod that owns it, and kept from clients, so that\nnone can choose a key to share another's count. Needed; never shown.",
           "type": [
             "string",
             "null"

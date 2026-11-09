@@ -24,6 +24,10 @@ arc-swap.workspace = true
 boring.workspace = true
 bytes.workspace = true
 edgerush-certificates.workspace = true
+# The store's tables and the asynchronous mode's messages and routing, which the
+# rate-limiting thread reaches the service's pods by.
+edgerush-cluster.workspace = true
+edgerush-cluster-asynchronous.workspace = true
 edgerush-config.workspace = true
 # Which of a Service's EndpointSlices' endpoints take requests.
 edgerush-discovery.workspace = true
@@ -65,8 +69,6 @@ nix.workspace = true
 edgerush-certificates = { workspace = true, features = ["testing"] }
 # A fake API server, for the namespaces followed.
 edgerush-kubernetes = { workspace = true, features = ["testing"] }
-# The store's settings and tables, for the synchronous mode's pods formed under test.
-edgerush-cluster.workspace = true
 # The engine's clients and its either-version server, for tests only: what talks to the
 # proxy as a client would, upstreams that speak both versions, and a second oracle for
 # EdgeRush's own HTTP/1 client (`upstream::h1::differential`).
