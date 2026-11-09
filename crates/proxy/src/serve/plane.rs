@@ -15,7 +15,7 @@ use crate::upstream::destination::{Aside, Destinations, Keys, Retiring, ReuseIde
 use crate::upstream::secure::{Secure, Stores};
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRateLimiting, MOST_LISTENERS};
-use edgerush_discovery::{Endpoints, SERVICE_NAME_LABEL, zone_of};
+use edgerush_discovery::{Endpoints, SERVICE_NAME_LABEL, Transport, zone_of};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
@@ -180,10 +180,16 @@ fn resolved(config: &Compiled, found: Found<'_>) -> Endpointed {
         .iter()
         .map(|upstream| match (&upstream.discovery, &upstream.dns) {
             (Some(service), _) => {
+                // A `udp` upstream's port is the Service's over UDP (24 §2).
+                let transport = match upstream.protocol {
+                    edgerush_config::UpstreamProtocol::Udp => Transport::Udp,
+                    edgerush_config::UpstreamProtocol::Http1
+                    | edgerush_config::UpstreamProtocol::Http2 => Transport::Tcp,
+                };
                 let endpoints = discovered
                     .get(&service.namespace)
                     .and_then(|services| services.get(&service.service))
-                    .map(|slices| Endpoints::of(service, slices))
+                    .map(|slices| Endpoints::of_over(service, slices, transport))
                     .unwrap_or_default();
                 let preferred = zone
                     .and_then(|zone| endpoints.for_zone(zone))

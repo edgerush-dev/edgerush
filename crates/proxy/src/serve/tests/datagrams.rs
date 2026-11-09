@@ -2,7 +2,7 @@
 //! (24).
 
 use super::*;
-use crate::serve::datagrams::sockets_full;
+use crate::serve::datagrams::{sends_refused, sockets_full};
 use crate::upstream::dial;
 
 /// A `udp` listener `dns` whose one route goes to `backends`, each `(upstream, weight)`,
@@ -580,6 +580,73 @@ async fn a_datagram_its_socket_has_no_room_for_is_dropped_either_way() {
             assert_eq!(&buffer[..len], b"again", "nothing held came first");
             socket.send_to(b"back", session).await.unwrap();
             assert_eq!(answer(&client).await, b"back");
+        })
+        .await;
+}
+
+/// An endpoint whose port is closed answers with ICMP port unreachable: the session ends,
+/// counted, the endpoint is set aside, and the next client goes to another (24 §3).
+#[tokio::test]
+async fn a_refused_session_ends_and_its_endpoint_is_set_aside() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // A port nothing listens on: bound, and let go.
+            let closed = std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            let there = naming_backend("there").await;
+            let (front, worker) = serving_udp(udp_to(&[closed, there], "")).await;
+            // Kept, so that each holds its session, and p2c sends the next elsewhere.
+            let mut clients = Vec::new();
+            for _ in 0..2 {
+                let client = client_of(front).await;
+                client.send(b"?").await.unwrap();
+                clients.push(client);
+            }
+            counted(&worker, &sessions_ended("refused", 1)).await;
+            counted(&worker, &active(1)).await;
+            let snapshot = worker.proxy().current.load();
+            let aside: Vec<SocketAddr> = snapshot
+                .destinations
+                .of(0)
+                .iter()
+                .filter(|endpoint| endpoint.set_aside_for().is_some())
+                .map(|endpoint| endpoint.address())
+                .collect();
+            assert_eq!(aside, [closed]);
+            // The refused client's next datagram is a new session, on the endpoint there.
+            for client in &clients {
+                assert_eq!(exchange(client, b"?").await, b"there");
+            }
+        })
+        .await;
+}
+
+/// A refusal the kernel reports on a send, before the session's own read sees it, ends the
+/// session as one on a read does, and the datagram is not sent again.
+#[tokio::test]
+async fn a_session_refused_on_a_send_ends_and_its_endpoint_is_set_aside() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (backend, socket) = silent_backend().await;
+            let (front, worker) = serving_udp(udp_to(&[backend], "")).await;
+            let client = client_of(front).await;
+            sends_refused(true);
+            client.send(b"refused").await.unwrap();
+            counted(&worker, &sessions_ended("refused", 1)).await;
+            sends_refused(false);
+            counted(&worker, &active(0)).await;
+            let endpoint = Arc::clone(worker.proxy().current.load().destinations.at(0, 0).unwrap());
+            assert!(endpoint.set_aside_for().is_some());
+            // Nothing of the refused one reached the backend; the next is a session anew.
+            client.send(b"again").await.unwrap();
+            let mut buffer = [0; 16];
+            let (len, _) = within(socket.recv_from(&mut buffer)).await.unwrap();
+            assert_eq!(&buffer[..len], b"again");
+            counted(&worker, &accepted(2)).await;
         })
         .await;
 }

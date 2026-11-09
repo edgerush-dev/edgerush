@@ -21,6 +21,8 @@ pub enum Kind {
     WebSocketClose,
     /// A `tcp` or `tls` listener's connection, once it has ended.
     Connection,
+    /// A `udp` listener's session, once it has ended.
+    Session,
 }
 
 impl Kind {
@@ -30,6 +32,7 @@ impl Kind {
             Self::WebSocketOpen => b"websocket_open",
             Self::WebSocketClose => b"websocket_close",
             Self::Connection => b"connection",
+            Self::Session => b"session",
         }
     }
 }
@@ -150,7 +153,8 @@ impl Record<'_> {
                 out.extend_from_slice(b",\"status\":");
                 decimal(out, u64::from(status));
             }
-            (None, Kind::Connection) => {}
+            // Neither carries HTTP: no status at all.
+            (None, Kind::Connection | Kind::Session) => {}
             (None, _) => out.extend_from_slice(b",\"status\":null"),
         }
         optional_string(out, b",\"reason\":", self.reason);
@@ -575,6 +579,12 @@ mod tests {
         assert!(written.contains("\"kind\":\"connection\""), "{written}");
         assert!(!written.contains("status"), "{written}");
         assert!(!written.contains("protocol"), "{written}");
+        let session = line(&Record {
+            kind: Kind::Session,
+            ..tunnel
+        });
+        assert!(session.contains("\"kind\":\"session\""), "{session}");
+        assert!(!session.contains("status"), "{session}");
     }
 
     #[test]
@@ -584,6 +594,7 @@ mod tests {
             (Kind::WebSocketOpen, "websocket_open"),
             (Kind::WebSocketClose, "websocket_close"),
             (Kind::Connection, "connection"),
+            (Kind::Session, "session"),
         ] {
             let written = line(&Record { kind, ..proxied() });
             assert!(

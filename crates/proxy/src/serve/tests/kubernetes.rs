@@ -53,6 +53,39 @@ async fn until(what: &str, done: impl Fn() -> bool) {
     .unwrap_or_else(|_| panic!("never: {what}"));
 }
 
+/// A `udp` upstream is served at its Service's port over UDP (24 §2): one named as it asks
+/// that a TCP upstream would pass over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_udp_upstream_is_served_at_its_services_port_over_udp() {
+    let fake = Fake::start(&["127.0.0.1"], |path| {
+        if path.contains("watch=true") {
+            open()
+        } else if path.contains("/namespaces/kube/") {
+            answer(
+                200,
+                r#"{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSliceList","metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"dns-1","namespace":"kube","resourceVersion":"5","labels":{"kubernetes.io/service-name":"dns"}},"addressType":"IPv4","ports":[{"name":"dns","port":5353,"protocol":"UDP"},{"name":"dns-tcp","port":5354,"protocol":"TCP"}],"endpoints":[{"addresses":["10.0.0.1"]}]}]}"#,
+            )
+        } else {
+            answer(500, "")
+        }
+    })
+    .await;
+    let api = fake.client(&token("proxy-follows-udp", "secret"), Timing::default());
+    let yaml = "listeners: {}\nroutes: []\nupstreams:\n  dns: { protocol: udp, load_balancer: p2c, endpoints: { kubernetes: \"dns.kube.svc.cluster.local:dns\" } }\n";
+    let config: Config = serde_saphyr::from_str(yaml).unwrap();
+    let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            tokio::task::spawn_local(Arc::clone(&proxy).follow_kubernetes(api, |_, _| {}));
+            until("the UDP port served", || {
+                served(&proxy) == ["10.0.0.1:5353"]
+            })
+            .await;
+        })
+        .await;
+}
+
 /// The namespace a config's upstream is in is followed, and its endpoints served; a reload
 /// that names another namespace follows that one instead, and forgets the first; and what
 /// fails is said, with its namespace.

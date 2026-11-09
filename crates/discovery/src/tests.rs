@@ -166,6 +166,31 @@ fn a_slice_without_the_port_over_tcp_with_a_number_gives_nothing() {
     }
 }
 
+/// A `udp` upstream's port is the one of its name over UDP: the same name over TCP, or
+/// a port that does not say, which is TCP's, is not it; and the other way about.
+#[test]
+fn a_port_is_matched_over_its_upstreams_transport() {
+    let endpoint = "  - { addresses: [10.0.0.1] }\n";
+    let over = |ports: &str, transport| {
+        let endpoints = Endpoints::of_over(&web(), &[slice("IPv4", ports, endpoint)], transport);
+        addresses(endpoints.ready())
+    };
+    let udp = "[{ name: http, port: 5353, protocol: UDP }]";
+    assert_eq!(over(udp, Transport::Udp), ["10.0.0.1:5353"]);
+    assert!(over(udp, Transport::Tcp).is_empty());
+    for tcp in [
+        "[{ name: http, port: 8080, protocol: TCP }]",
+        "[{ name: http, port: 8080 }]",
+    ] {
+        assert!(over(tcp, Transport::Udp).is_empty(), "{tcp}");
+        assert_eq!(over(tcp, Transport::Tcp), ["10.0.0.1:8080"], "{tcp}");
+    }
+    let only = KubernetesService::parse("web.shop.svc.cluster.local:53").unwrap();
+    let unnamed = slice("IPv4", "[{ port: 53, protocol: UDP }]", endpoint);
+    let found = Endpoints::of_over(&only, &[unnamed], Transport::Udp);
+    assert_eq!(addresses(found.ready()), ["10.0.0.1:53"]);
+}
+
 #[test]
 fn the_services_only_unnamed_port_is_the_slices_port_without_a_name() {
     let only = KubernetesService::parse("web.shop.svc.cluster.local:80").unwrap();

@@ -17,7 +17,7 @@ use crate::access_log::Sink;
 use crate::downstream::h1::connection::{self as h1, Answered};
 use crate::forwarding::{Client, Cut, FORWARDED_FOR};
 use crate::head::Forwarded;
-use crate::metrics::Tunnel;
+use crate::metrics::{SessionEnd, Tunnel};
 use crate::request_body::Counts;
 use crate::tunnel::Tunneled;
 use edgerush_filters::forwarding::client_address;
@@ -483,17 +483,37 @@ impl Passing {
         self.down = tunneled.down;
     }
 
+    /// Notes a datagram of a `udp` listener's session passed on: `up` bytes of the client's
+    /// to its endpoint, or `down` of the endpoint's back to it.
+    pub(super) fn passed(&mut self, up: usize, down: usize) {
+        self.up = self
+            .up
+            .saturating_add(u64::try_from(up).unwrap_or(u64::MAX));
+        self.down = self
+            .down
+            .saturating_add(u64::try_from(down).unwrap_or(u64::MAX));
+    }
+
     /// Writes the record, of a connection that ended `how`.
     pub(super) fn ended(self, worker: &Worker, how: Tunnel) {
+        self.write(worker, Kind::Connection, how.name());
+    }
+
+    /// Writes the record of a `udp` listener's session that ended `how` (24 §6).
+    pub(super) fn session_ended(self, worker: &Worker, how: SessionEnd) {
+        self.write(worker, Kind::Session, how.name());
+    }
+
+    fn write(self, worker: &Worker, kind: Kind, reason: &'static str) {
         let text = |span: Span| self.texts.get(span.from..span.to);
         let record = Record {
             time_ms: self.time_ms,
-            kind: Kind::Connection,
+            kind,
             listener: text(self.listener).unwrap_or_default(),
             client: self.client,
             peer: self.peer,
             host: self.host.and_then(text),
-            reason: Some(how.name()),
+            reason: Some(reason),
             route: self.route.and_then(text),
             upstream: self.upstream.and_then(text),
             endpoint: self.endpoint,

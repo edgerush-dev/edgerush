@@ -74,7 +74,7 @@ impl<T> Session<T> {
         not(any(test, feature = "fuzzing")),
         expect(
             dead_code,
-            reason = "a session's access log record names it (24 §8, step 3b)"
+            reason = "a reload keeps a session whose route lists its backend still (24 §8, step 4)"
         )
     )]
     pub fn backend(&self) -> Destination {
@@ -183,13 +183,6 @@ impl<T> Sessions<T> {
     /// Ends `client`'s session before its idle bound, as a refused one ends: handed back,
     /// for the caller to drop, which gives its room back. The client's next datagram makes
     /// a new one.
-    #[cfg_attr(
-        not(any(test, feature = "fuzzing")),
-        expect(
-            dead_code,
-            reason = "the refused end ends a session so (24 §8, step 3b)"
-        )
-    )]
     pub fn end(&mut self, client: &Client) -> Option<Session<T>> {
         let session = self.by_client.remove(client)?;
         self.deadlines.remove(session.deadline);

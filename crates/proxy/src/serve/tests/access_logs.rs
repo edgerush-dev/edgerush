@@ -1357,3 +1357,174 @@ async fn an_answer_cut_by_the_workers_shortage_is_logged_as_that() {
         })
         .await;
 }
+
+/// A worker serving the `udp` listener `dns` of `yaml`, which is given the listener's
+/// `access_log` setting and its idle bound, logging to a file of the test's own; swept
+/// every 50 ms, so that what it logs is written within moments; and the task serving it.
+async fn recording_udp(
+    test: &str,
+    yaml: impl FnOnce(&str) -> String,
+) -> (Recording, tokio::task::JoinHandle<()>) {
+    let directory = scratch(test);
+    let path = directory.join("access.log");
+    let logs = format!(
+        ", session_idle_seconds: 1, access_log: {{ file: '{}' }}",
+        path.display()
+    );
+    let config: Config = serde_saphyr::from_str(&yaml(&logs)).unwrap();
+    let limits = H1Limits {
+        sweep: Duration::from_millis(50),
+        ..H1Limits::default()
+    };
+    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+    let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let front = socket.local_addr().unwrap();
+    let serving = tokio::task::spawn_local(Rc::clone(&worker).serve_udp(0, socket).unwrap());
+    let _sweeping = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+    let recording = Recording {
+        front,
+        worker,
+        path,
+        directory,
+    };
+    (recording, serving)
+}
+
+/// A `udp` listener `dns` whose route goes to `backends`, of the upstream `up` at
+/// `endpoint`, with `logs` in the listener's settings.
+fn udp_logging(backends: &str, endpoint: SocketAddr, logs: &str) -> String {
+    format!(
+        "listeners: {{ dns: {{ address: \"127.0.0.1:0\", protocol: udp{logs} }} }}\n\
+         routes: []\n\
+         udp_routes: [{{ name: dns, listeners: [dns], backends: [{backends}] }}]\n\
+         upstreams: {{ up: {{ protocol: udp, load_balancer: p2c, endpoints: {{ listed: [\"{endpoint}\"] }} }} }}\n"
+    )
+}
+
+/// A UDP backend that answers every datagram with twice its bytes.
+async fn doubling_backend() -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    tokio::task::spawn_local(async move {
+        let mut buffer = vec![0; 1 << 16];
+        while let Ok((len, from)) = socket.recv_from(&mut buffer).await {
+            let answer = [&buffer[..len], &buffer[..len]].concat();
+            let _sent = socket.send_to(&answer, from).await;
+        }
+    });
+    address
+}
+
+/// A `udp` listener's session writes one record at its end, of a kind of its own: who it
+/// was, where it went, how it ended, and the bytes it passed on each way. No HTTP
+/// status: it had none (24 §6).
+#[tokio::test]
+async fn a_udp_session_is_logged_at_its_end() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = doubling_backend().await;
+            let (logged, _serving) = recording_udp("udp-session", |logs| {
+                udp_logging("{ upstream: up, weight: 1 }", backend, logs)
+            })
+            .await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client.connect(logged.front).await.unwrap();
+            let mut answer = [0; 64];
+            for len in [3, 10] {
+                client.send(&vec![7; len]).await.unwrap();
+                let got = within(client.recv(&mut answer)).await.unwrap();
+                assert_eq!(got, 2 * len);
+            }
+            // Ended idle, after its one second.
+            let records = logged.records(1).await;
+            let record = &records[0];
+            assert_eq!(record["kind"], "session");
+            assert_eq!(record["listener"], "dns");
+            assert_eq!(record["client"], "127.0.0.1");
+            assert_eq!(record["peer"], client.local_addr().unwrap().to_string());
+            assert_eq!(record["reason"], "idle", "{record}");
+            assert_eq!(record["route"], "dns");
+            assert_eq!(record["upstream"], "up");
+            assert_eq!(record["endpoint"], backend.to_string());
+            assert_eq!(record["bytes_in"], 13, "{record}");
+            assert_eq!(record["bytes_out"], 26, "{record}");
+            let lasted = record["duration_ms"].as_f64().unwrap();
+            assert!(lasted >= 900.0, "{record}");
+            for none in ["status", "protocol", "method", "host", "path", "tries"] {
+                assert!(record.get(none).is_none(), "{none}: {record}");
+            }
+        })
+        .await;
+}
+
+/// A session its endpoint refused is logged as refused; and one of an invalid backend,
+/// which went nowhere, with no upstream or endpoint, as its listener taken away left it.
+#[tokio::test]
+async fn a_refused_session_and_an_invalid_backends_are_logged_as_they_ended() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = doubling_backend().await;
+            let (logged, _serving) = recording_udp("udp-refused", |logs| {
+                udp_logging("{ upstream: up, weight: 1 }", backend, logs)
+            })
+            .await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client.connect(logged.front).await.unwrap();
+            crate::serve::datagrams::sends_refused(true);
+            client.send(b"refused").await.unwrap();
+            let records = logged.records(1).await;
+            crate::serve::datagrams::sends_refused(false);
+            assert_eq!(records[0]["reason"], "refused", "{}", records[0]);
+            assert_eq!(records[0]["bytes_in"], 0, "{}", records[0]);
+
+            let (logged, serving) = recording_udp("udp-invalid", |logs| {
+                udp_logging("{ invalid: \"no such Service\", weight: 1 }", backend, logs)
+            })
+            .await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client.connect(logged.front).await.unwrap();
+            client.send(b"lost").await.unwrap();
+            let line = "edgerush_listener_connections_active{listener=\"dns\"} 1\n";
+            until(|| logged.worker.proxy().metrics().contains(line)).await;
+            logged.worker.stop(0);
+            within(serving).await.unwrap();
+            let records = logged.records(1).await;
+            let record = &records[0];
+            assert_eq!(record["reason"], "drained", "{record}");
+            assert_eq!(record["route"], "dns");
+            assert!(record.get("upstream").is_none(), "{record}");
+            assert!(record.get("endpoint").is_none(), "{record}");
+            assert_eq!(record["bytes_in"], 0, "{record}");
+        })
+        .await;
+}
+
+/// A datagram dropped without a session writes no record: the metrics count it, and a
+/// flood of them does not flood the log (24 §6).
+#[tokio::test]
+async fn a_datagram_dropped_without_a_session_is_not_logged() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = doubling_backend().await;
+            let (logged, _serving) = recording_udp("udp-unlogged", |logs| {
+                udp_logging("{ upstream: up, weight: 0 }", backend, logs)
+            })
+            .await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client.connect(logged.front).await.unwrap();
+            for _ in 0..5 {
+                client.send(b"dropped").await.unwrap();
+            }
+            let line = "edgerush_listener_udp_datagrams_dropped_total{listener=\"dns\",reason=\"invalid_backend\"} 5\n";
+            until(|| logged.worker.proxy().metrics().contains(line)).await;
+            // Several sweeps, any of which would have written one.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let written = std::fs::read_to_string(&logged.path).unwrap_or_default();
+            assert!(written.is_empty(), "{written}");
+        })
+        .await;
+}
