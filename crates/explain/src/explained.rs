@@ -39,6 +39,9 @@ pub enum Unexplained {
     /// A connection to an `http` or `https` listener, which takes requests.
     #[error("listener {0} is an {1} listener: it takes requests, not bare connections")]
     NotPassthrough(String, &'static str),
+    /// Anything sent to a `udp` listener, whose sessions are not explained.
+    #[error("listener {0} is a udp listener, which explain and test do not cover")]
+    Udp(String),
     /// The request cannot be made into a head for the listener.
     #[error(transparent)]
     Invalid(#[from] Invalid),
@@ -82,6 +85,9 @@ impl Snapshot {
         listener: &'s CompiledListener,
         asked: &Asked,
     ) -> Result<Explained<'s>, Unexplained> {
+        if listener.protocol == Protocol::Udp {
+            return Err(Unexplained::Udp(listener.name.clone()));
+        }
         if matches!(listener.protocol, Protocol::Tcp | Protocol::Tls) {
             return Err(Unexplained::NotHttp(
                 listener.name.clone(),
@@ -642,6 +648,7 @@ pub fn protocol_name(protocol: Protocol) -> &'static str {
         Protocol::Https => "https",
         Protocol::Tcp => "tcp",
         Protocol::Tls => "tls",
+        Protocol::Udp => "udp",
     }
 }
 

@@ -1280,6 +1280,9 @@ pub enum ProxyError {
         /// What is wrong with them.
         error: TlsError,
     },
+    /// A `udp` listener, which the data plane does not serve yet.
+    #[error("listener `{0}`: a `udp` listener is not served yet")]
+    UdpUnserved(String),
     /// BoringSSL could not give the keys the data plane makes at start.
     #[error("no random keys to be had: {0}")]
     Random(String),

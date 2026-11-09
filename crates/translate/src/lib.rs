@@ -2236,6 +2236,7 @@ fn config_of(
         routes,
         tcp_routes: Vec::new(),
         tls_routes: Vec::new(),
+        udp_routes: Vec::new(),
         upstreams,
         data_plane: DataPlane::default(),
         rate_limiting: None,
@@ -2284,6 +2285,7 @@ fn bound_for(bound: &BTreeMap<String, Listener>, port: u16) -> &'static str {
         Some(Protocol::Https) => "HTTPS",
         Some(Protocol::Tcp) => "TCP",
         Some(Protocol::Tls) => "TLS",
+        Some(Protocol::Udp) => "UDP",
     }
 }
 

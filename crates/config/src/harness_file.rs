@@ -9,7 +9,7 @@
 
 use crate::{
     Certificate, Config, DataPlane, Limits, Listener, RateLimiting, Route, TcpRoute, TlsRoute,
-    Upstream,
+    UdpRoute, Upstream,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -42,6 +42,9 @@ pub struct HarnessFile {
     /// hostnames.
     #[serde(default)]
     pub tls_routes: Vec<TlsRoute>,
+    /// The routes of `udp` listeners: at most one for each.
+    #[serde(default)]
+    pub udp_routes: Vec<UdpRoute>,
     /// The upstreams that backends and mirrors name, by name.
     pub upstreams: BTreeMap<String, Upstream>,
     /// The data plane's own settings; left out, each has its value.
@@ -89,6 +92,7 @@ impl HarnessFile {
             routes: self.routes,
             tcp_routes: self.tcp_routes,
             tls_routes: self.tls_routes,
+            udp_routes: self.udp_routes,
             upstreams: self.upstreams,
             data_plane: self.data_plane,
             rate_limiting: self.rate_limiting,
@@ -110,6 +114,7 @@ listeners:
 routes: []
 tcp_routes: []
 tls_routes: []
+udp_routes: []
 upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
 data_plane: { set_aside_ms: 7 }
 "#;

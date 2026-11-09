@@ -45,6 +45,23 @@ pub struct TcpRoute {
     pub backends: Vec<Backend>,
 }
 
+/// A route for a `udp` listener: every session it takes goes to one of these backends, as
+/// Gateway API's UDPRoute has it (24 in the docs).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct UdpRoute {
+    /// Unique among every kind of route.
+    pub name: String,
+    /// The names of the `udp` listeners it is for.
+    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
+    pub listeners: Vec<String>,
+    /// Where sessions go, in proportion to the weights: each session's datagrams all to
+    /// one.
+    #[cfg_attr(feature = "schema", schemars(length(min = 1, max = crate::compile::MOST_BACKENDS)))]
+    pub backends: Vec<Backend>,
+}
+
 /// A route for a `tls` listener: the connections whose ClientHello asks for a name its
 /// hostnames cover, as Gateway API's TLSRoute has it in passthrough mode.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

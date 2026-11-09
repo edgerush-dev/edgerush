@@ -337,6 +337,9 @@ pub enum Problem {
     /// A listener the config does not have.
     #[error("there is no listener {0}")]
     NoListener(String),
+    /// A `udp` listener, whose sessions are not tested.
+    #[error("listener {0} is a udp listener, which explain and test do not cover")]
+    Udp(String),
     /// A field the listener's kind needs, missing.
     #[error("request needs {0} for {1} listener")]
     Missing(&'static str, &'static str),
@@ -563,6 +566,7 @@ fn kind(protocol: Protocol) -> &'static str {
         Protocol::Https => "an https",
         Protocol::Tcp => "a tcp",
         Protocol::Tls => "a tls",
+        Protocol::Udp => "a udp",
     }
 }
 
@@ -590,6 +594,8 @@ fn for_listener(test: &Test, listener: &CompiledListener) -> Vec<Problem> {
         Protocol::Https if passed(&test.request, listener).is_some() => (true, PASSED),
         Protocol::Http | Protocol::Https => (false, kind(listener.protocol)),
         Protocol::Tcp | Protocol::Tls => (true, kind(listener.protocol)),
+        // Refused whole by `asked`.
+        Protocol::Udp => return problems,
     };
     match connection {
         false => {
@@ -662,6 +668,7 @@ fn asked(request: &Request, snapshot: &Snapshot) -> Result<Asking, Problem> {
             .map_or(Ok(()), |(field, _)| Err(Problem::Unwanted(field, kind)))
     };
     match listener.protocol {
+        Protocol::Udp => return Err(Problem::Udp(request.listener.clone())),
         Protocol::Tcp => {
             unwanted(&http)?;
             unwanted(&[("sni", request.sni.is_some())])?;
