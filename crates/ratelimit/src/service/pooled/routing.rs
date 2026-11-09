@@ -24,8 +24,9 @@ pub trait Routing: Sized {
     /// nothing.
     fn through(&self, hash: u64, owner: Self::Pod) -> Option<Self::Pod>;
 
-    /// The pod to poll at `turn`, counted up from 0, when keys in use have gone unheard: each
-    /// in turn. `None` with no pod known.
+    /// The pod to poll at `turn`, counted up from 0, when keys in use have gone unheard, with
+    /// an empty batch, its answer bringing the pod's routing if later: each in turn. `None`
+    /// with no pod known, or where the routing reaches the participant unasked.
     fn polled(&self, turn: u64) -> Option<Self::Pod>;
 
     /// Whether it is later than `than`, and so replaces it.

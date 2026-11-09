@@ -764,6 +764,61 @@ async fn a_data_plane_cut_off_from_an_owner_reaches_it_through_a_replica() {
     assert_eq!((first.usage().forgiven, second.usage().forgiven), (0, 0));
 }
 
+/// A data plane whose table names an owner gone hears the table that moves the key on,
+/// though nothing it already reaches tells it — its one seed the owner itself, the third pod
+/// never sent anything — and though it asks no pod for it: sending the key through the
+/// replica, once the owner has gone unanswered four cycles, opens a stream to the replica,
+/// which tells it its table (#305).
+#[tokio::test]
+async fn a_data_plane_hears_the_table_from_the_replica_it_sends_through() {
+    use crate::ratelimit::{Hub, ToHub};
+    use std::hash::{BuildHasher, Hasher};
+    let holds = [(); 3].map(|()| Arc::new(Mutex::new(None)));
+    let (_seeds, pods) = held_pods(&holds, None).await;
+    let table = pods[0]
+        .with(|node, _| node.committed().cloned())
+        .await
+        .flatten()
+        .unwrap();
+    let key = b"moved-on".as_slice();
+    let secret = KeySecret::parse(SECRET).unwrap();
+    let mut hasher = edgerush_ratelimit::service::Keyed::new(secret.0).build_hasher();
+    hasher.write(key);
+    let shard = edgerush_cluster::table::shard_of(hasher.finish(), 16);
+    let owner = table.owner(shard).unwrap();
+    let service = edgerush_config::CompiledRateLimitService {
+        addresses: vec![table.members[&owner].clone()],
+        key_secret: secret,
+        cycle: Duration::from_millis(10),
+        max_key_bytes: 1 << 20,
+        poll_quiet_keys: false,
+        schedule_keys: true,
+        tls: None,
+    };
+    let hub = Hub::start(&service, 1, 1 << 20, None, None).unwrap();
+    let mut answered = joined(&hub);
+    told_the_table(&hub).await;
+    assert_eq!(admits(&hub, &mut answered, key, 1).await, 1);
+    pods[usize::try_from(owner - 1).unwrap()].stop().await;
+    // The key's owner as the data plane's table names it.
+    let owned = || async {
+        let (told, telling) = tokio::sync::oneshot::channel();
+        hub.to.send(ToHub::Table(told)).unwrap();
+        telling.await.unwrap().and_then(|table| table.owner(shard))
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while owned().await == Some(owner) {
+        assert!(
+            Instant::now() < deadline,
+            "still on the table naming member {owner}, gone, the key's owner"
+        );
+        // What it admits goes to the owner, and through the replica once the owner is
+        // unanswered.
+        let _admitted = admits(&hub, &mut answered, key, 1).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// A config with rate limits is refused where 128-bit atomics are not native, at start and
 /// at a reload alike; one without runs anywhere.
 #[test]

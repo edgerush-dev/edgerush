@@ -94,6 +94,9 @@ pub(crate) enum ToHub {
     /// For a test: to stand still, as a thread held up does, until told to go on.
     #[cfg(test)]
     Stall(std::sync::mpsc::Receiver<()>),
+    /// For a test: the table it routes by, told on the sender.
+    #[cfg(test)]
+    Table(tokio::sync::oneshot::Sender<Option<edgerush_cluster::Table>>),
 }
 
 /// What the process sends a worker: the decision on a request it asked about — refused,
@@ -644,6 +647,10 @@ impl State {
             #[cfg(test)]
             ToHub::Stall(until) => {
                 let _told = until.recv();
+            }
+            #[cfg(test)]
+            ToHub::Table(told) => {
+                let _gone = told.send(self.participant.borrow().routing().table().cloned());
             }
         }
     }

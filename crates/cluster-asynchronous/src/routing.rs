@@ -84,15 +84,12 @@ impl Routing for Routed {
         others().nth(usize::try_from(hash % count).ok()?)
     }
 
-    fn polled(&self, turn: u64) -> Option<NodeId> {
-        let members = &self.0.as_ref()?.members;
-        let count = u64::try_from(members.len())
-            .ok()
-            .filter(|count| *count > 0)?;
-        members
-            .keys()
-            .nth(usize::try_from(turn % count).ok()?)
-            .copied()
+    /// None: a data plane is told the table on every stream to a pod, as it opens and as
+    /// the pod commits one, and a key whose owner has gone unanswered goes through a replica,
+    /// whose stream tells it the replica's. An empty batch would ask for nothing more, and
+    /// take the pod's one exchange in flight, for a report to wait behind.
+    fn polled(&self, _: u64) -> Option<NodeId> {
+        None
     }
 
     /// A table is later by its stamp; any table is later than none.
@@ -208,10 +205,9 @@ mod tests {
     }
 
     #[test]
-    fn its_members_are_polled_in_turn() {
+    fn no_member_is_polled_and_its_members_are_named() {
         let routed = routed(&[4, 7, 9], 1);
-        let polled: Vec<_> = (0..6).map(|turn| routed.polled(turn).unwrap()).collect();
-        assert_eq!(polled, vec![4, 7, 9, 4, 7, 9]);
+        assert_eq!((0..6).find_map(|turn| routed.polled(turn)), None);
         assert_eq!(Routed::default().polled(0), None);
         assert!(routed.names(7));
         assert!(!routed.names(8));
@@ -238,6 +234,35 @@ mod tests {
             limit: n(100),
             window: n(1_000_000_000),
             burst: n(10),
+        }
+    }
+
+    /// A data plane on the store sends no empty batch, however long a key in use goes
+    /// unheard: tables come down its streams unasked, and an empty batch would only take a
+    /// pod's one exchange in flight, for a report to wait behind (#305). The key's reports
+    /// still go, every cycle.
+    #[test]
+    fn a_key_unheard_sends_its_reports_and_never_an_empty_batch() {
+        use edgerush_ratelimit::service::Keyed;
+        use edgerush_ratelimit::service::pooled::{Decision, Participant};
+        const CYCLE: u64 = 10_000_000;
+        let mut plane =
+            Participant::new(1, CYCLE, routed(&[1, 2, 3], 2), Keyed::new([1, 2])).unwrap();
+        plane.set_one_in_flight(true);
+        for at in 1..=8 {
+            let decided = plane.decide_all(&[(b"k".as_slice(), contract())], at * CYCLE - 1);
+            assert_eq!(decided, Decision::Admit);
+            plane.on_cycle(at * CYCLE);
+            let sent = plane.take_exchanges();
+            assert!(!sent.is_empty(), "cycle {at}: its report went");
+            for (pod, exchange, batch) in sent {
+                assert!(
+                    !batch.entries.is_empty(),
+                    "cycle {at}: an empty batch to {pod}"
+                );
+                // Failed at once, as to an owner gone: the next exchange may go.
+                plane.exchanged(pod, exchange);
+            }
         }
     }
 
