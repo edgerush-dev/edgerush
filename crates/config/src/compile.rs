@@ -160,8 +160,8 @@ pub struct CompiledSynchronous {
     pub tls: Option<CompiledServiceTls>,
 }
 
-/// The 128 bits the synchronous mode's keys are hashed under (`rate_limiting.service.key_secret`),
-/// as the hash takes them: never shown, its `Debug` saying only that it is there.
+/// The 128 bits the service's keys are hashed under (`rate_limiting.service.key_secret`), as the
+/// hash takes them: never shown, its `Debug` saying only that it is there.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct KeySecret(pub [u64; 2]);
 
@@ -204,11 +204,13 @@ impl CompiledRateLimiting {
     }
 }
 
-/// The rate-limiting service, checked.
+/// The asynchronous mode's service, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledRateLimitService {
-    /// The address of each pod, the first being pod 0.
-    pub pods: Vec<String>,
+    /// The addresses a data plane first asks for the store's table: its seeds.
+    pub addresses: Vec<String>,
+    /// What its keys are hashed under, as every data plane hashes them.
+    pub key_secret: KeySecret,
     /// The time between the process's messages to the service.
     pub cycle: Duration,
     /// The bytes the keys may hold on the data plane, held once by its process.
@@ -807,15 +809,12 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
             }
         }
         // Said wrong, it is not said back: a refusal is logged.
-        match (&service.key_secret, mode == RateLimitMode::Synchronous) {
-            (None, true) => errors.push(place.problem(Problem::RateLimitServiceKeySecretMissing)),
-            (Some(written), true) if KeySecret::parse(written).is_none() => {
+        match &service.key_secret {
+            None => errors.push(place.problem(Problem::RateLimitServiceKeySecretMissing)),
+            Some(written) if KeySecret::parse(written).is_none() => {
                 errors.push(place.problem(Problem::RateLimitServiceKeySecret));
             }
-            (Some(_), false) => {
-                errors.push(place.problem(Problem::RateLimitServiceSynchronousOnly("key_secret")))
-            }
-            _ => {}
+            Some(_) => {}
         }
         if mode == RateLimitMode::Synchronous {
             // The synchronous mode has no cycle of the data plane's and no levers: each
@@ -865,16 +864,14 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
                 certificate: named(config, &tls.certificate)?,
             })
         });
+    // Refused above if missing or said wrong, and nothing is compiled.
+    let key_secret = service
+        .and_then(|service| service.key_secret.as_deref())
+        .and_then(KeySecret::parse);
     match mode {
         RateLimitMode::Off => CompiledRateLimiting::Off,
         RateLimitMode::Local => CompiledRateLimiting::Local { max_key_bytes },
-        RateLimitMode::Synchronous => match (
-            service,
-            &limiting.synchronous,
-            service
-                .and_then(|service| service.key_secret.as_deref())
-                .and_then(KeySecret::parse),
-        ) {
+        RateLimitMode::Synchronous => match (service, &limiting.synchronous, key_secret) {
             (Some(service), Some(waiting), Some(key_secret)) => {
                 CompiledRateLimiting::Synchronous(CompiledSynchronous {
                     addresses: service.addresses.clone(),
@@ -889,18 +886,21 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
             }
             _ => CompiledRateLimiting::Off,
         },
-        RateLimitMode::Asynchronous => match service {
-            Some(service) => CompiledRateLimiting::Asynchronous(CompiledRateLimitService {
-                pods: service.addresses.clone(),
-                cycle: service
-                    .cycle_ms
-                    .map_or(CompiledRateLimitService::CYCLE, Duration::from_millis),
-                max_key_bytes,
-                poll_quiet_keys: service.poll_quiet_keys.unwrap_or(false),
-                schedule_keys: service.schedule_keys.unwrap_or(true),
-                tls,
-            }),
-            None => CompiledRateLimiting::Off,
+        RateLimitMode::Asynchronous => match (service, key_secret) {
+            (Some(service), Some(key_secret)) => {
+                CompiledRateLimiting::Asynchronous(CompiledRateLimitService {
+                    addresses: service.addresses.clone(),
+                    key_secret,
+                    cycle: service
+                        .cycle_ms
+                        .map_or(CompiledRateLimitService::CYCLE, Duration::from_millis),
+                    max_key_bytes,
+                    poll_quiet_keys: service.poll_quiet_keys.unwrap_or(false),
+                    schedule_keys: service.schedule_keys.unwrap_or(true),
+                    tls,
+                })
+            }
+            _ => CompiledRateLimiting::Off,
         },
     }
 }
@@ -3247,17 +3247,12 @@ pub enum Problem {
     /// The pods' ID, to check them by, that is not a SPIFFE ID.
     #[error("`rate_limiting.service.tls`: `pod_id` `{0}` is no SPIFFE ID (`spiffe://…`)")]
     RateLimitServicePodId(String),
-    /// The synchronous mode with no secret to hash its keys under.
-    #[error(
-        "`rate_limiting.service.key_secret` is needed by mode `synchronous`: 32 hex digits every data plane shares"
-    )]
+    /// The service with no secret to hash its keys under.
+    #[error("`rate_limiting.service.key_secret` is needed: 32 hex digits every data plane shares")]
     RateLimitServiceKeySecretMissing,
     /// A secret not written as 32 hex digits; what it says is not said back.
     #[error("`rate_limiting.service.key_secret` must be 32 hex digits")]
     RateLimitServiceKeySecret,
-    /// A field of the service only the synchronous mode has.
-    #[error("`rate_limiting.service.{0}` is for mode `synchronous`")]
-    RateLimitServiceSynchronousOnly(&'static str),
     /// A mode that needs the service, with none.
     #[error("`rate_limiting`: mode `{0}` needs `service`")]
     RateLimitingServiceMissing(&'static str),
@@ -6919,9 +6914,9 @@ upstreams: {}
         assert!(unsaid.is_err());
     }
 
-    /// Either mode takes any number of service addresses: the synchronous mode's are the
-    /// store's seeds, which say nothing of how many pods it has, and the switch that once
-    /// let it have fewer than three is no more.
+    /// Either mode takes any number of service addresses: they are the store's seeds, which
+    /// say nothing of how many pods it has, and the switch that once let the synchronous mode
+    /// have fewer than three is no more.
     #[test]
     fn either_mode_takes_any_number_of_addresses() {
         let with = |section: &str| {
@@ -6945,21 +6940,16 @@ rate_limiting: {{ {section} }}
                 addresses.join(", ")
             )
         };
-        // The synchronous mode's service has its secret; the asynchronous mode's takes none.
-        let synchronous =
+        let service =
             |count: usize| pods(count).replace("{secret}", &format!(", key_secret: {SECRET}"));
-        let pods = |count: usize| pods(count).replace("{secret}", "");
         for count in 1..=5 {
             assert_eq!(
-                with(&format!(
-                    "mode: synchronous, {}, {WAITS}",
-                    synchronous(count)
-                )),
+                with(&format!("mode: synchronous, {}, {WAITS}", service(count))),
                 Ok(()),
                 "{count}"
             );
             assert_eq!(
-                with(&format!("mode: asynchronous, {}", pods(count))),
+                with(&format!("mode: asynchronous, {}", service(count))),
                 Ok(()),
                 "{count}"
             );
@@ -6967,7 +6957,7 @@ rate_limiting: {{ {section} }}
         // The switch is no field the file knows.
         let gone = serde_saphyr::from_str::<Config>(&format!(
             "listeners: {{}}\nroutes: []\nupstreams: {{}}\nrate_limiting: {{ mode: synchronous, {}, {WAITS}, experimental_fewer_pods: true }}\n",
-            synchronous(1)
+            service(1)
         ))
         .unwrap_err()
         .to_string();
@@ -6980,20 +6970,25 @@ rate_limiting: {{ {section} }}
     /// How a request waits for its owner, as a synchronous data plane is to say it.
     const WAITS: &str = "synchronous: { timeout_ms: 20, when_unreachable: allow, breaker: { failures: 5, probe_after_ms: 1000 } }";
 
-    /// A secret the synchronous mode's keys are hashed under.
+    /// A secret the service's keys are hashed under.
     const SECRET: &str = "00112233445566778899aabbccddeeff";
 
-    /// The synchronous mode needs its secret, 32 hex digits and nothing else, and says so
-    /// without saying back what was written; no other mode takes one.
+    /// Either mode on the service needs its secret, 32 hex digits and nothing else, and says
+    /// so without saying back what was written.
     #[test]
-    fn the_synchronous_mode_needs_its_key_secret_and_no_other_takes_one() {
+    fn either_mode_on_the_service_needs_its_key_secret() {
         let with = |section: &str| {
             let yaml = format!(
-                "listeners: {{}}\nroutes: []\nupstreams: {{}}\nrate_limiting: {{ {section} }}\n"
+                "listeners: {{}}
+routes: []
+upstreams: {{}}
+rate_limiting: {{ {section} }}
+"
             );
             compile(&config(&yaml))
                 .map(|compiled| match compiled.rate_limiting() {
                     CompiledRateLimiting::Synchronous(synchronous) => Some(synchronous.key_secret),
+                    CompiledRateLimiting::Asynchronous(service) => Some(service.key_secret),
                     _ => None,
                 })
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
@@ -7001,51 +6996,48 @@ rate_limiting: {{ {section} }}
         let synchronous = |secret: &str| {
             format!(r#"mode: synchronous, service: {{ addresses: ["rl:7000"]{secret} }}, {WAITS}"#)
         };
-        assert_eq!(
-            with(&synchronous(&format!(", key_secret: {SECRET}"))),
-            Ok(Some(KeySecret([
-                0x0011_2233_4455_6677,
-                0x8899_aabb_ccdd_eeff
-            ])))
-        );
-        assert_eq!(
-            with(&synchronous(
-                ", key_secret: 00112233445566778899AABBCCDDEEFF"
-            )),
-            Ok(Some(KeySecret([
-                0x0011_2233_4455_6677,
-                0x8899_aabb_ccdd_eeff
-            ]))),
-            "either case"
-        );
-        assert_eq!(
-            with(&synchronous("")).unwrap_err(),
-            [
-                "the data plane: `rate_limiting.service.key_secret` is needed by mode `synchronous`: 32 hex digits every data plane shares"
-            ]
-        );
-        for written in [
-            "0011223344556677889",
-            "00112233445566778899aabbccddeef",
-            "00112233445566778899aabbccddeeff0",
-            "+0112233445566778899aabbccddeeff",
-            "g0112233445566778899aabbccddeeff",
-            "",
-        ] {
-            let refused = with(&synchronous(&format!(r#", key_secret: "{written}""#))).unwrap_err();
+        let asynchronous = |secret: &str| {
+            format!(r#"mode: asynchronous, service: {{ addresses: ["rl:7000"]{secret} }}"#)
+        };
+        let modes: [&dyn Fn(&str) -> String; 2] = [&synchronous, &asynchronous];
+        for mode in modes {
             assert_eq!(
-                refused,
-                ["the data plane: `rate_limiting.service.key_secret` must be 32 hex digits"],
-                "{written}"
+                with(&mode(&format!(", key_secret: {SECRET}"))),
+                Ok(Some(KeySecret([
+                    0x0011_2233_4455_6677,
+                    0x8899_aabb_ccdd_eeff
+                ])))
             );
+            assert_eq!(
+                with(&mode(", key_secret: 00112233445566778899AABBCCDDEEFF")),
+                Ok(Some(KeySecret([
+                    0x0011_2233_4455_6677,
+                    0x8899_aabb_ccdd_eeff
+                ]))),
+                "either case"
+            );
+            assert_eq!(
+                with(&mode("")).unwrap_err(),
+                [
+                    "the data plane: `rate_limiting.service.key_secret` is needed: 32 hex digits every data plane shares"
+                ]
+            );
+            for written in [
+                "0011223344556677889",
+                "00112233445566778899aabbccddeef",
+                "00112233445566778899aabbccddeeff0",
+                "+0112233445566778899aabbccddeeff",
+                "g0112233445566778899aabbccddeeff",
+                "",
+            ] {
+                let refused = with(&mode(&format!(r#", key_secret: "{written}""#))).unwrap_err();
+                assert_eq!(
+                    refused,
+                    ["the data plane: `rate_limiting.service.key_secret` must be 32 hex digits"],
+                    "{written}"
+                );
+            }
         }
-        assert_eq!(
-            with(&format!(
-                r#"mode: asynchronous, service: {{ addresses: ["rl:7000"], key_secret: {SECRET} }}"#
-            ))
-            .unwrap_err(),
-            ["the data plane: `rate_limiting.service.key_secret` is for mode `synchronous`"]
-        );
         let secret = KeySecret::parse(SECRET).unwrap();
         assert_eq!(format!("{secret:?}"), "KeySecret(..)", "never shown");
     }
@@ -7063,13 +7055,8 @@ rate_limiting: {{ {section} }}
                 r#"listeners: {{}}
 routes: []
 upstreams: {{}}
-rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}{secret} }}{synchronous} }}
+rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}, key_secret: {SECRET} }}{synchronous} }}
 "#,
-                secret = if mode == "synchronous" {
-                    format!(", key_secret: {SECRET}")
-                } else {
-                    String::new()
-                },
                 synchronous = if mode == "synchronous" {
                     format!(", {WAITS}")
                 } else {
@@ -7137,7 +7124,6 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}{secret
                 .map(|_| ())
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
-        let plain = r#"service: { addresses: ["rl-0:7000", "rl-1:7000", "rl-2:7000"] }"#;
         let service = format!(
             r#"service: {{ addresses: ["rl-0:7000", "rl-1:7000", "rl-2:7000"], key_secret: {SECRET} }}"#
         );
@@ -7150,7 +7136,7 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}{secret
             with(&format!("mode: synchronous, {service}")).unwrap_err(),
             ["the data plane: `rate_limiting`: mode `synchronous` needs `synchronous`"]
         );
-        for (mode, more) in [("off", ""), ("local", ""), ("asynchronous", plain)] {
+        for (mode, more) in [("off", ""), ("local", ""), ("asynchronous", service)] {
             let more = if more.is_empty() {
                 String::new()
             } else {
@@ -7229,13 +7215,14 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}{secret
         assert!(!parses(&WAITS.replace("allow", "wait")));
     }
 
-    /// The rate-limiting service: its pods, a cycle of at least 1 ms, 10 when left out, and
-    /// its levers, the fastest when left out.
+    /// The asynchronous mode's service: its seeds, a cycle of at least 1 ms, 10 when left
+    /// out, and its levers, the fastest when left out.
     #[test]
     fn the_rate_limit_service_is_checked() {
         let with = |service: &str| {
             let yaml = format!(
-                "listeners: {{}}\nroutes: []\nupstreams: {{}}\nrate_limiting: {{ mode: asynchronous, service: {service} }}\n"
+                "listeners: {{}}\nroutes: []\nupstreams: {{}}\nrate_limiting: {{ mode: asynchronous, service: {service} }}\n",
+                service = service.replacen("{ ", &format!("{{ key_secret: {SECRET}, "), 1),
             );
             compile(&config(&yaml))
                 .map(|compiled| compiled.rate_limit_service().cloned())
@@ -7244,7 +7231,7 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}{secret
         let service = with(r#"{ addresses: ["rl-0:7000", "rl-1:7000"] }"#)
             .unwrap()
             .unwrap();
-        assert_eq!(service.pods, ["rl-0:7000", "rl-1:7000"]);
+        assert_eq!(service.addresses, ["rl-0:7000", "rl-1:7000"]);
         assert_eq!(service.cycle, Duration::from_millis(10));
         assert_eq!(service.max_key_bytes, 256 << 20);
         assert_eq!(
@@ -7274,7 +7261,7 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}{secret
             );
         }
         let addresses = with(r#"{ addresses: ["10.0.0.1:7000", "[::1]:7000"] }"#);
-        assert_eq!(addresses.unwrap().unwrap().pods.len(), 2);
+        assert_eq!(addresses.unwrap().unwrap().addresses.len(), 2);
         let levers = with(r#"{ addresses: ["a:1"], poll_quiet_keys: true, schedule_keys: false }"#)
             .unwrap()
             .unwrap();
@@ -7284,7 +7271,7 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}{secret
             "when left out, the fastest: quiet keys not polled, keys scheduled"
         );
         let capped = compile(&config(
-            "listeners: {}\nroutes: []\nupstreams: {}\nrate_limiting: { mode: asynchronous, max_key_bytes: 1000, service: { addresses: [\"a:1\"] } }\n",
+            "listeners: {}\nroutes: []\nupstreams: {}\nrate_limiting: { mode: asynchronous, max_key_bytes: 1000, service: { addresses: [\"a:1\"], key_secret: 00112233445566778899aabbccddeeff } }\n",
         ))
         .unwrap();
         assert_eq!(capped.rate_limit_service().unwrap().max_key_bytes, 1000);
@@ -7309,7 +7296,7 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}{secret
         let with = |service: &str, bucket: &str| {
             with_section(
                 &format!(
-                    "rate_limiting: {{ mode: asynchronous, service: {{ addresses: [\"rl-0:7000\"]{service} }} }}"
+                    "rate_limiting: {{ mode: asynchronous, service: {{ addresses: [\"rl-0:7000\"], key_secret: {SECRET}{service} }} }}"
                 ),
                 bucket,
             )
@@ -7373,7 +7360,7 @@ limits:
         service: bool,
     ) -> Result<(Vec<String>, Vec<String>, Compiled), Vec<String>> {
         let service = if service {
-            "rate_limiting: { mode: asynchronous, service: { addresses: [\"rl-0:7000\"] } }"
+            "rate_limiting: { mode: asynchronous, service: { addresses: [\"rl-0:7000\"], key_secret: 00112233445566778899aabbccddeeff } }"
         } else {
             ""
         };
@@ -7683,7 +7670,7 @@ rate_limiting: {{ mode: local{switch} }}
     /// later. Off runs none and refuses none.
     #[test]
     fn each_mode_takes_the_models_it_runs() {
-        let service = r#"service: { addresses: ["rl-0:7000"] }"#;
+        let service = format!(r#"service: {{ addresses: ["rl-0:7000"], key_secret: {SECRET} }}"#);
         let synchronous = format!(
             r#"rate_limiting: {{ mode: synchronous, service: {{ addresses: ["rl-0:7000"], key_secret: {SECRET} }}, {WAITS} }}"#
         );

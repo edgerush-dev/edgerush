@@ -8,17 +8,6 @@
       "description": "What the pod's keys may hold; left out, each has its value.",
       "$ref": "#/$defs/ServiceKeys"
     },
-    "membership": {
-      "description": "The pods among which a majority agrees which of them serve: needed by the\nasynchronous mode, and refused by the synchronous one, which runs on the store.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ServiceMembership"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
     "mode": {
       "description": "The rate-limiting mode the pod serves: a pod serves one. Asynchronous when left out.",
       "anyOf": [
@@ -35,7 +24,7 @@
       "$ref": "#/$defs/ServicePod"
     },
     "store": {
-      "description": "The store's settings, which every pod of a cluster is to share; left out, the pod has\nnone. The synchronous mode runs on them, and needs them.",
+      "description": "The store's settings, which every pod of a cluster is to share. Either mode runs on\nthem, and needs them.",
       "anyOf": [
         {
           "$ref": "#/$defs/ServiceStore"
@@ -79,46 +68,6 @@
       },
       "additionalProperties": false
     },
-    "ServiceMembership": {
-      "description": "The pods among which a majority agrees which of them serve, and how long each waits on\nthe others.",
-      "type": "object",
-      "properties": {
-        "pods": {
-          "description": "Every pod, this one too, by its id: where it is reached, `host:port`.",
-          "type": "object",
-          "additionalProperties": false,
-          "patternProperties": {
-            "^\\d+$": {
-              "type": "string"
-            }
-          }
-        },
-        "silence_ms": {
-          "description": "Milliseconds a pod goes unheard before the others take it out of the view. 600 when\nleft out.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "default": null,
-          "minimum": 0
-        },
-        "stop_serving_ms": {
-          "description": "Milliseconds a pod goes without hearing a majority before it stops serving: more\nthan a heartbeat, and two heartbeats less than `silence_ms` at least, so that a pod\ncut off from the others stops before they take it out. Longer tolerates longer\nhiccups between the pods, and leaves a pod gone out of reach serving for longer. 400\nwhen left out.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "default": null,
-          "minimum": 0
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "pods"
-      ]
-    },
     "ServiceMode": {
       "description": "The rate-limiting mode a service pod serves.",
       "oneOf": [
@@ -135,11 +84,11 @@
       ]
     },
     "ServicePod": {
-      "description": "A service pod: which it is, where it is reached, and its cycle.",
+      "description": "A service pod: where it serves, where it is reached, and its data planes' cycle. It takes\na member id of its own each time it starts.",
       "type": "object",
       "properties": {
         "address": {
-          "description": "Where the other pods reach it, `host:port`, as it tells them in its hellos and as it\nasks to join the store. Needed with a `store` section, and only with one.",
+          "description": "Where the other pods and data planes reach it, `host:port`, as it tells them in its\nhellos and as it asks to join the store. Needed.",
           "type": [
             "string",
             "null"
@@ -156,22 +105,12 @@
           "default": null,
           "minimum": 1
         },
-        "id": {
-          "description": "Which of the `membership`'s pods this one is: needed by the asynchronous mode, and\nrefused by the synchronous one, where a pod takes a member id of its own each time it\nstarts.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "default": null,
-          "minimum": 0
-        },
         "listen": {
           "description": "Where it serves data planes and the other pods, `host:port`.",
           "type": "string"
         },
         "metrics": {
-          "description": "Where `/metrics` shows whether the pod serves, how often and how long it has gone\nwithout a majority and, in the asynchronous mode, what its keys hold; nowhere when\nleft out.",
+          "description": "Where `/metrics` shows the pod's store and what its mode counts, and `/ready` whether\nit is ready; nowhere when left out.",
           "type": [
             "string",
             "null"

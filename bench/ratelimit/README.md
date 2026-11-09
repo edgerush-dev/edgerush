@@ -21,10 +21,13 @@ simulator's numbers have real systems beside them.
 | `edgerush-w2-cpu1` | the above held to one CPU: a quota below the worker count | the same |
 
 `edgerush` runs from binaries built on the host (`cargo build --release -p edgerush -p
-edgerush-ratelimit-service`, copied to `$RLH_BIN`, `/home/claude/rlh-bin` by default) in an
-image with the host's glibc; its limit is keyed by the client's address, the only key it
-takes before authentication, so every run's load, from the host, is one key; faults on its
-owner strike the service pod that owns that key, found as the protocol finds it.
+edgerush-ratelimit-service --example form`, `edgerush`, `edgerush-ratelimit-service` and
+`examples/form` copied to `$RLH_BIN`, `/home/claude/rlh-bin` by default) in an image with the
+host's glibc: three pods of the service's store, formed by `form` as the controller will, and
+the proxies finding them by their addresses. Its limit is keyed by the client's address, the
+only key it takes before authentication, so every run's load, from the host, is one key. The
+store's table names that key's owner, which the harness cannot read yet: `owner-lost` and
+`owner-restart` refuse to run on `edgerush`.
 
 Every instance gets one CPU, the two-worker EdgeRush systems two. Clients reach instances on a front network; instances reach
 Redis, the ratelimit service or each other on a back network, which is what faults touch.

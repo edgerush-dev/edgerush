@@ -493,6 +493,7 @@ dependencies = [
  "bytes",
  "edgerush-certificates",
  "edgerush-cluster",
+ "edgerush-cluster-asynchronous",
  "edgerush-config",
  "edgerush-discovery",
  "edgerush-filters",

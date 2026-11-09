@@ -1,87 +1,90 @@
 //! The rate limits route rules are under, over HTTP/2 and HTTP/3 as over HTTP/1.1
 //! (`tests/ratelimit.rs`): the request core decides them whatever a request came by, with
-//! three service pods on real sockets, and refuses what is over with 429.
+//! three pods of the store, asynchronous, on real sockets, formed in-process as the bench's
+//! example program forms them, and refuses what is over with 429.
 
 use super::*;
 use edgerush_certificates::testing::Authority;
-use edgerush_ratelimit::service::PodId;
-use edgerush_ratelimit_service::grpc::{Client as PodClient, Server};
-use edgerush_ratelimit_service::pod::{Pod, Timing};
+use edgerush_cluster::Config as StoreConfig;
+use edgerush_cluster_asynchronous::Pod as AsyncPod;
+use edgerush_config::KeySecret;
+use edgerush_ratelimit_service::cluster::forming::Forming;
+use edgerush_ratelimit_service::cluster::link::Dial;
+use edgerush_ratelimit_service::cluster::pod::{StorePod, StoreServer};
 use edgerush_ratelimit_service::secure::{self, PodCredentials, PodTls};
-use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use tonic::transport::server::TcpIncoming;
 
-/// Three service pods, once they agree all three serve: their addresses.
+/// The secret the tests' data planes hash their keys under, as their config says it.
+const SECRET: &str = "00112233445566778899aabbccddeeff";
+
+/// Three pods of the store, once ready on one table: their addresses, the data planes' seeds.
 async fn service() -> Vec<String> {
-    counted_service(&Arc::new(AtomicUsize::new(0))).await
+    held_service(&Arc::new(Mutex::new(None)), None).await
 }
 
-/// The same, each exchange any of its pods is sent counted in `exchanges`.
-async fn counted_service(exchanges: &Arc<AtomicUsize>) -> Vec<String> {
-    held_service(exchanges, &Arc::new(Mutex::new(None)), None).await
+/// A naming file of the scratch directory's, apart from every other test's.
+fn naming_file() -> std::path::PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let directory =
+        std::env::temp_dir().join(format!("edgerush-async-limits-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    directory.join(NEXT.fetch_add(1, Ordering::Relaxed).to_string())
 }
 
-/// The same, the answer to every exchange that reaches a pod before `hold` held back for
-/// [`HELD`]; served with mutual TLS if `tls` gives the authority that issues the pods'
-/// certificates, carrying [`POD_ID`], to serve the data plane [`PLANE_ID`].
-async fn held_service(
-    exchanges: &Arc<AtomicUsize>,
-    hold: &Arc<Mutex<Option<Instant>>>,
+/// The same, what each pod tells a data plane's stream before `hold` held back for [`HELD`],
+/// and all that follows it on the stream behind it; served with mutual TLS if `tls` gives the
+/// authority that issues the pods' certificates, carrying [`POD_ID`], to serve the data plane
+/// [`PLANE_ID`]. The pods run for the rest of the test's runtime.
+async fn held_service(hold: &Arc<Mutex<Option<Instant>>>, tls: Option<&Authority>) -> Vec<String> {
+    let holds = [Arc::clone(hold), Arc::clone(hold), Arc::clone(hold)];
+    held_pods(&holds, tls).await.0
+}
+
+/// Three pods of the store, pod `id` holding back what it tells a data planes' stream as
+/// `holds[id - 1]` says, as [`held_service`] holds it: their addresses, and the pods.
+async fn held_pods(
+    holds: &[Arc<Mutex<Option<Instant>>>; 3],
     tls: Option<&Authority>,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<StorePod<AsyncPod>>) {
     let mut listeners = Vec::new();
-    let mut addresses = Vec::new();
     for _ in 0..3 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        addresses.push(listener.local_addr().unwrap().to_string());
-        listeners.push(listener);
+        let address = listener.local_addr().unwrap().to_string();
+        listeners.push((listener, address));
     }
-    let timing = Timing {
-        cycle: Duration::from_millis(10),
-        heartbeat: Duration::from_millis(20),
-        silence: Duration::from_millis(150),
-        settle: Duration::from_millis(60),
-        // Two heartbeats shorter than the silence, as a pod's must be, and no shorter, so
-        // that a starved runner's pause does not stop the pods.
-        stop_serving: Duration::from_millis(110),
+    let secured = tls.map(|authority| {
+        PodTls::new(&PodCredentials {
+            certificate: authority.issue(&["127.0.0.1", POD_ID]),
+            authorities: authority.pem(),
+            data_plane: PLANE_ID.to_owned(),
+        })
+        .unwrap()
+    });
+    let dial = secured.as_ref().map_or(Dial::Plain, |tls| {
+        Dial::Secured(tokio::sync::watch::channel(tls.connector().clone()).1)
+    });
+    let serving = secured.map(|tls| tokio::sync::watch::channel(Arc::new(tls)).1);
+    let config = StoreConfig {
+        shards: 16,
+        ..StoreConfig::defaults()
     };
     let mut pods = Vec::new();
-    for (id, listener) in (0..3).zip(listeners) {
-        let secured = tls.map(|authority| {
-            PodTls::new(&PodCredentials {
-                certificate: authority.issue(&["127.0.0.1", POD_ID]),
-                authorities: authority.pem(),
-                data_plane: PLANE_ID.to_owned(),
-            })
-            .unwrap()
-        });
-        let dialling = secured
-            .as_ref()
-            .map(|secured| tokio::sync::watch::channel(secured.connector().clone()).1);
-        let peers: BTreeMap<PodId, PodClient> = (0..3)
-            .filter(|pod| *pod != id)
-            .map(|pod| {
-                let address = &addresses[pod as usize];
-                let client = match &dialling {
-                    Some(dialling) => PodClient::secured(address, dialling.clone()),
-                    None => PodClient::new(address),
-                };
-                (pod, client.unwrap())
-            })
-            .collect();
-        let pod = Pod::spawn(id, vec![0, 1, 2], 1, timing, peers);
-        let server = Counted {
-            server: Server::new(pod.clone()),
-            exchanges: Arc::clone(exchanges),
+    let mut addresses = Vec::new();
+    for ((id, (listener, address)), hold) in (1..).zip(listeners).zip(holds) {
+        let mut mode = AsyncPod::new(id, address.clone(), config, [], 10_000_000);
+        mode.set_life(id);
+        let pod = StorePod::start(mode, address.clone(), dial.clone(), Vec::new());
+        let server = Held {
+            server: StoreServer::new(pod.clone()),
             hold: Arc::clone(hold),
         };
-        match secured {
-            Some(secured) => {
+        match &serving {
+            Some(tls) => {
                 tokio::spawn(secure::serve(
                     listener,
-                    tokio::sync::watch::channel(Arc::new(secured)).1,
+                    tls.clone(),
                     server,
                     |_peer, _why| {},
                     std::future::pending(),
@@ -89,46 +92,59 @@ async fn held_service(
             }
             None => {
                 tokio::spawn(async move {
-                    tonic::transport::Server::builder()
-                        .serve_with_incoming(server, TcpIncoming::from(listener))
-                        .await
-                        .unwrap();
+                    let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
+                    let _ended = tonic::transport::Server::builder()
+                        .serve_with_incoming(server, incoming)
+                        .await;
                 });
             }
         }
         pods.push(pod);
+        addresses.push(address);
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    for pod in &pods {
-        while !matches!(pod.view().await, Some((view, true)) if view.pods == [0, 1, 2]) {
-            assert!(Instant::now() < deadline, "the pods never agreed");
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    let forming = Forming::new(&config, naming_file()).unwrap().dialling(dial);
+    let forming_at = addresses.clone();
+    tokio::spawn(async move {
+        let _stopped = forming.run(forming_at).await;
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut stamps = Vec::new();
+        for pod in &pods {
+            stamps.push(
+                pod.with(|node, now| node.ready(now).then(|| node.committed_stamp()))
+                    .await
+                    .flatten(),
+            );
         }
+        if stamps.iter().all(Option::is_some) && stamps.windows(2).all(|pair| pair[0] == pair[1]) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the pods never formed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // A pod taken in makes no key afresh for three heartbeats, in case one is handed to it.
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    addresses
+    (addresses, pods)
 }
 
-/// How long an exchange's answer is held back.
+/// How long what a pod tells a data plane is held back.
 const HELD: Duration = Duration::from_millis(600);
 
-/// A service pod's server that counts the exchanges it is sent, and holds back the answers
-/// to those that reach it before its `hold`.
+/// A store pod's server that holds back what it tells a data plane's stream before its
+/// `hold`: each piece of the stream's body read while it lasts, for [`HELD`], and what follows
+/// it behind it, as a stream keeps its order.
 #[derive(Clone)]
-struct Counted {
-    server: Server,
-    exchanges: Arc<AtomicUsize>,
+struct Held {
+    server: StoreServer<AsyncPod>,
     hold: Arc<Mutex<Option<Instant>>>,
 }
 
-impl tonic::server::NamedService for Counted {
-    const NAME: &'static str = <Server as tonic::server::NamedService>::NAME;
+impl tonic::server::NamedService for Held {
+    const NAME: &'static str = <StoreServer<AsyncPod> as tonic::server::NamedService>::NAME;
 }
 
-impl tower_service::Service<http::Request<tonic::body::Body>> for Counted {
-    type Response = <Server as tower_service::Service<http::Request<tonic::body::Body>>>::Response;
-    type Error = <Server as tower_service::Service<http::Request<tonic::body::Body>>>::Error;
+impl tower_service::Service<http::Request<tonic::body::Body>> for Held {
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
     >;
@@ -142,23 +158,87 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for Counted {
 
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let exchange = request.uri().path().ends_with("/Exchange");
-        if exchange {
-            self.exchanges.fetch_add(1, Ordering::Relaxed);
-        }
-        let held = exchange
-            && self
+        let hold = Arc::clone(&self.hold);
+        let answer = self.server.call(request);
+        Box::pin(async move {
+            let answer = answer.await?;
+            if !exchange {
+                return Ok(answer);
+            }
+            Ok(answer.map(|body| {
+                tonic::body::Body::new(HeldBody {
+                    inner: body,
+                    hold,
+                    waiting: None,
+                })
+            }))
+        })
+    }
+}
+
+/// A stream's body, each piece read while `hold` lasts given out [`HELD`] later.
+struct HeldBody {
+    inner: tonic::body::Body,
+    hold: Arc<Mutex<Option<Instant>>>,
+    waiting: Option<(
+        std::pin::Pin<Box<tokio::time::Sleep>>,
+        http_body::Frame<Bytes>,
+    )>,
+}
+
+impl http_body::Body for HeldBody {
+    type Data = Bytes;
+    type Error = tonic::Status;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        use std::task::Poll;
+        loop {
+            if let Some((sleep, _)) = &mut self.waiting {
+                if sleep.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                let (_, frame) = self.waiting.take().unwrap();
+                return Poll::Ready(Some(Ok(frame)));
+            }
+            let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+            let Poll::Ready(Some(Ok(frame))) = polled else {
+                return polled;
+            };
+            let held = self
                 .hold
                 .lock()
                 .unwrap()
                 .is_some_and(|until| Instant::now() < until);
-        let answer = self.server.call(request);
-        Box::pin(async move {
-            let answer = answer.await;
-            if held {
-                tokio::time::sleep(HELD).await;
+            if !held {
+                return Poll::Ready(Some(Ok(frame)));
             }
-            answer
-        })
+            self.waiting = Some((Box::pin(tokio::time::sleep(HELD)), frame));
+        }
+    }
+}
+
+/// The batches `hub` has sent the service's pods.
+fn exchanges(hub: &crate::ratelimit::Hub) -> u64 {
+    let stats = hub.render_stats();
+    stats
+        .lines()
+        .find_map(|line| line.strip_prefix("edgerush_rate_limit_hub_exchanges_total "))
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("no exchanges counted: {stats}"))
+}
+
+/// Until `hub` has been told the store's table, which it names its pods by.
+async fn told_the_table(hub: &crate::ratelimit::Hub) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !hub
+        .render_stats()
+        .contains("edgerush_rate_limit_hub_pod_unanswered{")
+    {
+        assert!(Instant::now() < deadline, "never told the table");
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -183,7 +263,7 @@ fn limited(mut config: Config, service: &[String]) -> Config {
             poll_quiet_keys: None,
             schedule_keys: None,
             tls: None,
-            key_secret: None,
+            key_secret: Some(SECRET.to_owned()),
         }),
     });
     config
@@ -420,8 +500,7 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let exchanges = Arc::new(AtomicUsize::new(0));
-            let service = counted_service(&exchanges).await;
+            let service = service().await;
             let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
             if let Some(service) = service_of(&mut config) {
                 service.poll_quiet_keys = Some(false);
@@ -433,12 +512,13 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
             let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = requester("203.0.113.9");
+            told_the_table(&hub).await;
             let settle = || async {
                 // Quiet once a few cycles pass with no exchange.
-                let mut last = exchanges.load(Ordering::Relaxed);
+                let mut last = exchanges(&hub);
                 loop {
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    let now = exchanges.load(Ordering::Relaxed);
+                    let now = exchanges(&hub);
                     if now == last {
                         return now;
                     }
@@ -456,7 +536,7 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
                 Limited::Admit
             ));
             let deadline = Instant::now() + Duration::from_secs(2);
-            while exchanges.load(Ordering::Relaxed) == quiet {
+            while exchanges(&hub) == quiet {
                 assert!(Instant::now() < deadline, "the admission never reported");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -482,8 +562,7 @@ async fn scheduled_a_signal_with_no_room_leaves_the_next_free_to_go() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let exchanges = Arc::new(AtomicUsize::new(0));
-            let service = counted_service(&exchanges).await;
+            let service = service().await;
             let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
             if let Some(service) = service_of(&mut config) {
                 service.poll_quiet_keys = Some(false);
@@ -495,12 +574,13 @@ async fn scheduled_a_signal_with_no_room_leaves_the_next_free_to_go() {
             let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = requester("203.0.113.9");
+            told_the_table(&hub).await;
             let settle = || async {
                 // Quiet once a few cycles pass with no exchange.
-                let mut last = exchanges.load(Ordering::Relaxed);
+                let mut last = exchanges(&hub);
                 loop {
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    let now = exchanges.load(Ordering::Relaxed);
+                    let now = exchanges(&hub);
                     if now == last {
                         return now;
                     }
@@ -521,7 +601,7 @@ async fn scheduled_a_signal_with_no_room_leaves_the_next_free_to_go() {
                 Limited::Admit
             ));
             let deadline = Instant::now() + Duration::from_secs(2);
-            while exchanges.load(Ordering::Relaxed) == quiet {
+            while exchanges(&hub) == quiet {
                 assert!(Instant::now() < deadline, "the next signal never went");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -530,10 +610,11 @@ async fn scheduled_a_signal_with_no_room_leaves_the_next_free_to_go() {
         .await;
 }
 
-/// An exchange answered after the one that replaced it: its pod handled it first, so its
-/// bucket is the older, and it is not taken over the newer one's. A client that spent its
-/// bucket while the first exchange's answer was held back stays refused once that answer
-/// comes, and the late answer is counted.
+/// An exchange given up and answered after the one that replaced it was sent: its bucket is
+/// the older, and the reports still out are charged against it, however the answers come —
+/// in order on the owner's stream, or relayed through a replica sent to once the owner went
+/// unanswered. A client that spent its bucket while the first exchange's answer was held
+/// back stays refused once that answer comes.
 #[tokio::test]
 async fn a_late_answer_does_not_give_back_a_spent_bucket() {
     use crate::ratelimit::{Hub, Limited, Limiter};
@@ -541,7 +622,7 @@ async fn a_late_answer_does_not_give_back_a_spent_bucket() {
     local
         .run_until(async {
             let hold = Arc::new(Mutex::new(None));
-            let service = held_service(&Arc::new(AtomicUsize::new(0)), &hold, None).await;
+            let service = held_service(&hold, None).await;
             let config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
@@ -549,6 +630,7 @@ async fn a_late_answer_does_not_give_back_a_spent_bucket() {
             let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = requester("203.0.113.9");
+            told_the_table(&hub).await;
             let admitted = || {
                 (0..5)
                     .map(|_| limiter.decide_all(&rule.limits, 0b1, client))
@@ -566,15 +648,120 @@ async fn a_late_answer_does_not_give_back_a_spent_bucket() {
             // The held answer, a bucket with five left, has come.
             tokio::time::sleep_until(started + HELD + Duration::from_millis(300)).await;
             assert_eq!(admitted(), 0, "the late answer's bucket taken");
-            let stats = hub.render_stats();
-            let late = stats
-                .lines()
-                .find_map(|line| line.strip_prefix("edgerush_rate_limit_hub_answers_late_total "))
-                .and_then(|n| n.parse::<u64>().ok());
-            assert!(late.is_some_and(|late| late > 0), "{stats}");
             limiter.stop();
         })
         .await;
+}
+
+/// A process of its own, `hub`, its one worker joined: where its answers come.
+fn joined(
+    hub: &crate::ratelimit::Hub,
+) -> tokio::sync::mpsc::UnboundedReceiver<crate::ratelimit::FromHub> {
+    let (answers, answered) = tokio::sync::mpsc::unbounded_channel();
+    hub.to
+        .send(crate::ratelimit::ToHub::Join { worker: 0, answers })
+        .unwrap();
+    answered
+}
+
+/// How many of `count` asks of `hub`'s process about `key`, under ten an hour and a bucket
+/// of ten, it admits, each waited for.
+async fn admits(
+    hub: &crate::ratelimit::Hub,
+    answered: &mut tokio::sync::mpsc::UnboundedReceiver<crate::ratelimit::FromHub>,
+    key: &[u8],
+    count: usize,
+) -> usize {
+    use edgerush_ratelimit::service::Contract;
+    use std::num::NonZeroU64;
+    let contract = Contract {
+        limit: NonZeroU64::new(10).unwrap(),
+        window: NonZeroU64::new(3_600_000_000_000).unwrap(),
+        burst: NonZeroU64::new(10).unwrap(),
+    };
+    let mut admitted = 0;
+    for id in 0..count {
+        let (decided, _waits) = tokio::sync::oneshot::channel();
+        hub.to
+            .send(crate::ratelimit::ToHub::Ask {
+                worker: 0,
+                id: id as u64,
+                keys: vec![(key.into(), contract)],
+                until: u64::MAX,
+                decided,
+            })
+            .unwrap();
+        if within(answered.recv()).await.unwrap().admitted {
+            admitted += 1;
+        }
+    }
+    admitted
+}
+
+/// A data plane cut off from a key's owner — the owner telling its streams nothing — reaches
+/// it through one of the key's replicas once the owner has gone unanswered for four cycles:
+/// the replica forwards its reports to the owner and relays the owner's answers back, which
+/// the data plane takes as the owner's. Two data planes cut off so each hear what the other
+/// admitted, and are held to it; neither forgives a hit. The scrape shows the owner
+/// unanswered, and the other pods not.
+#[tokio::test]
+async fn a_data_plane_cut_off_from_an_owner_reaches_it_through_a_replica() {
+    use crate::ratelimit::Hub;
+    use std::hash::{BuildHasher, Hasher};
+    let holds = [(); 3].map(|()| Arc::new(Mutex::new(None)));
+    let (seeds, pods) = held_pods(&holds, None).await;
+    let service = edgerush_config::CompiledRateLimitService {
+        addresses: seeds,
+        key_secret: KeySecret::parse(SECRET).unwrap(),
+        cycle: Duration::from_millis(10),
+        max_key_bytes: 1 << 20,
+        poll_quiet_keys: false,
+        schedule_keys: true,
+        tls: None,
+    };
+    let key = b"cut-off".as_slice();
+    // The key's owner, as every data plane finds it: by its hash under the secret.
+    let table = pods[0]
+        .with(|node, _| node.committed().cloned())
+        .await
+        .flatten()
+        .unwrap();
+    let mut hasher = edgerush_ratelimit::service::Keyed::new(service.key_secret.0).build_hasher();
+    hasher.write(key);
+    let shard = edgerush_cluster::table::shard_of(hasher.finish(), 16);
+    let owner = table.owner(shard).unwrap();
+    let owner_at = &table.members[&owner];
+    *holds[usize::try_from(owner - 1).unwrap()].lock().unwrap() =
+        Some(Instant::now() + Duration::from_secs(60));
+    let (first, second) = (
+        Hub::start(&service, 1, 1 << 20, None, None).unwrap(),
+        Hub::start(&service, 1, 1 << 20, None, None).unwrap(),
+    );
+    let (mut to_first, mut to_second) = (joined(&first), joined(&second));
+    told_the_table(&first).await;
+    told_the_table(&second).await;
+    // Each admits one from its copy, and hears of the other's through a replica.
+    assert_eq!(admits(&first, &mut to_first, key, 1).await, 1);
+    assert_eq!(admits(&second, &mut to_second, key, 1).await, 1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let stats = first.render_stats();
+    for (id, address) in &table.members {
+        let unanswered = u8::from(*id == owner);
+        let line =
+            format!("edgerush_rate_limit_hub_pod_unanswered{{pod=\"{address}\"}} {unanswered}\n");
+        assert!(stats.contains(&line), "{line}{stats}");
+    }
+    // Each spends what it may, having heard the other's, through a replica: fewer than the
+    // nine its copy alone would let through, which is what each spends if it never hears
+    // (measured: five each, and nine each with relayed answers not taken as the owner's).
+    let spent = admits(&first, &mut to_first, key, 20).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let then = admits(&second, &mut to_second, key, 20).await;
+    assert!(
+        spent < 9 && then < 9,
+        "spent {spent}, then {then}: unheard, the owner at {owner_at} cut off"
+    );
+    assert_eq!((first.usage().forgiven, second.usage().forgiven), (0, 0));
 }
 
 /// A config with rate limits is refused where 128-bit atomics are not native, at start and
@@ -626,7 +813,7 @@ fn unlimited(mut config: Config) -> Config {
     config
 }
 
-/// A reload that changes a lever, the cycle or the pods starts the process's thread
+/// A reload that changes a lever, the cycle, the seeds or the secret starts the process's thread
 /// afresh; one that changes nothing, or only what its keys may hold, keeps it; one with no
 /// rate-limiting service lets it go, and one with a service again starts one.
 #[tokio::test]
@@ -645,13 +832,16 @@ async fn a_changed_service_starts_the_process_afresh() {
     }
     proxy.reload(compile(&bigger).unwrap()).unwrap();
     assert!(Arc::ptr_eq(&first, &hub_of(&proxy)), "only its keys' bytes");
-    let changes: [fn(&mut edgerush_config::RateLimitService); 4] = [
+    let changes: [fn(&mut edgerush_config::RateLimitService); 5] = [
         |service| service.poll_quiet_keys = Some(true),
         |service| service.schedule_keys = Some(false),
         |service| service.cycle_ms = Some(20),
         |service| service.addresses.push("127.0.0.1:2".to_owned()),
+        |service| service.key_secret = Some("ffeeddccbbaa99887766554433221100".to_owned()),
     ];
     for (at, change) in changes.into_iter().enumerate() {
+        // From the config itself, so that the change is the only one.
+        proxy.reload(compile(&config).unwrap()).unwrap();
         let current = hub_of(&proxy);
         let mut changed = config.clone();
         if let Some(service) = service_of(&mut changed) {
@@ -669,11 +859,11 @@ async fn a_changed_service_starts_the_process_afresh() {
 }
 
 /// Pods served with mutual TLS are sent no exchange by a data plane whose certificate,
-/// though their authority issued it, carries another workload's ID: it is refused once
-/// its handshake is done. A reload showing one with the data plane's ID keeps the
-/// process's thread, keys and all, and its next connections show that: what waited is
-/// reported. One that drops TLS starts the thread afresh, as its
-/// clients dial otherwise.
+/// though their authority issued it, carries another workload's ID: each stream is refused
+/// once its handshake is done, and no table is told. A reload showing one with the data
+/// plane's ID keeps the process's thread, keys and all, and its next streams show that: what
+/// waited is reported. One that drops TLS starts the thread afresh, as its streams dial
+/// otherwise.
 #[tokio::test]
 async fn pods_are_reached_with_the_certificate_the_config_shows() {
     use crate::ratelimit::{Limited, Limiter};
@@ -681,9 +871,7 @@ async fn pods_are_reached_with_the_certificate_the_config_shows() {
     local
         .run_until(async {
             let authority = Authority::new("workloads");
-            let exchanges = Arc::new(AtomicUsize::new(0));
-            let service =
-                held_service(&exchanges, &Arc::new(Mutex::new(None)), Some(&authority)).await;
+            let service = held_service(&Arc::new(Mutex::new(None)), Some(&authority)).await;
             let plain = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
             let stranger = authority.issue(&["plane", "spiffe://cluster.test/ns/edge/sa/other"]);
             let refused = service_tls(plain.clone(), &authority.pem(), POD_ID, stranger);
@@ -698,18 +886,14 @@ async fn pods_are_reached_with_the_certificate_the_config_shows() {
             ));
             // Thirty cycles, each reporting the admission again.
             tokio::time::sleep(Duration::from_millis(300)).await;
-            assert_eq!(
-                exchanges.load(Ordering::Relaxed),
-                0,
-                "refused once its handshake is done"
-            );
+            assert_eq!(exchanges(&hub), 0, "refused once its handshake is done");
 
             let ours = authority.issue(&["plane", PLANE_ID]);
             let shown = service_tls(plain.clone(), &authority.pem(), POD_ID, ours);
             proxy.reload(compile(&shown).unwrap()).unwrap();
             assert!(Arc::ptr_eq(&hub, &hub_of(&proxy)), "the thread kept");
             let deadline = Instant::now() + Duration::from_secs(5);
-            while exchanges.load(Ordering::Relaxed) == 0 {
+            while exchanges(&hub) == 0 {
                 assert!(Instant::now() < deadline, "never reported");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1288,10 +1472,10 @@ async fn an_ask_gone_or_out_of_time_when_taken_is_not_asked_of_the_service() {
     use edgerush_ratelimit::service::Contract;
     use std::num::NonZeroU64;
 
-    let exchanges = Arc::new(AtomicUsize::new(0));
-    let service = counted_service(&exchanges).await;
+    let service = service().await;
     let compiled = edgerush_config::CompiledRateLimitService {
-        pods: service,
+        addresses: service,
+        key_secret: KeySecret::parse(SECRET).unwrap(),
         // A cycle longer than the test: nothing is reported in it.
         cycle: Duration::from_secs(60),
         max_key_bytes: 1 << 20,
@@ -1302,7 +1486,8 @@ async fn an_ask_gone_or_out_of_time_when_taken_is_not_asked_of_the_service() {
     let hub = Hub::start(&compiled, 1, 1 << 20, None, None).unwrap();
     let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
     hub.to.send(ToHub::Join { worker: 0, answers }).unwrap();
-    let before = exchanges.load(Ordering::Relaxed);
+    told_the_table(&hub).await;
+    let before = exchanges(&hub);
     let ask = |id: u64, until: u64, decided| ToHub::Ask {
         worker: 0,
         id,
@@ -1340,11 +1525,7 @@ async fn an_ask_gone_or_out_of_time_when_taken_is_not_asked_of_the_service() {
         hub.render_stats()
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(
-        exchanges.load(Ordering::Relaxed),
-        before,
-        "decided and reported all the same"
-    );
+    assert_eq!(exchanges(&hub), before, "decided and reported all the same");
 }
 
 /// What a rate-limiting thread tells if it fails, counted.
@@ -1381,10 +1562,8 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
     use edgerush_ratelimit::service::Contract;
     use std::num::NonZeroU64;
 
-    let exchanges = Arc::new(AtomicUsize::new(0));
-    // Every answer held back past the replacing.
-    let hold = Arc::new(Mutex::new(Some(Instant::now() + Duration::from_secs(60))));
-    let pods = held_service(&exchanges, &hold, None).await;
+    let hold = Arc::new(Mutex::new(None));
+    let pods = held_service(&hold, None).await;
     let mut config = limited(everything_config("127.0.0.1:1".parse().unwrap()), &pods);
     // A new key asked about, decided by the process and reported next cycle: an exchange.
     let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
@@ -1394,7 +1573,10 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
     let ended = first.ended();
     let (answers, _answered) = tokio::sync::mpsc::unbounded_channel();
     first.to.send(ToHub::Join { worker: 0, answers }).unwrap();
-    let before = exchanges.load(Ordering::Relaxed);
+    // Told the table, then every answer held back past the replacing.
+    told_the_table(&first).await;
+    *hold.lock().unwrap() = Some(Instant::now() + Duration::from_secs(60));
+    let before = exchanges(&first);
     let (decided, _waits) = tokio::sync::oneshot::channel();
     first
         .to
@@ -1413,7 +1595,7 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
             decided,
         })
         .unwrap();
-    until(|| exchanges.load(Ordering::Relaxed) > before).await;
+    until(|| exchanges(&first) > before).await;
     if let Some(service) = service_of(&mut config) {
         service.cycle_ms = Some(20);
     }
@@ -1440,7 +1622,8 @@ async fn a_failed_rate_limiting_thread_tells_once() {
     let pods = service().await;
     for in_exchange in [false, true] {
         let compiled = edgerush_config::CompiledRateLimitService {
-            pods: pods.clone(),
+            addresses: pods.clone(),
+            key_secret: KeySecret::parse(SECRET).unwrap(),
             cycle: Duration::from_millis(10),
             max_key_bytes: 1 << 20,
             poll_quiet_keys: true,

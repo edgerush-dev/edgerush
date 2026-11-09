@@ -1,7 +1,7 @@
 //! The rate limits route rules are under, end to end: the engine's limits named by routes,
 //! the data plane's worker deciding each request under all of them at once as a data plane
-//! of the rate-limiting service, three service pods on real sockets, and clients told apart
-//! by their loopback addresses.
+//! of the rate-limiting service, three pods of its store on real sockets, and clients told
+//! apart by their loopback addresses.
 
 #![allow(
     clippy::unwrap_used,
@@ -10,20 +10,23 @@
     reason = "test set-up: the helpers around the tests fail them the way the tests would"
 )]
 
+use edgerush_cluster::Config as StoreConfig;
+use edgerush_cluster_asynchronous::Pod as AsyncPod;
 use edgerush_config::{Config, compile};
 use edgerush_proxy::{H1Limits, Proxy, Worker};
-use edgerush_ratelimit::service::PodId;
-use edgerush_ratelimit_service::grpc::{Client, Server};
-use edgerush_ratelimit_service::pod::{Pod, Timing};
-use std::collections::BTreeMap;
+use edgerush_ratelimit_service::cluster::forming::Forming;
+use edgerush_ratelimit_service::cluster::link::Dial;
+use edgerush_ratelimit_service::cluster::pod::{StorePod, StoreServer};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tonic::transport::server::TcpIncoming;
 
@@ -58,49 +61,71 @@ async fn upstream() -> SocketAddr {
     address
 }
 
-/// Three service pods, once they agree all three serve: their addresses.
+/// A naming file of the scratch directory's, apart from every other test's.
+fn naming_file() -> std::path::PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let directory =
+        std::env::temp_dir().join(format!("edgerush-ratelimit-test-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    directory.join(NEXT.fetch_add(1, Ordering::Relaxed).to_string())
+}
+
+/// Three pods of the store, asynchronous, formed as the bench's example program forms them,
+/// once ready on one table: their addresses, the data planes' seeds.
 async fn service() -> Vec<String> {
-    let mut listeners = Vec::new();
-    let mut addresses = Vec::new();
-    for _ in 0..3 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        addresses.push(listener.local_addr().unwrap().to_string());
-        listeners.push(listener);
-    }
-    let timing = Timing {
-        cycle: Duration::from_millis(10),
-        heartbeat: Duration::from_millis(20),
-        silence: Duration::from_millis(150),
-        settle: Duration::from_millis(60),
-        // Two heartbeats shorter than the silence, as a pod's must be, and no shorter, so
-        // that a starved runner's pause does not stop the pods.
-        stop_serving: Duration::from_millis(110),
+    slow_service(None).await
+}
+
+/// The same, what each pod tells a data plane's stream given out `delay` after it is told, if
+/// given: a network slow enough that a data plane answers its client before it hears from the
+/// service, the pods' own links as quick as ever.
+async fn slow_service(delay: Option<Duration>) -> Vec<String> {
+    let config = StoreConfig {
+        shards: 16,
+        ..StoreConfig::defaults()
     };
     let mut pods = Vec::new();
-    for (id, listener) in (0..3).zip(listeners) {
-        let peers: BTreeMap<PodId, Client> = (0..3)
-            .filter(|pod| *pod != id)
-            .map(|pod| (pod, Client::new(&addresses[pod as usize]).unwrap()))
-            .collect();
-        let pod = Pod::spawn(id, vec![0, 1, 2], 1, timing, peers);
-        let server = Server::new(pod.clone());
+    let mut addresses = Vec::new();
+    for id in 1..=3 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let mut mode = AsyncPod::new(id, address.clone(), config, [], 10_000_000);
+        mode.set_life(id);
+        let pod = StorePod::start(mode, address.clone(), Dial::Plain, Vec::new());
+        let server = Slowed {
+            server: StoreServer::new(pod.clone()),
+            delay: delay.unwrap_or_default(),
+        };
         tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .serve_with_incoming(server, TcpIncoming::from(listener))
-                .await
-                .unwrap();
+            let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
+            let _ended = tonic::transport::Server::builder()
+                .serve_with_incoming(server, incoming)
+                .await;
         });
         pods.push(pod);
+        addresses.push(address);
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    for pod in &pods {
-        while !matches!(pod.view().await, Some((view, true)) if view.pods == [0, 1, 2]) {
-            assert!(Instant::now() < deadline, "the pods never agreed");
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    let forming = Forming::new(&config, naming_file()).unwrap();
+    let forming_at = addresses.clone();
+    tokio::spawn(async move {
+        let _stopped = forming.run(forming_at).await;
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut stamps = Vec::new();
+        for pod in &pods {
+            stamps.push(
+                pod.with(|node, now| node.ready(now).then(|| node.committed_stamp()))
+                    .await
+                    .flatten(),
+            );
         }
+        if stamps.iter().all(Option::is_some) && stamps.windows(2).all(|pair| pair[0] == pair[1]) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the pods never formed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // A pod taken in makes no key afresh for three heartbeats, in case one is handed to it.
-    tokio::time::sleep(Duration::from_millis(80)).await;
     addresses
 }
 
@@ -114,7 +139,7 @@ limits:
   - { name: everything, key: client, model: { bucket: { rate: 20/h, burst: 20 } } }
 ";
 
-/// A data plane of one worker under [`LIMITS`], reaching the service pods at `service` with
+/// A data plane of one worker under [`LIMITS`], finding the store's pods at `service` with
 /// `levers` besides the defaults (`, name: value` each), and where it listens.
 async fn proxy(upstream: SocketAddr, service: &[String], levers: &str) -> SocketAddr {
     let pods = service
@@ -141,7 +166,7 @@ routes:
         forward: {{ backends: [{{ upstream: web, weight: 1 }}] }}
 upstreams:
   web: {{ load_balancer: p2c, endpoints: {{ listed: ["{upstream}"] }} }}
-rate_limiting: {{ mode: asynchronous, service: {{ addresses: [{pods}], cycle_ms: 10{levers} }} }}
+rate_limiting: {{ mode: asynchronous, service: {{ addresses: [{pods}], key_secret: 00112233445566778899aabbccddeeff, cycle_ms: 10{levers} }} }}
 "#
     );
     let mut config: Config = serde_saphyr::from_str(&yaml).unwrap();
@@ -324,25 +349,23 @@ async fn two_data_planes_share_a_key_through_the_service() {
 
 /// By default a data plane decides a key it has not heard of from a full bucket until the
 /// owner's word reaches it, and then owes what it admitted meanwhile: on a network slow
-/// enough that the second data plane hears nothing while its client is answered, it admits
-/// all eight on top of the first's six, and once it has heard, refuses.
+/// enough that the second data plane hears nothing while its client is answered — every
+/// pod's word to it slow — it admits all eight on top of the first's six, and once it has
+/// heard, refuses.
 #[tokio::test]
 async fn a_data_plane_decides_a_key_it_has_not_heard_of_from_a_full_bucket() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let service = service().await;
+            let service = slow_service(Some(Duration::from_millis(80))).await;
             let upstream = upstream().await;
             let first = proxy(upstream, &service, "").await;
-            let mut slowly = Vec::new();
-            for pod in &service {
-                slowly.push(slow(pod.clone(), Duration::from_millis(80)).await);
-            }
-            let second = proxy(upstream, &slowly, "").await;
+            let second = proxy(upstream, &service, "").await;
             let client = [127, 0, 0, 7];
             let one = statuses(first, client, "GET", "/by-client", 6).await;
-            // The first's admissions reach the owner within a cycle or two.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // The first's admissions reach the owner: its report goes behind the poll it has
+            // in flight, answered through the slow network too.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             let other = statuses(second, client, "GET", "/by-client", 8).await;
             assert_eq!(one, [200; 6]);
             assert_eq!(other, [200; 8], "decided before any word could arrive");
@@ -354,46 +377,102 @@ async fn a_data_plane_decides_a_key_it_has_not_heard_of_from_a_full_bucket() {
         .await;
 }
 
-/// A relay to `to` that holds back what it carries, either way, for `delay`: a network slow
-/// enough that a data plane answers its client before it hears from the service. Its
-/// address.
-async fn slow(to: String, delay: Duration) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    tokio::spawn(async move {
-        while let Ok((inbound, _)) = listener.accept().await {
-            let Ok(outbound) = TcpStream::connect(&to).await else {
-                continue;
-            };
-            let (from_plane, to_plane) = inbound.into_split();
-            let (from_pod, to_pod) = outbound.into_split();
-            tokio::spawn(late(from_plane, to_pod, delay));
-            tokio::spawn(late(from_pod, to_plane, delay));
-        }
-    });
-    address
+/// A store pod's server that gives out what it tells a data plane's stream `delay` after it
+/// is told, each piece of the stream's body in its turn.
+#[derive(Clone)]
+struct Slowed {
+    server: StoreServer<AsyncPod>,
+    delay: Duration,
 }
 
-/// What `from` reads, written to `to` `delay` after it was read: a constant delay, however
-/// the bytes come.
-async fn late(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, delay: Duration) {
-    let (pieces, mut held) = tokio::sync::mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
-    tokio::spawn(async move {
-        while let Some((read, piece)) = held.recv().await {
-            tokio::time::sleep_until((read + delay).into()).await;
-            if to.write_all(&piece).await.is_err() {
-                return;
+impl tonic::server::NamedService for Slowed {
+    const NAME: &'static str = <StoreServer<AsyncPod> as tonic::server::NamedService>::NAME;
+}
+
+impl tower_service::Service<http::Request<tonic::body::Body>> for Slowed {
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future =
+        std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.server.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        let slowed = request.uri().path().ends_with("/Exchange") && !self.delay.is_zero();
+        let delay = self.delay;
+        let answer = self.server.call(request);
+        Box::pin(async move {
+            let answer = answer.await?;
+            if !slowed {
+                return Ok(answer);
+            }
+            Ok(answer.map(|body| {
+                tonic::body::Body::new(SlowBody {
+                    inner: Some(body),
+                    delay,
+                    queue: VecDeque::new(),
+                    ended: None,
+                    sleep: None,
+                })
+            }))
+        })
+    }
+}
+
+/// What a frame of a stream's body is polled as.
+type Polled = Option<Result<http_body::Frame<bytes::Bytes>, tonic::Status>>;
+
+/// A stream's body, each piece given out `delay` after it was read, the end after them.
+struct SlowBody {
+    inner: Option<tonic::body::Body>,
+    delay: Duration,
+    queue: VecDeque<(tokio::time::Instant, http_body::Frame<bytes::Bytes>)>,
+    ended: Option<Polled>,
+    sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl http_body::Body for SlowBody {
+    type Data = bytes::Bytes;
+    type Error = tonic::Status;
+
+    fn poll_frame(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Polled> {
+        let delay = self.delay;
+        // Everything the body has now, each piece stamped with when it goes out.
+        while let Some(inner) = &mut self.inner {
+            match std::pin::Pin::new(inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    let at = tokio::time::Instant::now() + delay;
+                    self.queue.push_back((at, frame));
+                }
+                Poll::Ready(other) => {
+                    self.ended = Some(other);
+                    self.inner = None;
+                }
+                Poll::Pending => break,
             }
         }
-    });
-    let mut chunk = [0; 16_384];
-    while let Ok(read) = from.read(&mut chunk).await {
-        if read == 0
-            || pieces
-                .send((Instant::now(), chunk[..read].to_vec()))
-                .is_err()
-        {
-            return;
+        loop {
+            let Some((at, _)) = self.queue.front() else {
+                return match self.ended.take() {
+                    Some(ended) => Poll::Ready(ended),
+                    None => Poll::Pending,
+                };
+            };
+            let at = *at;
+            if tokio::time::Instant::now() >= at {
+                self.sleep = None;
+                let (_, frame) = self.queue.pop_front().unwrap();
+                return Poll::Ready(Some(Ok(frame)));
+            }
+            let sleep = self
+                .sleep
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(at)));
+            sleep.as_mut().reset(at);
+            if sleep.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
         }
     }
 }

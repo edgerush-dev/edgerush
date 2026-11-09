@@ -1051,7 +1051,7 @@ routes:
         forward: { backends: [{ upstream: u, weight: 1 }] }
         rate_limits: [writes]
 upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
-rate_limiting: { mode: asynchronous, service: { addresses: ["rl-0:7000"] } }
+rate_limiting: { mode: asynchronous, service: { addresses: ["rl-0:7000"], key_secret: 00112233445566778899aabbccddeeff } }
 "#;
         let limits = "limits:
   - { name: per-client, key: client, model: { bucket: { rate: 100/s, burst: 100 } } }
@@ -1084,7 +1084,7 @@ rate_limiting: { mode: asynchronous, service: { addresses: ["rl-0:7000"] } }
         );
         // Rate limiting off: the same limits named, and said to be enforced in none.
         let mut off: edgerush_config::Config = serde_saphyr::from_str(&yaml.replace(
-            r#"rate_limiting: { mode: asynchronous, service: { addresses: ["rl-0:7000"] } }"#,
+            r#"rate_limiting: { mode: asynchronous, service: { addresses: ["rl-0:7000"], key_secret: 00112233445566778899aabbccddeeff } }"#,
             "",
         ))
         .unwrap();
@@ -1101,7 +1101,7 @@ rate_limiting: { mode: asynchronous, service: { addresses: ["rl-0:7000"] } }
         );
         // Windows say their count and their window as written; off, a rolling one too.
         let mut windows: edgerush_config::Config = serde_saphyr::from_str(&yaml.replace(
-            r#"rate_limiting: { mode: asynchronous, service: { addresses: ["rl-0:7000"] } }"#,
+            r#"rate_limiting: { mode: asynchronous, service: { addresses: ["rl-0:7000"], key_secret: 00112233445566778899aabbccddeeff } }"#,
             "",
         ))
         .unwrap();

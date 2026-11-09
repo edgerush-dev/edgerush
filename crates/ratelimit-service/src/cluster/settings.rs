@@ -152,10 +152,7 @@ mod tests {
     /// A file with `pod`'s more and `store`'s section, if any.
     fn file(pod: &str, store: Option<&str>) -> ServiceFile {
         let store = store.map_or(String::new(), |store| format!("store: {{ {store} }}\n"));
-        serde_saphyr::from_str(&format!(
-            "pod: {{ id: 0, listen: 0.0.0.0:7000{pod} }}\nmembership: {{ pods: {{ 0: rl-0:7000 }} }}\n{store}"
-        ))
-        .unwrap()
+        serde_saphyr::from_str(&format!("pod: {{ listen: 0.0.0.0:7000{pod} }}\n{store}")).unwrap()
     }
 
     const ADDRESS: &str = ", address: rl-0.rl:7000";

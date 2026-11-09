@@ -61,8 +61,9 @@ change takes over without dropping a request.
     the data plane's own buckets until it answers. Each key's owner copies it to the key's
     replicas, so a pod's keys carry on when it leaves.
   - `asynchronous`: each process decides every request from its own copy of each key,
-    waiting on no one, and shares what it admitted through the service every cycle; a
-    burst on a key it has not heard of yet may overshoot a little.
+    waiting on no one, and shares what it admitted with each key's owner in the service's
+    cluster store every cycle, through one of the key's replicas while the owner is out of
+    reach; a burst on a key it has not heard of yet may overshoot a little.
 
 ### In Kubernetes
 
@@ -327,13 +328,13 @@ crates/certificates
                    translation admits are read by the same code; no I/O
 crates/cluster     the rate-limiting service's cluster store (`edgerush-cluster`): an elected
                    table of shard owners, leases, copies to replicas and handoffs, for any value
-                   that merges; pure, no I/O; the service's synchronous mode runs on it
+                   that merges; pure, no I/O; both of the service's modes run on it
 crates/cluster-asynchronous
                    the asynchronous mode on the cluster store (`edgerush-cluster-asynchronous`):
                    the owner's state of a key as the store's value, merged by the larger of
                    each part, the mode's pod applying data planes' batches and answering
-                   them, and the data planes' routing by the table; pure, no I/O, run by the
-                   cluster's simulation and the service's socket tests, not yet by the binary
+                   them, and the data planes' routing by the table; pure, no I/O; the service
+                   and the proxy run it
 crates/cluster-sim the cluster's simulation (`edgerush-cluster-sim`): the store's pods over a
                    network that delays, loses and cuts, with clients standing for data planes,
                    in the synchronous mode and the asynchronous, seeded and deterministic; its scenarios and chaos runs are its tests, and
@@ -382,9 +383,10 @@ crates/ratelimit-sim
                    across pods run against the contract, deterministic, no I/O; side by side
                    with `cargo run --release -p edgerush-ratelimit-sim --example compare`
 crates/ratelimit-service
-                   the rate-limiting service (`edgerush-ratelimit-service`): service pods, in the
-                   synchronous mode on the cluster store or the asynchronous mode, over gRPC, the
-                   asynchronous mode's client, and the `edgerush-ratelimit-service` binary
+                   the rate-limiting service (`edgerush-ratelimit-service`): the cluster store's
+                   pods, of either mode, over gRPC, the data planes' streams to them, and the
+                   `edgerush-ratelimit-service` binary; the protocol's own service pod, by a
+                   view of which pods serve, which the binary no longer runs
 crates/proxy       the data plane (`edgerush-proxy`): listeners, TLS, our HTTP/1 server and client,
                    HTTP/2 on h2, HTTP/3 on quiche, upstream pools and the request core between them,
                    and each rate-limiting mode's side of the data plane

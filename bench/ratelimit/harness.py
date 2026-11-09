@@ -250,10 +250,11 @@ async def restart_instance(system, n, i, route, stay_down=False):
 async def strike(fault, system, n, owner, t0, route, events, key):
     span = workloads.SPAN / 1e9
     store = f"{PROJECT}-{system.stores[0]}" if system.stores else None
-    # EdgeRush's service: the pod that owns the load's key.
-    if system.owner == "service":
-        store = f"{PROJECT}-rl{systems.service_owner()}"
     if fault in ("owner-lost", "owner-restart"):
+        # EdgeRush's service: the store's table names the key's owner, and the harness has no
+        # way to read it yet; striking another pod would measure the wrong fault.
+        if system.owner == "service":
+            raise SystemExit(f"{fault}: the owner of {system.key}'s key is not known to the harness")
         await at(t0, span / 2 - (0 if owner is None else DRAIN))
         events.append(("strike", time.monotonic_ns() - t0))
         if owner is None:

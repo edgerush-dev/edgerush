@@ -186,13 +186,16 @@ pub struct RateLimitBreaker {
     pub probe_after_ms: u64,
 }
 
-/// The rate-limiting service: its pods, and in the asynchronous mode how often each process
-/// sends them what it admitted and its levers, which the synchronous mode does not take.
+/// The rate-limiting service: where a data plane first finds its store, the secret keys are
+/// hashed under, and in the asynchronous mode how often each process sends the owners what it
+/// admitted and its levers, which the synchronous mode does not take.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitService {
-    /// The address (`host:port`) of each of its pods, the first being pod 0.
+    /// The addresses (`host:port`) a data plane first asks for the store's table, its seeds:
+    /// any of the service's pods, or a name that reaches them. The pods themselves are reached
+    /// at the addresses the table gives.
     #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub addresses: Vec<String>,
     /// Milliseconds between the process's messages to the service; 10 when left out. Every
@@ -224,11 +227,10 @@ pub struct RateLimitService {
     /// out, as the pods are then served.
     #[serde(default)]
     pub tls: Option<RateLimitServiceTls>,
-    /// The secret the synchronous mode's keys are hashed under, as 32 hex digits: the same on
-    /// every data plane, so that each sends a client's key to the pod that owns it, and kept
-    /// from clients, so that none can choose a key to share another's count
-    /// ([06 §4](../../../docs/06-rate-limiting.md)). Needed by the synchronous mode, and taken
-    /// by no other; never shown.
+    /// The secret keys are hashed under, as 32 hex digits: the same on every data plane, so
+    /// that each sends a client's key to the pod that owns it, and kept from clients, so that
+    /// none can choose a key to share another's count
+    /// ([06 §4](../../../docs/06-rate-limiting.md)). Needed; never shown.
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(regex(pattern = r"^[0-9a-fA-F]{32}$")))]
     pub key_secret: Option<String>,
