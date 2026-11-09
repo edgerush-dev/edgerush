@@ -122,6 +122,12 @@ impl<T> Heap<T> {
         }
     }
 
+    /// How many slots are given out.
+    #[cfg(test)]
+    pub(crate) fn taken(&self) -> usize {
+        self.taken
+    }
+
     /// What the slot holds.
     #[cfg(test)]
     fn value_mut(&mut self, key: Key) -> Option<&mut T> {
