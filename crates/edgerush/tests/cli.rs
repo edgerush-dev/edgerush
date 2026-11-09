@@ -422,15 +422,16 @@ listeners:
 #[test]
 fn proxy_serves_a_udp_listener_beside_a_tcp_one_and_follows_it() -> io::Result<()> {
     let (one, echo) = (upstream("one")?, udp_echo()?);
-    // A port free over both TCP and UDP, which both listeners are given: drawn again where
-    // the host keeps the TCP port's number from UDP, as Windows keeps ranges of it.
+    // A port free over both UDP and TCP, which both listeners are given. Drawn over UDP
+    // first: Windows keeps ranges of ports from UDP, and its TCP ports come one after
+    // another, so drawn over TCP first, a run of them can all be in one of those ranges.
     let shared = (0..8)
         .find_map(|_| {
-            let tcp = TcpListener::bind("127.0.0.1:0").ok()?;
-            let address = tcp.local_addr().ok()?;
-            UdpSocket::bind(address).ok().map(|_| address)
+            let udp = UdpSocket::bind("127.0.0.1:0").ok()?;
+            let address = udp.local_addr().ok()?;
+            TcpListener::bind(address).ok().map(|_| address)
         })
-        .expect("a port free over TCP and UDP");
+        .expect("a port free over UDP and TCP");
     let with = |dns: bool| {
         let mut yaml = config(&shared.to_string(), "up", Some(one)).replace(
             "upstreams:\n",

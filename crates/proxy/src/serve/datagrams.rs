@@ -7,7 +7,13 @@
 //! session, which reads its endpoint's answers and sends each out of the listener's
 //! socket, from the address the client's datagram arrived on. Nothing is held between
 //! the two: a datagram either way that its socket has no room for is dropped (24 §4).
+//!
+//! A session ends idle, refused — its endpoint's ICMP port unreachable, seen on its
+//! socket's next send or read, which sets the endpoint aside — or drained, its listener
+//! taken away; each end is counted and, where the listener logs, writes the session's one
+//! record (24 §3, §6).
 
+use super::logged::Passing;
 use super::{Proxy, Worker, balance_of};
 use crate::balance::Tried;
 use crate::connections::{Loads, QUIC_MOST};
@@ -15,8 +21,9 @@ use crate::descriptors::Descriptor;
 use crate::drain::Drain;
 use crate::metrics::{Dropped, SessionEnd};
 use crate::random::random;
-use crate::udp::sessions::{Client, Dropped as Unmade, Sessions};
+use crate::udp::sessions::{Client, Dropped as Unmade, Session, Sessions};
 use crate::upstream::balancing::InFlight;
+use crate::upstream::destination::{Aside, ReuseIdentity};
 use crate::upstream::dial::{self, Unconnected};
 use edgerush_config::Destination;
 use std::cell::RefCell;
@@ -28,6 +35,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
@@ -131,10 +139,15 @@ struct Held {
     /// Counted as a connection accepted and open until the session ends.
     _open: Open,
     connected: Option<Connected>,
+    /// Its access log record, where its listener logs (24 §6): boxed, so that a session
+    /// of one that does not holds no room for it.
+    record: Option<Box<Passing>>,
 }
 
 /// A session's socket to its endpoint, and what reads it.
 struct Connected {
+    /// What a refusal sets aside (24 §3).
+    endpoint: Arc<ReuseIdentity>,
     socket: Rc<UdpSocket>,
     /// Load on its endpoint for as long as it is open, as a tunnel is (03 §6).
     _load: InFlight,
@@ -149,8 +162,21 @@ impl Connected {
     /// kernel itself: the runtime knows a new socket writable only once its next turn has
     /// heard so, and a session's first datagram goes out before then.
     fn send(&self, datagram: &[u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        if REFUSING.get() {
+            return Err(io::ErrorKind::ConnectionRefused.into());
+        }
         socket2::SockRef::from(&*self.socket).send(datagram)
     }
+}
+
+/// Whether `error`, on a session's socket, is its endpoint's refusal: ICMP port
+/// unreachable, which Linux reports as refused and Windows as reset.
+fn refusal(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+    )
 }
 
 /// A task ended when this is dropped.
@@ -262,27 +288,42 @@ impl Listening {
             let datagram = buffer.get(..len).unwrap_or_default();
             let mut sessions = self.sessions.borrow_mut();
             let opened = sessions.arrived(client, now, &route.backends, random, |backend| {
-                self.open(worker, &snapshot, backend, client)
+                self.open(worker, &snapshot, &route.name, backend, client)
             });
             let why = match opened {
-                Ok(session) => match &session.value_mut().connected {
-                    Some(connected) => match sent(|| connected.send(datagram)) {
-                        Ok(_) => continue,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            Dropped::SendFull
-                        }
-                        // The endpoint's refusal, which a later step ends the session for
-                        // (24 §8, step 3b); the datagram is lost to it, as UDP loses one.
-                        Err(_) => continue,
-                    },
-                    None => Dropped::InvalidBackend,
-                },
-                Err(Unmade::NoBackend) => Dropped::InvalidBackend,
-                Err(Unmade::NoRoom) => Dropped::NoRoom,
-                Err(Unmade::Unopened(why)) => why,
+                Ok(session) => {
+                    let Held {
+                        connected, record, ..
+                    } = session.value_mut();
+                    match connected {
+                        Some(connected) => match sent(|| connected.send(datagram)) {
+                            Ok(_) => {
+                                if let Some(record) = record {
+                                    record.passed(len, 0);
+                                }
+                                continue;
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                Some(Dropped::SendFull)
+                            }
+                            // The endpoint's refusal ends the session, the datagram not
+                            // sent again (24 §3).
+                            Err(error) if refusal(&error) => None,
+                            // Lost, as UDP loses a datagram.
+                            Err(_) => continue,
+                        },
+                        None => Some(Dropped::InvalidBackend),
+                    }
+                }
+                Err(Unmade::NoBackend) => Some(Dropped::InvalidBackend),
+                Err(Unmade::NoRoom) => Some(Dropped::NoRoom),
+                Err(Unmade::Unopened(why)) => Some(why),
             };
             drop(sessions);
-            self.dropped(worker, why);
+            match why {
+                Some(why) => self.dropped(worker, why),
+                None => self.refused(worker, &client),
+            }
         }
         read
     }
@@ -294,15 +335,27 @@ impl Listening {
         self: &Rc<Self>,
         worker: &Rc<Worker>,
         snapshot: &super::Snapshot,
+        route: &str,
         backend: Destination,
         client: Client,
     ) -> Result<Held, Dropped> {
+        // Its record, where the listener logs, from its first datagram (24 §6).
+        let record = |upstream: Option<&str>, endpoint: Option<SocketAddr>| {
+            let started = tokio::time::Instant::now();
+            let mut record = Passing::start(snapshot, self.slot, None, Some(client.peer), started)?;
+            record.routed(route, upstream);
+            if let Some(endpoint) = endpoint {
+                record.connecting(endpoint);
+            }
+            Some(Box::new(record))
+        };
         let upstream = match backend {
             Destination::Upstream(upstream) => upstream,
             Destination::Invalid(_) => {
                 return Ok(Held {
                     _open: Open::new(&worker.proxy, self.slot),
                     connected: None,
+                    record: record(None, None),
                 });
             }
         };
@@ -337,9 +390,16 @@ impl Listening {
             client,
             Rc::clone(&socket),
         ));
+        let name = snapshot
+            .config
+            .upstreams()
+            .get(upstream.0)
+            .map(|upstream| upstream.name.as_str());
         Ok(Held {
             _open: Open::new(&worker.proxy, self.slot),
+            record: record(name, Some(endpoint.address())),
             connected: Some(Connected {
+                endpoint: Arc::clone(endpoint),
                 socket,
                 _load: load,
                 _file: file,
@@ -352,8 +412,28 @@ impl Listening {
     /// the session ends, which aborts it.
     async fn answers(self: Rc<Self>, worker: Rc<Worker>, client: Client, socket: Rc<UdpSocket>) {
         loop {
-            if socket.readable().await.is_err() {
+            // Its error too: Linux reports an endpoint's refusal on a UDP socket as an error
+            // alone, never as something to read, where Windows has a read fail with it.
+            let Ok(ready) = socket.ready(Interest::READABLE | Interest::ERROR).await else {
                 return;
+            };
+            if ready.is_error() {
+                match socket.take_error() {
+                    Ok(Some(error)) if refusal(&error) => {
+                        self.refused(&worker, &client);
+                        return;
+                    }
+                    // Any other is the socket's to forget: cleared, or it would be heard
+                    // for ever.
+                    _ => {
+                        let _cleared = socket.try_io(Interest::ERROR, || {
+                            Err::<(), _>(io::ErrorKind::WouldBlock.into())
+                        });
+                    }
+                }
+            }
+            if !ready.is_readable() {
+                continue;
             }
             let now = Instant::now();
             let mut read = 0;
@@ -372,8 +452,14 @@ impl Listening {
                         self.dropped(&worker, Dropped::Truncated);
                         continue;
                     }
-                    // The endpoint's refusal, which a later step ends the session for
-                    // (24 §8, step 3b): nothing came to carry.
+                    // The endpoint's refusal ends the session, and this task with it
+                    // (24 §3).
+                    Err(error) if refusal(&error) => {
+                        drop(buffer);
+                        self.refused(&worker, &client);
+                        return;
+                    }
+                    // Nothing came to carry.
                     Err(_) => {
                         read += 1;
                         continue;
@@ -381,17 +467,24 @@ impl Listening {
                 };
                 read += 1;
                 let answer = buffer.get(..len).unwrap_or_default();
-                match self.send_to_client(answer, &client) {
-                    Ok(()) => {}
+                let sent = match self.send_to_client(answer, &client) {
+                    Ok(()) => true,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         self.dropped(&worker, Dropped::SendFull);
+                        false
                     }
                     // Nothing to be done for one the client's side would not take.
-                    Err(_) => {}
-                }
+                    Err(_) => false,
+                };
                 drop(buffer);
                 // An answer keeps its session from its idle bound as a datagram does.
-                let _heard = self.sessions.borrow_mut().answered(&client, now);
+                let mut sessions = self.sessions.borrow_mut();
+                if let Some(session) = sessions.answered(&client, now)
+                    && sent
+                    && let Some(record) = &mut session.value_mut().record
+                {
+                    record.passed(0, len);
+                }
             }
             if read == BATCH {
                 tokio::task::yield_now().await;
@@ -461,27 +554,39 @@ impl Listening {
 
     /// Ends the sessions past their idle bound at `now`.
     fn expire(&self, worker: &Worker, now: Instant) {
-        let mut ended = 0_u64;
-        self.sessions
-            .borrow_mut()
-            .expire(now, |_, _session| ended += 1);
-        self.ended(worker, SessionEnd::Idle, ended);
+        self.sessions.borrow_mut().expire(now, |_, session| {
+            self.finish(worker, session, SessionEnd::Idle);
+        });
     }
 
     /// Ends every session: the listener was taken away, or the worker drains.
     fn end_every(&self, worker: &Worker) {
-        let mut ended = 0_u64;
-        self.sessions
-            .borrow_mut()
-            .end_every(|_, _session| ended += 1);
-        self.ended(worker, SessionEnd::Drained, ended);
+        self.sessions.borrow_mut().end_every(|_, session| {
+            self.finish(worker, session, SessionEnd::Drained);
+        });
     }
 
-    fn ended(&self, worker: &Worker, how: SessionEnd, count: u64) {
+    /// Ends `client`'s session, its endpoint having refused a datagram (ICMP port
+    /// unreachable), and sets the endpoint aside as a tunnel's failed connect does: the
+    /// client's next datagram makes a new session, on another endpoint (24 §3).
+    fn refused(&self, worker: &Worker, client: &Client) {
+        let Some(mut session) = self.sessions.borrow_mut().end(client) else {
+            return;
+        };
+        if let Some(connected) = &session.value_mut().connected {
+            connected.endpoint.set_aside(Aside::Connect);
+        }
+        self.finish(worker, session, SessionEnd::Refused);
+    }
+
+    /// A session ended `how`: counted, and its record written. Dropped here, which closes
+    /// its socket, ends its task and gives its room back.
+    fn finish(&self, worker: &Worker, mut session: Session<Held>, how: SessionEnd) {
         if let Some(counters) = worker.proxy.metrics.listener(self.slot) {
-            for _ in 0..count {
-                counters.session(how);
-            }
+            counters.session(how);
+        }
+        if let Some(record) = session.value_mut().record.take() {
+            record.session_ended(worker, how);
         }
     }
 
@@ -528,6 +633,20 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn sockets_full(full: bool) {
     FULL.set(full);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every session's socket a `udp` listener sends on from this thread is refused.
+    static REFUSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Has every session's socket a `udp` listener sends on from this thread report its
+/// endpoint's refusal on the send, or none from now on: where it shows first is the
+/// kernel's to say, which a test cannot choose.
+#[cfg(test)]
+pub(super) fn sends_refused(refused: bool) {
+    REFUSING.set(refused);
 }
 
 /// Whether a read failed for a datagram longer than its buffer: Windows says so, where

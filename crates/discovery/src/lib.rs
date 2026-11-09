@@ -14,7 +14,8 @@
 //! An endpoint is its first address, which the API says the others are interchangeable
 //! with, so that a pod is one endpoint however many addresses it lists. The port is the
 //! slice's own for the Service's port, matched by its name, or, for the Service's only
-//! port left unnamed, the one port without a name; TCP only. IPv4 and IPv6 slices both
+//! port left unnamed, the one port without a name; over TCP, or over UDP for an upstream
+//! that takes datagrams ([`Endpoints::of_over`], 24 §2). IPv4 and IPv6 slices both
 //! count; FQDN slices do not, as endpoints are pod addresses. An address listed more than
 //! once, as while slices are being replaced, is one endpoint, the readiest of its copies.
 //!
@@ -30,6 +31,26 @@ use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort
 use std::collections::BTreeSet;
 use std::collections::btree_map::{BTreeMap, Entry};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+/// The transport a Service's port is matched over: an EndpointSlice says each port's,
+/// TCP where it says none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// Every upstream's but a `udp` one's.
+    Tcp,
+    /// A `udp` upstream's ([24 §2](../../../docs/24-udp-proxying.md)).
+    Udp,
+}
+
+impl Transport {
+    /// Its name, as a slice's port says it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Tcp => "TCP",
+            Self::Udp => "UDP",
+        }
+    }
+}
 
 /// The label an EndpointSlice names its Service with.
 pub const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
@@ -60,6 +81,16 @@ impl Endpoints {
     /// data plane cannot use.
     #[must_use]
     pub fn of(service: &KubernetesService, slices: &[EndpointSlice]) -> Self {
+        Self::of_over(service, slices, Transport::Tcp)
+    }
+
+    /// The same, for the Service's port over `transport`.
+    #[must_use]
+    pub fn of_over(
+        service: &KubernetesService,
+        slices: &[EndpointSlice],
+        transport: Transport,
+    ) -> Self {
         let mut fit: BTreeMap<SocketAddr, Fit> = BTreeMap::new();
         let mut zones: BTreeMap<SocketAddr, Option<BTreeSet<String>>> = BTreeMap::new();
         for slice in slices
@@ -70,7 +101,7 @@ impl Endpoints {
                 .ports
                 .iter()
                 .flatten()
-                .find(|port| is_port(&service.port, port))
+                .find(|port| is_port(&service.port, transport, port))
                 .and_then(|port| u16::try_from(port.port?).ok())
                 .filter(|port| *port != 0)
             else {
@@ -220,14 +251,14 @@ fn is_of(namespace: &str, service: &str, slice: &EndpointSlice) -> bool {
 }
 
 /// Whether a slice's port is the Service's: the one of its name, or, for the Service's only
-/// port, the one without a name; over TCP, which a port that does not say is.
-fn is_port(wanted: &ServicePort, port: &EndpointPort) -> bool {
+/// port, the one without a name; over `transport`, a port that does not say being TCP's.
+fn is_port(wanted: &ServicePort, transport: Transport, port: &EndpointPort) -> bool {
     let name = port.name.as_deref().unwrap_or_default();
     let named = match wanted {
         ServicePort::Named(wanted) => name == wanted,
         ServicePort::Only(_) => name.is_empty(),
     };
-    named && port.protocol.as_deref().unwrap_or("TCP") == "TCP"
+    named && port.protocol.as_deref().unwrap_or("TCP") == transport.name()
 }
 
 /// An address of a slice of this type, if it is an IP address of the slice's family.

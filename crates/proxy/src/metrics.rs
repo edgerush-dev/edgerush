@@ -190,7 +190,7 @@ pub(crate) enum SessionEnd {
 
 impl SessionEnd {
     /// The name this is counted under.
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Idle => "idle",
             Self::Refused => "refused",
