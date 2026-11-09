@@ -13,6 +13,7 @@ use edgerush_certificates::testing::Authority;
 use edgerush_config::HarnessFile;
 use edgerush_control_service::{Credentials, Heard, acceptor, serve};
 use edgerush_control_stream::{Listening, Offer, Versions};
+use std::hash::{BuildHasher, RandomState};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::{Child, Command, Output, Stdio};
@@ -416,22 +417,34 @@ listeners:
     Ok(())
 }
 
+/// A port free over both UDP and TCP, for a test that names it for both, drawn as the
+/// proxy's own `listen_both` draws one (16 §5): the system's first, then ports named at
+/// random from the dynamic range. Windows hands ports out one after another and keeps runs
+/// of each protocol's from it, more than 1,000 long, so once one draw is in such a run, the
+/// system's next ones are too (#300, #310).
+fn free_over_udp_and_tcp() -> io::Result<SocketAddr> {
+    let keys = RandomState::new();
+    (0..16u64)
+        .find_map(|draw| {
+            let port = match draw {
+                0 => 0,
+                // Below 16,384, so the sum stays a port.
+                _ => 49152 + u16::try_from(keys.hash_one(draw) % 16384).unwrap_or_default(),
+            };
+            let udp = UdpSocket::bind(("127.0.0.1", port)).ok()?;
+            let address = udp.local_addr().ok()?;
+            TcpListener::bind(address).ok().map(|_| address)
+        })
+        .ok_or_else(|| io::Error::other("no port free over UDP and TCP"))
+}
+
 /// A `udp` listener is served beside a TCP-based one on the same port, as a config may
 /// have it (24 §2); taken away, it drains, the TCP listener left alone; and added again on
 /// that port, which the TCP listener keeps, it is served: TCP and UDP ports are not one.
 #[test]
 fn proxy_serves_a_udp_listener_beside_a_tcp_one_and_follows_it() -> io::Result<()> {
     let (one, echo) = (upstream("one")?, udp_echo()?);
-    // A port free over both UDP and TCP, which both listeners are given. Drawn over UDP
-    // first: Windows keeps ranges of ports from UDP, and its TCP ports come one after
-    // another, so drawn over TCP first, a run of them can all be in one of those ranges.
-    let shared = (0..8)
-        .find_map(|_| {
-            let udp = UdpSocket::bind("127.0.0.1:0").ok()?;
-            let address = udp.local_addr().ok()?;
-            TcpListener::bind(address).ok().map(|_| address)
-        })
-        .expect("a port free over UDP and TCP");
+    let shared = free_over_udp_and_tcp()?;
     let with = |dns: bool| {
         let mut yaml = config(&shared.to_string(), "up", Some(one)).replace(
             "upstreams:\n",
@@ -522,7 +535,8 @@ fn proxy_turns_a_listeners_http3_on_and_off() -> io::Result<()> {
     let (chain, key) = (scratch("http3-chain.pem"), scratch("http3-key.pem"));
     std::fs::write(&chain, &issued.chain)?;
     std::fs::write(&key, &issued.key)?;
-    let at = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    // Free over UDP too, for the HTTP/3 the second config turns on there.
+    let at = free_over_udp_and_tcp()?;
     let with = |http3: bool, comment: &str| {
         let http3 = if http3 {
             ", http3: { alt_svc_max_age: 60, force_retry: false }"
