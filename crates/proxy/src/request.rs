@@ -496,7 +496,7 @@ fn decide_with<'a, H: Head>(
         Outcome::Redirect(redirect) => {
             let scheme = match listener.protocol {
                 Protocol::Https => Scheme::Https,
-                Protocol::Http | Protocol::Tcp | Protocol::Tls => Scheme::Http,
+                Protocol::Http | Protocol::Tcp | Protocol::Tls | Protocol::Udp => Scheme::Http,
             };
             let location = redirect
                 .location(&Requested {

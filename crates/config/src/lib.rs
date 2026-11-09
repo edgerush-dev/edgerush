@@ -52,7 +52,7 @@ pub use limits::{
 pub use route::{
     Backend, EncodedSlash, Filter, Forward, Fraction, GrpcMethod, Header, HeaderChanges, Hostname,
     Match, Mirror, PathChange, PathMatch, Query, Redirect, Retry, Route, Rule, RulePaths, Scheme,
-    TcpRoute, Timeouts, TlsRoute, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
+    TcpRoute, Timeouts, TlsRoute, UdpRoute, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
 };
 pub use service_file::{
     STORE_MOST_MS, ServiceFile, ServiceKeys, ServiceMembership, ServiceMode, ServicePod,

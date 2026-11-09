@@ -67,15 +67,15 @@ pub struct Matches {
 
 impl Matches {
     /// The matches of the listener called `listener`, in the order its router was given
-    /// them; none for a `tcp` or `tls` listener, or a name there is no listener by.
+    /// them; none for a `tcp`, `tls` or `udp` listener, or a name there is no listener by.
     #[must_use]
     pub fn of(&self, listener: &str) -> &[RouteMatch<MatchId>] {
         self.http.get(listener).map_or(&[], Vec::as_slice)
     }
 
     /// The hostnames of the routes of no rules on the listener called `listener`, which its
-    /// router claims and serves nothing on ([`Router::with_claims`]); none for a `tcp` or
-    /// `tls` listener, or a name there is no listener by.
+    /// router claims and serves nothing on ([`Router::with_claims`]); none for a `tcp`,
+    /// `tls` or `udp` listener, or a name there is no listener by.
     #[must_use]
     pub fn claims_of(&self, listener: &str) -> &[HostClaim<()>] {
         self.claims.get(listener).map_or(&[], Vec::as_slice)
@@ -329,20 +329,27 @@ pub struct CompiledListener {
     /// Finds the rule a request belongs to, among the routes that are for this listener.
     pub router: Router<RuleId>,
     /// The routes that are for it, by their positions, as a [`RuleId`] gives them; none for
-    /// a `tcp` or `tls` listener, whose routes are its `l4`.
+    /// a `tcp` or `tls` listener, whose routes are its `l4`, or a `udp` one, whose route is
+    /// its `udp`.
     pub http_routes: Vec<usize>,
     /// Where a `tcp` or `tls` listener's connections go, and those an `https` listener
     /// passes through ([`CompiledListener::carries`]); `None` for any other HTTP listener.
     pub l4: Option<L4>,
+    /// Where a `udp` listener's sessions go (24 in the docs); `None` for any other, and for a
+    /// `udp` listener no route serves, which drops every datagram.
+    pub udp: Option<L4Route>,
     /// How long a tunnel of this listener's may carry nothing before it is closed: an hour
     /// unless its config says otherwise. Only a `tcp` or `tls` listener, or an `https` one
     /// that passes connections through, has tunnels.
     pub tunnel_idle: Duration,
-    /// What it tells upstreams of a request's client; nothing for a `tcp` or `tls`
+    /// How long a session of this listener's may carry nothing either way before it is
+    /// ended: a minute unless its config says otherwise. Only a `udp` listener has sessions.
+    pub session_idle: Duration,
+    /// What it tells upstreams of a request's client; nothing for a `tcp`, `tls` or `udp`
     /// listener, which carries no requests.
     pub forwarding: CompiledForwarding,
-    /// What it does with `X-Request-ID`; [`RequestId::Pass`] for a `tcp` or `tls` listener,
-    /// which carries no requests.
+    /// What it does with `X-Request-ID`; [`RequestId::Pass`] for a `tcp`, `tls` or `udp`
+    /// listener, which carries no requests.
     pub request_id: RequestId,
     /// The senders whose PROXY protocol headers are believed, on a listener that reads one
     /// at the start of every connection; `None` for a listener that reads none.
@@ -376,7 +383,7 @@ impl CompiledListener {
                         .and_then(|tls| tls.shared_by.as_deref())
                         .is_some_and(|shared| shared.passes_through(name))
             }
-            Protocol::Http => false,
+            Protocol::Http | Protocol::Udp => false,
         }
     }
 }
@@ -1359,6 +1366,16 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                 errors.push(Place::upstream(name).problem(problem));
             }
         }
+        if upstream.protocol == UpstreamProtocol::Udp {
+            let stated = [
+                ("tls", upstream.tls.is_some()),
+                ("health_check", upstream.health_check.is_some()),
+                ("proxy_protocol", upstream.proxy_protocol.is_some()),
+            ];
+            for (field, _) in stated.into_iter().filter(|(_, stated)| *stated) {
+                errors.push(Place::upstream(name).problem(Problem::NotForUdp(field)));
+            }
+        }
         if let Some(tls) = &upstream.tls {
             let problem = match tls.well_known_authorities {
                 None if tls.authorities.is_empty() => Some(Problem::NoAuthority),
@@ -1402,13 +1419,35 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         let problem = Problem::ListenersTooMany(config.listeners.len());
         errors.push(Place::of(Object::DataPlane).problem(problem));
     }
-    // Until listeners can share a socket, two on one address cannot both be served.
+    // Until listeners can share a socket, two on one address cannot both be served. A `udp`
+    // listener's sockets are apart from those over TCP, but not from HTTP/3's (24 §2).
+    let http3: BTreeMap<SocketAddr, &str> = config
+        .listeners
+        .iter()
+        .filter(|(_, listener)| listener.protocol == Protocol::Https && listener.http3.is_some())
+        .map(|(name, listener)| (listener.address, name.as_str()))
+        .collect();
     let mut addresses: BTreeMap<SocketAddr, &str> = BTreeMap::new();
+    let mut datagrams: BTreeMap<SocketAddr, &str> = BTreeMap::new();
     for (name, listener) in &config.listeners {
-        if let Some(other) = addresses.insert(listener.address, name) {
+        let taken = if listener.protocol == Protocol::Udp {
+            datagrams.insert(listener.address, name)
+        } else {
+            addresses.insert(listener.address, name)
+        };
+        if let Some(other) = taken {
             let problem = Problem::AddressTaken {
                 address: listener.address,
                 other: other.to_owned(),
+            };
+            errors.push(Place::listener(name).problem(problem));
+        }
+        if listener.protocol == Protocol::Udp
+            && let Some(other) = http3.get(&listener.address)
+        {
+            let problem = Problem::AddressTakenByHttp3 {
+                address: listener.address,
+                other: (*other).to_owned(),
             };
             errors.push(Place::listener(name).problem(problem));
         }
@@ -1419,10 +1458,11 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                 errors.push(Place::listener(name).problem(Problem::NoTls));
             }
             // A passthrough listener presents nothing: the backend terminates TLS.
-            (Protocol::Http | Protocol::Tcp | Protocol::Tls, true) => {
+            (Protocol::Http | Protocol::Tcp | Protocol::Tls | Protocol::Udp, true) => {
                 errors.push(Place::listener(name).problem(Problem::TlsUnwanted));
             }
-            (Protocol::Https, true) | (Protocol::Http | Protocol::Tcp | Protocol::Tls, false) => {}
+            (Protocol::Https, true)
+            | (Protocol::Http | Protocol::Tcp | Protocol::Tls | Protocol::Udp, false) => {}
         }
         if let (Protocol::Https, Some(tls)) = (listener.protocol, &listener.tls) {
             let mut seen = HashSet::new();
@@ -1505,6 +1545,9 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             (Protocol::Http | Protocol::Https, Some(_)) if !passes_some(listener) => {
                 errors.push(Place::listener(name).problem(Problem::TunnelIdleUnwanted));
             }
+            (Protocol::Udp, Some(_)) => {
+                errors.push(Place::listener(name).problem(Problem::TunnelIdleUnwanted));
+            }
             (_, Some(0)) => {
                 errors.push(Place::listener(name).problem(Problem::TunnelIdleZero));
             }
@@ -1515,11 +1558,25 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             }
             _ => {}
         }
+        match (listener.protocol, listener.session_idle_seconds) {
+            (Protocol::Udp, Some(0)) => {
+                errors.push(Place::listener(name).problem(Problem::SessionIdleZero));
+            }
+            (Protocol::Udp, Some(seconds)) => {
+                if let Some(problem) = too_long("session_idle_seconds", seconds) {
+                    errors.push(Place::listener(name).problem(problem));
+                }
+            }
+            (_, Some(_)) => {
+                errors.push(Place::listener(name).problem(Problem::SessionIdleUnwanted));
+            }
+            (_, None) => {}
+        }
         match (listener.protocol, &listener.forwarding) {
             (Protocol::Http | Protocol::Https, None) => {
                 errors.push(Place::listener(name).problem(Problem::NoForwarding));
             }
-            (Protocol::Tcp | Protocol::Tls, Some(_)) => {
+            (Protocol::Tcp | Protocol::Tls | Protocol::Udp, Some(_)) => {
                 errors.push(Place::listener(name).problem(Problem::ForwardingUnwanted));
             }
             (_, Some(forwarding)) => {
@@ -1527,21 +1584,26 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                     errors.push(Place::listener(name).problem(Problem::Forwarding(error)));
                 }
             }
-            (Protocol::Tcp | Protocol::Tls, None) => {}
+            (Protocol::Tcp | Protocol::Tls | Protocol::Udp, None) => {}
         }
         match (listener.protocol, listener.request_id) {
             (Protocol::Http | Protocol::Https, None) => {
                 errors.push(Place::listener(name).problem(Problem::NoRequestId));
             }
-            (Protocol::Tcp | Protocol::Tls, Some(_)) => {
+            (Protocol::Tcp | Protocol::Tls | Protocol::Udp, Some(_)) => {
                 errors.push(Place::listener(name).problem(Problem::RequestIdUnwanted));
             }
             _ => {}
         }
-        match &listener.proxy_protocol {
-            None => errors.push(Place::listener(name).problem(Problem::NoProxyProtocol)),
-            Some(ListenerProxyProtocol::Off) => {}
-            Some(ListenerProxyProtocol::Senders(senders)) => {
+        // A `udp` listener reads no PROXY protocol header (24 §1).
+        match (listener.protocol, &listener.proxy_protocol) {
+            (Protocol::Udp, None) => {}
+            (Protocol::Udp, Some(_)) => {
+                errors.push(Place::listener(name).problem(Problem::ProxyProtocolUnwanted));
+            }
+            (_, None) => errors.push(Place::listener(name).problem(Problem::NoProxyProtocol)),
+            (_, Some(ListenerProxyProtocol::Off)) => {}
+            (_, Some(ListenerProxyProtocol::Senders(senders))) => {
                 if senders.is_empty() {
                     errors.push(Place::listener(name).problem(Problem::NoSenders));
                 } else if let Err(error) = senders_of(senders) {
@@ -1606,7 +1668,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         }
         for listener in &listeners {
             let protocol = config.listeners.get(*listener).map(|l| l.protocol);
-            if let Some(protocol @ (Protocol::Tcp | Protocol::Tls)) = protocol {
+            if let Some(protocol @ (Protocol::Tcp | Protocol::Tls | Protocol::Udp)) = protocol {
                 errors.push(place.problem(Problem::WrongListener {
                     kind: "HTTP",
                     listener: (*listener).to_owned(),
@@ -1682,7 +1744,8 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
     }
 
     let (mut l4, sni) = l4_routes(config, &upstream_ids, &mut names, &mut errors);
-    proxy_protocol_upstreams(config, &mut errors);
+    let mut udp = udp_routes(config, &upstream_ids, &mut names, &mut errors);
+    http_route_upstreams(config, &mut errors);
     tls_route_probes(config, &mut errors);
 
     if errors.is_empty() {
@@ -1731,8 +1794,14 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                     router: Router::with_claims(own.into_iter().map(by_rule), claimed),
                     http_routes: http_routes.remove(name.as_str()).unwrap_or_default(),
                     l4: l4.remove(name.as_str()),
+                    udp: udp.remove(name.as_str()),
                     tunnel_idle: Duration::from_secs(
                         listener.tunnel_idle_seconds.unwrap_or(TUNNEL_IDLE_SECONDS),
+                    ),
+                    session_idle: Duration::from_secs(
+                        listener
+                            .session_idle_seconds
+                            .unwrap_or(SESSION_IDLE_SECONDS),
                     ),
                     // Found to compile above, or there would have been an error.
                     forwarding: listener
@@ -1821,15 +1890,20 @@ fn senders_of(senders: &[String]) -> Result<TrustedProxies, ForwardingError> {
     TrustedProxies::new(senders.iter().map(String::as_str))
 }
 
-/// Refuses an upstream that sends a PROXY header as an HTTP route's backend or mirror: its
-/// backends expect a header first on every connection, and a connection to an HTTP upstream
-/// carries many clients' requests, on which the spec forbids one (20 §2).
-fn proxy_protocol_upstreams(config: &Config, errors: &mut Vec<ConfigError>) {
-    let sends = |upstream: &str| {
-        config
-            .upstreams
-            .get(upstream)
-            .is_some_and(|upstream| upstream.proxy_protocol.is_some())
+/// Refuses as an HTTP route's backend or mirror an upstream spoken to over UDP, which takes
+/// datagrams (24 §2), and one that sends a PROXY header: its backends expect a header first
+/// on every connection, and a connection to an HTTP upstream carries many clients'
+/// requests, on which the spec forbids one (20 §2).
+fn http_route_upstreams(config: &Config, errors: &mut Vec<ConfigError>) {
+    let refused = |name: &str| {
+        let upstream = config.upstreams.get(name)?;
+        if upstream.protocol == UpstreamProtocol::Udp {
+            Some(Problem::UdpUpstream(name.to_owned()))
+        } else if upstream.proxy_protocol.is_some() {
+            Some(Problem::ProxyProtocolToHttp(name.to_owned()))
+        } else {
+            None
+        }
     };
     for route in &config.routes {
         for (rule_at, rule) in route.rules.iter().enumerate() {
@@ -1839,26 +1913,22 @@ fn proxy_protocol_upstreams(config: &Config, errors: &mut Vec<ConfigError>) {
             };
             let backends = rule.forward.iter().flat_map(|forward| &forward.backends);
             for (at, backend) in backends.enumerate() {
-                if let Some(upstream) = &backend.upstream
-                    && sends(upstream)
-                {
+                if let Some(problem) = backend.upstream.as_deref().and_then(refused) {
                     let place = Place {
                         backend: Some(at),
                         ..place.clone()
                     };
-                    let problem = Problem::ProxyProtocolToHttp(upstream.clone());
                     errors.push(place.problem(problem));
                 }
             }
             for (at, filter) in rule.filters.iter().enumerate() {
                 if let Filter::RequestMirror(mirror) = filter
-                    && sends(&mirror.upstream)
+                    && let Some(problem) = refused(&mirror.upstream)
                 {
                     let place = Place {
                         filter: Some(at),
                         ..place.clone()
                     };
-                    let problem = Problem::ProxyProtocolToHttp(mirror.upstream.clone());
                     errors.push(place.problem(problem));
                 }
             }
@@ -1918,6 +1988,9 @@ pub(crate) const MOST_BACKENDS: usize = 16;
 /// A tunnel's idle bound unless its listener's config says otherwise: an hour.
 const TUNNEL_IDLE_SECONDS: u64 = 3_600;
 
+/// A UDP session's idle bound unless its listener's config says otherwise: a minute.
+const SESSION_IDLE_SECONDS: u64 = 60;
+
 /// How a protocol is written in a config.
 fn protocol_name(protocol: Protocol) -> &'static str {
     match protocol {
@@ -1925,6 +1998,7 @@ fn protocol_name(protocol: Protocol) -> &'static str {
         Protocol::Https => "https",
         Protocol::Tcp => "tcp",
         Protocol::Tls => "tls",
+        Protocol::Udp => "udp",
     }
 }
 
@@ -1948,7 +2022,14 @@ fn l4_routes<'a>(
         let listeners = l4_listeners(config, &route.listeners, Protocol::Tcp, &place, errors);
         let compiled = L4Route {
             name: route.name.clone(),
-            backends: l4_backends(config, &route.backends, upstream_ids, &place, errors),
+            backends: l4_backends(
+                config,
+                &route.backends,
+                Protocol::Tcp,
+                upstream_ids,
+                &place,
+                errors,
+            ),
         };
         for listener in listeners {
             tcp.entry(listener).or_default().push(compiled.clone());
@@ -1977,7 +2058,14 @@ fn l4_routes<'a>(
             .collect();
         let compiled = L4Route {
             name: route.name.clone(),
-            backends: l4_backends(config, &route.backends, upstream_ids, &place, errors),
+            backends: l4_backends(
+                config,
+                &route.backends,
+                Protocol::Tls,
+                upstream_ids,
+                &place,
+                errors,
+            ),
         };
         for listener in listeners {
             let (routes, hosts) = tls.entry(listener).or_default();
@@ -2021,10 +2109,52 @@ fn l4_routes<'a>(
                 let hosts = HostIndex::new(hosts, |members: Vec<usize>| members);
                 compiled.insert(name.as_str(), L4::Tls(SniRouter { routes, hosts }));
             }
-            Protocol::Tls | Protocol::Http | Protocol::Https => {}
+            Protocol::Tls | Protocol::Http | Protocol::Https | Protocol::Udp => {}
         }
     }
     (compiled, sni)
+}
+
+/// The UDP routes, compiled, by the `udp` listener they are for; every problem with them,
+/// and with the upstreams they reach, into `errors`. A `udp` listener has at most one; one
+/// with none drops every datagram (24 §4).
+fn udp_routes<'a>(
+    config: &'a Config,
+    upstream_ids: &BTreeMap<&str, UpstreamId>,
+    names: &mut HashSet<&'a str>,
+    errors: &mut Vec<ConfigError>,
+) -> BTreeMap<&'a str, L4Route> {
+    let mut udp: BTreeMap<&str, Vec<L4Route>> = BTreeMap::new();
+    for route in &config.udp_routes {
+        let place = Place::route(&route.name);
+        if !names.insert(route.name.as_str()) {
+            errors.push(place.problem(Problem::DuplicateName));
+        }
+        let listeners = l4_listeners(config, &route.listeners, Protocol::Udp, &place, errors);
+        let compiled = L4Route {
+            name: route.name.clone(),
+            backends: l4_backends(
+                config,
+                &route.backends,
+                Protocol::Udp,
+                upstream_ids,
+                &place,
+                errors,
+            ),
+        };
+        for listener in listeners {
+            udp.entry(listener).or_default().push(compiled.clone());
+        }
+    }
+    let mut compiled = BTreeMap::new();
+    for (name, mut routes) in udp {
+        if routes.len() > 1 {
+            errors.push(Place::listener(name).problem(Problem::UdpRoutes(routes.len())));
+        } else if let Some(route) = routes.pop() {
+            compiled.insert(name, route);
+        }
+    }
+    compiled
 }
 
 /// The listeners a passthrough route is for, each once, as far as they exist and are of
@@ -2056,7 +2186,11 @@ fn l4_listeners<'a>(
             }
             Some(listener) if listener.protocol != kind => {
                 errors.push(place.problem(Problem::WrongListener {
-                    kind: if kind == Protocol::Tcp { "TCP" } else { "TLS" },
+                    kind: match kind {
+                        Protocol::Tcp => "TCP",
+                        Protocol::Udp => "UDP",
+                        Protocol::Tls | Protocol::Http | Protocol::Https => "TLS",
+                    },
                     listener: name.clone(),
                     protocol: protocol_name(listener.protocol),
                 }));
@@ -2067,11 +2201,14 @@ fn l4_listeners<'a>(
     listeners
 }
 
-/// A passthrough route's backends: 1 to 16, of upstreams that take plain bytes, or invalid,
-/// refusing their share of connections by closing them, as TLSRoute has it (17 §4).
+/// The backends of a route of `kind`, `tcp`, `tls` or `udp`: 1 to 16, of upstreams that take
+/// plain bytes, or for a UDP route datagrams, as they come; or invalid, refusing their share
+/// of connections by closing them, as TLSRoute has it (17 §4), or of sessions by dropping
+/// their datagrams (24 §4).
 fn l4_backends(
     config: &Config,
     backends: &[Backend],
+    kind: Protocol,
     upstream_ids: &BTreeMap<&str, UpstreamId>,
     place: &Place,
     errors: &mut Vec<ConfigError>,
@@ -2106,11 +2243,20 @@ fn l4_backends(
             errors.push(place.problem(Problem::UnknownUpstream(name.to_owned())));
             continue;
         };
-        let speaks_more = config.upstreams.get(name).is_some_and(|upstream| {
-            upstream.protocol != UpstreamProtocol::Http1 || upstream.tls.is_some()
-        });
-        if speaks_more {
-            errors.push(place.problem(Problem::PassthroughUpstream(name.to_owned())));
+        if let Some(upstream) = config.upstreams.get(name) {
+            let udp = upstream.protocol == UpstreamProtocol::Udp;
+            let problem = match kind {
+                Protocol::Udp if !udp => Some(Problem::NotUdpUpstream(name.to_owned())),
+                Protocol::Udp => None,
+                _ if udp => Some(Problem::UdpUpstream(name.to_owned())),
+                _ if upstream.protocol != UpstreamProtocol::Http1 || upstream.tls.is_some() => {
+                    Some(Problem::PassthroughUpstream(name.to_owned()))
+                }
+                _ => None,
+            };
+            if let Some(problem) = problem {
+                errors.push(place.problem(problem));
+            }
         }
         resolved.push((Ok(id), backend.weight));
     }
@@ -2805,6 +2951,15 @@ pub enum Problem {
         /// The listener that has it.
         other: String,
     },
+    /// A `udp` listener on the address of an `https` listener's HTTP/3, whose UDP socket
+    /// that is.
+    #[error("address {address} is already taken over UDP by listener `{other}`'s HTTP/3")]
+    AddressTakenByHttp3 {
+        /// The address both want.
+        address: SocketAddr,
+        /// The `https` listener whose HTTP/3 has it.
+        other: String,
+    },
     /// An `https` listener without `tls`.
     #[error("protocol `https` needs `tls`")]
     NoTls,
@@ -2854,6 +3009,12 @@ pub enum Problem {
     /// A tunnel that could never carry anything.
     #[error("`tunnel_idle_seconds` must be at least 1")]
     TunnelIdleZero,
+    /// A session's idle bound on a listener that has no sessions.
+    #[error("`session_idle_seconds` is for protocol `udp`")]
+    SessionIdleUnwanted,
+    /// A session that would end before it carried anything back.
+    #[error("`session_idle_seconds` must be at least 1")]
+    SessionIdleZero,
     /// A bound in seconds too long to be kept.
     #[error("`{field}` is {seconds}: at most 359996400, 99,999 hours")]
     TooLong {
@@ -2872,8 +3033,11 @@ pub enum Problem {
     #[error("`forwarding`: {0}")]
     Forwarding(ForwardingError),
     /// A listener that does not say whether it reads a PROXY protocol header.
-    #[error("every listener needs `proxy_protocol`: `off`, or `{{ senders: [...] }}`")]
+    #[error("every listener over TCP needs `proxy_protocol`: `off`, or `{{ senders: [...] }}`")]
     NoProxyProtocol,
+    /// PROXY protocol on a `udp` listener, which reads none.
+    #[error("`proxy_protocol` is for listeners over TCP; a `udp` listener reads none")]
+    ProxyProtocolUnwanted,
     /// PROXY protocol senders of which there are none, which would believe nobody.
     #[error("`proxy_protocol.senders` is empty: at least one range, or `off`")]
     NoSenders,
@@ -2889,6 +3053,18 @@ pub enum Problem {
         "upstream `{0}` is reached by a TLS route, whose backends speak TLS: an HTTP probe in the clear can never pass"
     )]
     HttpProbeBehindTls(String),
+    /// What an upstream spoken to over UDP cannot have: TLS, a probe, a PROXY protocol
+    /// header (24 §1).
+    #[error("`{0}` is not for protocol `udp`, whose datagrams are sent as they come")]
+    NotForUdp(&'static str),
+    /// A UDP route's backend that is not spoken to over UDP.
+    #[error(
+        "upstream `{0}` is not spoken to over UDP (`protocol: udp`), which a UDP route's backends are"
+    )]
+    NotUdpUpstream(String),
+    /// An upstream spoken to over UDP as the backend or mirror of a route that is not UDP's.
+    #[error("upstream `{0}` is spoken to over UDP, which only a UDP route's backends are")]
+    UdpUpstream(String),
     /// An HTTP listener that does not say what it does with `X-Request-ID`.
     #[error("protocols `http` and `https` need `request_id`")]
     NoRequestId,
@@ -2916,8 +3092,11 @@ pub enum Problem {
     /// A `tcp` listener without exactly one TCP route.
     #[error("a `tcp` listener needs exactly one TCP route; it has {0}")]
     TcpRoutes(usize),
-    /// More backends than a passthrough route may have.
-    #[error("a TCP or TLS route has at most 16 backends")]
+    /// A `udp` listener with more than one UDP route.
+    #[error("a `udp` listener has at most one UDP route; it has {0}")]
+    UdpRoutes(usize),
+    /// More backends than a TCP, TLS or UDP route may have.
+    #[error("a TCP, TLS or UDP route has at most 16 backends")]
     TooManyBackends,
     /// A passthrough route to an upstream spoken to in HTTP/2 or over TLS, which it cannot
     /// be: a passthrough route carries bytes as they come.
@@ -5241,7 +5420,7 @@ upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
                     tcp_route("a", "t", &seventeen)
                 )
             ),
-            ["route `a`: a TCP or TLS route has at most 16 backends"]
+            ["route `a`: a TCP, TLS or UDP route has at most 16 backends"]
         );
         assert_eq!(
             refused(
@@ -5291,6 +5470,368 @@ upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
                 &format!("routes: []\ntcp_routes: [{}]", tcp_route("a", "t", up))
             ),
             ["listener `t`: `tunnel_idle_seconds` must be at least 1"]
+        );
+    }
+
+    /// The listeners and upstreams of the UDP tests, beside what each test adds.
+    const UDP_UPSTREAMS: &str = "upstreams: { dns: { load_balancer: p2c, endpoints: { listed: [] }, protocol: udp }, plain: { load_balancer: p2c, endpoints: { listed: [] } }, h2: { load_balancer: p2c, endpoints: { listed: [] }, protocol: http2 } }";
+
+    /// What compiling `listeners` and `routes`, over [`UDP_UPSTREAMS`], refuses.
+    fn udp_refused(listeners: &str, routes: &str) -> Vec<String> {
+        let yaml = format!("listeners: {{ {listeners} }}\n{routes}\n{UDP_UPSTREAMS}\n");
+        compile(&config(&yaml))
+            .err()
+            .unwrap_or_default()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// A `udp` listener's sessions all go to its one route, and end after a minute idle
+    /// unless it says otherwise; one no route serves keeps its port and has no route; no
+    /// listener of another kind has a UDP route, and none of a `udp` listener's is carried
+    /// as a TCP connection.
+    #[test]
+    fn a_udp_listener_takes_its_one_route_and_its_idle_bound() {
+        let compiled = compile(&config(&format!(
+            r#"
+listeners:
+  dns: {{ address: "[::]:53", protocol: udp }}
+  syslog: {{ address: "[::]:514", protocol: udp, session_idle_seconds: 300 }}
+  quiet: {{ address: "[::]:9", protocol: udp }}
+  db: {{ address: "[::]:5432", protocol: tcp, proxy_protocol: off }}
+routes: []
+tcp_routes: [{{ name: db, listeners: [db], backends: [{{ upstream: plain, weight: 1 }}] }}]
+udp_routes:
+  - {{ name: dns, listeners: [dns, syslog], backends: [{{ upstream: dns, weight: 3 }}, {{ invalid: gone, weight: 1 }}] }}
+{UDP_UPSTREAMS}
+"#
+        )))
+        .unwrap();
+        let dns = listener(&compiled, "dns");
+        assert_eq!(dns.protocol, Protocol::Udp);
+        let route = dns.udp.as_ref().unwrap();
+        assert_eq!(route.name, "dns");
+        assert_eq!(route.backends.upstreams().count(), 1);
+        assert_eq!(route.backends.reason(0), Some("gone"));
+        assert_eq!(dns.session_idle, Duration::from_secs(60));
+        assert!(dns.l4.is_none());
+        assert!(dns.http_routes.is_empty());
+        assert!(!dns.carries(None));
+        assert!(!dns.sorts_by_hello());
+        let syslog = listener(&compiled, "syslog");
+        assert_eq!(syslog.udp.as_ref().unwrap().name, "dns");
+        assert_eq!(syslog.session_idle, Duration::from_secs(300));
+        assert!(listener(&compiled, "quiet").udp.is_none());
+        assert!(listener(&compiled, "db").udp.is_none());
+    }
+
+    /// A `udp` listener's sockets are apart from those over TCP, so it may have the address
+    /// of an `http`, `https`, `tcp` or `tls` listener; never that of another `udp` listener,
+    /// nor that of an `https` listener's HTTP/3, whose UDP socket it is.
+    #[test]
+    fn a_udp_listener_shares_an_address_only_with_listeners_over_tcp() {
+        let http = r#"web: { address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#;
+        let https = |http3: &str| {
+            format!(
+                r#"secure: {{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [], without_sni: none }}{http3} }}"#
+            )
+        };
+        let tcp = r#"db: { address: "[::]:53", protocol: tcp, proxy_protocol: off }"#;
+        let tls = r#"sni: { address: "[::]:853", protocol: tls, proxy_protocol: off }"#;
+        let udp = |name: &str, port: u16| {
+            format!(r#"{name}: {{ address: "[::]:{port}", protocol: udp }}"#)
+        };
+        let tcp_route = "tcp_routes: [{ name: db, listeners: [db], backends: [{ upstream: plain, weight: 1 }] }]";
+        let beside = [
+            http.to_owned(),
+            https(""),
+            tcp.to_owned(),
+            tls.to_owned(),
+            udp("u80", 80),
+            udp("u443", 443),
+            udp("u53", 53),
+            udp("u853", 853),
+        ]
+        .join(", ");
+        assert_eq!(
+            udp_refused(&beside, &format!("routes: []\n{tcp_route}")),
+            Vec::<String>::new()
+        );
+        // HTTP/3 on another port leaves the UDP listener its own.
+        let elsewhere = [https(", http3: {}"), udp("u8443", 8443)].join(", ");
+        assert_eq!(udp_refused(&elsewhere, "routes: []"), Vec::<String>::new());
+        assert_eq!(
+            udp_refused(&[udp("a", 53), udp("b", 53)].join(", "), "routes: []"),
+            ["listener `b`: address [::]:53 is already taken by listener `a`"]
+        );
+        // Whichever comes first by name.
+        for name in ["a", "z"] {
+            assert_eq!(
+                udp_refused(
+                    &[https(", http3: {}"), udp(name, 443)].join(", "),
+                    "routes: []"
+                ),
+                [format!(
+                    "listener `{name}`: address [::]:443 is already taken over UDP by listener `secure`'s HTTP/3"
+                )]
+            );
+        }
+    }
+
+    /// A `udp` listener takes no TLS, HTTP/3, tunnel bound, forwarding, request ID or PROXY
+    /// protocol, which are for listeners over TCP; its session bound is at least a second,
+    /// and no other listener has one. It may keep an access log.
+    #[test]
+    fn a_udp_listener_takes_only_what_applies_to_datagrams() {
+        let udp = |extra: &str| format!(r#"u: {{ address: "[::]:53", protocol: udp{extra} }}"#);
+        let alone = |extra: &str| udp_refused(&udp(extra), "routes: []");
+        assert_eq!(alone(", access_log: stdout"), Vec::<String>::new());
+        for (extra, refused) in [
+            (
+                ", tls: { certificates: [], without_sni: none }",
+                "`tls` is for protocol `https`",
+            ),
+            (", http3: {}", "`http3` is for protocol `https`"),
+            (
+                ", tunnel_idle_seconds: 60",
+                "`tunnel_idle_seconds` is for protocols `tcp` and `tls`, and for an `https` listener that passes connections through",
+            ),
+            (
+                ", forwarding: { trusted_proxies: [], trusted_only_headers: [] }",
+                "`forwarding` is for protocols `http` and `https`",
+            ),
+            (
+                ", request_id: generate",
+                "`request_id` is for protocols `http` and `https`",
+            ),
+            (
+                ", proxy_protocol: off",
+                "`proxy_protocol` is for listeners over TCP; a `udp` listener reads none",
+            ),
+            (
+                ", proxy_protocol: { senders: [10.0.0.0/8] }",
+                "`proxy_protocol` is for listeners over TCP; a `udp` listener reads none",
+            ),
+            (
+                ", session_idle_seconds: 0",
+                "`session_idle_seconds` must be at least 1",
+            ),
+        ] {
+            assert_eq!(
+                alone(extra),
+                [format!("listener `u`: {refused}")],
+                "{extra}"
+            );
+        }
+        assert_eq!(alone(", session_idle_seconds: 1"), Vec::<String>::new());
+        let http = r#"web: { address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, session_idle_seconds: 60 }"#;
+        let tcp = r#"db: { address: "[::]:5432", protocol: tcp, proxy_protocol: off, session_idle_seconds: 60 }"#;
+        assert_eq!(
+            udp_refused(
+                &format!("{http}, {tcp}"),
+                "routes: []\ntcp_routes: [{ name: db, listeners: [db], backends: [{ upstream: plain, weight: 1 }] }]"
+            ),
+            [
+                "listener `db`: `session_idle_seconds` is for protocol `udp`",
+                "listener `web`: `session_idle_seconds` is for protocol `udp`",
+            ]
+        );
+        // Still a listener over TCP that leaves it out is refused.
+        assert_eq!(
+            udp_refused(
+                r#"db: { address: "[::]:5432", protocol: tcp }"#,
+                "routes: []\ntcp_routes: [{ name: db, listeners: [db], backends: [{ upstream: plain, weight: 1 }] }]"
+            ),
+            [
+                "listener `db`: every listener over TCP needs `proxy_protocol`: `off`, or `{ senders: [...] }`"
+            ]
+        );
+    }
+
+    /// A UDP route goes only to `udp` listeners, at most one to each, and no other kind of
+    /// route goes to one; it has 1 to 16 backends, each an upstream spoken to over UDP. Its
+    /// name is no other route's.
+    #[test]
+    fn udp_routes_are_held_to_their_listeners_and_backends() {
+        let udp = r#"u: { address: "[::]:53", protocol: udp }"#;
+        let tcp = r#"t: { address: "[::]:1", protocol: tcp, proxy_protocol: off }"#;
+        let tls = r#"s: { address: "[::]:2", protocol: tls, proxy_protocol: off }"#;
+        let http = r#"h: { address: "[::]:3", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#;
+        let route = |name: &str, listeners: &str, backends: &str| {
+            format!("{{ name: {name}, listeners: [{listeners}], backends: [{backends}] }}")
+        };
+        let dns = "{ upstream: dns, weight: 1 }";
+        let plain = "{ upstream: plain, weight: 1 }";
+        let udp_routes =
+            |routes: &[String]| format!("routes: []\nudp_routes: [{}]", routes.join(", "));
+        let refused =
+            |listeners: &str, routes: &[String]| udp_refused(listeners, &udp_routes(routes));
+
+        assert_eq!(
+            refused(udp, &[route("a", "u", dns), route("b", "u", dns)]),
+            ["listener `u`: a `udp` listener has at most one UDP route; it has 2"]
+        );
+        assert_eq!(
+            refused(&format!("{udp}, {tcp}"), &[route("a", "u, t", dns)]),
+            [
+                "listener `t`: a `tcp` listener needs exactly one TCP route; it has 0",
+                "route `a`: a UDP route cannot be for listener `t`, which is `tcp`",
+            ]
+        );
+        assert_eq!(
+            refused(&format!("{udp}, {http}"), &[route("a", "h", dns)]),
+            ["route `a`: a UDP route cannot be for listener `h`, which is `http`"]
+        );
+        assert_eq!(
+            refused(udp, &[route("a", "", dns)]),
+            ["route `a`: no listeners"]
+        );
+        assert_eq!(
+            refused(udp, &[route("a", "v", dns)]),
+            ["route `a`: there is no listener `v`"]
+        );
+        assert_eq!(
+            refused(udp, &[route("a", "u, u", dns)]),
+            ["route `a`: listener `u` is listed twice"]
+        );
+        assert_eq!(
+            refused(udp, &[route("a", "u", "")]),
+            ["route `a`: no backends"]
+        );
+        assert_eq!(
+            refused(udp, &[route("a", "u", &vec![dns; 17].join(", "))]),
+            ["route `a`: a TCP, TLS or UDP route has at most 16 backends"]
+        );
+        assert_eq!(
+            refused(udp, &[route("a", "u", "{ upstream: nowhere, weight: 1 }")]),
+            ["route `a`, backends[0]: there is no upstream `nowhere`"]
+        );
+        assert_eq!(
+            refused(
+                udp,
+                &[route(
+                    "a",
+                    "u",
+                    "{ upstream: dns, weight: 1 }, { upstream: plain, weight: 1 }, { upstream: h2, weight: 1 }"
+                )]
+            ),
+            [
+                "route `a`, backends[1]: upstream `plain` is not spoken to over UDP (`protocol: udp`), which a UDP route's backends are",
+                "route `a`, backends[2]: upstream `h2` is not spoken to over UDP (`protocol: udp`), which a UDP route's backends are",
+            ]
+        );
+        // No other kind of route is for a `udp` listener.
+        assert_eq!(
+            udp_refused(
+                udp,
+                &format!("routes: []\ntcp_routes: [{}]", route("a", "u", plain))
+            ),
+            ["route `a`: a TCP route cannot be for listener `u`, which is `udp`"]
+        );
+        assert_eq!(
+            udp_refused(
+                udp,
+                "routes: []\ntls_routes: [{ name: a, listeners: [u], hostnames: [{ name: a.test, falls_through: true }], backends: [{ upstream: plain, weight: 1 }] }]"
+            ),
+            ["route `a`: a TLS route cannot be for listener `u`, which is `udp`"]
+        );
+        assert_eq!(
+            udp_refused(
+                udp,
+                "routes:\n  - { name: web, listeners: [u], hostnames: [{ name: \"*\", falls_through: true }], rules: [{ matches: [{ path: { prefix: / } }], forward: { backends: [{ upstream: plain, weight: 1 }] } }] }"
+            ),
+            ["route `web`: a HTTP route cannot be for listener `u`, which is `udp`"]
+        );
+        // One name among every kind of route.
+        assert_eq!(
+            udp_refused(
+                &format!("{udp}, {tls}"),
+                &format!(
+                    "routes: []\ntls_routes: [{{ name: a, listeners: [s], hostnames: [{{ name: a.test, falls_through: true }}], backends: [{plain}] }}]\nudp_routes: [{}]",
+                    route("a", "u", dns)
+                )
+            ),
+            ["route `a`: another route has the same name"]
+        );
+    }
+
+    /// An upstream spoken to over UDP takes datagrams as they come: no TLS, probe or PROXY
+    /// protocol header, nor HTTP/2's keepalive; and it is a UDP route's backend alone,
+    /// never an HTTP route's backend or mirror, nor a TCP or TLS route's.
+    #[test]
+    fn an_upstream_spoken_to_over_udp_is_a_udp_routes_alone() {
+        let refused = |extra: &str| {
+            let yaml = format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{ dns: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, protocol: udp{extra} }} }}\n"
+            );
+            compile(&config(&yaml))
+                .err()
+                .unwrap_or_default()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            refused(", slow_start: { window_ms: 1000 }"),
+            Vec::<String>::new()
+        );
+        for (extra, refused_as) in [
+            (
+                ", tls: { server_name: dns.test, authorities: [CA] }",
+                "`tls` is not for protocol `udp`, whose datagrams are sent as they come",
+            ),
+            (
+                ", health_check: { interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 1, unhealthy_threshold: 1, probe: tcp }",
+                "`health_check` is not for protocol `udp`, whose datagrams are sent as they come",
+            ),
+            (
+                ", proxy_protocol: v2",
+                "`proxy_protocol` is not for protocol `udp`, whose datagrams are sent as they come",
+            ),
+            (
+                ", keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false }",
+                "`keepalive` is for an upstream spoken to in HTTP/2",
+            ),
+        ] {
+            assert_eq!(
+                refused(extra),
+                [format!("upstream `dns`: {refused_as}")],
+                "{extra}"
+            );
+        }
+
+        let http = r#"h: { address: "[::]:3", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#;
+        let tcp = r#"t: { address: "[::]:1", protocol: tcp, proxy_protocol: off }"#;
+        let tls = r#"s: { address: "[::]:2", protocol: tls, proxy_protocol: off }"#;
+        let over_udp = "is spoken to over UDP, which only a UDP route's backends are";
+        assert_eq!(
+            udp_refused(
+                http,
+                "routes:\n  - { name: web, listeners: [h], hostnames: [{ name: \"*\", falls_through: true }], rules: [{ matches: [{ path: { prefix: / } }], filters: [{ type: request_mirror, upstream: dns, fraction: { numerator: 1, denominator: 1 } }], forward: { backends: [{ upstream: plain, weight: 1 }, { upstream: dns, weight: 1 }] } }] }"
+            ),
+            [
+                format!("route `web`, rules[0], forward.backends[1]: upstream `dns` {over_udp}"),
+                format!("route `web`, rules[0], filters[0]: upstream `dns` {over_udp}"),
+            ]
+        );
+        assert_eq!(
+            udp_refused(
+                tcp,
+                "routes: []\ntcp_routes: [{ name: db, listeners: [t], backends: [{ upstream: dns, weight: 1 }] }]"
+            ),
+            [format!(
+                "route `db`, backends[0]: upstream `dns` {over_udp}"
+            )]
+        );
+        assert_eq!(
+            udp_refused(
+                tls,
+                "routes: []\ntls_routes: [{ name: api, listeners: [s], hostnames: [{ name: a.test, falls_through: true }], backends: [{ upstream: dns, weight: 1 }] }]"
+            ),
+            [format!(
+                "route `api`, backends[0]: upstream `dns` {over_udp}"
+            )]
         );
     }
 
@@ -5389,7 +5930,9 @@ upstreams: {}
         };
         assert_eq!(
             refused(HTTP),
-            ["listener `l`: every listener needs `proxy_protocol`: `off`, or `{ senders: [...] }`"]
+            [
+                "listener `l`: every listener over TCP needs `proxy_protocol`: `off`, or `{ senders: [...] }`"
+            ]
         );
         assert_eq!(
             refused(&format!("{HTTP}, proxy_protocol: {{ senders: [] }}")),
@@ -5953,6 +6496,11 @@ routes:
                 "listeners: {{ db: {{ address: \"[::]:5432\", protocol: tcp, proxy_protocol: off, tunnel_idle_seconds: {seconds} }} }}\nroutes: []\ntcp_routes: [{{ name: pg, listeners: [db], backends: [{{ upstream: u, weight: 1 }}] }}]\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}\n"
             )
         };
+        let session = |seconds: u64| {
+            format!(
+                "listeners: {{ dns: {{ address: \"[::]:53\", protocol: udp, session_idle_seconds: {seconds} }} }}\nroutes: []\nupstreams: {{}}\n"
+            )
+        };
         let health = |interval: u64, timeout: u64| {
             format!(
                 "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, health_check: {{ interval_seconds: {interval}, timeout_seconds: {timeout}, healthy_threshold: 1, unhealthy_threshold: 1, probe: tcp }} }} }}\n"
@@ -5968,12 +6516,19 @@ routes:
                 .err()
                 .map(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
-        for yaml in [tunnel(most), health(most, most), keepalive(most, most)] {
+        for yaml in [
+            tunnel(most),
+            session(most),
+            health(most, most),
+            keepalive(most, most),
+        ] {
             assert_eq!(refused(&yaml), None, "{yaml}");
         }
         for (yaml, field) in [
             (tunnel(most + 1), "tunnel_idle_seconds"),
             (tunnel(u64::MAX), "tunnel_idle_seconds"),
+            (session(most + 1), "session_idle_seconds"),
+            (session(u64::MAX), "session_idle_seconds"),
             (health(most + 1, 1), "health_check.interval_seconds"),
             (health(u64::MAX, 1), "health_check.interval_seconds"),
             (health(most, most + 1), "health_check.timeout_seconds"),

@@ -897,6 +897,7 @@ fn name_of(protocol: Protocol) -> &'static str {
         Protocol::Https => "https",
         Protocol::Tcp => "tcp",
         Protocol::Tls => "tls",
+        Protocol::Udp => "udp",
     }
 }
 

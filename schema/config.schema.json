@@ -71,6 +71,14 @@
         "$ref": "#/$defs/TlsRoute"
       }
     },
+    "udp_routes": {
+      "description": "The routes of `udp` listeners: at most one for each.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/UdpRoute"
+      }
+    },
     "upstreams": {
       "description": "The upstreams that backends and mirrors name, by name.",
       "type": "object",
@@ -689,7 +697,7 @@
       "type": "object",
       "properties": {
         "access_log": {
-          "description": "Where a record of each of its requests, or each of its connections for a `tcp` or\n`tls` listener, is written. Left out, nothing is logged.",
+          "description": "Where a record of each of its requests, or each of its connections for a `tcp` or\n`tls` listener and each of its sessions for a `udp` one, is written. Left out, nothing is logged.",
           "anyOf": [
             {
               "$ref": "#/$defs/AccessLog"
@@ -701,7 +709,7 @@
           "default": null
         },
         "address": {
-          "description": "The address to listen on; `[::]:8080` is every address, IPv4 included. No two\nlisteners have the same one.",
+          "description": "The address to listen on; `[::]:8080` is every address, IPv4 included. No two\nlisteners have the same one, but for a `udp` listener beside one over TCP: their\nsockets are apart.",
           "type": "string"
         },
         "forwarding": {
@@ -733,7 +741,7 @@
           "$ref": "#/$defs/Protocol"
         },
         "proxy_protocol": {
-          "description": "Whether every connection starts with a PROXY protocol header, and whose to believe. Every listener states it, `off` included: it decides who a\nconnection is taken to come from.",
+          "description": "Whether every connection starts with a PROXY protocol header, and whose to believe. Every listener over TCP states it, `off` included: it decides who a\nconnection is taken to come from. A `udp` listener reads none, and states none.",
           "anyOf": [
             {
               "$ref": "#/$defs/ListenerProxyProtocol"
@@ -755,6 +763,17 @@
             }
           ],
           "default": null
+        },
+        "session_idle_seconds": {
+          "description": "How long, in seconds, a `udp` listener's session may carry nothing either way before\nit is ended: 60 unless said otherwise, as Envoy's UDP proxy has it.\nUDP has no close, so this is how every session ends that is not refused or drained.\nFor those listeners only.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "maximum": 359996400,
+          "minimum": 1
         },
         "tls": {
           "description": "What an `https` listener presents, which it must have; no other may.",
@@ -1054,6 +1073,11 @@
           "description": "TLS read as far as its ClientHello and no further, to the TLS route whose\nhostnames cover the name the client asks for (SNI).",
           "type": "string",
           "const": "tls"
+        },
+        {
+          "description": "Datagrams, as they come, to the listener's one UDP route, a session for each\nclient.",
+          "type": "string",
+          "const": "udp"
         }
       ]
     },
@@ -1851,6 +1875,39 @@
         "backends"
       ]
     },
+    "UdpRoute": {
+      "description": "A route for a `udp` listener: every session it takes goes to one of these backends, as\nGateway API's UDPRoute has it.",
+      "type": "object",
+      "properties": {
+        "backends": {
+          "description": "Where sessions go, in proportion to the weights: each session's datagrams all to\none.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Backend"
+          },
+          "maxItems": 16,
+          "minItems": 1
+        },
+        "listeners": {
+          "description": "The names of the `udp` listeners it is for.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "name": {
+          "description": "Unique among every kind of route.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "listeners",
+        "backends"
+      ]
+    },
     "Upstream": {
       "description": "A set of endpoints that serve the same thing.",
       "type": "object",
@@ -1888,12 +1945,12 @@
           "$ref": "#/$defs/LoadBalancer"
         },
         "protocol": {
-          "description": "What its endpoints are spoken to in, whatever the client spoke. An upstream of TCP\nand TLS routes is sent their bytes as they come: neither `http2` nor `tls`.",
+          "description": "What its endpoints are spoken to in, whatever the client spoke. An upstream of TCP\nand TLS routes is sent their bytes as they come: neither `http2` nor `tls`. One of\nUDP routes is `udp`, and no other route's.",
           "$ref": "#/$defs/UpstreamProtocol",
           "default": "http1"
         },
         "proxy_protocol": {
-          "description": "A PROXY protocol header ahead of each tunnel's bytes, telling the backend who the\nclient is; none is no header. For an upstream of TCP and TLS routes only: an HTTP\nroute's connections carry many clients' requests.",
+          "description": "A PROXY protocol header ahead of each tunnel's bytes, telling the backend who the\nclient is; none is no header. For an upstream of TCP and TLS routes only: an HTTP\nroute's connections carry many clients' requests, and a UDP route sends none.",
           "anyOf": [
             {
               "$ref": "#/$defs/ProxyProtocolVersion"
@@ -1947,6 +2004,11 @@
           "description": "HTTP/2, many requests at once on each connection. Without TLS, by prior knowledge\n(RFC 9113 §3.3): the upstream is expected to speak it from the first byte.",
           "type": "string",
           "const": "http2"
+        },
+        {
+          "description": "Datagrams as they come, for UDP routes alone: a Kubernetes\nService's port is the one of its name over UDP. No TLS, probe or PROXY protocol.",
+          "type": "string",
+          "const": "udp"
         }
       ]
     },

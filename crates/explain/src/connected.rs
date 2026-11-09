@@ -5,7 +5,7 @@
 //! name listed as the router crate's walk ranks them, which is held to that choice.
 
 use crate::explained::{Snapshot, Unexplained, field, protocol_name, verdict};
-use edgerush_config::{Backend, CompiledListener, L4, L4Route};
+use edgerush_config::{Backend, CompiledListener, L4, L4Route, Protocol};
 use edgerush_router::{Explanation, RequestParts, Verdict, explain};
 use http::Method;
 use http::header::HeaderMap;
@@ -37,6 +37,9 @@ impl Snapshot {
         listener: &'s CompiledListener,
         sni: Option<&str>,
     ) -> Result<Connected<'s>, Unexplained> {
+        if listener.protocol == Protocol::Udp {
+            return Err(Unexplained::Udp(listener.name.clone()));
+        }
         let carried = listener.l4.as_ref().filter(|_| listener.carries(sni));
         let Some(l4) = carried else {
             return Err(Unexplained::NotPassthrough(

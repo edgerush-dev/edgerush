@@ -875,7 +875,11 @@ impl Proxy {
                 Opening::Connect => None,
             };
             let toward = match identity.protocol() {
-                UpstreamProtocol::Http1 => Toward::Upgrade(Key::of(unguessable()?)),
+                // No HTTP route reaches an upstream spoken to over UDP: its config is
+                // refused.
+                UpstreamProtocol::Http1 | UpstreamProtocol::Udp => {
+                    Toward::Upgrade(Key::of(unguessable()?))
+                }
                 UpstreamProtocol::Http2 => Toward::Connect,
             };
             Some(Box::new(Handshake {

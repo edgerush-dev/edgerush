@@ -177,7 +177,7 @@ impl Asked {
     pub fn head(&self, listener: &CompiledListener) -> Result<Parts, Invalid> {
         let wanted = match listener.protocol {
             Protocol::Https => Scheme::HTTPS,
-            Protocol::Http | Protocol::Tcp | Protocol::Tls => Scheme::HTTP,
+            Protocol::Http | Protocol::Tcp | Protocol::Tls | Protocol::Udp => Scheme::HTTP,
         };
         if self.scheme != wanted {
             return Err(Invalid::Scheme {

@@ -140,7 +140,8 @@ impl Secure {
             builder.set_private_key(&identity.key).map_err(setup)?;
         }
         let offered: &[u8] = match protocol {
-            UpstreamProtocol::Http1 => b"\x08http/1.1",
+            // An upstream spoken to over UDP has no TLS: its config is refused.
+            UpstreamProtocol::Http1 | UpstreamProtocol::Udp => b"\x08http/1.1",
             UpstreamProtocol::Http2 => b"\x02h2",
         };
         builder.set_alpn_protos(offered).map_err(setup)?;

@@ -107,7 +107,10 @@ async fn over(mut socket: TcpStream, destination: &ReuseIdentity, probe: &Probe)
             drop(socket);
             true
         }
-        (Probe::Http { path }, UpstreamProtocol::Http1) => http1(socket, path, &authority).await?,
+        // An upstream spoken to over UDP has no probe: its config is refused.
+        (Probe::Http { path }, UpstreamProtocol::Http1 | UpstreamProtocol::Udp) => {
+            http1(socket, path, &authority).await?
+        }
         (Probe::Http { path }, UpstreamProtocol::Http2) => {
             http2(socket, &scheme, path, &authority).await?
         }

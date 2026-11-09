@@ -1,6 +1,6 @@
 //! The whole of what a data plane is given to run.
 
-use crate::{Route, TcpRoute, TlsRoute};
+use crate::{Route, TcpRoute, TlsRoute, UdpRoute};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -27,6 +27,9 @@ pub struct Config {
     /// hostnames.
     #[serde(default)]
     pub tls_routes: Vec<TlsRoute>,
+    /// The routes of `udp` listeners: at most one for each.
+    #[serde(default)]
+    pub udp_routes: Vec<UdpRoute>,
     /// The upstreams that backends refer to, by name. They have no order.
     pub upstreams: BTreeMap<String, Upstream>,
     /// The data plane's own settings; left out, each has its value.
@@ -258,7 +261,8 @@ pub struct RateLimitServiceTls {
 #[serde(deny_unknown_fields)]
 pub struct Listener {
     /// The address to listen on; `[::]:8080` is every address, IPv4 included. No two
-    /// listeners have the same one.
+    /// listeners have the same one, but for a `udp` listener beside one over TCP: their
+    /// sockets are apart.
     pub address: SocketAddr,
     /// What is spoken there.
     pub protocol: Protocol,
@@ -279,6 +283,16 @@ pub struct Listener {
         schemars(range(min = 1, max = crate::compile::MOST_SECONDS))
     )]
     pub tunnel_idle_seconds: Option<u64>,
+    /// How long, in seconds, a `udp` listener's session may carry nothing either way before
+    /// it is ended (24 in the docs): 60 unless said otherwise, as Envoy's UDP proxy has it.
+    /// UDP has no close, so this is how every session ends that is not refused or drained.
+    /// For those listeners only.
+    #[serde(default)]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(range(min = 1, max = crate::compile::MOST_SECONDS))
+    )]
+    pub session_idle_seconds: Option<u64>,
     /// What an `http` or `https` listener, which must have it, tells its upstreams of a
     /// request's client; no other may.
     #[serde(default)]
@@ -288,12 +302,12 @@ pub struct Listener {
     #[serde(default)]
     pub request_id: Option<RequestId>,
     /// Whether every connection starts with a PROXY protocol header, and whose to believe
-    /// (20 in the docs). Every listener states it, `off` included: it decides who a
-    /// connection is taken to come from.
+    /// (20 in the docs). Every listener over TCP states it, `off` included: it decides who a
+    /// connection is taken to come from. A `udp` listener reads none, and states none.
     #[serde(default)]
     pub proxy_protocol: Option<ListenerProxyProtocol>,
     /// Where a record of each of its requests, or each of its connections for a `tcp` or
-    /// `tls` listener, is written (08 §2, 21 in the docs). Left out, nothing is logged.
+    /// `tls` listener and each of its sessions for a `udp` one, is written (08 §2, 21 in the docs). Left out, nothing is logged.
     #[serde(default)]
     pub access_log: Option<AccessLog>,
 }
@@ -416,6 +430,9 @@ pub enum Protocol {
     /// TLS read as far as its ClientHello and no further, to the TLS route whose
     /// hostnames cover the name the client asks for (SNI).
     Tls,
+    /// Datagrams, as they come, to the listener's one UDP route, a session for each
+    /// client (24 in the docs).
+    Udp,
 }
 
 /// The TLS a listener terminates.
@@ -580,7 +597,8 @@ pub struct Upstream {
     /// Where its endpoints come from.
     pub endpoints: Endpoints,
     /// What its endpoints are spoken to in, whatever the client spoke. An upstream of TCP
-    /// and TLS routes is sent their bytes as they come: neither `http2` nor `tls`.
+    /// and TLS routes is sent their bytes as they come: neither `http2` nor `tls`. One of
+    /// UDP routes is `udp`, and no other route's.
     #[serde(default)]
     pub protocol: UpstreamProtocol,
     /// TLS to its endpoints; none is plain TCP.
@@ -602,7 +620,7 @@ pub struct Upstream {
     pub slow_start: Option<SlowStart>,
     /// A PROXY protocol header ahead of each tunnel's bytes, telling the backend who the
     /// client is; none is no header. For an upstream of TCP and TLS routes only: an HTTP
-    /// route's connections carry many clients' requests.
+    /// route's connections carry many clients' requests, and a UDP route sends none.
     #[serde(default)]
     pub proxy_protocol: Option<ProxyProtocolVersion>,
 }
@@ -799,4 +817,7 @@ pub enum UpstreamProtocol {
     /// HTTP/2, many requests at once on each connection. Without TLS, by prior knowledge
     /// (RFC 9113 §3.3): the upstream is expected to speak it from the first byte.
     Http2,
+    /// Datagrams as they come, for UDP routes alone (24 in the docs): a Kubernetes
+    /// Service's port is the one of its name over UDP. No TLS, probe or PROXY protocol.
+    Udp,
 }

@@ -170,6 +170,7 @@ fn run(options: &Options) -> Result<String, Failed> {
         Protocol::Https => "an https",
         Protocol::Tcp => "a tcp",
         Protocol::Tls => "a tls",
+        Protocol::Udp => return Err(Unexplained::Udp(listener.name.clone()).into()),
     };
     // What the listener's kind takes, and nothing else.
     let http = [
@@ -221,6 +222,7 @@ fn run(options: &Options) -> Result<String, Failed> {
             unwanted(&sni)?;
             return Ok(snapshot.explain_connection(listener, None)?.text());
         }
+        Protocol::Udp => return Err(Unexplained::Udp(listener.name.clone()).into()),
         Protocol::Tls => {
             unwanted(&http)?;
             let Some(name) = named()? else {
