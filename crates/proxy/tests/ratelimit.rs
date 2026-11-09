@@ -363,8 +363,10 @@ async fn a_data_plane_decides_a_key_it_has_not_heard_of_from_a_full_bucket() {
             let second = proxy(upstream, &service, "").await;
             let client = [127, 0, 0, 7];
             let one = statuses(first, client, "GET", "/by-client", 6).await;
-            // The first's admissions reach the owner: its report goes behind the poll it has
-            // in flight, answered through the slow network too.
+            // The first's admissions reach the owner once it has the table, which the slow
+            // network brings 80 ms late, and a cycle after: measured, 150 ms was always
+            // enough and 100 ms seldom, with or without polls; the rest is for a loaded
+            // machine.
             tokio::time::sleep(Duration::from_millis(500)).await;
             let other = statuses(second, client, "GET", "/by-client", 8).await;
             assert_eq!(one, [200; 6]);
