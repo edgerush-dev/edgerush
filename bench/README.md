@@ -18,9 +18,9 @@ those variants (none of them as a service), Docker for the `apisix` variants
 (`APISIX_IMAGE`) and for the Redis the shared rate limits of Kong, Envoy and APISIX use,
 `h2load` (`nghttp2-client`), [`oha`](https://github.com/hatoo/oha)
 (`cargo install oha --locked`), `python3`, `curl`, `taskset`, and a release build:
-`cargo build --release -p edgerush`. The `websocket` mode also needs
-[`wsbench`](wsbench/src/main.rs), this directory's own WebSocket load generator and echo
-backend: `cargo build --release --manifest-path bench/wsbench/Cargo.toml`.
+`cargo build --release -p edgerush`. The `websocket` and `udp` modes also need
+[`wsbench`](wsbench/src/main.rs), this directory's own WebSocket and UDP load generator and
+echo backend: `cargo build --release --manifest-path bench/wsbench/Cargo.toml`.
 
 ## Running it
 
@@ -64,6 +64,12 @@ bench/run.sh passthrough CHURN [TLS_CHURN]
                                     # connections at saturation, a connection a request at
                                     # CHURN (TLS_CHURN) a second, 8 MiB answers; with
                                     # PROXY_PROTOCOL=1, a header in and one out
+bench/run.sh udp [RATE] [CHURN] [PORTS]
+                                    # UDP sessions (UDP=1), wsbench the echo: 64 busy
+                                    # sessions, RATE (25,000) datagrams a second over 256,
+                                    # a new session a datagram at CHURN (400) a second,
+                                    # the same at PORTS (1,000) a second past what the
+                                    # local ports hold, and what held sessions cost
 bench/run.sh websocket [RATE] [CHURN]
                                     # WebSocket over HTTP/1.1 upgrades, wsbench the backend
                                     # (it echoes): 256 busy connections, RATE (25,000)
@@ -153,6 +159,21 @@ NGINX has its stream module in a package of its own: `sudo apt-get install
 libnginx-mod-stream`. TLS churn is a handshake at the client and one at the backend for
 every request; the laptop's generator and backend keep up with about 1,400 a second, so
 `TLS_CHURN` is half of `CHURN` unless said.
+
+`UDP=1`, which `udp` sets, has the proxies carry UDP sessions
+([24](../../docs/24-udp-proxying.md)) to `wsbench udp-serve`, an echo at 9053 beside the
+backend: EdgeRush with `udp.yaml` (a `udp` listener on 8053, its 60 s idle bound, and
+`passthrough.yaml`'s `tcp` listener on 8080 to be seen ready by), NGINX's `stream` module
+(`nginx-udp.conf`: `listen … udp reuseport`, `proxy_timeout 60s`, no `proxy_responses`, as
+EdgeRush has no way to end a session after its answers). HAProxy has no UDP proxy.
+EdgeRush's metrics are served at 9090 for what it says it dropped. A session holds a local
+port of the proxy's for as long as it lasts, from the kernel's ephemeral range (28,232 of
+them by default), so new sessions outrun the ports past some 470 a second at 60 s idle:
+`udp-churn` keeps under that, and `udp-ports` goes past it on purpose. wsbench's churned
+datagrams come from ports below that range, each from a source of its own, so that the
+generator is never the one short of ports. The mode takes open files at 524,288, the
+laptop's hard limit, as a pod's are many: at the other modes' 65,536, EdgeRush's room
+holds 28,224 sessions, under the ports, and `udp-ports` would measure the room.
 
 `PROXY_PROTOCOL=1` with `passthrough` has every connection carry a PROXY header in and one
 out ([20](../../docs/20-proxy-protocol.md)): clients reach a front hop, HAProxy on the
@@ -286,6 +307,11 @@ worth as much as the care that went into the other side.
 | `saturation-tcp`, `saturation-tls` | h2load through a tunnel: HTTP/1 over a `tcp` listener (256 connections), HTTP/2 over TLS over a `tls` one (4 connections × 100 streams) | What carrying small messages both ways costs, nothing of them read ([17](../../docs/17-tcp-and-tls-passthrough.md)) |
 | `churn-tcp`, `churn-tls` | oha, a new connection for every request, a fixed rate, through each listener | What a tunnel costs to make: the accept, the ClientHello read and routed by name, the connection to the backend |
 | `streamed-tcp` | oha, `STREAMED` bytes back through the `tcp` listener | What carrying bulk costs |
+| `udp-busy` | `wsbench udp`, 64 sessions, a 64-byte datagram and its echo at a time on each, closed loop; once a repetition straight at the echo too (`backend`) | What carrying datagrams of a few long sessions costs, nothing of them read ([24](../../docs/24-udp-proxying.md)) |
+| `udp-paced` | the same at `RATE` datagrams a second over 256 sessions, each timed from when it was due | Latency of datagrams at a load below the knee |
+| `udp-churn` | `wsbench udp-churn`, a new session for every datagram at `CHURN` a second, timed from when it was due to its echo | What a session costs to make: the table's entry, a socket connected to the endpoint, its first datagram each way |
+| `udp-ports` | the same at `PORTS` a second for `UDP_PORTS_SECONDS` (80), on a proxy started afresh; answered and lost counted by the second, with EdgeRush's drops by reason (`.metrics`) or NGINX's error log over the run (`.errors`) | What each proxy does once new sessions outrun its local ports, and that it serves again once the first sessions' idle bound frees theirs: a table of its own in the summary |
+| `udp-held` | `UDP_HELD` sessions, a datagram echoed on each and then quiet, on a proxy started afresh (`idle.py udp`), counted by the proxy's sockets to the echo | What a UDP session costs held, within its idle bound |
 | `idle-h2-N` | `N` HTTP/2 connections, one request each and then quiet, on a proxy started afresh | What an idle HTTP/2 connection costs, beside `idle-memory`'s HTTP/1 ones |
 | `churn` | oha, a new connection for every request, a fixed rate | The cost of accepting, and of a connection's first request |
 | `streamed-answer` | oha, a body of `STREAMED` bytes coming back | What the answer's path costs when it is carrying something rather than passing a few bytes along |

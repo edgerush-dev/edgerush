@@ -8,6 +8,11 @@
 //!                   [--size BYTES] [--most N] [--threads N]
 //! wsbench http URL [--host NAME] [--connections N] [--addresses N] [--seconds S]
 //!                  [--resident N] [--threads N]
+//! wsbench udp-serve ADDRESS [--threads N]
+//! wsbench udp ADDRESS [--sessions N] [--seconds S] [--size BYTES] [--rate PER_SECOND]
+//!                     [--threads N]
+//! wsbench udp-churn ADDRESS --rate PER_SECOND [--seconds S] [--size BYTES] [--most N]
+//!                           [--threads N]
 //! ```
 //!
 //! `serve` answers a handshake with its 101 and then sends every frame back as it came,
@@ -20,7 +25,8 @@
 //! its echo (what is timed), then a Close each way. URL is `ws://` or `wss://` with an IP
 //! address; `--host` is the name asked for, and the name TLS is asked for by.
 //!
-//! `http` is plain requests from many client addresses, for rate limits ([`http`]).
+//! `http` is plain requests from many client addresses, for rate limits ([`http`]); the
+//! `udp` commands are datagrams and their echoes, for UDP sessions ([`udp`]).
 //!
 //! A client prints one line of JSON: messages echoed, those that failed, the seconds they
 //! were sent in, their rate, and latency percentiles in milliseconds.
@@ -29,6 +35,7 @@
 
 mod frames;
 mod http;
+mod udp;
 
 use std::collections::HashMap;
 use std::io;
@@ -64,7 +71,7 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<(), String> {
     let (command, rest) = args
         .split_first()
-        .ok_or("no command: serve, echo, churn or http")?;
+        .ok_or("no command: serve, echo, churn, http, udp-serve, udp or udp-churn")?;
     let (place, flags) = rest.split_first().ok_or("no address or URL")?;
     let options = Options::read(flags)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -74,9 +81,7 @@ fn run(args: &[String]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     match command.as_str() {
         "serve" => {
-            let address: SocketAddr = place
-                .parse()
-                .map_err(|_| format!("not an address: {place}"))?;
+            let address = address(place)?;
             runtime
                 .block_on(serve(address))
                 .map_err(|error| error.to_string())
@@ -108,8 +113,42 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{}", tally.report(seconds));
             Ok(())
         }
+        "udp-serve" => {
+            let address = address(place)?;
+            runtime
+                .block_on(udp::serve(address, options.get("threads", 2)?))
+                .map_err(|error| error.to_string())
+        }
+        "udp" | "udp-churn" => {
+            let target = address(place)?;
+            let seconds: f64 = options.get("seconds", 10.0)?;
+            let size = options.get("size", 64)?;
+            if size < udp::NUMBER {
+                return Err(format!(
+                    "--size: at least {} bytes, for a datagram's number",
+                    udp::NUMBER
+                ));
+            }
+            let tally = if command == "udp" {
+                let sessions = options.get("sessions", 64)?;
+                let rate = options.optional("rate")?;
+                runtime.block_on(udp::echo(target, sessions, seconds, size, rate))
+            } else {
+                let rate: f64 = options.optional("rate")?.ok_or("udp-churn needs --rate")?;
+                let most = options.get("most", 4096)?;
+                runtime.block_on(udp::churn(target, rate, seconds, size, most))
+            };
+            println!("{}", tally.report(command, seconds));
+            Ok(())
+        }
         other => Err(format!("no command {other}")),
     }
+}
+
+fn address(place: &str) -> Result<SocketAddr, String> {
+    place
+        .parse()
+        .map_err(|_| format!("not an address: {place}"))
 }
 
 /// `--name value` pairs.
@@ -373,12 +412,30 @@ struct Tally {
     /// Each message's latency, in microseconds.
     took: Vec<u32>,
     failed: u64,
+    /// For `udp-churn`: those answered and those failed, by the second of the run they were
+    /// due in.
+    by_second: Vec<[u64; 2]>,
 }
 
 impl Tally {
     fn add(&mut self, other: Tally) {
         self.took.extend(other.took);
         self.failed += other.failed;
+        if self.by_second.len() < other.by_second.len() {
+            self.by_second.resize(other.by_second.len(), [0, 0]);
+        }
+        for (mine, theirs) in self.by_second.iter_mut().zip(other.by_second) {
+            mine[0] += theirs[0];
+            mine[1] += theirs[1];
+        }
+    }
+
+    /// One failed that was due in `second`.
+    fn lost_in(&mut self, second: usize) {
+        self.failed += 1;
+        if let Some(counts) = self.by_second.get_mut(second) {
+            counts[1] += 1;
+        }
     }
 
     fn report(mut self, command: &str, seconds: f64) -> String {
@@ -390,9 +447,19 @@ impl Tally {
         };
         let json =
             |value: Option<f64>| value.map_or("null".to_owned(), |value| format!("{value:.3}"));
+        let by_second = if self.by_second.is_empty() {
+            String::new()
+        } else {
+            let seconds: Vec<String> = self
+                .by_second
+                .iter()
+                .map(|[answered, failed]| format!("[{answered}, {failed}]"))
+                .collect();
+            format!(", \"by_second\": [{}]", seconds.join(", "))
+        };
         format!(
             "{{\"wsbench\": \"{command}\", \"messages\": {}, \"failed\": {}, \"seconds\": {seconds}, \
-             \"rate\": {:.1}, \"p50\": {}, \"p99\": {}, \"p99.9\": {}}}",
+             \"rate\": {:.1}, \"p50\": {}, \"p99\": {}, \"p99.9\": {}{by_second}}}",
             self.took.len(),
             self.failed,
             self.took.len() as f64 / seconds,
@@ -463,8 +530,8 @@ async fn echo(
     let mut tally = Tally::default();
     for connection in running {
         tally.add(connection.await.unwrap_or_else(|_| Tally {
-            took: Vec::new(),
             failed: 1,
+            ..Tally::default()
         }));
     }
     tally
@@ -627,6 +694,7 @@ mod tests {
         let tally = Tally {
             took: (1..=1000).rev().collect(),
             failed: 2,
+            ..Tally::default()
         };
         let report = tally.report("echo", 2.0);
         assert!(report.contains("\"messages\": 1000"), "{report}");
@@ -636,6 +704,17 @@ mod tests {
         assert!(report.contains("\"p99.9\": 1.000"), "{report}");
         let empty = Tally::default().report("churn", 1.0);
         assert!(empty.contains("\"p50\": null"), "{empty}");
+        assert!(!empty.contains("by_second"), "{empty}");
+        let churned = Tally {
+            took: vec![1, 2],
+            failed: 1,
+            by_second: vec![[2, 0], [0, 1]],
+        }
+        .report("udp-churn", 2.0);
+        assert!(
+            churned.ends_with(", \"by_second\": [[2, 0], [0, 1]]}"),
+            "{churned}"
+        );
     }
 
     /// A message whose time has passed is timed from it; one waited for, from the wake,
