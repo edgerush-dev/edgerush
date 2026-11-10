@@ -1543,7 +1543,9 @@ profile-body)
     ;;
 ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3 | h3latency | mixed | passthrough | udp | websocket | ratelimit) ;;
 *)
-    sed -n '2,62p' "$0" >&2
+    # Up to the usage's last line, found rather than counted, so that a mode added above
+    # it cannot leave the usage cut short.
+    sed -n '2,/^#   bench\/run\.sh summary DIR/p' "$0" >&2
     exit 2
     ;;
 esac
