@@ -1459,6 +1459,40 @@ async fn a_udp_session_is_logged_at_its_end() {
         .await;
 }
 
+/// A session ended on its answer is logged as answered, at once, with the answer's bytes
+/// among those it passed (24 §3).
+#[tokio::test]
+async fn a_udp_session_ended_on_its_answer_is_logged_as_answered() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = doubling_backend().await;
+            let (logged, _serving) = recording_udp("udp-answered", |logs| {
+                udp_logging(
+                    "{ upstream: up, weight: 1 }",
+                    backend,
+                    &format!("{logs}, session_answers: 1"),
+                )
+            })
+            .await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client.connect(logged.front).await.unwrap();
+            let mut answer = [0; 64];
+            client.send(&[7; 5]).await.unwrap();
+            assert_eq!(within(client.recv(&mut answer)).await.unwrap(), 10);
+            let records = logged.records(1).await;
+            let record = &records[0];
+            assert_eq!(record["kind"], "session");
+            assert_eq!(record["reason"], "answered", "{record}");
+            assert_eq!(record["bytes_in"], 5, "{record}");
+            assert_eq!(record["bytes_out"], 10, "{record}");
+            // Not kept for its idle bound of a second.
+            let lasted = record["duration_ms"].as_f64().unwrap();
+            assert!(lasted < 900.0, "{record}");
+        })
+        .await;
+}
+
 /// A session its endpoint refused is logged as refused; and one of an invalid backend,
 /// which went nowhere, with no upstream or endpoint, as its listener taken away left it.
 #[tokio::test]

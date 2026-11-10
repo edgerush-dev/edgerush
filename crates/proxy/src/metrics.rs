@@ -182,6 +182,8 @@ impl Quic {
 pub(crate) enum SessionEnd {
     /// Nothing either way for the listener's idle bound.
     Idle,
+    /// Its endpoint's answers came, as many as its listener expects for each datagram.
+    Answered,
     /// Its endpoint refused a datagram (ICMP port unreachable).
     Refused,
     /// Its listener was taken away, or the worker drained.
@@ -193,13 +195,14 @@ impl SessionEnd {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Idle => "idle",
+            Self::Answered => "answered",
             Self::Refused => "refused",
             Self::Drained => "drained",
         }
     }
 
     /// Every one of them, for a scrape that shows a series whether it has happened or not.
-    const ALL: [Self; 3] = [Self::Idle, Self::Refused, Self::Drained];
+    const ALL: [Self; 4] = [Self::Idle, Self::Answered, Self::Refused, Self::Drained];
 }
 
 /// Why a `udp` listener dropped a datagram, nothing sent to its client
@@ -1852,6 +1855,7 @@ mod tests {
         web.quic(Quic::Forwarded);
         web.quic(Quic::Retry);
         web.session(SessionEnd::Idle);
+        web.session(SessionEnd::Answered);
         web.dropped(Dropped::SendFull);
         web.dropped(Dropped::SendFull);
         let upstream = metrics.upstream(cart).unwrap();
@@ -1876,6 +1880,7 @@ mod tests {
             "edgerush_listener_quic_datagrams_total{listener=\"admin\",event=\"version_negotiation\"} 0\n",
             "edgerush_listener_quic_datagrams_total{listener=\"web\",event=\"no_room\"} 0\n",
             "edgerush_listener_udp_sessions_total{listener=\"web\",outcome=\"idle\"} 1\n",
+            "edgerush_listener_udp_sessions_total{listener=\"web\",outcome=\"answered\"} 1\n",
             "edgerush_listener_udp_sessions_total{listener=\"admin\",outcome=\"refused\"} 0\n",
             "edgerush_listener_udp_sessions_total{listener=\"web\",outcome=\"drained\"} 0\n",
             "edgerush_listener_udp_datagrams_dropped_total{listener=\"web\",reason=\"send_full\"} 2\n",
