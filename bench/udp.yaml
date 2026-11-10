@@ -1,0 +1,19 @@
+# The config of the UDP benchmark (24 step 5): a `udp` listener whose sessions all go to the
+# backend's UDP echo (bench/wsbench udp-serve), with the default idle bound of 60 s; and the
+# passthrough benchmark's `tcp` listener beside it, carried to the backend's plain port, for
+# run.sh to see the proxy ready by.
+listeners:
+  plain: { address: "127.0.0.1:8080", protocol: tcp, proxy_protocol: off }
+  datagrams: { address: "127.0.0.1:8053", protocol: udp, session_idle_seconds: 60 }
+
+routes: []
+
+tcp_routes:
+  - { name: plain, listeners: [plain], backends: [{ upstream: backend, weight: 1 }] }
+
+udp_routes:
+  - { name: datagrams, listeners: [datagrams], backends: [{ upstream: echo, weight: 1 }] }
+
+upstreams:
+  backend: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000"] } }
+  echo: { protocol: udp, load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9053"] } }

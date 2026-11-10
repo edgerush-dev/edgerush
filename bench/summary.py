@@ -99,6 +99,59 @@ def logged(path):
     return {"p50": at(0.5), "p99": at(0.99), "p99.9": at(0.999)}
 
 
+def ports(result):
+    """A run past the local ports, from `wsbench udp-churn`'s line: datagrams answered and
+    lost, the first second in which a hundredth or more of those due were lost, and the first
+    after it in which fewer were again; `None` for a line that does not count by second."""
+    by_second = result.get("by_second")
+    if not by_second:
+        return None
+
+    def short(answered, lost):
+        return lost > 0 and lost * 100 >= answered + lost
+
+    short_from = next((at for at, counts in enumerate(by_second) if short(*counts)), None)
+    again_from = None
+    if short_from is not None:
+        again_from = next(
+            (at for at in range(short_from + 1, len(by_second)) if not short(*by_second[at])),
+            None,
+        )
+    return {
+        "answered": sum(answered for answered, _ in by_second),
+        "lost": sum(lost for _, lost in by_second),
+        "short_from": short_from,
+        "again_from": again_from,
+    }
+
+
+def dropped(text):
+    """What EdgeRush's metrics say its udp listeners dropped, by reason, those it did."""
+    counted = defaultdict(int)
+    for line in text.splitlines():
+        found = re.match(
+            r'edgerush_listener_udp_datagrams_dropped_total\{.*reason="(\w+)".*\} ([\d.e+]+)$', line)
+        if found and float(found.group(2)):
+            counted[found.group(1)] += int(float(found.group(2)))
+    return "; ".join(f"{reason} {count:,}" for reason, count in sorted(counted.items()))
+
+
+def errors(text):
+    """NGINX's error log over a run: its commonest message, the connection's number and the
+    UDP client taken away, and how many lines it was among them all."""
+    messages = defaultdict(int)
+    lines = 0
+    for line in text.splitlines():
+        found = re.search(r"\[\w+\] \d+#\d+: (?:\*\d+ )?(.*?)(?:, udp client: .*)?$", line)
+        if found:
+            lines += 1
+            messages[found.group(1)] += 1
+    if not lines:
+        return ""
+    commonest = max(messages, key=messages.get)
+    return f"{lines:,} lines; {messages[commonest]:,}: {commonest}"
+
+
 def memory(text):
     """What idle connections cost: the lines bench/run.sh's idle_memory writes."""
     read = dict(
@@ -233,6 +286,7 @@ def middle(values):
 def main(directory):
     runs = defaultdict(list)
     held = {}
+    past_ports = []
     for out in sorted(directory.glob("*.out")):
         subject, _, scenario = out.name[: -len(".out")].rpartition(".")
         model = subject.rsplit(".", 1)[0] if subject.rsplit(".", 1)[-1].isdigit() else subject
@@ -248,6 +302,15 @@ def main(directory):
             print(f"cannot read {out.name}", file=sys.stderr)
             continue
         stem = out.name[: -len(".out")]
+        counted = ports(json.loads(text)) if text.lstrip().startswith("{") else None
+        if counted:
+            said = directory / f"{stem}.metrics"
+            logged_errors = directory / f"{stem}.errors"
+            if said.exists():
+                counted["said"] = dropped(said.read_text())
+            elif logged_errors.exists():
+                counted["said"] = errors(logged_errors.read_text())
+            past_ports.append((scenario, model, subject.rsplit(".", 1)[-1], counted))
         requests = directory / f"{stem}.requests"
         if requests.exists():
             result.update(logged(requests))
@@ -332,6 +395,24 @@ def main(directory):
                 cells.append(f"{statistics.median(values):,.0f}" if values else "")
             asked = "; ".join(result.get("proxy_deepest_asked", "") for result in results)
             print(f"| {scenario} | {model} | {len(results)} | " + " | ".join(cells) + f" | {asked} |")
+
+    if past_ports:
+        # A new session a datagram past what the local ports hold: when datagrams began to
+        # be lost, and when the first sessions' idle bound had freed ports enough for them
+        # to be answered again; what the proxy said it dropped, or logged.
+        print()
+        print("| scenario | variant | run | answered | lost | lost from s | answered again from s "
+              "| the proxy's count |")
+        print("|---|---|---|---|---|---|---|---|")
+        for scenario, model, run, counted in sorted(past_ports):
+            def second(value):
+                return "" if value is None else str(value)
+
+            print(
+                f"| {scenario} | {model} | {run} | {counted['answered']:,} | {counted['lost']:,} |"
+                f" {second(counted['short_from'])} | {second(counted['again_from'])} |"
+                f" {counted.get('said', '')} |"
+            )
 
     if held:
         # Not a row of the table: what a connection costs while nothing happens on it is

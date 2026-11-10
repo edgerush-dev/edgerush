@@ -1,10 +1,12 @@
-"""An idle connection's answer is read whole, however it arrives, so the next one starts clean."""
+"""An idle connection's answer is read whole, however it arrives, so the next one starts clean;
+a UDP session is held once its datagram is echoed."""
 
 import socket
 import threading
 import unittest
 
-from idle import SWITCHED, answer, h2_answer, h2_frame, h2_request, opened
+import idle
+from idle import SWITCHED, answer, h2_answer, h2_frame, h2_request, opened, session
 
 
 def served(*pieces):
@@ -116,6 +118,59 @@ class WebSocket(unittest.TestCase):
         with self.assertRaises(ConnectionError):
             opened("127.0.0.1", port, b"GET /ws HTTP/1.1\r\n\r\n", expect=SWITCHED)
         listener.close()
+
+
+def udp_echo(answers):
+    """A UDP socket that answers each of the first datagrams it is sent with what
+    `answers(datagram)` returns, or with nothing for `None`. Returns its address."""
+    backend = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    backend.bind(("127.0.0.1", 0))
+    backend.settimeout(10)
+
+    def serve():
+        try:
+            while True:
+                datagram, client = backend.recvfrom(65535)
+                answered = answers(datagram)
+                if answered is not None:
+                    backend.sendto(answered, client)
+        except OSError:
+            backend.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return backend.getsockname()
+
+
+class UdpSession(unittest.TestCase):
+    def setUp(self):
+        waited = idle.ECHO_WAIT
+        idle.ECHO_WAIT = 0.05
+        self.addCleanup(setattr, idle, "ECHO_WAIT", waited)
+
+    def test_a_session_is_held_once_its_datagram_is_echoed(self):
+        address, port = udp_echo(lambda datagram: datagram)
+        held = session(address, port)
+        self.assertEqual(held.getpeername(), (address, port))
+        held.close()
+
+    def test_a_lost_datagram_is_sent_again_and_a_session_never_echoed_is_an_error(self):
+        sent = []
+
+        def second_only(datagram):
+            sent.append(datagram)
+            return datagram if len(sent) == 2 else None
+
+        address, port = udp_echo(second_only)
+        session(address, port).close()
+        self.assertEqual(len(sent), 2)
+        address, port = udp_echo(lambda _: None)
+        with self.assertRaises(ConnectionError):
+            session(address, port)
+
+    def test_an_echo_that_differs_is_an_error(self):
+        address, port = udp_echo(lambda datagram: datagram[:-1])
+        with self.assertRaises(ConnectionError):
+            session(address, port)
 
 
 if __name__ == "__main__":

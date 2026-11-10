@@ -106,5 +106,64 @@ class WsBench(unittest.TestCase):
             self.assertIn("| 99 | 100 | 0.25 | 1.50 |", row)
 
 
+class PastThePorts(unittest.TestCase):
+    CHURNED = ('{{"wsbench": "udp-churn", "messages": {answered}, "failed": {lost}, '
+               '"seconds": 5, "rate": 10.0, "p50": 0.1, "p99": 0.2, "p99.9": 0.3, '
+               '"by_second": {by_second}}}\n')
+
+    def line(self, by_second):
+        return self.CHURNED.format(
+            answered=sum(answered for answered, _ in by_second),
+            lost=sum(lost for _, lost in by_second),
+            by_second=by_second,
+        )
+
+    def test_the_seconds_when_datagrams_began_to_be_lost_and_were_answered_again(self):
+        # A loss under a hundredth of a second's datagrams is not the ports running short.
+        read = summary.ports(summary.json.loads(self.line(
+            [[1000, 0], [999, 1], [400, 600], [0, 1000], [995, 5], [1000, 0]])))
+        self.assertEqual(read, {"answered": 4394, "lost": 1606, "short_from": 2, "again_from": 4})
+
+    def test_a_run_short_to_its_end_or_never_short_has_no_second_for_what_did_not_happen(self):
+        never = summary.ports(summary.json.loads(self.line([[10, 0], [10, 0]])))
+        self.assertEqual((never["short_from"], never["again_from"]), (None, None))
+        to_the_end = summary.ports(summary.json.loads(self.line([[10, 0], [0, 10], [0, 10]])))
+        self.assertEqual((to_the_end["short_from"], to_the_end["again_from"]), (1, None))
+        # The other clients' lines do not count by the second.
+        self.assertIsNone(summary.ports({"wsbench": "udp", "messages": 1}))
+
+    def test_edgerushs_drops_by_reason_and_nginxs_commonest_error(self):
+        metrics = (
+            'edgerush_listener_udp_datagrams_dropped_total{listener="datagrams",reason="exhausted"} 31000\n'
+            'edgerush_listener_udp_datagrams_dropped_total{listener="datagrams",reason="no_room"} 0\n'
+            'edgerush_listener_udp_datagrams_dropped_total{listener="datagrams",reason="send_full"} 2\n'
+            'edgerush_listener_udp_sessions_total{listener="datagrams",outcome="idle"} 28000\n')
+        self.assertEqual(summary.dropped(metrics), "exhausted 31,000; send_full 2")
+        log = (
+            "2026/11/10 10:00:01 [crit] 11#11: *5 connect() to 127.0.0.1:9053 failed (99: Cannot "
+            "assign requested address) while connecting to upstream, udp client: 127.20.0.1, "
+            "server: 127.0.0.1:8053, upstream: \"127.0.0.1:9053\", bytes from/to client:64/0\n"
+        ) * 2 + "2026/11/10 10:00:02 [alert] 12#12: something else\n"
+        self.assertEqual(
+            summary.errors(log),
+            "3 lines; 2: connect() to 127.0.0.1:9053 failed (99: Cannot assign requested "
+            "address) while connecting to upstream")
+
+    def test_a_run_past_the_ports_is_a_row_of_its_own_with_what_the_proxy_said(self):
+        with tempfile.TemporaryDirectory() as name:
+            directory = pathlib.Path(name)
+            (directory / "ours.2.udp-ports.out").write_text(self.line([[10, 0], [0, 10], [10, 0]]))
+            (directory / "ours.2.udp-ports.metrics").write_text(
+                'edgerush_listener_udp_datagrams_dropped_total{listener="datagrams",reason="exhausted"} 10\n')
+            (directory / "nginx.1.udp-ports.out").write_text(self.line([[10, 0], [10, 0]]))
+            (directory / "nginx.1.udp-ports.errors").write_text("")
+            printed = table(directory)
+            self.assertIn("| udp-ports | ours | 2 | 20 | 10 | 1 | 2 | exhausted 10 |", printed)
+            self.assertIn("| udp-ports | nginx | 1 | 20 | 0 |  |  |  |", printed)
+            # And a row of the run table, as any other client's line is.
+            self.assertTrue(any(line.startswith("| udp-ports | ours | 1 |")
+                                for line in printed.splitlines()))
+
+
 if __name__ == "__main__":
     unittest.main()

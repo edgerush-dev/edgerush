@@ -37,6 +37,12 @@
 #                                             saturation, a connection a request at CHURN (and
 #                                             TLS_CHURN) a second, and streamed answers;
 #                                             PROXY_PROTOCOL=1, a header in and one out
+#   bench/run.sh udp [RATE] [CHURN] [PORTS]   UDP sessions, to an echo backend: few kept
+#                                             busy, datagrams at RATE a second over more,
+#                                             a new session a datagram at CHURN a second,
+#                                             the same at PORTS a second for UDP_PORTS_SECONDS,
+#                                             past what the local ports hold, and what
+#                                             sessions cost held idle; NGINX's stream beside
 #   bench/run.sh websocket [RATE] [CHURN]     WebSocket over HTTP/1.1 upgrades, to an echo
 #                                             backend: busy connections, messages at RATE
 #                                             a second, large messages, a connection a
@@ -150,6 +156,17 @@ repo=$(dirname "$here")
 # (cargo build --release --manifest-path bench/wsbench/Cargo.toml).
 : "${WEBSOCKET:=0}"
 [ "${1:-}" = websocket ] && WEBSOCKET=1
+# UDP=1, which `udp` sets, has the proxies carry UDP sessions (24 step 5) to bench/wsbench's
+# UDP echo at 9053, beside the backend: udp.yaml for EdgeRush, NGINX's stream module
+# (nginx-udp.conf); HAProxy has no UDP proxy. Each keeps the passthrough's tcp listener at
+# 8080 to the backend, to be seen ready by. EdgeRush serves its metrics at 9090 there, for
+# what it says it dropped. UDP_PORTS_SECONDS is how long the run past the local ports lasts:
+# long enough that the first sessions' 60 s idle bound ends them and frees their ports.
+# UDP_HELD is how many sessions are held idle to weigh one.
+: "${UDP:=0}"
+[ "${1:-}" = udp ] && UDP=1
+: "${UDP_PORTS_SECONDS:=80}"
+: "${UDP_HELD:=10000}"
 : "${WSBENCH:=$here/wsbench/target/release/wsbench}"
 # The `ratelimit` scenario's service pod, on the backend's CPUs.
 : "${RL_SERVICE:=$repo/target/release/edgerush-ratelimit-service}"
@@ -219,8 +236,14 @@ repo=$(dirname "$here")
 : "${APISIX_IMAGE:=apache/apisix:3.19.0-debian}"
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
 
-# Hundreds of connections on either side of the proxy, and more when they churn.
-ulimit -n 65536
+# Hundreds of connections on either side of the proxy, and more when they churn. The udp
+# mode takes the laptop's hard limit, 524,288, as a pod's open files are many (containerd
+# gives 1,048,576): at 65,536 EdgeRush's room would hold 28,224 sessions, fewer than the
+# local ports, and the run past the ports would measure the room instead. Set once: a
+# limit set lowers the hard limit with it, and it cannot be raised again.
+open_files=65536
+[ "$UDP" = 1 ] && open_files=524288
+ulimit -n "$open_files"
 
 # The binary under test. `instructions` points this at a build with symbols in it.
 edgerush=${EDGERUSH:-$repo/target/release/edgerush}
@@ -237,6 +260,8 @@ scheme=http
 [ "$TLS" = 1 ] && scheme=https
 proxy=$scheme://$host:8080/
 proxy_at=127.0.0.1:8080
+# The udp listener, with UDP=1.
+udp_at=127.0.0.1:8053
 tls=$run/tls
 proxy_pid=
 # Set by the grpc mode: NGINX's gRPC proxy is given the gRPC service.
@@ -296,6 +321,22 @@ start_backend() {
             [ "$(grep -c 'senders' "$config")" = 2 ]
             [ "$(grep -c 'proxy_protocol: v2' "$config")" = 2 ]
         fi
+    fi
+    if [ "$UDP" = 1 ]; then
+        if [ "$ACCESS_LOG" = 1 ]; then
+            echo "ACCESS_LOG is not set up for udp" >&2
+            exit 2
+        fi
+        cp "$here/udp.yaml" "$config"
+        [ -x "$WSBENCH" ] || { echo "no wsbench at $WSBENCH: build it first" >&2; exit 2; }
+        # Something already echoing at 9053 would answer in its place.
+        if ss -Hun "( sport = :9053 )" | grep -q .; then
+            echo "something already holds UDP 9053: stop it first" >&2
+            exit 1
+        fi
+        taskset -c "$BACKEND_CPUS" "$WSBENCH" udp-serve 127.0.0.1:9053 \
+            --threads "$(cpus_in "$BACKEND_CPUS")" 2>>"$run/wsbench-udp.log" &
+        echo $! >"$run/wsbench-udp.pid"
     fi
     if [ "$WEBSOCKET" = 1 ]; then
         [ -x "$WSBENCH" ] || { echo "no wsbench at $WSBENCH: build it first" >&2; exit 2; }
@@ -378,10 +419,13 @@ stop_backend() {
         front_pid=
     fi
     [ -f "$run/nginx.pid" ] && kill "$(cat "$run/nginx.pid")" 2>/dev/null || true
-    if [ -f "$run/wsbench.pid" ]; then
-        kill "$(cat "$run/wsbench.pid")" 2>/dev/null || true
-        rm -f "$run/wsbench.pid"
-    fi
+    local pid_file
+    for pid_file in "$run/wsbench.pid" "$run/wsbench-udp.pid"; do
+        if [ -f "$pid_file" ]; then
+            kill "$(cat "$pid_file")" 2>/dev/null || true
+            rm -f "$pid_file"
+        fi
+    done
 }
 
 # An Envoy config made ready to run, as $run-envoy.yaml: its @...@ values filled in from
@@ -546,8 +590,10 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
             exit 2
         fi
         mkdir -p "$run-proxy/tmp"
-        if [ "$PASSTHROUGH" = 1 ]; then
-            sed "s/WORKERS/$WORKERS/" "$here/nginx-stream.conf" >"$run-proxy/nginx.conf"
+        if [ "$PASSTHROUGH" = 1 ] || [ "$UDP" = 1 ]; then
+            local stream_conf=$here/nginx-stream.conf
+            [ "$UDP" = 1 ] && stream_conf=$here/nginx-udp.conf
+            sed "s/WORKERS/$WORKERS/" "$stream_conf" >"$run-proxy/nginx.conf"
             # Ubuntu builds the stream module apart (libnginx-mod-stream), and its own
             # config loads it by a path relative to a prefix this run replaces.
             local stream_module=/usr/lib/nginx/modules/ngx_stream_module.so
@@ -610,6 +656,10 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
             -e "$run-proxy/error.log" 2>>"$OUT/proxy.log" &
         ;;
     haproxy | haproxy-rl)
+        if [ "$UDP" = 1 ]; then
+            echo "HAProxy has no UDP proxy: leave it out of the udp runs" >&2
+            exit 2
+        fi
         # A thread for every CPU it may run on: WORKERS of them, if PROXY_CPUS is as many.
         local haproxy_cfg=$run-haproxy.cfg
         if [ "$PASSTHROUGH" = 1 ]; then
@@ -1271,9 +1321,11 @@ idle_memory() { # name, [kind, count]: as bench/idle.py takes them
     stop_proxy
     start_proxy "${name%%.*}"
     sleep 1
-    local quiet
+    local quiet at=$proxy_at
+    # UDP sessions are held at the udp listener.
+    [ "$kind" = udp ] && at=$udp_at
     quiet=$(python3 "$here/rss.py" "$proxy_pid")
-    taskset -c "$GEN_CPUS" python3 "$here/idle.py" "$proxy_at" "$host" \
+    taskset -c "$GEN_CPUS" python3 "$here/idle.py" "$at" "$host" \
         "$count" "$kind" >"$OUT/$name.ready" 2>"$OUT/$name.err" &
     local holding=$!
     for _ in $(seq 1200); do
@@ -1286,8 +1338,13 @@ idle_memory() { # name, [kind, count]: as bench/idle.py takes them
     [ "$kind" = silent ] || sleep 2
     local held open
     held=$(python3 "$here/rss.py" "$proxy_pid")
-    # What is weighed is what is still open, which is not always all that were opened.
-    open=$(ss -Htn state established "( sport = :${proxy_at##*:} )" | wc -l)
+    # What is weighed is what is still open, which is not always all that were opened: for
+    # UDP, the sessions the proxy holds, a socket of its own connected to the echo each.
+    if [ "$kind" = udp ]; then
+        open=$(ss -Hun state established "( dport = :9053 )" | wc -l)
+    else
+        open=$(ss -Htn state established "( sport = :${proxy_at##*:} )" | wc -l)
+    fi
     {
         echo "kind $kind"
         echo "connections $count"
@@ -1426,6 +1483,10 @@ environment() {
             "tls at 8443 to its 9443 by name"
         [ "$WEBSOCKET" = 1 ] && echo "websocket: wsbench at 9000 answers and echoes;" \
             "$(sha256sum "$WSBENCH" | cut -c1-12)"
+        [ "$UDP" = 1 ] && echo "udp: udp at 8053 to wsbench's echo at 9053, 60 s idle;" \
+            "local ports $(tr '\t' '-' </proc/sys/net/ipv4/ip_local_port_range)," \
+            "open files $(ulimit -n);" \
+            "$(sha256sum "$WSBENCH" | cut -c1-12)"
         oha --version
         nginx -v 2>&1
         { command -v haproxy >/dev/null && haproxy -v | head -1; } || true
@@ -1468,9 +1529,9 @@ profile-body)
         exit 2
     }
     ;;
-ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3 | h3latency | mixed | passthrough | websocket | ratelimit) ;;
+ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3 | h3latency | mixed | passthrough | udp | websocket | ratelimit) ;;
 *)
-    sed -n '2,56p' "$0" >&2
+    sed -n '2,62p' "$0" >&2
     exit 2
     ;;
 esac
@@ -1771,6 +1832,57 @@ passthrough)
         streamed_answer "$1.streamed-tcp" "$streamed_rate"
     }
     each_variant passthrough_runs
+    ;;
+udp)
+    # UDP sessions (24 step 5), by bench/wsbench against its own UDP echo, 64-byte datagrams:
+    # 64 sessions kept busy, a datagram and its echo at a time on each (busy); RATE datagrams
+    # a second spread over 256 sessions, each timed from when it was due (paced); a new
+    # session for every datagram at CHURN a second, timed from when it was due to its echo
+    # (churn), 400 unless said: under the some 470 a second that the 60 s idle bound and the
+    # laptop's 28,232 local ports allow (24 §7), the proxy holding a port a session; the same
+    # at PORTS a second, 1,000 unless said, for UDP_PORTS_SECONDS on a proxy started afresh
+    # (ports): past what the ports hold after some 28 s, and on until the first sessions
+    # have gone idle and freed theirs, answered and lost counted by the second, with what
+    # the proxy says it dropped; and what UDP_HELD sessions cost held idle (held). Busy and
+    # paced straight at the echo first, once a repetition: the generator's and the echo's
+    # own.
+    udp_rate=${2:-25000} churn_rate=${3:-400} ports_rate=${4:-1000}
+    METRICS=${METRICS:-127.0.0.1:9090}
+    udpload() { # name, at, command, options...
+        local name=$1 at=$2 command=$3
+        shift 3
+        measured "$name" "$WSBENCH" "$command" "$at" --seconds "$DURATION" \
+            --threads "$(cpus_in "$GEN_CPUS")" "$@"
+    }
+    udp_ports() { # name
+        local name=$1 logged=0
+        stop_proxy
+        start_proxy "${name%%.*}"
+        [ -f "$run-proxy/error.log" ] && logged=$(wc -l <"$run-proxy/error.log")
+        DURATION=$UDP_PORTS_SECONDS udpload "$name" "$udp_at" udp-churn --rate "$ports_rate"
+        # What the proxy says it dropped: EdgeRush's metrics, NGINX's error log.
+        case "${name%%.*}" in
+        nginx*)
+            tail -n +$((logged + 1)) "$run-proxy/error.log" >"$OUT/$name.errors" 2>/dev/null || true
+            ;;
+        *)
+            curl -s "http://$METRICS/metrics" | grep '^edgerush_listener_udp_' \
+                >"$OUT/$name.metrics" || true
+            ;;
+        esac
+    }
+    udp_runs() {
+        udpload "$1.udp-busy" "$udp_at" udp --sessions 64
+        udpload "$1.udp-paced" "$udp_at" udp --sessions 256 --rate "$udp_rate"
+        udpload "$1.udp-churn" "$udp_at" udp-churn --rate "$churn_rate"
+        udp_ports "$1.udp-ports"
+        idle_memory "$1.udp-held" udp "$UDP_HELD"
+    }
+    for rep in $(seq "$REPS"); do
+        udpload "backend.$rep.udp-busy" 127.0.0.1:9053 udp --sessions 64
+        udpload "backend.$rep.udp-paced" 127.0.0.1:9053 udp --sessions 256 --rate "$udp_rate"
+    done
+    each_variant udp_runs
     ;;
 websocket)
     # WebSocket over HTTP/1.1 upgrades (19 step 5), by bench/wsbench against its own echo:

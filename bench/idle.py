@@ -19,12 +19,15 @@ What each connection does first is the fourth argument:
   bench's certificate is not checked), HTTP/2 asked for by ALPN: what an idle TLS
   connection costs, which a pod's memory pays for too. Opened 64 at a time: one after
   another, handshakes are slow enough that the first would pass the proxy's keep-alive
-  deadline, and be closed, before the last was open.
+  deadline, and be closed, before the last was open;
+- `udp`: a UDP socket of its own each, connected to a `udp` listener, one datagram sent and
+  its echo taken, and then nothing more: what a UDP session costs held (24 step 5), within
+  the proxy's idle bound. The host is not used.
 
 Says `ready` on its standard output once they are all answered, or all open, and then waits
 to be killed.
 
-    bench/idle.py 127.0.0.1:8080 bench.example.com 10000 [one-request|large-head|silent|refreshed|h2|websocket|tls|tls-h2]
+    bench/idle.py 127.0.0.1:8080 bench.example.com 10000 [one-request|large-head|silent|refreshed|h2|websocket|tls|tls-h2|udp]
 """
 
 import socket
@@ -40,6 +43,11 @@ WEBSOCKET_KEY = "dGhlIHNhbXBsZSBub25jZQ=="
 H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 # Within the proxy's 30-second keep-alive deadline, with room to spare.
 REFRESH = 20
+# A UDP session's datagram, and how long its echo may take, and how many times it is sent
+# before the session counts as not made.
+DATAGRAM = b"x" * 64
+ECHO_WAIT = 1.0
+ECHO_TRIES = 3
 
 
 def answer(connection) -> bytes:
@@ -140,6 +148,25 @@ def opened(address, port, request, http2=False, expect=READY, tls=None):
     return connection
 
 
+def session(address, port):
+    """A UDP socket connected to the proxy, whose datagram has been echoed: a session the
+    proxy holds. Raises `ConnectionError` if no echo comes, or one that differs."""
+    held = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    held.connect((address, int(port)))
+    held.settimeout(ECHO_WAIT)
+    for _ in range(ECHO_TRIES):
+        held.send(DATAGRAM)
+        try:
+            if held.recv(65535) == DATAGRAM:
+                return held
+        except TimeoutError:
+            continue
+        held.close()
+        raise ConnectionError("an echo that differs")
+    held.close()
+    raise ConnectionError("no echo")
+
+
 def main() -> int:
     where, host, many = sys.argv[1], sys.argv[2], int(sys.argv[3])
     kind = sys.argv[4] if len(sys.argv) > 4 else "one-request"
@@ -164,9 +191,12 @@ def main() -> int:
     tls = host if kind in ("tls", "tls-h2") else None
 
     try:
-        # A handshake lets go of the interpreter while it waits, so threads do overlap.
-        with ThreadPoolExecutor(max_workers=64 if tls else 1) as pool:
-            held = list(pool.map(lambda _: opened(address, port, asked, http2, expect, tls), range(many)))
+        if kind == "udp":
+            held = [session(address, port) for _ in range(many)]
+        else:
+            # A handshake lets go of the interpreter while it waits, so threads do overlap.
+            with ThreadPoolExecutor(max_workers=64 if tls else 1) as pool:
+                held = list(pool.map(lambda _: opened(address, port, asked, http2, expect, tls), range(many)))
     except (OSError, ConnectionError) as error:
         print(error, file=sys.stderr)
         return 1
@@ -174,6 +204,9 @@ def main() -> int:
     print(f"ready {len(held)}", flush=True)
     # Held until this process is killed. The sockets go when it does.
     try:
+        if kind == "udp":
+            while True:
+                time.sleep(REFRESH)
         if kind != "refreshed":
             while True:
                 held[0].recv(1)
