@@ -535,6 +535,19 @@ impl<V: Held> Node<V> {
         self.data.values().map(BTreeMap::len).sum()
     }
 
+    /// How many keys it holds of the shards its committed table names it the owner of: none
+    /// with no table. A count by shard, never a walk of the keys.
+    #[must_use]
+    pub fn owned_key_count(&self) -> usize {
+        self.committed.as_ref().map_or(0, |table| {
+            table
+                .owned_by(self.id)
+                .filter_map(|shard| self.data.get(&shard))
+                .map(BTreeMap::len)
+                .sum()
+        })
+    }
+
     /// Whether it serves `shard` at `now`: its table names it the owner, it is not waiting for
     /// the shard's last changes from the owner it was handed on from, and it and a majority of
     /// the voting set hear each other within `stop_serving`.
@@ -3359,6 +3372,34 @@ mod tests {
         let _ = replica.receive(1, reply, ms(1));
         let sent = owner.receive(2, Message::TableReply { table: first }, ms(1));
         (owner, replica, sent)
+    }
+
+    /// The keys it owns are those of the shards its committed table names it the owner of;
+    /// the rest it holds are copies, and with no table it owns none.
+    #[test]
+    fn it_owns_the_keys_of_the_shards_its_table_names_it_the_owner_of() {
+        let mut config = config();
+        config.shards = 8;
+        let first = table::first(&named(&[1, 2, 3]), 8, 2, 1);
+        let mut node = Node::new(1, address(1), config, [2, 3]);
+        // Two keys in each shard.
+        for shard in 0..8 {
+            for key in (0..).filter(|key| shard_of(*key, 8) == shard).take(2) {
+                node.load(key, Counts::of(1));
+            }
+        }
+        assert_eq!(
+            (node.key_count(), node.owned_key_count()),
+            (16, 0),
+            "no table"
+        );
+        let _ = node.receive(2, Message::TableReply { table: first }, ms(1));
+        let owned = owned_by_1(&node).len();
+        assert!(
+            0 < owned && owned < 8,
+            "it owns some shards, not all: {owned}"
+        );
+        assert_eq!((node.key_count(), node.owned_key_count()), (16, 2 * owned));
     }
 
     /// The shards 1 owns.

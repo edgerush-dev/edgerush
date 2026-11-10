@@ -147,8 +147,8 @@ impl Counted for TurnedAway {
 }
 
 /// The text of a store pod's scrape, of what `observed` says of it: whether it serves, its keys
-/// against their cap, what its mode counts, its peers' clocks, what its sending dropped, and
-/// the table it follows.
+/// and those it owns against their cap, what its mode counts, its peers' clocks, what its
+/// sending dropped, and the table it follows.
 #[must_use]
 pub fn render_store<C: Counted>(observed: Observed<C>) -> String {
     let mut scrape = Exposition::new();
@@ -168,6 +168,10 @@ pub fn render_store<C: Counted>(observed: Observed<C>) -> String {
     let name = "edgerush_rate_limit_keys";
     scrape.family(name, Kind::Gauge, "Keys held, owned and copies.");
     scrape.sample(name, &[], observed.keys);
+    let name = "edgerush_rate_limit_keys_owned";
+    let help = "Keys held of the shards the table the pod follows names it the owner of.";
+    scrape.family(name, Kind::Gauge, help);
+    scrape.sample(name, &[], observed.owned_keys);
     let name = "edgerush_rate_limit_keys_evicted_total";
     let help = "Keys evicted, least recently changed first, to keep within the bytes they \
                 may hold; each starts again full.";
@@ -365,6 +369,7 @@ mod tests {
             leader: false,
             table: (4_294_967_297, 12),
             keys: 10,
+            owned_keys: 7,
             key_bytes: 9_710,
             max_key_bytes: Some(1 << 20),
             forgotten: 5,
@@ -385,6 +390,7 @@ mod tests {
             "edgerush_rate_limit_key_bytes 9710\n",
             "edgerush_rate_limit_max_key_bytes 1048576\n",
             "edgerush_rate_limit_keys 10\n",
+            "edgerush_rate_limit_keys_owned 7\n",
             "edgerush_rate_limit_keys_evicted_total 4\n",
             "edgerush_rate_limit_keys_forgotten_total 5\n",
             "edgerush_rate_limit_decided_from_copy_total 6\n",

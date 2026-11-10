@@ -218,6 +218,35 @@ def owner_of(system, n, key):
     return 0
 
 
+# The gauge a pod of EdgeRush's service shows the keys it owns by.
+OWNED = "edgerush_rate_limit_keys_owned"
+
+
+def owner_in(scrapes):
+    """Which of EdgeRush's service pods owns the load's key, by their scrapes in order: the
+    one showing a key owned, as the load is one key. Refused unless exactly one does."""
+    owned = []
+    for pod, scrape in enumerate(scrapes):
+        values = [line.split()[1] for line in scrape.splitlines() if line.split()[:1] == [OWNED]]
+        if not values:
+            raise ValueError(f"pod {pod}'s scrape shows no {OWNED}")
+        owned.append(int(values[0]))
+    owners = [pod for pod, count in enumerate(owned) if count > 0]
+    if len(owners) != 1:
+        raise ValueError(f"not one pod owns the load's key: owned: {owned}")
+    return owners[0]
+
+
+def service_owner(system):
+    """The index, among `system.stores`, of the service pod owning the load's key now."""
+    scrapes = []
+    for store in system.stores:
+        url = f"http://{systems.STORE_IPS[store]}:{systems.SERVICE_METRICS}/metrics"
+        with urllib.request.urlopen(url, timeout=2) as r:
+            scrapes.append(r.read().decode())
+    return owner_in(scrapes)
+
+
 async def run_command(*args):
     process = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
@@ -251,10 +280,17 @@ async def strike(fault, system, n, owner, t0, route, events, key):
     span = workloads.SPAN / 1e9
     store = f"{PROJECT}-{system.stores[0]}" if system.stores else None
     if fault in ("owner-lost", "owner-restart"):
-        # EdgeRush's service: the store's table names the key's owner, and the harness has no
-        # way to read it yet; striking another pod would measure the wrong fault.
+        # EdgeRush's service: the pod its scrapes show owning the load's key, read a second
+        # before the strike, the key in use since the start.
         if system.owner == "service":
-            raise SystemExit(f"{fault}: the owner of {system.key}'s key is not known to the harness")
+            await at(t0, span / 2 - 1)
+            loop = asyncio.get_running_loop()
+            try:
+                pod = await loop.run_in_executor(None, service_owner, system)
+            except (OSError, ValueError) as error:
+                raise SystemExit(f"{fault}: {system.key}'s owner: {error}") from error
+            store = f"{PROJECT}-{system.stores[pod]}"
+            events.append((f"owner {system.stores[pod]}", time.monotonic_ns() - t0))
         await at(t0, span / 2 - (0 if owner is None else DRAIN))
         events.append(("strike", time.monotonic_ns() - t0))
         if owner is None:

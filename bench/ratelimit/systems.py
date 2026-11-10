@@ -17,6 +17,8 @@ REDIS_IP, RATELIMIT_IP = f"{BACK}.2", f"{BACK}.3"
 # EdgeRush's rate-limiting service: three pods of its store, the program that forms them, and
 # where the binaries built on the host are.
 SERVICE_IPS = [f"{BACK}.{4 + pod}" for pod in range(3)]
+# Where each pod serves its scrape, which shows the keys it owns.
+SERVICE_METRICS = 9090
 FORM_IP = f"{BACK}.7"
 BINARIES = os.environ.get("RLH_BIN", "/home/claude/rlh-bin")
 
@@ -549,7 +551,8 @@ def build_edgerush(n, workers=1, sharing="", cpus=None):
     for pod in range(3):
         files[f"rl{pod}.yaml"] = (
             "mode: asynchronous\n"
-            f"pod: {{ listen: 0.0.0.0:7000, address: {SERVICE_IPS[pod]}:7000, cycle_ms: 10 }}\n"
+            f"pod: {{ listen: 0.0.0.0:7000, address: {SERVICE_IPS[pod]}:7000, cycle_ms: 10, "
+            f"metrics: 0.0.0.0:{SERVICE_METRICS} }}\n"
             "store: {}\n"
         )
         services[f"rl{pod}"] = {

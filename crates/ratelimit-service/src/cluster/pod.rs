@@ -123,6 +123,8 @@ pub struct Observed<C = DecidedFromCopy> {
     pub table: Stamp,
     /// Keys it holds, owned and copies.
     pub keys: u64,
+    /// Of those, the keys of the shards its committed table names it the owner of.
+    pub owned_keys: u64,
     /// About the bytes they take.
     pub key_bytes: u64,
     /// What those bytes are capped at, if anything.
@@ -272,6 +274,7 @@ impl<M: Mode> StorePod<M> {
                 leader: node.is_leader(),
                 table: node.committed_stamp(),
                 keys: u64::try_from(node.key_count()).unwrap_or(u64::MAX),
+                owned_keys: u64::try_from(node.owned_key_count()).unwrap_or(u64::MAX),
                 key_bytes: node.key_bytes(),
                 max_key_bytes: node.config().max_key_bytes,
                 forgotten: node.forgotten(),
