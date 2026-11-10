@@ -512,6 +512,10 @@ pub struct Worker {
     /// By key ([`Routed`]): the drain of the tunnels routed by a listener, route and
     /// upstream, which a reload that takes any of the three away starts (03 §10).
     routes: RefCell<HashMap<u64, Rc<Drain>>>,
+    /// Started at the next snapshot `validated` is brought up to, and put in the place of by
+    /// a new one: how a `udp` listener hears of a reload, whose sessions it walks then
+    /// (24 §5).
+    reloaded: RefCell<Rc<Drain>>,
     /// What its requests' access-log records are written into, until handed to the logger
     /// ([21 §4](../../docs/21-access-logs.md)).
     batches: Batches,

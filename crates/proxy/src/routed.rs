@@ -1,7 +1,7 @@
 //! What a tunnel was routed by, known across reloads ([03 §10](../../docs/03-data-plane.md)).
 //!
 //! A tunnel — a passthrough connection, or a WebSocket once it has switched — is routed
-//! once, when it opens. A reload that takes away its route, its route's listing of the
+//! once, when it opens, as a `udp` listener's session is when it is made (24 §5). A reload that takes away its route, its route's listing of the
 //! upstream it went to, or its listener drains it; one that keeps all three, whatever else
 //! it changes, does not. So every snapshot gives each listener, route and upstream it has a
 //! key, kept from the snapshot before for as long as all three are there by name: a tunnel
@@ -24,6 +24,8 @@ pub(crate) enum Through {
     Tcp,
     /// A `tls` listener's route at this position among its routes.
     Tls(usize),
+    /// A `udp` listener's one route: a session's.
+    Udp,
 }
 
 /// The keys of what a snapshot's tunnels go by.
@@ -118,7 +120,15 @@ fn routes_of<'a>(
         }
         None => {}
     }
-    // None for a `tcp` or `tls` listener; an `https` one that passes some through has both.
+    if let Some(route) = &listener.udp {
+        found.extend(
+            route
+                .backends
+                .upstreams()
+                .map(|upstream| (Through::Udp, route.name.as_str(), upstream)),
+        );
+    }
+    // None for a `tcp`, `tls` or `udp` listener; an `https` one that passes some through has both.
     for &route in &listener.http_routes {
         let Some(name) = config.route_name(route) else {
             continue;
@@ -338,5 +348,61 @@ tls_routes: [{tls}]
             gone.key(DB, Through::Tcp, ONE),
             again.key(DB, Through::Tcp, ONE)
         );
+    }
+
+    /// A `udp` listener's route keys its sessions as a `tcp` one's keys its tunnels: kept
+    /// while the listener, the route and its listing of the upstream are, whatever the
+    /// weights; dropped once the route or the listing goes.
+    #[test]
+    fn a_udp_listeners_route_keys_its_sessions() {
+        let udp = |route: &str, backends: &str| {
+            let yaml = format!(
+                "listeners:\n  dns: {{ address: \"[::]:53\", protocol: udp }}\n\
+                 routes: []\n\
+                 udp_routes: [{{ name: {route}, listeners: [dns], backends: [{backends}] }}]\n\
+                 upstreams:\n  \
+                 one: {{ protocol: udp, load_balancer: p2c, endpoints: {{ listed: [\"10.0.0.1:53\"] }} }}\n  \
+                 two: {{ protocol: udp, load_balancer: p2c, endpoints: {{ listed: [\"10.0.0.2:53\"] }} }}\n"
+            );
+            compile(&serde_saphyr::from_str::<Config>(&yaml).unwrap()).unwrap()
+        };
+        let keys = Keys::default();
+        let dns = [Some("dns".to_owned()), None];
+        let before = Routed::reconcile(
+            &udp("dns", "{ upstream: one, weight: 1 }"),
+            &dns,
+            &Routed::default(),
+            &keys,
+        );
+        let one = before.key(0, Through::Udp, ONE).unwrap();
+        assert_eq!(before.key(0, Through::Tcp, ONE), None);
+
+        let reweighted = Routed::reconcile(
+            &udp(
+                "dns",
+                "{ upstream: one, weight: 3 }, { upstream: two, weight: 1 }",
+            ),
+            &dns,
+            &before,
+            &keys,
+        );
+        assert_eq!(reweighted.key(0, Through::Udp, ONE), Some(one));
+        assert!(reweighted.holds(one));
+
+        let listing_gone = Routed::reconcile(
+            &udp("dns", "{ upstream: two, weight: 1 }"),
+            &dns,
+            &reweighted,
+            &keys,
+        );
+        assert!(!listing_gone.holds(one));
+        let two = listing_gone.key(0, Through::Udp, TWO).unwrap();
+        let renamed = Routed::reconcile(
+            &udp("names", "{ upstream: two, weight: 1 }"),
+            &dns,
+            &listing_gone,
+            &keys,
+        );
+        assert!(!renamed.holds(two));
     }
 }

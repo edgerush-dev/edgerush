@@ -222,6 +222,8 @@ pub(crate) enum Dropped {
     Truncated,
     /// Either way, the socket it was to go out of had no room for it.
     SendFull,
+    /// A new client's, its listener taken away or its worker draining (24 §5).
+    Draining,
 }
 
 impl Dropped {
@@ -235,11 +237,12 @@ impl Dropped {
             Self::Unreachable => "unreachable",
             Self::Truncated => "truncated",
             Self::SendFull => "send_full",
+            Self::Draining => "draining",
         }
     }
 
     /// Every one of them, for a scrape that shows a series whether it has happened or not.
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::NoRoute,
         Self::InvalidBackend,
         Self::NoRoom,
@@ -247,6 +250,7 @@ impl Dropped {
         Self::Unreachable,
         Self::Truncated,
         Self::SendFull,
+        Self::Draining,
     ];
 }
 
@@ -1877,6 +1881,7 @@ mod tests {
             "edgerush_listener_udp_datagrams_dropped_total{listener=\"web\",reason=\"send_full\"} 2\n",
             "edgerush_listener_udp_datagrams_dropped_total{listener=\"web\",reason=\"no_route\"} 0\n",
             "edgerush_listener_udp_datagrams_dropped_total{listener=\"admin\",reason=\"unreachable\"} 0\n",
+            "edgerush_listener_udp_datagrams_dropped_total{listener=\"admin\",reason=\"draining\"} 0\n",
             "edgerush_listener_time_to_response_head_seconds_bucket{listener=\"web\",le=\"0.0005\"} 1\n",
             "edgerush_listener_time_to_response_head_seconds_bucket{listener=\"web\",le=\"0.001\"} 2\n",
             "edgerush_listener_time_to_response_head_seconds_bucket{listener=\"web\",le=\"+Inf\"} 2\n",

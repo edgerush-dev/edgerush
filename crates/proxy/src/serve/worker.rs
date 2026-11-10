@@ -165,6 +165,7 @@ impl Worker {
             quic_listening,
             validated,
             routes: RefCell::default(),
+            reloaded: RefCell::default(),
             batches,
             said: Said::default(),
             limiter_said: LimiterSaid::default(),
@@ -239,7 +240,8 @@ impl Worker {
     /// Brings the validations and the routes up to the snapshot in force, once a reload has
     /// come: the connections of a listener whose client validation it replaced drain (03 §3),
     /// and those of one whose certificates alone changed do not; the tunnels of a listener,
-    /// route and upstream it took away drain (03 §10). For the sweep.
+    /// route and upstream it took away drain (03 §10); and the `udp` listeners are told
+    /// (24 §5). For the sweep.
     pub(super) fn revalidate(&self) {
         let snapshot = self.proxy.current.load();
         if snapshot.generation == self.validated.get() {
@@ -270,6 +272,7 @@ impl Worker {
             }
             Rc::strong_count(drain) > 1
         });
+        replaced.push(self.reloaded.replace(Rc::default()));
         for drain in replaced {
             drain.start();
         }
@@ -288,6 +291,12 @@ impl Worker {
             drain,
         };
         std::mem::replace(validation, replaced).drain
+    }
+
+    /// What is started the next time this worker's sweep finds a snapshot newer than the
+    /// last it brought itself up to.
+    pub(super) fn next_reload(&self) -> Rc<Drain> {
+        Rc::clone(&self.reloaded.borrow())
     }
 
     /// Until this worker drains.

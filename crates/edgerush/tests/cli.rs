@@ -18,6 +18,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
@@ -439,8 +440,9 @@ fn free_over_udp_and_tcp() -> io::Result<SocketAddr> {
 }
 
 /// A `udp` listener is served beside a TCP-based one on the same port, as a config may
-/// have it (24 §2); taken away, it drains, the TCP listener left alone; and added again on
-/// that port, which the TCP listener keeps, it is served: TCP and UDP ports are not one.
+/// have it (24 §2); taken away, it drains, the TCP listener left alone, and goes once its
+/// last session has ended; and added again on that port, which the TCP listener keeps, it
+/// is served: TCP and UDP ports are not one.
 #[test]
 fn proxy_serves_a_udp_listener_beside_a_tcp_one_and_follows_it() -> io::Result<()> {
     let (one, echo) = (upstream("one")?, udp_echo()?);
@@ -457,8 +459,9 @@ fn proxy_serves_a_udp_listener_beside_a_tcp_one_and_follows_it() -> io::Result<(
                 "listeners:\n",
                 "udp_routes: [{ name: dns, listeners: [dns], backends: [{ upstream: echo, weight: 1 }] }]\nlisteners:\n",
             );
+            // A second's idle bound: its session ends idle, long before the drain's bound.
             yaml.push_str(&format!(
-                "  dns: {{ address: \"{shared}\", protocol: udp }}\n"
+                "  dns: {{ address: \"{shared}\", protocol: udp, session_idle_seconds: 1 }}\n"
             ));
         }
         yaml
@@ -485,7 +488,8 @@ fn proxy_serves_a_udp_listener_beside_a_tcp_one_and_follows_it() -> io::Result<(
     let scrape = get(metrics, "/metrics")?;
     assert!(scrape.contains(accepted), "{scrape}");
 
-    // Taken away: it drains, its session ended, and the TCP listener is left alone.
+    // Taken away: it drains, until its session has ended, and the TCP listener is left
+    // alone.
     std::fs::write(&file, with(false))?;
     harness.wait_for("listener \"dns\" has drained");
     assert!(get(shared, "/")?.contains("x-upstream: one"));
@@ -497,6 +501,80 @@ fn proxy_serves_a_udp_listener_beside_a_tcp_one_and_follows_it() -> io::Result<(
     assert_eq!(udp_exchange(shared, b"again")?, b"again");
     assert!(get(shared, "/")?.contains("x-upstream: one"));
     Ok(())
+}
+
+/// A `udp` listener a reload keeps keeps its socket and its sessions: a client sending all
+/// through reload after reload is answered every time, by the endpoint its session was made
+/// for, though the reloads moved its upstream to another; a new client goes to that one
+/// (24 §5).
+#[test]
+fn proxy_keeps_a_udp_listeners_sessions_across_reloads() -> io::Result<()> {
+    let (a, b) = (udp_naming(b"a")?, udp_naming(b"b")?);
+    let at = free_over_udp_and_tcp()?;
+    let with = |endpoint: SocketAddr, idle: u32| {
+        format!(
+            "upstreams:\n  up: {{ protocol: udp, load_balancer: p2c, endpoints: {{ listed: [\"{endpoint}\"] }} }}\n\
+             routes: []\n\
+             udp_routes: [{{ name: dns, listeners: [dns], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
+             listeners:\n  dns: {{ address: \"{at}\", protocol: udp, session_idle_seconds: {idle} }}\n"
+        )
+    };
+    let file = scratch("udp-reloads.yaml");
+    std::fs::write(&file, with(a, 60))?;
+    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
+    harness.wait_for("listener \"dns\" is on ");
+    harness.wait_for("1 worker, thread-per-core");
+    let client = UdpSocket::bind("127.0.0.1:0")?;
+    client.connect(at)?;
+    client.set_read_timeout(Some(PATIENCE))?;
+    assert_eq!(asked(&client)?, b"a");
+
+    // Sending all the while, on a thread of its own, as the reloads come.
+    let done = Arc::new(AtomicBool::new(false));
+    let sending = {
+        let (client, done) = (client.try_clone()?, Arc::clone(&done));
+        thread::spawn(move || -> io::Result<usize> {
+            let mut answered = 0;
+            while !done.load(Ordering::Relaxed) {
+                assert_eq!(asked(&client)?, b"a", "after {answered} answers");
+                answered += 1;
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(answered)
+        })
+    };
+    for idle in 61..=63 {
+        std::fs::write(&file, with(b, idle))?;
+        harness.wait_for("config reloaded");
+    }
+    // Past the worker's next sweep, which is when it sees a reload.
+    thread::sleep(Duration::from_millis(1500));
+    done.store(true, Ordering::Relaxed);
+    let answered = sending.join().expect("the sender")?;
+    assert!(answered > 10, "{answered} answers");
+    assert_eq!(udp_exchange(at, b"?")?, b"b");
+    Ok(())
+}
+
+/// What `client`, connected, is answered with for a datagram of its own.
+fn asked(client: &UdpSocket) -> io::Result<Vec<u8>> {
+    client.send(b"?")?;
+    let mut buffer = [0; 16];
+    let len = client.recv(&mut buffer)?;
+    Ok(buffer[..len].to_vec())
+}
+
+/// Starts a UDP upstream that answers every datagram with `name`.
+fn udp_naming(name: &'static [u8]) -> io::Result<SocketAddr> {
+    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    let address = socket.local_addr()?;
+    thread::spawn(move || {
+        let mut buffer = vec![0; 1 << 16];
+        while let Ok((_, from)) = socket.recv_from(&mut buffer) {
+            let _sent = socket.send_to(name, from);
+        }
+    });
+    Ok(address)
 }
 
 /// What `to` answers a datagram `datagram` with, from a socket of the test's own.

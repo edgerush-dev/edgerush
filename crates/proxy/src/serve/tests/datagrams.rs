@@ -4,6 +4,7 @@
 use super::*;
 use crate::serve::datagrams::{sends_refused, sockets_full};
 use crate::upstream::dial;
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 
 /// A `udp` listener `dns` whose one route goes to `backends`, each `(upstream, weight)`,
 /// with `upstreams` the upstreams' YAML and `extra` in the listener's settings.
@@ -651,24 +652,337 @@ async fn a_session_refused_on_a_send_ends_and_its_endpoint_is_set_aside() {
         .await;
 }
 
-/// A listener taken away, or a worker that drains, ends every session, counted, and the
-/// listener's task with them.
+/// A listener taken away drains its sessions: each carried on both ways to the drain's
+/// bound, however busy, then ended, counted; a new client is given none, its datagram
+/// dropped; and the listener's task ends with the last session (24 §5).
 #[tokio::test]
-async fn a_listener_stopped_ends_its_sessions() {
+async fn a_listener_stopped_drains_its_sessions_and_makes_none() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let backend = echo_backend().await;
             let (front, worker, serving) =
                 serving_udp_reading(udp_to(&[backend], ""), H1Limits::default(), 1 << 16).await;
+            let mut clients = Vec::new();
             for _ in 0..3 {
                 let client = client_of(front).await;
                 assert_eq!(exchange(&client, b"?").await, b"?");
+                clients.push(client);
             }
             worker.stop(0);
+            let stopped = Instant::now();
+            let late = client_of(front).await;
+            late.send(b"new").await.unwrap();
+            counted(&worker, &dropped("draining", 1)).await;
+            assert!(unanswered(&late).await);
+            // Busy to the end: answered all the way to the bound.
+            while stopped.elapsed() + SLACK < SHORT.drain {
+                assert_eq!(exchange(&clients[0], b"busy").await, b"busy");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             within(serving).await.unwrap();
+            let took = stopped.elapsed();
+            assert!(
+                took + EARLY >= SHORT.drain && took < SHORT.drain + SLACK,
+                "ended after {took:?}"
+            );
             counted(&worker, &sessions_ended("drained", 3)).await;
             counted(&worker, &active(0)).await;
+        })
+        .await;
+}
+
+/// A listener taken away with no session ends at once.
+#[tokio::test]
+async fn a_listener_stopped_with_no_session_ends_at_once() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = echo_backend().await;
+            let (_, worker, serving) =
+                serving_udp_reading(udp_to(&[backend], ""), H1Limits::default(), 1 << 16).await;
+            // Waiting on its socket first: the stop is what wakes it.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let stopped = Instant::now();
+            worker.stop(0);
+            within(serving).await.unwrap();
+            assert!(
+                stopped.elapsed() < SLACK,
+                "ended after {:?}",
+                stopped.elapsed()
+            );
+        })
+        .await;
+}
+
+/// A worker that drains makes no session from then on, and drains those it has, as a
+/// listener taken away does.
+#[tokio::test]
+async fn a_draining_worker_drains_its_sessions() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = echo_backend().await;
+            let (front, worker, serving) =
+                serving_udp_reading(udp_to(&[backend], ""), H1Limits::default(), 1 << 16).await;
+            let client = client_of(front).await;
+            assert_eq!(exchange(&client, b"one").await, b"one");
+            worker.drain();
+            let drained = Instant::now();
+            assert_eq!(exchange(&client, b"two").await, b"two");
+            let late = client_of(front).await;
+            late.send(b"new").await.unwrap();
+            counted(&worker, &dropped("draining", 1)).await;
+            within(serving).await.unwrap();
+            let took = drained.elapsed();
+            assert!(
+                took + EARLY >= SHORT.drain && took < SHORT.drain + SLACK,
+                "ended after {took:?}"
+            );
+            counted(&worker, &sessions_ended("drained", 1)).await;
+        })
+        .await;
+}
+
+/// A worker serving `config`'s one listener, a `udp` one, its sweep run every 50 ms, as
+/// `serving_swept`'s: where it listens, and the worker.
+async fn serving_udp_swept(config: Compiled) -> (SocketAddr, Rc<Worker>) {
+    let limits = H1Limits {
+        sweep: Duration::from_millis(50),
+        ..H1Limits::default()
+    };
+    let (front, worker, _serving) =
+        serving_udp_reading(config, limits, crate::serve::datagrams::BUFFER).await;
+    let _sweeping = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+    (front, worker)
+}
+
+/// Long enough for a reload to be swept and any drain it started to have ended.
+fn swept_and_drained(worker: &Worker) -> Duration {
+    worker.limits.sweep * 2 + SHORT.drain + SLACK
+}
+
+/// A session open across a reload that keeps its listener, its route and the route's
+/// listing of its upstream carries on, with its endpoint, though the reload took the
+/// endpoint from the upstream and changed the weights; a new client goes where the new
+/// config says (24 §5).
+#[tokio::test]
+async fn a_session_whose_route_a_reload_keeps_carries_on_with_its_endpoint() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let a = naming_backend("a").await;
+            let b = naming_backend("b").await;
+            let (front, worker) = serving_udp_swept(udp_to(&[a], "")).await;
+            let client = client_of(front).await;
+            assert_eq!(exchange(&client, b"?").await, b"a");
+
+            let moved = udp_config(
+                "{ upstream: up, weight: 3 }, { upstream: spare, weight: 0 }",
+                &format!(
+                    "{}, {}",
+                    udp_upstream("up", &[b]),
+                    udp_upstream("spare", &[a])
+                ),
+                "",
+            );
+            worker.proxy().reload(moved).unwrap();
+            tokio::time::sleep(swept_and_drained(&worker)).await;
+            assert_eq!(exchange(&client, b"?").await, b"a");
+            assert_eq!(exchange(&client_of(front).await, b"?").await, b"b");
+            counted(&worker, &sessions_ended("drained", 0)).await;
+            counted(&worker, &active(2)).await;
+        })
+        .await;
+}
+
+/// A session open across a reload that takes its upstream from its route drains: carried
+/// on to the drain's bound from the sweep that saw the reload, then ended, counted; the
+/// client's next datagram makes a session under the new config.
+#[tokio::test]
+async fn a_session_is_drained_once_a_reload_takes_its_upstream_from_its_route() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let a = naming_backend("a").await;
+            let b = naming_backend("b").await;
+            let (front, worker) = serving_udp_swept(udp_to(&[a], "")).await;
+            let client = client_of(front).await;
+            assert_eq!(exchange(&client, b"?").await, b"a");
+
+            let swapped = udp_config(
+                "{ upstream: other, weight: 1 }",
+                &format!(
+                    "{}, {}",
+                    udp_upstream("up", &[a]),
+                    udp_upstream("other", &[b])
+                ),
+                "",
+            );
+            worker.proxy().reload(swapped).unwrap();
+            let reloaded = Instant::now();
+            tokio::time::sleep(worker.limits.sweep * 2).await;
+            assert_eq!(
+                exchange(&client, b"?").await,
+                b"a",
+                "carried on while it drains"
+            );
+            counted(&worker, &sessions_ended("drained", 1)).await;
+            let took = reloaded.elapsed();
+            assert!(
+                took + EARLY >= SHORT.drain && took < worker.limits.sweep + SHORT.drain + SLACK,
+                "ended after {took:?}"
+            );
+            assert_eq!(exchange(&client, b"?").await, b"b");
+        })
+        .await;
+}
+
+/// A session whose listener a reload keeps, and whose route it takes away, drains as one
+/// whose upstream it takes away does; a new client meanwhile finds no route.
+#[tokio::test]
+async fn a_session_whose_route_a_reload_takes_away_is_carried_to_the_bound() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = echo_backend().await;
+            let (front, worker) = serving_udp_swept(udp_to(&[backend], "")).await;
+            let client = client_of(front).await;
+            assert_eq!(exchange(&client, b"one").await, b"one");
+
+            let yaml = "listeners: { dns: { address: \"127.0.0.1:0\", protocol: udp } }\nroutes: []\nupstreams: {}\n";
+            let unrouted: Config = serde_saphyr::from_str(yaml).unwrap();
+            worker.proxy().reload(compile(&unrouted).unwrap()).unwrap();
+            tokio::time::sleep(worker.limits.sweep * 2).await;
+            assert_eq!(exchange(&client, b"two").await, b"two");
+            let late = client_of(front).await;
+            late.send(b"new").await.unwrap();
+            counted(&worker, &dropped("no_route", 1)).await;
+            counted(&worker, &sessions_ended("drained", 1)).await;
+            client.send(b"three").await.unwrap();
+            counted(&worker, &dropped("no_route", 2)).await;
+            assert!(unanswered(&client).await);
+        })
+        .await;
+}
+
+/// A reload ends the sessions of an invalid backend at once, which hold nothing and only
+/// drop, so that their clients pick again under the new config; a new snapshot of the same
+/// config, endpoints found, leaves them be (24 §5).
+#[tokio::test]
+async fn a_reload_ends_the_sessions_of_an_invalid_backend() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let config = || {
+                udp_config(
+                    "{ invalid: \"no such Service\", weight: 1 }",
+                    "found: { protocol: udp, load_balancer: p2c, endpoints: { kubernetes: \"dns.shop.svc.cluster.local:dns\" } }",
+                    "",
+                )
+            };
+            let (front, worker) = serving_udp_swept(config()).await;
+            let client = client_of(front).await;
+            client.send(b"one").await.unwrap();
+            counted(&worker, &dropped("invalid_backend", 1)).await;
+            counted(&worker, &active(1)).await;
+
+            let slice: EndpointSlice = serde_saphyr::from_str(
+                "metadata: { name: dns-1, namespace: shop, labels: { kubernetes.io/service-name: dns } }\n\
+                 addressType: IPv4\n\
+                 ports: [{ name: dns, port: 53, protocol: UDP }]\n\
+                 endpoints: [{ addresses: [\"10.0.0.1\"] }]\n",
+            )
+            .unwrap();
+            let changed = worker
+                .proxy()
+                .rediscover([("shop".to_owned(), Some(vec![slice].into()))])
+                .unwrap();
+            assert!(changed, "the endpoints changed");
+            tokio::time::sleep(worker.limits.sweep * 3).await;
+            counted(&worker, &sessions_ended("drained", 0)).await;
+            counted(&worker, &active(1)).await;
+
+            worker.proxy().reload(config()).unwrap();
+            counted(&worker, &sessions_ended("drained", 1)).await;
+            counted(&worker, &active(0)).await;
+            client.send(b"two").await.unwrap();
+            counted(&worker, &accepted(2)).await;
+        })
+        .await;
+}
+
+/// A reload that changes the listener's idle bound gives it to the sessions made from
+/// then on; one made before keeps its own, as a tunnel does (24 §5).
+#[tokio::test]
+async fn a_reload_gives_a_new_idle_bound_to_new_sessions_alone() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = echo_backend().await;
+            let (front, worker) =
+                serving_udp_swept(udp_to(&[backend], ", session_idle_seconds: 1")).await;
+            let before = client_of(front).await;
+            let first = Instant::now();
+            assert_eq!(exchange(&before, b"one").await, b"one");
+
+            worker
+                .proxy()
+                .reload(udp_to(&[backend], ", session_idle_seconds: 3"))
+                .unwrap();
+            tokio::time::sleep(worker.limits.sweep * 3).await;
+            let after = client_of(front).await;
+            let second = Instant::now();
+            assert_eq!(exchange(&after, b"two").await, b"two");
+
+            counted(&worker, &sessions_ended("idle", 1)).await;
+            let took = first.elapsed();
+            assert!(
+                took + EARLY >= Duration::from_secs(1)
+                    && took < Duration::from_secs(1) + SLACK + SLACK,
+                "the first ended after {took:?}"
+            );
+            counted(&worker, &active(1)).await;
+            counted(&worker, &sessions_ended("idle", 2)).await;
+            let took = second.elapsed();
+            assert!(
+                took + EARLY >= Duration::from_secs(3)
+                    && took < Duration::from_secs(3) + SLACK + SLACK,
+                "the second ended after {took:?}"
+            );
+        })
+        .await;
+}
+
+/// A listener kept across reloads loses nothing to them: datagrams sent while reload after
+/// reload comes are all carried, and all answered.
+#[tokio::test]
+async fn a_listener_kept_across_reloads_loses_nothing() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = echo_backend().await;
+            let (front, worker) = serving_udp_swept(udp_to(&[backend], "")).await;
+            let clients = [client_of(front).await, client_of(front).await];
+            for round in 0_u32..100 {
+                if round % 10 == 0 {
+                    let idle = 60 + round;
+                    worker
+                        .proxy()
+                        .reload(udp_to(
+                            &[backend],
+                            &format!(", session_idle_seconds: {idle}"),
+                        ))
+                        .unwrap();
+                }
+                for client in &clients {
+                    let sent = round.to_be_bytes();
+                    assert_eq!(exchange(client, &sent).await, sent);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            counted(&worker, &sessions_ended("drained", 0)).await;
+            counted(&worker, &accepted(2)).await;
         })
         .await;
 }
