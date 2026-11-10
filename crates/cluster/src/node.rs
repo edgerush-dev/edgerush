@@ -1079,13 +1079,15 @@ impl<V: Held> Node<V> {
         if !self.draining {
             joining.insert(self.id, self.address.clone());
         }
-        // Those that have answered its latest heartbeats, it with them.
-        let recent = self.config.heartbeat * 2;
+        // Those that have answered its heartbeats within a lease, it with them: the ones that
+        // can hold one. An echo rides its sender's next heartbeat, a round trip and up to a
+        // heartbeat after the one it echoes; a shorter window drops a taker's moves now and
+        // then over a slow network, and asks for them again, and it never takes its shards.
         let answering: BTreeSet<NodeId> = self
             .peers
             .iter()
             .copied()
-            .filter(|peer| self.mutual(*peer, now, recent))
+            .filter(|peer| self.mutual(*peer, now, self.config.stop_serving))
             .chain(std::iter::once(self.id))
             .collect();
         // The next table, made only once something changes it: most ticks nothing does.

@@ -282,7 +282,7 @@ pub fn first(members: &BTreeMap<NodeId, String>, shards: u16, replicas: usize, t
 }
 
 /// What the leader changes in `table` given the members it hears (`live`), those that have
-/// answered its latest heartbeats (`answering`) and those asking to join (`joining`, each with
+/// answered its heartbeats within a lease (`answering`) and those asking to join (`joining`, each with
 /// the address it gave): new members taken in, members gone taken out, each shard whose owner is gone given to a live
 /// replica with its term raised, replicas gone replaced so that each shard keeps `replicas`
 /// live copies where it can, and the voting set worked towards. `None` when nothing changes.
@@ -392,7 +392,7 @@ fn fill_replicas(table: &mut Table, replicas: usize) {
 /// live replica not draining (or else the live member owning fewest), then shards from the
 /// live members owning most to those owning fewest, until no two differ by more than one.
 /// Moves already asked for stay while their shard's owner and target still stand; the rest go.
-/// A shard is moved only to a member that has answered the leader's latest heartbeats
+/// A shard is moved only to a member that has answered the leader's heartbeats within a lease
 /// (`answering`): one the leader hears but that does not hear it may hold no lease, and never
 /// serve what it takes. `None` when nothing changes.
 #[must_use]
