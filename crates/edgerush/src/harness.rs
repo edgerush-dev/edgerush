@@ -2134,7 +2134,11 @@ upstreams: {{}}
     /// A listener whose HTTP/3 cannot have its port is refused as HTTP/3, at that port.
     #[test]
     fn a_listener_whose_udp_port_is_taken_is_refused_for_http3() {
-        let taken = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // A port free over TCP as well, its TCP side let go just before the listener takes
+        // it: a UDP port drawn alone may be one whose TCP side another test holds, which
+        // refuses the listener for its TCP port first (#318).
+        let (tcp, taken) = listen_both("127.0.0.1:0".parse().unwrap(), Port::Own).unwrap();
+        drop(tcp);
         let named = taken.local_addr().unwrap();
         let refused = opened(&mut with_http3(named), NonZeroUsize::MIN, Port::Own).unwrap_err();
         let Failure::Listen { what, address, .. } = refused else {
