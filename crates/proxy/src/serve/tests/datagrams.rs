@@ -805,6 +805,39 @@ async fn a_session_whose_route_a_reload_keeps_carries_on_with_its_endpoint() {
         .await;
 }
 
+/// A session whose backend a reload leaves listed at weight 0 carries on, with its
+/// endpoint, while new clients go to the backends with a share: weight 0 retires a backend
+/// gently (24 §5, 03 §10).
+#[tokio::test]
+async fn a_session_whose_backend_a_reload_gives_weight_zero_carries_on() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let a = naming_backend("a").await;
+            let b = naming_backend("b").await;
+            let (front, worker) = serving_udp_swept(udp_to(&[a], "")).await;
+            let client = client_of(front).await;
+            assert_eq!(exchange(&client, b"?").await, b"a");
+
+            let retired = udp_config(
+                "{ upstream: up, weight: 0 }, { upstream: other, weight: 1 }",
+                &format!(
+                    "{}, {}",
+                    udp_upstream("up", &[a]),
+                    udp_upstream("other", &[b])
+                ),
+                "",
+            );
+            worker.proxy().reload(retired).unwrap();
+            tokio::time::sleep(swept_and_drained(&worker)).await;
+            assert_eq!(exchange(&client, b"?").await, b"a");
+            assert_eq!(exchange(&client_of(front).await, b"?").await, b"b");
+            counted(&worker, &sessions_ended("drained", 0)).await;
+            counted(&worker, &active(2)).await;
+        })
+        .await;
+}
+
 /// A session open across a reload that takes its upstream from its route drains: carried
 /// on to the drain's bound from the sweep that saw the reload, then ended, counted; the
 /// client's next datagram makes a session under the new config.

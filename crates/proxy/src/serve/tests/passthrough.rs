@@ -466,6 +466,66 @@ async fn a_tls_tunnel_is_drained_once_a_reload_takes_its_route_away() {
         .await;
 }
 
+/// A tunnel whose backend a reload leaves listed at weight 0 is left alone, while new
+/// connections go to the backends with a share: weight 0 retires a backend gently. Once a
+/// reload takes the backend out of the route, the tunnel drains (03 §10).
+#[tokio::test]
+async fn a_tunnel_whose_backend_a_reload_gives_weight_zero_is_left_alone() {
+    use tokio::io::AsyncReadExt;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = naming_backend("a").await;
+            let other = naming_backend("b").await;
+            let yaml = tcp_to(backend, "");
+            let (front, worker) = passing_swept(&yaml).await;
+            let mut client = TcpStream::connect(front).await.unwrap();
+            let mut name = [0; 1];
+            bounded(client.read_exact(&mut name)).await.unwrap();
+            assert_eq!(&name, b"a");
+
+            let with = |backends: &str| {
+                let yaml = yaml
+                    .replace("[{ upstream: up, weight: 1 }]", backends)
+                    .replace(
+                        "upstreams: {",
+                        &format!(
+                            "upstreams: {{ elsewhere: {{ load_balancer: p2c, endpoints: {{ listed: [\"{other}\"] }} }}, "
+                        ),
+                    );
+                let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+                compile(&config).unwrap()
+            };
+            worker
+                .proxy()
+                .reload(with(
+                    "[{ upstream: up, weight: 0 }, { upstream: elsewhere, weight: 1 }]",
+                ))
+                .unwrap();
+            let quiet = worker.limits.sweep * 2 + SHORT.drain + SLACK;
+            assert!(
+                still_open(&mut client, quiet).await,
+                "a tunnel whose backend was left at weight 0 ended"
+            );
+            let mut fresh = TcpStream::connect(front).await.unwrap();
+            bounded(fresh.read_exact(&mut name)).await.unwrap();
+            assert_eq!(&name, b"b");
+
+            worker
+                .proxy()
+                .reload(with("[{ upstream: elsewhere, weight: 1 }]"))
+                .unwrap();
+            let took = closed_after(&mut client).await;
+            assert!(took + EARLY >= SHORT.drain, "closed after {took:?}");
+            assert!(
+                took < worker.limits.sweep + SHORT.drain + SLACK,
+                "closed after {took:?}"
+            );
+            tunnel_ended(&worker, "db", "drained").await;
+        })
+        .await;
+}
+
 /// A tunnel whose route a reload sends to another upstream is drained, as the route's
 /// listing of the upstream it went to is gone; new connections go to the new one.
 #[tokio::test]
