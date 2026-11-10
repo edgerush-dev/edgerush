@@ -209,6 +209,8 @@ pub struct Node<V> {
     /// Keys it has forgotten, their time come, and keys it has evicted for the cap.
     forgotten: u64,
     evicted: u64,
+    /// Elections it stood in that came to nothing, for its pod to tell of.
+    lapsed: u64,
     /// When it is to stand for election, if no leader is heard by then.
     elect_at: Option<Time>,
     /// The highest term it has seen anyone in.
@@ -309,6 +311,7 @@ impl<V: Held> Node<V> {
             swept_at: None,
             forgotten: 0,
             evicted: 0,
+            lapsed: 0,
             elect_at: None,
             seen_term: 0,
             data: BTreeMap::new(),
@@ -657,6 +660,14 @@ impl<V: Held> Node<V> {
         }
     }
 
+    /// How many elections it has stood in, pre-vote or vote, that came to nothing: no majority
+    /// answered within two heartbeats. More than now and then, the round trip between pods is
+    /// longer than that, and no election can pass.
+    #[must_use]
+    pub const fn elections_lapsed(&self) -> u64 {
+        self.lapsed
+    }
+
     /// The peers whose wall clocks are off from its own by more than `skew_warning`, each by
     /// how far, ahead if positive, as their heartbeats last told.
     #[must_use]
@@ -820,6 +831,7 @@ impl<V: Held> Node<V> {
                 // An election that came to nothing, its asks or answers lost: try again after two
                 // heartbeats, not a whole silence, which leaves the table unchangeable.
                 if now.saturating_sub(since) > self.config.heartbeat * 2 {
+                    self.lapsed += 1;
                     self.role = Role::Follower;
                     self.elect_at = None;
                 }
@@ -5185,6 +5197,45 @@ mod tests {
             (stood_at - ms(2)) / 1_000_000
         );
         assert!(stood_at <= ms(2) + config.silence + config.election_jitter + ms(5));
+    }
+
+    /// An election no majority answers within two heartbeats is counted as come to nothing,
+    /// once; one won is not.
+    #[test]
+    fn an_election_unanswered_for_two_heartbeats_is_counted_as_lapsed() {
+        let config = config();
+        let form = Message::Form {
+            generation: 1,
+            voters: named(&[1, 2, 3]),
+            latest: (0, 0),
+        };
+        let stand = |node: &mut Node| {
+            let _ = node.receive(99, form.clone(), ms(1));
+            (1..100)
+                .map(|at| ms(at * 5))
+                .find(|now| {
+                    node.tick(*now)
+                        .iter()
+                        .any(|(_, message)| matches!(message, Message::StartJoin { .. }))
+                })
+                .expect("it never stood")
+        };
+        let mut unanswered = Node::new(1, address(1), config, [2, 3]);
+        let stood = stand(&mut unanswered);
+        let _ = unanswered.tick(stood + config.heartbeat * 2);
+        assert_eq!(unanswered.elections_lapsed(), 0, "lapsed at two heartbeats");
+        let _ = unanswered.tick(stood + config.heartbeat * 2 + ms(5));
+        assert_eq!(unanswered.elections_lapsed(), 1);
+        let _ = unanswered.tick(stood + config.heartbeat * 2 + ms(10));
+        assert_eq!(unanswered.elections_lapsed(), 1, "one lapse counted twice");
+
+        let mut won = Node::new(1, address(1), config, [2, 3]);
+        let stood = stand(&mut won);
+        let term = won.term();
+        let _ = won.receive(2, Message::Join { term }, stood + ms(1));
+        assert!(won.is_leader());
+        let _ = won.tick(stood + config.heartbeat * 3);
+        assert_eq!(won.elections_lapsed(), 0);
     }
 
     /// A voter in a later term — one that stood to form the generation while cut off, then

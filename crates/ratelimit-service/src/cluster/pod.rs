@@ -70,6 +70,11 @@ pub const STREAMS_IDLE: Duration = Duration::from_secs(5);
 /// log (decided): once a minute, so that a skew lasting is seen in recent lines.
 pub const SKEW_TOLD_AGAIN: Duration = Duration::from_secs(60);
 
+/// How often elections that keep coming to nothing are told of again in the log (decided):
+/// the first at once, then at most once a minute with how many since, as a slow network can
+/// lapse several a second.
+pub const LAPSES_TOLD_AGAIN: Duration = Duration::from_secs(60);
+
 /// The control plane, as a pod's store names it: no pod's member id.
 pub const CONTROL_PLANE: NodeId = NodeId::MAX;
 
@@ -236,6 +241,7 @@ impl<M: Mode> StorePod<M> {
             commands: commands.downgrade(),
             drains: Vec::new(),
             skews: SkewWarnings::default(),
+            lapses: LapseWarnings::default(),
             skewed,
             clients: BTreeMap::new(),
             next_client: CLIENTS,
@@ -455,6 +461,7 @@ struct Running<M: Mode> {
     /// Those waiting for it to stop, drained.
     drains: Vec<oneshot::Sender<()>>,
     skews: SkewWarnings,
+    lapses: LapseWarnings,
     /// The peers skewed now, as [`StorePod::skewed`] says.
     skewed: Arc<AtomicUsize>,
     /// The clients asking it, each with where what it tells them goes.
@@ -488,6 +495,31 @@ impl SkewWarnings {
     }
 }
 
+/// How many of its store's elections that came to nothing have been told of in the log, and
+/// when last.
+#[derive(Debug, Default)]
+struct LapseWarnings {
+    told: u64,
+    at: Option<Instant>,
+}
+
+impl LapseWarnings {
+    /// Of `lapsed` in all, how many to tell of at `now`: those since the last told, at once if
+    /// none was told within [`LAPSES_TOLD_AGAIN`], else once that has passed.
+    fn due(&mut self, lapsed: u64, now: Instant) -> Option<u64> {
+        let recent = self
+            .at
+            .is_some_and(|at| now.duration_since(at) < LAPSES_TOLD_AGAIN);
+        if lapsed <= self.told || recent {
+            return None;
+        }
+        let since = lapsed - self.told;
+        self.told = lapsed;
+        self.at = Some(now);
+        Some(since)
+    }
+}
+
 impl<M: Mode> Running<M> {
     /// Its time, as its store reads it, with its wall clock set from the system's.
     fn now(&mut self) -> Time {
@@ -516,6 +548,7 @@ impl<M: Mode> Running<M> {
                     self.follow();
                     self.ask_seeds();
                     self.warn_skews();
+                    self.warn_lapses();
                 }
                 command = received.recv() => match command {
                     None | Some(Command::Stop) => return,
@@ -761,6 +794,26 @@ impl<M: Mode> Running<M> {
                 skew.unsigned_abs() / 1_000_000
             );
         }
+    }
+
+    /// Tells in the log of its store's elections that came to nothing, as [`LapseWarnings`]
+    /// has it: many, and the round trip between pods is too long for any to pass.
+    fn warn_lapses(&mut self) {
+        let store = self.node.store();
+        let Some(since) = self.lapses.due(store.elections_lapsed(), Instant::now()) else {
+            return;
+        };
+        let within = store.config().heartbeat.saturating_mul(2) / 1_000_000;
+        let elections = if since == 1 {
+            "an election this pod stood in".to_owned()
+        } else {
+            format!("{since} elections this pod stood in")
+        };
+        eprintln!(
+            "edgerush-ratelimit-service: {elections} came to nothing: no majority of the \
+             voting set answered within two heartbeats ({within} ms), which the round trip \
+             between pods must stay within"
+        );
     }
 
     /// Asks each seed who answers there, every [`ASK_SEEDS`] while it is no member: the
@@ -1233,6 +1286,7 @@ mod tests {
             commands: commands.downgrade(),
             drains: Vec::new(),
             skews: SkewWarnings::default(),
+            lapses: LapseWarnings::default(),
             skewed: Arc::default(),
             clients: BTreeMap::new(),
             next_client: CLIENTS,
@@ -1383,6 +1437,21 @@ mod tests {
         assert!(warnings.due(&only, at(59)).is_empty());
         assert_eq!(warnings.due(&skewed, at(59)), vec![(3, -400_000_000)]);
         assert_eq!(warnings.due(&skewed, at(60)), vec![(2, 300_000_000)]);
+    }
+
+    #[test]
+    fn lapsed_elections_are_told_of_at_once_then_at_most_every_minute_with_how_many() {
+        let mut warnings = LapseWarnings::default();
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        assert_eq!(warnings.due(0, at(0)), None);
+        assert_eq!(warnings.due(1, at(1)), Some(1));
+        assert_eq!(warnings.due(5, at(30)), None);
+        assert_eq!(warnings.due(9, at(60)), None);
+        assert_eq!(warnings.due(9, at(61)), Some(8));
+        // None since: nothing told, and the next told at once, however long after.
+        assert_eq!(warnings.due(9, at(200)), None);
+        assert_eq!(warnings.due(10, at(300)), Some(1));
     }
 
     #[test]
