@@ -1,5 +1,5 @@
-//! Running a test ([22 §3](../../../docs/22-explain-and-test.md)): its request or connection
-//! explained, and what came of it held to what the test expects. Each difference is a line,
+//! Running a test ([22 §3](../../../docs/22-explain-and-test.md)): its request, connection
+//! or datagrams explained, and what came of it held to what the test expects. Each difference is a line,
 //! expected beside got; a test with none passed.
 
 use crate::asked::{self, Asked};
@@ -49,6 +49,7 @@ pub fn run(snapshot: &Snapshot, test: &Prepared) -> Result<Ran, Unexplained> {
             &test.expect,
         ),
         Asking::Connection(sni) => connection(snapshot, listener, sni.as_deref(), &test.expect),
+        Asking::Datagrams => datagrams(snapshot, listener, &test.expect),
     }
 }
 
@@ -290,6 +291,46 @@ fn connection(
     })
 }
 
+/// Runs a test of datagrams: their route, and its backends or why every one is dropped.
+fn datagrams(
+    snapshot: &Snapshot,
+    listener: &CompiledListener,
+    expect: &Expect,
+) -> Result<Ran, Unexplained> {
+    let datagrams = snapshot.explain_datagrams(listener)?;
+    let mut differences = Differences::default();
+    differences.differ(
+        "route",
+        or_none(expect.route.clone()),
+        or_none(datagrams.route().map(str::to_owned)),
+    );
+    match (&expect.forward, &expect.dropped, datagrams.dropped()) {
+        (Some(forward), _, None) => {
+            differences.differ(
+                "backends",
+                backends(&forward.backends),
+                backends(datagrams.backends()),
+            );
+        }
+        (_, Some(dropped), Some(got)) => {
+            differences.differ("dropped", dropped.clone(), got.to_owned());
+        }
+        (_, dropped, got) => {
+            let said = |dropped: Option<&str>| {
+                dropped.map_or_else(
+                    || "forward".to_owned(),
+                    |reason| format!("dropped {reason}"),
+                )
+            };
+            differences.differ("outcome", said(dropped.as_deref()), said(got));
+        }
+    }
+    Ok(Ran {
+        differences: differences.0,
+        explanation: datagrams.text(),
+    })
+}
+
 /// A rule's backends as a test states them.
 fn rule_backends(rule: &Rule) -> Vec<Backend> {
     rule.forward
@@ -492,6 +533,72 @@ upstreams:
         assert_eq!(
             connection_differences(api, "{ route: api, refused: no_backend }"),
             ["outcome: expected refused no_backend, got forward"]
+        );
+    }
+
+    const DATAGRAMS: &str = r#"
+listeners:
+  dns: { address: "[::]:53", protocol: udp }
+  idle: { address: "[::]:54", protocol: udp }
+  bare: { address: "[::]:55", protocol: udp }
+routes: []
+udp_routes:
+  - { name: resolvers, listeners: [dns], backends: [{ upstream: a, weight: 3 }, { upstream: b, weight: 1 }] }
+  - { name: kept, listeners: [idle], backends: [{ upstream: a, weight: 0 }] }
+upstreams:
+  a: { protocol: udp, load_balancer: p2c, endpoints: { listed: [] } }
+  b: { protocol: udp, load_balancer: p2c, endpoints: { listed: [] } }
+"#;
+
+    /// Runs one test of datagrams to `listener`; what differed.
+    fn datagram_differences(listener: &str, expect: &str) -> Vec<String> {
+        let snapshot = Snapshot::new(serde_saphyr::from_str(DATAGRAMS).unwrap()).unwrap();
+        let yaml = format!(
+            "tests:\n  - name: a\n    request: {{ listener: {listener} }}\n    expect: {expect}\n"
+        );
+        let tests = test_file::read(yaml.as_bytes())
+            .unwrap()
+            .prepare(&snapshot)
+            .unwrap();
+        let ran = run(&snapshot, &tests[0]).unwrap();
+        assert!(ran.explanation.contains(" (udp)"), "{}", ran.explanation);
+        ran.differences
+    }
+
+    #[test]
+    fn a_datagrams_test_holds_their_route_backends_and_drop() {
+        let resolvers = "{ route: resolvers, forward: { backends: [{ upstream: a, weight: 3 }, { upstream: b, weight: 1 }] } }";
+        assert!(datagram_differences("dns", resolvers).is_empty());
+        assert!(datagram_differences("bare", "{ dropped: no_route }").is_empty());
+        assert!(
+            datagram_differences("idle", "{ route: kept, dropped: invalid_backend }").is_empty()
+        );
+
+        assert_eq!(
+            datagram_differences(
+                "dns",
+                "{ route: resolvers, forward: { backends: [{ upstream: a, weight: 1 }] } }"
+            ),
+            ["backends: expected a (weight 1), got a (weight 3), b (weight 1)"]
+        );
+        assert_eq!(
+            datagram_differences("idle", "{ dropped: invalid_backend }"),
+            ["route: expected none, got kept"]
+        );
+        assert_eq!(
+            datagram_differences("idle", "{ route: kept, dropped: no_route }"),
+            ["dropped: expected no_route, got invalid_backend"]
+        );
+        assert_eq!(
+            datagram_differences("bare", resolvers),
+            [
+                "route: expected resolvers, got none",
+                "outcome: expected forward, got dropped no_route"
+            ]
+        );
+        assert_eq!(
+            datagram_differences("dns", "{ route: resolvers, dropped: invalid_backend }"),
+            ["outcome: expected dropped invalid_backend, got forward"]
         );
     }
 

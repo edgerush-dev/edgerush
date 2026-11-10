@@ -6,7 +6,7 @@ harness; none of them limits requests.
 
 | Example | Shows |
 |---|---|
-| [All features](all-features.yaml) | Every implemented feature once: four listeners (HTTP, TCP and TLS passthrough), weighted and mirrored routes, every filter, redirects, gRPC, WebSockets, timeouts, retries, health checks, with [routing checks](all-features-tests.yaml) |
+| [All features](all-features.yaml) | Every implemented feature once: five listeners (HTTP, TCP, TLS passthrough and UDP), weighted and mirrored routes, every filter, redirects, gRPC, WebSockets, timeouts, retries, health checks, with [routing checks](all-features-tests.yaml) |
 | [Docker Compose](docker-compose/README.md) | Two NGINX backends, load balancing, health checks, rewrites, redirects, forwarding headers, access logs, metrics and config reloads |
 | [Development config](dev-harness.yaml) | An API prefix rewritten to one upstream, with other requests sent to another; JSON access logs |
 | [gRPC](grpc.yaml) | Service and method matching, HTTP/2 upstreams, health checks, retries on UNAVAILABLE and a canary mirror |
@@ -57,10 +57,11 @@ what each part demonstrates:
 | `internal` | `127.0.0.1:8081` | Exact `/status` route on `localhost`, preserving the caller's request ID |
 | `raw` | `127.0.0.1:10000` | TCP passthrough with an outgoing PROXY v2 header |
 | `sni` | `127.0.0.1:10443` | TLS passthrough for `*.example.com`, including multiple subdomain labels |
+| `dns` | `127.0.0.1:10053` | UDP sessions to one backend, each ended after 30 s idle |
 
 Its routing tests run without network services. To serve traffic, supply HTTP backends on
 ports 9000–9002, a gRPC backend with health service on 50051, a TCP backend accepting
-PROXY v2 on 10001, and a TLS backend on 9443. A WebSocket request needs a
+PROXY v2 on 10001, a TLS backend on 9443, and a UDP backend on 10054. A WebSocket request needs a
 WebSocket-capable HTTP backend. Then run:
 
 ```sh

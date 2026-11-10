@@ -122,3 +122,8 @@ tests:
   - name: TLS without SNI has no route
     request: { listener: sni, sni: none }
     expect: { refused: no_route }
+  - name: UDP sessions go by the only route
+    request: { listener: dns }
+    expect:
+      route: dns_forward
+      forward: { backends: [{ upstream: dns_backend, weight: 1 }] }

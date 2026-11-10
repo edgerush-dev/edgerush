@@ -136,6 +136,9 @@ pub struct Expect {
     /// A `tcp` or `tls` connection is refused, for the reason the metrics name.
     #[serde(default)]
     pub refused: Option<String>,
+    /// Every datagram a `udp` listener is sent is dropped, for the reason the metrics name.
+    #[serde(default)]
+    pub dropped: Option<String>,
     /// What the upstream is sent, as far as it is stated.
     #[serde(default)]
     pub upstream_request: Option<UpstreamRequest>,
@@ -256,6 +259,9 @@ const ANSWERS: [&str; 11] = [
 /// The reasons a `tcp` or `tls` connection is refused for, as the metrics name them.
 const REFUSALS: [&str; 2] = ["no_route", "no_backend"];
 
+/// The reasons a `udp` listener drops every datagram for, as the metrics name them.
+const DROPS: [&str; 2] = ["no_route", "invalid_backend"];
+
 /// What is wrong with a file of tests, and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mistake {
@@ -284,7 +290,7 @@ pub enum Problem {
     #[error("test name '{0}' is used twice")]
     NameTwice(String),
     /// No outcome, or more than one.
-    #[error("a test expects one of forward, redirect, answer and refused, and only one")]
+    #[error("a test expects one of forward, redirect, answer, refused and dropped, and only one")]
     Outcome,
     /// `route` without `rule`, or the other way round, for a request.
     #[error("route and rule are stated together")]
@@ -292,8 +298,8 @@ pub enum Problem {
     /// A forward or redirect without its route and rule.
     #[error("a forwarded or redirected request has a route and rule: state them")]
     NoRoute,
-    /// A forwarded connection without its route.
-    #[error("a forwarded connection has a route: state it")]
+    /// A forwarded connection, or datagrams, without the route.
+    #[error("a forwarded connection or datagram has a route: state it")]
     NoConnectionRoute,
     /// An answer the gateway never gives itself.
     #[error("'{0}' is not an answer the gateway gives: one of {list}", list = ANSWERS.join(", "))]
@@ -301,6 +307,9 @@ pub enum Problem {
     /// A refusal the gateway never gives a connection.
     #[error("'{0}' is not a refusal the gateway gives: one of {list}", list = REFUSALS.join(", "))]
     Refused(String),
+    /// A reason the gateway never drops every datagram for.
+    #[error("'{0}' is not a reason the gateway drops every datagram for: one of {list}", list = DROPS.join(", "))]
+    Dropped(String),
     /// `upstream_request` beside something other than `forward`.
     #[error("upstream_request is for a forwarded request")]
     UpstreamRequest,
@@ -337,9 +346,6 @@ pub enum Problem {
     /// A listener the config does not have.
     #[error("there is no listener {0}")]
     NoListener(String),
-    /// A `udp` listener, whose sessions are not tested.
-    #[error("listener {0} is a udp listener, which explain and test do not cover")]
-    Udp(String),
     /// A field the listener's kind needs, missing.
     #[error("request needs {0} for {1} listener")]
     Missing(&'static str, &'static str),
@@ -391,6 +397,8 @@ pub enum Asking {
     /// through, with the name its ClientHello asks for:
     /// always `None` for `tcp`.
     Connection(Option<String>),
+    /// Datagrams, to a `udp` listener, whose route alone decides where they go.
+    Datagrams,
 }
 
 impl TestFile {
@@ -462,6 +470,7 @@ fn expectation(expect: &Expect) -> Vec<Problem> {
         expect.redirect.is_some(),
         expect.answer.is_some(),
         expect.refused.is_some(),
+        expect.dropped.is_some(),
     ];
     if outcomes.iter().filter(|stated| **stated).count() != 1 {
         problems.push(Problem::Outcome);
@@ -475,6 +484,11 @@ fn expectation(expect: &Expect) -> Vec<Problem> {
         && !REFUSALS.contains(&refused.as_str())
     {
         problems.push(Problem::Refused(refused.clone()));
+    }
+    if let Some(dropped) = &expect.dropped
+        && !DROPS.contains(&dropped.as_str())
+    {
+        problems.push(Problem::Dropped(dropped.clone()));
     }
     if let Some(upstream) = &expect.upstream_request {
         if expect.forward.is_none() {
@@ -585,18 +599,23 @@ fn passed(request: &Request, listener: &CompiledListener) -> Option<Option<Strin
 }
 
 /// What is wrong with a test for `listener`: a request's has a rule beside its route; a
-/// connection's has a route alone, is forwarded or refused, and has no answer, mirrors or
-/// rate limits of HTTP's.
+/// connection's, or datagrams', has a route alone, is forwarded, or refused (a connection)
+/// or dropped (datagrams), and has no answer, mirrors or rate limits of HTTP's.
 fn for_listener(test: &Test, listener: &CompiledListener) -> Vec<Problem> {
     let expect = &test.expect;
     let mut problems = Vec::new();
     let (connection, kind) = match listener.protocol {
         Protocol::Https if passed(&test.request, listener).is_some() => (true, PASSED),
         Protocol::Http | Protocol::Https => (false, kind(listener.protocol)),
-        Protocol::Tcp | Protocol::Tls => (true, kind(listener.protocol)),
-        // Refused whole by `asked`.
-        Protocol::Udp => return problems,
+        Protocol::Tcp | Protocol::Tls | Protocol::Udp => (true, kind(listener.protocol)),
     };
+    let udp = listener.protocol == Protocol::Udp;
+    if expect.dropped.is_some() && !udp {
+        problems.push(Problem::Unwanted("dropped", kind));
+    }
+    if expect.refused.is_some() && udp {
+        problems.push(Problem::Unwanted("refused", kind));
+    }
     match connection {
         false => {
             let routed = expect.forward.is_some() || expect.redirect.is_some();
@@ -668,7 +687,11 @@ fn asked(request: &Request, snapshot: &Snapshot) -> Result<Asking, Problem> {
             .map_or(Ok(()), |(field, _)| Err(Problem::Unwanted(field, kind)))
     };
     match listener.protocol {
-        Protocol::Udp => return Err(Problem::Udp(request.listener.clone())),
+        Protocol::Udp => {
+            unwanted(&http)?;
+            unwanted(&[("sni", request.sni.is_some())])?;
+            return Ok(Asking::Datagrams);
+        }
         Protocol::Tcp => {
             unwanted(&http)?;
             unwanted(&[("sni", request.sni.is_some())])?;
@@ -736,6 +759,7 @@ listeners:
   web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
   db: { address: "[::]:5432", protocol: tcp, proxy_protocol: off }
   sni: { address: "[::]:443", protocol: tls, proxy_protocol: off }
+  dns: { address: "[::]:53", protocol: udp }
 routes:
   - name: shop
     listeners: [web]
@@ -745,8 +769,11 @@ routes:
         forward: { backends: [{ upstream: cart, weight: 1 }] }
 upstreams:
   cart: { load_balancer: p2c, endpoints: { listed: [] } }
+  resolver: { protocol: udp, load_balancer: p2c, endpoints: { listed: [] } }
 tcp_routes:
   - { name: postgres, listeners: [db], backends: [{ upstream: cart, weight: 1 }] }
+udp_routes:
+  - { name: resolvers, listeners: [dns], backends: [{ upstream: resolver, weight: 1 }] }
 tls_routes:
   - { name: api, listeners: [sni], hostnames: [{ name: api.example.com, falls_through: true }], backends: [{ upstream: cart, weight: 1 }] }
 "#;
@@ -805,7 +832,8 @@ tls_routes:
 
     #[test]
     fn what_is_wrong_with_an_expectation_is_said_with_its_line() {
-        let one = "a test expects one of forward, redirect, answer and refused, and only one";
+        let one =
+            "a test expects one of forward, redirect, answer, refused and dropped, and only one";
         let cases = [
             ("{ route: shop, rule: 0 }", one.to_owned()),
             (
@@ -992,7 +1020,7 @@ tls_routes:
             .iter()
             .map(|test| match &test.asked {
                 Asking::Connection(sni) => sni.clone(),
-                Asking::Request(_) => panic!("a connection"),
+                Asking::Request(_) | Asking::Datagrams => panic!("a connection"),
             })
             .collect();
         assert_eq!(asked, [None, Some("api.example.com".to_owned()), None]);
@@ -1029,7 +1057,7 @@ tls_routes:
             .iter()
             .map(|test| match &test.asked {
                 Asking::Request(asked) => asked.sni.clone(),
-                Asking::Connection(_) => panic!("a request"),
+                Asking::Connection(_) | Asking::Datagrams => panic!("a request"),
             })
             .collect();
         assert_eq!(said, [Some(Some("b.example.com".to_owned())), Some(None)]);
@@ -1133,7 +1161,7 @@ tls_routes:
             (
                 "{ listener: db }",
                 "{ forward: { backends: [] } }",
-                vec!["a forwarded connection has a route: state it"],
+                vec!["a forwarded connection or datagram has a route: state it"],
             ),
             (
                 "{ listener: sni, sni: none }",
@@ -1155,6 +1183,90 @@ tls_routes:
                 "{request} {expect}"
             );
         }
+        // Datagrams take nothing of a request's or a connection's, and are dropped, never
+        // refused; nothing else is dropped.
+        let dropped = "{ dropped: no_route }";
+        let cases = [
+            (
+                "{ listener: dns, client: 203.0.113.7 }",
+                dropped,
+                vec!["client does not apply to a udp listener"],
+            ),
+            (
+                "{ listener: dns, sni: none }",
+                dropped,
+                vec!["sni does not apply to a udp listener"],
+            ),
+            (
+                "{ listener: dns }",
+                "{ route: resolvers, rule: 0, forward: { backends: [], mirrors: [], rate_limits: [] } }",
+                vec![
+                    "rule does not apply to a udp listener",
+                    "mirrors does not apply to a udp listener",
+                    "rate_limits does not apply to a udp listener",
+                ],
+            ),
+            (
+                "{ listener: dns }",
+                "{ forward: { backends: [] } }",
+                vec!["a forwarded connection or datagram has a route: state it"],
+            ),
+            (
+                "{ listener: dns }",
+                "{ refused: no_route }",
+                vec!["refused does not apply to a udp listener"],
+            ),
+            (
+                "{ listener: dns }",
+                "{ answer: no_route }",
+                vec!["answer does not apply to a udp listener"],
+            ),
+            (
+                "{ listener: dns }",
+                "{ dropped: no_backend }",
+                vec![
+                    "'no_backend' is not a reason the gateway drops every datagram for: one of no_route, invalid_backend",
+                ],
+            ),
+            (
+                "{ listener: db }",
+                dropped,
+                vec!["dropped does not apply to a tcp listener"],
+            ),
+            (
+                REQUEST,
+                dropped,
+                vec!["dropped does not apply to an http listener"],
+            ),
+            (
+                "{ listener: dns }",
+                "{ refused: no_route, dropped: no_route }",
+                vec![
+                    "a test expects one of forward, redirect, answer, refused and dropped, and only one",
+                    "refused does not apply to a udp listener",
+                ],
+            ),
+        ];
+        for (request, expect, said) in cases {
+            let said: Vec<(u64, String)> =
+                said.into_iter().map(|said| (2, said.to_owned())).collect();
+            assert_eq!(
+                mistakes(&[test("a", request, expect)]),
+                said,
+                "{request} {expect}"
+            );
+        }
+        let yaml = format!(
+            "tests:
+{}",
+            test(
+                "a",
+                "{ listener: dns }",
+                "{ route: resolvers, forward: { backends: [{ upstream: resolver, weight: 1 }] } }"
+            )
+        );
+        let prepared = read(yaml.as_bytes()).unwrap().prepare(&snapshot()).unwrap();
+        assert!(matches!(prepared[0].asked, Asking::Datagrams));
         // A request is refused nothing: its listener answers.
         assert_eq!(
             mistakes(&[test("a", REQUEST, refused)]),
