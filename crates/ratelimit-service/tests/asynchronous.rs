@@ -387,6 +387,36 @@ async fn a_batch_on_a_data_planes_stream_is_applied_answered_and_copied() {
     }
 }
 
+/// What a pod's scrape shows of its keys: the key's owner alone holds it owned, its replicas
+/// a copy each, which is how one outside the cluster finds the owner of a lone key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owner_alone_shows_a_key_owned_its_replicas_a_copy() {
+    let cluster = Cluster::ready(3).await;
+    let (mut stream, table) = opened(&cluster, 1).await;
+    let key = key_owned_by(&table, 1);
+    stream
+        .up
+        .send(batch_to_wire(batch(table.stamp(), key, 1, 3)))
+        .await
+        .unwrap();
+    let answered = answers(&mut stream, ANSWERED).await.unwrap().own();
+    assert!(answered.unserved.is_empty(), "{answered:?}");
+    assert_eq!(answered.entries.len(), 1, "{answered:?}");
+    let shard = &table.shards[usize::from(shard_of(key, SHARDS))];
+    // Seen within a cycle or two of the answer: the key, its bucket full again within 30 ms,
+    // is forgotten everywhere about a second on.
+    for id in 1..=3 {
+        let held = u64::from(id == 1 || shard.replicas.contains(&id));
+        let owned = u64::from(id == 1);
+        let shown = within(COPIED, || async {
+            let observed = cluster.pod(id).observed().await?;
+            (observed.keys == held).then_some(observed.owned_keys)
+        })
+        .await;
+        assert_eq!(shown, Some(owned), "pod {id}: held {held}, owned");
+    }
+}
+
 /// A batch reaching a pod not its keys' owner is answered there, nothing of it applied, and
 /// forwarded to the owner, whose answers come back on the same stream; sent to the owner as
 /// well, as a data plane cut off from it sends, it is applied once.

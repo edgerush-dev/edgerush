@@ -26,8 +26,9 @@ edgerush-ratelimit-service --example form`, `edgerush`, `edgerush-ratelimit-serv
 host's glibc: three pods of the service's store, formed by `form` as the controller will, and
 the proxies finding them by their addresses. Its limit is keyed by the client's address, the
 only key it takes before authentication, so every run's load, from the host, is one key. The
-store's table names that key's owner, which the harness cannot read yet: `owner-lost` and
-`owner-restart` refuse to run on `edgerush`.
+store's table names that key's owner: `owner-lost` and `owner-restart` strike the one pod whose
+scrape shows a key owned (`edgerush_rate_limit_keys_owned`), read a second before, and refuse
+to run if not exactly one does.
 
 Every instance gets one CPU, the two-worker EdgeRush systems two. Clients reach instances on a front network; instances reach
 Redis, the ratelimit service or each other on a back network, which is what faults touch.
@@ -45,7 +46,8 @@ python3 report.py out.jsonl
 
 A sweep skips runs already in its output, so it can be stopped and started again. Faults,
 as the simulator's, strike half way through a ten-second run: the owner lost or restarted
-(the store where there is one; Gubernator's owning instance; otherwise the first
+(the store where there is one; the service pod owning the key for EdgeRush; Gubernator's
+owning instance; otherwise the first
 instance), the last instance restarted, every instance restarted in turn from 3 s, the
 second half of the instances cut off from the first half and the store from 3 s to 7 s,
 and 10% packet loss on the back network. An instance stopped has its traffic steered to
