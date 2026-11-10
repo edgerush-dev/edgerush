@@ -762,9 +762,9 @@ fn swept_and_drained(worker: &Worker) -> Duration {
     worker.limits.sweep * 2 + SHORT.drain + SLACK
 }
 
-/// A session open across a reload that keeps its listener, its route and the route's
-/// listing of its upstream carries on, with its endpoint, though the reload took the
-/// endpoint from the upstream and changed the weights; a new client goes where the new
+/// A session open across a reload that keeps its listener, its route, the route's listing
+/// of its upstream and the upstream's of its endpoint carries on, with its endpoint, though
+/// the reload gave most of the weight to another upstream; new clients go where the new
 /// config says (24 §5).
 #[tokio::test]
 async fn a_session_whose_route_a_reload_keeps_carries_on_with_its_endpoint() {
@@ -778,20 +778,29 @@ async fn a_session_whose_route_a_reload_keeps_carries_on_with_its_endpoint() {
             assert_eq!(exchange(&client, b"?").await, b"a");
 
             let moved = udp_config(
-                "{ upstream: up, weight: 3 }, { upstream: spare, weight: 0 }",
+                "{ upstream: up, weight: 1 }, { upstream: other, weight: 9 }",
                 &format!(
                     "{}, {}",
-                    udp_upstream("up", &[b]),
-                    udp_upstream("spare", &[a])
+                    udp_upstream("up", &[a]),
+                    udp_upstream("other", &[b])
                 ),
                 "",
             );
             worker.proxy().reload(moved).unwrap();
             tokio::time::sleep(swept_and_drained(&worker)).await;
             assert_eq!(exchange(&client, b"?").await, b"a");
-            assert_eq!(exchange(&client_of(front).await, b"?").await, b"b");
+            // Nine in ten go to `other`: twenty new clients all missing it is one chance in
+            // 10^20.
+            let mut new = Vec::new();
+            let mut found = false;
+            while !found && new.len() < 20 {
+                let client = client_of(front).await;
+                found = exchange(&client, b"?").await == b"b";
+                new.push(client);
+            }
+            assert!(found, "no new client went to the new upstream");
             counted(&worker, &sessions_ended("drained", 0)).await;
-            counted(&worker, &active(2)).await;
+            counted(&worker, &active(1 + u64::try_from(new.len()).unwrap())).await;
         })
         .await;
 }
@@ -862,6 +871,105 @@ async fn a_session_whose_route_a_reload_takes_away_is_carried_to_the_bound() {
             client.send(b"three").await.unwrap();
             counted(&worker, &dropped("no_route", 2)).await;
             assert!(unanswered(&client).await);
+        })
+        .await;
+}
+
+/// A session whose endpoint a reload takes from its upstream drains, though the reload
+/// keeps its listener, its route and the route's listing of the upstream: a connected UDP
+/// socket would never hear that the endpoint is gone (24 §5). Carried on to the drain's
+/// bound, then ended, counted; the client's next datagram goes to the endpoint left.
+#[tokio::test]
+async fn a_session_whose_endpoint_a_reload_takes_away_is_carried_to_the_bound() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let a = naming_backend("a").await;
+            let b = naming_backend("b").await;
+            let (front, worker) = serving_udp_swept(udp_to(&[a], "")).await;
+            let client = client_of(front).await;
+            assert_eq!(exchange(&client, b"?").await, b"a");
+
+            worker.proxy().reload(udp_to(&[b], "")).unwrap();
+            let reloaded = Instant::now();
+            tokio::time::sleep(worker.limits.sweep * 2).await;
+            assert_eq!(
+                exchange(&client, b"?").await,
+                b"a",
+                "carried on while it drains"
+            );
+            counted(&worker, &sessions_ended("drained", 1)).await;
+            let took = reloaded.elapsed();
+            assert!(
+                took + EARLY >= SHORT.drain && took < worker.limits.sweep + SHORT.drain + SLACK,
+                "ended after {took:?}"
+            );
+            assert_eq!(exchange(&client, b"?").await, b"b");
+        })
+        .await;
+}
+
+/// A session on an endpoint that discovery keeps carries on as others come; once discovery
+/// drops it, the session drains as one whose endpoint a reload takes away does, and a new
+/// client picks from the endpoints left (24 §5).
+#[tokio::test]
+async fn a_session_whose_endpoint_discovery_drops_is_carried_to_the_bound() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let a = naming_backend("a").await;
+            let b = naming_backend("b").await;
+            // Loopback endpoints are discovered only with egress unrestricted.
+            let yaml = "data_plane: { experimental_unrestricted_egress: true }\n\
+                 listeners: { dns: { address: \"127.0.0.1:0\", protocol: udp } }\n\
+                 routes: []\n\
+                 udp_routes: [{ name: dns, listeners: [dns], backends: [{ upstream: found, weight: 1 }] }]\n\
+                 upstreams: { found: { protocol: udp, load_balancer: p2c, endpoints: { kubernetes: \"dns.shop.svc.cluster.local:dns\" } } }\n";
+            let config: Config = serde_saphyr::from_str(yaml).unwrap();
+            let (front, worker) = serving_udp_swept(compile(&config).unwrap()).await;
+            let slice = |name: &str, at: SocketAddr| -> EndpointSlice {
+                serde_saphyr::from_str(&format!(
+                    "metadata: {{ name: {name}, namespace: shop, labels: {{ kubernetes.io/service-name: dns }} }}\n\
+                     addressType: IPv4\n\
+                     ports: [{{ name: dns, port: {}, protocol: UDP }}]\n\
+                     endpoints: [{{ addresses: [\"{}\"] }}]\n",
+                    at.port(),
+                    at.ip()
+                ))
+                .unwrap()
+            };
+            let discover = |slices: Vec<EndpointSlice>| {
+                let changed = worker
+                    .proxy()
+                    .rediscover([("shop".to_owned(), Some(slices.into()))])
+                    .unwrap();
+                assert!(changed, "the endpoints changed");
+            };
+            discover(vec![slice("dns-a", a)]);
+            let client = client_of(front).await;
+            assert_eq!(exchange(&client, b"?").await, b"a");
+
+            discover(vec![slice("dns-a", a), slice("dns-b", b)]);
+            tokio::time::sleep(swept_and_drained(&worker)).await;
+            assert_eq!(exchange(&client, b"?").await, b"a", "kept with its endpoint");
+            counted(&worker, &sessions_ended("drained", 0)).await;
+
+            discover(vec![slice("dns-b", b)]);
+            let dropped = Instant::now();
+            tokio::time::sleep(worker.limits.sweep * 2).await;
+            assert_eq!(
+                exchange(&client, b"?").await,
+                b"a",
+                "carried on while it drains"
+            );
+            counted(&worker, &sessions_ended("drained", 1)).await;
+            let took = dropped.elapsed();
+            assert!(
+                took + EARLY >= SHORT.drain && took < worker.limits.sweep + SHORT.drain + SLACK,
+                "ended after {took:?}"
+            );
+            assert_eq!(exchange(&client, b"?").await, b"b");
+            assert_eq!(exchange(&client_of(front).await, b"?").await, b"b");
         })
         .await;
 }

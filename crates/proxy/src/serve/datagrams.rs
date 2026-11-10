@@ -13,9 +13,11 @@
 //! counted and, where the listener logs, writes the session's one record (24 §3, §6).
 //!
 //! A session is routed once, when it is made, by a key of its listener, route and upstream
-//! ([`Routed`](crate::routed::Routed)), as a tunnel is. At a reload the listener walks its
-//! sessions: those whose key the reload took away drain, carried on to the drain's bound
-//! and then ended, and those of an invalid backend end. A listener taken away, or one of a
+//! ([`Routed`](crate::routed::Routed)), as a tunnel is. At a reload, or a change in what
+//! discovery found, the listener walks its sessions: those whose key went, or whose
+//! endpoint left its upstream, drain, carried on to the drain's bound and then ended; and
+//! at a reload those of an invalid backend end. A session drains when its endpoint goes,
+//! though a tunnel does not, because a connected UDP socket never hears that it went. A listener taken away, or one of a
 //! worker that drains, makes no session and drains every one it has, and is served until
 //! the last has ended (24 §5).
 
@@ -160,7 +162,7 @@ struct Held {
 
 /// A session's socket to its endpoint, and what reads it.
 struct Connected {
-    /// What a refusal sets aside (24 §3).
+    /// What a refusal sets aside (24 §3), and what says the endpoint left its upstream.
     endpoint: Arc<ReuseIdentity>,
     socket: Rc<UdpSocket>,
     /// Load on its endpoint for as long as it is open, as a tunnel is (03 §6).
@@ -610,11 +612,12 @@ impl Listening {
         });
     }
 
-    /// Brings the sessions up to the snapshot in force, if a reload has come since they
-    /// last were (24 §5): the sessions made from now on take the listener's idle bound as
-    /// it is, those whose key the reload took away drain, and those of an invalid backend,
-    /// which hold nothing and only drop, end, so that their clients' next datagrams pick
-    /// again, under the new config.
+    /// Brings the sessions up to the snapshot in force, if a reload or a change in what
+    /// discovery found has come since they last were (24 §5): the sessions made from now on
+    /// take the listener's idle bound as it is, those whose key went or whose endpoint left
+    /// its upstream drain, and at a reload those of an invalid backend, which hold nothing
+    /// and only drop, end, so that their clients' next datagrams pick again, under the new
+    /// config.
     fn reloaded(&self, worker: &Worker, now: Instant) {
         let snapshot = worker.proxy.current.load();
         if self.walked.replace(snapshot.generation) == snapshot.generation {
@@ -624,11 +627,14 @@ impl Listening {
         if let Some(listener) = snapshot.listener(self.slot) {
             sessions.set_idle(listener.session_idle);
         }
+        // Retired before the snapshot that has it no more is published, so seen here.
         sessions.drain(now + worker.deadlines.drain, |session| {
-            session
-                .value()
-                .key
-                .is_some_and(|key| !snapshot.routed.holds(key))
+            let held = session.value();
+            held.key.is_some_and(|key| !snapshot.routed.holds(key))
+                || held
+                    .connected
+                    .as_ref()
+                    .is_some_and(|connected| connected.endpoint.is_retired())
         });
         // Endpoints found, names resolved: the same config, under which an invalid
         // backend is as it was.
