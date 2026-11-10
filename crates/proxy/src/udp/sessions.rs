@@ -18,6 +18,11 @@
 //! tunnel keeps its own. Draining gives it a second deadline, which a datagram never moves:
 //! it ends at whichever comes first.
 //!
+//! Where its listener says how many answers a session expects for each datagram (24 §3), a
+//! session counts the datagrams that went to its endpoint and the answers that came back,
+//! and says when the answers are that many for each datagram, for the caller to end it; it
+//! keeps the count it was made with, as it keeps its idle bound.
+//!
 //! Nothing here reads a clock, draws a random number or touches a socket: the time and the
 //! randomness are handed in, and what a session holds of its own is the caller's.
 
@@ -28,6 +33,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -69,9 +75,22 @@ pub struct Session<T> {
     idle: Duration,
     /// When it ends however busy it is, once it drains.
     drain_by: Option<Instant>,
+    /// What it counts toward ending on its answers, where its listener expects them.
+    answers: Option<Answers>,
     /// The connection it counts as, given back when it ends: held for its drop alone.
     _held: Held,
     value: T,
+}
+
+/// A session's datagrams and answers, counted toward its end (24 §3).
+#[derive(Debug, Clone, Copy)]
+struct Answers {
+    /// The answers it expects for each datagram.
+    each: NonZeroU32,
+    /// Its client's datagrams that went to its endpoint.
+    sent: u32,
+    /// Its endpoint's answers read.
+    read: u32,
 }
 
 impl<T> Session<T> {
@@ -90,6 +109,26 @@ impl<T> Session<T> {
     /// What the caller opened for it.
     pub fn value_mut(&mut self) -> &mut T {
         &mut self.value
+    }
+
+    /// One of its client's datagrams went to its endpoint: an answer more to wait for.
+    pub fn sent(&mut self) {
+        if let Some(answers) = &mut self.answers {
+            answers.sent = answers.sent.saturating_add(1);
+        }
+    }
+
+    /// An answer was read from its endpoint: whether the answers are now as many as it
+    /// expects for each datagram that went, for the caller to end it. Never for a session
+    /// whose listener expects no number, nor before a datagram has gone: what comes before
+    /// is nothing its client asked for.
+    pub fn answered(&mut self) -> bool {
+        let Some(answers) = &mut self.answers else {
+            return false;
+        };
+        answers.read = answers.read.saturating_add(1);
+        answers.sent > 0
+            && u64::from(answers.read) >= u64::from(answers.each.get()) * u64::from(answers.sent)
     }
 }
 
@@ -124,6 +163,8 @@ pub struct Sessions<T> {
     deadlines: Heap<Client>,
     /// The idle bound of the sessions made from now on.
     idle: Duration,
+    /// The answers they expect for each datagram, if their listener says.
+    answers: Option<NonZeroU32>,
     /// Every session drains, and none is made.
     draining: bool,
     loads: Arc<Loads>,
@@ -143,6 +184,7 @@ impl<T> Sessions<T> {
             by_client: HashMap::new(),
             deadlines: Heap::default(),
             idle,
+            answers: None,
             draining: false,
             loads,
             worker,
@@ -188,6 +230,11 @@ impl<T> Sessions<T> {
                     deadline: self.deadlines.add(client),
                     idle: self.idle,
                     drain_by: None,
+                    answers: self.answers.map(|each| Answers {
+                        each,
+                        sent: 0,
+                        read: 0,
+                    }),
                     _held: held,
                     value,
                 });
@@ -209,6 +256,12 @@ impl<T> Sessions<T> {
     /// The idle bound of the sessions made from now on; those there are keep theirs.
     pub fn set_idle(&mut self, idle: Duration) {
         self.idle = idle;
+    }
+
+    /// The answers the sessions made from now on expect for each datagram, `None` for none;
+    /// those there are keep theirs.
+    pub fn set_answers(&mut self, answers: Option<NonZeroU32>) {
+        self.answers = answers;
     }
 
     /// Every session `which` picks that does not drain already drains: it ends at `by`, or
@@ -556,6 +609,71 @@ mod tests {
         assert_eq!(ended(&mut sessions, heard + IDLE / 2), []);
         assert_eq!(ended(&mut sessions, heard + IDLE), [client(1)]);
         assert_eq!(ended(&mut sessions, heard + IDLE * 2), [client(2)]);
+    }
+
+    /// A session whose listener expects `each` answers a datagram, after `sent` datagrams
+    /// went to its endpoint and `read` answers came: whether the last answer said it is
+    /// answered.
+    fn answered_after(each: Option<u32>, sent: u32, read: u32) -> bool {
+        let (mut sessions, _loads) = sessions(10);
+        sessions.set_answers(each.and_then(NonZeroU32::new));
+        let session = sessions
+            .arrived(client(1), Instant::now(), &backends(&[1]), || 0, opened)
+            .unwrap();
+        for _ in 0..sent {
+            session.sent();
+        }
+        let mut last = false;
+        for _ in 0..read {
+            last = session.answered();
+        }
+        last
+    }
+
+    /// A session is answered once the answers read are as many as its listener expects
+    /// for each datagram that went to its endpoint, and not before.
+    #[test]
+    fn a_session_is_answered_once_every_datagram_has_its_answers() {
+        assert!(answered_after(Some(1), 1, 1));
+        assert!(!answered_after(Some(2), 1, 1));
+        assert!(answered_after(Some(2), 1, 2));
+        assert!(!answered_after(Some(1), 2, 1));
+        assert!(answered_after(Some(1), 2, 2));
+        assert!(answered_after(Some(3), 2, 6));
+        assert!(!answered_after(Some(3), 2, 5));
+    }
+
+    /// One whose listener expects no number is never answered, nor one whose endpoint
+    /// sends before any datagram went to it.
+    #[test]
+    fn a_session_is_never_answered_unasked_nor_without_a_count() {
+        assert!(!answered_after(None, 1, 1));
+        assert!(!answered_after(None, 0, 5));
+        assert!(!answered_after(Some(1), 0, 1));
+        assert!(!answered_after(Some(1), 0, 3));
+    }
+
+    /// The answers a listener expects are those of the sessions made from then on: one made
+    /// before keeps the count it was made with.
+    #[test]
+    fn a_session_keeps_the_answers_it_was_made_with() {
+        let (mut sessions, _loads) = sessions(10);
+        let backends = backends(&[1]);
+        let start = Instant::now();
+        sessions.set_answers(NonZeroU32::new(1));
+        assert!(datagram(&mut sessions, client(1), start, &backends, 0).is_ok());
+        sessions.set_answers(NonZeroU32::new(2));
+        assert!(datagram(&mut sessions, client(2), start, &backends, 0).is_ok());
+        sessions.set_answers(None);
+        assert!(datagram(&mut sessions, client(3), start, &backends, 0).is_ok());
+        let answered = |sessions: &mut Sessions<u32>, client: Client| {
+            let session = sessions.heard(&client, start).unwrap();
+            session.sent();
+            session.answered()
+        };
+        assert!(answered(&mut sessions, client(1)));
+        assert!(!answered(&mut sessions, client(2)));
+        assert!(!answered(&mut sessions, client(3)));
     }
 
     /// A drained session ends at its drain's bound however busy it is, or at its idle bound

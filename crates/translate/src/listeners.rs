@@ -68,6 +68,7 @@ pub(crate) fn listener(plane: &Plane, port: u16, protocol: Protocol) -> Listener
             .filter(|_| https),
         tunnel_idle_seconds: None,
         session_idle_seconds: None,
+        session_answers: None,
         forwarding: http.then(|| {
             settings
                 .and_then(|settings| settings.forwarding.clone())

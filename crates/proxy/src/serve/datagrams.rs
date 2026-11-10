@@ -89,10 +89,11 @@ impl Worker {
             crate::downstream::h3::pktinfo::enable(&socket, local.is_ipv6())?;
         }
         let snapshot = self.proxy.current.load();
-        let idle = snapshot
-            .listener(listener)
+        let compiled = snapshot.listener(listener);
+        let idle = compiled
             // A slot no listener has is never served: what the config says unless told.
             .map_or(Duration::from_secs(60), |compiled| compiled.session_idle);
+        let answers = compiled.and_then(|compiled| compiled.session_answers);
         // A worker made apart from the others counts its sessions in loads of its own.
         let (loads, worker) = match &self.connections {
             Some(loads) => (Arc::clone(loads), usize::from(self.position)),
@@ -108,12 +109,14 @@ impl Worker {
         } else {
             Vec::new()
         });
+        let mut sessions = Sessions::new(idle, loads, worker, listener);
+        sessions.set_answers(answers);
         let listening = Rc::new(Listening {
             slot: listener,
             socket,
             local,
             wildcard,
-            sessions: RefCell::new(Sessions::new(idle, loads, worker, listener)),
+            sessions: RefCell::new(sessions),
             walked: Cell::new(snapshot.generation),
             config: RefCell::new(Arc::clone(&snapshot.config)),
             buffer,
@@ -350,6 +353,8 @@ impl Listening {
                                 if let Some(record) = record {
                                     record.passed(len, 0);
                                 }
+                                // Gone to the endpoint: one to be answered (24 §3).
+                                session.sent();
                                 continue;
                             }
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -526,13 +531,24 @@ impl Listening {
                     Err(_) => false,
                 };
                 drop(buffer);
-                // An answer keeps its session from its idle bound as a datagram does.
+                // An answer keeps its session from its idle bound as a datagram does, and
+                // counts toward its end where its listener expects answers (24 §3), sent on
+                // to the client or not.
                 let mut sessions = self.sessions.borrow_mut();
-                if let Some(session) = sessions.heard(&client, now)
-                    && sent
-                    && let Some(record) = &mut session.value_mut().record
-                {
-                    record.passed(0, len);
+                let answered = sessions.heard(&client, now).is_some_and(|session| {
+                    if sent && let Some(record) = &mut session.value_mut().record {
+                        record.passed(0, len);
+                    }
+                    session.answered()
+                });
+                if answered {
+                    let session = sessions.end(&client);
+                    drop(sessions);
+                    // Dropped by finishing, which aborts this task: nothing more is read.
+                    if let Some(session) = session {
+                        self.finish(&worker, session, SessionEnd::Answered);
+                    }
+                    return;
                 }
             }
             if read == BATCH {
@@ -614,7 +630,7 @@ impl Listening {
 
     /// Brings the sessions up to the snapshot in force, if a reload or a change in what
     /// discovery found has come since they last were (24 §5): the sessions made from now on
-    /// take the listener's idle bound as it is, those whose key went or whose endpoint left
+    /// take the listener's idle bound and answers as they are, those whose key went or whose endpoint left
     /// its upstream drain, and at a reload those of an invalid backend, which hold nothing
     /// and only drop, end, so that their clients' next datagrams pick again, under the new
     /// config.
@@ -626,6 +642,7 @@ impl Listening {
         let mut sessions = self.sessions.borrow_mut();
         if let Some(listener) = snapshot.listener(self.slot) {
             sessions.set_idle(listener.session_idle);
+            sessions.set_answers(listener.session_answers);
         }
         // Retired before the snapshot that has it no more is published, so seen here.
         sessions.drain(now + worker.deadlines.drain, |session| {

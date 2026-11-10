@@ -287,14 +287,23 @@ pub struct Listener {
     pub tunnel_idle_seconds: Option<u64>,
     /// How long, in seconds, a `udp` listener's session may carry nothing either way before
     /// it is ended (24 in the docs): 60 unless said otherwise, as Envoy's UDP proxy has it.
-    /// UDP has no close, so this is how every session ends that is not refused or drained.
-    /// For those listeners only.
+    /// UDP has no close, so this is how every session ends that is not refused, drained or
+    /// ended on its answers (`session_answers`). For those listeners only.
     #[serde(default)]
     #[cfg_attr(
         feature = "schema",
         schemars(range(min = 1, max = crate::compile::MOST_SECONDS))
     )]
     pub session_idle_seconds: Option<u64>,
+    /// How many answers a `udp` listener's session expects for each datagram its client
+    /// sends (24 in the docs), as NGINX's `proxy_responses`: 1 for DNS. Once the answers read
+    /// from its endpoint are that many for each datagram that went to it, the session ends
+    /// and lets go of its local port, rather than at its idle bound, which still ends one
+    /// whose answers do not all come. Unless said, a session ends when idle alone. For
+    /// those listeners only.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub session_answers: Option<u32>,
     /// What an `http` or `https` listener, which must have it, tells its upstreams of a
     /// request's client; no other may.
     #[serde(default)]

@@ -1095,6 +1095,192 @@ async fn a_reload_gives_a_new_idle_bound_to_new_sessions_alone() {
         .await;
 }
 
+/// A backend that answers every datagram with the port it came from, `times` times.
+async fn port_backend(times: usize) -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    tokio::task::spawn_local(async move {
+        let mut buffer = vec![0; 1 << 16];
+        while let Ok((_, from)) = socket.recv_from(&mut buffer).await {
+            for _ in 0..times {
+                let _sent = socket.send_to(&from.port().to_be_bytes(), from).await;
+            }
+        }
+    });
+    address
+}
+
+/// Where the listener expects an answer a datagram, a session ends on its answer, counted
+/// `answered`, and gives its room and its socket back: the client's next datagram makes a
+/// new session, from another local port (24 §3).
+#[tokio::test]
+async fn a_session_ends_on_its_answer_and_the_next_datagram_makes_another() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = port_backend(1).await;
+            let (front, worker) = serving_udp(udp_to(&[backend], ", session_answers: 1")).await;
+            let client = client_of(front).await;
+            let first = exchange(&client, b"?").await;
+            counted(&worker, &sessions_ended("answered", 1)).await;
+            counted(&worker, &active(0)).await;
+            let second = exchange(&client, b"?").await;
+            assert_ne!(first, second, "the same session's port");
+            counted(&worker, &accepted(2)).await;
+            counted(&worker, &sessions_ended("answered", 2)).await;
+            assert!(
+                worker
+                    .proxy()
+                    .metrics()
+                    .contains(&sessions_ended("idle", 0)),
+                "{}",
+                worker.proxy().metrics()
+            );
+        })
+        .await;
+}
+
+/// A session expecting two answers a datagram ends on its second; one expecting three
+/// that has two ends at its idle bound instead.
+#[tokio::test]
+async fn a_session_ends_only_once_its_datagrams_answers_are_all_in() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = port_backend(2).await;
+            let (front, worker) = serving_udp(udp_to(&[backend], ", session_answers: 2")).await;
+            let client = client_of(front).await;
+            let first = exchange(&client, b"?").await;
+            assert_eq!(answer(&client).await, first, "the second answer");
+            counted(&worker, &sessions_ended("answered", 1)).await;
+
+            let (front, worker) = serving_udp(udp_to(
+                &[backend],
+                ", session_answers: 3, session_idle_seconds: 1",
+            ))
+            .await;
+            let client = client_of(front).await;
+            let first = exchange(&client, b"?").await;
+            assert_eq!(answer(&client).await, first);
+            counted(&worker, &sessions_ended("idle", 1)).await;
+            assert!(
+                worker
+                    .proxy()
+                    .metrics()
+                    .contains(&sessions_ended("answered", 0)),
+                "{}",
+                worker.proxy().metrics()
+            );
+        })
+        .await;
+}
+
+/// Two datagrams sent before either is answered: the session waits for both answers, and
+/// carries the second rather than ending on the first.
+#[tokio::test]
+async fn a_session_waits_for_the_answers_of_every_datagram_that_went() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (backend, socket) = silent_backend().await;
+            let (front, worker) = serving_udp(udp_to(&[backend], ", session_answers: 1")).await;
+            let client = client_of(front).await;
+            client.send(b"one").await.unwrap();
+            client.send(b"two").await.unwrap();
+            let mut buffer = [0; 16];
+            let (_, session) = within(socket.recv_from(&mut buffer)).await.unwrap();
+            let (_, again) = within(socket.recv_from(&mut buffer)).await.unwrap();
+            assert_eq!(session, again, "one session");
+            socket.send_to(b"ONE", session).await.unwrap();
+            assert_eq!(answer(&client).await, b"ONE");
+            socket.send_to(b"TWO", session).await.unwrap();
+            assert_eq!(answer(&client).await, b"TWO");
+            counted(&worker, &sessions_ended("answered", 1)).await;
+            counted(&worker, &accepted(1)).await;
+        })
+        .await;
+}
+
+/// A datagram dropped before its endpoint, its socket full, is not waited for: the session
+/// ends on the answer to the one that went (24 §3).
+#[tokio::test]
+async fn a_datagram_dropped_before_its_endpoint_is_not_waited_for() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (backend, socket) = silent_backend().await;
+            let (front, worker) = serving_udp(udp_to(&[backend], ", session_answers: 1")).await;
+            let client = client_of(front).await;
+            sockets_full(true);
+            client.send(b"lost").await.unwrap();
+            counted(&worker, &dropped("send_full", 1)).await;
+            sockets_full(false);
+            client.send(b"kept").await.unwrap();
+            let mut buffer = [0; 16];
+            let (len, session) = within(socket.recv_from(&mut buffer)).await.unwrap();
+            assert_eq!(&buffer[..len], b"kept");
+            socket.send_to(b"back", session).await.unwrap();
+            assert_eq!(answer(&client).await, b"back");
+            counted(&worker, &sessions_ended("answered", 1)).await;
+            counted(&worker, &accepted(1)).await;
+        })
+        .await;
+}
+
+/// An answer read from the endpoint counts though the client could not be sent it: the
+/// session ends on it, and the client's next datagram makes another (24 §3).
+#[tokio::test]
+async fn an_answer_the_client_could_not_be_sent_still_counts() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (backend, socket) = silent_backend().await;
+            let (front, worker) = serving_udp(udp_to(&[backend], ", session_answers: 1")).await;
+            let client = client_of(front).await;
+            client.send(b"ask").await.unwrap();
+            let mut buffer = [0; 16];
+            let (_, session) = within(socket.recv_from(&mut buffer)).await.unwrap();
+            sockets_full(true);
+            socket.send_to(b"lost", session).await.unwrap();
+            counted(&worker, &dropped("send_full", 1)).await;
+            counted(&worker, &sessions_ended("answered", 1)).await;
+            sockets_full(false);
+            assert!(unanswered(&client).await);
+            client.send(b"again").await.unwrap();
+            let (_, next) = within(socket.recv_from(&mut buffer)).await.unwrap();
+            assert_ne!(next, session, "a new session");
+        })
+        .await;
+}
+
+/// A reload that has the listener expect answers gives the count to the sessions made from
+/// then on; one made before keeps its own, none, as it keeps its idle bound (24 §5).
+#[tokio::test]
+async fn a_reload_gives_a_count_of_answers_to_new_sessions_alone() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = port_backend(1).await;
+            let (front, worker) = serving_udp_swept(udp_to(&[backend], "")).await;
+            let before = client_of(front).await;
+            let port = exchange(&before, b"?").await;
+            worker
+                .proxy()
+                .reload(udp_to(&[backend], ", session_answers: 1"))
+                .unwrap();
+            tokio::time::sleep(worker.limits.sweep * 3).await;
+            let after = client_of(front).await;
+            exchange(&after, b"?").await;
+            counted(&worker, &sessions_ended("answered", 1)).await;
+            // The first carries on, on its own session's port.
+            assert_eq!(exchange(&before, b"?").await, port);
+            assert_eq!(exchange(&before, b"?").await, port);
+            counted(&worker, &accepted(2)).await;
+            counted(&worker, &active(1)).await;
+        })
+        .await;
+}
+
 /// A listener kept across reloads loses nothing to them: datagrams sent while reload after
 /// reload comes are all carried, and all answered.
 #[tokio::test]

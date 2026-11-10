@@ -32,6 +32,7 @@ use http::Method;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -347,6 +348,10 @@ pub struct CompiledListener {
     /// How long a session of this listener's may carry nothing either way before it is
     /// ended: a minute unless its config says otherwise. Only a `udp` listener has sessions.
     pub session_idle: Duration,
+    /// How many answers a session of this listener's expects for each datagram its client
+    /// sends, after which it ends; `None` for a session ended by its idle bound alone, and
+    /// for every listener but a `udp` one.
+    pub session_answers: Option<NonZeroU32>,
     /// What it tells upstreams of a request's client; nothing for a `tcp`, `tls` or `udp`
     /// listener, which carries no requests.
     pub forwarding: CompiledForwarding,
@@ -1572,6 +1577,15 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             }
             (_, None) => {}
         }
+        match (listener.protocol, listener.session_answers) {
+            (Protocol::Udp, Some(0)) => {
+                errors.push(Place::listener(name).problem(Problem::SessionAnswersZero));
+            }
+            (Protocol::Udp, _) | (_, None) => {}
+            (_, Some(_)) => {
+                errors.push(Place::listener(name).problem(Problem::SessionAnswersUnwanted));
+            }
+        }
         match (listener.protocol, &listener.forwarding) {
             (Protocol::Http | Protocol::Https, None) => {
                 errors.push(Place::listener(name).problem(Problem::NoForwarding));
@@ -1803,6 +1817,8 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                             .session_idle_seconds
                             .unwrap_or(SESSION_IDLE_SECONDS),
                     ),
+                    // Refused above for any listener but a `udp` one, and as 0.
+                    session_answers: listener.session_answers.and_then(NonZeroU32::new),
                     // Found to compile above, or there would have been an error.
                     forwarding: listener
                         .forwarding
@@ -3015,6 +3031,12 @@ pub enum Problem {
     /// A session that would end before it carried anything back.
     #[error("`session_idle_seconds` must be at least 1")]
     SessionIdleZero,
+    /// A session's answers on a listener that has no sessions.
+    #[error("`session_answers` is for protocol `udp`")]
+    SessionAnswersUnwanted,
+    /// A session that would end on no answer at all.
+    #[error("`session_answers` must be at least 1")]
+    SessionAnswersZero,
     /// A bound in seconds too long to be kept.
     #[error("`{field}` is {seconds}: at most 359996400, 99,999 hours")]
     TooLong {
@@ -5487,12 +5509,12 @@ upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
     /// listener of another kind has a UDP route, and none of a `udp` listener's is carried
     /// as a TCP connection.
     #[test]
-    fn a_udp_listener_takes_its_one_route_and_its_idle_bound() {
+    fn a_udp_listener_takes_its_one_route_its_idle_bound_and_its_answers() {
         let compiled = compile(&config(&format!(
             r#"
 listeners:
   dns: {{ address: "[::]:53", protocol: udp }}
-  syslog: {{ address: "[::]:514", protocol: udp, session_idle_seconds: 300 }}
+  syslog: {{ address: "[::]:514", protocol: udp, session_idle_seconds: 300, session_answers: 2 }}
   quiet: {{ address: "[::]:9", protocol: udp }}
   db: {{ address: "[::]:5432", protocol: tcp, proxy_protocol: off }}
 routes: []
@@ -5510,6 +5532,7 @@ udp_routes:
         assert_eq!(route.backends.upstreams().count(), 1);
         assert_eq!(route.backends.reason(0), Some("gone"));
         assert_eq!(dns.session_idle, Duration::from_secs(60));
+        assert_eq!(dns.session_answers, None);
         assert!(dns.l4.is_none());
         assert!(dns.http_routes.is_empty());
         assert!(!dns.carries(None));
@@ -5517,6 +5540,7 @@ udp_routes:
         let syslog = listener(&compiled, "syslog");
         assert_eq!(syslog.udp.as_ref().unwrap().name, "dns");
         assert_eq!(syslog.session_idle, Duration::from_secs(300));
+        assert_eq!(syslog.session_answers, NonZeroU32::new(2));
         assert!(listener(&compiled, "quiet").udp.is_none());
         assert!(listener(&compiled, "db").udp.is_none());
     }
@@ -5576,7 +5600,8 @@ udp_routes:
 
     /// A `udp` listener takes no TLS, HTTP/3, tunnel bound, forwarding, request ID or PROXY
     /// protocol, which are for listeners over TCP; its session bound is at least a second,
-    /// and no other listener has one. It may keep an access log.
+    /// its sessions' answers at least one, and no other listener has either. It may keep an
+    /// access log.
     #[test]
     fn a_udp_listener_takes_only_what_applies_to_datagrams() {
         let udp = |extra: &str| format!(r#"u: {{ address: "[::]:53", protocol: udp{extra} }}"#);
@@ -5612,6 +5637,10 @@ udp_routes:
                 ", session_idle_seconds: 0",
                 "`session_idle_seconds` must be at least 1",
             ),
+            (
+                ", session_answers: 0",
+                "`session_answers` must be at least 1",
+            ),
         ] {
             assert_eq!(
                 alone(extra),
@@ -5620,8 +5649,9 @@ udp_routes:
             );
         }
         assert_eq!(alone(", session_idle_seconds: 1"), Vec::<String>::new());
-        let http = r#"web: { address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, session_idle_seconds: 60 }"#;
-        let tcp = r#"db: { address: "[::]:5432", protocol: tcp, proxy_protocol: off, session_idle_seconds: 60 }"#;
+        assert_eq!(alone(", session_answers: 1"), Vec::<String>::new());
+        let http = r#"web: { address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, session_idle_seconds: 60, session_answers: 1 }"#;
+        let tcp = r#"db: { address: "[::]:5432", protocol: tcp, proxy_protocol: off, session_idle_seconds: 60, session_answers: 1 }"#;
         assert_eq!(
             udp_refused(
                 &format!("{http}, {tcp}"),
@@ -5629,7 +5659,9 @@ udp_routes:
             ),
             [
                 "listener `db`: `session_idle_seconds` is for protocol `udp`",
+                "listener `db`: `session_answers` is for protocol `udp`",
                 "listener `web`: `session_idle_seconds` is for protocol `udp`",
+                "listener `web`: `session_answers` is for protocol `udp`",
             ]
         );
         // Still a listener over TCP that leaves it out is refused.

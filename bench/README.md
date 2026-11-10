@@ -174,6 +174,10 @@ datagrams come from ports below that range, each from a source of its own, so th
 generator is never the one short of ports. The mode takes open files at 524,288, the
 laptop's hard limit, as a pod's are many: at the other modes' 65,536, EdgeRush's room
 holds 28,224 sessions, under the ports, and `udp-ports` would measure the room.
+`UDP_ANSWERS=N` has every session end once it has N answers for each datagram
+(`session_answers` for EdgeRush, `proxy_responses` for NGINX), so that a session holds its
+port for a round trip: with it, `udp-ports` should never run short, and `udp-held` is left
+out, its sessions ending as soon as they are held.
 
 `PROXY_PROTOCOL=1` with `passthrough` has every connection carry a PROXY header in and one
 out ([20](../../docs/20-proxy-protocol.md)): clients reach a front hop, HAProxy on the

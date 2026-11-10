@@ -162,11 +162,14 @@ repo=$(dirname "$here")
 # 8080 to the backend, to be seen ready by. EdgeRush serves its metrics at 9090 there, for
 # what it says it dropped. UDP_PORTS_SECONDS is how long the run past the local ports lasts:
 # long enough that the first sessions' 60 s idle bound ends them and frees their ports.
-# UDP_HELD is how many sessions are held idle to weigh one.
+# UDP_HELD is how many sessions are held idle to weigh one. UDP_ANSWERS=N has each session
+# end once it has N answers for each datagram (24 §3): `session_answers` for EdgeRush,
+# `proxy_responses` for NGINX; unset, sessions end when idle alone.
 : "${UDP:=0}"
 [ "${1:-}" = udp ] && UDP=1
 : "${UDP_PORTS_SECONDS:=80}"
 : "${UDP_HELD:=10000}"
+: "${UDP_ANSWERS:=}"
 : "${WSBENCH:=$here/wsbench/target/release/wsbench}"
 # The `ratelimit` scenario's service pod, on the backend's CPUs.
 : "${RL_SERVICE:=$repo/target/release/edgerush-ratelimit-service}"
@@ -328,6 +331,10 @@ start_backend() {
             exit 2
         fi
         cp "$here/udp.yaml" "$config"
+        if [ -n "$UDP_ANSWERS" ]; then
+            sed -i "s#session_idle_seconds: 60 }#session_idle_seconds: 60, session_answers: $UDP_ANSWERS }#" "$config"
+            grep -q "session_answers: $UDP_ANSWERS" "$config"
+        fi
         [ -x "$WSBENCH" ] || { echo "no wsbench at $WSBENCH: build it first" >&2; exit 2; }
         # Something already echoing at 9053 would answer in its place.
         if ss -Hun "( sport = :9053 )" | grep -q .; then
@@ -594,6 +601,10 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
             local stream_conf=$here/nginx-stream.conf
             [ "$UDP" = 1 ] && stream_conf=$here/nginx-udp.conf
             sed "s/WORKERS/$WORKERS/" "$stream_conf" >"$run-proxy/nginx.conf"
+            if [ "$UDP" = 1 ] && [ -n "$UDP_ANSWERS" ]; then
+                sed -i "s#^        proxy_timeout 60s;#&\n        proxy_responses $UDP_ANSWERS;#" "$run-proxy/nginx.conf"
+                grep -q "proxy_responses $UDP_ANSWERS;" "$run-proxy/nginx.conf"
+            fi
             # Ubuntu builds the stream module apart (libnginx-mod-stream), and its own
             # config loads it by a path relative to a prefix this run replaces.
             local stream_module=/usr/lib/nginx/modules/ngx_stream_module.so
@@ -1486,6 +1497,7 @@ environment() {
         [ "$UDP" = 1 ] && echo "udp: udp at 8053 to wsbench's echo at 9053, 60 s idle;" \
             "local ports $(tr '\t' '-' </proc/sys/net/ipv4/ip_local_port_range)," \
             "open files $(ulimit -n);" \
+            "${UDP_ANSWERS:+sessions ended on $UDP_ANSWERS answers a datagram;}" \
             "$(sha256sum "$WSBENCH" | cut -c1-12)"
         oha --version
         nginx -v 2>&1
@@ -1876,7 +1888,8 @@ udp)
         udpload "$1.udp-paced" "$udp_at" udp --sessions 256 --rate "$udp_rate"
         udpload "$1.udp-churn" "$udp_at" udp-churn --rate "$churn_rate"
         udp_ports "$1.udp-ports"
-        idle_memory "$1.udp-held" udp "$UDP_HELD"
+        # Sessions ended on their answers are gone as soon as they are held: nothing to weigh.
+        [ -n "$UDP_ANSWERS" ] || idle_memory "$1.udp-held" udp "$UDP_HELD"
     }
     for rep in $(seq "$REPS"); do
         udpload "backend.$rep.udp-busy" 127.0.0.1:9053 udp --sessions 64
