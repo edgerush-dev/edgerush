@@ -505,22 +505,24 @@ fn proxy_serves_a_udp_listener_beside_a_tcp_one_and_follows_it() -> io::Result<(
 
 /// A `udp` listener a reload keeps keeps its socket and its sessions: a client sending all
 /// through reload after reload is answered every time, by the endpoint its session was made
-/// for, though the reloads moved its upstream to another; a new client goes to that one
-/// (24 §5).
+/// for, though the reloads gave most of the weight to another upstream; new clients go to
+/// that one (24 §5).
 #[test]
 fn proxy_keeps_a_udp_listeners_sessions_across_reloads() -> io::Result<()> {
     let (a, b) = (udp_naming(b"a")?, udp_naming(b"b")?);
     let at = free_over_udp_and_tcp()?;
-    let with = |endpoint: SocketAddr, idle: u32| {
+    let with = |other: u32, idle: u32| {
+        let up = 1;
         format!(
-            "upstreams:\n  up: {{ protocol: udp, load_balancer: p2c, endpoints: {{ listed: [\"{endpoint}\"] }} }}\n\
+            "upstreams:\n  up: {{ protocol: udp, load_balancer: p2c, endpoints: {{ listed: [\"{a}\"] }} }}\n  \
+             other: {{ protocol: udp, load_balancer: p2c, endpoints: {{ listed: [\"{b}\"] }} }}\n\
              routes: []\n\
-             udp_routes: [{{ name: dns, listeners: [dns], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
+             udp_routes: [{{ name: dns, listeners: [dns], backends: [{{ upstream: up, weight: {up} }}, {{ upstream: other, weight: {other} }}] }}]\n\
              listeners:\n  dns: {{ address: \"{at}\", protocol: udp, session_idle_seconds: {idle} }}\n"
         )
     };
     let file = scratch("udp-reloads.yaml");
-    std::fs::write(&file, with(a, 60))?;
+    std::fs::write(&file, with(0, 60))?;
     let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
     harness.wait_for("listener \"dns\" is on ");
     harness.wait_for("1 worker, thread-per-core");
@@ -544,7 +546,7 @@ fn proxy_keeps_a_udp_listeners_sessions_across_reloads() -> io::Result<()> {
         })
     };
     for idle in 61..=63 {
-        std::fs::write(&file, with(b, idle))?;
+        std::fs::write(&file, with(9, idle))?;
         harness.wait_for("config reloaded");
     }
     // Past the worker's next sweep, which is when it sees a reload.
@@ -552,7 +554,15 @@ fn proxy_keeps_a_udp_listeners_sessions_across_reloads() -> io::Result<()> {
     done.store(true, Ordering::Relaxed);
     let answered = sending.join().expect("the sender")?;
     assert!(answered > 10, "{answered} answers");
-    assert_eq!(udp_exchange(at, b"?")?, b"b");
+    // Nine in ten go to `other`: twenty new clients all missing it is one chance in 10^20.
+    let mut found = false;
+    for _ in 0..20 {
+        if udp_exchange(at, b"?")? == b"b" {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "no new client went to the new upstream");
     Ok(())
 }
 
