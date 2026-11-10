@@ -24,8 +24,8 @@ Request, every part of it required for an http or https listener:
       --connect-protocol <NAME>  An extended CONNECT's protocol, over HTTP/2 or HTTP/3
 
 Connection to a tls listener, or to an https one whose port listeners share, one of the
-two (a tcp listener's takes nothing; one whose name an https listener passes through,
-carried as a tls listener's, takes nothing else):
+two (a tcp listener's takes nothing, nor do a udp listener's datagrams; one whose name an
+https listener passes through, carried as a tls listener's, takes nothing else):
       --sni <NAME>               The name its ClientHello asks for
       --no-sni                   A ClientHello that asks for no name
 
@@ -170,7 +170,7 @@ fn run(options: &Options) -> Result<String, Failed> {
         Protocol::Https => "an https",
         Protocol::Tcp => "a tcp",
         Protocol::Tls => "a tls",
-        Protocol::Udp => return Err(Unexplained::Udp(listener.name.clone()).into()),
+        Protocol::Udp => "a udp",
     };
     // What the listener's kind takes, and nothing else.
     let http = [
@@ -222,7 +222,11 @@ fn run(options: &Options) -> Result<String, Failed> {
             unwanted(&sni)?;
             return Ok(snapshot.explain_connection(listener, None)?.text());
         }
-        Protocol::Udp => return Err(Unexplained::Udp(listener.name.clone()).into()),
+        Protocol::Udp => {
+            unwanted(&http)?;
+            unwanted(&sni)?;
+            return Ok(snapshot.explain_datagrams(listener)?.text());
+        }
         Protocol::Tls => {
             unwanted(&http)?;
             let Some(name) = named()? else {
@@ -678,6 +682,49 @@ redirect  301 to /open
             Err(UsageError::Twice("--no-sni"))
         );
         assert_eq!(parsed(&["--sni"]), Err(UsageError::NoValue("--sni")));
+    }
+
+    #[test]
+    fn a_udp_listener_takes_its_name_alone() {
+        let udp = CONFIG
+            .replace(
+                "  db: {",
+                "  dns: { address: \"[::]:53\", protocol: udp }\n  bare: { address: \"[::]:54\", protocol: udp }\n  db: {",
+            )
+            .replace(
+                "upstreams:\n",
+                "upstreams:\n  resolver: { protocol: udp, load_balancer: p2c, endpoints: { listed: [] } }\n",
+            )
+            + "udp_routes:\n  - { name: resolvers, listeners: [dns], backends: [{ upstream: resolver, weight: 1 }] }\n";
+        let run = |test: &str, args: &[&str]| explain_on(&udp, test, args);
+        let (status, text, _) = run("udp_routed", &["--listener", "dns"]);
+        assert_eq!(
+            (status, text.as_str()),
+            (
+                0,
+                "dns (udp)\n\n→ resolvers  the listener's one route\n\nroute     resolvers\nbackends  resolver (weight 1)\n"
+            )
+        );
+        let (status, text, _) = run("udp_bare", &["--listener", "bare"]);
+        assert_eq!(status, 0);
+        assert!(text.ends_with("\ndropped   no_route\n"), "{text}");
+
+        let failed = |test: &str, args: &[&str]| {
+            let (status, stdout, stderr) = run(test, args);
+            assert_eq!((status, stdout.as_str()), (2, ""), "{test}");
+            stderr
+        };
+        assert_eq!(
+            failed(
+                "udp_client",
+                &["--listener", "dns", "--client", "192.0.2.1"]
+            ),
+            "error: '--client' does not apply to a udp listener\n"
+        );
+        assert_eq!(
+            failed("udp_sni", &["--listener", "dns", "--no-sni"]),
+            "error: '--no-sni' does not apply to a udp listener\n"
+        );
     }
 
     #[test]

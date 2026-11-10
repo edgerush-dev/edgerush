@@ -75,6 +75,13 @@ listeners:
     tunnel_idle_seconds: 3600
     access_log: stdout
 
+  dns:
+    # UDP: each client's datagrams are one session, carried to one backend until it idles.
+    address: "127.0.0.1:10053"
+    protocol: udp
+    session_idle_seconds: 30
+    access_log: stdout
+
 routes:
   - name: application
     listeners: [web]
@@ -204,6 +211,11 @@ tls_routes:
     hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: true }]
     backends: [{ upstream: tls_backend, weight: 1 }]
 
+udp_routes:
+  - name: dns_forward
+    listeners: [dns]
+    backends: [{ upstream: dns_backend, weight: 1 }]
+
 upstreams:
   web_backend:
     endpoints: { listed: ["127.0.0.1:9000", "127.0.0.1:9001"] }
@@ -264,6 +276,11 @@ upstreams:
     # Carries the client's TLS unchanged, so it has no tls of its own; an HTTP probe could
     # never pass behind it, and a health check here would be a tcp one.
     endpoints: { listed: ["127.0.0.1:9443"] }
+    load_balancer: p2c
+
+  dns_backend:
+    endpoints: { listed: ["127.0.0.1:10054"] }
+    protocol: udp
     load_balancer: p2c
 
 data_plane:

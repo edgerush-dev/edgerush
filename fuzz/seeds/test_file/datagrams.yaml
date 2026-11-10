@@ -1,0 +1,10 @@
+tests:
+  - name: sessions by the listener's one route
+    request: { listener: dns }
+    expect: { route: resolvers, forward: { backends: [{ upstream: resolver, weight: 3 }, { upstream: resolver-b, weight: 1 }] } }
+  - name: a route with nowhere to send
+    request: { listener: idle }
+    expect: { route: udp-kept, dropped: invalid_backend }
+  - name: no route at all
+    request: { listener: bare }
+    expect: { dropped: no_route }

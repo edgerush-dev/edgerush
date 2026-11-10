@@ -20,13 +20,16 @@ use std::sync::OnceLock;
 /// redirect, a rewrite, a mirror, a rule with nowhere to send; listeners that generate
 /// request IDs and that pass them, over HTTP/1.1 and 2; a tcp listener, and a tls one with
 /// routes by exact name, by wildcard, one that does not fall through and one with nowhere to
-/// send.
+/// send; udp listeners served by a weighted route, by one with nowhere to send, and by none.
 const CONFIG: &str = r#"
 listeners:
   web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }, request_id: generate }
   passing: { address: "[::]:8081", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
   db: { address: "[::]:5432", protocol: tcp, proxy_protocol: off }
   sni: { address: "[::]:443", protocol: tls, proxy_protocol: off }
+  dns: { address: "[::]:53", protocol: udp }
+  idle: { address: "[::]:54", protocol: udp }
+  bare: { address: "[::]:55", protocol: udp }
 routes:
   - name: shop
     listeners: [web]
@@ -83,6 +86,11 @@ upstreams:
   cart-canary: { load_balancer: p2c, endpoints: { listed: [] } }
   fallback: { load_balancer: p2c, endpoints: { listed: [] } }
   shadow: { load_balancer: p2c, endpoints: { listed: [] } }
+  resolver: { protocol: udp, load_balancer: p2c, endpoints: { listed: [] } }
+  resolver-b: { protocol: udp, load_balancer: p2c, endpoints: { listed: [] } }
+udp_routes:
+  - { name: resolvers, listeners: [dns], backends: [{ upstream: resolver, weight: 3 }, { upstream: resolver-b, weight: 1 }] }
+  - { name: udp-kept, listeners: [idle], backends: [{ upstream: resolver, weight: 0 }] }
 tcp_routes:
   - { name: postgres, listeners: [db], backends: [{ upstream: fallback, weight: 1 }] }
 tls_routes:
