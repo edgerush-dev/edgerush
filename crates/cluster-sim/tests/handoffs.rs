@@ -57,3 +57,32 @@ fn a_rollout_refuses_nothing_however_long_a_shard_takes_to_copy() {
         assert_eq!(world.lost(), 0, "seed {seed}");
     }
 }
+
+/// A pod joining over slow links (#306), every link 60 ms each way: the leader moves its share
+/// of shards to it while it holds a lease, the echo of a heartbeat riding its next one, a
+/// round trip and up to a heartbeat late. Moving them only to a pod that answered within two
+/// heartbeats, the leader dropped its moves and asked for them again, table after table, from
+/// 30 ms each way, and it never became ready.
+#[test]
+fn a_pod_joining_over_slow_links_takes_its_shards() {
+    for seed in SEEDS {
+        let shape = Shape {
+            shards: 16,
+            ..Shape::defaults()
+        };
+        let (mut world, _) = scenario::cluster(seed, shape);
+        world.set_default_link(Link {
+            delay: ms(60),
+            jitter: ms(1),
+            ..Link::lan()
+        });
+        let new = world.add_pod();
+        let ready = world.run_while_not(ms(10_000), |world| scenario::ready(world, new));
+        assert!(ready.is_some(), "seed {seed}: {new} never ready");
+        assert!(
+            world.stats.violations.is_empty(),
+            "{:?}",
+            world.stats.violations
+        );
+    }
+}
