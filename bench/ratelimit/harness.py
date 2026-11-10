@@ -121,8 +121,11 @@ def wait_ready(system, instances, deadline=120.0):
 
 
 def wait_cluster(system, n):
-    """Ready, and for Gubernator every instance seeing every other."""
+    """Ready, for EdgeRush's service every pod serving one table, and for Gubernator every
+    instance seeing every other."""
     wait_ready(system, range(n))
+    if system.owner == "service":
+        wait_service(system)
     if system.ask == "gubernator":
         start = time.monotonic()
         while any(len(gubernator_ring(i, n)) != n for i in range(n)):
@@ -237,14 +240,72 @@ def owner_in(scrapes):
     return owners[0]
 
 
-def service_owner(system):
-    """The index, among `system.stores`, of the service pod owning the load's key now."""
+def service_scrapes(system):
+    """Every service pod's scrape, in the order of `system.stores`."""
     scrapes = []
     for store in system.stores:
         url = f"http://{systems.STORE_IPS[store]}:{systems.SERVICE_METRICS}/metrics"
         with urllib.request.urlopen(url, timeout=2) as r:
             scrapes.append(r.read().decode())
-    return owner_in(scrapes)
+    return scrapes
+
+
+def service_owner(system):
+    """The index, among `system.stores`, of the service pod owning the load's key now."""
+    return owner_in(service_scrapes(system))
+
+
+SERVING = "edgerush_rate_limit_pod_serving"
+TERM = "edgerush_rate_limit_table_term"
+VERSION = "edgerush_rate_limit_table_version"
+
+
+def gauge(scrape, name):
+    """The value of the series `name` in `scrape`, None if it has none."""
+    for line in scrape.splitlines():
+        parts = line.split()
+        if parts[:1] == [name] and len(parts) > 1:
+            return int(float(parts[1]))
+    return None
+
+
+def table_served(scrapes):
+    """The table, as (term, version), that every one of EdgeRush's service pods serves by
+    their scrapes, or None while one is not serving, or they are on tables apart. A pod no
+    cluster took in serves nothing, so this is also every pod a member."""
+    tables = set()
+    for scrape in scrapes:
+        if gauge(scrape, SERVING) != 1:
+            return None
+        tables.add((gauge(scrape, TERM), gauge(scrape, VERSION)))
+    if len(tables) != 1:
+        return None
+    return tables.pop()
+
+
+# How long the table every pod serves must stay as it is before a run: a pod taken in has
+# shards moved to it, each a table of its own.
+SETTLED = 3.0
+
+
+def wait_service(system, deadline=120.0):
+    """Every service pod serving one table, unchanged for `SETTLED` seconds: a run that
+    strikes a pod strikes a cluster of all three."""
+    start = time.monotonic()
+    held, since = None, None
+    while True:
+        try:
+            served = table_served(service_scrapes(system))
+        except OSError:
+            served = None
+        now = time.monotonic()
+        if served is None or served != held:
+            held, since = served, now
+        elif now - since >= SETTLED:
+            return
+        if now - start > deadline:
+            raise RuntimeError(f"{system.key}: the service's pods never served one table")
+        time.sleep(0.25)
 
 
 async def run_command(*args):

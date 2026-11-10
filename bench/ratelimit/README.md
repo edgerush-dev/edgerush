@@ -25,7 +25,10 @@ edgerush-ratelimit-service --bins --example form`, `--bins` as naming an example
 alone; `edgerush`, `edgerush-ratelimit-service` and `examples/form` copied to `$RLH_BIN`,
 `/home/claude/rlh-bin` by default) in an image with the
 host's glibc: three pods of the service's store, formed by `form` as the controller will, and
-the proxies finding them by their addresses. Its limit is keyed by the client's address, the
+the proxies finding them by their addresses. Each pod has the other two as its seeds, so that a
+pod `form` did not name, or one restarted by a fault, joins the cluster again; every run waits
+until all three serve one table and it has not changed for 3 s, so that a fault strikes a
+cluster of three. Its limit is keyed by the client's address, the
 only key it takes before authentication, so every run's load, from the host, is one key. The
 store's table names that key's owner: `owner-lost` and `owner-restart` strike the one pod whose
 scrape shows a key owned (`edgerush_rate_limit_keys_owned`), read a second before, and refuse
