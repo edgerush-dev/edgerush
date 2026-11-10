@@ -1979,6 +1979,10 @@ impl<V: Held> Node<V> {
                         return out;
                     }
                     out.push((from, Message::Join { term }));
+                    // Its vote is as good as a leader heard now: the winner's word is a round
+                    // trip away, and standing before it comes would unseat the winner. It waits
+                    // a silence for it, then its own part of the jitter, as for a leader gone.
+                    self.elect_at = Some(now + self.config.silence + self.jitter(term + 1));
                 }
             }
             Message::Join { term } => self.on_join(from, term, now, &mut out),
@@ -5127,6 +5131,58 @@ mod tests {
                 .any(|(_, message)| matches!(message, Message::StartJoin { .. }))
         });
         assert!(stood, "it never stood with the table it holds");
+    }
+
+    /// A pod named to form that votes for another gives the winner a `silence` to be heard,
+    /// as it would a leader it had heard last then, before it stands itself: over a round trip
+    /// longer than its part of `election_jitter`, standing sooner unseats the leader it has
+    /// just elected, every term. With no leader heard by then, it stands.
+    #[test]
+    fn a_pod_that_votes_while_forming_waits_a_silence_before_it_stands() {
+        let config = config();
+        let mut node = Node::new(3, address(3), config, [1, 2]);
+        let form = Message::Form {
+            generation: 1,
+            voters: named(&[1, 2, 3]),
+            latest: (0, 0),
+        };
+        let _ = node.receive(99, form.clone(), ms(1));
+        let voted = node.receive(
+            1,
+            Message::StartJoin {
+                term: first_term(1),
+                accepted: (0, 0),
+            },
+            ms(2),
+        );
+        assert!(
+            voted
+                .iter()
+                .any(|(to, message)| *to == 1 && matches!(message, Message::Join { .. }))
+        );
+        // Named again every heartbeat, as the control plane does until the generation forms.
+        let mut stood_at = None;
+        for at in 1..=400 {
+            let now = ms(2 + at * 5);
+            if at % 20 == 0 {
+                let _ = node.receive(99, form.clone(), now);
+            }
+            let out = node.tick(now);
+            if out
+                .iter()
+                .any(|(_, message)| matches!(message, Message::StartJoin { .. }))
+            {
+                stood_at = Some(now);
+                break;
+            }
+        }
+        let stood_at = stood_at.expect("it never stood, no leader heard");
+        assert!(
+            stood_at >= ms(2) + config.silence,
+            "stood {} ms after its vote",
+            (stood_at - ms(2)) / 1_000_000
+        );
+        assert!(stood_at <= ms(2) + config.silence + config.election_jitter + ms(5));
     }
 
     /// A voter in a later term — one that stood to form the generation while cut off, then

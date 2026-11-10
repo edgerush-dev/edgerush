@@ -562,3 +562,27 @@ fn late_reports_never_form_a_cluster_beside_one_that_runs() {
         );
     }
 }
+
+/// Pods forming over slow links (#306): every link 90 ms each way, a round trip longer than
+/// most of `election_jitter` and short of the two heartbeats an election waits. Those that
+/// voted for the first to stand give its word a silence to reach them, so the first term
+/// forms the cluster; standing after their own part of the jitter, they unseated the leader
+/// they had just elected, term after term, and from 100 ms each way it never formed.
+#[test]
+fn pods_forming_over_slow_links_form_in_the_first_term() {
+    for seed in SEEDS {
+        let mut config = Config::defaults();
+        config.shards = shape().shards;
+        let mut world = World::new(seed, config);
+        world.set_default_link(Link {
+            delay: ms(90),
+            jitter: ms(1),
+            ..Link::lan()
+        });
+        let _ = world.start_cluster(3);
+        let took = world.run_while_not(ms(10_000), World::settled);
+        assert!(took.is_some(), "seed {seed}: never formed");
+        clean(&world);
+        assert_eq!(world.stats.terms, 1, "seed {seed}");
+    }
+}
