@@ -9,9 +9,15 @@
 //! the two: a datagram either way that its socket has no room for is dropped (24 §4).
 //!
 //! A session ends idle, refused — its endpoint's ICMP port unreachable, seen on its
-//! socket's next send or read, which sets the endpoint aside — or drained, its listener
-//! taken away; each end is counted and, where the listener logs, writes the session's one
-//! record (24 §3, §6).
+//! socket's next send or read, which sets the endpoint aside — or drained; each end is
+//! counted and, where the listener logs, writes the session's one record (24 §3, §6).
+//!
+//! A session is routed once, when it is made, by a key of its listener, route and upstream
+//! ([`Routed`](crate::routed::Routed)), as a tunnel is. At a reload the listener walks its
+//! sessions: those whose key the reload took away drain, carried on to the drain's bound
+//! and then ended, and those of an invalid backend end. A listener taken away, or one of a
+//! worker that drains, makes no session and drains every one it has, and is served until
+//! the last has ended (24 §5).
 
 use super::logged::Passing;
 use super::{Proxy, Worker, balance_of};
@@ -21,12 +27,13 @@ use crate::descriptors::Descriptor;
 use crate::drain::Drain;
 use crate::metrics::{Dropped, SessionEnd};
 use crate::random::random;
-use crate::udp::sessions::{Client, Dropped as Unmade, Session, Sessions};
+use crate::routed::Through;
+use crate::udp::sessions::{Client, Dropped as Unmade, Ended, Session, Sessions};
 use crate::upstream::balancing::InFlight;
 use crate::upstream::destination::{Aside, ReuseIdentity};
 use crate::upstream::dial::{self, Unconnected};
-use edgerush_config::Destination;
-use std::cell::RefCell;
+use edgerush_config::{Compiled, Destination};
+use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -49,7 +56,7 @@ const BATCH: usize = 64;
 
 impl Worker {
     /// Serves the `udp` listener whose slot is `listener` on `socket`, until the worker
-    /// drains or the listener is taken away, which ends its sessions.
+    /// drains or the listener is taken away and its last session has ended.
     ///
     /// # Errors
     ///
@@ -79,10 +86,8 @@ impl Worker {
         if wildcard {
             crate::downstream::h3::pktinfo::enable(&socket, local.is_ipv6())?;
         }
-        let idle = self
-            .proxy
-            .current
-            .load()
+        let snapshot = self.proxy.current.load();
+        let idle = snapshot
             .listener(listener)
             // A slot no listener has is never served: what the config says unless told.
             .map_or(Duration::from_secs(60), |compiled| compiled.session_idle);
@@ -107,6 +112,8 @@ impl Worker {
             local,
             wildcard,
             sessions: RefCell::new(Sessions::new(idle, loads, worker, listener)),
+            walked: Cell::new(snapshot.generation),
+            config: RefCell::new(Arc::clone(&snapshot.config)),
             buffer,
             #[cfg(target_os = "linux")]
             control,
@@ -126,6 +133,10 @@ struct Listening {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     wildcard: bool,
     sessions: RefCell<Sessions<Held>>,
+    /// The snapshot its sessions were last walked for, at a reload.
+    walked: Cell<u64>,
+    /// That snapshot's config: one a reload replaces ends the sessions of invalid backends.
+    config: RefCell<Arc<Compiled>>,
     /// The worker's, lent to whichever of its tasks reads, never across an await.
     buffer: Rc<RefCell<Box<[u8]>>>,
     /// Room for the control message a wildcard bind's datagram's destination comes in.
@@ -138,6 +149,9 @@ struct Listening {
 struct Held {
     /// Counted as a connection accepted and open until the session ends.
     _open: Open,
+    /// What it was routed by: its listener, route and upstream, which it drains once a
+    /// reload takes away. None for an invalid backend's.
+    key: Option<u64>,
     connected: Option<Connected>,
     /// Its access log record, where its listener logs (24 §6): boxed, so that a session
     /// of one that does not holds no room for it.
@@ -225,17 +239,29 @@ enum Read {
 }
 
 impl Listening {
-    /// Serves until `drain` starts, then ends every session.
+    /// Serves until `drain` starts, then drains every session, and ends once the last has.
     async fn serve(self: Rc<Self>, worker: Rc<Worker>, drain: Rc<Drain>) {
         let mut idle = pin!(tokio::time::sleep_until(tokio::time::Instant::now()));
+        let mut reload = worker.next_reload();
+        // Asked once what is started at the next reload is in hand: one since this
+        // listener's snapshot was read is not missed.
+        self.reloaded(&worker, Instant::now());
         loop {
-            if drain.is_on() {
-                self.end_every(&worker);
-                return;
-            }
             // One clock read a batch: what a datagram's session is kept from its bound by.
             let now = Instant::now();
+            if reload.is_on() {
+                reload = worker.next_reload();
+                self.reloaded(&worker, now);
+            }
+            if drain.is_on() && !self.sessions.borrow().draining() {
+                self.sessions
+                    .borrow_mut()
+                    .drain_every(now + worker.deadlines.drain);
+            }
             self.expire(&worker, now);
+            if drain.is_on() && self.sessions.borrow().is_empty() {
+                return;
+            }
             let read = self.read_batch(&worker, now);
             if read == BATCH {
                 // A full batch: everything else the worker has goes first.
@@ -246,9 +272,15 @@ impl Listening {
             if let Some(soonest) = soonest {
                 idle.as_mut().reset(soonest.into());
             }
+            // Once its sessions drain, a drain started is no news.
+            let drains = self.sessions.borrow().draining();
             let mut draining = pin!(drain.notified());
+            let mut reloading = pin!(reload.notified());
             poll_fn(|cx| {
-                if drain.poll_on(draining.as_mut(), cx).is_ready() {
+                if !drains && drain.poll_on(draining.as_mut(), cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                if reload.poll_on(reloading.as_mut(), cx).is_ready() {
                     return Poll::Ready(());
                 }
                 if soonest.is_some() && idle.as_mut().poll(cx).is_ready() {
@@ -281,15 +313,30 @@ impl Listening {
                     continue;
                 }
             };
-            let Some(route) = route else {
-                self.dropped(worker, Dropped::NoRoute);
-                continue;
-            };
             let datagram = buffer.get(..len).unwrap_or_default();
             let mut sessions = self.sessions.borrow_mut();
-            let opened = sessions.arrived(client, now, &route.backends, random, |backend| {
-                self.open(worker, &snapshot, &route.name, backend, client)
-            });
+            let opened = match route {
+                Some(route) => sessions
+                    .arrived(client, now, &route.backends, random, |backend| {
+                        self.open(worker, &snapshot, &route.name, backend, client)
+                    })
+                    .map_err(|unmade| match unmade {
+                        Unmade::NoBackend => Dropped::InvalidBackend,
+                        Unmade::NoRoom => Dropped::NoRoom,
+                        Unmade::Draining => Dropped::Draining,
+                        Unmade::Unopened(why) => why,
+                    }),
+                // Nothing to make a session by: a client that has one is carried on, until
+                // the drain the reload that took its route away started ends it.
+                None => {
+                    let why = if sessions.draining() {
+                        Dropped::Draining
+                    } else {
+                        Dropped::NoRoute
+                    };
+                    sessions.heard(&client, now).ok_or(why)
+                }
+            };
             let why = match opened {
                 Ok(session) => {
                     let Held {
@@ -315,9 +362,7 @@ impl Listening {
                         None => Some(Dropped::InvalidBackend),
                     }
                 }
-                Err(Unmade::NoBackend) => Some(Dropped::InvalidBackend),
-                Err(Unmade::NoRoom) => Some(Dropped::NoRoom),
-                Err(Unmade::Unopened(why)) => Some(why),
+                Err(why) => Some(why),
             };
             drop(sessions);
             match why {
@@ -354,6 +399,7 @@ impl Listening {
             Destination::Invalid(_) => {
                 return Ok(Held {
                     _open: Open::new(&worker.proxy, self.slot),
+                    key: None,
                     connected: None,
                     record: record(None, None),
                 });
@@ -397,6 +443,7 @@ impl Listening {
             .map(|upstream| upstream.name.as_str());
         Ok(Held {
             _open: Open::new(&worker.proxy, self.slot),
+            key: snapshot.routed.key(self.slot, Through::Udp, upstream.0),
             record: record(name, Some(endpoint.address())),
             connected: Some(Connected {
                 endpoint: Arc::clone(endpoint),
@@ -479,7 +526,7 @@ impl Listening {
                 drop(buffer);
                 // An answer keeps its session from its idle bound as a datagram does.
                 let mut sessions = self.sessions.borrow_mut();
-                if let Some(session) = sessions.answered(&client, now)
+                if let Some(session) = sessions.heard(&client, now)
                     && sent
                     && let Some(record) = &mut session.value_mut().record
                 {
@@ -552,18 +599,47 @@ impl Listening {
         })
     }
 
-    /// Ends the sessions past their idle bound at `now`.
+    /// Ends the sessions past their idle bound at `now`, or their drain's.
     fn expire(&self, worker: &Worker, now: Instant) {
-        self.sessions.borrow_mut().expire(now, |_, session| {
-            self.finish(worker, session, SessionEnd::Idle);
+        self.sessions.borrow_mut().expire(now, |_, session, how| {
+            let how = match how {
+                Ended::Idle => SessionEnd::Idle,
+                Ended::Drained => SessionEnd::Drained,
+            };
+            self.finish(worker, session, how);
         });
     }
 
-    /// Ends every session: the listener was taken away, or the worker drains.
-    fn end_every(&self, worker: &Worker) {
-        self.sessions.borrow_mut().end_every(|_, session| {
-            self.finish(worker, session, SessionEnd::Drained);
+    /// Brings the sessions up to the snapshot in force, if a reload has come since they
+    /// last were (24 §5): the sessions made from now on take the listener's idle bound as
+    /// it is, those whose key the reload took away drain, and those of an invalid backend,
+    /// which hold nothing and only drop, end, so that their clients' next datagrams pick
+    /// again, under the new config.
+    fn reloaded(&self, worker: &Worker, now: Instant) {
+        let snapshot = worker.proxy.current.load();
+        if self.walked.replace(snapshot.generation) == snapshot.generation {
+            return;
+        }
+        let mut sessions = self.sessions.borrow_mut();
+        if let Some(listener) = snapshot.listener(self.slot) {
+            sessions.set_idle(listener.session_idle);
+        }
+        sessions.drain(now + worker.deadlines.drain, |session| {
+            session
+                .value()
+                .key
+                .is_some_and(|key| !snapshot.routed.holds(key))
         });
+        // Endpoints found, names resolved: the same config, under which an invalid
+        // backend is as it was.
+        if Arc::ptr_eq(&snapshot.config, &self.config.borrow()) {
+            return;
+        }
+        self.config.replace(Arc::clone(&snapshot.config));
+        sessions.end_where(
+            |session| matches!(session.backend(), Destination::Invalid(_)),
+            |_, session| self.finish(worker, session, SessionEnd::Drained),
+        );
     }
 
     /// Ends `client`'s session, its endpoint having refused a datagram (ICMP port

@@ -171,6 +171,11 @@ impl<T> Heap<T> {
         self.compact();
     }
 
+    /// The slot's deadline as it stands, if it has one.
+    pub fn due(&self, key: Key) -> Option<Instant> {
+        self.slot(key).and_then(|slot| slot.due)
+    }
+
     /// Whether `due` had come the last time the slot's deadline was found to have come.
     pub fn reached(&self, key: Key, due: Instant) -> bool {
         self.slot(key).is_some_and(|slot| slot.rang >= Some(due))
@@ -322,6 +327,23 @@ mod tests {
         assert!(expired(&mut heap, start + ms(10)).is_empty());
         assert_eq!(heap.soonest(), Some(start + ms(50)));
         assert_eq!(expired(&mut heap, start + ms(50)), [1]);
+    }
+
+    /// A slot's deadline is the one last set, wherever its entry is queued; a slot given up
+    /// has none.
+    #[test]
+    fn a_slots_deadline_is_the_one_last_set() {
+        let start = Instant::now();
+        let mut heap = Heap::default();
+        let key = heap.add(1);
+        assert_eq!(heap.due(key), None);
+        set(&mut heap, key, Some(start + ms(10)), || start + ms(10));
+        set(&mut heap, key, Some(start + ms(40)), || start + ms(40));
+        assert_eq!(heap.due(key), Some(start + ms(40)), "moved later");
+        set(&mut heap, key, Some(start + ms(20)), || start + ms(20));
+        assert_eq!(heap.due(key), Some(start + ms(20)), "moved sooner");
+        heap.remove(key);
+        assert_eq!(heap.due(key), None);
     }
 
     #[test]

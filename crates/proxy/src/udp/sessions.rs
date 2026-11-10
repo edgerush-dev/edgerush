@@ -1,7 +1,7 @@
 //! A worker's sessions on one `udp` listener
 //! ([24 §3](../../../../docs/24-udp-proxying.md)): which backend each client's datagrams go
-//! to, until neither the client nor its backend has sent anything for the listener's idle
-//! bound.
+//! to, until neither the client nor its backend has sent anything for the session's idle
+//! bound, or until the bound of its drain (24 §5).
 //!
 //! A client is its address and port with the local address its datagram arrived on. Its
 //! first datagram makes its session, and picks the session's backend by weight, once: every
@@ -13,7 +13,10 @@
 //!
 //! The idle bound is a deadline in a [`Heap`] that moves later with every datagram either
 //! way. Moving later touches the session's slot alone, so a datagram costs a lookup and a
-//! time stored, and the heap is touched at most once an idle bound a session.
+//! time stored, and the heap is touched at most once an idle bound a session. A session
+//! takes the listener's idle bound as it is when the session is made, and keeps it, as a
+//! tunnel keeps its own. Draining gives it a second deadline, which a datagram never moves:
+//! it ends at whichever comes first.
 //!
 //! Nothing here reads a clock, draws a random number or touches a socket: the time and the
 //! randomness are handed in, and what a session holds of its own is the caller's.
@@ -62,6 +65,10 @@ fn bits(ip: IpAddr) -> u128 {
 pub struct Session<T> {
     backend: Destination,
     deadline: Key,
+    /// Its idle bound: its listener's when it was made.
+    idle: Duration,
+    /// When it ends however busy it is, once it drains.
+    drain_by: Option<Instant>,
     /// The connection it counts as, given back when it ends: held for its drop alone.
     _held: Held,
     value: T,
@@ -70,21 +77,29 @@ pub struct Session<T> {
 impl<T> Session<T> {
     /// Where its datagrams go: picked by its first.
     #[must_use]
-    #[cfg_attr(
-        not(any(test, feature = "fuzzing")),
-        expect(
-            dead_code,
-            reason = "a reload keeps a session whose route lists its backend still (24 §8, step 4)"
-        )
-    )]
     pub fn backend(&self) -> Destination {
         self.backend
+    }
+
+    /// What the caller opened for it.
+    #[must_use]
+    pub fn value(&self) -> &T {
+        &self.value
     }
 
     /// What the caller opened for it.
     pub fn value_mut(&mut self) -> &mut T {
         &mut self.value
     }
+}
+
+/// How a session's time ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// It carried nothing either way for its idle bound.
+    Idle,
+    /// Its drain's bound came.
+    Drained,
 }
 
 /// Why a datagram from a new client made no session.
@@ -94,6 +109,8 @@ pub enum Dropped<E> {
     NoBackend,
     /// The worker has no room for another connection, or the listener holds its share.
     NoRoom,
+    /// The listener drains: it makes no session (24 §5).
+    Draining,
     /// What the session was to hold could not be opened, for the reason given.
     Unopened(E),
 }
@@ -105,7 +122,10 @@ pub struct Sessions<T> {
     /// them choose which ones collide.
     by_client: HashMap<Client, Session<T>>,
     deadlines: Heap<Client>,
+    /// The idle bound of the sessions made from now on.
     idle: Duration,
+    /// Every session drains, and none is made.
+    draining: bool,
     loads: Arc<Loads>,
     worker: usize,
     listener: usize,
@@ -123,6 +143,7 @@ impl<T> Sessions<T> {
             by_client: HashMap::new(),
             deadlines: Heap::default(),
             idle,
+            draining: false,
             loads,
             worker,
             listener,
@@ -137,7 +158,8 @@ impl<T> Sessions<T> {
     /// taken or opened. Without a session, the datagram is dropped, for the reason given.
     ///
     /// [`Sessions::expire`] is asked for `now` first: until then, a session past its bound
-    /// is carried on.
+    /// is carried on. Once every session drains ([`Sessions::drain_every`]), a new client
+    /// is given none.
     pub fn arrived<E>(
         &mut self,
         client: Client,
@@ -149,9 +171,10 @@ impl<T> Sessions<T> {
         match self.by_client.entry(client) {
             Entry::Occupied(found) => {
                 let session = found.into_mut();
-                touch(&mut self.deadlines, session.deadline, now, self.idle);
+                touch(&mut self.deadlines, session, now);
                 Ok(session)
             }
+            Entry::Vacant(_) if self.draining => Err(Dropped::Draining),
             Entry::Vacant(vacant) => {
                 let backend = backends.pick(random()).ok_or(Dropped::NoBackend)?;
                 let held = self
@@ -160,24 +183,73 @@ impl<T> Sessions<T> {
                     .ok_or(Dropped::NoRoom)?;
                 // Dropping `held` with the error gives the room back.
                 let value = open(backend).map_err(Dropped::Unopened)?;
-                let deadline = self.deadlines.add(client);
-                touch(&mut self.deadlines, deadline, now, self.idle);
-                Ok(vacant.insert(Session {
+                let session = vacant.insert(Session {
                     backend,
-                    deadline,
+                    deadline: self.deadlines.add(client),
+                    idle: self.idle,
+                    drain_by: None,
                     _held: held,
                     value,
-                }))
+                });
+                touch(&mut self.deadlines, session, now);
+                Ok(session)
             }
         }
     }
 
-    /// The backend answered `client` at `now`: its session, if it has one, which the
-    /// answer keeps from its idle bound as a datagram from the client does.
-    pub fn answered(&mut self, client: &Client, now: Instant) -> Option<&mut Session<T>> {
+    /// Something passed on `client`'s session at `now`: its backend's answer, or a datagram
+    /// from the client where no session is to be made for it: the session, if it has one,
+    /// which this keeps from its idle bound.
+    pub fn heard(&mut self, client: &Client, now: Instant) -> Option<&mut Session<T>> {
         let session = self.by_client.get_mut(client)?;
-        touch(&mut self.deadlines, session.deadline, now, self.idle);
+        touch(&mut self.deadlines, session, now);
         Some(session)
+    }
+
+    /// The idle bound of the sessions made from now on; those there are keep theirs.
+    pub fn set_idle(&mut self, idle: Duration) {
+        self.idle = idle;
+    }
+
+    /// Every session `which` picks that does not drain already drains: it ends at `by`, or
+    /// at its idle bound if that comes first.
+    pub fn drain(&mut self, by: Instant, mut which: impl FnMut(&Session<T>) -> bool) {
+        for session in self.by_client.values_mut() {
+            if session.drain_by.is_some() || !which(session) {
+                continue;
+            }
+            session.drain_by = Some(by);
+            let due = self
+                .deadlines
+                .due(session.deadline)
+                .map_or(by, |due| due.min(by));
+            self.deadlines.wait(session.deadline, due, || due, |_| {});
+        }
+    }
+
+    /// Every session drains, by `by` at the latest, and none is made from now on: the
+    /// listener was taken away, or its worker drains.
+    pub fn drain_every(&mut self, by: Instant) {
+        self.draining = true;
+        self.drain(by, |_| true);
+    }
+
+    /// Whether every session drains, and none is made.
+    #[must_use]
+    pub fn draining(&self) -> bool {
+        self.draining
+    }
+
+    /// Ends every session `which` picks, now: each handed to `each`, with its client.
+    pub fn end_where(
+        &mut self,
+        mut which: impl FnMut(&Session<T>) -> bool,
+        mut each: impl FnMut(Client, Session<T>),
+    ) {
+        for (client, session) in self.by_client.extract_if(|_, session| which(session)) {
+            self.deadlines.remove(session.deadline);
+            each(client, session);
+        }
     }
 
     /// Ends `client`'s session before its idle bound, as a refused one ends: handed back,
@@ -195,9 +267,10 @@ impl<T> Sessions<T> {
         self.deadlines.soonest()
     }
 
-    /// The time is `now`: every session that has carried nothing either way for the idle
-    /// bound up to it is ended and handed to `each`, with its client.
-    pub fn expire(&mut self, now: Instant, mut each: impl FnMut(Client, Session<T>)) {
+    /// The time is `now`: every session that has carried nothing either way for its idle
+    /// bound up to it, or whose drain's bound has come, is ended and handed to `each`, with
+    /// its client and which it was.
+    pub fn expire(&mut self, now: Instant, mut each: impl FnMut(Client, Session<T>, Ended)) {
         let Self {
             by_client,
             deadlines,
@@ -207,21 +280,17 @@ impl<T> Sessions<T> {
         deadlines.expire(now, |client| {
             if let Some(session) = by_client.remove(client) {
                 ended.push(session.deadline);
-                each(*client, session);
+                let how = if session.drain_by.is_some_and(|by| by <= now) {
+                    Ended::Drained
+                } else {
+                    Ended::Idle
+                };
+                each(*client, session, how);
             }
         });
         for deadline in ended.drain(..) {
             deadlines.remove(deadline);
         }
-    }
-
-    /// Ends every session, as a listener taken away ends them: each handed to `each`, with
-    /// its client.
-    pub fn end_every(&mut self, mut each: impl FnMut(Client, Session<T>)) {
-        for (client, session) in self.by_client.drain() {
-            each(client, session);
-        }
-        self.deadlines = Heap::default();
     }
 
     /// How many sessions there are.
@@ -233,19 +302,21 @@ impl<T> Sessions<T> {
 
     /// Whether there are none.
     #[must_use]
-    #[cfg(any(test, feature = "fuzzing"))]
     pub fn is_empty(&self) -> bool {
         self.by_client.is_empty()
     }
 }
 
-/// The session whose slot is `deadline` was heard from at `now`: its idle bound is
-/// reckoned from then.
-fn touch(deadlines: &mut Heap<Client>, deadline: Key, now: Instant, idle: Duration) {
+/// `session` was heard from at `now`: its idle bound is reckoned from then, and it ends
+/// then unless its drain's bound comes first.
+fn touch<T>(deadlines: &mut Heap<Client>, session: &Session<T>, now: Instant) {
     // An idle bound past what the clock can count to is one never reached.
-    if let Some(due) = now.checked_add(idle) {
-        deadlines.wait(deadline, due, || due, |_| {});
-    }
+    let due = match (now.checked_add(session.idle), session.drain_by) {
+        (Some(idle), Some(by)) => idle.min(by),
+        (Some(due), None) | (None, Some(due)) => due,
+        (None, None) => return,
+    };
+    deadlines.wait(session.deadline, due, || due, |_| {});
 }
 
 #[cfg(test)]
@@ -300,8 +371,17 @@ mod tests {
     }
 
     fn ended(sessions: &mut Sessions<u32>, now: Instant) -> Vec<Client> {
+        ended_how(sessions, now)
+            .into_iter()
+            .map(|(client, _)| client)
+            .collect()
+    }
+
+    /// The sessions ended at `now`, and how, in the order of their clients' ports.
+    fn ended_how(sessions: &mut Sessions<u32>, now: Instant) -> Vec<(Client, Ended)> {
         let mut ended = Vec::new();
-        sessions.expire(now, |client, _| ended.push(client));
+        sessions.expire(now, |client, _, how| ended.push((client, how)));
+        ended.sort_by_key(|(client, _)| client.peer.port());
         ended
     }
 
@@ -400,7 +480,7 @@ mod tests {
         let heard = start + IDLE / 2;
         assert!(datagram(&mut sessions, client(1), start, &backends, 0).is_ok());
         assert!(datagram(&mut sessions, client(2), start, &backends, 0).is_ok());
-        assert!(sessions.answered(&client(2), heard).is_some());
+        assert!(sessions.heard(&client(2), heard).is_some());
         assert_eq!(sessions.soonest(), Some(start + IDLE));
         let nanosecond = Duration::from_nanos(1);
         assert_eq!(ended(&mut sessions, start + IDLE - nanosecond), []);
@@ -433,24 +513,114 @@ mod tests {
         assert!(datagram(&mut sessions, client(2), start, &backends, 0).is_ok());
     }
 
+    /// The sessions picked are ended at once and handed over, their room given back and
+    /// their bounds gone; the others go on, and the clients ended pick again.
     #[test]
-    fn ending_every_session_hands_each_over_and_gives_their_room_back() {
+    fn ending_the_sessions_picked_hands_each_over_and_gives_their_room_back() {
         let (mut sessions, loads) = sessions(3);
-        let backends = backends(&[1]);
+        let backends = backends(&[1, 1]);
         let start = Instant::now();
         for port in 1..=3 {
-            assert!(datagram(&mut sessions, client(port), start, &backends, 0).is_ok());
+            let random = u64::from(port % 2);
+            assert!(datagram(&mut sessions, client(port), start, &backends, random).is_ok());
         }
         let mut handed = Vec::new();
-        sessions.end_every(|client, _| handed.push(client.peer.port()));
+        sessions.end_where(
+            |session| session.backend() == Destination::Upstream(UpstreamId(1)),
+            |client, _| handed.push(client.peer.port()),
+        );
         handed.sort_unstable();
-        assert_eq!(handed, [1, 2, 3]);
-        assert!(sessions.is_empty());
-        assert_eq!(loads.now(), [0]);
-        assert_eq!(sessions.soonest(), None, "no idle bound is left to come");
-        // The table goes on as new: a client is given a session again, and its bound comes.
+        assert_eq!(handed, [1, 3]);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(loads.now(), [1]);
+        assert_eq!(sessions.deadlines.taken(), 1, "their slots are given up");
         assert!(datagram(&mut sessions, client(1), start, &backends, 0).is_ok());
-        assert_eq!(ended(&mut sessions, start + IDLE), [client(1)]);
+        assert_eq!(ended(&mut sessions, start + IDLE), [client(1), client(2)]);
+    }
+
+    /// A session keeps the idle bound it was made with: one set later is for the sessions
+    /// made after it.
+    #[test]
+    fn a_session_keeps_the_idle_bound_it_was_made_with() {
+        let (mut sessions, _loads) = sessions(10);
+        let backends = backends(&[1]);
+        let start = Instant::now();
+        assert!(datagram(&mut sessions, client(1), start, &backends, 0).is_ok());
+        sessions.set_idle(IDLE * 2);
+        assert!(datagram(&mut sessions, client(2), start, &backends, 0).is_ok());
+        sessions.set_idle(IDLE / 2);
+        // Heard from again, each is kept for its own bound from then.
+        let heard = start + IDLE / 4;
+        assert!(sessions.heard(&client(1), heard).is_some());
+        assert!(datagram(&mut sessions, client(2), heard, &backends, 0).is_ok());
+        assert_eq!(ended(&mut sessions, heard + IDLE / 2), []);
+        assert_eq!(ended(&mut sessions, heard + IDLE), [client(1)]);
+        assert_eq!(ended(&mut sessions, heard + IDLE * 2), [client(2)]);
+    }
+
+    /// A drained session ends at its drain's bound however busy it is, or at its idle bound
+    /// if that comes first; draining it again moves neither; one not picked goes on.
+    #[test]
+    fn a_drained_session_ends_at_its_drains_bound_or_idle_first() {
+        let (mut sessions, _loads) = sessions(10);
+        let backends = backends(&[1, 1]);
+        let start = Instant::now();
+        for port in 1..=3 {
+            let random = u64::from(port == 3);
+            assert!(datagram(&mut sessions, client(port), start, &backends, random).is_ok());
+        }
+        let by = start + IDLE / 2;
+        sessions.drain(by, |session| {
+            session.backend() == Destination::Upstream(UpstreamId(0))
+        });
+        sessions.drain(start + IDLE, |_| true);
+        // Client 1 busy to the end, client 2 quiet: both end at the drain's bound.
+        let nanosecond = Duration::from_nanos(1);
+        assert!(sessions.heard(&client(1), by - nanosecond).is_some());
+        assert_eq!(ended_how(&mut sessions, by - nanosecond), []);
+        assert_eq!(
+            ended_how(&mut sessions, by),
+            [(client(1), Ended::Drained), (client(2), Ended::Drained)]
+        );
+        // Client 3 drains from the second alone, by when its idle bound comes: the drain's
+        // bound, come, is what ends it.
+        assert_eq!(
+            ended_how(&mut sessions, start + IDLE),
+            [(client(3), Ended::Drained)]
+        );
+
+        let (mut sessions, _loads) = self::sessions(10);
+        assert!(datagram(&mut sessions, client(1), start, &backends, 0).is_ok());
+        sessions.drain(start + IDLE * 2, |_| true);
+        assert_eq!(
+            ended_how(&mut sessions, start + IDLE),
+            [(client(1), Ended::Idle)],
+            "its idle bound came first"
+        );
+    }
+
+    /// Once every session drains, a new client is given none, while the sessions there are
+    /// carry on to their drain's bound.
+    #[test]
+    fn once_every_session_drains_no_new_one_is_made() {
+        let (mut sessions, loads) = sessions(10);
+        let backends = backends(&[1]);
+        let start = Instant::now();
+        assert!(datagram(&mut sessions, client(1), start, &backends, 0).is_ok());
+        assert!(!sessions.draining());
+        sessions.drain_every(start + IDLE / 2);
+        assert!(sessions.draining());
+        assert_eq!(
+            datagram(&mut sessions, client(2), start, &backends, 0),
+            Err(Dropped::Draining)
+        );
+        assert_eq!(loads.now(), [1], "no room is taken for it");
+        assert!(datagram(&mut sessions, client(1), start, &backends, 0).is_ok());
+        assert_eq!(
+            ended_how(&mut sessions, start + IDLE / 2),
+            [(client(1), Ended::Drained)]
+        );
+        assert!(sessions.is_empty());
     }
 
     #[test]
@@ -544,7 +714,7 @@ mod tests {
         assert!(sessions.end(&client(1)).is_some());
         assert!(sessions.end(&client(1)).is_none());
         assert_eq!(loads.now(), [0]);
-        assert!(sessions.answered(&client(1), start).is_none());
+        assert!(sessions.heard(&client(1), start).is_none());
         let later = start + IDLE / 2;
         assert_eq!(
             datagram(&mut sessions, client(1), later, &backends, 1),
@@ -561,9 +731,40 @@ mod tests {
     /// What may happen to a listener's sessions, a number of milliseconds after the last.
     #[derive(Debug, Clone)]
     enum Op {
-        Datagram { client: u8, after: u64, random: u64 },
-        Answered { client: u8, after: u64 },
-        End { client: u8, after: u64 },
+        Datagram {
+            client: u8,
+            after: u64,
+            random: u64,
+        },
+        Answered {
+            client: u8,
+            after: u64,
+        },
+        End {
+            client: u8,
+            after: u64,
+        },
+        /// The idle bound of the sessions made from then.
+        Idle {
+            idle: u64,
+            after: u64,
+        },
+        /// The clients in `which`, as bits, drain, by `within` from then.
+        Drain {
+            which: u8,
+            within: u64,
+            after: u64,
+        },
+        /// Every session drains, by `within` from then, and none is made.
+        DrainEvery {
+            within: u64,
+            after: u64,
+        },
+        /// The clients in `which`, as bits, are ended.
+        EndWhere {
+            which: u8,
+            after: u64,
+        },
     }
 
     fn op() -> impl Strategy<Value = Op> {
@@ -575,7 +776,43 @@ mod tests {
             }),
             (0_u8..8, 0_u64..1500).prop_map(|(client, after)| Op::Answered { client, after }),
             (0_u8..8, 0_u64..1500).prop_map(|(client, after)| Op::End { client, after }),
+            (1_u64..3000, 0_u64..1500).prop_map(|(idle, after)| Op::Idle { idle, after }),
+            (any::<u8>(), 0_u64..3000, 0_u64..1500).prop_map(|(which, within, after)| Op::Drain {
+                which,
+                within,
+                after
+            }),
+            (0_u64..3000, 0_u64..1500).prop_map(|(within, after)| Op::DrainEvery { within, after }),
+            (any::<u8>(), 0_u64..1500).prop_map(|(which, after)| Op::EndWhere { which, after }),
         ]
+    }
+
+    /// A client in the model: its backend, the last time anything was heard of it, its idle
+    /// bound and when it ends draining, all in milliseconds.
+    #[derive(Debug, Clone, Copy)]
+    struct Modelled {
+        backend: usize,
+        last: u64,
+        idle: u64,
+        drain_by: Option<u64>,
+    }
+
+    impl Modelled {
+        fn due(&self) -> u64 {
+            let idle = self.last + self.idle;
+            self.drain_by.map_or(idle, |by| idle.min(by))
+        }
+
+        fn ended(&self, now: u64) -> Option<Ended> {
+            if self.due() > now {
+                return None;
+            }
+            Some(if self.drain_by.is_some_and(|by| by <= now) {
+                Ended::Drained
+            } else {
+                Ended::Idle
+            })
+        }
     }
 
     /// Clients on two local addresses, so that one port on each is two clients.
@@ -611,44 +848,52 @@ mod tests {
             let mut sessions = Sessions::<u8>::new(idle, Arc::clone(&loads), 0, 0);
             let backends = backends(&weights);
             let start = Instant::now();
-            // The model: each client with a session, its backend and the last time, in
-            // milliseconds, anything was heard of it.
-            let mut model: BTreeMap<u8, (usize, u64)> = BTreeMap::new();
+            // The model: each client with a session, and the idle bound and drain of those
+            // made from now.
+            let mut model: BTreeMap<u8, Modelled> = BTreeMap::new();
+            let mut idle_ms = idle_ms;
+            let mut draining = false;
             let mut now_ms = 0;
             for op in ops {
-                let (Op::Datagram { client, after, .. }
-                | Op::Answered { client, after }
-                | Op::End { client, after }) = op;
+                let (Op::Datagram { after, .. }
+                | Op::Answered { after, .. }
+                | Op::End { after, .. }
+                | Op::Idle { after, .. }
+                | Op::Drain { after, .. }
+                | Op::DrainEvery { after, .. }
+                | Op::EndWhere { after, .. }) = op;
                 now_ms += after;
                 let now = start + Duration::from_millis(now_ms);
 
-                let mut expired: Vec<Client> = Vec::new();
-                sessions.expire(now, |client, _| expired.push(client));
-                expired.sort_by_key(|client| (client.local, client.peer));
-                let due: Vec<u8> = model
+                let mut expired: Vec<(Client, Ended)> = Vec::new();
+                sessions.expire(now, |client, _, how| expired.push((client, how)));
+                expired.sort_by_key(|(client, _)| (client.local, client.peer));
+                let mut due: Vec<(Client, Ended)> = model
                     .iter()
-                    .filter(|(_, (_, last))| last + idle_ms <= now_ms)
-                    .map(|(client, _)| *client)
+                    .filter_map(|(client, modelled)| Some((numbered(*client), modelled.ended(now_ms)?)))
                     .collect();
-                model.retain(|_, (_, last)| *last + idle_ms > now_ms);
-                let mut due: Vec<Client> = due.into_iter().map(numbered).collect();
-                due.sort_by_key(|client| (client.local, client.peer));
+                model.retain(|_, modelled| modelled.ended(now_ms).is_none());
+                due.sort_by_key(|(client, _)| (client.local, client.peer));
                 prop_assert_eq!(expired, due);
 
+                // The value a session holds is its client's number, which `which` picks by.
+                let picked = |which: u8, client: u8| which & (1 << client) != 0;
                 match op {
-                    Op::Datagram { random, .. } => {
+                    Op::Datagram { client, random, .. } => {
                         let found = sessions
                             .arrived(numbered(client), now, &backends, || random, |_| Ok::<_, ()>(client))
                             .map(|session| (session.backend(), *session.value_mut()));
-                        let expected = if let Some((backend, last)) = model.get_mut(&client) {
-                            *last = now_ms;
-                            Ok(*backend)
+                        let expected = if let Some(modelled) = model.get_mut(&client) {
+                            modelled.last = now_ms;
+                            Ok(modelled.backend)
+                        } else if draining {
+                            Err(Dropped::Draining)
                         } else {
                             match naive_pick(&weights, random) {
                                 None => Err(Dropped::NoBackend),
                                 Some(_) if model.len() == cap => Err(Dropped::NoRoom),
                                 Some(backend) => {
-                                    model.insert(client, (backend, now_ms));
+                                    model.insert(client, Modelled { backend, last: now_ms, idle: idle_ms, drain_by: None });
                                     Ok(backend)
                                 }
                             }
@@ -657,27 +902,57 @@ mod tests {
                             .map(|backend| (Destination::Upstream(UpstreamId(backend)), client));
                         prop_assert_eq!(found, expected);
                     }
-                    Op::Answered { .. } => {
-                        let found = sessions.answered(&numbered(client), now).map(|session| session.backend());
-                        let expected = model.get_mut(&client).map(|(backend, last)| {
-                            *last = now_ms;
-                            Destination::Upstream(UpstreamId(*backend))
+                    Op::Answered { client, .. } => {
+                        let found = sessions.heard(&numbered(client), now).map(|session| session.backend());
+                        let expected = model.get_mut(&client).map(|modelled| {
+                            modelled.last = now_ms;
+                            Destination::Upstream(UpstreamId(modelled.backend))
                         });
                         prop_assert_eq!(found, expected);
                     }
-                    Op::End { .. } => {
+                    Op::End { client, .. } => {
                         let found = sessions.end(&numbered(client)).map(|session| session.backend());
                         let expected = model
                             .remove(&client)
-                            .map(|(backend, _)| Destination::Upstream(UpstreamId(backend)));
+                            .map(|modelled| Destination::Upstream(UpstreamId(modelled.backend)));
+                        prop_assert_eq!(found, expected);
+                    }
+                    Op::Idle { idle, .. } => {
+                        sessions.set_idle(Duration::from_millis(idle));
+                        idle_ms = idle;
+                    }
+                    Op::Drain { which, within, .. } => {
+                        let by = now_ms + within;
+                        sessions.drain(start + Duration::from_millis(by), |session| picked(which, *session.value()));
+                        for (client, modelled) in &mut model {
+                            if picked(which, *client) && modelled.drain_by.is_none() {
+                                modelled.drain_by = Some(by);
+                            }
+                        }
+                    }
+                    Op::DrainEvery { within, .. } => {
+                        let by = now_ms + within;
+                        sessions.drain_every(start + Duration::from_millis(by));
+                        draining = true;
+                        for modelled in model.values_mut() {
+                            modelled.drain_by.get_or_insert(by);
+                        }
+                    }
+                    Op::EndWhere { which, .. } => {
+                        let mut found: Vec<u8> = Vec::new();
+                        sessions.end_where(|session| picked(which, *session.value()), |_, session| found.push(*session.value()));
+                        found.sort_unstable();
+                        let expected: Vec<u8> = model.keys().copied().filter(|client| picked(which, *client)).collect();
+                        model.retain(|client, _| !picked(which, *client));
                         prop_assert_eq!(found, expected);
                     }
                 }
 
                 prop_assert_eq!(sessions.len(), model.len());
+                prop_assert_eq!(sessions.draining(), draining);
                 prop_assert_eq!(loads.now(), vec![model.len()]);
                 prop_assert_eq!(sessions.deadlines.taken(), model.len(), "an ended session's slot is given up");
-                let first_due = model.values().map(|(_, last)| last + idle_ms).min();
+                let first_due = model.values().map(Modelled::due).min();
                 match (sessions.soonest(), first_due) {
                     (None, None) => {}
                     (Some(soonest), Some(due)) => prop_assert!(
