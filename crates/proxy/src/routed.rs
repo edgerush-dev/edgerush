@@ -94,8 +94,9 @@ impl Routed {
     }
 }
 
-/// Every route of `listener`'s and upstream it lists: for an HTTP route, every upstream
-/// its rules forward to with a share; a mirror is no route of a tunnel's.
+/// Every route of `listener`'s and upstream it lists, weight 0 among them, so that a
+/// backend retired gently keeps what it carries (03 §10): for an HTTP route, every upstream
+/// its rules forward to; a mirror is no route of a tunnel's.
 fn routes_of<'a>(
     config: &'a Compiled,
     listener: &'a CompiledListener,
@@ -105,7 +106,7 @@ fn routes_of<'a>(
         Some(L4::Tcp(route)) => found.extend(
             route
                 .backends
-                .upstreams()
+                .listed()
                 .map(|upstream| (Through::Tcp, route.name.as_str(), upstream)),
         ),
         Some(L4::Tls(routes)) => {
@@ -113,7 +114,7 @@ fn routes_of<'a>(
                 found.extend(
                     route
                         .backends
-                        .upstreams()
+                        .listed()
                         .map(|upstream| (Through::Tls(at), route.name.as_str(), upstream)),
                 );
             }
@@ -124,7 +125,7 @@ fn routes_of<'a>(
         found.extend(
             route
                 .backends
-                .upstreams()
+                .listed()
                 .map(|upstream| (Through::Udp, route.name.as_str(), upstream)),
         );
     }
@@ -137,7 +138,7 @@ fn routes_of<'a>(
             if let Outcome::Forward { backends, .. } = &rule.outcome {
                 found.extend(
                     backends
-                        .upstreams()
+                        .listed()
                         .map(|upstream| (Through::Http(route), name, upstream)),
                 );
             }
@@ -350,6 +351,59 @@ tls_routes: [{tls}]
         );
     }
 
+    /// A backend a reload leaves listed at weight 0 keeps its key, on every kind of route:
+    /// it takes no new tunnel, and those it has carry on (03 §10). Taken out of the route,
+    /// it loses it.
+    #[test]
+    fn a_backend_left_listed_at_weight_zero_keeps_the_key() {
+        let keys = Keys::default();
+        let before = Routed::reconcile(
+            &config(
+                &http("chat", "/chat", "one"),
+                &tcp("one", 1),
+                &tls("api", "api.test", "two"),
+            ),
+            &listeners(),
+            &Routed::default(),
+            &keys,
+        );
+        let chat = before.key(WEB, Through::Http(0), ONE).unwrap();
+        let db = before.key(DB, Through::Tcp, ONE).unwrap();
+        let api = before.key(SNI, Through::Tls(0), TWO).unwrap();
+
+        let unweighted = |route: String| route.replace("weight: 1", "weight: 0");
+        let retired = Routed::reconcile(
+            &config(
+                &unweighted(http("chat", "/chat", "one")),
+                &tcp("one", 0),
+                &unweighted(tls("api", "api.test", "two")),
+            ),
+            &listeners(),
+            &before,
+            &keys,
+        );
+        assert_eq!(retired.key(WEB, Through::Http(0), ONE), Some(chat));
+        assert_eq!(retired.key(DB, Through::Tcp, ONE), Some(db));
+        assert_eq!(retired.key(SNI, Through::Tls(0), TWO), Some(api));
+        for key in [chat, db, api] {
+            assert!(retired.holds(key), "{key} dropped");
+        }
+
+        let taken_out = Routed::reconcile(
+            &config(
+                &http("chat", "/chat", "two"),
+                &tcp("two", 1),
+                &tls("api", "api.test", "one"),
+            ),
+            &listeners(),
+            &retired,
+            &keys,
+        );
+        for key in [chat, db, api] {
+            assert!(!taken_out.holds(key), "{key} kept");
+        }
+    }
+
     /// A `udp` listener's route keys its sessions as a `tcp` one's keys its tunnels: kept
     /// while the listener, the route and its listing of the upstream are, whatever the
     /// weights; dropped once the route or the listing goes.
@@ -388,6 +442,17 @@ tls_routes: [{tls}]
         );
         assert_eq!(reweighted.key(0, Through::Udp, ONE), Some(one));
         assert!(reweighted.holds(one));
+
+        let retired = Routed::reconcile(
+            &udp(
+                "dns",
+                "{ upstream: one, weight: 0 }, { upstream: two, weight: 1 }",
+            ),
+            &dns,
+            &reweighted,
+            &keys,
+        );
+        assert_eq!(retired.key(0, Through::Udp, ONE), Some(one));
 
         let listing_gone = Routed::reconcile(
             &udp("dns", "{ upstream: two, weight: 1 }"),

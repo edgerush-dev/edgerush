@@ -20,7 +20,11 @@ pub enum Destination {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightedBackends {
     /// Backends with a share, each with the sum of the weights up to and including its
-    /// own: the backend for a point is the first whose sum lies beyond it.
+    /// own: the backend for a point is the first whose sum lies beyond it. Then the
+    /// upstreams listed at weight 0, each at the total: never picked, since the last with a
+    /// share already lies beyond every point, but still the route's, so that what they carry
+    /// is kept across a reload. Kept in the one list, so that a rule's backends take no more
+    /// room than they did.
     shares: Box<[(u64, Destination)]>,
     total: u64,
     /// Why each invalid backend is, by [`Destination::Invalid`]'s position.
@@ -38,16 +42,22 @@ impl WeightedBackends {
     }
 
     /// From pairs of a backend, an upstream or an invalid one's reason, and its weight. A
-    /// weight of zero is no share.
+    /// weight of zero is no share; an upstream of weight zero is still listed.
     pub fn with_invalid(
         backends: impl IntoIterator<Item = (Result<UpstreamId, String>, u32)>,
     ) -> Self {
         let mut total = 0_u64;
         let mut reasons = Vec::new();
-        let shares = backends
+        let mut unweighted = Vec::new();
+        let mut shares: Vec<(u64, Destination)> = backends
             .into_iter()
-            .filter(|(_, weight)| *weight > 0)
-            .map(|(backend, weight)| {
+            .filter_map(|(backend, weight)| {
+                if weight == 0 {
+                    if let Ok(upstream) = backend {
+                        unweighted.push(upstream);
+                    }
+                    return None;
+                }
                 let destination = match backend {
                     Ok(upstream) => Destination::Upstream(upstream),
                     Err(reason) => {
@@ -57,11 +67,16 @@ impl WeightedBackends {
                 };
                 // No sum of `u32`s that fits in memory overflows a `u64`.
                 total += u64::from(weight);
-                (total, destination)
+                Some((total, destination))
             })
             .collect();
+        shares.extend(
+            unweighted
+                .into_iter()
+                .map(|upstream| (total, Destination::Upstream(upstream))),
+        );
         Self {
-            shares,
+            shares: shares.into(),
             total,
             reasons: reasons.into(),
         }
@@ -80,6 +95,23 @@ impl WeightedBackends {
 
     /// The upstreams with a share, in the order they were given; invalid backends have none.
     pub fn upstreams(&self) -> impl Iterator<Item = UpstreamId> + '_ {
+        // A share is a sum beyond the one before it; those at weight 0 add nothing.
+        self.shares
+            .iter()
+            .scan(0, |before, (sum, destination)| {
+                let share = *sum > *before;
+                *before = *sum;
+                Some((share, *destination))
+            })
+            .filter_map(|(share, destination)| match destination {
+                Destination::Upstream(upstream) if share => Some(upstream),
+                Destination::Upstream(_) | Destination::Invalid(_) => None,
+            })
+    }
+
+    /// Every upstream listed, with a share or at weight 0: what a reload keeps a tunnel or
+    /// a session of, while [`upstreams`](Self::upstreams) are what is picked from.
+    pub fn listed(&self) -> impl Iterator<Item = UpstreamId> + '_ {
         self.shares
             .iter()
             .filter_map(|(_, destination)| match destination {
@@ -157,6 +189,26 @@ mod tests {
         assert_eq!(backends.reason(0), Some("Service shop/gone does not exist"));
         assert_eq!(backends.reason(1), None);
         assert_eq!(backends.upstreams().collect::<Vec<_>>(), [UpstreamId(0)]);
+    }
+
+    /// A backend of weight 0 is never picked, and is still listed: what it carries is kept
+    /// across a reload. An invalid one, of any weight, lists no upstream.
+    #[test]
+    fn a_backend_of_weight_zero_is_listed_but_never_picked() {
+        let mixed = WeightedBackends::with_invalid([
+            (Ok(UpstreamId(0)), 0),
+            (Ok(UpstreamId(1)), 2),
+            (Err("gone".to_owned()), 0),
+            (Ok(UpstreamId(2)), 0),
+        ]);
+        let picked: Vec<Option<Destination>> = (0..2).map(|point| mixed.pick(point)).collect();
+        let one = Some(Destination::Upstream(UpstreamId(1)));
+        assert_eq!(picked, [one, one]);
+        assert_eq!(mixed.upstreams().collect::<Vec<_>>(), [UpstreamId(1)]);
+        let mut listed: Vec<UpstreamId> = mixed.listed().collect();
+        listed.sort_by_key(|upstream| upstream.0);
+        assert_eq!(listed, [UpstreamId(0), UpstreamId(1), UpstreamId(2)]);
+        assert!(backends(&[3, 1]).listed().eq(backends(&[3, 1]).upstreams()));
     }
 
     #[test]
