@@ -148,15 +148,9 @@ impl Pooled {
                 .filter(|(at, _)| outcome.signal & (1 << at) != 0)
                 .map(|(_, entry)| Arc::clone(entry));
             self.participant.on_signals(signalled);
-            if outcome.drain {
-                for (key, _) in keys {
-                    self.participant.drain(key, now);
-                }
-            }
             match outcome.local {
                 Local::Admit => return Decision::Admit,
                 Local::Refuse => return Decision::Refuse,
-                Local::Defer => return Decision::Defer,
                 Local::Ask => {}
             }
         }
@@ -287,12 +281,6 @@ proptest! {
     /// `DataPlane` does, the cycle and the answers — late, out of order, twice — included:
     /// the per-key state moved into shared words changes no decision. Requests come a unit
     /// apart or more, cycles on their boundary.
-    ///
-    /// But one: where `DataPlane` refuses a request because another's hold is outstanding,
-    /// pooled defers it, rather than refuse what the hold may yet give back. Such a request
-    /// is set aside — the reference's refusal of it, which changed nothing, put aside too —
-    /// and given to both again after every event, compared when pooled decides it. Pooled
-    /// defers only where the reference refuses.
     #[test]
     fn a_participant_decides_as_a_data_plane(
         events in prop::collection::vec((event(), 0u64..4), 1..300),
@@ -312,20 +300,7 @@ proptest! {
                 next_cycle += CYCLE;
             }
             comparison.event(at, &event, now)?;
-            comparison.again(at, now)?;
         }
-        // What is still set aside, decided once the holds it waits on have settled.
-        for round in 0..20 {
-            if comparison.aside.is_empty() {
-                break;
-            }
-            now = next_cycle;
-            comparison.cycle(next_cycle);
-            next_cycle += CYCLE;
-            comparison.event(1_000 + round, &Event::Exchange, now)?;
-            comparison.again(1_000 + round, now)?;
-        }
-        prop_assert!(comparison.aside.is_empty(), "never decided: {:?}", comparison.aside);
         for (key, _) in keys {
             prop_assert_eq!(comparison.pooled.pod.counted(key), comparison.reference.pod.counted(key));
         }
@@ -445,13 +420,11 @@ proptest! {
     }
 }
 
-/// Pooled against the reference over one schedule, with the requests pooled set aside.
+/// Pooled against the reference over one schedule.
 struct Comparison {
     keys: [(&'static [u8], Contract); 3],
     pooled: Pooled,
     reference: Reference,
-    /// Requests deferred, by their keys' places.
-    aside: Vec<Vec<usize>>,
 }
 
 impl Comparison {
@@ -460,7 +433,6 @@ impl Comparison {
             keys,
             pooled: Pooled::new(),
             reference: Reference::new(),
-            aside: Vec::new(),
         }
     }
 
@@ -469,15 +441,11 @@ impl Comparison {
         self.reference.plane.on_cycle(now);
     }
 
-    /// A request under the keys at `places`: decided alike, or set aside where pooled
-    /// defers and the reference refuses. Whether pooled decided it.
-    fn request(&mut self, at: usize, places: &[usize], now: u64) -> Result<bool, TestCaseError> {
+    /// A request under the keys at `places`, decided alike.
+    fn request(&mut self, at: usize, places: &[usize], now: u64) -> Result<(), TestCaseError> {
         let request: Vec<(&[u8], Contract)> =
             places.iter().map(|place| self.keys[*place]).collect();
         let got = self.pooled.decide(&request, now);
-        if got == Decision::Defer {
-            return Ok(false);
-        }
         let want = self.reference.plane.decide_all(&request, now);
         prop_assert_eq!(
             discriminant(got),
@@ -488,21 +456,13 @@ impl Comparison {
             got,
             want
         );
-        Ok(true)
+        Ok(())
     }
 
     fn event(&mut self, at: usize, event: &Event, now: u64) -> Result<(), TestCaseError> {
         match event {
-            Event::Request(key) => {
-                if !self.request(at, &[*key], now)? {
-                    self.set_aside(at, &[*key], now)?;
-                }
-            }
-            Event::Pair(first, second) => {
-                if !self.request(at, &[*first, *second], now)? {
-                    self.set_aside(at, &[*first, *second], now)?;
-                }
-            }
+            Event::Request(key) => self.request(at, &[*key], now)?,
+            Event::Pair(first, second) => self.request(at, &[*first, *second], now)?,
             Event::Cycle => {}
             Event::Exchange => {
                 self.pooled.exchange(now);
@@ -526,32 +486,6 @@ impl Comparison {
         }
         Ok(())
     }
-
-    /// Pooled deferred a request: the reference must have refused it, which changes nothing
-    /// it keeps but the keys' use.
-    fn set_aside(&mut self, at: usize, places: &[usize], now: u64) -> Result<(), TestCaseError> {
-        let request: Vec<(&[u8], Contract)> =
-            places.iter().map(|place| self.keys[*place]).collect();
-        let want = self.reference.plane.decide_all(&request, now);
-        prop_assert_eq!(
-            want,
-            crate::service::Decision::Refuse,
-            "event {}: deferred where the reference does not refuse",
-            at
-        );
-        self.aside.push(places.to_vec());
-        Ok(())
-    }
-
-    /// Every request set aside, decided again on both sides.
-    fn again(&mut self, at: usize, now: u64) -> Result<(), TestCaseError> {
-        for places in std::mem::take(&mut self.aside) {
-            if !self.request(at, &places, now)? {
-                self.aside.push(places);
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Which decision: pooled's and the reference's compared.
@@ -563,7 +497,6 @@ fn discriminant(decision: impl Into<Kind>) -> Kind {
 enum Kind {
     Admit,
     Refuse,
-    Defer,
 }
 
 impl From<Decision> for Kind {
@@ -571,7 +504,6 @@ impl From<Decision> for Kind {
         match decision {
             Decision::Admit => Self::Admit,
             Decision::Refuse => Self::Refuse,
-            Decision::Defer => Self::Defer,
         }
     }
 }
@@ -586,8 +518,7 @@ impl From<crate::service::Decision> for Kind {
 }
 
 /// Room for `burst` at once and nothing more: many threads taking at once, started
-/// together, get the bucket exactly, the final token to one of them. 16,000: within what a
-/// key may hold unreported, as nothing drains it here.
+/// together, get the bucket exactly, the final token to one of them, each counted once.
 #[test]
 fn threads_racing_for_the_last_tokens_admit_the_bucket_exactly() {
     let entry = Entry::new(b"k"[..].into(), contract(1, 16_000), CYCLE, 0);
@@ -647,221 +578,131 @@ fn threads_spend_a_cycles_allowance_once_and_advance_it_once() {
 }
 
 /// The transport draining while workers admit loses no admission and counts none twice:
-/// what it sent and what is left add up to what the workers admitted — with the count's
-/// most the real one, and with one of 8, so that admissions meet a full count and wait for
-/// a drain rather than wrap it.
+/// what it sent and what is left add up to what the workers admitted.
 #[test]
 fn reports_racing_admissions_count_each_once() {
-    for most in [word::MOST_RESERVED, 8] {
-        let mut participant = participant();
-        let key: &[u8] = b"k";
-        let contract = contract(1_000_000, 1_000_000);
-        participant.ensure(key, contract, 0);
-        set_most_reserved(&mut participant, key, most);
-        let entry = participant.entries(&[(key, contract)]).remove(0);
-        // Drained until every worker is done, however late the threads start: a fixed
-        // number of drains could end before they filled the small count.
-        let done = std::sync::atomic::AtomicUsize::new(0);
-        let (admitted, full, sent) = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..4)
-                .map(|_| {
-                    let entry = Arc::clone(&entry);
-                    let done = &done;
-                    scope.spawn(move || {
-                        let (mut admitted, mut full) = (0u64, 0u64);
-                        while admitted < 20_000 {
-                            match entry.take(Op::Admit, 1).0 {
-                                Taken::Done | Taken::Pressed => admitted += 1,
-                                Taken::Full => full += 1,
-                                // Time standing still, the bucket runs out: done.
-                                Taken::Refused | Taken::Closed => break,
-                                Taken::Contended => {}
-                            }
+    let mut participant = participant();
+    let key: &[u8] = b"k";
+    let contract = contract(1_000_000, 1_000_000);
+    participant.ensure(key, contract, 0);
+    let entry = participant.entries(&[(key, contract)]).remove(0);
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let (admitted, sent) = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let entry = Arc::clone(&entry);
+                let done = &done;
+                scope.spawn(move || {
+                    let mut admitted = 0u64;
+                    while admitted < 20_000 {
+                        match entry.take(1).0 {
+                            Taken::Done => admitted += 1,
+                            // Time standing still, the bucket runs out: done.
+                            Taken::Refused | Taken::Closed => break,
                         }
-                        done.fetch_add(1, Ordering::Relaxed);
-                        (admitted, full)
-                    })
+                    }
+                    done.fetch_add(1, Ordering::Relaxed);
+                    admitted
                 })
-                .collect();
-            let mut sent = 0u64;
-            while done.load(Ordering::Relaxed) < 4 {
-                participant.on_cycle(1);
-                for (_, batch) in participant.take_outgoing() {
-                    for batch_entry in batch.entries {
-                        if let Report::Hits { count, .. } = batch_entry.report {
-                            sent += count;
-                        }
+            })
+            .collect();
+        let mut sent = 0u64;
+        while done.load(Ordering::Relaxed) < 4 {
+            participant.on_cycle(1);
+            for (_, batch) in participant.take_outgoing() {
+                for batch_entry in batch.entries {
+                    if let Report::Hits { count, .. } = batch_entry.report {
+                        sent += count;
                     }
                 }
             }
-            let (admitted, full) = workers
-                .into_iter()
-                .map(|worker| worker.join().unwrap())
-                .fold((0, 0), |(a, f), (admitted, full)| (a + admitted, f + full));
-            (admitted, full, sent)
-        });
-        let tracked = participant.keys.get(key).unwrap();
-        let fields = entry.snapshot();
-        assert!(fields.unreported <= most, "never past its most");
-        assert_eq!(
-            sent + fields.unreported + tracked.unsent,
-            admitted,
-            "most {most}"
-        );
-        if most == 8 {
-            assert!(full > 0, "the small count filled");
         }
-    }
-}
-
-/// Sets the most `key`'s entry may hold unreported, holds included: small, to fill.
-fn set_most_reserved(participant: &mut Participant<FixedState>, key: &[u8], most: u64) {
-    let tracked = participant.keys.get_mut(key).unwrap();
-    let entry = Arc::get_mut(&mut tracked.entry);
-    match entry {
-        Some(entry) => entry.most_reserved = most,
-        None => {
-            // Shared with the registry: made again with the most set, and registered.
-            let old = &tracked.entry;
-            let mut fresh = Entry::new(old.key.clone(), old.terms.contract, old.terms.cycle, 0);
-            fresh.most_reserved = most;
-            participant.registry.remove(&tracked.entry);
-            tracked.entry = Arc::new(fresh);
-            participant.registry.insert(Arc::clone(&tracked.entry));
-        }
-    }
-}
-
-/// With every place in the count reserved — admitted and held — holds still settle either
-/// way, and a request more defers rather than counts past its most; drained, it is taken.
-#[test]
-fn a_full_count_defers_and_holds_still_settle() {
-    let mut entry = Entry::new(b"k"[..].into(), contract(100, 100), CYCLE, 0);
-    entry.most_reserved = 4;
-    for _ in 0..2 {
-        assert!(entry.take(Op::Hold, 0).0.done());
-    }
-    for _ in 0..2 {
-        assert!(entry.take(Op::Admit, 0).0.done());
-    }
-    assert_eq!(entry.take(Op::Admit, 0).0, Taken::Full);
-    assert_eq!(decide(&[&entry], 0).local, Local::Defer);
-    entry.settle(true, 0);
-    entry.settle(false, 0);
-    let fields = entry.snapshot();
-    assert_eq!((fields.unreported, fields.held), (3, 0));
-    assert!(
-        entry.take(Op::Admit, 0).0.done(),
-        "the given-back place free again"
-    );
-    assert_eq!(entry.take(Op::Admit, 0).0, Taken::Full);
-    let (drained, _, _) = entry.drain(0, Cycle::AsItIs);
-    assert_eq!(drained, 4);
-    assert_eq!(decide(&[&entry], 0).local, Local::Admit);
-}
-
-/// Passing half its count's most, a key says once that it wants draining; drained, it can
-/// say so again.
-#[test]
-fn a_key_asks_for_a_drain_once_at_half_its_count() {
-    let mut entry = Entry::new(b"k"[..].into(), contract(100, 100), CYCLE, 0);
-    entry.most_reserved = 8;
-    let drains: Vec<bool> = (0..6).map(|_| decide(&[&entry], 0).drain).collect();
-    assert_eq!(drains, [false, false, false, true, false, false]);
-    entry.drain(0, Cycle::AsItIs);
-    let drains: Vec<bool> = (0..4).map(|_| decide(&[&entry], 0).drain).collect();
-    assert_eq!(drains, [false, false, false, true]);
-}
-
-/// The refund of a refused hold, from the word alone: given to a cycle that has spent
-/// some — the hold's own, or a later one another worker advanced to and spent from — and
-/// not to one that has spent nothing, which would raise it past its allowance.
-#[test]
-fn a_refused_hold_gives_back_to_a_cycle_only_what_it_spent() {
-    let entry = Entry::new(b"k"[..].into(), contract(1_000, 1_000), CYCLE, 0);
-    // Its own cycle: held, refused, all back.
-    assert!(entry.take(Op::Hold, CYCLE).0.done());
-    let held = entry.snapshot();
-    entry.settle(false, CYCLE);
-    let back = entry.snapshot();
-    assert_eq!((back.left, back.spent), (held.left + 1, held.spent - 1));
-    // Held in one cycle; the next advanced by another worker's admission, which spends one;
-    // the hold refused after: the new cycle gets its one back.
-    assert!(entry.take(Op::Hold, 2 * CYCLE).0.done());
-    assert!(entry.take(Op::Admit, 3 * CYCLE).0.done());
-    let spent = entry.snapshot();
-    assert_eq!(spent.spent, 1);
-    entry.settle(false, 3 * CYCLE);
-    let after = entry.snapshot();
-    assert_eq!((after.left, after.spent), (spent.left + 1, 0));
-    // Held in one cycle, refused in the next, which has spent nothing: nothing given to it.
-    assert!(entry.take(Op::Hold, 4 * CYCLE).0.done());
-    let fresh = word::advanced(
-        &entry.terms.bucket,
-        entry.snapshot(),
-        entry.advance(),
-        5 * CYCLE,
-    );
-    entry.settle(false, 5 * CYCLE);
-    let after = entry.snapshot();
+        let admitted: u64 = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .sum();
+        (admitted, sent)
+    });
+    let tracked = participant.keys.get(key).unwrap();
     assert_eq!(
-        (after.left, after.spent),
-        (fresh.left, 0),
-        "its allowance, no more"
+        sent + entry.snapshot().unreported + tracked.unsent,
+        admitted
     );
 }
 
-/// A request that finds a key's last room taken by another's hold defers rather than be
-/// refused; the hold given back, it is admitted. The three steps of the race: A holds the
-/// last token on X, B needs X, A fails on Y and gives X back.
+/// A count at its most, which the transport never lets a key reach, stops there: a request
+/// more is admitted, its hit not counted, rather than wrap the count to nothing.
 #[test]
-fn a_request_short_only_by_anothers_hold_waits_for_it() {
-    let x = Entry::new(b"x"[..].into(), contract(100, 1), CYCLE, 0);
-    assert!(x.take(Op::Hold, 0).0.done(), "A holds X's last token");
-    let b = decide(&[&x], 0);
-    assert_eq!(b.local, Local::Defer, "B is not refused");
-    x.add_waiter();
-    assert!(x.settle(false, 0).0, "A gives X back, and B is to be woken");
-    assert_eq!(decide(&[&x], 0).local, Local::Admit, "B, again");
-    x.remove_waiter();
-    // With nothing held, no room is a refusal.
-    assert_eq!(decide(&[&x], 0).local, Local::Refuse);
-    assert!(!x.settle(true, 0).0 || x.snapshot().held == 0);
+fn a_count_at_its_most_stops_rather_than_wraps() {
+    let entry = Entry::new(b"k"[..].into(), contract(100, 100), CYCLE, 0);
+    let fields = Fields {
+        unreported: word::MOST_UNREPORTED,
+        ..entry.snapshot()
+    };
+    entry.word.store(fields.pack(), Ordering::Release);
+    assert_eq!(decide(&[&entry], 0).local, Local::Admit);
+    assert_eq!(entry.snapshot().unreported, word::MOST_UNREPORTED);
+    let other = Entry::new(b"o"[..].into(), contract(100, 100), CYCLE, 0);
+    assert_eq!(decide(&[&other, &entry], 0).local, Local::Admit);
+    assert_eq!(entry.snapshot().unreported, word::MOST_UNREPORTED);
 }
 
-/// A key's holds at their most defer a request that would hold one more, its earlier holds
-/// given back; one settled, it is admitted.
+/// A request under several keys reads each key's cycle as it would be advanced: a key
+/// whose allowance the last cycle spent has the next cycle's, no visit of the transport
+/// between.
 #[test]
-fn holds_at_their_most_defer_a_request_rather_than_refuse_it() {
-    let x = Entry::new(b"x"[..].into(), contract(1_000, 1_000), CYCLE, 0);
-    let y = Entry::new(b"y"[..].into(), contract(1_000, 1_000), CYCLE, 0);
-    for _ in 0..word::MOST_HELD {
-        assert!(x.take(Op::Hold, 0).0.done());
+fn a_read_takes_the_next_cycles_allowance() {
+    let entry = Entry::new(b"k"[..].into(), contract(1_000, 1_000), CYCLE, 0);
+    entry.others.store(1, Ordering::Release);
+    let other = Entry::new(b"o"[..].into(), contract(1_000, 1_000), CYCLE, 0);
+    while decide(&[&entry], CYCLE).local == Local::Admit {}
+    assert_eq!(entry.snapshot().left, 0, "the cycle's allowance spent");
+    assert_eq!(decide(&[&other, &entry], CYCLE).local, Local::Refuse);
+    assert_eq!(
+        decide(&[&other, &entry], 2 * CYCLE).local,
+        Local::Admit,
+        "the next cycle's"
+    );
+}
+
+/// Threads racing two-key requests for one key's last room admit at least all of it and at
+/// most one more a thread, read then charged: none refused within the limit, a few let
+/// through past it, each counted once.
+#[test]
+fn threads_racing_under_two_keys_over_admit_only() {
+    const THREADS: u64 = 8;
+    for _ in 0..20 {
+        let tight = Entry::new(b"t"[..].into(), contract(1, 1_000), CYCLE, 0);
+        let roomy = Entry::new(b"r"[..].into(), contract(1, 1_000_000), CYCLE, 0);
+        let start = std::sync::Barrier::new(THREADS as usize);
+        let admitted: u64 = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        (0..1_000)
+                            .filter(|_| decide(&[&roomy, &tight], 0).local == Local::Admit)
+                            .count() as u64
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .sum()
+        });
+        assert!(
+            (1_000..1_000 + THREADS).contains(&admitted),
+            "{admitted} admitted of 1,000"
+        );
+        assert_eq!(tight.snapshot().unreported, admitted, "each counted once");
+        assert_eq!(roomy.snapshot().unreported, admitted);
     }
-    let before = y.snapshot();
-    assert_eq!(decide(&[&y, &x], 0).local, Local::Defer);
-    given_back_as_it_was(&y, before);
-    x.settle(true, 0);
-    assert_eq!(decide(&[&y, &x], 0).local, Local::Admit);
-}
-
-/// Settling or draining wakes only where requests wait: none waiting, nothing to wake.
-#[test]
-fn only_a_key_with_waiters_wants_waking() {
-    let x = Entry::new(b"x"[..].into(), contract(100, 10), CYCLE, 0);
-    assert!(x.take(Op::Hold, 0).0.done());
-    assert!(!x.settle(false, 0).0);
-    assert!(x.take(Op::Admit, 0).0.done());
-    x.add_waiter();
-    assert!(x.drain(0, Cycle::AsItIs).2);
-    x.remove_waiter();
-    assert!(x.take(Op::Admit, 0).0.done());
-    assert!(!x.drain(0, Cycle::AsItIs).2);
 }
 
 /// An answer racing admissions rebases the bucket on the owner's view and charges every
 /// admission the owner has not seen exactly once: what was admitted since the report,
-/// what was reported and not acknowledged, and what is held.
+/// and what was reported and not acknowledged.
 #[test]
 fn a_rebase_charges_what_the_owner_has_not_seen_once() {
     let mut participant = participant();
@@ -869,16 +710,15 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
     let c = contract(100, 100);
     participant.ensure(key, c, 0);
     let entry = participant.entries(&[(key, c)]).remove(0);
-    // Three admitted and reported, two admitted since, one held.
+    // Three admitted and reported, three admitted since.
     for _ in 0..3 {
-        assert!(entry.take(Op::Admit, 0).0.done());
+        assert_eq!(entry.take(0).0, Taken::Done);
     }
     participant.on_cycle(0);
     let _batches = participant.take_outgoing();
-    for _ in 0..2 {
-        assert!(entry.take(Op::Admit, 0).0.done());
+    for _ in 0..3 {
+        assert_eq!(entry.take(0).0, Taken::Done);
     }
-    assert!(entry.take(Op::Hold, 0).0.done());
     // The owner has seen none of it, and its own bucket is full.
     participant.on_answers(
         Answers {
@@ -900,7 +740,7 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
     assert_eq!(
         bucket.remaining(entry.snapshot().arrival, bucket.units(0)),
         100 - 6,
-        "three reported, two since, one held"
+        "three reported, three since"
     );
     // Seen applied, the three reported leave the count of what the owner has not seen.
     participant.on_answers(
@@ -1048,11 +888,7 @@ fn decided_over_round_trips(
             .min()
             .unwrap();
         if request == Some(now) {
-            decided[at] = match participant.decide_all(&[(key, c)], now) {
-                Decision::Admit => Some(true),
-                Decision::Refuse => Some(false),
-                waits => panic!("decided from the copy, not {waits:?}"),
-            };
+            decided[at] = Some(participant.decide_all(&[(key, c)], now) == Decision::Admit);
             at += 1;
         } else if answer == Some(now) {
             let (_, exchange, answer) = answers.pop_front().unwrap();
@@ -1109,28 +945,8 @@ proptest! {
     }
 }
 
-/// `entry` as it was `before` a hold taken and given back at 0: its bucket as full at 0, but
-/// full from then rather than from long before, as the reference's is left.
-fn given_back_as_it_was(entry: &Entry, before: Fields) {
-    let after = entry.snapshot();
-    assert_eq!(
-        Fields {
-            arrival: before.arrival,
-            ..after
-        },
-        before,
-        "given back as it was"
-    );
-    let bucket = &entry.terms.bucket;
-    assert_eq!(
-        bucket.remaining(after.arrival, bucket.units(0)),
-        bucket.remaining(before.arrival, bucket.units(0)),
-        "as much room"
-    );
-}
-
-/// A request under two keys is held on both or neither: the second without room gives
-/// the first back as it was.
+/// A request under two keys is charged on both or neither: the second without room
+/// leaves the first untouched, its word as it was, whichever comes first.
 #[test]
 fn a_two_key_request_is_charged_on_both_or_neither() {
     let roomy = Entry::new(b"a"[..].into(), contract(100, 10), CYCLE, 0);
@@ -1138,11 +954,12 @@ fn a_two_key_request_is_charged_on_both_or_neither() {
     assert_eq!(decide(&[&empty], 0).local, Local::Admit);
     let before = roomy.snapshot();
     assert_eq!(decide(&[&roomy, &empty], 0).local, Local::Refuse);
-    given_back_as_it_was(&roomy, before);
+    assert_eq!(decide(&[&empty, &roomy], 0).local, Local::Refuse);
+    assert_eq!(roomy.snapshot(), before, "untouched");
     let fresh = Entry::new(b"c"[..].into(), contract(100, 1), CYCLE, 0);
     assert_eq!(decide(&[&roomy, &fresh], 0).local, Local::Admit);
-    let after = roomy.snapshot();
-    assert_eq!((after.held, after.unreported), (0, 1));
+    assert_eq!(roomy.snapshot().unreported, 1);
+    assert_eq!(fresh.snapshot().unreported, 1);
 }
 
 /// An entry closed for eviction refuses nothing and admits nothing more: a worker holding
@@ -1165,15 +982,28 @@ fn an_evicted_entry_sends_its_holders_to_the_new_one() {
     let c = contract(100, 10);
     participant.ensure(key, c, 0);
     let old = participant.entries(&[(key, c)]).remove(0);
-    assert!(old.take(Op::Admit, 0).0.done());
+    assert_eq!(old.take(0).0, Taken::Done);
     assert!(
         !close_if_quiet(participant.keys.get(key).unwrap()),
         "an admission not drained"
     );
     // Drained into the ledger: nothing left in the word to lose.
-    participant.drain(key, 0);
+    let tracked = participant.keys.get_mut(key).unwrap();
+    let (count, started) = tracked.entry.drain(0);
+    tracked.unsent_more(count, started);
     assert!(close_if_quiet(participant.keys.get(key).unwrap()));
     assert_eq!(decide(&[&old], 0).local, Local::Ask);
+    let other = Entry::new(b"o"[..].into(), c, CYCLE, 0);
+    assert_eq!(
+        decide(&[&other, &old], 0).local,
+        Local::Ask,
+        "under several keys too"
+    );
+    assert_eq!(other.snapshot().unreported, 0, "nothing charged");
+    // A charge that finds it closed since it was read leaves it as it is.
+    let closed = old.snapshot();
+    assert!(!old.charge(0));
+    assert_eq!(old.snapshot(), closed);
     participant.keys.remove(key);
     participant.ensure(key, c, 0);
     let new = participant.entries(&[(key, c)]).remove(0);
@@ -1301,13 +1131,13 @@ fn one_exchange_in_flight_gathers_what_comes_meanwhile() {
     assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     let entry = participant.entries(&[(key, c)]).remove(0);
     // One admitted, sent with a cycle, and not answered.
-    assert!(entry.take(Op::Admit, CYCLE).0.done());
+    assert_eq!(entry.take(CYCLE).0, Taken::Done);
     participant.on_cycle(CYCLE);
     let first = participant.take_outgoing();
     assert_eq!(first.len(), 1, "the report");
     // Three cycles more, an admission each: nothing goes while the first is out.
     for cycle in 2..5 {
-        assert!(entry.take(Op::Admit, cycle * CYCLE).0.done());
+        assert_eq!(entry.take(cycle * CYCLE).0, Taken::Done);
         participant.on_cycle(cycle * CYCLE);
         assert!(participant.take_outgoing().is_empty(), "cycle {cycle}");
     }
@@ -1327,7 +1157,7 @@ fn one_exchange_in_flight_gathers_what_comes_meanwhile() {
         .collect();
     assert_eq!(hits, [3]);
     // Never answered: after the exchange's time, taken as failed, and the next goes.
-    assert!(entry.take(Op::Admit, 6 * CYCLE).0.done());
+    assert_eq!(entry.take(6 * CYCLE).0, Taken::Done);
     let later = 5 * CYCLE + RESEND_AFTER_CYCLES * CYCLE;
     participant.on_cycle(later);
     assert!(
@@ -2099,7 +1929,7 @@ fn replay(schedule: &[(Event, u64)]) {
                         .terms
                         .bucket
                         .remaining(fields.arrival, entry.terms.bucket.units(now));
-                    (fields.left, left, fields.held, tracked.heard.get())
+                    (fields.left, left, tracked.heard.get())
                 });
                 format!("{want:?}/{got:?}")
             })

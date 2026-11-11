@@ -50,10 +50,6 @@ pub(crate) struct Nodes {
     paused: Vec<u64>,
     held: Vec<Vec<(u64, Answers)>>,
     pending: Vec<Vec<Asked>>,
-    /// Pooled, by process: requests deferred (`Local::Defer`) or handed back to decide
-    /// again, with the worker that decides them, retried at the process's next arrival,
-    /// answer or cycle.
-    deferred: Vec<Vec<(usize, usize)>>,
     /// The nodes before the service pods, as the run numbers them: the data planes, or,
     /// pooled, their workers.
     front: usize,
@@ -132,7 +128,7 @@ impl Plane {
 
 impl Nodes {
     /// Pooled, request `request` comes to worker `worker` at `now`: decided now, or later
-    /// (its process held up, or deferred).
+    /// (its process held up).
     fn pooled_arrival(
         &mut self,
         request: usize,
@@ -207,7 +203,6 @@ impl Nodes {
                     return Some(true);
                 }
                 Local::Refuse => return Some(false),
-                Local::Defer => return self.defer(process, request, worker),
                 Local::Ask => {}
             }
         }
@@ -226,20 +221,9 @@ impl Nodes {
                 Some(true)
             }
             Pooled::Refuse => Some(false),
-            Pooled::Defer => self.defer(process, request, worker),
         };
         self.flush_plane(process, outbox);
         decided
-    }
-
-    /// Pooled, request `request` deferred by `worker` of `process`, to decide again; one
-    /// with no number, which nothing can come back to, refused.
-    fn defer(&mut self, process: usize, request: usize, worker: usize) -> Option<bool> {
-        if request == usize::MAX {
-            return Some(false);
-        }
-        self.deferred[process].push((request, worker));
-        None
     }
 }
 
@@ -313,7 +297,6 @@ impl Nodes {
             paused: vec![0; planes],
             held: vec![Vec::new(); planes],
             pending: vec![Vec::new(); planes],
-            deferred: vec![Vec::new(); planes],
             front: planes,
         }
     }
@@ -355,19 +338,9 @@ impl Nodes {
                     self.decided.push((request, true));
                 }
                 Pooled::Refuse => self.decided.push((request, false)),
-                Pooled::Defer => self.deferred[plane].push((request, worker)),
             }
         }
         self.flush_plane(plane, outbox);
-    }
-
-    /// Pooled, every request process `process` deferred, decided again at `now`.
-    fn again(&mut self, process: usize, now: u64, outbox: &mut Outbox) {
-        for (request, worker) in std::mem::take(&mut self.deferred[process]) {
-            if let Some(admitted) = self.pooled_arrival(request, worker, now, outbox) {
-                self.decided.push((request, admitted));
-            }
-        }
     }
 
     /// Pooled, worker `worker` holds the entries participant `plane` has of `keys`.
@@ -518,9 +491,6 @@ impl Nodes {
         for (request, _, _) in std::mem::take(&mut self.pending[plane]) {
             self.decided.push((request, false));
         }
-        for (request, _) in std::mem::take(&mut self.deferred[plane]) {
-            self.decided.push((request, false));
-        }
         self.held[plane].clear();
         self.paused[plane] = 0;
         self.lives[plane] += 1;
@@ -605,9 +575,7 @@ impl Cluster for Nodes {
     ) -> Option<bool> {
         // Pooled: the request comes to a worker, which decides it from the entries it
         // holds, or asks its participant, and holds the entries it gives.
-        if let Some(pool) = &self.pool {
-            let process = plane / pool.workers;
-            self.again(process, now, outbox);
+        if self.pool.is_some() {
             return self.pooled_arrival(request, plane, now, outbox);
         }
         let limits: Vec<(&[u8], service::Contract)> = self
@@ -621,8 +589,7 @@ impl Cluster for Nodes {
                 self.count(request);
                 Some(true)
             }
-            // A data plane never defers.
-            Pooled::Refuse | Pooled::Defer => Some(false),
+            Pooled::Refuse => Some(false),
         };
         self.flush_plane(plane, outbox);
         decided
@@ -655,9 +622,6 @@ impl Cluster for Nodes {
             }
             self.planes[node].on_cycle(now);
             self.flush_plane(node, outbox);
-            if self.pool.is_some() {
-                self.again(node, now, outbox);
-            }
         } else {
             let pod = node - self.front;
             if !self.gone[pod] {
@@ -716,9 +680,6 @@ impl Cluster for Nodes {
                 }
                 self.planes[to].on_answers(exchange, answers, now);
                 self.flush_plane(to, outbox);
-                if self.pool.is_some() {
-                    self.again(to, now, outbox);
-                }
             }
             _ => {}
         }

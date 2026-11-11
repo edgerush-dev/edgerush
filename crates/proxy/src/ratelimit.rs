@@ -196,12 +196,12 @@ fn key_into(buffer: &mut Vec<u8>, name: &str, definition: [u8; 8], key: KeyValue
 }
 
 /// How long a request may wait on its rate limits in all, from when its worker's limiter
-/// first meets it, wherever it waits — deferred, queued for the process, handed back.
+/// first meets it, wherever it waits — queued for the process, asked of the service.
 /// Fixed, until measuring shows that setting it would be worth what it costs.
 pub(crate) const WAIT: Duration = Duration::from_millis(400);
 
-/// The most requests a worker has waiting on its rate limits at once — asked about or
-/// deferred — past which a request is answered [`Undecided::Full`]. A place is held until
+/// The most requests a worker has waiting on its rate limits at once, asked about, past
+/// which a request is answered [`Undecided::Full`]. A place is held until
 /// nothing is left of the request's wait: an ask's until the process answers it, even once
 /// the request has gone, so that what its process holds of a worker's, queued or asking, is
 /// within it too.
@@ -297,7 +297,7 @@ pub(crate) enum Limited {
     /// Over it: why, where its decision says (local mode), or for the worker's entries to
     /// say (the asynchronous mode).
     Refuse(Option<Refused>),
-    /// Asked about or deferred: its decision comes, or why there is none.
+    /// Asked about: its decision comes, or why there is none.
     Later(Later),
     /// Not decided, and not to be: why.
     Undecided(Undecided),
@@ -433,8 +433,6 @@ pub(crate) struct Limiter {
     next: Cell<u64>,
     /// The places its asks hold until its process answers them, by number.
     asked: RefCell<HashMap<u64, Reservation>>,
-    /// What its deferred requests wait on.
-    settled: Arc<Notify>,
     /// The places its requests wait on its rate limits in, and its dry runs, apart.
     waiting: Places,
     dry_runs: Places,
@@ -464,7 +462,6 @@ impl Limiter {
     /// its participant keeps, its task started.
     pub(crate) fn new(service: &CompiledRateLimitService, hub: Arc<Hub>, index: usize) -> Rc<Self> {
         let registry = hub.registry();
-        let settled = hub.settled();
         let (answers, answered) = mpsc::unbounded_channel();
         let _gone = hub.to.send(ToHub::Join {
             worker: index,
@@ -481,7 +478,6 @@ impl Limiter {
             handles: RefCell::new(HashSet::with_hasher(hasher)),
             next: Cell::new(0),
             asked: RefCell::new(HashMap::new()),
-            settled,
             waiting: Places::new(MOST_WAITING, MOST_WAITING_BYTES),
             dry_runs: Places::new(MOST_DRY_RUNS_WAITING, MOST_DRY_RUNS_WAITING_BYTES),
             room: Room::new(),
@@ -579,7 +575,6 @@ impl Limiter {
                 PooledLocal::Admit => Limited::Admit,
                 PooledLocal::Refuse => Limited::Refuse(None),
                 PooledLocal::Ask => self.ask(parts, now, places),
-                PooledLocal::Defer => self.defer(parts, now, places),
             }
         })
     }
@@ -723,8 +718,6 @@ fn decide(
 ) -> Pooled {
     let ask = Pooled {
         local: PooledLocal::Ask,
-        drain: false,
-        wake: false,
         signal: 0,
     };
     let held = |handles: &Handles, key: &[u8], contract| {
@@ -791,9 +784,9 @@ impl Limiter {
         (&*self.hub, cycle, &self.room)
     }
 
-    /// What a decision asks of others: a key's count drained, waiters woken, and with keys
-    /// visited only when they need it, the keys it signalled kept to hand over — or, with no
-    /// room left to keep them, every key asked to be visited.
+    /// What a decision asks of others: with keys visited only when they need it, the keys it
+    /// signalled kept to hand over — or, with no room left to keep them, every key asked to
+    /// be visited.
     fn signal(&self, outcome: &Pooled, parts: &[(&[u8], Contract)]) {
         if outcome.signal != 0 && self.service.schedule_keys {
             let handles = self.handles.borrow();
@@ -818,14 +811,6 @@ impl Limiter {
                     self.registry.require_scan();
                 }
             }
-        }
-        if outcome.drain {
-            for (key, _) in parts {
-                let _gone = self.hub.to.send(ToHub::Drain((*key).into()));
-            }
-        }
-        if outcome.wake {
-            self.settled.notify_waiters();
         }
     }
 
@@ -872,90 +857,6 @@ impl Limiter {
         true
     }
 
-    /// A request under `parts`, met at `now`, deferred: decided again on a task of its own
-    /// as its keys' holds settle and counts drain, until its time is up; or, with no place
-    /// to wait in among `places`, undecided at once.
-    fn defer(self: &Rc<Self>, parts: &[(&[u8], Contract)], now: u64, places: &Places) -> Limited {
-        let Some(place) = places.take(parts) else {
-            return Limited::Undecided(Undecided::Full);
-        };
-        let (at, until) = self.deadline(now);
-        let keys: Vec<(Box<[u8]>, Contract)> = parts
-            .iter()
-            .map(|(key, contract)| ((*key).into(), *contract))
-            .collect();
-        let (decided, later) = oneshot::channel();
-        tokio::task::spawn_local(Rc::clone(self).deferred(keys, (decided, place), (at, until)));
-        Limited::Later(Later(Awaited::Hub {
-            decided: later,
-            until,
-        }))
-    }
-
-    /// A deferred request under `keys`, decided again whenever a hold settles or a count
-    /// drains anywhere in the process, until it is decided, asked about — its decision and
-    /// place handed to the ask — its time is up, or nobody waits for it any more.
-    async fn deferred(
-        self: Rc<Self>,
-        keys: Vec<(Box<[u8]>, Contract)>,
-        asked: Asked,
-        (at, deadline): (u64, tokio::time::Instant),
-    ) {
-        let (mut decided, place) = asked;
-        let parts: Vec<(&[u8], Contract)> = keys
-            .iter()
-            .map(|(key, contract)| (&**key, *contract))
-            .collect();
-        let decision = |admitted| {
-            Ok(Decided {
-                admitted,
-                refused_by: Box::default(),
-            })
-        };
-        let result = loop {
-            // Let go before it is decided again, never charged for: nobody waits for it, or
-            // its time is up — however it was woken, or before its task first ran.
-            if decided.is_closed() {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break Err(Undecided::Timeout);
-            }
-            // Waiting on its keys before it decides, and listening before it decides, so
-            // that a hold settled between the two is not missed.
-            let _waiting = Waiting::on(&self.handles, &self.registry, &parts);
-            let woken = self.settled.notified();
-            tokio::pin!(woken);
-            woken.as_mut().enable();
-            let outcome = decide(
-                &self.handles,
-                &self.registry,
-                self.making(),
-                &parts,
-                self.now(),
-            );
-            self.signal(&outcome, &parts);
-            match outcome.local {
-                PooledLocal::Admit => break decision(true),
-                PooledLocal::Refuse => break decision(false),
-                PooledLocal::Ask => {
-                    // The ask answers the request itself, and keeps its place till then.
-                    drop(_waiting);
-                    let _asked = self.send_ask(&parts, at, (decided, place));
-                    return;
-                }
-                PooledLocal::Defer => {}
-            }
-            tokio::select! {
-                () = &mut woken => {}
-                () = tokio::time::sleep_until(deadline) => break Err(Undecided::Timeout),
-                () = decided.closed() => return,
-            }
-        };
-        drop(place);
-        let _gone = decided.send(result);
-    }
-
     /// The most requests it may have waiting, for a test to fill.
     #[cfg(test)]
     pub(crate) fn set_most_waiting(&self, most: usize) {
@@ -986,21 +887,6 @@ impl Limiter {
         self.waiting.bytes.get()
     }
 
-    /// Defers a request from `client` under those of `limits` that `limited` marks,
-    /// whatever its keys say, for a test of what a deferred request does.
-    #[cfg(test)]
-    pub(crate) fn defer_regardless(
-        self: &Rc<Self>,
-        limits: &[Arc<CompiledLimit>],
-        limited: u64,
-        client: Requester,
-    ) -> Limited {
-        let now = self.now();
-        self.with_keys(limits, limited, client.into(), |parts| {
-            self.defer(parts, now, &self.waiting)
-        })
-    }
-
     /// The most keys it may have made and not yet taken in, and the most bytes they may
     /// hold, for a test to fill.
     #[cfg(test)]
@@ -1019,46 +905,6 @@ impl Limiter {
     #[cfg(test)]
     pub(crate) fn set_wait(&self, wait: Duration) {
         self.wait.set(wait);
-    }
-}
-
-/// A deferred request's wait on the entries of its keys, from before it decides again
-/// until after: what settles or drains them wakes it.
-struct Waiting(Vec<Arc<Entry>>);
-
-impl Waiting {
-    fn on(
-        handles: &RefCell<Handles>,
-        registry: &Registry<Keyed>,
-        parts: &[(&[u8], Contract)],
-    ) -> Self {
-        let mut handles = handles.borrow_mut();
-        let entries: Vec<Arc<Entry>> = parts
-            .iter()
-            .filter_map(|(key, contract)| {
-                let held = handles
-                    .get(*key)
-                    .filter(|held| held.entry().contract() == *contract)
-                    .map(|held| Arc::clone(held.entry()));
-                held.or_else(|| {
-                    let found = registry.find(key, *contract)?;
-                    handles.replace(Handle::new(Arc::clone(&found)));
-                    Some(found)
-                })
-            })
-            .collect();
-        for entry in &entries {
-            entry.add_waiter();
-        }
-        Self(entries)
-    }
-}
-
-impl Drop for Waiting {
-    fn drop(&mut self) {
-        for entry in &self.0 {
-            entry.remove_waiter();
-        }
     }
 }
 

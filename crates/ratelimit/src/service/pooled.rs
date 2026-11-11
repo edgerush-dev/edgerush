@@ -3,10 +3,11 @@
 //!
 //! The process is one data plane of the protocol (one [`PlaneId`] for its life). A key's
 //! admission state — its bucket, the cycle's allowance and carry, what was admitted for the
-//! transport to report, what is held for a request under several keys — is one 128-bit word
-//! in an [`Entry`] that every worker holds a handle to. A warm request is decided by the
-//! worker with one compare-and-swap on that word, the cycle advanced in the same step if it
-//! is due. Nothing on that path waits on another thread.
+//! transport to report — is one 128-bit word in an [`Entry`] that every worker holds a
+//! handle to. A warm request is decided by the worker with one compare-and-swap on that
+//! word, the cycle advanced in the same step if it is due; under several keys, each is read
+//! and then, if all have room, each charged, as local mode decides. Nothing on that path
+//! waits on another thread.
 //!
 //! The [`Participant`] is the transport: the process thread's side, single-threaded. It
 //! sends what was admitted every cycle, rebases each key's bucket on the owner's answers,
@@ -41,7 +42,7 @@ use keys::Keys;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::sync::{Arc, RwLock};
-use sync::{AtomicBool, AtomicU32, AtomicU64, AtomicU128, Ordering, fence};
+use sync::{AtomicBool, AtomicU32, AtomicU64, AtomicU128, Ordering};
 use word::{Advance, Bucket, Fields, Step};
 
 /// A worker's own decision of a request.
@@ -49,16 +50,10 @@ use word::{Advance, Bucket, Fields, Step};
 pub enum Local {
     /// Every key had room: admitted, and taken from each.
     Admit,
-    /// A key has no room, and no hold still outstanding could explain it: refused.
+    /// A key has no room: refused.
     Refuse,
     /// A key is closed, or the worker has none: for the transport to decide.
     Ask,
-    /// Not to be decided now without a refusal that may be false or a count that could be
-    /// lost: a key's holds or its unreported admissions are at their most, or a key has no
-    /// room while another request's holds are outstanding. Nothing of it is held; the
-    /// worker waits ([`Entry::add_waiter`]) and decides it again, whole, when the keys'
-    /// holds settle or their counts are drained.
-    Defer,
 }
 
 /// A worker's decision and what it asks of others.
@@ -66,11 +61,6 @@ pub enum Local {
 pub struct Outcome {
     /// The decision.
     pub local: Local,
-    /// A key's unreported admissions passed half their most: the transport should drain it
-    /// ([`Participant::drain`]) before the next cycle. Said once until it does.
-    pub drain: bool,
-    /// A hold was settled on a key requests wait on: wake them.
-    pub wake: bool,
     /// The keys, by position (bit `n` for the `n`th), that now want the transport's
     /// attention: their count started, nothing having been admitted since it was last
     /// drained, or a request brought them back into use after a refill time without one.
@@ -87,8 +77,6 @@ pub enum Decision {
     Admit,
     /// Refused.
     Refuse,
-    /// As [`Local::Defer`].
-    Defer,
 }
 
 /// What a participant may give up of accuracy for throughput, each the user's to choose.
@@ -331,13 +319,6 @@ pub struct Entry {
     started: AtomicU64,
     /// Compare-and-swap attempts that lost to another and went round again.
     retries: AtomicU64,
-    /// The most admitted and not yet drained, holds included: `word::MOST_RESERVED`, or
-    /// less in tests.
-    most_reserved: u64,
-    /// Requests deferred on it, waiting for its holds to settle or its count to drain.
-    waiters: AtomicU64,
-    /// Its count passed half its most and the transport was told to drain it.
-    pressed: AtomicBool,
     /// A signal of it is on its way to the transport: held in a worker's batch, or queued
     /// ([`Self::claim_signal`]).
     signalled: AtomicBool,
@@ -380,41 +361,15 @@ impl std::fmt::Debug for Entry {
     }
 }
 
-/// What an operation on a word came to.
+/// What a key says of a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Taken {
+    /// Room: taken, or there to take.
     Done,
-    /// Done, and its count passed half its most for the first time since drained.
-    Pressed,
-    /// No room, and nothing held on it.
+    /// No room.
     Refused,
     /// The entry is closed: ask for the key's new one.
     Closed,
-    /// Its holds, or its admitted-and-held count, at their most: nothing taken.
-    Full,
-    /// No room while holds are outstanding on it, which may yet be given back.
-    Contended,
-}
-
-impl Taken {
-    fn done(self) -> bool {
-        matches!(self, Self::Done | Self::Pressed)
-    }
-}
-
-/// What to do to a word.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Op {
-    Admit,
-    Hold,
-}
-
-/// Whether an operation advances the cycle first if it is due: always, but for a drain at
-/// a worker's word ([`Participant::drain`]), which leaves the cycle to the transport.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Cycle {
-    Advance,
-    AsItIs,
 }
 
 impl Entry {
@@ -430,12 +385,10 @@ impl Entry {
             arrival: Bucket::full(terms.bucket.units(now)),
             // No share bound until a cycle sets one, as a new `DataPlane` key has none.
             left: word::MOST_LEFT,
-            spent: 0,
             cycle: word::cycle_of(now, cycle),
             shared: false,
             closed: false,
             unreported: 0,
-            held: 0,
             set: false,
         };
         Self {
@@ -447,9 +400,6 @@ impl Entry {
             last_request: AtomicU64::new(now),
             started: AtomicU64::new(now),
             retries: AtomicU64::new(0),
-            most_reserved: word::MOST_RESERVED,
-            waiters: AtomicU64::new(0),
-            pressed: AtomicBool::new(false),
             signalled: AtomicBool::new(false),
         }
     }
@@ -467,25 +417,6 @@ impl Entry {
     /// Gives back a claim on its signal: its signal is no longer on its way.
     pub fn unclaim_signal(&self) {
         self.signalled.swap(false, Ordering::AcqRel);
-    }
-
-    /// A request deferred on it waits from now: a hold settled or the count drained after
-    /// this is seen by whoever settles or drains it ([`Outcome::wake`],
-    /// [`Participant::take_wake`]). Called before the request is decided again, so that no
-    /// wake-up falls between the two.
-    pub fn add_waiter(&self) {
-        wait_on(&self.waiters);
-    }
-
-    /// A deferred request waits on it no longer.
-    pub fn remove_waiter(&self) {
-        self.waiters.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    /// Whether a change just made to the word is one deferred requests wait for. The fence
-    /// pairs with `add_waiter`'s: either the waiter sees the change, or this sees it.
-    fn wanted(&self) -> bool {
-        waited_on(&self.waiters)
     }
 
     /// Its key.
@@ -523,14 +454,9 @@ impl Entry {
         }
     }
 
-    /// Applies `change` to the word until it holds, the cycle advanced first if due and
-    /// `cycle` says so: `change` says the new fields, or none to leave the word as it is.
-    fn update(
-        &self,
-        now: u64,
-        cycle: Cycle,
-        mut change: impl FnMut(Fields) -> Option<Fields>,
-    ) -> Option<Fields> {
+    /// Applies `change` to the word until it holds, the cycle advanced first if it is due:
+    /// `change` says the new fields, or none to leave the word as it is.
+    fn update(&self, now: u64, mut change: impl FnMut(Fields) -> Option<Fields>) -> Option<Fields> {
         // The record read before the word, so that it is no later than the word's cycle.
         let advance = self.advance();
         let mut current = self.word.load(Ordering::Acquire);
@@ -538,8 +464,7 @@ impl Entry {
             let before = Fields::unpack(current);
             // Whether this advances the cycle: by the step, not by the 16-bit number, which
             // a gap of a multiple of its range leaves as it was.
-            let moved = cycle == Cycle::Advance
-                && word::step(before.cycle, advance.record, now, advance.cycle) != Step::Same;
+            let moved = word::step(before.cycle, advance.record, now, advance.cycle) != Step::Same;
             let fields = if moved {
                 word::advanced(&self.terms.bucket, before, advance, now)
             } else {
@@ -570,89 +495,79 @@ impl Entry {
         }
     }
 
-    /// Takes one request's worth at `now`: admitted, or held for a request under several
-    /// keys until all of them are decided. Taking does not count as the key's use: a
-    /// request's arrival does ([`decide`] marks it). With whether it started the key's
-    /// count: an admission counted where none was, read from the compare-and-swap that took
-    /// it, never from an attempt.
-    fn take(&self, op: Op, now: u64) -> (Taken, bool) {
-        let units = self.terms.bucket.units(now);
-        let mut why = Taken::Refused;
-        let mut was = 0;
-        let taken = self.update(now, Cycle::Advance, |fields| {
-            was = fields.unreported;
-            why = if fields.closed {
-                Taken::Closed
-            } else if fields.unreported + fields.held >= self.most_reserved
-                || (op == Op::Hold && fields.held == word::MOST_HELD)
-            {
-                // Out of places to count it, which says nothing of the client's room.
-                Taken::Full
-            } else if fields.left == 0 || !self.terms.bucket.admits(fields.arrival, units) {
-                if fields.held > 0 {
-                    Taken::Contended
-                } else {
-                    Taken::Refused
-                }
-            } else {
-                if op == Op::Admit && fields.unreported == 0 {
-                    self.started.store(now, Ordering::Relaxed);
-                }
-                return Some(Fields {
-                    arrival: Bucket::charge(fields.arrival, units, 1),
-                    left: fields.left - 1,
-                    spent: fields.spent + 1,
-                    unreported: fields.unreported + u64::from(op == Op::Admit),
-                    held: fields.held + u64::from(op == Op::Hold),
-                    ..fields
-                });
-            };
-            None
-        });
-        let Some(taken) = taken else {
-            return (why, false);
-        };
-        let started = was == 0 && taken.unreported > 0;
-        if taken.unreported + taken.held >= self.most_reserved.div_ceil(2)
-            && !self.pressed.swap(true, Ordering::AcqRel)
-        {
-            (Taken::Pressed, started)
+    /// What it says of a request at `now`, from its word as it is, its cycle advanced if
+    /// that is due, nothing written: room, none, or closed.
+    fn look(&self, now: u64) -> Taken {
+        let fields = word::advanced(&self.terms.bucket, self.snapshot(), self.advance(), now);
+        if fields.closed {
+            Taken::Closed
+        } else if self.has_room(fields, now) {
+            Taken::Done
         } else {
-            (Taken::Done, started)
+            Taken::Refused
         }
     }
 
-    /// A request held, decided: admitted, its hold becomes an admission to report, the
-    /// place it reserved kept; refused, its charge is given back, and one of the cycle's
-    /// allowance if the cycle under way has spent any, as `DataPlane`'s `spent − 1` does —
-    /// all read from the one word. Whether requests wait on it, and whether it started the
-    /// key's count, as [`Self::take`].
-    fn settle(&self, admitted: bool, now: u64) -> (bool, bool) {
+    fn has_room(&self, fields: Fields, now: u64) -> bool {
+        fields.left > 0
+            && self
+                .terms
+                .bucket
+                .admits(fields.arrival, self.terms.bucket.units(now))
+    }
+
+    /// Takes one request's worth at `now` if it has room, in one compare-and-swap. Taking
+    /// does not count as the key's use: a request's arrival does ([`decide`] marks it).
+    /// With whether it started the key's count: an admission counted where none was, read
+    /// from the compare-and-swap that took it, never from an attempt.
+    fn take(&self, now: u64) -> (Taken, bool) {
+        let mut why = Taken::Refused;
         let mut was = 0;
-        let settled = self.update(now, Cycle::Advance, |fields| {
+        let taken = self.update(now, |fields| {
             was = fields.unreported;
-            Some(if admitted {
-                if fields.unreported == 0 {
-                    self.started.store(now, Ordering::Relaxed);
-                }
-                Fields {
-                    held: fields.held.saturating_sub(1),
-                    unreported: fields.unreported + 1,
-                    ..fields
-                }
+            why = if fields.closed {
+                Taken::Closed
+            } else if self.has_room(fields, now) {
+                return Some(self.charged(fields, now));
             } else {
-                let refund = u64::from(fields.spent > 0);
-                Fields {
-                    held: fields.held.saturating_sub(1),
-                    arrival: Bucket::release(fields.arrival),
-                    left: fields.left + refund,
-                    spent: fields.spent - refund,
-                    ..fields
-                }
-            })
+                Taken::Refused
+            };
+            None
         });
-        let started = settled.is_some_and(|fields| was == 0 && fields.unreported > 0);
-        (self.wanted(), started)
+        match taken {
+            Some(taken) => (Taken::Done, was == 0 && taken.unreported > 0),
+            None => (why, false),
+        }
+    }
+
+    /// Charges one request at `now`, room or none, once a read of every key of the request
+    /// found room ([`decide`]): a charge that finds the room taken since admits one more
+    /// than the key has, never refuses one within it. A closed entry is left as it is, the
+    /// hit never reported: it was idle for two refill times before it closed. Whether it
+    /// started the key's count, as [`Self::take`].
+    fn charge(&self, now: u64) -> bool {
+        let mut was = 0;
+        let charged = self.update(now, |fields| {
+            was = fields.unreported;
+            (!fields.closed).then(|| self.charged(fields, now))
+        });
+        charged.is_some_and(|fields| was == 0 && fields.unreported > 0)
+    }
+
+    /// `fields` with one request charged at `now`: the bucket, the cycle's allowance and
+    /// the count, the count's start noted if it had none. The allowance and the count each
+    /// stop at their ends rather than wrap: a charge past the allowance only a race gives,
+    /// and the count is one the transport never lets fill.
+    fn charged(&self, fields: Fields, now: u64) -> Fields {
+        if fields.unreported == 0 {
+            self.started.store(now, Ordering::Relaxed);
+        }
+        Fields {
+            arrival: Bucket::charge(fields.arrival, self.terms.bucket.units(now), 1),
+            left: fields.left.saturating_sub(1),
+            unreported: (fields.unreported + 1).min(word::MOST_UNREPORTED),
+            ..fields
+        }
     }
 
     /// Marks a request's arrival at `now`, a request being its use whether it is admitted or
@@ -663,12 +578,11 @@ impl Entry {
     }
 
     /// Takes what was admitted and not yet drained, in one compare-and-swap that leaves the
-    /// rest — holds, the bucket, the allowance — as they are, its cycle advanced first if
-    /// `cycle` says so: the count, for the transport's ledger, when the earliest of it was
-    /// admitted, and whether requests wait on it.
-    fn drain(&self, now: u64, cycle: Cycle) -> (u64, u64, bool) {
+    /// rest — the bucket, the allowance — as they are, its cycle advanced first if due: the
+    /// count, for the transport's ledger, and when the earliest of it was admitted.
+    fn drain(&self, now: u64) -> (u64, u64) {
         let mut count = 0;
-        self.update(now, cycle, |fields| {
+        self.update(now, |fields| {
             count = fields.unreported;
             Some(Fields {
                 unreported: 0,
@@ -678,8 +592,7 @@ impl Entry {
         // After the compare-and-swap, whose acquire sees the time written before the one
         // that started the count.
         let started = self.started.load(Ordering::Relaxed);
-        self.pressed.store(false, Ordering::Release);
-        (count, started, count > 0 && self.wanted())
+        (count, started)
     }
 
     /// How long from `now` it waits to admit a request, if it would refuse one: its
@@ -705,37 +618,19 @@ impl Entry {
     }
 }
 
-/// One more request waits on what `waiters` counts: the count raised, then a fence, before
-/// the request looks at the word again — so that a change to the word made after the look
-/// sees the count ([`waited_on`]). The word's own accesses are acquire and release, too
-/// weak alone for this: each side writes one location and then reads the other's.
-fn wait_on(waiters: &AtomicU64) {
-    waiters.fetch_add(1, Ordering::SeqCst);
-    fence(Ordering::SeqCst);
-}
-
-/// Whether a change just made to the word is one requests wait on: a fence, then the count
-/// read, pairing with [`wait_on`]'s, so that the waiter sees the change or this sees it.
-fn waited_on(waiters: &AtomicU64) -> bool {
-    fence(Ordering::SeqCst);
-    waiters.load(Ordering::Relaxed) > 0
-}
-
-/// A worker deciding a request under `entries` at `now`, all or none: admitted with one
-/// compare-and-swap a key when all have room; refused if any has none and no outstanding
-/// hold could explain it; for the transport if any is closed; deferred if not to be decided
-/// now ([`Local::Defer`]).
+/// A worker deciding a request under `entries` at `now`, all or none, as local mode does:
+/// one key taken in one compare-and-swap if it has room; several read, then, if every one
+/// has room, each charged. Requests racing for a key's last room under several keys may
+/// both be admitted, one more than it has; none is refused within its limits. Refused if a
+/// key has no room; for the transport if one is closed.
 pub fn decide(entries: &[&Entry], now: u64) -> Outcome {
     let mut outcome = Outcome {
         local: Local::Admit,
-        drain: false,
-        wake: false,
         signal: 0,
     };
     if let [entry] = entries {
         let back = entry.arrive(now);
-        let (taken, started) = entry.take(Op::Admit, now);
-        outcome.drain = taken == Taken::Pressed;
+        let (taken, started) = entry.take(now);
         outcome.local = local(taken);
         outcome.signal = u64::from(back || started);
         return outcome;
@@ -747,23 +642,16 @@ pub fn decide(entries: &[&Entry], now: u64) -> Outcome {
             outcome.signal |= bit(at);
         }
     }
-    // Every key held first, then all settled one way: holds are never reported, so a
-    // request given back leaves no trace in what the transport sends.
-    for (held, entry) in entries.iter().enumerate() {
-        let (taken, _) = entry.take(Op::Hold, now);
-        outcome.drain |= taken == Taken::Pressed;
-        if !taken.done() {
-            for entry in &entries[..held] {
-                outcome.wake |= entry.settle(false, now).0;
-            }
+    // Every key read first, nothing written; then, every one with room, each charged.
+    for entry in entries {
+        let taken = entry.look(now);
+        if taken != Taken::Done {
             outcome.local = local(taken);
             return outcome;
         }
     }
     for (at, entry) in entries.iter().enumerate() {
-        let (wake, started) = entry.settle(true, now);
-        outcome.wake |= wake;
-        if started {
+        if entry.charge(now) {
             outcome.signal |= bit(at);
         }
     }
@@ -779,13 +667,12 @@ fn bit(at: usize) -> u64 {
         .unwrap_or(0)
 }
 
-/// What a worker makes of a take that did not hold.
+/// What a worker makes of what a key says.
 fn local(taken: Taken) -> Local {
     match taken {
-        Taken::Done | Taken::Pressed => Local::Admit,
+        Taken::Done => Local::Admit,
         Taken::Refused => Local::Refuse,
         Taken::Closed => Local::Ask,
-        Taken::Full | Taken::Contended => Local::Defer,
     }
 }
 
@@ -863,7 +750,6 @@ impl<P> Tracked<P> {
         let last = self.entry.last_request.load(Ordering::Relaxed);
         fields.unreported == 0
             && self.unsent == 0
-            && fields.held == 0
             && self.unacknowledged.is_empty()
             && now.saturating_sub(last) > 2 * self.entry.terms.hold
     }
@@ -1016,8 +902,6 @@ pub struct Participant<S, R: Routing = View> {
     /// Batches numbered, over every key: a key made again numbers its own from here, past
     /// every number an earlier life of it used.
     numbered: u64,
-    /// A hold settled or a count drained on a key requests wait on.
-    wake: bool,
     /// What is to go to each pod.
     queued: BTreeMap<R::Pod, Queued>,
     /// With one exchange in flight to a pod at a time: the pods that have one, since when.
@@ -1117,7 +1001,6 @@ struct Visit<'a, S, R: Routing> {
     forgiven: &'a mut u64,
     spare: &'a mut Spare,
     cut_off: bool,
-    wake: bool,
     /// Whether the key last visited was left out of its owner's piece, wholly or in part.
     left_out: bool,
     /// Keys left out so, all told.
@@ -1150,9 +1033,8 @@ impl<S: BuildHasher, R: Routing> Visit<'_, S, R> {
         let now = self.now;
         // What was admitted drained into the ledger, every key's, with an owner to send it
         // to or not, so that no count fills.
-        let (count, started, woken) = tracked.entry.drain(now, Cycle::Advance);
+        let (count, started) = tracked.entry.drain(now);
         tracked.unsent_more(count, started);
-        self.wake |= woken;
         let entry = &tracked.entry;
         let key = &entry.key;
         let hold = entry.terms.hold;
@@ -1299,7 +1181,6 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             hasher: hasher.clone(),
             keys: Keys::new(hasher),
             numbered: 0,
-            wake: false,
             queued: BTreeMap::new(),
             one_in_flight: false,
             sending: BTreeMap::new(),
@@ -1622,41 +1503,16 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
         let entries: Vec<Arc<Entry>> = self.entries(keys);
         let entries: Vec<&Entry> = entries.iter().map(|entry| &**entry).collect();
         let outcome = decide(&entries, now);
-        self.wake |= outcome.wake;
         for (at, (key, _)) in keys.iter().enumerate() {
             if outcome.signal & bit(at) != 0 {
                 self.run(key);
             }
         }
-        if outcome.drain {
-            for (key, _) in keys {
-                self.drain(key, now);
-            }
-        }
         match outcome.local {
             Local::Admit => Decision::Admit,
-            Local::Defer => Decision::Defer,
             // Closed is impossible: every entry was made live above, on this thread.
             Local::Refuse | Local::Ask => Decision::Refuse,
         }
-    }
-
-    /// Drains `key`'s count into its ledger now, at a worker's word that it passed half
-    /// its most, rather than at the next cycle.
-    pub fn drain(&mut self, key: &[u8], now: u64) {
-        let Some(tracked) = self.keys.get_mut(key) else {
-            return;
-        };
-        let (count, started, wake) = tracked.entry.drain(now, Cycle::AsItIs);
-        tracked.unsent_more(count, started);
-        self.wake |= wake;
-        self.run(key);
-    }
-
-    /// Whether, since last asked, a hold was settled or a count drained on a key deferred
-    /// requests wait on: if so, wake them.
-    pub fn take_wake(&mut self) -> bool {
-        std::mem::take(&mut self.wake)
     }
 
     /// The cycle's work at `now`, as `DataPlane::on_cycle`: each key's cycle advanced if no
@@ -1681,7 +1537,6 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             forgiven: &mut self.forgiven,
             spare: &mut self.spare,
             cut_off: false,
-            wake: false,
             left_out: false,
             keys_left_out: 0,
         };
@@ -1726,12 +1581,11 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
         }
         self.spare_left_out = previous;
         self.left_out = left_out;
-        let (cut_off, wake) = (visit.cut_off, visit.wake);
+        let cut_off = visit.cut_off;
         self.keys_left_out += visit.keys_left_out;
         self.visits += visits;
         self.next_runnable = std::mem::replace(&mut self.runnable, next);
         self.next_runnable.clear();
-        self.wake |= wake;
         if cut_off && let Some(pod) = self.routing.polled(self.polls) {
             self.polls += 1;
             if !self.sending.contains_key(&pod) {
@@ -1931,8 +1785,8 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             let unapplied = unseen + tracked.unsent;
             let entry = &tracked.entry;
             let units = entry.terms.bucket.units(made);
-            entry.update(now, Cycle::Advance, |fields| {
-                let extra = unapplied + fields.unreported + fields.held;
+            entry.update(now, |fields| {
+                let extra = unapplied + fields.unreported;
                 Some(Fields {
                     arrival: entry.terms.bucket.rebased(units, answer.behind, extra),
                     ..fields
@@ -2100,8 +1954,8 @@ impl<S: BuildHasher + Clone> Participant<S, View> {
     }
 }
 
-/// Closes `tracked`'s entry if nothing was admitted since the last report and nothing is
-/// held, in one compare-and-swap: a take after it fails and asks, and none before it is
+/// Closes `tracked`'s entry if nothing was admitted since the last report, in one
+/// compare-and-swap: a take after it fails and asks, and none before it is
 /// lost. Whether it closed.
 fn close_if_quiet<P>(tracked: &Tracked<P>) -> bool {
     let entry = &tracked.entry;
@@ -2111,7 +1965,7 @@ fn close_if_quiet<P>(tracked: &Tracked<P>) -> bool {
         if fields.closed {
             return true;
         }
-        if fields.unreported != 0 || fields.held != 0 {
+        if fields.unreported != 0 {
             return false;
         }
         let closed = Fields {

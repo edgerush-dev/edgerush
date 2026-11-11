@@ -1243,41 +1243,6 @@ async fn a_worker_makes_new_keys_only_with_room_and_asks_without() {
         .await;
 }
 
-/// A deferred request is let go before it is decided again once nothing waits for it, or
-/// once its time is up, never charged for: here gone before its task first ran, and out of
-/// time before it did. The key's one token is left for the next request.
-#[tokio::test]
-async fn a_deferred_request_gone_or_out_of_time_is_not_decided_again() {
-    use crate::ratelimit::{Limited, Undecided, WAIT};
-
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (limiter, rule, _) = one_token_limiter().await;
-            let client = requester("203.0.113.1");
-            drop(limiter.defer_regardless(&rule.limits, 0b1, client));
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            limiter.set_wait(Duration::ZERO);
-            let Limited::Later(late) = limiter.defer_regardless(&rule.limits, 0b1, client) else {
-                panic!("not deferred");
-            };
-            assert_eq!(
-                within(late.decided()).await.map(|d| d.admitted),
-                Err(Undecided::Timeout)
-            );
-            limiter.set_wait(WAIT);
-            assert!(
-                matches!(
-                    limiter.decide_all(&rule.limits, 0b1, client),
-                    Limited::Admit
-                ),
-                "the token taken for a request no longer waiting"
-            );
-            limiter.stop();
-        })
-        .await;
-}
-
 /// A decision made in time but taken up once the request's time is up — its worker held up
 /// meanwhile — is answered out of time: nothing goes on past its time to wait.
 #[tokio::test]
@@ -1287,13 +1252,14 @@ async fn a_decision_taken_up_after_its_time_is_out_of_time() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (limiter, rule, _) = one_token_limiter().await;
+            let (limiter, rule, release) = asking_limiter().await;
             limiter.set_wait(Duration::from_millis(100));
             let client = requester("203.0.113.1");
-            let Limited::Later(later) = limiter.defer_regardless(&rule.limits, 0b1, client) else {
-                panic!("not deferred");
+            let Limited::Later(later) = limiter.decide_all(&rule.limits, 0b1, client) else {
+                panic!("not asked about");
             };
-            // Its task decides it at once; its answer is there well before its time is up.
+            // Its process decides it at once; its answer is there well before its time is up.
+            release.send(()).unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
             std::thread::sleep(Duration::from_millis(150));
             assert_eq!(
@@ -1330,8 +1296,8 @@ async fn asking_limiter() -> (
     (limiter, Arc::clone(&compiled.rules_of(0)[0]), release)
 }
 
-/// A worker has so many places for requests waiting on its rate limits, asks and deferred
-/// alike: past them a request is answered full at once, never queued; a place is given back
+/// A worker has so many places for requests waiting on its rate limits, asked about: past
+/// them a request is answered full at once, never queued; a place is given back
 /// once its ask is answered. Asks here wait on their process, held up.
 #[tokio::test]
 async fn a_worker_holds_no_more_requests_waiting_than_it_has_places() {

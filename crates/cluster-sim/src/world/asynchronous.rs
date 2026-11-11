@@ -235,9 +235,7 @@ impl Sim<Asynchronous> {
         all
     }
 
-    /// A request reaches data plane `id`, under its next key: decided from its copy. One
-    /// deferred, as a worker does when its key's count is full, is refused, as `ratelimit-sim`
-    /// takes it of a data plane.
+    /// A request reaches data plane `id`, under its next key: decided from its copy.
     fn on_request(&mut self, id: NodeId) {
         if self.clients_stopped {
             return;
@@ -253,7 +251,7 @@ impl Sim<Asynchronous> {
             let bytes = bytes_of(key);
             match plane.data.decide_all(&[(&bytes, plane.contract)], now) {
                 Decision::Admit => plane.admitted.entry(key).or_default().push(now),
-                Decision::Refuse | Decision::Defer => plane.refused += 1,
+                Decision::Refuse => plane.refused += 1,
             }
         }
         self.stats.sent += 1;
