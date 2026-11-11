@@ -1443,13 +1443,14 @@ fn backend(
     let calls = match route_kind {
         "GRPCRoute" => Calls::Grpc,
         "TLSRoute" | "TCPRoute" => Calls::Tunnel,
+        "UDPRoute" => Calls::Datagrams,
         _ => Calls::Http,
     };
     // A port a policy may cover, which its status then says of the Gateway: none covers a
-    // TLSRoute's or a TCPRoute's backend (04 §2).
-    if calls != Calls::Tunnel
+    // TLSRoute's, a TCPRoute's or a UDPRoute's backend (04 §2).
+    if !matches!(calls, Calls::Tunnel | Calls::Datagrams)
         && let Some(service) = &reference.service
-        && let Ok(Ok(found)) = crate::service_port(cluster, namespace, service)
+        && let Ok(Ok(found)) = crate::service_port(cluster, namespace, service, false)
     {
         policies.reach(namespace, written.name, found.name);
     }

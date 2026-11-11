@@ -1,0 +1,1 @@
+Gateway shop/web: listener quic: has port 443's UDP socket, so Ingress's TLS hosts there are served without HTTP/3

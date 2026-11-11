@@ -11,7 +11,8 @@
 //! says, `gateway.txt`, what was made of the data plane's Gateway's listeners, a line each
 //! (none otherwise: the data plane is no Gateway, or names one not there or not ours); and,
 //! where the case says, `routes.txt`, what became of each HTTPRoute's parents of that
-//! Gateway, then each GRPCRoute's, then each TLSRoute's, a line each (none otherwise); and, where the case says,
+//! Gateway, then each GRPCRoute's, then each TLSRoute's, each TCPRoute's and each UDPRoute's,
+//! a line each (none otherwise); and, where the case says,
 //! `status.txt`, what the
 //! status of that Gateway, each of its listeners, each route's parent of it and each
 //! BackendTLSPolicy of it as an ancestor is to say, a line each. The report's last lines are the hosts a claim of one API takes from the
@@ -184,6 +185,7 @@ fn every_case_translates_to_its_config_and_report() {
             .chain(&translation.grpc_routes)
             .chain(&translation.tls_routes)
             .chain(&translation.tcp_routes)
+            .chain(&translation.udp_routes)
             .flat_map(|outcome| {
                 outcome
                     .to_string()

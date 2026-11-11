@@ -1,0 +1,35 @@
+# Ingress's TLS hosts on its HTTPS port, whose settings serve HTTP/3, beside the Gateway's
+# UDP listener on that port: the UDP listener has the port's UDP socket, and Ingress's
+# listener there serves its hosts without HTTP/3, said as a note (Lucas), so that a
+# Gateway's listeners never hang on Ingresses.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: quic, port: 443, protocol: UDP }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: site, namespace: shop }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [shop.example.com], secretName: shop-tls }]
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]

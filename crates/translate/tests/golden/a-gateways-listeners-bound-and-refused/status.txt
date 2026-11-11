@@ -1,10 +1,10 @@
-Gateway, generation 0: Accepted=True/ListenersNotValid (listeners not accepted: secure, dns, second); ResolvedRefs=False/ListenersNotResolved (listeners with refs not resolved: unsigned)
+Gateway, generation 0: Accepted=True/ListenersNotValid (listeners not accepted: secure, sctp, second); ResolvedRefs=False/ListenersNotResolved (listeners with refs not resolved: unsigned)
 listener http: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener elsewhere: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener plain-on-secure: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener secure: no kind, attached 0: Accepted=False/ProtocolConflict (port 8443 is taken for http by listener plain-on-secure, which comes first); Conflicted=True/ProtocolConflict (port 8443 is taken for http by listener plain-on-secure, which comes first); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (port 8443 is taken for http by listener plain-on-secure, which comes first)
 listener unsigned: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/InvalidCertificateRef (it names no certificateRef); Programmed=False/Invalid (no certificateRef of it can be used)
-listener dns: no kind, attached 0: Accepted=False/UnsupportedProtocol (protocol `UDP` is not one the gateway serves); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (protocol `UDP` is not one the gateway serves)
+listener sctp: no kind, attached 0: Accepted=False/UnsupportedProtocol (protocol `SCTP` is not one the gateway serves); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (protocol `SCTP` is not one the gateway serves)
 listener first: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener second: no kind, attached 0: Accepted=False/HostnameConflict (listener first, which comes first, has its port, protocol and hostname); Conflicted=True/HostnameConflict (listener first, which comes first, has its port, protocol and hostname); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (listener first, which comes first, has its port, protocol and hostname)
 listener apart: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

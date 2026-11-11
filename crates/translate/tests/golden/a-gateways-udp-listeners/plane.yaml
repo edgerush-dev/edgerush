@@ -1,0 +1,12 @@
+# A data plane, the Gateway shop/web, serving HTTP/3 on 443, and settings for the UDP
+# listeners on 5353 and 5432 and the TCP one on 5432.
+ingress_class: edge
+gateway: shop/web
+cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+ingress_https_redirect: true
+ingress_https_redirect_max_age: 30
+ports:
+  443: { http3: {} }
+  5353: { session_idle_seconds: 30, session_answers: 1, access_log: { file: /var/log/edgerush/dns.log } }
+  5432: { session_idle_seconds: 120, proxy_protocol: { senders: [10.0.0.0/16] } }

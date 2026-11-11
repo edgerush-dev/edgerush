@@ -1,0 +1,7 @@
+UDPRoute shop/elder, section one: attached to one (*)
+UDPRoute shop/by-both, section three, port 5302: attached to three (*)
+UDPRoute shop/by-port, port 5300: attached to one (*)
+UDPRoute shop/by-section, section two: attached to two (*)
+UDPRoute shop/old-shape, section two: attached to two (*)
+UDPRoute shop/weighted, section weighted: attached to weighted (*)
+UDPRoute shop/attach-all: attached to one (*); two (*); three (*); weighted (*)

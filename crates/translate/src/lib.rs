@@ -35,8 +35,8 @@ use edgerush_config::{
     Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, GrpcMethod, Header,
     HeaderChanges, Hostname, Listener, ListenerCertificate, LoadBalancer, Match, PathMatch,
     Protocol, Query, Redirect, Route, Rule, Scheme, SharingHostname, SharingListener, StatedNames,
-    TcpRoute, TlsRoute, Upstream, UpstreamProtocol, UpstreamTls, ValueMatch, WellKnownAuthorities,
-    Wildcard, compile,
+    TcpRoute, TlsRoute, UdpRoute, Upstream, UpstreamProtocol, UpstreamTls, ValueMatch,
+    WellKnownAuthorities, Wildcard, compile,
 };
 use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use edgerush_gateway_api::gateway::Gateway;
@@ -67,6 +67,7 @@ pub mod listeners;
 pub mod status;
 mod tcp_route;
 mod tls_route;
+mod udp_route;
 
 pub use gateway::{
     Allowed, GatewayOutcome, ListenerOutcome, ListenerProblem, Namespaces, Requirement, Selector,
@@ -177,9 +178,18 @@ pub struct PortSettings {
     /// Whether each request is given an ID of its own; `generate` by default.
     #[serde(default)]
     pub request_id: Option<edgerush_config::RequestId>,
-    /// Where a record of each of its requests is written; nowhere by default.
+    /// Where a record of each of its requests, or of its UDP listener's sessions, is
+    /// written; nowhere by default.
     #[serde(default)]
     pub access_log: Option<edgerush_config::AccessLog>,
+    /// How long, in seconds, a session of the UDP listener on it may carry nothing before it
+    /// is ended; the data plane's 60 by default ([24 §3](../../../docs/24-udp-proxying.md)).
+    #[serde(default)]
+    pub session_idle_seconds: Option<u64>,
+    /// How many answers a session of the UDP listener on it expects for each datagram its
+    /// client sends; none by default, a session ending when idle alone (24 §3).
+    #[serde(default)]
+    pub session_answers: Option<u32>,
 }
 
 /// What a data plane's ports are bound on ([04 §2](../../../docs/04-control-plane.md)).
@@ -323,6 +333,8 @@ pub struct Translation {
     pub tls_routes: Vec<RouteOutcome>,
     /// Each TCPRoute that does, and what became of each such parent.
     pub tcp_routes: Vec<RouteOutcome>,
+    /// Each UDPRoute that does, and what became of each such parent.
+    pub udp_routes: Vec<RouteOutcome>,
     /// What that Gateway's status is to say (04 §6).
     pub gateway_status: Option<GatewayStatus>,
     /// What each of those routes' status is to say of those parents, in their order, the
@@ -343,7 +355,10 @@ impl Problem {
     /// HTTPS by a Gateway listener another.
     #[must_use]
     pub fn is_note(&self) -> bool {
-        matches!(self, Self::RetryCapped { .. } | Self::HostOverTls { .. })
+        matches!(
+            self,
+            Self::RetryCapped { .. } | Self::HostOverTls { .. } | Self::Http3GivenWay { .. }
+        )
     }
 }
 
@@ -781,14 +796,18 @@ pub enum Problem {
         /// Why.
         why: RefProblem,
     },
-    /// A TLSRoute or a TCPRoute not of the shape the `v1` API gives one, as one written
-    /// through an older version may be: not accepted.
+    /// A TLSRoute, a TCPRoute or a UDPRoute not of the shape the `v1` API gives one, as one
+    /// written through an older version may be: not accepted.
     #[error("{0}, so it is not accepted")]
     RouteRefused(String),
     /// A TLSRoute's or a TCPRoute's backend is invalid: its share of connections is closed,
     /// as the spec has it (`ResolvedRefs` false).
     #[error("a backend's share of connections is closed: {0}")]
     ConnectionsClosed(RefProblem),
+    /// A UDPRoute's backend is invalid: its share of datagrams is dropped, as the spec has
+    /// it (`ResolvedRefs` false).
+    #[error("a backend's share of datagrams is dropped: {0}")]
+    DatagramsDropped(RefProblem),
     /// A BackendTLSPolicy's target that another, which comes first, covers.
     #[error("covers nothing of {target}: {by} covers it, and comes first")]
     PolicyConflicted {
@@ -820,9 +839,9 @@ pub enum Problem {
         /// The route that serves it.
         by: Object,
     },
-    /// A TCPRoute attached to a data-plane listener an earlier TCPRoute is attached to: the
-    /// earlier serves it, as the one rule ranks them (04 §2), and this one stays accepted,
-    /// as conformance has it.
+    /// A TCPRoute attached to a data-plane listener an earlier TCPRoute is attached to, or a
+    /// UDPRoute to one an earlier UDPRoute is: the earlier serves it, as the one rule ranks
+    /// them (04 §2), and this one stays accepted, as conformance has it.
     #[error("{listener} is served by {by}, which comes first")]
     ListenerTaken {
         /// The data plane's listener.
@@ -880,6 +899,19 @@ pub enum Problem {
         /// The host.
         host: String,
     },
+    /// The data plane's listener Ingress's TLS hosts are served on, on a port whose UDP
+    /// socket a UDP listener of the Gateway has: served without the HTTP/3 its settings ask
+    /// for, as the Gateway's listeners never hang on Ingresses (Lucas, 04 §2). A note.
+    #[error(
+        "listener {name}: has port {port}'s UDP socket, so Ingress's TLS hosts there are served \
+         without HTTP/3"
+    )]
+    Http3GivenWay {
+        /// The UDP listener's name.
+        name: String,
+        /// The port.
+        port: u16,
+    },
     /// A listener of the data plane's Gateway names route kinds it cannot take
     /// (`InvalidRouteKinds`); it takes the others.
     #[error("listener {name}: takes no route of kind {kinds}")]
@@ -905,18 +937,20 @@ pub enum Problem {
 pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let mut report = Vec::new();
     let gateway = gateway::outcome(plane, cluster, &mut report);
-    let (http_routes, grpc_routes, tls_routes, tcp_routes) = gateway
+    let (http_routes, grpc_routes, tls_routes, tcp_routes, udp_routes) = gateway
         .as_ref()
         .map(|gateway| {
             let http = cluster.http_routes.iter().map(http_route::Routed::http);
             let grpc = cluster.grpc_routes.iter().map(http_route::Routed::grpc);
             let tls = cluster.tls_routes.iter().map(http_route::Routed::tls);
             let tcp = cluster.tcp_routes.iter().map(http_route::Routed::tcp);
+            let udp = cluster.udp_routes.iter().map(http_route::Routed::udp);
             (
                 http_route::attached(http.collect(), gateway, cluster),
                 http_route::attached(grpc.collect(), gateway, cluster),
                 http_route::attached(tls.collect(), gateway, cluster),
                 http_route::attached(tcp.collect(), gateway, cluster),
+                http_route::attached(udp.collect(), gateway, cluster),
             )
         })
         .unwrap_or_default();
@@ -925,6 +959,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         .chain(&grpc_routes)
         .chain(&tls_routes)
         .chain(&tcp_routes)
+        .chain(&udp_routes)
     {
         for parent in &outcome.parents {
             if let Err(why) = parent.attached {
@@ -961,17 +996,6 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         }
         if let Err(why) = &outcome.asked {
             say(Problem::PolicyFailing(why.clone()));
-        }
-    }
-    // UDPRoutes are followed and not translated yet: each that names the data plane's
-    // Gateway, or a ListenerSet naming it, is said.
-    if let Some(gateway) = &gateway {
-        let udp = cluster.udp_routes.iter().map(http_route::Routed::udp);
-        for outcome in http_route::attached(udp.collect(), gateway, cluster) {
-            report.push(Finding {
-                object: outcome.route,
-                problem: Problem::NotSupportedYet("UDPRoute"),
-            });
         }
     }
     // An Ingress is the data plane's when its class is, and its class is when the
@@ -1024,7 +1048,11 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             implicit.push(listeners::name(port));
         }
     }
-    let mut bound = listeners::bound(plane, &ports);
+    let udp_ports = gateway
+        .as_ref()
+        .map(|gateway| gateway.udp_ports.clone())
+        .unwrap_or_default();
+    let mut bound = listeners::bound(plane, &ports, &udp_ports);
     let (ingress_http, ingress_https) = ingress_listeners(plane, &bound);
     // Each Ingress is compiled alone, with the listeners it is served on, so that one the
     // data plane would refuse is left out by itself rather than refusing every other's
@@ -1515,6 +1543,72 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         let served: Vec<String> = taken.into_keys().collect();
         tcp.extend(tcp_route::claims(gateway, &served));
     }
+    // Each attached UDPRoute's UDP routes, ranked as TCPRoutes' are: a data-plane listener's
+    // one route is the first's, each later one said; a listener none serves is claimed, its
+    // datagrams dropped (04 §2).
+    let mut udp: Vec<UdpRoute> = Vec::new();
+    if let Some(gateway) = &gateway {
+        let mut ranked: Vec<(Rank, Object, Vec<UdpRoute>)> = Vec::new();
+        for outcome in &udp_routes {
+            if !outcome.parents.iter().any(|parent| parent.attached.is_ok()) {
+                continue;
+            }
+            let Some(route) = cluster
+                .udp_routes
+                .iter()
+                .find(|route| Object::of("UDPRoute", &route.metadata) == outcome.route)
+            else {
+                continue;
+            };
+            let translated =
+                udp_route::translated(route, outcome, gateway, plane, cluster, &policies);
+            if let Some(why) = translated.refused {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::RouteRefused(why),
+                });
+                continue;
+            }
+            for why in translated.invalid {
+                report.push(Finding {
+                    object: outcome.route.clone(),
+                    problem: Problem::DatagramsDropped(why),
+                });
+            }
+            tunnel_upstreams.extend(translated.upstreams);
+            ranked.push((
+                rank(&route.metadata, 0),
+                outcome.route.clone(),
+                translated.routes,
+            ));
+        }
+        ranked.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut taken: BTreeMap<String, Object> = BTreeMap::new();
+        for (_, object, routes) in ranked {
+            for route in routes {
+                if let Some((listener, by)) = route
+                    .listeners
+                    .iter()
+                    .find_map(|listener| taken.get(listener).map(|by| (listener, by)))
+                {
+                    report.push(Finding {
+                        object: object.clone(),
+                        problem: Problem::ListenerTaken {
+                            listener: listener.clone(),
+                            by: by.clone(),
+                        },
+                    });
+                    continue;
+                }
+                for listener in &route.listeners {
+                    taken.insert(listener.clone(), object.clone());
+                }
+                udp.push(route);
+            }
+        }
+        let served: Vec<String> = taken.into_keys().collect();
+        udp.extend(udp_route::claims(gateway, &served));
+    }
     // Each listener hostname of the Gateway is claimed, so that nothing less specific serves
     // it (04 §2, listener isolation).
     if let Some(gateway) = &gateway {
@@ -1658,6 +1752,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     };
     config.tls_routes = passthrough;
     config.tcp_routes = tcp;
+    config.udp_routes = udp;
     if let Some(gateway) = &gateway {
         gateway_tls(&mut config, gateway, cluster, &mut report);
         if let Some(Ok(name)) = &gateway.client_certificate {
@@ -1679,13 +1774,37 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             config.listeners.insert(name, alone);
         }
     }
+    // A port whose UDP socket a UDP listener of the Gateway has serves no HTTP/3 over TCP's
+    // listener there: that one is Ingress's alone, as a Gateway HTTPS listener serving
+    // HTTP/3 keeps a UDP listener from the port (04 §2), and it gives way, said.
+    if let Some(gateway) = &gateway {
+        for listener in &gateway.listeners {
+            let udp = listeners::udp_name(listener.port);
+            if !listener.served.as_ref().is_ok_and(|on| on.contains(&udp)) {
+                continue;
+            }
+            let Some(sharing) = config.listeners.get_mut(&listeners::name(listener.port)) else {
+                continue;
+            };
+            if sharing.http3.take().is_some() {
+                report.push(Finding {
+                    object: gateway.gateway.clone(),
+                    problem: Problem::Http3GivenWay {
+                        name: listener.name.clone(),
+                        port: listener.port,
+                    },
+                });
+            }
+        }
+    }
     // Every route's status, of whichever kind, HTTPRoutes first, then GRPCRoutes,
-    // TLSRoutes and TCPRoutes; a listener counts them all.
+    // TLSRoutes, TCPRoutes and UDPRoutes; a listener counts them all.
     let routes: Vec<RouteOutcome> = http_routes
         .iter()
         .chain(&grpc_routes)
         .chain(&tls_routes)
         .chain(&tcp_routes)
+        .chain(&udp_routes)
         .cloned()
         .collect();
     let route_statuses = status::routes(&routes, &report);
@@ -1711,6 +1830,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         grpc_routes,
         tls_routes,
         tcp_routes,
+        udp_routes,
         gateway_status,
         route_statuses,
         policy_statuses,
@@ -2788,7 +2908,7 @@ fn forward(path: PathMatch, backend: Backend) -> Rule {
 /// What a route calls its backends with: HTTP, in HTTP/1.1 unless the port's `appProtocol`
 /// says otherwise (an Ingress, an HTTPRoute); gRPC, in HTTP/2 wherever the port's
 /// `appProtocol` agrees (a GRPCRoute; 04 §2); or nothing but the client's bytes (a
-/// TLSRoute).
+/// TLSRoute, a TCPRoute) or datagrams (a UDPRoute).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Calls {
     Http,
@@ -2796,6 +2916,9 @@ pub(crate) enum Calls {
     /// Bytes as they come, a TLSRoute's (17): in the clear over TCP, whatever the port's
     /// `appProtocol`, which says what the client's TLS carries.
     Tunnel,
+    /// Datagrams as they come, a UDPRoute's ([24](../../../docs/24-udp-proxying.md)): to the
+    /// Service's UDP port of the number named, whatever its `appProtocol` (04 §2).
+    Datagrams,
 }
 
 /// The upstream a backend leads to, and its name: one a Service's port, whose endpoints are
@@ -2821,7 +2944,7 @@ fn backend_upstream(
         number,
         app_protocol,
         headless,
-    } = match service_port(cluster, namespace, backend)? {
+    } = match service_port(cluster, namespace, backend, calls == Calls::Datagrams)? {
         Ok(port) => port,
         Err(missing) => return Ok(Err(missing)),
     };
@@ -2832,7 +2955,7 @@ fn backend_upstream(
     // leaving them in the clear; its own status says why, not the route's.
     let policy = policies.covering(namespace, service, port_name);
     let covered = match (calls, policy) {
-        (Calls::Tunnel, _) | (_, None) => None,
+        (Calls::Tunnel | Calls::Datagrams, _) | (_, None) => None,
         (_, Some(Outcome { asked: Ok(tls), .. })) => Some(tls),
         (
             _,
@@ -2857,6 +2980,8 @@ fn backend_upstream(
     let mut apart = false;
     let mut tunnel_apart = false;
     let (protocol, tls) = match (calls, app_protocol) {
+        // A `udp` upstream is named apart wherever: no other route's backend is one (24 §2).
+        (Calls::Datagrams, _) => (UpstreamProtocol::Udp, None),
         // Named apart from the HTTP upstream of the same port wherever that one speaks
         // HTTP/2 or TLS, or the port says a protocol HTTP routes cannot reach it by: a
         // policy's TLS among them.
@@ -2957,6 +3082,9 @@ fn backend_upstream(
     if tunnel_apart {
         name.push_str("/tcp");
     }
+    if calls == Calls::Datagrams {
+        name.push_str("/udp");
+    }
     let upstream = Upstream {
         endpoints,
         protocol,
@@ -2985,11 +3113,13 @@ struct ServicePort<'a> {
     headless: bool,
 }
 
-/// The Service port a backend names. Or what is not there; or why the Ingress is left out.
+/// The Service port a backend names, `over_udp` its UDP one alone (04 §2). Or what is not
+/// there, or not over UDP; or why the Ingress is left out.
 fn service_port<'a>(
     cluster: &'a Cluster,
     namespace: &str,
     backend: &IngressServiceBackend,
+    over_udp: bool,
 ) -> Result<Result<ServicePort<'a>, RefProblem>, Problem> {
     // Kubernetes requires a port, by name or by number, of a Service backend.
     let wanted = match &backend.port {
@@ -3017,18 +3147,33 @@ fn service_port<'a>(
     let ports = spec
         .and_then(|spec| spec.ports.as_deref())
         .unwrap_or_default();
-    let found = ports
-        .iter()
-        .find(|port| match (&wanted.name, wanted.number) {
+    let named =
+        |port: &&k8s_openapi::api::core::v1::ServicePort| match (&wanted.name, wanted.number) {
             (Some(name), _) => port.name.as_ref() == Some(name),
             (None, Some(number)) => port.port == number,
             (None, None) => false,
-        });
+        };
+    // Kubernetes takes a port of no protocol as TCP.
+    let udp =
+        |port: &&k8s_openapi::api::core::v1::ServicePort| port.protocol.as_deref() == Some("UDP");
+    let found = ports
+        .iter()
+        .filter(|port| !over_udp || udp(port))
+        .find(named);
     let Some(port) = found else {
         let wanted = match (&wanted.name, wanted.number) {
             (Some(name), _) => format!("named {name}"),
             (None, number) => number.unwrap_or_default().to_string(),
         };
+        if over_udp && ports.iter().any(|port| named(&port)) {
+            return Ok(Err(RefProblem::new(
+                RefReason::UnsupportedProtocol,
+                format!(
+                    "Service {namespace}/{service_name} has port {wanted} over TCP alone; a \
+                     UDPRoute's backend is a Service's UDP port"
+                ),
+            )));
+        }
         return Ok(Err(RefProblem::new(
             RefReason::NotFound,
             format!("Service {namespace}/{service_name} has no port {wanted}"),

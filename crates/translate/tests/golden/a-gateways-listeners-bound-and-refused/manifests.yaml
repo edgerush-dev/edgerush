@@ -1,7 +1,7 @@
 # Each of the Gateway's listeners as the data plane can serve it, or why it cannot: each
 # port is bound once, however many listeners state it; of two listeners stating one port
 # for two protocols, the first takes the port for its own and the later is refused;
-# protocols not taken yet, or never, are refused; an HTTPS listener of no certificate is
+# a protocol never taken is refused; an HTTPS listener of no certificate is
 # accepted, serving nothing, its port bound and refusing every handshake until it has one;
 # of two that cannot be told apart, the first is served and the later refused, and one
 # beside them that differs by its hostname alone is served.
@@ -22,7 +22,7 @@ spec:
     - { name: plain-on-secure, port: 8443, protocol: HTTP }
     - { name: secure, port: 8443, protocol: HTTPS }
     - { name: unsigned, port: 8444, protocol: HTTPS }
-    - { name: dns, port: 53, protocol: UDP }
+    - { name: sctp, port: 53, protocol: SCTP }
     - { name: first, port: 8080, protocol: HTTP, hostname: a.example.com }
     - { name: second, port: 8080, protocol: HTTP, hostname: a.example.com }
     - { name: apart, port: 8080, protocol: HTTP, hostname: b.example.com }

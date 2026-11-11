@@ -610,8 +610,9 @@ impl Handed {
 impl GatewayApi {
     /// Writes, one at a time, each status that says other than `handed` has it: that of
     /// the data plane's Gateway's class, of the Gateway, `addresses` among it, of each
-    /// ListenerSet naming it, of each route followed, HTTPRoute, GRPCRoute, TLSRoute or
-    /// TCPRoute, whether or not it still names the Gateway or one of those ListenerSets, and
+    /// ListenerSet naming it, of each route followed, HTTPRoute, GRPCRoute, TLSRoute,
+    /// TCPRoute or UDPRoute, whether or not it still names the Gateway or one of those
+    /// ListenerSets, and
     /// of each BackendTLSPolicy followed, whether or not a route of the Gateway reaches it.
     async fn write_statuses(
         &self,
@@ -723,13 +724,14 @@ impl GatewayApi {
                     .map(|set| set.set.clone()),
             )
             .collect();
-        // A GRPCRoute's, a TLSRoute's and a TCPRoute's status are merged and written as an
-        // HTTPRoute's, of one type in the spec (gateway_status::grpc_as_http, tls_as_http,
-        // tcp_as_http).
+        // A GRPCRoute's, a TLSRoute's, a TCPRoute's and a UDPRoute's status are merged and
+        // written as an HTTPRoute's, of one type in the spec (gateway_status::grpc_as_http,
+        // tls_as_http, tcp_as_http, udp_as_http).
         let http_routes = self.http_routes.as_deref().map(objects).unwrap_or_default();
         let grpc_routes = self.grpc_routes.as_deref().map(objects).unwrap_or_default();
         let tls_routes = self.tls_routes.as_deref().map(objects).unwrap_or_default();
         let tcp_routes = self.tcp_routes.as_deref().map(objects).unwrap_or_default();
+        let udp_routes = self.udp_routes.as_deref().map(objects).unwrap_or_default();
         let routes = http_routes
             .iter()
             .map(|route| ("HTTPRoute", &route.metadata, route.status.clone()))
@@ -744,6 +746,10 @@ impl GatewayApi {
             .chain(tcp_routes.iter().map(|route| {
                 let status = route.status.as_ref().map(gateway_status::tcp_as_http);
                 ("TCPRoute", &route.metadata, status)
+            }))
+            .chain(udp_routes.iter().map(|route| {
+                let status = route.status.as_ref().map(gateway_status::udp_as_http);
+                ("UDPRoute", &route.metadata, status)
             }));
         for (kind, metadata, live) in routes {
             let object = Object {
@@ -773,6 +779,10 @@ impl GatewayApi {
                     }
                     "TCPRoute" => {
                         api.replace_status::<TCPRoute>(namespace, name, version, &status)
+                            .await
+                    }
+                    "UDPRoute" => {
+                        api.replace_status::<UDPRoute>(namespace, name, version, &status)
                             .await
                     }
                     _ => {

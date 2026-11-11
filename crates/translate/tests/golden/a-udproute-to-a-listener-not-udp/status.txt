@@ -1,0 +1,5 @@
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener http: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/pages, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+UDPRoute shop/by-port, generation 0, parent web port 8080: Accepted=False/NotAllowedByListeners (no listener it names takes its kind from its namespace); ResolvedRefs=True/ResolvedRefs
+UDPRoute shop/dns, generation 0, parent web section http: Accepted=False/NotAllowedByListeners (no listener it names takes its kind from its namespace); ResolvedRefs=True/ResolvedRefs

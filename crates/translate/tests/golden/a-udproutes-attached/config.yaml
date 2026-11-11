@@ -1,0 +1,90 @@
+listeners:
+  port-5300:
+    address: 0.0.0.0:5300
+    protocol: http
+    forwarding:
+      trusted_proxies: []
+      trusted_only_headers:
+      - Forwarded
+      - X-Real-IP
+      - X-Forwarded-*
+    request_id: generate
+    proxy_protocol: 'off'
+  port-5300-udp:
+    address: 0.0.0.0:5300
+    protocol: udp
+  port-5301-udp:
+    address: 0.0.0.0:5301
+    protocol: udp
+  port-5302-udp:
+    address: 0.0.0.0:5302
+    protocol: udp
+  port-5303-udp:
+    address: 0.0.0.0:5303
+    protocol: udp
+  port-5304-udp:
+    address: 0.0.0.0:5304
+    protocol: udp
+routes: []
+tcp_routes: []
+tls_routes: []
+udp_routes:
+- name: udproute/shop/elder/one
+  listeners:
+  - port-5300-udp
+  backends:
+  - upstream: shop/dns/dns/udp
+    weight: 1
+- name: udproute/shop/by-both/three
+  listeners:
+  - port-5302-udp
+  backends:
+  - upstream: shop/syslog/514/udp
+    weight: 1
+- name: udproute/shop/by-section/two
+  listeners:
+  - port-5301-udp
+  backends:
+  - upstream: shop/dns/dns/udp
+    weight: 1
+- name: udproute/shop/weighted/weighted
+  listeners:
+  - port-5303-udp
+  backends:
+  - upstream: shop/dns/dns/udp
+    weight: 70
+  - upstream: shop/syslog/514/udp
+    weight: 30
+  - upstream: other/resolver/dns/udp
+    weight: 0
+  - invalid: Service shop/not-there does not exist
+    weight: 10
+  - invalid: a backend of kind /ConfigMap is not one translation reads
+    weight: 5
+  - invalid: Service other/secret is another namespace's, and no ReferenceGrant there lets UDPRoutes of
+      shop reach it
+    weight: 5
+  - invalid: Service shop/tcp-only has port 53 over TCP alone; a UDPRoute's backend is a Service's UDP port
+    weight: 5
+- name: gateway/shop/web/idle
+  listeners:
+  - port-5304-udp
+  backends:
+  - invalid: no UDPRoute serves listener idle
+    weight: 1
+upstreams:
+  other/resolver/dns/udp:
+    endpoints:
+      kubernetes: resolver.other.svc.cluster.local:dns
+    protocol: udp
+    load_balancer: p2c
+  shop/dns/dns/udp:
+    endpoints:
+      kubernetes: dns.shop.svc.cluster.local:dns
+    protocol: udp
+    load_balancer: p2c
+  shop/syslog/514/udp:
+    endpoints:
+      kubernetes: syslog.shop.svc.cluster.local:514
+    protocol: udp
+    load_balancer: p2c

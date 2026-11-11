@@ -105,7 +105,10 @@ pub(crate) fn claims(gateway: &GatewayOutcome, served: &[String]) -> Vec<TcpRout
         .filter(|listener| gateway.ports.get(&listener.port) == Some(&Protocol::Tcp))
         .filter_map(|listener| {
             let on = listener.served.as_ref().ok()?;
-            if on.iter().all(|name| served.contains(name)) {
+            // A UDP listener on the port number is served apart, on the port's `udp` one.
+            if !on.contains(&crate::listeners::name(listener.port))
+                || on.iter().all(|name| served.contains(name))
+            {
                 return None;
             }
             let stater = listener.set.as_ref().unwrap_or(&gateway.gateway);

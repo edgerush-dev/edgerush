@@ -1,0 +1,3 @@
+Gateway shop/web: listener quic: not accepted: port 443 serves HTTP/3 over UDP, as the data plane's settings have it for the HTTPS listener there
+Gateway shop/web: listener dns-again: not accepted: listener dns, which comes first, has its port, protocol and hostname
+Gateway shop/web: listener kinds: takes no route of kind gateway.networking.k8s.io/TCPRoute

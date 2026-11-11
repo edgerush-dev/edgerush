@@ -1,2 +1,2 @@
 Gateway, generation 0: Accepted=False/ListenersNotValid (no listener is accepted); ResolvedRefs=True/ResolvedRefs; nothing to program
-listener dns: no kind, attached 0: Accepted=False/UnsupportedProtocol (protocol `UDP` is not one the gateway serves); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (protocol `UDP` is not one the gateway serves)
+listener sctp: no kind, attached 0: Accepted=False/UnsupportedProtocol (protocol `SCTP` is not one the gateway serves); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (protocol `SCTP` is not one the gateway serves)

@@ -1,0 +1,144 @@
+# UDPRoutes attached to a Gateway's UDP listeners by port, by sectionName, by both and by
+# neither, as conformance has them (UDPRouteParentRefPortAndSectionName,
+# UDPRouteParentRefAttachAllListeners): each listener served by its oldest route, a later one
+# on it said and left accepted (UDPRouteMultipleRoutesAttachment), a listener no route may
+# attach to dropping its datagrams. A UDP listener shares its port number with an HTTP one, and a route
+# attached by that port takes the UDP one alone. Backends share sessions by weight
+# (UDPRouteWeightedRouting), a weight of 0 never picked, an invalid one's share of datagrams
+# dropped: missing (UDPRouteInvalidBackendRefNonexistent), of a kind not served, of a port
+# over TCP alone, or in another namespace with no ReferenceGrant from UDPRoute
+# (UDPRouteInvalidCrossNamespaceBackendRef); one with a grant reached (UDPRouteReferenceGrant).
+# A backend is its Service's UDP port of the number named, apart from a TCP one of that
+# number, its upstream named apart. A route of two rules, which only v1alpha2 writes, is not
+# accepted.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: one, port: 5300, protocol: UDP }
+    - { name: two, port: 5301, protocol: UDP }
+    - { name: three, port: 5302, protocol: UDP }
+    - { name: weighted, port: 5303, protocol: UDP }
+    - name: idle
+      port: 5304
+      protocol: UDP
+      allowedRoutes: { namespaces: { from: Selector, selector: { matchLabels: { team: dns } } } }
+    - { name: http, port: 5300, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: { name: elder, namespace: shop, creationTimestamp: "2025-06-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: one }]
+  rules:
+    - backendRefs: [{ name: dns, port: 53 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: { name: by-port, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, port: 5300 }]
+  rules:
+    - backendRefs: [{ name: syslog, port: 514 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: { name: by-section, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: two }]
+  rules:
+    - backendRefs: [{ name: dns, port: 53 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: { name: by-both, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: three, port: 5302 }]
+  rules:
+    - backendRefs: [{ name: syslog, port: 514 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: { name: weighted, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: weighted }]
+  rules:
+    - backendRefs:
+        - { name: dns, port: 53, weight: 70 }
+        - { name: syslog, port: 514, weight: 30 }
+        - { name: resolver, namespace: other, port: 53, weight: 0 }
+        - { name: not-there, port: 1, weight: 10 }
+        - { group: "", kind: ConfigMap, name: settings, port: 1, weight: 5 }
+        - { name: secret, namespace: other, port: 53, weight: 5 }
+        - { name: tcp-only, port: 53, weight: 5 }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: { name: attach-all, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web }]
+  rules:
+    - backendRefs: [{ name: dns, port: 53 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: { name: old-shape, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  parentRefs: [{ name: web, sectionName: two }]
+  rules:
+    - backendRefs: [{ name: dns, port: 53 }]
+    - backendRefs: [{ name: syslog, port: 514 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: from-shop, namespace: other }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: UDPRoute, namespace: shop }]
+  to: [{ group: "", kind: Service, name: resolver }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: { name: tcp-only, namespace: other }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: TCPRoute, namespace: shop }]
+  to: [{ group: "", kind: Service, name: secret }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: dns, namespace: shop }
+spec:
+  ports:
+    - { name: dns-tcp, port: 53 }
+    - { name: dns, port: 53, protocol: UDP, appProtocol: dns }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: syslog, namespace: shop }
+spec:
+  ports: [{ port: 514, protocol: UDP }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: tcp-only, namespace: shop }
+spec:
+  ports: [{ name: dns, port: 53, protocol: TCP }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: resolver, namespace: other }
+spec:
+  ports: [{ name: dns, port: 53, protocol: UDP }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: secret, namespace: other }
+spec:
+  ports: [{ name: dns, port: 53, protocol: UDP }]

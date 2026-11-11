@@ -631,18 +631,18 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 );
                 let report: Vec<String> =
                     translation.report.iter().map(ToString::to_string).collect();
-                // Its backend is no Service the cluster has; the TLSRoute and the TCPRoute
-                // followed reach translation, and the Gateway has no listener to take either;
-                // the BackendTLSPolicy and the ConfigMap it names reach it too, the CA read
-                // and found no certificate, so that the HTTPRoute's backend fails closed; the
-                // UDPRoute reaches it too, which does not serve it yet.
+                // Its backend is no Service the cluster has; the TLSRoute, the TCPRoute and
+                // the UDPRoute followed reach translation, and the Gateway has no listener to
+                // take any; the BackendTLSPolicy and the ConfigMap it names reach it too, the
+                // CA read and found no certificate, so that the HTTPRoute's backend fails
+                // closed.
                 assert_eq!(
                     report,
                     [
                         "TLSRoute shop/api: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
                         "TCPRoute shop/db: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
+                        "UDPRoute shop/dns: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
                         "BackendTLSPolicy shop/tls: the connections it covers fail: ConfigMap shop/ca's ca.crt is not PEM certificates",
-                        "UDPRoute shop/dns: not supported yet: UDPRoute",
                         "HTTPRoute shop/web: rule 0: a backend's share is answered 500: Service shop/web port http is covered by BackendTLSPolicy shop/tls, whose TLS cannot be had: ConfigMap shop/ca's ca.crt is not PEM certificates",
                         "GRPCRoute shop/calls: rule 0: a backend's share is answered UNAVAILABLE: Service shop/calls does not exist"
                     ]
@@ -1619,7 +1619,8 @@ spec:
   listeners:
     - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
     - { name: tls, port: 8443, protocol: TLS, tls: { mode: Passthrough }, allowedRoutes: { namespaces: { from: All } } }
-    - { name: tcp, port: 5432, protocol: TCP, allowedRoutes: { namespaces: { from: All } } }",
+    - { name: tcp, port: 5432, protocol: TCP, allowedRoutes: { namespaces: { from: All } } }
+    - { name: udp, port: 5353, protocol: UDP, allowedRoutes: { namespaces: { from: All } } }",
     )
     .unwrap();
     let app: HTTPRoute = serde_saphyr::from_str(
@@ -1683,6 +1684,14 @@ spec:
   rules: [{ backendRefs: [{ name: web, port: 80 }] }]",
     )
     .unwrap();
+    // And a UDPRoute's.
+    let dns: UDPRoute = serde_saphyr::from_str(
+        "metadata: { name: dns, namespace: shop, generation: 8, resourceVersion: '16' }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: udp }]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]",
+    )
+    .unwrap();
     // A BackendTLSPolicy the HTTPRoute reaches, its one CA certificate ref of a kind none
     // can be: its status says so of the Gateway.
     let tls: BackendTLSPolicy = serde_saphyr::from_str(
@@ -1728,6 +1737,7 @@ spec:
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/grpcroutes/gone/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/tlsroutes/tunnel/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/tcproutes/db/status",
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/udproutes/dns/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/backendtlspolicies/tls/status",
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/backendtlspolicies/old-tls/status",
     ];
@@ -1751,6 +1761,7 @@ spec:
         grpc_routes: vec![calls.clone(), gone.clone()],
         tls_routes: vec![tunnel.clone()],
         tcp_routes: vec![db.clone()],
+        udp_routes: vec![dns.clone()],
         backend_tls_policies: vec![tls.clone(), old_tls.clone(), quiet.clone()],
         ..Cluster::default()
     };
@@ -1773,6 +1784,7 @@ spec:
                      grpc_routes,
                      tls_routes,
                      tcp_routes,
+                     udp_routes,
                      policies| {
         GatewayApi {
             crds: Vec::new(),
@@ -1786,7 +1798,7 @@ spec:
             grpc_routes: Some(vec![follow_of("grpcroutes", true, grpc_routes)]),
             tls_routes: Some(vec![follow_of("tlsroutes", true, tls_routes)]),
             tcp_routes: Some(vec![follow_of("tcproutes", true, tcp_routes)]),
-            udp_routes: None,
+            udp_routes: Some(vec![follow_of("udproutes", true, udp_routes)]),
             reference_grants: None,
             backend_tls_policies: Some(vec![follow_of("backendtlspolicies", true, policies)]),
             config_maps: None,
@@ -1803,6 +1815,7 @@ spec:
         vec![calls.clone(), gone.clone()],
         vec![tunnel.clone()],
         vec![db.clone()],
+        vec![dns.clone()],
         vec![tls.clone(), old_tls.clone(), quiet.clone()],
     )
     .write_statuses(&api, &handed, &addresses, &programmed, &said)
@@ -1818,6 +1831,7 @@ spec:
             "status of GRPCRoute shop/gone",
             "status of TLSRoute shop/tunnel",
             "status of TCPRoute shop/db",
+            "status of UDPRoute shop/dns",
             "status of BackendTLSPolicy shop/tls",
             "status of BackendTLSPolicy shop/old-tls",
         ]
@@ -1842,6 +1856,7 @@ spec:
     assert_eq!(status(1)["listeners"][0]["attachedRoutes"], 2);
     assert_eq!(status(1)["listeners"][1]["attachedRoutes"], 1);
     assert_eq!(status(1)["listeners"][2]["attachedRoutes"], 1);
+    assert_eq!(status(1)["listeners"][3]["attachedRoutes"], 1);
     assert_eq!(status(1)["conditions"][0]["observedGeneration"], 2);
     assert_eq!(
         status(2)["parents"][0]["controllerName"],
@@ -1896,15 +1911,25 @@ spec:
     );
     assert_eq!(
         fake.seen()[8].path,
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/udproutes/dns/status"
+    );
+    assert_eq!(bodies[8]["kind"], "UDPRoute");
+    assert_eq!(status(8)["parents"][0]["parentRef"]["sectionName"], "udp");
+    assert_eq!(
+        status(8)["parents"][0]["conditions"][0]["observedGeneration"],
+        8
+    );
+    assert_eq!(
+        fake.seen()[9].path,
         "/apis/gateway.networking.k8s.io/v1/namespaces/shop/backendtlspolicies/tls/status"
     );
-    assert_eq!(bodies[8]["kind"], "BackendTLSPolicy");
+    assert_eq!(bodies[9]["kind"], "BackendTLSPolicy");
     assert_eq!(
-        bodies[8]["apiVersion"], "gateway.networking.k8s.io/v1",
+        bodies[9]["apiVersion"], "gateway.networking.k8s.io/v1",
         "written as of the version followed"
     );
     assert_eq!(
-        status(8)["ancestors"],
+        status(9)["ancestors"],
         serde_json::json!([{
             "ancestorRef": {
                 "group": "gateway.networking.k8s.io",
@@ -1912,11 +1937,11 @@ spec:
                 "name": "web",
                 "namespace": "edge",
             },
-            "conditions": status(8)["ancestors"][0]["conditions"].clone(),
+            "conditions": status(9)["ancestors"][0]["conditions"].clone(),
             "controllerName": GATEWAY_CONTROLLER,
         }])
     );
-    let conditions: Vec<(&str, &str, &str, i64)> = status(8)["ancestors"][0]["conditions"]
+    let conditions: Vec<(&str, &str, &str, i64)> = status(9)["ancestors"][0]["conditions"]
         .as_array()
         .unwrap()
         .iter()
@@ -1937,12 +1962,12 @@ spec:
         ]
     );
     assert_eq!(
-        status(9)["ancestors"],
+        status(10)["ancestors"],
         serde_json::to_value(&old_tls.status.as_ref().unwrap().ancestors[1..]).unwrap()
     );
     // Read back as written, every status says what it should: nothing more is written.
     let (mut class, mut gateway, mut app, mut old) = (class, gateway, app, old);
-    let (mut calls, mut gone, mut tunnel, mut db) = (calls, gone, tunnel, db);
+    let (mut calls, mut gone, mut tunnel, mut db, mut dns) = (calls, gone, tunnel, db, dns);
     let (mut tls, mut old_tls) = (tls, old_tls);
     class.status = serde_json::from_value(bodies[0]["status"].clone()).unwrap();
     gateway.status = serde_json::from_value(bodies[1]["status"].clone()).unwrap();
@@ -1952,8 +1977,9 @@ spec:
     gone.status = serde_json::from_value(bodies[5]["status"].clone()).unwrap();
     tunnel.status = serde_json::from_value(bodies[6]["status"].clone()).unwrap();
     db.status = serde_json::from_value(bodies[7]["status"].clone()).unwrap();
-    tls.status = serde_json::from_value(bodies[8]["status"].clone()).unwrap();
-    old_tls.status = serde_json::from_value(bodies[9]["status"].clone()).unwrap();
+    dns.status = serde_json::from_value(bodies[8]["status"].clone()).unwrap();
+    tls.status = serde_json::from_value(bodies[9]["status"].clone()).unwrap();
+    old_tls.status = serde_json::from_value(bodies[10]["status"].clone()).unwrap();
     following(
         vec![class],
         vec![gateway],
@@ -1961,11 +1987,12 @@ spec:
         vec![calls, gone],
         vec![tunnel],
         vec![db],
+        vec![dns],
         vec![tls, old_tls, quiet],
     )
     .write_statuses(&api, &handed, &addresses, &programmed, &said)
     .await;
-    assert_eq!(fake.seen().len(), 10, "a status written again");
+    assert_eq!(fake.seen().len(), 11, "a status written again");
 }
 
 #[test]
