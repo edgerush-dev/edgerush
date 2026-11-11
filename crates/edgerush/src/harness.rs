@@ -957,7 +957,7 @@ impl Listening<'_> {
             .filter(|bound| bound.draining.is_none())
             .filter(|bound| {
                 let kept = config.listeners().iter().find(|l| l.name == bound.name);
-                kept.is_none_or(|kept| kept.address != bound.address)
+                kept.is_none_or(|kept| !bound.keeps_its_sockets_as(kept))
             })
             .map(|bound| bound.name.clone())
             .collect();
@@ -1646,6 +1646,14 @@ impl From<&edgerush_config::CompiledListener> for Bound {
 }
 
 impl Bound {
+    /// Whether `listener`, of its name in a new config, is served on its sockets: on the
+    /// same address and the same transport. One moved, or turned between `udp` and a
+    /// TCP-based protocol, is one gone and one added (03 §10).
+    fn keeps_its_sockets_as(&self, listener: &edgerush_config::CompiledListener) -> bool {
+        self.address == listener.address
+            && self.udp == (listener.protocol == edgerush_config::Protocol::Udp)
+    }
+
     /// Whether its sockets and `other`'s, on one address, would be on one port of one
     /// transport: TCP for every listener but a `udp` one, UDP for that one and for HTTP/3,
     /// draining HTTP/3 among it. A `udp` listener and a TCP-based one share an address
@@ -1732,7 +1740,7 @@ fn http3_turned(bound: &[Bound], config: &Compiled) -> Vec<(String, bool)> {
             let kept = bound.iter().find(|bound| {
                 bound.name == listener.name
                     && bound.draining.is_none()
-                    && bound.address == listener.address
+                    && bound.keeps_its_sockets_as(listener)
             })?;
             let on = listener.http3.is_some();
             (kept.http3 != on).then(|| (listener.name.clone(), on))
@@ -2159,6 +2167,20 @@ upstreams: {{}}
         };
         assert_eq!(what, "listener \"secure\"");
         assert_eq!(address, named);
+    }
+
+    /// A listener serving HTTP/3 that a config turns to `udp` on its address is taken away
+    /// whole, its HTTP/3 with it: not turned off as well, as if its TCP side were kept.
+    #[test]
+    fn http3_is_not_turned_off_for_a_listener_turned_to_udp() {
+        let address: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let yaml = format!(
+            "routes: []\nupstreams: {{}}\nlisteners:\n  secure: {{ address: \"{address}\", protocol: udp, session_idle_seconds: 1 }}\n"
+        );
+        let config = compile(&serde_saphyr::from_str(&yaml).unwrap()).unwrap();
+        let bound = with_http3(address);
+        assert!(!bound.keeps_its_sockets_as(&config.listeners()[0]));
+        assert_eq!(http3_turned(&[bound], &config), Vec::new());
     }
 
     /// HTTP/3 turned on again while its drain from being turned off is under way waits for
