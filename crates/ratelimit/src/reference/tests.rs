@@ -279,18 +279,24 @@ fn from(from: u64, times: Vec<u64>) -> Vec<u64> {
     times.into_iter().map(|at| at + from).collect()
 }
 
-/// Two copies of `model`: one that took `before`, reserved a request `gap` later, took
-/// `between` and released the reservation; and one that took `before` and only what the
-/// first admitted of `between`, charged without asking. The first is `None` if the
-/// reservation found no room. Also returns the latest time either saw.
-fn released(model: Any, before: &[u64], gap: u64, between: Vec<u64>) -> (Option<Any>, Any, u64) {
+/// Two copies of `model`: one that took `before`, reserved a request at the first moment
+/// with room from `gap` later on, took `between` and released the reservation; and one
+/// that took `before` and only what the first admitted of `between`, charged without
+/// asking. Also returns the latest time either saw.
+///
+/// Waiting for room, rather than giving up on an input that finds none, keeps every input
+/// in play however many cases are run, and puts reservations on the moment a window
+/// frees up.
+fn released(model: Any, before: &[u64], gap: u64, between: Vec<u64>) -> (Any, Any, u64) {
     let (mut with, mut without) = (model.clone(), model);
     run(&mut with, before);
     run(&mut without, before);
-    let reserved = before.last().unwrap() + gap;
-    if !with.admits(reserved) {
-        return (None, without, reserved);
-    }
+    let at = before.last().unwrap() + gap;
+    let reserved = with.retry_at(at).unwrap_or(at);
+    assert!(
+        with.admits(reserved),
+        "no room at {reserved}, the time to retry"
+    );
     let receipt = with.charge(reserved);
     let between = from(reserved, between);
     for (&at, admitted) in between.iter().zip(run(&mut with, &between)) {
@@ -299,7 +305,7 @@ fn released(model: Any, before: &[u64], gap: u64, between: Vec<u64>) -> (Option<
         }
     }
     with.release(receipt);
-    (Some(with), without, *between.last().unwrap())
+    (with, without, *between.last().unwrap())
 }
 
 /// A token bucket with a history behind it, owing up to `owed` more charged at its end,
@@ -613,9 +619,7 @@ proptest! {
         kind in prop::sample::select(vec![0u8, 2, 3]), limit in 1u64..8, window in 1u64..2000,
         before in arrivals(), gap in 0u64..3000, between in arrivals(), rest in arrivals(),
     ) {
-        let (with, mut without, latest) = released(make(kind, limit, window, 1), &before, gap, between);
-        prop_assume!(with.is_some());
-        let mut with = with.unwrap();
+        let (mut with, mut without, latest) = released(make(kind, limit, window, 1), &before, gap, between);
         prop_assert_eq!(with.remaining(latest), without.remaining(latest));
         prop_assert_eq!(with.retry_at(latest), without.retry_at(latest));
         let rest = from(latest, rest);
@@ -629,8 +633,7 @@ proptest! {
         before in arrivals(), gap in 0u64..3000, between in arrivals(),
     ) {
         let (with, without, now) = released(make(4, limit, window, capacity), &before, gap, between);
-        prop_assume!(with.is_some());
-        let (got, owed) = (with.unwrap().remaining(now), without.remaining(now));
+        let (got, owed) = (with.remaining(now), without.remaining(now));
         prop_assert!(owed <= got && got <= owed + 1, "{} remaining after the release, {} without the charge", got, owed);
     }
 }
