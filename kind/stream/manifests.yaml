@@ -109,6 +109,7 @@ rules:
       - grpcroutes.gateway.networking.k8s.io
       - tlsroutes.gateway.networking.k8s.io
       - tcproutes.gateway.networking.k8s.io
+      - udproutes.gateway.networking.k8s.io
       - backendtlspolicies.gateway.networking.k8s.io
       - httproutes.gateway.networking.k8s.io
       - referencegrants.gateway.networking.k8s.io
@@ -128,7 +129,7 @@ rules:
     resources: [ingresses]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [listenersets, grpcroutes, httproutes, referencegrants, tlsroutes, tcproutes, backendtlspolicies]
+    resources: [listenersets, grpcroutes, httproutes, referencegrants, tlsroutes, tcproutes, udproutes, backendtlspolicies]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
     resources: [listenersets/status, grpcroutes/status, httproutes/status, tlsroutes/status, tcproutes/status, backendtlspolicies/status]
@@ -154,7 +155,7 @@ rules:
     resources: [ingresses]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [listenersets, grpcroutes, httproutes, referencegrants, tlsroutes, tcproutes, backendtlspolicies]
+    resources: [listenersets, grpcroutes, httproutes, referencegrants, tlsroutes, tcproutes, udproutes, backendtlspolicies]
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
     resources: [listenersets/status, grpcroutes/status, httproutes/status, tlsroutes/status, tcproutes/status, backendtlspolicies/status]

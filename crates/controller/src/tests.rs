@@ -345,6 +345,7 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
         grpc_routes: None,
         tls_routes: None,
         tcp_routes: None,
+        udp_routes: None,
         reference_grants: None,
         backend_tls_policies: None,
         config_maps: None,
@@ -498,6 +499,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 200,
                 r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"db","namespace":"shop"},"spec":{"parentRefs":[{"name":"web","namespace":"edge"}],"rules":[{"backendRefs":[{"name":"db","port":5432}]}]}}]}"#,
             )
+        } else if named(GatewayKind::UDPRoute) {
+            page(&[crd(GatewayKind::UDPRoute, &["v1"])])
+        } else if path.starts_with(&format!("{gateway_api}udproutes?")) {
+            answer(
+                200,
+                r#"{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"dns","namespace":"shop"},"spec":{"parentRefs":[{"name":"web","namespace":"edge"}],"rules":[{"backendRefs":[{"name":"dns","port":53}]}]}}]}"#,
+            )
         } else if named(GatewayKind::BackendTLSPolicy) {
             page(&[crd(GatewayKind::BackendTLSPolicy, &["v1"])])
         } else if path.starts_with(&format!("{gateway_api}backendtlspolicies?")) {
@@ -563,6 +571,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
              grpcroutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              tlsroutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              tcproutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
+             udproutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0); \
              referencegrants.gateway.networking.k8s.io: not served at v1 (only v1beta1; Gateway API v1.7.0), \
              so taken as having no objects; \
              backendtlspolicies.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)"
@@ -579,7 +588,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
             .filter(|line| {
                 line.starts_with("waiting on ")
                     && line.contains(
-                        "gatewayclasses in the cluster, gateways in edge, listenersets in the cluster, httproutes in the cluster, grpcroutes in the cluster, tlsroutes in the cluster, tcproutes in the cluster",
+                        "gatewayclasses in the cluster, gateways in edge, listenersets in the cluster, httproutes in the cluster, grpcroutes in the cluster, tlsroutes in the cluster, tcproutes in the cluster, udproutes in the cluster",
                     )
             })
             .count()
@@ -625,13 +634,15 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 // Its backend is no Service the cluster has; the TLSRoute and the TCPRoute
                 // followed reach translation, and the Gateway has no listener to take either;
                 // the BackendTLSPolicy and the ConfigMap it names reach it too, the CA read
-                // and found no certificate, so that the HTTPRoute's backend fails closed.
+                // and found no certificate, so that the HTTPRoute's backend fails closed; the
+                // UDPRoute reaches it too, which does not serve it yet.
                 assert_eq!(
                     report,
                     [
                         "TLSRoute shop/api: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
                         "TCPRoute shop/db: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace",
                         "BackendTLSPolicy shop/tls: the connections it covers fail: ConfigMap shop/ca's ca.crt is not PEM certificates",
+                        "UDPRoute shop/dns: not supported yet: UDPRoute",
                         "HTTPRoute shop/web: rule 0: a backend's share is answered 500: Service shop/web port http is covered by BackendTLSPolicy shop/tls, whose TLS cannot be had: ConfigMap shop/ca's ca.crt is not PEM certificates",
                         "GRPCRoute shop/calls: rule 0: a backend's share is answered UNAVAILABLE: Service shop/calls does not exist"
                     ]
@@ -665,6 +676,13 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                     .path
                     .starts_with("/apis/gateway.networking.k8s.io/v1/tcproutes?")),
                 "TCPRoutes never listed"
+            );
+            // UDPRoutes likewise.
+            assert!(
+                fake.seen().iter().any(|seen| seen
+                    .path
+                    .starts_with("/apis/gateway.networking.k8s.io/v1/udproutes?")),
+                "UDPRoutes never listed"
             );
             // BackendTLSPolicies likewise, and the ConfigMaps with them.
             for listed in [
@@ -1768,6 +1786,7 @@ spec:
             grpc_routes: Some(vec![follow_of("grpcroutes", true, grpc_routes)]),
             tls_routes: Some(vec![follow_of("tlsroutes", true, tls_routes)]),
             tcp_routes: Some(vec![follow_of("tcproutes", true, tcp_routes)]),
+            udp_routes: None,
             reference_grants: None,
             backend_tls_policies: Some(vec![follow_of("backendtlspolicies", true, policies)]),
             config_maps: None,

@@ -27,6 +27,7 @@ use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
+use edgerush_gateway_api::udp_route::UDPRoute;
 use edgerush_kubernetes::{ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow};
 use edgerush_translate::{
     Cluster, GatewayName, GatewayStatus, Object, Plane, PolicyStatus, RouteStatus, Translation,
@@ -463,6 +464,7 @@ struct GatewayApi {
     grpc_routes: Option<Vec<Follow<GRPCRoute>>>,
     tls_routes: Option<Vec<Follow<TLSRoute>>>,
     tcp_routes: Option<Vec<Follow<TCPRoute>>>,
+    udp_routes: Option<Vec<Follow<UDPRoute>>>,
     reference_grants: Option<Vec<Follow<ReferenceGrant>>>,
     backend_tls_policies: Option<Vec<Follow<BackendTLSPolicy>>>,
     /// The ConfigMaps of the watch scope, followed while BackendTLSPolicies are, for the
@@ -494,6 +496,7 @@ impl GatewayApi {
             grpc_routes: None,
             tls_routes: None,
             tcp_routes: None,
+            udp_routes: None,
             reference_grants: None,
             backend_tls_policies: None,
             config_maps: None,
@@ -513,9 +516,9 @@ impl GatewayApi {
 
     /// Follows each kind `served` says is served, in `scope` (GatewayClasses in the
     /// cluster, Gateways in the data plane's Gateway's namespace; ListenerSets, HTTPRoutes,
-    /// GRPCRoutes, TLSRoutes, TCPRoutes, ReferenceGrants and BackendTLSPolicies in `scope`,
-    /// with the ConfigMaps there while BackendTLSPolicies are), and stops following each it
-    /// says is not.
+    /// GRPCRoutes, TLSRoutes, TCPRoutes, UDPRoutes, ReferenceGrants and BackendTLSPolicies
+    /// in `scope`, with the ConfigMaps there while BackendTLSPolicies are), and stops
+    /// following each it says is not.
     fn follow(&mut self, served: &[(GatewayKind, Served)], start: &mut Start<'_>, scope: &[Scope]) {
         for (kind, served) in served {
             let on = served.is_served();
@@ -537,6 +540,7 @@ impl GatewayApi {
                 GatewayKind::GRPCRoute => keep(&mut self.grpc_routes, on, || start.follows(scope)),
                 GatewayKind::TLSRoute => keep(&mut self.tls_routes, on, || start.follows(scope)),
                 GatewayKind::TCPRoute => keep(&mut self.tcp_routes, on, || start.follows(scope)),
+                GatewayKind::UDPRoute => keep(&mut self.udp_routes, on, || start.follows(scope)),
                 GatewayKind::ReferenceGrant => {
                     keep(&mut self.reference_grants, on, || start.follows(scope));
                 }
@@ -566,6 +570,7 @@ impl GatewayApi {
             .chain(unlisted(self.grpc_routes.as_deref().unwrap_or_default()))
             .chain(unlisted(self.tls_routes.as_deref().unwrap_or_default()))
             .chain(unlisted(self.tcp_routes.as_deref().unwrap_or_default()))
+            .chain(unlisted(self.udp_routes.as_deref().unwrap_or_default()))
             .chain(unlisted(
                 self.reference_grants.as_deref().unwrap_or_default(),
             ))
@@ -957,6 +962,7 @@ impl Followed {
             grpc_routes: of(gateway_api.and_then(|g| g.grpc_routes.as_ref())),
             tls_routes: of(gateway_api.and_then(|g| g.tls_routes.as_ref())),
             tcp_routes: of(gateway_api.and_then(|g| g.tcp_routes.as_ref())),
+            udp_routes: of(gateway_api.and_then(|g| g.udp_routes.as_ref())),
             reference_grants: of(gateway_api.and_then(|g| g.reference_grants.as_ref())),
             backend_tls_policies: of(gateway_api.and_then(|g| g.backend_tls_policies.as_ref())),
             config_maps: of(gateway_api.and_then(|g| g.config_maps.as_ref())),

@@ -33,6 +33,8 @@ pub enum GatewayKind {
     TLSRoute,
     /// `TCPRoute`.
     TCPRoute,
+    /// `UDPRoute`.
+    UDPRoute,
     /// `ReferenceGrant`.
     ReferenceGrant,
     /// `BackendTLSPolicy`.
@@ -41,7 +43,7 @@ pub enum GatewayKind {
 
 impl GatewayKind {
     /// Every kind followed, in the order said.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::GatewayClass,
         Self::Gateway,
         Self::ListenerSet,
@@ -49,6 +51,7 @@ impl GatewayKind {
         Self::GRPCRoute,
         Self::TLSRoute,
         Self::TCPRoute,
+        Self::UDPRoute,
         Self::ReferenceGrant,
         Self::BackendTLSPolicy,
     ];
@@ -64,6 +67,7 @@ impl GatewayKind {
             Self::GRPCRoute => "grpcroutes.gateway.networking.k8s.io",
             Self::TLSRoute => "tlsroutes.gateway.networking.k8s.io",
             Self::TCPRoute => "tcproutes.gateway.networking.k8s.io",
+            Self::UDPRoute => "udproutes.gateway.networking.k8s.io",
             Self::ReferenceGrant => "referencegrants.gateway.networking.k8s.io",
             Self::BackendTLSPolicy => "backendtlspolicies.gateway.networking.k8s.io",
         }
@@ -135,6 +139,7 @@ impl GatewayKind {
             Self::GRPCRoute => "GRPCRoute",
             Self::TLSRoute => "TLSRoute",
             Self::TCPRoute => "TCPRoute",
+            Self::UDPRoute => "UDPRoute",
             Self::ReferenceGrant => "ReferenceGrant",
             Self::BackendTLSPolicy => "BackendTLSPolicy",
         }
@@ -279,6 +284,7 @@ mod tests {
                 "grpcroutes.gateway.networking.k8s.io",
                 "tlsroutes.gateway.networking.k8s.io",
                 "tcproutes.gateway.networking.k8s.io",
+                "udproutes.gateway.networking.k8s.io",
                 "referencegrants.gateway.networking.k8s.io",
                 "backendtlspolicies.gateway.networking.k8s.io",
             ]

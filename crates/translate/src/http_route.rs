@@ -22,6 +22,7 @@ use edgerush_gateway_api::http_route::{
 };
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
+use edgerush_gateway_api::udp_route::UDPRoute;
 use k8s_openapi::api::networking::v1::{IngressBackend, IngressServiceBackend, ServiceBackendPort};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::{BTreeMap, BTreeSet};
@@ -209,6 +210,16 @@ impl<'a> Routed<'a> {
     pub(crate) fn tcp(route: &'a TCPRoute) -> Self {
         Self {
             kind: "TCPRoute",
+            metadata: &route.metadata,
+            parents: parent_refs!(route.spec.parent_refs),
+            hostnames: &[],
+        }
+    }
+
+    /// A UDPRoute as attachment reads it: it has no hostnames.
+    pub(crate) fn udp(route: &'a UDPRoute) -> Self {
+        Self {
+            kind: "UDPRoute",
             metadata: &route.metadata,
             parents: parent_refs!(route.spec.parent_refs),
             hostnames: &[],
