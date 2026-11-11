@@ -503,6 +503,42 @@ fn proxy_serves_a_udp_listener_beside_a_tcp_one_and_follows_it() -> io::Result<(
     Ok(())
 }
 
+/// A listener a reload turns from a TCP-based protocol to `udp`, or back, keeping its name
+/// and address, is one taken away and one added, as a listener moved is (03 §10): its
+/// old sockets drained, then sockets of its new transport opened, and it is served on them.
+#[test]
+fn proxy_follows_a_listener_turned_between_tcp_and_udp() -> io::Result<()> {
+    let (one, echo) = (upstream("one")?, udp_echo()?);
+    let at = free_over_udp_and_tcp()?;
+    let over_tcp = config(&at.to_string(), "up", Some(one));
+    // A second's idle bound: its session ends idle, long before the drain's bound.
+    let over_udp = format!(
+        "upstreams:\n  echo: {{ protocol: udp, load_balancer: p2c, endpoints: {{ listed: [\"{echo}\"] }} }}\n\
+         routes: []\n\
+         udp_routes: [{{ name: dns, listeners: [web], backends: [{{ upstream: echo, weight: 1 }}] }}]\n\
+         listeners:\n  web: {{ address: \"{at}\", protocol: udp, session_idle_seconds: 1 }}\n"
+    );
+    let file = scratch("tcp-to-udp.yaml");
+    std::fs::write(&file, &over_tcp)?;
+    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
+    assert_eq!(harness.address_after("listener \"web\" is on "), at);
+    harness.wait_for("1 worker, thread-per-core");
+    assert!(get(at, "/")?.contains("x-upstream: one"));
+
+    std::fs::write(&file, &over_udp)?;
+    harness.wait_for("listener \"web\" has drained");
+    let on_udp = format!("listener \"web\" is on {at}, over UDP");
+    assert_eq!(harness.wait_for("listener \"web\" is on "), on_udp);
+    assert_eq!(udp_exchange(at, b"over UDP")?, b"over UDP");
+    assert!(refused_soon(at), "still listened on over TCP");
+
+    std::fs::write(&file, &over_tcp)?;
+    harness.wait_for("listener \"web\" has drained");
+    assert_eq!(harness.address_after("listener \"web\" is on "), at);
+    assert!(get(at, "/")?.contains("x-upstream: one"));
+    Ok(())
+}
+
 /// A `udp` listener a reload keeps keeps its socket and its sessions: a client sending all
 /// through reload after reload is answered every time, by the endpoint its session was made
 /// for, though the reloads gave most of the weight to another upstream; new clients go to
