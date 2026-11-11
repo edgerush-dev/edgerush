@@ -21,7 +21,10 @@
 //! Where its listener says how many answers a session expects for each datagram (24 §3), a
 //! session counts the datagrams that went to its endpoint and the answers that came back,
 //! and says when the answers are that many for each datagram, for the caller to end it; it
-//! keeps the count it was made with, as it keeps its idle bound.
+//! keeps the count it was made with, as it keeps its idle bound. The idle bound is held in
+//! whole seconds, as a listener's config gives it, so that it and the counts take the room
+//! a `Duration` alone would: a session of a listener that counts nothing is no larger for
+//! the counting.
 //!
 //! Nothing here reads a clock, draws a random number or touches a socket: the time and the
 //! randomness are handed in, and what a session holds of its own is the caller's.
@@ -71,12 +74,12 @@ fn bits(ip: IpAddr) -> u128 {
 pub struct Session<T> {
     backend: Destination,
     deadline: Key,
-    /// Its idle bound: its listener's when it was made.
-    idle: Duration,
     /// When it ends however busy it is, once it drains.
     drain_by: Option<Instant>,
-    /// What it counts toward ending on its answers, where its listener expects them.
-    answers: Option<Answers>,
+    /// Its idle bound, in seconds: its listener's when it was made.
+    idle: u32,
+    /// What it counts toward ending on its answers.
+    answers: Answers,
     /// The connection it counts as, given back when it ends: held for its drop alone.
     _held: Held,
     value: T,
@@ -85,8 +88,9 @@ pub struct Session<T> {
 /// A session's datagrams and answers, counted toward its end (24 §3).
 #[derive(Debug, Clone, Copy)]
 struct Answers {
-    /// The answers it expects for each datagram.
-    each: NonZeroU32,
+    /// The answers it expects for each datagram; `None` where its listener expects no
+    /// number, and nothing is counted.
+    each: Option<NonZeroU32>,
     /// Its client's datagrams that went to its endpoint.
     sent: u32,
     /// Its endpoint's answers read.
@@ -113,7 +117,8 @@ impl<T> Session<T> {
 
     /// One of its client's datagrams went to its endpoint: an answer more to wait for.
     pub fn sent(&mut self) {
-        if let Some(answers) = &mut self.answers {
+        let answers = &mut self.answers;
+        if answers.each.is_some() {
             answers.sent = answers.sent.saturating_add(1);
         }
     }
@@ -123,12 +128,13 @@ impl<T> Session<T> {
     /// whose listener expects no number, nor before a datagram has gone: what comes before
     /// is nothing its client asked for.
     pub fn answered(&mut self) -> bool {
-        let Some(answers) = &mut self.answers else {
+        let answers = &mut self.answers;
+        let Some(each) = answers.each else {
             return false;
         };
         answers.read = answers.read.saturating_add(1);
         answers.sent > 0
-            && u64::from(answers.read) >= u64::from(answers.each.get()) * u64::from(answers.sent)
+            && u64::from(answers.read) >= u64::from(each.get()) * u64::from(answers.sent)
     }
 }
 
@@ -161,8 +167,8 @@ pub struct Sessions<T> {
     /// them choose which ones collide.
     by_client: HashMap<Client, Session<T>>,
     deadlines: Heap<Client>,
-    /// The idle bound of the sessions made from now on.
-    idle: Duration,
+    /// The idle bound of the sessions made from now on, in seconds.
+    idle: u32,
     /// The answers they expect for each datagram, if their listener says.
     answers: Option<NonZeroU32>,
     /// Every session drains, and none is made.
@@ -176,10 +182,10 @@ pub struct Sessions<T> {
 }
 
 impl<T> Sessions<T> {
-    /// No sessions yet, of a listener whose idle bound is `idle`, counted as connections of
-    /// `worker`'s on `listener` in `loads`.
+    /// No sessions yet, of a listener whose idle bound is `idle` seconds, counted as
+    /// connections of `worker`'s on `listener` in `loads`.
     #[must_use]
-    pub fn new(idle: Duration, loads: Arc<Loads>, worker: usize, listener: usize) -> Self {
+    pub fn new(idle: u32, loads: Arc<Loads>, worker: usize, listener: usize) -> Self {
         Self {
             by_client: HashMap::new(),
             deadlines: Heap::default(),
@@ -228,13 +234,13 @@ impl<T> Sessions<T> {
                 let session = vacant.insert(Session {
                     backend,
                     deadline: self.deadlines.add(client),
-                    idle: self.idle,
                     drain_by: None,
-                    answers: self.answers.map(|each| Answers {
-                        each,
+                    idle: self.idle,
+                    answers: Answers {
+                        each: self.answers,
                         sent: 0,
                         read: 0,
-                    }),
+                    },
                     _held: held,
                     value,
                 });
@@ -253,8 +259,9 @@ impl<T> Sessions<T> {
         Some(session)
     }
 
-    /// The idle bound of the sessions made from now on; those there are keep theirs.
-    pub fn set_idle(&mut self, idle: Duration) {
+    /// The idle bound of the sessions made from now on, in seconds; those there are keep
+    /// theirs.
+    pub fn set_idle(&mut self, idle: u32) {
         self.idle = idle;
     }
 
@@ -364,7 +371,8 @@ impl<T> Sessions<T> {
 /// then unless its drain's bound comes first.
 fn touch<T>(deadlines: &mut Heap<Client>, session: &Session<T>, now: Instant) {
     // An idle bound past what the clock can count to is one never reached.
-    let due = match (now.checked_add(session.idle), session.drain_by) {
+    let idle = Duration::from_secs(u64::from(session.idle));
+    let due = match (now.checked_add(idle), session.drain_by) {
         (Some(idle), Some(by)) => idle.min(by),
         (Some(due), None) | (None, Some(due)) => due,
         (None, None) => return,
@@ -383,6 +391,12 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV6};
 
     const IDLE: Duration = Duration::from_secs(60);
+
+    /// `idle` in the whole seconds a listener's idle bound is given in.
+    fn seconds(idle: Duration) -> u32 {
+        assert_eq!(idle.subsec_nanos(), 0, "whole seconds");
+        u32::try_from(idle.as_secs()).unwrap()
+    }
 
     fn client(port: u16) -> Client {
         Client {
@@ -403,7 +417,10 @@ mod tests {
     /// Sessions of the one worker's one listener, with room for `cap`.
     fn sessions(cap: usize) -> (Sessions<u32>, Arc<Loads>) {
         let loads = Loads::new(1, cap, QUIC_MOST, 1);
-        (Sessions::new(IDLE, Arc::clone(&loads), 0, 0), loads)
+        (
+            Sessions::new(seconds(IDLE), Arc::clone(&loads), 0, 0),
+            loads,
+        )
     }
 
     fn opened(_: Destination) -> Result<u32, ()> {
@@ -599,9 +616,9 @@ mod tests {
         let backends = backends(&[1]);
         let start = Instant::now();
         assert!(datagram(&mut sessions, client(1), start, &backends, 0).is_ok());
-        sessions.set_idle(IDLE * 2);
+        sessions.set_idle(seconds(IDLE * 2));
         assert!(datagram(&mut sessions, client(2), start, &backends, 0).is_ok());
-        sessions.set_idle(IDLE / 2);
+        sessions.set_idle(seconds(IDLE / 2));
         // Heard from again, each is kept for its own bound from then.
         let heard = start + IDLE / 4;
         assert!(sessions.heard(&client(1), heard).is_some());
@@ -674,6 +691,19 @@ mod tests {
         assert!(answered(&mut sessions, client(1)));
         assert!(!answered(&mut sessions, client(2)));
         assert!(!answered(&mut sessions, client(3)));
+    }
+
+    /// A session's answer counts cost nothing in room, counted or not: with its idle bound
+    /// they take what the idle bound took as a `Duration`, so that a session is the size of
+    /// what it held before it counted answers.
+    #[test]
+    fn a_session_is_no_larger_for_its_answer_counts() {
+        let before = size_of::<Destination>()
+            + size_of::<Key>()
+            + size_of::<Duration>()
+            + size_of::<Option<Instant>>()
+            + size_of::<Held>();
+        assert_eq!(size_of::<Session<()>>(), before);
     }
 
     /// A drained session ends at its drain's bound however busy it is, or at its idle bound
@@ -846,7 +876,7 @@ mod tests {
         assert_eq!(ended(&mut sessions, later + IDLE), [client(1)]);
     }
 
-    /// What may happen to a listener's sessions, a number of milliseconds after the last.
+    /// What may happen to a listener's sessions, a number of seconds after the last.
     #[derive(Debug, Clone)]
     enum Op {
         Datagram {
@@ -906,7 +936,7 @@ mod tests {
     }
 
     /// A client in the model: its backend, the last time anything was heard of it, its idle
-    /// bound and when it ends draining, all in milliseconds.
+    /// bound and when it ends draining, all in seconds.
     #[derive(Debug, Clone, Copy)]
     struct Modelled {
         backend: usize,
@@ -957,21 +987,20 @@ mod tests {
         #[test]
         fn sessions_are_what_a_list_of_clients_and_their_last_times_says(
             weights in prop::collection::vec(0_u32..4, 1..5),
-            idle_ms in 1_u64..3000,
+            idle_s in 1_u32..3000,
             cap in 0_usize..6,
             ops in prop::collection::vec(op(), 1..60),
         ) {
-            let idle = Duration::from_millis(idle_ms);
             let loads = Loads::new(1, cap, QUIC_MOST, 1);
-            let mut sessions = Sessions::<u8>::new(idle, Arc::clone(&loads), 0, 0);
+            let mut sessions = Sessions::<u8>::new(idle_s, Arc::clone(&loads), 0, 0);
             let backends = backends(&weights);
             let start = Instant::now();
             // The model: each client with a session, and the idle bound and drain of those
             // made from now.
             let mut model: BTreeMap<u8, Modelled> = BTreeMap::new();
-            let mut idle_ms = idle_ms;
+            let mut idle_s = u64::from(idle_s);
             let mut draining = false;
-            let mut now_ms = 0;
+            let mut now_s = 0;
             for op in ops {
                 let (Op::Datagram { after, .. }
                 | Op::Answered { after, .. }
@@ -980,17 +1009,17 @@ mod tests {
                 | Op::Drain { after, .. }
                 | Op::DrainEvery { after, .. }
                 | Op::EndWhere { after, .. }) = op;
-                now_ms += after;
-                let now = start + Duration::from_millis(now_ms);
+                now_s += after;
+                let now = start + Duration::from_secs(now_s);
 
                 let mut expired: Vec<(Client, Ended)> = Vec::new();
                 sessions.expire(now, |client, _, how| expired.push((client, how)));
                 expired.sort_by_key(|(client, _)| (client.local, client.peer));
                 let mut due: Vec<(Client, Ended)> = model
                     .iter()
-                    .filter_map(|(client, modelled)| Some((numbered(*client), modelled.ended(now_ms)?)))
+                    .filter_map(|(client, modelled)| Some((numbered(*client), modelled.ended(now_s)?)))
                     .collect();
-                model.retain(|_, modelled| modelled.ended(now_ms).is_none());
+                model.retain(|_, modelled| modelled.ended(now_s).is_none());
                 due.sort_by_key(|(client, _)| (client.local, client.peer));
                 prop_assert_eq!(expired, due);
 
@@ -1002,7 +1031,7 @@ mod tests {
                             .arrived(numbered(client), now, &backends, || random, |_| Ok::<_, ()>(client))
                             .map(|session| (session.backend(), *session.value_mut()));
                         let expected = if let Some(modelled) = model.get_mut(&client) {
-                            modelled.last = now_ms;
+                            modelled.last = now_s;
                             Ok(modelled.backend)
                         } else if draining {
                             Err(Dropped::Draining)
@@ -1011,7 +1040,7 @@ mod tests {
                                 None => Err(Dropped::NoBackend),
                                 Some(_) if model.len() == cap => Err(Dropped::NoRoom),
                                 Some(backend) => {
-                                    model.insert(client, Modelled { backend, last: now_ms, idle: idle_ms, drain_by: None });
+                                    model.insert(client, Modelled { backend, last: now_s, idle: idle_s, drain_by: None });
                                     Ok(backend)
                                 }
                             }
@@ -1023,7 +1052,7 @@ mod tests {
                     Op::Answered { client, .. } => {
                         let found = sessions.heard(&numbered(client), now).map(|session| session.backend());
                         let expected = model.get_mut(&client).map(|modelled| {
-                            modelled.last = now_ms;
+                            modelled.last = now_s;
                             Destination::Upstream(UpstreamId(modelled.backend))
                         });
                         prop_assert_eq!(found, expected);
@@ -1036,12 +1065,12 @@ mod tests {
                         prop_assert_eq!(found, expected);
                     }
                     Op::Idle { idle, .. } => {
-                        sessions.set_idle(Duration::from_millis(idle));
-                        idle_ms = idle;
+                        sessions.set_idle(u32::try_from(idle).unwrap());
+                        idle_s = idle;
                     }
                     Op::Drain { which, within, .. } => {
-                        let by = now_ms + within;
-                        sessions.drain(start + Duration::from_millis(by), |session| picked(which, *session.value()));
+                        let by = now_s + within;
+                        sessions.drain(start + Duration::from_secs(by), |session| picked(which, *session.value()));
                         for (client, modelled) in &mut model {
                             if picked(which, *client) && modelled.drain_by.is_none() {
                                 modelled.drain_by = Some(by);
@@ -1049,8 +1078,8 @@ mod tests {
                         }
                     }
                     Op::DrainEvery { within, .. } => {
-                        let by = now_ms + within;
-                        sessions.drain_every(start + Duration::from_millis(by));
+                        let by = now_s + within;
+                        sessions.drain_every(start + Duration::from_secs(by));
                         draining = true;
                         for modelled in model.values_mut() {
                             modelled.drain_by.get_or_insert(by);
@@ -1074,7 +1103,7 @@ mod tests {
                 match (sessions.soonest(), first_due) {
                     (None, None) => {}
                     (Some(soonest), Some(due)) => prop_assert!(
-                        soonest <= start + Duration::from_millis(due),
+                        soonest <= start + Duration::from_secs(due),
                         "the soonest bound is never later than it comes"
                     ),
                     (soonest, due) => prop_assert!(false, "soonest {soonest:?}, due {due:?}"),
@@ -1090,7 +1119,7 @@ mod tests {
         ) {
             const CLIENTS: u16 = 4000;
             let loads = Loads::new(1, usize::MAX, QUIC_MOST, 1);
-            let mut sessions = Sessions::<()>::new(IDLE, loads, 0, 0);
+            let mut sessions = Sessions::<()>::new(seconds(IDLE), loads, 0, 0);
             let backends = backends(&weights);
             let now = Instant::now();
             let mut random = seed;
