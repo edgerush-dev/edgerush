@@ -1,0 +1,31 @@
+# A backend is its Service's TCP port of the number or name it names, a port of no protocol
+# among them, whatever comes first: DNS's Service lists its UDP port 53 before its TCP one.
+# A Service with that port over UDP alone, or named so over UDP alone, is an invalid
+# backend, its path answered 500 and reported.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: dns, port: { number: 53 } } } }
+          - { path: /by-name, pathType: Prefix, backend: { service: { name: dns, port: { name: dns-tcp } } } }
+          - { path: /udp-name, pathType: Prefix, backend: { service: { name: dns, port: { name: dns } } } }
+          - { path: /udp-only, pathType: Prefix, backend: { service: { name: udp-only, port: { number: 53 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: dns, namespace: shop }
+spec:
+  ports:
+    - { name: dns, port: 53, protocol: UDP }
+    - { name: dns-tcp, port: 53 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: udp-only, namespace: shop }
+spec:
+  ports: [{ name: dns, port: 53, protocol: UDP }]

@@ -3113,8 +3113,8 @@ struct ServicePort<'a> {
     headless: bool,
 }
 
-/// The Service port a backend names, `over_udp` its UDP one alone (04 §2). Or what is not
-/// there, or not over UDP; or why the Ingress is left out.
+/// The Service port a backend names: its UDP one `over_udp`, its TCP one otherwise (04 §2).
+/// Or what is not there, or not over that protocol; or why the Ingress is left out.
 fn service_port<'a>(
     cluster: &'a Cluster,
     namespace: &str,
@@ -3153,25 +3153,28 @@ fn service_port<'a>(
             (None, Some(number)) => port.port == number,
             (None, None) => false,
         };
-    // Kubernetes takes a port of no protocol as TCP.
-    let udp =
-        |port: &&k8s_openapi::api::core::v1::ServicePort| port.protocol.as_deref() == Some("UDP");
-    let found = ports
-        .iter()
-        .filter(|port| !over_udp || udp(port))
-        .find(named);
+    // Kubernetes takes a port of no protocol as TCP. A Service may have one number over
+    // both, DNS's 53 the usual one, in either order.
+    let carried = |port: &&k8s_openapi::api::core::v1::ServicePort| match port.protocol.as_deref() {
+        None | Some("TCP") => !over_udp,
+        Some("UDP") => over_udp,
+        Some(_) => false,
+    };
+    let found = ports.iter().filter(carried).find(named);
     let Some(port) = found else {
         let wanted = match (&wanted.name, wanted.number) {
             (Some(name), _) => format!("named {name}"),
             (None, number) => number.unwrap_or_default().to_string(),
         };
-        if over_udp && ports.iter().any(|port| named(&port)) {
+        if ports.iter().any(|port| named(&port)) {
+            let why = if over_udp {
+                "but not over UDP; a UDPRoute's backend is a Service's UDP port"
+            } else {
+                "but not over TCP; every backend but a UDPRoute's is a Service's TCP port"
+            };
             return Ok(Err(RefProblem::new(
                 RefReason::UnsupportedProtocol,
-                format!(
-                    "Service {namespace}/{service_name} has port {wanted} over TCP alone; a \
-                     UDPRoute's backend is a Service's UDP port"
-                ),
+                format!("Service {namespace}/{service_name} has port {wanted} {why}"),
             )));
         }
         return Ok(Err(RefProblem::new(

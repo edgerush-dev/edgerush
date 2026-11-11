@@ -64,7 +64,7 @@ udp_routes:
   - invalid: Service other/secret is another namespace's, and no ReferenceGrant there lets UDPRoutes of
       shop reach it
     weight: 5
-  - invalid: Service shop/tcp-only has port 53 over TCP alone; a UDPRoute's backend is a Service's UDP port
+  - invalid: Service shop/tcp-only has port 53 but not over UDP; a UDPRoute's backend is a Service's UDP port
     weight: 5
 - name: gateway/shop/web/idle
   listeners:

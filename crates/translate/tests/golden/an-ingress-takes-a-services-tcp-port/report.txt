@@ -1,0 +1,2 @@
+Ingress shop/web: path /udp-name (Prefix) on shop.example.com is answered 500: Service shop/dns has port named dns but not over TCP; every backend but a UDPRoute's is a Service's TCP port
+Ingress shop/web: path /udp-only (Prefix) on shop.example.com is answered 500: Service shop/udp-only has port 53 but not over TCP; every backend but a UDPRoute's is a Service's TCP port

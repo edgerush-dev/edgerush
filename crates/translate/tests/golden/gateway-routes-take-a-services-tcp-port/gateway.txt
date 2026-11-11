@@ -1,0 +1,3 @@
+listener http: served on port-8080, taking HTTPRoute, GRPCRoute from namespace shop
+listener tcp: served on port-5300, taking TCPRoute from namespace shop
+listener udp: served on port-5300-udp, taking UDPRoute from namespace shop

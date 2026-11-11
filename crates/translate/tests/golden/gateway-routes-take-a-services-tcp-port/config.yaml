@@ -1,0 +1,33 @@
+listeners:
+  port-5300:
+    address: "0.0.0.0:5300"
+    protocol: tcp
+    proxy_protocol: off
+  port-5300-udp:
+    address: "0.0.0.0:5300"
+    protocol: udp
+  port-8080:
+    address: "0.0.0.0:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: httproute/shop/web/http
+    listeners: [port-8080]
+    hostnames: [{ name: "*", falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/dns/dns-tcp, weight: 1 }] }
+      - matches: [{ path: { prefix: /udp-only } }]
+        forward: { backends: [{ invalid: "Service shop/udp-only has port 53 but not over TCP; every backend but a UDPRoute's is a Service's TCP port", weight: 1 }] }
+      - matches: [{ path: { prefix: /sctp-only } }]
+        forward: { backends: [{ invalid: "Service shop/sctp-only has port 53 but not over TCP; every backend but a UDPRoute's is a Service's TCP port", weight: 1 }] }
+tcp_routes:
+  - { name: tcproute/shop/dns/tcp, listeners: [port-5300], backends: [{ upstream: shop/dns/dns-tcp, weight: 1 }] }
+tls_routes: []
+udp_routes:
+  - { name: udproute/shop/dns/udp, listeners: [port-5300-udp], backends: [{ upstream: shop/dns/dns/udp, weight: 1 }] }
+upstreams:
+  shop/dns/dns-tcp: { load_balancer: p2c, endpoints: { kubernetes: "dns.shop.svc.cluster.local:dns-tcp" } }
+  shop/dns/dns/udp: { protocol: udp, load_balancer: p2c, endpoints: { kubernetes: "dns.shop.svc.cluster.local:dns" } }

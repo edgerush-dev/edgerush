@@ -1,0 +1,3 @@
+HTTPRoute shop/web, section http: attached to http (*)
+TCPRoute shop/dns, section tcp: attached to tcp (*)
+UDPRoute shop/dns, section udp: attached to udp (*)

@@ -1,0 +1,7 @@
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener http: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener tcp: TCPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener udp: UDPRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/web, generation 0, parent web section http: Accepted=True/Accepted; ResolvedRefs=False/UnsupportedProtocol (Service shop/udp-only has port 53 but not over TCP; every backend but a UDPRoute's is a Service's TCP port; Service shop/sctp-only has port 53 but not over TCP; every backend but a UDPRoute's is a Service's TCP port)
+TCPRoute shop/dns, generation 0, parent web section tcp: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+UDPRoute shop/dns, generation 0, parent web section udp: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

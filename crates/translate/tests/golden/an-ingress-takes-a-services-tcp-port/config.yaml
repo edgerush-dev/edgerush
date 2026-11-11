@@ -1,0 +1,22 @@
+listeners:
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: ingress/shop/web/shop.example.com
+    listeners: [port-80]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/dns/dns-tcp, weight: 1 }] }
+      - matches: [{ path: { prefix: /by-name } }]
+        forward: { backends: [{ upstream: shop/dns/dns-tcp, weight: 1 }] }
+      - matches: [{ path: { prefix: /udp-name } }]
+        forward: { backends: [{ invalid: "Service shop/dns has port named dns but not over TCP; every backend but a UDPRoute's is a Service's TCP port", weight: 1 }] }
+      - matches: [{ path: { prefix: /udp-only } }]
+        forward: { backends: [{ invalid: "Service shop/udp-only has port 53 but not over TCP; every backend but a UDPRoute's is a Service's TCP port", weight: 1 }] }
+upstreams:
+  shop/dns/dns-tcp: { load_balancer: p2c, endpoints: { kubernetes: "dns.shop.svc.cluster.local:dns-tcp" } }
