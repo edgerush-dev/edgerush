@@ -1,0 +1,31 @@
+# A Gateway's UDP listeners: each served on a `udp` listener of the data plane of its own,
+# `port-<n>-udp`, beside a listener of another protocol on that port number, TCP's
+# included, and distinct by port alone, its hostname not read, so a second on a port is
+# refused. Where an HTTPS listener on its port serves HTTP/3, as the settings have it, the
+# port's UDP socket is HTTP/3's and the UDP listener is not accepted (Lucas). The settings
+# give a port's UDP listener its sessions' idle bound, the answers they expect and its
+# access log, and the TCP listener there what is TCP's. Where no UDPRoute serves one, its
+# datagrams are dropped, its port bound all the same. The kinds a UDP listener names that
+# it cannot take are said.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: quic, port: 443, protocol: UDP }
+    - { name: secure, port: 443, protocol: HTTPS, hostname: secure.example.com, tls: { certificateRefs: [{ name: secure }] } }
+    - { name: dns, port: 5353, protocol: UDP, hostname: dns.example.com }
+    - { name: dns-again, port: 5353, protocol: UDP }
+    - { name: db, port: 5432, protocol: TCP }
+    - { name: db-udp, port: 5432, protocol: UDP }
+    - name: kinds
+      port: 6000
+      protocol: UDP
+      allowedRoutes: { kinds: [{ kind: UDPRoute }, { kind: TCPRoute }] }

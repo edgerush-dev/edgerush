@@ -73,8 +73,8 @@ change takes over without dropping a request.
   spoken to as their `appProtocol` says, TLS from Secrets, and plain HTTP redirected to
   HTTPS for the hosts an Ingress secures. Where the Gateway API's CRDs are installed, it
   serves its data plane's Gateway beside them, from one data plane: the Gateway's
-  listeners and the ListenerSets it takes, HTTPRoutes, GRPCRoutes, TLSRoutes and
-  TCPRoutes, ReferenceGrants, and BackendTLSPolicies, their CA certificates from
+  listeners and the ListenerSets it takes, HTTPRoutes, GRPCRoutes, TLSRoutes, TCPRoutes
+  and UDPRoutes, ReferenceGrants, and BackendTLSPolicies, their CA certificates from
   ConfigMaps or the system's. It streams each config to its data planes over gRPC and
   mutual TLS, writes the status of each Ingress and Gateway API object (replicas elect one
   writer by a Lease; a Gateway is `Programmed` once its data plane's pods run it), and
@@ -202,10 +202,10 @@ ingress_https_redirect_max_age: 30
 | `ingress_hosts_fall_through` | Whether an Ingress host stays a candidate on hosts a more specific one also covers; `false` is ingress-nginx's way. |
 | `ingress_https_redirect` | Whether plain HTTP to a host an Ingress's `tls` lists is redirected to HTTPS, as a `DataPlane` does by default. An Ingress's `gateway.edgerush.dev/https-redirect: "false"` or `"true"` overrides it for its own routes. |
 | `ingress_https_redirect_max_age` | How long, in seconds, a client may keep that redirect (30 for a `DataPlane` by default). |
-| `gateway` | Optional: the Gateway this data plane is, as `namespace/name`. Its listeners are bound: one data-plane listener for each port they state, named `port-<n>`. Ingress binds only its own two ports, below, and only while it serves something there. |
+| `gateway` | Optional: the Gateway this data plane is, as `namespace/name`. Its listeners are bound: one data-plane listener for each port they state, named `port-<n>`, and one more, `port-<n>-udp`, for a port's UDP listener. Ingress binds only its own two ports, below, and only while it serves something there. |
 | `ingress_http_port` | Optional: the port an Ingress is served on over plain HTTP, 80 by default: shared with the Gateway's listener there if that is `HTTP`, bound for `http` if no listener of the Gateway is. |
 | `ingress_https_port` | Optional: the port the hosts an Ingress's `tls` lists are served on over HTTPS, 443 by default: shared with the Gateway's listener there if that is `HTTPS`, bound for `https` if no listener of the Gateway is, and named in a redirect there unless 443. |
-| `ports` | Optional: each port's settings, as a config's listener states them: `http3` (an `https` port's alone), `proxy_protocol`, `forwarding`, `request_id` and `access_log`. A port not listed trusts no proxy's forwarding headers, gives each request an ID and logs nothing. |
+| `ports` | Optional: each port's settings, as a config's listener states them: `http3` (an `https` port's alone), `proxy_protocol`, `forwarding`, `request_id`, `access_log`, and `session_idle_seconds` and `session_answers` (for its UDP listener alone, which of the others takes `access_log` only). A port not listed trusts no proxy's forwarding headers, gives each request an ID and logs nothing. |
 | `ip_family` | Optional: `ipv4`, the default, binds `0.0.0.0`; `ipv6` and `dual` bind `[::]`. |
 | `backend_authorities` | Optional: certificates in PEM trusted for a Service port spoken to over TLS (`appProtocol: kubernetes.io/wss`). |
 | `data_plane` | Optional: the data plane's own settings, as a config states them, written into every config. `own_service: edgerush.edge.svc.cluster.local` names the Service of the data plane's own pods, whose EndpointSlices say its zone. |

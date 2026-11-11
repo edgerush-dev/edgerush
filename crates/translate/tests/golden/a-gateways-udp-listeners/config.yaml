@@ -1,0 +1,38 @@
+listeners:
+  port-443:
+    address: "0.0.0.0:443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: shop/secure, names: [secure.example.com] }
+      without_sni: none
+    http3: { alt_svc_max_age: 86400, force_retry: false }
+  port-5353-udp:
+    address: "0.0.0.0:5353"
+    protocol: udp
+    session_idle_seconds: 30
+    session_answers: 1
+    access_log: { file: /var/log/edgerush/dns.log }
+  port-5432:
+    address: "0.0.0.0:5432"
+    protocol: tcp
+    proxy_protocol: { senders: [10.0.0.0/16] }
+  port-5432-udp:
+    address: "0.0.0.0:5432"
+    protocol: udp
+    session_idle_seconds: 120
+  port-6000-udp:
+    address: "0.0.0.0:6000"
+    protocol: udp
+routes:
+  - { name: gateway/shop/web/secure, listeners: [port-443], hostnames: [{ name: secure.example.com, falls_through: false }], rules: [] }
+tcp_routes:
+  - { name: gateway/shop/web/db, listeners: [port-5432], backends: [{ invalid: no TCPRoute serves listener db, weight: 1 }] }
+udp_routes:
+  - { name: gateway/shop/web/dns, listeners: [port-5353-udp], backends: [{ invalid: no UDPRoute serves listener dns, weight: 1 }] }
+  - { name: gateway/shop/web/db-udp, listeners: [port-5432-udp], backends: [{ invalid: no UDPRoute serves listener db-udp, weight: 1 }] }
+  - { name: gateway/shop/web/kinds, listeners: [port-6000-udp], backends: [{ invalid: no UDPRoute serves listener kinds, weight: 1 }] }
+upstreams: {}

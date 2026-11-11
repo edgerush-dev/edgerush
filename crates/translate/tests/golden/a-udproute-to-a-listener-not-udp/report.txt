@@ -1,0 +1,2 @@
+UDPRoute shop/by-port: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace
+UDPRoute shop/dns: not attached to the data plane's Gateway: no listener it names takes its kind from its namespace

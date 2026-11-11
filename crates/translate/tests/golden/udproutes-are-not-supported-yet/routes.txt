@@ -1,1 +1,0 @@
-HTTPRoute shop/pages: attached to http (shop.example.com)

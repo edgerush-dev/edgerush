@@ -1,1 +1,1 @@
-listener dns: not accepted: protocol `UDP` is not one the gateway serves
+listener sctp: not accepted: protocol `SCTP` is not one the gateway serves

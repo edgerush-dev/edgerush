@@ -431,9 +431,9 @@ fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
             let reason = match problem {
                 ListenerProblem::UnsupportedProtocol(_) => "UnsupportedProtocol",
                 ListenerProblem::HostnameConflict { .. } => "HostnameConflict",
-                ListenerProblem::ProtocolConflict { .. } | ListenerProblem::NotDistinct { .. } => {
-                    "ProtocolConflict"
-                }
+                ListenerProblem::ProtocolConflict { .. }
+                | ListenerProblem::NotDistinct { .. }
+                | ListenerProblem::Http3 { .. } => "ProtocolConflict",
                 ListenerProblem::PortPastSlots { .. } => "PortUnavailable",
                 ListenerProblem::TooManyListeners { .. } => "TooManyListeners",
                 ListenerProblem::TlsMode(_)
@@ -451,6 +451,7 @@ fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
                 ListenerProblem::HostnameConflict { .. }
                     | ListenerProblem::ProtocolConflict { .. }
                     | ListenerProblem::NotDistinct { .. }
+                    | ListenerProblem::Http3 { .. }
             ) {
                 conditions.push(Condition::new(
                     "Conflicted",
@@ -529,10 +530,11 @@ pub(crate) fn routes(outcomes: &[RouteOutcome], report: &[Finding]) -> Vec<Route
 }
 
 /// A route's conditions for one parent: `Accepted`, `ResolvedRefs` and, where some of its
-/// rules are served as written and some not, `PartiallyInvalid`. A TLSRoute or a TCPRoute
-/// not of the shape the `v1` API gives one is not accepted, as an HTTPRoute none of whose
-/// rules is served is not; its backends' shares closed are its unresolved references; a
-/// TCPRoute whose listener an older one serves stays accepted, as conformance has it.
+/// rules are served as written and some not, `PartiallyInvalid`. A TLSRoute, a TCPRoute or a
+/// UDPRoute not of the shape the `v1` API gives one is not accepted, as an HTTPRoute none of
+/// whose rules is served is not; its backends' shares closed or dropped are its unresolved
+/// references; a TCPRoute or a UDPRoute whose listener an older one serves stays accepted, as
+/// conformance has it.
 fn parent_conditions(parent: &ParentOutcome, said: &[&Problem]) -> Vec<Condition> {
     let not_accepted = said
         .iter()
@@ -556,7 +558,8 @@ fn parent_conditions(parent: &ParentOutcome, said: &[&Problem]) -> Vec<Condition
         .filter_map(|p| match p {
             Problem::BackendInvalid { why, .. }
             | Problem::MirrorLeftOff { why, .. }
-            | Problem::ConnectionsClosed(why) => Some(why),
+            | Problem::ConnectionsClosed(why)
+            | Problem::DatagramsDropped(why) => Some(why),
             _ => None,
         })
         // A share a BackendTLSPolicy fails closed is resolved: the policy's status says why.

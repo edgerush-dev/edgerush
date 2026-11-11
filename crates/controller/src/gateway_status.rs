@@ -34,6 +34,9 @@ use edgerush_gateway_api::tcp_route::{
 use edgerush_gateway_api::tls_route::{
     TLSRouteStatus, TLSRouteStatusParents, TLSRouteStatusParentsParentRef,
 };
+use edgerush_gateway_api::udp_route::{
+    UDPRouteStatus, UDPRouteStatusParents, UDPRouteStatusParentsParentRef,
+};
 use edgerush_translate::{self as translate, GATEWAY_CONTROLLER, Object};
 use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
@@ -511,6 +514,13 @@ as_http!(
     TCPRouteStatus,
     TCPRouteStatusParents,
     TCPRouteStatusParentsParentRef
+);
+as_http!(
+    /// A UDPRoute's status as an HTTPRoute's.
+    udp_as_http,
+    UDPRouteStatus,
+    UDPRouteStatusParents,
+    UDPRouteStatusParentsParentRef
 );
 
 /// What the status of a route of `namespace`, of any kind, is to say, as `wanted` has it of its

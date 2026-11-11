@@ -12,4 +12,4 @@ metadata: { name: web, namespace: edge }
 spec:
   gatewayClassName: edgerush
   listeners:
-    - { name: dns, port: 80, protocol: UDP }
+    - { name: sctp, port: 80, protocol: SCTP }

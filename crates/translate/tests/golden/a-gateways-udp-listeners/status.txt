@@ -1,0 +1,8 @@
+Gateway, generation 0: Accepted=True/ListenersNotValid (listeners not accepted: quic, dns-again); ResolvedRefs=False/ListenersNotResolved (listeners with refs not resolved: kinds)
+listener quic: no kind, attached 0: Accepted=False/ProtocolConflict (port 443 serves HTTP/3 over UDP, as the data plane's settings have it for the HTTPS listener there); Conflicted=True/ProtocolConflict (port 443 serves HTTP/3 over UDP, as the data plane's settings have it for the HTTPS listener there); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (port 443 serves HTTP/3 over UDP, as the data plane's settings have it for the HTTPS listener there)
+listener secure: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener dns: UDPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener dns-again: no kind, attached 0: Accepted=False/HostnameConflict (listener dns, which comes first, has its port, protocol and hostname); Conflicted=True/HostnameConflict (listener dns, which comes first, has its port, protocol and hostname); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (listener dns, which comes first, has its port, protocol and hostname)
+listener db: TCPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener db-udp: UDPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener kinds: UDPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/InvalidRouteKinds (takes no route of kind gateway.networking.k8s.io/TCPRoute)

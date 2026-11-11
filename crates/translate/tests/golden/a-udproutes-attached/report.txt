@@ -1,0 +1,10 @@
+UDPRoute shop/old-shape: it has 2 rules, where the v1 API has a UDPRoute of exactly one, so it is not accepted
+UDPRoute shop/weighted: a backend's share of datagrams is dropped: Service shop/not-there does not exist
+UDPRoute shop/weighted: a backend's share of datagrams is dropped: a backend of kind /ConfigMap is not one translation reads
+UDPRoute shop/weighted: a backend's share of datagrams is dropped: Service other/secret is another namespace's, and no ReferenceGrant there lets UDPRoutes of shop reach it
+UDPRoute shop/weighted: a backend's share of datagrams is dropped: Service shop/tcp-only has port 53 over TCP alone; a UDPRoute's backend is a Service's UDP port
+UDPRoute shop/by-port: port-5300-udp is served by UDPRoute shop/elder, which comes first
+UDPRoute shop/attach-all: port-5300-udp is served by UDPRoute shop/elder, which comes first
+UDPRoute shop/attach-all: port-5301-udp is served by UDPRoute shop/by-section, which comes first
+UDPRoute shop/attach-all: port-5302-udp is served by UDPRoute shop/by-both, which comes first
+UDPRoute shop/attach-all: port-5303-udp is served by UDPRoute shop/weighted, which comes first

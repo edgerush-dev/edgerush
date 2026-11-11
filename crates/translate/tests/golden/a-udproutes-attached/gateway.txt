@@ -1,0 +1,6 @@
+listener one: served on port-5300-udp, taking UDPRoute from namespace shop
+listener two: served on port-5301-udp, taking UDPRoute from namespace shop
+listener three: served on port-5302-udp, taking UDPRoute from namespace shop
+listener weighted: served on port-5303-udp, taking UDPRoute from namespace shop
+listener idle: served on port-5304-udp, taking UDPRoute from namespaces labelled team=dns
+listener http: served on port-5300, taking HTTPRoute, GRPCRoute from namespace shop

@@ -1,0 +1,7 @@
+listener quic: not accepted: port 443 serves HTTP/3 over UDP, as the data plane's settings have it for the HTTPS listener there
+listener secure: served on port-443, presenting shop/secure, taking HTTPRoute, GRPCRoute from namespace shop
+listener dns: served on port-5353-udp, taking UDPRoute from namespace shop
+listener dns-again: not accepted: listener dns, which comes first, has its port, protocol and hostname
+listener db: served on port-5432, taking TCPRoute from namespace shop
+listener db-udp: served on port-5432-udp, taking UDPRoute from namespace shop
+listener kinds: served on port-6000-udp, taking UDPRoute from namespace shop

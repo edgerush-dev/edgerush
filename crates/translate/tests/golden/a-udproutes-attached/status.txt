@@ -1,0 +1,14 @@
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener one: UDPRoute, attached 3: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener two: UDPRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener three: UDPRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener weighted: UDPRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener idle: UDPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener http: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+UDPRoute shop/elder, generation 0, parent web section one: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+UDPRoute shop/by-both, generation 0, parent web section three port 5302: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+UDPRoute shop/by-port, generation 0, parent web port 5300: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+UDPRoute shop/by-section, generation 0, parent web section two: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+UDPRoute shop/old-shape, generation 0, parent web section two: Accepted=False/UnsupportedValue (it has 2 rules, where the v1 API has a UDPRoute of exactly one, so it is not accepted); ResolvedRefs=True/ResolvedRefs
+UDPRoute shop/weighted, generation 0, parent web section weighted: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Service shop/not-there does not exist; a backend of kind /ConfigMap is not one translation reads; Service other/secret is another namespace's, and no ReferenceGrant there lets UDPRoutes of shop reach it; Service shop/tcp-only has port 53 over TCP alone; a UDPRoute's backend is a Service's UDP port)
+UDPRoute shop/attach-all, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

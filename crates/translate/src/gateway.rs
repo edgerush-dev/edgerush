@@ -32,10 +32,13 @@ pub struct GatewayOutcome {
     /// Each of its listeners, its own in the order it lists them, then those of each
     /// ListenerSet attached to it, in precedence (04 §2).
     pub listeners: Vec<ListenerOutcome>,
-    /// The ports its accepted listeners state, and the protocol each is bound for: the data
-    /// plane's listeners. A port HTTPS and TLS listeners share is bound for HTTPS, passing
-    /// the TLS ones' names through (17 §2).
+    /// The ports its accepted listeners state over TCP, and the protocol each is bound for:
+    /// the data plane's listeners. A port HTTPS and TLS listeners share is bound for HTTPS,
+    /// passing the TLS ones' names through (17 §2).
     pub ports: BTreeMap<u16, Protocol>,
+    /// The ports its accepted UDP listeners state: each a `udp` listener of the data plane's,
+    /// apart from one of another protocol on that port number (04 §2).
+    pub udp_ports: BTreeSet<u16>,
     /// Each ListenerSet naming it as its parent, in precedence: those it takes, whose
     /// listeners are among `listeners`, and those it does not.
     pub sets: Vec<SetOutcome>,
@@ -328,6 +331,17 @@ pub enum ListenerProblem {
         /// beyond.
         by: String,
     },
+    /// A UDP listener on a port whose accepted HTTPS listener serves HTTP/3, as the data
+    /// plane's settings have it: the port's UDP socket is HTTP/3's, whatever the order
+    /// (Lucas; `ProtocolConflict`).
+    #[error(
+        "port {port} serves HTTP/3 over UDP, as the data plane's settings have it for the \
+         HTTPS listener there"
+    )]
+    Http3 {
+        /// The port.
+        port: u16,
+    },
     /// Its port is past the data plane's slots for the Gateway API's ports, taken in the
     /// order listeners state them (`PortUnavailable`).
     #[error(
@@ -412,15 +426,27 @@ pub(crate) fn outcome(
         .collect();
     let (sets, theirs) = attached_sets(gateway, &object, cluster, report);
     written.extend(theirs);
-    let mut listeners = listeners(&written, &object);
+    // The ports whose HTTPS listener, where one is accepted, serves HTTP/3 too.
+    let http3: BTreeSet<u16> = plane
+        .ports
+        .iter()
+        .filter(|(_, settings)| settings.http3.is_some())
+        .map(|(port, _)| *port)
+        .collect();
+    let mut listeners = listeners(&written, &object, &http3);
     // Bound as long as one listener on them is accepted: one whose certificates cannot be
     // used too, which keeps its port refusing its hostname (04 §2). For HTTPS where an HTTPS
     // listener shares the port with TLS ones.
     let mut ports: BTreeMap<u16, Protocol> = BTreeMap::new();
+    let mut udp_ports = BTreeSet::new();
     for (listener, written) in listeners.iter().zip(&written) {
         let (Ok(_), Ok(protocol)) = (&listener.served, protocol(&written.listener)) else {
             continue;
         };
+        if protocol == Protocol::Udp {
+            udp_ports.insert(listener.port);
+            continue;
+        }
         let bound = ports.entry(listener.port).or_insert(protocol);
         if protocol == Protocol::Https {
             *bound = Protocol::Https;
@@ -502,6 +528,7 @@ pub(crate) fn outcome(
         generation: gateway.metadata.generation.unwrap_or_default(),
         listeners,
         ports,
+        udp_ports,
         sets,
         client_certificate,
     })
@@ -758,7 +785,57 @@ pub(crate) struct Written {
 /// HTTPS or TLS, none of them on it is accepted, as the spec has it (Q-c1), and, refused,
 /// they take no port: a later resource's listener there is judged as any (Q-c1b), so that
 /// one team's ListenerSet never keeps a port from another's.
-pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOutcome> {
+///
+/// A UDP listener is distinct by port alone, as a TCP one, its port number another
+/// protocol's too, whose socket is not its (04 §2); except where an HTTPS listener accepted
+/// on its port serves HTTP/3, as `http3` holds the ports whose settings have it: there the
+/// port's UDP socket is HTTP/3's, whatever the order (Lucas), and the UDP listener is
+/// refused, taking no port. A UDP listener refused so leaves its slot to a later listener,
+/// which may be an HTTPS one on a port of HTTP/3 where another UDP listener was accepted:
+/// so the listeners are judged again until no more is refused so, each time refusing more
+/// UDP listeners and accepting no fewer others, which ends.
+pub(crate) fn listeners(
+    written: &[Written],
+    gateway: &Object,
+    http3: &BTreeSet<u16>,
+) -> Vec<ListenerOutcome> {
+    let mut yielded: BTreeSet<usize> = BTreeSet::new();
+    loop {
+        let outcomes = judged(written, gateway, &yielded);
+        let accepted = |protocol: &'static str| {
+            outcomes
+                .iter()
+                .zip(written)
+                .enumerate()
+                .filter(move |(_, (outcome, stated))| {
+                    outcome.served.is_ok() && stated.listener.protocol == protocol
+                })
+                .map(|(at, (outcome, _))| (at, outcome.port))
+        };
+        let serving: BTreeSet<u16> = accepted("HTTPS")
+            .map(|(_, port)| port)
+            .filter(|port| http3.contains(port))
+            .collect();
+        let more: Vec<usize> = accepted("UDP")
+            .filter(|(_, port)| serving.contains(port))
+            .map(|(at, _)| at)
+            .collect();
+        // Ends once none is newly refused, which a listener refused before never is.
+        let before = yielded.len();
+        yielded.extend(more);
+        if yielded.len() == before {
+            return outcomes;
+        }
+    }
+}
+
+/// Each listener's outcome, as `listeners` has it, those at the places `yielded` holds
+/// refused for HTTP/3 before any other judgement.
+fn judged(
+    written: &[Written],
+    gateway: &Object,
+    yielded: &BTreeSet<usize>,
+) -> Vec<ListenerOutcome> {
     // The ports each resource (the Gateway's own listeners, `None`, or a ListenerSet's)
     // states for TCP and for HTTP, HTTPS or TLS.
     let not_distinct: BTreeSet<(Option<&Object>, i32)> = {
@@ -779,10 +856,10 @@ pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOu
             .map(|(place, _)| place)
             .collect()
     };
-    // Each port taken, by the protocols it is for, the protocol of the listener that took
-    // it and that listener; each place, by the listener in it: only those accepted, by
-    // their place in `written`.
-    let mut ports: BTreeMap<i32, (&'static str, &'static str, usize)> = BTreeMap::new();
+    // Each port's socket taken, by its number and whether over UDP, by the protocols it is
+    // for, the protocol of the listener that took it and that listener; each place, by the
+    // listener in it: only those accepted, by their place in `written`.
+    let mut ports: BTreeMap<(i32, bool), (&'static str, &'static str, usize)> = BTreeMap::new();
     let mut places: BTreeMap<(i32, &'static str, Option<&str>), usize> = BTreeMap::new();
     let by = |earlier: usize, now: &Written| {
         let earlier = &written[earlier];
@@ -813,7 +890,11 @@ pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOu
                         },
                     });
                 }
+                if yielded.contains(&at) {
+                    return Err(ListenerProblem::Http3 { port });
+                }
                 let name = name_of(protocol);
+                let over_udp = protocol == Protocol::Udp;
                 // HTTPS and TLS share a port, one data-plane listener reading each
                 // ClientHello (Q-t1): one hostname on both is a conflict of hostnames.
                 let family = if protocol == Protocol::Tls {
@@ -824,9 +905,16 @@ pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOu
                 let hostname = listener
                     .hostname
                     .as_deref()
-                    .filter(|_| protocol != Protocol::Tcp);
+                    .filter(|_| !matches!(protocol, Protocol::Tcp | Protocol::Udp));
                 let place = (listener.port, family, hostname);
-                match (ports.get(&listener.port), places.get(&place)) {
+                let socket = (listener.port, over_udp);
+                // The data plane's listener on that socket.
+                let on = if over_udp {
+                    crate::listeners::udp_name(port)
+                } else {
+                    crate::listeners::name(port)
+                };
+                match (ports.get(&socket), places.get(&place)) {
                     (Some((taken, protocol, earlier)), _) if *taken != family => {
                         Err(ListenerProblem::ProtocolConflict {
                             port,
@@ -839,12 +927,12 @@ pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOu
                     }),
                     (Some(_), None) => {
                         places.insert(place, at);
-                        Ok(vec![crate::listeners::name(port)])
+                        Ok(vec![on])
                     }
                     (None, None) if ports.len() < crate::listeners::MOST_GATEWAY_PORTS => {
-                        ports.insert(listener.port, (family, name, at));
+                        ports.insert(socket, (family, name, at));
                         places.insert(place, at);
-                        Ok(vec![crate::listeners::name(port)])
+                        Ok(vec![on])
                     }
                     (None, None) if stated.set.is_some() => {
                         Err(ListenerProblem::TooManyListeners { port })
@@ -864,7 +952,7 @@ pub(crate) fn listeners(written: &[Written], gateway: &Object) -> Vec<ListenerOu
                 hostname: listener
                     .hostname
                     .clone()
-                    .filter(|_| listener.protocol != "TCP"),
+                    .filter(|_| !matches!(listener.protocol.as_str(), "TCP" | "UDP")),
                 port,
                 passes_through: listener.protocol == "TLS",
                 certificates: Vec::new(),
@@ -886,6 +974,7 @@ fn protocol(written: &GatewayListeners) -> Result<Protocol, ListenerProblem> {
             other => Err(ListenerProblem::PassthroughOnly(other.to_owned())),
         },
         "TCP" => Ok(Protocol::Tcp),
+        "UDP" => Ok(Protocol::Udp),
         other => Err(ListenerProblem::UnsupportedProtocol(other.to_owned())),
     }
 }
@@ -917,6 +1006,7 @@ fn kinds_for(protocol: &str) -> &'static [&'static str] {
         "HTTP" | "HTTPS" => &["HTTPRoute", "GRPCRoute"],
         "TLS" => &["TLSRoute"],
         "TCP" => &["TCPRoute"],
+        "UDP" => &["UDPRoute"],
         _ => &[],
     }
 }
@@ -1035,7 +1125,7 @@ mod tests {
             namespace: "edge".to_owned(),
             name: "web".to_owned(),
         };
-        super::listeners(&written, &gateway)
+        super::listeners(&written, &gateway, &BTreeSet::new())
     }
     use crate::listeners::MOST_GATEWAY_PORTS;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1061,7 +1151,7 @@ mod tests {
             "{ name: first, port: 8080, protocol: HTTP, hostname: a.example.com }",
             "{ name: second, port: 8080, protocol: HTTP, hostname: a.example.com }",
             "{ name: apart, port: 8080, protocol: HTTP, hostname: b.example.com }",
-            "{ name: dns, port: 8080, protocol: UDP }",
+            "{ name: sctp, port: 8080, protocol: SCTP }",
         ]
         .iter()
         .map(|yaml| serde_saphyr::from_str(yaml).unwrap())
@@ -1081,9 +1171,131 @@ mod tests {
                 "first: port-8080",
                 "second: listener first, which comes first, has its port, protocol and hostname",
                 "apart: port-8080",
-                "dns: protocol `UDP` is not one the gateway serves",
+                "sctp: protocol `SCTP` is not one the gateway serves",
             ]
         );
+    }
+
+    /// The outcomes of a Gateway's own listeners, each written as YAML, where `http3` holds
+    /// the ports whose settings serve HTTP/3, said a line each.
+    fn said_with(written: &[&str], http3: &[u16]) -> Vec<String> {
+        let written: Vec<Written> = written
+            .iter()
+            .map(|yaml| Written {
+                listener: serde_saphyr::from_str(yaml).unwrap(),
+                set: None,
+                namespace: "edge".to_owned(),
+            })
+            .collect();
+        let gateway = Object {
+            kind: "Gateway",
+            namespace: "edge".to_owned(),
+            name: "web".to_owned(),
+        };
+        super::listeners(&written, &gateway, &http3.iter().copied().collect())
+            .iter()
+            .map(|o| match &o.served {
+                Ok(on) => format!("{}: {}", o.name, on.join(", ")),
+                Err(why) => format!("{}: {why}", o.name),
+            })
+            .collect()
+    }
+
+    /// A UDP listener is served on a `udp` listener of its port, apart from one of another
+    /// protocol there, even a TCP one, and distinct by port alone, its hostname not read:
+    /// a second on a port is refused.
+    #[test]
+    fn a_udp_listener_is_apart_from_others_on_its_port() {
+        let said = said_with(
+            &[
+                "{ name: web, port: 8080, protocol: HTTP }",
+                "{ name: dns, port: 8080, protocol: UDP, hostname: dns.example.com }",
+                "{ name: db, port: 5432, protocol: TCP }",
+                "{ name: db-udp, port: 5432, protocol: UDP }",
+                "{ name: dns-again, port: 8080, protocol: UDP }",
+                "{ name: alone, port: 53, protocol: UDP }",
+            ],
+            &[],
+        );
+        assert_eq!(
+            said,
+            [
+                "web: port-8080",
+                "dns: port-8080-udp",
+                "db: port-5432",
+                "db-udp: port-5432-udp",
+                "dns-again: listener dns, which comes first, has its port, protocol and hostname",
+                "alone: port-53-udp",
+            ]
+        );
+    }
+
+    /// Where an HTTPS listener accepted on a port serves HTTP/3, as the settings have it,
+    /// the port's UDP socket is HTTP/3's, whatever the order (Lucas); where none is accepted
+    /// there, or the settings serve no HTTP/3 there, a UDP listener has it.
+    #[test]
+    fn a_udp_listener_yields_to_http3_on_its_port() {
+        let https = "{ name: secure, port: 443, protocol: HTTPS }";
+        let udp = "{ name: quic, port: 443, protocol: UDP }";
+        let refused = "quic: port 443 serves HTTP/3 over UDP, as the data plane's settings have \
+                       it for the HTTPS listener there";
+        assert_eq!(
+            said_with(&[https, udp], &[443]),
+            ["secure: port-443", refused]
+        );
+        assert_eq!(
+            said_with(&[udp, https], &[443]),
+            [refused, "secure: port-443"]
+        );
+        assert_eq!(
+            said_with(&[https, udp], &[8443]),
+            ["secure: port-443", "quic: port-443-udp"]
+        );
+        // The port is HTTP's, so no HTTPS listener is accepted there.
+        let plain = "{ name: plain, port: 443, protocol: HTTP }";
+        assert_eq!(
+            said_with(&[plain, https, udp], &[443]),
+            [
+                "plain: port-443",
+                "secure: port 443 is taken for http by listener plain, which comes first",
+                "quic: port-443-udp",
+            ]
+        );
+    }
+
+    /// A UDP listener refused for HTTP/3 takes no slot: a listener past the slots while it
+    /// took one is served. One that takes the last slot before an HTTPS listener on its port
+    /// keeps it, the HTTPS listener past the slots serving no HTTP/3.
+    #[test]
+    fn a_udp_listener_yielding_to_http3_takes_no_slot() {
+        let filler: Vec<String> = (2..MOST_GATEWAY_PORTS)
+            .map(|at| format!("{{ name: l{at}, port: {}, protocol: HTTP }}", 2000 + at))
+            .collect();
+        let mut written: Vec<&str> = filler.iter().map(String::as_str).collect();
+        written.push("{ name: quic, port: 443, protocol: UDP }");
+        written.push("{ name: secure, port: 443, protocol: HTTPS }");
+        written.push("{ name: last, port: 3000, protocol: HTTP }");
+        let said = said_with(&written, &[443]);
+        assert_eq!(
+            said[MOST_GATEWAY_PORTS - 2..],
+            [
+                "quic: port 443 serves HTTP/3 over UDP, as the data plane's settings have it \
+                 for the HTTPS listener there",
+                "secure: port-443",
+                "last: port-3000",
+            ]
+        );
+        // Without HTTP/3 the UDP listener keeps its slot, and the last is past the slots.
+        let said = said_with(&written, &[]);
+        assert_eq!(said[MOST_GATEWAY_PORTS - 2], "quic: port-443-udp");
+        assert!(said[MOST_GATEWAY_PORTS].starts_with("last: the data plane serves at most"));
+        // The UDP listener takes the last slot: the HTTPS listener is past it, so no HTTP/3
+        // is served there.
+        written.pop();
+        written.insert(0, "{ name: first, port: 2001, protocol: HTTP }");
+        let said = said_with(&written, &[443]);
+        assert_eq!(said[MOST_GATEWAY_PORTS - 1], "quic: port-443-udp");
+        assert!(said[MOST_GATEWAY_PORTS].starts_with("secure: the data plane serves at most"));
     }
 
     /// A TCP listener is distinct by port alone, its hostname not read; where one resource
@@ -1151,7 +1363,7 @@ mod tests {
             namespace: of.map_or("edge", |_| "shop").to_owned(),
         })
         .collect();
-        let outcomes = super::listeners(&written, &gateway);
+        let outcomes = super::listeners(&written, &gateway, &BTreeSet::new());
         let said: Vec<String> = outcomes
             .iter()
             .map(|o| match &o.served {
@@ -1227,7 +1439,7 @@ mod tests {
             set: Some(set),
             namespace: "shop".to_owned(),
         });
-        let outcomes = super::listeners(&written, &gateway);
+        let outcomes = super::listeners(&written, &gateway, &BTreeSet::new());
         let last = outcomes.last().unwrap();
         assert_eq!(
             last.served
@@ -1292,7 +1504,7 @@ mod tests {
         // A listener refused for another reason takes no slot.
         let mut unsupported = written[..MOST_GATEWAY_PORTS].to_vec();
         unsupported[0] =
-            serde_saphyr::from_str("{ name: dns, port: 4000, protocol: UDP }").unwrap();
+            serde_saphyr::from_str("{ name: sctp, port: 4000, protocol: SCTP }").unwrap();
         unsupported.push(listener("fits", 3000));
         let outcomes = listeners(&unsupported);
         assert!(outcomes.last().unwrap().served.is_ok());
