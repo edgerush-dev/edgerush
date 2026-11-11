@@ -8,6 +8,7 @@ listeners:
   port-8443:
     address: "0.0.0.0:8443"
     protocol: tls
+    tunnel_idle_seconds: 30
     proxy_protocol: off
   port-9444:
     address: "0.0.0.0:9444"
@@ -16,6 +17,7 @@ listeners:
   port-9445:
     address: "0.0.0.0:9445"
     protocol: https
+    tunnel_idle_seconds: 45
     proxy_protocol: off
     forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
     request_id: generate

@@ -182,6 +182,11 @@ pub struct PortSettings {
     /// written; nowhere by default.
     #[serde(default)]
     pub access_log: Option<edgerush_config::AccessLog>,
+    /// How long, in seconds, a tunnel of the `tcp` or `tls` listener on it, or of an `https`
+    /// one for the connections it passes through, may carry nothing either way before both
+    /// its ends are closed; the data plane's hour by default.
+    #[serde(default)]
+    pub tunnel_idle_seconds: Option<u64>,
     /// How long, in seconds, a session of the UDP listener on it may carry nothing before it
     /// is ended; the data plane's 60 by default ([24 §3](../../../docs/24-udp-proxying.md)).
     #[serde(default)]
@@ -1760,6 +1765,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         }
     }
     shared_by(&mut config, gateway.as_ref(), &presented, &ingress_https);
+    tunnels_passed_through(&mut config);
     // Ingress's HTTPS port shared for it with a Gateway's TLS listeners, and no Ingress
     // served there: its listener passes every connection through, as a `tls` one, closing
     // what no TLS route takes rather than refusing it in a handshake.
@@ -2271,6 +2277,20 @@ fn shared_by(
         // One that passes through is said alone too: its names are carried.
         if sharing.len() >= 2 || sharing.iter().any(|sharer| sharer.passes_through) {
             tls.shared_by = sharing;
+        }
+    }
+}
+
+/// The tunnel idle bound of a port taken from its `https` listener where that passes no
+/// connection through (04 §2): every connection's TLS ends there, so it has no tunnel.
+fn tunnels_passed_through(config: &mut Config) {
+    for listener in config.listeners.values_mut() {
+        let passes_some = listener
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.shared_by.iter().any(|sharer| sharer.passes_through));
+        if listener.protocol == Protocol::Https && !passes_some {
+            listener.tunnel_idle_seconds = None;
         }
     }
 }

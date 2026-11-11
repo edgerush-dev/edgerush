@@ -1,7 +1,13 @@
-# The data plane, as the Gateway shop/web.
+# The data plane, as the Gateway shop/web, a tunnel idle bound given its TLS port 8443, the
+# port 9445 its HTTPS listener passes some connections through on, and its HTTP port 8080,
+# which has no tunnel: theirs but the last's.
 ingress_class: edge
 gateway: shop/web
 cluster_domain: cluster.local
 ingress_hosts_fall_through: false
 ingress_https_redirect: true
 ingress_https_redirect_max_age: 30
+ports:
+  8080: { tunnel_idle_seconds: 60 }
+  8443: { tunnel_idle_seconds: 30 }
+  9445: { tunnel_idle_seconds: 45 }

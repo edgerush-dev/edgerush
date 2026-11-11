@@ -2,6 +2,7 @@ listeners:
   port-443:
     address: "0.0.0.0:443"
     protocol: tls
+    tunnel_idle_seconds: 120
     proxy_protocol: off
   port-80:
     address: "0.0.0.0:80"

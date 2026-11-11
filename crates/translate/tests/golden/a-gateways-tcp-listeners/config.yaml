@@ -2,6 +2,7 @@ listeners:
   port-5432:
     address: 0.0.0.0:5432
     protocol: tcp
+    tunnel_idle_seconds: 90
     proxy_protocol: 'off'
   port-6379:
     address: 0.0.0.0:6379
