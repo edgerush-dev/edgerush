@@ -5,7 +5,8 @@
 //! of one. And a worker meeting a key it holds no handle to, in its process's registry of a
 //! hundred thousand: found, made by another worker; and made, cold keys decided locally. And
 //! a worker deciding on a key it holds, as the proxy's do: the first request of a cycle, which
-//! starts the key's count and notes when, one after it, and one refused, the bucket empty.
+//! starts the key's count and notes when, one after it, and one refused, the bucket empty;
+//! and a request under two and three keys it holds, admitted.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-ratelimit --bench decide`, see the
 //! repository README.
@@ -140,6 +141,11 @@ fn find_or_make(registry: Shared) -> (Made, Shared) {
 /// answered and visited at the next cycle, which leaves its count at none; and `admitted`
 /// requests decided on it since, at 21 ms.
 fn held(burst: u64, admitted: usize) -> Arc<Entry> {
+    held_key(KEY, burst, admitted)
+}
+
+/// As [`held`], for `key`.
+fn held_key(key: &[u8], burst: u64, admitted: usize) -> Arc<Entry> {
     let view = View {
         epoch: 1,
         pods: vec![0],
@@ -150,14 +156,14 @@ fn held(burst: u64, admitted: usize) -> Arc<Entry> {
         Participant::new(1, 10 * MS, view, hasher).expect("native 128-bit atomics on Linux");
     participant.set_levers(Levers { poll_quiet: false });
     let contract = contract(burst);
-    participant.decide_all(&[(KEY, contract)], 0);
+    participant.decide_all(&[(key, contract)], 0);
     participant.on_cycle(10 * MS);
     for (_, batch) in participant.take_outgoing() {
         let answers = pod.on_batch(batch, 10 * MS);
         participant.on_answers(answers, 10 * MS);
     }
     participant.on_cycle(20 * MS);
-    let entry = participant.entries(&[(KEY, contract)]).remove(0);
+    let entry = participant.entries(&[(key, contract)]).remove(0);
     for _ in 0..admitted {
         let _decided = pooled::decide(&[&entry], 21 * MS);
     }
@@ -173,9 +179,32 @@ fn worker(entry: Arc<Entry>) -> (Outcome, Arc<Entry>) {
     (outcome, entry)
 }
 
+/// The first `limits` of `KEY`, `ROUTE` and `GLOBAL`, each held as [`held`] has it, one
+/// request decided on each since.
+fn held_all(limits: usize) -> Vec<Arc<Entry>> {
+    [KEY, ROUTE, GLOBAL][..limits]
+        .iter()
+        .map(|key| held_key(key, 100, 1))
+        .collect()
+}
+
+#[library_benchmark]
+#[bench::two(held_all(2))]
+#[bench::three(held_all(3))]
+fn worker_all(held: Vec<Arc<Entry>>) -> (Outcome, Vec<Arc<Entry>>) {
+    // The keys as the proxy hands the usual few over, with no list made for them.
+    let now = black_box(22 * MS);
+    let outcome = match held.as_slice() {
+        [a, b] => pooled::decide(black_box(&[&**a, &**b]), now),
+        [a, b, c] => pooled::decide(black_box(&[&**a, &**b, &**c]), now),
+        more => pooled::decide(&more.iter().map(|entry| &**entry).collect::<Vec<_>>(), now),
+    };
+    (outcome, held)
+}
+
 library_benchmark_group!(name = data_plane; benchmarks = decide, decide_all);
 library_benchmark_group!(name = registry_of_keys; benchmarks = find, find_or_make);
-library_benchmark_group!(name = participant; benchmarks = worker);
+library_benchmark_group!(name = participant; benchmarks = worker, worker_all);
 main!(
     library_benchmark_groups = data_plane,
     registry_of_keys,

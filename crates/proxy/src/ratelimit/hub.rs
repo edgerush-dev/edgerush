@@ -35,7 +35,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 
 /// The time between a worker's handing its signals to its process.
 pub(crate) const SYNC: Duration = Duration::from_millis(1);
@@ -80,8 +80,6 @@ pub(crate) enum ToHub {
     },
     /// The bytes the keys may hold from now on.
     Capacity(u64),
-    /// A key whose unreported count passed half its most: to drain now.
-    Drain(Box<[u8]>),
     /// An entry a worker made, for the process to keep, with the room it holds among its
     /// worker's until the process takes it in.
     Adopt(Arc<Entry>, Made),
@@ -224,9 +222,6 @@ pub(crate) struct Hub {
     service: CompiledRateLimitService,
     /// Its participant's registry of live entries, for workers meeting a key.
     registry: Arc<Registry<Keyed>>,
-    /// Woken when a hold settles or a count drains on a key requests are deferred on, by
-    /// whichever thread did it: the workers' deferred requests wait on it.
-    settled: Arc<Notify>,
     /// What its streams dial the pods with, if with TLS: replaced by a reload that keeps the
     /// thread, for the connections made after it.
     tls: Option<watch::Sender<SslConnector>>,
@@ -261,8 +256,6 @@ impl Hub {
         let (to, from) = mpsc::unbounded_channel();
         let running = Arc::clone(&shared);
         let set = service.clone();
-        let settled = Arc::new(Notify::new());
-        let waking = Arc::clone(&settled);
         let (tls, dialling) = tls.map(watch::channel).unzip();
         // The participant is made on the thread and its registry handed back, or why not.
         let (made, registry) = std::sync::mpsc::sync_channel(1);
@@ -271,7 +264,6 @@ impl Hub {
             .spawn(move || {
                 let running = Running {
                     shared: running,
-                    settled: waking,
                     failed,
                 };
                 let dial = dialling.map_or(Dial::Plain, Dial::Secured);
@@ -287,7 +279,6 @@ impl Hub {
             shared,
             service: service.clone(),
             registry,
-            settled,
             tls,
         }))
     }
@@ -329,11 +320,6 @@ impl Hub {
             );
         }
         out
-    }
-
-    /// What deferred requests wait on.
-    pub(crate) fn settled(&self) -> Arc<Notify> {
-        Arc::clone(&self.settled)
     }
 
     /// Whether it reaches `service` as it is set now: the same seeds and secret, plain or
@@ -384,7 +370,6 @@ impl std::fmt::Debug for Hub {
 /// What the process thread shares with its handles, and what it calls if it fails.
 struct Running {
     shared: Arc<Shared>,
-    settled: Arc<Notify>,
     failed: Option<Failed>,
 }
 
@@ -505,13 +490,11 @@ fn run(
         .collect();
     let state = Rc::new(State {
         participant: RefCell::new(participant),
-        deferred: RefCell::new(Vec::new()),
         dial,
         seeds,
         members: RefCell::new(BTreeMap::new()),
         answers: RefCell::new(vec![None; workers]),
         shared: Arc::clone(&running.shared),
-        settled: Arc::clone(&running.settled),
         watch: Rc::clone(&watch),
         #[cfg(test)]
         panic_in_exchange: Cell::new(false),
@@ -525,13 +508,11 @@ fn run(
 
 /// A request a worker asked about.
 struct Asked {
-    /// The worker, and its number for the request.
-    worker: usize,
+    /// Its worker's number for the request.
     id: u64,
     keys: Vec<(Box<[u8]>, Contract)>,
-    /// When the process took it, and by when it must be decided: its deadline, set by its
-    /// worker when it first met the request, whatever has become of it since.
-    since: u64,
+    /// By when it must be decided: its deadline, set by its worker when it first met the
+    /// request, whatever has become of it since.
     until: u64,
     /// Where its decision goes: closed once the request has gone.
     decided: Decision,
@@ -563,9 +544,6 @@ impl Asked {
 /// The process thread's state.
 struct State {
     participant: RefCell<Plane>,
-    /// Requests deferred here, decided again at every turn of the loop until their time is
-    /// up: no more than their workers have places for.
-    deferred: RefCell<Vec<Asked>>,
     /// What its streams dial with.
     dial: Dial,
     /// A stream to each seed, sent nothing: what it is told is the store's table.
@@ -576,7 +554,6 @@ struct State {
     /// By worker: where its answers go, once it has joined.
     answers: RefCell<Vec<Option<mpsc::UnboundedSender<FromHub>>>>,
     shared: Arc<Shared>,
-    settled: Arc<Notify>,
     watch: Rc<Watch>,
     /// For a test: the next answer's task panics.
     #[cfg(test)]
@@ -612,31 +589,21 @@ impl State {
             } => {
                 self.shared.stats.asks.fetch_add(1, Ordering::Relaxed);
                 let asked = Asked {
-                    worker,
                     id,
                     keys,
-                    since: now,
                     until,
                     decided: to,
                 };
                 // Gone or out of time while queued: answered undecided — never decided, or
                 // charged, for a request no longer waiting for it.
                 let told = match asked.over(now, &self.shared.stats) {
-                    Ok(over) => Some(over),
-                    Err(asked) => decided(
-                        &mut self.participant.borrow_mut(),
-                        &mut self.deferred.borrow_mut(),
-                        asked,
-                        now,
-                    ),
+                    Ok(over) => over,
+                    Err(asked) => decided(&mut self.participant.borrow_mut(), asked, now),
                 };
-                if let Some(told) = told {
-                    self.shared.stats.answered(0);
-                    self.tell(worker, told);
-                }
+                self.shared.stats.answered(0);
+                self.tell(worker, told);
             }
             ToHub::Capacity(bytes) => self.participant.borrow_mut().set_capacity(bytes),
-            ToHub::Drain(key) => self.participant.borrow_mut().drain(&key, now),
             // Its room given back once it is taken in.
             ToHub::Adopt(entry, _made) => self.participant.borrow_mut().adopt(entry),
             ToHub::Signals(entries) => self.participant.borrow_mut().on_signals(entries),
@@ -652,38 +619,6 @@ impl State {
             ToHub::Table(told) => {
                 let _gone = told.send(self.participant.borrow().routing().table().cloned());
             }
-        }
-    }
-
-    /// Decides again what is deferred here, and wakes what waits on a settled hold or a
-    /// drained count.
-    fn answer(&self) {
-        let now = self.now();
-        let mut participant = self.participant.borrow_mut();
-        let mut deferred = self.deferred.borrow_mut();
-        let mut told: Vec<(usize, FromHub)> = Vec::new();
-        // Every request deferred here, decided again while its time lasts and it is there.
-        for asked in std::mem::take(&mut *deferred) {
-            let (worker, since) = (asked.worker, asked.since);
-            let asked = match asked.over(now, &self.shared.stats) {
-                Ok(over) => {
-                    self.shared.stats.answered(now.saturating_sub(since));
-                    told.push((worker, over));
-                    continue;
-                }
-                Err(asked) => asked,
-            };
-            if let Some(answer) = decided(&mut participant, &mut deferred, asked, now) {
-                self.shared.stats.answered(now.saturating_sub(since));
-                told.push((worker, answer));
-            }
-        }
-        if participant.take_wake() {
-            self.settled.notify_waiters();
-        }
-        drop((participant, deferred));
-        for (worker, message) in told {
-            self.tell(worker, message);
         }
     }
 
@@ -1092,7 +1027,6 @@ async fn open(state: &Rc<State>, stream: &Rc<PodStream>, generation: u64) {
         };
         let started = Instant::now();
         state.told(stream, told, state.now());
-        state.answer();
         state.send();
         let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         state
@@ -1103,42 +1037,26 @@ async fn open(state: &Rc<State>, stream: &Rc<PodStream>, generation: u64) {
     }
 }
 
-/// What comes of request `asked` at `now`: told its decision now, or deferred, to be
-/// decided again while its time lasts. What is kept needs no bound of its own: each holds
-/// one of its worker's places until it is answered.
-fn decided(
-    participant: &mut Plane,
-    deferred: &mut Vec<Asked>,
-    asked: Asked,
-    now: u64,
-) -> Option<FromHub> {
+/// The decision of request `asked` at `now`, for its worker.
+fn decided(participant: &mut Plane, asked: Asked, now: u64) -> FromHub {
     let keys: Vec<(&[u8], Contract)> = asked
         .keys
         .iter()
         .map(|(key, contract)| (&**key, *contract))
         .collect();
-    let id = asked.id;
-    match participant.decide_all(&keys, now) {
-        Pooled::Defer => {
-            deferred.push(asked);
-            None
-        }
-        decision => {
-            let admitted = decision == Pooled::Admit;
-            let refused_by = if admitted {
-                Box::default()
-            } else {
-                participant.waits(&keys, now).collect()
-            };
-            Some(FromHub {
-                id,
-                to: Some(asked.decided),
-                admitted,
-                undecided: None,
-                refused_by,
-                entries: participant.entries(&keys),
-            })
-        }
+    let admitted = participant.decide_all(&keys, now) == Pooled::Admit;
+    let refused_by = if admitted {
+        Box::default()
+    } else {
+        participant.waits(&keys, now).collect()
+    };
+    FromHub {
+        id: asked.id,
+        to: Some(asked.decided),
+        admitted,
+        undecided: None,
+        refused_by,
+        entries: participant.entries(&keys),
     }
 }
 
@@ -1203,9 +1121,8 @@ async fn serve(state: Rc<State>, mut from: mpsc::UnboundedReceiver<ToHub>, cycle
                 state.shared.stats.cycle_ns_most.fetch_max(took, Ordering::Relaxed);
             }
         }
-        // What was deferred decided again, and what settled woken, every turn.
+        // What is to go to the pods sent, every turn.
         let started = Instant::now();
-        state.answer();
         state.send();
         let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         state
@@ -1238,7 +1155,6 @@ mod tests {
         .expect("native 128-bit atomics");
         Rc::new(State {
             participant: RefCell::new(participant),
-            deferred: RefCell::new(Vec::new()),
             dial: Dial::Plain,
             seeds: Vec::new(),
             members: RefCell::new(BTreeMap::new()),
@@ -1250,7 +1166,6 @@ mod tests {
                 stats: Stats::default(),
                 pods: Mutex::new(Vec::new()),
             }),
-            settled: Arc::new(Notify::new()),
             watch: Rc::new(Watch {
                 failed: None,
                 over: Cell::new(false),

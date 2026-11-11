@@ -2,8 +2,9 @@
 //! (`RUSTFLAGS="--cfg loom" cargo test --release -p edgerush-ratelimit --lib loom`).
 //!
 //! Loom has no 128-bit atomic, so the word is behind a loom mutex here ([`super::sync`]):
-//! these check how the waiters, the cycle record and the signals order around the word,
-//! not the word's own orderings, which the threaded tests in `tests` exercise.
+//! these check how a request's reads and charges, the cycle record and the signals order
+//! around the word, not the word's own orderings, which the threaded tests in `tests`
+//! exercise.
 
 #![cfg(loom)]
 
@@ -23,51 +24,54 @@ fn contract(limit: u64, burst: u64) -> Contract {
     }
 }
 
-/// The handshake between a request deferred on a key and whoever changes the key's word
-/// next ([`wait_on`], [`waited_on`]), with a loom atomic in the word's place used as the
-/// word is: the request's look at it a plain acquire load, as a refusal is; the change a
-/// compare-and-swap. Either the request sees the change, or the changer sees it waiting
-/// and wakes it — never neither. (The word itself is a lock under loom, which would order
-/// the two however the handshake was written.)
+/// Two requests for a key's last room at once, each under it and another key with room:
+/// read then charged, so both may be admitted, one past the limit; never both refused,
+/// which would refuse one within it. Each admission is counted once on each of its keys.
 #[test]
-fn loom_a_change_to_the_word_wakes_or_reaches_its_waiter() {
+fn loom_requests_racing_for_the_last_room_over_admit_only() {
     loom::model(|| {
-        let word = Arc::new(AtomicU64::new(0));
-        let waiters = Arc::new(AtomicU64::new(0));
-        let waiter = {
-            let (word, waiters) = (Arc::clone(&word), Arc::clone(&waiters));
+        let tight = Arc::new(Entry::new(b"t"[..].into(), contract(1, 1), CYCLE, 0));
+        let roomy = Arc::new(Entry::new(
+            b"r"[..].into(),
+            contract(1_000, 1_000),
+            CYCLE,
+            0,
+        ));
+        let request = || {
+            let (tight, roomy) = (Arc::clone(&tight), Arc::clone(&roomy));
             loom::thread::spawn(move || {
-                wait_on(&waiters);
-                word.load(Ordering::Acquire)
+                u64::from(decide(&[&roomy, &tight], 0).local == Local::Admit)
             })
         };
-        let changed = word
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        let wake = waited_on(&waiters);
-        let seen = waiter.join().unwrap();
-        assert!(changed);
-        assert!(seen == 1 || wake, "the change unseen and nobody woken");
+        let (a, b) = (request(), request());
+        let admitted = a.join().unwrap() + b.join().unwrap();
+        assert!(admitted >= 1, "both refused, one within the limit");
+        assert_eq!(tight.snapshot().unreported, admitted);
+        assert_eq!(roomy.snapshot().unreported, admitted);
     });
 }
 
-/// A request deferred on a key's outstanding hold, the hold given back at once: found or
-/// woken, through the entry's own calls.
+/// One request under the last room's key alone, one under it and another: the one key's
+/// compare-and-swap and the other's read then charge, at once. One at least is admitted.
 #[test]
-fn loom_a_hold_given_back_wakes_or_admits_its_waiter() {
+fn loom_one_key_and_two_racing_for_the_last_room_over_admit_only() {
     loom::model(|| {
-        let entry = Arc::new(Entry::new(b"k"[..].into(), contract(1, 1), CYCLE, 0));
-        assert!(entry.take(Op::Hold, 0).0.done(), "the last token held");
-        let waiter = {
-            let entry = Arc::clone(&entry);
-            loom::thread::spawn(move || {
-                entry.add_waiter();
-                entry.take(Op::Admit, 0).0
-            })
+        let tight = Arc::new(Entry::new(b"t"[..].into(), contract(1, 1), CYCLE, 0));
+        let roomy = Arc::new(Entry::new(
+            b"r"[..].into(),
+            contract(1_000, 1_000),
+            CYCLE,
+            0,
+        ));
+        let alone = {
+            let tight = Arc::clone(&tight);
+            loom::thread::spawn(move || u64::from(decide(&[&tight], 0).local == Local::Admit))
         };
-        let (wake, _) = entry.settle(false, 0);
-        let taken = waiter.join().unwrap();
-        assert!(taken.done() || wake, "{taken:?}, nobody woken");
+        let both = u64::from(decide(&[&roomy, &tight], 0).local == Local::Admit);
+        let admitted = alone.join().unwrap() + both;
+        assert!(admitted >= 1, "both refused, one within the limit");
+        assert_eq!(tight.snapshot().unreported, admitted);
+        assert_eq!(roomy.snapshot().unreported, both);
     });
 }
 
@@ -86,12 +90,12 @@ fn loom_admissions_racing_a_drain_are_counted_once_and_a_count_left_is_signalled
         let admit = |entry: &Arc<Entry>| {
             let entry = Arc::clone(entry);
             loom::thread::spawn(move || {
-                let (taken, started) = entry.take(Op::Admit, 0);
-                (u64::from(taken.done()), started)
+                let (taken, started) = entry.take(0);
+                (u64::from(taken == Taken::Done), started)
             })
         };
         let (a, b) = (admit(&entry), admit(&entry));
-        let (drained, _, _) = entry.drain(0, Cycle::AsItIs);
+        let (drained, _) = entry.drain(0);
         let (a, b) = (a.join().unwrap(), b.join().unwrap());
         let left = entry.snapshot().unreported;
         assert_eq!(drained + left, a.0 + b.0, "each admission counted once");
@@ -122,11 +126,11 @@ fn loom_a_signal_carried_by_one_on_its_way_reaches_the_transport() {
         let admit = |entry: &Arc<Entry>, queue: &Arc<loom::sync::Mutex<Vec<Arc<Entry>>>>| {
             let (entry, queue) = (Arc::clone(entry), Arc::clone(queue));
             loom::thread::spawn(move || {
-                let (taken, started) = entry.take(Op::Admit, 0);
+                let (taken, started) = entry.take(0);
                 if started && entry.claim_signal() {
                     queue.lock().unwrap().push(Arc::clone(&entry));
                 }
-                u64::from(taken.done())
+                u64::from(taken == Taken::Done)
             })
         };
         let (a, b) = (admit(&entry, &queue), admit(&entry, &queue));
@@ -134,7 +138,7 @@ fn loom_a_signal_carried_by_one_on_its_way_reaches_the_transport() {
         let mut drained = 0;
         for signalled in &taken {
             signalled.unclaim_signal();
-            drained += signalled.drain(0, Cycle::AsItIs).0;
+            drained += signalled.drain(0).0;
         }
         let admitted = a.join().unwrap() + b.join().unwrap();
         let left = entry.snapshot().unreported;
@@ -165,7 +169,7 @@ fn loom_two_clocks_leave_the_record_with_the_words_cycle() {
         let (early, late) = (255 * CYCLE, 256 * CYCLE);
         let at = |entry: &Arc<Entry>, now| {
             let entry = Arc::clone(entry);
-            loom::thread::spawn(move || entry.take(Op::Admit, now).0.done())
+            loom::thread::spawn(move || entry.take(now).0 == Taken::Done)
         };
         let (a, b) = (at(&entry, early), at(&entry, late));
         assert!(a.join().unwrap() && b.join().unwrap());

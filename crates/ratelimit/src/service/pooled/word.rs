@@ -4,16 +4,11 @@
 //! |---|---|---|
 //! | arrival | 56 | the GCRA arrival time, modulo 2^56, in units of 1/65,536 of the interval |
 //! | left | 16 | what the cycle under way may still admit |
-//! | spent | 16 | what the cycle under way has taken, net of what was given back: `left + spent` is the cycle's allowance |
 //! | cycle | 16 | the cycle number of the last advance, modulo 2^16 |
 //! | shared | 1 | whether that advance shared out the copy |
 //! | closed | 1 | evicted: nothing more is taken |
-//! | unreported | 14 | admitted here and not yet drained by the transport into its ledger |
-//! | held | 7 | charged and held for requests under several keys until all are decided, each reserving a place in `unreported` |
+//! | unreported | 37 | admitted here and not yet drained by the transport into its ledger |
 //! | set | 1 | a cycle has set the allowance: until then there is none, as a new key has none |
-//!
-//! Invariants, kept by every compare-and-swap: `left + spent <= MOST_LEFT`, and
-//! `unreported + held <= MOST_RESERVED`.
 
 use crate::service::Contract;
 
@@ -38,14 +33,13 @@ const FULL_FOR: u64 = MOST_BURST * UNITS;
 /// Units added to a wait so that it is never short: the arrival and `now` are each
 /// rounded by under a unit when converted, so the wait in units is off by under two.
 const WAIT_SLACK: u64 = 2;
-/// The most a cycle's allowance can be: `left` and `spent` each, and their sum. The proxy
-/// refuses a pooled configuration whose contracts could need more ([`fits`]).
+/// The most a cycle's allowance can be. The proxy refuses a pooled configuration whose contracts could need more ([`fits`]).
 pub(super) const MOST_LEFT: u64 = (1 << 16) - 1;
 const CYCLE_MASK: u64 = (1 << 16) - 1;
-/// The most admitted and not yet drained, holds included: past it a request waits for the
-/// transport to drain the count rather than lose any of it.
-pub(super) const MOST_RESERVED: u64 = (1 << 14) - 1;
-pub(super) const MOST_HELD: u64 = (1 << 7) - 1;
+/// The most admitted and not yet drained: 137 billion, which the transport, draining every
+/// key's count every cycle it visits it, never lets a key reach. Past it, an admission is
+/// not counted rather than wrap the count.
+pub(super) const MOST_UNREPORTED: u64 = (1 << 37) - 1;
 
 /// Whether `contract` fits a pooled entry at `cycle`: the largest allowance a cycle can set,
 /// a whole bucket and two cycles' refill (the cycle after a share keeps what the one before
@@ -67,12 +61,10 @@ pub fn fits(contract: Contract, cycle: u64) -> bool {
 pub(super) struct Fields {
     pub(super) arrival: u64,
     pub(super) left: u64,
-    pub(super) spent: u64,
     pub(super) cycle: u64,
     pub(super) shared: bool,
     pub(super) closed: bool,
     pub(super) unreported: u64,
-    pub(super) held: u64,
     pub(super) set: bool,
 }
 
@@ -80,12 +72,10 @@ impl Fields {
     pub(super) fn pack(self) -> u128 {
         u128::from(self.arrival & ARRIVAL_MASK)
             | u128::from(self.left & MOST_LEFT) << 56
-            | u128::from(self.spent & MOST_LEFT) << 72
-            | u128::from(self.cycle & CYCLE_MASK) << 88
-            | u128::from(self.shared) << 104
-            | u128::from(self.closed) << 105
-            | u128::from(self.unreported & MOST_RESERVED) << 106
-            | u128::from(self.held & MOST_HELD) << 120
+            | u128::from(self.cycle & CYCLE_MASK) << 72
+            | u128::from(self.shared) << 88
+            | u128::from(self.closed) << 89
+            | u128::from(self.unreported & MOST_UNREPORTED) << 90
             | u128::from(self.set) << 127
     }
 
@@ -95,12 +85,10 @@ impl Fields {
         Self {
             arrival: field(0, ARRIVAL_MASK),
             left: field(56, MOST_LEFT),
-            spent: field(72, MOST_LEFT),
-            cycle: field(88, CYCLE_MASK),
-            shared: field(104, 1) == 1,
-            closed: field(105, 1) == 1,
-            unreported: field(106, MOST_RESERVED),
-            held: field(120, MOST_HELD),
+            cycle: field(72, CYCLE_MASK),
+            shared: field(88, 1) == 1,
+            closed: field(89, 1) == 1,
+            unreported: field(90, MOST_UNREPORTED),
             set: field(127, 1) == 1,
         }
     }
@@ -255,11 +243,6 @@ impl Bucket {
         now.wrapping_sub(FULL_FOR) & ARRIVAL_MASK
     }
 
-    /// The arrival after giving one charge back.
-    pub(super) fn release(arrival: u64) -> u64 {
-        arrival.wrapping_sub(UNITS) & ARRIVAL_MASK
-    }
-
     /// The arrival `behind` from full at `now`, as [`TokenBucket::behind`] says it
     /// (time multiplied by the limit, an interval being the window), plus `extra` charges:
     /// [`full`](Self::full) if both are none, as [`TokenBucket::rebase`] leaves no arrival.
@@ -310,7 +293,7 @@ pub(super) struct Advance {
 ///
 /// Waking after a gap of two cycles or more, however long, is one advance of the second
 /// kind: the bucket refilled from the time gone by, never past its burst; the share from
-/// the sharing it last heard of; at most one carried; the count and holds untouched. Missed
+/// the sharing it last heard of; at most one carried; the count untouched. Missed
 /// cycles add no allowance, and the copy's freshness is not this function's to change.
 pub(super) fn advanced(bucket: &Bucket, fields: Fields, advance: Advance, now: u64) -> Fields {
     let step = step(fields.cycle, advance.record, now, advance.cycle);
@@ -330,7 +313,6 @@ pub(super) fn advanced(bucket: &Bucket, fields: Fields, advance: Advance, now: u
     Fields {
         // Within the most whenever the contract fits (`fits`), which the proxy requires.
         left: allowance.min(MOST_LEFT),
-        spent: 0,
         cycle: current,
         shared: !after_share,
         set: true,
@@ -359,12 +341,10 @@ mod tests {
         let all = Fields {
             arrival: ARRIVAL_MASK,
             left: MOST_LEFT,
-            spent: MOST_LEFT,
             cycle: CYCLE_MASK,
             shared: true,
             closed: true,
-            unreported: MOST_RESERVED,
-            held: MOST_HELD,
+            unreported: MOST_UNREPORTED,
             set: true,
         };
         assert_eq!(Fields::unpack(all.pack()), all);
@@ -372,12 +352,10 @@ mod tests {
         let one = Fields {
             arrival: 0,
             left: 0,
-            spent: 0,
             cycle: 0,
             shared: false,
             closed: false,
             unreported: 0,
-            held: 0,
             set: false,
         };
         for fields in [
@@ -386,7 +364,6 @@ mod tests {
                 ..one
             },
             Fields { left: 7, ..one },
-            Fields { spent: 5, ..one },
             Fields { cycle: 9, ..one },
             Fields {
                 shared: true,
@@ -400,7 +377,6 @@ mod tests {
                 unreported: 3,
                 ..one
             },
-            Fields { held: 2, ..one },
             Fields { set: true, ..one },
         ] {
             assert_eq!(Fields::unpack(fields.pack()), fields);
@@ -445,7 +421,6 @@ mod tests {
         assert!((100_000_000..=100_003_052).contains(&wait), "{wait}");
         assert!(bucket.admits(arrival, bucket.units(100_000_000)));
         assert!(!bucket.admits(arrival, bucket.units(99_999_999)));
-        assert_eq!(bucket.remaining(Bucket::release(arrival), now), 1);
     }
 
     /// Long after the last charge, the arrival time has fallen behind: still a full
@@ -505,12 +480,10 @@ mod tests {
         let start = Fields {
             arrival: bucket.units(0),
             left: MOST_LEFT,
-            spent: 0,
             cycle: 0,
             shared: false,
             closed: false,
             unreported: 0,
-            held: 0,
             set: false,
         };
         let first = advanced(&bucket, start, advance, cycle);
@@ -591,9 +564,9 @@ mod tests {
         }
 
         /// Waking after a gap, however long, gives at most the share of the bucket refilled
-        /// from the time gone by and one cycle's refill, and one carried; at least one, the
-        /// cycle unspent; the count, the holds and the bucket as they were. Going quiet and
-        /// waking gains nothing a cycle's share does not allow.
+        /// from the time gone by and one cycle's refill, and one carried; at least one; the
+        /// count and the bucket as they were. Going quiet and waking gains nothing a cycle's
+        /// share does not allow.
         #[test]
         fn waking_after_a_gap_is_bounded(
             limit in 1u64..10_000,
@@ -602,8 +575,7 @@ mod tests {
             left in 0u64..=MOST_LEFT,
             shared: bool,
             set: bool,
-            unreported in 0u64..=MOST_RESERVED,
-            held in 0u64..=MOST_HELD,
+            unreported in 0u64..=MOST_UNREPORTED,
             last in 0u64..1 << 30,
             gap in 2u64..1 << 20,
             charged in 0u64..10_000,
@@ -615,8 +587,8 @@ mod tests {
                 Bucket::charge(at, bucket.units(start), 1)
             });
             let fields = Fields {
-                arrival, left, spent: 0, cycle: last & CYCLE_MASK, shared, closed: false,
-                unreported, held, set,
+                arrival, left, cycle: last & CYCLE_MASK, shared, closed: false, unreported,
+                set,
             };
             let refill = c.refilled(LENGTH);
             let advance = Advance {
@@ -633,11 +605,10 @@ mod tests {
                 .max(1);
             prop_assert!(woken.left >= 1);
             prop_assert!(woken.left <= (share + 1).min(MOST_LEFT), "{} > {}", woken.left, share + 1);
-            prop_assert_eq!(woken.spent, 0);
             prop_assert_eq!(woken.cycle, (last + gap) & CYCLE_MASK);
             prop_assert_eq!(
-                (woken.arrival, woken.unreported, woken.held, woken.closed),
-                (fields.arrival, fields.unreported, fields.held, fields.closed)
+                (woken.arrival, woken.unreported, woken.closed),
+                (fields.arrival, fields.unreported, fields.closed)
             );
         }
     }
