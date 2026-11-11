@@ -1,0 +1,68 @@
+# A backend of every route but a UDPRoute is its Service's TCP port of the number named, a
+# port of no protocol among them, whatever comes first: DNS's Service lists its UDP port 53
+# before its TCP one, which an HTTPRoute and a TCPRoute reach, and a UDPRoute the UDP one,
+# their upstreams apart. A Service with that number over UDP alone, or over SCTP alone, is
+# an invalid backend (UnsupportedProtocol).
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP }
+    - { name: tcp, port: 5300, protocol: TCP }
+    - { name: udp, port: 5300, protocol: UDP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: web, namespace: shop }
+spec:
+  parentRefs: [{ name: web, sectionName: http }]
+  rules:
+    - backendRefs: [{ name: dns, port: 53 }]
+    - matches: [{ path: { type: PathPrefix, value: /udp-only } }]
+      backendRefs: [{ name: udp-only, port: 53 }]
+    - matches: [{ path: { type: PathPrefix, value: /sctp-only } }]
+      backendRefs: [{ name: sctp-only, port: 53 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: { name: dns, namespace: shop }
+spec:
+  parentRefs: [{ name: web, sectionName: tcp }]
+  rules:
+    - backendRefs: [{ name: dns, port: 53 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: { name: dns, namespace: shop }
+spec:
+  parentRefs: [{ name: web, sectionName: udp }]
+  rules:
+    - backendRefs: [{ name: dns, port: 53 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: dns, namespace: shop }
+spec:
+  ports:
+    - { name: dns, port: 53, protocol: UDP }
+    - { name: dns-tcp, port: 53, protocol: TCP }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: udp-only, namespace: shop }
+spec:
+  ports: [{ name: dns, port: 53, protocol: UDP }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: sctp-only, namespace: shop }
+spec:
+  ports: [{ name: dns, port: 53, protocol: SCTP }]

@@ -1,0 +1,2 @@
+HTTPRoute shop/web: rule 1: a backend's share is answered 500: Service shop/udp-only has port 53 but not over TCP; every backend but a UDPRoute's is a Service's TCP port
+HTTPRoute shop/web: rule 2: a backend's share is answered 500: Service shop/sctp-only has port 53 but not over TCP; every backend but a UDPRoute's is a Service's TCP port
