@@ -1,7 +1,9 @@
-# The shared data plane, as the Gateway shop/web.
+# The shared data plane, as the Gateway shop/web, a tunnel idle bound given 443.
 ingress_class: edge
 gateway: shop/web
 cluster_domain: cluster.local
 ingress_hosts_fall_through: false
 ingress_https_redirect: true
 ingress_https_redirect_max_age: 30
+ports:
+  443: { tunnel_idle_seconds: 120 }

@@ -84,7 +84,11 @@ pub(crate) fn listener(plane: &Plane, port: u16, protocol: Protocol) -> Listener
         http3: settings
             .and_then(|settings| settings.http3)
             .filter(|_| https),
-        tunnel_idle_seconds: None,
+        // An `https` port's is for the connections it passes through, and is taken away
+        // again once its sharers are known if it passes none.
+        tunnel_idle_seconds: settings
+            .and_then(|settings| settings.tunnel_idle_seconds)
+            .filter(|_| matches!(protocol, Protocol::Tcp | Protocol::Tls | Protocol::Https)),
         session_idle_seconds: settings
             .and_then(|settings| settings.session_idle_seconds)
             .filter(|_| udp),
@@ -181,6 +185,47 @@ mod tests {
         assert_eq!(
             bound["port-8443"].http3.map(|http3| http3.alt_svc_max_age),
             Some(60)
+        );
+    }
+
+    /// A port's tunnel idle bound is its `tcp` or `tls` listener's, and its `https` one's
+    /// for the connections that passes through; never an `http` or `udp` listener's.
+    #[test]
+    fn a_ports_tunnel_idle_bound_is_its_tunnels() {
+        let protocols = [
+            (80, Protocol::Http),
+            (443, Protocol::Https),
+            (5432, Protocol::Tcp),
+            (8443, Protocol::Tls),
+        ]
+        .into();
+        let settings: String = [80, 443, 5432, 8443, 53]
+            .map(|port| format!("  {port}: {{ tunnel_idle_seconds: 90 }}\n"))
+            .concat();
+        let bound = bound(
+            &plane(&format!("ports:\n{settings}")),
+            &protocols,
+            &[53].into(),
+        );
+        let tunnel_idle: Vec<(&str, Option<u64>)> = bound
+            .iter()
+            .map(|(name, listener)| (name.as_str(), listener.tunnel_idle_seconds))
+            .collect();
+        assert_eq!(
+            tunnel_idle,
+            [
+                ("port-443", Some(90)),
+                ("port-53-udp", None),
+                ("port-5432", Some(90)),
+                ("port-80", None),
+                ("port-8443", Some(90)),
+            ]
+        );
+        let defaults = super::bound(&plane(""), &protocols, &BTreeSet::new());
+        assert!(
+            defaults
+                .values()
+                .all(|listener| listener.tunnel_idle_seconds.is_none())
         );
     }
 

@@ -1,7 +1,11 @@
-# The shared data plane, as the Gateway edge/web.
+# The shared data plane, as the Gateway edge/web, a tunnel idle bound given its HTTPS ports,
+# which pass no connection through: not theirs.
 ingress_class: edge
 gateway: edge/web
 cluster_domain: cluster.local
 ingress_hosts_fall_through: false
 ingress_https_redirect: true
 ingress_https_redirect_max_age: 30
+ports:
+  443: { tunnel_idle_seconds: 60 }
+  9443: { tunnel_idle_seconds: 60 }
