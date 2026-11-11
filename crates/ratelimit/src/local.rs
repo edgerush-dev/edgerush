@@ -11,6 +11,10 @@
 //! that — and past the byte cap evicts the keys whose buckets would be full soonest, the
 //! least forgiven.
 //!
+//! What a limit's keys share — the limit and the arithmetic made from it — is kept once a
+//! limit, in terms each of its keys points to, rather than copied into every key: two
+//! thirds of a key's bytes otherwise, at the tens of millions of keys a process may hold.
+//!
 //! Times are nanoseconds from any origin the caller keeps to, as everywhere in the crate.
 //! A bucket's arrival time is kept in units of 1/65,536 of a request's interval, modulo
 //! 2^63; a window's number modulo 2^23 above its count in 40 bits. The top bit of the word
@@ -27,6 +31,7 @@ mod tests;
 pub use crate::service::Contract;
 
 use key_set::{KeySet, SLOT_BYTES};
+use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::num::NonZeroU64;
 use sync::{Arc, AtomicU64, Ordering, RwLock};
@@ -55,8 +60,11 @@ const COUNT_MASK: u64 = (1 << COUNT_BITS) - 1;
 /// a window is never read as.
 const NUMBER_MASK: u64 = (1 << (63 - COUNT_BITS)) - 1;
 /// How many shards the registry has: a worker meeting a key it holds no handle to takes one
-/// shard's lock, and the sweep takes each in turn. A few under loom, which tracks each lock.
-const SHARDS: usize = if cfg!(loom) { 2 } else { 256 };
+/// shard's lock, and the sweep takes each in turn. So many that each holds few of the
+/// process's keys: a shard's table grows by moving all its keys under its lock, which the
+/// worker making a key waits out, with any other wanting the shard — at 30 million keys,
+/// some 7,300 a shard. A few under loom, which tracks each lock.
+const SHARDS: usize = if cfg!(loom) { 2 } else { 4_096 };
 
 /// A contract's arithmetic: time to units and back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,7 +126,7 @@ impl Rate {
 
 /// A fixed window's contract: at most `limit` requests in each window of a key, its
 /// windows shifted by an offset from its hash so that keys' boundaries spread (06 §3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Window {
     /// Requests a window.
     pub limit: NonZeroU64,
@@ -127,7 +135,7 @@ pub struct Window {
 }
 
 /// What a key is held to: a bucket or a fixed window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Limit {
     /// A bucket, by GCRA.
     Bucket(Contract),
@@ -148,7 +156,8 @@ impl From<Window> for Limit {
 }
 
 /// A fixed window's arithmetic: times to windows' numbers, and a number and count to a
-/// word and back.
+/// word and back. A limit's terms hold it unshifted; a key's own is shifted by its offset
+/// ([`Span::at`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Span {
     limit: u64,
@@ -158,12 +167,22 @@ struct Span {
 }
 
 impl Span {
-    fn new(window: Window, hash: u64) -> Self {
+    fn new(window: Window) -> Self {
         Self {
             limit: window.limit.get(),
             window: window.window.get(),
-            offset: hash % window.window.get(),
+            offset: 0,
         }
+    }
+
+    /// How far a key's windows are shifted, from its name's hash.
+    fn offset_of(&self, hash: u64) -> u64 {
+        hash % self.window
+    }
+
+    /// The same, shifted by `offset`: a key's.
+    fn at(&self, offset: u64) -> Self {
+        Self { offset, ..*self }
     }
 
     /// The number of the window `at` is in.
@@ -198,18 +217,38 @@ enum Held {
     Window(Span),
 }
 
+/// What every key under one limit shares: the limit, and the arithmetic its words are read
+/// by. Made once a limit and pointed to by each of its keys.
+#[derive(Debug)]
+struct Terms {
+    limit: Limit,
+    held: Held,
+}
+
+impl Terms {
+    fn new(limit: Limit) -> Self {
+        let held = match limit {
+            Limit::Bucket(contract) => Held::Bucket(Rate::new(contract)),
+            Limit::FixedWindow(window) => Held::Window(Span::new(window)),
+        };
+        Self { limit, held }
+    }
+}
+
 /// One key: its bucket's arrival time or its window's count, and when it was last asked
 /// for.
 #[derive(Debug)]
 pub struct Key {
     key: Box<[u8]>,
-    contract: Limit,
-    held: Held,
+    terms: Arc<Terms>,
     /// The arrival time in units, or the window's number and count; the top bit set once
     /// the key is closed.
     word: AtomicU64,
     /// The latest time a request was charged under it, moved before the charge lands.
     last: AtomicU64,
+    /// How far its windows are shifted, under a window: from its name's hash, so that keys'
+    /// boundaries spread (06 §3). Nothing under a bucket.
+    offset: u64,
 }
 
 /// What a look at a key found.
@@ -223,24 +262,26 @@ enum Look {
 }
 
 impl Key {
-    fn new(key: Box<[u8]>, contract: Limit, hash: u64, now: u64) -> Self {
-        let (held, word) = match contract {
-            Limit::Bucket(contract) => {
-                let rate = Rate::new(contract);
-                (Held::Bucket(rate), rate.units(now))
-            }
-            Limit::FixedWindow(window) => {
-                let span = Span::new(window, hash);
-                (Held::Window(span), Span::word(span.number(now), 0))
+    fn new(key: Box<[u8]>, terms: Arc<Terms>, hash: u64, now: u64) -> Self {
+        let (word, offset) = match &terms.held {
+            Held::Bucket(rate) => (rate.units(now), 0),
+            Held::Window(span) => {
+                let span = span.at(span.offset_of(hash));
+                (Span::word(span.number(now), 0), span.offset)
             }
         };
         Self {
             key,
-            contract,
-            held,
+            terms,
             word: AtomicU64::new(word),
             last: AtomicU64::new(now),
+            offset,
         }
+    }
+
+    /// The limit it is held to.
+    fn limit(&self) -> Limit {
+        self.terms.limit
     }
 
     fn closed(&self) -> bool {
@@ -250,7 +291,7 @@ impl Key {
     /// How long a key goes unused before it is fresh whatever its word says: its bucket's
     /// refill, or its window.
     fn refill(&self) -> u64 {
-        match &self.held {
+        match &self.terms.held {
             Held::Bucket(rate) => rate.refill,
             Held::Window(span) => span.window,
         }
@@ -280,7 +321,7 @@ impl Key {
             return Look::Closed;
         }
         let last = self.last.load(Ordering::Relaxed);
-        match &self.held {
+        match &self.terms.held {
             Held::Bucket(rate) => {
                 if now.saturating_sub(last) > rate.refill {
                     let now_units = rate.units(now);
@@ -288,7 +329,7 @@ impl Key {
                 }
                 Self::fits(rate, word, word, rate.units(now.max(last)))
             }
-            Held::Window(span) => Self::window_look(span, word, last, now),
+            Held::Window(span) => Self::window_look(&span.at(self.offset), word, last, now),
         }
     }
 
@@ -400,9 +441,9 @@ impl Key {
     /// one key a tenth more instructions (Callgrind).
     #[inline]
     fn take(&self, now: u64) -> Look {
-        match &self.held {
+        match &self.terms.held {
             Held::Bucket(rate) => self.bucket_take(rate, now),
-            Held::Window(span) => self.window_take(span, now),
+            Held::Window(span) => self.window_take(&span.at(self.offset), now),
         }
     }
 
@@ -443,7 +484,7 @@ impl Key {
 
     /// One request at `now` charged, whether it fits or not: false if the key was closed.
     fn charge(&self, now: u64) -> bool {
-        match &self.held {
+        match &self.terms.held {
             Held::Bucket(rate) => {
                 let now_units = rate.units(now);
                 loop {
@@ -456,7 +497,7 @@ impl Key {
                     }
                 }
             }
-            Held::Window(span) => self.window_charge(span, now),
+            Held::Window(span) => self.window_charge(&span.at(self.offset), now),
         }
     }
 
@@ -497,12 +538,13 @@ impl Key {
 
     /// The same, its word read as `word`.
     fn full_in_from(&self, word: u64, now: u64) -> u64 {
-        match &self.held {
+        match &self.terms.held {
             Held::Bucket(rate) => {
                 let now_units = rate.units(now);
                 rate.nanos(Rate::ahead(self.arrival(word, now, now_units), now_units))
             }
             Held::Window(span) => {
+                let span = span.at(self.offset);
                 let at = now.max(self.last.load(Ordering::Relaxed));
                 if self.idle(now) || Span::count(word, span.number(at)) == 0 {
                     0
@@ -552,11 +594,15 @@ pub struct Local<S> {
     holding: AtomicU64,
     capacity: AtomicU64,
     evicted: AtomicU64,
+    /// Each limit's terms, which its keys point to: read when a key is made, and let go of
+    /// by the sweep once no key holds them.
+    terms: RwLock<HashMap<Limit, Arc<Terms>>>,
 }
 
 /// The bytes a key of `key` is counted as: the key itself, its name, and a slot for its
 /// handle in the registry and in each of `workers`' sets, a byte of a table's control with
-/// each. An estimate, not what the allocator takes.
+/// each. An estimate, not what the allocator takes. Its limit's terms are not counted:
+/// there is one a limit, however many keys it has.
 #[must_use]
 pub fn key_bytes(key: &[u8], workers: u64) -> u64 {
     // An `Arc`'s two counts beside the key.
@@ -577,6 +623,7 @@ impl<S: BuildHasher + Clone> Local<S> {
             holding: AtomicU64::new(0),
             capacity: AtomicU64::new(u64::MAX),
             evicted: AtomicU64::new(0),
+            terms: RwLock::new(HashMap::new()),
         }
     }
 
@@ -618,27 +665,39 @@ impl<S: BuildHasher + Clone> Local<S> {
         &self.shards[at]
     }
 
+    /// What keys under `limit` share: made the first time it is asked for.
+    fn terms(&self, limit: Limit) -> Arc<Terms> {
+        if let Some(terms) = read(&self.terms).get(&limit) {
+            return Arc::clone(terms);
+        }
+        Arc::clone(
+            write(&self.terms)
+                .entry(limit)
+                .or_insert_with(|| Arc::new(Terms::new(limit))),
+        )
+    }
+
     /// The live key of `key` under `contract`, made at `now`, full, if there is none; one
     /// closed or under another contract is replaced.
     fn find_or_make(&self, key: &[u8], contract: Limit, now: u64) -> Arc<Key> {
         let hash = self.hasher.hash_one(key);
         let shard = self.shard(hash);
         if let Some(found) = read(shard).get_hashed(hash, key)
-            && found.contract == contract
+            && found.limit() == contract
             && !found.closed()
         {
             return Arc::clone(found);
         }
         let mut set = write(shard);
         if let Some(found) = set.get_hashed(hash, key) {
-            if found.contract == contract && !found.closed() {
+            if found.limit() == contract && !found.closed() {
                 return Arc::clone(found);
             }
             found.close();
             self.holding
                 .fetch_sub(key_bytes(key, self.workers), Ordering::Relaxed);
         }
-        let made = Arc::new(Key::new(key.into(), contract, hash, now));
+        let made = Arc::new(Key::new(key.into(), self.terms(contract), hash, now));
         set.replace_hashed(hash, Arc::clone(&made));
         self.holding
             .fetch_add(key_bytes(key, self.workers), Ordering::Relaxed);
@@ -708,7 +767,10 @@ impl<S: BuildHasher + Clone> Local<S> {
 
     /// Forgets the keys whose buckets are full at `now` and that no request used for
     /// `quiet`; then, past the cap, evicts the keys whose buckets will be full soonest, down
-    /// to nine tenths of it. Taken every second or so, off the request path.
+    /// to nine tenths of it. Lets go of the terms of limits no key holds any longer, as
+    /// after a reload that drops a limit: a key forgotten holds its terms until the workers'
+    /// handles let go of it, so they go at a later sweep. Taken every second or so, off the
+    /// request path.
     pub fn sweep(&self, now: u64, quiet: u64) -> Swept {
         let mut swept = Swept::default();
         let mut freed = 0;
@@ -723,6 +785,9 @@ impl<S: BuildHasher + Clone> Local<S> {
             });
         }
         self.holding.fetch_sub(freed, Ordering::Relaxed);
+        // Held by the map alone: no key points to them, and none can be made meanwhile, as
+        // making one takes the map's lock to find them.
+        write(&self.terms).retain(|_, terms| Arc::strong_count(terms) > 1);
         let capacity = self.capacity.load(Ordering::Relaxed);
         if self.holding() <= capacity {
             return swept;
@@ -822,7 +887,7 @@ impl<S: BuildHasher + Clone> Handles<S> {
     ) -> R {
         let hash = self.set.hash(key);
         let held: &Key = match self.set.get_hashed(hash, key) {
-            Some(found) if found.contract == contract => found,
+            Some(found) if found.limit() == contract => found,
             _ => self.made(local, key, hash, contract, now),
         };
         act(held)

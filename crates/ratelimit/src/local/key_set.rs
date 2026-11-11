@@ -15,7 +15,7 @@ use hashbrown::hash_table::Entry;
 use std::hash::BuildHasher;
 
 /// The bits of a hash below a part's: a table places a key by the hash's low bits and tags
-/// it with its top seven, and a registry chooses its shard by bits 32 to 39 (`Local`).
+/// it with its top seven, and a registry chooses its shard by bits 32 to 43 (`Local`).
 const PART_SHIFT: u32 = 40;
 
 /// A key with its name's hash.

@@ -458,7 +458,8 @@ fn most_over((limit, window, burst): (NonZeroU64, NonZeroU64, NonZeroU64), times
 /// A key for the set a worker's handles and the registry's shards keep their keys in
 /// (`key_set`, #111).
 fn held_key(name: &[u8]) -> Arc<Key> {
-    Arc::new(Key::new(name.into(), contract(10, SECOND, 10).into(), 0, 0))
+    let terms = Arc::new(Terms::new(contract(10, SECOND, 10).into()));
+    Arc::new(Key::new(name.into(), terms, 0, 0))
 }
 
 proptest! {
@@ -797,4 +798,57 @@ proptest! {
             prop_assert_eq!(admitted, expected, "at {}", now);
         }
     }
+}
+
+/// The key `local` holds for `key`, if it holds one.
+fn key_of(local: &Local<FixedState>, key: &[u8]) -> Option<Arc<Key>> {
+    let hash = local.hasher.hash_one(key);
+    read(local.shard(hash)).get_hashed(hash, key).cloned()
+}
+
+/// Every key under one limit points to one copy of the limit's arithmetic, rather than
+/// keeping its own; a key under another limit, to that limit's.
+#[test]
+fn keys_under_one_limit_share_its_terms() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let (c, other) = (contract(10, SECOND, 5), contract(20, SECOND, 5));
+    assert!(one(&local, &mut handles, b"a", c, 0));
+    assert!(one(&local, &mut handles, b"b", c, 0));
+    assert!(one_in(&local, &mut handles, b"w", window(3, SECOND), 0));
+    assert!(one(&local, &mut handles, b"c", other, 0));
+    let terms = |key: &[u8]| Arc::clone(&key_of(&local, key).unwrap().terms);
+    assert!(Arc::ptr_eq(&terms(b"a"), &terms(b"b")));
+    assert!(!Arc::ptr_eq(&terms(b"a"), &terms(b"c")));
+    assert!(!Arc::ptr_eq(&terms(b"a"), &terms(b"w")));
+    assert_eq!(read(&local.terms).len(), 3);
+}
+
+/// A limit's terms are let go of once no key holds them, as after a reload that drops the
+/// limit, and made again if a key under it comes back. A key forgotten still holds them
+/// while a worker's handle does: they go at the sweep after the handles let go of it.
+#[test]
+fn the_sweep_lets_go_of_terms_no_key_holds() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let (gone, kept) = (contract(10, SECOND, 1), contract(20, SECOND, 1));
+    assert!(one(&local, &mut handles, b"gone", gone, 0));
+    assert!(one(&local, &mut handles, b"kept", kept, 0));
+    // `gone` is full and quiet by then; `kept` was used a moment before.
+    assert!(one(&local, &mut handles, b"kept", kept, 2 * SECOND));
+    assert_eq!(local.sweep(2 * SECOND, SECOND).forgotten, 1);
+    assert!(key_of(&local, b"gone").is_none());
+    assert_eq!(read(&local.terms).len(), 2, "a handle still holds `gone`");
+    handles.prune();
+    local.sweep(2 * SECOND, SECOND);
+    assert_eq!(read(&local.terms).len(), 1, "only `kept`'s terms are left");
+    assert!(one(&local, &mut handles, b"gone", gone, 3 * SECOND));
+    assert_eq!(read(&local.terms).len(), 2);
+}
+
+/// A key holds its name, a pointer to its limit's terms, its word, its last use and its
+/// window's offset: no arithmetic of its own (#259).
+#[test]
+fn a_key_holds_no_arithmetic_of_its_own() {
+    assert_eq!(size_of::<Key>(), 48);
 }
