@@ -92,7 +92,7 @@ impl Worker {
         let compiled = snapshot.listener(listener);
         let idle = compiled
             // A slot no listener has is never served: what the config says unless told.
-            .map_or(Duration::from_secs(60), |compiled| compiled.session_idle);
+            .map_or(60, |compiled| idle_seconds(compiled.session_idle));
         let answers = compiled.and_then(|compiled| compiled.session_answers);
         // A worker made apart from the others counts its sessions in loads of its own.
         let (loads, worker) = match &self.connections {
@@ -187,6 +187,13 @@ impl Connected {
         }
         socket2::SockRef::from(&*self.socket).send(datagram)
     }
+}
+
+/// A listener's idle bound in seconds, as the session table holds it: the whole seconds its
+/// config gives, 99,999 hours at most, which fit. One past what fits, which the config
+/// refuses, would be held as the most that does, some 136 years: as never reached.
+fn idle_seconds(idle: Duration) -> u32 {
+    u32::try_from(idle.as_secs()).unwrap_or(u32::MAX)
 }
 
 /// Whether `error`, on a session's socket, is its endpoint's refusal: ICMP port
@@ -641,7 +648,7 @@ impl Listening {
         }
         let mut sessions = self.sessions.borrow_mut();
         if let Some(listener) = snapshot.listener(self.slot) {
-            sessions.set_idle(listener.session_idle);
+            sessions.set_idle(idle_seconds(listener.session_idle));
             sessions.set_answers(listener.session_answers);
         }
         // Retired before the snapshot that has it no more is published, so seen here.

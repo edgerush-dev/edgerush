@@ -40,7 +40,7 @@ type Table = (Sessions<u64>, WeightedBackends, Instant);
 
 fn full() -> Table {
     let loads = Loads::new(1, usize::MAX, QUIC_MOST, 1);
-    let mut sessions = Sessions::new(Duration::from_secs(60), loads, 0, 0);
+    let mut sessions = Sessions::new(60, loads, 0, 0);
     let backends = WeightedBackends::new([(UpstreamId(0), 1), (UpstreamId(1), 1)]);
     let start = Instant::now();
     for port in 0..SESSIONS {
