@@ -13,6 +13,7 @@ use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
+use edgerush_gateway_api::udp_route::UDPRoute;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -139,6 +140,10 @@ impl Kind for TLSRoute {
 }
 
 impl Kind for TCPRoute {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for UDPRoute {
     const NAMESPACED: bool = true;
 }
 

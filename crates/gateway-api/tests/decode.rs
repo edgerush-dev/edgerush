@@ -10,6 +10,7 @@ use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
+use edgerush_gateway_api::udp_route::UDPRoute;
 use k8s_openapi::{ListableResource, Resource};
 
 #[test]
@@ -186,6 +187,29 @@ spec: {}",
     )
     .unwrap();
     assert!(route.spec.rules.is_empty());
+    // A UDPRoute's likewise.
+    let route: UDPRoute = serde_saphyr::from_str(
+        "metadata: { name: dns }
+spec:
+  rules: [{ backendRefs: [{ name: dns, port: 53 }] }]",
+    )
+    .unwrap();
+    let backend = &route.spec.rules[0].backend_refs[0];
+    assert_eq!(
+        (
+            backend.weight,
+            backend.group.as_str(),
+            backend.kind.as_str(),
+            backend.port
+        ),
+        (1, "", "Service", Some(53))
+    );
+    let route: UDPRoute = serde_saphyr::from_str(
+        "metadata: { name: dns }
+spec: {}",
+    )
+    .unwrap();
+    assert!(route.spec.rules.is_empty());
     // A BackendTLSPolicy's target and validation, its CA references defaulted as the spec
     // has them; its options a map.
     let policy: BackendTLSPolicy = serde_saphyr::from_str(
@@ -265,6 +289,10 @@ fn each_kind_is_listed_where_the_api_server_serves_it() {
     assert_eq!(
         of::<TCPRoute>(),
         at(group, "v1", "tcproutes", "TCPRouteList")
+    );
+    assert_eq!(
+        of::<UDPRoute>(),
+        at(group, "v1", "udproutes", "UDPRouteList")
     );
     assert_eq!(
         of::<BackendTLSPolicy>(),

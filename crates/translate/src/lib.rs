@@ -47,6 +47,7 @@ use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
+use edgerush_gateway_api::udp_route::UDPRoute;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{
     Ingress, IngressBackend, IngressClass, IngressServiceBackend,
@@ -270,6 +271,8 @@ pub struct Cluster {
     pub tls_routes: Vec<TLSRoute>,
     /// Every TCPRoute seen.
     pub tcp_routes: Vec<TCPRoute>,
+    /// Every UDPRoute seen.
+    pub udp_routes: Vec<UDPRoute>,
     /// Every ReferenceGrant seen.
     pub reference_grants: Vec<ReferenceGrant>,
     /// Every BackendTLSPolicy seen.
@@ -958,6 +961,17 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         }
         if let Err(why) = &outcome.asked {
             say(Problem::PolicyFailing(why.clone()));
+        }
+    }
+    // UDPRoutes are followed and not translated yet: each that names the data plane's
+    // Gateway, or a ListenerSet naming it, is said.
+    if let Some(gateway) = &gateway {
+        let udp = cluster.udp_routes.iter().map(http_route::Routed::udp);
+        for outcome in http_route::attached(udp.collect(), gateway, cluster) {
+            report.push(Finding {
+                object: outcome.route,
+                problem: Problem::NotSupportedYet("UDPRoute"),
+            });
         }
     }
     // An Ingress is the data plane's when its class is, and its class is when the

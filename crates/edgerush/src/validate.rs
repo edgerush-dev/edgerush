@@ -12,6 +12,7 @@ use edgerush_gateway_api::listener_set::ListenerSet;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
+use edgerush_gateway_api::udp_route::UDPRoute;
 use edgerush_translate::{Cluster, Plane, Translation, translate};
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
@@ -167,6 +168,7 @@ enum Manifest {
     GRPCRoute(Box<GRPCRoute>),
     TLSRoute(Box<TLSRoute>),
     TCPRoute(Box<TCPRoute>),
+    UDPRoute(Box<UDPRoute>),
     ReferenceGrant(Box<ReferenceGrant>),
     BackendTLSPolicy(Box<BackendTLSPolicy>),
     ConfigMap(Box<ConfigMap>),
@@ -192,6 +194,7 @@ impl Manifest {
             Self::GRPCRoute(route) => cluster.grpc_routes.push(*route),
             Self::TLSRoute(route) => cluster.tls_routes.push(*route),
             Self::TCPRoute(route) => cluster.tcp_routes.push(*route),
+            Self::UDPRoute(route) => cluster.udp_routes.push(*route),
             Self::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
             Self::BackendTLSPolicy(policy) => cluster.backend_tls_policies.push(*policy),
             Self::ConfigMap(map) => cluster.config_maps.push(*map),
@@ -513,6 +516,11 @@ metadata: { name: db, namespace: shop }
 spec: { rules: [{ backendRefs: [{ name: db, port: 5432 }] }] }
 ---
 apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: { name: dns, namespace: shop }
+spec: { rules: [{ backendRefs: [{ name: dns, port: 53 }] }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
 kind: ReferenceGrant
 metadata: { name: from-edge, namespace: shop }
 spec: { from: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: edge }], to: [{ group: '', kind: Service }] }
@@ -543,11 +551,12 @@ metadata: { name: shop, labels: { team: shop } }
             cluster.grpc_routes.len(),
             cluster.tls_routes.len(),
             cluster.tcp_routes.len(),
+            cluster.udp_routes.len(),
             cluster.reference_grants.len(),
             cluster.backend_tls_policies.len(),
             cluster.config_maps.len(),
             cluster.namespaces.len(),
         );
-        assert_eq!(counts, (1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1));
+        assert_eq!(counts, (1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1));
     }
 }
