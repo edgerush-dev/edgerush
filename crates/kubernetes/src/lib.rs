@@ -1,9 +1,15 @@
 //! EdgeRush's client of the Kubernetes API: it lists and watches the kinds EdgeRush reads,
-//! and does nothing else. The data plane follows the EndpointSlices of the namespaces its
-//! upstreams name ([02 §4](../../../docs/02-architecture.md),
+//! and writes what EdgeRush keeps. The data plane follows the EndpointSlices of the
+//! namespaces its upstreams name ([02 §4](../../../docs/02-architecture.md),
 //! [03 §6](../../../docs/03-data-plane.md)); the control plane, Ingresses, IngressClasses,
 //! Services and Secrets ([04 §1](../../../docs/04-control-plane.md)). [`Kind`] says what is
 //! asked of each, [`Watch`] what to ask next, and [`follow`] keeps asking.
+//!
+//! What the operator makes it keeps by server-side apply with force, under a field manager
+//! of its own, and deletes by name or by label ([05 §2](../../../docs/05-operator.md)):
+//! [`ApiServer::apply`], [`ApiServer::apply_status`], [`ApiServer::delete`] and
+//! [`ApiServer::delete_all`]. Others write what they own with a field manager of their own
+//! beside it, as the control plane does its authority's bundle in a ControlPlane's status.
 //!
 //! In a cluster it is [`ApiServer::in_cluster`]: the API server the pod's environment names,
 //! as Kubernetes' own clients find it, its certificate checked against the address it is
@@ -45,6 +51,13 @@ pub const MOST_EVENT_BYTES: usize = 4 << 20;
 
 /// The most of an error's body that is read for its message.
 const MOST_ERROR_BYTES: usize = 64 << 10;
+
+/// The content type of a server-side apply: YAML, of which JSON is a part, and JSON is sent.
+const APPLY: &str = "application/apply-patch+yaml";
+
+/// How a delete is asked to go: the object at once, what it owns after it, as `kubectl`
+/// deletes by default; not waiting on what it owns, nor leaving that behind.
+const BACKGROUND: &str = "propagationPolicy=Background";
 
 /// How long the API server is asked to keep a watch open before it ends it, after which it
 /// is begun again from where it was.
@@ -128,6 +141,9 @@ pub enum ApiError {
     /// An answer that is not what was asked for.
     #[error("an answer that cannot be read: {0}")]
     Unreadable(String),
+    /// A delete by label of no label, which would delete every object of a kind there.
+    #[error("a delete by label that names no label")]
+    NoLabels,
 }
 
 impl ApiError {
@@ -143,6 +159,26 @@ impl ApiError {
     #[must_use]
     pub fn is_conflict(&self) -> bool {
         matches!(self, Self::Answered { code: 409, .. })
+    }
+
+    /// Whether this is the API server's 404: no such object, or no such namespace.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Answered { code: 404, .. })
+    }
+
+    /// Whether this is the API server's 403: a right the service account does not hold, or
+    /// a namespace being deleted, where nothing new may be made.
+    #[must_use]
+    pub fn is_forbidden(&self) -> bool {
+        matches!(self, Self::Answered { code: 403, .. })
+    }
+
+    /// Whether this is the API server's 422: an object it refuses as written, by its schema,
+    /// its CEL rules or an admission policy's.
+    #[must_use]
+    pub fn is_invalid(&self) -> bool {
+        matches!(self, Self::Answered { code: 422, .. })
     }
 }
 
@@ -392,23 +428,7 @@ impl ApiServer {
     ) -> Result<(), ApiError> {
         let mut path = object_path::<K>(namespace, name)?;
         path.push_str("/status");
-        let api_version = if K::GROUP.is_empty() {
-            K::VERSION.to_owned()
-        } else {
-            format!("{}/{}", K::GROUP, K::VERSION)
-        };
-        let mut metadata = serde_json::json!({ "name": name, "resourceVersion": version });
-        if !namespace.is_empty() {
-            metadata["namespace"] = serde_json::Value::from(namespace);
-        }
-        let object = serde_json::json!({
-            "apiVersion": api_version,
-            "kind": K::KIND,
-            "metadata": metadata,
-            "status": status,
-        });
-        let body =
-            serde_json::to_vec(&object).map_err(|error| ApiError::Http(error.to_string()))?;
+        let body = status_object::<K>(namespace, name, Some(version), status)?;
         let deadline = Instant::now() + self.timing.answer;
         // What it answers, the object as it now is, is not needed.
         let _object = self
@@ -422,6 +442,135 @@ impl ApiServer {
         Ok(())
     }
 
+    /// Applies `object`, `K`'s object `name` in `namespace` (`""` for a kind whose objects
+    /// are the cluster's), by server-side apply with force under field manager `manager`:
+    /// the object is made if there is none, and of one there, the fields `object` states
+    /// become `manager`'s and take the values it gives them, whoever set them before. Fields
+    /// `manager` stated in its last apply and `object` leaves out are removed, unless
+    /// another manager holds them too; fields others alone set are left as they are.
+    /// `object` states its `apiVersion`, `kind` and `metadata.name`, as every apply must,
+    /// and no `resourceVersion`, which would make the apply wait on a version: the object as
+    /// it now is comes back.
+    ///
+    /// # Errors
+    ///
+    /// An [`ApiError`]: [`ApiError::is_invalid`] for an object the API server refuses as
+    /// written, [`ApiError::is_forbidden`] without the right to write it.
+    pub async fn apply<K: Kind>(
+        &self,
+        manager: &str,
+        namespace: &str,
+        name: &str,
+        object: &impl serde::Serialize,
+    ) -> Result<K, ApiError> {
+        let mut path = object_path::<K>(namespace, name)?;
+        manager_into(&mut path, manager);
+        let body = serde_json::to_vec(object).map_err(|error| ApiError::Http(error.to_string()))?;
+        let deadline = Instant::now() + self.timing.answer;
+        let answered = self
+            .send(
+                Method::PATCH,
+                &path,
+                Some((APPLY, Bytes::from(body))),
+                deadline,
+            )
+            .await?;
+        self.read_object(answered, deadline).await
+    }
+
+    /// Applies `status` as the status of `K`'s object `name` in `namespace` (`""` for a
+    /// kind whose objects are the cluster's), as [`ApiServer::apply`] does an object, under
+    /// field manager `manager`: the fields of the status it states are `manager`'s, and
+    /// those another manager states are left to it, as the operator's conditions are beside
+    /// the control plane's bundle in a ControlPlane's. Nothing but the status is changed.
+    ///
+    /// # Errors
+    ///
+    /// An [`ApiError`]: [`ApiError::is_not_found`] for an object gone, as a status is never
+    /// made without its object.
+    pub async fn apply_status<K: Kind>(
+        &self,
+        manager: &str,
+        namespace: &str,
+        name: &str,
+        status: &impl serde::Serialize,
+    ) -> Result<(), ApiError> {
+        let mut path = object_path::<K>(namespace, name)?;
+        path.push_str("/status");
+        manager_into(&mut path, manager);
+        let body = status_object::<K>(namespace, name, None, status)?;
+        let deadline = Instant::now() + self.timing.answer;
+        // What it answers, the object as it now is, is not needed.
+        let _object = self
+            .send(
+                Method::PATCH,
+                &path,
+                Some((APPLY, Bytes::from(body))),
+                deadline,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Deletes `K`'s object `name` in `namespace` (`""` for a kind whose objects are the
+    /// cluster's), and what it owns after it, in the background: whether there was one. One
+    /// with finalizers is gone once they have run.
+    ///
+    /// # Errors
+    ///
+    /// An [`ApiError`] for anything the API server answers but a deletion or 404, such as
+    /// [`ApiError::is_forbidden`] without the right to delete it.
+    pub async fn delete<K: Kind>(&self, namespace: &str, name: &str) -> Result<bool, ApiError> {
+        let mut path = object_path::<K>(namespace, name)?;
+        path.push('?');
+        path.push_str(BACKGROUND);
+        let deadline = Instant::now() + self.timing.answer;
+        // What it answers, the object as its deletion leaves it or a status, is not needed.
+        match self.send(Method::DELETE, &path, None, deadline).await {
+            Ok(_answered) => Ok(true),
+            Err(error) if error.is_not_found() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Deletes every object of `K`'s in `scope` that carries each of `labels`, as
+    /// [`ApiServer::delete`] does one, by one request the API server answers once it has
+    /// deleted them: what the operator made where no owner reference reaches. A kind whose
+    /// objects are a namespace's is deleted a namespace at a time, as the API server deletes
+    /// no collection across them.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::NoLabels`] for no labels, asking nothing, as that would delete every
+    /// object of the kind there; an [`ApiError`] for anything the API server answers but a
+    /// deletion, such as [`ApiError::is_forbidden`] without `deletecollection` on the kind.
+    pub async fn delete_all<K: Kind>(
+        &self,
+        scope: &Scope,
+        labels: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), ApiError> {
+        if labels.is_empty() {
+            return Err(ApiError::NoLabels);
+        }
+        if K::NAMESPACED && *scope == Scope::Cluster {
+            return Err(ApiError::Namespaced(K::KIND));
+        }
+        let mut path = kind::collection::<K>(scope)?;
+        let selector: Vec<String> = labels
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        path.push_str("?labelSelector=");
+        encode_into(&mut path, &selector.join(","));
+        fields_into::<K>(scope, &mut path);
+        path.push('&');
+        path.push_str(BACKGROUND);
+        let deadline = Instant::now() + self.timing.answer;
+        // What it answers, the list of what it deleted, is not needed.
+        let _deleted = self.send(Method::DELETE, &path, None, deadline).await?;
+        Ok(())
+    }
+
     /// Sends `object` with `method` to `path`, and reads back what the API server made of
     /// it.
     async fn write<K: Kind + serde::Serialize>(
@@ -432,7 +581,6 @@ impl ApiServer {
     ) -> Result<K, ApiError> {
         let body = serde_json::to_vec(object).map_err(|error| ApiError::Http(error.to_string()))?;
         let deadline = Instant::now() + self.timing.answer;
-        // The API server answers a create with 201: a success as 200 is.
         let answered = self
             .send(
                 method,
@@ -503,7 +651,12 @@ impl ApiServer {
             .await
             .map_err(|_| ApiError::TimedOut)??;
         let (head, body) = answer.into_parts();
-        if head.status == StatusCode::OK || head.status == StatusCode::CREATED {
+        // A create is answered 201, and a delete whose finalizers have yet to run may be
+        // answered 202: successes as 200 is.
+        if matches!(
+            head.status,
+            StatusCode::OK | StatusCode::CREATED | StatusCode::ACCEPTED
+        ) {
             return Ok(body);
         }
         let said = read_whole(body, MOST_ERROR_BYTES, "an error", deadline)
@@ -576,6 +729,44 @@ impl ApiServer {
             .await
             .map_err(|error| ApiError::Http(error.to_string()))
     }
+}
+
+/// `manager`, as the field manager of a server-side apply with force, written into the query
+/// of a path that has none yet.
+fn manager_into(path: &mut String, manager: &str) {
+    path.push_str("?fieldManager=");
+    encode_into(path, manager);
+    path.push_str("&force=true");
+}
+
+/// `K`'s object `name` in `namespace` (`""` for the cluster's) with `status` and nothing else,
+/// as of `version` if a version is asked for, as JSON: what is sent for its status alone,
+/// which the API server takes nothing else of.
+fn status_object<K: Kind>(
+    namespace: &str,
+    name: &str,
+    version: Option<&str>,
+    status: &impl serde::Serialize,
+) -> Result<Vec<u8>, ApiError> {
+    let api_version = if K::GROUP.is_empty() {
+        K::VERSION.to_owned()
+    } else {
+        format!("{}/{}", K::GROUP, K::VERSION)
+    };
+    let mut metadata = serde_json::json!({ "name": name });
+    if let Some(version) = version {
+        metadata["resourceVersion"] = serde_json::Value::from(version);
+    }
+    if !namespace.is_empty() {
+        metadata["namespace"] = serde_json::Value::from(namespace);
+    }
+    let object = serde_json::json!({
+        "apiVersion": api_version,
+        "kind": K::KIND,
+        "metadata": metadata,
+        "status": status,
+    });
+    serde_json::to_vec(&object).map_err(|error| ApiError::Http(error.to_string()))
 }
 
 /// The path of `K`'s object `name` in `namespace`.

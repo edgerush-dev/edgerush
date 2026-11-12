@@ -1,7 +1,8 @@
-//! The kinds EdgeRush lists and watches, and what it asks of each: the data plane's
+//! The kinds EdgeRush reads and writes, and what it asks of each: the data plane's
 //! EndpointSlices; the control plane's Ingresses, IngressClasses, Services and Secrets, the
 //! Gateway API's kinds and their CRDs ([04 §1](../../../docs/04-control-plane.md)), and the
-//! Lease its replicas elect a leader by ([02 §3](../../../docs/02-architecture.md)).
+//! Lease its replicas elect a leader by ([02 §3](../../../docs/02-architecture.md)); and the
+//! RoleBindings the operator makes ([05 §2](../../../docs/05-operator.md)).
 
 use crate::ApiError;
 use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
@@ -18,12 +19,13 @@ use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
+use k8s_openapi::api::rbac::v1::RoleBinding;
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::{ListableResource, Metadata};
 use serde::de::DeserializeOwned;
 
-/// A kind EdgeRush lists and watches.
+/// A kind EdgeRush lists and watches, or writes.
 pub trait Kind:
     ListableResource + Metadata<Ty = ObjectMeta> + DeserializeOwned + Clone + PartialEq + Send + Sync
 {
@@ -67,6 +69,10 @@ impl Kind for IngressClass {
 }
 
 impl Kind for Service {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for RoleBinding {
     const NAMESPACED: bool = true;
 }
 
