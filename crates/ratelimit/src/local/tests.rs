@@ -536,44 +536,51 @@ fn handles_spread_over_their_parts() {
     );
 }
 
-/// A request whose clock is behind the key's last charge, as one worker's can be behind
-/// another's, is decided as of that charge (#108): at its own time it would see the charge as
-/// still to come, and the bucket emptier than it is by the refill between.
+/// A request whose clock lags the key's last charge by up to the slack (`crate::SLACK`), as
+/// one worker's can lag another's, is decided at its own clock and refused nothing within the
+/// limit: as of that clock the bucket owes the lag's refill more, which the slack covers. Ten
+/// of a burst of ten at 100 a second: one charged, then nine more half the slack behind (eight
+/// without the slack).
 #[test]
-fn a_request_with_a_clock_behind_the_keys_is_decided_as_of_its_last_charge() {
+fn a_request_with_a_clock_lagging_by_the_slack_is_refused_nothing_within_the_limit() {
     let local = local();
     let mut handles = Handles::new(FixedState::default());
     let c = contract(100, SECOND, 10);
-    assert!(one(&local, &mut handles, b"k", c, 100 * MS));
+    let at = 100 * MS;
+    assert!(one(&local, &mut handles, b"k", c, at));
+    let behind = at - crate::SLACK / 2;
     let admitted = (0..12)
-        .filter(|_| one(&local, &mut handles, b"k", c, 0))
+        .filter(|_| one(&local, &mut handles, b"k", c, behind))
         .count();
     assert_eq!(admitted, 9);
 }
 
 /// The same through a request under several keys, which looks at each before charging any.
 #[test]
-fn a_request_under_several_keys_with_a_clock_behind_is_decided_as_of_the_last_charge() {
+fn a_request_under_several_keys_with_a_clock_lagging_by_the_slack_is_refused_nothing() {
     let local = local();
     let mut handles = Handles::new(FixedState::default());
     let c = contract(100, SECOND, 10);
-    assert!(one(&local, &mut handles, b"a", c, 100 * MS));
+    let at = 100 * MS;
+    assert!(one(&local, &mut handles, b"a", c, at));
     let both = [(&b"a"[..], c), (&b"b"[..], c)];
+    let behind = at - crate::SLACK / 2;
     let admitted = (0..12)
-        .filter(|_| local.decide(&mut handles, &both, 0) == Decision::Admit)
+        .filter(|_| local.decide(&mut handles, &both, behind) == Decision::Admit)
         .count();
     assert_eq!(admitted, 9);
 }
 
-/// A limit no request could reach refuses none, even with a clock behind: the burst kept is
-/// capped, the rate is not, so a microsecond's refill is more than the whole bucket (#108).
+/// A limit no request could reach refuses none with a clock lagging the last charge by a
+/// little: the burst kept is capped (2^40), the rate is not, so at this rate the bucket and
+/// the slack's refill, capped the same, cover some 200 ns of lag.
 #[test]
-fn an_enormous_limit_refuses_none_with_a_clock_behind() {
+fn an_enormous_limit_refuses_none_with_a_clock_a_little_behind() {
     let local = local();
     let mut handles = Handles::new(FixedState::default());
     let c = contract(u64::MAX / 4, SECOND, u64::MAX / 4);
     assert!(one(&local, &mut handles, b"k", c, 1_000));
-    assert!((0..100).all(|_| one(&local, &mut handles, b"k", c, 0)));
+    assert!((0..100).all(|_| one(&local, &mut handles, b"k", c, 900)));
 }
 
 fn window(limit: u64, window: u64) -> Window {
@@ -746,8 +753,9 @@ fn wandering(window: u64, gaps: &[i64]) -> Vec<u64> {
 
 proptest! {
     /// A key's window decides as the reference's aligned to the clock, shifted by the key's
-    /// offset, and a refusal waits until the reference would admit, a clock behind the key's
-    /// last charge decided as of that charge, as the reference has it.
+    /// offset, and a refusal waits until the reference would admit. A clock behind the key's
+    /// last charge across a window's boundary is decided in the charge's window, as the
+    /// reference has it, the word saying which; its wait runs from its own clock.
     #[test]
     fn one_window_decides_as_the_reference(
         limit in 1_u64..20,
@@ -759,19 +767,17 @@ proptest! {
         let mut handles = Handles::new(FixedState::default());
         let off = offset(&local, b"k", w.window.get());
         let mut reference = FixedWindow::new(w.limit, w.window, Alignment::Clock);
-        let mut last = 0;
         for now in wandering(w.window.get(), &gaps) {
             let shifted = now + off;
             let expected = reference.decide(shifted);
             match local.decide(&mut handles, &[(b"k", w)], now) {
                 Decision::Admit => {
                     prop_assert!(expected, "admitted at {}", now);
-                    last = last.max(now);
                 }
                 Decision::Refuse { wait, .. } => {
                     prop_assert!(!expected, "refused at {}", now);
                     let retry = reference.retry_at(shifted).unwrap();
-                    prop_assert_eq!(wait, retry - (now.max(last) + off), "at {}", now);
+                    prop_assert_eq!(wait, retry - (now + off), "at {}", now);
                 }
             }
         }
