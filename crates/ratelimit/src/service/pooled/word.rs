@@ -1,14 +1,16 @@
 //! A key's admission state as one 128-bit word, and the arithmetic on it: pure, no atomics.
+//! Its low half is laid out as local mode's word is, the bucket's arrival and the closed bit;
+//! its high half holds what syncing adds (#350).
 //!
 //! | Field | Bits | |
 //! |---|---|---|
-//! | arrival | 56 | the GCRA arrival time, modulo 2^56, in units of 1/65,536 of the interval |
+//! | arrival | 63 | the GCRA arrival time, modulo 2^63, in units of 1/65,536 of the interval |
+//! | closed | 1 | evicted: nothing more is taken |
 //! | left | 16 | what the cycle under way may still admit |
 //! | cycle | 16 | the cycle number of the last advance, modulo 2^16 |
 //! | shared | 1 | whether that advance shared out the copy |
-//! | closed | 1 | evicted: nothing more is taken |
-//! | unreported | 37 | admitted here and not yet drained by the transport into its ledger |
 //! | set | 1 | a cycle has set the allowance: until then there is none, as a new key has none |
+//! | unreported | 30 | admitted here and not yet drained by the transport into its ledger |
 
 use crate::service::Contract;
 
@@ -17,12 +19,12 @@ use crate::service::Contract;
 /// unit at each conversion, is 1/65,536 of an interval: 15 µs under one a second, 5.5 ms
 /// under ten an hour.
 pub(super) const UNITS: u64 = 1 << 16;
-const ARRIVAL_BITS: u32 = 56;
+const ARRIVAL_BITS: u32 = 63;
 const ARRIVAL_MASK: u64 = (1 << ARRIVAL_BITS) - 1;
 /// Differences under half the arrival's range are ahead; the rest, behind.
 const AHEAD_BELOW: u64 = 1 << (ARRIVAL_BITS - 1);
 /// The largest burst kept: its tolerance stays well inside the ahead half of the arrival's
-/// range (2^39 intervals), and so does a key left untouched for the two refill times
+/// range (2^46 intervals), and so does a key left untouched for the two refill times
 /// (two bursts' intervals) after which the transport evicts it. A larger burst is held to
 /// this, 137 billion requests, rather than wrapping into no bound at all.
 pub(super) const MOST_BURST: u64 = 1 << 37;
@@ -36,10 +38,10 @@ const WAIT_SLACK: u64 = 2;
 /// The most a cycle's allowance can be. The proxy refuses a pooled configuration whose contracts could need more ([`fits`]).
 pub(super) const MOST_LEFT: u64 = (1 << 16) - 1;
 const CYCLE_MASK: u64 = (1 << 16) - 1;
-/// The most admitted and not yet drained: 137 billion, which the transport, draining every
-/// key's count every cycle it visits it, never lets a key reach. Past it, an admission is
-/// not counted rather than wrap the count.
-pub(super) const MOST_UNREPORTED: u64 = (1 << 37) - 1;
+/// The most admitted and not yet drained: about a billion, which the transport, draining
+/// every key's count every cycle it visits it, never lets a key reach. Past it, an admission
+/// is not counted rather than wrap the count.
+pub(super) const MOST_UNREPORTED: u64 = (1 << 30) - 1;
 
 /// Whether `contract` fits a pooled entry at `cycle`: the largest allowance a cycle can set,
 /// a whole bucket with the slack's refill ([`SLACK`](crate::SLACK)) and two cycles' refill
@@ -74,12 +76,12 @@ pub(super) struct Fields {
 impl Fields {
     pub(super) fn pack(self) -> u128 {
         u128::from(self.arrival & ARRIVAL_MASK)
-            | u128::from(self.left & MOST_LEFT) << 56
-            | u128::from(self.cycle & CYCLE_MASK) << 72
-            | u128::from(self.shared) << 88
-            | u128::from(self.closed) << 89
-            | u128::from(self.unreported & MOST_UNREPORTED) << 90
-            | u128::from(self.set) << 127
+            | u128::from(self.closed) << 63
+            | u128::from(self.left & MOST_LEFT) << 64
+            | u128::from(self.cycle & CYCLE_MASK) << 80
+            | u128::from(self.shared) << 96
+            | u128::from(self.set) << 97
+            | u128::from(self.unreported & MOST_UNREPORTED) << 98
     }
 
     pub(super) fn unpack(word: u128) -> Self {
@@ -87,12 +89,12 @@ impl Fields {
         let field = |shift: u32, mask: u64| (word >> shift) as u64 & mask;
         Self {
             arrival: field(0, ARRIVAL_MASK),
-            left: field(56, MOST_LEFT),
-            cycle: field(72, CYCLE_MASK),
-            shared: field(88, 1) == 1,
-            closed: field(89, 1) == 1,
-            unreported: field(90, MOST_UNREPORTED),
-            set: field(127, 1) == 1,
+            closed: field(63, 1) == 1,
+            left: field(64, MOST_LEFT),
+            cycle: field(80, CYCLE_MASK),
+            shared: field(96, 1) == 1,
+            set: field(97, 1) == 1,
+            unreported: field(98, MOST_UNREPORTED),
         }
     }
 }
@@ -348,6 +350,40 @@ mod tests {
         }
     }
 
+    /// The low half is laid out as local mode's word is: the bucket's arrival below the
+    /// closed bit, all of it; what syncing adds is all in the high half.
+    #[test]
+    fn the_low_half_is_laid_out_as_local_modes_word() {
+        let none = Fields {
+            arrival: 0,
+            closed: false,
+            left: 0,
+            cycle: 0,
+            shared: false,
+            set: false,
+            unreported: 0,
+        };
+        let arrival = Fields {
+            arrival: ARRIVAL_MASK,
+            ..none
+        };
+        assert_eq!(arrival.pack(), u128::from(u64::MAX >> 1));
+        let closed = Fields {
+            closed: true,
+            ..none
+        };
+        assert_eq!(closed.pack(), 1 << 63);
+        let synced = Fields {
+            left: MOST_LEFT,
+            cycle: CYCLE_MASK,
+            shared: true,
+            set: true,
+            unreported: MOST_UNREPORTED,
+            ..none
+        };
+        assert_eq!(synced.pack(), u128::from(u64::MAX) << 64);
+    }
+
     #[test]
     fn every_field_packs_and_unpacks_alone() {
         let all = Fields {
@@ -441,7 +477,7 @@ mod tests {
 
     /// Long after the last charge, the arrival time has fallen behind: still a full
     /// bucket, never one far ahead, for as long as the ahead half of the range lasts,
-    /// 2^39 intervals (550 s at a billion a second, 17 years at a thousand). Past that an
+    /// 2^46 intervals (19.5 hours at a billion a second, 2,230 years at a thousand). Past that an
     /// untouched key reads as owing; the transport evicts it long before, after two refill
     /// times idle, which `MOST_BURST` keeps to 2^38 intervals at most.
     #[test]
@@ -645,7 +681,7 @@ mod tests {
     /// rate on either side of the wrap.
     #[test]
     fn the_arrival_wraps_without_a_wrong_decision() {
-        // A request a microsecond: the range of units wraps every 2^56 / 2^16 µs, 12.7 days.
+        // A request a microsecond: the range of units wraps every 2^63 / 2^16 µs, 4.5 years.
         let c = contract(1_000_000, 1_000_000_000, 3);
         let bucket = Bucket::new(c);
         let interval = 1_000;
