@@ -1,6 +1,6 @@
 [package]
 name = "edgerush-kubernetes"
-description = "EdgeRush's client of the Kubernetes API: the list and watch of the kinds it reads"
+description = "EdgeRush's client of the Kubernetes API: the list and watch of the kinds it reads, and the writes of what it keeps"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

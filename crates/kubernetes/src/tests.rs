@@ -8,6 +8,7 @@ use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
+use k8s_openapi::api::rbac::v1::RoleBinding;
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
@@ -887,5 +888,291 @@ async fn a_status_is_replaced_as_of_its_version_in_a_namespace_or_the_cluster() 
     assert_eq!(
         bodies[1]["metadata"],
         serde_json::json!({ "name": "web", "namespace": "shop", "resourceVersion": "3" })
+    );
+}
+
+/// The API server's refusal of a write, with `code`.
+fn refusal(code: u16, message: &str) -> Answer {
+    answer(
+        code,
+        &format!(
+            r#"{{"kind":"Status","apiVersion":"v1","status":"Failure","code":{code},"message":"{message}"}}"#
+        ),
+    )
+}
+
+#[tokio::test]
+async fn an_object_is_applied_by_its_manager_with_force_and_read_back() {
+    let fake = Fake::start_by_method(&["127.0.0.1"], |method, path| match (method, path) {
+        (
+            "PATCH",
+            "/api/v1/namespaces/edge/services/web?fieldManager=edgerush-operator&force=true",
+        ) => answer(
+            200,
+            r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"web","namespace":"edge","resourceVersion":"5","labels":{"team":"shop"},"managedFields":[{"manager":"edgerush-operator","operation":"Apply"}]},"spec":{"ports":[{"port":443}]}}"#,
+        ),
+        (
+            "PATCH",
+            "/apis/networking.k8s.io/v1/ingressclasses/edge?fieldManager=edgerush-operator&force=true",
+        ) => answer(
+            200,
+            r#"{"apiVersion":"networking.k8s.io/v1","kind":"IngressClass","metadata":{"name":"edge","resourceVersion":"2"}}"#,
+        ),
+        (_, path) if path.contains("/invalid?") => refusal(422, "spec.ports: Required value"),
+        _ => refusal(403, "services is forbidden"),
+    })
+    .await;
+    let client = fake.client(&token("apply", "secret"), Timing::default());
+    let stated = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": { "name": "web", "namespace": "edge" },
+        "spec": { "ports": [{ "port": 443 }] },
+    });
+    let applied: Service = client
+        .apply("edgerush-operator", "edge", "web", &stated)
+        .await
+        .unwrap();
+    // What comes back is the object as it now is, others' fields with it, trimmed as a
+    // list's would be.
+    let mut expected: Service = serde_json::from_value(stated.clone()).unwrap();
+    expected.metadata.resource_version = Some("5".to_owned());
+    expected.metadata.labels = Some(BTreeMap::from([("team".to_owned(), "shop".to_owned())]));
+    assert_eq!(applied, expected);
+    let class = serde_json::json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "IngressClass",
+        "metadata": { "name": "edge" },
+    });
+    let applied: IngressClass = client
+        .apply("edgerush-operator", "", "edge", &class)
+        .await
+        .unwrap();
+    assert_eq!(applied.metadata.resource_version.as_deref(), Some("2"));
+    let seen = fake.seen();
+    assert_eq!(seen.len(), 2);
+    for seen in &seen {
+        assert_eq!(seen.method, "PATCH");
+        assert_eq!(
+            seen.content_type.as_deref(),
+            Some("application/apply-patch+yaml")
+        );
+        assert_eq!(seen.authorization.as_deref(), Some("Bearer secret"));
+    }
+    // What is sent is the object as stated, and nothing else: JSON, which is YAML.
+    let sent: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
+    assert_eq!(sent, stated);
+    // A refusal is said, and told apart.
+    let invalid = client
+        .apply::<Service>("edgerush-operator", "edge", "invalid", &stated)
+        .await
+        .unwrap_err();
+    assert!(
+        invalid.is_invalid() && !invalid.is_forbidden(),
+        "{invalid:?}"
+    );
+    assert_eq!(
+        invalid,
+        ApiError::Answered {
+            code: 422,
+            message: "spec.ports: Required value".to_owned()
+        }
+    );
+    let forbidden = client
+        .apply::<Service>("edgerush-operator", "shop", "web", &stated)
+        .await
+        .unwrap_err();
+    assert!(
+        forbidden.is_forbidden() && !forbidden.is_invalid(),
+        "{forbidden:?}"
+    );
+    // A namespace that cannot be one, or a kind that is in none, is refused unasked.
+    assert_eq!(
+        client
+            .apply::<Service>("edgerush-operator", "Edge", "web", &stated)
+            .await
+            .unwrap_err(),
+        ApiError::Namespace("Edge".to_owned())
+    );
+    assert_eq!(
+        client
+            .apply::<IngressClass>("edgerush-operator", "edge", "edge", &class)
+            .await
+            .unwrap_err(),
+        ApiError::NotNamespaced("IngressClass")
+    );
+    assert_eq!(fake.seen().len(), 4);
+}
+
+#[tokio::test]
+async fn a_status_is_applied_by_its_manager_in_a_namespace_or_the_cluster() {
+    let fake = Fake::start_by_method(&["127.0.0.1"], |method, path| match (method, path) {
+        (
+            "PATCH",
+            "/apis/gateway.networking.k8s.io/v1/namespaces/edge/gateways/edge/status?fieldManager=edgerush-control-plane&force=true"
+            | "/apis/gateway.networking.k8s.io/v1/gatewayclasses/edge/status?fieldManager=edgerush-operator&force=true",
+        ) => answer(200, "{}"),
+        _ => refusal(404, "not found"),
+    })
+    .await;
+    let client = fake.client(&token("apply-status", "secret"), Timing::default());
+    let status = serde_json::json!({ "conditions": [{ "type": "Accepted", "status": "True" }] });
+    client
+        .apply_status::<Gateway>("edgerush-control-plane", "edge", "edge", &status)
+        .await
+        .unwrap();
+    client
+        .apply_status::<GatewayClass>("edgerush-operator", "", "edge", &status)
+        .await
+        .unwrap();
+    let gone = client
+        .apply_status::<Gateway>("edgerush-control-plane", "edge", "gone", &status)
+        .await
+        .unwrap_err();
+    assert!(gone.is_not_found(), "{gone:?}");
+    assert_eq!(
+        client
+            .apply_status::<GatewayClass>("edgerush-operator", "edge", "edge", &status)
+            .await
+            .unwrap_err(),
+        ApiError::NotNamespaced("GatewayClass")
+    );
+    let seen = fake.seen();
+    assert_eq!(seen.len(), 3, "a refused name was sent");
+    // What is sent is the object's kind and name, and its status alone: no version, as an
+    // apply is of the fields it states whatever the object's version.
+    let bodies: Vec<serde_json::Value> = seen
+        .iter()
+        .map(|seen| {
+            assert_eq!(seen.method, "PATCH");
+            assert_eq!(
+                seen.content_type.as_deref(),
+                Some("application/apply-patch+yaml")
+            );
+            serde_json::from_str(&seen.body).unwrap()
+        })
+        .collect();
+    assert_eq!(
+        bodies[0],
+        serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "Gateway",
+            "metadata": { "name": "edge", "namespace": "edge" },
+            "status": status,
+        })
+    );
+    assert_eq!(bodies[1]["metadata"], serde_json::json!({ "name": "edge" }));
+}
+
+#[tokio::test]
+async fn an_object_is_deleted_in_the_background_and_one_gone_is_no_error() {
+    let fake = Fake::start_by_method(&["127.0.0.1"], |method, path| match (method, path) {
+        ("DELETE", "/api/v1/namespaces/edge/services/web?propagationPolicy=Background") => {
+            answer(200, r#"{"kind":"Status","apiVersion":"v1","status":"Success"}"#)
+        }
+        // One whose finalizers have yet to run is answered as accepted.
+        (
+            "DELETE",
+            "/apis/networking.k8s.io/v1/ingressclasses/edge?propagationPolicy=Background",
+        ) => answer(
+            202,
+            r#"{"apiVersion":"networking.k8s.io/v1","kind":"IngressClass","metadata":{"name":"edge"}}"#,
+        ),
+        ("DELETE", path) if path.contains("/gone?") => refusal(404, "not found"),
+        _ => refusal(403, "services is forbidden"),
+    })
+    .await;
+    let client = fake.client(&token("delete", "secret"), Timing::default());
+    assert!(client.delete::<Service>("edge", "web").await.unwrap());
+    assert!(client.delete::<IngressClass>("", "edge").await.unwrap());
+    assert!(!client.delete::<Service>("edge", "gone").await.unwrap());
+    let forbidden = client.delete::<Service>("shop", "web").await.unwrap_err();
+    assert!(forbidden.is_forbidden(), "{forbidden:?}");
+    assert_eq!(
+        client.delete::<Service>("", "web").await.unwrap_err(),
+        ApiError::Namespace(String::new())
+    );
+    let seen = fake.seen();
+    assert_eq!(seen.len(), 4, "a refused name was sent");
+    assert!(
+        seen.iter()
+            .all(|seen| seen.method == "DELETE" && seen.body.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn objects_are_deleted_by_their_labels_and_never_unselected() {
+    let fake = Fake::start_by_method(&["127.0.0.1"], |method, path| match (method, path) {
+        (
+            "DELETE",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/shop/rolebindings?labelSelector=app.kubernetes.io%2Fmanaged-by%3Dedgerush-operator%2Cgateway.edgerush.dev%2Fcontrol-plane%3Dedge&propagationPolicy=Background"
+            | "/apis/networking.k8s.io/v1/ingressclasses?labelSelector=gateway.edgerush.dev%2Fcontrol-plane%3Dedge&propagationPolicy=Background"
+            | "/apis/networking.k8s.io/v1/ingressclasses?labelSelector=gateway.edgerush.dev%2Fcontrol-plane%3Dedge&fieldSelector=metadata.name%3Dedge.web&propagationPolicy=Background",
+        ) => answer(
+            200,
+            r#"{"kind":"IngressClassList","apiVersion":"networking.k8s.io/v1","metadata":{},"items":[]}"#,
+        ),
+        _ => refusal(403, "deletecollection is forbidden"),
+    })
+    .await;
+    let client = fake.client(&token("delete-all", "secret"), Timing::default());
+    let labels = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    };
+    let control_plane = labels(&[("gateway.edgerush.dev/control-plane", "edge")]);
+    client
+        .delete_all::<RoleBinding>(
+            &namespace("shop"),
+            &labels(&[
+                ("app.kubernetes.io/managed-by", "edgerush-operator"),
+                ("gateway.edgerush.dev/control-plane", "edge"),
+            ]),
+        )
+        .await
+        .unwrap();
+    client
+        .delete_all::<IngressClass>(&Scope::Cluster, &control_plane)
+        .await
+        .unwrap();
+    // One object named alone is selected by its name too.
+    client
+        .delete_all::<IngressClass>(&Scope::named("edge.web").unwrap(), &control_plane)
+        .await
+        .unwrap();
+    let forbidden = client
+        .delete_all::<RoleBinding>(&namespace("other"), &control_plane)
+        .await
+        .unwrap_err();
+    assert!(forbidden.is_forbidden(), "{forbidden:?}");
+    // Every object of the kind, which no label narrows, is never asked for.
+    assert_eq!(
+        client
+            .delete_all::<RoleBinding>(&namespace("shop"), &BTreeMap::new())
+            .await
+            .unwrap_err(),
+        ApiError::NoLabels
+    );
+    assert_eq!(
+        client
+            .delete_all::<RoleBinding>(&Scope::Cluster, &control_plane)
+            .await
+            .unwrap_err(),
+        ApiError::Namespaced("RoleBinding")
+    );
+    let seen = fake.seen();
+    assert!(seen.iter().all(|seen| seen.method == "DELETE"));
+    let paths: Vec<&str> = seen.iter().map(|seen| seen.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/shop/rolebindings?labelSelector=app.kubernetes.io%2Fmanaged-by%3Dedgerush-operator%2Cgateway.edgerush.dev%2Fcontrol-plane%3Dedge&propagationPolicy=Background",
+            "/apis/networking.k8s.io/v1/ingressclasses?labelSelector=gateway.edgerush.dev%2Fcontrol-plane%3Dedge&propagationPolicy=Background",
+            "/apis/networking.k8s.io/v1/ingressclasses?labelSelector=gateway.edgerush.dev%2Fcontrol-plane%3Dedge&fieldSelector=metadata.name%3Dedge.web&propagationPolicy=Background",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/other/rolebindings?labelSelector=gateway.edgerush.dev%2Fcontrol-plane%3Dedge&propagationPolicy=Background",
+        ],
+        "a refused delete was sent, or one asked for other than it should be"
     );
 }
