@@ -1851,7 +1851,7 @@ fn spare_lists_are_kept_up_to_a_bound_with_room_for_one() {
 
 #[test]
 fn the_platform_has_native_128_bit_atomics() {
-    assert!(supported(), "the participant would not start here");
+    assert!(crate::supported(), "the participant would not start here");
 }
 
 /// Runs `schedule` on both sides, printing what each decided and every key's room after

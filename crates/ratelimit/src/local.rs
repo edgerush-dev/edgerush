@@ -34,14 +34,19 @@ use key_set::{KeySet, SLOT_BYTES};
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::num::NonZeroU64;
-use sync::{Arc, AtomicU64, Ordering, RwLock};
+use sync::{Arc, AtomicU64, AtomicU128, Ordering, RwLock};
 
 use crate::rate::{MASK, Rate, UNITS};
+use crate::word::{local, local_parts};
 
 /// The tables a worker's handles are split into, by bits of each key's hash: each doubles
 /// on its own, and [`Handles::prune_next`] reads one at a time.
 pub const HANDLE_PARTS: usize = 64;
 
+/// The cycle a key's last charge is kept to in its word, 10 ms, as the asynchronous mode's:
+/// how recently it was used, read by the idle rule and the sweep, which a cycle's grain
+/// serves.
+const CYCLE: u64 = 10_000_000;
 /// The word's top bit: the key was forgotten or evicted, and a new one takes its place.
 const CLOSED: u64 = 1 << 63;
 /// A window's count: the word's low bits, saturating there.
@@ -169,26 +174,44 @@ impl Terms {
     }
 }
 
-/// One key: its bucket's arrival time or its window's count, and when it was last asked
-/// for.
+/// One key: its bucket's arrival time or its window's count, and the cycle it was last
+/// charged in, in one word.
 #[derive(Debug)]
 pub struct Key {
     key: Box<[u8]>,
     terms: Arc<Terms>,
-    /// The arrival time in units, or the window's number and count; the top bit set once
-    /// the key is closed.
-    word: AtomicU64,
-    /// The latest time a request was charged under it, moved before the charge lands.
-    last: AtomicU64,
+    /// Its state in one word, its low half laid out as the asynchronous mode's entries'
+    /// (`word::local`): below, the arrival time in units, or the window's number and count,
+    /// and the closed bit; above, the cycle it was last charged in ([`CYCLE`]). A charge is
+    /// one compare-and-swap.
+    state: AtomicU128,
     /// How far its windows are shifted, under a window: from its name's hash, so that keys'
     /// boundaries spread (06 §3). Nothing under a bucket.
     offset: u64,
 }
 
+/// A key's state as read: its word, the low half, and the cycle it was last charged in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Seen {
+    word: u64,
+    cycle: u64,
+}
+
+impl Seen {
+    fn of(state: u128) -> Self {
+        let (word, cycle) = local_parts(state);
+        Self { word, cycle }
+    }
+
+    fn pack(self) -> u128 {
+        local(self.word, self.cycle)
+    }
+}
+
 /// What a look at a key found.
 enum Look {
-    /// A request fits, the word as read and the arrival time it would charge from.
-    Fits { word: u64, from: u64 },
+    /// A request fits, the state as read and the arrival time or count it would charge from.
+    Fits { seen: Seen, from: u64 },
     /// No room: the time until there is.
     Full { wait: u64 },
     /// The key was closed: its successor in the registry is to be used.
@@ -204,11 +227,14 @@ impl Key {
                 (Span::word(span.number(now), 0), span.offset)
             }
         };
+        let seen = Seen {
+            word,
+            cycle: Self::cycle_of(now),
+        };
         Self {
             key,
             terms,
-            word: AtomicU64::new(word),
-            last: AtomicU64::new(now),
+            state: AtomicU128::new(seen.pack()),
             offset,
         }
     }
@@ -218,8 +244,12 @@ impl Key {
         self.terms.limit
     }
 
+    fn read(&self) -> Seen {
+        Seen::of(self.state.load(Ordering::Acquire))
+    }
+
     fn closed(&self) -> bool {
-        self.word.load(Ordering::Acquire) & CLOSED != 0
+        self.read().word & CLOSED != 0
     }
 
     /// How long a key goes unused before it is fresh whatever its word says: its bucket's
@@ -231,46 +261,60 @@ impl Key {
         }
     }
 
-    /// Whether, at `now`, the key went unused for longer than its bucket takes to refill or
-    /// than its window: fresh, whatever its word says once its clock or its windows' numbers
-    /// have come round. Sound because a charge moves the last use before it lands
-    /// ([`charge_from`]): a word read is never older than the last use read after it.
-    ///
-    /// [`charge_from`]: Self::charge_from
-    fn idle(&self, now: u64) -> bool {
-        now.saturating_sub(self.last.load(Ordering::Relaxed)) > self.refill()
+    /// `now`'s cycle number.
+    fn cycle_of(now: u64) -> u64 {
+        now / CYCLE
     }
 
-    /// The arrival time as of `now` (units `now_units`) from `word`: as it is, unless the key
+    /// Whole cycles from `cycle` to `now`'s: none if it is `now`'s or a later one, a clock a
+    /// moment behind another's.
+    fn since(cycle: u64, now: u64) -> u64 {
+        Self::cycle_of(now).saturating_sub(cycle)
+    }
+
+    /// Nanoseconds that surely passed since a key `seen` at `now` was last charged: its
+    /// charge as late in its cycle as it could have been.
+    fn unused_for(seen: Seen, now: u64) -> u64 {
+        Self::since(seen.cycle, now).saturating_sub(1) * CYCLE
+    }
+
+    /// Whether a key `seen` at `now` went unused for longer than its bucket takes to refill
+    /// or than its window: fresh, whatever its word says once its clock or its windows'
+    /// numbers have come round. Read in the same word as the charge, so never older than it.
+    fn idle(&self, seen: Seen, now: u64) -> bool {
+        Self::unused_for(seen, now) > self.refill()
+    }
+
+    /// The arrival time as of `now` (units `now_units`) from `seen`: as it is, unless the key
     /// is idle, when it is full.
-    fn arrival(&self, word: u64, now: u64, now_units: u64) -> u64 {
-        if self.idle(now) { now_units } else { word }
+    fn arrival(&self, seen: Seen, now: u64, now_units: u64) -> u64 {
+        if self.idle(seen, now) {
+            now_units
+        } else {
+            seen.word
+        }
     }
 
     /// Whether a request at `now` fits, nothing written, as a charge would decide it.
+    // Always, as `take`: called, it costs a decision under two keys some 6% more
+    // instructions (Callgrind).
+    #[inline(always)]
     fn look(&self, now: u64) -> Look {
-        let word = self.word.load(Ordering::Acquire);
-        if word & CLOSED != 0 {
+        let seen = self.read();
+        if seen.word & CLOSED != 0 {
             return Look::Closed;
         }
-        let last = self.last.load(Ordering::Relaxed);
         match &self.terms.held {
             Held::Bucket(rate) => {
-                if now.saturating_sub(last) > rate.refill {
-                    let now_units = rate.units(now);
-                    return Self::fits(rate, word, now_units, now_units);
-                }
-                Self::fits(rate, word, word, rate.units(now))
+                let now_units = rate.units(now);
+                Self::fits(rate, seen, self.arrival(seen, now, now_units), now_units)
             }
-            Held::Window(span) => Self::window_look(&span.at(self.offset), word, last, now),
+            Held::Window(span) => {
+                let span = span.at(self.offset);
+                let (number, count) = Self::window_at(&span, seen.word, self.idle(seen, now), now);
+                Self::window_fits(&span, seen, count, number, now)
+            }
         }
-    }
-
-    /// The same for a window, its word and last use read as `word` and `last`.
-    fn window_look(span: &Span, word: u64, last: u64, now: u64) -> Look {
-        let idle = now.saturating_sub(last) > span.window;
-        let (number, count) = Self::window_at(span, word, idle, now);
-        Self::window_fits(span, word, count, number, now)
     }
 
     /// The window a request at `now` is decided in, and what it has counted then: `now`'s,
@@ -291,7 +335,7 @@ impl Key {
     }
 
     /// Whether a request at `now_units` fits, the bucket's arrival time `arrival` as of then.
-    fn fits(rate: &Rate, word: u64, arrival: u64, now_units: u64) -> Look {
+    fn fits(rate: &Rate, seen: Seen, arrival: u64, now_units: u64) -> Look {
         let ahead = Rate::ahead(arrival, now_units);
         if ahead > rate.tolerance {
             return Look::Full {
@@ -299,97 +343,50 @@ impl Key {
             };
         }
         let from = if ahead > 0 { arrival } else { now_units };
-        Look::Fits { word, from }
+        Look::Fits { seen, from }
     }
 
     /// Whether a request at `now` fits window `number`, which has counted `count`: `from` is
     /// the count it charges from. A refusal waits, from `now`, until that window ends.
-    fn window_fits(span: &Span, word: u64, count: u64, number: u64, now: u64) -> Look {
+    fn window_fits(span: &Span, seen: Seen, count: u64, number: u64, now: u64) -> Look {
         if count >= span.limit {
             return Look::Full {
                 wait: Self::window_left(span, number, now),
             };
         }
-        Look::Fits { word, from: count }
+        Look::Fits { seen, from: count }
     }
 
-    /// Nanoseconds from `now` until window `number`, `now`'s or the one after, ends.
+    /// Nanoseconds from `now` until window `number`, `now`'s or a later one, ends.
     fn window_left(span: &Span, number: u64, now: u64) -> u64 {
         span.left(now) + (number - span.number(now)) * span.window
     }
 
-    /// The word a charge at `now` (units `now_units`) is to replace, and the time in units it
-    /// is decided at; `None` if the key was closed. An idle key's word is first made to say
-    /// what the key is, full at `now`, before a charge moves its last use: a word from
-    /// before the idle spell, its clock perhaps come round, is never read beside a recent
-    /// last use, which would take it as it is.
-    ///
-    /// A request is decided at its own clock, behind the key's last charge or not, as one
-    /// worker's can be behind another's: the slack ([`SLACK`](crate::SLACK)) keeps a lag of
-    /// up to it from refusing a request within the limit.
-    fn word_to_charge(&self, rate: &Rate, now: u64, now_units: u64) -> Option<(u64, u64)> {
-        loop {
-            let word = self.word.load(Ordering::Acquire);
-            if word & CLOSED != 0 {
-                return None;
-            }
-            let last = self.last.load(Ordering::Relaxed);
-            if now.saturating_sub(last) <= rate.refill {
-                return Some((word, now_units));
-            }
-            if self
-                .word
-                .compare_exchange(word, now_units, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Some((now_units, now_units));
-            }
-        }
-    }
-
-    /// A window's word a charge at `now` is to replace, the window it is decided in, and what
-    /// that has counted; `None` if the key was closed. As a bucket's
-    /// ([`word_to_charge`](Self::word_to_charge)): at the request's own clock, in the window
-    /// after if the word holds it ([`window_at`](Self::window_at)), and an idle key's word
-    /// first made a fresh window's before a charge moves its last use, so that no worker
-    /// reads a word from before the idle spell, its number perhaps come round, beside a
-    /// recent last use.
-    fn window_to_charge(&self, span: &Span, now: u64) -> Option<(u64, u64, u64)> {
-        loop {
-            let word = self.word.load(Ordering::Acquire);
-            if word & CLOSED != 0 {
-                return None;
-            }
-            let last = self.last.load(Ordering::Relaxed);
-            if now.saturating_sub(last) <= span.window {
-                let (number, count) = Self::window_at(span, word, false, now);
-                return Some((word, number, count));
-            }
-            let number = span.number(now);
-            let fresh = Span::word(number, 0);
-            if self
-                .word
-                .compare_exchange(word, fresh, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Some((fresh, number, 0));
-            }
-        }
-    }
-
-    /// Replaces `word` with `charged`, a charge at `now`, false if the word changed. The last
-    /// use moves first, so that a worker reading the charge reads a last use at least as
-    /// recent, and never takes the key for idle and charges over it.
-    fn charge_from(&self, word: u64, charged: u64, now: u64) -> bool {
-        self.last.fetch_max(now, Ordering::Relaxed);
-        self.word
-            .compare_exchange(word, charged, Ordering::AcqRel, Ordering::Acquire)
+    /// Replaces `seen` with `word` charged at `now`, and the cycle with `now`'s, unless a
+    /// clock ahead of this one's charged in a later cycle already: one compare-and-swap,
+    /// false if the state changed. A request is decided at its own clock, behind the key's
+    /// last charge or not, as one worker's can be behind another's: the slack
+    /// ([`SLACK`](crate::SLACK)) keeps a lag of up to it from refusing a request within the
+    /// limit.
+    fn charge_from(&self, seen: Seen, word: u64, now: u64) -> bool {
+        let charged = Seen {
+            word,
+            cycle: seen.cycle.max(Self::cycle_of(now)),
+        };
+        self.state
+            .compare_exchange(
+                seen.pack(),
+                charged.pack(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
     }
 
-    /// One request at `now`, admitted if it fits. Inlined: called, it costs a decision under
-    /// one key a tenth more instructions (Callgrind).
-    #[inline]
+    /// One request at `now`, admitted if it fits.
+    // Always: called, it costs a decision under one key a tenth more instructions
+    // (Callgrind), and with one 128-bit word the compiler stopped inlining it on a hint.
+    #[inline(always)]
     fn take(&self, now: u64) -> Look {
         match &self.terms.held {
             Held::Bucket(rate) => self.bucket_take(rate, now),
@@ -397,17 +394,19 @@ impl Key {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn bucket_take(&self, rate: &Rate, now: u64) -> Look {
         let now_units = rate.units(now);
         loop {
-            let Some((word, at)) = self.word_to_charge(rate, now, now_units) else {
+            let seen = self.read();
+            if seen.word & CLOSED != 0 {
                 return Look::Closed;
-            };
-            match Self::fits(rate, word, word, at) {
-                Look::Fits { word, from } => {
-                    if self.charge_from(word, from.wrapping_add(UNITS) & MASK, now) {
-                        return Look::Fits { word, from };
+            }
+            let arrival = self.arrival(seen, now, now_units);
+            match Self::fits(rate, seen, arrival, now_units) {
+                Look::Fits { seen, from } => {
+                    if self.charge_from(seen, from.wrapping_add(UNITS) & MASK, now) {
+                        return Look::Fits { seen, from };
                     }
                 }
                 other => return other,
@@ -415,16 +414,20 @@ impl Key {
         }
     }
 
+    // Always, as `bucket_take`: called, it costs a window's decision a quarter more
+    // instructions (Callgrind).
+    #[inline(always)]
     fn window_take(&self, span: &Span, now: u64) -> Look {
         loop {
-            let Some((word, number, count)) = self.window_to_charge(span, now) else {
+            let seen = self.read();
+            if seen.word & CLOSED != 0 {
                 return Look::Closed;
-            };
-            match Self::window_fits(span, word, count, number, now) {
-                Look::Fits { word, from } => {
-                    let charged = Span::word(number, from + 1);
-                    if self.charge_from(word, charged, now) {
-                        return Look::Fits { word, from };
+            }
+            let (number, count) = Self::window_at(span, seen.word, self.idle(seen, now), now);
+            match Self::window_fits(span, seen, count, number, now) {
+                Look::Fits { seen, from } => {
+                    if self.charge_from(seen, Span::word(number, from + 1), now) {
+                        return Look::Fits { seen, from };
                     }
                 }
                 other => return other,
@@ -434,29 +437,30 @@ impl Key {
 
     /// One request at `now` charged, whether it fits or not: false if the key was closed.
     fn charge(&self, now: u64) -> bool {
-        match &self.terms.held {
-            Held::Bucket(rate) => {
-                let now_units = rate.units(now);
-                loop {
-                    let Some((word, at)) = self.word_to_charge(rate, now, now_units) else {
-                        return false;
-                    };
-                    let from = if Rate::ahead(word, at) > 0 { word } else { at };
-                    if self.charge_from(word, from.wrapping_add(UNITS) & MASK, now) {
-                        return true;
-                    }
-                }
-            }
-            Held::Window(span) => self.window_charge(&span.at(self.offset), now),
-        }
-    }
-
-    fn window_charge(&self, span: &Span, now: u64) -> bool {
         loop {
-            let Some((word, number, count)) = self.window_to_charge(span, now) else {
+            let seen = self.read();
+            if seen.word & CLOSED != 0 {
                 return false;
+            }
+            let word = match &self.terms.held {
+                Held::Bucket(rate) => {
+                    let now_units = rate.units(now);
+                    let arrival = self.arrival(seen, now, now_units);
+                    let from = if Rate::ahead(arrival, now_units) > 0 {
+                        arrival
+                    } else {
+                        now_units
+                    };
+                    from.wrapping_add(UNITS) & MASK
+                }
+                Held::Window(span) => {
+                    let span = span.at(self.offset);
+                    let idle = self.idle(seen, now);
+                    let (number, count) = Self::window_at(&span, seen.word, idle, now);
+                    Span::word(number, count + 1)
+                }
             };
-            if self.charge_from(word, Span::word(number, count + 1), now) {
+            if self.charge_from(seen, word, now) {
                 return true;
             }
         }
@@ -465,37 +469,53 @@ impl Key {
     /// Closes it if, at `now`, its bucket is full or its window has counted none, and
     /// nothing used it for `quiet`: true if it did.
     fn close_if_forgettable(&self, now: u64, quiet: u64) -> bool {
-        let word = self.word.load(Ordering::Acquire);
-        if word & CLOSED != 0 {
+        let seen = self.read();
+        if seen.word & CLOSED != 0 {
             return true;
         }
-        if now.saturating_sub(self.last.load(Ordering::Relaxed)) < quiet {
+        if Self::unused_for(seen, now) < quiet {
             return false;
         }
-        if self.full_in_from(word, now) > 0 {
+        if self.full_in_from(seen, now) > 0 {
             return false;
         }
+        let closed = Seen {
+            word: seen.word | CLOSED,
+            ..seen
+        };
         // Lost to a request just made, the key stays: it is in use.
-        self.word
-            .compare_exchange(word, word | CLOSED, Ordering::AcqRel, Ordering::Acquire)
+        self.state
+            .compare_exchange(
+                seen.pack(),
+                closed.pack(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
     }
 
     /// Nanoseconds from `now` until its bucket is full or its window has counted none.
     fn full_in(&self, now: u64) -> u64 {
-        self.full_in_from(self.word.load(Ordering::Acquire) & MASK, now)
+        let seen = self.read();
+        self.full_in_from(
+            Seen {
+                word: seen.word & MASK,
+                ..seen
+            },
+            now,
+        )
     }
 
-    /// The same, its word read as `word`.
-    fn full_in_from(&self, word: u64, now: u64) -> u64 {
+    /// The same, its state read as `seen`.
+    fn full_in_from(&self, seen: Seen, now: u64) -> u64 {
         match &self.terms.held {
             Held::Bucket(rate) => {
                 let now_units = rate.units(now);
-                rate.nanos(Rate::ahead(self.arrival(word, now, now_units), now_units))
+                rate.nanos(Rate::ahead(self.arrival(seen, now, now_units), now_units))
             }
             Held::Window(span) => {
                 let span = span.at(self.offset);
-                match Self::window_at(&span, word, self.idle(now), now) {
+                match Self::window_at(&span, seen.word, self.idle(seen, now), now) {
                     (_, 0) => 0,
                     (number, _) => Self::window_left(&span, number, now),
                 }
@@ -504,7 +524,7 @@ impl Key {
     }
 
     fn close(&self) {
-        self.word.fetch_or(CLOSED, Ordering::AcqRel);
+        self.state.fetch_or(u128::from(CLOSED), Ordering::AcqRel);
     }
 }
 
