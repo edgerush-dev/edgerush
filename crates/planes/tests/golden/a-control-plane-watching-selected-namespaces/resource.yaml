@@ -1,0 +1,10 @@
+# The namespaces of a team watched, its own not among them, and an authority provided.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: payments, namespace: payments-edge, uid: 6f1c2b8e-0000-4000-8000-000000000003 }
+spec:
+  watch:
+    namespaces:
+      from: Selector
+      selector: { matchLabels: { team: payments } }
+  authority: { secretRef: { name: payments-ca } }

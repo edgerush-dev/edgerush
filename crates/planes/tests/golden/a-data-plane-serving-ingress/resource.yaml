@@ -1,0 +1,12 @@
+# Ingress alone, every other field left to its default, of a ControlPlane of its own
+# namespace.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: payments, namespace: payments-edge, uid: 6f1c2b8e-0000-4000-8000-000000000001 }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata: { name: public, namespace: payments-edge, uid: 0d6a9f3c-0000-4000-8000-000000000001 }
+spec:
+  controlPlaneRef: { name: payments }
+  ingress: { httpPort: 80, httpsPort: 443 }

@@ -485,6 +485,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-planes"
+version = "0.0.0"
+dependencies = [
+ "edgerush-crdgen",
+ "edgerush-gateway-api",
+ "edgerush-translate",
+ "k8s-openapi",
+ "proptest",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "edgerush-proxy"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,126 @@
+# The rights the operator grants, and the only ones: it holds `bind` on these four by name
+# and creates no role (docs/05 §2). Each is for one place a right is bound, so that no
+# binding grants more than its place needs.
+#
+# The control plane's reads in a watched namespace, and its writes of what it reports there.
+# Bound by a RoleBinding in each namespace of its watch scope, or by one ClusterRoleBinding
+# where it watches them all.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edgerush-control-plane
+  labels: { app.kubernetes.io/part-of: edgerush }
+rules:
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [list, watch]
+  # An Ingress's load balancer addresses, written as a JSON merge patch (04 §6).
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses/status]
+    verbs: [patch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [listenersets, grpcroutes, httproutes, referencegrants, tlsroutes, tcproutes, udproutes, backendtlspolicies]
+    verbs: [list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [listenersets/status, grpcroutes/status, httproutes/status, tlsroutes/status, tcproutes/status, udproutes/status, backendtlspolicies/status]
+    verbs: [update]
+  # Backends, the certificates objects name, and the CA certificates of BackendTLSPolicies.
+  - apiGroups: [""]
+    resources: [services, secrets, configmaps]
+    verbs: [list, watch]
+---
+# The control plane's reads of cluster-scoped kinds. Bound by a ClusterRoleBinding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edgerush-control-plane-cluster
+  labels: { app.kubernetes.io/part-of: edgerush }
+rules:
+  - apiGroups: [networking.k8s.io]
+    resources: [ingressclasses]
+    verbs: [list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gatewayclasses]
+    verbs: [list, watch]
+  # The status of the class its Gateway names (04 §6).
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gatewayclasses/status]
+    verbs: [update]
+  # Namespaces' labels, which a listener's selector of namespaces matches.
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [list, watch]
+  # The CRDs of the Gateway API kinds it follows, those alone, read by name (04 §1).
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    resourceNames:
+      - gatewayclasses.gateway.networking.k8s.io
+      - gateways.gateway.networking.k8s.io
+      - listenersets.gateway.networking.k8s.io
+      - grpcroutes.gateway.networking.k8s.io
+      - tlsroutes.gateway.networking.k8s.io
+      - tcproutes.gateway.networking.k8s.io
+      - udproutes.gateway.networking.k8s.io
+      - backendtlspolicies.gateway.networking.k8s.io
+      - httproutes.gateway.networking.k8s.io
+      - referencegrants.gateway.networking.k8s.io
+    verbs: [get, list, watch]
+---
+# What the control plane reads and writes in its own namespace, where its ControlPlane, its
+# DataPlanes and their Gateways are. Bound by a RoleBinding there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edgerush-control-plane-own
+  labels: { app.kubernetes.io/part-of: edgerush }
+rules:
+  # The leader's Lease (04 §6).
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+  # Each replica's report of what its data planes run, which the leader merges (04 §6).
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, create, update]
+  # The data plane's Service, which the control plane owns (05 §2). A Service it writes
+  # may hold no externalIPs: admission.yaml refuses them.
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [list, watch, create, patch, delete]
+  # The certificates its Gateway's listeners name, which need no grant (04 §1).
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [list, watch]
+  # The data plane's own Service's EndpointSlices: its ready pods, counted for Programmed.
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list, watch]
+  # Its DataPlanes' Gateways, and the ListenerSets that attach there.
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gateways, listenersets]
+    verbs: [list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gateways/status, listenersets/status]
+    verbs: [update]
+  # Its DataPlanes, which it reads itself (05 §3).
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [dataplanes]
+    verbs: [list, watch]
+  # Its authority's bundle, published in its ControlPlane's status under a field manager of
+  # its own (05 §2).
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [controlplanes/status]
+    verbs: [patch]
+---
+# The data plane's one right: its upstreams' EndpointSlices, where they discover Services
+# (02 §4). Bound as edgerush-control-plane is, over its control plane's watch scope, and in
+# its own namespace, where its own Service's slices say its zone.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edgerush-data-plane
+  labels: { app.kubernetes.io/part-of: edgerush }
+rules:
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list, watch]

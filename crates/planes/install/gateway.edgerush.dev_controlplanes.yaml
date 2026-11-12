@@ -1,0 +1,257 @@
+# EdgeRush's ControlPlane, as the install ships it. Written by hand: the Rust types are
+# written from it (crates/planes/tests/generated.rs), never the other way about.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: controlplanes.gateway.edgerush.dev
+spec:
+  group: gateway.edgerush.dev
+  names:
+    categories:
+    - edgerush
+    kind: ControlPlane
+    listKind: ControlPlaneList
+    plural: controlplanes
+    singular: controlplane
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ControlPlane is an EdgeRush control plane: a controller that follows a watch scope
+          and translates what it finds there for the DataPlanes of its own namespace that name
+          it. The operator deploys it, gives it the rights of its scope, and makes the
+          GatewayClass named as it is.
+
+          Its name is a DNS label, unique in the cluster: the oldest ControlPlane of a name
+          holds it, and a later one of the same name in another namespace is not accepted.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            default: {}
+            description: Spec is what the control plane is to be.
+            properties:
+              authority:
+                description: |-
+                  Authority is the certificate authority the control plane signs its workloads'
+                  certificates with, provided by the platform. Left out, the control plane makes
+                  one of its own on first start, in its own namespace.
+                properties:
+                  secretRef:
+                    description: |-
+                      SecretRef names a Secret in the ControlPlane's namespace holding the
+                      authority's key and certificate, signed by the platform's own root, with
+                      the chain up to that root. The control plane signs with it and never
+                      writes it: its rotation is the platform's.
+                    properties:
+                      name:
+                        description: Name is the Secret's name.
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                    required:
+                    - name
+                    type: object
+                required:
+                - secretRef
+                type: object
+              replicas:
+                default: 1
+                description: |-
+                  Replicas is how many controllers run. One leads, elected by a Lease; the
+                  others stand by to take over.
+                format: int32
+                minimum: 1
+                type: integer
+              watch:
+                default: {}
+                description: Watch is where the control plane follows Ingresses, routes and what they name.
+                properties:
+                  namespaces:
+                    default:
+                      from: Same
+                    description: |-
+                      Namespaces is which namespaces the control plane watches. Beyond its own,
+                      the platform's allowance bounds them: a ControlPlane asking for more is not
+                      accepted.
+                    properties:
+                      from:
+                        default: Same
+                        description: |-
+                          From is where the namespaces watched are:
+
+                          * Same: the ControlPlane's own namespace alone.
+                          * Selector: those whose labels the selector matches.
+                          * All: every namespace in the cluster.
+                        enum:
+                        - All
+                        - Selector
+                        - Same
+                        type: string
+                      selector:
+                        description: |-
+                          Selector is the namespaces watched where From is "Selector", and
+                          must be left out otherwise.
+                        properties:
+                          matchExpressions:
+                            description: matchExpressions is a list of label selector
+                              requirements. The requirements are ANDed.
+                            items:
+                              description: |-
+                                A label selector requirement is a selector that contains values, a key, and an operator that
+                                relates the key and values.
+                              properties:
+                                key:
+                                  description: key is the label key that the selector
+                                    applies to.
+                                  type: string
+                                operator:
+                                  description: |-
+                                    operator represents a key's relationship to a set of values.
+                                    Valid operators are In, NotIn, Exists and DoesNotExist.
+                                  type: string
+                                values:
+                                  description: |-
+                                    values is an array of string values. If the operator is In or NotIn,
+                                    the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                    the values array must be empty. This array is replaced during a strategic
+                                    merge patch.
+                                  items:
+                                    type: string
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                              required:
+                              - key
+                              - operator
+                              type: object
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          matchLabels:
+                            additionalProperties:
+                              type: string
+                            description: |-
+                              matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                              map is equivalent to an element of matchExpressions, whose key field is "key", the
+                              operator is "In", and the values array contains only "value". The requirements are ANDed.
+                            type: object
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    type: object
+                    x-kubernetes-validations:
+                    - message: selector must be given where from is Selector, and only there
+                      rule: 'self.from == ''Selector'' ? has(self.selector) : !has(self.selector)'
+                type: object
+              webhook:
+                default: {}
+                description: Webhook is the control plane's admission webhook, which judges an Ingress as it is written.
+                properties:
+                  enabled:
+                    default: true
+                    description: |-
+                      Enabled registers the webhook. Off, an Ingress is judged only in its
+                      status: for a platform that keeps admission webhooks to its own, or a team
+                      that would rather read status alone.
+                    type: boolean
+                type: object
+            type: object
+          status:
+            description: Status is what the operator and the control plane report of it.
+            properties:
+              conditions:
+                description: |-
+                  Conditions describe the ControlPlane's state. Known condition types are:
+
+                  * "Accepted": whether the operator accepted it, and made what it asks for.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 8
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+            type: object
+        type: object
+        x-kubernetes-validations:
+        - message: the name of a ControlPlane must be a DNS label, at most 63 lower-case letters, digits and '-', starting and ending with a letter or digit
+          rule: size(self.metadata.name) <= 63 && self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+    served: true
+    storage: true
+    subresources:
+      status: {}

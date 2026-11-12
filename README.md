@@ -373,6 +373,10 @@ crates/gateway-api the Gateway API kinds EdgeRush follows (`edgerush-gateway-api
                    release by its `fetch.sh`; a test fails when the two differ; no I/O
 crates/kubernetes  EdgeRush's client of the Kubernetes API (`edgerush-kubernetes`): it lists and
                    watches the kinds EdgeRush reads and does nothing else, over h2 and BoringSSL
+crates/planes     EdgeRush's own kinds, ControlPlane and DataPlane (`edgerush-planes`): the CRDs,
+                   ClusterRoles and admission policy the install ships in its `install/`, the
+                   types written from the CRDs by `edgerush-crdgen`, and the objects the
+                   operator makes for each resource, a pure function; no I/O
 crates/ratelimit   rate limiting (`edgerush-ratelimit`): pure, no I/O; the admission models as
                    reference implementations behind one interface, an example that runs the same
                    clients through each (`cargo run -p edgerush-ratelimit --example timelines`),
