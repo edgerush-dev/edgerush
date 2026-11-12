@@ -74,7 +74,7 @@ struct Rate {
     per_ns_high: u64,
     per_ns_low: u64,
     /// How far ahead of now the arrival time may be for a request to be admitted, in units:
-    /// the bucket less one.
+    /// the bucket less one, and the slack's refill ([`SLACK`](crate::SLACK)).
     tolerance: u64,
     /// The contract's window and limit, for units back to time.
     window: u128,
@@ -94,10 +94,20 @@ impl Rate {
         let rest = ((scaled % window) << 64).div_ceil(window);
         let per_ns = (whole << 64) + rest;
         let refill = (u128::from(burst) * window).div_ceil(limit);
+        // The slack's refill (`crate::SLACK`), rounded up as the rate is, erring towards
+        // admitting; within the most a bucket keeps, so that the tolerance stays far inside
+        // the range.
+        let slack = u64::try_from(
+            u128::from(crate::SLACK)
+                .saturating_mul(per_ns)
+                .div_ceil(1 << 64),
+        )
+        .unwrap_or(u64::MAX)
+        .min(MOST_BURST * UNITS);
         Self {
             per_ns_high: u64::try_from(per_ns >> 64).unwrap_or(u64::MAX),
             per_ns_low: per_ns as u64,
-            tolerance: (burst - 1) * UNITS,
+            tolerance: (burst - 1) * UNITS + slack,
             window,
             limit,
             refill: u64::try_from(refill).unwrap_or(u64::MAX),

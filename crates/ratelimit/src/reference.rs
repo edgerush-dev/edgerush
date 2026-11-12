@@ -413,6 +413,19 @@ impl TokenBucket {
         }
     }
 
+    /// The same bucket admitting a request whose arrival time is up to `slack` nanoseconds'
+    /// refill further ahead: a data plane's ([`SLACK`](crate::SLACK)), whose workers' clocks
+    /// may lag one another's.
+    #[must_use]
+    pub fn with_slack(self, slack: u64) -> Self {
+        Self {
+            tolerance: self
+                .tolerance
+                .saturating_add(u128::from(slack) * self.limit),
+            ..self
+        }
+    }
+
     /// `now` as the model takes it, and scaled.
     fn scaled(&self, now: u64) -> (u64, u128) {
         let now = now.max(self.last);
