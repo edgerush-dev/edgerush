@@ -6,8 +6,8 @@
 
 use super::*;
 use crate::service::{
-    Answer, DataPlane, ENTRY_BYTES, FixedState, Keyed, MOST_UNACKNOWLEDGED, PIECE_BYTES, PodId,
-    ServicePod,
+    ACTIVE_CYCLES, Answer, DataPlane, ENTRY_BYTES, FixedState, Keyed, MOST_UNACKNOWLEDGED,
+    PIECE_BYTES, PodId, ServicePod,
 };
 use proptest::prelude::*;
 use std::collections::VecDeque;
@@ -1203,7 +1203,7 @@ fn others_hits(key: &[u8], c: Contract, count: u64) -> Batch {
 
 /// Service pod 0 in its life `life`.
 fn pod(life: u64) -> ServicePod {
-    let mut pod = ServicePod::new(0, CYCLE, view());
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
     pod.set_life(life);
     pod
 }
@@ -2579,4 +2579,103 @@ fn a_scheduled_backlog_goes_a_piece_an_exchange_and_none_starves() {
 #[test]
 fn a_scanned_backlog_goes_a_piece_an_exchange_and_none_starves() {
     a_backlog_goes_a_piece_an_exchange_and_none_starves(false);
+}
+
+/// 10,000 a second, a bucket of one cycle's refill: 100.
+fn tight() -> Contract {
+    Contract {
+        limit: NonZeroU64::new(10_000).unwrap(),
+        window: NonZeroU64::new(1_000 * MS).unwrap(),
+        burst: NonZeroU64::new(100).unwrap(),
+    }
+}
+
+/// `participant` with `key` under `c` admitted at 0 and reported at the next cycle, and the
+/// pod's answer that three other data planes admit it.
+fn shared_among_four(key: &[u8], c: Contract) -> Participant<FixedState> {
+    let mut participant = participant();
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
+    for from in 8..=10 {
+        let _ = pod.on_batch(
+            Batch {
+                from,
+                ..others_hits(key, c, 1)
+            },
+            0,
+        );
+    }
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    participant.on_cycle(CYCLE);
+    let (exchange, batch) = only_exchange(&mut participant);
+    let answers = pod.on_batch(batch, CYCLE);
+    participant.on_answers_to(exchange, answers, CYCLE);
+    let entry = participant.entries(&[(key, c)]).remove(0);
+    assert_eq!(entry.others.load(Ordering::Acquire), 3);
+    participant
+}
+
+/// What `participant` admits of `key` under `c` over `cycles`, offered three times its rate
+/// each, whatever it sends lost.
+fn flooded(
+    participant: &mut Participant<FixedState>,
+    key: &[u8],
+    c: Contract,
+    cycles: std::ops::RangeInclusive<u64>,
+) -> u64 {
+    let mut admitted = 0;
+    for cycle in cycles {
+        let now = cycle * CYCLE;
+        participant.on_cycle(now);
+        let _ = participant.take_exchanges();
+        admitted += (0..300)
+            .filter(|_| participant.decide_all(&[(key, c)], now) == Decision::Admit)
+            .count() as u64;
+    }
+    admitted
+}
+
+/// As `DataPlane`'s: a participant cut off from a key's owner, a report of it out and
+/// nothing heard of it for `ACTIVE_CYCLES`, enforces the whole bucket on what it sees, not
+/// the share it last heard of; until then it keeps the share.
+#[test]
+fn a_participant_cut_off_from_the_owner_enforces_the_whole_limit() {
+    let (key, c): (&[u8], Contract) = (b"k", tight());
+    let mut participant = shared_among_four(key, c);
+    // Nothing reaches the pod from now on.
+    let sharing = flooded(&mut participant, key, c, 2..=ACTIVE_CYCLES);
+    assert!(sharing < ACTIVE_CYCLES * 100 / 2, "its share: {sharing}");
+    let _ = flooded(
+        &mut participant,
+        key,
+        c,
+        ACTIVE_CYCLES + 1..=2 * ACTIVE_CYCLES,
+    );
+    let alone = flooded(
+        &mut participant,
+        key,
+        c,
+        2 * ACTIVE_CYCLES + 1..=2 * ACTIVE_CYCLES + 100,
+    );
+    assert!(alone >= 100 * 100 - 100, "the whole limit: {alone}");
+}
+
+/// As `DataPlane`'s: a key quiet for longer than `ACTIVE_CYCLES` keeps the share it last
+/// heard of when it is next admitted and reported.
+#[test]
+fn a_participants_quiet_key_keeps_its_share_when_it_is_next_reported() {
+    // A refill time of a second: kept through the quiet.
+    let c = Contract {
+        limit: NonZeroU64::new(100).unwrap(),
+        window: NonZeroU64::new(1_000 * MS).unwrap(),
+        burst: NonZeroU64::new(100).unwrap(),
+    };
+    let key: &[u8] = b"k";
+    let mut participant = shared_among_four(key, c);
+    let woken = 3 * ACTIVE_CYCLES * CYCLE;
+    assert_eq!(participant.decide_all(&[(key, c)], woken), Decision::Admit);
+    participant.on_cycle(woken);
+    let _ = participant.take_exchanges();
+    participant.on_cycle(woken + CYCLE);
+    let entry = participant.entries(&[(key, c)]).remove(0);
+    assert_eq!(entry.others.load(Ordering::Acquire), 3);
 }
