@@ -247,8 +247,7 @@ impl Key {
         if self.idle(now) { now_units } else { word }
     }
 
-    /// Whether a request at `now` fits: as of the key's last charge if `now` is behind it,
-    /// as [`word_to_charge`](Self::word_to_charge) decides.
+    /// Whether a request at `now` fits, nothing written, as a charge would decide it.
     fn look(&self, now: u64) -> Look {
         let word = self.word.load(Ordering::Acquire);
         if word & CLOSED != 0 {
@@ -261,7 +260,7 @@ impl Key {
                     let now_units = rate.units(now);
                     return Self::fits(rate, word, now_units, now_units);
                 }
-                Self::fits(rate, word, word, rate.units(now.max(last)))
+                Self::fits(rate, word, word, rate.units(now))
             }
             Held::Window(span) => Self::window_look(&span.at(self.offset), word, last, now),
         }
@@ -269,13 +268,26 @@ impl Key {
 
     /// The same for a window, its word and last use read as `word` and `last`.
     fn window_look(span: &Span, word: u64, last: u64, now: u64) -> Look {
-        let at = now.max(last);
-        let count = if now.saturating_sub(last) > span.window {
-            0
-        } else {
-            Span::count(word, span.number(at))
-        };
-        Self::window_fits(span, word, count, at)
+        let idle = now.saturating_sub(last) > span.window;
+        let (number, count) = Self::window_at(span, word, idle, now);
+        Self::window_fits(span, word, count, number, now)
+    }
+
+    /// The window a request at `now` is decided in, and what it has counted then: `now`'s,
+    /// none if the key is `idle`; or, its word holding a later window, that one: a clock
+    /// lagging a charge made across one boundary or more, decided in the charge's window, as
+    /// the word's numbers say, so that it never writes an earlier window over a later. A word
+    /// is told ahead within half the numbers' range; one that far ahead is idle long before.
+    fn window_at(span: &Span, word: u64, idle: bool, now: u64) -> (u64, u64) {
+        let number = span.number(now);
+        if idle {
+            return (number, 0);
+        }
+        let ahead = ((word >> COUNT_BITS) & NUMBER_MASK).wrapping_sub(number) & NUMBER_MASK;
+        if ahead > 0 && ahead <= NUMBER_MASK / 2 {
+            return (number + ahead, word & COUNT_MASK);
+        }
+        (number, Span::count(word, number))
     }
 
     /// Whether a request at `now_units` fits, the bucket's arrival time `arrival` as of then.
@@ -290,15 +302,20 @@ impl Key {
         Look::Fits { word, from }
     }
 
-    /// Whether a request at `at` fits a window that has counted `count`: `from` is the count
-    /// it charges from.
-    fn window_fits(span: &Span, word: u64, count: u64, at: u64) -> Look {
+    /// Whether a request at `now` fits window `number`, which has counted `count`: `from` is
+    /// the count it charges from. A refusal waits, from `now`, until that window ends.
+    fn window_fits(span: &Span, word: u64, count: u64, number: u64, now: u64) -> Look {
         if count >= span.limit {
             return Look::Full {
-                wait: span.left(at),
+                wait: Self::window_left(span, number, now),
             };
         }
         Look::Fits { word, from: count }
+    }
+
+    /// Nanoseconds from `now` until window `number`, `now`'s or the one after, ends.
+    fn window_left(span: &Span, number: u64, now: u64) -> u64 {
+        span.left(now) + (number - span.number(now)) * span.window
     }
 
     /// The word a charge at `now` (units `now_units`) is to replace, and the time in units it
@@ -307,9 +324,9 @@ impl Key {
     /// before the idle spell, its clock perhaps come round, is never read beside a recent
     /// last use, which would take it as it is.
     ///
-    /// A request whose clock is behind the key's last charge, as one worker's can be behind
-    /// another's, is decided as of that charge (#108): taken at its own time, it would see
-    /// the charge as still to come, the bucket emptier than it is by the refill between.
+    /// A request is decided at its own clock, behind the key's last charge or not, as one
+    /// worker's can be behind another's: the slack ([`SLACK`](crate::SLACK)) keeps a lag of
+    /// up to it from refusing a request within the limit.
     fn word_to_charge(&self, rate: &Rate, now: u64, now_units: u64) -> Option<(u64, u64)> {
         loop {
             let word = self.word.load(Ordering::Acquire);
@@ -317,10 +334,7 @@ impl Key {
                 return None;
             }
             let last = self.last.load(Ordering::Relaxed);
-            if last > now {
-                return Some((word, rate.units(last)));
-            }
-            if now - last <= rate.refill {
+            if now.saturating_sub(last) <= rate.refill {
                 return Some((word, now_units));
             }
             if self
@@ -333,12 +347,13 @@ impl Key {
         }
     }
 
-    /// A window's word a charge at `now` is to replace, the time it is decided at, and what
-    /// the window has counted then; `None` if the key was closed. As a bucket's
-    /// ([`word_to_charge`](Self::word_to_charge)): decided as of the last charge if `now` is
-    /// behind it, and an idle key's word first made a fresh window's before a charge moves
-    /// its last use, so that no worker reads a word from before the idle spell, its number
-    /// perhaps come round, beside a recent last use.
+    /// A window's word a charge at `now` is to replace, the window it is decided in, and what
+    /// that has counted; `None` if the key was closed. As a bucket's
+    /// ([`word_to_charge`](Self::word_to_charge)): at the request's own clock, in the window
+    /// after if the word holds it ([`window_at`](Self::window_at)), and an idle key's word
+    /// first made a fresh window's before a charge moves its last use, so that no worker
+    /// reads a word from before the idle spell, its number perhaps come round, beside a
+    /// recent last use.
     fn window_to_charge(&self, span: &Span, now: u64) -> Option<(u64, u64, u64)> {
         loop {
             let word = self.word.load(Ordering::Acquire);
@@ -346,17 +361,18 @@ impl Key {
                 return None;
             }
             let last = self.last.load(Ordering::Relaxed);
-            let at = now.max(last);
             if now.saturating_sub(last) <= span.window {
-                return Some((word, at, Span::count(word, span.number(at))));
+                let (number, count) = Self::window_at(span, word, false, now);
+                return Some((word, number, count));
             }
-            let fresh = Span::word(span.number(now), 0);
+            let number = span.number(now);
+            let fresh = Span::word(number, 0);
             if self
                 .word
                 .compare_exchange(word, fresh, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Some((fresh, now, 0));
+                return Some((fresh, number, 0));
             }
         }
     }
@@ -401,12 +417,12 @@ impl Key {
 
     fn window_take(&self, span: &Span, now: u64) -> Look {
         loop {
-            let Some((word, at, count)) = self.window_to_charge(span, now) else {
+            let Some((word, number, count)) = self.window_to_charge(span, now) else {
                 return Look::Closed;
             };
-            match Self::window_fits(span, word, count, at) {
+            match Self::window_fits(span, word, count, number, now) {
                 Look::Fits { word, from } => {
-                    let charged = Span::word(span.number(at), from + 1);
+                    let charged = Span::word(number, from + 1);
                     if self.charge_from(word, charged, now) {
                         return Look::Fits { word, from };
                     }
@@ -437,10 +453,10 @@ impl Key {
 
     fn window_charge(&self, span: &Span, now: u64) -> bool {
         loop {
-            let Some((word, at, count)) = self.window_to_charge(span, now) else {
+            let Some((word, number, count)) = self.window_to_charge(span, now) else {
                 return false;
             };
-            if self.charge_from(word, Span::word(span.number(at), count + 1), now) {
+            if self.charge_from(word, Span::word(number, count + 1), now) {
                 return true;
             }
         }
@@ -479,11 +495,9 @@ impl Key {
             }
             Held::Window(span) => {
                 let span = span.at(self.offset);
-                let at = now.max(self.last.load(Ordering::Relaxed));
-                if self.idle(now) || Span::count(word, span.number(at)) == 0 {
-                    0
-                } else {
-                    span.left(at)
+                match Self::window_at(&span, word, self.idle(now), now) {
+                    (_, 0) => 0,
+                    (number, _) => Self::window_left(&span, number, now),
                 }
             }
         }
