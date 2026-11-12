@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::service::{
-    ACTIVE_CYCLES, Answer, DataPlane, ENTRY_BYTES, FixedState, Keyed, MOST_UNACKNOWLEDGED,
+    Answer, CUT_OFF_CYCLES, DataPlane, ENTRY_BYTES, FixedState, Keyed, MOST_UNACKNOWLEDGED,
     PIECE_BYTES, PodId, ServicePod,
 };
 use proptest::prelude::*;
@@ -2635,43 +2635,43 @@ fn flooded(
 }
 
 /// As `DataPlane`'s: a participant cut off from a key's owner, a report of it out and
-/// nothing heard of it for `ACTIVE_CYCLES`, enforces the whole bucket on what it sees, not
+/// nothing heard of it for `CUT_OFF_CYCLES`, enforces the whole bucket on what it sees, not
 /// the share it last heard of; until then it keeps the share.
 #[test]
 fn a_participant_cut_off_from_the_owner_enforces_the_whole_limit() {
     let (key, c): (&[u8], Contract) = (b"k", tight());
     let mut participant = shared_among_four(key, c);
     // Nothing reaches the pod from now on.
-    let sharing = flooded(&mut participant, key, c, 2..=ACTIVE_CYCLES);
-    assert!(sharing < ACTIVE_CYCLES * 100 / 2, "its share: {sharing}");
+    let sharing = flooded(&mut participant, key, c, 2..=CUT_OFF_CYCLES);
+    assert!(sharing < CUT_OFF_CYCLES * 100 / 2, "its share: {sharing}");
     let _ = flooded(
         &mut participant,
         key,
         c,
-        ACTIVE_CYCLES + 1..=2 * ACTIVE_CYCLES,
+        CUT_OFF_CYCLES + 1..=2 * CUT_OFF_CYCLES,
     );
     let alone = flooded(
         &mut participant,
         key,
         c,
-        2 * ACTIVE_CYCLES + 1..=2 * ACTIVE_CYCLES + 100,
+        2 * CUT_OFF_CYCLES + 1..=2 * CUT_OFF_CYCLES + 100,
     );
     assert!(alone >= 100 * 100 - 100, "the whole limit: {alone}");
 }
 
-/// As `DataPlane`'s: a key quiet for longer than `ACTIVE_CYCLES` keeps the share it last
+/// As `DataPlane`'s: a key quiet for longer than `CUT_OFF_CYCLES` keeps the share it last
 /// heard of when it is next admitted and reported.
 #[test]
 fn a_participants_quiet_key_keeps_its_share_when_it_is_next_reported() {
-    // A refill time of a second: kept through the quiet.
+    // A refill time of four seconds: kept through the quiet.
     let c = Contract {
         limit: NonZeroU64::new(100).unwrap(),
         window: NonZeroU64::new(1_000 * MS).unwrap(),
-        burst: NonZeroU64::new(100).unwrap(),
+        burst: NonZeroU64::new(400).unwrap(),
     };
     let key: &[u8] = b"k";
     let mut participant = shared_among_four(key, c);
-    let woken = 3 * ACTIVE_CYCLES * CYCLE;
+    let woken = 3 * CUT_OFF_CYCLES * CYCLE;
     assert_eq!(participant.decide_all(&[(key, c)], woken), Decision::Admit);
     participant.on_cycle(woken);
     let _ = participant.take_exchanges();

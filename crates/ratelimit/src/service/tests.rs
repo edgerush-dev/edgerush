@@ -500,7 +500,7 @@ fn flooded(plane: &mut DataPlane, c: Contract, cycles: std::ops::RangeInclusive<
 }
 
 /// A data plane cut off from a key's owner, a report of it out and nothing heard of it for
-/// `ACTIVE_CYCLES`, enforces the whole bucket on what it sees (06 §6), not the share it last
+/// `CUT_OFF_CYCLES`, enforces the whole bucket on what it sees (06 §6), not the share it last
 /// heard of: among four, a bucket of one cycle's refill would hold it to some 40% of the
 /// limit. Until then it keeps the share.
 #[test]
@@ -514,13 +514,13 @@ fn a_data_plane_cut_off_from_the_owner_enforces_the_whole_limit() {
     // The owner said three others admit it a cycle in, and nothing more.
     at.others = 3;
     at.heard = Some(CYCLE);
-    let sharing = flooded(&mut plane, c, 1..=ACTIVE_CYCLES);
-    assert!(sharing < ACTIVE_CYCLES * 100 / 2, "its share: {sharing}");
-    let _ = flooded(&mut plane, c, ACTIVE_CYCLES + 1..=2 * ACTIVE_CYCLES);
+    let sharing = flooded(&mut plane, c, 1..=CUT_OFF_CYCLES);
+    assert!(sharing < CUT_OFF_CYCLES * 100 / 2, "its share: {sharing}");
+    let _ = flooded(&mut plane, c, CUT_OFF_CYCLES + 1..=2 * CUT_OFF_CYCLES);
     let alone = flooded(
         &mut plane,
         c,
-        2 * ACTIVE_CYCLES + 1..=2 * ACTIVE_CYCLES + 100,
+        2 * CUT_OFF_CYCLES + 1..=2 * CUT_OFF_CYCLES + 100,
     );
     assert!(alone >= 100 * 100 - 100, "the whole limit: {alone}");
 }
@@ -534,7 +534,7 @@ fn a_data_plane_still_answered_keeps_its_share() {
     plane.decide(b"k", c, 0);
     plane.on_cycle(0);
     let _ = plane.take_outgoing();
-    let now = 2 * ACTIVE_CYCLES * CYCLE;
+    let now = 2 * CUT_OFF_CYCLES * CYCLE;
     let at = plane.keys.get_mut(&b"k"[..]).unwrap();
     assert_eq!(
         at.unacknowledged.front().map(|unseen| unseen.first),
@@ -546,14 +546,14 @@ fn a_data_plane_still_answered_keeps_its_share() {
     assert_eq!(plane.keys[&b"k"[..]].others, 3);
 }
 
-/// A key quiet for longer than `ACTIVE_CYCLES` keeps the share it last heard of when it is
+/// A key quiet for longer than `CUT_OFF_CYCLES` keeps the share it last heard of when it is
 /// next admitted and reported: its owner has not been left unanswered, only not asked, and
 /// data planes waking on it together must not each take the whole bucket.
 #[test]
 fn a_quiet_key_keeps_its_share_when_it_is_next_reported() {
-    // A refill time of a second: kept through the quiet.
+    // A refill time of four seconds: kept through the quiet.
     let c = Contract {
-        burst: NonZeroU64::new(100).unwrap(),
+        burst: NonZeroU64::new(400).unwrap(),
         ..contract()
     };
     let mut plane: DataPlane = DataPlane::new(100, CYCLE, view(&[0, 1, 2], 1));
@@ -564,7 +564,7 @@ fn a_quiet_key_keeps_its_share_when_it_is_next_reported() {
     at.others = 3;
     at.unacknowledged.clear();
     at.heard = Some(CYCLE);
-    let woken = 3 * ACTIVE_CYCLES * CYCLE;
+    let woken = 3 * CUT_OFF_CYCLES * CYCLE;
     assert_eq!(plane.decide(b"k", c, woken), Decision::Admit);
     plane.on_cycle(woken);
     plane.on_cycle(woken + CYCLE);

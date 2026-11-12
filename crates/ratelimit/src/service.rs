@@ -55,6 +55,14 @@ pub const RESEND_AFTER_CYCLES: u64 = 4;
 /// through at 1.44 times the contract with one packet in ten lost (simulator, TCP-like loss).
 pub const ACTIVE_CYCLES: u64 = 30;
 
+/// For how many cycles a key's owner may go unanswered, about the key, before a data plane
+/// takes itself as cut off from it and drops the share it last heard of: a second
+/// at a 10 ms cycle, longer than the store takes to replace a lost owner (about 600 ms), so
+/// that a failover is not taken for being cut off. Dropped sooner, at 300 ms, a lost owner's
+/// tight bucket among 8 data planes let through 3.1 times its limit in the second after,
+/// against 1.24 times keeping the share (cluster simulator).
+pub const CUT_OFF_CYCLES: u64 = 100;
+
 /// The most reports a data plane has out for one key, sent and not yet seen applied: past
 /// it, new hits wait in the key's ledger, one running count, until one is. Above what a
 /// healthy link has out — a report a cycle through the [`ACTIVE_CYCLES`] a lost segment takes
@@ -467,13 +475,13 @@ impl Unseen {
 }
 
 /// Whether a data plane is cut off from a key's owner at `now`: nothing heard of the key
-/// since `heard` for `lately`, and its oldest report not seen applied, first sent at
-/// `oldest`, out as long. It then stops counting the others the owner last said admit the
-/// key and enforces the whole bucket on what it sees (06 §6), as the owner counts a data
-/// plane among them only for as long. A key merely quiet, its oldest report out for less,
-/// keeps its share: data planes waking on it together must not each take the whole bucket.
-fn cut_off_from_owner(heard: Option<u64>, oldest: Option<u64>, lately: u64, now: u64) -> bool {
-    let long = |at: Option<u64>| at.is_some_and(|at| now.saturating_sub(at) >= lately);
+/// since `heard` for `after` ([`CUT_OFF_CYCLES`]), and its oldest report not seen applied,
+/// first sent at `oldest`, out as long. It then stops counting the others the owner last
+/// said admit the key and enforces the whole bucket on what it sees (06 §6). A key merely
+/// quiet, its oldest report out for less, keeps its share: data planes waking on it together
+/// must not each take the whole bucket.
+fn cut_off_from_owner(heard: Option<u64>, oldest: Option<u64>, after: u64, now: u64) -> bool {
+    let long = |at: Option<u64>| at.is_some_and(|at| now.saturating_sub(at) >= after);
     long(heard) && long(oldest)
 }
 
@@ -1030,13 +1038,13 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
     pub fn on_cycle(&mut self, now: u64) {
         let resend_after = RESEND_AFTER_CYCLES * self.cycle;
         let cycle = self.cycle;
-        let lately = ACTIVE_CYCLES * cycle;
+        let cut_off_after = CUT_OFF_CYCLES * cycle;
         let mut cut_off = false;
         for (key, at) in &mut self.keys {
             let hold = at.contract.refill_time();
             let refill = at.contract.refilled(cycle);
             let oldest = at.unacknowledged.front().map(|unseen| unseen.first);
-            if cut_off_from_owner(at.heard, oldest, lately, now) {
+            if cut_off_from_owner(at.heard, oldest, cut_off_after, now) {
                 at.others = 0;
             }
             let left = at
