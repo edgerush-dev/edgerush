@@ -37,11 +37,14 @@
 #     takes is closed, and the HTTPS listener's name served, the route said accepted; a
 #     TCP listener's connections are carried to its oldest TCPRoute's backend, a newer
 #     route accepted and counted but reached only once the older is gone, and every
-#     connection closed with none; an HTTPRoute's backend that a BackendTLSPolicy covers is
-#     reached over TLS, verified by a ConfigMap's authority and the policy's hostname, a
-#     wrong hostname or authority, the ConfigMap's change taken in, or a ConfigMap not
-#     there answered 5xx, and the policy says so of the Gateway, and nothing once no route
-#     reaches it;
+#     connection closed with none; a UDP listener beside an HTTP one of its port number
+#     carries a datagram to its UDPRoute's backend and the answer back, as a pod's /dial
+#     sees it, and answers nothing with no route, the route said accepted, and
+#     UnsupportedProtocol once led to a TCP port; an HTTPRoute's backend that a
+#     BackendTLSPolicy covers is reached over TLS, verified by a ConfigMap's authority and
+#     the policy's hostname, a wrong hostname or authority, the ConfigMap's change taken
+#     in, or a ConfigMap not there answered 5xx, and the policy says so of the Gateway, and
+#     nothing once no route reaches it;
 #   - the Ingress's status says the data plane's Service's address;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
@@ -853,6 +856,115 @@ listeners=$(k -n edge get gateway web -o jsonpath='{.spec.listeners[*].name}' | 
 k -n edge patch gateway web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 1))\"}]" >/dev/null
 k -n shop delete deploy/older service/older deploy/newer service/newer >/dev/null
 pass "a TCP listener's connections are carried to its oldest TCPRoute's backend, a newer route accepted and counted and reached only once the older is gone, and closed with none"
+
+# A UDP listener (04 §2, 24) on the port number of the Gateway's `alt` HTTP listener, a
+# socket of its own beside that one's: a datagram to it is carried to its UDPRoute's
+# backend, agnhost's netexec over UDP, which answers `hostname` with its pod's name, and the
+# answer comes back from the address the datagram came to, as the client's connected socket
+# takes no other. No port-forward carries UDP, so the client is the `web` pod's netexec,
+# asked through the API server to dial the data plane's pod (/dial: a socket of its own each
+# time, and so a session each). The route says it is accepted and resolved, of its
+# generation, which writing it needs udproutes/status; with no route the listener's port
+# stays bound and answers nothing; led to a Service's port that is not UDP, a route says
+# UnsupportedProtocol.
+k apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: echo, namespace: shop }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: echo } }
+  template:
+    metadata: { labels: { app: echo } }
+    spec:
+      containers:
+        - name: echo
+          image: $AGNHOST
+          args: ["netexec", "--http-port=8080", "--udp-port=8081"]
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: datagrams, containerPort: 8081, protocol: UDP }
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 1 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: echo, namespace: shop }
+spec:
+  selector: { app: echo }
+  ports: [{ name: datagrams, port: 8081, protocol: UDP, targetPort: datagrams }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: { name: echo, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: udp }]
+  rules: [{ backendRefs: [{ name: echo, port: 8081 }] }]
+EOF
+k -n edge patch gateway web --type=json -p '[
+  {"op":"add","path":"/spec/listeners/-","value":{"name":"udp","port":8080,"protocol":"UDP","allowedRoutes":{"namespaces":{"from":"All"}}}}
+]' >/dev/null
+k -n shop rollout status deploy/echo --timeout=120s >/dev/null
+said deploy/edgerush 'listener "port-8080-udp" is on 0.0.0.0:8080, over UDP' 60 ||
+    fail "the data plane never bound the UDP listener's port: $(k -n edge logs deploy/edgerush | tail -5)"
+client=$(k -n shop get pod -l app=web -o jsonpath='{.items[0].metadata.name}')
+plane=$(k -n edge get pod "$(pod)" -o jsonpath='{.status.podIP}')
+# What netexec's /dial says of a datagram `hostname` sent to the UDP listener: its answers
+# and its errors.
+dialled() {
+    k get --raw "/api/v1/namespaces/shop/pods/$client:8080/proxy/dial?request=hostname&protocol=udp&host=$plane&port=8080&tries=1" 2>&1 || true
+}
+# What that datagram is answered: the pod that served it, or nothing once netexec stops
+# waiting for an answer.
+echoed() { dialled | sed -n 's/.*"responses":\["\([^"]*\)".*/\1/p'; }
+for _ in $(seq 1 30); do
+    case "$(echoed)" in echo-*) break ;; esac
+    sleep 1
+done
+case "$(echoed)" in
+    echo-*) ;;
+    *) fail "a datagram to the UDP listener is not answered by its UDPRoute's backend: $(dialled)" ;;
+esac
+forward 8080
+answers route.example 200 30 ||
+    fail "beside the UDP listener of its port number, the HTTP listener answers $(status route.example)"
+forward
+stated 1 '{.status.listeners[?(@.name=="udp")].attachedRoutes}' 30 -n edge gateway web ||
+    fail "the UDP listener does not count its route: $(said_of -n edge gateway web)"
+stated True "$(of_listener udp status)" 30 -n edge gateway web ||
+    fail "the UDP listener is not said programmed: $(said_of -n edge gateway web)"
+stated "True True" '{.status.parents[0].conditions[?(@.type=="Accepted")].status} {.status.parents[0].conditions[?(@.type=="ResolvedRefs")].status}' \
+    30 -n shop udproute echo || fail "the UDPRoute says $(said_of -n shop udproute echo)"
+generation=$(k -n shop get udproute echo -o jsonpath='{.metadata.generation}')
+stated "$generation" '{.status.parents[0].conditions[?(@.type=="Accepted")].observedGeneration}' \
+    5 -n shop udproute echo ||
+    fail "the UDPRoute's status is not of generation $generation: $(said_of -n shop udproute echo)"
+refused_any && fail "a control-plane replica was refused something of a UDPRoute"
+k -n shop delete udproute echo >/dev/null
+for _ in $(seq 1 30); do
+    [ -z "$(echoed)" ] && break
+    sleep 1
+done
+[ -z "$(echoed)" ] || fail "with no UDPRoute, a datagram is answered: $(dialled)"
+stated 0 '{.status.listeners[?(@.name=="udp")].attachedRoutes}' 30 -n edge gateway web ||
+    fail "with no UDPRoute, the UDP listener counts one: $(said_of -n edge gateway web)"
+k -n edge logs deploy/edgerush | grep 'listener "port-8080-udp" has drained' >/dev/null &&
+    fail "with no UDPRoute, the UDP listener's port was let go"
+k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: { name: echo, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: udp }]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]
+EOF
+stated "True False UnsupportedProtocol" '{.status.parents[0].conditions[?(@.type=="Accepted")].status} {.status.parents[0].conditions[?(@.type=="ResolvedRefs")].status} {.status.parents[0].conditions[?(@.type=="ResolvedRefs")].reason}' \
+    30 -n shop udproute echo ||
+    fail "a UDPRoute led to a Service's TCP port says $(said_of -n shop udproute echo)"
+k -n shop delete udproute echo >/dev/null
+listeners=$(k -n edge get gateway web -o jsonpath='{.spec.listeners[*].name}' | wc -w)
+k -n edge patch gateway web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 1))\"}]" >/dev/null
+k -n shop delete deploy/echo service/echo >/dev/null
+pass "a UDP listener beside an HTTP one of its port number carries datagrams to its UDPRoute's backend and back, the route accepted and resolved; with none, its port bound and nothing answered; led to a TCP port, the route says UnsupportedProtocol"
 
 # A BackendTLSPolicy (04 §2, §6): an HTTPRoute's backend, agnhost's netexec over TLS of a
 # certificate the stream's authority made for secured.shop.example, is reached over TLS,
