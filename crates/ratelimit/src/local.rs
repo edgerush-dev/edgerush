@@ -36,22 +36,14 @@ use std::hash::BuildHasher;
 use std::num::NonZeroU64;
 use sync::{Arc, AtomicU64, Ordering, RwLock};
 
+use crate::rate::{MASK, Rate, UNITS};
+
 /// The tables a worker's handles are split into, by bits of each key's hash: each doubles
 /// on its own, and [`Handles::prune_next`] reads one at a time.
 pub const HANDLE_PARTS: usize = 64;
 
-/// Units in a request's interval.
-const UNITS: u64 = 1 << 16;
-/// The arrival time's range: units modulo 2^63.
-const MASK: u64 = (1 << 63) - 1;
-/// How far ahead of now an arrival time may be and still be ahead, not behind: a quarter of
-/// the range, so that the difference of two times within it is never mistaken.
-const AHEAD_BELOW: u64 = 1 << 61;
 /// The word's top bit: the key was forgotten or evicted, and a new one takes its place.
 const CLOSED: u64 = 1 << 63;
-/// The most of a bucket kept: past it, a bucket is this big. Keeps the tolerance far within
-/// [`AHEAD_BELOW`].
-const MOST_BURST: u64 = 1 << 40;
 /// A window's count: the word's low bits, saturating there.
 const COUNT_BITS: u32 = 40;
 const COUNT_MASK: u64 = (1 << COUNT_BITS) - 1;
@@ -65,74 +57,6 @@ const NUMBER_MASK: u64 = (1 << (63 - COUNT_BITS)) - 1;
 /// worker making a key waits out, with any other wanting the shard — at 30 million keys,
 /// some 7,300 a shard. A few under loom, which tracks each lock.
 const SHARDS: usize = if cfg!(loom) { 2 } else { 4_096 };
-
-/// A contract's arithmetic: time to units and back.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Rate {
-    /// Units a nanosecond, as a 64.64 fixed-point number, rounded up: a time converts to at
-    /// most a unit more than it is worth, which errs towards admitting.
-    per_ns_high: u64,
-    per_ns_low: u64,
-    /// How far ahead of now the arrival time may be for a request to be admitted, in units:
-    /// the bucket less one, and the slack's refill ([`SLACK`](crate::SLACK)).
-    tolerance: u64,
-    /// The contract's window and limit, for units back to time.
-    window: u128,
-    limit: u128,
-    /// The time a full bucket takes to refill, rounded up: a key unused for longer is full,
-    /// whatever its word says once its clock has wrapped round.
-    refill: u64,
-}
-
-impl Rate {
-    fn new(contract: Contract) -> Self {
-        let limit = u128::from(contract.limit.get());
-        let window = u128::from(contract.window.get());
-        let burst = contract.burst.get().min(MOST_BURST);
-        let scaled = limit * u128::from(UNITS);
-        let whole = scaled / window;
-        let rest = ((scaled % window) << 64).div_ceil(window);
-        let per_ns = (whole << 64) + rest;
-        let refill = (u128::from(burst) * window).div_ceil(limit);
-        // The slack's refill (`crate::SLACK`), rounded up as the rate is, erring towards
-        // admitting; within the most a bucket keeps, so that the tolerance stays far inside
-        // the range.
-        let slack = u64::try_from(
-            u128::from(crate::SLACK)
-                .saturating_mul(per_ns)
-                .div_ceil(1 << 64),
-        )
-        .unwrap_or(u64::MAX)
-        .min(MOST_BURST * UNITS);
-        Self {
-            per_ns_high: u64::try_from(per_ns >> 64).unwrap_or(u64::MAX),
-            per_ns_low: per_ns as u64,
-            tolerance: (burst - 1) * UNITS + slack,
-            window,
-            limit,
-            refill: u64::try_from(refill).unwrap_or(u64::MAX),
-        }
-    }
-
-    /// `now`, in units, modulo the range.
-    fn units(&self, now: u64) -> u64 {
-        let high = u128::from(now) * u128::from(self.per_ns_high);
-        let low = (u128::from(now) * u128::from(self.per_ns_low)) >> 64;
-        (high + low) as u64 & MASK
-    }
-
-    /// How far ahead of `now` (units) `arrival` is: zero if it is behind.
-    fn ahead(arrival: u64, now: u64) -> u64 {
-        let ahead = arrival.wrapping_sub(now) & MASK;
-        if ahead < AHEAD_BELOW { ahead } else { 0 }
-    }
-
-    /// Nanoseconds that `units` take to pass, rounded up.
-    fn nanos(&self, units: u64) -> u64 {
-        let nanos = (u128::from(units) * self.window).div_ceil(self.limit * u128::from(UNITS));
-        u64::try_from(nanos).unwrap_or(u64::MAX)
-    }
-}
 
 /// A fixed window's contract: at most `limit` requests in each window of a key, its
 /// windows shifted by an offset from its hash so that keys' boundaries spread (06 §3).

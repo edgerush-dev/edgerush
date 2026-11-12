@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::sync::{Arc, RwLock};
 use sync::{AtomicBool, AtomicU32, AtomicU64, AtomicU128, Ordering};
-use word::{Advance, Bucket, Fields, Step};
+use word::{Advance, Fields, Rate, Step};
 
 /// A worker's own decision of a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -330,7 +330,7 @@ pub struct Entry {
 #[derive(Debug)]
 struct Terms {
     contract: Contract,
-    bucket: Bucket,
+    bucket: Rate,
     /// The contract's refill time: how long a copy stays fresh after an answer.
     hold: u64,
     /// The protocol's cycle, and what the contract refills in one, in requests and in units.
@@ -343,11 +343,11 @@ impl Terms {
     fn new(contract: Contract, cycle: u64) -> Self {
         Self {
             contract,
-            bucket: Bucket::new(contract),
+            bucket: Rate::new(contract),
             hold: contract.refill_time(),
             cycle,
             refill: contract.refilled(cycle),
-            refill_units: Bucket::new(contract).units(cycle),
+            refill_units: Rate::new(contract).units(cycle),
         }
     }
 }
@@ -382,7 +382,7 @@ impl Entry {
     fn with_terms(key: Box<[u8]>, terms: Arc<Terms>, now: u64) -> Self {
         let cycle = terms.cycle;
         let fields = Fields {
-            arrival: Bucket::full(terms.bucket.units(now)),
+            arrival: Rate::full(terms.bucket.units(now)),
             // No share bound until a cycle sets one, as a new `DataPlane` key has none.
             left: word::MOST_LEFT,
             cycle: word::cycle_of(now, cycle),
@@ -563,7 +563,7 @@ impl Entry {
             self.started.store(now, Ordering::Relaxed);
         }
         Fields {
-            arrival: Bucket::charge(fields.arrival, self.terms.bucket.units(now), 1),
+            arrival: Rate::charge(fields.arrival, self.terms.bucket.units(now), 1),
             left: fields.left.saturating_sub(1),
             unreported: (fields.unreported + 1).min(word::MOST_UNREPORTED),
             ..fields
