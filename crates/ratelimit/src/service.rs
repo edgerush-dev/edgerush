@@ -619,7 +619,7 @@ impl PlaneKey {
             contract,
             hold: contract.refill_time(),
             owner,
-            bucket: contract.bucket(),
+            bucket: contract.bucket().with_slack(crate::SLACK),
             unsent: 0,
             unsent_since: 0,
             sent: numbered,

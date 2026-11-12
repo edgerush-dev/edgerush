@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc d13524874a7515f72aa34e805fc84dbff8881f85675d09086f1a661c6895510b # shrinks to limit = 3125, window = 1000000000, burst = 3, steps = [0, 0, 0, 1]
+cc 5b90ac841fdfbdee28a6f77bf76235e4bbcb19c6ad01da6db22a1e200484ce47 # shrinks to limit = 11, window_s = 1, burst = 1, steps = [(0, false), (0, false)]
+cc ade6fef091c93f8a0fc630ac699502e15c093ae58a749a7185739e3f5c128abf # shrinks to limit = 1, interval = 1, burst = 1, steps = [0]

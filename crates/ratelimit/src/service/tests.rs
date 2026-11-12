@@ -1333,23 +1333,29 @@ fn a_refused_request_waits_for_the_latest_of_its_keys() {
     let both = [(&a[..], contract()), (&b[..], slow)];
     let plane = &mut net.planes[0];
     assert_eq!(plane.retry_after(&both, 0), None, "both admit");
-    // A hundred a second: one request back every 10 ms.
+    // A hundred a second: one request back every 10 ms, the slack (`crate::SLACK`) sooner.
     while plane.decide(&a, contract(), 0) == Decision::Admit {}
-    assert_eq!(plane.retry_after(&both, 0), Some((0, 10 * MS)));
+    assert_eq!(
+        plane.retry_after(&both, 0),
+        Some((0, 10 * MS - crate::SLACK))
+    );
     let twice = [(&a[..], contract()), (&a[..], contract())];
     assert_eq!(
         plane.retry_after(&twice, 0),
-        Some((0, 10 * MS)),
+        Some((0, 10 * MS - crate::SLACK)),
         "the first"
     );
     while plane.decide(&b, slow, 0) == Decision::Admit {}
     assert_eq!(
         plane.retry_after(&both, 0),
-        Some((1, 100 * MS)),
+        Some((1, 100 * MS - crate::SLACK)),
         "the latest"
     );
     let reversed = [(&b[..], slow), (&a[..], contract())];
-    assert_eq!(plane.retry_after(&reversed, 0), Some((0, 100 * MS)));
+    assert_eq!(
+        plane.retry_after(&reversed, 0),
+        Some((0, 100 * MS - crate::SLACK))
+    );
 }
 
 /// A key with room whose share of the cycle is spent waits for the next cycle.

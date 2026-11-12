@@ -42,15 +42,18 @@ const CYCLE_MASK: u64 = (1 << 16) - 1;
 pub(super) const MOST_UNREPORTED: u64 = (1 << 37) - 1;
 
 /// Whether `contract` fits a pooled entry at `cycle`: the largest allowance a cycle can set,
-/// a whole bucket and two cycles' refill (the cycle after a share keeps what the one before
-/// left) and one carried, within `MOST_LEFT`.
+/// a whole bucket with the slack's refill ([`SLACK`](crate::SLACK)) and two cycles' refill
+/// (the cycle after a share keeps what the one before left) and one carried, within
+/// `MOST_LEFT`.
 #[must_use]
 pub fn fits(contract: Contract, cycle: u64) -> bool {
     let refill = contract.refilled(cycle.max(1)).saturating_add(1);
+    let slack = contract.refilled(crate::SLACK).saturating_add(1);
     contract
         .burst
         .get()
         .min(MOST_BURST)
+        .saturating_add(slack)
         .saturating_add(refill.saturating_mul(2))
         .saturating_add(1)
         <= MOST_LEFT
@@ -180,10 +183,19 @@ impl Bucket {
         let whole = scaled / window;
         let rest = ((scaled % window) << 64).div_ceil(window);
         let per_ns = (whole << 64) + rest;
+        // The slack's refill (`crate::SLACK`), rounded up as the rate is, erring towards
+        // admitting; within the most a bucket keeps.
+        let slack = u64::try_from(
+            u128::from(crate::SLACK)
+                .saturating_mul(per_ns)
+                .div_ceil(1 << 64),
+        )
+        .unwrap_or(u64::MAX)
+        .min(MOST_BURST * UNITS);
         Self {
             per_ns_high: u64::try_from(per_ns >> 64).unwrap_or(u64::MAX),
             per_ns_low: per_ns as u64,
-            tolerance: (contract.burst.get().min(MOST_BURST) - 1) * UNITS,
+            tolerance: (contract.burst.get().min(MOST_BURST) - 1) * UNITS + slack,
             window,
             limit,
         }
@@ -389,14 +401,16 @@ mod tests {
     }
 
     /// The largest allowance a contract can set fits the word, or the contract is not
-    /// pooled: a whole bucket and two cycles' refill, at a 10 ms cycle.
+    /// pooled: a whole bucket with the slack's refill and two cycles' refill, at a 10 ms
+    /// cycle.
     #[test]
     fn a_contract_fits_while_its_largest_allowance_does() {
         let cycle = 10_000_000;
         assert!(fits(contract(100, 1_000_000_000, 100), cycle));
-        // 65,535 - 1 carried - 2 x (refill 1 + its rounding 1) = 65,530 burst.
-        assert!(fits(contract(100, 1_000_000_000, 65_530), cycle));
-        assert!(!fits(contract(100, 1_000_000_000, 65_531), cycle));
+        // 65,535 - 1 carried - the slack's refill (0 + its rounding 1) - 2 x (refill 1 + its
+        // rounding 1) = 65,529 burst.
+        assert!(fits(contract(100, 1_000_000_000, 65_529), cycle));
+        assert!(!fits(contract(100, 1_000_000_000, 65_530), cycle));
         // 6 M a second: 60,000 a cycle, twice, is past it whatever the burst.
         assert!(!fits(contract(6_000_000, 1_000_000_000, 1), cycle));
         assert!(fits(contract(3_000_000, 1_000_000_000, 5_000), cycle));
@@ -415,12 +429,14 @@ mod tests {
         }
         assert_eq!(admitted, 10);
         assert_eq!(bucket.remaining(arrival, now), 0);
-        // One a tenth of a second, and a wait never short of it: up to the slack's two
-        // units longer, a unit being 1/65,536 of the interval, 1,526 ns here.
+        // One a tenth of a second less the slack (`crate::SLACK`), rounded up to a whole
+        // unit: 66 units, a unit being 1/65,536 of the interval, 1,526 ns here, so 100,708
+        // ns. The wait is never short of that, and up to the wait's two units longer.
+        let due = 100_000_000 - 66 * 100_000_000 / 65_536;
         let wait = bucket.wait(arrival, now).unwrap();
-        assert!((100_000_000..=100_003_052).contains(&wait), "{wait}");
-        assert!(bucket.admits(arrival, bucket.units(100_000_000)));
-        assert!(!bucket.admits(arrival, bucket.units(99_999_999)));
+        assert!((due..=due + 3_052).contains(&wait), "{wait}");
+        assert!(bucket.admits(arrival, bucket.units(due + 1_526)));
+        assert!(!bucket.admits(arrival, bucket.units(due - 1_526)));
     }
 
     /// Long after the last charge, the arrival time has fallen behind: still a full
@@ -430,13 +446,16 @@ mod tests {
     /// times idle, which `MOST_BURST` keeps to 2^38 intervals at most.
     #[test]
     fn an_old_arrival_is_behind_not_ahead() {
-        let bucket = Bucket::new(contract(1_000_000_000, 1_000_000_000, 5));
+        let c = contract(1_000_000_000, 1_000_000_000, 5);
+        let bucket = Bucket::new(c);
         let arrival = Bucket::charge(0, bucket.units(0), 5);
         let margin = AHEAD_BELOW / UNITS;
+        // Full: the burst, and the slack's refill, a request a nanosecond.
+        let full = 5 + c.refilled(crate::SLACK);
         for later in [1_000_000, 2 * MOST_BURST, margin - 1] {
             let later = bucket.units(later);
             assert_eq!(Bucket::ahead(arrival, later), 0, "{later}");
-            assert_eq!(bucket.remaining(arrival, later), 5);
+            assert_eq!(bucket.remaining(arrival, later), full);
         }
         assert!(
             2 * MOST_BURST <= margin / 2,
@@ -633,7 +652,7 @@ mod tests {
         let wrap =
             u64::try_from((u128::from(ARRIVAL_MASK) + 1) / u128::from(UNITS)).unwrap() * interval;
         for start in [wrap - 2 * interval, wrap - interval / 2, wrap, wrap + 1] {
-            let mut reference: TokenBucket = c.bucket();
+            let mut reference: TokenBucket = c.bucket().with_slack(crate::SLACK);
             let mut arrival = bucket.units(start);
             for step in 0..8 {
                 let now = start + step * interval / 2;
@@ -667,13 +686,14 @@ mod tests {
     proptest! {
         /// At any time, not only on interval boundaries, and at low rates, around the
         /// moment the bucket has room again: never refused where the reference admits,
-        /// admitted early by under two units (2/65,536 of an interval), and a refusal's
-        /// wait never shorter than the reference's nor three units longer. Owners' answers
-        /// rebase it now and then, as the transport does. The bounds: a rebased arrival is
-        /// under two units early (its `now` and its `behind` each rounded down), and `now`
-        /// under one unit late.
+        /// admitted early by under three units (3/65,536 of an interval), and a refusal's
+        /// wait short of the reference's by under a unit and never three units longer.
+        /// Owners' answers rebase it now and then, as the transport does. The bounds: a
+        /// rebased arrival is under two units early (its `now` and its `behind` each rounded
+        /// down), `now` under one unit late, and the slack (`crate::SLACK`) rounded up to a
+        /// whole unit, erring towards admitting, under one unit more.
         #[test]
-        fn off_the_grid_it_is_never_late_and_under_two_units_early(
+        fn off_the_grid_it_is_never_late_and_under_three_units_early(
             limit in 1u64..20,
             window_s in 1u64..3_600,
             burst in 1u64..12,
@@ -684,7 +704,7 @@ mod tests {
             let bucket = Bucket::new(c);
             let unit = unit_ns(c);
             let interval = window / limit;
-            let mut reference: TokenBucket = c.bucket();
+            let mut reference: TokenBucket = c.bucket().with_slack(crate::SLACK);
             let mut arrival = 0;
             let mut now = 0u64;
             for (thousandths, rebase) in steps {
@@ -701,13 +721,46 @@ mod tests {
                     arrival = Bucket::charge(arrival, units, 1);
                 } else if ours {
                     let due = reference.retry_at(now).unwrap() - now;
-                    prop_assert!(due < 2 * unit, "admitted {} ns early, a unit {}", due, unit);
+                    prop_assert!(due < 3 * unit, "admitted {} ns early, a unit {}", due, unit);
                 } else {
                     let due = reference.retry_at(now).unwrap() - now;
                     let wait = bucket.wait(arrival, units).unwrap();
-                    prop_assert!(wait >= due, "wait {} short of {}", wait, due);
+                    prop_assert!(wait + unit > due, "wait {} short of {} by a unit or more", wait, due);
                     prop_assert!(wait <= due + 3 * unit, "wait {} over {} by three units or more", wait, due);
                 }
+            }
+        }
+
+        /// Workers' clocks lagging the true time by up to the slack (`crate::SLACK`), each
+        /// request decided at its worker's clock, never leave the bucket having admitted
+        /// fewer than a bucket of the contract would have on the true times: a lag refuses
+        /// nothing within the limit. A request a microsecond and slower.
+        #[test]
+        fn a_lag_within_the_slack_never_falls_behind_the_contract(
+            limit in 1u64..1_000_000,
+            burst in 1u64..20,
+            steps in prop::collection::vec((0u64..3_000, 0u64..=crate::SLACK), 1..300),
+        ) {
+            let window = 1_000_000_000;
+            let c = contract(limit, window, burst);
+            let bucket = Bucket::new(c);
+            let interval = window / limit;
+            let mut exact = c.bucket();
+            let (mut arrival, mut ours, mut theirs) = (0, 0u64, 0u64);
+            let mut now = crate::SLACK;
+            for (thousandths, lag) in steps {
+                // Up to three intervals on, the request's clock up to the slack behind.
+                now += interval * thousandths / 1_000;
+                let clock = bucket.units(now - lag);
+                if bucket.admits(arrival, clock) {
+                    arrival = Bucket::charge(arrival, clock, 1);
+                    ours += 1;
+                }
+                if exact.admits(now) {
+                    exact.charge(now);
+                    theirs += 1;
+                }
+                prop_assert!(ours >= theirs, "{} admitted against {} at {}", ours, theirs, now);
             }
         }
 
@@ -724,7 +777,7 @@ mod tests {
             let window = limit * interval;
             let c = contract(limit, window, burst);
             let bucket = Bucket::new(c);
-            let mut reference: TokenBucket = c.bucket();
+            let mut reference: TokenBucket = c.bucket().with_slack(crate::SLACK);
             let mut arrival = 0;
             let mut now = 0u64;
             for step in steps {

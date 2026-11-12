@@ -12,6 +12,15 @@
 //! process on what it sees alone. The synchronous mode's owner is the cluster store's
 //! (`edgerush_cluster_synchronous`).
 
+/// How far, in nanoseconds, a worker's clock may lag the latest charge of a key without a
+/// request within the limit being refused on a data plane: a bucket admits a request whose
+/// arrival time is up to its burst and this much refill ahead (06 §4). Workers read their own
+/// clocks, so one may decide a moment after another that read a later time; a key at 100 a
+/// second refills a request every 10 ms, so microseconds of lag refuse nothing below about
+/// 100,000 a second, and this covers the rest. The burst grows by it times the rate: 0.01 of a
+/// request at 100 a second, 100 at a million. The rate is unchanged.
+pub const SLACK: u64 = 100_000;
+
 pub mod local;
 pub mod reference;
 pub mod service;

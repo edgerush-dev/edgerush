@@ -27,6 +27,24 @@ fn local() -> Local<FixedState> {
     Local::new(FixedState::default(), 1)
 }
 
+/// Asserts that `decision` refuses at `position` with the wait `owed` nanoseconds of `c`'s
+/// refill come to less the slack ([`SLACK`](crate::SLACK)), within a unit of the contract
+/// either way: the slack is rounded up to a whole unit, erring towards admitting, and a time
+/// off the units' grid is rounded when converted.
+#[track_caller]
+fn assert_refused(decision: Decision, position: usize, owed: u64, c: Contract) {
+    let unit = c.window.get().div_ceil(c.limit.get() * UNITS);
+    let due = owed - crate::SLACK;
+    let Decision::Refuse { position: at, wait } = decision else {
+        panic!("admitted, not refused at {position}");
+    };
+    assert_eq!(at, position);
+    assert!(
+        (due - unit..=due + unit).contains(&wait),
+        "waits {wait}, due {due}"
+    );
+}
+
 /// Decides one request under `key` alone.
 fn one(
     local: &Local<FixedState>,
@@ -49,6 +67,19 @@ fn a_new_key_admits_its_bucket_then_refuses() {
     assert_eq!(admitted, 5);
 }
 
+/// A key's bucket holds its burst and the slack's refill (`crate::SLACK`): at a request a
+/// microsecond, a hundred more than a burst of one.
+#[test]
+fn a_key_holds_its_burst_and_the_slacks_refill() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let c = contract(1_000_000, SECOND, 1);
+    let admitted = (0..200)
+        .filter(|_| one(&local, &mut handles, b"k", c, SECOND))
+        .count();
+    assert_eq!(admitted, 101);
+}
+
 #[test]
 fn it_refills_at_its_rate() {
     let local = local();
@@ -65,12 +96,12 @@ fn a_refusal_says_how_long_until_room() {
     let mut handles = Handles::new(FixedState::default());
     let c = contract(10, SECOND, 1);
     assert!(one(&local, &mut handles, b"k", c, 0));
-    // Never short, so that a client waiting as long finds room; long by less than a unit.
-    let Decision::Refuse { position: 0, wait } = local.decide(&mut handles, &[(b"k", c)], 30 * MS)
-    else {
-        panic!("refused");
+    // A client waiting as long finds room.
+    let decision = local.decide(&mut handles, &[(b"k", c)], 30 * MS);
+    assert_refused(decision, 0, 70 * MS, c);
+    let Decision::Refuse { wait, .. } = decision else {
+        unreachable!("asserted refused");
     };
-    assert!((70 * MS..70 * MS + 2_000).contains(&wait), "{wait}");
     assert!(one(&local, &mut handles, b"k", c, 30 * MS + wait));
 }
 
@@ -107,13 +138,7 @@ fn several_limits_charge_all_or_none() {
     let (wide, narrow) = (contract(10, SECOND, 3), contract(10, SECOND, 1));
     let both: [(&[u8], Contract); 2] = [(b"wide", wide), (b"narrow", narrow)];
     assert_eq!(local.decide(&mut handles, &both, 0), Decision::Admit);
-    assert_eq!(
-        local.decide(&mut handles, &both, 0),
-        Decision::Refuse {
-            position: 1,
-            wait: 100 * MS
-        }
-    );
+    assert_refused(local.decide(&mut handles, &both, 0), 1, 100 * MS, narrow);
     // The refusal charged neither: the wide limit still has two.
     assert!(one(&local, &mut handles, b"wide", wide, 0));
     assert!(one(&local, &mut handles, b"wide", wide, 0));
@@ -127,13 +152,7 @@ fn several_refusing_say_the_longest_wait() {
     let (slow, fast) = (contract(1, SECOND, 1), contract(10, SECOND, 1));
     let both: [(&[u8], Contract); 2] = [(b"fast", fast), (b"slow", slow)];
     assert_eq!(local.decide(&mut handles, &both, 0), Decision::Admit);
-    assert_eq!(
-        local.decide(&mut handles, &both, 0),
-        Decision::Refuse {
-            position: 1,
-            wait: SECOND
-        }
-    );
+    assert_refused(local.decide(&mut handles, &both, 0), 1, SECOND, slow);
 }
 
 #[test]
@@ -188,16 +207,9 @@ fn a_refusal_names_each_limit_out_of_room_and_charges_none() {
     let (roomy, tight) = (contract(10, SECOND, 5), contract(10, SECOND, 1));
     let three: [(&[u8], Contract); 3] = [(b"a", tight), (b"b", roomy), (b"c", tight)];
     assert_eq!(local.decide(&mut handles, &three, 0), Decision::Admit);
-    assert_eq!(
-        local.decide_saying(&mut handles, &three, 0),
-        (
-            Decision::Refuse {
-                position: 0,
-                wait: 100 * MS
-            },
-            0b101
-        )
-    );
+    let (decision, refusing) = local.decide_saying(&mut handles, &three, 0);
+    assert_refused(decision, 0, 100 * MS, tight);
+    assert_eq!(refusing, 0b101);
     // The roomy one still has its four.
     let left = (0..5)
         .filter(|_| one(&local, &mut handles, b"b", roomy, 0))
@@ -214,16 +226,9 @@ fn one_limit_refusing_is_named() {
         local.decide_saying(&mut handles, &[(b"k", c)], 0),
         (Decision::Admit, 0)
     );
-    assert_eq!(
-        local.decide_saying(&mut handles, &[(b"k", c)], 0),
-        (
-            Decision::Refuse {
-                position: 0,
-                wait: 100 * MS
-            },
-            1
-        )
-    );
+    let (decision, refusing) = local.decide_saying(&mut handles, &[(b"k", c)], 0);
+    assert_refused(decision, 0, 100 * MS, c);
+    assert_eq!(refusing, 1);
 }
 
 #[test]
@@ -233,18 +238,12 @@ fn of_limits_refusing_as_long_the_first_is_named() {
     let c = contract(10, SECOND, 1);
     let both: [(&[u8], Contract); 2] = [(b"one", c), (b"other", c)];
     assert_eq!(local.decide(&mut handles, &both, 0), Decision::Admit);
-    assert_eq!(
-        local.decide(&mut handles, &both, 0),
-        Decision::Refuse {
-            position: 0,
-            wait: 100 * MS
-        }
-    );
+    assert_refused(local.decide(&mut handles, &both, 0), 0, 100 * MS, c);
 }
 
 proptest! {
     /// However its interval divides into nanoseconds, a client waiting as long as it was
-    /// told finds room.
+    /// told finds room: spent until refused, past its burst by the slack's refill at most.
     #[test]
     fn the_wait_said_is_never_short(
         limit in 1_u64..1_000,
@@ -258,8 +257,12 @@ proptest! {
         for _ in 0..burst {
             prop_assert!(one(&local, &mut handles, b"k", c, at));
         }
-        let Decision::Refuse { wait, .. } = local.decide(&mut handles, &[(b"k", c)], at) else {
-            return Err(TestCaseError::fail("refused once spent"));
+        let slack = c.refilled(crate::SLACK) + 1;
+        let decision = (0..=slack)
+            .map(|_| local.decide(&mut handles, &[(b"k", c)], at))
+            .find(|decision| *decision != Decision::Admit);
+        let Some(Decision::Refuse { wait, .. }) = decision else {
+            return Err(TestCaseError::fail("not refused past the burst and the slack"));
         };
         prop_assert!(one(&local, &mut handles, b"k", c, at + wait), "after {}", wait);
     }
@@ -384,7 +387,7 @@ proptest! {
         let c = contract(limit, window_ms * MS, burst);
         let local = local();
         let mut handles = Handles::new(FixedState::default());
-        let mut reference = TokenBucket::new(c.limit, c.window, c.burst);
+        let mut reference = TokenBucket::new(c.limit, c.window, c.burst).with_slack(crate::SLACK);
         for now in exact_times(&c, &steps) {
             let expected = reference.decide(now);
             prop_assert_eq!(one(&local, &mut handles, b"k", c, now), expected, "at {}", now);
