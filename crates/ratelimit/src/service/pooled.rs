@@ -34,8 +34,9 @@ pub use routing::{Replied, Reply, Routing};
 pub use word::fits;
 
 use super::{
-    Answers, Batch, Contract, Entry as BatchEntry, MOST_UNACKNOWLEDGED, PlaneId, Queued,
-    RESEND_AFTER_CYCLES, Report, Room, Unseen, View, encoded_entry_bytes, longest,
+    ACTIVE_CYCLES, Answers, Batch, Contract, Entry as BatchEntry, MOST_UNACKNOWLEDGED, PlaneId,
+    Queued, RESEND_AFTER_CYCLES, Report, Room, Unseen, View, cut_off_from_owner,
+    encoded_entry_bytes, longest,
 };
 use chunked::MinHeap;
 use keys::Keys;
@@ -982,6 +983,9 @@ impl Ord for Due {
 struct Visit<'a, S, R: Routing> {
     now: u64,
     resend_after: u64,
+    /// How long a key's owner may go unanswered before it is cut off from it
+    /// ([`cut_off_from_owner`]).
+    lately: u64,
     poll_quiet: bool,
     hasher: &'a S,
     routing: &'a R,
@@ -1030,6 +1034,11 @@ impl<S: BuildHasher, R: Routing> Visit<'_, S, R> {
         let entry = &tracked.entry;
         let key = &entry.key;
         let hold = entry.terms.hold;
+        let oldest = tracked.unacknowledged.as_slice().first();
+        let oldest = oldest.map(|unseen| unseen.first);
+        if cut_off_from_owner(tracked.heard.get(), oldest, self.lately, now) {
+            entry.others.store(0, Ordering::Release);
+        }
         let Some(owner) = tracked.owner else {
             return false;
         };
@@ -1519,6 +1528,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
         let mut visit = Visit {
             now,
             resend_after,
+            lately: ACTIVE_CYCLES * self.cycle,
             poll_quiet: self.levers.poll_quiet,
             hasher: &self.hasher,
             routing: &self.routing,

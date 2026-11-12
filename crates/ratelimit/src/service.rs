@@ -466,6 +466,17 @@ impl Unseen {
     }
 }
 
+/// Whether a data plane is cut off from a key's owner at `now`: nothing heard of the key
+/// since `heard` for `lately`, and its oldest report not seen applied, first sent at
+/// `oldest`, out as long. It then stops counting the others the owner last said admit the
+/// key and enforces the whole bucket on what it sees (06 §6), as the owner counts a data
+/// plane among them only for as long. A key merely quiet, its oldest report out for less,
+/// keeps its share: data planes waking on it together must not each take the whole bucket.
+fn cut_off_from_owner(heard: Option<u64>, oldest: Option<u64>, lately: u64, now: u64) -> bool {
+    let long = |at: Option<u64>| at.is_some_and(|at| now.saturating_sub(at) >= lately);
+    long(heard) && long(oldest)
+}
+
 /// What a data plane has to send one service pod: entries, their hits' ages counting back
 /// from `made`; and what they take, by [`Entry::bytes`].
 #[derive(Debug, Default)]
@@ -1019,10 +1030,15 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
     pub fn on_cycle(&mut self, now: u64) {
         let resend_after = RESEND_AFTER_CYCLES * self.cycle;
         let cycle = self.cycle;
+        let lately = ACTIVE_CYCLES * cycle;
         let mut cut_off = false;
         for (key, at) in &mut self.keys {
             let hold = at.contract.refill_time();
             let refill = at.contract.refilled(cycle);
+            let oldest = at.unacknowledged.front().map(|unseen| unseen.first);
+            if cut_off_from_owner(at.heard, oldest, lately, now) {
+                at.others = 0;
+            }
             let left = at
                 .allowance
                 .map_or(0, |before| before.saturating_sub(at.spent));
