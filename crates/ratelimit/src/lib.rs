@@ -22,5 +22,6 @@
 pub const SLACK: u64 = 100_000;
 
 pub mod local;
+mod rate;
 pub mod reference;
 pub mod service;
