@@ -1,0 +1,40 @@
+# Gateway API alone, autoscaled, of a ControlPlane that watches the namespaces it selects.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: payments, namespace: payments-edge, uid: 6f1c2b8e-0000-4000-8000-000000000003 }
+spec:
+  watch:
+    namespaces:
+      from: Selector
+      selector: { matchLabels: { team: payments } }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata: { name: api, namespace: payments-edge, uid: 0d6a9f3c-0000-4000-8000-000000000002 }
+spec:
+  controlPlaneRef: { name: payments }
+  replicas: { min: 3, max: 20 }
+  gateway:
+    listeners:
+      - { name: http, port: 80, protocol: HTTP }
+      - name: wildcard
+        port: 443
+        protocol: HTTPS
+        hostname: "*.payments.example.com"
+        tls: { certificateRefs: [{ name: payments-wildcard }] }
+    allowedListeners: { namespaces: { from: Same } }
+    tls:
+      frontend:
+        default: {}
+        perPort:
+          - port: 443
+            tls:
+              validation: { caCertificateRefs: [{ group: "", kind: ConfigMap, name: client-ca }], mode: AllowValidOnly }
+  ipFamily: Dual
+  ports:
+    - { port: 443, http3: {}, proxyProtocol: { senders: [10.0.0.0/16] }, requestId: Generate }
+    - { port: 80, proxyProtocol: { senders: [10.0.0.0/16] } }
+  service:
+    annotations: { service.beta.kubernetes.io/aws-load-balancer-type: nlb }
+    loadBalancerClass: service.k8s.aws/nlb
+  resources: { requests: { cpu: "1.5", memory: 1Gi } }

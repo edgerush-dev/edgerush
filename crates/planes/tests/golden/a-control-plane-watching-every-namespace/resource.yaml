@@ -1,0 +1,8 @@
+# The whole cluster watched, two replicas, no webhook.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: edge, namespace: edge-system, uid: 6f1c2b8e-0000-4000-8000-000000000002 }
+spec:
+  watch: { namespaces: { from: All } }
+  replicas: 2
+  webhook: { enabled: false }

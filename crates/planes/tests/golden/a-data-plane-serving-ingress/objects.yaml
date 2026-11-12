@@ -1,0 +1,169 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/data-plane: public
+  name: edgerush-proxy-public
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: public
+    uid: 0d6a9f3c-0000-4000-8000-000000000001
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/data-plane: public
+  name: edgerush-proxy-payments.public
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: public
+    uid: 0d6a9f3c-0000-4000-8000-000000000001
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edgerush-data-plane
+subjects:
+- kind: ServiceAccount
+  name: edgerush-proxy-public
+  namespace: payments-edge
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/data-plane: public
+  name: edgerush-proxy-public
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: public
+    uid: 0d6a9f3c-0000-4000-8000-000000000001
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: proxy
+      app.kubernetes.io/managed-by: edgerush-operator
+      app.kubernetes.io/name: edgerush
+      gateway.edgerush.dev/control-plane: payments
+      gateway.edgerush.dev/data-plane: public
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: proxy
+        app.kubernetes.io/managed-by: edgerush-operator
+        app.kubernetes.io/name: edgerush
+        gateway.edgerush.dev/control-plane: payments
+        gateway.edgerush.dev/data-plane: public
+    spec:
+      containers:
+      - args:
+        - proxy
+        - --control-plane
+        - edgerush-controller-payments.payments-edge.svc:9443
+        - --workers
+        - "1"
+        env:
+        - name: POD_IPS
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIPs
+        image: edgerush:golden
+        name: edgerush
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+      securityContext:
+        runAsGroup: 65534
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+        sysctls:
+        - name: net.ipv4.ip_unprivileged_port_start
+          value: "0"
+      serviceAccountName: edgerush-proxy-public
+      topologySpreadConstraints:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/component: proxy
+            app.kubernetes.io/managed-by: edgerush-operator
+            app.kubernetes.io/name: edgerush
+            gateway.edgerush.dev/control-plane: payments
+            gateway.edgerush.dev/data-plane: public
+        maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/data-plane: public
+  name: edgerush-proxy-public
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: public
+    uid: 0d6a9f3c-0000-4000-8000-000000000001
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: proxy
+      app.kubernetes.io/managed-by: edgerush-operator
+      app.kubernetes.io/name: edgerush
+      gateway.edgerush.dev/control-plane: payments
+      gateway.edgerush.dev/data-plane: public
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/data-plane: public
+  name: payments.public
+spec:
+  controller: edgerush.dev/ingress-controller

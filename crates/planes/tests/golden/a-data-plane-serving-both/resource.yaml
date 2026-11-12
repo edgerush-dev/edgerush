@@ -1,0 +1,19 @@
+# Ingress and Gateway API, a fixed fleet of two (max no more than min), a CPU limit below
+# the request rounded up, of a ControlPlane that watches every namespace.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: edge, namespace: edge-system, uid: 6f1c2b8e-0000-4000-8000-000000000002 }
+spec:
+  watch: { namespaces: { from: All } }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata: { name: shared, namespace: edge-system, uid: 0d6a9f3c-0000-4000-8000-000000000003 }
+spec:
+  controlPlaneRef: { name: edge }
+  replicas: { min: 2, max: 2 }
+  gateway:
+    listeners:
+      - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+  ingress: { httpPort: 80, httpsPort: 443, httpsRedirect: false }
+  resources: { requests: { cpu: 3200m }, limits: { cpu: "3" } }

@@ -1,0 +1,194 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: shared
+  name: edgerush-proxy-shared
+  namespace: edge-system
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: shared
+    uid: 0d6a9f3c-0000-4000-8000-000000000003
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: shared
+  name: edgerush-proxy-edge.shared
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edgerush-data-plane
+subjects:
+- kind: ServiceAccount
+  name: edgerush-proxy-shared
+  namespace: edge-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: shared
+  name: edgerush-proxy-shared
+  namespace: edge-system
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: shared
+    uid: 0d6a9f3c-0000-4000-8000-000000000003
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: proxy
+      app.kubernetes.io/managed-by: edgerush-operator
+      app.kubernetes.io/name: edgerush
+      gateway.edgerush.dev/control-plane: edge
+      gateway.edgerush.dev/data-plane: shared
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: proxy
+        app.kubernetes.io/managed-by: edgerush-operator
+        app.kubernetes.io/name: edgerush
+        gateway.edgerush.dev/control-plane: edge
+        gateway.edgerush.dev/data-plane: shared
+    spec:
+      containers:
+      - args:
+        - proxy
+        - --control-plane
+        - edgerush-controller-edge.edge-system.svc:9443
+        - --workers
+        - "3"
+        env:
+        - name: POD_IPS
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIPs
+        image: edgerush:golden
+        name: edgerush
+        resources:
+          limits:
+            cpu: "3"
+          requests:
+            cpu: 3200m
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+      securityContext:
+        runAsGroup: 65534
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+        sysctls:
+        - name: net.ipv4.ip_unprivileged_port_start
+          value: "0"
+      serviceAccountName: edgerush-proxy-shared
+      topologySpreadConstraints:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/component: proxy
+            app.kubernetes.io/managed-by: edgerush-operator
+            app.kubernetes.io/name: edgerush
+            gateway.edgerush.dev/control-plane: edge
+            gateway.edgerush.dev/data-plane: shared
+        maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: shared
+  name: edgerush-proxy-shared
+  namespace: edge-system
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: shared
+    uid: 0d6a9f3c-0000-4000-8000-000000000003
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: proxy
+      app.kubernetes.io/managed-by: edgerush-operator
+      app.kubernetes.io/name: edgerush
+      gateway.edgerush.dev/control-plane: edge
+      gateway.edgerush.dev/data-plane: shared
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: shared
+  name: edge.shared
+spec:
+  controller: edgerush.dev/ingress-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: shared
+  name: shared
+  namespace: edge-system
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: shared
+    uid: 0d6a9f3c-0000-4000-8000-000000000003
+spec:
+  gatewayClassName: edge
+  listeners:
+  - allowedRoutes:
+      namespaces:
+        from: All
+    name: http
+    port: 80
+    protocol: HTTP
