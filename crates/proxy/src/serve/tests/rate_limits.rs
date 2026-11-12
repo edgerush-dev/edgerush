@@ -819,8 +819,10 @@ async fn a_data_plane_hears_the_table_from_the_replica_it_sends_through() {
     }
 }
 
-/// A config with rate limits is refused where 128-bit atomics are not native, at start and
-/// at a reload alike; one without runs anywhere.
+/// A config with rate limits kept in 128-bit words is refused where 128-bit atomics are not
+/// native, at start and at a reload alike: the asynchronous mode's, local mode's, and the
+/// synchronous mode's deciding for itself where owners cannot be reached. One without, or
+/// a synchronous one denying instead, runs anywhere.
 #[test]
 fn rate_limits_need_native_128_bit_atomics() {
     use crate::serve::plane::runs_rate_limits;
@@ -836,6 +838,40 @@ fn rate_limits_need_native_128_bit_atomics() {
         runs_rate_limits(&limited, false),
         Err(ProxyError::RateLimitsUnsupported)
     );
+    let mut local = config.clone();
+    local.rate_limiting = Some(edgerush_config::RateLimiting {
+        mode: edgerush_config::RateLimitMode::Local,
+        max_key_bytes: None,
+        synchronous: None,
+        experimental_header_keys: None,
+        service: None,
+    });
+    let local = compile(&local).unwrap();
+    assert_eq!(runs_rate_limits(&local, true), Ok(()));
+    assert_eq!(
+        runs_rate_limits(&local, false),
+        Err(ProxyError::RateLimitsUnsupported)
+    );
+    for (when_unreachable, refused) in [("local", true), ("deny", false)] {
+        let mut synchronous = config.clone();
+        synchronous.rate_limiting = Some(
+            serde_saphyr::from_str(&format!(
+                "{{ mode: synchronous, service: {{ addresses: [\"127.0.0.1:1\"], key_secret: {SECRET} }}, synchronous: {{ timeout_ms: 100, when_unreachable: {when_unreachable}, breaker: {{ failures: 5, probe_after_ms: 1000 }} }} }}"
+            ))
+            .unwrap(),
+        );
+        let synchronous = compile(&synchronous).unwrap();
+        let want = if refused {
+            Err(ProxyError::RateLimitsUnsupported)
+        } else {
+            Ok(())
+        };
+        assert_eq!(
+            runs_rate_limits(&synchronous, false),
+            want,
+            "{when_unreachable}"
+        );
+    }
     // A burst that, with two cycles' refill, passes what a key's cycle holds: refused rather
     // than held to less; one that fits runs.
     for (burst, fits) in [(65_000, true), (70_000, false)] {

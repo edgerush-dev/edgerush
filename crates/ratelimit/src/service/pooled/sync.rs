@@ -27,10 +27,6 @@ impl AtomicU128 {
         Self(loom::sync::Mutex::new(value))
     }
 
-    pub(super) fn is_lock_free() -> bool {
-        true
-    }
-
     pub(super) fn load(&self, _: Ordering) -> u128 {
         *self
             .0

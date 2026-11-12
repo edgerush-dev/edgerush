@@ -25,17 +25,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Refuses a config with a rate-limiting service on a machine without the native 128-bit
-/// compare-and-swap its keys' entries need (`supported` false): a lock in its place would
-/// put one on every request. And one with a limit whose largest allowance a cycle could
-/// pass what a key's entry holds, rather than hold it to less and refuse what it allows.
+/// Refuses a config whose rate limits keep keys in one 128-bit word (06 §4) on a machine
+/// without the native 128-bit compare-and-swap it needs (`supported` false): local mode's
+/// keys, the asynchronous mode's entries, and the synchronous mode's own keys when it
+/// decides itself where owners cannot be reached. A lock in its place would put one on
+/// every request. And, in the asynchronous mode, one with a limit whose largest allowance a
+/// cycle could pass what a key's entry holds, rather than hold it to less and refuse what it
+/// allows.
 pub(super) fn runs_rate_limits(config: &Compiled, supported: bool) -> Result<(), ProxyError> {
+    let keeps_words = match config.rate_limiting() {
+        CompiledRateLimiting::Off => false,
+        CompiledRateLimiting::Local { .. } | CompiledRateLimiting::Asynchronous(_) => true,
+        CompiledRateLimiting::Synchronous(synchronous) => {
+            synchronous.when_unreachable == edgerush_config::WhenUnreachable::Local
+        }
+    };
+    if keeps_words && !supported {
+        return Err(ProxyError::RateLimitsUnsupported);
+    }
     let Some(service) = config.rate_limit_service() else {
         return Ok(());
     };
-    if !supported {
-        return Err(ProxyError::RateLimitsUnsupported);
-    }
     let cycle = u64::try_from(service.cycle.as_nanos()).unwrap_or(u64::MAX);
     for limit in config.limits() {
         // A window is refused in this mode as the config is compiled.
@@ -286,7 +296,7 @@ impl Snapshot {
         keys: &Keys,
         logs: Vec<Option<Sink>>,
     ) -> Result<(Self, Retiring), ProxyError> {
-        runs_rate_limits(&config, edgerush_ratelimit::service::pooled::supported())?;
+        runs_rate_limits(&config, edgerush_ratelimit::supported())?;
         // Kept for the same config, made again by endpoints found.
         let service_tls = match previous {
             Some(previous) if Arc::ptr_eq(&previous.config, &config) => {

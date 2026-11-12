@@ -290,14 +290,6 @@ impl<S: BuildHasher> Registry<S> {
     }
 }
 
-/// Whether the machine has the native 128-bit compare-and-swap the entries need, found at
-/// run time where the build does not assume it: the participant does not start without
-/// it rather than put the fallback's lock on the request path.
-#[must_use]
-pub fn supported() -> bool {
-    AtomicU128::is_lock_free()
-}
-
 /// One key's shared state, for one incarnation of it: a key evicted and met again is a
 /// new entry, made only once the old one is closed.
 pub struct Entry {
@@ -1169,7 +1161,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
     /// atomics.
     #[must_use]
     pub fn new(id: PlaneId, cycle: u64, routing: R, hasher: S) -> Option<Self> {
-        if !supported() {
+        if !crate::supported() {
             return None;
         }
         Some(Self {

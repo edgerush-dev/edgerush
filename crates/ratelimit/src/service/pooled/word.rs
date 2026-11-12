@@ -1,28 +1,11 @@
-//! A key's admission state as one 128-bit word, and the arithmetic on it: pure, no atomics.
-//! Its low half is laid out as local mode's word is, the bucket's arrival and the closed bit;
-//! its high half holds what syncing adds (#350).
-//!
-//! | Field | Bits | |
-//! |---|---|---|
-//! | arrival | 63 | the GCRA arrival time, modulo 2^63, in units of 1/65,536 of the interval |
-//! | closed | 1 | evicted: nothing more is taken |
-//! | left | 16 | what the cycle under way may still admit |
-//! | cycle | 16 | the cycle number of the last advance, modulo 2^16 |
-//! | shared | 1 | whether that advance shared out the copy |
-//! | set | 1 | a cycle has set the allowance: until then there is none, as a new key has none |
-//! | unreported | 30 | admitted here and not yet drained by the transport into its ledger |
+//! The asynchronous mode's arithmetic on its entries' words ([`crate::word`]): whether a
+//! contract fits, and the cycle's advance, pure, no atomics.
 
+use crate::rate::MOST_BURST;
 pub(super) use crate::rate::Rate;
-use crate::rate::{MASK, MOST_BURST};
 use crate::service::Contract;
-
-/// The most a cycle's allowance can be. The proxy refuses a pooled configuration whose contracts could need more ([`fits`]).
-pub(super) const MOST_LEFT: u64 = (1 << 16) - 1;
-const CYCLE_MASK: u64 = (1 << 16) - 1;
-/// The most admitted and not yet drained: about a billion, which the transport, draining
-/// every key's count every cycle it visits it, never lets a key reach. Past it, an admission
-/// is not counted rather than wrap the count.
-pub(super) const MOST_UNREPORTED: u64 = (1 << 30) - 1;
+use crate::word::CYCLE_MASK;
+pub(super) use crate::word::{Fields, MOST_LEFT, MOST_UNREPORTED};
 
 /// Whether `contract` fits a pooled entry at `cycle`: the largest allowance a cycle can set,
 /// a whole bucket with the slack's refill ([`SLACK`](crate::SLACK)) and two cycles' refill
@@ -40,44 +23,6 @@ pub fn fits(contract: Contract, cycle: u64) -> bool {
         .saturating_add(refill.saturating_mul(2))
         .saturating_add(1)
         <= MOST_LEFT
-}
-
-/// The word's fields.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Fields {
-    pub(super) arrival: u64,
-    pub(super) left: u64,
-    pub(super) cycle: u64,
-    pub(super) shared: bool,
-    pub(super) closed: bool,
-    pub(super) unreported: u64,
-    pub(super) set: bool,
-}
-
-impl Fields {
-    pub(super) fn pack(self) -> u128 {
-        u128::from(self.arrival & MASK)
-            | u128::from(self.closed) << 63
-            | u128::from(self.left & MOST_LEFT) << 64
-            | u128::from(self.cycle & CYCLE_MASK) << 80
-            | u128::from(self.shared) << 96
-            | u128::from(self.set) << 97
-            | u128::from(self.unreported & MOST_UNREPORTED) << 98
-    }
-
-    pub(super) fn unpack(word: u128) -> Self {
-        // Each field is masked to its width first: the casts keep only what fits.
-        let field = |shift: u32, mask: u64| (word >> shift) as u64 & mask;
-        Self {
-            arrival: field(0, MASK),
-            closed: field(63, 1) == 1,
-            left: field(64, MOST_LEFT),
-            cycle: field(80, CYCLE_MASK),
-            shared: field(96, 1) == 1,
-            set: field(97, 1) == 1,
-            unreported: field(98, MOST_UNREPORTED),
-        }
-    }
 }
 
 /// `now`'s cycle number, modulo the field's width.
@@ -199,87 +144,6 @@ mod tests {
             limit: n(limit),
             window: n(window),
             burst: n(burst),
-        }
-    }
-
-    /// The low half is laid out as local mode's word is: the bucket's arrival below the
-    /// closed bit, all of it; what syncing adds is all in the high half.
-    #[test]
-    fn the_low_half_is_laid_out_as_local_modes_word() {
-        let none = Fields {
-            arrival: 0,
-            closed: false,
-            left: 0,
-            cycle: 0,
-            shared: false,
-            set: false,
-            unreported: 0,
-        };
-        let arrival = Fields {
-            arrival: MASK,
-            ..none
-        };
-        assert_eq!(arrival.pack(), u128::from(u64::MAX >> 1));
-        let closed = Fields {
-            closed: true,
-            ..none
-        };
-        assert_eq!(closed.pack(), 1 << 63);
-        let synced = Fields {
-            left: MOST_LEFT,
-            cycle: CYCLE_MASK,
-            shared: true,
-            set: true,
-            unreported: MOST_UNREPORTED,
-            ..none
-        };
-        assert_eq!(synced.pack(), u128::from(u64::MAX) << 64);
-    }
-
-    #[test]
-    fn every_field_packs_and_unpacks_alone() {
-        let all = Fields {
-            arrival: MASK,
-            left: MOST_LEFT,
-            cycle: CYCLE_MASK,
-            shared: true,
-            closed: true,
-            unreported: MOST_UNREPORTED,
-            set: true,
-        };
-        assert_eq!(Fields::unpack(all.pack()), all);
-        assert_eq!(all.pack(), u128::MAX, "the fields fill the word");
-        let one = Fields {
-            arrival: 0,
-            left: 0,
-            cycle: 0,
-            shared: false,
-            closed: false,
-            unreported: 0,
-            set: false,
-        };
-        for fields in [
-            Fields {
-                arrival: 12_345,
-                ..one
-            },
-            Fields { left: 7, ..one },
-            Fields { cycle: 9, ..one },
-            Fields {
-                shared: true,
-                ..one
-            },
-            Fields {
-                closed: true,
-                ..one
-            },
-            Fields {
-                unreported: 3,
-                ..one
-            },
-            Fields { set: true, ..one },
-        ] {
-            assert_eq!(Fields::unpack(fields.pack()), fields);
         }
     }
 

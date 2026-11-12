@@ -22,6 +22,23 @@
 pub const SLACK: u64 = 100_000;
 
 pub mod local;
+
+/// Whether the machine has the native 128-bit compare-and-swap a key's word needs, local
+/// mode's and the asynchronous mode's alike (#350), found at run time where the build does
+/// not assume it: the proxy does not start their limits without it rather than put the
+/// fallback's lock on the request path. Under loom, whose atomics are its own, always.
+#[must_use]
+pub fn supported() -> bool {
+    #[cfg(not(loom))]
+    {
+        portable_atomic::AtomicU128::is_lock_free()
+    }
+    #[cfg(loom)]
+    {
+        true
+    }
+}
 mod rate;
 pub mod reference;
 pub mod service;
+mod word;
