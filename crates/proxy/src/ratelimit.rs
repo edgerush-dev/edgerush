@@ -40,7 +40,7 @@ use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 /// How long the process waits for a pod's answer to an exchange before taking it as failed
@@ -450,8 +450,8 @@ pub(crate) struct Limiter {
     /// kept so that no request makes them afresh; and their contracts.
     keys: RefCell<Vec<Vec<u8>>>,
     contracts: RefCell<Vec<service::Limit>>,
-    /// The clock: its process's ([`hub::Clock`]).
-    clock: hub::Clock,
+    /// The clock: its process's.
+    start: Instant,
     /// Wakes its task to stop.
     stopping: Notify,
     stopped: Cell<bool>,
@@ -469,7 +469,7 @@ impl Limiter {
         });
         let entropy = RandomState::new();
         let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
-        let clock = hub.clock();
+        let start = hub.epoch();
         let limiter = Rc::new(Self {
             service: service.clone(),
             hub,
@@ -486,7 +486,7 @@ impl Limiter {
             most_signalled: Cell::new(MOST_SIGNALLED),
             keys: RefCell::new(Vec::new()),
             contracts: RefCell::new(Vec::new()),
-            clock,
+            start,
             stopping: Notify::new(),
             stopped: Cell::new(false),
         });
@@ -518,7 +518,7 @@ impl Limiter {
     }
 
     fn now(&self) -> u64 {
-        self.clock.now()
+        u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
     /// When a request the limiter meets at `now` must be decided by: in the process's clock,
@@ -526,7 +526,7 @@ impl Limiter {
     fn deadline(&self, now: u64) -> (u64, tokio::time::Instant) {
         let wait = self.wait.get();
         let at = now.saturating_add(u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX));
-        let until = self.clock.instant(at);
+        let until = self.start + Duration::from_nanos(at);
         (at, tokio::time::Instant::from_std(until))
     }
 
@@ -943,17 +943,11 @@ impl Held for Contract {
     }
 }
 
-/// The asynchronous mode's: a bucket's contract, or a fixed window's limit and length.
+/// The asynchronous mode's: a bucket's contract. Windows are refused in that mode as the
+/// config is compiled.
 impl Held for service::Limit {
     fn of(limit: &CompiledLimit, count: NonZeroU64) -> Option<Self> {
-        match limit.model {
-            CompiledModel::Bucket { .. } => Contract::of(limit, count).map(Self::Bucket),
-            CompiledModel::FixedWindow { .. } => Some(Self::FixedWindow(service::FixedWindow {
-                limit: count,
-                length: limit.window,
-            })),
-            CompiledModel::RollingWindow { .. } => None,
-        }
+        Contract::of(limit, count).map(Self::Bucket)
     }
 }
 
@@ -1069,6 +1063,56 @@ mod tests {
 
     fn address(text: &str) -> KeyValue<'static> {
         KeyValue::Address(text.parse().unwrap())
+    }
+
+    /// The asynchronous mode holds a bucket alone: a window, which that mode's config refuses,
+    /// is nothing its owners could be sent (06 §4).
+    #[test]
+    fn the_asynchronous_mode_holds_a_bucket_alone() {
+        let mut config: edgerush_config::Config = serde_saphyr::from_str(
+            "listeners: {}
+routes: []
+upstreams: {}
+",
+        )
+        .unwrap();
+        config.limits = Some(
+            serde_saphyr::from_str(
+                "limits:
+  - { name: b, key: client, model: { bucket: { rate: 10/s, burst: 20 } } }
+  - { name: f, key: client, model: { fixed_window: { limit: 3, window: 1m } } }
+  - { name: r, key: client, model: { rolling_window: { limit: 7, window: 1h } } }
+",
+            )
+            .unwrap(),
+        );
+        let compiled = edgerush_config::compile(&config).unwrap();
+        let held: Vec<_> = compiled
+            .limits()
+            .iter()
+            .map(|limit| {
+                (
+                    limit.name.as_str(),
+                    <service::Limit as Held>::of(limit, limit.count),
+                )
+            })
+            .collect();
+        let n = |n| NonZeroU64::new(n).unwrap();
+        assert_eq!(
+            held,
+            [
+                (
+                    "b",
+                    Some(service::Limit::Bucket(Contract {
+                        limit: n(10),
+                        window: n(1_000_000_000),
+                        burst: n(20),
+                    }))
+                ),
+                ("f", None),
+                ("r", None),
+            ]
+        );
     }
 
     /// A key is the limit's name, a zero, its definition's digest and the value: another

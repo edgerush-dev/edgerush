@@ -12,10 +12,9 @@ use super::{Event, Mode, Sim, address, store_kind, store_size};
 use edgerush_cluster::Message as StoreMessage;
 use edgerush_cluster::{Config, Node, NodeId, Time, ms};
 use edgerush_cluster_asynchronous::{Answers, Message, Pod, Routed, Value};
-use edgerush_ratelimit::service::pooled::{Decision, Levers, Participant, Routing, window_at};
+use edgerush_ratelimit::service::pooled::{Decision, Levers, Participant, Routing};
 use edgerush_ratelimit::service::{Keyed, Limit};
 use std::collections::BTreeMap;
-use std::hash::{BuildHasher, Hasher};
 
 /// The time between a data plane's batches.
 pub const CYCLE: Time = ms(10);
@@ -219,16 +218,6 @@ impl Sim<Asynchronous> {
             .get(&id)
             .map(|plane| plane.data.unanswered(self.now).collect())
             .unwrap_or_default()
-    }
-
-    /// The number of the fixed window `key` is in at `at`, under windows `length` long, as
-    /// every data plane numbers it: by the key's hash under the secret they share.
-    #[must_use]
-    pub fn window_of(&self, key: u64, length: Time, at: Time) -> u64 {
-        // As the participant hashes a key's bytes: written whole, nothing before them.
-        let mut state = Keyed::new(SECRET).build_hasher();
-        state.write(&bytes_of(key));
-        window_at(state.finish(), length, at).0
     }
 
     /// When each key's requests were admitted, every data plane's together, in order.

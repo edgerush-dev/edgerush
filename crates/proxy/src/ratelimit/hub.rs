@@ -111,47 +111,10 @@ pub(crate) struct FromHub {
     pub(crate) entries: Vec<Arc<Entry>>,
 }
 
-/// The asynchronous mode's clock, which the process thread and its workers all read: the wall
-/// clock as the process read it when the thread began, carried on by the monotonic clock. Every
-/// data plane numbers a key's fixed windows by it alike (06 §4), as near as their wall clocks
-/// agree, and no time it reads goes back.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Clock {
-    epoch: Instant,
-    /// The wall clock at `epoch`, in nanoseconds since 1970.
-    wall: u64,
-}
-
-impl Clock {
-    /// The clock from now.
-    fn new() -> Self {
-        let wall = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| {
-                u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
-            });
-        Self {
-            epoch: Instant::now(),
-            wall,
-        }
-    }
-
-    /// The time, in nanoseconds since 1970.
-    pub(crate) fn now(&self) -> u64 {
-        let since = u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        self.wall.saturating_add(since)
-    }
-
-    /// The instant of time `at`, to wait until.
-    pub(crate) fn instant(&self, at: u64) -> Instant {
-        self.epoch + Duration::from_nanos(at.saturating_sub(self.wall))
-    }
-}
-
 /// What the process thread and the workers share: the clock its times are read by, what its
 /// keys hold, and the pods it waits on.
 struct Shared {
-    clock: Clock,
+    epoch: Instant,
     /// Bytes, keys, and evictions and hits forgiven all told, as of its last cycle.
     usage: [AtomicU64; 4],
     stats: Stats,
@@ -285,7 +248,7 @@ impl Hub {
             return Err(ProxyError::RateLimitThread("refused for a test".to_owned()));
         }
         let shared = Arc::new(Shared {
-            clock: Clock::new(),
+            epoch: Instant::now(),
             usage: Default::default(),
             stats: Stats::default(),
             pods: Mutex::new(Vec::new()),
@@ -373,8 +336,8 @@ impl Hub {
     }
 
     /// The clock its times are read by.
-    pub(crate) fn clock(&self) -> Clock {
-        self.shared.clock
+    pub(crate) fn epoch(&self) -> Instant {
+        self.shared.epoch
     }
 
     /// For a test that lets go of every handle: whether its thread has ended since, told
@@ -601,7 +564,7 @@ struct State {
 
 impl State {
     fn now(&self) -> u64 {
-        self.shared.clock.now()
+        u64::try_from(self.shared.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
     /// Sends worker `worker` `message`, if it has joined and is there still.
@@ -1177,26 +1140,6 @@ mod tests {
     use super::*;
     use edgerush_cluster_asynchronous::Answers;
 
-    /// The asynchronous mode's clock reads the wall clock, so that data planes started at
-    /// different times number a key's fixed windows alike (06 §4), and its times turn back
-    /// into the instants they are.
-    #[test]
-    fn the_clock_reads_the_wall_clock() {
-        let clock = Clock::new();
-        let wall = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|since| u64::try_from(since.as_nanos()).unwrap())
-            .unwrap();
-        let now = clock.now();
-        assert!(now.abs_diff(wall) < 1_000_000_000, "{now} against {wall}");
-        let later = now + 5_000_000;
-        let instant = clock.instant(later);
-        assert_eq!(
-            instant - clock.epoch,
-            Duration::from_nanos(later - clock.wall)
-        );
-    }
-
     /// A thread's state, as `run` makes it, routed by a table of `members` (ids and addresses)
     /// rather than told one, its streams none.
     fn state(members: &[(NodeId, &str)]) -> Rc<State> {
@@ -1220,10 +1163,7 @@ mod tests {
             answers: RefCell::new(Vec::new()),
             // A second old, so that its clock reads past the exchange timeout.
             shared: Arc::new(Shared {
-                clock: Clock {
-                    epoch: Instant::now() - Duration::from_secs(1),
-                    wall: 0,
-                },
+                epoch: Instant::now() - Duration::from_secs(1),
                 usage: Default::default(),
                 stats: Stats::default(),
                 pods: Mutex::new(Vec::new()),
