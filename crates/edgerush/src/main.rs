@@ -1,8 +1,9 @@
 //! The EdgeRush binary.
 //!
-//! One executable will carry every role (operator, control plane, data plane) as
-//! subcommands. So far: `proxy`, a data plane run from a config file — the development
-//! harness — `controller`, a control plane for one data plane, `explain`, which says where
+//! One executable carries every role (operator, control plane, data plane) as
+//! subcommands: `operator`, which turns ControlPlanes and DataPlanes into what runs them,
+//! `proxy`, a data plane run from a config file — the development harness —
+//! `controller`, a control plane for one data plane, `explain`, which says where
 //! a request would go and why, `test`, which checks a file of such requests and what is
 //! expected of them, and `validate`, which translates Kubernetes manifests as the control
 //! plane would.
@@ -14,6 +15,7 @@ mod essential;
 mod explain;
 mod harness;
 mod limits;
+mod operator;
 mod per_core;
 mod resolver;
 mod stream;
@@ -31,6 +33,7 @@ const USAGE: &str = "\
 Usage: edgerush [OPTIONS] [COMMAND]
 
 Commands:
+  operator    Run the operator, which makes what runs each ControlPlane and DataPlane, in a cluster
   proxy       Run a data plane from a config file, without Kubernetes (development harness)
   controller  Run a control plane for one data plane, in a cluster
   explain     Say where a request to a listener goes, and why no other match took it
@@ -64,6 +67,7 @@ fn run(
         None | Some("-h" | "--help") => write!(stdout, "{USAGE}").map(|()| 0),
         Some("-V" | "--version") => writeln!(stdout, "{VERSION}").map(|()| 0),
         Some("proxy") => return harness::command(args, stdout, stderr),
+        Some("operator") => return operator::command(args, stdout, stderr),
         Some("controller") => return controller::command(args, stdout, stderr),
         Some("explain") => return explain::command(args, stdout, stderr),
         Some("test") => return testing::command(args, stdout, stderr),

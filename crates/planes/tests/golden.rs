@@ -8,6 +8,9 @@
 //! line each; and `objects.yaml`, the objects expected for the case's last resource, as
 //! YAML documents in the order they are made. The install's image is `edgerush:golden`.
 //!
+//! Each object says the kind and metadata it is written with, and between them the cases
+//! make every kind the operator makes.
+//!
 //! A case whose objects have changed on purpose is written again, and then read over, with
 //! `EDGERUSH_WRITE_GOLDEN=1 cargo test -p edgerush-planes --test golden`.
 
@@ -64,6 +67,7 @@ fn every_case_makes_its_objects() {
         .collect();
     cases.sort();
     assert!(!cases.is_empty(), "no cases under {}", root.display());
+    let mut kinds = BTreeSet::new();
     for case in cases {
         let name = case.file_name().unwrap().to_string_lossy().into_owned();
         let resources: Vec<Resource> =
@@ -82,6 +86,17 @@ fn every_case_makes_its_objects() {
             _ => panic!("{name}: resource.yaml is a ControlPlane, then perhaps a DataPlane"),
         }
         .unwrap_or_else(|error| panic!("{name}: {error}"));
+        // What the operator applies each by: its kind and metadata, as it is written.
+        for object in &objects {
+            let as_written = serde_json::to_value(object).unwrap();
+            assert_eq!(as_written["kind"], object.kind(), "{name}");
+            assert_eq!(
+                as_written["metadata"],
+                serde_json::to_value(object.metadata()).unwrap(),
+                "{name}"
+            );
+            kinds.insert(object.kind());
+        }
         let made = written(&objects);
         let expected_at = case.join("objects.yaml");
         if write {
@@ -96,4 +111,9 @@ fn every_case_makes_its_objects() {
              golden, and read them over"
         );
     }
+    assert_eq!(
+        kinds.len(),
+        10,
+        "a kind the operator makes is in no case: {kinds:?}"
+    );
 }

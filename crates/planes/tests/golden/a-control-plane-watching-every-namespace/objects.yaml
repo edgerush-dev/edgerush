@@ -6,6 +6,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/namespace: edge-system
   name: edgerush-controller-edge
   namespace: edge-system
   ownerReferences:
@@ -24,6 +25,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/namespace: edge-system
   name: edgerush-controller-edge
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -42,6 +44,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/namespace: edge-system
   name: edgerush-controller-edge-cluster
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -60,6 +63,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/namespace: edge-system
   name: edgerush-controller-edge-own
   namespace: edge-system
   ownerReferences:
@@ -86,6 +90,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/namespace: edge-system
   name: edgerush-controller-edge
   namespace: edge-system
   ownerReferences:
@@ -103,6 +108,7 @@ spec:
       app.kubernetes.io/managed-by: edgerush-operator
       app.kubernetes.io/name: edgerush
       gateway.edgerush.dev/control-plane: edge
+      gateway.edgerush.dev/namespace: edge-system
   template:
     metadata:
       labels:
@@ -110,6 +116,7 @@ spec:
         app.kubernetes.io/managed-by: edgerush-operator
         app.kubernetes.io/name: edgerush
         gateway.edgerush.dev/control-plane: edge
+        gateway.edgerush.dev/namespace: edge-system
     spec:
       containers:
       - args:
@@ -156,6 +163,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/namespace: edge-system
   name: edgerush-controller-edge
   namespace: edge-system
   ownerReferences:
@@ -175,6 +183,7 @@ spec:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/namespace: edge-system
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
@@ -184,6 +193,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/namespace: edge-system
   name: edge
 spec:
   controllerName: edgerush.dev/gateway-controller

@@ -70,6 +70,10 @@ pub const GATEWAY_CONTROLLER: &str = "edgerush.dev/gateway-controller";
 pub const CONTROL_PLANE_LABEL: &str = "gateway.edgerush.dev/control-plane";
 /// The label naming the DataPlane an object is for, beside its ControlPlane's.
 pub const DATA_PLANE_LABEL: &str = "gateway.edgerush.dev/data-plane";
+/// The label naming the namespace of the resource an object is for: names are unique only
+/// with it, so that a resource of the same names in another namespace never selects, by
+/// label, what was made for this one (05 §2).
+pub const NAMESPACE_LABEL: &str = "gateway.edgerush.dev/namespace";
 /// The label saying the operator made an object.
 pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 /// Its value.
@@ -134,6 +138,42 @@ pub struct Made<S> {
     pub metadata: ObjectMeta,
     /// Its spec.
     pub spec: S,
+}
+
+impl Object {
+    /// Its kind.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ServiceAccount(_) => "ServiceAccount",
+            Self::RoleBinding(_) => "RoleBinding",
+            Self::ClusterRoleBinding(_) => "ClusterRoleBinding",
+            Self::Deployment(_) => "Deployment",
+            Self::Service(_) => "Service",
+            Self::HorizontalPodAutoscaler(_) => "HorizontalPodAutoscaler",
+            Self::PodDisruptionBudget(_) => "PodDisruptionBudget",
+            Self::GatewayClass(_) => "GatewayClass",
+            Self::IngressClass(_) => "IngressClass",
+            Self::Gateway(_) => "Gateway",
+        }
+    }
+
+    /// Its metadata: its name, its namespace for a namespace's object, and its labels.
+    #[must_use]
+    pub fn metadata(&self) -> &ObjectMeta {
+        match self {
+            Self::ServiceAccount(object) => &object.metadata,
+            Self::RoleBinding(object) => &object.metadata,
+            Self::ClusterRoleBinding(object) => &object.metadata,
+            Self::Deployment(object) => &object.metadata,
+            Self::Service(object) => &object.metadata,
+            Self::HorizontalPodAutoscaler(object) => &object.metadata,
+            Self::PodDisruptionBudget(object) => &object.metadata,
+            Self::GatewayClass(object) => &object.metadata,
+            Self::IngressClass(object) => &object.metadata,
+            Self::Gateway(object) => &object.metadata,
+        }
+    }
 }
 
 /// Why the objects could not be made: each a resource that should not have reached here.
@@ -264,9 +304,33 @@ fn watched(
     }
 }
 
-/// What every object for the control plane `cp`, and for its data plane `dp`, is labelled
-/// with; its pods' selector is these.
-fn labels(component: &str, cp: &str, dp: Option<&str>) -> BTreeMap<String, String> {
+/// What every object made for ControlPlane `control_plane` of `namespace` is labelled
+/// with, and what it is found by where no owner reference reaches it (05 §2): none of its
+/// DataPlanes' carries them all, nor any other resource's.
+#[must_use]
+pub fn control_plane_labels(namespace: &str, control_plane: &str) -> BTreeMap<String, String> {
+    labels("controller", namespace, control_plane, None)
+}
+
+/// What every object made for DataPlane `data_plane` of `namespace`, of ControlPlane
+/// `control_plane`, is labelled with, and found by.
+#[must_use]
+pub fn data_plane_labels(
+    namespace: &str,
+    control_plane: &str,
+    data_plane: &str,
+) -> BTreeMap<String, String> {
+    labels("proxy", namespace, control_plane, Some(data_plane))
+}
+
+/// What every object for the control plane `cp`, and for its data plane `dp`, both of
+/// `namespace`, is labelled with; its pods' selector is these.
+fn labels(
+    component: &str,
+    namespace: &str,
+    cp: &str,
+    dp: Option<&str>,
+) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::from([
         ("app.kubernetes.io/name".to_owned(), "edgerush".to_owned()),
         (
@@ -275,6 +339,7 @@ fn labels(component: &str, cp: &str, dp: Option<&str>) -> BTreeMap<String, Strin
         ),
         (MANAGED_BY_LABEL.to_owned(), MANAGED_BY.to_owned()),
         (CONTROL_PLANE_LABEL.to_owned(), cp.to_owned()),
+        (NAMESPACE_LABEL.to_owned(), namespace.to_owned()),
     ]);
     if let Some(dp) = dp {
         labels.insert(DATA_PLANE_LABEL.to_owned(), dp.to_owned());
@@ -410,7 +475,7 @@ pub fn for_control_plane(
 ) -> Result<Vec<Object>, Error> {
     let cp = Identity::of(&control_plane.metadata, "ControlPlane")?;
     let owner = cp.owner("ControlPlane");
-    let labels = labels("controller", cp.name, None);
+    let labels = control_plane_labels(cp.namespace, cp.name);
     let name = controller_name(cp.name);
     let watched = watched(control_plane, cp.namespace, selected);
     let webhook = control_plane.spec.webhook.enabled;
@@ -577,7 +642,7 @@ pub fn for_data_plane(
         });
     }
     let owner = dp.owner("DataPlane");
-    let labels = labels("proxy", cp.name, Some(dp.name));
+    let labels = data_plane_labels(dp.namespace, cp.name, dp.name);
     let name = proxy_name(dp.name);
     let spec = &data_plane.spec;
 

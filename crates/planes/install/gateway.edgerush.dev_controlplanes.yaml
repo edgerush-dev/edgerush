@@ -186,7 +186,10 @@ spec:
                 description: |-
                   Conditions describe the ControlPlane's state. Known condition types are:
 
-                  * "Accepted": whether the operator accepted it, and made what it asks for.
+                  * "Accepted": whether the operator accepted it, by the checks only the
+                    cluster can make; what the control plane acts on.
+                  * "Programmed": whether what it asks for is made, and its workload has a
+                    replica available.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.

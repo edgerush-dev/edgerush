@@ -1,0 +1,31 @@
+[package]
+name = "edgerush-operator"
+description = "EdgeRush's operator: ControlPlanes and DataPlanes turned into running infrastructure, and kept so"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The Gateway and GatewayClass it makes, of Gateway API's own types.
+edgerush-gateway-api.workspace = true
+# What it reads and writes, and the Lease its replicas elect a leader by.
+edgerush-kubernetes.workspace = true
+# The resources, and the objects made for each, a pure function of them.
+edgerush-planes.workspace = true
+k8s-openapi.workspace = true
+# The finalizer and the conditions, applied as JSON.
+serde_json.workspace = true
+# "sync": each follow's objects, and the word that one has changed; with the workspace's
+# "rt", the follows' tasks, and "time", the debounce and the retries; "macros", the loop
+# waiting on whichever comes first.
+tokio = { workspace = true, features = ["macros", "sync"] }
+
+[dev-dependencies]
+edgerush-kubernetes = { workspace = true, features = ["testing"] }
+# The fake API server answers on a runtime with threads of its own.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

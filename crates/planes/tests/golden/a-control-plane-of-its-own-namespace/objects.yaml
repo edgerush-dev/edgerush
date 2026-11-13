@@ -6,6 +6,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
   name: edgerush-controller-payments
   namespace: payments-edge
   ownerReferences:
@@ -24,6 +25,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
   name: edgerush-controller-payments
   namespace: payments-edge
   ownerReferences:
@@ -50,6 +52,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
   name: edgerush-controller-payments-cluster
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -68,6 +71,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
   name: edgerush-controller-payments-own
   namespace: payments-edge
   ownerReferences:
@@ -94,6 +98,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
   name: edgerush-controller-payments
   namespace: payments-edge
   ownerReferences:
@@ -111,6 +116,7 @@ spec:
       app.kubernetes.io/managed-by: edgerush-operator
       app.kubernetes.io/name: edgerush
       gateway.edgerush.dev/control-plane: payments
+      gateway.edgerush.dev/namespace: payments-edge
   template:
     metadata:
       labels:
@@ -118,6 +124,7 @@ spec:
         app.kubernetes.io/managed-by: edgerush-operator
         app.kubernetes.io/name: edgerush
         gateway.edgerush.dev/control-plane: payments
+        gateway.edgerush.dev/namespace: payments-edge
     spec:
       containers:
       - args:
@@ -170,6 +177,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
   name: edgerush-controller-payments
   namespace: payments-edge
   ownerReferences:
@@ -192,6 +200,7 @@ spec:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
@@ -201,6 +210,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-operator
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
   name: payments
 spec:
   controllerName: edgerush.dev/gateway-controller

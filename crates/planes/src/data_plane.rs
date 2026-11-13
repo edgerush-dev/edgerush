@@ -1305,7 +1305,10 @@ pub struct DataPlaneService {
 pub struct DataPlaneStatus {
     /// Conditions describe the DataPlane's state. Known condition types are:
     ///
-    /// * "Accepted": whether the operator accepted it, and made what it asks for.
+    /// * "Accepted": whether the operator accepted it, by the checks only the
+    ///   cluster can make; what the control plane acts on.
+    /// * "Programmed": whether what it asks for is made, and its workload has a
+    ///   replica available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<Condition>>,
 }

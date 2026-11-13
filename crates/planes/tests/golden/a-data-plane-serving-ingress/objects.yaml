@@ -7,6 +7,7 @@ metadata:
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
     gateway.edgerush.dev/data-plane: public
+    gateway.edgerush.dev/namespace: payments-edge
   name: edgerush-proxy-public
   namespace: payments-edge
   ownerReferences:
@@ -26,6 +27,7 @@ metadata:
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
     gateway.edgerush.dev/data-plane: public
+    gateway.edgerush.dev/namespace: payments-edge
   name: edgerush-proxy-payments.public
   namespace: payments-edge
   ownerReferences:
@@ -53,6 +55,7 @@ metadata:
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
     gateway.edgerush.dev/data-plane: public
+    gateway.edgerush.dev/namespace: payments-edge
   name: edgerush-proxy-public
   namespace: payments-edge
   ownerReferences:
@@ -71,6 +74,7 @@ spec:
       app.kubernetes.io/name: edgerush
       gateway.edgerush.dev/control-plane: payments
       gateway.edgerush.dev/data-plane: public
+      gateway.edgerush.dev/namespace: payments-edge
   strategy:
     rollingUpdate:
       maxSurge: 1
@@ -84,6 +88,7 @@ spec:
         app.kubernetes.io/name: edgerush
         gateway.edgerush.dev/control-plane: payments
         gateway.edgerush.dev/data-plane: public
+        gateway.edgerush.dev/namespace: payments-edge
     spec:
       containers:
       - args:
@@ -133,6 +138,7 @@ spec:
             app.kubernetes.io/name: edgerush
             gateway.edgerush.dev/control-plane: payments
             gateway.edgerush.dev/data-plane: public
+            gateway.edgerush.dev/namespace: payments-edge
         maxSkew: 1
         topologyKey: topology.kubernetes.io/zone
         whenUnsatisfiable: ScheduleAnyway
@@ -150,6 +156,7 @@ metadata:
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
     gateway.edgerush.dev/data-plane: public
+    gateway.edgerush.dev/namespace: payments-edge
   name: edgerush-proxy-public
   namespace: payments-edge
   ownerReferences:
@@ -168,6 +175,7 @@ spec:
       app.kubernetes.io/name: edgerush
       gateway.edgerush.dev/control-plane: payments
       gateway.edgerush.dev/data-plane: public
+      gateway.edgerush.dev/namespace: payments-edge
 ---
 apiVersion: networking.k8s.io/v1
 kind: IngressClass
@@ -178,6 +186,7 @@ metadata:
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
     gateway.edgerush.dev/data-plane: public
+    gateway.edgerush.dev/namespace: payments-edge
   name: payments.public
 spec:
   controller: edgerush.dev/ingress-controller

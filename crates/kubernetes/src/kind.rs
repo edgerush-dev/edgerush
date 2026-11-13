@@ -2,8 +2,9 @@
 //! EndpointSlices; the control plane's Ingresses, IngressClasses, Services and Secrets, the
 //! Gateway API's kinds and their CRDs ([04 §1](../../../docs/04-control-plane.md)), and the
 //! Lease its replicas elect a leader by ([02 §3](../../../docs/02-architecture.md)); and the
-//! RoleBindings the operator makes ([05 §2](../../../docs/05-operator.md)); and the
-//! DataPlanes a control plane reads its data plane's settings from (05 §3).
+//! ControlPlanes and DataPlanes the operator makes its objects for, and those objects
+//! ([05 §2](../../../docs/05-operator.md)); the DataPlanes a control plane reads its data
+//! plane's settings from (05 §3).
 
 use crate::ApiError;
 use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
@@ -16,16 +17,21 @@ use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_gateway_api::udp_route::UDPRoute;
+use edgerush_planes::control_plane::ControlPlane;
 use edgerush_planes::data_plane::DataPlane;
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::coordination::v1::Lease;
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service, ServiceAccount};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
-use k8s_openapi::api::rbac::v1::RoleBinding;
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::{ListableResource, Metadata};
 use serde::de::DeserializeOwned;
+use std::collections::BTreeMap;
 
 /// A kind EdgeRush lists and watches, or writes.
 pub trait Kind:
@@ -169,6 +175,30 @@ impl Kind for DataPlane {
     const NAMESPACED: bool = true;
 }
 
+impl Kind for ControlPlane {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for ServiceAccount {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for Deployment {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for HorizontalPodAutoscaler {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for PodDisruptionBudget {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for ClusterRoleBinding {
+    const NAMESPACED: bool = false;
+}
+
 /// The annotations of a CRD that are kept: the Gateway API's release and channel.
 const CRD_ANNOTATIONS: [&str; 2] = [
     "gateway.networking.k8s.io/bundle-version",
@@ -209,6 +239,10 @@ pub enum Scope {
     /// the CRDs of the Gateway API kinds followed (04 §9). Listed as the cluster's with a
     /// field selector on its name, which a list of no such object answers empty.
     Named(String),
+    /// Every object in the cluster that carries the labels of this selector, written as
+    /// [`Scope::labelled`] writes it: what the operator made, which it alone follows
+    /// ([05 §2](../../../docs/05-operator.md)).
+    Labelled(String),
 }
 
 impl Scope {
@@ -225,6 +259,18 @@ impl Scope {
         Ok(Self::Namespace(name.to_owned()))
     }
 
+    /// Every object in the cluster carrying each of `labels`.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::NoLabels`] for no labels, which would be every object.
+    pub fn labelled(labels: &BTreeMap<String, String>) -> Result<Self, ApiError> {
+        if labels.is_empty() {
+            return Err(ApiError::NoLabels);
+        }
+        Ok(Self::Labelled(selector(labels)))
+    }
+
     /// The object named `name`.
     ///
     /// # Errors
@@ -236,6 +282,15 @@ impl Scope {
         }
         Ok(Self::Named(name.to_owned()))
     }
+}
+
+/// `labels` as a label selector asks for objects carrying each of them.
+pub(crate) fn selector(labels: &BTreeMap<String, String>) -> String {
+    let each: Vec<String> = labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    each.join(",")
 }
 
 /// Whether `name` can be an object's: a DNS subdomain, as Kubernetes asks of most.
@@ -269,7 +324,7 @@ pub(crate) fn collection<K: Kind>(scope: &Scope) -> Result<String, ApiError> {
         format!("/apis/{}/{}", K::GROUP, K::VERSION)
     };
     match scope {
-        Scope::Cluster => Ok(format!("{group}/{}", K::URL_PATH_SEGMENT)),
+        Scope::Cluster | Scope::Labelled(_) => Ok(format!("{group}/{}", K::URL_PATH_SEGMENT)),
         Scope::Named(name) => {
             if K::NAMESPACED {
                 return Err(ApiError::Namespaced(K::KIND));

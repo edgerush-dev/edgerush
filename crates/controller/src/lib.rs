@@ -28,7 +28,9 @@ use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_gateway_api::udp_route::UDPRoute;
-use edgerush_kubernetes::{ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow};
+use edgerush_kubernetes::{
+    ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow, lease,
+};
 use edgerush_translate::{
     Cluster, GatewayName, GatewayStatus, Object, Plane, PolicyStatus, RouteStatus, Translation,
     translate,
@@ -54,7 +56,6 @@ pub mod expiry;
 pub mod gateway_api;
 mod gateway_status;
 pub mod issuing;
-pub mod lease;
 pub mod status;
 
 use gateway_api::{GatewayKind, Served};
@@ -492,6 +493,7 @@ fn followed<K: Kind>(part: &Scope) -> String {
         Scope::Cluster => format!("{} in the cluster", K::URL_PATH_SEGMENT),
         Scope::Namespace(namespace) => format!("{} in {namespace}", K::URL_PATH_SEGMENT),
         Scope::Named(name) => format!("{} named {name}", K::URL_PATH_SEGMENT),
+        Scope::Labelled(labels) => format!("{} labelled {labels}", K::URL_PATH_SEGMENT),
     }
 }
 
@@ -1075,7 +1077,7 @@ fn watched(scope: &[Scope]) -> Option<Vec<String>> {
         .iter()
         .map(|part| match part {
             Scope::Namespace(namespace) => Some(namespace.clone()),
-            Scope::Cluster | Scope::Named(_) => None,
+            Scope::Cluster | Scope::Named(_) | Scope::Labelled(_) => None,
         })
         .collect()
 }

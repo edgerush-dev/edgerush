@@ -5,6 +5,7 @@ use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use k8s_openapi::ByteString;
+use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
@@ -12,7 +13,9 @@ use k8s_openapi::api::rbac::v1::RoleBinding;
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::watch;
 
 /// A namespace's scope.
 fn namespace(name: &str) -> Scope {
@@ -50,6 +53,45 @@ async fn a_list_is_asked_for_with_the_token_and_read() {
     );
     // Both over one connection.
     assert_eq!(fake.connections.load(Ordering::SeqCst), 1);
+}
+
+/// What the operator made, followed over the cluster by its labels alone (05 §2).
+#[tokio::test]
+async fn a_labelled_scope_is_listed_and_watched_over_the_cluster_by_its_labels() {
+    let fake = Fake::start(&["127.0.0.1"], |_| answer(200, &list("5", None))).await;
+    let client = fake.client(&token("labelled", "secret"), Timing::default());
+    let labels = BTreeMap::from([
+        (
+            "app.kubernetes.io/managed-by".to_owned(),
+            "edgerush-operator".to_owned(),
+        ),
+        (
+            "gateway.edgerush.dev/control-plane".to_owned(),
+            "edge".to_owned(),
+        ),
+    ]);
+    let managed = Scope::labelled(&labels).unwrap();
+    client.list::<EndpointSlice>(&managed, None).await.unwrap();
+    client
+        .list::<EndpointSlice>(&managed, Some("a"))
+        .await
+        .unwrap();
+    // The watch's answer is not read: what was asked is.
+    drop(client.watch::<EndpointSlice>(&managed, "5").await);
+    let paths: Vec<String> = fake.seen().into_iter().map(|seen| seen.path).collect();
+    let selector = "labelSelector=app.kubernetes.io%2Fmanaged-by%3Dedgerush-operator%2Cgateway.edgerush.dev%2Fcontrol-plane%3Dedge";
+    assert_eq!(
+        paths,
+        [
+            format!("/apis/discovery.k8s.io/v1/endpointslices?limit=500&{selector}"),
+            format!("/apis/discovery.k8s.io/v1/endpointslices?limit=500&{selector}&continue=a"),
+            format!(
+                "/apis/discovery.k8s.io/v1/endpointslices?watch=true&allowWatchBookmarks=true&timeoutSeconds=300&{selector}&resourceVersion=5"
+            ),
+        ]
+    );
+    // No labels would be every object.
+    assert_eq!(Scope::labelled(&BTreeMap::new()), Err(ApiError::NoLabels));
 }
 
 #[tokio::test]
@@ -726,8 +768,46 @@ async fn a_status_is_merged_into_its_objects_and_a_refusal_said() {
     assert_eq!(fake.seen().len(), 2);
 }
 
+/// A list written whole, as of the version read: a resource's finalizers.
+#[tokio::test]
+async fn an_object_is_merged_as_of_its_version_and_a_conflict_said() {
+    let fake = Fake::start(&["127.0.0.1"], |path| {
+        if path.contains("/moved") {
+            answer(
+                409,
+                r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"the object has been modified","code":409}"#,
+            )
+        } else {
+            answer(200, "{}")
+        }
+    })
+    .await;
+    let client = fake.client(&token("patch-object", "secret"), Timing::default());
+    let patch = serde_json::json!({
+        "metadata": { "resourceVersion": "7", "finalizers": ["other.example/keep"] }
+    });
+    client
+        .patch::<Service>("shop", "web", &patch)
+        .await
+        .unwrap();
+    let seen = fake.seen();
+    assert_eq!(seen[0].method, "PATCH");
+    assert_eq!(seen[0].path, "/api/v1/namespaces/shop/services/web");
+    assert_eq!(
+        seen[0].content_type.as_deref(),
+        Some("application/merge-patch+json")
+    );
+    let sent: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
+    assert_eq!(sent, patch);
+    let moved = client
+        .patch::<Service>("shop", "moved", &patch)
+        .await
+        .unwrap_err();
+    assert!(moved.is_conflict(), "{moved:?}");
+}
+
 /// Lease `edgerush` in `edge`, held by `holder`, at `version`.
-fn lease(holder: &str, version: &str) -> k8s_openapi::api::coordination::v1::Lease {
+fn lease(holder: &str, version: &str) -> Lease {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "coordination.k8s.io/v1",
         "kind": "Lease",
@@ -739,7 +819,6 @@ fn lease(holder: &str, version: &str) -> k8s_openapi::api::coordination::v1::Lea
 
 #[tokio::test]
 async fn an_object_is_read_created_and_replaced_as_of_its_version() {
-    use k8s_openapi::api::coordination::v1::Lease;
     let fake = Fake::start_by_method(&["127.0.0.1"], |method, path| {
         let object = |holder: &str, version: &str| {
             answer(200, &serde_json::to_string(&lease(holder, version)).unwrap())
@@ -1112,7 +1191,8 @@ async fn objects_are_deleted_by_their_labels_and_never_unselected() {
             "DELETE",
             "/apis/rbac.authorization.k8s.io/v1/namespaces/shop/rolebindings?labelSelector=app.kubernetes.io%2Fmanaged-by%3Dedgerush-operator%2Cgateway.edgerush.dev%2Fcontrol-plane%3Dedge&propagationPolicy=Background"
             | "/apis/networking.k8s.io/v1/ingressclasses?labelSelector=gateway.edgerush.dev%2Fcontrol-plane%3Dedge&propagationPolicy=Background"
-            | "/apis/networking.k8s.io/v1/ingressclasses?labelSelector=gateway.edgerush.dev%2Fcontrol-plane%3Dedge&fieldSelector=metadata.name%3Dedge.web&propagationPolicy=Background",
+            | "/apis/networking.k8s.io/v1/ingressclasses?labelSelector=gateway.edgerush.dev%2Fcontrol-plane%3Dedge&fieldSelector=metadata.name%3Dedge.web&propagationPolicy=Background"
+            | "/apis/networking.k8s.io/v1/ingressclasses?labelSelector=gateway.edgerush.dev%2Fcontrol-plane%3Dedge%2Capp.kubernetes.io%2Fmanaged-by%3Dedgerush-operator&propagationPolicy=Background",
         ) => answer(
             200,
             r#"{"kind":"IngressClassList","apiVersion":"networking.k8s.io/v1","metadata":{},"items":[]}"#,
@@ -1147,6 +1227,16 @@ async fn objects_are_deleted_by_their_labels_and_never_unselected() {
         .delete_all::<IngressClass>(&Scope::named("edge.web").unwrap(), &control_plane)
         .await
         .unwrap();
+    // A labelled scope's labels narrow it further.
+    let managed = Scope::labelled(&labels(&[(
+        "app.kubernetes.io/managed-by",
+        "edgerush-operator",
+    )]))
+    .unwrap();
+    client
+        .delete_all::<IngressClass>(&managed, &control_plane)
+        .await
+        .unwrap();
     let forbidden = client
         .delete_all::<RoleBinding>(&namespace("other"), &control_plane)
         .await
@@ -1167,6 +1257,13 @@ async fn objects_are_deleted_by_their_labels_and_never_unselected() {
             .unwrap_err(),
         ApiError::Namespaced("RoleBinding")
     );
+    assert_eq!(
+        client
+            .delete_all::<RoleBinding>(&managed, &control_plane)
+            .await
+            .unwrap_err(),
+        ApiError::Namespaced("RoleBinding")
+    );
     let seen = fake.seen();
     assert!(seen.iter().all(|seen| seen.method == "DELETE"));
     let paths: Vec<&str> = seen.iter().map(|seen| seen.path.as_str()).collect();
@@ -1176,8 +1273,103 @@ async fn objects_are_deleted_by_their_labels_and_never_unselected() {
             "/apis/rbac.authorization.k8s.io/v1/namespaces/shop/rolebindings?labelSelector=app.kubernetes.io%2Fmanaged-by%3Dedgerush-operator%2Cgateway.edgerush.dev%2Fcontrol-plane%3Dedge&propagationPolicy=Background",
             "/apis/networking.k8s.io/v1/ingressclasses?labelSelector=gateway.edgerush.dev%2Fcontrol-plane%3Dedge&propagationPolicy=Background",
             "/apis/networking.k8s.io/v1/ingressclasses?labelSelector=gateway.edgerush.dev%2Fcontrol-plane%3Dedge&fieldSelector=metadata.name%3Dedge.web&propagationPolicy=Background",
+            "/apis/networking.k8s.io/v1/ingressclasses?labelSelector=gateway.edgerush.dev%2Fcontrol-plane%3Dedge%2Capp.kubernetes.io%2Fmanaged-by%3Dedgerush-operator&propagationPolicy=Background",
             "/apis/rbac.authorization.k8s.io/v1/namespaces/other/rolebindings?labelSelector=gateway.edgerush.dev%2Fcontrol-plane%3Dedge&propagationPolicy=Background",
         ],
         "a refused delete was sent, or one asked for other than it should be"
     );
+}
+
+/// Until `done`, or a panic naming `what` after ten seconds.
+async fn until(what: &str, done: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("never: {what}"));
+}
+
+/// No Lease: one is made and held, and renewed; renewals refused, leading stops within the
+/// renew deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_makes_the_lease_leads_renews_and_stops_when_it_cannot() {
+    let made = Arc::new(AtomicBool::new(false));
+    let refusing = Arc::new(AtomicBool::new(false));
+    let (was_made, refused) = (Arc::clone(&made), Arc::clone(&refusing));
+    let fake = Fake::start_by_method(&["127.0.0.1"], move |method, path| {
+        let held: Lease = serde_json::from_value(serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "edgerush", "namespace": "edge", "resourceVersion": "2" },
+            "spec": { "holderIdentity": "me", "leaseDurationSeconds": 1 },
+        }))
+        .unwrap();
+        let body = serde_json::to_string(&held).unwrap();
+        assert!(
+            path.starts_with("/apis/coordination.k8s.io/v1/namespaces/edge/leases"),
+            "{path}"
+        );
+        match method {
+            "GET" if !was_made.load(Ordering::SeqCst) => {
+                answer(404, r#"{"kind":"Status","code":404}"#)
+            }
+            "GET" => answer(200, &body),
+            "POST" => {
+                was_made.store(true, Ordering::SeqCst);
+                Answer {
+                    status: 201,
+                    ..answer(200, &body)
+                }
+            }
+            "PUT" if refused.load(Ordering::SeqCst) => {
+                answer(409, r#"{"kind":"Status","code":409,"message":"modified"}"#)
+            }
+            _ => answer(200, &body),
+        }
+    })
+    .await;
+    let api = fake.client(&token("controller-lease", "secret"), Timing::default());
+    let timing = crate::lease::Timing {
+        duration: Duration::from_millis(600),
+        renew_deadline: Duration::from_millis(400),
+        retry: Duration::from_millis(50),
+    };
+    let (leading, mut leads) = watch::channel(false);
+    let electing = tokio::spawn(async move {
+        crate::lease::elect(&api, "edge", "edgerush", "me", timing, &leading, |_| {}).await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), leads.wait_for(|leads| *leads))
+        .await
+        .expect("never led")
+        .unwrap();
+    until("renewed", || {
+        fake.seen()
+            .iter()
+            .filter(|seen| seen.method == "PUT")
+            .count()
+            >= 2
+    })
+    .await;
+    refusing.store(true, Ordering::SeqCst);
+    let refused_at = Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), leads.wait_for(|leads| !*leads))
+        .await
+        .expect("led on, its renewals refused")
+        .unwrap();
+    // Not before its last renewal's deadline.
+    assert!(
+        refused_at.elapsed() >= Duration::from_millis(300),
+        "stopped after {:?}",
+        refused_at.elapsed()
+    );
+    electing.abort();
+    let created = fake
+        .seen()
+        .into_iter()
+        .find(|seen| seen.method == "POST")
+        .unwrap();
+    let created: Lease = serde_json::from_str(&created.body).unwrap();
+    assert_eq!(created.spec.unwrap().holder_identity.as_deref(), Some("me"));
 }
