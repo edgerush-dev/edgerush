@@ -330,6 +330,115 @@ async fn a_config_the_data_plane_would_refuse_is_said_and_not_written() {
     assert!(!written.exists(), "a refused config written");
 }
 
+/// With --authority, the stream's certificate is signed from the authority that Secret
+/// holds, the control plane's own or the platform's, in place of files; never both, and
+/// only for a ControlPlane, whose trust domain it signs in.
+#[test]
+fn the_streams_certificate_is_signed_from_an_authority_instead_of_files() {
+    let stream_of = |args: &[&str]| match parsed(args) {
+        Ok(Parsed::Control(options)) => options.stream.map(|stream| stream.credentials),
+        other => panic!("not parsed: {other:?}"),
+    };
+    let base = ["--control-plane", "edge", "--listen", "[::]:9443"];
+    let with = |more: &[&'static str]| {
+        let mut args = base.to_vec();
+        args.extend(more);
+        args
+    };
+    assert_eq!(
+        stream_of(&with(&[
+            "--authority",
+            "edgerush-controller-edge-authority"
+        ])),
+        Some(StreamCredentials::Authority {
+            secret: "edgerush-controller-edge-authority".to_owned(),
+            kind: Kind::Made
+        })
+    );
+    assert_eq!(
+        stream_of(&with(&[
+            "--authority-provided",
+            "--authority",
+            "platform-ca"
+        ])),
+        Some(StreamCredentials::Authority {
+            secret: "platform-ca".to_owned(),
+            kind: Kind::Provided
+        })
+    );
+    assert_eq!(
+        parsed(&with(&["--authority", "a", "--certificate", "c"])),
+        Err(UsageError::Together)
+    );
+    assert_eq!(
+        parsed(&["--control-plane", "edge", "--authority", "a"]),
+        Err(UsageError::Together)
+    );
+    assert_eq!(
+        parsed(&with(&["--authority-provided"])),
+        Err(UsageError::AuthorityProvidedAlone)
+    );
+    assert_eq!(
+        parsed(&with(&[
+            "--authority",
+            "a",
+            "--authority-provided",
+            "--authority-provided"
+        ])),
+        Err(UsageError::Twice("--authority-provided"))
+    );
+    assert_eq!(
+        parsed(&with(&["--authority", "Not_A_Name"])),
+        Err(UsageError::Authority("Not_A_Name".to_owned()))
+    );
+    assert_eq!(
+        parsed(&[
+            "--data-plane",
+            "p",
+            "--listen",
+            "[::]:9443",
+            "--authority",
+            "a"
+        ]),
+        Err(UsageError::AuthorityWithoutControlPlane)
+    );
+}
+
+/// Each certificate the issuer signs is taken once: none is waited for, and one taken is
+/// not taken again until another is signed.
+#[tokio::test]
+async fn each_certificate_signed_is_taken_once() {
+    let written = |bundle: &str| Written {
+        certificate: "chain".to_owned(),
+        key: "key".to_owned(),
+        bundle: bundle.to_owned(),
+    };
+    let quiet = Duration::from_millis(50);
+    let (signs, mut signed) = watch::channel(None);
+    assert!(
+        tokio::time::timeout(quiet, next_signed(&mut signed))
+            .await
+            .is_err(),
+        "taken before one was signed"
+    );
+    signs.send_replace(Some(written("first")));
+    let first = next_signed(&mut signed).await.unwrap();
+    assert_eq!(first.authorities, "first");
+    assert!(
+        tokio::time::timeout(quiet, next_signed(&mut signed))
+            .await
+            .is_err(),
+        "the same taken again"
+    );
+    signs.send_replace(Some(written("second")));
+    assert_eq!(
+        next_signed(&mut signed).await.unwrap().authorities,
+        "second"
+    );
+    drop(signs);
+    assert!(next_signed(&mut signed).await.is_none());
+}
+
 #[test]
 fn the_stream_is_given_whole_or_not_at_all() {
     let stream = [
@@ -352,11 +461,11 @@ fn the_stream_is_given_whole_or_not_at_all() {
             write_config: None,
             stream: Some(Box::new(Stream {
                 listen: "[::]:9443".parse().unwrap(),
-                files: Files {
+                credentials: StreamCredentials::Files(Files {
                     certificate: PathBuf::from("c"),
                     key: PathBuf::from("k"),
                     authorities: PathBuf::from("a"),
-                },
+                }),
             })),
             own_names: Vec::new(),
             status: None,
@@ -955,9 +1064,11 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
         .await;
     let serving = Serving {
         listener,
-        files: files.clone(),
-        credentials,
-        reread: Duration::from_millis(20),
+        credentials: Credentialing::Files {
+            files: files.clone(),
+            credentials,
+            reread: Duration::from_millis(20),
+        },
         versions: Versions::new(7),
         own: Own {
             names: vec!["peers.edge.svc.cluster.local".to_owned()],

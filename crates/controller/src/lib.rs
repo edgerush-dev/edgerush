@@ -53,6 +53,7 @@ pub mod data_plane;
 pub mod expiry;
 pub mod gateway_api;
 mod gateway_status;
+pub mod issuing;
 pub mod lease;
 pub mod status;
 

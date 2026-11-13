@@ -9,13 +9,16 @@
 # The control plane and the data plane are one binary, built from the repository as it is
 # checked out, a release build on this host, put alone in an image of this host's
 # distribution (kind/discovery/Dockerfile) and loaded into the cluster: Linux only, on
-# Ubuntu 26.04 as the laptop is. The stream's authority and each end's certificate are made
-# here with openssl, and handed to each as a Secret. A backend Service in `shop` sits behind
+# Ubuntu 26.04 as the laptop is. The stream runs on certificates the control plane signs
+# from the authority it makes (05 §2); the webhook's certificate and its authority are made
+# here with openssl, and handed to it as a Secret. A backend Service in `shop` sits behind
 # an Ingress of class `edge.web`, for host shop.example; the control plane in `edge` follows
-# `shop`, and the data plane in `edge` dials it at edgerush-control.edge.svc:9443 and is
-# reached by `kubectl port-forward`. The control plane reads the data plane's settings from
-# its DataPlane, `web`, which the script says the operator accepted, as of each generation.
-# Then:
+# `shop`, and the data plane in `edge` dials it at edgerush-controller-edge.edge.svc:9443 and
+# is reached by `kubectl port-forward`. The control plane reads the data plane's settings
+# from its DataPlane, `web`, which the script says the operator accepted, as of each
+# generation. Then:
+#   - the stream runs on the control plane's certificates, the data plane's of its ID, and
+#     one written again is taken into the data plane's pod with no restart;
 #   - an edit of the DataPlane is not served until the operator has accepted its
 #     generation, and is once it has;
 #   - the data plane named as a Gateway, the control plane says the Gateway API's CRDs are
@@ -114,7 +117,7 @@ sed "s|BASE|$BASE|" kind/discovery/Dockerfile > "$image/Dockerfile"
 docker build -q -t edgerush:kind "$image" >/dev/null
 kind load docker-image edgerush:kind --name "$name" >/dev/null
 
-echo "== the stream's certificates"
+echo "== the webhook's certificate"
 pki=target/kind/stream-pki
 rm -rf "$pki" && mkdir -p "$pki"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
@@ -126,18 +129,11 @@ issue() {
     openssl x509 -req -in "$pki/$1.csr" -CA "$pki/ca.crt" -CAkey "$pki/ca.key" -days 1 \
         -extfile <(printf 'subjectAltName=DNS:%s' "$2") -out "$pki/$1.crt" 2>/dev/null
 }
-issue control edgerush-control.edge.svc
-issue data-plane edgerush.edge
 # The name the API server asks the webhook by.
-issue webhook edgerush-control.edge.svc
+issue webhook edgerush-controller-edge.edge.svc
 
 echo "== deploying"
 k create namespace edge --dry-run=client -o yaml | k apply -f - >/dev/null
-for end in control data-plane; do
-    k -n edge create secret generic "edgerush-$end-stream" \
-        --from-file=tls.crt="$pki/$end.crt" --from-file=tls.key="$pki/$end.key" \
-        --from-file=ca.crt="$pki/ca.crt" --dry-run=client -o yaml | k apply -f - >/dev/null
-done
 k -n edge create secret tls edgerush-control-webhook \
     --cert="$pki/webhook.crt" --key="$pki/webhook.key" --dry-run=client -o yaml |
     k apply -f - >/dev/null
@@ -275,6 +271,42 @@ k -n edge patch dataplane web --type=json -p '[{"op":"remove","path":"/spec/port
 accept
 request_ids yes 30 || fail "the DataPlane's edit back, accepted, was never served"
 pass "an edit of the DataPlane is served once the operator has accepted its generation, and not before"
+# The stream on certificates the control plane made (05 §2): its authority, made by the
+# leader, and the data plane's, of its ServiceAccount's ID in the ControlPlane's trust domain.
+k -n edge get secret edgerush-controller-edge-authority >/dev/null 2>&1 ||
+    fail "the control plane never made its authority"
+identity() {
+    k -n edge get secret edgerush-proxy-web-identity -o jsonpath='{.data.tls\.crt}' | base64 -d
+}
+identity | openssl x509 -noout -ext subjectAltName 2>/dev/null |
+    grep "URI:spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-web" >/dev/null ||
+    fail "the data plane's certificate is not of its ID: $(identity | openssl x509 -noout -ext subjectAltName 2>&1)"
+pass "the stream runs on certificates the control plane made, the data plane's of its ID"
+# Written again, as at half its life: here by its Secret gone, which the leader writes again
+# with a new key; the kubelet puts it into the pod's files, which the data plane reads again
+# every second, and the pod is not restarted.
+fingerprint() { openssl x509 -noout -fingerprint -sha256; }
+before=$(identity | fingerprint)
+running=$(pod)
+k -n edge delete secret edgerush-proxy-web-identity >/dev/null
+after=
+for _ in $(seq 1 150); do
+    after=$(identity 2>/dev/null | fingerprint 2>/dev/null || true)
+    [ -n "$after" ] && [ "$after" != "$before" ] && break
+    sleep 0.2
+done
+[ -n "$after" ] && [ "$after" != "$before" ] || fail "the data plane's certificate was never written again"
+mounted=
+for _ in $(seq 1 600); do
+    mounted=$(k -n edge exec "$running" -- cat /etc/edgerush/stream/tls.crt 2>/dev/null | fingerprint 2>/dev/null || true)
+    [ "$mounted" = "$after" ] && break
+    sleep 0.2
+done
+[ "$mounted" = "$after" ] || fail "the certificate written again never reached the data plane's pod"
+[ "$(k -n edge get pod "$running" -o jsonpath='{.status.containerStatuses[0].restartCount}')" = 0 ] ||
+    fail "the data plane's pod restarted"
+answers shop.example 200 10 || fail "the Ingress is not served after the certificate was written again"
+pass "a certificate written again reaches the data plane's pod with no restart, and it serves on"
 # Requests without pause to the Ingress from before the CRDs are installed until its
 # Gateway, made after them, is served: Ingress's port, which asks nothing of the Gateway,
 # is never let go, and every request is answered (04 §2).
@@ -1427,7 +1459,7 @@ webhooks:
         operations: [CREATE, UPDATE]
         resources: [ingresses]
     clientConfig:
-      service: { namespace: edge, name: edgerush-control, path: /validate, port: 443 }
+      service: { namespace: edge, name: edgerush-controller-edge, path: /validate, port: 443 }
       caBundle: $(base64 -w0 "$pki/ca.crt")
     failurePolicy: Ignore
     sideEffects: None

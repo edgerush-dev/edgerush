@@ -6,6 +6,7 @@
 
 use crate::validate::{described, read};
 use bytes::Bytes;
+use edgerush_certificates::authority::{Kind, Written};
 use edgerush_config::Certificate;
 use edgerush_control_service::metrics;
 use edgerush_control_service::webhook::{self, Bounds};
@@ -18,6 +19,7 @@ use edgerush_controller::acks::{Pods, Reporter, Runs};
 use edgerush_controller::admission::{self, Asked};
 use edgerush_controller::data_plane::{self, follow_data_planes};
 use edgerush_controller::expiry::Expiry;
+use edgerush_controller::issuing::{self, Issuer};
 use edgerush_controller::lease::{self, elect};
 use edgerush_controller::status::{Addresses, address};
 use edgerush_controller::{Acks, Debounce, Reports, Said, control};
@@ -42,7 +44,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 pub(crate) const USAGE: &str = "\
 Usage: edgerush controller (--data-plane <FILE> | --control-plane <NAME> [--cluster-domain <DOMAIN>])
          [--namespace <NAME>]... [--write-config <FILE>]
-         [--listen <ADDRESS> --certificate <FILE> --key <FILE> --authorities <FILE>
+         [--listen <ADDRESS> (--certificate <FILE> --key <FILE> --authorities <FILE>
+                              | --authority <SECRET> [--authority-provided])
           [--own-name <NAME>]...]
          [--status-service <NAMESPACE>/<NAME> | --status-address <ADDRESS>...]
          [--leader-lease <NAMESPACE>/<NAME>]
@@ -114,6 +117,12 @@ Options:
       --key <FILE>           Its private key
       --authorities <FILE>   The stream's authorities, which every data plane's
                              certificate must be signed by
+      --authority <SECRET>   Instead of those three, with --control-plane: the Secret of
+                             the pod's own namespace that holds the authority it signs
+                             with, made by the leader if it is not there; each replica
+                             signs its own certificate from it, and the leader writes
+                             each DataPlane's into a Secret its pods mount
+      --authority-provided   The authority is the platform's, never made or written
       --own-name <NAME>      A headless Service's name whose pods are the gateway's own:
                              the data planes', the control plane's or the rate-limiting
                              service's, given once for each; looked up again as each
@@ -183,8 +192,33 @@ pub(crate) fn command(
                     },
                 },
             };
-            let stream = match &options.stream {
-                Some(stream) => Some(runtime.block_on(credentials(stream))?),
+            let stream = match options.stream.as_deref() {
+                Some(Stream {
+                    credentials: StreamCredentials::Files(files),
+                    ..
+                }) => Some(Initial::Files(runtime.block_on(credentials(files))?)),
+                Some(Stream {
+                    credentials: StreamCredentials::Authority { secret, kind },
+                    ..
+                }) => {
+                    let Settings::DataPlane {
+                        control_plane,
+                        cluster_domain,
+                    } = &options.settings
+                    else {
+                        return Err(UsageError::AuthorityWithoutControlPlane.to_string());
+                    };
+                    Some(Initial::Signed {
+                        api: Box::new(ApiServer::in_cluster().map_err(|error| outside(&error))?),
+                        issuer: Issuer {
+                            namespace: own_namespace_name()?,
+                            control_plane: control_plane.clone(),
+                            cluster_domain: cluster_domain.clone(),
+                            authority: secret.clone(),
+                            kind: *kind,
+                        },
+                    })
+                }
                 None => None,
             };
             let webhook = match &options.webhook {
@@ -232,9 +266,20 @@ pub(crate) fn command(
             };
             Some(Serving {
                 listener,
-                files: stream.files.clone(),
-                credentials,
-                reread: REREAD,
+                credentials: match (credentials, &stream.credentials) {
+                    (Initial::Files(credentials), StreamCredentials::Files(files)) => {
+                        Credentialing::Files {
+                            files: files.clone(),
+                            credentials,
+                            reread: REREAD,
+                        }
+                    }
+                    (Initial::Signed { api, issuer }, _) => Credentialing::Signed { api, issuer },
+                    (Initial::Files(_), StreamCredentials::Authority { .. }) => {
+                        return writeln!(stderr, "error: the stream's credentials are not its own")
+                            .map_or(1, |()| 1);
+                    }
+                },
                 versions: Versions::new(started_at()),
                 own: Own {
                     names: options.own_names.clone(),
@@ -323,10 +368,9 @@ fn unix_now() -> i64 {
 }
 
 /// The stream's credentials, read and checked to be usable.
-async fn credentials(stream: &Stream) -> Result<Credentials, String> {
+async fn credentials(files: &Files) -> Result<Credentials, String> {
     let failed = |error: String| format!("the stream's certificates: {error}");
-    let credentials = stream
-        .files
+    let credentials = files
         .read()
         .await
         .map_err(|error| failed(error.to_string()))?;
@@ -400,17 +444,52 @@ enum Source {
 
 /// The pod's own namespace, as its service account says it.
 fn own_namespace() -> Result<Scope, String> {
+    let name = own_namespace_name()?;
+    Scope::namespace(&name).map_err(|error| format!("the pod's namespace: {error}"))
+}
+
+/// The name of the pod's own namespace, as its service account says it.
+fn own_namespace_name() -> Result<String, String> {
     let path = Path::new(SERVICE_ACCOUNT).join("namespace");
     let written = std::fs::read_to_string(&path)
         .map_err(|error| format!("the pod's namespace, {}: {error}", path.display()))?;
-    Scope::namespace(written.trim()).map_err(|error| format!("the pod's namespace: {error}"))
+    let name = written.trim().to_owned();
+    Scope::namespace(&name).map_err(|error| format!("the pod's namespace: {error}"))?;
+    Ok(name)
+}
+
+/// The next certificate the issuer signs that has not been taken yet, as the stream's
+/// credentials, waited for until it signs one; none once it is gone. Each is taken once.
+async fn next_signed(signed: &mut watch::Receiver<Option<Written>>) -> Option<Credentials> {
+    loop {
+        // At once for one not yet seen; else once another comes.
+        signed.changed().await.ok()?;
+        if let Some(written) = signed.borrow_and_update().clone() {
+            return Some(Credentials {
+                certificate: Certificate {
+                    chain: written.certificate,
+                    key: written.key,
+                },
+                authorities: written.bundle,
+            });
+        }
+    }
 }
 
 /// The config stream, as the command line gives it.
 #[derive(Debug, PartialEq, Eq)]
 struct Stream {
     listen: SocketAddr,
-    files: Files,
+    credentials: StreamCredentials,
+}
+
+/// Where the stream's certificate comes from.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamCredentials {
+    /// Files, read again every second.
+    Files(Files),
+    /// Signed by the control plane from its authority, kept in this Secret (05 §2).
+    Authority { secret: String, kind: Kind },
 }
 
 /// The admission webhook, as the command line gives it.
@@ -444,8 +523,16 @@ enum UsageError {
     Namespace(String, ApiError),
     #[error("'--listen {0}' is not an address and a port, such as [::]:9443")]
     Listen(String),
-    #[error("'--listen', '--certificate', '--key' and '--authorities' are given together")]
+    #[error(
+        "'--listen' is given with '--certificate', '--key' and '--authorities', or with '--authority'"
+    )]
     Together,
+    #[error("'--authority {0}' is not a Secret's name")]
+    Authority(String),
+    #[error("'--authority-provided' is for '--authority'")]
+    AuthorityProvidedAlone,
+    #[error("'--authority' signs in its ControlPlane's trust domain, and needs '--control-plane'")]
+    AuthorityWithoutControlPlane,
     #[error("'--status-service {0}' is not a namespace and a name, as edge/edgerush")]
     StatusService(String),
     #[error("'--status-service' and '--status-address' are not given together")]
@@ -475,6 +562,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut certificate = None;
     let mut key = None;
     let mut authorities = None;
+    let mut authority = None;
+    let mut provided = false;
     let mut status_service = None;
     let mut leader = None;
     let mut webhook_listen = None;
@@ -496,6 +585,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             "--certificate" => "--certificate",
             "--key" => "--key",
             "--authorities" => "--authorities",
+            "--authority" => "--authority",
+            "--authority-provided" => {
+                if provided {
+                    return Err(UsageError::Twice("--authority-provided"));
+                }
+                provided = true;
+                continue;
+            }
             "--status-service" => "--status-service",
             "--status-address" => "--status-address",
             "--leader-lease" => "--leader-lease",
@@ -531,6 +628,15 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                 let domain = edgerush_config::DnsName::host(&value)
                     .map_err(|error| UsageError::ClusterDomain(value.clone(), error))?;
                 if cluster_domain.replace(domain).is_some() {
+                    return Err(UsageError::Twice(option));
+                }
+                continue;
+            }
+            "--authority" => {
+                if Scope::named(&value).is_err() {
+                    return Err(UsageError::Authority(value));
+                }
+                if authority.replace(value).is_some() {
                     return Err(UsageError::Twice(option));
                 }
                 continue;
@@ -602,16 +708,28 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     if scope.is_empty() {
         scope.push(Scope::Cluster);
     }
-    let stream = match (listen, certificate, key, authorities) {
-        (Some(listen), Some(certificate), Some(key), Some(authorities)) => Some(Box::new(Stream {
+    if provided && authority.is_none() {
+        return Err(UsageError::AuthorityProvidedAlone);
+    }
+    let stream = match (listen, certificate, key, authorities, authority) {
+        (Some(listen), Some(certificate), Some(key), Some(authorities), None) => {
+            Some(Box::new(Stream {
+                listen,
+                credentials: StreamCredentials::Files(Files {
+                    certificate,
+                    key,
+                    authorities,
+                }),
+            }))
+        }
+        (Some(listen), None, None, None, Some(secret)) => Some(Box::new(Stream {
             listen,
-            files: Files {
-                certificate,
-                key,
-                authorities,
+            credentials: StreamCredentials::Authority {
+                secret,
+                kind: if provided { Kind::Provided } else { Kind::Made },
             },
         })),
-        (None, None, None, None) => None,
+        (None, None, None, None, None) => None,
         _ => return Err(UsageError::Together),
     };
     let webhook = match (webhook_listen, webhook_certificate, webhook_key) {
@@ -645,6 +763,16 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             ));
         }
     };
+    if let (
+        Some(Stream {
+            credentials: StreamCredentials::Authority { .. },
+            ..
+        }),
+        Settings::File(_),
+    ) = (stream.as_deref(), &settings)
+    {
+        return Err(UsageError::AuthorityWithoutControlPlane);
+    }
     Ok(Parsed::Control(Box::new(Options {
         settings,
         scope,
@@ -698,14 +826,30 @@ struct Hooking {
     reread: Duration,
 }
 
+/// The stream's credentials as it starts.
+enum Initial {
+    /// What its files held.
+    Files(Credentials),
+    /// None yet: signed once the authority is read, through a client of their own.
+    Signed { api: Box<ApiServer>, issuer: Issuer },
+}
+
+/// The stream's credentials, ready to be kept.
+enum Credentialing {
+    /// Its files, what they held as it started, and how often they are read again.
+    Files {
+        files: Files,
+        credentials: Credentials,
+        reread: Duration,
+    },
+    /// Signed from the authority, by the issuer (05 §2).
+    Signed { api: Box<ApiServer>, issuer: Issuer },
+}
+
 /// The config stream, ready to be served.
 struct Serving {
     listener: std::net::TcpListener,
-    files: Files,
-    /// What the files held as it started.
-    credentials: Credentials,
-    /// How often the files are read again.
-    reread: Duration,
+    credentials: Credentialing,
     versions: Versions,
     /// The names whose addresses are the gateway's own pods, the nameservers they are asked
     /// of, and at what pace.
@@ -875,28 +1019,92 @@ async fn control_until(
                 )));
             }
             let (stopping, stopped) = oneshot::channel::<()>();
-            let tls = watch::Sender::new(Arc::new(
-                acceptor(&serving.credentials).map_err(io::Error::other)?,
-            ));
             serving.listener.set_nonblocking(true)?;
             let listener = tokio::net::TcpListener::from_std(serving.listener)?;
             // Heard on the server's own tasks, and said here, where `say` lives.
             let (heard, mut hearing) = mpsc::unbounded_channel();
-            served = Some((
-                stopping,
-                tokio::spawn(serve(
-                    listener,
-                    tls.subscribe(),
-                    offered,
-                    addresses,
-                    move |peer, said| {
-                        let _stopped = heard.send((told_of(peer, &said), ran(peer, &said)));
-                    },
-                    async move {
-                        let _ = stopped.await;
-                    },
-                )),
-            ));
+            let hear = move |peer, said| {
+                let _stopped = heard.send((told_of(peer, &said), ran(peer, &said)));
+            };
+            let until = async move {
+                let _ = stopped.await;
+            };
+            match serving.credentials {
+                Credentialing::Files {
+                    files,
+                    credentials,
+                    reread: every,
+                } => {
+                    let tls = watch::Sender::new(Arc::new(
+                        acceptor(&credentials).map_err(io::Error::other)?,
+                    ));
+                    served = Some((
+                        stopping,
+                        tokio::spawn(serve(
+                            listener,
+                            tls.subscribe(),
+                            offered,
+                            addresses,
+                            hear,
+                            until,
+                        )),
+                    ));
+                    let telling = Rc::clone(&say);
+                    tasks.push(tokio::task::spawn_local(reread(
+                        files,
+                        credentials,
+                        every,
+                        move |changed| telling(&replaced(changed, &tls)),
+                    )));
+                }
+                Credentialing::Signed { api, issuer } => {
+                    // Its own certificate, as the issuer signs it: the stream is served from
+                    // the first on, each after it taking the next connection (05 §2).
+                    let (own, mut signed) = watch::channel(None);
+                    let telling = Rc::clone(&say);
+                    tasks.push(tokio::task::spawn_local(issuing::issue(
+                        *api,
+                        issuer,
+                        leading.clone(),
+                        own,
+                        move |line| telling(line),
+                    )));
+                    let telling = Rc::clone(&say);
+                    served = Some((
+                        stopping,
+                        tokio::task::spawn_local(async move {
+                            // The first it can serve with: one it cannot is said, and the
+                            // next waited for.
+                            let tls = loop {
+                                let Some(first) = next_signed(&mut signed).await else {
+                                    return Ok(());
+                                };
+                                match acceptor(&first) {
+                                    Ok(first) => break watch::Sender::new(Arc::new(first)),
+                                    Err(error) => telling(&format!(
+                                        "the stream's certificate cannot be used: {error}"
+                                    )),
+                                }
+                            };
+                            let accepting = tls.subscribe();
+                            tokio::task::spawn_local(async move {
+                                while let Some(next) = next_signed(&mut signed).await {
+                                    match acceptor(&next) {
+                                        Ok(next) => {
+                                            tls.send_replace(Arc::new(next));
+                                            telling("the stream's certificate replaced");
+                                        }
+                                        Err(error) => telling(&format!(
+                                            "the stream's certificate cannot be used: {error}"
+                                        )),
+                                    }
+                                }
+                            });
+                            serve(listener, accepting, offered, addresses, hear, until).await
+                        }),
+                    ));
+                }
+            }
             let (telling, taking, telling_pods) = (Rc::clone(&say), Rc::clone(&runs), pods.clone());
             tasks.push(tokio::task::spawn_local(async move {
                 while let Some((line, ran)) = hearing.recv().await {
@@ -908,13 +1116,6 @@ async fn control_until(
                     }
                 }
             }));
-            let telling = Rc::clone(&say);
-            tasks.push(tokio::task::spawn_local(reread(
-                serving.files,
-                serving.credentials,
-                serving.reread,
-                move |changed| telling(&replaced(changed, &tls)),
-            )));
             Some(Offering {
                 versions: RefCell::new(serving.versions),
                 offers,

@@ -69,6 +69,21 @@ pub fn verdict(data_plane: &DataPlane) -> Verdict {
     }
 }
 
+/// Whether the operator has accepted `data_plane` as of any generation: one served, if
+/// not yet as it now is.
+#[must_use]
+pub fn accepted_ever(data_plane: &DataPlane) -> bool {
+    data_plane
+        .status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .is_some_and(|conditions| {
+            conditions
+                .iter()
+                .any(|condition| condition.type_ == ACCEPTED && condition.status == "True")
+        })
+}
+
 /// Why nothing new is served.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Waiting {

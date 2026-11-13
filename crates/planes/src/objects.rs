@@ -26,8 +26,8 @@ use k8s_openapi::api::autoscaling::v2::{
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, ObjectFieldSelector,
     PodSecurityContext, PodSpec, PodTemplateSpec, ResourceRequirements, SeccompProfile,
-    SecurityContext, Service, ServiceAccount, ServicePort, ServiceSpec, Sysctl,
-    TopologySpreadConstraint,
+    SecretVolumeSource, SecurityContext, Service, ServiceAccount, ServicePort, ServiceSpec, Sysctl,
+    TopologySpreadConstraint, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{IngressClass, IngressClassSpec};
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
@@ -202,13 +202,41 @@ pub fn controller_name(control_plane: &str) -> String {
     format!("edgerush-controller-{control_plane}")
 }
 
-/// The name of a data plane's ServiceAccount and workload.
-/// The name of a data plane's Deployment, and of its Service, which the control plane makes
-/// ([05 §2](../../../docs/05-operator.md)).
+/// The name of a data plane's ServiceAccount and Deployment, and of its Service, which the
+/// control plane makes ([05 §2](../../../docs/05-operator.md)).
 #[must_use]
 pub fn proxy_name(data_plane: &str) -> String {
     format!("edgerush-proxy-{data_plane}")
 }
+
+/// The Secret a ControlPlane's own authority is kept in, where it makes one (05 §2).
+#[must_use]
+pub fn authority_secret(control_plane: &str) -> String {
+    format!("{}-authority", controller_name(control_plane))
+}
+
+/// The Secret a DataPlane's certificate is kept in, which the control plane writes and
+/// its pods mount (05 §2).
+#[must_use]
+pub fn identity_secret(data_plane: &str) -> String {
+    format!("{}-identity", proxy_name(data_plane))
+}
+
+/// The SPIFFE ID a workload of ControlPlane `control_plane`'s is known by: its
+/// ServiceAccount's, in its ControlPlane's own trust domain, `<controlplane>.<cluster
+/// domain>` ([12](../../../docs/12-open-questions.md) item 22).
+#[must_use]
+pub fn spiffe_id(
+    control_plane: &str,
+    cluster_domain: &str,
+    namespace: &str,
+    service_account: &str,
+) -> String {
+    format!("spiffe://{control_plane}.{cluster_domain}/ns/{namespace}/sa/{service_account}")
+}
+
+/// Where a data plane's pods mount their certificate.
+const IDENTITY_MOUNT: &str = "/etc/edgerush/identity";
 
 /// The name of a data plane's bindings, in namespaces other DataPlanes' may share.
 fn proxy_binding(control_plane: &str, data_plane: &str) -> String {
@@ -431,6 +459,16 @@ pub fn for_control_plane(
         "--leader-lease".to_owned(),
         format!("{}/{name}", cp.namespace),
     ];
+    // The authority it signs with: its own, or the platform's it is given, never written
+    // (05 §2).
+    match &control_plane.spec.authority {
+        Some(provided) => args.extend([
+            "--authority".to_owned(),
+            provided.secret_ref.name.clone(),
+            "--authority-provided".to_owned(),
+        ]),
+        None => args.extend(["--authority".to_owned(), authority_secret(cp.name)]),
+    }
     for namespace in watched.iter().flatten() {
         args.extend(["--namespace".to_owned(), namespace.clone()]);
     }
@@ -583,9 +621,22 @@ pub fn for_data_plane(
             ),
             "--workers".to_owned(),
             workers.to_string(),
+            // Its certificate on the stream, which the control plane writes (05 §2).
+            "--certificate".to_owned(),
+            format!("{IDENTITY_MOUNT}/tls.crt"),
+            "--key".to_owned(),
+            format!("{IDENTITY_MOUNT}/tls.key"),
+            "--authorities".to_owned(),
+            format!("{IDENTITY_MOUNT}/ca.crt"),
         ]),
         // The pod's own addresses, which it never sends a request to (03 §6).
         env: Some(vec![from_field("POD_IPS", "status.podIPs")]),
+        volume_mounts: Some(vec![VolumeMount {
+            name: "identity".to_owned(),
+            mount_path: IDENTITY_MOUNT.to_owned(),
+            read_only: Some(true),
+            ..VolumeMount::default()
+        }]),
         resources: resources.map(requirements),
         security_context: Some(locked_down()),
         ..Container::default()
@@ -633,6 +684,16 @@ pub fn for_data_plane(
                         ..TopologySpreadConstraint::default()
                     }]),
                     containers: vec![container],
+                    // Its certificate, which the control plane writes: a pod waits for it,
+                    // as it can serve nothing without the stream (05 §2).
+                    volumes: Some(vec![Volume {
+                        name: "identity".to_owned(),
+                        secret: Some(SecretVolumeSource {
+                            secret_name: Some(identity_secret(dp.name)),
+                            ..SecretVolumeSource::default()
+                        }),
+                        ..Volume::default()
+                    }]),
                     ..PodSpec::default()
                 }),
             },

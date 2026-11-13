@@ -15,6 +15,7 @@ use boring::pkey::{PKey, Private};
 use boring::x509::{X509, X509Ref};
 use edgerush_config::Certificate;
 
+pub mod authority;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 

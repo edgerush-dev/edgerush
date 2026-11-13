@@ -142,6 +142,9 @@ spec:
         - 0.0.0.0:9443
         - --leader-lease
         - payments-edge/edgerush-controller-payments
+        - --authority
+        - payments-ca
+        - --authority-provided
         - --namespace
         - payments-api
         - --namespace
