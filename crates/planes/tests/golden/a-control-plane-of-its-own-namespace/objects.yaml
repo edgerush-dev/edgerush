@@ -130,6 +130,8 @@ spec:
         - 0.0.0.0:9443
         - --leader-lease
         - payments-edge/edgerush-controller-payments
+        - --authority
+        - edgerush-controller-payments-authority
         - --namespace
         - payments-edge
         - --webhook-listen

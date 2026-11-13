@@ -92,6 +92,12 @@ spec:
         - edgerush-controller-payments.payments-edge.svc:9443
         - --workers
         - "1"
+        - --certificate
+        - /etc/edgerush/identity/tls.crt
+        - --key
+        - /etc/edgerush/identity/tls.key
+        - --authorities
+        - /etc/edgerush/identity/ca.crt
         env:
         - name: POD_IPS
           valueFrom:
@@ -105,6 +111,10 @@ spec:
             drop:
             - ALL
           readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /etc/edgerush/identity
+          name: identity
+          readOnly: true
       securityContext:
         runAsGroup: 65534
         runAsNonRoot: true
@@ -126,6 +136,10 @@ spec:
         maxSkew: 1
         topologyKey: topology.kubernetes.io/zone
         whenUnsatisfiable: ScheduleAnyway
+      volumes:
+      - name: identity
+        secret:
+          secretName: edgerush-proxy-public-identity
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

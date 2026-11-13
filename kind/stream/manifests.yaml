@@ -11,8 +11,9 @@
 # It follows `blog` too, where an HTTPRoute leads to `shop`'s Service while a ReferenceGrant
 # allows it.
 # The control plane runs as two replicas, which elect the one that writes status by a Lease
-# in `edge`; both serve the stream, and the admission webhook, with a certificate of the same
-# authority for edgerush-control.edge.svc. The webhook's registration is the script's, made
+# in `edge`; both serve the stream, each on a certificate it signs from the authority its
+# leader makes (05 §2), for edgerush-controller-edge.edge.svc, the name the data plane
+# dials, and the admission webhook, with a certificate the script makes. The webhook's registration is the script's, made
 # once the checks that leave the Ingress out are done, as it would refuse them.
 apiVersion: v1
 kind: Namespace
@@ -178,8 +179,12 @@ kind: Role
 metadata: { name: edgerush-control-status, namespace: edge }
 rules:
   - apiGroups: [""]
-    resources: [services, secrets]
+    resources: [services]
     verbs: [list, watch]
+  # Its authority, and the data plane's certificate, which it writes (05 §2).
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch, create, update]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, create, update]
@@ -245,12 +250,8 @@ spec:
             - blog
             - --listen
             - "0.0.0.0:9443"
-            - --certificate
-            - /etc/edgerush/stream/tls.crt
-            - --key
-            - /etc/edgerush/stream/tls.key
-            - --authorities
-            - /etc/edgerush/stream/ca.crt
+            - --authority
+            - edgerush-controller-edge-authority
             - --status-service
             - edge/edgerush
             - --leader-lease
@@ -274,17 +275,15 @@ spec:
             - { name: stream, containerPort: 9443 }
             - { name: webhook, containerPort: 8443 }
           volumeMounts:
-            - { name: stream, mountPath: /etc/edgerush/stream }
             - { name: webhook, mountPath: /etc/edgerush/webhook }
       volumes:
-        - name: stream
-          secret: { secretName: edgerush-control-stream }
         - name: webhook
           secret: { secretName: edgerush-control-webhook }
 ---
+# Of the name the operator gives it, which the control plane's own certificate carries.
 apiVersion: v1
 kind: Service
-metadata: { name: edgerush-control, namespace: edge }
+metadata: { name: edgerush-controller-edge, namespace: edge }
 spec:
   selector: { app: edgerush-control }
   ports:
@@ -376,7 +375,7 @@ spec:
           args:
             - proxy
             - --control-plane
-            - edgerush-control.edge.svc:9443
+            - edgerush-controller-edge.edge.svc:9443
             - --certificate
             - /etc/edgerush/stream/tls.crt
             - --key
@@ -395,6 +394,7 @@ spec:
           # The Ingress HTTP port, which the Gateway's `http` listener shares.
           ports: [{ name: http, containerPort: 80 }]
           volumeMounts: [{ name: stream, mountPath: /etc/edgerush/stream }]
+      # Its certificate, which the control plane writes for DataPlane web.
       volumes:
         - name: stream
-          secret: { secretName: edgerush-data-plane-stream }
+          secret: { secretName: edgerush-proxy-web-identity }

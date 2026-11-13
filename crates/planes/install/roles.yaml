@@ -87,10 +87,11 @@ rules:
   - apiGroups: [""]
     resources: [services]
     verbs: [list, watch, create, patch, delete]
-  # The certificates its Gateway's listeners name, which need no grant (04 §1).
+  # The certificates its Gateway's listeners name, which need no grant (04 §1); and the
+  # authority it signs with and each DataPlane's certificate, which it writes (05 §2).
   - apiGroups: [""]
     resources: [secrets]
-    verbs: [list, watch]
+    verbs: [get, list, watch, create, update]
   # The data plane's own Service's EndpointSlices: its ready pods, counted for Programmed.
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]

@@ -540,7 +540,7 @@ async fn a_crd_is_asked_for_by_its_name_and_kept_without_its_schemas() {
 
 /// A Secret as `kubectl apply` leaves it: a certificate, its key, a key besides, and the
 /// whole again in kubectl's annotation.
-const SECRET: &str = r#"{"metadata":{"name":"tls","namespace":"shop","resourceVersion":"3","labels":{"app":"web"},"annotations":{"kubectl.kubernetes.io/last-applied-configuration":"{\"data\":{\"password\":\"aHVudGVyMg==\"}}"},"managedFields":[{"manager":"kubectl"}]},"type":"kubernetes.io/tls","data":{"tls.crt":"Y2VydA==","tls.key":"a2V5","password":"aHVudGVyMg=="}}"#;
+const SECRET: &str = r#"{"metadata":{"name":"tls","namespace":"shop","resourceVersion":"3","labels":{"app":"web"},"annotations":{"kubectl.kubernetes.io/last-applied-configuration":"{\"data\":{\"password\":\"aHVudGVyMg==\"}}"},"managedFields":[{"manager":"kubectl"}]},"type":"kubernetes.io/tls","data":{"tls.crt":"Y2VydA==","tls.key":"a2V5","ca.crt":"Y2E=","password":"aHVudGVyMg=="}}"#;
 
 /// [`SECRET`] as it is kept.
 fn trimmed_secret() -> Secret {
@@ -555,6 +555,7 @@ fn trimmed_secret() -> Secret {
         data: Some(BTreeMap::from([
             ("tls.crt".to_owned(), ByteString(b"cert".to_vec())),
             ("tls.key".to_owned(), ByteString(b"key".to_vec())),
+            ("ca.crt".to_owned(), ByteString(b"ca".to_vec())),
         ])),
         ..Secret::default()
     }

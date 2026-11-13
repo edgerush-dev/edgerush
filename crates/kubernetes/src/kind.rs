@@ -78,8 +78,10 @@ impl Kind for RoleBinding {
     const NAMESPACED: bool = true;
 }
 
-/// A Secret's keys a certificate is read from: those alone are kept.
-const CERTIFICATE_KEYS: [&str; 2] = ["tls.crt", "tls.key"];
+/// A Secret's keys a certificate is read from: those alone are kept. `ca.crt` is the
+/// authorities a Secret of cert-manager's shape names, which the control plane's own
+/// authority and its workloads' certificates are kept with (05 §2).
+const CERTIFICATE_KEYS: [&str; 3] = ["tls.crt", "tls.key", "ca.crt"];
 
 impl Kind for Secret {
     const NAMESPACED: bool = true;
@@ -94,9 +96,9 @@ impl Kind for Secret {
     const FIELDS: Option<&'static str> =
         Some("type!=helm.sh/release.v1,type!=kubernetes.io/service-account-token");
 
-    /// Only a certificate and its key are kept, and of the metadata only what names the
-    /// Secret: its annotations are dropped with the rest, kubectl's record of what it
-    /// applied among them, which holds the whole Secret again.
+    /// Only a certificate, its key and its authorities are kept, and of the metadata only
+    /// what names the Secret: its annotations are dropped with the rest, kubectl's record of
+    /// what it applied among them, which holds the whole Secret again.
     fn trim(&mut self) {
         let metadata = self.metadata_mut();
         metadata.managed_fields = None;

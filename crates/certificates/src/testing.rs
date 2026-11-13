@@ -116,6 +116,26 @@ impl Authority {
         builder.sign(&self.key, MessageDigest::sha256()).unwrap();
         written(&builder.build(), &key)
     }
+
+    /// An intermediate authority `name` that it signs, with its key: as a platform's root
+    /// signs the authority it gives a ControlPlane.
+    #[must_use]
+    pub fn issue_authority(&self, name: &str) -> Certificate {
+        let key = key();
+        let subject = subject(name);
+        let mut builder = builder(&subject, self.certificate.subject_name(), &key);
+        let constraints = BasicConstraints::new().critical().ca().build().unwrap();
+        builder.append_extension(&constraints).unwrap();
+        let usage = KeyUsage::new()
+            .critical()
+            .key_cert_sign()
+            .crl_sign()
+            .build()
+            .unwrap();
+        builder.append_extension(&usage).unwrap();
+        builder.sign(&self.key, MessageDigest::sha256()).unwrap();
+        written(&builder.build(), &key)
+    }
 }
 
 fn key() -> PKey<Private> {

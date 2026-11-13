@@ -122,6 +122,8 @@ spec:
         - 0.0.0.0:9443
         - --leader-lease
         - edge-system/edgerush-controller-edge
+        - --authority
+        - edgerush-controller-edge-authority
         env:
         - name: EDGERUSH_POD_UID
           valueFrom:
