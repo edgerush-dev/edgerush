@@ -49,6 +49,7 @@ use tokio::time::Instant;
 
 pub mod acks;
 pub mod admission;
+pub mod data_plane;
 pub mod expiry;
 pub mod gateway_api;
 mod gateway_status;
@@ -164,13 +165,18 @@ pub enum Said<'a> {
 /// always. With `leading`,
 /// only while it says this replica leads, every status that says otherwise written as it
 /// comes to (02 §3).
+/// The data plane's settings are what `planes` holds, as it changes: none, and nothing is
+/// followed or translated until it holds some. A change that leaves what is followed as it
+/// was, such as an Ingress's redirect, is translated again as any change is; one that changes
+/// it, the data plane's Gateway or its own Service, has the follows begun again for it
+/// ([05 §3](../../../docs/05-operator.md)).
 /// Runs for as long as it is polled, its follows ended with it. For a thread and runtime of
 /// its own, in a `LocalSet`.
 #[allow(clippy::too_many_arguments)]
 pub async fn control(
     api: ApiServer,
     scope: &[Scope],
-    plane: &Plane,
+    mut planes: watch::Receiver<Option<Plane>>,
     debounce: Debounce,
     status: Option<Addresses>,
     leading: Option<watch::Receiver<bool>>,
@@ -179,13 +185,67 @@ pub async fn control(
 ) {
     let api = Rc::new(api);
     let said: Rc<dyn Fn(Said<'_>)> = Rc::new(said);
+    loop {
+        let plane = planes.borrow_and_update().clone();
+        match plane {
+            Some(plane) => {
+                serve(
+                    &api,
+                    scope,
+                    plane,
+                    &mut planes,
+                    debounce,
+                    status.as_ref(),
+                    leading.as_ref(),
+                    &acks,
+                    &said,
+                )
+                .await;
+            }
+            // Settings that will never come are nothing to serve.
+            None => {
+                if planes.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// What a data plane's settings shape of what is followed: its Gateway, and its own Service.
+fn shape(plane: &Plane) -> (Option<GatewayName>, Option<ServiceName>) {
+    (plane.gateway.clone(), own_service(plane))
+}
+
+/// [`control`] for `plane`, until `planes` holds none, or settings of another [`shape`].
+#[allow(clippy::too_many_arguments)]
+async fn serve(
+    api: &Rc<ApiServer>,
+    scope: &[Scope],
+    mut plane: Plane,
+    planes: &mut watch::Receiver<Option<Plane>>,
+    debounce: Debounce,
+    status: Option<&Addresses>,
+    leading: Option<&watch::Receiver<bool>>,
+    acks: &Acks,
+    said: &Rc<dyn Fn(Said<'_>)>,
+) {
     let changed = Rc::new(Notify::new());
     let mut tasks = JoinSet::new();
+    // The settings changing is a change.
+    {
+        let (mut told, changed) = (planes.clone(), Rc::clone(&changed));
+        tasks.spawn_local(async move {
+            while told.changed().await.is_ok() {
+                changed.notify_one();
+            }
+        });
+    }
     let mut start = Start {
         tasks: &mut tasks,
-        api: &api,
+        api,
         changed: &changed,
-        said: &said,
+        said,
     };
     let mut followed = Followed {
         ingress_classes: start.follows(&[Scope::Cluster]),
@@ -199,7 +259,7 @@ pub async fn control(
             }
             None => scope.to_vec(),
         }),
-        status_service: match &status {
+        status_service: match status {
             Some(Addresses::Service { namespace, .. }) => {
                 start.follows(&[Scope::Namespace(namespace.clone())])
             }
@@ -214,7 +274,7 @@ pub async fn control(
             Some(reports) => start.follows(&[Scope::Namespace(reports.namespace.clone())]),
             None => Vec::new(),
         },
-        ready: match own_service(plane) {
+        ready: match own_service(&plane) {
             Some(service) => start.follows(&[Scope::Namespace(service.namespace)]),
             None => Vec::new(),
         },
@@ -232,7 +292,7 @@ pub async fn control(
     let mut handed_since: Option<(i64, Instant)> = None;
     // Coming to lead is a change: every status is looked at, as the last leader may have
     // left some stale.
-    if let Some(leading) = &leading {
+    if let Some(leading) = leading {
         let (mut told, changed) = (leading.clone(), Rc::clone(&changed));
         tasks.spawn_local(async move {
             while told.changed().await.is_ok() {
@@ -247,6 +307,14 @@ pub async fn control(
     // What the config handed on says the Gateway API's objects' status is to say.
     let mut handed_api: Option<Handed> = None;
     loop {
+        // New settings: translated as any change is, unless what is followed is theirs no
+        // longer. A sender gone leaves them as they were.
+        if planes.has_changed().unwrap_or(false) {
+            match planes.borrow_and_update().clone() {
+                Some(next) if shape(&next) == shape(&plane) => plane = next,
+                _ => return,
+            }
+        }
         // The follows of the Gateway API kinds, started and stopped as their CRDs say.
         if let Some(gateway_api) = &mut followed.gateway_api
             && let Some(served) = gateway_api.served()
@@ -254,9 +322,9 @@ pub async fn control(
         {
             let mut start = Start {
                 tasks: &mut tasks,
-                api: &api,
+                api,
                 changed: &changed,
-                said: &said,
+                said,
             };
             gateway_api.follow(&served, &mut start, scope);
             said(Said::GatewayApi(&served));
@@ -264,7 +332,7 @@ pub async fn control(
         }
         // Follows stopped are aborted: what is left of them is let go of.
         while tasks.try_join_next().is_some() {}
-        match translator.step(plane, followed.unlisted(), || followed.cluster()) {
+        match translator.step(&plane, followed.unlisted(), || followed.cluster()) {
             Step::Nothing => {}
             Step::Waiting(unlisted) => said(Said::Waiting(unlisted)),
             Step::Translated(translation) => {
@@ -290,7 +358,7 @@ pub async fn control(
         // again; one at a time, which is all the pace there is. A status written is a change
         // to its object, and the round it brings finds nothing more to write. The data
         // plane's addresses, where it is told where to find them, once they are listed.
-        let addresses = match &status {
+        let addresses = match status {
             _ if !followed.status_listed() => None,
             None => Some(Vec::new()),
             Some(Addresses::Stated(addresses)) => Some(addresses.clone()),
@@ -302,25 +370,25 @@ pub async fn control(
                 Some(status::of_service(named))
             }
         };
-        let leads = leading.as_ref().is_none_or(|leads| *leads.borrow());
+        let leads = leading.is_none_or(|leads| *leads.borrow());
         // The Gateway API's, always, as the spec has every controller write them (04 §6).
         if let (Some(gateway_api), Some(handed), Some(addresses), true) =
             (&followed.gateway_api, &handed_api, &addresses, leads)
         {
             let addresses = gateway_status::addresses(addresses);
-            let pods = followed.pods(&acks);
-            let ready = own_service(plane).map(|service| followed.ready(&service));
+            let pods = followed.pods(acks);
+            let ready = own_service(&plane).map(|service| followed.ready(&service));
             let overdue =
                 handed_since.is_some_and(|(_, since)| since.elapsed() >= PROGRAMMED_WITHIN);
             let programmed =
                 Programmed::of(handed.status.generation, &pods, ready.as_deref(), overdue);
             gateway_api
-                .write_statuses(&api, handed, &addresses, &programmed, &*said)
+                .write_statuses(api, handed, &addresses, &programmed, &**said)
                 .await;
         }
         // An Ingress's only where the control plane is told where the addresses are.
         if let (Some(_), Some((claimed, served)), Some(addresses), true) =
-            (&status, &handed, &addresses, leads)
+            (status, &handed, &addresses, leads)
         {
             let ingresses = followed.ingresses();
             for change in status::changes(claimed, served, &ingresses, addresses) {

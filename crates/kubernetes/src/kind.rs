@@ -2,7 +2,8 @@
 //! EndpointSlices; the control plane's Ingresses, IngressClasses, Services and Secrets, the
 //! Gateway API's kinds and their CRDs ([04 §1](../../../docs/04-control-plane.md)), and the
 //! Lease its replicas elect a leader by ([02 §3](../../../docs/02-architecture.md)); and the
-//! RoleBindings the operator makes ([05 §2](../../../docs/05-operator.md)).
+//! RoleBindings the operator makes ([05 §2](../../../docs/05-operator.md)); and the
+//! DataPlanes a control plane reads its data plane's settings from (05 §3).
 
 use crate::ApiError;
 use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
@@ -15,6 +16,7 @@ use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_gateway_api::udp_route::UDPRoute;
+use edgerush_planes::data_plane::DataPlane;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -158,6 +160,10 @@ impl Kind for ReferenceGrant {
 }
 
 impl Kind for BackendTLSPolicy {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for DataPlane {
     const NAMESPACED: bool = true;
 }
 

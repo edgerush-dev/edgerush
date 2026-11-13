@@ -53,6 +53,7 @@ fn written(objects: &[Object]) -> String {
 fn every_case_makes_its_objects() {
     let write = std::env::var_os("EDGERUSH_WRITE_GOLDEN").is_some();
     let install = Install {
+        cluster_domain: "cluster.local".to_owned(),
         image: "edgerush:golden".to_owned(),
     };
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");

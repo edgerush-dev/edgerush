@@ -134,6 +134,10 @@ spec:
       containers:
       - args:
         - controller
+        - --control-plane
+        - payments
+        - --cluster-domain
+        - cluster.local
         - --listen
         - 0.0.0.0:9443
         - --leader-lease
