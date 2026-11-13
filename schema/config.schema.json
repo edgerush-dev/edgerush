@@ -1182,7 +1182,7 @@
           "minItems": 1
         },
         "cold_share": {
-          "description": "The share of each limit, in percent, a data plane takes on a key before the key's\nowner first answers about it: of its bucket, or under a fixed window of each window,\nwhose start is cold alike. Below the whole, a burst landing on several data planes at\nonce is held to that share on each, rather than the whole limit on each; a client\nwhose traffic all reaches one data plane is refused past it until the owner answers,\nabout a cycle and a round trip, told to come back in a second. Rounded up to one\nrequest at least. 100, the whole, when left out.",
+          "description": "The share of each limit's bucket, in percent, a data plane takes on a key before the\nkey's owner first answers about it. Below the whole, a burst landing on several data\nplanes at once is held to that share on each, rather than a whole bucket on each,\nthough one retried after the owner's first answers can take more; a client whose\ntraffic all reaches one data plane is refused past it until the owner answers, about a\ncycle and a round trip, told to come back in a second. Rounded up to one request at\nleast. 100, the whole, when left out.",
           "type": [
             "integer",
             "null"
