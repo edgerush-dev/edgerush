@@ -4,7 +4,7 @@
 //! nothing through another.
 
 use super::*;
-use crate::service::{FixedState, PodId, Standing};
+use crate::service::{Contract, FixedState, PodId, Standing};
 use std::num::NonZeroU64;
 
 const CYCLE: u64 = 10_000_000;
@@ -76,7 +76,7 @@ const KEY: &[u8] = b"k";
 /// A hit on the key just before cycle `at`, then the cycle: the pods sent entries, and how
 /// many each; the empty batches polling a pod in turn, while the key goes unheard, left out.
 fn cycle(participant: &mut Participant<FixedState, Fixed>, at: u64) -> Vec<(u64, usize)> {
-    let decided = participant.decide_all(&[(KEY, contract())], at * CYCLE - 1);
+    let decided = participant.decide_all(&[(KEY, Limit::Bucket(contract()))], at * CYCLE - 1);
     assert_eq!(decided, Decision::Admit);
     participant.on_cycle(at * CYCLE);
     sent(participant.take_outgoing())
@@ -245,7 +245,7 @@ fn todays_pods_are_sent_nothing_through_another() {
     let owner: PodId = view.owners(KEY).0.unwrap();
     let mut participant = Participant::new(7, CYCLE, view, FixedState::default()).unwrap();
     for at in 1..=20 {
-        let decided = participant.decide_all(&[(KEY, contract())], at * CYCLE - 1);
+        let decided = participant.decide_all(&[(KEY, Limit::Bucket(contract()))], at * CYCLE - 1);
         assert_eq!(decided, Decision::Admit);
         participant.on_cycle(at * CYCLE);
         for (pod, batch) in participant.take_outgoing() {

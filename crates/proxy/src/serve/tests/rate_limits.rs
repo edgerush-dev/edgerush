@@ -672,7 +672,7 @@ async fn admits(
     key: &[u8],
     count: usize,
 ) -> usize {
-    use edgerush_ratelimit::service::Contract;
+    use edgerush_ratelimit::service::{self, Contract};
     use std::num::NonZeroU64;
     let contract = Contract {
         limit: NonZeroU64::new(10).unwrap(),
@@ -686,7 +686,7 @@ async fn admits(
             .send(crate::ratelimit::ToHub::Ask {
                 worker: 0,
                 id: id as u64,
-                keys: vec![(key.into(), contract)],
+                keys: vec![(key.into(), service::Limit::Bucket(contract))],
                 until: u64::MAX,
                 decided,
             })
@@ -1526,7 +1526,7 @@ async fn a_request_gone_keeps_its_place_while_its_ask_is_out() {
 #[tokio::test]
 async fn an_ask_gone_or_out_of_time_when_taken_is_not_asked_of_the_service() {
     use crate::ratelimit::{FromHub, Hub, ToHub, Undecided};
-    use edgerush_ratelimit::service::Contract;
+    use edgerush_ratelimit::service::{self, Contract};
     use std::num::NonZeroU64;
 
     let service = service().await;
@@ -1550,11 +1550,11 @@ async fn an_ask_gone_or_out_of_time_when_taken_is_not_asked_of_the_service() {
         id,
         keys: vec![(
             format!("cold-{id}").into_bytes().into(),
-            Contract {
+            service::Limit::Bucket(Contract {
                 limit: NonZeroU64::new(10).unwrap(),
                 window: NonZeroU64::new(3_600_000_000_000).unwrap(),
                 burst: NonZeroU64::new(10).unwrap(),
-            },
+            }),
         )],
         until,
         decided,
@@ -1616,7 +1616,7 @@ async fn until(done: impl Fn() -> bool) {
 #[tokio::test]
 async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
     use crate::ratelimit::ToHub;
-    use edgerush_ratelimit::service::Contract;
+    use edgerush_ratelimit::service::{self, Contract};
     use std::num::NonZeroU64;
 
     let hold = Arc::new(Mutex::new(None));
@@ -1642,11 +1642,11 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
             id: 0,
             keys: vec![(
                 b"cold".as_slice().into(),
-                Contract {
+                service::Limit::Bucket(Contract {
                     limit: NonZeroU64::new(10).unwrap(),
                     window: NonZeroU64::new(3_600_000_000_000).unwrap(),
                     burst: NonZeroU64::new(10).unwrap(),
-                },
+                }),
             )],
             until: u64::MAX,
             decided,
@@ -1673,7 +1673,7 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
 #[tokio::test]
 async fn a_failed_rate_limiting_thread_tells_once() {
     use crate::ratelimit::{Hub, ToHub};
-    use edgerush_ratelimit::service::Contract;
+    use edgerush_ratelimit::service::{self, Contract};
     use std::num::NonZeroU64;
 
     let pods = service().await;
@@ -1706,7 +1706,10 @@ async fn a_failed_rate_limiting_thread_tells_once() {
             ToHub::Ask {
                 worker: 0,
                 id,
-                keys: vec![(format!("cold-{id}").into_bytes().into(), contract)],
+                keys: vec![(
+                    format!("cold-{id}").into_bytes().into(),
+                    service::Limit::Bucket(contract),
+                )],
                 until: u64::MAX,
                 decided,
             }

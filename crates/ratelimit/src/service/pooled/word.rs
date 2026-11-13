@@ -132,6 +132,50 @@ pub(super) fn advanced(bucket: &Rate, fields: Fields, advance: Advance, now: u64
     }
 }
 
+/// The fixed window `now` is in, for a key whose hash is `hash`, its windows `length` long:
+/// its number, counted from 1, and when it ends. Each key's windows are shifted by an offset
+/// from its hash, below `length`, so that keys' boundaries spread and every data plane sharing
+/// the hash numbers them alike.
+pub(super) fn window_at(hash: u64, length: u64, now: u64) -> (u64, u64) {
+    let length = length.max(1);
+    let offset = hash % length;
+    let number = now.saturating_add(offset) / length + 1;
+    let ends = number.saturating_mul(length).saturating_sub(offset);
+    (number, ends)
+}
+
+/// `fields`, a fixed window's under `limit`, advanced to the cycle of `now` if that is due,
+/// as the bucket's are ([`advanced`]), with no refill within a window: the cycle after a share
+/// keeps what it left; otherwise its share of what the copy has left (`fields.arrival` is the
+/// count), at least one while the copy shows room, none once it shows none (06 §4). Capped
+/// at what the word holds, a rate past any one process's.
+pub(super) fn window_advanced(limit: u64, fields: Fields, advance: Advance, now: u64) -> Fields {
+    let step = step(fields.cycle, advance.record, now, advance.cycle);
+    if step == Step::Same {
+        return fields;
+    }
+    let current = cycle_of(now, advance.cycle);
+    let after_share = advance.others > 0 && fields.shared && step == Step::Next;
+    let left = if fields.set { fields.left } else { 0 };
+    let allowance = if after_share {
+        left
+    } else {
+        let room = limit.saturating_sub(fields.arrival);
+        if room == 0 {
+            0
+        } else {
+            (room / (advance.others + 1)).max(1)
+        }
+    };
+    Fields {
+        left: allowance.min(MOST_LEFT),
+        cycle: current,
+        shared: !after_share,
+        set: true,
+        ..fields
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

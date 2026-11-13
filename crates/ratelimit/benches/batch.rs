@@ -13,7 +13,7 @@
 )]
 
 use edgerush_ratelimit::service::{
-    Answers, Batch, Contract, Entry, PlaneId, Report, ServicePod, View,
+    Answers, Batch, Contract, Entry, Limit, PlaneId, Report, ServicePod, View,
 };
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
@@ -48,7 +48,7 @@ fn batch(from: PlaneId, sequence: u64, keys: impl Iterator<Item = u32>) -> Batch
     let entries = keys
         .map(|k| Entry {
             key: key(k),
-            contract: contract(),
+            limit: Limit::Bucket(contract()),
             report: Report::Hits {
                 sequence,
                 count: 1,
