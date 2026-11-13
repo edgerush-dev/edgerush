@@ -137,7 +137,6 @@ limits:
   - { name: per-client, key: client, model: { bucket: { rate: 10/h, burst: 10 } } }
   - { name: writes, key: client, match: { methods: [POST], path_prefix: /api/orders }, model: { bucket: { rate: 3/h, burst: 3 } } }
   - { name: everything, key: client, model: { bucket: { rate: 20/h, burst: 20 } } }
-  - { name: per-window, key: client, model: { fixed_window: { limit: 5, window: 1h } } }
 ";
 
 /// A data plane of one worker under [`LIMITS`], finding the store's pods at `service` with
@@ -163,9 +162,6 @@ routes:
       - matches: [{{ path: {{ prefix: /api }} }}]
         forward: {{ backends: [{{ upstream: web, weight: 1 }}] }}
         rate_limits: [writes]
-      - matches: [{{ path: {{ prefix: /windowed }} }}]
-        forward: {{ backends: [{{ upstream: web, weight: 1 }}] }}
-        rate_limits: [per-window]
       - matches: [{{ path: {{ prefix: / }} }}]
         forward: {{ backends: [{{ upstream: web, weight: 1 }}] }}
 upstreams:
@@ -533,59 +529,11 @@ async fn a_refusal_says_when_the_request_would_be_admitted() {
     .await;
 }
 
-/// A fixed window of five an hour admits five, and refuses the next until its window ends:
-/// within the hour, each key's windows shifted by its own offset (06 §4).
-#[tokio::test]
-async fn a_fixed_window_admits_its_limit_and_refuses_until_it_ends() {
-    with_proxy(|front| async move {
-        let socket = TcpSocket::new_v4().unwrap();
-        socket.bind(SocketAddr::from(([127, 0, 0, 20], 0))).unwrap();
-        let mut stream = socket.connect(front).await.unwrap();
-        for _ in 0..5 {
-            assert_eq!(answer(&mut stream, "GET", "/windowed").await.0, 200);
-        }
-        let refused = answer(&mut stream, "GET", "/windowed").await;
-        let after = refused.1.expect("a Retry-After");
-        assert!((1..=3_601).contains(&after), "{refused:?}");
-        assert!(refused_by(&refused, "per-window", after), "{refused:?}");
-    })
-    .await;
-}
-
-/// Two data planes share a client's fixed window through the service, as they share a
-/// bucket: once the second has heard from the owner, what the first admitted counts in its
-/// window, and the five an hour are five between them.
-#[tokio::test]
-async fn two_data_planes_share_a_fixed_window_through_the_service() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let service = service().await;
-            let upstream = upstream().await;
-            let first = proxy(upstream, &service, "").await;
-            let second = proxy(upstream, &service, "").await;
-            let client = [127, 0, 0, 21];
-            let one = statuses(first, client, "GET", "/windowed", 3).await;
-            // The first's reports have reached the owner, and it no longer counts as
-            // admitting the key (`ACTIVE_CYCLES`).
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let heard = statuses(second, client, "GET", "/windowed", 1).await;
-            // Its report and the owner's answer, a cycle or two.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let other = statuses(second, client, "GET", "/windowed", 5).await;
-            assert_eq!(one, [200; 3]);
-            assert_eq!(heard, [200]);
-            assert_eq!(other, [200, 429, 429, 429, 429], "one left of five");
-        })
-        .await;
-}
-
 /// With a cold share of 40%, a data plane that has not yet heard from a key's owner admits
-/// 40% of each limit — two of the window's five, four of the bucket's ten — and refuses the
-/// rest with a second's wait, by when the owner will have answered; once it has, the copy is
-/// the owner's, the rest of the limit is admitted, and a refusal waits for the window's end
-/// or the bucket's refill (06 §4). The pods' word is slowed, so that none can arrive while
-/// the first requests are answered.
+/// 40% of its limit — four of the bucket's ten — and refuses the rest with a second's wait,
+/// by when the owner will have answered; once it has, the copy is the owner's, the rest of the
+/// bucket is admitted, and a refusal waits for its refill (06 §4). The pods' word is slowed,
+/// so that none can arrive while the first requests are answered.
 #[tokio::test]
 async fn a_cold_share_holds_a_key_until_its_owner_answers() {
     let local = tokio::task::LocalSet::new();
@@ -596,25 +544,20 @@ async fn a_cold_share_holds_a_key_until_its_owner_answers() {
             let socket = TcpSocket::new_v4().unwrap();
             socket.bind(SocketAddr::from(([127, 0, 0, 22], 0))).unwrap();
             let mut stream = socket.connect(front).await.unwrap();
-            for (path, limit, share, whole) in [
-                ("/windowed", "per-window", 2, 5),
-                ("/by-client", "per-client", 4, 10),
-            ] {
-                for _ in 0..share {
-                    assert_eq!(answer(&mut stream, "GET", path).await.0, 200, "{path}");
-                }
-                let cold = answer(&mut stream, "GET", path).await;
-                assert!(refused_by(&cold, limit, 1), "{path}: {cold:?}");
-                // A report and the owner's answer, both ways through the slow network.
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                for _ in share..whole {
-                    assert_eq!(answer(&mut stream, "GET", path).await.0, 200, "{path}");
-                }
-                let spent = answer(&mut stream, "GET", path).await;
-                let after = spent.1.expect("a Retry-After");
-                assert!(after > 60, "{path}: {spent:?}");
-                assert!(refused_by(&spent, limit, after), "{path}: {spent:?}");
+            for _ in 0..4 {
+                assert_eq!(answer(&mut stream, "GET", "/by-client").await.0, 200);
             }
+            let cold = answer(&mut stream, "GET", "/by-client").await;
+            assert!(refused_by(&cold, "per-client", 1), "{cold:?}");
+            // A report and the owner's answer, both ways through the slow network.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            for _ in 4..10 {
+                assert_eq!(answer(&mut stream, "GET", "/by-client").await.0, 200);
+            }
+            let spent = answer(&mut stream, "GET", "/by-client").await;
+            let after = spent.1.expect("a Retry-After");
+            assert!(after > 60, "{spent:?}");
+            assert!(refused_by(&spent, "per-client", after), "{spent:?}");
         })
         .await;
 }

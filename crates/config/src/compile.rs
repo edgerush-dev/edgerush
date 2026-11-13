@@ -711,9 +711,9 @@ fn rule_limits(
 /// The mode, as a refusal says it, if `rate_limiting` cannot run `model`. Local mode keeps a
 /// key in one word, which holds no rolling window's slots, and `when_unreachable: local`
 /// decides from local mode's keys (06 §3, #204); the synchronous mode's store runs both
-/// windows, and the asynchronous mode the fixed window alone, a minute long or more
-/// ([`window_under_a_minute`]), the rolling window following local mode's. Off runs none,
-/// and refuses none.
+/// windows; the asynchronous mode runs no fixed window, which it cannot hold against a
+/// client bursting on every data plane at each window's start (06 §4), and its rolling
+/// window follows local mode's. Off runs none, and refuses none.
 fn unsupported_in(
     model: &CompiledModel,
     rate_limiting: &CompiledRateLimiting,
@@ -723,10 +723,11 @@ fn unsupported_in(
         | (_, CompiledRateLimiting::Off)
         | (
             CompiledModel::FixedWindow { .. },
-            CompiledRateLimiting::Local { .. }
-            | CompiledRateLimiting::Synchronous(_)
-            | CompiledRateLimiting::Asynchronous(_),
+            CompiledRateLimiting::Local { .. } | CompiledRateLimiting::Synchronous(_),
         ) => None,
+        (CompiledModel::FixedWindow { .. }, CompiledRateLimiting::Asynchronous(_)) => Some(
+            "in the asynchronous mode, which cannot hold a window against bursts: a quota there is a `bucket`, and a window held exactly takes the synchronous mode",
+        ),
         (CompiledModel::RollingWindow { .. }, CompiledRateLimiting::Local { .. }) => {
             Some("in local mode")
         }
@@ -756,22 +757,6 @@ fn bucket_under_two_cycles(limit: &CompiledLimit, cycle: Duration) -> Option<Pro
         rate: rate.clone(),
         cycle_ms: cycle.as_millis(),
         least: needed.div_ceil(window),
-    })
-}
-
-/// The shortest fixed window the asynchronous mode takes (Lucas): a limit per second there is a
-/// bucket. Each data plane decides from a copy a cycle behind the others, and a minute's
-/// window spans enough cycles that their slip stays a small part of its limit (06 §4).
-const SHORTEST_ASYNCHRONOUS_WINDOW: Duration = Duration::from_secs(60);
-
-/// A fixed window under a minute, which the asynchronous mode refuses.
-fn window_under_a_minute(limit: &CompiledLimit) -> Option<Problem> {
-    let CompiledModel::FixedWindow { window } = &limit.model else {
-        return None;
-    };
-    let shortest = SHORTEST_ASYNCHRONOUS_WINDOW.as_nanos();
-    (u128::from(limit.window.get()) < shortest).then(|| Problem::LimitWindowUnderAMinute {
-        window: window.clone(),
     })
 }
 
@@ -1694,11 +1679,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
     }
     if let CompiledRateLimiting::Asynchronous(service) = &rate_limiting {
         for limit in engine.all() {
-            let problems = [
-                bucket_under_two_cycles(&limit, service.cycle),
-                window_under_a_minute(&limit),
-            ];
-            for problem in problems.into_iter().flatten() {
+            if let Some(problem) = bucket_under_two_cycles(&limit, service.cycle) {
                 errors.push(Place::of(Object::Limit(limit.name.clone())).problem(problem));
             }
         }
@@ -3286,14 +3267,6 @@ pub enum Problem {
         cycle_ms: u128,
         /// The smallest burst that holds two cycles of the rate.
         least: u128,
-    },
-    /// A fixed window under a minute in the asynchronous mode.
-    #[error(
-        "`model.fixed_window.window` is {window}: the asynchronous mode takes a fixed window of a minute or more; a limit per second there is a `bucket`"
-    )]
-    LimitWindowUnderAMinute {
-        /// The window as it was written.
-        window: String,
     },
     /// A limit whose match does not compile.
     #[error("`match`, {field}: {message}")]
@@ -7761,8 +7734,8 @@ rate_limiting: {{ mode: local{switch} }}
 
     /// Each mode takes the models it can run, and a limit of another is refused naming it:
     /// local mode keeps no rolling window, nor does `when_unreachable: local`, the
-    /// synchronous mode's store runs both windows, and the asynchronous mode the fixed window
-    /// alone, a minute long or more. Off runs none and refuses none.
+    /// synchronous mode's store runs both windows, and the asynchronous mode neither, however
+    /// long. Off runs none and refuses none.
     #[test]
     fn each_mode_takes_the_models_it_runs() {
         let service = format!(r#"service: {{ addresses: ["rl-0:7000"], key_secret: {SECRET} }}"#);
@@ -7783,6 +7756,7 @@ rate_limiting: {{ mode: local{switch} }}
         let falling_back_locally =
             "with `when_unreachable: local`, which decides as local mode does";
         let not_async = "in the asynchronous mode";
+        let no_async_window = "in the asynchronous mode, which cannot hold a window against bursts: a quota there is a `bucket`, and a window held exactly takes the synchronous mode";
         for (mode, model, expected) in [
             ("", bucket, Ok(())),
             ("", fixed, Ok(())),
@@ -7801,15 +7775,17 @@ rate_limiting: {{ mode: local{switch} }}
                 refused("rolling_window", falling_back_locally),
             ),
             (&asynchronous, bucket, Ok(())),
-            (&asynchronous, fixed, Ok(())),
-            (&asynchronous, rolling, refused("rolling_window", not_async)),
             (
                 &asynchronous,
-                "{ fixed_window: { limit: 10, window: 59s } }",
-                Err(vec![
-                    "limit `k`: `model.fixed_window.window` is 59s: the asynchronous mode takes a fixed window of a minute or more; a limit per second there is a `bucket`".to_owned(),
-                ]),
+                fixed,
+                refused("fixed_window", no_async_window),
             ),
+            (
+                &asynchronous,
+                "{ fixed_window: { limit: 10, window: 1d } }",
+                refused("fixed_window", no_async_window),
+            ),
+            (&asynchronous, rolling, refused("rolling_window", not_async)),
             (
                 &synchronous,
                 "{ fixed_window: { limit: 10, window: 1s } }",
