@@ -40,6 +40,14 @@ rules:
   - apiGroups: [gateway.edgerush.dev]
     resources: [controlplanes/finalizers, dataplanes/finalizers]
     verbs: [update]
+  # What the platform allows them (05 §4), and Namespaces' labels, which its allowances,
+  # and the ControlPlanes' selectors, match.
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [platformdefaults]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch]
   # What it makes in a plane's own namespace, which goes with the plane by its owner
   # reference. Applied: `create` for one not there yet, `patch` for one that is.
   - apiGroups: [""]
@@ -58,10 +66,11 @@ rules:
     resources: [gateways]
     verbs: [get, list, watch, create, patch]
   # What no owner reference reaches, deleted by label: the classes, ClusterRoleBindings,
-  # and RoleBindings in other namespaces.
+  # and RoleBindings in other namespaces. A binding also deleted by name, once what it
+  # grants is no longer asked for or allowed (05 §4).
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [rolebindings, clusterrolebindings]
-    verbs: [get, list, watch, create, patch, deletecollection]
+    verbs: [get, list, watch, create, patch, delete, deletecollection]
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gatewayclasses]
     verbs: [get, list, watch, create, patch, deletecollection]

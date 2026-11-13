@@ -8,23 +8,28 @@
 //! objects made for it has changed since it was last applied whole, so that a hand edit
 //! is undone and an object deleted by hand made again; and at every step while anything of
 //! it is not applied. Its GatewayClass or Gateway is left out while the cluster does not
-//! serve the kind, and made once it does. One being deleted has what no owner reference
-//! reaches deleted by its labels, then its finalizer taken away.
+//! serve the kind, and made once it does. Its bindings it no longer asks for are deleted:
+//! those of namespaces its ControlPlane's selector no longer selects, and, for one whose
+//! ControlPlane is not accepted, every right beyond its own namespace, so that an allowance
+//! narrowed takes back what it granted (05 §4). One being deleted has what no owner
+//! reference reaches deleted by its labels, then its finalizer taken away.
 //!
 //! Nothing is kept from step to step but what saves a write: a new leader applies
 //! everything once, and converges from what the cluster holds.
 
+use crate::allowance::{self, Labels};
 use crate::judge::{Refused, judge};
 use crate::status::{self, Made};
 use crate::{FINALIZER, MANAGER};
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_kubernetes::{ApiError, ApiServer, Kind, Scope};
-use edgerush_planes::control_plane::ControlPlane;
+use edgerush_planes::control_plane::{ControlPlane, ControlPlaneWatchNamespaces};
 use edgerush_planes::data_plane::DataPlane;
 use edgerush_planes::objects::{
     self, Install, Object, control_plane_labels, controller_name, data_plane_labels, proxy_name,
 };
+use edgerush_planes::platform_defaults::PlatformDefaults;
 use k8s_openapi::Resource;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
@@ -90,6 +95,10 @@ pub struct Seen {
     pub control_planes: Vec<ControlPlane>,
     /// Every DataPlane in the cluster.
     pub data_planes: Vec<DataPlane>,
+    /// The `PlatformDefaults`, if there is one.
+    pub platform_defaults: Option<PlatformDefaults>,
+    /// Every Namespace's labels, by its name.
+    pub namespaces: BTreeMap<String, Labels>,
     /// Every object the operator made, of every kind it makes.
     pub children: Vec<Child>,
     /// Which of the Gateway API's kinds it makes the cluster serves.
@@ -149,6 +158,46 @@ struct Plane<'a> {
     objects: Result<Vec<Object>, Made>,
     /// For a DataPlane, its ControlPlane's generation, which its objects follow too.
     depends: Option<i64>,
+    /// The namespaces its ControlPlane's selector selects, which its bindings follow too.
+    selected: BTreeSet<String>,
+    /// The bindings it may keep, each `(kind, namespace, name)`: any other made for it is
+    /// deleted. `None` for one whose rights are not judged here.
+    keep: Option<BTreeSet<Binding>>,
+}
+
+/// A binding, as `(kind, namespace, name)`: empty for a ClusterRoleBinding's namespace.
+type Binding = (&'static str, String, String);
+
+/// The bindings of `objects`.
+fn bindings_of(objects: &[Object]) -> BTreeSet<Binding> {
+    objects
+        .iter()
+        .filter(|object| {
+            matches!(
+                object,
+                Object::RoleBinding(_) | Object::ClusterRoleBinding(_)
+            )
+        })
+        .map(|object| {
+            let metadata = object.metadata();
+            (
+                object.kind(),
+                metadata.namespace.clone().unwrap_or_default(),
+                metadata.name.clone().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// `control_plane` as it would be watching its own namespace alone: what it keeps while it
+/// is not accepted, the rights beyond its namespace taken back.
+fn own_namespace_only(control_plane: &ControlPlane) -> ControlPlane {
+    let mut own = control_plane.clone();
+    own.spec.watch.namespaces = ControlPlaneWatchNamespaces {
+        from: "Same".to_owned(),
+        selector: None,
+    };
+    own
 }
 
 /// What a resource was last applied whole as: when none of it has changed, applying it
@@ -157,6 +206,8 @@ struct Plane<'a> {
 struct Applied {
     generation: Option<i64>,
     depends: Option<i64>,
+    /// The namespaces its ControlPlane's selector selects.
+    selected: BTreeSet<String>,
     /// Which kinds were served, so that an object left out is made once its kind is.
     gateway_api: GatewayApi,
     /// Each of its objects, by kind, namespace and name, at its version.
@@ -182,6 +233,7 @@ impl Applied {
         Self {
             generation: plane.metadata.generation,
             depends: plane.depends,
+            selected: plane.selected.clone(),
             gateway_api: seen.gateway_api,
             children,
         }
@@ -222,8 +274,12 @@ impl Operator {
         now: &Time,
         say: &dyn Fn(&str),
     ) -> bool {
-        let judged = judge(&seen.control_planes, &seen.data_planes);
-        let selected = BTreeSet::new();
+        let judged = judge(
+            &seen.control_planes,
+            &seen.data_planes,
+            seen.platform_defaults.as_ref(),
+            &seen.namespaces,
+        );
         let mut planes = Vec::new();
         for (control_plane, verdict) in &judged.control_planes {
             let name = control_plane.metadata.name.as_deref().unwrap_or_default();
@@ -232,10 +288,24 @@ impl Operator {
                 .namespace
                 .as_deref()
                 .unwrap_or_default();
-            let objects = match verdict {
-                Ok(()) => objects::for_control_plane(control_plane, &selected, &self.install)
-                    .map_err(|error| Made::Refused(error.to_string())),
-                Err(_) => Err(Made::Pending(String::new())),
+            let selected = selected(control_plane, verdict.is_ok(), seen);
+            let (objects, keep) = match verdict {
+                Ok(()) => {
+                    let objects =
+                        objects::for_control_plane(control_plane, &selected, &self.install);
+                    let keep = objects.as_deref().ok().map(bindings_of);
+                    (
+                        objects.map_err(|error| Made::Refused(error.to_string())),
+                        keep,
+                    )
+                }
+                Err(_) => {
+                    let own = own_namespace_only(control_plane);
+                    let keep = objects::for_control_plane(&own, &selected, &self.install)
+                        .ok()
+                        .map(|objects| bindings_of(&objects));
+                    (Err(Made::Pending(String::new())), keep)
+                }
             };
             planes.push(Plane {
                 kind: PlaneKind::ControlPlane,
@@ -246,28 +316,44 @@ impl Operator {
                 accepted: verdict.clone(),
                 objects,
                 depends: None,
+                selected,
+                keep,
             });
         }
         for (data_plane, verdict) in &judged.data_planes {
             let name = data_plane.metadata.name.as_deref().unwrap_or_default();
             let namespace = data_plane.metadata.namespace.as_deref().unwrap_or_default();
             let of = &data_plane.spec.control_plane_ref.name;
-            let objects = match verdict {
+            let (objects, keep, selected) = match verdict {
                 Ok(control_plane) => {
                     let accepted = judged.control_planes.iter().any(|(judged, verdict)| {
                         std::ptr::eq(*judged, *control_plane) && verdict.is_ok()
                     });
+                    let selected = selected(control_plane, accepted, seen);
                     if accepted {
-                        objects::for_data_plane(data_plane, control_plane, &selected, &self.install)
-                            .map_err(|error| Made::Refused(error.to_string()))
+                        let objects = objects::for_data_plane(
+                            data_plane,
+                            control_plane,
+                            &selected,
+                            &self.install,
+                        );
+                        let keep = objects.as_deref().ok().map(bindings_of);
+                        let objects = objects.map_err(|error| Made::Refused(error.to_string()));
+                        (objects, keep, selected)
                     } else {
-                        Err(Made::Pending(format!(
+                        let own = own_namespace_only(control_plane);
+                        let keep =
+                            objects::for_data_plane(data_plane, &own, &selected, &self.install)
+                                .ok()
+                                .map(|objects| bindings_of(&objects));
+                        let pending = Made::Pending(format!(
                             "ControlPlane {of} is not accepted: nothing of this generation is \
                              made until it is."
-                        )))
+                        ));
+                        (Err(pending), keep, selected)
                     }
                 }
-                Err(_) => Err(Made::Pending(String::new())),
+                Err(_) => (Err(Made::Pending(String::new())), None, BTreeSet::new()),
             };
             planes.push(Plane {
                 kind: PlaneKind::DataPlane,
@@ -281,6 +367,8 @@ impl Operator {
                     .as_ref()
                     .ok()
                     .and_then(|control_plane| control_plane.metadata.generation),
+                selected,
+                keep,
             });
         }
         let present: HashSet<String> = planes
@@ -398,6 +486,9 @@ impl Operator {
             }
             Err(made) => made.clone(),
         };
+        if let Some(keep) = &plane.keep {
+            done &= unbind(api, &plane, keep, seen, &what, say).await;
+        }
         let available = seen.children.iter().any(|child| {
             child.kind == Deployment::KIND
                 && child.namespace == namespace
@@ -457,6 +548,57 @@ fn summary(conditions: &[Condition]) -> String {
         })
         .collect();
     each.join("; ")
+}
+
+/// The namespaces `control_plane`'s selector selects while it is `accepted`, by their
+/// labels as `seen`: none while it is not, so that nothing is bound for a scope not allowed.
+fn selected(control_plane: &ControlPlane, accepted: bool, seen: &Seen) -> BTreeSet<String> {
+    if accepted {
+        allowance::selected(&control_plane.spec.watch.namespaces, &seen.namespaces)
+    } else {
+        BTreeSet::new()
+    }
+}
+
+/// The bindings made for `plane`, said as `what`, that are not among those it may `keep`,
+/// deleted: whether they all were. Each is one the operator made, by its labels, so nothing
+/// else of the name is touched.
+async fn unbind(
+    api: &ApiServer,
+    plane: &Plane<'_>,
+    keep: &BTreeSet<Binding>,
+    seen: &Seen,
+    what: &str,
+    say: &dyn Fn(&str),
+) -> bool {
+    let mut done = true;
+    let kept =
+        |child: &Child| keep.contains(&(child.kind, child.namespace.clone(), child.name.clone()));
+    for child in seen.children.iter().filter(|child| {
+        (child.kind == RoleBinding::KIND || child.kind == ClusterRoleBinding::KIND)
+            && carries(&child.labels, &plane.labels)
+            && !kept(child)
+    }) {
+        let deleted = if child.kind == RoleBinding::KIND {
+            api.delete::<RoleBinding>(&child.namespace, &child.name)
+                .await
+        } else {
+            api.delete::<ClusterRoleBinding>("", &child.name).await
+        };
+        let binding = if child.namespace.is_empty() {
+            format!("{} {}", child.kind, child.name)
+        } else {
+            format!("{} {}/{}", child.kind, child.namespace, child.name)
+        };
+        match deleted {
+            Ok(_) => say(&format!("{what}: {binding} deleted, no longer granted")),
+            Err(error) => {
+                say(&format!("{what}: {binding} cannot be deleted: {error}"));
+                done = false;
+            }
+        }
+    }
+    done
 }
 
 /// Whether `labels` carries each of `wanted`.

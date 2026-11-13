@@ -2,15 +2,17 @@
 //! resources turned into running infrastructure, and kept so. It never sees traffic
 //! configuration, and has no part in a plane's day-to-day running.
 //!
-//! [`judge`] says which resources are accepted, by the checks only the cluster can make;
+//! [`judge`] says which resources are accepted, by the checks only the cluster can make,
+//! [`allowance`] among them, what `PlatformDefaults` lets a ControlPlane watch;
 //! [`status`] what their conditions say; [`Operator::step`] applies what each accepted one
 //! asks for, as `edgerush-planes` makes it, and deletes what no owner reference reaches of
-//! one deleted. [`operate`] follows every ControlPlane and DataPlane in the cluster and
-//! every object the operator made, elects a leader among the replicas by a Lease, and has
+//! one deleted. [`operate`] follows every ControlPlane and DataPlane in the cluster, the
+//! `PlatformDefaults`, every Namespace for its labels, and every object the operator made, elects a leader among the replicas by a Lease, and has
 //! the leader step each time any of them changes. GatewayClasses and Gateways it follows,
 //! and makes, only while the cluster serves them: Ingress alone needs no Gateway API CRDs
 //! ([05 §6](../../../docs/05-operator.md)).
 
+pub mod allowance;
 pub mod judge;
 pub mod status;
 mod step;
@@ -25,9 +27,10 @@ use edgerush_kubernetes::{ApiServer, Kind, Listed, Retry, Scope, follow};
 use edgerush_planes::control_plane::ControlPlane;
 use edgerush_planes::data_plane::DataPlane;
 use edgerush_planes::objects::{Install, MANAGED_BY, MANAGED_BY_LABEL};
+use edgerush_planes::platform_defaults::PlatformDefaults;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
-use k8s_openapi::api::core::v1::{Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{Namespace, Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::IngressClass;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
@@ -237,6 +240,15 @@ pub async fn operate(
         followed(&mut tasks, &api, Scope::Cluster, &changed, &say);
     let data_planes: Followed<DataPlane> =
         followed(&mut tasks, &api, Scope::Cluster, &changed, &say);
+    let platform_defaults: Followed<PlatformDefaults> = followed(
+        &mut tasks,
+        &api,
+        Scope::Named(allowance::NAME.to_owned()),
+        &changed,
+        &say,
+    );
+    let namespaces: Followed<Namespace> =
+        followed(&mut tasks, &api, Scope::Cluster, &changed, &say);
     let mut children = Children {
         service_accounts: followed(&mut tasks, &api, made.clone(), &changed, &say),
         role_bindings: followed(&mut tasks, &api, made.clone(), &changed, &say),
@@ -307,9 +319,11 @@ pub async fn operate(
         if !leads {
             continue;
         }
-        let (control_planes_now, data_planes_now) = (
+        let (control_planes_now, data_planes_now, platform_now, namespaces_now) = (
             Arc::clone(&control_planes.borrow()),
             Arc::clone(&data_planes.borrow()),
+            Arc::clone(&platform_defaults.borrow()),
+            Arc::clone(&namespaces.borrow()),
         );
         let (Some(gateway_classes), Some(gateways)) = (
             children.gateway_classes.keep(&api, &made, &changed, &say),
@@ -320,12 +334,28 @@ pub async fn operate(
         let Some(children_now) = children.seen() else {
             continue;
         };
-        if !control_planes_now.listed || !data_planes_now.listed {
+        if !control_planes_now.listed
+            || !data_planes_now.listed
+            || !platform_now.listed
+            || !namespaces_now.listed
+        {
             continue;
         }
         let seen = Seen {
             control_planes: control_planes_now.objects.clone(),
             data_planes: data_planes_now.objects.clone(),
+            platform_defaults: platform_now.objects.first().cloned(),
+            namespaces: namespaces_now
+                .objects
+                .iter()
+                .filter_map(|namespace| {
+                    let metadata = &namespace.metadata;
+                    Some((
+                        metadata.name.clone()?,
+                        metadata.labels.clone().unwrap_or_default(),
+                    ))
+                })
+                .collect(),
             children: children_now,
             gateway_api: GatewayApi {
                 gateway_classes,

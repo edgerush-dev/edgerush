@@ -209,6 +209,36 @@ fn the_operator_reads_the_crds_of_the_two_kinds_it_makes_alone() {
 }
 
 #[test]
+fn the_operator_reads_platform_defaults_and_never_writes_them() {
+    // What the platform allows is the platform's to write (05 §4).
+    let shipped: Vec<OperatorInstall> =
+        serde_saphyr::from_multiple(&read("operator.yaml")).unwrap();
+    let rules: Vec<_> = shipped
+        .iter()
+        .filter_map(|object| match object {
+            OperatorInstall::ClusterRole(role) => role.rules.clone(),
+            OperatorInstall::Role(role) => role.rules.clone(),
+            _ => None,
+        })
+        .flatten()
+        .filter(|rule| {
+            rule.resources
+                .iter()
+                .flatten()
+                .any(|resource| resource.starts_with("platformdefaults"))
+        })
+        .collect();
+    let [read_only] = rules.as_slice() else {
+        panic!("one rule holds PlatformDefaults: {rules:?}");
+    };
+    assert_eq!(
+        read_only.resources.as_deref(),
+        Some(&["platformdefaults".to_owned()][..])
+    );
+    assert_eq!(read_only.verbs, ["get", "list", "watch"]);
+}
+
+#[test]
 fn the_operator_runs_as_the_planes_do_on_the_image_it_gives_them() {
     let shipped: Vec<OperatorInstall> =
         serde_saphyr::from_multiple(&read("operator.yaml")).unwrap();
