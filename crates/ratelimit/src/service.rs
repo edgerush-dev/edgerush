@@ -123,6 +123,56 @@ impl Contract {
     }
 }
 
+/// A limit as the asynchronous mode's owner keeps it: its model, with the numbers that model
+/// takes (06 §3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Limit {
+    /// A token bucket.
+    Bucket(Contract),
+    /// A fixed window: at most `limit` in each window, the windows numbered by the data
+    /// planes' clocks.
+    FixedWindow(FixedWindow),
+}
+
+/// A fixed window's numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FixedWindow {
+    /// Requests a window.
+    pub limit: NonZeroU64,
+    /// The window's length, in nanoseconds.
+    pub length: NonZeroU64,
+}
+
+impl Limit {
+    /// How long its whole room takes to come back, in nanoseconds: a bucket's refill time, a
+    /// window's length.
+    #[must_use]
+    pub fn refill_time(&self) -> u64 {
+        match self {
+            Self::Bucket(contract) => contract.refill_time(),
+            Self::FixedWindow(window) => window.length.get(),
+        }
+    }
+}
+
+/// Where a key stands as its owner holds it, said back to a data plane: what its copy is
+/// rebased on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// A bucket.
+    Bucket {
+        /// How far from full, as `TokenBucket::behind` says.
+        behind: u128,
+    },
+    /// A fixed window: the latest window the owner has counted hits in, and how many.
+    Window {
+        /// The window's number, as the data planes number it; 0 while it has counted none.
+        number: u64,
+        /// The hits counted in it.
+        count: u64,
+    },
+}
+
 /// Which service pods are serving, as they agree on it, and since when: a later epoch
 /// replaces an earlier one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,8 +252,12 @@ pub enum Report {
         seen: u64,
         /// How long before the batch was made ([`Batch::made`]) the earliest of the hits was
         /// admitted: the owner charges them as of the batch's arrival less this, so that a
-        /// hit takes the room it took when admitted, not what has refilled since.
+        /// hit takes the room it took when admitted, not what has refilled since. A bucket's
+        /// alone: 0 for a fixed window.
         age: u64,
+        /// For a fixed window, the window every one of the hits was admitted in, numbered from
+        /// 1 by the data plane's clock: the owner counts them there (06 §4). 0 for a bucket.
+        window: u64,
     },
     /// Nothing to report, but the key is in use: a fresh copy, please.
     Poll,
@@ -460,6 +514,8 @@ impl Unseen {
             count: self.count,
             seen,
             age: made.saturating_sub(self.admitted),
+            // Buckets alone so far (#260 slice 2).
+            window: 0,
         }
     }
 
@@ -1723,6 +1779,8 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 count,
                 seen,
                 age,
+                // This owner keeps buckets alone.
+                window: _,
             } = entry.report
             {
                 changed = true;

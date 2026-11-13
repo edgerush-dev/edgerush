@@ -1195,6 +1195,7 @@ fn others_hits(key: &[u8], c: Contract, count: u64) -> Batch {
                 count,
                 seen: 0,
                 age: 0,
+                window: 0,
             },
         }],
         made: 0,

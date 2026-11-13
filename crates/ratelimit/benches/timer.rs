@@ -66,6 +66,7 @@ fn holding(after: u64) -> (Box<ServicePod>, u64) {
                     count: 1,
                     seen: 0,
                     age: 0,
+                    window: 0,
                 },
             })
             .collect();
