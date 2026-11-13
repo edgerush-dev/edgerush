@@ -7,16 +7,19 @@
 //! asks for, as `edgerush-planes` makes it, and deletes what no owner reference reaches of
 //! one deleted. [`operate`] follows every ControlPlane and DataPlane in the cluster and
 //! every object the operator made, elects a leader among the replicas by a Lease, and has
-//! the leader step each time any of them changes.
+//! the leader step each time any of them changes. GatewayClasses and Gateways it follows,
+//! and makes, only while the cluster serves them: Ingress alone needs no Gateway API CRDs
+//! ([05 §6](../../../docs/05-operator.md)).
 
 pub mod judge;
 pub mod status;
 mod step;
 
-pub use step::{Child, Operator, Seen};
+pub use step::{Child, GatewayApi, Operator, Seen};
 
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
+use edgerush_kubernetes::gateway_api::{GatewayKind, Served};
 use edgerush_kubernetes::lease::{self, elect};
 use edgerush_kubernetes::{ApiServer, Kind, Listed, Retry, Scope, follow};
 use edgerush_planes::control_plane::ControlPlane;
@@ -28,6 +31,7 @@ use k8s_openapi::api::core::v1::{Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::IngressClass;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -95,6 +99,87 @@ fn followed<K: Kind + 'static>(
     listed
 }
 
+/// `followed`'s objects added to `into` as children: whether they are listed whole.
+fn each<K: Kind>(followed: &Followed<K>, into: &mut Vec<Child>) -> bool {
+    let listed = followed.borrow();
+    into.extend(listed.objects.iter().map(Child::of));
+    listed.listed
+}
+
+/// A kind of the Gateway API's the operator makes: its CRD followed by name, and the
+/// objects of it the operator made only while the CRD serves the version read.
+struct WhileServed<K: Kind> {
+    kind: GatewayKind,
+    crd: Followed<CustomResourceDefinition>,
+    /// What was last said of the kind.
+    last: Option<Served>,
+    /// The follow of its objects, and its tasks, aborted when dropped.
+    objects: Option<(Followed<K>, JoinSet<()>)>,
+}
+
+impl<K: Kind + 'static> WhileServed<K> {
+    /// Follows `kind`'s CRD in a task of `tasks`, its objects waiting on what it says.
+    fn start(
+        kind: GatewayKind,
+        tasks: &mut JoinSet<()>,
+        api: &Rc<ApiServer>,
+        changed: &Rc<Notify>,
+        say: &Rc<dyn Fn(&str)>,
+    ) -> Self {
+        let crd = followed(
+            tasks,
+            api,
+            Scope::Named(kind.crd().to_owned()),
+            changed,
+            say,
+        );
+        Self {
+            kind,
+            crd,
+            last: None,
+            objects: None,
+        }
+    }
+
+    /// Whether the kind is served, once its CRD is listed: its objects in `scope` followed
+    /// from when it is, and no longer from when it is not, each change said to `say`.
+    fn keep(
+        &mut self,
+        api: &Rc<ApiServer>,
+        scope: &Scope,
+        changed: &Rc<Notify>,
+        say: &Rc<dyn Fn(&str)>,
+    ) -> Option<bool> {
+        let served = {
+            let listed = self.crd.borrow();
+            if !listed.listed {
+                return None;
+            }
+            Served::of(&listed.objects)
+        };
+        if self.last.as_ref() != Some(&served) {
+            say(&format!("Gateway API's {}: {served}", self.kind.name()));
+            if served.is_served() != self.objects.is_some() {
+                self.objects = served.is_served().then(|| {
+                    let mut tasks = JoinSet::new();
+                    let objects = followed(&mut tasks, api, scope.clone(), changed, say);
+                    (objects, tasks)
+                });
+            }
+            self.last = Some(served);
+        }
+        Some(self.objects.is_some())
+    }
+
+    /// Its objects added to `into` as children, none while it is not served: whether they
+    /// are listed whole.
+    fn seen(&self, into: &mut Vec<Child>) -> bool {
+        self.objects
+            .as_ref()
+            .is_none_or(|(objects, _)| each(objects, into))
+    }
+}
+
 /// Every object of a kind the operator makes, followed.
 struct Children {
     service_accounts: Followed<ServiceAccount>,
@@ -104,19 +189,14 @@ struct Children {
     services: Followed<Service>,
     autoscalers: Followed<HorizontalPodAutoscaler>,
     disruption_budgets: Followed<PodDisruptionBudget>,
-    gateway_classes: Followed<GatewayClass>,
     ingress_classes: Followed<IngressClass>,
-    gateways: Followed<Gateway>,
+    gateway_classes: WhileServed<GatewayClass>,
+    gateways: WhileServed<Gateway>,
 }
 
 impl Children {
     /// Each kind's objects, as listed so far: none until every kind is listed whole.
     fn seen(&self) -> Option<Vec<Child>> {
-        fn each<K: Kind>(followed: &Followed<K>, into: &mut Vec<Child>) -> bool {
-            let listed = followed.borrow();
-            into.extend(listed.objects.iter().map(Child::of));
-            listed.listed
-        }
         let mut children = Vec::new();
         let deployments = self.deployments.borrow();
         children.extend(deployments.objects.iter().map(Child::of_deployment));
@@ -128,9 +208,9 @@ impl Children {
             each(&self.services, &mut children),
             each(&self.autoscalers, &mut children),
             each(&self.disruption_budgets, &mut children),
-            each(&self.gateway_classes, &mut children),
             each(&self.ingress_classes, &mut children),
-            each(&self.gateways, &mut children),
+            self.gateway_classes.seen(&mut children),
+            self.gateways.seen(&mut children),
         ];
         listed.iter().all(|listed| *listed).then_some(children)
     }
@@ -157,7 +237,7 @@ pub async fn operate(
         followed(&mut tasks, &api, Scope::Cluster, &changed, &say);
     let data_planes: Followed<DataPlane> =
         followed(&mut tasks, &api, Scope::Cluster, &changed, &say);
-    let children = Children {
+    let mut children = Children {
         service_accounts: followed(&mut tasks, &api, made.clone(), &changed, &say),
         role_bindings: followed(&mut tasks, &api, made.clone(), &changed, &say),
         cluster_role_bindings: followed(&mut tasks, &api, made.clone(), &changed, &say),
@@ -165,9 +245,15 @@ pub async fn operate(
         services: followed(&mut tasks, &api, made.clone(), &changed, &say),
         autoscalers: followed(&mut tasks, &api, made.clone(), &changed, &say),
         disruption_budgets: followed(&mut tasks, &api, made.clone(), &changed, &say),
-        gateway_classes: followed(&mut tasks, &api, made.clone(), &changed, &say),
         ingress_classes: followed(&mut tasks, &api, made.clone(), &changed, &say),
-        gateways: followed(&mut tasks, &api, made, &changed, &say),
+        gateway_classes: WhileServed::start(
+            GatewayKind::GatewayClass,
+            &mut tasks,
+            &api,
+            &changed,
+            &say,
+        ),
+        gateways: WhileServed::start(GatewayKind::Gateway, &mut tasks, &api, &changed, &say),
     };
     let (leading_out, leading) = watch::channel(false);
     {
@@ -225,6 +311,12 @@ pub async fn operate(
             Arc::clone(&control_planes.borrow()),
             Arc::clone(&data_planes.borrow()),
         );
+        let (Some(gateway_classes), Some(gateways)) = (
+            children.gateway_classes.keep(&api, &made, &changed, &say),
+            children.gateways.keep(&api, &made, &changed, &say),
+        ) else {
+            continue;
+        };
         let Some(children_now) = children.seen() else {
             continue;
         };
@@ -235,6 +327,10 @@ pub async fn operate(
             control_planes: control_planes_now.objects.clone(),
             data_planes: data_planes_now.objects.clone(),
             children: children_now,
+            gateway_api: GatewayApi {
+                gateway_classes,
+                gateways,
+            },
         };
         let now = Time(lease::wall_clock());
         let done = operator.step(&api, &seen, &now, &*say).await;

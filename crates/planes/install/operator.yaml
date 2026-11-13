@@ -68,6 +68,14 @@ rules:
   - apiGroups: [networking.k8s.io]
     resources: [ingressclasses]
     verbs: [get, list, watch, create, patch, deletecollection]
+  # The CRDs of the Gateway API kinds it makes, those alone, read by name: without them it
+  # makes neither, Ingress alone being a valid install (05 §6).
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    resourceNames:
+      - gatewayclasses.gateway.networking.k8s.io
+      - gateways.gateway.networking.k8s.io
+    verbs: [get, list, watch]
   # The four roles it binds, and those alone: binding needs no right it grants.
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [clusterroles]

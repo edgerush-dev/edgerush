@@ -39,7 +39,12 @@ fn control_plane(from: &str) -> ControlPlane {
 
 /// DataPlane `web` of namespace `edge`, of ControlPlane `edge`, serving Ingress.
 fn data_plane() -> DataPlane {
-    serde_json::from_value(serde_json::json!({
+    serde_json::from_value(data_plane_json()).unwrap()
+}
+
+/// [`data_plane`], as JSON.
+fn data_plane_json() -> serde_json::Value {
+    serde_json::json!({
         "apiVersion": "gateway.edgerush.dev/v1alpha1",
         "kind": "DataPlane",
         "metadata": {
@@ -50,9 +55,29 @@ fn data_plane() -> DataPlane {
             "controlPlaneRef": { "name": "edge" },
             "ingress": { "httpPort": 80, "httpsPort": 443 },
         },
-    }))
-    .unwrap()
+    })
 }
+
+/// DataPlane `web` as [`data_plane`], with a Gateway too.
+fn data_plane_with_gateway() -> DataPlane {
+    let mut value = data_plane_json();
+    value["spec"]["gateway"] = serde_json::json!({
+        "listeners": [{ "name": "http", "port": 8080, "protocol": "HTTP" }],
+    });
+    serde_json::from_value(value).unwrap()
+}
+
+/// A cluster with the Gateway API's CRDs.
+const SERVED: GatewayApi = GatewayApi {
+    gateway_classes: true,
+    gateways: true,
+};
+
+/// A cluster without the Gateway API's CRDs.
+const NO_GATEWAY_API: GatewayApi = GatewayApi {
+    gateway_classes: false,
+    gateways: false,
+};
 
 /// The operator's finalizer on a resource, read at version 4.
 fn finalized(metadata: &mut ObjectMeta) {
@@ -220,11 +245,15 @@ fn path_of(object: &Object) -> String {
 
 /// Every object made for the control plane and data plane of these tests.
 fn made() -> (Vec<Object>, Vec<Object>) {
+    made_of(&data_plane())
+}
+
+/// Every object made for the control plane of these tests, and for `data_plane` of it.
+fn made_of(data_plane: &DataPlane) -> (Vec<Object>, Vec<Object>) {
     let selected = BTreeSet::new();
     (
         objects::for_control_plane(&control_plane("Same"), &selected, &install()).unwrap(),
-        objects::for_data_plane(&data_plane(), &control_plane("Same"), &selected, &install())
-            .unwrap(),
+        objects::for_data_plane(data_plane, &control_plane("Same"), &selected, &install()).unwrap(),
     )
 }
 
@@ -253,6 +282,7 @@ async fn an_accepted_resource_is_finalized_then_made_then_reported() {
         control_planes: vec![control_plane("Same")],
         data_planes: vec![data_plane()],
         children: Vec::new(),
+        gateway_api: SERVED,
     };
     let said = Said::default();
     let mut operator = Operator::new(install());
@@ -319,9 +349,25 @@ async fn an_accepted_resource_is_finalized_then_made_then_reported() {
 /// The step after the first, of the resources as the first left them, with every object it
 /// made at version `version`, and the proxy's Deployment with `available` replicas.
 fn after_first(version: &str, available: i32) -> Seen {
-    let (for_control_plane, for_data_plane) = made();
+    after_first_of(data_plane(), SERVED, version, available)
+}
+
+/// [`after_first`] of `data_plane`, in a cluster that serves `gateway_api`, where nothing
+/// of a kind it does not serve was made.
+fn after_first_of(
+    data_plane: DataPlane,
+    gateway_api: GatewayApi,
+    version: &str,
+    available: i32,
+) -> Seen {
+    let (for_control_plane, for_data_plane) = made_of(&data_plane);
     let mut children = children_of(&for_control_plane, version);
     children.extend(children_of(&for_data_plane, version));
+    children.retain(|child| match child.kind {
+        "GatewayClass" => gateway_api.gateway_classes,
+        "Gateway" => gateway_api.gateways,
+        _ => true,
+    });
     for child in &mut children {
         if child.kind == "Deployment" {
             child.available = Some(available);
@@ -329,7 +375,7 @@ fn after_first(version: &str, available: i32) -> Seen {
     }
     let mut cp = control_plane("Same");
     finalized(&mut cp.metadata);
-    let mut dp = data_plane();
+    let mut dp = data_plane;
     finalized(&mut dp.metadata);
     let wanted = |workload: &str| {
         status::conditions(
@@ -352,6 +398,7 @@ fn after_first(version: &str, available: i32) -> Seen {
         control_planes: vec![cp],
         data_planes: vec![dp],
         children,
+        gateway_api,
     }
 }
 
@@ -560,6 +607,7 @@ async fn an_object_of_its_name_not_the_operators_is_left_alone_and_said() {
         control_planes: vec![control_plane("Same")],
         data_planes: vec![data_plane()],
         children: Vec::new(),
+        gateway_api: SERVED,
     };
     assert!(
         !operator.step(&api, &seen, &time(0), &said.say()).await,
@@ -648,6 +696,7 @@ async fn a_refused_control_plane_makes_nothing_and_its_data_plane_waits_on_it() 
         control_planes: vec![control_plane("All")],
         data_planes: vec![data_plane()],
         children: Vec::new(),
+        gateway_api: SERVED,
     };
     assert!(
         operator.step(&api, &seen, &time(0), &said.say()).await,
@@ -924,5 +973,176 @@ async fn finalizers_changed_meanwhile_are_read_again_not_undone() {
             .filter(|write| *write == &format!("PATCH {DATA_PLANE}"))
             .count(),
         1
+    );
+}
+
+/// The message of the `Programmed` condition last written to `path`'s status.
+fn programmed_message(asked: &[Asked], path: &str) -> String {
+    let written = asked
+        .iter()
+        .rev()
+        .find(|asked| asked.method == "PATCH" && asked.path == format!("{path}/status{APPLY}"))
+        .unwrap_or_else(|| panic!("no status written to {path}"));
+    let body: serde_json::Value = serde_json::from_str(&written.body).unwrap();
+    let conditions = body["status"]["conditions"].as_array().unwrap();
+    let programmed = conditions
+        .iter()
+        .find(|condition| condition["type"] == "Programmed")
+        .unwrap();
+    programmed["message"].as_str().unwrap().to_owned()
+}
+
+/// Whether a request is of one of the Gateway API's kinds.
+fn of_gateway_api(asked: &Asked) -> bool {
+    asked.path.starts_with("/apis/gateway.networking.k8s.io/")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_gateway_apis_crds_the_rest_is_made_and_a_gateway_waits_on_them() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let seen = Seen {
+        control_planes: vec![control_plane("Same")],
+        data_planes: vec![data_plane_with_gateway()],
+        children: Vec::new(),
+        gateway_api: NO_GATEWAY_API,
+    };
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    // Not a step left undone, to be tried again: the CRDs' follows say when they are there.
+    assert!(
+        operator.step(&api, &seen, &time(0), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    let of_its_kinds: Vec<_> = asked.iter().filter(|asked| of_gateway_api(asked)).collect();
+    assert!(of_its_kinds.is_empty(), "{of_its_kinds:?}");
+    // Everything else made.
+    let (for_control_plane, for_data_plane) = made_of(&data_plane_with_gateway());
+    let writes = writes(&asked);
+    for object in for_control_plane.iter().chain(&for_data_plane) {
+        if !matches!(object, Object::GatewayClass(_) | Object::Gateway(_)) {
+            let applied = format!("PATCH {}{APPLY}", path_of(object));
+            assert!(writes.contains(&applied), "{applied} not in {writes:?}");
+        }
+    }
+    let pending = conditions_of(&[
+        ("Accepted", "True", "Accepted"),
+        ("Programmed", "False", "Pending"),
+    ]);
+    assert_eq!(status_written(&asked, DATA_PLANE), pending);
+    assert_eq!(
+        programmed_message(&asked, DATA_PLANE),
+        "Gateway edge/web is not made until the cluster serves the Gateway API's Gateways, \
+         their CRD at v1; the rest is made."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_apis_crds_installed_later_have_what_was_left_out_made() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    // Everything but the GatewayClass and the Gateway made, the workloads available.
+    let without = after_first_of(data_plane_with_gateway(), NO_GATEWAY_API, "1", 1);
+    assert!(
+        operator.step(&api, &without, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    // The ControlPlane is programmed without its GatewayClass, its status left as it is;
+    // the DataPlane not, without its Gateway.
+    assert!(
+        !writes(&asked).contains(&format!("PATCH {CONTROL_PLANE}/status{APPLY}")),
+        "{:?}",
+        writes(&asked)
+    );
+    assert_eq!(
+        status_written(&asked, DATA_PLANE),
+        conditions_of(&[
+            ("Accepted", "True", "Accepted"),
+            ("Programmed", "False", "Pending"),
+        ])
+    );
+    // Nothing changed, nothing more is asked: waiting on the CRDs is not retried.
+    let mut waiting = without.clone();
+    waiting.data_planes[0].status = Some(edgerush_planes::data_plane::DataPlaneStatus {
+        conditions: Some(status::conditions(
+            Some(1),
+            Ok(()),
+            &Made::Pending(programmed_message(&asked, DATA_PLANE)),
+            "edgerush-proxy-web",
+            true,
+            &[],
+            &time(10),
+        )),
+    });
+    let before = fake.seen().len();
+    assert!(
+        operator.step(&api, &waiting, &time(20), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    assert_eq!(fake.seen().len(), before, "{:?}", &fake.seen()[before..]);
+    // The CRDs installed, and nothing else changed: the GatewayClass and the Gateway made,
+    // and the DataPlane programmed.
+    let installed = Seen {
+        gateway_api: SERVED,
+        ..waiting
+    };
+    assert!(
+        operator
+            .step(&api, &installed, &time(30), &said.say())
+            .await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen()[before..].to_vec();
+    let made: Vec<_> = writes(&asked)
+        .into_iter()
+        .filter(|write| write.contains("/gateway.networking.k8s.io/"))
+        .collect();
+    let (for_control_plane, for_data_plane) = made_of(&data_plane_with_gateway());
+    let expected: Vec<String> = for_control_plane
+        .iter()
+        .chain(&for_data_plane)
+        .filter(|object| matches!(object, Object::GatewayClass(_) | Object::Gateway(_)))
+        .map(|object| format!("PATCH {}{APPLY}", path_of(object)))
+        .collect();
+    assert_eq!(made, expected);
+    assert_eq!(
+        status_written(&asked, DATA_PLANE),
+        conditions_of(&[
+            ("Accepted", "True", "Accepted"),
+            ("Programmed", "True", "Programmed"),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_plane_deleted_without_gateway_apis_crds_deletes_no_gateway_class() {
+    // A cluster without the CRD answers a delete of GatewayClasses 404.
+    let (fake, api) = cluster(|method, path| {
+        (method == "DELETE" && path.contains("gatewayclasses"))
+            .then(|| answer(404, r#"{"kind":"Status","code":404}"#))
+    })
+    .await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let mut seen = after_first_of(data_plane(), NO_GATEWAY_API, "1", 1);
+    seen.control_planes[0].metadata.deletion_timestamp = Some(time(5));
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    let of_its_kinds: Vec<_> = asked.iter().filter(|asked| of_gateway_api(asked)).collect();
+    assert!(of_its_kinds.is_empty(), "{of_its_kinds:?}");
+    assert!(
+        writes(&asked).contains(&format!("PATCH {CONTROL_PLANE}")),
+        "its finalizer not taken away: {:?}",
+        said.0
     );
 }

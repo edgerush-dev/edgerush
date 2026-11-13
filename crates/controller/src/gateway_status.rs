@@ -9,7 +9,6 @@
 //! place. Pure: the time is passed in.
 
 use crate::acks::{Pod, Pods};
-use crate::gateway_api::{GatewayKind, Served, supported};
 use edgerush_gateway_api::backend_tls_policy::{
     BackendTLSPolicyStatus, BackendTLSPolicyStatusAncestors,
     BackendTLSPolicyStatusAncestorsAncestorRef,
@@ -37,6 +36,7 @@ use edgerush_gateway_api::tls_route::{
 use edgerush_gateway_api::udp_route::{
     UDPRouteStatus, UDPRouteStatusParents, UDPRouteStatusParentsParentRef,
 };
+use edgerush_kubernetes::gateway_api::{GatewayKind, Served, supported};
 use edgerush_translate::{self as translate, GATEWAY_CONTROLLER, Object};
 use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};

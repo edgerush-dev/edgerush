@@ -977,6 +977,7 @@ async fn read_whole(
 }
 
 mod follow;
+pub mod gateway_api;
 mod kind;
 pub mod lease;
 mod watch;

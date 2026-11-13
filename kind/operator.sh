@@ -9,13 +9,17 @@
 # host, put alone in an image of this host's distribution (kind/discovery/Dockerfile),
 # tagged edgerush:dev as install/operator.yaml names it, and loaded into the cluster: Linux
 # only, on Ubuntu 26.04 as the laptop is. The install is applied as a user would: the
-# CRDs, the four roles, the admission policy and the operator; then Gateway API's CRDs, as
-# the GatewayClass and the Gateway the operator makes are of them. A backend Service in
-# `edge` sits behind an Ingress of class `edge.web`, for host shop.example. Then:
+# CRDs, the four roles, the admission policy and the operator, and not Gateway API's CRDs,
+# Ingress alone being a valid install. A backend Service in `edge` sits behind an Ingress
+# of class `edge.web`, for host shop.example. Then:
 #   - ControlPlane `edge` (its webhook off, which waits for its registration) and DataPlane
-#     `web` applied are both accepted and programmed, and the Ingress is served through
-#     the data plane, reached by `kubectl port-forward`, on certificates the control plane
-#     signs: two resources make a working gateway;
+#     `web`, with a Gateway, applied are both accepted, the ControlPlane programmed and the
+#     DataPlane not, waiting on Gateway API's CRDs, and the Ingress is served through the
+#     data plane, reached by `kubectl port-forward`, on certificates the control plane
+#     signs: two resources make a working gateway, of Ingress alone;
+#   - a ControlPlane deleted there, without Gateway API's CRDs, is gone;
+#   - Gateway API's CRDs installed, the operator makes the GatewayClass and the Gateway,
+#     and the DataPlane is programmed, without a restart;
 #   - the data plane's Deployment's image edited by hand is put back, and a label added by
 #     hand is kept;
 #   - a second DataPlane of `edge` is not accepted, and nothing is made for it;
@@ -102,9 +106,6 @@ k apply --server-side -f "$install/gateway.edgerush.dev_controlplanes.yaml" \
     -f "$install/roles.yaml" -f "$install/admission.yaml" >/dev/null
 k wait --for condition=Established --timeout=60s \
     crd/controlplanes.gateway.edgerush.dev crd/dataplanes.gateway.edgerush.dev >/dev/null
-k create -f crates/gateway-api/crds/ >/dev/null
-k wait --for condition=Established --timeout=60s \
-    crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io >/dev/null
 k apply --server-side -f "$install/operator.yaml" >/dev/null
 k -n edgerush-system rollout status deploy/edgerush-operator --timeout=120s >/dev/null ||
     fail "the operator never ran"
@@ -149,7 +150,7 @@ spec:
             backend: { service: { name: shop, port: { name: http } } }
 EOF
 
-echo "== two resources"
+echo "== two resources, without Gateway API's CRDs"
 k apply -f - >/dev/null <<'EOF'
 apiVersion: gateway.edgerush.dev/v1alpha1
 kind: ControlPlane
@@ -162,6 +163,8 @@ kind: DataPlane
 metadata: { name: web, namespace: edge }
 spec:
   controlPlaneRef: { name: edge }
+  gateway:
+    listeners: [{ name: http, port: 8080, protocol: HTTP }]
   ingress: { httpPort: 80, httpsPort: 443 }
 EOF
 condition_is controlplane/edge edge Accepted "True Accepted" 60 ||
@@ -170,9 +173,14 @@ condition_is dataplane/web edge Accepted "True Accepted" 60 ||
     fail "DataPlane web not accepted: $(condition dataplane/web edge Accepted)"
 condition_is controlplane/edge edge Programmed "True Programmed" 180 ||
     fail "ControlPlane edge not programmed: $(condition controlplane/edge edge Programmed)"
-condition_is dataplane/web edge Programmed "True Programmed" 180 ||
-    fail "DataPlane web not programmed: $(condition dataplane/web edge Programmed)"
-pass "a ControlPlane and a DataPlane applied are accepted and programmed"
+condition_is dataplane/web edge Programmed "False Pending" 60 ||
+    fail "DataPlane web, its Gateway's CRD missing: $(condition dataplane/web edge Programmed)"
+k -n edge get dataplane web -o jsonpath='{.status.conditions[?(@.type=="Programmed")].message}' |
+    grep -F "Gateway edge/web is not made until" >/dev/null ||
+    fail "DataPlane web does not say it waits on Gateway API's CRDs"
+k -n edge rollout status deploy/edgerush-proxy-web --timeout=180s >/dev/null ||
+    fail "the data plane never ran"
+pass "without Gateway API's CRDs, the ControlPlane is programmed and the DataPlane says it waits on them"
 
 port=18080
 forward() {
@@ -192,7 +200,39 @@ for _ in $(seq 1 12); do
     fi
 done
 [ -n "$served" ] || fail "the Ingress is not served through the data plane: $(status shop.example)"
-pass "two resources make a working gateway: the Ingress is served through the data plane"
+pass "two resources make a working gateway of Ingress alone: the Ingress is served through the data plane"
+
+k create namespace alone >/dev/null
+k apply -f - >/dev/null <<'EOF'
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: alone, namespace: alone }
+spec:
+  webhook: { enabled: false }
+EOF
+until_true 'made_in alone alone' 60 || fail "nothing was made for ControlPlane alone"
+k -n alone delete controlplane alone --wait=false >/dev/null
+until_true '! k -n alone get controlplane alone' 60 ||
+    fail "ControlPlane alone, deleted without Gateway API's CRDs, is never gone"
+pass "a ControlPlane deleted without Gateway API's CRDs is gone"
+
+echo "== Gateway API's CRDs installed"
+# The operator's pod and its restarts: the same once the CRDs are taken in.
+operator_pod() {
+    k -n edgerush-system get pods -l app.kubernetes.io/component=operator \
+        -o jsonpath='{range .items[*]}{.metadata.name} {.status.containerStatuses[0].restartCount}{" "}{end}'
+}
+before=$(operator_pod)
+k create -f crates/gateway-api/crds/ >/dev/null
+k wait --for condition=Established --timeout=60s \
+    crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io >/dev/null
+until_true 'k get gatewayclass edge && k -n edge get gateway web' 60 ||
+    fail "the GatewayClass and the Gateway are not made once Gateway API's CRDs are installed"
+condition_is dataplane/web edge Programmed "True Programmed" 60 ||
+    fail "DataPlane web not programmed: $(condition dataplane/web edge Programmed)"
+[ "$(operator_pod)" = "$before" ] ||
+    fail "the operator was restarted: before '$before', now '$(operator_pod)'"
+pass "Gateway API's CRDs installed: the GatewayClass and the Gateway made, the DataPlane programmed, no restart"
 
 echo "== kept as stated"
 k -n edge label deploy/edgerush-proxy-web team=shop >/dev/null
