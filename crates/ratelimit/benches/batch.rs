@@ -54,6 +54,7 @@ fn batch(from: PlaneId, sequence: u64, keys: impl Iterator<Item = u32>) -> Batch
                 count: 1,
                 seen: sequence - 1,
                 age: 0,
+                window: 0,
             },
         })
         .collect();

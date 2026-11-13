@@ -39,6 +39,7 @@ fn hits(sequence: u64, count: u64, seen: u64) -> Report {
         count,
         seen,
         age: 0,
+        window: 0,
     }
 }
 

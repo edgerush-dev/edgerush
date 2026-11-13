@@ -6,6 +6,7 @@
 use crate::message::{Answers, Batch, Entry};
 use edgerush_cluster::table::shard_of;
 use edgerush_cluster::{NodeId, Table};
+use edgerush_ratelimit::service::Limit;
 use edgerush_ratelimit::service::pooled::{Replied, Reply, Routing};
 
 /// The table a data plane holds, if a pod has told it one.
@@ -42,7 +43,7 @@ impl Routed {
                 .iter()
                 .map(|answer| Replied {
                     key: answer.key,
-                    behind: answer.answered.behind,
+                    standing: answer.answered.standing,
                     applied: answer.answered.applied,
                     others: answer.answered.others,
                 })
@@ -122,7 +123,8 @@ impl Routing for Routed {
                 .iter()
                 .map(|entry| Entry {
                     key: hash(&entry.key),
-                    contract: entry.contract,
+                    // The participant keeps buckets alone so far (#260 slice 2).
+                    limit: Limit::Bucket(entry.contract),
                     report: entry.report,
                 })
                 .collect(),
@@ -141,7 +143,7 @@ mod tests {
     use crate::message::{Answer, Unserved, Why};
     use crate::owner::Answered;
     use edgerush_cluster::table::first;
-    use edgerush_ratelimit::service::{self, Contract, Report};
+    use edgerush_ratelimit::service::{self, Contract, Report, Standing};
     use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroU64;
 
@@ -298,12 +300,12 @@ mod tests {
                 entries: vec![
                     Entry {
                         key: 200,
-                        contract: contract(),
+                        limit: Limit::Bucket(contract()),
                         report
                     },
                     Entry {
                         key: 300,
-                        contract: contract(),
+                        limit: Limit::Bucket(contract()),
                         report
                     },
                 ],
@@ -322,8 +324,12 @@ mod tests {
     /// left out, the table as the routing; relayed ones as the owner's.
     #[test]
     fn answers_are_replied_as_the_owners_the_unserved_left_out() {
+        let standing = Standing::Window {
+            number: 4,
+            count: 7,
+        };
         let answered = Answered {
-            behind: 7,
+            standing,
             applied: 3,
             others: 2,
         };
@@ -350,7 +356,7 @@ mod tests {
                 made: 13,
                 entries: vec![Replied {
                     key: 5,
-                    behind: 7,
+                    standing,
                     applied: 3,
                     others: 2,
                 }],

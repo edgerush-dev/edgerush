@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 4ce3e32ba30dab6f71e6b2b1981552c3bd2b9649f208717532568103970d2266 # shrinks to value = Value { contract: None, bucket: BucketState { arrival: 18446744073709551616, last: 0 }, counted: 0, planes: Records([]) }
+cc acbd1335909e663eaba69570a62679a3091c4624fece5fc1e69be9932bebf591 # shrinks to batch = Batch { from: 0, stamp: (0, 0), made: 0, entries: [Entry { key: 0, limit: Bucket(Contract { limit: 1, window: 1, burst: 1 }), report: Hits { sequence: 1, count: 0, seen: 0, age: 0, window: 1 } }] }

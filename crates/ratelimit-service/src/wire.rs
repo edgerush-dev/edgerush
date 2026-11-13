@@ -22,6 +22,17 @@ pub struct Contract {
     pub burst: u64,
 }
 
+/// A fixed window's numbers, where a key is kept under one rather than a bucket's contract.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+pub struct FixedWindow {
+    /// Requests a window.
+    #[prost(uint64, tag = "1")]
+    pub limit: u64,
+    /// The window's length, in nanoseconds.
+    #[prost(uint64, tag = "2")]
+    pub length_ns: u64,
+}
+
 /// Hits a data plane admitted.
 #[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
 pub struct Hits {
@@ -39,6 +50,9 @@ pub struct Hits {
     /// nanoseconds; 0, from a data plane that does not say, charges them as they arrive.
     #[prost(uint64, tag = "6")]
     pub age_ns: u64,
+    /// For a fixed window, the window they were admitted in, numbered from 1; 0 for a bucket.
+    #[prost(uint64, tag = "7")]
+    pub window: u64,
 }
 
 /// Nothing to report; a fresh copy, please.
@@ -245,6 +259,9 @@ pub enum Invalid {
     /// A contract with a limit, window or burst of zero.
     #[error("a contract with a limit, window or burst of zero")]
     ZeroContract,
+    /// A key under a bucket's contract and a fixed window at once.
+    #[error("a key under a bucket and a fixed window at once")]
+    TwoLimits,
     /// An entry that reports nothing.
     #[error("an entry that reports nothing")]
     NoReport,
@@ -346,6 +363,36 @@ pub(crate) fn contract(contract: Option<Contract>) -> Result<service::Contract, 
     })
 }
 
+/// A limit as the wire carries it: a bucket's contract, or a fixed window's numbers.
+pub(crate) fn limit_to_wire(limit: service::Limit) -> (Option<Contract>, Option<FixedWindow>) {
+    match limit {
+        service::Limit::Bucket(contract) => (Some(contract.into()), None),
+        service::Limit::FixedWindow(window) => (
+            None,
+            Some(FixedWindow {
+                limit: window.limit.get(),
+                length_ns: window.length.get(),
+            }),
+        ),
+    }
+}
+
+/// The protocol's limit from the wire's: one of a contract and a fixed window, holding no zero.
+pub(crate) fn limit(
+    contract: Option<Contract>,
+    window: Option<FixedWindow>,
+) -> Result<service::Limit, Invalid> {
+    let n = |n| NonZeroU64::new(n).ok_or(Invalid::ZeroContract);
+    match (contract, window) {
+        (Some(_), Some(_)) => Err(Invalid::TwoLimits),
+        (None, Some(window)) => Ok(service::Limit::FixedWindow(service::FixedWindow {
+            limit: n(window.limit)?,
+            length: n(window.length_ns)?,
+        })),
+        (contract, None) => self::contract(contract).map(service::Limit::Bucket),
+    }
+}
+
 /// The protocol's report as the wire carries it.
 pub(crate) const fn report_to_wire(report: service::Report) -> Report {
     match report {
@@ -354,11 +401,13 @@ pub(crate) const fn report_to_wire(report: service::Report) -> Report {
             count,
             seen,
             age,
+            window,
         } => Report::Hits(Hits {
             sequence,
             count,
             seen,
             age_ns: age,
+            window,
         }),
         service::Report::Poll => Report::Poll(Poll {}),
     }
@@ -375,6 +424,7 @@ pub(crate) fn report(report: Option<Report>) -> Result<service::Report, Invalid>
             count: hits.count,
             seen: hits.seen,
             age: hits.age_ns,
+            window: hits.window,
         },
         Report::Poll(_) => service::Report::Poll,
     })
@@ -559,6 +609,7 @@ mod tests {
                         count,
                         seen: seen % sequence,
                         age,
+                        window: 0,
                     }
                 }
             ),
@@ -756,6 +807,7 @@ mod tests {
                     count: u64::MAX,
                     seen: u64::MAX - 1,
                     age: u64::MAX,
+                    window: 0,
                 },
             }],
             made: u64::MAX,
@@ -858,6 +910,7 @@ mod tests {
                     count: 1,
                     seen: 0,
                     age: 0,
+                    window: 0,
                 },
             };
             if !full(&hits, entry.bytes()) {
@@ -952,6 +1005,7 @@ mod tests {
                     count: 1,
                     seen,
                     age_ns: 0,
+                    window: 0,
                 })),
             }],
         };

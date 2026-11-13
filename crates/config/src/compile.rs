@@ -705,8 +705,8 @@ fn rule_limits(
 /// The mode, as a refusal says it, if `rate_limiting` cannot run `model`. Local mode keeps a
 /// key in one word, which holds no rolling window's slots, and `when_unreachable: local`
 /// decides from local mode's keys (06 §3, #204); the synchronous mode's store runs both
-/// windows, and the asynchronous mode's windows are designed later. Off runs none, and refuses
-/// none.
+/// windows, and the asynchronous mode's data plane runs neither yet (06 §4, #260). Off runs
+/// none, and refuses none.
 fn unsupported_in(
     model: &CompiledModel,
     rate_limiting: &CompiledRateLimiting,
@@ -7698,8 +7698,8 @@ rate_limiting: {{ mode: local{switch} }}
 
     /// Each mode takes the models it can run, and a limit of another is refused naming it:
     /// local mode keeps no rolling window, nor does `when_unreachable: local`, the
-    /// synchronous mode's store runs both windows, and the asynchronous mode's are designed
-    /// later. Off runs none and refuses none.
+    /// synchronous mode's store runs both windows, and the asynchronous mode's data plane
+    /// neither yet. Off runs none and refuses none.
     #[test]
     fn each_mode_takes_the_models_it_runs() {
         let service = format!(r#"service: {{ addresses: ["rl-0:7000"], key_secret: {SECRET} }}"#);

@@ -35,7 +35,7 @@ pub use word::fits;
 
 use super::{
     Answers, Batch, CUT_OFF_CYCLES, Contract, Entry as BatchEntry, MOST_UNACKNOWLEDGED, PlaneId,
-    Queued, RESEND_AFTER_CYCLES, Report, Room, Unseen, View, cut_off_from_owner,
+    Queued, RESEND_AFTER_CYCLES, Report, Room, Standing, Unseen, View, cut_off_from_owner,
     encoded_entry_bytes, longest,
 };
 use chunked::MinHeap;
@@ -1776,6 +1776,11 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             if !current {
                 continue;
             }
+            // The participant keeps buckets alone so far (#260 slice 2): a copy is never
+            // rebased on a window's standing.
+            let Standing::Bucket { behind } = answer.standing else {
+                continue;
+            };
             tracked.entry.others.store(answer.others, Ordering::Release);
             let unseen: u64 = tracked
                 .unacknowledged
@@ -1790,7 +1795,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             entry.update(now, |fields| {
                 let extra = unapplied + fields.unreported;
                 Some(Fields {
-                    arrival: entry.terms.bucket.rebased(units, answer.behind, extra),
+                    arrival: entry.terms.bucket.rebased(units, behind, extra),
                     ..fields
                 })
             });

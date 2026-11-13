@@ -11,7 +11,7 @@
 use edgerush_cluster::table::{self, shard_of};
 use edgerush_cluster::{Config, Message, NodeId, Time, ms};
 use edgerush_cluster_asynchronous::{Store, Value, apply};
-use edgerush_ratelimit::service::{Contract, Report};
+use edgerush_ratelimit::service::{Contract, Limit, Report};
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
 
@@ -94,9 +94,10 @@ fn replicas_hold_the_owners_value_and_go_on_from_it() {
             count,
             seen: sequence - 1,
             age: 0,
+            window: 0,
         };
         let applied = pods[owner].update(key, now, |kept, wall| {
-            apply(kept, 100, contract(), report, CYCLE, wall)
+            apply(kept, 100, Limit::Bucket(contract()), report, CYCLE, wall)
         });
         assert_eq!(applied.map(|answer| answer.applied), Some(sequence));
         now += CYCLE;
@@ -133,15 +134,17 @@ fn replicas_hold_the_owners_value_and_go_on_from_it() {
         count: 2,
         seen: 2,
         age: 0,
+        window: 0,
     };
-    let (answer, _) = apply(&mut copy, 100, contract(), again, CYCLE, now);
+    let (answer, _) = apply(&mut copy, 100, Limit::Bucket(contract()), again, CYCLE, now);
     assert_eq!((answer.applied, copy.value.counted()), (3, 9));
     let next = Report::Hits {
         sequence: 4,
         count: 1,
         seen: 3,
         age: 0,
+        window: 0,
     };
-    let (answer, _) = apply(&mut copy, 100, contract(), next, CYCLE, now);
+    let (answer, _) = apply(&mut copy, 100, Limit::Bucket(contract()), next, CYCLE, now);
     assert_eq!((answer.applied, copy.value.counted()), (4, 10));
 }

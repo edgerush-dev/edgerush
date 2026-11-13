@@ -20,7 +20,7 @@ use edgerush_cluster::{
 use edgerush_cluster_asynchronous::{
     Answers, Batch, Entry, Message, Pod, Turned, TurnedAway, Unserved, Value, Why,
 };
-use edgerush_ratelimit::service::{Contract, Report};
+use edgerush_ratelimit::service::{Contract, Limit, Report};
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::pod::{
     ExchangeStream, StoreClient, StorePod, StoreServer, TICK, ask, exchange_stream,
@@ -290,12 +290,13 @@ fn batch(stamp: Stamp, key: u64, sequence: u64, count: u64) -> Batch {
         made: 5,
         entries: vec![Entry {
             key,
-            contract: contract(),
+            limit: Limit::Bucket(contract()),
             report: Report::Hits {
                 sequence,
                 count,
                 seen: sequence - 1,
                 age: 0,
+                window: 0,
             },
         }],
     }

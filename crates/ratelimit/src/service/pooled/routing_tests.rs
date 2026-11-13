@@ -4,7 +4,7 @@
 //! nothing through another.
 
 use super::*;
-use crate::service::{FixedState, PodId};
+use crate::service::{FixedState, PodId, Standing};
 use std::num::NonZeroU64;
 
 const CYCLE: u64 = 10_000_000;
@@ -161,7 +161,7 @@ fn a_relayed_reply_acknowledges_as_the_owners_and_ends_no_wait() {
         via: Some(2),
         entries: vec![Replied {
             key: hash,
-            behind: 0,
+            standing: Standing::Bucket { behind: 0 },
             applied: sent,
             others: 0,
         }],
