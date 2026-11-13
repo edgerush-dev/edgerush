@@ -7,6 +7,7 @@ use boring::ssl::{
     select_next_proto,
 };
 use boring::x509::store::X509StoreBuilder;
+use boring::x509::verify::X509VerifyFlags;
 use boring::x509::{X509, X509VerifyError};
 use edgerush_certificates::{CertificateError, Identity, spiffe_id};
 use edgerush_config::Certificate;
@@ -130,7 +131,10 @@ pub fn webhook_acceptor(certificate: &Certificate) -> Result<SslAcceptor, TlsErr
 }
 
 /// What both ends are set up with: TLS 1.3 alone, their own certificate, and the stream's
-/// authorities, alone: the machine's own store is not consulted.
+/// authorities, alone: the machine's own store is not consulted. Each authority is an
+/// anchor, root or not: a ControlPlane's provided authority is an intermediate of the
+/// platform's root, and only what it signs is trusted, not what the root's other
+/// intermediates do (05 §2).
 fn common(builder: &mut SslContextBuilder, credentials: &Credentials) -> Result<(), TlsError> {
     let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
     presenting(builder, &credentials.certificate)?;
@@ -138,6 +142,7 @@ fn common(builder: &mut SslContextBuilder, credentials: &Credentials) -> Result<
     for authority in authorities(&credentials.authorities)? {
         trusted.add_cert(authority).map_err(setup)?;
     }
+    trusted.set_flags(X509VerifyFlags::PARTIAL_CHAIN);
     builder
         .set_verify_cert_store(trusted.build())
         .map_err(setup)?;
