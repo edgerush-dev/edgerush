@@ -13,7 +13,9 @@ use boring::hash::MessageDigest;
 use boring::nid::Nid;
 use boring::pkey::{PKey, Private};
 use boring::rsa::Rsa;
-use boring::x509::extension::{BasicConstraints, KeyUsage, SubjectAlternativeName};
+use boring::x509::extension::{
+    BasicConstraints, KeyUsage, SubjectAlternativeName, SubjectKeyIdentifier,
+};
 use boring::x509::{X509, X509Builder, X509Name, X509NameBuilder, X509NameRef};
 use edgerush_config::Certificate;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -126,6 +128,11 @@ impl Authority {
         let mut builder = builder(&subject, self.certificate.subject_name(), &key);
         let constraints = BasicConstraints::new().critical().ca().build().unwrap();
         builder.append_extension(&constraints).unwrap();
+        // Its key's identifier, as cert-manager's intermediates carry one.
+        let identifier = SubjectKeyIdentifier::new()
+            .build(&builder.x509v3_context(None, None))
+            .unwrap();
+        builder.append_extension(&identifier).unwrap();
         let usage = KeyUsage::new()
             .critical()
             .key_cert_sign()
