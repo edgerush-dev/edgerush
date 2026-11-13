@@ -33,7 +33,7 @@ mod tests;
 mod window_tests;
 
 pub use routing::{Replied, Reply, Routing};
-pub use word::fits;
+pub use word::{fits, window_at};
 
 use super::{
     Answers, Batch, CUT_OFF_CYCLES, Entry as BatchEntry, Limit, MOST_UNACKNOWLEDGED, PlaneId,

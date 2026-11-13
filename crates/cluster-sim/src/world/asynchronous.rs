@@ -12,9 +12,10 @@ use super::{Event, Mode, Sim, address, store_kind, store_size};
 use edgerush_cluster::Message as StoreMessage;
 use edgerush_cluster::{Config, Node, NodeId, Time, ms};
 use edgerush_cluster_asynchronous::{Answers, Message, Pod, Routed, Value};
-use edgerush_ratelimit::service::pooled::{Decision, Levers, Participant};
-use edgerush_ratelimit::service::{Contract, Keyed, Limit};
+use edgerush_ratelimit::service::pooled::{Decision, Levers, Participant, Routing, window_at};
+use edgerush_ratelimit::service::{Keyed, Limit};
 use std::collections::BTreeMap;
+use std::hash::{BuildHasher, Hasher};
 
 /// The time between a data plane's batches.
 pub const CYCLE: Time = ms(10);
@@ -37,7 +38,7 @@ pub struct Plane {
     /// The keys it takes requests under, in turn.
     keys: Vec<u64>,
     next: usize,
-    contract: Contract,
+    limit: Limit,
     interval: Time,
     /// When each key's requests were admitted, by the world's clock.
     admitted: BTreeMap<u64, Vec<Time>>,
@@ -148,7 +149,7 @@ impl Mode for Asynchronous {
 
 impl Sim<Asynchronous> {
     /// `count` data planes, each taking `rate` requests a second, spread in turn over `keys`
-    /// shared by all, every key held to `contract`; each knowing the latest table, as a data
+    /// shared by all, every key held to `limit`; each knowing the latest table, as a data
     /// plane is told it when its stream to a pod opens.
     ///
     /// # Panics
@@ -158,7 +159,7 @@ impl Sim<Asynchronous> {
         clippy::expect_used,
         reason = "the simulation runs only where the proxy's participant does"
     )]
-    pub fn add_planes(&mut self, count: u64, keys: &[u64], rate: u64, contract: Contract) {
+    pub fn add_planes(&mut self, count: u64, keys: &[u64], rate: u64, limit: Limit) {
         let interval = 1_000_000_000 / rate.max(1);
         let table = self.table().cloned();
         for _ in 0..count {
@@ -175,7 +176,7 @@ impl Sim<Asynchronous> {
                 data,
                 keys: keys.to_vec(),
                 next: usize::try_from(self.rng.below(keys.len() as u64)).unwrap_or(0),
-                contract,
+                limit,
                 interval,
                 admitted: BTreeMap::new(),
                 requests: 0,
@@ -220,6 +221,16 @@ impl Sim<Asynchronous> {
             .unwrap_or_default()
     }
 
+    /// The number of the fixed window `key` is in at `at`, under windows `length` long, as
+    /// every data plane numbers it: by the key's hash under the secret they share.
+    #[must_use]
+    pub fn window_of(&self, key: u64, length: Time, at: Time) -> u64 {
+        // As the participant hashes a key's bytes: written whole, nothing before them.
+        let mut state = Keyed::new(SECRET).build_hasher();
+        state.write(&bytes_of(key));
+        window_at(state.finish(), length, at).0
+    }
+
     /// When each key's requests were admitted, every data plane's together, in order.
     #[must_use]
     pub fn admissions(&self) -> BTreeMap<u64, Vec<Time>> {
@@ -249,10 +260,7 @@ impl Sim<Asynchronous> {
             plane.next += 1;
             plane.requests += 1;
             let bytes = bytes_of(key);
-            match plane
-                .data
-                .decide_all(&[(&bytes, Limit::Bucket(plane.contract))], now)
-            {
+            match plane.data.decide_all(&[(&bytes, plane.limit)], now) {
                 Decision::Admit => plane.admitted.entry(key).or_default().push(now),
                 Decision::Refuse => plane.refused += 1,
             }
@@ -261,12 +269,24 @@ impl Sim<Asynchronous> {
         self.schedule(now + interval, Event::ClientSend(id));
     }
 
-    /// A data plane's cycle: its batches, each to the pod the participant routed it to.
+    /// A data plane's cycle: its batches, each to the pod the participant routed it to. First,
+    /// the latest table committed, if later than the one it holds: what its stream to a seed
+    /// tells it as a pod commits one, the proxy keeping that stream open to the service's
+    /// address whatever its keys are doing, and opening it again on a pod alive should the one
+    /// it reached go. Without it, a data plane whose keys sent nothing through a rollout would
+    /// never hear of the new pods.
     fn on_cycle(&mut self, id: NodeId) {
         let now = self.now;
+        let latest = self.table().cloned();
         let Some(plane) = self.clients.get_mut(&id) else {
             return;
         };
+        if let Some(table) = latest {
+            let told = Routed::new(Some(table));
+            if told.later(plane.data.routing()) {
+                plane.data.on_routing(told, now);
+            }
+        }
         plane.data.on_cycle(now);
         let sends = plane.data.take_outgoing();
         for (to, batch) in sends {
