@@ -136,7 +136,8 @@ pub(super) fn advanced(bucket: &Rate, fields: Fields, advance: Advance, now: u64
 /// its number, counted from 1, and when it ends. Each key's windows are shifted by an offset
 /// from its hash, below `length`, so that keys' boundaries spread and every data plane sharing
 /// the hash numbers them alike.
-pub(super) fn window_at(hash: u64, length: u64, now: u64) -> (u64, u64) {
+#[must_use]
+pub fn window_at(hash: u64, length: u64, now: u64) -> (u64, u64) {
     let length = length.max(1);
     let offset = hash % length;
     let number = now.saturating_add(offset) / length + 1;
