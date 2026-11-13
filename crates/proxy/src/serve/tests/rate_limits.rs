@@ -262,6 +262,7 @@ fn limited(mut config: Config, service: &[String]) -> Config {
             cycle_ms: Some(10),
             poll_quiet_keys: None,
             schedule_keys: None,
+            cold_share: None,
             tls: None,
             key_secret: Some(SECRET.to_owned()),
         }),
@@ -717,6 +718,7 @@ async fn a_data_plane_cut_off_from_an_owner_reaches_it_through_a_replica() {
         max_key_bytes: 1 << 20,
         poll_quiet_keys: false,
         schedule_keys: true,
+        cold_share: 100,
         tls: None,
     };
     let key = b"cut-off".as_slice();
@@ -793,6 +795,7 @@ async fn a_data_plane_hears_the_table_from_the_replica_it_sends_through() {
         max_key_bytes: 1 << 20,
         poll_quiet_keys: false,
         schedule_keys: true,
+        cold_share: 100,
         tls: None,
     };
     let hub = Hub::start(&service, 1, 1 << 20, None, None).unwrap();
@@ -923,9 +926,10 @@ async fn a_changed_service_starts_the_process_afresh() {
     }
     proxy.reload(compile(&bigger).unwrap()).unwrap();
     assert!(Arc::ptr_eq(&first, &hub_of(&proxy)), "only its keys' bytes");
-    let changes: [fn(&mut edgerush_config::RateLimitService); 5] = [
+    let changes: [fn(&mut edgerush_config::RateLimitService); 6] = [
         |service| service.poll_quiet_keys = Some(true),
         |service| service.schedule_keys = Some(false),
+        |service| service.cold_share = Some(80),
         |service| service.cycle_ms = Some(20),
         |service| service.addresses.push("127.0.0.1:2".to_owned()),
         |service| service.key_secret = Some("ffeeddccbbaa99887766554433221100".to_owned()),
@@ -1538,6 +1542,7 @@ async fn an_ask_gone_or_out_of_time_when_taken_is_not_asked_of_the_service() {
         max_key_bytes: 1 << 20,
         poll_quiet_keys: true,
         schedule_keys: false,
+        cold_share: 100,
         tls: None,
     };
     let hub = Hub::start(&compiled, 1, 1 << 20, None, None).unwrap();
@@ -1685,6 +1690,7 @@ async fn a_failed_rate_limiting_thread_tells_once() {
             max_key_bytes: 1 << 20,
             poll_quiet_keys: true,
             schedule_keys: false,
+            cold_share: 100,
             tls: None,
         };
         let (failed, failures) = told_failures();

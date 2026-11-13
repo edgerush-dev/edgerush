@@ -24,6 +24,8 @@ mod sync;
 mod word;
 
 #[cfg(test)]
+mod cold_tests;
+#[cfg(test)]
 mod loom_tests;
 #[cfg(test)]
 mod routing_tests;
@@ -163,6 +165,9 @@ pub struct Registry<S> {
     scan: AtomicBool,
     /// What keys share, by limit: read when an entry is made.
     terms: RwLock<HashMap<Limit, Arc<Terms>>>,
+    /// The cold share, in percent ([`Participant::set_cold_share`]): read when a limit's
+    /// terms are made.
+    cold_share: AtomicU64,
 }
 
 impl<S: BuildHasher + Default> Default for Registry<S> {
@@ -178,6 +183,7 @@ impl<S: BuildHasher> Registry<S> {
             shards: (0..SHARDS).map(|_| RwLock::new(HashSet::new())).collect(),
             scan: AtomicBool::new(false),
             terms: RwLock::new(HashMap::new()),
+            cold_share: AtomicU64::new(WHOLE_SHARE),
         }
     }
 
@@ -276,11 +282,10 @@ impl<S: BuildHasher> Registry<S> {
                 .terms
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Arc::clone(
-                terms
-                    .entry(limit)
-                    .or_insert_with(|| Arc::new(Terms::new(limit, cycle))),
-            )
+            Arc::clone(terms.entry(limit).or_insert_with(|| {
+                let share = self.cold_share.load(Ordering::Relaxed);
+                Arc::new(Terms::new(limit, cycle, share))
+            }))
         })
     }
 
@@ -350,6 +355,10 @@ pub struct Entry {
     /// A signal of it is on its way to the transport: held in a worker's batch, or queued
     /// ([`Self::claim_signal`]).
     signalled: AtomicBool,
+    /// Its owner has answered about its copy, its own window's under a fixed window: until
+    /// then a copy started short of its limit ([`Terms::cold`]) refuses for a cycle, by when
+    /// the owner will have said what is left.
+    answered: AtomicBool,
 }
 
 /// What every key under one limit shares, made once a limit and pointed to by each key's
@@ -364,6 +373,10 @@ struct Terms {
     hold: u64,
     /// The protocol's cycle.
     cycle: u64,
+    /// What a copy starts charged with besides what its owner says, until the owner first
+    /// answers about it: the part of its bucket or window past the cold share. 0 under the
+    /// whole.
+    cold: u64,
 }
 
 /// A limit's arithmetic, by its model.
@@ -414,7 +427,12 @@ impl Terms {
 }
 
 impl Terms {
-    fn new(limit: Limit, cycle: u64) -> Self {
+    /// `limit`'s terms at `cycle`, a cold copy showing `share` percent of it.
+    fn new(limit: Limit, cycle: u64, share: u64) -> Self {
+        let whole = match limit {
+            Limit::Bucket(contract) => contract.burst.get(),
+            Limit::FixedWindow(window) => window.limit.get(),
+        };
         let model = match limit {
             Limit::Bucket(contract) => Model::Bucket {
                 bucket: Rate::new(contract),
@@ -431,8 +449,21 @@ impl Terms {
             model,
             hold: limit.refill_time(),
             cycle,
+            cold: whole - cold_share_of(whole, share),
         }
     }
+}
+
+/// The share of a cold copy, in percent, when none is set: the whole limit.
+pub const WHOLE_SHARE: u64 = 100;
+
+/// `share` percent of `whole`, rounded up, so that a cold copy shows one request at least;
+/// a share outside 1 to 100 taken as the nearest of them.
+fn cold_share_of(whole: u64, share: u64) -> u64 {
+    let share = share.clamp(1, WHOLE_SHARE);
+    let part = u128::from(whole) * u128::from(share);
+    // At most `whole`, the share being at most the whole.
+    u64::try_from(part.div_ceil(u128::from(WHOLE_SHARE))).unwrap_or(whole)
 }
 
 impl std::fmt::Debug for Entry {
@@ -539,7 +570,7 @@ impl Entry {
     fn new(key: Box<[u8]>, contract: super::Contract, cycle: u64, now: u64) -> Self {
         Self::with_terms(
             key,
-            Arc::new(Terms::new(Limit::Bucket(contract), cycle)),
+            Arc::new(Terms::new(Limit::Bucket(contract), cycle, WHOLE_SHARE)),
             now,
             None,
         )
@@ -549,9 +580,17 @@ impl Entry {
     /// when it ends.
     fn with_terms(key: Box<[u8]>, terms: Arc<Terms>, now: u64, window: Option<(u64, u64)>) -> Self {
         let cycle = terms.cycle;
+        // Cold, the copy shows the cold share of the limit alone: the rest charged until the
+        // owner answers, its answer then replacing the copy whole.
         let arrival = match terms.model {
-            Model::Bucket { bucket, .. } => Rate::full(bucket.units(now)),
-            Model::Window { .. } => 0,
+            Model::Bucket { bucket, .. } => {
+                let units = bucket.units(now);
+                match terms.cold {
+                    0 => Rate::full(units),
+                    cold => Rate::charge(Rate::full(units), units, cold),
+                }
+            }
+            Model::Window { .. } => terms.cold,
         };
         let (window, ends) = window.unwrap_or((0, u64::MAX));
         let fields = Fields {
@@ -576,6 +615,7 @@ impl Entry {
             started: AtomicU64::new(now),
             retries: AtomicU64::new(0),
             signalled: AtomicBool::new(false),
+            answered: AtomicBool::new(false),
         }
     }
 
@@ -844,10 +884,21 @@ impl Entry {
 
     /// How long from `now` it waits to admit a request, if it would refuse one: its
     /// bucket's refill to one, or its window's end with the window counted full; or, with
-    /// room but the cycle's allowance spent, the cycle. None once its window is over: the
-    /// next window's entry decides.
+    /// room but the cycle's allowance spent, or a copy started short of its limit that its
+    /// owner has yet to answer about, the cycle. None once its window is over: the next
+    /// window's entry decides.
     #[must_use]
     pub fn wait(&self, now: u64) -> Option<u64> {
+        let wait = self.copys_wait(now)?;
+        if self.terms.cold > 0 && !self.answered.load(Ordering::Acquire) {
+            return Some(self.terms.cycle);
+        }
+        Some(wait)
+    }
+
+    /// How long from `now` its copy waits to admit a request, if it would refuse one, as
+    /// [`Self::wait`] says, whether its owner has answered or not.
+    fn copys_wait(&self, now: u64) -> Option<u64> {
         let full = match self.arith() {
             Ariths::Bucket(arith) => {
                 let fields = arith.advanced(self.snapshot(), self.advance(arith), now);
@@ -1509,6 +1560,17 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
         self.scheduled = on;
     }
 
+    /// The share, in percent, of its limit a key's copy shows until the key's owner first
+    /// answers about it — its bucket, or under a fixed window each window's count — rounded
+    /// up to a request at least; the whole, 100, when not set (06 §4). A request refused
+    /// meanwhile is told to come back in a cycle. Taken as 1 to 100. Set before it holds any
+    /// key: a limit's terms take it when made.
+    pub fn set_cold_share(&mut self, share: u64) {
+        self.registry
+            .cold_share
+            .store(share.clamp(1, WHOLE_SHARE), Ordering::Relaxed);
+    }
+
     /// Keys its workers' decisions signalled ([`Outcome::signal`]): visited at the next
     /// cycle, each claim taken first ([`Entry::claim_signal`]) — the key queued already, or
     /// no longer kept, alike — so that a signal after it is sent anew. A scan leaves claims
@@ -2153,6 +2215,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
                 _ => continue,
             };
             entry.others.store(answer.others, Ordering::Release);
+            let rebases = !matches!(rebase, Rebase::Nothing);
             // The hits the owner has yet to apply.
             let unapplied = tracked.unapplied();
             match rebase {
@@ -2176,6 +2239,10 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
                     });
                 }
                 Rebase::Nothing => {}
+            }
+            // After the copy it rebased: a refusal reading it answered reads the owner's count.
+            if rebases {
+                entry.answered.store(true, Ordering::Release);
             }
             tracked.heard = Heard::at(now);
             queue(tracked, &mut self.runnable);

@@ -194,7 +194,7 @@ fn loom_a_request_racing_a_windows_switch_is_counted_once_or_asks() {
             limit: n(10),
             length: n(60_000 * MS),
         });
-        let terms = Arc::new(Terms::new(limit, CYCLE));
+        let terms = Arc::new(Terms::new(limit, CYCLE, WHOLE_SHARE));
         let old = Arc::new(Entry::with_terms(
             b"w"[..].into(),
             terms,

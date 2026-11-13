@@ -1181,6 +1181,17 @@
           },
           "minItems": 1
         },
+        "cold_share": {
+          "description": "The share of each limit, in percent, a data plane takes on a key before the key's\nowner first answers about it: of its bucket, or under a fixed window of each window,\nwhose start is cold alike. Below the whole, a burst landing on several data planes at\nonce is held to that share on each, rather than the whole limit on each; a client\nwhose traffic all reaches one data plane is refused past it until the owner answers,\nabout a cycle and a round trip, told to come back in a second. Rounded up to one\nrequest at least. 100, the whole, when left out.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "maximum": 100,
+          "minimum": 1
+        },
         "cycle_ms": {
           "description": "Milliseconds between the process's messages to the service; 10 when left out. Every\nlimit's bucket holds at least two cycles of its rate, so a longer cycle asks for\nlarger buckets: at 20 ms, a burst of 40 at `1000/s`.",
           "type": [

@@ -369,6 +369,7 @@ impl Hub {
             && self.service.cycle == service.cycle
             && self.service.poll_quiet_keys == service.poll_quiet_keys
             && self.service.schedule_keys == service.schedule_keys
+            && self.service.cold_share == service.cold_share
     }
 
     /// The clock its times are read by.
@@ -511,6 +512,7 @@ fn run(
         poll_quiet: service.poll_quiet_keys,
     });
     participant.set_scheduled(service.schedule_keys);
+    participant.set_cold_share(service.cold_share);
     if made.send(Ok(participant.registry())).is_err() {
         return;
     }
