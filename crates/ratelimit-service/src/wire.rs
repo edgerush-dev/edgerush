@@ -76,12 +76,15 @@ pub struct Entry {
     /// The key.
     #[prost(bytes = "vec", tag = "1")]
     pub key: Vec<u8>,
-    /// Its contract.
+    /// Its bucket's contract, if it is kept under one.
     #[prost(message, optional, tag = "2")]
     pub contract: Option<Contract>,
     /// What about it.
     #[prost(oneof = "Report", tags = "3, 5")]
     pub report: Option<Report>,
+    /// Its fixed window, if it is kept under one.
+    #[prost(message, optional, tag = "6")]
+    pub fixed_window: Option<FixedWindow>,
 }
 
 /// A data plane's batch.
@@ -442,10 +445,14 @@ impl From<service::Batch> for Batch {
             entries: batch
                 .entries
                 .into_iter()
-                .map(|entry| Entry {
-                    key: entry.key.into_vec(),
-                    contract: Some(entry.contract.into()),
-                    report: Some(report_to_wire(entry.report)),
+                .map(|entry| {
+                    let (contract, fixed_window) = limit_to_wire(entry.limit);
+                    Entry {
+                        key: entry.key.into_vec(),
+                        contract,
+                        report: Some(report_to_wire(entry.report)),
+                        fixed_window,
+                    }
                 })
                 .collect(),
             made_ns: batch.made,
@@ -463,7 +470,7 @@ impl TryFrom<Batch> for service::Batch {
             .map(|entry| {
                 Ok(service::Entry {
                     key: entry.key.into_boxed_slice(),
-                    contract: contract(entry.contract)?,
+                    limit: limit(entry.contract, entry.fixed_window)?,
                     report: report(entry.report)?,
                 })
             })
@@ -625,7 +632,7 @@ mod tests {
         let entry =
             (key(), contract(), report()).prop_map(|(key, contract, report)| service::Entry {
                 key,
-                contract,
+                limit: service::Limit::Bucket(contract),
                 report,
             });
         (
@@ -801,7 +808,7 @@ mod tests {
             from: u64::MAX,
             entries: vec![service::Entry {
                 key,
-                contract,
+                limit: service::Limit::Bucket(contract),
                 report: service::Report::Hits {
                     sequence: u64::MAX,
                     count: u64::MAX,
@@ -904,7 +911,7 @@ mod tests {
         loop {
             let entry = service::Entry {
                 key: key(n),
-                contract,
+                limit: service::Limit::Bucket(contract),
                 report: service::Report::Hits {
                     sequence: 1,
                     count: 1,
@@ -941,6 +948,7 @@ mod tests {
             key: b"k".to_vec(),
             contract,
             report: Some(Report::Poll(Poll {})),
+            fixed_window: None,
         };
         let batch = |entry| Batch {
             from: 1,
@@ -1007,6 +1015,7 @@ mod tests {
                     age_ns: 0,
                     window: 0,
                 })),
+                fixed_window: None,
             }],
         };
         for (sequence, seen) in [(0, 0), (1, 1), (5, 5), (5, 6), (5, u64::MAX)] {

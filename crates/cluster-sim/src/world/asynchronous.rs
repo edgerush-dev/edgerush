@@ -13,7 +13,7 @@ use edgerush_cluster::Message as StoreMessage;
 use edgerush_cluster::{Config, Node, NodeId, Time, ms};
 use edgerush_cluster_asynchronous::{Answers, Message, Pod, Routed, Value};
 use edgerush_ratelimit::service::pooled::{Decision, Levers, Participant};
-use edgerush_ratelimit::service::{Contract, Keyed};
+use edgerush_ratelimit::service::{Contract, Keyed, Limit};
 use std::collections::BTreeMap;
 
 /// The time between a data plane's batches.
@@ -249,7 +249,10 @@ impl Sim<Asynchronous> {
             plane.next += 1;
             plane.requests += 1;
             let bytes = bytes_of(key);
-            match plane.data.decide_all(&[(&bytes, plane.contract)], now) {
+            match plane
+                .data
+                .decide_all(&[(&bytes, Limit::Bucket(plane.contract))], now)
+            {
                 Decision::Admit => plane.admitted.entry(key).or_default().push(now),
                 Decision::Refuse => plane.refused += 1,
             }

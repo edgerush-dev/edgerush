@@ -253,7 +253,7 @@ pub enum Report {
         /// How long before the batch was made ([`Batch::made`]) the earliest of the hits was
         /// admitted: the owner charges them as of the batch's arrival less this, so that a
         /// hit takes the room it took when admitted, not what has refilled since. A bucket's
-        /// alone: 0 for a fixed window.
+        /// alone: the owner reads none under a fixed window.
         age: u64,
         /// For a fixed window, the window every one of the hits was admitted in, numbered from
         /// 1 by the data plane's clock: the owner counts them there (06 §4). 0 for a bucket.
@@ -268,9 +268,9 @@ pub enum Report {
 pub struct Entry {
     /// The key.
     pub key: Box<[u8]>,
-    /// Its contract, as the data plane holds it: the service needs no configuration of its
-    /// own, and a contract changed anywhere starts the key afresh.
-    pub contract: Contract,
+    /// Its limit, as the data plane holds it: the service needs no configuration of its
+    /// own, and a limit changed anywhere starts the key afresh.
+    pub limit: Limit,
     /// What about it.
     pub report: Report,
 }
@@ -503,6 +503,8 @@ struct Unseen {
     /// When it was first sent, and last.
     first: u64,
     last: u64,
+    /// Under a fixed window, the window its hits were admitted in; 0 under a bucket.
+    window: u64,
 }
 
 impl Unseen {
@@ -514,8 +516,7 @@ impl Unseen {
             count: self.count,
             seen,
             age: made.saturating_sub(self.admitted),
-            // Buckets alone so far (#260 slice 2).
-            window: 0,
+            window: self.window,
         }
     }
 
@@ -752,12 +753,14 @@ impl PlaneKey {
             admitted: self.unsent_since,
             first: now,
             last: now,
+            // This data plane keeps buckets alone.
+            window: 0,
         };
         self.unacknowledged.push_back(unseen);
         self.unsent = 0;
         Some(Entry {
             key: key.into(),
-            contract: self.contract,
+            limit: Limit::Bucket(self.contract),
             report: unseen.report(self.seen, now),
         })
     }
@@ -1140,7 +1143,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                     unseen.last = now;
                     entries.push(Entry {
                         key: key.clone(),
-                        contract: at.contract,
+                        limit: Limit::Bucket(at.contract),
                         report: unseen.report(at.seen, now),
                     });
                     reported = true;
@@ -1156,7 +1159,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             if !reported && in_use {
                 entries.push(Entry {
                     key: key.clone(),
-                    contract: at.contract,
+                    limit: Limit::Bucket(at.contract),
                     report: Report::Poll,
                 });
             }
@@ -1266,7 +1269,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 let report = unseen.report(at.seen, queued.made);
                 queued.push_entry(Entry {
                     key: key.clone(),
-                    contract: at.contract,
+                    limit: Limit::Bucket(at.contract),
                     report,
                 });
             }
@@ -1750,16 +1753,19 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         };
         for entry in entries {
             let (owner, _) = self.view.owners(&entry.key);
+            // This pod keeps buckets alone: a window's entry is left unanswered.
+            let Limit::Bucket(contract) = entry.limit else {
+                continue;
+            };
             if owner != Some(self.me) {
                 continue;
             }
-            if !matches!(self.keys.get(&entry.key), Some(owned) if owned.contract == entry.contract)
-            {
+            if !matches!(self.keys.get(&entry.key), Some(owned) if owned.contract == contract) {
                 // Just joined: the key may be on its way, handed over.
                 if now < self.fresh_from {
                     continue;
                 }
-                self.hold(entry.key.clone(), Owned::new(entry.contract, now), now);
+                self.hold(entry.key.clone(), Owned::new(contract, now), now);
             }
             let Some(owned) = self.keys.get_mut(&entry.key) else {
                 continue;

@@ -21,7 +21,9 @@
 )]
 
 use edgerush_ratelimit::service::pooled::{self, Entry, Levers, Outcome, Participant, Registry};
-use edgerush_ratelimit::service::{Contract, DataPlane, Decision, Keyed, ServicePod, View};
+use edgerush_ratelimit::service::{
+    Contract, DataPlane, Decision, FixedWindow, Keyed, Limit, ServicePod, View,
+};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
 use std::num::NonZeroU64;
@@ -118,7 +120,7 @@ fn registry() -> Shared {
     let contract = contract(100);
     let keys = (0..100_000).map(|k| format!("api/0\0key-{k}").into_bytes());
     for key in keys.chain([KEY.to_vec()]) {
-        let _made = registry.find_or_make(&key, contract, 0, 0);
+        let _made = registry.find_or_make(&key, Limit::Bucket(contract), 0, 0);
     }
     registry
 }
@@ -126,14 +128,19 @@ fn registry() -> Shared {
 #[library_benchmark]
 #[bench::found(registry())]
 fn find(registry: Shared) -> (Option<Arc<Entry>>, Shared) {
-    let found = registry.find(black_box(KEY), black_box(contract(100)));
+    let found = registry.find(black_box(KEY), black_box(Limit::Bucket(contract(100))), 0);
     (found, registry)
 }
 
 #[library_benchmark]
 #[bench::made(registry())]
 fn find_or_make(registry: Shared) -> (Made, Shared) {
-    let made = registry.find_or_make(black_box(ROUTE), black_box(contract(100)), 0, MS);
+    let made = registry.find_or_make(
+        black_box(ROUTE),
+        black_box(Limit::Bucket(contract(100))),
+        0,
+        MS,
+    );
     (made, registry)
 }
 
@@ -156,14 +163,16 @@ fn held_key(key: &[u8], burst: u64, admitted: usize) -> Arc<Entry> {
         Participant::new(1, 10 * MS, view, hasher).expect("native 128-bit atomics on Linux");
     participant.set_levers(Levers { poll_quiet: false });
     let contract = contract(burst);
-    participant.decide_all(&[(key, contract)], 0);
+    participant.decide_all(&[(key, Limit::Bucket(contract))], 0);
     participant.on_cycle(10 * MS);
     for (_, batch) in participant.take_outgoing() {
         let answers = pod.on_batch(batch, 10 * MS);
         participant.on_answers(answers, 10 * MS);
     }
     participant.on_cycle(20 * MS);
-    let entry = participant.entries(&[(key, contract)]).remove(0);
+    let entry = participant
+        .entries(&[(key, Limit::Bucket(contract))])
+        .remove(0);
     for _ in 0..admitted {
         let _decided = pooled::decide(&[&entry], 21 * MS);
     }
@@ -175,6 +184,45 @@ fn held_key(key: &[u8], burst: u64, admitted: usize) -> Arc<Entry> {
 #[bench::admitted(held(100, 1))]
 #[bench::refused_empty(held(1, 1))]
 fn worker(entry: Arc<Entry>) -> (Outcome, Arc<Entry>) {
+    let outcome = pooled::decide(&[black_box(&*entry)], black_box(22 * MS));
+    (outcome, entry)
+}
+
+/// A worker's handle to `KEY`'s entry under a fixed window of `limit` a minute, as [`held`]
+/// has a bucket's: the window's first request admitted and reported at 10 ms, the next
+/// cycle visited at 20 ms, and `admitted` requests decided on it since, at 21 ms.
+fn held_window(limit: u64, admitted: usize) -> Arc<Entry> {
+    let view = View {
+        epoch: 1,
+        pods: vec![0],
+    };
+    let hasher = Keyed::new([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
+    let mut participant =
+        Participant::new(1, 10 * MS, view, hasher).expect("native 128-bit atomics on Linux");
+    participant.set_levers(Levers { poll_quiet: false });
+    let n = |n| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
+    let window = Limit::FixedWindow(FixedWindow {
+        limit: n(limit),
+        length: n(60_000 * MS),
+    });
+    participant.decide_all(&[(KEY, window)], 0);
+    participant.on_cycle(10 * MS);
+    let _sent = participant.take_outgoing();
+    participant.on_cycle(20 * MS);
+    let entry = participant.entries(&[(KEY, window)]).remove(0);
+    for _ in 0..admitted {
+        let _decided = pooled::decide(&[&entry], 21 * MS);
+    }
+    entry
+}
+
+// A fixed window's decision, as `worker` a bucket's: the first of a cycle, one admitted, and
+// one refused, its window counted full.
+#[library_benchmark]
+#[bench::first_of_a_cycle(held_window(100, 0))]
+#[bench::admitted(held_window(100, 1))]
+#[bench::refused_full(held_window(1, 0))]
+fn worker_window(entry: Arc<Entry>) -> (Outcome, Arc<Entry>) {
     let outcome = pooled::decide(&[black_box(&*entry)], black_box(22 * MS));
     (outcome, entry)
 }
@@ -204,7 +252,7 @@ fn worker_all(held: Vec<Arc<Entry>>) -> (Outcome, Vec<Arc<Entry>>) {
 
 library_benchmark_group!(name = data_plane; benchmarks = decide, decide_all);
 library_benchmark_group!(name = registry_of_keys; benchmarks = find, find_or_make);
-library_benchmark_group!(name = participant; benchmarks = worker, worker_all);
+library_benchmark_group!(name = participant; benchmarks = worker, worker_all, worker_window);
 main!(
     library_benchmark_groups = data_plane,
     registry_of_keys,
