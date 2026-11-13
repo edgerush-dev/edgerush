@@ -1,8 +1,10 @@
-//! Which of the Gateway API's kinds the cluster serves at the version EdgeRush reads. Once
-//! the data plane names a Gateway, each kind's CRD is followed by its name, and the kind
-//! itself only while its CRD is there and serves `v1`: one an older install lacks, or
-//! serves at another version alone, is taken as having no objects, and said, never waited
-//! on ([04 §1](../../../docs/04-control-plane.md)).
+//! Which of the Gateway API's kinds the cluster serves at the version EdgeRush reads. Each
+//! kind's CRD is followed by its name, and the kind itself only while its CRD is there and
+//! serves `v1`: one an older install lacks, or serves at another version alone, is taken
+//! as having no objects, and said, never waited on. So the control plane follows the kinds
+//! once its data plane names a Gateway ([04 §1](../../../docs/04-control-plane.md)), and
+//! the operator GatewayClasses and Gateways, which Ingress alone does without
+//! ([05 §6](../../../docs/05-operator.md)).
 
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use std::fmt;
@@ -16,7 +18,7 @@ pub const RELEASE: &str = "gateway.networking.k8s.io/bundle-version";
 /// The Gateway API minor releases supported: the latest two (05 §6).
 pub const SUPPORTED: [&str; 2] = ["v1.6", "v1.7"];
 
-/// A Gateway API kind the control plane follows.
+/// A Gateway API kind the control plane follows, or the operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GatewayKind {
     /// `GatewayClass`.
@@ -211,21 +213,28 @@ mod tests {
     use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 
     fn crd(release: Option<&str>, versions: &[(&str, bool)]) -> CustomResourceDefinition {
-        let annotations = release
-            .map(|release| {
-                format!("annotations: {{ gateway.networking.k8s.io/bundle-version: {release} }}")
-            })
-            .unwrap_or_default();
-        let versions: Vec<String> = versions
-            .iter()
-            .map(|(name, served)| format!("{{ name: {name}, served: {served}, storage: false }}"))
+        let annotations: serde_json::Map<_, _> = release
+            .map(|release| (super::RELEASE.to_owned(), release.into()))
+            .into_iter()
             .collect();
-        serde_saphyr::from_str(&format!(
-            "metadata: {{ name: referencegrants.gateway.networking.k8s.io, {annotations} }}\n\
-             spec: {{ group: gateway.networking.k8s.io, scope: Namespaced, \
-             names: {{ kind: ReferenceGrant, plural: referencegrants }}, versions: [{}] }}",
-            versions.join(", ")
-        ))
+        let versions: Vec<_> = versions
+            .iter()
+            .map(|(name, served)| {
+                serde_json::json!({ "name": name, "served": served, "storage": false })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "metadata": {
+                "name": "referencegrants.gateway.networking.k8s.io",
+                "annotations": annotations,
+            },
+            "spec": {
+                "group": "gateway.networking.k8s.io",
+                "scope": "Namespaced",
+                "names": { "kind": "ReferenceGrant", "plural": "referencegrants" },
+                "versions": versions,
+            },
+        }))
         .unwrap()
     }
 

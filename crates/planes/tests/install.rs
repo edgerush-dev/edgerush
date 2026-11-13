@@ -172,6 +172,43 @@ fn the_operator_binds_the_four_roles_alone_and_reads_no_secret() {
 }
 
 #[test]
+fn the_operator_reads_the_crds_of_the_two_kinds_it_makes_alone() {
+    let shipped: Vec<OperatorInstall> =
+        serde_saphyr::from_multiple(&read("operator.yaml")).unwrap();
+    let crds: Vec<_> = shipped
+        .iter()
+        .filter_map(|object| match object {
+            OperatorInstall::ClusterRole(role) => role.rules.clone(),
+            _ => None,
+        })
+        .flatten()
+        .filter(|rule| {
+            rule.resources
+                .iter()
+                .flatten()
+                .any(|resource| resource == "customresourcedefinitions")
+        })
+        .collect();
+    let [crds] = crds.as_slice() else {
+        panic!("one rule reads CRDs: {crds:?}");
+    };
+    assert_eq!(
+        crds.resources.as_deref(),
+        Some(&["customresourcedefinitions".to_owned()][..])
+    );
+    assert_eq!(crds.verbs, ["get", "list", "watch"]);
+    assert_eq!(
+        crds.resource_names.as_deref(),
+        Some(
+            &[
+                "gatewayclasses.gateway.networking.k8s.io".to_owned(),
+                "gateways.gateway.networking.k8s.io".to_owned(),
+            ][..]
+        )
+    );
+}
+
+#[test]
 fn the_operator_runs_as_the_planes_do_on_the_image_it_gives_them() {
     let shipped: Vec<OperatorInstall> =
         serde_saphyr::from_multiple(&read("operator.yaml")).unwrap();

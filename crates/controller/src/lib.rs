@@ -3,7 +3,7 @@
 //! for the data plane once every kind has been listed whole, and each config that compiles
 //! and differs from the last handed on. Where the data plane is a Gateway, the Gateway
 //! API's kinds are followed too, each while its CRD serves the version read
-//! ([`gateway_api`]).
+//! ([`gateway_api`](edgerush_kubernetes::gateway_api)).
 //!
 //! The changes of a moment make one translation: it waits until no change has come for
 //! [`Debounce::quiet`], and never more than [`Debounce::most`] after the first it waits on
@@ -53,12 +53,11 @@ pub mod acks;
 pub mod admission;
 pub mod data_plane;
 pub mod expiry;
-pub mod gateway_api;
 mod gateway_status;
 pub mod issuing;
 pub mod status;
 
-use gateway_api::{GatewayKind, Served};
+use edgerush_kubernetes::gateway_api::{GatewayKind, Served};
 use status::Addresses;
 
 /// How long the data plane's pods are waited on to run a generation of its Gateway before

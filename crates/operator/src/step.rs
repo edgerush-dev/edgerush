@@ -7,8 +7,9 @@
 //! A resource is applied again when it, its ControlPlane for a DataPlane, or one of the
 //! objects made for it has changed since it was last applied whole, so that a hand edit
 //! is undone and an object deleted by hand made again; and at every step while anything of
-//! it is not applied. One being deleted has what no owner reference reaches deleted by its
-//! labels, then its finalizer taken away.
+//! it is not applied. Its GatewayClass or Gateway is left out while the cluster does not
+//! serve the kind, and made once it does. One being deleted has what no owner reference
+//! reaches deleted by its labels, then its finalizer taken away.
 //!
 //! Nothing is kept from step to step but what saves a write: a new leader applies
 //! everything once, and converges from what the cluster holds.
@@ -83,7 +84,7 @@ impl Child {
 }
 
 /// What the follows have seen.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Seen {
     /// Every ControlPlane in the cluster.
     pub control_planes: Vec<ControlPlane>,
@@ -91,6 +92,31 @@ pub struct Seen {
     pub data_planes: Vec<DataPlane>,
     /// Every object the operator made, of every kind it makes.
     pub children: Vec<Child>,
+    /// Which of the Gateway API's kinds it makes the cluster serves.
+    pub gateway_api: GatewayApi,
+}
+
+/// Which of the Gateway API's kinds the operator makes the cluster serves, its CRD there
+/// and serving `v1`: a cluster without them is a valid install, of Ingress alone
+/// ([05 §6](../../../docs/05-operator.md)). An object of a kind not served is not made, and
+/// is made once it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayApi {
+    /// GatewayClasses, which ControlPlanes make.
+    pub gateway_classes: bool,
+    /// Gateways, which DataPlanes with a `gateway` make.
+    pub gateways: bool,
+}
+
+impl GatewayApi {
+    /// Whether `object` is of a kind served, or of none of the Gateway API's.
+    fn serves(self, object: &Object) -> bool {
+        match object {
+            Object::GatewayClass(_) => self.gateway_classes,
+            Object::Gateway(_) => self.gateways,
+            _ => true,
+        }
+    }
 }
 
 /// The kinds of resource the operator makes objects for.
@@ -131,6 +157,8 @@ struct Plane<'a> {
 struct Applied {
     generation: Option<i64>,
     depends: Option<i64>,
+    /// Which kinds were served, so that an object left out is made once its kind is.
+    gateway_api: GatewayApi,
     /// Each of its objects, by kind, namespace and name, at its version.
     children: Vec<(&'static str, String, String, String)>,
 }
@@ -154,6 +182,7 @@ impl Applied {
         Self {
             generation: plane.metadata.generation,
             depends: plane.depends,
+            gateway_api: seen.gateway_api,
             children,
         }
     }
@@ -322,11 +351,15 @@ impl Operator {
                     say(&format!("{what}: its finalizer cannot be added: {error}"));
                     return false;
                 }
+                // An object of a kind the cluster does not serve is made once it does.
+                let (objects, left_out): (Vec<&Object>, Vec<&Object>) = objects
+                    .iter()
+                    .partition(|object| seen.gateway_api.serves(object));
                 let applied = Applied::of(&plane, seen);
-                if self.applied.get(uid) == Some(&applied) {
+                let made = if self.applied.get(uid) == Some(&applied) {
                     Made::Applied
                 } else {
-                    let made = apply_all(api, objects, &plane.labels, uid).await;
+                    let made = apply_all(api, &objects, &plane.labels, uid).await;
                     match &made {
                         Made::Applied => {
                             self.applied.insert(uid.to_owned(), applied);
@@ -346,6 +379,21 @@ impl Operator {
                         }
                     }
                     made
+                };
+                // Without its Gateway, a DataPlane is not programmed, though the rest is
+                // made: not a step left undone, as the CRD's follow says when it is there.
+                // A ControlPlane is programmed without its GatewayClass, as Ingress alone
+                // has none.
+                match left_out
+                    .iter()
+                    .find(|object| matches!(object, Object::Gateway(_)))
+                {
+                    Some(gateway) if made == Made::Applied => Made::Pending(format!(
+                        "{} is not made until the cluster serves the Gateway API's Gateways, \
+                         their CRD at v1; the rest is made.",
+                        described(gateway)
+                    )),
+                    _ => made,
                 }
             }
             Err(made) => made.clone(),
@@ -445,12 +493,12 @@ fn described(object: &Object) -> String {
 /// Every one of `objects` applied, those that are not the operator's left alone.
 async fn apply_all(
     api: &ApiServer,
-    objects: &[Object],
+    objects: &[&Object],
     labels: &BTreeMap<String, String>,
     uid: &str,
 ) -> Made {
     let mut not_ours = Vec::new();
-    for object in objects {
+    for &object in objects {
         let applied = match object {
             Object::ServiceAccount(_) => apply::<ServiceAccount>(api, object, labels, uid).await,
             Object::RoleBinding(_) => apply::<RoleBinding>(api, object, labels, uid).await,
@@ -554,7 +602,9 @@ async fn unfinalize(
 }
 
 /// What no owner reference reaches deleted by its labels: the resource's cluster-scoped
-/// objects, and its RoleBindings in namespaces other than its own.
+/// objects, and its RoleBindings in namespaces other than its own. GatewayClasses only
+/// where the cluster serves them: without their CRD there are none, and a delete of them
+/// would fail.
 async fn clean(
     api: &ApiServer,
     plane: &Plane<'_>,
@@ -565,8 +615,10 @@ async fn clean(
         .await?;
     match plane.kind {
         PlaneKind::ControlPlane => {
-            api.delete_all::<GatewayClass>(&Scope::Cluster, &plane.labels)
-                .await?;
+            if seen.gateway_api.gateway_classes {
+                api.delete_all::<GatewayClass>(&Scope::Cluster, &plane.labels)
+                    .await?;
+            }
         }
         PlaneKind::DataPlane => {
             api.delete_all::<IngressClass>(&Scope::Cluster, &plane.labels)
