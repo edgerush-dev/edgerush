@@ -1,5 +1,6 @@
 //! Leader election by a Kubernetes Lease ([02 §3](../../../docs/02-architecture.md)): every
-//! replica serves, and the one that holds the Lease writes status.
+//! replica runs, and the one that holds the Lease alone writes, the control plane's status,
+//! the operator what it makes ([05 §2](../../../docs/05-operator.md)).
 //!
 //! The election itself is pure: told what the Lease says and what time it is, it says what to
 //! write, and whether this replica leads. As client-go's elector does, it never compares
@@ -7,7 +8,7 @@
 //! a Lease it sees no change in for [`Timing::duration`], by its own monotonic clock, is
 //! taken as abandoned. [`elect`] runs it against the API server.
 
-use edgerush_kubernetes::{ApiError, ApiServer};
+use crate::{ApiError, ApiServer};
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta};
 use k8s_openapi::jiff::Timestamp;
@@ -150,7 +151,8 @@ impl Election {
 }
 
 /// The wall clock's time, as a Lease holds one; the epoch for a clock before it.
-pub(crate) fn wall_clock() -> Timestamp {
+#[must_use]
+pub fn wall_clock() -> Timestamp {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .ok()

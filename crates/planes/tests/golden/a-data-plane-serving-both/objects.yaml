@@ -7,6 +7,7 @@ metadata:
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
     gateway.edgerush.dev/data-plane: shared
+    gateway.edgerush.dev/namespace: edge-system
   name: edgerush-proxy-shared
   namespace: edge-system
   ownerReferences:
@@ -26,6 +27,7 @@ metadata:
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
     gateway.edgerush.dev/data-plane: shared
+    gateway.edgerush.dev/namespace: edge-system
   name: edgerush-proxy-edge.shared
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -45,6 +47,7 @@ metadata:
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
     gateway.edgerush.dev/data-plane: shared
+    gateway.edgerush.dev/namespace: edge-system
   name: edgerush-proxy-shared
   namespace: edge-system
   ownerReferences:
@@ -63,6 +66,7 @@ spec:
       app.kubernetes.io/name: edgerush
       gateway.edgerush.dev/control-plane: edge
       gateway.edgerush.dev/data-plane: shared
+      gateway.edgerush.dev/namespace: edge-system
   strategy:
     rollingUpdate:
       maxSurge: 1
@@ -76,6 +80,7 @@ spec:
         app.kubernetes.io/name: edgerush
         gateway.edgerush.dev/control-plane: edge
         gateway.edgerush.dev/data-plane: shared
+        gateway.edgerush.dev/namespace: edge-system
     spec:
       containers:
       - args:
@@ -130,6 +135,7 @@ spec:
             app.kubernetes.io/name: edgerush
             gateway.edgerush.dev/control-plane: edge
             gateway.edgerush.dev/data-plane: shared
+            gateway.edgerush.dev/namespace: edge-system
         maxSkew: 1
         topologyKey: topology.kubernetes.io/zone
         whenUnsatisfiable: ScheduleAnyway
@@ -147,6 +153,7 @@ metadata:
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
     gateway.edgerush.dev/data-plane: shared
+    gateway.edgerush.dev/namespace: edge-system
   name: edgerush-proxy-shared
   namespace: edge-system
   ownerReferences:
@@ -165,6 +172,7 @@ spec:
       app.kubernetes.io/name: edgerush
       gateway.edgerush.dev/control-plane: edge
       gateway.edgerush.dev/data-plane: shared
+      gateway.edgerush.dev/namespace: edge-system
 ---
 apiVersion: networking.k8s.io/v1
 kind: IngressClass
@@ -175,6 +183,7 @@ metadata:
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
     gateway.edgerush.dev/data-plane: shared
+    gateway.edgerush.dev/namespace: edge-system
   name: edge.shared
 spec:
   controller: edgerush.dev/ingress-controller
@@ -188,6 +197,7 @@ metadata:
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
     gateway.edgerush.dev/data-plane: shared
+    gateway.edgerush.dev/namespace: edge-system
   name: shared
   namespace: edge-system
   ownerReferences:

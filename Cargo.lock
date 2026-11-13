@@ -273,6 +273,8 @@ dependencies = [
  "edgerush-explain",
  "edgerush-gateway-api",
  "edgerush-kubernetes",
+ "edgerush-operator",
+ "edgerush-planes",
  "edgerush-proxy",
  "edgerush-translate",
  "http",
@@ -484,6 +486,18 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-boring",
+]
+
+[[package]]
+name = "edgerush-operator"
+version = "0.0.0"
+dependencies = [
+ "edgerush-gateway-api",
+ "edgerush-kubernetes",
+ "edgerush-planes",
+ "k8s-openapi",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

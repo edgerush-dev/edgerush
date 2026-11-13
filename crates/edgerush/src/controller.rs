@@ -20,9 +20,9 @@ use edgerush_controller::admission::{self, Asked};
 use edgerush_controller::data_plane::{self, follow_data_planes};
 use edgerush_controller::expiry::Expiry;
 use edgerush_controller::issuing::{self, Issuer};
-use edgerush_controller::lease::{self, elect};
 use edgerush_controller::status::{Addresses, address};
 use edgerush_controller::{Acks, Debounce, Reports, Said, control};
+use edgerush_kubernetes::lease::{self, elect};
 use edgerush_kubernetes::{ApiError, ApiServer, Listed, Retry, SERVICE_ACCOUNT, Scope, follow};
 use edgerush_translate::{Plane, Translation};
 use http::StatusCode;
@@ -390,7 +390,7 @@ async fn webhook_certificate(files: &CertificateFiles) -> Result<Certificate, St
 }
 
 /// Why a control plane cannot run here.
-fn outside(error: &ApiError) -> String {
+pub(crate) fn outside(error: &ApiError) -> String {
     format!("the API server cannot be reached as a pod reaches it: {error}")
 }
 
@@ -449,7 +449,7 @@ fn own_namespace() -> Result<Scope, String> {
 }
 
 /// The name of the pod's own namespace, as its service account says it.
-fn own_namespace_name() -> Result<String, String> {
+pub(crate) fn own_namespace_name() -> Result<String, String> {
     let path = Path::new(SERVICE_ACCOUNT).join("namespace");
     let written = std::fs::read_to_string(&path)
         .map_err(|error| format!("the pod's namespace, {}: {error}", path.display()))?;
@@ -809,7 +809,7 @@ struct Elector {
 
 /// This replica, as a Lease names its holder: its pod's name, which the environment gives
 /// as its host name, and when it started, so that a pod started again is another.
-fn identity() -> String {
+pub(crate) fn identity() -> String {
     let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "edgerush".to_owned());
     format!("{host}_{}", started_at())
 }
@@ -1583,7 +1583,7 @@ fn written(translation: &Translation, path: &Path) -> io::Result<()> {
 
 /// Done when the process is told to stop: Ctrl-C, or on Unix SIGTERM, which is how
 /// Kubernetes asks.
-async fn told_to_stop() -> io::Result<()> {
+pub(crate) async fn told_to_stop() -> io::Result<()> {
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = pin!(tokio::signal::ctrl_c());

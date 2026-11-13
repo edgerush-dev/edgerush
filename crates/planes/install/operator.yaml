@@ -1,0 +1,147 @@
+# The operator itself (docs/05): applied after the CRDs, roles.yaml and admission.yaml.
+#
+# Its rights are what it writes and nothing it grants: the objects it makes for each
+# ControlPlane and DataPlane, read before each is applied and followed by its label; `bind`
+# on the four shipped ClusterRoles by name, the only rights it grants, and no role made;
+# `deletecollection` on the kinds no owner reference reaches, deleted by label; and no
+# Secrets, routes or Ingresses (05 §2).
+#
+# Until images are published (docs/12 item 6), the image is built and loaded by hand, as
+# the kind runs do: its name is in two places below, the container's and --image, which
+# the planes run.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edgerush-system
+  labels: { app.kubernetes.io/part-of: edgerush }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: edgerush-operator
+  namespace: edgerush-system
+  labels: { app.kubernetes.io/part-of: edgerush }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edgerush-operator
+  labels: { app.kubernetes.io/part-of: edgerush }
+rules:
+  # The resources it makes objects for. `patch`: its finalizer, applied; `update` on
+  # finalizers: an owner reference that blocks its owner's deletion, where the cluster
+  # checks that (OwnerReferencesPermissionEnforcement).
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [controlplanes, dataplanes]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [controlplanes/status, dataplanes/status]
+    verbs: [patch]
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [controlplanes/finalizers, dataplanes/finalizers]
+    verbs: [update]
+  # What it makes in a plane's own namespace, which goes with the plane by its owner
+  # reference. Applied: `create` for one not there yet, `patch` for one that is.
+  - apiGroups: [""]
+    resources: [serviceaccounts, services]
+    verbs: [get, list, watch, create, patch]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, patch]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch, create, patch]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch, create, patch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gateways]
+    verbs: [get, list, watch, create, patch]
+  # What no owner reference reaches, deleted by label: the classes, ClusterRoleBindings,
+  # and RoleBindings in other namespaces.
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [rolebindings, clusterrolebindings]
+    verbs: [get, list, watch, create, patch, deletecollection]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gatewayclasses]
+    verbs: [get, list, watch, create, patch, deletecollection]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingressclasses]
+    verbs: [get, list, watch, create, patch, deletecollection]
+  # The four roles it binds, and those alone: binding needs no right it grants.
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    verbs: [bind]
+    resourceNames:
+      - edgerush-control-plane
+      - edgerush-control-plane-cluster
+      - edgerush-control-plane-own
+      - edgerush-data-plane
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: edgerush-operator
+  labels: { app.kubernetes.io/part-of: edgerush }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edgerush-operator
+subjects:
+  - { kind: ServiceAccount, name: edgerush-operator, namespace: edgerush-system }
+---
+# The Lease its replicas elect a leader by, in its own namespace alone.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: edgerush-operator
+  namespace: edgerush-system
+  labels: { app.kubernetes.io/part-of: edgerush }
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: edgerush-operator
+  namespace: edgerush-system
+  labels: { app.kubernetes.io/part-of: edgerush }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: edgerush-operator
+subjects:
+  - { kind: ServiceAccount, name: edgerush-operator, namespace: edgerush-system }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edgerush-operator
+  namespace: edgerush-system
+  labels: { app.kubernetes.io/name: edgerush, app.kubernetes.io/component: operator }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: edgerush, app.kubernetes.io/component: operator }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: edgerush, app.kubernetes.io/component: operator }
+    spec:
+      serviceAccountName: edgerush-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: operator
+          image: edgerush:dev
+          args: [operator, --image, "edgerush:dev", --cluster-domain, cluster.local]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }

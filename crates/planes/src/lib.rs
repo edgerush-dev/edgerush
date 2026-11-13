@@ -1,9 +1,10 @@
 //! EdgeRush's own kinds, `ControlPlane` and `DataPlane`, `gateway.edgerush.dev/v1alpha1`
 //! ([05 §1](../../../docs/05-operator.md)), and what the install ships beside them.
 //!
-//! `install/` holds what is applied before the operator starts: the two CRDs; the four
-//! ClusterRoles, the only rights the operator ever grants, by `bind` (05 §2); and the
-//! admission policy that refuses `externalIPs` on a Service a control plane writes. The
+//! `install/` holds what is applied as the operator is installed: the two CRDs; the four
+//! ClusterRoles, the only rights the operator ever grants, by `bind` (05 §2); the
+//! admission policy that refuses `externalIPs` on a Service a control plane writes; and
+//! the operator itself, its rights and its Deployment. The
 //! CRDs are written by hand, and the types here are written from them by `edgerush-crdgen`,
 //! as Gateway API's are ([02 §7](../../../docs/02-architecture.md)); the DataPlane's
 //! `spec.gateway` holds the Gateway's own fields, copied from Gateway API's CRD. The

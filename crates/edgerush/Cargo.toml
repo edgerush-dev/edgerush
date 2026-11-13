@@ -22,6 +22,9 @@ edgerush-control-service.workspace = true
 edgerush-control-stream.workspace = true
 edgerush-controller.workspace = true
 edgerush-explain.workspace = true
+# `edgerush operator`, and the objects it makes, whose install settings it is given.
+edgerush-operator.workspace = true
+edgerush-planes.workspace = true
 # The cluster's API server, found as a pod finds it, which discovered upstreams are
 # followed through.
 edgerush-kubernetes.workspace = true

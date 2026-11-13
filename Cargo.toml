@@ -45,6 +45,7 @@ edgerush-dns = { path = "crates/dns" }
 edgerush-kubernetes = { path = "crates/kubernetes" }
 edgerush-explain = { path = "crates/explain" }
 edgerush-gateway-api = { path = "crates/gateway-api" }
+edgerush-operator = { path = "crates/operator" }
 edgerush-filters = { path = "crates/filters" }
 edgerush-planes = { path = "crates/planes" }
 edgerush-proxy = { path = "crates/proxy" }

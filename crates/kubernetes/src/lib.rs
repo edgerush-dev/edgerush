@@ -8,7 +8,8 @@
 //! What the operator makes it keeps by server-side apply with force, under a field manager
 //! of its own, and deletes by name or by label ([05 §2](../../../docs/05-operator.md)):
 //! [`ApiServer::apply`], [`ApiServer::apply_status`], [`ApiServer::delete`] and
-//! [`ApiServer::delete_all`]. Others write what they own with a field manager of their own
+//! [`ApiServer::delete_all`]; and takes its finalizer off a resource by
+//! [`ApiServer::patch`], as of the version read. Others write what they own with a field manager of their own
 //! beside it, as the control plane does its authority's bundle in a ControlPlane's status.
 //!
 //! In a cluster it is [`ApiServer::in_cluster`]: the API server the pod's environment names,
@@ -141,8 +142,9 @@ pub enum ApiError {
     /// An answer that is not what was asked for.
     #[error("an answer that cannot be read: {0}")]
     Unreadable(String),
-    /// A delete by label of no label, which would delete every object of a kind there.
-    #[error("a delete by label that names no label")]
+    /// Objects asked for by label, of no label, which would be every object of a kind
+    /// there.
+    #[error("objects asked for by label, of no label")]
     NoLabels,
 }
 
@@ -300,6 +302,7 @@ impl ApiServer {
     ) -> Result<List<K>, ApiError> {
         let mut path = format!("{}?limit={}", kind::collection::<K>(scope)?, K::PAGE);
         fields_into::<K>(scope, &mut path);
+        labels_into(scope, &mut path);
         if let Some(token) = continue_from {
             path.push_str("&continue=");
             encode_into(&mut path, token);
@@ -324,6 +327,7 @@ impl ApiServer {
             kind::collection::<K>(scope)?
         );
         fields_into::<K>(scope, &mut path);
+        labels_into(scope, &mut path);
         path.push_str("&resourceVersion=");
         encode_into(&mut path, from);
         let body = self.get(&path, Instant::now() + self.timing.answer).await?;
@@ -333,6 +337,26 @@ impl ApiServer {
             quiet: self.timing.quiet,
             kind: PhantomData,
         })
+    }
+
+    /// Merges `patch`, JSON, into `K`'s object `name` in `namespace`, as `kubectl patch
+    /// --type merge` does (RFC 7386): a field it states takes the place of the one there, a
+    /// list whole, and one it leaves out is left as it is. A `metadata.resourceVersion` it
+    /// states makes it wait on that version: what a list is written whole by, such as a
+    /// resource's finalizers, whoever set each.
+    ///
+    /// # Errors
+    ///
+    /// An [`ApiError`]: [`ApiError::is_conflict`] when the object has changed since the
+    /// version stated, [`ApiError::is_not_found`] for an object gone.
+    pub async fn patch<K: Kind>(
+        &self,
+        namespace: &str,
+        name: &str,
+        patch: &serde_json::Value,
+    ) -> Result<(), ApiError> {
+        let path = object_path::<K>(namespace, name)?;
+        self.merge(&path, patch).await
     }
 
     /// Merges `patch`, JSON, into the status of `K`'s object `name` in `namespace`, as
@@ -352,12 +376,17 @@ impl ApiServer {
     ) -> Result<(), ApiError> {
         let mut path = object_path::<K>(namespace, name)?;
         path.push_str("/status");
+        self.merge(&path, patch).await
+    }
+
+    /// Merges `patch` into what `path` names.
+    async fn merge(&self, path: &str, patch: &serde_json::Value) -> Result<(), ApiError> {
         let body = serde_json::to_vec(patch).map_err(|error| ApiError::Http(error.to_string()))?;
         let deadline = Instant::now() + self.timing.answer;
         let merge = ("application/merge-patch+json", Bytes::from(body));
         // What it answers, the object as it now is, is not needed.
         let _object = self
-            .send(Method::PATCH, &path, Some(merge), deadline)
+            .send(Method::PATCH, path, Some(merge), deadline)
             .await?;
         Ok(())
     }
@@ -552,16 +581,17 @@ impl ApiServer {
         if labels.is_empty() {
             return Err(ApiError::NoLabels);
         }
-        if K::NAMESPACED && *scope == Scope::Cluster {
+        if K::NAMESPACED && matches!(scope, Scope::Cluster | Scope::Labelled(_)) {
             return Err(ApiError::Namespaced(K::KIND));
         }
         let mut path = kind::collection::<K>(scope)?;
-        let selector: Vec<String> = labels
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect();
         path.push_str("?labelSelector=");
-        encode_into(&mut path, &selector.join(","));
+        let mut selector = kind::selector(labels);
+        if let Scope::Labelled(more) = scope {
+            selector.push(',');
+            selector.push_str(more);
+        }
+        encode_into(&mut path, &selector);
         fields_into::<K>(scope, &mut path);
         path.push('&');
         path.push_str(BACKGROUND);
@@ -901,6 +931,14 @@ fn fields_into<K: Kind>(scope: &Scope, query: &mut String) {
     }
 }
 
+/// The label selector of a labelled `scope`, written into a query.
+fn labels_into(scope: &Scope, query: &mut String) {
+    if let Scope::Labelled(selector) = scope {
+        query.push_str("&labelSelector=");
+        encode_into(query, selector);
+    }
+}
+
 /// `value` written into a query, every byte but RFC 3986's unreserved percent-encoded:
 /// versions and list tokens are opaque.
 fn encode_into(query: &mut String, value: &str) {
@@ -940,6 +978,7 @@ async fn read_whole(
 
 mod follow;
 mod kind;
+pub mod lease;
 mod watch;
 
 pub use follow::{Failure, Listed, Retry, follow};
