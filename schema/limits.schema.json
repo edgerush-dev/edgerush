@@ -140,7 +140,7 @@
           ]
         },
         {
-          "description": "At most `limit` requests in each `window`, the count starting again as each ends:\na whole window's worth may come at once, and two windows' worth across a boundary.\nEach key's windows are shifted by an offset of its own, so that keys' boundaries\nspread. In local mode only, for now.",
+          "description": "At most `limit` requests in each `window`, the count starting again as each ends:\na whole window's worth may come at once, and two windows' worth across a boundary.\nEach key's windows are shifted by an offset of its own, so that keys' boundaries\nspread. In the asynchronous mode a minute long or more: a limit per second there is a\nbucket.",
           "type": "object",
           "properties": {
             "fixed_window": {
