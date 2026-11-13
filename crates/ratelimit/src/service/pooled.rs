@@ -1750,6 +1750,11 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             return;
         };
         let old = std::mem::replace(&mut tracked.entry, Arc::clone(&next));
+        // A visit queued, or a key left out of its piece, holds a handle to the old entry,
+        // which a cycle skips as no longer the key's: marked so still, the key would never be
+        // queued again, its hits never reported. Queued anew below.
+        tracked.queued = false;
+        tracked.left_out = false;
         close(&old);
         let (count, started) = old.drain(now);
         tracked.unsent_more(count, started);

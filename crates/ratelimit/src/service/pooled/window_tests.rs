@@ -368,3 +368,30 @@ fn only_the_answers_windows_hits_are_counted_on_top_of_it() {
         "10 and its own 3"
     );
 }
+
+/// Visiting only the keys that need it, a key whose report is still out as its window ends is
+/// visited again in its next window's entry: what that window admits is reported, and the
+/// report still out is sent again. A key left marked as queued under its old entry would be
+/// visited never again, its hits never reported (the cluster simulator, packets lost).
+#[test]
+fn a_key_queued_as_its_window_ends_is_visited_in_the_next() {
+    let limit = window(100);
+    let mut participant = participant();
+    participant.set_scheduled(true);
+    assert_eq!(requests(&mut participant, limit, 2, MS), 2);
+    let old = entry(&participant);
+    participant.on_cycle(CYCLE);
+    assert_eq!(sent(&mut participant), [(1, 2, old.window)]);
+    // Unanswered, the key stays queued for the cycle after; the window ends meanwhile.
+    assert_eq!(requests(&mut participant, limit, 3, old.ends), 3);
+    let next = entry(&participant).window;
+    participant.on_cycle(old.ends + CYCLE);
+    let reports = sent(&mut participant);
+    assert!(reports.contains(&(2, 3, next)), "{reports:?}");
+    participant.on_cycle(old.ends + 5 * CYCLE);
+    let reports = sent(&mut participant);
+    assert!(
+        reports.contains(&(1, 2, old.window)),
+        "sent again: {reports:?}"
+    );
+}
