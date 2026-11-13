@@ -48,9 +48,7 @@ pub(super) fn runs_rate_limits(config: &Compiled, supported: bool) -> Result<(),
     };
     let cycle = u64::try_from(service.cycle.as_nanos()).unwrap_or(u64::MAX);
     for limit in config.limits() {
-        // A bucket's alone: a fixed window's allowance a cycle is capped at what an entry
-        // holds, past any one process's rate (06 §4), and a rolling window is refused in this
-        // mode as the config is compiled.
+        // A window is refused in this mode as the config is compiled.
         let Some(contract) = <edgerush_ratelimit::service::Contract as crate::ratelimit::Held>::of(
             limit,
             limit.count,
