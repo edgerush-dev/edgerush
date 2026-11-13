@@ -137,6 +137,7 @@ limits:
   - { name: per-client, key: client, model: { bucket: { rate: 10/h, burst: 10 } } }
   - { name: writes, key: client, match: { methods: [POST], path_prefix: /api/orders }, model: { bucket: { rate: 3/h, burst: 3 } } }
   - { name: everything, key: client, model: { bucket: { rate: 20/h, burst: 20 } } }
+  - { name: per-window, key: client, model: { fixed_window: { limit: 5, window: 1h } } }
 ";
 
 /// A data plane of one worker under [`LIMITS`], finding the store's pods at `service` with
@@ -162,6 +163,9 @@ routes:
       - matches: [{{ path: {{ prefix: /api }} }}]
         forward: {{ backends: [{{ upstream: web, weight: 1 }}] }}
         rate_limits: [writes]
+      - matches: [{{ path: {{ prefix: /windowed }} }}]
+        forward: {{ backends: [{{ upstream: web, weight: 1 }}] }}
+        rate_limits: [per-window]
       - matches: [{{ path: {{ prefix: / }} }}]
         forward: {{ backends: [{{ upstream: web, weight: 1 }}] }}
 upstreams:
@@ -527,4 +531,51 @@ async fn a_refusal_says_when_the_request_would_be_admitted() {
         assert!(refused_by(&refused, "everything", 180), "{refused:?}");
     })
     .await;
+}
+
+/// A fixed window of five an hour admits five, and refuses the next until its window ends:
+/// within the hour, each key's windows shifted by its own offset (06 §4).
+#[tokio::test]
+async fn a_fixed_window_admits_its_limit_and_refuses_until_it_ends() {
+    with_proxy(|front| async move {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::from(([127, 0, 0, 20], 0))).unwrap();
+        let mut stream = socket.connect(front).await.unwrap();
+        for _ in 0..5 {
+            assert_eq!(answer(&mut stream, "GET", "/windowed").await.0, 200);
+        }
+        let refused = answer(&mut stream, "GET", "/windowed").await;
+        let after = refused.1.expect("a Retry-After");
+        assert!((1..=3_601).contains(&after), "{refused:?}");
+        assert!(refused_by(&refused, "per-window", after), "{refused:?}");
+    })
+    .await;
+}
+
+/// Two data planes share a client's fixed window through the service, as they share a
+/// bucket: once the second has heard from the owner, what the first admitted counts in its
+/// window, and the five an hour are five between them.
+#[tokio::test]
+async fn two_data_planes_share_a_fixed_window_through_the_service() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let service = service().await;
+            let upstream = upstream().await;
+            let first = proxy(upstream, &service, "").await;
+            let second = proxy(upstream, &service, "").await;
+            let client = [127, 0, 0, 21];
+            let one = statuses(first, client, "GET", "/windowed", 3).await;
+            // The first's reports have reached the owner, and it no longer counts as
+            // admitting the key (`ACTIVE_CYCLES`).
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let heard = statuses(second, client, "GET", "/windowed", 1).await;
+            // Its report and the owner's answer, a cycle or two.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let other = statuses(second, client, "GET", "/windowed", 5).await;
+            assert_eq!(one, [200; 3]);
+            assert_eq!(heard, [200]);
+            assert_eq!(other, [200, 429, 429, 429, 429], "one left of five");
+        })
+        .await;
 }

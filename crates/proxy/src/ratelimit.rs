@@ -40,7 +40,7 @@ use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 /// How long the process waits for a pod's answer to an exchange before taking it as failed
@@ -450,8 +450,8 @@ pub(crate) struct Limiter {
     /// kept so that no request makes them afresh; and their contracts.
     keys: RefCell<Vec<Vec<u8>>>,
     contracts: RefCell<Vec<service::Limit>>,
-    /// The clock: its process's.
-    start: Instant,
+    /// The clock: its process's ([`hub::Clock`]).
+    clock: hub::Clock,
     /// Wakes its task to stop.
     stopping: Notify,
     stopped: Cell<bool>,
@@ -469,7 +469,7 @@ impl Limiter {
         });
         let entropy = RandomState::new();
         let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
-        let start = hub.epoch();
+        let clock = hub.clock();
         let limiter = Rc::new(Self {
             service: service.clone(),
             hub,
@@ -486,7 +486,7 @@ impl Limiter {
             most_signalled: Cell::new(MOST_SIGNALLED),
             keys: RefCell::new(Vec::new()),
             contracts: RefCell::new(Vec::new()),
-            start,
+            clock,
             stopping: Notify::new(),
             stopped: Cell::new(false),
         });
@@ -518,7 +518,7 @@ impl Limiter {
     }
 
     fn now(&self) -> u64 {
-        u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        self.clock.now()
     }
 
     /// When a request the limiter meets at `now` must be decided by: in the process's clock,
@@ -526,7 +526,7 @@ impl Limiter {
     fn deadline(&self, now: u64) -> (u64, tokio::time::Instant) {
         let wait = self.wait.get();
         let at = now.saturating_add(u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX));
-        let until = self.start + Duration::from_nanos(at);
+        let until = self.clock.instant(at);
         (at, tokio::time::Instant::from_std(until))
     }
 

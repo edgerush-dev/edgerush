@@ -92,7 +92,8 @@ pub enum Model {
     /// At most `limit` requests in each `window`, the count starting again as each ends:
     /// a whole window's worth may come at once, and two windows' worth across a boundary.
     /// Each key's windows are shifted by an offset of its own, so that keys' boundaries
-    /// spread. In local mode only, for now.
+    /// spread. In the asynchronous mode a minute long or more: a limit per second there is a
+    /// bucket.
     FixedWindow(Window),
     /// At most `limit` requests in any span of `window`, counted to a thousandth of it. In
     /// no mode yet; never in local mode, nor with `when_unreachable: local`.
