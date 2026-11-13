@@ -579,3 +579,42 @@ async fn two_data_planes_share_a_fixed_window_through_the_service() {
         })
         .await;
 }
+
+/// With a cold share of 40%, a data plane that has not yet heard from a key's owner admits
+/// 40% of each limit — two of the window's five, four of the bucket's ten — and refuses the
+/// rest with a second's wait, by when the owner will have answered; once it has, the copy is
+/// the owner's, the rest of the limit is admitted, and a refusal waits for the window's end
+/// or the bucket's refill (06 §4). The pods' word is slowed, so that none can arrive while
+/// the first requests are answered.
+#[tokio::test]
+async fn a_cold_share_holds_a_key_until_its_owner_answers() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let service = slow_service(Some(Duration::from_millis(80))).await;
+            let front = proxy(upstream().await, &service, ", cold_share: 40").await;
+            let socket = TcpSocket::new_v4().unwrap();
+            socket.bind(SocketAddr::from(([127, 0, 0, 22], 0))).unwrap();
+            let mut stream = socket.connect(front).await.unwrap();
+            for (path, limit, share, whole) in [
+                ("/windowed", "per-window", 2, 5),
+                ("/by-client", "per-client", 4, 10),
+            ] {
+                for _ in 0..share {
+                    assert_eq!(answer(&mut stream, "GET", path).await.0, 200, "{path}");
+                }
+                let cold = answer(&mut stream, "GET", path).await;
+                assert!(refused_by(&cold, limit, 1), "{path}: {cold:?}");
+                // A report and the owner's answer, both ways through the slow network.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                for _ in share..whole {
+                    assert_eq!(answer(&mut stream, "GET", path).await.0, 200, "{path}");
+                }
+                let spent = answer(&mut stream, "GET", path).await;
+                let after = spent.1.expect("a Retry-After");
+                assert!(after > 60, "{path}: {spent:?}");
+                assert!(refused_by(&spent, limit, after), "{path}: {spent:?}");
+            }
+        })
+        .await;
+}

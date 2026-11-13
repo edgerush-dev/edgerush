@@ -220,6 +220,8 @@ pub struct CompiledRateLimitService {
     pub poll_quiet_keys: bool,
     /// Whether each cycle visits only the keys that need it.
     pub schedule_keys: bool,
+    /// The share of each limit, in percent, a key's copy shows until its owner first answers.
+    pub cold_share: u64,
     /// Mutual TLS to the pods, if they are reached so.
     pub tls: Option<CompiledServiceTls>,
 }
@@ -667,6 +669,10 @@ pub const MOST_ATTEMPTS: u32 = 5;
 /// overflow; this one fits however long the process has run.
 pub(crate) const MOST_SECONDS: u64 = 99_999 * 3_600;
 
+/// The asynchronous mode's cold share when left out, and the most it may be: the whole
+/// limit, in percent (06 §4).
+pub(crate) const WHOLE_COLD_SHARE: u64 = 100;
+
 /// `field` and its `seconds`, if they are more than [`MOST_SECONDS`].
 fn too_long(field: &'static str, seconds: u64) -> Option<Problem> {
     (seconds > MOST_SECONDS).then_some(Problem::TooLong { field, seconds })
@@ -821,6 +827,11 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
         if service.cycle_ms == Some(0) {
             errors.push(place.problem(Problem::RateLimitServiceCycleNever));
         }
+        if let Some(share) = service.cold_share
+            && !(1..=WHOLE_COLD_SHARE).contains(&share)
+        {
+            errors.push(place.problem(Problem::RateLimitServiceColdShare(share)));
+        }
         if let Some(tls) = &service.tls {
             if tls.authorities.is_empty() {
                 errors.push(place.problem(Problem::NoAuthority));
@@ -849,6 +860,7 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
                 ("cycle_ms", service.cycle_ms.is_some()),
                 ("poll_quiet_keys", service.poll_quiet_keys.is_some()),
                 ("schedule_keys", service.schedule_keys.is_some()),
+                ("cold_share", service.cold_share.is_some()),
             ];
             for (field, said) in asynchronous {
                 if said {
@@ -923,6 +935,7 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
                     max_key_bytes,
                     poll_quiet_keys: service.poll_quiet_keys.unwrap_or(false),
                     schedule_keys: service.schedule_keys.unwrap_or(true),
+                    cold_share: service.cold_share.unwrap_or(WHOLE_COLD_SHARE),
                     tls,
                 })
             }
@@ -3299,6 +3312,9 @@ pub enum Problem {
     /// A rate-limiting service whose cycle never comes.
     #[error("`rate_limiting.service`: `cycle_ms` is 0: at least 1")]
     RateLimitServiceCycleNever,
+    /// A cold share that is no percentage of a limit.
+    #[error("`rate_limiting.service`: `cold_share` is {0}: from 1 to {WHOLE_COLD_SHARE}")]
+    RateLimitServiceColdShare(u64),
     /// The pods' ID, to check them by, that is not a SPIFFE ID.
     #[error("`rate_limiting.service.tls`: `pod_id` `{0}` is no SPIFFE ID (`spiffe://…`)")]
     RateLimitServicePodId(String),
@@ -7235,6 +7251,7 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}, key_s
             ("cycle_ms", "10"),
             ("poll_quiet_keys", "false"),
             ("schedule_keys", "true"),
+            ("cold_share", "100"),
         ] {
             let service = format!(
                 r#"service: {{ addresses: ["rl-0:7000", "rl-1:7000", "rl-2:7000"], key_secret: {SECRET}, {field}: {value} }}"#
@@ -7335,6 +7352,19 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}, key_s
             !service.poll_quiet_keys && service.schedule_keys,
             "when left out, the fastest: quiet keys not polled, keys scheduled"
         );
+        assert_eq!(service.cold_share, 100, "when left out, the whole");
+        for share in [1, 80, 100] {
+            let set = with(&format!(r#"{{ addresses: ["a:1"], cold_share: {share} }}"#));
+            assert_eq!(set.unwrap().unwrap().cold_share, share);
+        }
+        for share in [0, 101] {
+            assert_eq!(
+                with(&format!(r#"{{ addresses: ["a:1"], cold_share: {share} }}"#)).unwrap_err(),
+                [format!(
+                    "the data plane: `rate_limiting.service`: `cold_share` is {share}: from 1 to 100"
+                )]
+            );
+        }
         let capped = compile(&config(
             "listeners: {}\nroutes: []\nupstreams: {}\nrate_limiting: { mode: asynchronous, max_key_bytes: 1000, service: { addresses: [\"a:1\"], key_secret: 00112233445566778899aabbccddeeff } }\n",
         ))
