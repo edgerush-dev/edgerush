@@ -90,6 +90,9 @@ const NOBODY: i64 = 65534;
 pub struct Install {
     /// The image the planes run, the operator's own: one binary, one image (05 §7).
     pub image: String,
+    /// The cluster's DNS domain, which a Service's name ends in: `cluster.local` unless
+    /// the cluster was set up otherwise (05 §3).
+    pub cluster_domain: String,
 }
 
 /// An object the operator makes, written as the API server takes it.
@@ -200,7 +203,10 @@ pub fn controller_name(control_plane: &str) -> String {
 }
 
 /// The name of a data plane's ServiceAccount and workload.
-fn proxy_name(data_plane: &str) -> String {
+/// The name of a data plane's Deployment, and of its Service, which the control plane makes
+/// ([05 §2](../../../docs/05-operator.md)).
+#[must_use]
+pub fn proxy_name(data_plane: &str) -> String {
     format!("edgerush-proxy-{data_plane}")
 }
 
@@ -415,6 +421,11 @@ pub fn for_control_plane(
 
     let mut args = vec![
         "controller".to_owned(),
+        // Its DataPlane, in its own namespace, which it reads itself (05 §3).
+        "--control-plane".to_owned(),
+        cp.name.to_owned(),
+        "--cluster-domain".to_owned(),
+        install.cluster_domain.clone(),
         "--listen".to_owned(),
         format!("0.0.0.0:{STREAM_PORT}"),
         "--leader-lease".to_owned(),

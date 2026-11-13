@@ -1,6 +1,9 @@
-# What kind/stream.sh runs: a backend Service in `shop` behind an Ingress of class `edge`;
-# in `edge`, the control plane, which follows `shop` and serves the config stream, and a data
-# plane that dials it. Each holds a certificate of the stream's own authority, from the
+# What kind/stream.sh runs: a backend Service in `shop` behind an Ingress of class `edge.web`;
+# in `edge`, the control plane of ControlPlane `edge`, which follows `shop` and serves the
+# config stream, and the data plane of DataPlane `web`, which dials it. The control plane
+# reads the DataPlane itself (05 §3), as the operator has accepted it: until the operator
+# runs, the script says so in its status, and writes the classes and the Gateway the
+# operator would. Each holds a certificate of the stream's own authority, from the
 # Secrets the script makes. The data plane may only list and watch EndpointSlices in `shop`
 # (09 §1); the control plane reads the cluster's IngressClasses and `shop`'s Ingresses,
 # Services and Secrets, writes the status of `shop`'s Ingresses, and reads the data plane's
@@ -49,14 +52,14 @@ spec:
 ---
 apiVersion: networking.k8s.io/v1
 kind: IngressClass
-metadata: { name: edge }
+metadata: { name: edge.web }
 spec: { controller: edgerush.dev/ingress-controller }
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: web, namespace: shop }
 spec:
-  ingressClassName: edge
+  ingressClassName: edge.web
   rules:
     - host: shop.example
       http:
@@ -192,6 +195,10 @@ rules:
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gateways, listenersets]
     verbs: [list, watch]
+  # Its DataPlane, which it reads itself (05 §3).
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [dataplanes]
+    verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gateways/status, listenersets/status]
     verbs: [update]
@@ -202,21 +209,17 @@ metadata: { name: edgerush-control-status, namespace: edge }
 roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: edgerush-control-status }
 subjects: [{ kind: ServiceAccount, name: edgerush-control, namespace: edge }]
 ---
-# The data plane's settings, as the control plane translates for it.
-apiVersion: v1
-kind: ConfigMap
-metadata: { name: edgerush-plane, namespace: edge }
-data:
-  plane.yaml: |
-    ingress_class: edge
-    # The data plane is this Gateway: the Gateway API's kinds are followed.
-    gateway: edge/web
-    cluster_domain: cluster.local
-    ingress_hosts_fall_through: false
-    ingress_https_redirect: false
-    ingress_https_redirect_max_age: 30
-    # Whose slices say the data plane's zone: the Service of its own pods, ready or not.
-    data_plane: { own_service: edgerush-peers.edge.svc.cluster.local }
+# The data plane's settings: its DataPlane, of Ingress, class `edge.web`, and of the Gateway
+# API, the Gateway edge/web, whose listeners the script writes itself until the operator
+# does. Its own pods' Service, which says its zone, is `edgerush-proxy-web` (below).
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata: { name: web, namespace: edge }
+spec:
+  controlPlaneRef: { name: edge }
+  ingress: { httpPort: 80, httpsPort: 443, httpsRedirect: false }
+  gateway:
+    listeners: [{ name: http, port: 80, protocol: HTTP }]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -234,8 +237,8 @@ spec:
           imagePullPolicy: Never
           args:
             - controller
-            - --data-plane
-            - /etc/edgerush/plane.yaml
+            - --control-plane
+            - edge
             - --namespace
             - shop
             - --namespace
@@ -256,7 +259,7 @@ spec:
             - --own-name
             - edgerush-control-peers.edge.svc.cluster.local
             - --own-name
-            - edgerush-peers.edge.svc.cluster.local
+            - edgerush-proxy-web.edge.svc.cluster.local
             - --webhook-listen
             - "0.0.0.0:8443"
             - --webhook-certificate
@@ -271,12 +274,9 @@ spec:
             - { name: stream, containerPort: 9443 }
             - { name: webhook, containerPort: 8443 }
           volumeMounts:
-            - { name: plane, mountPath: /etc/edgerush }
             - { name: stream, mountPath: /etc/edgerush/stream }
             - { name: webhook, mountPath: /etc/edgerush/webhook }
       volumes:
-        - name: plane
-          configMap: { name: edgerush-plane }
         - name: stream
           secret: { secretName: edgerush-control-stream }
         - name: webhook
@@ -292,7 +292,9 @@ spec:
     - { name: webhook, port: 443, targetPort: webhook }
 ---
 # The control plane's pods and the data plane's, by headless Services whose names resolve
-# to every pod's address, ready or not: the gateway's own, which it never sends to.
+# to every pod's address, ready or not: the gateway's own, which it never sends to. The data
+# plane's is of the name the control plane gives its DataPlane's Service (05 §3), whose
+# slices say the data plane's zone.
 apiVersion: v1
 kind: Service
 metadata: { name: edgerush-control-peers, namespace: edge }
@@ -304,7 +306,7 @@ spec:
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: edgerush-peers, namespace: edge }
+metadata: { name: edgerush-proxy-web, namespace: edge }
 spec:
   clusterIP: None
   publishNotReadyAddresses: true

@@ -402,6 +402,10 @@ fn each_kind_is_asked_for_at_its_own_path_in_the_cluster_or_a_namespace() {
             kind::collection::<ReferenceGrant>(&shop),
             "/apis/gateway.networking.k8s.io/v1/namespaces/shop/referencegrants",
         ),
+        (
+            kind::collection::<edgerush_planes::data_plane::DataPlane>(&shop),
+            "/apis/gateway.edgerush.dev/v1alpha1/namespaces/shop/dataplanes",
+        ),
         // One object by its name is the cluster's, selected by its name (below).
         (
             kind::collection::<CustomResourceDefinition>(&Scope::Named(

@@ -9,6 +9,7 @@ use crate::data_plane::{DataPlane, DataPlaneIngress, DataPlaneResources};
 
 fn install() -> Install {
     Install {
+        cluster_domain: "cluster.local".to_owned(),
         image: "edgerush:test".to_owned(),
     }
 }

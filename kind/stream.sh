@@ -11,9 +11,13 @@
 # distribution (kind/discovery/Dockerfile) and loaded into the cluster: Linux only, on
 # Ubuntu 26.04 as the laptop is. The stream's authority and each end's certificate are made
 # here with openssl, and handed to each as a Secret. A backend Service in `shop` sits behind
-# an Ingress of class `edge`, for host shop.example; the control plane in `edge` follows
+# an Ingress of class `edge.web`, for host shop.example; the control plane in `edge` follows
 # `shop`, and the data plane in `edge` dials it at edgerush-control.edge.svc:9443 and is
-# reached by `kubectl port-forward`. Then:
+# reached by `kubectl port-forward`. The control plane reads the data plane's settings from
+# its DataPlane, `web`, which the script says the operator accepted, as of each generation.
+# Then:
+#   - an edit of the DataPlane is not served until the operator has accepted its
+#     generation, and is once it has;
 #   - the data plane named as a Gateway, the control plane says the Gateway API's CRDs are
 #     not installed, and the Ingress is served on its own port, 80; installed, each kind is
 #     followed, its CRD read by name alone as RBAC allows, and every request to the Ingress
@@ -137,7 +141,18 @@ done
 k -n edge create secret tls edgerush-control-webhook \
     --cert="$pki/webhook.crt" --key="$pki/webhook.key" --dry-run=client -o yaml |
     k apply -f - >/dev/null
+# The DataPlane's kind, as the install ships it, ready before a DataPlane is written.
+k apply --server-side -f crates/planes/install/gateway.edgerush.dev_dataplanes.yaml >/dev/null
+k wait --for condition=established crd/dataplanes.gateway.edgerush.dev --timeout=60s >/dev/null
 sed "s|AGNHOST|$AGNHOST|" kind/stream/manifests.yaml | k apply -f - >/dev/null
+# What the operator says of DataPlane web, said by hand until it runs (05 §3): accepted, as
+# of its generation now.
+accept() {
+    local generation
+    generation=$(k -n edge get dataplane web -o jsonpath='{.metadata.generation}')
+    k -n edge patch dataplane web --subresource=status --type=merge -p "{\"status\":{\"conditions\":[{\"type\":\"Accepted\",\"status\":\"True\",\"reason\":\"Accepted\",\"message\":\"accepted by kind/stream.sh\",\"lastTransitionTime\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"observedGeneration\":$generation}]}}" >/dev/null
+}
+accept
 k -n shop rollout status deploy/web --timeout=120s >/dev/null
 k -n edge rollout status deploy/edgerush-control --timeout=120s >/dev/null
 k -n edge rollout status deploy/edgerush --timeout=120s >/dev/null
@@ -226,6 +241,40 @@ said deploy/edgerush 'listener "port-80" is on 0.0.0.0:80' 60 ||
 forward
 answers shop.example 200 30 || fail "without the CRDs, the Ingress is not served: $(status shop.example)"
 pass "without the Gateway API's CRDs, the control plane says so, and the Ingress is served on its own port, 80"
+# The X-Request-ID an answer from host $1 carries, if any: one the data plane made, while
+# port 80 generates them.
+request_id() {
+    curl -s -o /dev/null -D - -H "host: $1" "http://127.0.0.1:$port/hostname" |
+        tr -d '\r' | sed -n 's/^x-request-id: //Ip'
+}
+# Waits up to $2 seconds for answers from host shop.example to carry an X-Request-ID, with
+# $1 "yes", or none.
+request_ids() {
+    for _ in $(seq 1 $(($2 * 5))); do
+        if [ -n "$(request_id shop.example)" ]; then
+            [ "$1" = yes ] && return 0
+        else
+            [ "$1" = no ] && return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+request_ids yes 10 || fail "port 80 does not generate request IDs as its default has it"
+# Port 80 passing request IDs on, an edit of the DataPlane the operator has yet to accept:
+# the last generation accepted is served, and the control plane says why.
+k -n edge patch dataplane web --type=merge -p '{"spec":{"ports":[{"port":80,"requestId":"Pass"}]}}' >/dev/null
+control_said "DataPlane edge/web: the operator has yet to accept it; the DataPlane last accepted is served" 30 ||
+    fail "the control plane never said the DataPlane's edit waits on the operator"
+sleep 2
+request_ids yes 1 || fail "an edit of the DataPlane was served before the operator accepted it"
+accept
+request_ids no 30 || fail "the DataPlane's edit, accepted, was never served"
+# And back, port 80 generating them again.
+k -n edge patch dataplane web --type=json -p '[{"op":"remove","path":"/spec/ports"}]' >/dev/null
+accept
+request_ids yes 30 || fail "the DataPlane's edit back, accepted, was never served"
+pass "an edit of the DataPlane is served once the operator has accepted its generation, and not before"
 # Requests without pause to the Ingress from before the CRDs are installed until its
 # Gateway, made after them, is served: Ingress's port, which asks nothing of the Gateway,
 # is never let go, and every request is answered (04 §2).
@@ -510,7 +559,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: ranked, namespace: shop }
 spec:
-  ingressClassName: edge
+  ingressClassName: edge.web
   rules:
     - host: ranked.example
       http:
@@ -1165,7 +1214,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: loop, namespace: shop }
 spec:
-  ingressClassName: edge
+  ingressClassName: edge.web
   rules:
     - host: loop.example
       http:
@@ -1224,7 +1273,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: zoned, namespace: shop }
 spec:
-  ingressClassName: edge
+  ingressClassName: edge.web
   rules:
     - host: zoned.example
       http:

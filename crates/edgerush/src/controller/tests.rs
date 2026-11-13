@@ -18,7 +18,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
     assert_eq!(
         parsed(&["--data-plane", "p"]),
         Ok(Parsed::Control(Box::new(Options {
-            data_plane: PathBuf::from("p"),
+            settings: Settings::File(PathBuf::from("p")),
             scope: vec![Scope::Cluster],
             write_config: None,
             stream: None,
@@ -41,7 +41,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             "c"
         ]),
         Ok(Parsed::Control(Box::new(Options {
-            data_plane: PathBuf::from("p"),
+            settings: Settings::File(PathBuf::from("p")),
             scope: vec![
                 Scope::Namespace("shop".to_owned()),
                 Scope::Namespace("blog".to_owned())
@@ -58,7 +58,9 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
     assert_eq!(parsed(&["--help"]), Ok(Parsed::Help));
     assert_eq!(
         parsed(&["--namespace", "shop"]),
-        Err(UsageError::Required("--data-plane <FILE>"))
+        Err(UsageError::Required(
+            "--data-plane <FILE> or --control-plane <NAME>"
+        ))
     );
     assert_eq!(
         parsed(&["--data-plane", "p", "--data-plane", "q"]),
@@ -205,7 +207,7 @@ async fn run_until(
     let lines: Rc<RefCell<Vec<String>>> = Rc::default();
     let heard = Rc::clone(&lines);
     let options = Options {
-        data_plane: PathBuf::new(),
+        settings: Settings::File(PathBuf::new()),
         scope: vec![Scope::Cluster],
         write_config,
         stream: None,
@@ -232,7 +234,7 @@ async fn run_until(
         .run_until(control_until(
             api,
             options,
-            plane,
+            Source::Fixed(plane),
             listeners,
             None,
             stop,
@@ -345,7 +347,7 @@ fn the_stream_is_given_whole_or_not_at_all() {
     assert_eq!(
         parsed(&args),
         Ok(Parsed::Control(Box::new(Options {
-            data_plane: PathBuf::from("p"),
+            settings: Settings::File(PathBuf::from("p")),
             scope: vec![Scope::Cluster],
             write_config: None,
             stream: Some(Box::new(Stream {
@@ -446,7 +448,7 @@ fn the_webhook_is_given_whole_or_not_at_all() {
     assert_eq!(
         parsed(&args),
         Ok(Parsed::Control(Box::new(Options {
-            data_plane: PathBuf::from("p"),
+            settings: Settings::File(PathBuf::from("p")),
             scope: vec![Scope::Cluster],
             write_config: None,
             stream: None,
@@ -548,11 +550,74 @@ fn classes(listed: bool) -> Listed<IngressClass> {
     }
 }
 
+/// With --control-plane, the data plane's settings are its DataPlane's, in the cluster's
+/// own domain unless one is given; never with --data-plane too.
+#[test]
+fn a_control_plane_reads_its_data_plane_or_a_file_is_given_but_not_both() {
+    let Ok(Parsed::Control(options)) = parsed(&["--control-plane", "edge"]) else {
+        panic!("not parsed");
+    };
+    assert_eq!(
+        options.settings,
+        Settings::DataPlane {
+            control_plane: "edge".to_owned(),
+            cluster_domain: "cluster.local".to_owned()
+        }
+    );
+    let Ok(Parsed::Control(options)) = parsed(&[
+        "--cluster-domain",
+        "cluster.example",
+        "--control-plane",
+        "edge",
+    ]) else {
+        panic!("not parsed");
+    };
+    assert_eq!(
+        options.settings,
+        Settings::DataPlane {
+            control_plane: "edge".to_owned(),
+            cluster_domain: "cluster.example".to_owned()
+        }
+    );
+    assert_eq!(
+        parsed(&["--data-plane", "p", "--control-plane", "edge"]),
+        Err(UsageError::Settings)
+    );
+    assert_eq!(
+        parsed(&["--data-plane", "p", "--cluster-domain", "cluster.example"]),
+        Err(UsageError::ClusterDomainWithoutControlPlane)
+    );
+    assert_eq!(
+        parsed(&["--control-plane", "edge.web"]),
+        Err(UsageError::ControlPlane("edge.web".to_owned()))
+    );
+    assert_eq!(
+        parsed(&["--control-plane", "edge", "--control-plane", "other"]),
+        Err(UsageError::Twice("--control-plane"))
+    );
+    assert!(matches!(
+        parsed(&["--control-plane", "edge", "--cluster-domain", "a b"]),
+        Err(UsageError::ClusterDomain(..))
+    ));
+}
+
+/// Until the data plane's settings are known, as while its DataPlane waits on the operator,
+/// a review is answered 503, as there is nothing to judge it for.
+#[test]
+fn a_review_waits_on_the_data_planes_settings() {
+    let answer = review(None, &classes(true), &review_of("u-1", "{}"));
+    assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        String::from_utf8(answer.body).unwrap(),
+        "the data plane's settings are not known yet"
+    );
+}
+
 #[test]
 fn a_review_is_answered_once_the_classes_are_listed_and_what_is_none_is_a_bad_request() {
     let plane: Plane = serde_saphyr::from_str(&plane()).unwrap();
     let answered = |listed: bool, body: &[u8]| {
-        let answer = review(&plane, &classes(listed), body);
+        let answer = review(Some(&plane), &classes(listed), body);
         (answer.status, String::from_utf8(answer.body).unwrap())
     };
     let (status, body) = answered(false, &review_of("u-1", "{}"));

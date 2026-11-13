@@ -16,11 +16,12 @@ use edgerush_control_service::{
 use edgerush_control_stream::{Offer, OfferError, Versions};
 use edgerush_controller::acks::{Pods, Reporter, Runs};
 use edgerush_controller::admission::{self, Asked};
+use edgerush_controller::data_plane::{self, follow_data_planes};
 use edgerush_controller::expiry::Expiry;
 use edgerush_controller::lease::{self, elect};
 use edgerush_controller::status::{Addresses, address};
 use edgerush_controller::{Acks, Debounce, Reports, Said, control};
-use edgerush_kubernetes::{ApiError, ApiServer, Listed, Retry, Scope, follow};
+use edgerush_kubernetes::{ApiError, ApiServer, Listed, Retry, SERVICE_ACCOUNT, Scope, follow};
 use edgerush_translate::{Plane, Translation};
 use http::StatusCode;
 use k8s_openapi::api::networking::v1::IngressClass;
@@ -39,7 +40,8 @@ use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub(crate) const USAGE: &str = "\
-Usage: edgerush controller --data-plane <FILE> [--namespace <NAME>]... [--write-config <FILE>]
+Usage: edgerush controller (--data-plane <FILE> | --control-plane <NAME> [--cluster-domain <DOMAIN>])
+         [--namespace <NAME>]... [--write-config <FILE>]
          [--listen <ADDRESS> --certificate <FILE> --key <FILE> --authorities <FILE>
           [--own-name <NAME>]...]
          [--status-service <NAMESPACE>/<NAME> | --status-address <ADDRESS>...]
@@ -51,6 +53,11 @@ Runs a control plane for one data plane, in a cluster: follows the IngressClasse
 Ingresses, Services and Secrets of its scope through the API server, found as a pod finds
 it, and translates them each time they change, once every kind has been listed whole. What
 each translation came to is said on stderr, as `edgerush validate` says it.
+The data plane's settings are a file's, with --data-plane, or, with --control-plane, the
+DataPlane of the pod's own namespace that names that ControlPlane, followed: a generation
+of it is acted on once the operator's Accepted condition is of it, the last accepted kept
+meanwhile, and nothing is translated until one is. What a DataPlane has no field for takes
+its default: no authorities for wss backends, the data plane's own settings left out.
 With --listen, it serves the config stream there, gRPC over mutual TLS that data planes
 dial: each config translated is offered to every data plane, and what each says of it is
 said on stderr. The certificate, key and authorities are PEM files, read again every
@@ -86,6 +93,12 @@ certificates cannot be used, or it is not in a cluster.
 Options:
       --data-plane <FILE>    The data plane's settings, in YAML, as `edgerush validate`
                              reads them
+      --control-plane <NAME> The ControlPlane this is, whose DataPlane, in the pod's own
+                             namespace, says the data plane's settings; instead of
+                             --data-plane
+      --cluster-domain <DOMAIN>
+                             The cluster's DNS domain, with --control-plane;
+                             cluster.local when left out
       --namespace <NAME>     A namespace to watch, given once for each; left out, the
                              whole cluster. IngressClasses are the cluster's, and are
                              followed in it either way
@@ -146,13 +159,29 @@ pub(crate) fn command(
         Ok(runtime) => runtime,
         Err(error) => return writeln!(stderr, "error: {error}").map_or(1, |()| 1),
     };
-    let started = read::<Plane>(&options.data_plane)
-        .map_err(|failed| failed.to_string())
-        .and_then(|plane| {
-            let plane = Plane {
-                system_authorities: crate::system_authorities::read()
-                    .map_err(|error| format!("the system's authorities: {error}"))?,
-                ..plane
+    let started = crate::system_authorities::read()
+        .map_err(|error| format!("the system's authorities: {error}"))
+        .and_then(|system_authorities| {
+            let plane = match &options.settings {
+                Settings::File(path) => {
+                    let plane = read::<Plane>(path).map_err(|failed| failed.to_string())?;
+                    Source::Fixed(Plane {
+                        system_authorities,
+                        ..plane
+                    })
+                }
+                Settings::DataPlane {
+                    control_plane,
+                    cluster_domain,
+                } => Source::Followed {
+                    api: ApiServer::in_cluster().map_err(|error| outside(&error))?,
+                    namespace: own_namespace()?,
+                    own: data_plane::Own {
+                        control_plane: control_plane.clone(),
+                        cluster_domain: cluster_domain.clone(),
+                        system_authorities,
+                    },
+                },
             };
             let stream = match &options.stream {
                 Some(stream) => Some(runtime.block_on(credentials(stream))?),
@@ -329,7 +358,7 @@ enum Parsed {
 
 #[derive(Debug, PartialEq)]
 struct Options {
-    data_plane: PathBuf,
+    settings: Settings,
     /// The scope: its namespaces, or the cluster.
     scope: Vec<Scope>,
     write_config: Option<PathBuf>,
@@ -343,6 +372,38 @@ struct Options {
     webhook: Option<Box<Webhook>>,
     /// Where its own metrics are served, if they are.
     metrics: Option<SocketAddr>,
+}
+
+/// Where the data plane's settings come from.
+#[derive(Debug, PartialEq, Eq)]
+enum Settings {
+    /// A file, as the development harness has them.
+    File(PathBuf),
+    /// The DataPlane of the pod's own namespace that names this ControlPlane (05 §3).
+    DataPlane {
+        control_plane: String,
+        cluster_domain: String,
+    },
+}
+
+/// The data plane's settings, ready to be served.
+enum Source {
+    /// As they are, for good.
+    Fixed(Plane),
+    /// As the DataPlanes of `namespace` say them, followed on a client of their own.
+    Followed {
+        api: ApiServer,
+        namespace: Scope,
+        own: data_plane::Own,
+    },
+}
+
+/// The pod's own namespace, as its service account says it.
+fn own_namespace() -> Result<Scope, String> {
+    let path = Path::new(SERVICE_ACCOUNT).join("namespace");
+    let written = std::fs::read_to_string(&path)
+        .map_err(|error| format!("the pod's namespace, {}: {error}", path.display()))?;
+    Scope::namespace(written.trim()).map_err(|error| format!("the pod's namespace: {error}"))
 }
 
 /// The config stream, as the command line gives it.
@@ -369,6 +430,14 @@ enum UsageError {
     Twice(&'static str),
     #[error("'{0}' is required")]
     Required(&'static str),
+    #[error("'--data-plane' and '--control-plane' are not given together")]
+    Settings,
+    #[error("'--control-plane {0}' is not a ControlPlane's name, a DNS label")]
+    ControlPlane(String),
+    #[error("'--cluster-domain {0}': {1}")]
+    ClusterDomain(String, edgerush_config::DnsNameError),
+    #[error("'--cluster-domain' is for '--control-plane'")]
+    ClusterDomainWithoutControlPlane,
     #[error("namespace '{0}' is given twice")]
     NamespaceTwice(String),
     #[error("'--namespace {0}': {1}")]
@@ -399,6 +468,8 @@ enum UsageError {
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut data_plane = None;
+    let mut control_plane = None;
+    let mut cluster_domain = None;
     let mut write_config = None;
     let mut listen = None;
     let mut certificate = None;
@@ -417,6 +488,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         let option = match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
             "--data-plane" => "--data-plane",
+            "--control-plane" => "--control-plane",
+            "--cluster-domain" => "--cluster-domain",
             "--write-config" => "--write-config",
             "--namespace" => "--namespace",
             "--listen" => "--listen",
@@ -442,6 +515,24 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                     return Err(UsageError::NamespaceTwice(value));
                 }
                 scope.push(namespace);
+                continue;
+            }
+            "--control-plane" => {
+                // A ControlPlane's name is a DNS label, as a namespace's is (05 §3).
+                if Scope::namespace(&value).is_err() {
+                    return Err(UsageError::ControlPlane(value));
+                }
+                if control_plane.replace(value).is_some() {
+                    return Err(UsageError::Twice(option));
+                }
+                continue;
+            }
+            "--cluster-domain" => {
+                let domain = edgerush_config::DnsName::host(&value)
+                    .map_err(|error| UsageError::ClusterDomain(value.clone(), error))?;
+                if cluster_domain.replace(domain).is_some() {
+                    return Err(UsageError::Twice(option));
+                }
                 continue;
             }
             "--status-service" => {
@@ -540,8 +631,22 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         (None, false) => Some(Addresses::Stated(status_addresses)),
         (None, true) => None,
     };
+    let settings = match (data_plane, control_plane, cluster_domain) {
+        (Some(_), Some(_), _) => return Err(UsageError::Settings),
+        (Some(_), None, Some(_)) => return Err(UsageError::ClusterDomainWithoutControlPlane),
+        (Some(path), None, None) => Settings::File(path),
+        (None, Some(control_plane), domain) => Settings::DataPlane {
+            control_plane,
+            cluster_domain: domain.unwrap_or_else(|| "cluster.local".to_owned()),
+        },
+        (None, None, _) => {
+            return Err(UsageError::Required(
+                "--data-plane <FILE> or --control-plane <NAME>",
+            ));
+        }
+    };
     Ok(Parsed::Control(Box::new(Options {
-        data_plane: data_plane.ok_or(UsageError::Required("--data-plane <FILE>"))?,
+        settings,
         scope,
         write_config,
         stream,
@@ -629,7 +734,7 @@ struct Listeners {
 async fn control_until(
     api: ApiServer,
     options: Options,
-    plane: Plane,
+    source: Source,
     listeners: Listeners,
     elector: Option<Elector>,
     stop: impl Future<Output = io::Result<()>>,
@@ -699,6 +804,30 @@ async fn control_until(
     };
     let scope = options.scope;
     let mut tasks = Vec::new();
+    // The data plane's settings, as they are or as its DataPlane says them. Held for as
+    // long as the control plane runs, as nothing more is said of fixed ones.
+    let (settings, planes) = watch::channel(None);
+    let _fixed = match source {
+        Source::Fixed(plane) => {
+            settings.send_replace(Some(plane));
+            Some(settings)
+        }
+        Source::Followed {
+            api,
+            namespace,
+            own,
+        } => {
+            let telling = Rc::clone(&say);
+            tasks.push(tokio::task::spawn_local(follow_data_planes(
+                api,
+                namespace,
+                own,
+                settings,
+                move |line| telling(line),
+            )));
+            None
+        }
+    };
     // The dates of the certificates handed out (04 §2, 08 §1): every replica keeps them
     // for its gauge, and the leader says those out of date.
     let expiry = Rc::new(RefCell::new(Expiry::new()));
@@ -802,7 +931,7 @@ async fn control_until(
         let (stopping, stopped) = oneshot::channel::<()>();
         let (ending, ended) = oneshot::channel::<()>();
         hooked = Some((stopping, ended));
-        hook(hooking, plane.clone(), said, stopped, ending)?;
+        hook(hooking, planes.clone(), said, stopped, ending)?;
         let telling = Rc::clone(&say);
         tasks.push(tokio::task::spawn_local(async move {
             while let Some(line) = hearing.recv().await {
@@ -815,7 +944,7 @@ async fn control_until(
         control(
             api,
             &scope,
-            &plane,
+            planes,
             Debounce::default(),
             status,
             leading,
@@ -1009,8 +1138,8 @@ fn said_runs(pods: &watch::Sender<Pods>, runs: &Runs) {
 
 /// Serves the webhook `hooking` holds on a thread and runtime of its own (04 §3), so that a
 /// flood of reviews, which anyone in the cluster can send, costs only its answers: the
-/// IngressClasses followed on its own client, each review judged for the data plane `plane`
-/// describes, and its certificate files read again. What it says goes to `said`, a line each;
+/// IngressClasses followed on its own client, each review judged for the data plane the
+/// settings `planes` holds as it comes describe, and its certificate files read again. What it says goes to `said`, a line each;
 /// it stops once `stop` is done, or dropped, and tells `ended` as it ends.
 ///
 /// # Errors
@@ -1019,7 +1148,7 @@ fn said_runs(pods: &watch::Sender<Pods>, runs: &Runs) {
 /// runtime cannot be started.
 fn hook(
     hooking: Hooking,
-    plane: Plane,
+    planes: watch::Receiver<Option<Plane>>,
     said: mpsc::UnboundedSender<String>,
     stop: oneshot::Receiver<()>,
     ended: oneshot::Sender<()>,
@@ -1059,7 +1188,7 @@ fn hook(
                             listener,
                             accepting,
                             Bounds::default(),
-                            move |body| review(&plane, &classes.borrow(), body),
+                            move |body| review(planes.borrow().as_ref(), &classes.borrow(), body),
                             async move {
                                 let _ = stop.await;
                             },
@@ -1080,10 +1209,15 @@ fn hook(
 }
 
 /// The webhook's answer to the review `body`, an Ingress of the data plane `plane`
-/// describes judged alone, as `classes` say which is its: 503 until they are listed, as
-/// there is nothing to say which is; 400 for what is not a review.
-fn review(plane: &Plane, classes: &Listed<IngressClass>, body: &[u8]) -> webhook::Answer {
+/// describes judged alone, as `classes` say which is its: 503 until there are settings and
+/// the classes are listed, as there is nothing to say which is; 400 for what is not a
+/// review.
+fn review(plane: Option<&Plane>, classes: &Listed<IngressClass>, body: &[u8]) -> webhook::Answer {
     let answer = |status, body: Vec<u8>| webhook::Answer { status, body };
+    let Some(plane) = plane else {
+        let why = "the data plane's settings are not known yet";
+        return answer(StatusCode::SERVICE_UNAVAILABLE, why.as_bytes().to_vec());
+    };
     if !classes.listed {
         let why = "the IngressClasses are not listed yet";
         return answer(StatusCode::SERVICE_UNAVAILABLE, why.as_bytes().to_vec());

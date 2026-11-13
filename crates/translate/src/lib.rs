@@ -90,8 +90,10 @@ pub const GATEWAY_CONTROLLER: &str = "edgerush.dev/gateway-controller";
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Plane {
-    /// The IngressClass whose Ingresses it serves.
-    pub ingress_class: String,
+    /// The IngressClass whose Ingresses it serves, if it serves Ingress: none, and no
+    /// Ingress is its, whatever its class ([05 §3](../../../docs/05-operator.md)).
+    #[serde(default)]
+    pub ingress_class: Option<String>,
     /// The Gateway it is, if it serves the Gateway API, written `<namespace>/<name>`
     /// ([04 §2](../../../docs/04-control-plane.md)). Only then are the Gateway API's kinds
     /// followed (04 §1).
@@ -1009,7 +1011,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     let claim = class_claim(plane, cluster, &mut report);
     let ours = |ingress: &&Ingress| match (claim, class_of(ingress)) {
         (None, _) => false,
-        (Some(_), Some(class)) => class == plane.ingress_class,
+        (Some(_), Some(class)) => plane.ingress_class.as_deref() == Some(class),
         (Some(default), None) => default,
     };
     // Oldest first, then by namespace and name, as Gateway API ranks routes: the order is
@@ -2451,15 +2453,17 @@ fn namespace(metadata: &ObjectMeta) -> &str {
 /// Whether the data plane's class is this controller's, and if so whether it is the
 /// cluster's default; why not, in the report.
 fn class_claim(plane: &Plane, cluster: &Cluster, report: &mut Vec<Finding>) -> Option<bool> {
+    // A data plane that does not serve Ingress has no class to claim, nor to say of.
+    let name = plane.ingress_class.as_deref()?;
     let object = Object {
         kind: "IngressClass",
         namespace: String::new(),
-        name: plane.ingress_class.clone(),
+        name: name.to_owned(),
     };
     let Some(class) = cluster
         .ingress_classes
         .iter()
-        .find(|class| class.metadata.name.as_deref() == Some(plane.ingress_class.as_str()))
+        .find(|class| class.metadata.name.as_deref() == Some(name))
     else {
         report.push(Finding {
             object,
@@ -3398,6 +3402,53 @@ spec: { controller: edgerush.dev/ingress-controller }
             .map(|r| r.name.as_str())
             .collect();
         assert_eq!(routes, ["ingress/shop/good/good.example.com"]);
+    }
+
+    /// A data plane of no IngressClass, one that does not serve Ingress, serves no Ingress:
+    /// neither one naming a class of this controller's, the cluster's default, nor one of
+    /// no class; and nothing is said of a class it was never given.
+    #[test]
+    fn a_data_plane_of_no_class_serves_no_ingress() {
+        let plane: Plane = serde_saphyr::from_str(
+            "cluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\ningress_https_redirect_max_age: 30\n",
+        )
+        .unwrap();
+        assert_eq!(plane.ingress_class, None);
+        let ingress = |name: &str, class: &str| -> Ingress {
+            serde_saphyr::from_str(&format!(
+                "metadata: {{ name: {name}, namespace: shop }}\nspec:\n  {class}rules:\n    - host: {name}.example.com\n      http:\n        paths:\n          - {{ path: /, pathType: Prefix, backend: {{ service: {{ name: web, port: {{ number: 80 }} }} }} }}\n"
+            ))
+            .unwrap()
+        };
+        let translation = translate(
+            &plane,
+            &Cluster {
+                ingress_classes: vec![
+                    serde_saphyr::from_str(
+                        "metadata:\n  name: edge\n  annotations: { ingressclass.kubernetes.io/is-default-class: \"true\" }\nspec: { controller: edgerush.dev/ingress-controller }\n",
+                    )
+                    .unwrap(),
+                ],
+                ingresses: vec![
+                    ingress("named", "ingressClassName: edge\n  "),
+                    ingress("unnamed", ""),
+                ],
+                services: vec![
+                    serde_saphyr::from_str(
+                        "metadata: { name: web, namespace: shop }\nspec: { ports: [{ name: http, port: 80 }] }\n",
+                    )
+                    .unwrap(),
+                ],
+                ..Cluster::default()
+            },
+        );
+        assert!(
+            translation.config.routes.is_empty(),
+            "{:?}",
+            translation.config.routes
+        );
+        assert!(translation.claimed.is_empty() && translation.served.is_empty());
+        assert_eq!(reported(&translation), Vec::<String>::new());
     }
 
     /// Secrets taken as they will be in the cluster secure their hosts as named, unread,

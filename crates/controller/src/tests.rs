@@ -28,6 +28,11 @@ fn plane() -> Plane {
     plane_with("")
 }
 
+/// Settings that never change: `plane`, its sender gone.
+fn fixed(plane: &Plane) -> watch::Receiver<Option<Plane>> {
+    watch::channel(Some(plane.clone())).1
+}
+
 /// IngressClass `edge`, which names this controller.
 fn class() -> IngressClass {
     serde_saphyr::from_str(
@@ -603,7 +608,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                     control(
                         api,
                         &[Scope::Cluster],
-                        &plane,
+                        fixed(&plane),
                         Debounce::default(),
                         None,
                         None,
@@ -920,7 +925,7 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
                     control(
                         api,
                         &[Scope::Cluster],
-                        &plane,
+                        fixed(&plane),
                         debounce,
                         None,
                         None,
@@ -996,6 +1001,101 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
         .await;
 }
 
+/// Settings that change are followed (05 §3): none, and nothing is followed; new settings
+/// that leave what is followed as it was are translated again, the follows as they were; and
+/// settings of another Gateway have the follows begun again for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_settings_are_followed_as_they_change() {
+    let fake = Fake::start(&["127.0.0.1"], |path| {
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[ingress("shop", "web", "shop.example")])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/secrets?")
+            || path.starts_with("/api/v1/namespaces/edge/secrets?")
+        {
+            page::<Secret>(&[])
+        } else {
+            answer(500, "")
+        }
+    })
+    .await;
+    let api = fake.client(&token("controller-settings", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (settings, planes) = watch::channel(None);
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &[Scope::Cluster],
+                        planes,
+                        Debounce::default(),
+                        None,
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            let lists = |path: &str| {
+                fake.seen()
+                    .iter()
+                    .filter(|seen| {
+                        seen.path.starts_with(&format!("{path}?"))
+                            && !seen.path.contains("watch=true")
+                    })
+                    .count()
+            };
+            let ingresses = || lists("/apis/networking.k8s.io/v1/ingresses");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(fake.seen().is_empty(), "followed without settings");
+
+            settings.send_replace(Some(plane()));
+            until("translated", || heard.borrow().translations.len() == 1).await;
+            assert_eq!(
+                routes(&heard.borrow().translations[0]),
+                ["ingress/shop/web/shop.example"]
+            );
+            assert_eq!(ingresses(), 1);
+
+            // Another class: the Ingress is no longer the data plane's, and nothing more is
+            // followed or listed again for it.
+            let mut other = plane();
+            other.ingress_class = Some("other".to_owned());
+            settings.send_replace(Some(other));
+            until("translated again", || {
+                heard.borrow().translations.len() == 2
+            })
+            .await;
+            assert!(routes(&heard.borrow().translations[1]).is_empty());
+            assert_eq!(
+                ingresses(),
+                1,
+                "listed again for settings of the same shape"
+            );
+
+            // A Gateway: what is followed changes, and the follows are begun again.
+            settings.send_replace(Some(gateway_plane()));
+            until("followed again", || ingresses() == 2).await;
+            until("the Gateway API's CRDs listed", || {
+                lists("/apis/apiextensions.k8s.io/v1/customresourcedefinitions") > 0
+            })
+            .await;
+            controlling.abort();
+        })
+        .await;
+}
+
 /// Secrets are followed in the Gateway's namespace beside the scope's, where its listeners'
 /// certificateRefs of their own namespace are; nothing else is followed there but the
 /// Gateway's own kinds (04 §1).
@@ -1025,7 +1125,7 @@ async fn secrets_are_followed_in_the_gateways_namespace_beside_the_scope() {
                 control(
                     api,
                     &scope,
-                    &plane,
+                    fixed(&plane),
                     Debounce::default(),
                     None,
                     None,
@@ -1095,7 +1195,7 @@ async fn each_namespace_of_the_scope_is_followed_and_all_are_translated_together
                     control(
                         api,
                         &scope,
-                        &plane,
+                        fixed(&plane),
                         Debounce::default(),
                         None,
                         None,
@@ -1329,7 +1429,7 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
                     control(
                         api,
                         &[Scope::Cluster],
-                        &plane,
+                        fixed(&plane),
                         Debounce::default(),
                         Some(source),
                         None,
@@ -1415,7 +1515,7 @@ async fn a_config_is_not_held_up_by_its_status() {
                     control(
                         api,
                         &[Scope::Cluster],
-                        &plane,
+                        fixed(&plane),
                         Debounce::default(),
                         Some(source),
                         None,
@@ -1575,7 +1675,7 @@ async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
                     control(
                         api,
                         &[Scope::Cluster],
-                        &plane,
+                        fixed(&plane),
                         Debounce::default(),
                         Some(source),
                         Some(leading),

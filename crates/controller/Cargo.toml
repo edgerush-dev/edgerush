@@ -14,6 +14,8 @@ edgerush-config.workspace = true
 # The Gateway API kinds followed.
 edgerush-gateway-api.workspace = true
 edgerush-kubernetes.workspace = true
+# The DataPlane the data plane's settings are read from (05 §3).
+edgerush-planes.workspace = true
 edgerush-telemetry.workspace = true
 edgerush-translate.workspace = true
 k8s-openapi.workspace = true
@@ -24,8 +26,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 # "sync": each follow's objects, and the word that one has changed; with the workspace's
-# "rt", the follows' tasks, ended with the control plane, and "time", the debounce.
-tokio = { workspace = true, features = ["sync"] }
+# "rt", the follows' tasks, ended with the control plane, and "time", the debounce;
+# "macros", the DataPlanes' follow waiting on a change or on no one left to tell.
+tokio = { workspace = true, features = ["macros", "sync"] }
 
 [dev-dependencies]
 bytes.workspace = true
