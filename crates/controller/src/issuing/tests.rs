@@ -20,8 +20,10 @@ fn issuer(kind: Kind) -> Issuer {
     }
 }
 
+/// Now, a few seconds on: the test's own certificates are valid from the second they are
+/// made, which may come after the clock was read.
 fn now() -> i64 {
-    unix_now()
+    unix_now() + 5
 }
 
 /// DataPlane `name` of ControlPlane `control_plane`, its Accepted condition `accepted` if
@@ -135,6 +137,54 @@ fn a_certificate_is_issued_again_at_half_its_life_or_once_its_bundle_changes() {
     assert!(reissue(Some(&issued), &again, now));
 }
 
+/// A provided authority replaced by one of a new key: the control plane's own certificate
+/// of the one before is kept, trusting both, until the switch, and only then signed anew,
+/// so that a workload still trusting the one before alone never refuses it.
+#[test]
+fn its_own_certificate_of_a_replaced_authority_is_kept_until_the_switch() {
+    let now = now();
+    let root = edgerush_certificates::testing::Authority::new("platform root");
+    let provided = |name: &str| {
+        let intermediate = root.issue_authority(name);
+        Authority::read(
+            &Written {
+                certificate: intermediate.chain,
+                key: intermediate.key,
+                bundle: root.pem(),
+            },
+            Kind::Provided,
+            now,
+        )
+        .unwrap()
+    };
+    let old = provided("payments");
+    let leaf = issuer(Kind::Provided).own_leaf();
+    let held = old.issue(&leaf, now).unwrap();
+    assert_eq!(own_step(Some(&held), &old, now, None), Own::Keep);
+    assert_eq!(own_step(None, &old, now, None), Own::Issue);
+    let new = provided("payments").trusting(&[&held.bundle], now);
+    let switch_at = Some(now + SWITCH_AFTER);
+    let Own::Rebundle(kept) = own_step(Some(&held), &new, now, switch_at) else {
+        panic!("not kept");
+    };
+    assert_eq!(
+        (&kept.certificate, &kept.key),
+        (&held.certificate, &held.key)
+    );
+    assert_eq!(kept.bundle, new.trusted_pem());
+    assert_eq!(own_step(Some(&kept), &new, now + 60, switch_at), Own::Keep);
+    assert_eq!(
+        own_step(Some(&kept), &new, now + SWITCH_AFTER, switch_at),
+        Own::Issue
+    );
+    // Of an authority it no longer trusts at all, signed anew at once.
+    let unrelated = provided("payments");
+    assert_eq!(
+        own_step(Some(&held), &unrelated, now, switch_at),
+        Own::Issue
+    );
+}
+
 #[test]
 fn the_data_planes_kept_are_its_own_control_planes_ever_accepted() {
     let planes = [
@@ -176,6 +226,18 @@ async fn run(
     leads: bool,
     done: impl Fn(&[String], &Fake, &Option<Written>) -> bool,
 ) -> (Fake, Vec<String>, Option<Written>) {
+    run_as(name, Kind::Made, secrets, planes, leads, done).await
+}
+
+/// [`run`], of an authority of `kind`.
+async fn run_as(
+    name: &str,
+    kind: Kind,
+    secrets: Vec<serde_json::Value>,
+    planes: Vec<serde_json::Value>,
+    leads: bool,
+    done: impl Fn(&[String], &Fake, &Option<Written>) -> bool,
+) -> (Fake, Vec<String>, Option<Written>) {
     let fake = Fake::start_by_method(&["127.0.0.1"], move |method, path| {
         if path.contains("watch=true") {
             return open();
@@ -206,7 +268,7 @@ async fn run(
         .run_until(async {
             let issuing = tokio::task::spawn_local(issue(
                 api,
-                issuer(Kind::Made),
+                issuer(kind),
                 Some(leading),
                 own,
                 move |line| heard.borrow_mut().push(line.to_owned()),
@@ -355,4 +417,79 @@ async fn its_own_certificate_is_signed_and_each_data_planes_written_by_the_leade
     .await;
     assert!(!wrote(&fake), "a follower wrote: {said:?}");
     assert!(own.is_some());
+}
+
+/// The platform's authority replaced by one of a new key, a DataPlane's Secret holding a
+/// certificate of the one before: the one before is remembered from that Secret and trusted
+/// beside the new, by the stream and in the DataPlane's certificate written again (05 §2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replaced_provided_authority_is_remembered_from_its_workloads_secrets() {
+    let now = now();
+    let root = edgerush_certificates::testing::Authority::new("platform root");
+    let intermediate = |name: &str| {
+        let made = root.issue_authority(name);
+        Written {
+            certificate: made.chain,
+            key: made.key,
+            bundle: root.pem(),
+        }
+    };
+    let old = Authority::read(&intermediate("payments"), Kind::Provided, now).unwrap();
+    let held = old
+        .issue(&issuer(Kind::Provided).data_plane_leaf("web"), now)
+        .unwrap();
+    let replaced = intermediate("payments");
+    let secrets = vec![
+        json(&secret(
+            "edgerush-controller-payments-authority",
+            "edge",
+            &replaced,
+            None,
+            Some("9".to_owned()),
+        )),
+        json(&secret(
+            "edgerush-proxy-web-identity",
+            "edge",
+            &held,
+            None,
+            Some("3".to_owned()),
+        )),
+    ];
+    let planes = vec![json(&serde_json::json!({
+        "metadata": { "name": "web", "namespace": "edge", "generation": 1, "uid": "uid-web" },
+        "spec": { "controlPlaneRef": { "name": "payments" }, "ingress": { "httpPort": 80, "httpsPort": 443 } },
+        "status": { "conditions": [{ "type": "Accepted", "status": "True", "reason": "R", "message": "", "lastTransitionTime": "2026-11-13T10:00:00Z", "observedGeneration": 1 }] },
+    }))];
+    let (fake, said, own) = run_as(
+        "issuing-rotation",
+        Kind::Provided,
+        secrets,
+        planes,
+        true,
+        |said, _, own| {
+            own.is_some()
+                && said
+                    .iter()
+                    .any(|line| line.contains("certificate of DataPlane edge/web written"))
+        },
+    )
+    .await;
+    let new = Authority::read(&replaced, Kind::Provided, now).unwrap();
+    // The stream trusts both: the DataPlane's certificate of the one before is let in.
+    let own = own.unwrap();
+    let both = Authority::read(&replaced, Kind::Provided, now)
+        .unwrap()
+        .trusting(&[&held.bundle], now)
+        .trusted_pem();
+    assert_eq!(own.bundle, both, "{said:?}");
+    // Its certificate, written again of the new, trusting both until it is mounted.
+    let put = fake
+        .seen()
+        .into_iter()
+        .find(|seen| seen.method == "PUT")
+        .unwrap();
+    let rewritten: Secret = serde_json::from_str(&put.body).unwrap();
+    let rewritten = written(&rewritten).unwrap();
+    assert_eq!(rewritten.bundle, both);
+    assert!(new.signed(&rewritten, now));
 }

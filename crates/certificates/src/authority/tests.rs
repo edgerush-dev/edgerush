@@ -10,7 +10,8 @@ use boring::x509::X509StoreContext;
 use boring::x509::store::X509StoreBuilder;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Now, as the clock says: what verifying a chain checks dates against.
+/// Now, a few seconds on: the test's own certificates are valid from the second they are
+/// made, which may come after the clock was read.
 fn now() -> i64 {
     i64::try_from(
         SystemTime::now()
@@ -19,6 +20,7 @@ fn now() -> i64 {
             .as_secs(),
     )
     .unwrap()
+        + 5
 }
 
 /// Whether `leaf`'s chain leads to one of `bundle`'s, at the clock's now.
@@ -193,10 +195,99 @@ fn a_provided_authority_issues_with_its_chain_and_is_never_signed_again() {
             .len(),
         2
     );
-    assert_eq!(issued.bundle, root.pem());
     assert!(verifies(&issued, &root.pem()));
+    // What its workloads trust is its own certificate, not the platform's root: what
+    // another ControlPlane's authority of the same root issues is not trusted, though it
+    // leads to that root too.
+    assert_eq!(issued.bundle, intermediate.chain);
+    assert_eq!(authority.trusted_pem(), intermediate.chain);
+    assert!(authority.trusts(&issued, now));
+    let sibling = root.issue_authority("shop");
+    let sibling = Authority::read(
+        &Written {
+            certificate: sibling.chain,
+            key: sibling.key,
+            bundle: root.pem(),
+        },
+        Kind::Provided,
+        now,
+    )
+    .unwrap();
+    let theirs = sibling.issue(&leaf(), now).unwrap();
+    assert!(
+        verifies(&theirs, &root.pem()),
+        "the sibling's leaf leads to the root"
+    );
+    assert!(!authority.trusts(&theirs, now));
     assert!(!authority.due(now + AUTHORITY_SECONDS * 2));
     assert_eq!(authority.resign(now).err(), Some(IssueError::Provided));
+}
+
+/// A provided authority the platform replaces with one of a new key: its predecessor stays
+/// trusted beside it, as its workloads' Secrets remember it, until it expires, so that a
+/// workload still holding a certificate of the old is not refused; one expired is let go.
+#[test]
+fn a_provided_authority_replaced_trusts_its_predecessor_until_it_expires() {
+    let now = now();
+    let root = TestAuthority::new("platform root");
+    let provided = |name: &str| {
+        let intermediate = root.issue_authority(name);
+        Authority::read(
+            &Written {
+                certificate: intermediate.chain,
+                key: intermediate.key,
+                bundle: root.pem(),
+            },
+            Kind::Provided,
+            now,
+        )
+        .unwrap()
+    };
+    let old = provided("payments");
+    let held = old.issue(&leaf(), now).unwrap();
+    let new = provided("payments");
+    assert!(!new.trusts(&held, now), "the new alone refuses the old's");
+    let new = new.trusting(&[&held.bundle], now);
+    assert!(new.trusts(&held, now));
+    assert!(new.trusts(&new.issue(&leaf(), now).unwrap(), now));
+    assert_eq!(
+        X509::stack_from_pem(new.trusted_pem().as_bytes())
+            .unwrap()
+            .len(),
+        2
+    );
+    // Remembered twice, it is trusted once; past its end, not at all.
+    let again = new.trusting(&[&held.bundle, &held.bundle], now);
+    assert_eq!(
+        X509::stack_from_pem(again.trusted_pem().as_bytes())
+            .unwrap()
+            .len(),
+        2
+    );
+    let later = provided("payments").trusting(&[&held.bundle], now + 40 * 86_400);
+    assert_eq!(
+        X509::stack_from_pem(later.trusted_pem().as_bytes())
+            .unwrap()
+            .len(),
+        1,
+        "the test root's intermediates live 30 days"
+    );
+    // What is not a predecessor is never remembered: one of another name, though the same
+    // root signed it, or one of its name that another root signed.
+    let other_name = provided("shop");
+    let other_root = TestAuthority::new("another root").issue_authority("payments");
+    let strangers = format!("{}{}", other_name.trusted_pem(), other_root.chain);
+    let wary = provided("payments").trusting(&[&strangers], now);
+    assert_eq!(
+        X509::stack_from_pem(wary.trusted_pem().as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    // A made one's bundle is its own business.
+    let made = Authority::make("payments", now).unwrap();
+    let before = made.trusted_pem();
+    assert_eq!(made.trusting(&[&held.bundle], now).trusted_pem(), before);
 }
 
 #[test]

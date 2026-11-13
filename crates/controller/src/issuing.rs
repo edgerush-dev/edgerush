@@ -34,6 +34,57 @@ const LOOK: Duration = Duration::from_secs(60);
 /// The type of every Secret it writes, as cert-manager writes one.
 const TLS: &str = "kubernetes.io/tls";
 
+/// How long, once a provided authority is replaced, the control plane keeps its own
+/// certificate of the one before: time for the kubelet to put each workload's new bundle,
+/// which trusts both, into its pods, so that none refuses the control plane meanwhile
+/// (05 §2). The kubelet takes some two minutes at most.
+pub const SWITCH_AFTER: i64 = 300;
+
+/// What is to be done of the control plane's own certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Own {
+    /// Kept as it is.
+    Keep,
+    /// Kept, trusting this bundle now.
+    Rebundle(Written),
+    /// Signed anew.
+    Issue,
+}
+
+/// What is to be done of the control plane's own certificate `current` at `now`, by
+/// `authority`, where its predecessor's is kept until `switch_at`: none, one it does not
+/// trust, or one past half its life is signed anew; one of its predecessor's is kept until
+/// then; one whose bundle is no longer what it trusts is given the new.
+#[must_use]
+pub fn own_step(
+    current: Option<&Written>,
+    authority: &Authority,
+    now: i64,
+    switch_at: Option<i64>,
+) -> Own {
+    let Some(current) = current else {
+        return Own::Issue;
+    };
+    let due = current
+        .validity()
+        .is_none_or(|dates| renewal_due(dates, now));
+    if due || !authority.trusts(current, now) {
+        return Own::Issue;
+    }
+    if !authority.signed(current, now) && switch_at.is_none_or(|at| now >= at) {
+        return Own::Issue;
+    }
+    let trusted = authority.trusted_pem();
+    if current.bundle == trusted {
+        Own::Keep
+    } else {
+        Own::Rebundle(Written {
+            bundle: trusted,
+            ..current.clone()
+        })
+    }
+}
+
 /// Who it is, and the authority it signs with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Issuer {
@@ -144,7 +195,7 @@ pub fn reissue(current: Option<&Written>, authority: &Authority, now: i64) -> bo
     let Some(current) = current else {
         return true;
     };
-    if current.bundle != authority.bundle_pem() || !authority.trusts(current, now) {
+    if current.bundle != authority.trusted_pem() || !authority.trusts(current, now) {
         return true;
     }
     current
@@ -302,6 +353,8 @@ pub async fn issue(
         });
     }
     let mut said: Option<String> = None;
+    // Until when its own certificate of a provided authority's predecessor is kept.
+    let mut switch_at: Option<i64> = None;
     loop {
         if own.is_closed() {
             return;
@@ -366,18 +419,43 @@ pub async fn issue(
                     None
                 }
                 Step::Ready(authority) => {
-                    // Its own, every replica.
-                    let renew = reissue(own.borrow().as_ref(), &authority, now);
-                    if renew {
-                        match authority.issue(&issuer.own_leaf(), now) {
+                    // A provided authority's predecessors, as the Secrets it wrote and its
+                    // own certificate remember them, trusted until they expire (05 §2).
+                    let remembered: Vec<String> = served(&issuer, &planes_now.objects)
+                        .iter()
+                        .filter_map(|data_plane| data_plane.metadata.name.as_deref())
+                        .filter_map(|name| find(&identity_secret(name)).and_then(written))
+                        .map(|held| held.bundle)
+                        .chain(own.borrow().as_ref().map(|held| held.bundle.clone()))
+                        .collect();
+                    let remembered: Vec<&str> = remembered.iter().map(String::as_str).collect();
+                    let authority = authority.trusting(&remembered, now);
+                    // Its own, every replica: one of a predecessor's is kept a while, for
+                    // its workloads to be given the new bundle first.
+                    let current = own.borrow().clone();
+                    if let Some(current) = &current {
+                        if authority.signed(current, now) {
+                            switch_at = None;
+                        } else if switch_at.is_none() {
+                            switch_at = Some(now + SWITCH_AFTER);
+                        }
+                    }
+                    match own_step(current.as_ref(), &authority, now, switch_at) {
+                        Own::Keep => {}
+                        Own::Rebundle(kept) => {
+                            own.send_replace(Some(kept));
+                            say("own certificate kept, trusting the authority's new bundle");
+                        }
+                        Own::Issue => match authority.issue(&issuer.own_leaf(), now) {
                             Ok(issued) => {
                                 own.send_replace(Some(issued));
+                                switch_at = None;
                                 say("own certificate signed");
                             }
                             Err(error) => {
                                 say(&format!("own certificate cannot be signed: {error}"))
                             }
-                        }
+                        },
                     }
                     // Each DataPlane's, the leader's alone to write.
                     if leads {

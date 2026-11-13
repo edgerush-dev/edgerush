@@ -284,6 +284,76 @@ async fn a_data_plane_the_authorities_do_not_vouch_for_is_refused() {
     plane.join().await;
 }
 
+/// The stream's own credentials of `authority`, a ControlPlane's, for `names`: what it
+/// issues, and what its workloads trust.
+fn signed(authority: &edgerush_certificates::authority::Authority, names: &[&str]) -> Credentials {
+    let issued = authority
+        .issue(
+            &edgerush_certificates::authority::Leaf {
+                common_name: names[0].to_owned(),
+                dns: names.iter().map(|name| (*name).to_owned()).collect(),
+                spiffe_id: format!("spiffe://edge.cluster.local/ns/edge/sa/{}", names[0]),
+            },
+            now(),
+        )
+        .unwrap();
+    Credentials {
+        certificate: Certificate {
+            chain: issued.certificate,
+            key: issued.key,
+        },
+        authorities: issued.bundle,
+    }
+}
+
+/// Now, a few seconds on: the test's own certificates are valid from the second they are
+/// made, which may come after the clock was read.
+fn now() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+        + 5
+}
+
+/// Two ControlPlanes' authorities that a platform's one root signs: each end of a stream
+/// trusts its own ControlPlane's authority alone, an intermediate it anchors at, and what
+/// the other's issues is refused though it leads to the same root (05 §2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provided_authority_is_trusted_alone_and_not_its_siblings() {
+    use edgerush_certificates::authority::{Authority as Issuing, Kind, Written};
+    let root = Authority::new("platform root");
+    let provided = |name: &str| {
+        let intermediate = root.issue_authority(name);
+        Issuing::read(
+            &Written {
+                certificate: intermediate.chain,
+                key: intermediate.key,
+                bundle: root.pem(),
+            },
+            Kind::Provided,
+            now(),
+        )
+        .unwrap()
+    };
+    let (ours, theirs) = (provided("edge"), provided("shop"));
+    let offer = Offer::new(&config(80), None, &mut Versions::new(7)).unwrap();
+    let mut plane = Plane::start(&signed(&ours, &["control.test"]), Some(offer)).await;
+    // Of its own authority: served.
+    let tls = connector(&signed(&ours, &["data-plane"])).unwrap();
+    let (mut running, _following) = follower(&plane.address, "control.test", tls, |_| false);
+    ran(&mut running).await;
+    // Of the other ControlPlane's, of the same root: refused.
+    let tls = connector(&signed(&theirs, &["data-plane"])).unwrap();
+    let (_, following) = follower(&plane.address, "control.test", tls, |_| false);
+    assert!(matches!(ended(following).await, Ended::Unreachable(_)));
+    plane.signal();
+    plane.join().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_control_plane_the_authorities_do_not_vouch_for_or_of_another_name_is_refused() {
     let authority = Authority::new("stream");

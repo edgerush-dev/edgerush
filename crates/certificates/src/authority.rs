@@ -8,7 +8,10 @@
 //! is never signed again here. Either is kept as a Secret of `kubernetes.io/tls`'s shape,
 //! as cert-manager writes one: its certificate, its key, and the bundle a workload is to
 //! trust, [`Written`]. What it issues, a leaf of seven days on a key of its own, is
-//! written so too.
+//! written so too, its bundle what a workload of it trusts: a made authority's roots, or a
+//! provided one's own certificate, never the platform's root, which signs other
+//! ControlPlanes' authorities too and would vouch for what they issue (05 §2). A peer
+//! anchors trust at that certificate, as [`Authority::trusts`] does.
 //!
 //! Every time is passed in, in seconds since the Unix epoch: nothing here reads a clock.
 //! Keys and serial numbers are BoringSSL's random.
@@ -23,9 +26,11 @@ use boring::nid::Nid;
 use boring::pkey::{PKey, Private};
 use boring::stack::Stack;
 use boring::x509::extension::{
-    BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName, SubjectKeyIdentifier,
+    AuthorityKeyIdentifier, BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
+    SubjectKeyIdentifier,
 };
 use boring::x509::store::X509StoreBuilder;
+use boring::x509::verify::X509VerifyFlags;
 use boring::x509::{X509, X509Builder, X509NameBuilder, X509StoreContext};
 
 /// How long a leaf lives: a week (Lucas, 05 §2).
@@ -122,6 +127,8 @@ pub struct Authority {
     key: PKey<Private>,
     bundle: Vec<X509>,
     kind: Kind,
+    /// A provided one's predecessors, still trusted until they expire.
+    previous: Vec<X509>,
 }
 
 impl std::fmt::Debug for Authority {
@@ -148,6 +155,7 @@ impl Authority {
             chain: Vec::new(),
             key,
             kind: Kind::Made,
+            previous: Vec::new(),
         })
     }
 
@@ -174,6 +182,7 @@ impl Authority {
             key: identity.key,
             bundle,
             kind,
+            previous: Vec::new(),
         };
         // What it would issue, checked as a peer checks it: only then is it an authority.
         let probe = authority
@@ -186,7 +195,7 @@ impl Authority {
                 now,
             )
             .map_err(|_| ReadError::NotAnAuthority)?;
-        if !authority.trusts(&probe, now) {
+        if !verifies(&probe, &authority.bundle, now) {
             return Err(ReadError::NotAnAuthority);
         }
         Ok(authority)
@@ -207,10 +216,70 @@ impl Authority {
         }
     }
 
-    /// The bundle a workload of it trusts, in PEM.
+    /// The bundle its Secret holds, in PEM: a made one's roots, or what the platform gave
+    /// with a provided one.
     #[must_use]
     pub fn bundle_pem(&self) -> String {
         self.bundle.iter().map(pem).collect()
+    }
+
+    /// What a workload of it trusts, in PEM: a made one's roots; a provided one's own
+    /// certificate, and its predecessors until they expire, as the platform's root vouches
+    /// for other ControlPlanes' too.
+    #[must_use]
+    pub fn trusted_pem(&self) -> String {
+        self.trusted().iter().map(pem).collect()
+    }
+
+    /// The certificates a workload of it trusts.
+    fn trusted(&self) -> Vec<X509> {
+        match self.kind {
+            Kind::Made => self.bundle.clone(),
+            Kind::Provided => std::iter::once(self.certificate.clone())
+                .chain(self.previous.iter().cloned())
+                .collect(),
+        }
+    }
+
+    /// It, a provided one, trusting too each certificate of `bundles` that is a predecessor
+    /// of its: of its own subject, signed by the platform's root it is given, valid at
+    /// `now`, and not itself. Its predecessors are what its workloads' Secrets remember,
+    /// trusted until they expire, so that the platform's rotation of it refuses none of its
+    /// workloads that still hold a certificate of the one before (05 §2); anything else
+    /// written there is never trusted. A made one is left as it is: its own bundle holds
+    /// its predecessors.
+    #[must_use]
+    pub fn trusting(mut self, bundles: &[&str], now: i64) -> Self {
+        if self.kind == Kind::Made {
+            return self;
+        }
+        let own = self.certificate.to_der().ok();
+        let subject = self.certificate.subject_name().to_der().ok();
+        for bundle in bundles {
+            for certificate in X509::stack_from_pem(bundle.as_bytes()).unwrap_or_default() {
+                let der = certificate.to_der().ok();
+                let valid = validity(&certificate)
+                    .is_some_and(|dates| dates.not_before <= now && now < dates.not_after);
+                let known = der == own
+                    || self
+                        .previous
+                        .iter()
+                        .any(|previous| previous.to_der().ok() == der);
+                let named = certificate.subject_name().to_der().ok() == subject;
+                let rooted = || {
+                    let written = Written {
+                        certificate: pem(&certificate),
+                        key: String::new(),
+                        bundle: String::new(),
+                    };
+                    verifies(&written, &self.bundle, now)
+                };
+                if valid && !known && named && rooted() {
+                    self.previous.push(certificate);
+                }
+            }
+        }
+        self
     }
 
     /// Whether, made here, it is to be signed again at `now`: once a fifth of its life is
@@ -253,6 +322,7 @@ impl Authority {
             key: self.key.clone(),
             bundle,
             kind: Kind::Made,
+            previous: Vec::new(),
         })
     }
 
@@ -289,6 +359,15 @@ impl Authority {
         names.uri(&leaf.spiffe_id);
         let names = names.build(&builder.x509v3_context(Some(&self.certificate), None))?;
         builder.append_extension(&names)?;
+        // Which key signed it, where its authority says its own: a peer then finds its
+        // issuer among several of one name, as a replaced authority and the one before it
+        // are.
+        if self.certificate.subject_key_id().is_some() {
+            let signer = AuthorityKeyIdentifier::new()
+                .keyid(true)
+                .build(&builder.x509v3_context(Some(&self.certificate), None))?;
+            builder.append_extension(&signer)?;
+        }
         builder.sign(&self.key, MessageDigest::sha256())?;
         let issued = builder.build();
         let mut certificate = pem(&issued);
@@ -302,36 +381,54 @@ impl Authority {
             certificate,
             key: String::from_utf8(key.private_key_to_pem_pkcs8()?)
                 .map_err(|error| IssueError::Tls(error.to_string()))?,
-            bundle: self.bundle_pem(),
+            bundle: self.trusted_pem(),
         })
     }
 
-    /// Whether `leaf`'s chain leads to its bundle at `now`: one it issued, or another of the
-    /// authorities it trusts.
+    /// Whether it signed `leaf`, as of `now`: issued under its own certificate, not a
+    /// predecessor's it still trusts.
+    #[must_use]
+    pub fn signed(&self, leaf: &Written, now: i64) -> bool {
+        match self.kind {
+            Kind::Made => self.trusts(leaf, now),
+            Kind::Provided => verifies(leaf, std::slice::from_ref(&self.certificate), now),
+        }
+    }
+
+    /// Whether a workload of it trusts `leaf` at `now`, as a peer of the stream checks it:
+    /// its chain leads to what it trusts, each of those an anchor whether or not it is a
+    /// root. A provided authority's sibling, signed by the same platform root, is not.
     #[must_use]
     pub fn trusts(&self, leaf: &Written, now: i64) -> bool {
-        let verified = || -> Result<bool, ErrorStack> {
-            let mut chain = X509::stack_from_pem(leaf.certificate.as_bytes())?.into_iter();
-            let Some(first) = chain.next() else {
-                return Ok(false);
-            };
-            let mut untrusted = Stack::new()?;
-            for certificate in chain {
-                untrusted.push(certificate)?;
-            }
-            let mut store = X509StoreBuilder::new()?;
-            for root in &self.bundle {
-                store.add_cert(root.clone())?;
-            }
-            store.verify_param_mut().set_time(now);
-            let store = store.build();
-            let mut context = X509StoreContext::new()?;
-            context.init(&store, &first, &untrusted, |context| {
-                Ok(context.verify_cert()? && context.verify_result().is_ok())
-            })
-        };
-        verified().unwrap_or(false)
+        verifies(leaf, &self.trusted(), now)
     }
+}
+
+/// Whether `leaf`'s chain leads to one of `anchors` at `now`, each an anchor whether or
+/// not it is a root (partial chains, as the stream's peers verify).
+fn verifies(leaf: &Written, anchors: &[X509], now: i64) -> bool {
+    let verified = || -> Result<bool, ErrorStack> {
+        let mut chain = X509::stack_from_pem(leaf.certificate.as_bytes())?.into_iter();
+        let Some(first) = chain.next() else {
+            return Ok(false);
+        };
+        let mut untrusted = Stack::new()?;
+        for certificate in chain {
+            untrusted.push(certificate)?;
+        }
+        let mut store = X509StoreBuilder::new()?;
+        for anchor in anchors {
+            store.add_cert(anchor.clone())?;
+        }
+        store.set_flags(X509VerifyFlags::PARTIAL_CHAIN);
+        store.verify_param_mut().set_time(now);
+        let store = store.build();
+        let mut context = X509StoreContext::new()?;
+        context.init(&store, &first, &untrusted, |context| {
+            Ok(context.verify_cert()? && context.verify_result().is_ok())
+        })
+    };
+    verified().unwrap_or(false)
 }
 
 /// Whether a leaf of `dates` is to be issued again at `now`: from half its life on, or
