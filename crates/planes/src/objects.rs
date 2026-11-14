@@ -303,6 +303,25 @@ pub fn spiffe_id(
     format!("spiffe://{control_plane}.{cluster_domain}/ns/{namespace}/sa/{service_account}")
 }
 
+/// The SPIFFE ID DataPlane `data_plane` of ControlPlane `control_plane`'s is known by, its
+/// pods sharing it: its ServiceAccount's, in its ControlPlane's namespace `namespace`. Its
+/// certificate carries it, and the config stream serves it its own config by it
+/// ([05 §3](../../../docs/05-operator.md)).
+#[must_use]
+pub fn data_plane_id(
+    control_plane: &str,
+    cluster_domain: &str,
+    namespace: &str,
+    data_plane: &str,
+) -> String {
+    spiffe_id(
+        control_plane,
+        cluster_domain,
+        namespace,
+        &proxy_name(data_plane),
+    )
+}
+
 /// Where a data plane's pods mount their certificate.
 const IDENTITY_MOUNT: &str = "/etc/edgerush/identity";
 

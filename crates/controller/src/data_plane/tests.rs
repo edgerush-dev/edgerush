@@ -39,6 +39,19 @@ const BOTH: &str = "  ingress: { httpPort: 8080, httpsPort: 8443, hostFallThroug
 #[test]
 fn a_data_plane_serving_both_is_its_settings_field_by_field() {
     let plane = plane(&web(1, BOTH, ""), &own()).unwrap();
+    // The stream knows its data plane by the ID the certificate written for it carries.
+    let issuer = crate::issuing::Issuer {
+        namespace: "edge".to_owned(),
+        control_plane: "edge".to_owned(),
+        cluster_domain: "cluster.example".to_owned(),
+        authority: "edge-authority".to_owned(),
+        kind: edgerush_certificates::authority::Kind::Made,
+    };
+    assert_eq!(
+        plane.id.as_deref(),
+        Some("spiffe://edge.cluster.example/ns/edge/sa/edgerush-proxy-web")
+    );
+    assert_eq!(plane.id, Some(issuer.data_plane_leaf("web").spiffe_id));
     assert_eq!(plane.ingress_class.as_deref(), Some("edge.web"));
     assert_eq!(
         plane.gateway,

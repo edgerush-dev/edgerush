@@ -1261,6 +1261,145 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
     );
 }
 
+/// A translation is offered to the data plane it was made for alone: one made for another
+/// ID than the stream serves serves that ID in its place, and nothing offered before is
+/// kept for it or built on; the stream serves whom the settings say, none without them.
+#[test]
+fn a_translation_is_offered_to_the_data_plane_it_was_made_for_alone() {
+    const WEB: &str = "spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-web";
+    const API: &str = "spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-api";
+    let settings = |more: &str| edgerush_controller::Settings {
+        plane: serde_saphyr::from_str(&plane_with(more)).unwrap(),
+        service: None,
+    };
+    assert!(matches!(whom(None), Served::Nobody));
+    assert!(matches!(whom(Some(&settings(""))), Served::Anyone(None)));
+    let web = whom(Some(&settings(&format!("id: {WEB}"))));
+    assert!(
+        matches!(&web, Served::One { id, offer: None } if id == WEB),
+        "{web:?}"
+    );
+    let (served, offered) = watch::channel(web);
+    let offering = Offering {
+        versions: RefCell::new(Versions::new(7)),
+        served,
+        runs: Rc::default(),
+        pods: watch::channel(edgerush_controller::acks::Pods::new()).0,
+    };
+    let translation =
+        edgerush_translate::translate(&settings("").plane, &edgerush_translate::Cluster::default());
+    let first = offering.offer(&translation, Some(WEB)).unwrap();
+    let web_offer = offered
+        .borrow()
+        .offer_to(Some(WEB))
+        .unwrap()
+        .cloned()
+        .unwrap();
+    assert_eq!(web_offer.version(), first);
+    // The same config again, for the same data plane, is built on what it holds.
+    let again = offering.offer(&translation, Some(WEB)).unwrap();
+    assert_eq!(again, first);
+    // For another: served in its place, with an offer of its own.
+    let other = offering.offer(&translation, Some(API)).unwrap();
+    assert_ne!(other, first);
+    let served = offered.borrow().clone();
+    assert!(served.offer_to(Some(WEB)).is_err());
+    assert_eq!(
+        served.offer_to(Some(API)).unwrap().unwrap().version(),
+        other
+    );
+}
+
+/// Where the settings state the ID their data plane's certificate carries, the data plane
+/// that carries it is sent each config, and one that does not is refused, which both say.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_data_plane_is_served_only_where_its_certificate_carries_the_id_stated() {
+    const WEB: &str = "spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-web";
+    let fake = cluster().await;
+    let authority = Authority::new("stream");
+    let files = stream_files("served-by-id", &authority, "control.test");
+    let credentials = files.read().await.unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let serving = Serving {
+        listener,
+        credentials: Credentialing::Files {
+            files,
+            credentials,
+            reread: Duration::from_secs(1),
+        },
+        versions: Versions::new(7),
+        own: None,
+    };
+    let dialling = |names: &[&str]| {
+        let tls = edgerush_control_service::connector(&Credentials {
+            certificate: authority.issue(names),
+            authorities: authority.pem(),
+        })
+        .unwrap();
+        let (ran, running) = tokio::sync::mpsc::unbounded_channel();
+        let address = address.clone();
+        let following = tokio::spawn(async move {
+            let mut staging = Staging::new();
+            edgerush_control_service::follow(
+                &address,
+                "control.test",
+                &tls,
+                &mut staging,
+                |config| {
+                    let _ = ran.send(*config);
+                    std::future::ready(Ok(()))
+                },
+                |_| {},
+                None,
+            )
+            .await
+        });
+        (running, following)
+    };
+    let (mut running, served) = dialling(&["data-plane", WEB]);
+    let (mut refused_running, refused) = dialling(&["data-plane"]);
+    let why = "the data plane's certificate carries no SPIFFE ID, or more than one";
+    let lines = run_until(
+        &fake,
+        "controller-serves-by-id",
+        &plane_with(&format!("id: {WEB}")),
+        None,
+        Listeners {
+            stream: Some(serving),
+            webhook: None,
+            metrics: None,
+        },
+        |lines| {
+            let said = |end: &str| {
+                lines
+                    .iter()
+                    .any(|line| line.starts_with("data plane 127.0.0.1:") && line.ends_with(end))
+            };
+            lines.iter().any(|line| line.contains(": runs config 7."))
+                && said(&format!(": the stream ended: {why}"))
+        },
+    )
+    .await;
+    let config = running.try_recv().unwrap();
+    let routes: Vec<&str> = config
+        .routes
+        .iter()
+        .map(|route| route.name.as_str())
+        .collect();
+    assert_eq!(routes, ["ingress/shop/web/shop.example"], "{lines:?}");
+    assert!(refused_running.try_recv().is_err(), "{lines:?}");
+    let ended = tokio::time::timeout(Duration::from_secs(5), refused)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ended,
+        edgerush_control_service::Ended::Ended(why.to_owned())
+    );
+    let _stopped = tokio::time::timeout(Duration::from_secs(5), served).await;
+}
+
 #[test]
 fn the_leader_lease_is_a_namespace_and_a_name() {
     let leader = |args: &[&str]| {

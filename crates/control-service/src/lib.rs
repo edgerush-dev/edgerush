@@ -31,7 +31,7 @@ pub mod webhook;
 pub use boring::ssl::{SslAcceptor, SslConnector};
 pub use client::{Ended, follow};
 pub use files::{CertificateFiles, Files, FilesError, Reread, reread};
-pub use server::{Heard, ServeError, serve};
+pub use server::{Heard, ServeError, Served, Unserved, serve};
 pub use subscribe::{Backoff, Following, Subscription, subscribe};
 pub use tls::{Credentials, TlsError, acceptor, connector, connector_to, webhook_acceptor};
 

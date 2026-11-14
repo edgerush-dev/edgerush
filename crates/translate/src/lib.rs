@@ -36,7 +36,7 @@ use edgerush_config::{
     HeaderChanges, Hostname, Listener, ListenerCertificate, LoadBalancer, Match, PathMatch,
     Protocol, Query, Redirect, Route, Rule, Scheme, SharingHostname, SharingListener, StatedNames,
     TcpRoute, TlsRoute, UdpRoute, Upstream, UpstreamProtocol, UpstreamTls, ValueMatch,
-    WellKnownAuthorities, Wildcard, compile,
+    WellKnownAuthorities, Wildcard, compile, is_spiffe_id,
 };
 use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use edgerush_gateway_api::gateway::Gateway;
@@ -90,6 +90,13 @@ pub const GATEWAY_CONTROLLER: &str = "edgerush.dev/gateway-controller";
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Plane {
+    /// The SPIFFE ID its data plane's certificate carries, which the config stream knows it
+    /// by and serves this config to alone, refusing any other
+    /// ([05 §3](../../../docs/05-operator.md)): its DataPlane's in a cluster, stated or left
+    /// out in a settings file, and then any data plane the stream's authorities vouch for is
+    /// served it. The stream's alone: translation never reads it.
+    #[serde(default, deserialize_with = "spiffe_id")]
+    pub id: Option<String>,
     /// The IngressClass whose Ingresses it serves, if it serves Ingress: none, and no
     /// Ingress is its, whatever its class ([05 §3](../../../docs/05-operator.md)).
     #[serde(default)]
@@ -147,6 +154,18 @@ pub struct Plane {
     /// ([07 §1](../../../docs/07-config-and-dsl.md)), written into every config as they are.
     #[serde(default)]
     pub data_plane: DataPlane,
+}
+
+/// A [`Plane`]'s `id`, refused unless it is a SPIFFE ID.
+fn spiffe_id<'de, D: serde::Deserializer<'de>>(read: D) -> Result<Option<String>, D::Error> {
+    let id = String::deserialize(read)?;
+    if is_spiffe_id(&id) {
+        Ok(Some(id))
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "`{id}` is not a SPIFFE ID: spiffe://, a trust domain, then the workload's path"
+        )))
+    }
 }
 
 /// 80, where an Ingress's hosts are served over plain HTTP unless the settings say
@@ -3345,6 +3364,34 @@ mod tests {
     }
 
     const PLANE: &str = "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\ningress_https_redirect_max_age: 30\n";
+
+    /// A data plane is known on the stream by the SPIFFE ID its settings state, or by none
+    /// where they state none; settings that state what is not one are refused as they are
+    /// read.
+    #[test]
+    fn a_plane_states_its_spiffe_id_or_none() {
+        let read = |more: &str| serde_saphyr::from_str::<Plane>(&format!("{PLANE}{more}"));
+        assert_eq!(read("").unwrap().id, None);
+        assert_eq!(
+            read("id: spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-web")
+                .unwrap()
+                .id
+                .as_deref(),
+            Some("spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-web")
+        );
+        for not in [
+            "https://edge.cluster.local/ns/edge/sa/web",
+            "spiffe://",
+            "spiffe:///ns/edge/sa/web",
+            "edgerush-proxy-web",
+        ] {
+            let refused = read(&format!("id: \"{not}\"")).unwrap_err().to_string();
+            assert!(
+                refused.contains(&format!("`{not}` is not a SPIFFE ID")),
+                "{not}: {refused}"
+            );
+        }
+    }
 
     /// Ingresses `good`, routing `/`, and `bad`, routing a path that climbs, which the data
     /// plane refuses, translated for a data plane of no Gateway with these more settings.

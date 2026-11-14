@@ -33,7 +33,7 @@ pub use compile::{
     CompiledUpstreamTls, ConfigError, KeySecret, L4, L4Route, MOST_ATTEMPTS, MOST_LISTENERS,
     MatchId, Matches, NamedCertificate, Object, Outcome, Place, PresentedCertificate, Problem,
     RuleId, SharedListeners, SniRouter, Step, Timeout, compile, compile_with_matches, is_dns_name,
-    is_host_name, is_uri,
+    is_host_name, is_spiffe_id, is_uri,
 };
 pub use config::{
     AccessLog, Certificate, ClientValidation, Config, DataPlane, Endpoints, Forwarding,
