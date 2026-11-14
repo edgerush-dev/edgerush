@@ -1,8 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 0adf4e4cabac70b090b44d9802f8f99efb1a08d5ba9a35ccc6150304cfab4429 # shrinks to (all, arriving) = ([Sent { plane: 1, sequence: 1, count: 0, number: 1 }, Sent { plane: 1, sequence: 2, count: 0, number: 1 }, Sent { plane: 1, sequence: 2, count: 0, number: 1 }, Sent { plane: 1, sequence: 3, count: 0, number: 1 }, Sent { plane: 1, sequence: 4, count: 0, number: 2 }, Sent { plane: 1, sequence: 5, count: 0, number: 2 }, Sent { plane: 1, sequence: 5, count: 0, number: 2 }, Sent { plane: 1, sequence: 6, count: 0, number: 2 }, Sent { plane: 2, sequence: 1, count: 1, number: 1 }], [Sent { plane: 1, sequence: 3, count: 0, number: 1 }, Sent { plane: 1, sequence: 2, count: 0, number: 1 }, Sent { plane: 1, sequence: 5, count: 0, number: 2 }, Sent { plane: 1, sequence: 6, count: 0, number: 2 }, Sent { plane: 1, sequence: 1, count: 0, number: 1 }, Sent { plane: 1, sequence: 2, count: 0, number: 1 }, Sent { plane: 1, sequence: 4, count: 0, number: 2 }, Sent { plane: 1, sequence: 5, count: 0, number: 2 }, Sent { plane: 2, sequence: 1, count: 1, number: 1 }])
-cc 4b10bef5523dfbc72cac7fe578fcd3693e7f3ff14fe820ca734a69d06c1cac10 # shrinks to (all, arriving) = ([Sent { plane: 1, sequence: 1, count: 0, number: 1 }, Sent { plane: 1, sequence: 2, count: 0, number: 1 }, Sent { plane: 1, sequence: 3, count: 0, number: 2 }], [Sent { plane: 1, sequence: 1, count: 0, number: 1 }, Sent { plane: 1, sequence: 3, count: 0, number: 2 }, Sent { plane: 1, sequence: 2, count: 0, number: 1 }])

@@ -15,7 +15,7 @@
 
 use edgerush_cluster::{Config, Message as StoreMessage, NodeId, Time, table};
 use edgerush_cluster_asynchronous::{Answers, Batch, Entry, Message, Outbox, Pod};
-use edgerush_ratelimit::service::{Contract, Limit, PlaneId, Report};
+use edgerush_ratelimit::service::{Contract, PlaneId, Report};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
 use std::num::NonZeroU64;
@@ -47,13 +47,12 @@ fn batch(from: PlaneId, sequence: u64, keys: impl Iterator<Item = u64>) -> Batch
     let entries = keys
         .map(|k| Entry {
             key: key(k),
-            limit: Limit::Bucket(contract()),
+            contract: contract(),
             report: Report::Hits {
                 sequence,
                 count: 1,
                 seen: sequence - 1,
                 age: 0,
-                window: 0,
             },
         })
         .collect();

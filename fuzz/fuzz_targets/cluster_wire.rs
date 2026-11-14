@@ -29,12 +29,18 @@ fuzz_target!(|bytes: &[u8]| {
     if let Ok(sent) = ToPeer::<Synchronous>::decode(bytes)
         && let Ok((from, message)) = wire::from_peer::<Value>(sent)
     {
-        assert_eq!(again(wire::wire(from, message.clone())), Ok((from, message)));
+        assert_eq!(
+            again(wire::wire(from, message.clone())),
+            Ok((from, message))
+        );
     }
     if let Ok(sent) = ToCopy::<Synchronous>::decode(bytes)
         && let Ok((from, message)) = wire::from_copy::<Value>(sent)
     {
-        assert_eq!(again(wire::wire(from, message.clone())), Ok((from, message)));
+        assert_eq!(
+            again(wire::wire(from, message.clone())),
+            Ok((from, message))
+        );
     }
     // The bytes as pieces, each a length byte and its part, the length's top bit for more.
     let mut joining = Joining::new(MOST);

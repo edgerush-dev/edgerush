@@ -39,7 +39,6 @@ fn hits(sequence: u64, count: u64, seen: u64) -> Report {
         count,
         seen,
         age: 0,
-        window: 0,
     }
 }
 
@@ -48,7 +47,7 @@ fn batch(from: PlaneId, report: Report) -> Batch {
         from,
         entries: vec![Entry {
             key: b"k"[..].into(),
-            limit: Limit::Bucket(contract()),
+            contract: contract(),
             report,
         }],
         made: 0,
@@ -730,7 +729,7 @@ fn a_key_changed_twice_is_copied_once_as_it_last_stood() {
     let mut both = batch(1, hits(2, 3, 1));
     both.entries.push(Entry {
         key: other[..].into(),
-        limit: Limit::Bucket(contract()),
+        contract: contract(),
         report: hits(1, 1, 0),
     });
     pod.on_batch(both, CYCLE);
@@ -1013,7 +1012,7 @@ fn a_long_refill_keeps_a_silent_record_for_its_refill_time() {
     let send = |pod: &mut ServicePod, from, sequence, now| {
         let entry = Entry {
             key: b"k"[..].into(),
-            limit: Limit::Bucket(hourly),
+            contract: hourly,
             report: hits(sequence, 1, sequence - 1),
         };
         pod.on_batch(
@@ -1671,7 +1670,7 @@ fn a_timer_looks_only_at_keys_due() {
     many.entries = (0..100)
         .map(|n| Entry {
             key: format!("k{n}").into_bytes().into(),
-            limit: Limit::Bucket(contract()),
+            contract: contract(),
             report: hits(1, 1, 0),
         })
         .collect();
@@ -1753,7 +1752,7 @@ proptest::proptest! {
                     *sequence += 1;
                     let mut hit = batch(plane, hits(*sequence, 1, *sequence - 1));
                     hit.entries[0].key = vec![key].into();
-                    hit.entries[0].limit = Limit::Bucket(if is_slow { slow } else { contract() });
+                    hit.entries[0].contract = if is_slow { slow } else { contract() };
                     pod.on_batch(hit, now);
                 }
                 PodEvent::Poll { plane, key } => {
@@ -1953,14 +1952,13 @@ fn a_batch_ages_what_joined_it_earlier() {
     let mut queued = Queued::default();
     queued.at(10 * MS).entries.push(Entry {
         key: b"k"[..].into(),
-        limit: Limit::Bucket(contract()),
+        contract: contract(),
         report: Unseen {
             sequence: 1,
             count: 1,
             admitted: 4 * MS,
             first: 10 * MS,
             last: 10 * MS,
-            window: 0,
         }
         .report(0, 10 * MS),
     });
@@ -2221,7 +2219,7 @@ fn a_piece_takes_no_more_than_fits() {
     let entries: Vec<Entry> = (0..3_000)
         .map(|n| Entry {
             key: key(n),
-            limit: Limit::Bucket(contract()),
+            contract: contract(),
             report: hits(1, 1, 0),
         })
         .collect();
@@ -2250,7 +2248,7 @@ fn a_piece_takes_an_entry_bigger_than_itself_alone() {
     for key in [vec![b'a'; 2 * PIECE_BYTES], vec![b'b'; 10]] {
         queued.push_entry(Entry {
             key: key.into(),
-            limit: Limit::Bucket(contract()),
+            contract: contract(),
             report: Report::Poll,
         });
     }

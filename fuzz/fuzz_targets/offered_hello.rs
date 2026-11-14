@@ -56,7 +56,9 @@ fuzz_target!(|data: &[u8]| {
     }
     // In TLS 1.3 the schemes alone decide: no suite or group changes what is offered.
     let tls13 = versions.is_some_and(|versions| {
-        versions.first().is_some_and(|&length| usize::from(length) + 1 == versions.len())
+        versions
+            .first()
+            .is_some_and(|&length| usize::from(length) + 1 == versions.len())
             && versions[1..]
                 .chunks_exact(2)
                 .any(|version| version == [0x03, 0x04])

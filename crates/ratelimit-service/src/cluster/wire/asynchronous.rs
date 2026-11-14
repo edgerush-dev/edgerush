@@ -14,9 +14,7 @@ use super::{
     stamp_from, table_from, table_to_wire, wire,
 };
 use crate::grpc::MAX_MESSAGE;
-use crate::wire::{
-    Contract, FixedWindow, Report, limit, limit_to_wire, narrow, report, report_to_wire,
-};
+use crate::wire::{Contract, Report, contract, narrow, report, report_to_wire};
 use edgerush_cluster::{Message, NodeId};
 use edgerush_cluster_asynchronous::{
     Answer as AsyncAnswer, Answered as AsyncAnswered, Answers as AsyncAnswers, Batch as AsyncBatch,
@@ -24,11 +22,12 @@ use edgerush_cluster_asynchronous::{
     Value as AsyncValue, Why,
 };
 use edgerush_ratelimit::reference::BucketState;
-use edgerush_ratelimit::service::Standing;
 
 /// One batch waiting behind one missing, in a data plane's record.
 #[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
 pub struct Waiting {
+    // Tag 4, a fixed window's number, is retired with the asynchronous mode's windows (#389): never
+    // reuse it.
     /// The batch's number.
     #[prost(uint64, tag = "1")]
     pub sequence: u64,
@@ -38,9 +37,6 @@ pub struct Waiting {
     /// When they are charged as of, in nanoseconds of the wall clock.
     #[prost(uint64, tag = "3")]
     pub at: u64,
-    /// Under a fixed window, the window they were admitted in; 0 under a bucket.
-    #[prost(uint64, tag = "4")]
-    pub window: u64,
 }
 
 /// What an owner knows of one data plane admitting a key.
@@ -63,8 +59,9 @@ pub struct Record {
 /// The asynchronous mode's value under one key.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct Asynchronous {
-    /// The bucket's contract it is kept under; none for a key never made, or kept under a
-    /// fixed window.
+    // Tags 7 to 9, a fixed window and its count, are retired with the asynchronous mode's windows
+    // (#389): never reuse them.
+    /// The contract it is kept under; none for a key never made.
     #[prost(message, optional, tag = "1")]
     pub contract: Option<Contract>,
     /// Its bucket's arrival time, its high 64 bits; 0 with the low for none.
@@ -82,15 +79,6 @@ pub struct Asynchronous {
     /// What it knows of each data plane admitting the key.
     #[prost(message, repeated, tag = "6")]
     pub planes: Vec<Record>,
-    /// The fixed window it is kept under, if it is.
-    #[prost(message, optional, tag = "7")]
-    pub fixed_window: Option<FixedWindow>,
-    /// Under a fixed window, the latest window it has counted hits in.
-    #[prost(uint64, tag = "8")]
-    pub window_number: u64,
-    /// The hits counted in it.
-    #[prost(uint64, tag = "9")]
-    pub window_count: u64,
 }
 
 impl Value for AsyncValue {
@@ -98,19 +86,14 @@ impl Value for AsyncValue {
 
     fn to_wire(&self) -> Asynchronous {
         let Parts {
-            limit,
+            contract,
             bucket,
-            window: (window_number, window_count),
             counted,
             planes,
         } = self.parts();
         let arrival = bucket.arrival();
-        let (contract, fixed_window) = limit.map_or((None, None), limit_to_wire);
         Asynchronous {
-            contract,
-            fixed_window,
-            window_number,
-            window_count,
+            contract: contract.map(Contract::from),
             // The arrival time's two halves, each 64 bits.
             arrival_high: u64::try_from(arrival >> 64).unwrap_or(u64::MAX),
             arrival_low: u64::try_from(arrival & u128::from(u64::MAX)).unwrap_or(u64::MAX),
@@ -125,11 +108,10 @@ impl Value for AsyncValue {
                     waiting: plane
                         .waiting
                         .into_iter()
-                        .map(|(sequence, count, at, window)| Waiting {
+                        .map(|(sequence, count, at)| Waiting {
                             sequence,
                             count,
                             at,
-                            window,
                         })
                         .collect(),
                 })
@@ -138,15 +120,15 @@ impl Value for AsyncValue {
     }
 
     fn from_wire(wire: Asynchronous) -> Result<Self, Invalid> {
-        let limit = match (wire.contract, wire.fixed_window) {
-            (None, None) => None,
-            (contract, window) => Some(limit(contract, window).map_err(Invalid::Entry)?),
-        };
+        let contract = wire
+            .contract
+            .map(|held| contract(Some(held)))
+            .transpose()
+            .map_err(Invalid::Entry)?;
         let arrival = (u128::from(wire.arrival_high) << 64) | u128::from(wire.arrival_low);
         let parts = Parts {
-            limit,
+            contract,
             bucket: BucketState::from_parts(arrival, wire.last),
-            window: (wire.window_number, wire.window_count),
             counted: wire.counted,
             planes: wire
                 .planes
@@ -158,9 +140,7 @@ impl Value for AsyncValue {
                     waiting: record
                         .waiting
                         .into_iter()
-                        .map(|waiting| {
-                            (waiting.sequence, waiting.count, waiting.at, waiting.window)
-                        })
+                        .map(|waiting| (waiting.sequence, waiting.count, waiting.at))
                         .collect(),
                 })
                 .collect(),
@@ -172,18 +152,17 @@ impl Value for AsyncValue {
 /// One key in a batch.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct Entry {
+    // Tag 6, a fixed window, is retired with the asynchronous mode's windows (#389): never reuse
+    // it.
     /// The key, as the data plane hashed it.
     #[prost(uint64, tag = "1")]
     pub key: u64,
-    /// Its bucket's contract, if it is kept under one.
+    /// Its contract.
     #[prost(message, optional, tag = "2")]
     pub contract: Option<Contract>,
     /// What about it.
     #[prost(oneof = "Report", tags = "3, 5")]
     pub report: Option<Report>,
-    /// Its fixed window, if it is kept under one.
-    #[prost(message, optional, tag = "6")]
-    pub fixed_window: Option<FixedWindow>,
 }
 
 /// A data plane's batch: all it has for the keys its table names one pod the owner of.
@@ -207,11 +186,13 @@ pub struct Batch {
 /// The owner's answer about one key.
 #[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
 pub struct Answer {
+    // Tag 5, a fixed window's standing, is retired with the asynchronous mode's windows (#389):
+    // never reuse it.
     /// The key.
     #[prost(uint64, tag = "1")]
     pub key: u64,
     /// How far the owner's bucket is from full, in time multiplied by the limit; past what 64
-    /// bits hold, the most they do, as today's answers have it. 0 under a fixed window.
+    /// bits hold, the most they do, as today's answers have it.
     #[prost(uint64, tag = "2")]
     pub behind: u64,
     /// The highest of the data plane's batches applied.
@@ -220,20 +201,6 @@ pub struct Answer {
     /// How many other data planes are admitting the key.
     #[prost(uint64, tag = "4")]
     pub others: u64,
-    /// Under a fixed window, where it stands; none under a bucket.
-    #[prost(message, optional, tag = "5")]
-    pub window: Option<WindowStanding>,
-}
-
-/// Where a fixed window stands, as its owner holds it.
-#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
-pub struct WindowStanding {
-    /// The latest window it has counted hits in; 0 while none.
-    #[prost(uint64, tag = "1")]
-    pub number: u64,
-    /// The hits counted in it.
-    #[prost(uint64, tag = "2")]
-    pub count: u64,
 }
 
 /// A key the pod does not serve.
@@ -324,42 +291,19 @@ pub enum Answered {
 }
 
 fn entry_to_wire(entry: AsyncEntry) -> Entry {
-    let (contract, fixed_window) = limit_to_wire(entry.limit);
     Entry {
         key: entry.key,
-        contract,
+        contract: Some(entry.contract.into()),
         report: Some(report_to_wire(entry.report)),
-        fixed_window,
     }
 }
 
 fn entry_from(entry: Entry) -> Result<AsyncEntry, Invalid> {
     Ok(AsyncEntry {
         key: entry.key,
-        limit: limit(entry.contract, entry.fixed_window).map_err(Invalid::Entry)?,
+        contract: contract(entry.contract).map_err(Invalid::Entry)?,
         report: report(entry.report).map_err(Invalid::Entry)?,
     })
-}
-
-/// Where a key stands as the wire carries it: a bucket's distance from full, or a window.
-fn standing_to_wire(standing: Standing) -> (u64, Option<WindowStanding>) {
-    match standing {
-        Standing::Bucket { behind } => (narrow(behind), None),
-        Standing::Window { number, count } => (0, Some(WindowStanding { number, count })),
-    }
-}
-
-/// Where a key stands from the wire: a window if one is said, else a bucket.
-fn standing_from(behind: u64, window: Option<WindowStanding>) -> Standing {
-    window.map_or(
-        Standing::Bucket {
-            behind: u128::from(behind),
-        },
-        |window| Standing::Window {
-            number: window.number,
-            count: window.count,
-        },
-    )
 }
 
 /// A data plane's batch as the wire carries it.
@@ -408,15 +352,11 @@ pub fn answers_to_wire(answers: AsyncAnswers) -> Answers {
         entries: answers
             .entries
             .into_iter()
-            .map(|answer| {
-                let (behind, window) = standing_to_wire(answer.answered.standing);
-                Answer {
-                    key: answer.key,
-                    behind,
-                    applied: answer.answered.applied,
-                    others: answer.answered.others,
-                    window,
-                }
+            .map(|answer| Answer {
+                key: answer.key,
+                behind: narrow(answer.answered.behind),
+                applied: answer.answered.applied,
+                others: answer.answered.others,
             })
             .collect(),
         unserved: answers
@@ -447,7 +387,7 @@ pub fn answers_from(answers: Answers) -> Result<AsyncAnswers, Invalid> {
             .map(|answer| AsyncAnswer {
                 key: answer.key,
                 answered: AsyncAnswered {
-                    standing: standing_from(answer.behind, answer.window),
+                    behind: u128::from(answer.behind),
                     applied: answer.applied,
                     others: answer.others,
                 },
@@ -587,8 +527,7 @@ mod tests {
     use crate::cluster::wire::{Request, Synchronous};
     use edgerush_cluster::table::first;
     use edgerush_ratelimit::service::{
-        Contract as ServiceContract, FixedWindow as ServiceWindow, Limit, MOST_UNACKNOWLEDGED,
-        Report as ServiceReport,
+        Contract as ServiceContract, MOST_UNACKNOWLEDGED, Report as ServiceReport,
     };
     use proptest::prelude::*;
     use prost::Message as _;
@@ -605,28 +544,14 @@ mod tests {
         })
     }
 
-    fn limits() -> impl Strategy<Value = Limit> {
-        prop_oneof![
-            contracts().prop_map(Limit::Bucket),
-            (1u64.., 1u64..).prop_map(|(limit, length)| {
-                let n = |n| NonZeroU64::new(n).unwrap();
-                Limit::FixedWindow(ServiceWindow {
-                    limit: n(limit),
-                    length: n(length),
-                })
-            }),
-        ]
-    }
-
     fn reports() -> impl Strategy<Value = ServiceReport> {
         prop_oneof![
-            (1u64.., any::<u64>(), any::<u64>(), any::<(u64, u64)>()).prop_map(
-                |(sequence, count, seen, (age, window))| ServiceReport::Hits {
+            (1u64.., any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
+                |(sequence, count, seen, age)| ServiceReport::Hits {
                     sequence,
                     count,
                     seen: seen % sequence,
                     age,
-                    window,
                 }
             ),
             Just(ServiceReport::Poll),
@@ -634,8 +559,12 @@ mod tests {
     }
 
     fn batches() -> impl Strategy<Value = AsyncBatch> {
-        let entry = (any::<u64>(), limits(), reports())
-            .prop_map(|(key, limit, report)| AsyncEntry { key, limit, report });
+        let entry =
+            (any::<u64>(), contracts(), reports()).prop_map(|(key, contract, report)| AsyncEntry {
+                key,
+                contract,
+                report,
+            });
         (
             any::<u64>(),
             any::<(u64, u64)>(),
@@ -659,7 +588,7 @@ mod tests {
     fn answers() -> impl Strategy<Value = AsyncAnswers> {
         (
             any::<(u64, u64, u64)>(),
-            prop::collection::vec((any::<(u64, u64, u64, u64)>(), any::<bool>()), 0..4),
+            prop::collection::vec(any::<(u64, u64, u64, u64)>(), 0..4),
             prop::collection::vec((any::<u64>(), any::<bool>()), 0..4),
             any::<bool>(),
         )
@@ -670,19 +599,10 @@ mod tests {
                     made,
                     entries: entries
                         .into_iter()
-                        .map(|((key, behind, applied, others), windowed)| AsyncAnswer {
+                        .map(|(key, behind, applied, others)| AsyncAnswer {
                             key,
                             answered: AsyncAnswered {
-                                standing: if windowed {
-                                    Standing::Window {
-                                        number: behind,
-                                        count: others ^ behind,
-                                    }
-                                } else {
-                                    Standing::Bucket {
-                                        behind: u128::from(behind),
-                                    }
-                                },
+                                behind: u128::from(behind),
                                 applied,
                                 others,
                             },
@@ -707,24 +627,20 @@ mod tests {
     /// A value any owner could hold: records of data planes each once, batches waiting each
     /// once and up to as many as a data plane may have out, its arrival time any of 128 bits.
     fn values() -> impl Strategy<Value = AsyncValue> {
-        let waiting = prop::collection::btree_map(
-            any::<u64>(),
-            any::<(u64, u64, u64)>(),
-            0..=MOST_UNACKNOWLEDGED,
-        );
+        let waiting =
+            prop::collection::btree_map(any::<u64>(), any::<(u64, u64)>(), 0..=MOST_UNACKNOWLEDGED);
         let plane = (any::<u64>(), prop::option::of(any::<u64>()), waiting);
         (
-            prop::option::of(limits()),
+            prop::option::of(contracts()),
             any::<u128>(),
-            any::<(u64, u64, u64)>(),
+            any::<u64>(),
             any::<u64>(),
             prop::collection::btree_map(any::<u64>(), plane, 0..4),
         )
-            .prop_map(|(limit, arrival, (last, number, count), counted, planes)| {
+            .prop_map(|(contract, arrival, last, counted, planes)| {
                 AsyncValue::from_parts(Parts {
-                    limit,
+                    contract,
                     bucket: BucketState::from_parts(arrival, last),
-                    window: (number, count),
                     counted,
                     planes: planes
                         .into_iter()
@@ -736,9 +652,7 @@ mod tests {
                             admitted: admitted.map(|at| at.min(u64::MAX - 1)),
                             waiting: waiting
                                 .into_iter()
-                                .map(|(sequence, (count, at, window))| {
-                                    (sequence, count, at, window)
-                                })
+                                .map(|(sequence, (count, at))| (sequence, count, at))
                                 .collect(),
                         })
                         .collect(),
@@ -921,11 +835,11 @@ mod tests {
             made: 0,
             entries: vec![AsyncEntry {
                 key: 3,
-                limit: Limit::Bucket(ServiceContract {
+                contract: ServiceContract {
                     limit: one,
                     window: one,
                     burst: one,
-                }),
+                },
                 report: ServiceReport::Poll,
             }],
         };
@@ -936,32 +850,12 @@ mod tests {
             batch_from(no_contract),
             Err(Invalid::Entry(crate::wire::Invalid::NoContract))
         );
-        let mut both = batch_to_wire(fine.clone());
-        both.entries[0].fixed_window = Some(FixedWindow {
-            limit: 1,
-            length_ns: 1,
-        });
-        assert_eq!(
-            batch_from(both),
-            Err(Invalid::Entry(crate::wire::Invalid::TwoLimits))
-        );
-        let mut zero_window = batch_to_wire(fine.clone());
-        zero_window.entries[0].contract = None;
-        zero_window.entries[0].fixed_window = Some(FixedWindow {
-            limit: 1,
-            length_ns: 0,
-        });
-        assert_eq!(
-            batch_from(zero_window),
-            Err(Invalid::Entry(crate::wire::Invalid::ZeroContract))
-        );
         let mut seen = batch_to_wire(fine);
         seen.entries[0].report = Some(Report::Hits(crate::wire::Hits {
             sequence: 2,
             count: 1,
             seen: 2,
             age_ns: 0,
-            window: 0,
         }));
         assert_eq!(
             batch_from(seen),

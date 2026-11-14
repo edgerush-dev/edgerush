@@ -1,7 +1,6 @@
 //! What the asynchronous mode keeps under each key: its owner's state of it, as today's
-//! asynchronous owner keeps it (`edgerush_ratelimit::service`), by the wall clock: a bucket's
-//! state, or a fixed window's latest window and its count. Each part only rises — the bucket's
-//! arrival time, the window and its count, the hits counted, each data plane's highest batch
+//! asynchronous owner keeps it (`edgerush_ratelimit::service`), by the wall clock. Each part
+//! only rises — the bucket's arrival time, the hits counted, each data plane's highest batch
 //! applied and last admission — so that two copies merge by keeping the larger of each, in
 //! whatever order they meet. Batches kept waiting behind a missing one merge as a union, the
 //! same batch twice taking the smaller count; records of data planes long silent are retired
@@ -9,19 +8,15 @@
 
 use edgerush_cluster::Held;
 use edgerush_ratelimit::reference::{BucketState, TokenBucket};
-use edgerush_ratelimit::service::{
-    Contract, Limit, MOST_UNACKNOWLEDGED, PlaneId, RECORD_KEPT, Standing,
-};
+use edgerush_ratelimit::service::{Contract, MOST_UNACKNOWLEDGED, PlaneId, RECORD_KEPT};
 
 /// A key's state as its owner holds it, and every replica a copy of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Value {
-    /// The limit it is kept under; `None` for a key never made.
-    pub(crate) limit: Option<Limit>,
-    /// Under a bucket, its state, the contract its terms, by the wall clock.
+    /// The contract it is kept under; `None` for a key never made.
+    pub(crate) contract: Option<Contract>,
+    /// Its bucket's state, the contract its terms, by the wall clock.
     pub(crate) bucket: BucketState,
-    /// Under a fixed window, the latest window it has counted hits in.
-    pub(crate) window: Counted,
     /// Hits applied, each once: for measuring.
     pub(crate) counted: u64,
     /// What it knows of each data plane admitting the key.
@@ -29,20 +24,19 @@ pub struct Value {
 }
 
 impl Value {
-    /// A key made afresh under `limit`: a full bucket, or a window with nothing counted; no
-    /// data plane known.
+    /// A key made afresh under `contract`: a full bucket, nothing counted, no data plane known.
     #[must_use]
-    pub fn new(limit: Limit) -> Self {
+    pub fn new(contract: Contract) -> Self {
         Self {
-            limit: Some(limit),
+            contract: Some(contract),
             ..Self::default()
         }
     }
 
-    /// The limit it is kept under; `None` for a key never made.
+    /// The contract it is kept under; `None` for a key never made.
     #[must_use]
-    pub const fn limit(&self) -> Option<Limit> {
-        self.limit
+    pub const fn contract(&self) -> Option<Contract> {
+        self.contract
     }
 
     /// Hits applied, each once.
@@ -51,33 +45,10 @@ impl Value {
         self.counted
     }
 
-    /// Its bucket, under its contract; `None` for a key never made, or kept under a window.
+    /// Its bucket, under its contract; `None` for a key never made.
     #[must_use]
     pub fn bucket(&self) -> Option<TokenBucket> {
-        match self.limit? {
-            Limit::Bucket(contract) => Some(self.bucket_under(contract)),
-            Limit::FixedWindow(_) => None,
-        }
-    }
-
-    /// Under a fixed window, the latest window it has counted hits in and how many: `(0, 0)`
-    /// while it has counted none.
-    #[must_use]
-    pub const fn window(&self) -> (u64, u64) {
-        (self.window.number, self.window.count)
-    }
-
-    /// Where it stands at `now` under `limit`, as a data plane is told.
-    pub(crate) fn standing(&self, limit: Limit, now: u64) -> Standing {
-        match limit {
-            Limit::Bucket(contract) => Standing::Bucket {
-                behind: self.bucket_under(contract).behind(now),
-            },
-            Limit::FixedWindow(_) => Standing::Window {
-                number: self.window.number,
-                count: self.window.count,
-            },
-        }
+        self.contract.map(|contract| self.bucket_under(contract))
     }
 
     /// The highest of `plane`'s batches applied, every one before it too, if it has a record.
@@ -112,9 +83,9 @@ impl Value {
     /// `count` reported hits, admitted at `at`, applied at `now`: charged as of `at`, each if
     /// there is room, or as debt while it would be paid back within a refill time of `now`; the
     /// rest forgiven. In one step, whatever the count: it comes from the wire. Nothing for a
-    /// key never made, or kept under a window.
+    /// key never made.
     pub(crate) fn charge(&mut self, count: u64, at: u64, now: u64) {
-        let Some(Limit::Bucket(contract)) = self.limit else {
+        let Some(contract) = self.contract else {
             return;
         };
         self.counted = self.counted.saturating_add(count);
@@ -139,10 +110,11 @@ impl Value {
     }
 
     /// How long a silent data plane's record is kept after the latest admission: ten minutes,
-    /// or the key's refill time (a window's length) if longer.
+    /// or the key's refill time if longer.
     pub(crate) fn record_kept(&self) -> u64 {
-        self.limit
-            .map_or(RECORD_KEPT, |limit| limit.refill_time().max(RECORD_KEPT))
+        self.contract.map_or(RECORD_KEPT, |contract| {
+            contract.refill_time().max(RECORD_KEPT)
+        })
     }
 
     /// Lets go of the records of data planes that last admitted more than
@@ -153,14 +125,14 @@ impl Value {
         self.planes.retire(kept)
     }
 
-    /// Takes in `other`, a copy of the same key: under the same limit, the larger of each
+    /// Takes in `other`, a copy of the same key: under the same contract, the larger of each
     /// part, then the records of data planes silent for ten minutes (or a refill time, if
     /// longer) before the latest admission gone, as the owner lets them go; under another, it
     /// replaces a value never charged — never made, or made by polls alone — and is otherwise
     /// ignored, as the synchronous mode's value of another shape is. Whether it changed
     /// anything.
     pub fn merge(&mut self, other: &Self) -> bool {
-        if self.limit != other.limit {
+        if self.contract != other.contract {
             // No hit applied, of any count: the bucket was never charged either.
             if self.counted == 0 {
                 *self = other.clone();
@@ -172,10 +144,6 @@ impl Value {
         let bucket = self.bucket.larger(other.bucket);
         if bucket != self.bucket {
             self.bucket = bucket;
-            changed = true;
-        }
-        if other.window > self.window {
-            self.window = other.window;
             changed = true;
         }
         if other.counted > self.counted {
@@ -200,9 +168,8 @@ impl Value {
     #[must_use]
     pub fn parts(&self) -> Parts {
         Parts {
-            limit: self.limit,
+            contract: self.contract,
             bucket: self.bucket,
-            window: self.window(),
             counted: self.counted,
             planes: self
                 .planes
@@ -214,9 +181,7 @@ impl Value {
                     waiting: record.waiting.as_deref().map_or_else(Vec::new, |waiting| {
                         waiting
                             .iter()
-                            .map(|(sequence, tally)| {
-                                (*sequence, tally.count, tally.at, tally.window)
-                            })
+                            .map(|(sequence, tally)| (*sequence, tally.count, tally.at))
                             .collect()
                     }),
                 })
@@ -230,9 +195,8 @@ impl Value {
     #[must_use]
     pub fn from_parts(parts: Parts) -> Option<Self> {
         let Parts {
-            limit,
+            contract,
             bucket,
-            window: (number, count),
             counted,
             mut planes,
         } = parts;
@@ -245,7 +209,7 @@ impl Value {
             let mut waiting: Vec<(u64, Tally)> = plane
                 .waiting
                 .into_iter()
-                .map(|(sequence, count, at, window)| (sequence, Tally { count, at, window }))
+                .map(|(sequence, count, at)| (sequence, Tally { count, at }))
                 .collect();
             waiting.sort_by_key(|(sequence, _)| *sequence);
             if waiting.len() > MOST_UNACKNOWLEDGED
@@ -261,9 +225,8 @@ impl Value {
             records.push((plane.plane, record));
         }
         Some(Self {
-            limit,
+            contract,
             bucket,
-            window: Counted { number, count },
             counted,
             planes: Records(records),
         })
@@ -273,12 +236,10 @@ impl Value {
 /// A [`Value`] in its parts, as a wire carries it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Parts {
-    /// The limit it is kept under; `None` for a key never made.
-    pub limit: Option<Limit>,
-    /// Under a bucket, its state, by the wall clock.
+    /// The contract it is kept under; `None` for a key never made.
+    pub contract: Option<Contract>,
+    /// Its bucket's state, by the wall clock.
     pub bucket: BucketState,
-    /// Under a fixed window, the latest window it has counted hits in and how many.
-    pub window: (u64, u64),
     /// Hits applied, each once.
     pub counted: u64,
     /// What it knows of each data plane admitting the key.
@@ -294,10 +255,9 @@ pub struct PlaneParts {
     pub applied: u64,
     /// When it last admitted the key, by the wall clock, if it has.
     pub admitted: Option<u64>,
-    /// Batches that came ahead of one still missing: `(sequence, count, at, window)`, `at`
-    /// when their hits are charged as of, by the wall clock, and `window` the one they were
-    /// admitted in under a fixed window (0 under a bucket).
-    pub waiting: Vec<(u64, u64, u64, u64)>,
+    /// Batches that came ahead of one still missing: `(sequence, count, at)`, `at` when their
+    /// hits are charged as of, by the wall clock.
+    pub waiting: Vec<(u64, u64, u64)>,
 }
 
 impl Held for Value {
@@ -305,16 +265,16 @@ impl Held for Value {
         Self::merge(self, other)
     }
 
-    /// The limit's three parts, the bucket's two, the window's two, the count, and for each
-    /// record its data plane, highest applied and last admission, and each batch waiting's
-    /// number, count, time and window.
+    /// The contract's three parts, the bucket's two, the count, and for each record its data
+    /// plane, highest applied and last admission, and each batch waiting's number, count and
+    /// time.
     fn bytes(&self) -> u64 {
         let records: u64 = self
             .planes
             .iter()
-            .map(|(_, record)| 24 + 32 * record.waiting_len() as u64)
+            .map(|(_, record)| 24 + 24 * record.waiting_len() as u64)
             .sum();
-        72 + records
+        56 + records
     }
 }
 
@@ -336,51 +296,23 @@ pub(crate) struct Record {
     pub(crate) last_admitted: Admitted,
 }
 
-/// A batch's hits as its owner applies them: how many, as of when they are charged, by the
-/// wall clock, and under a fixed window the window they were admitted in (0 under a bucket).
-/// Ordered by count, then time: of the same batch twice, the smaller is the one sent again
-/// emptied, or, as many, the one charged earlier.
+/// A batch's hits as its owner applies them: how many, and as of when they are charged, by the
+/// wall clock. Ordered by count, then time: of the same batch twice, the smaller is the one
+/// sent again emptied, or, as many, the one charged earlier.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Tally {
     pub(crate) count: u64,
     pub(crate) at: u64,
-    pub(crate) window: u64,
 }
 
 impl Tally {
-    /// A bucket's tallies as one: counts come from the wire, as many as a count holds, never
-    /// wrapped round; charged as of the earlier, as one entry's hits are as of its earliest.
-    pub(crate) fn add(self, other: Self) -> Self {
+    /// Counts come from the wire: as many as a count holds, never wrapped round. Charged as of
+    /// the earlier, as one entry's hits are as of its earliest.
+    fn add(self, other: Self) -> Self {
         Self {
             count: self.count.saturating_add(other.count),
             at: self.at.min(other.at),
-            window: self.window,
         }
-    }
-}
-
-/// A fixed window's latest window and the hits counted in it. Ordered by window, then count:
-/// the larger of two copies is the later window, or in the same window the one counted
-/// further.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Counted {
-    pub(crate) number: u64,
-    pub(crate) count: u64,
-}
-
-impl Counted {
-    /// `count` reported hits admitted in window `number`: counted in it if it is the latest
-    /// window counted in, starting it if later; counted for nothing if earlier, that window
-    /// being over (06 §4), or if numbered 0, as no data plane numbers one. Counts come from
-    /// the wire: as many as a count holds, never wrapped round.
-    pub(crate) fn add(&mut self, number: u64, count: u64) {
-        if number == 0 || number < self.number {
-            return;
-        }
-        if number > self.number {
-            *self = Self { number, count: 0 };
-        }
-        self.count = self.count.saturating_add(count);
     }
 }
 
@@ -404,11 +336,11 @@ impl Admitted {
 
 impl Record {
     /// Batch `sequence` of `tally` hits arrives: the hits now ready to apply, of it and of the
-    /// batches kept waiting for it, each batch once and in order, each handed to `ready`. A
-    /// batch already waiting keeps the smaller tally of the two, as a merge does.
-    pub(crate) fn take(&mut self, sequence: u64, tally: Tally, mut ready: impl FnMut(Tally)) {
+    /// batches kept waiting for it, each batch once. A batch already waiting keeps the smaller
+    /// tally of the two, as a merge does.
+    pub(crate) fn take(&mut self, sequence: u64, tally: Tally) -> Tally {
         if sequence <= self.applied {
-            return;
+            return Tally::default();
         }
         if sequence > self.applied + 1 {
             let waiting = self.waiting.get_or_insert_default();
@@ -418,10 +350,10 @@ impl Record {
                 Err(_) if waiting.len() >= MOST_UNACKNOWLEDGED => {}
                 Err(at) => waiting.insert(at, (sequence, tally)),
             }
-            return;
+            return Tally::default();
         }
         self.applied = sequence;
-        ready(tally);
+        let mut ready = tally;
         if let Some(waiting) = &mut self.waiting {
             // All ahead of it: the first of them follow on from it. One at or below it, left
             // by a merge with a copy that had applied further, was applied already.
@@ -435,7 +367,7 @@ impl Record {
                     break;
                 }
                 self.applied = at;
-                ready(waited);
+                ready = ready.add(waited);
                 caught_up += 1;
             }
             waiting.drain(..caught_up);
@@ -443,6 +375,7 @@ impl Record {
                 self.waiting = None;
             }
         }
+        ready
     }
 
     /// The data plane has seen batches up to `seen` applied, and will not send them again.
@@ -600,7 +533,7 @@ mod tests {
     use crate::owner::apply;
     use edgerush_cluster::Kept;
     use edgerush_ratelimit::reference::Model;
-    use edgerush_ratelimit::service::{FixedWindow, Report};
+    use edgerush_ratelimit::service::Report;
     use proptest::prelude::*;
     use std::num::NonZeroU64;
 
@@ -617,34 +550,12 @@ mod tests {
         }
     }
 
-    /// The usual contract's bucket.
-    fn bucket() -> Limit {
-        Limit::Bucket(contract())
-    }
-
-    /// Ten every 50 ms, a fixed window.
-    fn window() -> Limit {
-        let n = |n| NonZeroU64::new(n).unwrap();
-        Limit::FixedWindow(FixedWindow {
-            limit: n(10),
-            length: n(WINDOW),
-        })
-    }
-
-    /// The fixed window's length.
-    const WINDOW: u64 = 50 * MS;
-
     fn hits(sequence: u64, count: u64, seen: u64) -> Report {
-        in_window(sequence, count, seen, 0)
-    }
-
-    fn in_window(sequence: u64, count: u64, seen: u64, window: u64) -> Report {
         Report::Hits {
             sequence,
             count,
             seen,
             age: 0,
-            window,
         }
     }
 
@@ -654,7 +565,7 @@ mod tests {
     struct Plane {
         next: u64,
         seen: u64,
-        out: Vec<(u64, u64, u64)>,
+        out: Vec<(u64, u64)>,
     }
 
     /// What one data plane does: sends a new batch, lost on the way or not; sends its oldest
@@ -674,14 +585,9 @@ mod tests {
         ]
     }
 
-    /// An owner's value under `limit` after each of `steps`, each by one of four data planes
-    /// after a gap: the copies it would send, in the order made. Under a fixed window each
-    /// batch is in the window of when it was made.
-    fn history(limit: Limit, steps: &[(u64, Step, u64)]) -> Vec<Value> {
-        let window_of = |now: u64| match limit {
-            Limit::Bucket(_) => 0,
-            Limit::FixedWindow(_) => now / WINDOW + 1,
-        };
+    /// An owner's value after each of `steps`, each by one of four data planes after a gap:
+    /// the copies it would send, in the order made.
+    fn history(steps: &[(u64, Step, u64)]) -> Vec<Value> {
         let mut planes: Vec<Plane> = (0..4)
             .map(|_| Plane {
                 next: 1,
@@ -699,30 +605,24 @@ mod tests {
                 Step::Send { count, lost } => {
                     let sequence = plane.next;
                     plane.next += 1;
-                    let number = window_of(now);
-                    plane.out.push((sequence, *count, number));
+                    plane.out.push((sequence, *count));
                     if *lost {
                         continue;
                     }
-                    in_window(sequence, *count, plane.seen, number)
+                    hits(sequence, *count, plane.seen)
                 }
                 Step::Again { emptied } => {
-                    let Some(&(sequence, count, number)) = plane.out.first() else {
+                    let Some(&(sequence, count)) = plane.out.first() else {
                         continue;
                     };
-                    in_window(
-                        sequence,
-                        if *emptied { 0 } else { count },
-                        plane.seen,
-                        number,
-                    )
+                    hits(sequence, if *emptied { 0 } else { count }, plane.seen)
                 }
                 Step::Poll => Report::Poll,
             };
-            let (answer, _) = apply(&mut kept, id, limit, report, CYCLE, now);
+            let (answer, _) = apply(&mut kept, id, contract(), report, CYCLE, now);
             plane.seen = plane.seen.max(answer.applied);
             let seen = plane.seen;
-            plane.out.retain(|(sequence, _, _)| *sequence > seen);
+            plane.out.retain(|(sequence, _)| *sequence > seen);
             copies.push(kept.value.clone());
         }
         copies
@@ -759,9 +659,8 @@ mod tests {
         fn copies_merged_in_any_order_and_twice_end_as_the_owner(
             steps in proptest::collection::vec((0u64..4, step(), 0u64..30 * MS), 1..60),
             seed in any::<u64>(),
-            windowed in any::<bool>(),
         ) {
-            let copies = history(if windowed { window() } else { bucket() }, &steps);
+            let copies = history(&steps);
             let Some(owner) = copies.last().cloned() else {
                 return Ok(());
             };
@@ -779,26 +678,20 @@ mod tests {
         }
 
         /// A merge never lowers a part: the merged bucket admits no more than either, the
-        /// window is as late as either's and counts as many in it, the count and every record
-        /// kept are as high as either's.
+        /// count and every record kept are as high as either's.
         #[test]
         fn a_merge_never_lowers_a_part(
             steps in proptest::collection::vec((0u64..4, step(), 0u64..30 * MS), 2..60),
             pick in any::<(prop::sample::Index, prop::sample::Index)>(),
-            windowed in any::<bool>(),
         ) {
-            let copies = history(if windowed { window() } else { bucket() }, &steps);
+            let copies = history(&steps);
             prop_assume!(copies.len() >= 2);
             let (a, b) = (&copies[pick.0.index(copies.len())], &copies[pick.1.index(copies.len())]);
             let mut both = a.clone();
             both.merge(b);
             let now = 2 * 60 * 30 * MS;
             for side in [a, b] {
-                if windowed {
-                    prop_assert!(both.window() >= side.window());
-                } else {
-                    prop_assert!(both.bucket().unwrap().remaining(now) <= side.bucket().unwrap().remaining(now));
-                }
+                prop_assert!(both.bucket().unwrap().remaining(now) <= side.bucket().unwrap().remaining(now));
                 prop_assert!(both.counted() >= side.counted());
                 for plane in both.planes() {
                     prop_assert!(both.applied(plane) >= side.applied(plane));
@@ -812,9 +705,8 @@ mod tests {
         #[test]
         fn a_value_is_itself_again_from_its_parts(
             steps in proptest::collection::vec((0u64..4, step(), 0u64..30 * MS), 1..60),
-            windowed in any::<bool>(),
         ) {
-            for copy in history(if windowed { window() } else { bucket() }, &steps) {
+            for copy in history(&steps) {
                 let mut parts = copy.parts();
                 parts.planes.reverse();
                 for plane in &mut parts.planes {
@@ -829,35 +721,33 @@ mod tests {
     /// more batches waiting than a data plane may have out.
     #[test]
     fn parts_no_value_could_have_are_refused() {
-        let plane = |plane, waiting: Vec<(u64, u64, u64, u64)>| PlaneParts {
+        let plane = |plane, waiting: Vec<(u64, u64, u64)>| PlaneParts {
             plane,
             applied: 1,
             admitted: Some(5),
             waiting,
         };
         let parts = |planes| Parts {
-            limit: Some(bucket()),
+            contract: Some(contract()),
             bucket: BucketState::default(),
-            window: (0, 0),
             counted: 3,
             planes,
         };
         assert!(
-            Value::from_parts(parts(vec![plane(1, vec![(3, 1, 4, 0)]), plane(2, vec![])]))
-                .is_some()
+            Value::from_parts(parts(vec![plane(1, vec![(3, 1, 4)]), plane(2, vec![])])).is_some()
         );
         assert_eq!(
             Value::from_parts(parts(vec![plane(1, vec![]), plane(1, vec![])])),
             None
         );
         assert_eq!(
-            Value::from_parts(parts(vec![plane(1, vec![(3, 1, 4, 0), (3, 2, 4, 0)])])),
+            Value::from_parts(parts(vec![plane(1, vec![(3, 1, 4), (3, 2, 4)])])),
             None
         );
         let most = u64::try_from(MOST_UNACKNOWLEDGED).unwrap();
-        let full: Vec<_> = (3..3 + most).map(|sequence| (sequence, 1, 4, 0)).collect();
+        let full: Vec<_> = (3..3 + most).map(|sequence| (sequence, 1, 4)).collect();
         assert!(Value::from_parts(parts(vec![plane(1, full.clone())])).is_some());
-        let over: Vec<_> = (3..4 + most).map(|sequence| (sequence, 1, 4, 0)).collect();
+        let over: Vec<_> = (3..4 + most).map(|sequence| (sequence, 1, 4)).collect();
         assert_eq!(Value::from_parts(parts(vec![plane(1, over)])), None);
     }
 
@@ -866,12 +756,12 @@ mod tests {
     #[test]
     fn a_record_the_owner_retired_goes_from_a_replica_with_the_merge() {
         let mut kept = Kept::<Value>::default();
-        apply(&mut kept, 1, bucket(), hits(1, 1, 0), CYCLE, 0);
+        apply(&mut kept, 1, contract(), hits(1, 1, 0), CYCLE, 0);
         let mut replica = kept.value.clone();
         apply(
             &mut kept,
             2,
-            bucket(),
+            contract(),
             hits(1, 1, 0),
             CYCLE,
             RECORD_KEPT + CYCLE,
@@ -882,7 +772,7 @@ mod tests {
         let mut owner = kept.value.clone();
         let old: Value = {
             let mut old = Kept::<Value>::default();
-            apply(&mut old, 1, bucket(), hits(1, 1, 0), CYCLE, 0);
+            apply(&mut old, 1, contract(), hits(1, 1, 0), CYCLE, 0);
             old.value
         };
         assert!(!owner.merge(&old), "the older copy brings nothing back");
@@ -900,19 +790,19 @@ mod tests {
             apply(&mut kept, 1, contract, hits(1, count, 0), CYCLE, 0);
             kept.value
         };
-        let new = charged(Limit::Bucket(bigger), 3);
+        let new = charged(bigger, 3);
 
         let mut never_made = Value::default();
         assert!(never_made.merge(&new));
         assert_eq!(never_made, new);
 
         let mut polled = Kept::<Value>::default();
-        apply(&mut polled, 1, bucket(), Report::Poll, CYCLE, 0);
-        assert_eq!(polled.value.limit(), Some(bucket()));
+        apply(&mut polled, 1, contract(), Report::Poll, CYCLE, 0);
+        assert_eq!(polled.value.contract(), Some(contract()));
         assert!(polled.value.merge(&new));
         assert_eq!(polled.value, new);
 
-        let mut old = charged(bucket(), 5);
+        let mut old = charged(contract(), 5);
         let before = old.clone();
         assert!(!old.merge(&new));
         assert_eq!(old, before, "kept under its own contract");
@@ -922,13 +812,9 @@ mod tests {
     /// twice taking the smaller tally, the lowest [`MOST_UNACKNOWLEDGED`] kept.
     #[test]
     fn batches_waiting_merge_as_the_union_above_the_highest_applied() {
-        let tally = |count| Tally {
-            count,
-            at: 0,
-            window: 0,
-        };
+        let tally = |count| Tally { count, at: 0 };
         let with = |applied, waiting: Vec<(u64, Tally)>| {
-            let mut value = Value::new(bucket());
+            let mut value = Value::new(contract());
             let record = value.planes.entry(1);
             record.applied = applied;
             record.last_admitted = Admitted::at(0);
@@ -960,48 +846,17 @@ mod tests {
         assert_eq!(waiting.last().unwrap().0, 1 + most);
     }
 
-    /// The store counts the limit, the bucket, the window and the count, and each record with
-    /// each of its batches waiting.
+    /// The store counts the contract, the bucket and the count, and each record with each of
+    /// its batches waiting.
     #[test]
     fn a_value_counts_its_records_and_batches_waiting() {
         let mut kept = Kept::<Value>::default();
-        apply(&mut kept, 1, bucket(), Report::Poll, CYCLE, 0);
-        assert_eq!(kept.value.bytes(), 72, "a poll leaves no record");
-        apply(&mut kept, 1, bucket(), hits(1, 1, 0), CYCLE, 0);
-        assert_eq!(kept.value.bytes(), 72 + 24);
-        apply(&mut kept, 1, bucket(), hits(3, 1, 1), CYCLE, 0);
-        assert_eq!(kept.value.bytes(), 72 + 24 + 32);
-    }
-
-    /// Two copies of a window merge as the later window, or in the same window as the one
-    /// counted further, in either order.
-    #[test]
-    fn the_later_of_two_windows_is_the_one_kept() {
-        let at = |reports: &[(u64, u64, u64)]| {
-            let mut kept = Kept::<Value>::default();
-            for &(sequence, count, number) in reports {
-                apply(
-                    &mut kept,
-                    1,
-                    window(),
-                    in_window(sequence, count, sequence - 1, number),
-                    CYCLE,
-                    0,
-                );
-            }
-            kept.value
-        };
-        let early = at(&[(1, 9, 3)]);
-        let further = at(&[(1, 9, 3), (2, 2, 3)]);
-        let later = at(&[(1, 9, 3), (2, 2, 3), (3, 1, 4)]);
-        for (a, b, kept) in [(&early, &further, (3, 11)), (&further, &later, (4, 1))] {
-            let mut one = a.clone();
-            assert!(one.merge(b));
-            assert_eq!(one.window(), kept);
-            let mut other = b.clone();
-            assert!(!other.merge(a), "the earlier brings nothing");
-            assert_eq!(other.window(), kept);
-        }
+        apply(&mut kept, 1, contract(), Report::Poll, CYCLE, 0);
+        assert_eq!(kept.value.bytes(), 56, "a poll leaves no record");
+        apply(&mut kept, 1, contract(), hits(1, 1, 0), CYCLE, 0);
+        assert_eq!(kept.value.bytes(), 56 + 24);
+        apply(&mut kept, 1, contract(), hits(3, 1, 1), CYCLE, 0);
+        assert_eq!(kept.value.bytes(), 56 + 24 + 24);
     }
 
     /// Two states of one bucket merge as the further charged, in either order.

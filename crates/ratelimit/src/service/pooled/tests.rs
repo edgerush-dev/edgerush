@@ -6,8 +6,8 @@
 
 use super::*;
 use crate::service::{
-    Answer, CUT_OFF_CYCLES, Contract, DataPlane, ENTRY_BYTES, FixedState, Keyed,
-    MOST_UNACKNOWLEDGED, PIECE_BYTES, PodId, ServicePod,
+    Answer, CUT_OFF_CYCLES, DataPlane, ENTRY_BYTES, FixedState, Keyed, MOST_UNACKNOWLEDGED,
+    PIECE_BYTES, PodId, ServicePod,
 };
 use proptest::prelude::*;
 use std::collections::VecDeque;
@@ -135,7 +135,7 @@ impl Pooled {
             .map(|(key, contract)| {
                 self.handles
                     .get(*key)
-                    .filter(|entry| entry.limit() == Limit::Bucket(*contract))
+                    .filter(|entry| entry.contract() == *contract)
                     .cloned()
             })
             .collect();
@@ -154,12 +154,8 @@ impl Pooled {
                 Local::Ask => {}
             }
         }
-        let limits: Vec<(&[u8], Limit)> = keys
-            .iter()
-            .map(|(key, contract)| (*key, Limit::Bucket(*contract)))
-            .collect();
-        let decision = self.participant.decide_all(&limits, now);
-        for entry in self.participant.entries(&limits) {
+        let decision = self.participant.decide_all(keys, now);
+        for entry in self.participant.entries(keys) {
             self.handles.insert(entry.key().into(), entry);
         }
         decision
@@ -588,10 +584,8 @@ fn reports_racing_admissions_count_each_once() {
     let mut participant = participant();
     let key: &[u8] = b"k";
     let contract = contract(1_000_000, 1_000_000);
-    participant.ensure(key, Limit::Bucket(contract), 0);
-    let entry = participant
-        .entries(&[(key, Limit::Bucket(contract))])
-        .remove(0);
+    participant.ensure(key, contract, 0);
+    let entry = participant.entries(&[(key, contract)]).remove(0);
     let done = std::sync::atomic::AtomicUsize::new(0);
     let (admitted, sent) = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..4)
@@ -714,8 +708,8 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
     let mut participant = participant();
     let key: &[u8] = b"k";
     let c = contract(100, 100);
-    participant.ensure(key, Limit::Bucket(c), 0);
-    let entry = participant.entries(&[(key, Limit::Bucket(c))]).remove(0);
+    participant.ensure(key, c, 0);
+    let entry = participant.entries(&[(key, c)]).remove(0);
     // Three admitted and reported, three admitted since.
     for _ in 0..3 {
         assert_eq!(entry.take(0).0, Taken::Done);
@@ -742,7 +736,7 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
         },
         0,
     );
-    let bucket = entry.terms.bucket();
+    let bucket = entry.terms.bucket;
     assert_eq!(
         bucket.remaining(entry.snapshot().arrival, bucket.units(0)),
         100 - 6,
@@ -780,8 +774,8 @@ fn answers_that_do_not_say_when_are_taken_as_they_come() {
     let mut participant = participant();
     let key: &[u8] = b"k";
     let c = contract(100, 10);
-    participant.ensure(key, Limit::Bucket(c), 0);
-    let entry = participant.entries(&[(key, Limit::Bucket(c))]).remove(0);
+    participant.ensure(key, c, 0);
+    let entry = participant.entries(&[(key, c)]).remove(0);
     let now = 50 * INTERVAL;
     participant.on_answers(
         Answers {
@@ -799,7 +793,7 @@ fn answers_that_do_not_say_when_are_taken_as_they_come() {
         },
         now,
     );
-    let bucket = entry.terms.bucket();
+    let bucket = entry.terms.bucket;
     assert_eq!(
         bucket.remaining(entry.snapshot().arrival, bucket.units(now)),
         5
@@ -814,8 +808,8 @@ fn answers_held_up_are_taken_as_of_no_more_than_a_cycle_before() {
     let mut participant = participant();
     let key: &[u8] = b"k";
     let c = contract(100, 10);
-    participant.ensure(key, Limit::Bucket(c), 0);
-    let entry = participant.entries(&[(key, Limit::Bucket(c))]).remove(0);
+    participant.ensure(key, c, 0);
+    let entry = participant.entries(&[(key, c)]).remove(0);
     let now = 50 * INTERVAL;
     participant.on_answers(
         Answers {
@@ -833,7 +827,7 @@ fn answers_held_up_are_taken_as_of_no_more_than_a_cycle_before() {
         },
         now,
     );
-    let bucket = entry.terms.bucket();
+    let bucket = entry.terms.bucket;
     assert_eq!(
         entry.snapshot().arrival,
         bucket.units(now - CYCLE) + 5 * 65_536
@@ -852,17 +846,14 @@ fn a_client_at_exactly_its_rate_is_admitted_after_a_round_trip() {
     let interval = c.window.get();
     let mut exact = c.bucket();
     assert!(exact.decide(0));
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Admit
-    );
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     participant.on_cycle(CYCLE);
     let (exchange, batch) = only_exchange(&mut participant);
     let answers = pod.on_batch(batch, CYCLE + MS);
     participant.on_answers_to(exchange, answers, CYCLE + 2 * MS);
     assert!(exact.decide(interval));
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], interval),
+        participant.decide_all(&[(key, c)], interval),
         Decision::Admit,
         "one interval after the last, as a plain bucket admits it"
     );
@@ -897,8 +888,7 @@ fn decided_over_round_trips(
             .min()
             .unwrap();
         if request == Some(now) {
-            decided[at] =
-                Some(participant.decide_all(&[(key, Limit::Bucket(c))], now) == Decision::Admit);
+            decided[at] = Some(participant.decide_all(&[(key, c)], now) == Decision::Admit);
             at += 1;
         } else if answer == Some(now) {
             let (_, exchange, answer) = answers.pop_front().unwrap();
@@ -990,8 +980,8 @@ fn an_evicted_entry_sends_its_holders_to_the_new_one() {
     .unwrap();
     let key: &[u8] = b"k";
     let c = contract(100, 10);
-    participant.ensure(key, Limit::Bucket(c), 0);
-    let old = participant.entries(&[(key, Limit::Bucket(c))]).remove(0);
+    participant.ensure(key, c, 0);
+    let old = participant.entries(&[(key, c)]).remove(0);
     assert_eq!(old.take(0).0, Taken::Done);
     assert!(
         !close_if_quiet(participant.keys.get(key).unwrap()),
@@ -1015,8 +1005,8 @@ fn an_evicted_entry_sends_its_holders_to_the_new_one() {
     assert!(!old.charge(0));
     assert_eq!(old.snapshot(), closed);
     participant.keys.remove(key);
-    participant.ensure(key, Limit::Bucket(c), 0);
-    let new = participant.entries(&[(key, Limit::Bucket(c))]).remove(0);
+    participant.ensure(key, c, 0);
+    let new = participant.entries(&[(key, c)]).remove(0);
     assert!(!Arc::ptr_eq(&old, &new));
     assert_eq!(decide(&[&new], 0).local, Local::Admit);
 }
@@ -1031,16 +1021,11 @@ fn a_stalled_transport_leaves_workers_advancing_cycles_with_one_refill() {
     // Five cycles later: one advance, sharing out what the bucket refilled (capped at the
     // bucket) and one cycle's refill, among two — not five refills.
     let now = 5 * CYCLE;
-    let fields = word::advanced(
-        entry.terms.bucket(),
-        entry.snapshot(),
-        entry.advance_now(),
-        now,
-    );
-    let sees = entry.terms.bucket().remaining_within(
+    let fields = word::advanced(&entry.terms.bucket, entry.snapshot(), entry.advance(), now);
+    let sees = entry.terms.bucket.remaining_within(
         fields.arrival,
-        entry.terms.bucket().units(now),
-        entry.terms.refill_units(),
+        entry.terms.bucket.units(now),
+        entry.terms.refill_units,
     );
     // No cycle had set an allowance before: nothing is carried.
     assert_eq!(
@@ -1053,8 +1038,8 @@ fn a_stalled_transport_leaves_workers_advancing_cycles_with_one_refill() {
         .count() as u64;
     let remaining = entry
         .terms
-        .bucket()
-        .remaining(fields.arrival, entry.terms.bucket().units(now));
+        .bucket
+        .remaining(fields.arrival, entry.terms.bucket.units(now));
     assert_eq!(admitted, fields.left.min(remaining));
 }
 
@@ -1075,47 +1060,27 @@ fn a_worker_finds_the_pods_entry_without_asking() {
     .unwrap();
     let registry = participant.registry();
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
-    assert!(
-        registry.find(key, Limit::Bucket(c), 0).is_none(),
-        "nothing made yet"
-    );
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Admit
-    );
-    let found = registry.find(key, Limit::Bucket(c), 0).unwrap();
-    assert!(Arc::ptr_eq(
-        &found,
-        &participant.entries(&[(key, Limit::Bucket(c))])[0]
-    ));
+    assert!(registry.find(key, c).is_none(), "nothing made yet");
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    let found = registry.find(key, c).unwrap();
+    assert!(Arc::ptr_eq(&found, &participant.entries(&[(key, c)])[0]));
     assert_eq!(
         decide(&[&found], 0).local,
         Local::Admit,
         "decided from it alone"
     );
     assert!(
-        registry
-            .find(key, Limit::Bucket(contract(100, 11)), 0)
-            .is_none(),
+        registry.find(key, contract(100, 11)).is_none(),
         "another contract"
     );
     // Replaced by a changed contract: the old one is closed and gone from the registry.
-    participant.ensure(key, Limit::Bucket(contract(50, 10)), 0);
-    assert!(registry.find(key, Limit::Bucket(c), 0).is_none());
-    assert!(
-        registry
-            .find(key, Limit::Bucket(contract(50, 10)), 0)
-            .is_some()
-    );
+    participant.ensure(key, contract(50, 10), 0);
+    assert!(registry.find(key, c).is_none());
+    assert!(registry.find(key, contract(50, 10)).is_some());
     // Evicted, idle: no longer found.
     let later = 100 * 1_000 * MS;
     participant.on_cycle(later);
-    assert!(
-        registry
-            .find(key, Limit::Bucket(contract(50, 10)), 0)
-            .is_none(),
-        "evicted"
-    );
+    assert!(registry.find(key, contract(50, 10)).is_none(), "evicted");
 }
 
 /// A key's bytes count a handle to its entry for each worker that may hold one, so that a
@@ -1139,7 +1104,7 @@ fn a_keys_bytes_count_every_workers_handle() {
         )
         .unwrap();
         participant.set_workers(workers);
-        participant.ensure(b"k", Limit::Bucket(contract(100, 10)), 0);
+        participant.ensure(b"k", contract(100, 10), 0);
         participant.holding()
     };
     let handle = (size_of::<Handle>() + 1) as u64;
@@ -1163,11 +1128,8 @@ fn one_exchange_in_flight_gathers_what_comes_meanwhile() {
     let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 100));
     // A new key, made and decided here.
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Admit
-    );
-    let entry = participant.entries(&[(key, Limit::Bucket(c))]).remove(0);
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    let entry = participant.entries(&[(key, c)]).remove(0);
     // One admitted, sent with a cycle, and not answered.
     assert_eq!(entry.take(CYCLE).0, Taken::Done);
     participant.on_cycle(CYCLE);
@@ -1227,13 +1189,12 @@ fn others_hits(key: &[u8], c: Contract, count: u64) -> Batch {
         from: 8,
         entries: vec![BatchEntry {
             key: key.into(),
-            limit: Limit::Bucket(c),
+            contract: c,
             report: Report::Hits {
                 sequence: 1,
                 count,
                 seen: 0,
                 age: 0,
-                window: 0,
             },
         }],
         made: 0,
@@ -1264,10 +1225,7 @@ fn a_late_answer_does_not_put_back_an_older_bucket() {
     let mut participant = one_in_flight();
     let mut pod = pod(1);
     let (key, c): (&[u8], Contract) = (b"k", slow());
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Admit
-    );
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     participant.on_cycle(CYCLE);
     let (first, batch) = only_exchange(&mut participant);
     let older = pod.on_batch(batch, CYCLE);
@@ -1279,12 +1237,12 @@ fn a_late_answer_does_not_put_back_an_older_bucket() {
     let newer = pod.on_batch(batch, 5 * CYCLE);
     participant.on_answers_to(next, newer, 6 * CYCLE);
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 6 * CYCLE),
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
         Decision::Refuse
     );
     participant.on_answers_to(first, older, 6 * CYCLE);
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 6 * CYCLE),
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
         Decision::Refuse,
         "the older bucket put back"
     );
@@ -1299,10 +1257,7 @@ fn a_late_answer_leaves_the_next_exchange_in_flight() {
     let mut participant = one_in_flight();
     let mut pod = pod(1);
     let (key, c): (&[u8], Contract) = (b"k", slow());
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Admit
-    );
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     participant.on_cycle(CYCLE);
     let (first, batch) = only_exchange(&mut participant);
     let late = pod.on_batch(batch, CYCLE);
@@ -1311,7 +1266,7 @@ fn a_late_answer_leaves_the_next_exchange_in_flight() {
     participant.on_answers_to(first, late, 6 * CYCLE);
     participant.exchanged(0, first);
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 6 * CYCLE),
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
         Decision::Admit
     );
     participant.on_cycle(7 * CYCLE);
@@ -1332,10 +1287,7 @@ fn a_late_answer_still_acknowledges() {
     let mut participant = one_in_flight();
     let mut pod = pod(1);
     let (key, c): (&[u8], Contract) = (b"k", slow());
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Admit
-    );
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     participant.on_cycle(CYCLE);
     let (first, batch) = only_exchange(&mut participant);
     let late = pod.on_batch(batch, CYCLE);
@@ -1375,10 +1327,7 @@ fn the_answer_to_the_latest_exchange_is_taken_though_given_up() {
     let mut participant = one_in_flight();
     let mut pod = pod(1);
     let (key, c): (&[u8], Contract) = (b"k", slow());
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Admit
-    );
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     participant.on_cycle(CYCLE);
     let (first, batch) = only_exchange(&mut participant);
     let _ = pod.on_batch(others_hits(key, c, 9), CYCLE);
@@ -1388,7 +1337,7 @@ fn the_answer_to_the_latest_exchange_is_taken_though_given_up() {
     participant.on_answers_to(first, answer, 6 * CYCLE);
     assert_eq!(participant.late_answers(), 0);
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 6 * CYCLE),
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
         Decision::Refuse
     );
 }
@@ -1400,10 +1349,7 @@ fn a_late_answer_the_pod_handled_later_is_taken() {
     let mut participant = one_in_flight();
     let mut pod = pod(1);
     let (key, c): (&[u8], Contract) = (b"k", slow());
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Admit
-    );
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     participant.on_cycle(CYCLE);
     let (first, first_batch) = only_exchange(&mut participant);
     participant.on_cycle(5 * CYCLE);
@@ -1413,13 +1359,13 @@ fn a_late_answer_the_pod_handled_later_is_taken() {
     let later = pod.on_batch(first_batch, 5 * CYCLE);
     participant.on_answers_to(next, earlier, 6 * CYCLE);
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 6 * CYCLE),
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
         Decision::Admit
     );
     participant.on_answers_to(first, later, 6 * CYCLE);
     assert_eq!(participant.late_answers(), 0);
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 6 * CYCLE),
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
         Decision::Refuse,
         "the newer bucket not taken"
     );
@@ -1435,10 +1381,7 @@ fn a_restarted_pods_answers_are_taken() {
     for _ in 0..3 {
         let _ = before.on_batch(others_hits(b"other", c, 1), 0);
     }
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Admit
-    );
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     participant.on_cycle(CYCLE);
     let (first, batch) = only_exchange(&mut participant);
     let answer = before.on_batch(batch, CYCLE);
@@ -1448,7 +1391,7 @@ fn a_restarted_pods_answers_are_taken() {
     let mut after = pod(2);
     let _ = after.on_batch(others_hits(key, c, 10), 2 * CYCLE);
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 2 * CYCLE),
+        participant.decide_all(&[(key, c)], 2 * CYCLE),
         Decision::Admit
     );
     participant.on_cycle(3 * CYCLE);
@@ -1458,7 +1401,7 @@ fn a_restarted_pods_answers_are_taken() {
     participant.on_answers_to(next, answer, 3 * CYCLE);
     assert_eq!(participant.late_answers(), 0);
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 3 * CYCLE),
+        participant.decide_all(&[(key, c)], 3 * CYCLE),
         Decision::Refuse,
         "the restarted pod's bucket not taken"
     );
@@ -1471,10 +1414,7 @@ fn an_earlier_lifes_late_answer_is_not_taken() {
     let mut participant = one_in_flight();
     let mut before = pod(1);
     let (key, c): (&[u8], Contract) = (b"k", slow());
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Admit
-    );
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     participant.on_cycle(CYCLE);
     let (first, batch) = only_exchange(&mut participant);
     let old = before.on_batch(batch, CYCLE);
@@ -1487,13 +1427,13 @@ fn an_earlier_lifes_late_answer_is_not_taken() {
     let new = after.on_batch(batch, 5 * CYCLE);
     participant.on_answers_to(next, new, 6 * CYCLE);
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 6 * CYCLE),
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
         Decision::Refuse
     );
     participant.on_answers_to(first, old, 6 * CYCLE);
     assert_eq!(participant.late_answers(), 1);
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 6 * CYCLE),
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
         Decision::Refuse,
         "the earlier life's bucket put back"
     );
@@ -1508,10 +1448,7 @@ fn an_earlier_lifes_answer_to_a_later_exchange_is_not_taken() {
     let mut before = pod(1);
     let mut after = pod(2);
     let (key, c): (&[u8], Contract) = (b"k", slow());
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Admit
-    );
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     participant.on_cycle(CYCLE);
     let (first, delayed) = only_exchange(&mut participant);
     participant.on_cycle(5 * CYCLE);
@@ -1523,13 +1460,13 @@ fn an_earlier_lifes_answer_to_a_later_exchange_is_not_taken() {
     let new = after.on_batch(delayed, 6 * CYCLE);
     participant.on_answers_to(first, new, 6 * CYCLE);
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 6 * CYCLE),
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
         Decision::Refuse
     );
     participant.on_answers_to(next, old, 6 * CYCLE);
     assert_eq!(participant.late_answers(), 1);
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 6 * CYCLE),
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
         Decision::Refuse,
         "the earlier life's bucket put back"
     );
@@ -1546,10 +1483,7 @@ fn an_earlier_lifes_late_answer_acknowledges_nothing() {
     let mut after = pod(2);
     let (key, c): (&[u8], Contract) = (b"k", slow());
     for _ in 0..10 {
-        assert_eq!(
-            participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-            Decision::Admit
-        );
+        assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     }
     participant.on_cycle(CYCLE);
     let (first, batch) = only_exchange(&mut participant);
@@ -1570,7 +1504,7 @@ fn an_earlier_lifes_late_answer_acknowledges_nothing() {
     participant.on_answers_to(third, new, 10 * CYCLE);
     assert_eq!(after.counted(key), Some(10), "the reports not sent again");
     assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 10 * CYCLE),
+        participant.decide_all(&[(key, c)], 10 * CYCLE),
         Decision::Refuse
     );
 }
@@ -1591,15 +1525,9 @@ fn a_cold_key_is_decided_locally_and_reported_with_the_cycle() {
     let mut participant = participant();
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 3));
     for _ in 0..3 {
-        assert_eq!(
-            participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-            Decision::Admit
-        );
+        assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     }
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Refuse
-    );
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Refuse);
     assert!(participant.take_outgoing().is_empty());
     participant.on_cycle(CYCLE);
     let reported: u64 = participant
@@ -1621,17 +1549,13 @@ fn a_worker_makes_a_local_key_and_the_participant_adopts_it() {
     let mut participant = participant();
     let registry = participant.registry();
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
-    let (made, fresh) = registry
-        .find_or_make(key, Limit::Bucket(c), CYCLE, 0)
-        .unwrap();
+    let (made, fresh) = registry.find_or_make(key, c, CYCLE, 0).unwrap();
     assert!(fresh);
-    let (again, fresh) = registry
-        .find_or_make(key, Limit::Bucket(c), CYCLE, 0)
-        .unwrap();
+    let (again, fresh) = registry.find_or_make(key, c, CYCLE, 0).unwrap();
     assert!(!fresh && Arc::ptr_eq(&made, &again), "one entry");
     assert!(
         registry
-            .find_or_make(key, Limit::Bucket(contract(100, 11)), CYCLE, 0)
+            .find_or_make(key, contract(100, 11), CYCLE, 0)
             .is_none(),
         "another contract"
     );
@@ -1639,19 +1563,10 @@ fn a_worker_makes_a_local_key_and_the_participant_adopts_it() {
     participant.adopt(Arc::clone(&made));
     participant.adopt(Arc::clone(&made));
     assert_eq!(participant.key_count(), 1);
-    assert!(Arc::ptr_eq(
-        &participant.entries(&[(key, Limit::Bucket(c))])[0],
-        &made
-    ));
+    assert!(Arc::ptr_eq(&participant.entries(&[(key, c)])[0], &made));
     // The participant meeting the key itself keeps the worker's entry.
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Admit
-    );
-    assert!(Arc::ptr_eq(
-        &participant.entries(&[(key, Limit::Bucket(c))])[0],
-        &made
-    ));
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    assert!(Arc::ptr_eq(&participant.entries(&[(key, c)])[0], &made));
     participant.on_cycle(CYCLE);
     let reported: u64 = participant
         .take_outgoing()
@@ -1674,10 +1589,7 @@ fn quiet_keys_are_polled_only_when_asked_to_be() {
         participant.set_levers(Levers { poll_quiet });
         let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
         let (key, c): (&[u8], Contract) = (b"k", contract(100, 100));
-        assert_eq!(
-            participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-            Decision::Admit
-        );
+        assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
         // Its admission reported and answered; then a cycle with nothing to report.
         participant.on_cycle(CYCLE);
         for (_, batch) in participant.take_outgoing() {
@@ -1706,8 +1618,8 @@ fn an_earlier_clock_does_not_move_a_cycle_back() {
     };
     let mut participant = Participant::new(7, CYCLE, view, FixedState::default()).unwrap();
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
-    participant.ensure(key, Limit::Bucket(c), 0);
-    let entry = participant.entries(&[(key, Limit::Bucket(c))]).remove(0);
+    participant.ensure(key, c, 0);
+    let entry = participant.entries(&[(key, c)]).remove(0);
     // Nine others: a share of one a cycle.
     entry.others.store(9, Ordering::Release);
     let at = 5 * CYCLE;
@@ -1748,8 +1660,8 @@ fn a_key_untouched_for_the_cycle_numbers_range_gets_a_new_share() {
         )
         .unwrap();
         let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
-        participant.ensure(key, Limit::Bucket(c), 0);
-        let entry = participant.entries(&[(key, Limit::Bucket(c))]).remove(0);
+        participant.ensure(key, c, 0);
+        let entry = participant.entries(&[(key, c)]).remove(0);
         // Nine others: a share of one a cycle, spent at once.
         entry.others.store(9, Ordering::Release);
         assert_eq!(decide(&[&entry], CYCLE).local, Local::Admit);
@@ -1783,11 +1695,11 @@ fn a_key_untouched_for_the_cycle_numbers_range_gets_a_new_share() {
 fn the_participant_keeps_a_key_once() {
     let mut participant = participant();
     let key: &[u8] = b"k";
-    participant.ensure(key, Limit::Bucket(contract(100, 10)), 0);
+    participant.ensure(key, contract(100, 10), 0);
     for c in [contract(100, 10), contract(100, 11)] {
-        participant.ensure(key, Limit::Bucket(c), 0);
+        participant.ensure(key, c, 0);
         let entry = Arc::clone(&participant.keys.get(key).unwrap().entry);
-        assert_eq!(entry.terms.limit, Limit::Bucket(c));
+        assert_eq!(entry.terms.contract, c);
         let hash = participant.hash(key);
         let by_hash = participant.keys.by_hash_mut(hash).unwrap();
         assert!(Arc::ptr_eq(&by_hash.entry, &entry));
@@ -1801,15 +1713,11 @@ fn the_participant_keeps_a_key_once() {
 fn keys_under_one_contract_share_their_terms() {
     let registry = Registry::new(FixedState::default());
     let c = contract(100, 10);
-    let (a, _) = registry
-        .find_or_make(b"a", Limit::Bucket(c), CYCLE, 0)
-        .unwrap();
-    let (b, _) = registry
-        .find_or_make(b"b", Limit::Bucket(c), CYCLE, 0)
-        .unwrap();
+    let (a, _) = registry.find_or_make(b"a", c, CYCLE, 0).unwrap();
+    let (b, _) = registry.find_or_make(b"b", c, CYCLE, 0).unwrap();
     assert!(Arc::ptr_eq(&a.terms, &b.terms));
     let (other, _) = registry
-        .find_or_make(b"c", Limit::Bucket(contract(100, 11)), CYCLE, 0)
+        .find_or_make(b"c", contract(100, 11), CYCLE, 0)
         .unwrap();
     assert!(!Arc::ptr_eq(&a.terms, &other.terms));
     assert!(size_of::<Entry>() <= 128, "{}", size_of::<Entry>());
@@ -1861,7 +1769,6 @@ fn unseen(sequence: u64) -> Unseen {
         admitted: sequence,
         first: sequence,
         last: sequence,
-        window: 0,
     }
 }
 
@@ -2016,16 +1923,12 @@ fn replay(schedule: &[(Event, u64)]) {
                     });
                 let got = pooled.participant.keys.get(key).map(|tracked| {
                     let entry = &tracked.entry;
-                    let fields = word::advanced(
-                        entry.terms.bucket(),
-                        entry.snapshot(),
-                        entry.advance_now(),
-                        now,
-                    );
+                    let fields =
+                        word::advanced(&entry.terms.bucket, entry.snapshot(), entry.advance(), now);
                     let left = entry
                         .terms
-                        .bucket()
-                        .remaining(fields.arrival, entry.terms.bucket().units(now));
+                        .bucket
+                        .remaining(fields.arrival, entry.terms.bucket.units(now));
                     (fields.left, left, tracked.heard.get())
                 });
                 format!("{want:?}/{got:?}")
@@ -2112,13 +2015,13 @@ fn scheduled_under(keys: u64, c: Contract) -> (Participant<FixedState>, Vec<Arc<
     participant.set_levers(Levers { poll_quiet: false });
     let names: Vec<Vec<u8>> = (0..keys).map(|n| format!("k{n}").into_bytes()).collect();
     for name in &names {
-        participant.ensure(name, Limit::Bucket(c), 0);
+        participant.ensure(name, c, 0);
     }
     participant.on_cycle(CYCLE);
     let _ = participant.take_outgoing();
     let entries = names
         .iter()
-        .map(|name| participant.entries(&[(name, Limit::Bucket(c))]).remove(0))
+        .map(|name| participant.entries(&[(name, c)]).remove(0))
         .collect();
     (participant, entries)
 }
@@ -2334,10 +2237,7 @@ fn the_lists_of_keys_to_visit_keep_their_room() {
     let c = contract(100, 10);
     for n in 0..KEYS {
         let name = format!("k{n}").into_bytes();
-        assert_eq!(
-            participant.decide_all(&[(&name, Limit::Bucket(c))], 0),
-            Decision::Admit
-        );
+        assert_eq!(participant.decide_all(&[(&name, c)], 0), Decision::Admit);
     }
     let lists = |participant: &Participant<FixedState>| {
         let (one, other) = (&participant.runnable, &participant.next_runnable);
@@ -2374,7 +2274,7 @@ fn a_key_made_again_is_counted_from_its_first_report() {
         let mut participant = one_in_flight();
         participant.set_scheduled(scheduled);
         let mut pod = pod(1);
-        let keys: [(&[u8], Limit); 1] = [(b"k", Limit::Bucket(contract(100, 10)))];
+        let keys: [(&[u8], Contract); 1] = [(b"k", contract(100, 10))];
         let mut exchange = |participant: &mut Participant<FixedState>, now: u64| {
             participant.on_cycle(now);
             for (_, exchange, batch) in participant.take_exchanges() {
@@ -2409,19 +2309,13 @@ fn a_key_evicted_with_hits_outstanding_is_forgiven_and_counted_afresh() {
     let (a, b): (&[u8], &[u8]) = (b"a", b"b");
     // Two hits on `a` go out, and their batch is lost.
     for _ in 0..2 {
-        assert_eq!(
-            participant.decide_all(&[(a, Limit::Bucket(c))], 0),
-            Decision::Admit
-        );
+        assert_eq!(participant.decide_all(&[(a, c)], 0), Decision::Admit);
     }
     participant.on_cycle(CYCLE);
     let (exchange, _lost) = only_exchange(&mut participant);
     // Three on `b` wait in its ledger while that exchange is out.
     for _ in 0..3 {
-        assert_eq!(
-            participant.decide_all(&[(b, Limit::Bucket(c))], CYCLE),
-            Decision::Admit
-        );
+        assert_eq!(participant.decide_all(&[(b, c)], CYCLE), Decision::Admit);
     }
     participant.set_capacity(1);
     participant.on_cycle(2 * CYCLE);
@@ -2434,7 +2328,7 @@ fn a_key_evicted_with_hits_outstanding_is_forgiven_and_counted_afresh() {
     participant.exchanged(0, exchange);
     participant.set_capacity(u64::MAX);
     assert_eq!(
-        participant.decide_all(&[(a, Limit::Bucket(c))], 3 * CYCLE),
+        participant.decide_all(&[(a, c)], 3 * CYCLE),
         Decision::Admit
     );
     participant.on_cycle(4 * CYCLE);
@@ -2450,10 +2344,7 @@ fn a_participant_counts_the_hits_of_a_stale_report_as_forgiven() {
     let mut participant = participant();
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
     for _ in 0..3 {
-        assert_eq!(
-            participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-            Decision::Admit
-        );
+        assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     }
     participant.on_cycle(CYCLE);
     // A refill time of some 105 ms from the report's first sending.
@@ -2474,10 +2365,7 @@ fn a_participant_keeps_a_bounded_number_of_reports_out() {
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 100));
     for cycle in 1..=50 {
         let now = cycle * CYCLE;
-        assert_eq!(
-            participant.decide_all(&[(key, Limit::Bucket(c))], now),
-            Decision::Admit
-        );
+        assert_eq!(participant.decide_all(&[(key, c)], now), Decision::Admit);
         participant.on_cycle(now);
         let _lost = participant.take_outgoing();
     }
@@ -2504,7 +2392,7 @@ fn a_replaced_entry_counts_until_it_is_freed_and_is_freed_first() {
     let one = participant.holding();
     let old = Arc::downgrade(&entries[0]);
     drop(entries);
-    participant.ensure(b"k0", Limit::Bucket(contract(100, 10)), 2 * CYCLE);
+    participant.ensure(b"k0", contract(100, 10), 2 * CYCLE);
     assert!(old.upgrade().is_some(), "kept by its eviction time");
     let stale = participant.holding() - one;
     assert!(stale > 0, "and counted");
@@ -2525,7 +2413,7 @@ fn a_replaced_entry_stops_counting_when_its_time_comes() {
     let (mut participant, entries) = scheduled_under(1, hourly());
     let old = Arc::downgrade(&entries[0]);
     drop(entries);
-    participant.ensure(b"k0", Limit::Bucket(contract(100, 10)), 2 * CYCLE);
+    participant.ensure(b"k0", contract(100, 10), 2 * CYCLE);
     participant.on_cycle(3 * CYCLE);
     assert!(old.upgrade().is_some(), "not yet due");
     participant.on_cycle(3 * 3_600_000 * MS);
@@ -2557,7 +2445,7 @@ fn a_polled_key_is_visited_while_in_use() {
     let mut participant = participant();
     participant.set_scheduled(true);
     let c = contract(100, 10);
-    participant.ensure(b"k", Limit::Bucket(c), 0);
+    participant.ensure(b"k", c, 0);
     participant.on_cycle(CYCLE);
     let _ = participant.take_outgoing();
     let mut visited = Vec::new();
@@ -2611,11 +2499,11 @@ fn a_backlog_goes_a_piece_an_exchange_and_none_starves(scheduled: bool) {
         })
         .collect();
     for name in &names {
-        participant.ensure(name, Limit::Bucket(c), 0);
+        participant.ensure(name, c, 0);
     }
     let entries: Vec<Arc<Entry>> = names
         .iter()
-        .map(|name| participant.entries(&[(name, Limit::Bucket(c))]).remove(0))
+        .map(|name| participant.entries(&[(name, c)]).remove(0))
         .collect();
     let piece = PIECE_BYTES / (300 + ENTRY_BYTES);
     let rounds = KEYS.div_ceil(piece);
@@ -2716,15 +2604,12 @@ fn shared_among_four(key: &[u8], c: Contract) -> Participant<FixedState> {
             0,
         );
     }
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], 0),
-        Decision::Admit
-    );
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
     participant.on_cycle(CYCLE);
     let (exchange, batch) = only_exchange(&mut participant);
     let answers = pod.on_batch(batch, CYCLE);
     participant.on_answers_to(exchange, answers, CYCLE);
-    let entry = participant.entries(&[(key, Limit::Bucket(c))]).remove(0);
+    let entry = participant.entries(&[(key, c)]).remove(0);
     assert_eq!(entry.others.load(Ordering::Acquire), 3);
     participant
 }
@@ -2743,7 +2628,7 @@ fn flooded(
         participant.on_cycle(now);
         let _ = participant.take_exchanges();
         admitted += (0..300)
-            .filter(|_| participant.decide_all(&[(key, Limit::Bucket(c))], now) == Decision::Admit)
+            .filter(|_| participant.decide_all(&[(key, c)], now) == Decision::Admit)
             .count() as u64;
     }
     admitted
@@ -2787,13 +2672,10 @@ fn a_participants_quiet_key_keeps_its_share_when_it_is_next_reported() {
     let key: &[u8] = b"k";
     let mut participant = shared_among_four(key, c);
     let woken = 3 * CUT_OFF_CYCLES * CYCLE;
-    assert_eq!(
-        participant.decide_all(&[(key, Limit::Bucket(c))], woken),
-        Decision::Admit
-    );
+    assert_eq!(participant.decide_all(&[(key, c)], woken), Decision::Admit);
     participant.on_cycle(woken);
     let _ = participant.take_exchanges();
     participant.on_cycle(woken + CYCLE);
-    let entry = participant.entries(&[(key, Limit::Bucket(c))]).remove(0);
+    let entry = participant.entries(&[(key, c)]).remove(0);
     assert_eq!(entry.others.load(Ordering::Acquire), 3);
 }
