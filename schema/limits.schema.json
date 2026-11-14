@@ -140,7 +140,7 @@
           ]
         },
         {
-          "description": "At most `limit` requests in each `window`, the count starting again as each ends:\na whole window's worth may come at once, and two windows' worth across a boundary.\nEach key's windows are shifted by an offset of its own, so that keys' boundaries\nspread. Not in the asynchronous mode, which cannot hold a window against a client\nbursting on every data plane at each window's start: a quota there is a bucket, and a\nwindow held exactly takes the synchronous mode.",
+          "description": "At most `limit` requests in each `window`, the count starting again as each ends:\na whole window's worth may come at once, and two windows' worth across a boundary.\nEach key's windows are shifted by an offset of its own, so that keys' boundaries\nspread. Not in the asynchronous mode, which runs only buckets.",
           "type": "object",
           "properties": {
             "fixed_window": {
@@ -153,11 +153,11 @@
           ]
         },
         {
-          "description": "At most `limit` requests in any span of `window`, counted to a thousandth of it. Only\nin the synchronous mode, and not with `when_unreachable: local`: local mode keeps no\nrolling window yet, and the asynchronous mode cannot hold one against bursts, as with\na fixed window.",
+          "description": "At most `limit` requests in any span of `window`, each counted in one of `slots` slots\na window, its time rounded down to its slot's start: room comes back up to a slot\nearly, never late, and at most `limit` come in any span of (`slots` − 1) / `slots` of\nthe window. Not in the asynchronous mode, which runs only buckets.",
           "type": "object",
           "properties": {
             "rolling_window": {
-              "$ref": "#/$defs/Window"
+              "$ref": "#/$defs/Rolling"
             }
           },
           "additionalProperties": false,
@@ -165,6 +165,39 @@
             "rolling_window"
           ]
         }
+      ]
+    },
+    "Rolling": {
+      "description": "A rolling window's numbers.",
+      "type": "object",
+      "properties": {
+        "limit": {
+          "description": "Requests in any window.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "slots": {
+          "description": "The slots a window is counted in, 1,000 when left out: room comes back up to a slot\nearly, so fewer bring it back sooner; each key holds a count for every slot, whatever\nits limit: 4 bytes each, 8 for a limit of 524,288 or more.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "maximum": 1000,
+          "minimum": 2
+        },
+        "window": {
+          "description": "The window: a whole number and `ms`, `s`, `m`, `h` or `d`, as `500ms`, `1m`, `1d`.",
+          "type": "string",
+          "pattern": "^[1-9][0-9]*(ms|s|m|h|d)$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "limit",
+        "window"
       ]
     },
     "Window": {

@@ -92,15 +92,13 @@ pub enum Model {
     /// At most `limit` requests in each `window`, the count starting again as each ends:
     /// a whole window's worth may come at once, and two windows' worth across a boundary.
     /// Each key's windows are shifted by an offset of its own, so that keys' boundaries
-    /// spread. Not in the asynchronous mode, which cannot hold a window against a client
-    /// bursting on every data plane at each window's start: a quota there is a bucket, and a
-    /// window held exactly takes the synchronous mode.
+    /// spread. Not in the asynchronous mode, which runs only buckets.
     FixedWindow(Window),
-    /// At most `limit` requests in any span of `window`, counted to a thousandth of it. Only
-    /// in the synchronous mode, and not with `when_unreachable: local`: local mode keeps no
-    /// rolling window yet, and the asynchronous mode cannot hold one against bursts, as with
-    /// a fixed window.
-    RollingWindow(Window),
+    /// At most `limit` requests in any span of `window`, each counted in one of `slots` slots
+    /// a window, its time rounded down to its slot's start: room comes back up to a slot
+    /// early, never late, and at most `limit` come in any span of (`slots` − 1) / `slots` of
+    /// the window. Not in the asynchronous mode, which runs only buckets.
+    RollingWindow(Rolling),
 }
 
 /// A token bucket's numbers.
@@ -132,6 +130,28 @@ pub struct Window {
     #[cfg_attr(feature = "schema", schemars(regex(pattern = WINDOW_PATTERN)))]
     pub window: String,
 }
+
+/// A rolling window's numbers.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Rolling {
+    /// Requests in any window.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub limit: u64,
+    /// The window: a whole number and `ms`, `s`, `m`, `h` or `d`, as `500ms`, `1m`, `1d`.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = WINDOW_PATTERN)))]
+    pub window: String,
+    /// The slots a window is counted in, 1,000 when left out: room comes back up to a slot
+    /// early, so fewer bring it back sooner; each key holds a count for every slot, whatever
+    /// its limit: 4 bytes each, 8 for a limit of 524,288 or more.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(range(min = 2, max = 1000)))]
+    pub slots: Option<u64>,
+}
+
+/// The slots a rolling window is counted in when its limit says none.
+pub(crate) const DEFAULT_SLOTS: u64 = 1_000;
 
 /// What a rate looks like.
 #[cfg(feature = "schema")]
@@ -188,10 +208,12 @@ pub enum CompiledModel {
         /// Its window as it was written, `1m`: for telling a person.
         window: String,
     },
-    /// A rolling window, which only the synchronous mode decides.
+    /// A rolling window.
     RollingWindow {
         /// Its window as it was written, `1m`: for telling a person.
         window: String,
+        /// The slots a window is counted in: 2 to 1,000.
+        slots: NonZeroU64,
     },
 }
 
@@ -382,28 +404,55 @@ fn model(
             let rate = bucket.rate.clone();
             Some((count, window, CompiledModel::Bucket { rate, burst }))
         }
-        Model::FixedWindow(numbers) | Model::RollingWindow(numbers) => {
-            let name = window_name(model);
-            let count = NonZeroU64::new(numbers.limit);
-            if count.is_none() {
-                errors.push(place.problem(Problem::LimitCountZero(name)));
-            }
-            let length = window_length(&numbers.window);
-            if length.is_none() {
-                errors.push(place.problem(Problem::LimitWindow {
-                    model: name,
-                    window: numbers.window.clone(),
-                }));
+        Model::FixedWindow(numbers) => {
+            let (count, length) =
+                window_numbers(model, numbers.limit, &numbers.window, place, errors);
+            let window = numbers.window.clone();
+            Some((count?, length?, CompiledModel::FixedWindow { window }))
+        }
+        Model::RollingWindow(numbers) => {
+            let (count, length) =
+                window_numbers(model, numbers.limit, &numbers.window, place, errors);
+            let said = numbers.slots.unwrap_or(DEFAULT_SLOTS);
+            let slots = NonZeroU64::new(said).filter(|_| (2..=1_000).contains(&said));
+            if slots.is_none() {
+                errors.push(place.problem(Problem::LimitSlots(said)));
             }
             let window = numbers.window.clone();
-            let compiled = if matches!(model, Model::FixedWindow(_)) {
-                CompiledModel::FixedWindow { window }
-            } else {
-                CompiledModel::RollingWindow { window }
-            };
-            Some((count?, length?, compiled))
+            Some((
+                count?,
+                length?,
+                CompiledModel::RollingWindow {
+                    window,
+                    slots: slots?,
+                },
+            ))
         }
     }
+}
+
+/// A window model's count and length, if they are as they should be; the problems found
+/// pushed to `errors` at `place`.
+fn window_numbers(
+    model: &Model,
+    limit: u64,
+    window: &str,
+    place: &Place,
+    errors: &mut Vec<ConfigError>,
+) -> (Option<NonZeroU64>, Option<NonZeroU64>) {
+    let name = window_name(model);
+    let count = NonZeroU64::new(limit);
+    if count.is_none() {
+        errors.push(place.problem(Problem::LimitCountZero(name)));
+    }
+    let length = window_length(window);
+    if length.is_none() {
+        errors.push(place.problem(Problem::LimitWindow {
+            model: name,
+            window: window.to_owned(),
+        }));
+    }
+    (count, length)
 }
 
 /// The digest of what defines `limit` apart from its name, the same on every data plane
@@ -436,10 +485,20 @@ fn definition(limit: &Limit) -> [u8; 8] {
             feed(bucket.rate.as_bytes());
             feed(&bucket.burst.to_le_bytes());
         }
-        Model::FixedWindow(window) | Model::RollingWindow(window) => {
-            feed(window_name(&limit.model).as_bytes());
+        Model::FixedWindow(window) => {
+            feed(b"fixed_window");
             feed(&window.limit.to_le_bytes());
             feed(window.window.as_bytes());
+        }
+        Model::RollingWindow(rolling) => {
+            feed(b"rolling_window");
+            feed(&rolling.limit.to_le_bytes());
+            feed(rolling.window.as_bytes());
+            // Only slots other than the default: a limit that says none, as every one did
+            // before they could be said, keeps its keys, and saying 1,000 is saying none.
+            if let Some(slots) = rolling.slots.filter(|slots| *slots != DEFAULT_SLOTS) {
+                feed(&slots.to_le_bytes());
+            }
         }
     }
     hash.to_le_bytes()
@@ -574,6 +633,40 @@ mod tests {
         ] {
             assert_ne!(fixed, digest(other), "{other}");
         }
+    }
+
+    /// A rolling window's slots are in its digest when they are not the default: other slots
+    /// count afresh, and a limit saying 1,000, or none as before slots could be said, keeps
+    /// its keys.
+    #[test]
+    fn a_rolling_windows_slots_are_digested_unless_the_default() {
+        let limit = |yaml: &str| -> Limit { serde_saphyr::from_str(yaml).unwrap() };
+        let digest = |numbers: &str| {
+            definition(&limit(&format!(
+                "{{ name: a, key: client, model: {{ rolling_window: {{ limit: 10, window: 1s{numbers} }} }} }}"
+            )))
+        };
+        assert_eq!(digest(""), digest(", slots: 1000"));
+        assert_ne!(digest(""), digest(", slots: 60"));
+        assert_ne!(digest(", slots: 60"), digest(", slots: 61"));
+        // What every rolling window's digest was before slots could be said.
+        let before = {
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            let mut feed = |bytes: &[u8]| {
+                for byte in (bytes.len() as u64).to_le_bytes().iter().chain(bytes) {
+                    hash ^= u64::from(*byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            };
+            feed(&0_u64.to_le_bytes());
+            feed(b"");
+            feed(b"client");
+            feed(b"rolling_window");
+            feed(&10_u64.to_le_bytes());
+            feed(b"1s");
+            hash.to_le_bytes()
+        };
+        assert_eq!(digest(""), before, "a rolling window's keys not kept");
     }
 
     #[test]

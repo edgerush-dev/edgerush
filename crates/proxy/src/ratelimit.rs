@@ -23,7 +23,7 @@ use boring::ssl::SslConnector;
 use edgerush_config::{
     Compiled, CompiledLimit, CompiledModel, CompiledRateLimitService, CompiledRateLimiting,
 };
-use edgerush_ratelimit::local::{Limit, Window};
+use edgerush_ratelimit::local::{Limit, Rolling, Window};
 use edgerush_ratelimit::service::pooled::{
     self, Entry, Handle, Local as PooledLocal, Outcome as Pooled, Registry,
 };
@@ -946,7 +946,11 @@ impl Held for Limit {
                 limit: count,
                 window: limit.window,
             })),
-            CompiledModel::RollingWindow { .. } => None,
+            CompiledModel::RollingWindow { slots, .. } => Some(Self::RollingWindow(Rolling {
+                limit: count,
+                window: limit.window,
+                slots,
+            })),
         }
     }
 }

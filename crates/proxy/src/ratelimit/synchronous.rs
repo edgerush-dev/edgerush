@@ -31,7 +31,7 @@ use edgerush_ratelimit::local::{Decision, Limit};
 use edgerush_ratelimit::service::{Decided, longest};
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::plane::{
-    Answer, Due, GIVE_BACK_AGAIN, GIVE_BACK_LATER, Giving, MOST_SLOTS, NodeId, Plane, Rule, Told,
+    Answer, Due, GIVE_BACK_AGAIN, GIVE_BACK_LATER, Giving, NodeId, Plane, Rule, Told,
 };
 use edgerush_ratelimit_service::cluster::pod::decide_stream;
 use edgerush_ratelimit_service::cluster::wire::{self, Asking, Telling};
@@ -631,8 +631,7 @@ async fn open(stream: Weak<Stream>, limiter: Weak<SyncLimiter>, generation: u64)
 }
 
 /// What a key is held to in the synchronous mode: the store's rule, which its owner decides
-/// by, and the same limit as local mode keeps it, for `when_unreachable: local`; none for a
-/// rolling window, which local mode does not keep and its config refuses with it.
+/// by, and the same limit as local mode keeps it, for `when_unreachable: local`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HeldTo {
     rule: Rule,
@@ -649,11 +648,10 @@ impl super::Held for HeldTo {
                 burst: burst.get(),
             },
             CompiledModel::FixedWindow { .. } => Rule::Window { per, window },
-            // The slots come with config's `slots`; until then, the store's own number.
-            CompiledModel::RollingWindow { .. } => Rule::Rolling {
+            CompiledModel::RollingWindow { slots, .. } => Rule::Rolling {
                 per,
                 window,
-                slots: MOST_SLOTS,
+                slots: slots.get(),
             },
         };
         Some(Self {
@@ -1412,10 +1410,13 @@ mod tests {
     }
 
     /// Each model goes to the store as its own rule, at the limit's numbers, with local
-    /// mode's limit beside it for `when_unreachable: local`: none for a rolling window.
+    /// mode's limit beside it for `when_unreachable: local`, a rolling window's in the same
+    /// slots.
     #[test]
     fn a_limit_is_held_at_the_store_by_its_own_model() {
         use super::{HeldTo, Rule};
+        use edgerush_ratelimit::local::{Limit, Rolling};
+        use std::num::NonZeroU64;
         let mut config: edgerush_config::Config = serde_saphyr::from_str(
             r#"
 listeners: { web: { address: "127.0.0.1:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
@@ -1423,7 +1424,7 @@ routes:
   - name: api
     listeners: [web]
     hostnames: [{ name: "*", falls_through: true }]
-    rules: [{ matches: [{ path: { prefix: / } }], forward: { backends: [{ upstream: u, weight: 1 }] }, rate_limits: [b, f, r] }]
+    rules: [{ matches: [{ path: { prefix: / } }], forward: { backends: [{ upstream: u, weight: 1 }] }, rate_limits: [b, f, r, s] }]
 upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
 "#,
         )
@@ -1434,6 +1435,7 @@ upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
   - { name: b, key: client, model: { bucket: { rate: 10/s, burst: 20 } } }
   - { name: f, key: client, model: { fixed_window: { limit: 3, window: 1m } } }
   - { name: r, key: client, model: { rolling_window: { limit: 7, window: 1h } } }
+  - { name: s, key: client, model: { rolling_window: { limit: 7, window: 1h, slots: 60 } } }
 ",
             )
             .unwrap(),
@@ -1469,11 +1471,25 @@ upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
                 slots: 1_000
             }
         );
-        assert!(held("b").local.is_some() && held("f").local.is_some());
-        assert!(
-            held("r").local.is_none(),
-            "local mode keeps no rolling window"
+        assert_eq!(
+            held("s").rule,
+            Rule::Rolling {
+                per: 7,
+                window: 3_600_000_000_000,
+                slots: 60
+            }
         );
+        assert!(held("b").local.is_some() && held("f").local.is_some());
+        // The fallback in the same slots as the store, so that both decide alike.
+        let rolling = |slots| {
+            Some(Limit::RollingWindow(Rolling {
+                limit: NonZeroU64::new(7).unwrap(),
+                window: NonZeroU64::new(3_600_000_000_000).unwrap(),
+                slots: NonZeroU64::new(slots).unwrap(),
+            }))
+        };
+        assert_eq!(held("r").local, rolling(1_000));
+        assert_eq!(held("s").local, rolling(60));
     }
 
     /// A give-back's answer that comes 10 ms after it is sent, other than answered: its

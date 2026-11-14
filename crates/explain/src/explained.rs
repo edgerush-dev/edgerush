@@ -402,8 +402,8 @@ fn text(
                             CompiledModel::FixedWindow { window } => {
                                 format!("{} in each {window} window", limit.count)
                             }
-                            CompiledModel::RollingWindow { window } => {
-                                format!("{} in any {window}", limit.count)
+                            CompiledModel::RollingWindow { window, slots } => {
+                                format!("{} in any {window}, in {slots} slots", limit.count)
                             }
                         };
                         format!("{} ({model}{dry_run})", limit.name)
@@ -1122,7 +1122,7 @@ rate_limiting: { mode: asynchronous, service: { addresses: ["rl-0:7000"], key_se
         let text = snapshot.explain(listener, &asked).unwrap().text();
         assert!(
             text.contains(
-                "limits    writes (10 in any 1h), per-client (1000 in each 1m window); rate limiting is off, none enforced"
+                "limits    writes (10 in any 1h, in 1000 slots), per-client (1000 in each 1m window); rate limiting is off, none enforced"
             ),
             "{text}"
         );
