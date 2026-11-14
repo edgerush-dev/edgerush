@@ -153,7 +153,7 @@
           ]
         },
         {
-          "description": "At most `limit` requests in any span of `window`, counted to a thousandth of it. In\nno mode yet; never in local mode, nor with `when_unreachable: local`.",
+          "description": "At most `limit` requests in any span of `window`, counted to a thousandth of it. Only\nin the synchronous mode, and not with `when_unreachable: local`: local mode keeps no\nrolling window yet, nor does the asynchronous mode, which decides from local mode's\nkeys.",
           "type": "object",
           "properties": {
             "rolling_window": {
