@@ -19,12 +19,16 @@ use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
 };
 
 /// Each kind's CRD in `install/` and the module written from it, at `v1alpha1`.
-const KINDS: [(&str, &str); 2] = [
+const KINDS: [(&str, &str); 3] = [
     (
         "gateway.edgerush.dev_controlplanes.yaml",
         "control_plane.rs",
     ),
     ("gateway.edgerush.dev_dataplanes.yaml", "data_plane.rs"),
+    (
+        "gateway.edgerush.dev_platformdefaults.yaml",
+        "platform_defaults.rs",
+    ),
 ];
 
 /// The DataPlane's CRD.

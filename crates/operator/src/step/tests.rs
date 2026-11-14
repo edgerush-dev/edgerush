@@ -279,6 +279,8 @@ fn children_of(objects: &[Object], version: &str) -> Vec<Child> {
 async fn an_accepted_resource_is_finalized_then_made_then_reported() {
     let (fake, api) = cluster(|_, _| None).await;
     let seen = Seen {
+        platform_defaults: None,
+        namespaces: BTreeMap::new(),
         control_planes: vec![control_plane("Same")],
         data_planes: vec![data_plane()],
         children: Vec::new(),
@@ -395,6 +397,8 @@ fn after_first_of(
         conditions: Some(wanted("edgerush-proxy-web")),
     });
     Seen {
+        platform_defaults: None,
+        namespaces: BTreeMap::new(),
         control_planes: vec![cp],
         data_planes: vec![dp],
         children,
@@ -604,6 +608,8 @@ async fn an_object_of_its_name_not_the_operators_is_left_alone_and_said() {
     let said = Said::default();
     let mut operator = Operator::new(install());
     let seen = Seen {
+        platform_defaults: None,
+        namespaces: BTreeMap::new(),
         control_planes: vec![control_plane("Same")],
         data_planes: vec![data_plane()],
         children: Vec::new(),
@@ -693,6 +699,8 @@ async fn a_refused_control_plane_makes_nothing_and_its_data_plane_waits_on_it() 
     let said = Said::default();
     let mut operator = Operator::new(install());
     let seen = Seen {
+        platform_defaults: None,
+        namespaces: BTreeMap::new(),
         control_planes: vec![control_plane("All")],
         data_planes: vec![data_plane()],
         children: Vec::new(),
@@ -1001,6 +1009,8 @@ fn of_gateway_api(asked: &Asked) -> bool {
 async fn without_gateway_apis_crds_the_rest_is_made_and_a_gateway_waits_on_them() {
     let (fake, api) = cluster(|_, _| None).await;
     let seen = Seen {
+        platform_defaults: None,
+        namespaces: BTreeMap::new(),
         control_planes: vec![control_plane("Same")],
         data_planes: vec![data_plane_with_gateway()],
         children: Vec::new(),
@@ -1088,6 +1098,8 @@ async fn gateway_apis_crds_installed_later_have_what_was_left_out_made() {
     // The CRDs installed, and nothing else changed: the GatewayClass and the Gateway made,
     // and the DataPlane programmed.
     let installed = Seen {
+        platform_defaults: None,
+        namespaces: BTreeMap::new(),
         gateway_api: SERVED,
         ..waiting
     };
@@ -1145,4 +1157,296 @@ async fn a_control_plane_deleted_without_gateway_apis_crds_deletes_no_gateway_cl
         "its finalizer not taken away: {:?}",
         said.0
     );
+}
+
+/// A `PlatformDefaults` named `default` letting the ControlPlanes of namespace `edge`
+/// watch `namespaces`, as JSON.
+fn allowing(namespaces: serde_json::Value) -> PlatformDefaults {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "gateway.edgerush.dev/v1alpha1",
+        "kind": "PlatformDefaults",
+        "metadata": { "name": "default" },
+        "spec": { "watchScopes": [{
+            "controlPlanes": { "namespaceSelector": { "matchLabels": { "kubernetes.io/metadata.name": "edge" } } },
+            "namespaces": namespaces,
+        }] },
+    }))
+    .unwrap()
+}
+
+/// Namespace `edge`, `pay` and `bill` of team `payments`, and `search` of team `search`,
+/// each labelled with its name, as the API server labels them.
+fn namespaces() -> BTreeMap<String, Labels> {
+    [
+        ("edge", None),
+        ("pay", Some("payments")),
+        ("bill", Some("payments")),
+        ("search", Some("search")),
+    ]
+    .into_iter()
+    .map(|(name, team)| {
+        let mut labels =
+            BTreeMap::from([("kubernetes.io/metadata.name".to_owned(), name.to_owned())]);
+        if let Some(team) = team {
+            labels.insert("team".to_owned(), team.to_owned());
+        }
+        (name.to_owned(), labels)
+    })
+    .collect()
+}
+
+/// The allowance of the namespaces of team `payments`.
+fn payments() -> PlatformDefaults {
+    allowing(serde_json::json!({
+        "from": "Selector", "selector": { "matchLabels": { "team": "payments" } },
+    }))
+}
+
+/// ControlPlane `edge` watching the namespaces of team `payments`.
+fn selecting_payments() -> ControlPlane {
+    let mut control_plane = control_plane("Same");
+    control_plane.spec.watch.namespaces = serde_json::from_value(serde_json::json!({
+        "from": "Selector", "selector": { "matchLabels": { "team": "payments" } },
+    }))
+    .unwrap();
+    control_plane
+}
+
+/// Where each binding of `objects` is applied.
+fn binding_paths(objects: &[Object]) -> BTreeSet<String> {
+    objects
+        .iter()
+        .filter(|object| {
+            matches!(
+                object,
+                Object::RoleBinding(_) | Object::ClusterRoleBinding(_)
+            )
+        })
+        .map(path_of)
+        .collect()
+}
+
+/// The paths of `asked`'s requests of `method`, without their query.
+fn written(asked: &[Asked], method: &str) -> BTreeSet<String> {
+    asked
+        .iter()
+        .filter(|asked| asked.method == method)
+        .map(|asked| asked.path.split('?').next().unwrap().to_owned())
+        .collect()
+}
+
+const ROLE_BINDINGS: &str = "/apis/rbac.authorization.k8s.io/v1/namespaces";
+const CLUSTER_ROLE_BINDINGS: &str = "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings";
+
+/// [`after_first`] with its ControlPlane `seen_as`, but everything of it and its DataPlane
+/// made as `made_as` and `selected` had it, in a cluster whose namespaces are
+/// [`namespaces`] and whose `PlatformDefaults` is `platform`.
+fn made_then(
+    made_as: &ControlPlane,
+    selected: &BTreeSet<String>,
+    seen_as: &ControlPlane,
+    platform: Option<PlatformDefaults>,
+) -> Seen {
+    let mut seen = after_first("1", 1);
+    let mut control_plane = seen_as.clone();
+    control_plane.metadata = seen.control_planes[0].metadata.clone();
+    seen.control_planes = vec![control_plane];
+    let for_control_plane = objects::for_control_plane(made_as, selected, &install()).unwrap();
+    let for_data_plane =
+        objects::for_data_plane(&data_plane(), made_as, selected, &install()).unwrap();
+    seen.children = children_of(&for_control_plane, "1");
+    seen.children.extend(children_of(&for_data_plane, "1"));
+    seen.platform_defaults = platform;
+    seen.namespaces = namespaces();
+    seen
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scope_of_all_allowed_is_bound_over_the_cluster_and_its_own_namespace_no_more() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let (same, all, none) = (control_plane("Same"), control_plane("All"), BTreeSet::new());
+    let allowed = allowing(serde_json::json!({ "from": "All" }));
+    let seen = made_then(&same, &none, &all, Some(allowed));
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    let patched = written(&asked, "PATCH");
+    for binding in [
+        "edgerush-controller-edge",
+        "edgerush-controller-edge-cluster",
+        "edgerush-proxy-edge.web",
+    ] {
+        let path = format!("{CLUSTER_ROLE_BINDINGS}/{binding}");
+        assert!(patched.contains(&path), "{path}: {:?}", writes(&asked));
+    }
+    // The bindings its scope had in its own namespace are no longer asked for: those of
+    // its own role stay.
+    let mut was = binding_paths(&objects::for_control_plane(&same, &none, &install()).unwrap());
+    was.extend(binding_paths(
+        &objects::for_data_plane(&data_plane(), &same, &none, &install()).unwrap(),
+    ));
+    let mut is = binding_paths(&objects::for_control_plane(&all, &none, &install()).unwrap());
+    is.extend(binding_paths(
+        &objects::for_data_plane(&data_plane(), &all, &none, &install()).unwrap(),
+    ));
+    let gone: BTreeSet<String> = was.difference(&is).cloned().collect();
+    assert_eq!(
+        gone,
+        BTreeSet::from([
+            format!("{ROLE_BINDINGS}/edge/rolebindings/edgerush-controller-edge"),
+            format!("{ROLE_BINDINGS}/edge/rolebindings/edgerush-proxy-edge.web"),
+        ])
+    );
+    assert_eq!(written(&asked, "DELETE"), gone);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_selector_scope_allowed_is_bound_in_each_namespace_it_selects() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let selecting = selecting_payments();
+    let seen = made_then(&selecting, &BTreeSet::new(), &selecting, Some(payments()));
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    let patched = written(&asked, "PATCH");
+    let role_binding =
+        |namespace: &str, name: &str| format!("{ROLE_BINDINGS}/{namespace}/rolebindings/{name}");
+    for namespace in ["pay", "bill"] {
+        for name in ["edgerush-controller-edge", "edgerush-proxy-edge.web"] {
+            let path = role_binding(namespace, name);
+            assert!(patched.contains(&path), "{path}: {patched:?}");
+        }
+    }
+    assert!(
+        !patched
+            .iter()
+            .any(|path| path.contains("/namespaces/search/")),
+        "{patched:?}"
+    );
+    // The controller is told the namespaces selected.
+    let deployment = asked
+        .iter()
+        .find(|asked| {
+            asked.method == "PATCH" && asked.path.contains("/deployments/edgerush-controller-edge")
+        })
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&deployment.body).unwrap();
+    let args = body["spec"]["template"]["spec"]["containers"][0]["args"].to_string();
+    assert!(
+        args.contains(r#""--namespace","bill","--namespace","pay""#),
+        "{args}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_allowance_narrowed_takes_back_the_rights_it_granted_and_keeps_the_rest() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let all = control_plane("All");
+    // Made while All was allowed; now no allowance is for it.
+    let seen = made_then(&all, &BTreeSet::new(), &all, None);
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    assert_eq!(
+        status_written(&asked, CONTROL_PLANE),
+        conditions_of(&[
+            ("Accepted", "False", "ScopeNotAllowed"),
+            ("Programmed", "False", "Pending")
+        ])
+    );
+    // The rights over the cluster its scope had, its controller's and its data plane's,
+    // are deleted; the controller's right to the cluster's own kinds is not its scope's,
+    // and stays, as does everything else.
+    assert_eq!(
+        written(&asked, "DELETE"),
+        BTreeSet::from([
+            format!("{CLUSTER_ROLE_BINDINGS}/edgerush-controller-edge"),
+            format!("{CLUSTER_ROLE_BINDINGS}/edgerush-proxy-edge.web"),
+        ]),
+        "{:?}",
+        said.0
+    );
+    assert!(
+        written(&asked, "PATCH")
+            .iter()
+            .all(|path| path.ends_with("/status")),
+        "nothing applied: {:?}",
+        writes(&asked)
+    );
+    assert!(said.any("no longer granted"), "{:?}", said.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_namespace_no_longer_selected_has_the_bindings_in_it_deleted() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let selecting = selecting_payments();
+    // Made while `search` was of team payments too.
+    let then = BTreeSet::from(["bill".to_owned(), "pay".to_owned(), "search".to_owned()]);
+    let seen = made_then(&selecting, &then, &selecting, Some(payments()));
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    assert_eq!(
+        written(&fake.seen(), "DELETE"),
+        BTreeSet::from([
+            format!("{ROLE_BINDINGS}/search/rolebindings/edgerush-controller-edge"),
+            format!("{ROLE_BINDINGS}/search/rolebindings/edgerush-proxy-edge.web"),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_binding_that_cannot_be_deleted_is_said_and_tried_again() {
+    let (_fake, api) = cluster(|method, _| {
+        (method == "DELETE").then(|| answer(403, r#"{"kind":"Status","code":403}"#))
+    })
+    .await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let all = control_plane("All");
+    let seen = made_then(&all, &BTreeSet::new(), &all, None);
+    assert!(!operator.step(&api, &seen, &time(10), &said.say()).await);
+    assert!(said.any("cannot be deleted"), "{:?}", said.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_namespace_newly_selected_has_its_bindings_made_with_nothing_else_changed() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let selecting = selecting_payments();
+    let selected = BTreeSet::from(["bill".to_owned(), "pay".to_owned()]);
+    let seen = made_then(&selecting, &selected, &selecting, Some(payments()));
+    assert!(operator.step(&api, &seen, &time(10), &said.say()).await);
+    // Applied once; then `search` labelled into team payments, and nothing else.
+    let before = fake.seen().len();
+    let mut labelled = seen.clone();
+    labelled
+        .namespaces
+        .get_mut("search")
+        .unwrap()
+        .insert("team".to_owned(), "payments".to_owned());
+    assert!(operator.step(&api, &labelled, &time(20), &said.say()).await);
+    let patched = written(&fake.seen()[before..], "PATCH");
+    let path = format!("{ROLE_BINDINGS}/search/rolebindings/edgerush-controller-edge");
+    assert!(patched.contains(&path), "{patched:?}");
 }

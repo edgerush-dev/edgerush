@@ -19,6 +19,7 @@ use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_gateway_api::udp_route::UDPRoute;
 use edgerush_planes::control_plane::ControlPlane;
 use edgerush_planes::data_plane::DataPlane;
+use edgerush_planes::platform_defaults::PlatformDefaults;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::coordination::v1::Lease;
@@ -177,6 +178,10 @@ impl Kind for DataPlane {
 
 impl Kind for ControlPlane {
     const NAMESPACED: bool = true;
+}
+
+impl Kind for PlatformDefaults {
+    const NAMESPACED: bool = false;
 }
 
 impl Kind for ServiceAccount {

@@ -3,24 +3,24 @@
 //! condition says, and what the control plane acts on. No I/O.
 //!
 //! A ControlPlane's name is unique in the cluster: the oldest of a name holds it, by its
-//! creation time, then its UID. Until the allowance of `PlatformDefaults` (05 §4), it may
-//! watch its own namespace alone. A DataPlane names a ControlPlane of its own namespace,
-//! which must hold that name; and of one ControlPlane's DataPlanes the oldest alone is
-//! served, by its creation time, then its name, as the control plane chooses (05 §3).
+//! creation time, then its UID. It may watch its own namespace, and beyond it what an
+//! allowance of `PlatformDefaults` for its namespace allows ([`allowance`], 05 §4). A
+//! DataPlane names a ControlPlane of its own namespace, which must hold that name; and of
+//! one ControlPlane's DataPlanes the oldest alone is served, by its creation time, then its
+//! name, as the control plane chooses (05 §3).
 //!
-//! A ControlPlane refused for an edit beyond the checks refuses none of its DataPlanes:
-//! what was made for it is kept, as the control plane keeps the last accepted, and it
+//! A ControlPlane refused once accepted, for an edit beyond the checks or an allowance
+//! narrowed, refuses none of its DataPlanes: what was made for it is kept, but for the
+//! rights beyond its own namespace, as the control plane keeps the last accepted, and it
 //! would stop serving a DataPlane refused.
 
+use crate::allowance::{self, Beyond, Labels};
 use edgerush_planes::control_plane::ControlPlane;
 use edgerush_planes::data_plane::DataPlane;
+use edgerush_planes::platform_defaults::PlatformDefaults;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-
-/// The one watch scope accepted while no allowance says more: the ControlPlane's own
-/// namespace.
-const SAME: &str = "Same";
 
 /// Why a resource is not accepted: its `Accepted` condition's reason and message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,11 +30,8 @@ pub enum Refused {
         /// That one, as `<namespace>/<name>`.
         holder: String,
     },
-    /// A ControlPlane watching beyond its own namespace, which no allowance lets it.
-    ScopeNotAllowed {
-        /// The scope it asks for.
-        from: String,
-    },
+    /// A ControlPlane watching beyond its own namespace further than any allowance lets it.
+    ScopeNotAllowed(Beyond),
     /// A DataPlane of a ControlPlane an older DataPlane is served by.
     OneDataPlaneOnly {
         /// That DataPlane's name.
@@ -53,7 +50,7 @@ impl Refused {
     pub fn reason(&self) -> &'static str {
         match self {
             Self::NameTaken { .. } => "NameTaken",
-            Self::ScopeNotAllowed { .. } => "ScopeNotAllowed",
+            Self::ScopeNotAllowed(_) => "ScopeNotAllowed",
             Self::OneDataPlaneOnly { .. } => "OneDataPlaneOnly",
             Self::NoControlPlane { .. } => "NoControlPlane",
         }
@@ -67,10 +64,23 @@ impl Refused {
                 "The name is held by ControlPlane {holder}, which is older: a ControlPlane's \
                  name is unique in the cluster."
             ),
-            Self::ScopeNotAllowed { from } => format!(
-                "A watch scope of {from} is beyond what is allowed: a ControlPlane may watch \
-                 its own namespace alone (Same)."
+            Self::ScopeNotAllowed(Beyond { asked, allowed }) if allowed.is_empty() => format!(
+                "A watch scope of {asked} is beyond what is allowed: no allowance of \
+                 PlatformDefaults {} is for this namespace, so a ControlPlane here may watch \
+                 its own namespace alone (Same).",
+                allowance::NAME
             ),
+            Self::ScopeNotAllowed(Beyond { asked, allowed }) => {
+                let allowed: Vec<String> = allowed.iter().map(ToString::to_string).collect();
+                format!(
+                    "A watch scope of {asked} is beyond what is allowed: PlatformDefaults {} \
+                     lets a ControlPlane here watch its own namespace (Same), or {}; a Selector \
+                     scope is within a Selector allowed where its selector carries every \
+                     requirement of that one's.",
+                    allowance::NAME,
+                    allowed.join(", or ")
+                )
+            }
             Self::OneDataPlaneOnly { holder } => format!(
                 "DataPlane {holder}, which is older, is its ControlPlane's: a ControlPlane \
                  serves one DataPlane."
@@ -92,9 +102,15 @@ pub struct Judged<'a> {
     pub data_planes: Vec<(&'a DataPlane, Result<&'a ControlPlane, Refused>)>,
 }
 
-/// Judges every ControlPlane and DataPlane of the cluster.
+/// Judges every ControlPlane and DataPlane of the cluster, as `platform` allows, each
+/// ControlPlane's namespace's labels found by its name in `namespaces`.
 #[must_use]
-pub fn judge<'a>(control_planes: &'a [ControlPlane], data_planes: &'a [DataPlane]) -> Judged<'a> {
+pub fn judge<'a>(
+    control_planes: &'a [ControlPlane],
+    data_planes: &'a [DataPlane],
+    platform: Option<&PlatformDefaults>,
+    namespaces: &BTreeMap<String, Labels>,
+) -> Judged<'a> {
     // The holder of each name: the oldest.
     let mut holders: BTreeMap<&str, &ControlPlane> = BTreeMap::new();
     for control_plane in control_planes {
@@ -124,12 +140,19 @@ pub fn judge<'a>(control_planes: &'a [ControlPlane], data_planes: &'a [DataPlane
                 Some(holder) if !std::ptr::eq(*holder, control_plane) => Err(Refused::NameTaken {
                     holder: named(&holder.metadata),
                 }),
-                _ if control_plane.spec.watch.namespaces.from != SAME => {
-                    Err(Refused::ScopeNotAllowed {
-                        from: control_plane.spec.watch.namespaces.from.clone(),
-                    })
+                _ => {
+                    let labels = control_plane
+                        .metadata
+                        .namespace
+                        .as_ref()
+                        .and_then(|namespace| namespaces.get(namespace));
+                    allowance::allows(
+                        platform,
+                        labels.unwrap_or(&Labels::new()),
+                        &control_plane.spec.watch.namespaces,
+                    )
+                    .map_err(Refused::ScopeNotAllowed)
                 }
-                _ => Ok(()),
             };
             (control_plane, verdict)
         })

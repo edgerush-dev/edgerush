@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # What the install ships, judged by a real API server in a kind cluster (docs/05 §1, §2;
-# docs/10): the ControlPlane and DataPlane CRDs, the four ClusterRoles and the admission
-# policy on a control plane's Services, applied as a user would.
+# docs/10): the ControlPlane, DataPlane and PlatformDefaults CRDs, the four ClusterRoles and
+# the admission policy on a control plane's Services, applied as a user would.
 #
 #   kind/planes.sh 1.37          make the cluster, run every check, delete the cluster
 #   KEEP=1 kind/planes.sh 1.37   the same, the cluster left for a look
@@ -15,7 +15,10 @@
 #     no listener or of one the Gateway would refuse, Ingress short of a port or with one
 #     port twice, max below min, one port's settings given twice, an enumerated value
 #     written in another case, a file access log of no path, a LoadBalancer's fields on
-#     another type, and, on an update, a LoadBalancer's class changed;
+#     another type, and, on an update, a LoadBalancer's class changed; a PlatformDefaults
+#     not named default, an allowance of a selector of no requirement, for ControlPlanes or
+#     for what they watch, with a selector where it takes none or none where it takes one,
+#     of a scope it cannot allow, or of an operator Kubernetes does not have;
 #   - a Service holding externalIPs is refused written as a control plane's ServiceAccount,
 #     and admitted written by another; one without them is admitted from either.
 # Nothing is built: no image is needed. Each check says PASS or FAIL; the first FAIL ends
@@ -43,9 +46,11 @@ fail() {
 install=crates/planes/install
 k apply --server-side -f "$install/gateway.edgerush.dev_controlplanes.yaml" \
     -f "$install/gateway.edgerush.dev_dataplanes.yaml" \
+    -f "$install/gateway.edgerush.dev_platformdefaults.yaml" \
     -f "$install/roles.yaml" -f "$install/admission.yaml" >/dev/null
 k wait --for condition=Established --timeout=60s \
-    crd/controlplanes.gateway.edgerush.dev crd/dataplanes.gateway.edgerush.dev >/dev/null
+    crd/controlplanes.gateway.edgerush.dev crd/dataplanes.gateway.edgerush.dev \
+    crd/platformdefaults.gateway.edgerush.dev >/dev/null
 k create namespace edge >/dev/null
 
 # `admitted <what> <yaml>`: the object, applied as a dry run on the server, which judges it
@@ -122,6 +127,35 @@ refused "a ControlPlane selecting without a selector" "selector must be given" "
 refused "a ControlPlane of its own namespace with a selector" "selector must be given" "$(control_plane payments 'spec: { watch: { namespaces: { selector: { matchLabels: { a: b } } } } }')"
 refused "a ControlPlane of no replicas" "spec.replicas" "$(control_plane payments 'spec: { replicas: 0 }')"
 refused "a ControlPlane's authority naming no Secret" "spec.authority.secretRef" "$(control_plane payments 'spec: { authority: {} }')"
+
+# What the PlatformDefaults' rules admit and refuse.
+platform_defaults() {
+    printf 'apiVersion: gateway.edgerush.dev/v1alpha1\nkind: PlatformDefaults\nmetadata: { name: %s }\n%s\n' "$1" "${2:-}"
+}
+# One allowance for the ControlPlanes of namespace `edge`, of `$1`.
+allowing() {
+    platform_defaults default "spec:
+  watchScopes:
+    - controlPlanes: { namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: edge } } }
+      namespaces: $1"
+}
+admitted "PlatformDefaults of no allowance" "$(platform_defaults default)"
+admitted "PlatformDefaults of an allowance of All and one of a selector" "$(platform_defaults default 'spec:
+  watchScopes:
+    - controlPlanes: { namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: edge } } }
+      namespaces: { from: All }
+    - controlPlanes: { namespaceSelector: { matchExpressions: [{ key: tenant, operator: In, values: [payments] }] } }
+      namespaces: { from: Selector, selector: { matchLabels: { team: payments } } }')"
+refused "PlatformDefaults not named default" "named default" "$(platform_defaults other)"
+refused "an allowance of a selector of no requirement" "at least one requirement" "$(allowing '{ from: Selector, selector: {} }')"
+refused "an allowance for the ControlPlanes of every namespace" "at least one requirement" "$(platform_defaults default 'spec:
+  watchScopes:
+    - controlPlanes: { namespaceSelector: {} }
+      namespaces: { from: All }')"
+refused "an allowance selecting without a selector" "selector must be given" "$(allowing '{ from: Selector }')"
+refused "an allowance of All with a selector" "selector must be given" "$(allowing '{ from: All, selector: { matchLabels: { a: b } } }')"
+refused "an allowance of its own namespace alone" "spec.watchScopes[0].namespaces.from" "$(allowing '{ from: Same }')"
+refused "an allowance of an operator Kubernetes does not have" "operator must be" "$(allowing '{ from: Selector, selector: { matchExpressions: [{ key: a, operator: Near }] } }')"
 
 # What the DataPlane's rules refuse.
 refused "a DataPlane whose name is no DNS label" "must be a DNS label" "$(data_plane pub.lic '  ingress: { httpPort: 80, httpsPort: 443 }')"

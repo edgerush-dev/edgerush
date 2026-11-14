@@ -26,7 +26,11 @@
 #   - a ControlPlane of `edge`'s name in another namespace is not accepted, its status
 #     naming the one that holds it, and nothing is made for it; given the operator's
 #     finalizer by hand and deleted, it deletes nothing of `edge`'s;
-#   - a ControlPlane watching every namespace is not accepted, and nothing is made for it;
+#   - the watch scope's allowance (docs/05 §4): a ControlPlane watching every namespace
+#     not accepted, nothing made for it, until an allowance lets it, then bound over the
+#     cluster; a Selector scope within a selector allowance bound in the namespaces it
+#     selects alone, one beyond it not accepted and bound nowhere; the allowance narrowed
+#     taking back the rights it granted, the rest kept;
 #   - a ServiceAccount of a name the operator would use, made by hand, is left alone, and
 #     its ControlPlane says so;
 #   - DataPlane `web` deleted takes with it everything made for it, its IngressClass and
@@ -103,9 +107,11 @@ echo "== installing"
 install=crates/planes/install
 k apply --server-side -f "$install/gateway.edgerush.dev_controlplanes.yaml" \
     -f "$install/gateway.edgerush.dev_dataplanes.yaml" \
+    -f "$install/gateway.edgerush.dev_platformdefaults.yaml" \
     -f "$install/roles.yaml" -f "$install/admission.yaml" >/dev/null
 k wait --for condition=Established --timeout=60s \
-    crd/controlplanes.gateway.edgerush.dev crd/dataplanes.gateway.edgerush.dev >/dev/null
+    crd/controlplanes.gateway.edgerush.dev crd/dataplanes.gateway.edgerush.dev \
+    crd/platformdefaults.gateway.edgerush.dev >/dev/null
 k apply --server-side -f "$install/operator.yaml" >/dev/null
 k -n edgerush-system rollout status deploy/edgerush-operator --timeout=120s >/dev/null ||
     fail "the operator never ran"
@@ -287,6 +293,41 @@ k get gatewayclass edge >/dev/null 2>&1 &&
     fail "deleting a ControlPlane of the same name elsewhere deleted the holder's objects"
 pass "a ControlPlane of the same name elsewhere, given the finalizer and deleted, deletes nothing of the holder's"
 
+echo "== the watch scope's allowance"
+# Whether a binding of ControlPlane $2 named $3 is in namespace $1 ("" for the cluster's).
+# kubectl takes no label selector beside a name, so the label is read and compared.
+bound() {
+    local of
+    if [ -z "$1" ]; then
+        of=$(k get clusterrolebinding "$3" -o jsonpath='{.metadata.labels.gateway\.edgerush\.dev/control-plane}' 2>/dev/null)
+    else
+        of=$(k -n "$1" get rolebinding "$3" -o jsonpath='{.metadata.labels.gateway\.edgerush\.dev/control-plane}' 2>/dev/null)
+    fi
+    [ "$of" = "$2" ]
+}
+# PlatformDefaults `default`, letting ControlPlanes of namespace `wide` watch every
+# namespace and those of `picked` the namespaces of team a; `$1` set to "narrowed", the
+# first allowance taken away.
+allowance() {
+    {
+        cat <<'EOF'
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: PlatformDefaults
+metadata: { name: default }
+spec:
+  watchScopes:
+EOF
+        [ "${1:-}" = narrowed ] || cat <<'EOF'
+    - controlPlanes: { namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: wide } } }
+      namespaces: { from: All }
+EOF
+        cat <<'EOF'
+    - controlPlanes: { namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: picked } } }
+      namespaces: { from: Selector, selector: { matchLabels: { team: a } } }
+EOF
+    } | k apply -f - >/dev/null
+}
+
 k create namespace wide >/dev/null
 k apply -f - >/dev/null <<'EOF'
 apiVersion: gateway.edgerush.dev/v1alpha1
@@ -297,12 +338,67 @@ spec:
   webhook: { enabled: false }
 EOF
 condition_is controlplane/wide wide Accepted "False ScopeNotAllowed" 60 ||
-    fail "a scope beyond Same: $(condition controlplane/wide wide Accepted)"
+    fail "a scope beyond Same with no allowance: $(condition controlplane/wide wide Accepted)"
 sleep 3
 ! made_in wide wide || fail "something was made for a ControlPlane watching every namespace"
 [ -z "$(k get clusterrolebindings -l gateway.edgerush.dev/control-plane=wide -o name)" ] ||
     fail "a ClusterRoleBinding was made for a ControlPlane watching every namespace"
-pass "a ControlPlane watching beyond its own namespace is not accepted, and nothing is made for it"
+pass "with no allowance, a ControlPlane watching every namespace is not accepted, and nothing is made for it"
+
+k create namespace picked >/dev/null
+k create namespace team-a >/dev/null
+k create namespace team-b >/dev/null
+k label namespace team-a team=a >/dev/null
+k label namespace team-b team=b >/dev/null
+allowance
+condition_is controlplane/wide wide Accepted "True Accepted" 60 ||
+    fail "a scope of All, allowed: $(condition controlplane/wide wide Accepted)"
+until_true 'bound "" wide edgerush-controller-wide' 60 ||
+    fail "ControlPlane wide, allowed All, is not bound over the cluster"
+pass "an allowance of All lets a ControlPlane watch every namespace: accepted, bound over the cluster"
+
+k apply -f - >/dev/null <<'EOF'
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: picked, namespace: picked }
+spec:
+  watch: { namespaces: { from: Selector, selector: { matchLabels: { team: a, tier: web } } } }
+  webhook: { enabled: false }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: loose, namespace: picked }
+spec:
+  watch: { namespaces: { from: Selector, selector: { matchLabels: { tier: web } } } }
+  webhook: { enabled: false }
+EOF
+k label namespace team-a tier=web >/dev/null
+k label namespace team-b tier=web >/dev/null
+condition_is controlplane/picked picked Accepted "True Accepted" 60 ||
+    fail "a Selector within the allowance: $(condition controlplane/picked picked Accepted)"
+until_true 'bound team-a picked edgerush-controller-picked' 60 ||
+    fail "ControlPlane picked is not bound in team-a, which it selects"
+! bound team-b picked edgerush-controller-picked ||
+    fail "ControlPlane picked is bound in team-b, which it does not select"
+pass "a Selector scope within a selector allowance is accepted, bound in the namespaces it selects alone"
+condition_is controlplane/loose picked Accepted "False ScopeNotAllowed" 60 ||
+    fail "a Selector beyond the allowance: $(condition controlplane/loose picked Accepted)"
+k -n picked get controlplane loose -o jsonpath='{.status.conditions[?(@.type=="Accepted")].message}' |
+    grep -F "Selector of team=a" >/dev/null || fail "a Selector beyond the allowance does not say what is allowed"
+sleep 3
+! bound team-b loose edgerush-controller-loose && ! bound team-a loose edgerush-controller-loose ||
+    fail "ControlPlane loose, beyond its allowance, was bound"
+pass "a Selector scope beyond its allowance is not accepted, says what is allowed, and is bound nowhere"
+
+allowance narrowed
+condition_is controlplane/wide wide Accepted "False ScopeNotAllowed" 60 ||
+    fail "the allowance narrowed: $(condition controlplane/wide wide Accepted)"
+until_true '! bound "" wide edgerush-controller-wide' 60 ||
+    fail "the allowance narrowed, ControlPlane wide is still bound over the cluster"
+bound "" wide edgerush-controller-wide-cluster && k -n wide get deploy edgerush-controller-wide >/dev/null ||
+    fail "the allowance narrowed took more than the rights it granted"
+pass "an allowance narrowed takes back the rights it granted, and keeps the rest"
+k delete platformdefaults default >/dev/null
 
 echo "== not the operator's"
 k create namespace own >/dev/null

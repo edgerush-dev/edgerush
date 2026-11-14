@@ -83,9 +83,10 @@ fn what_is_not_made_says_why() {
 
 #[test]
 fn a_refused_resource_says_why_and_that_nothing_of_it_is_made() {
-    let refused = Refused::ScopeNotAllowed {
-        from: "All".to_owned(),
-    };
+    let refused = Refused::ScopeNotAllowed(crate::allowance::Beyond {
+        asked: crate::allowance::Scope::All,
+        allowed: Vec::new(),
+    });
     // Whatever was made of a generation before.
     let made = of(Err(&refused), &Made::Applied, true);
     assert_eq!(
