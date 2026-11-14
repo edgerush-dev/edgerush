@@ -2,6 +2,7 @@ use super::*;
 use edgerush_certificates::testing::Authority;
 use edgerush_config::{Config, HarnessFile};
 use edgerush_control_stream::Staging;
+use edgerush_controller::status::address;
 use edgerush_kubernetes::Timing;
 use edgerush_kubernetes::testing::{Answer, Fake, answer, token};
 use std::cell::RefCell;
@@ -23,7 +24,6 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             write_config: None,
             stream: None,
             own_names: Vec::new(),
-            status: None,
             leader: None,
             webhook: None,
             metrics: None,
@@ -49,7 +49,6 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             write_config: Some(PathBuf::from("c")),
             stream: None,
             own_names: Vec::new(),
-            status: None,
             leader: None,
             webhook: None,
             metrics: None,
@@ -266,7 +265,6 @@ async fn run_until(
         write_config,
         stream: None,
         own_names: Vec::new(),
-        status: None,
         leader: None,
         webhook: None,
         metrics: None,
@@ -522,7 +520,6 @@ fn the_stream_is_given_whole_or_not_at_all() {
                 }),
             })),
             own_names: Vec::new(),
-            status: None,
             leader: None,
             webhook: None,
             metrics: None,
@@ -616,7 +613,6 @@ fn the_webhook_is_given_whole_or_not_at_all() {
             write_config: None,
             stream: None,
             own_names: Vec::new(),
-            status: None,
             leader: None,
             webhook: Some(Box::new(Webhook {
                 listen: "[::]:8443".parse().unwrap(),
@@ -1264,44 +1260,7 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
 }
 
 #[test]
-fn ingress_statuses_say_the_data_planes_service_or_addresses_stated_never_both() {
-    let status = |args: &[&str]| {
-        let mut all = vec!["--data-plane", "p"];
-        all.extend(args);
-        parsed(&all).map(|parsed| match parsed {
-            Parsed::Control(options) => options.status,
-            Parsed::Help => panic!("help"),
-        })
-    };
-    assert_eq!(status(&[]), Ok(None));
-    assert_eq!(
-        status(&["--status-service", "edge/edgerush"]),
-        Ok(Some(Addresses::Service {
-            namespace: "edge".to_owned(),
-            name: "edgerush".to_owned(),
-        }))
-    );
-    assert_eq!(
-        status(&[
-            "--status-address",
-            "203.0.113.7",
-            "--status-address",
-            "lb.example"
-        ]),
-        Ok(Some(Addresses::Stated(vec![
-            address("203.0.113.7"),
-            address("lb.example")
-        ])))
-    );
-    assert_eq!(
-        status(&[
-            "--status-service",
-            "edge/edgerush",
-            "--status-address",
-            "203.0.113.7"
-        ]),
-        Err(UsageError::Status)
-    );
+fn the_leader_lease_is_a_namespace_and_a_name() {
     let leader = |args: &[&str]| {
         let mut all = vec!["--data-plane", "p"];
         all.extend(args);
@@ -1315,25 +1274,29 @@ fn ingress_statuses_say_the_data_planes_service_or_addresses_stated_never_both()
         leader(&["--leader-lease", "edge/edgerush-control"]),
         Ok(Some(("edge".to_owned(), "edgerush-control".to_owned())))
     );
-    assert_eq!(
-        leader(&["--leader-lease", "edge"]),
-        Err(UsageError::LeaderLease("edge".to_owned()))
-    );
-    assert_eq!(
-        leader(&["--leader-lease", "edge/a", "--leader-lease", "edge/b"]),
-        Err(UsageError::Twice("--leader-lease"))
-    );
-    for named in ["edgerush", "Edge/edgerush", "edge/", "edge/a/b"] {
+    for named in ["edge", "Edge/edgerush", "edge/", "edge/a/b"] {
         assert_eq!(
-            status(&["--status-service", named]),
-            Err(UsageError::StatusService(named.to_owned())),
+            leader(&["--leader-lease", named]),
+            Err(UsageError::LeaderLease(named.to_owned())),
             "{named}"
         );
     }
     assert_eq!(
-        status(&["--status-service", "edge/a", "--status-service", "edge/b"]),
-        Err(UsageError::Twice("--status-service"))
+        leader(&["--leader-lease", "edge/a", "--leader-lease", "edge/b"]),
+        Err(UsageError::Twice("--leader-lease"))
     );
+}
+
+#[test]
+fn the_addresses_statuses_say_are_never_given_on_the_command_line() {
+    // The data plane's Service the control plane writes gives them (05 §2).
+    for option in ["--status-service", "--status-address"] {
+        assert_eq!(
+            parsed(&["--control-plane", "edge", option, "edge/edgerush"]),
+            Err(UsageError::Unexpected(option.to_owned())),
+            "{option}"
+        );
+    }
 }
 
 #[test]

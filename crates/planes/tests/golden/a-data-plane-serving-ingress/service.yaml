@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-controller
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/data-plane: public
+    gateway.edgerush.dev/namespace: payments-edge
+  name: edgerush-proxy-public
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: public
+    uid: 0d6a9f3c-0000-4000-8000-000000000001
+spec:
+  externalTrafficPolicy: Local
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: port-80
+    port: 80
+    protocol: TCP
+    targetPort: 80
+  - name: port-443
+    port: 443
+    protocol: TCP
+    targetPort: 443
+  selector:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/data-plane: public
+    gateway.edgerush.dev/namespace: payments-edge
+  sessionAffinity: None
+  type: LoadBalancer

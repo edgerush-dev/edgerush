@@ -9,13 +9,16 @@
 //! none, as after a restart, nothing is served until it is. What a DataPlane has no field
 //! for stays at its default: the authorities trusted for `wss` backends none, and the data
 //! plane's own settings the config's defaults, but for the Service of its own pods, which
-//! says its zone: the data plane's Service, of the name the control plane gives it.
+//! says its zone: the data plane's Service, of the name the control plane gives it, and
+//! writes as the DataPlane shapes it (05 §2).
 
 use edgerush_config::{AccessLog, Forwarding, Http3, ListenerProxyProtocol, RequestId};
 use edgerush_kubernetes::{ApiServer, Listed, Retry, Scope, follow};
 use edgerush_planes::data_plane::{DataPlane, DataPlanePorts};
-use edgerush_planes::objects::proxy_name;
+use edgerush_planes::objects::{ProxyService, proxy_name};
 use edgerush_translate::{GatewayName, IpFamily, Plane, PortSettings};
+
+use crate::Settings;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
@@ -109,10 +112,10 @@ impl fmt::Display for Waiting {
 }
 
 /// What is to be served next.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Next {
     /// These settings, a new generation accepted.
-    Serve(Plane),
+    Serve(Box<Settings>),
     /// Those last served, kept, and why nothing new.
     Keep(Waiting),
     /// Nothing, and why.
@@ -123,7 +126,7 @@ pub enum Next {
 #[derive(Debug, Default)]
 pub struct Chooser {
     /// The settings last served, if any are.
-    pub last: Option<Plane>,
+    pub last: Option<Settings>,
 }
 
 impl Chooser {
@@ -148,8 +151,8 @@ impl Chooser {
         });
         let first = |wanted: Verdict| ours.iter().copied().find(|d| verdict(d) == wanted);
         let next = if let Some(accepted) = first(Verdict::Accepted) {
-            match plane(accepted, own) {
-                Ok(plane) => Next::Serve(plane),
+            match settings(accepted, own) {
+                Ok(settings) => Next::Serve(Box::new(settings)),
                 Err(unusable) => Next::Keep(Waiting::Unusable(unusable.to_string())),
             }
         } else if let Some(pending) = first(Verdict::Pending) {
@@ -160,9 +163,9 @@ impl Chooser {
             Next::Wait(Waiting::None)
         };
         match next {
-            Next::Serve(plane) => {
-                self.last = Some(plane.clone());
-                Next::Serve(plane)
+            Next::Serve(settings) => {
+                self.last = Some((*settings).clone());
+                Next::Serve(settings)
             }
             Next::Keep(waiting) if self.last.is_none() => Next::Wait(waiting),
             Next::Keep(waiting) => Next::Keep(waiting),
@@ -182,7 +185,7 @@ pub async fn follow_data_planes(
     api: ApiServer,
     namespace: Scope,
     own: Own,
-    out: watch::Sender<Option<Plane>>,
+    out: watch::Sender<Option<Settings>>,
     say: impl Fn(&str) + 'static,
 ) {
     let say: Rc<dyn Fn(&str)> = Rc::new(say);
@@ -207,10 +210,10 @@ pub async fn follow_data_planes(
             continue;
         }
         let waiting = match chooser.next(&now.objects, &own) {
-            Next::Serve(plane) => {
+            Next::Serve(settings) => {
                 out.send_if_modified(|served| {
-                    let changed = served.as_ref() != Some(&plane);
-                    *served = Some(plane);
+                    let changed = served.as_ref() != Some(&*settings);
+                    *served = Some(*settings);
                     changed
                 });
                 None
@@ -252,6 +255,25 @@ pub struct Unusable {
     pub field: String,
     /// What is wrong with its value.
     pub why: String,
+}
+
+/// What is served of `data_plane`, as it now is: the settings translation is given, and
+/// the data plane's Service as it shapes it (05 §2).
+///
+/// # Errors
+///
+/// [`Unusable`] for a value its schema let through that the data plane cannot take.
+pub fn settings(data_plane: &DataPlane, own: &Own) -> Result<Settings, Unusable> {
+    let plane = plane(data_plane, own)?;
+    let service = ProxyService::of(data_plane).map_err(|error| Unusable {
+        data_plane: named(data_plane),
+        field: "service".to_owned(),
+        why: error.to_string(),
+    })?;
+    Ok(Settings {
+        plane,
+        service: Some(service),
+    })
 }
 
 /// The settings translation is given of `data_plane`, as it now is (05 §3): its

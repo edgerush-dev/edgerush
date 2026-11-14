@@ -7,6 +7,9 @@
 //! ControlPlane's watch scope is a selector, `selected.txt`, the namespaces it selects, a
 //! line each; and `objects.yaml`, the objects expected for the case's last resource, as
 //! YAML documents in the order they are made. The install's image is `edgerush:golden`.
+//! A DataPlane's case has `service.yaml` too, the data plane's Service its control plane
+//! writes, for the ports `bound.txt` says the config binds, a line each of the port and
+//! `tcp`, `udp` or both (none without the file).
 //!
 //! Each object says the kind and metadata it is written with, and between them the cases
 //! make every kind the operator makes.
@@ -20,13 +23,15 @@
     reason = "a case that cannot be read fails the test"
 )]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
 use edgerush_planes::control_plane::ControlPlane;
 use edgerush_planes::data_plane::DataPlane;
-use edgerush_planes::objects::{Install, Object, for_control_plane, for_data_plane};
+use edgerush_planes::objects::{
+    Install, Object, ProxyService, Transports, for_control_plane, for_data_plane,
+};
 use serde::Deserialize;
 
 /// A resource of a case.
@@ -50,6 +55,26 @@ fn written(objects: &[Object]) -> String {
         .map(|object| serde_saphyr::to_string(object).unwrap())
         .collect::<Vec<_>>()
         .join("---\n")
+}
+
+/// The ports of `bound.txt`.
+fn bound(lines: &str) -> BTreeMap<u16, Transports> {
+    lines
+        .lines()
+        .map(|line| {
+            let mut words = line.split_whitespace();
+            let port = words.next().unwrap().parse().unwrap();
+            let mut transports = Transports::default();
+            for word in words {
+                match word {
+                    "tcp" => transports.tcp = true,
+                    "udp" => transports.udp = true,
+                    _ => panic!("bound.txt: {line}"),
+                }
+            }
+            (port, transports)
+        })
+        .collect()
 }
 
 #[test]
@@ -78,6 +103,33 @@ fn every_case_makes_its_objects() {
         } else {
             BTreeSet::new()
         };
+        if let [_, Resource::DataPlane(dp)] = resources.as_slice() {
+            let bound_at = case.join("bound.txt");
+            let bound = if bound_at.exists() {
+                bound(&read(&bound_at))
+            } else {
+                BTreeMap::new()
+            };
+            let service = ProxyService::of(dp)
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+                .service(&bound);
+            let made = match service {
+                Some(service) => serde_saphyr::to_string(&service).unwrap(),
+                None => "# No port, so no Service.
+"
+                .to_owned(),
+            };
+            let expected_at = case.join("service.yaml");
+            if write {
+                fs::write(&expected_at, &made).unwrap();
+            } else {
+                assert_eq!(
+                    read(&expected_at),
+                    made,
+                    "{name} makes another Service than its service.yaml says; if that is                      meant, write it again with EDGERUSH_WRITE_GOLDEN=1 cargo test -p                      edgerush-planes --test golden, and read it over"
+                );
+            }
+        }
         let objects = match resources.as_slice() {
             [Resource::ControlPlane(cp)] => for_control_plane(cp, &selected, &install),
             [Resource::ControlPlane(cp), Resource::DataPlane(dp)] => {

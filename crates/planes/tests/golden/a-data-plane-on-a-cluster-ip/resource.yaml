@@ -1,0 +1,17 @@
+# Gateway API alone, over IPv6, its Service of the cluster alone, which takes no traffic
+# policy; a UDP listener's port and an HTTP one's.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: edge, namespace: edge, uid: 6f1c2b8e-0000-4000-8000-000000000004 }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata: { name: inside, namespace: edge, uid: 0d6a9f3c-0000-4000-8000-000000000004 }
+spec:
+  controlPlaneRef: { name: edge }
+  gateway:
+    listeners:
+      - { name: dns, port: 5353, protocol: UDP }
+      - { name: http, port: 8080, protocol: HTTP }
+  ipFamily: IPv6
+  service: { type: ClusterIP }

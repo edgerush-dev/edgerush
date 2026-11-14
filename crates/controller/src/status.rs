@@ -1,26 +1,11 @@
 //! Ingress status ([04 §6](../../../docs/04-control-plane.md)): the data plane's addresses in
 //! `status.loadBalancer.ingress` of each Ingress it serves, and none in that of each of its
-//! class it does not. Pure: what each Ingress's status should say is a function of what was
+//! class it does not, the addresses the data plane's Service gives
+//! ([`service::addresses`](crate::service::addresses)). Pure: what each Ingress's status should say is a function of what was
 //! translated, what each says now and the addresses.
 
 use edgerush_translate::Object;
-use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::networking::v1::{Ingress, IngressLoadBalancerIngress};
-
-/// Where the data plane's addresses come from.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Addresses {
-    /// These, stated: for a cluster with no load balancer.
-    Stated(Vec<IngressLoadBalancerIngress>),
-    /// The data plane's Service, `name` in `namespace`, followed: its load balancer's
-    /// addresses, else its external IPs.
-    Service {
-        /// Its namespace.
-        namespace: String,
-        /// Its name.
-        name: String,
-    },
-}
 
 /// An address as a status holds it: an IP address, or else a host name.
 #[must_use]
@@ -36,38 +21,6 @@ pub fn address(stated: &str) -> IngressLoadBalancerIngress {
             ..Default::default()
         }
     }
-}
-
-/// The addresses `service` gives: its load balancer's, else its external IPs; none for a
-/// Service that is not there, or has neither yet.
-pub(crate) fn of_service(service: Option<&Service>) -> Vec<IngressLoadBalancerIngress> {
-    let Some(service) = service else {
-        return Vec::new();
-    };
-    let balanced: Vec<IngressLoadBalancerIngress> = service
-        .status
-        .as_ref()
-        .and_then(|status| status.load_balancer.as_ref())
-        .and_then(|balancer| balancer.ingress.as_ref())
-        .into_iter()
-        .flatten()
-        .map(|ingress| IngressLoadBalancerIngress {
-            ip: ingress.ip.clone(),
-            hostname: ingress.hostname.clone(),
-            ports: None,
-        })
-        .collect();
-    if !balanced.is_empty() {
-        return balanced;
-    }
-    service
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.external_ips.as_ref())
-        .into_iter()
-        .flatten()
-        .map(|ip| address(ip))
-        .collect()
 }
 
 /// An Ingress whose status says other than it should, and what it should say.

@@ -52,7 +52,10 @@
 #     the policy's hostname, a wrong hostname or authority, the ConfigMap's change taken
 #     in, or a ConfigMap not there answered 5xx, and the policy says so of the Gateway, and
 #     nothing once no route reaches it;
-#   - the Ingress's status says the data plane's Service's address;
+#   - the control plane writes the data plane's Service, Ingress's two ports listed before
+#     the Gateway is, a listener's port added as it is bound and taken away with it, a UDP
+#     listener's datagrams answered through the Service; the Ingress's status says the
+#     Service's address, its cluster IP;
 #   - an Ingress changed is served as it now says; left out, it says no address, and
 #     taken back, the address again;
 #   - asked to reach its Service by the Service's own address, it is served through the
@@ -204,6 +207,41 @@ said() {
 
 said deploy/edgerush "config from the control plane runs" 60 ||
     fail "the data plane never ran a config: $(k -n edge logs deploy/edgerush | tail -5)"
+
+# The data plane's Service, which the control plane writes (05 §2): the ports it lists, as
+# `port/protocol`, sorted, a line each.
+listed() {
+    k -n edge get service edgerush-proxy-web -o jsonpath='{range .spec.ports[*]}{.port}/{.protocol}{"\n"}{end}' 2>/dev/null | sort -n
+}
+# Waits up to $2 seconds for the Service to list the ports $1 says, a space between them.
+listing() {
+    for _ in $(seq 1 $(($2 * 5))); do
+        [ "$(listed | tr '\n' ' ' | sed 's/ $//')" = "$1" ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+listing "80/TCP 443/TCP" 30 ||
+    fail "the data plane's Service lists '$(listed | tr '\n' ' ')', not Ingress's two ports"
+owner=$(k -n edge get service edgerush-proxy-web -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}')
+[ "$owner" = DataPlane/web ] || fail "the data plane's Service is owned by '$owner'"
+# Its address, which the statuses say.
+address=$(k -n edge get service edgerush-proxy-web -o jsonpath='{.spec.clusterIP}')
+[ -n "$address" ] || fail "the data plane's Service has no cluster IP"
+pass "the control plane writes the data plane's Service, owned by its DataPlane, Ingress's two ports listed"
+# Waits up to $3 seconds for the Service to list port $2 (`port/protocol`) if $1 is `with`,
+# or not to if `without`.
+listing_one() {
+    for _ in $(seq 1 $(($3 * 5))); do
+        if listed | grep -x "$2" >/dev/null; then
+            [ "$1" = with ] && return 0
+        else
+            [ "$1" = without ] && return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
 # Whichever replica the data plane dialled.
 said --selector=app=edgerush-control "runs config" 10 ||
     fail "the control plane never heard the data plane run its config"
@@ -406,7 +444,7 @@ stated True "$(condition Accepted status)" 30 -n edge gateway web ||
 generation=$(k -n edge get gateway web -o jsonpath='{.metadata.generation}')
 stated "$generation" "$(condition Accepted observedGeneration)" 5 -n edge gateway web ||
     fail "the Gateway's status is not of generation $generation: $(said_of -n edge gateway web)"
-stated 192.0.2.10 '{.status.addresses[0].value}' 5 -n edge gateway web ||
+stated "$address" '{.status.addresses[0].value}' 5 -n edge gateway web ||
     fail "the Gateway does not say the data plane's address: $(said_of -n edge gateway web)"
 stated 1 '{.status.listeners[0].attachedRoutes}' 5 -n edge gateway web ||
     fail "the Gateway's listener does not count its route: $(said_of -n edge gateway web)"
@@ -1005,6 +1043,20 @@ case "$(echoed)" in
     echo-*) ;;
     *) fail "a datagram to the UDP listener is not answered by its UDPRoute's backend: $(dialled)" ;;
 esac
+# The listener's port on the data plane's Service, over UDP beside the HTTP listener's TCP,
+# and a datagram answered through it.
+listing_one with 8080/UDP 30 && listing_one with 8080/TCP 1 ||
+    fail "with the UDP listener bound, the data plane's Service lists '$(listed | tr '\n' ' ')'"
+plane=$address
+for _ in $(seq 1 30); do
+    case "$(echoed)" in echo-*) break ;; esac
+    sleep 1
+done
+case "$(echoed)" in
+    echo-*) ;;
+    *) fail "a datagram through the data plane's Service is not answered: $(dialled)" ;;
+esac
+plane=$(k -n edge get pod "$(pod)" -o jsonpath='{.status.podIP}')
 forward 8080
 answers route.example 200 30 ||
     fail "beside the UDP listener of its port number, the HTTP listener answers $(status route.example)"
@@ -1045,7 +1097,9 @@ k -n shop delete udproute echo >/dev/null
 listeners=$(k -n edge get gateway web -o jsonpath='{.spec.listeners[*].name}' | wc -w)
 k -n edge patch gateway web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 1))\"}]" >/dev/null
 k -n shop delete deploy/echo service/echo >/dev/null
-pass "a UDP listener beside an HTTP one of its port number carries datagrams to its UDPRoute's backend and back, the route accepted and resolved; with none, its port bound and nothing answered; led to a TCP port, the route says UnsupportedProtocol"
+listing_one without 8080/UDP 30 && listing_one with 8080/TCP 1 ||
+    fail "the UDP listener gone, the data plane's Service lists '$(listed | tr '\n' ' ')'"
+pass "a UDP listener beside an HTTP one of its port number carries datagrams to its UDPRoute's backend and back, through the data plane's Service too, its port listed there while it is bound, the route accepted and resolved; with none, its port bound and nothing answered; led to a TCP port, the route says UnsupportedProtocol"
 
 # A BackendTLSPolicy (04 §2, §6): an HTTPRoute's backend, agnhost's netexec over TLS of a
 # certificate the stream's authority made for secured.shop.example, is reached over TLS,
@@ -1185,7 +1239,7 @@ saying() {
     done
     return 1
 }
-saying 192.0.2.10 30 || fail "the Ingress's status says '$(says)', not the data plane's address"
+saying "$address" 30 || fail "the Ingress's status says '$(says)', not the data plane's address"
 pass "the Ingress's status says the data plane's address"
 
 k -n shop patch ingress web --type=json \
@@ -1198,7 +1252,7 @@ pass "the Ingress changed is served as it now says"
 k -n shop annotate ingress web nginx.ingress.kubernetes.io/rewrite-target=/ >/dev/null
 saying "" 30 || fail "left out, the Ingress's status still says '$(says)'"
 k -n shop annotate ingress web nginx.ingress.kubernetes.io/rewrite-target- >/dev/null
-saying 192.0.2.10 30 || fail "taken back, the Ingress's status says '$(says)'"
+saying "$address" 30 || fail "taken back, the Ingress's status says '$(says)'"
 answers other.example 200 30 || fail "taken back, the Ingress is not served: $(status other.example)"
 pass "left out, the Ingress says no address, and taken back, the address again"
 
@@ -1361,7 +1415,7 @@ done
 k -n shop annotate ingress web nginx.ingress.kubernetes.io/rewrite-target=/ >/dev/null
 saying "" 30 || fail "with $took leading, the status still says '$(says)'"
 k -n shop annotate ingress web nginx.ingress.kubernetes.io/rewrite-target- >/dev/null
-saying 192.0.2.10 30 || fail "with $took leading, the status says '$(says)'"
+saying "$address" 30 || fail "with $took leading, the status says '$(says)'"
 k -n edge rollout status deploy/edgerush-control --timeout=120s >/dev/null
 pass "the leader gone, $took took the Lease and writes status"
 # The replica that took the deleted one's place is a new pod, at a new address, which the
