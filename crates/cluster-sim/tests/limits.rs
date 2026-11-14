@@ -29,6 +29,7 @@ const RULES: [Rule; 3] = [
     Rule::Rolling {
         per: 3,
         window: ms(500),
+        slots: 1_000,
     },
     Rule::Bucket {
         per: 3,

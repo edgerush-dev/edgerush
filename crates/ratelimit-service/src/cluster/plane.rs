@@ -15,7 +15,7 @@ use edgerush_cluster::{Message as StoreMessage, Stamp, Table};
 /// owner's answer.
 pub use edgerush_cluster::{NodeId, Time};
 use edgerush_cluster_synchronous::Message;
-pub use edgerush_cluster_synchronous::{Answer, Rule};
+pub use edgerush_cluster_synchronous::{Answer, MOST_SLOTS, Rule};
 use edgerush_ratelimit::service::Keyed;
 use std::hash::{BuildHasher, Hasher};
 
