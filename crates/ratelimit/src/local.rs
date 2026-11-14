@@ -2,7 +2,8 @@
 //! rate-limiting service and nothing shared with other processes.
 //!
 //! A key is one 64-bit atomic — its bucket's arrival time as GCRA keeps it (governor's way),
-//! or its fixed window's number and count — in a registry the process's workers share. A worker keeps its own handles to the keys it
+//! or its fixed window's number and count, or a rolling window's total beside a ring of its
+//! slots' counts (`rolling`) — in a registry the process's workers share. A worker keeps its own handles to the keys it
 //! has met, so that a decision takes no lock: it reads the key's word and swaps in the
 //! charged one. A request under several limits is admitted only if every one has room, read
 //! first and charged after: two racing on the last room of a limit may both be admitted, a
@@ -21,6 +22,7 @@
 //! marks a key forgotten.
 
 mod key_set;
+mod rolling;
 mod sync;
 
 #[cfg(all(test, loom))]
@@ -29,8 +31,10 @@ mod loom_tests;
 mod tests;
 
 pub use crate::service::Contract;
+pub use rolling::MOST_SLOTS;
 
 use key_set::{KeySet, SLOT_BYTES};
+use rolling::Ring;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::num::NonZeroU64;
@@ -73,13 +77,29 @@ pub struct Window {
     pub window: NonZeroU64,
 }
 
-/// What a key is held to: a bucket or a fixed window.
+/// A rolling window's contract: at most `limit` requests in any span of `window`, each
+/// admission counted in one of `slots` slots a window, its time rounded down to its slot's
+/// start, so that room comes back up to a slot early, never late (06 §3). At most
+/// [`MOST_SLOTS`]; a key holds a count for each, whatever its limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Rolling {
+    /// Requests in any window.
+    pub limit: NonZeroU64,
+    /// The window, in nanoseconds.
+    pub window: NonZeroU64,
+    /// The slots a window is counted in.
+    pub slots: NonZeroU64,
+}
+
+/// What a key is held to: a bucket, a fixed window or a rolling window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Limit {
     /// A bucket, by GCRA.
     Bucket(Contract),
     /// A fixed window.
     FixedWindow(Window),
+    /// A rolling window.
+    RollingWindow(Rolling),
 }
 
 impl From<Contract> for Limit {
@@ -91,6 +111,12 @@ impl From<Contract> for Limit {
 impl From<Window> for Limit {
     fn from(window: Window) -> Self {
         Self::FixedWindow(window)
+    }
+}
+
+impl From<Rolling> for Limit {
+    fn from(rolling: Rolling) -> Self {
+        Self::RollingWindow(rolling)
     }
 }
 
@@ -154,10 +180,13 @@ impl Span {
 enum Held {
     Bucket(Rate),
     Window(Span),
+    /// Boxed, so that a bucket's and a window's terms stay their few words.
+    Rolling(Box<Ring>),
 }
 
 /// What every key under one limit shares: the limit, and the arithmetic its words are read
-/// by. Made once a limit and pointed to by each of its keys.
+/// by. Made once a limit and pointed to by each of its keys — but a rolling window's, whose
+/// ring is its key's own: each of its keys has terms of its own.
 #[derive(Debug)]
 struct Terms {
     limit: Limit,
@@ -169,6 +198,7 @@ impl Terms {
         let held = match limit {
             Limit::Bucket(contract) => Held::Bucket(Rate::new(contract)),
             Limit::FixedWindow(window) => Held::Window(Span::new(window)),
+            Limit::RollingWindow(rolling) => Held::Rolling(Box::new(Ring::new(rolling))),
         };
         Self { limit, held }
     }
@@ -220,23 +250,32 @@ enum Look {
 
 impl Key {
     fn new(key: Box<[u8]>, terms: Arc<Terms>, hash: u64, now: u64) -> Self {
-        let (word, offset) = match &terms.held {
-            Held::Bucket(rate) => (rate.units(now), 0),
+        let (state, offset) = match &terms.held {
+            Held::Bucket(rate) => (Self::fresh(rate.units(now), now), 0),
             Held::Window(span) => {
                 let span = span.at(span.offset_of(hash));
-                (Span::word(span.number(now), 0), span.offset)
+                (
+                    Self::fresh(Span::word(span.number(now), 0), now),
+                    span.offset,
+                )
             }
-        };
-        let seen = Seen {
-            word,
-            cycle: Self::cycle_of(now),
+            Held::Rolling(ring) => (ring.word_at(now), 0),
         };
         Self {
             key,
             terms,
-            state: AtomicU128::new(seen.pack()),
+            state: AtomicU128::new(state),
             offset,
         }
+    }
+
+    /// A bucket's or fixed window's state, its word `word`, charged last in `now`'s cycle.
+    fn fresh(word: u64, now: u64) -> u128 {
+        Seen {
+            word,
+            cycle: Self::cycle_of(now),
+        }
+        .pack()
     }
 
     /// The limit it is held to.
@@ -258,6 +297,7 @@ impl Key {
         match &self.terms.held {
             Held::Bucket(rate) => rate.refill,
             Held::Window(span) => span.window,
+            Held::Rolling(ring) => ring.window(),
         }
     }
 
@@ -314,6 +354,7 @@ impl Key {
                 let (number, count) = Self::window_at(&span, seen.word, self.idle(seen, now), now);
                 Self::window_fits(&span, seen, count, number, now)
             }
+            Held::Rolling(ring) => ring.look(&self.state, now),
         }
     }
 
@@ -391,6 +432,7 @@ impl Key {
         match &self.terms.held {
             Held::Bucket(rate) => self.bucket_take(rate, now),
             Held::Window(span) => self.window_take(&span.at(self.offset), now),
+            Held::Rolling(ring) => ring.take(&self.state, now),
         }
     }
 
@@ -437,6 +479,9 @@ impl Key {
 
     /// One request at `now` charged, whether it fits or not: false if the key was closed.
     fn charge(&self, now: u64) -> bool {
+        if let Held::Rolling(ring) = &self.terms.held {
+            return ring.charge(&self.state, now);
+        }
         loop {
             let seen = self.read();
             if seen.word & CLOSED != 0 {
@@ -459,6 +504,8 @@ impl Key {
                     let (number, count) = Self::window_at(&span, seen.word, idle, now);
                     Span::word(number, count + 1)
                 }
+                // Charged above, in its own way.
+                Held::Rolling(_) => return false,
             };
             if self.charge_from(seen, word, now) {
                 return true;
@@ -469,6 +516,9 @@ impl Key {
     /// Closes it if, at `now`, its bucket is full or its window has counted none, and
     /// nothing used it for `quiet`: true if it did.
     fn close_if_forgettable(&self, now: u64, quiet: u64) -> bool {
+        if let Held::Rolling(ring) = &self.terms.held {
+            return ring.close_if_forgettable(&self.state, now, quiet);
+        }
         let seen = self.read();
         if seen.word & CLOSED != 0 {
             return true;
@@ -520,6 +570,7 @@ impl Key {
                     (number, _) => Self::window_left(&span, number, now),
                 }
             }
+            Held::Rolling(ring) => ring.full_in(&self.state, now),
         }
     }
 
@@ -567,15 +618,20 @@ pub struct Local<S> {
     terms: RwLock<HashMap<Limit, Arc<Terms>>>,
 }
 
-/// The bytes a key of `key` is counted as: the key itself, its name, and a slot for its
-/// handle in the registry and in each of `workers`' sets, a byte of a table's control with
-/// each. An estimate, not what the allocator takes. Its limit's terms are not counted:
-/// there is one a limit, however many keys it has.
+/// The bytes a key of `key` under `limit` is counted as: the key itself, its name, and a
+/// slot for its handle in the registry and in each of `workers`' sets, a byte of a table's
+/// control with each; a rolling window's own terms and ring besides. An estimate, not what
+/// the allocator takes. Any other limit's terms are not counted: there is one a limit,
+/// however many keys it has.
 #[must_use]
-pub fn key_bytes(key: &[u8], workers: u64) -> u64 {
+pub fn key_bytes(key: &[u8], limit: Limit, workers: u64) -> u64 {
     // An `Arc`'s two counts beside the key.
     let entry = 2 * size_of::<usize>() + size_of::<Key>() + key.len();
-    entry as u64 + SLOT_BYTES * (1 + workers)
+    let own = match limit {
+        Limit::RollingWindow(rolling) => Ring::bytes(rolling),
+        Limit::Bucket(_) | Limit::FixedWindow(_) => 0,
+    };
+    entry as u64 + own + SLOT_BYTES * (1 + workers)
 }
 
 impl<S: BuildHasher + Clone> Local<S> {
@@ -662,13 +718,19 @@ impl<S: BuildHasher + Clone> Local<S> {
                 return Arc::clone(found);
             }
             found.close();
-            self.holding
-                .fetch_sub(key_bytes(key, self.workers), Ordering::Relaxed);
+            self.holding.fetch_sub(
+                key_bytes(key, found.limit(), self.workers),
+                Ordering::Relaxed,
+            );
         }
-        let made = Arc::new(Key::new(key.into(), self.terms(contract), hash, now));
+        let terms = match contract {
+            Limit::RollingWindow(_) => Arc::new(Terms::new(contract)),
+            Limit::Bucket(_) | Limit::FixedWindow(_) => self.terms(contract),
+        };
+        let made = Arc::new(Key::new(key.into(), terms, hash, now));
         set.replace_hashed(hash, Arc::clone(&made));
         self.holding
-            .fetch_add(key_bytes(key, self.workers), Ordering::Relaxed);
+            .fetch_add(key_bytes(key, contract, self.workers), Ordering::Relaxed);
         made
     }
 
@@ -747,7 +809,7 @@ impl<S: BuildHasher + Clone> Local<S> {
                 let forget = key.close_if_forgettable(now, quiet);
                 if forget {
                     swept.forgotten += 1;
-                    freed += key_bytes(&key.key, self.workers);
+                    freed += key_bytes(&key.key, key.limit(), self.workers);
                 }
                 !forget
             });
@@ -784,8 +846,10 @@ impl<S: BuildHasher + Clone> Local<S> {
             {
                 key.close();
                 set.remove(&key.key);
-                self.holding
-                    .fetch_sub(key_bytes(&key.key, self.workers), Ordering::Relaxed);
+                self.holding.fetch_sub(
+                    key_bytes(&key.key, key.limit(), self.workers),
+                    Ordering::Relaxed,
+                );
                 self.evicted.fetch_add(1, Ordering::Relaxed);
                 swept.evicted += 1;
             }

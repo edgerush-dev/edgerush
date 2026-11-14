@@ -1,7 +1,8 @@
 //! Every interleaving of local mode's limiter, under loom
 //! (`RUSTFLAGS="--cfg loom" cargo test --release -p edgerush-ratelimit --lib loom`): workers
 //! racing on a key's last room, requests under two limits, and the sweep closing a key a
-//! request is using; each for a bucket and for a fixed window.
+//! request is using; each for a bucket and for a fixed window. And a rolling window's last
+//! room, and its slot taken off under an admission between its two writes.
 
 #![cfg(loom)]
 
@@ -113,7 +114,7 @@ fn loom_a_key_forgotten_under_a_request_admits_it() {
         };
         local.sweep(2_000 * MS, 500 * MS);
         assert!(worker.join().unwrap(), "refused though full");
-        let held = u64::try_from(local.key_count()).unwrap() * key_bytes(b"k", 1);
+        let held = u64::try_from(local.key_count()).unwrap() * key_bytes(b"k", c.into(), 1);
         assert_eq!(local.holding(), held);
     });
 }
@@ -175,7 +176,57 @@ fn loom_a_window_forgotten_under_a_request_admits_it() {
         };
         local.sweep(2_000 * MS, 500 * MS);
         assert!(worker.join().unwrap(), "refused though counting none");
-        let held = u64::try_from(local.key_count()).unwrap() * key_bytes(b"k", 1);
+        let held = u64::try_from(local.key_count()).unwrap() * key_bytes(b"k", w.into(), 1);
         assert_eq!(local.holding(), held);
+    });
+}
+
+/// One a window of two slots of a millisecond each.
+fn rolling() -> Rolling {
+    Rolling {
+        limit: NonZeroU64::new(1).unwrap(),
+        window: NonZeroU64::new(2 * MS).unwrap(),
+        slots: NonZeroU64::new(2).unwrap(),
+    }
+}
+
+/// What `local`'s key `k` under `r` counts at `now`: its word's total, and its slots'.
+fn standing(local: &Local<FixedState>, r: Rolling, now: u64) -> (u64, u64) {
+    let key = local.find_or_make(b"k", r.into(), now);
+    let Held::Rolling(ring) = &key.terms.held else {
+        panic!("a rolling key");
+    };
+    ring.standing(&key.state, now)
+}
+
+/// Two workers asking at once for a rolling window's one request of room: exactly one gets
+/// it, the other's count taken back from its slot, so that the slots count what the total
+/// does.
+#[test]
+fn loom_a_rolling_windows_last_room_goes_to_one_of_two() {
+    model(|| {
+        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let one = request(&local, &[b"k"], rolling(), 0);
+        let other = request(&local, &[b"k"], rolling(), 0);
+        let admitted = [one.join().unwrap(), other.join().unwrap()];
+        assert_eq!(admitted.iter().filter(|a| **a).count(), 1, "{admitted:?}");
+        assert_eq!(standing(&local, rolling(), 0), (1, 1));
+    });
+}
+
+/// A request a window after another, taking its slot off while that one is between its two
+/// writes: the later is admitted, the slot it waits on having left — never refused for a
+/// count the total holds and the slot does not, which charging the total first would leave.
+#[test]
+fn loom_a_slot_taken_off_under_an_admission_refuses_neither() {
+    model(|| {
+        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let early = request(&local, &[b"k"], rolling(), 0);
+        let late = request(&local, &[b"k"], rolling(), 2 * MS);
+        assert!(late.join().unwrap(), "refused, its window empty");
+        // Decided after the later one, the earlier one's clock is a window behind the key's
+        // count: refused or not, its slots stay what the total says.
+        early.join().unwrap();
+        assert_eq!(standing(&local, rolling(), 2 * MS), (1, 1));
     });
 }
