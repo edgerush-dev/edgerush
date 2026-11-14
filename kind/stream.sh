@@ -6,25 +6,30 @@
 #   kind/stream.sh 1.37          make the cluster, run every check, delete the cluster
 #   KEEP=1 kind/stream.sh 1.37   the same, the cluster left for a look
 #
-# The control plane and the data plane are one binary, built from the repository as it is
-# checked out, a release build on this host, put alone in an image of this host's
-# distribution (kind/discovery/Dockerfile) and loaded into the cluster: Linux only, on
-# Ubuntu 26.04 as the laptop is. The stream runs on certificates the control plane signs
-# from the authority it makes (05 §2); the webhook's certificate and its authority are made
-# here with openssl, and handed to it as a Secret. A backend Service in `shop` sits behind
-# an Ingress of class `edge.web`, for host shop.example; the control plane in `edge` follows
-# `shop`, and the data plane in `edge` dials it at edgerush-controller-edge.edge.svc:9443 and
-# is reached by `kubectl port-forward`. The control plane reads the data plane's settings
-# from its DataPlane, `web`, which the script says the operator accepted, as of each
-# generation. Then:
+# The operator, the control plane and the data plane are one binary, built from the
+# repository as it is checked out, a release build on this host, put alone in an image of
+# this host's distribution (kind/discovery/Dockerfile), tagged edgerush:dev as
+# install/operator.yaml names it, and loaded into the cluster: Linux only, on Ubuntu 26.04
+# as the laptop is. Everything runs through the operator (05): the install applied as a
+# user would, then ControlPlane `edge` and DataPlane `web`, in `edge`, so that the shipped
+# roles are the rights under test. The control plane, two replicas, watches the namespaces
+# labelled team=web, `shop` and `blog`, as PlatformDefaults allows it; its webhook is off
+# until the last checks, as it would refuse Ingresses the checks before leave out. A backend
+# Service in `shop` sits behind an Ingress of class `edge.web`, for host shop.example; the
+# data plane dials the control plane at edgerush-controller-edge.edge.svc:9443, on
+# certificates it signs from the authority it makes (05 §2), and is reached by
+# `kubectl port-forward`. The certificates of listeners and backends are made here with
+# openssl. Where a check needs the operator out of the way, it is stopped, and started
+# again after. Then:
 #   - the stream runs on the control plane's certificates, the data plane's of its ID, and
 #     one written again is taken into the data plane's pod with no restart;
-#   - an edit of the DataPlane is not served until the operator has accepted its
-#     generation, and is once it has;
+#   - an edit of the DataPlane made while the operator is stopped is not served, and is
+#     once the operator is back and has accepted its generation;
 #   - the data plane named as a Gateway, the control plane says the Gateway API's CRDs are
 #     not installed, and the Ingress is served on its own port, 80; installed, each kind is
 #     followed, its CRD read by name alone as RBAC allows, and every request to the Ingress
-#     answered as they come and the Gateway is made, its `http` listener sharing the port;
+#     answered as they come and the operator makes the GatewayClass and the Gateway, its
+#     `http` listener sharing the port;
 #     an HTTPRoute attached to the Gateway, of this controller's class, is served beside
 #     the Ingress, from one data plane, and on the Gateway's other port alone, where the
 #     Ingress is not; the GatewayClass, the Gateway and the
@@ -74,7 +79,8 @@
 #   - with the control plane gone, the data plane serves on;
 #   - a data plane started while it is gone waits for its first config, serving nothing,
 #     and serves once the control plane is back;
-#   - the webhook registered, an Ingress of the class that would be left out is refused,
+#   - the webhook turned on and registered by the operator, an Ingress of the class that
+#     would be left out is refused,
 #     with why, one that would not is admitted, and one of another class, however it is.
 # Each check says PASS or FAIL; the first FAIL ends the run with status 1. Nothing here
 # reads or writes the user's own kubeconfig: every kubectl is given the cluster's.
@@ -107,7 +113,9 @@ pass() { echo "PASS: $*"; }
 fail() {
     echo "FAIL: $*"
     echo "-- the data plane's last lines:"
-    k -n edge logs deploy/edgerush --tail=15 2>&1 | sed 's/^/   /'
+    k -n edge logs deploy/edgerush-proxy-web --tail=15 2>&1 | sed 's/^/   /'
+    echo "-- the operator's last lines:"
+    k -n edgerush-system logs deploy/edgerush-operator --tail=10 2>&1 | sed 's/^/   /'
     exit 1
 }
 
@@ -117,10 +125,10 @@ image=target/kind/image
 rm -rf "$image" && mkdir -p "$image"
 cp target/release/edgerush "$image/"
 sed "s|BASE|$BASE|" kind/discovery/Dockerfile > "$image/Dockerfile"
-docker build -q -t edgerush:kind "$image" >/dev/null
-kind load docker-image edgerush:kind --name "$name" >/dev/null
+docker build -q -t edgerush:dev "$image" >/dev/null
+kind load docker-image edgerush:dev --name "$name" >/dev/null
 
-echo "== the webhook's certificate"
+echo "== the authority of the listeners' and backends' certificates"
 pki=target/kind/stream-pki
 rm -rf "$pki" && mkdir -p "$pki"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
@@ -132,29 +140,141 @@ issue() {
     openssl x509 -req -in "$pki/$1.csr" -CA "$pki/ca.crt" -CAkey "$pki/ca.key" -days 1 \
         -extfile <(printf 'subjectAltName=DNS:%s' "$2") -out "$pki/$1.crt" 2>/dev/null
 }
-# The name the API server asks the webhook by.
-issue webhook edgerush-controller-edge.edge.svc
+
+echo "== installing"
+install=crates/planes/install
+k apply --server-side -f "$install/gateway.edgerush.dev_controlplanes.yaml" \
+    -f "$install/gateway.edgerush.dev_dataplanes.yaml" \
+    -f "$install/gateway.edgerush.dev_platformdefaults.yaml" \
+    -f "$install/roles.yaml" -f "$install/admission.yaml" >/dev/null
+k wait --for condition=Established --timeout=60s \
+    crd/controlplanes.gateway.edgerush.dev crd/dataplanes.gateway.edgerush.dev \
+    crd/platformdefaults.gateway.edgerush.dev >/dev/null
+k apply --server-side -f "$install/operator.yaml" >/dev/null
+k -n edgerush-system rollout status deploy/edgerush-operator --timeout=120s >/dev/null ||
+    fail "the operator never ran"
+# The operator stopped, so that what it would put back stays as a check leaves it, and
+# started again.
+operator_stop() {
+    k -n edgerush-system scale deploy/edgerush-operator --replicas=0 >/dev/null
+    for _ in $(seq 1 300); do
+        [ -z "$(k -n edgerush-system get pod -l app.kubernetes.io/component=operator -o name)" ] && return 0
+        sleep 0.2
+    done
+    fail "the operator never stopped"
+}
+operator_start() {
+    k -n edgerush-system scale deploy/edgerush-operator --replicas=1 >/dev/null
+    k -n edgerush-system rollout status deploy/edgerush-operator --timeout=120s >/dev/null ||
+        fail "the operator never ran again"
+}
 
 echo "== deploying"
-k create namespace edge --dry-run=client -o yaml | k apply -f - >/dev/null
-k -n edge create secret tls edgerush-control-webhook \
-    --cert="$pki/webhook.crt" --key="$pki/webhook.key" --dry-run=client -o yaml |
-    k apply -f - >/dev/null
-# The DataPlane's kind, as the install ships it, ready before a DataPlane is written.
-k apply --server-side -f crates/planes/install/gateway.edgerush.dev_dataplanes.yaml >/dev/null
-k wait --for condition=established crd/dataplanes.gateway.edgerush.dev --timeout=60s >/dev/null
-sed "s|AGNHOST|$AGNHOST|" kind/stream/manifests.yaml | k apply -f - >/dev/null
-# What the operator says of DataPlane web, said by hand until it runs (05 §3): accepted, as
-# of its generation now.
-accept() {
-    local generation
-    generation=$(k -n edge get dataplane web -o jsonpath='{.metadata.generation}')
-    k -n edge patch dataplane web --subresource=status --type=merge -p "{\"status\":{\"conditions\":[{\"type\":\"Accepted\",\"status\":\"True\",\"reason\":\"Accepted\",\"message\":\"accepted by kind/stream.sh\",\"lastTransitionTime\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"observedGeneration\":$generation}]}}" >/dev/null
+# The pods the operator makes, by the labels it gives them.
+PROXY=app.kubernetes.io/component=proxy,gateway.edgerush.dev/data-plane=web
+CONTROL=app.kubernetes.io/component=controller,gateway.edgerush.dev/control-plane=edge
+k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Namespace
+metadata: { name: shop, labels: { team: web } }
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: blog, labels: { team: web } }
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: edge }
+---
+# The backend: agnhost's netexec, which answers /hostname with the name of its pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web, namespace: shop }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: web } }
+  template:
+    metadata: { labels: { app: web } }
+    spec:
+      containers:
+        - name: web
+          image: $AGNHOST
+          args: ["netexec", "--http-port=8080"]
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 1 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  selector: { app: web }
+  ports: [{ name: http, port: 80, targetPort: http }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge.web
+  rules:
+    - host: shop.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: web, port: { name: http } } }
+---
+# What the platform allows: ControlPlanes of edge may watch team web's namespaces.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: PlatformDefaults
+metadata: { name: default }
+spec:
+  watchScopes:
+    - controlPlanes: { namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: edge } } }
+      namespaces: { from: Selector, selector: { matchLabels: { team: web } } }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: edge, namespace: edge }
+spec:
+  replicas: 2
+  watch: { namespaces: { from: Selector, selector: { matchLabels: { team: web } } } }
+  webhook: { enabled: false }
+---
+# Of Ingress, class edge.web, and of the Gateway API, the Gateway edge/web, which takes
+# routes and ListenerSets from every namespace; one pod, on a ClusterIP Service, as kind
+# has no load balancer.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata: { name: web, namespace: edge }
+spec:
+  controlPlaneRef: { name: edge }
+  ingress: { httpPort: 80, httpsPort: 443, httpsRedirect: false }
+  gateway:
+    allowedListeners: { namespaces: { from: All } }
+    listeners:
+      - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+      - { name: alt, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+  service: { type: ClusterIP }
+EOF
+# Waits up to $3 seconds for condition $2 of $1 (kind/name) in edge to be True.
+holds() {
+    for _ in $(seq 1 $(($3 * 5))); do
+        [ "$(k -n edge get "$1" -o jsonpath="{.status.conditions[?(@.type==\"$2\")].status}" 2>/dev/null)" = True ] && return 0
+        sleep 0.2
+    done
+    return 1
 }
-accept
+holds controlplane/edge Accepted 60 || fail "ControlPlane edge was not accepted: $(k -n edge get controlplane edge -o jsonpath='{.status}')"
+holds dataplane/web Accepted 60 || fail "DataPlane web was not accepted: $(k -n edge get dataplane web -o jsonpath='{.status}')"
+for _ in $(seq 1 300); do
+    k -n edge get deploy edgerush-controller-edge edgerush-proxy-web >/dev/null 2>&1 && break
+    sleep 0.2
+done
 k -n shop rollout status deploy/web --timeout=120s >/dev/null
-k -n edge rollout status deploy/edgerush-control --timeout=120s >/dev/null
-k -n edge rollout status deploy/edgerush --timeout=120s >/dev/null
+k -n edge rollout status deploy/edgerush-controller-edge --timeout=180s >/dev/null ||
+    fail "the control plane never ran"
+k -n edge rollout status deploy/edgerush-proxy-web --timeout=180s >/dev/null ||
+    fail "the data plane never ran"
 
 # The data plane on localhost:$port, through a port-forward started afresh after a restart,
 # on a port of its own each time, so that none waits for the last to let its port go; to
@@ -165,7 +285,7 @@ port=18080
 forward() {
     [ -n "$forward_pid" ] && kill "$forward_pid" 2>/dev/null || true
     port=$((port + 1))
-    k -n edge port-forward deploy/edgerush "$port:${1:-80}" >/dev/null 2>&1 &
+    k -n edge port-forward deploy/edgerush-proxy-web "$port:${1:-80}" >/dev/null 2>&1 &
     forward_pid=$!
     for _ in $(seq 1 50); do
         if [ -n "${2:-}" ]; then
@@ -189,10 +309,10 @@ answers() {
 # The one data-plane pod there is, once there is one alone.
 pod() {
     for _ in $(seq 1 300); do
-        [ "$(k -n edge get pod -l app=edgerush -o name | grep -c .)" = 1 ] && break
+        [ "$(k -n edge get pod -l "$PROXY" -o name | grep -c .)" = 1 ] && break
         sleep 0.2
     done
-    k -n edge get pod -l app=edgerush -o jsonpath='{.items[0].metadata.name}'
+    k -n edge get pod -l "$PROXY" -o jsonpath='{.items[0].metadata.name}'
 }
 # Waits up to $3 seconds for the logs of deploy or pod $1 to have a line with $2 in it.
 # Here and below, grep reads a log whole: with -q it stops at the first match, kubectl,
@@ -205,8 +325,8 @@ said() {
     return 1
 }
 
-said deploy/edgerush "config from the control plane runs" 60 ||
-    fail "the data plane never ran a config: $(k -n edge logs deploy/edgerush | tail -5)"
+said deploy/edgerush-proxy-web "config from the control plane runs" 60 ||
+    fail "the data plane never ran a config: $(k -n edge logs deploy/edgerush-proxy-web | tail -5)"
 
 # The data plane's Service, which the control plane writes (05 §2): the ports it lists, as
 # `port/protocol`, sorted, a line each.
@@ -243,7 +363,7 @@ listing_one() {
     return 1
 }
 # Whichever replica the data plane dialled.
-said --selector=app=edgerush-control "runs config" 10 ||
+said --selector="$CONTROL" "runs config" 10 ||
     fail "the control plane never heard the data plane run its config"
 
 # Waits up to $2 seconds for every control-plane replica's logs, whole, to have a line
@@ -251,7 +371,7 @@ said --selector=app=edgerush-control "runs config" 10 ||
 control_said() {
     for _ in $(seq 1 $(($2 * 5))); do
         local all=yes
-        for replica in $(k -n edge get pod -l app=edgerush-control -o name); do
+        for replica in $(k -n edge get pod -l "$CONTROL" -o name); do
             k -n edge logs "$replica" 2>/dev/null | grep -- "$1" >/dev/null || all=
         done
         [ -n "$all" ] && return 0
@@ -261,7 +381,7 @@ control_said() {
 }
 # Whether a control-plane replica was refused anything of the Gateway API.
 refused_any() {
-    for replica in $(k -n edge get pod -l app=edgerush-control -o name); do
+    for replica in $(k -n edge get pod -l "$CONTROL" -o name); do
         k -n edge logs "$replica" 2>/dev/null |
             grep -E "(customresourcedefinitions|gatewayclasses|gateways|listenersets|grpcroutes|tlsroutes|tcproutes|udproutes|httproutes|referencegrants|backendtlspolicies|configmaps).*(403|forbidden)" &&
             return 0
@@ -270,8 +390,8 @@ refused_any() {
 }
 control_said "httproutes.gateway.networking.k8s.io: not installed" 30 ||
     fail "the control plane never said the Gateway API's CRDs are not installed"
-said deploy/edgerush 'listener "port-80" is on 0.0.0.0:80' 60 ||
-    fail "without the CRDs, the data plane never bound the Ingress HTTP port: $(k -n edge logs deploy/edgerush | tail -5)"
+said deploy/edgerush-proxy-web 'listener "port-80" is on 0.0.0.0:80' 60 ||
+    fail "without the CRDs, the data plane never bound the Ingress HTTP port: $(k -n edge logs deploy/edgerush-proxy-web | tail -5)"
 forward
 answers shop.example 200 30 || fail "without the CRDs, the Ingress is not served: $(status shop.example)"
 pass "without the Gateway API's CRDs, the control plane says so, and the Ingress is served on its own port, 80"
@@ -295,18 +415,19 @@ request_ids() {
     return 1
 }
 request_ids yes 10 || fail "port 80 does not generate request IDs as its default has it"
-# Port 80 passing request IDs on, an edit of the DataPlane the operator has yet to accept:
-# the last generation accepted is served, and the control plane says why.
+# Port 80 passing request IDs on, an edit of the DataPlane made while the operator is
+# stopped, which it has yet to accept: the last generation accepted is served, and the
+# control plane says why; the operator back, it accepts the edit, and it is served.
+operator_stop
 k -n edge patch dataplane web --type=merge -p '{"spec":{"ports":[{"port":80,"requestId":"Pass"}]}}' >/dev/null
 control_said "DataPlane edge/web: the operator has yet to accept it; the DataPlane last accepted is served" 30 ||
     fail "the control plane never said the DataPlane's edit waits on the operator"
 sleep 2
 request_ids yes 1 || fail "an edit of the DataPlane was served before the operator accepted it"
-accept
-request_ids no 30 || fail "the DataPlane's edit, accepted, was never served"
+operator_start
+request_ids no 60 || fail "the DataPlane's edit, accepted, was never served"
 # And back, port 80 generating them again.
 k -n edge patch dataplane web --type=json -p '[{"op":"remove","path":"/spec/ports"}]' >/dev/null
-accept
 request_ids yes 30 || fail "the DataPlane's edit back, accepted, was never served"
 pass "an edit of the DataPlane is served once the operator has accepted its generation, and not before"
 # The stream on certificates the control plane made (05 §2): its authority, made by the
@@ -336,7 +457,7 @@ done
 [ -n "$after" ] && [ "$after" != "$before" ] || fail "the data plane's certificate was never written again"
 mounted=
 for _ in $(seq 1 600); do
-    mounted=$(k -n edge exec "$running" -- cat /etc/edgerush/stream/tls.crt 2>/dev/null | fingerprint 2>/dev/null || true)
+    mounted=$(k -n edge exec "$running" -- cat /etc/edgerush/identity/tls.crt 2>/dev/null | fingerprint 2>/dev/null || true)
     [ "$mounted" = "$after" ] && break
     sleep 0.2
 done
@@ -373,22 +494,13 @@ control_said "udproutes.gateway.networking.k8s.io: served at v1 (Gateway API v1.
 control_said "backendtlspolicies.gateway.networking.k8s.io: served at v1 (Gateway API v1.7.0)" 5 ||
     fail "the control plane never said BackendTLSPolicies are served"
 sleep 3
+# The operator makes the GatewayClass and the Gateway, as the DataPlane states it.
+for _ in $(seq 1 300); do
+    k -n edge get gateway web >/dev/null 2>&1 && break
+    sleep 0.2
+done
+k -n edge get gateway web >/dev/null 2>&1 || fail "the operator never made the Gateway"
 k apply -f - >/dev/null <<EOF
-apiVersion: gateway.networking.k8s.io/v1
-kind: GatewayClass
-metadata: { name: edgerush }
-spec: { controllerName: edgerush.dev/gateway-controller }
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata: { name: web, namespace: edge }
-spec:
-  gatewayClassName: edgerush
-  allowedListeners: { namespaces: { from: All } }
-  listeners:
-    - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
-    - { name: alt, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
----
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata: { name: web, namespace: shop }
@@ -397,8 +509,8 @@ spec:
   hostnames: [route.example]
   rules: [{ backendRefs: [{ name: web, port: 80 }] }]
 EOF
-said deploy/edgerush 'listener "port-8080" is on 0.0.0.0:8080' 60 ||
-    fail "the data plane never bound its Gateway's other listener: $(k -n edge logs deploy/edgerush | tail -5)"
+said deploy/edgerush-proxy-web 'listener "port-8080" is on 0.0.0.0:8080' 60 ||
+    fail "the data plane never bound its Gateway's other listener: $(k -n edge logs deploy/edgerush-proxy-web | tail -5)"
 answers route.example 200 30 || fail "the HTTPRoute is not served: $(status route.example)"
 sleep 2
 touch "$installing/stop"
@@ -409,7 +521,7 @@ other=$(grep -vc '^200$' "$installing/answers" || true)
 [ "$other" = 0 ] && [ "$total" -gt 20 ] ||
     fail "$other of $total requests to the Ingress as the Gateway API came were not answered 200: $(grep -v '^200$' "$installing/answers" | sort | uniq -c | head -5)"
 rm -r "$installing"
-k -n edge logs deploy/edgerush | grep 'listener "port-80" has drained' >/dev/null &&
+k -n edge logs deploy/edgerush-proxy-web | grep 'listener "port-80" has drained' >/dev/null &&
     fail "the Ingress HTTP port was let go as the Gateway took it"
 pass "the CRDs installed and the Gateway made, all $total requests to the Ingress were answered 200, its port shared with the Gateway's, by $(curl -s -H 'host: shop.example' "http://127.0.0.1:$port/hostname")"
 answers shop.example 200 5 || fail "beside the HTTPRoute, the Ingress is not served: $(status shop.example)"
@@ -435,10 +547,10 @@ stated() { # what, jsonpath, seconds, the object
 }
 said_of() { k get "$@" -o jsonpath='{.status}'; }
 condition() { echo "{.status.conditions[?(@.type==\"$1\")].$2}"; }
-stated True "$(condition Accepted status)" 30 gatewayclass edgerush ||
-    fail "the GatewayClass says $(said_of gatewayclass edgerush)"
-stated True "$(condition SupportedVersion status)" 5 gatewayclass edgerush ||
-    fail "the GatewayClass's version is not said supported: $(said_of gatewayclass edgerush)"
+stated True "$(condition Accepted status)" 30 gatewayclass edge ||
+    fail "the GatewayClass says $(said_of gatewayclass edge)"
+stated True "$(condition SupportedVersion status)" 5 gatewayclass edge ||
+    fail "the GatewayClass's version is not said supported: $(said_of gatewayclass edge)"
 stated True "$(condition Accepted status)" 30 -n edge gateway web ||
     fail "the Gateway says $(said_of -n edge gateway web)"
 generation=$(k -n edge get gateway web -o jsonpath='{.metadata.generation}')
@@ -455,17 +567,28 @@ stated True "$(condition Programmed status)" 30 -n edge gateway web ||
     fail "the Gateway is not said programmed: $(said_of -n edge gateway web)"
 stated True '{.status.listeners[0].conditions[?(@.type=="Programmed")].status}' 5 -n edge gateway web ||
     fail "the Gateway's listener is not said programmed: $(said_of -n edge gateway web)"
-k -n edge get configmap -l gateway.edgerush.dev/acks=edgerush-control -o name | grep -q . ||
+k -n edge get configmap -l gateway.edgerush.dev/acks=edgerush-controller-edge -o name | grep -q . ||
     fail "no replica reports what its data planes run"
 refused_any && fail "a control-plane replica was refused a status of the Gateway API"
 pass "the GatewayClass, the Gateway and the HTTPRoute say they are accepted, the Gateway its address and its route, each of its generation, and the Gateway programmed once its data plane runs it"
 
-# A listener on a port the data plane cannot bind, its own metrics' (03 §10): that
-# listener alone is not programmed, still pending, saying the pod and why; the Gateway and
-# its other listeners are, as the config runs on every pod (04 §6).
+# A listener on a port the data plane cannot bind, 9100, which a container of its own in
+# the data plane's pod holds, as its metrics would (03 §10): that listener alone is not
+# programmed, still pending, saying the pod and why; the Gateway and its other listeners
+# are, as the config runs on every pod (04 §6).
+holding() {
+    k -n edge get pod "$(pod)" -o jsonpath='{.status.ephemeralContainerStatuses[?(@.name=="holder")].state.running}'
+}
+k -n edge debug "pod/$(pod)" --quiet --image="$AGNHOST" --container=holder -- \
+    /agnhost netexec --http-port=9100 --udp-port=9101 >/dev/null
+for _ in $(seq 1 300); do
+    [ -n "$(holding)" ] && break
+    sleep 0.2
+done
+[ -n "$(holding)" ] || fail "the container that holds port 9100 never ran"
 of_listener() { echo "{.status.listeners[?(@.name==\"$1\")].conditions[?(@.type==\"Programmed\")].$2}"; }
-k -n edge patch gateway web --type=json \
-    -p '[{"op":"add","path":"/spec/listeners/-","value":{"name":"taken","port":9100,"protocol":"HTTP"}}]' >/dev/null
+k -n edge patch dataplane web --type=json \
+    -p '[{"op":"add","path":"/spec/gateway/listeners/-","value":{"name":"taken","port":9100,"protocol":"HTTP"}}]' >/dev/null
 stated False "$(of_listener taken status)" 60 -n edge gateway web ||
     fail "a listener on a port the data plane cannot bind is not said unprogrammed: $(said_of -n edge gateway web)"
 stated Pending "$(of_listener taken reason)" 5 -n edge gateway web ||
@@ -477,7 +600,7 @@ stated True "$(of_listener http status)" 30 -n edge gateway web ||
 stated True "$(condition Programmed status)" 5 -n edge gateway web ||
     fail "beside a listener not bound, the Gateway is not said programmed: $(said_of -n edge gateway web)"
 answers route.example 200 5 || fail "beside a listener not bound, the HTTPRoute answers $(status route.example)"
-k -n edge patch gateway web --type=json -p '[{"op":"remove","path":"/spec/listeners/2"}]' >/dev/null
+k -n edge patch dataplane web --type=json -p '[{"op":"remove","path":"/spec/gateway/listeners/2"}]' >/dev/null
 stated "http alt" '{.status.listeners[*].name}' 30 -n edge gateway web ||
     fail "the listener taken away is still said: $(said_of -n edge gateway web)"
 pass "a listener on a port its data plane cannot bind alone is not programmed, pending, saying the pod and why; the Gateway and its other listeners are"
@@ -500,8 +623,8 @@ spec:
   parentRefs: [{ kind: ListenerSet, name: team }]
   rules: [{ backendRefs: [{ name: web, port: 80 }] }]
 EOF
-said deploy/edgerush 'listener "port-9090" is on 0.0.0.0:9090' 60 ||
-    fail "the data plane never bound the ListenerSet's listener: $(k -n edge logs deploy/edgerush | tail -5)"
+said deploy/edgerush-proxy-web 'listener "port-9090" is on 0.0.0.0:9090' 60 ||
+    fail "the data plane never bound the ListenerSet's listener: $(k -n edge logs deploy/edgerush-proxy-web | tail -5)"
 forward 9090
 answers team.example 200 30 || fail "the route of the ListenerSet is not served: $(status team.example)"
 forward
@@ -533,9 +656,9 @@ for name in a b; do
     k -n "$namespace" create secret tls "shared-$name" --cert="$pki/shared-$name.crt" \
         --key="$pki/shared-$name.key" --dry-run=client -o yaml | k apply -f - >/dev/null
 done
-k -n edge patch gateway web --type=json -p '[
-  {"op":"add","path":"/spec/listeners/-","value":{"name":"shared-a","port":8443,"protocol":"HTTPS","hostname":"a.example","allowedRoutes":{"namespaces":{"from":"All"}},"tls":{"certificateRefs":[{"name":"shared-a"}]}}},
-  {"op":"add","path":"/spec/listeners/-","value":{"name":"shared-b","port":8443,"protocol":"HTTPS","hostname":"b.example","allowedRoutes":{"namespaces":{"from":"All"}},"tls":{"certificateRefs":[{"name":"shared-b","namespace":"shop"}]}}}
+k -n edge patch dataplane web --type=json -p '[
+  {"op":"add","path":"/spec/gateway/listeners/-","value":{"name":"shared-a","port":8443,"protocol":"HTTPS","hostname":"a.example","allowedRoutes":{"namespaces":{"from":"All"}},"tls":{"certificateRefs":[{"name":"shared-a"}]}}},
+  {"op":"add","path":"/spec/gateway/listeners/-","value":{"name":"shared-b","port":8443,"protocol":"HTTPS","hostname":"b.example","allowedRoutes":{"namespaces":{"from":"All"}},"tls":{"certificateRefs":[{"name":"shared-b","namespace":"shop"}]}}}
 ]' >/dev/null
 k apply -f - >/dev/null <<EOF
 apiVersion: gateway.networking.k8s.io/v1
@@ -554,8 +677,8 @@ spec:
     - { name: web, namespace: edge, sectionName: shared-b }
   rules: [{ backendRefs: [{ name: web, port: 80 }] }]
 EOF
-said deploy/edgerush 'listener "port-8443" is on 0.0.0.0:8443' 60 ||
-    fail "the data plane never bound the HTTPS listeners' port: $(k -n edge logs deploy/edgerush | tail -5)"
+said deploy/edgerush-proxy-web 'listener "port-8443" is on 0.0.0.0:8443' 60 ||
+    fail "the data plane never bound the HTTPS listeners' port: $(k -n edge logs deploy/edgerush-proxy-web | tail -5)"
 stated True "$(of_listener shared-a status)" 60 -n edge gateway web ||
     fail "the HTTPS listener is not said programmed: $(said_of -n edge gateway web)"
 forward 8443 a.example
@@ -577,8 +700,8 @@ for http in --http1.1 --http2; do
 done
 forward
 k -n shop delete httproute shared >/dev/null
-listeners=$(k -n edge get gateway web -o jsonpath='{.spec.listeners[*].name}' | wc -w)
-k -n edge patch gateway web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 1))\"},{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 2))\"}]" >/dev/null
+listeners=$(k -n edge get dataplane web -o jsonpath='{.spec.gateway.listeners[*].name}' | wc -w)
+k -n edge patch dataplane web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/gateway/listeners/$((listeners - 1))\"},{\"op\":\"remove\",\"path\":\"/spec/gateway/listeners/$((listeners - 2))\"}]" >/dev/null
 k -n shop delete referencegrant shared-certificates >/dev/null
 k -n edge delete secret shared-a >/dev/null
 k -n shop delete secret shared-b >/dev/null
@@ -803,13 +926,13 @@ spec:
   parentRefs: [{ name: web, namespace: edge, sectionName: secure }]
   rules: [{ backendRefs: [{ name: web, port: 80 }] }]
 EOF
-k -n edge patch gateway web --type=json -p '[
-  {"op":"add","path":"/spec/listeners/-","value":{"name":"secure","port":8443,"protocol":"HTTPS","hostname":"a.example","allowedRoutes":{"namespaces":{"from":"All"}},"tls":{"certificateRefs":[{"name":"secure"}]}}},
-  {"op":"add","path":"/spec/listeners/-","value":{"name":"tunnels","port":8443,"protocol":"TLS","hostname":"*.tunnel.example","allowedRoutes":{"namespaces":{"from":"All"}},"tls":{"mode":"Passthrough"}}}
+k -n edge patch dataplane web --type=json -p '[
+  {"op":"add","path":"/spec/gateway/listeners/-","value":{"name":"secure","port":8443,"protocol":"HTTPS","hostname":"a.example","allowedRoutes":{"namespaces":{"from":"All"}},"tls":{"certificateRefs":[{"name":"secure"}]}}},
+  {"op":"add","path":"/spec/gateway/listeners/-","value":{"name":"tunnels","port":8443,"protocol":"TLS","hostname":"*.tunnel.example","allowedRoutes":{"namespaces":{"from":"All"}},"tls":{"mode":"Passthrough"}}}
 ]' >/dev/null
 k -n shop rollout status deploy/tunnel --timeout=120s >/dev/null
-said deploy/edgerush 'listener "port-8443" is on 0.0.0.0:8443' 60 ||
-    fail "the data plane never bound the shared port: $(k -n edge logs deploy/edgerush | tail -5)"
+said deploy/edgerush-proxy-web 'listener "port-8443" is on 0.0.0.0:8443' 60 ||
+    fail "the data plane never bound the shared port: $(k -n edge logs deploy/edgerush-proxy-web | tail -5)"
 stated True "$(of_listener tunnels status)" 60 -n edge gateway web ||
     fail "the TLS listener is not said programmed: $(said_of -n edge gateway web)"
 forward 8443 a.example
@@ -845,8 +968,8 @@ refused_any && fail "a control-plane replica was refused something of a TLSRoute
 forward
 k -n shop delete tlsroute tunnel >/dev/null
 k -n shop delete httproute secure >/dev/null
-listeners=$(k -n edge get gateway web -o jsonpath='{.spec.listeners[*].name}' | wc -w)
-k -n edge patch gateway web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 1))\"},{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 2))\"}]" >/dev/null
+listeners=$(k -n edge get dataplane web -o jsonpath='{.spec.gateway.listeners[*].name}' | wc -w)
+k -n edge patch dataplane web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/gateway/listeners/$((listeners - 1))\"},{\"op\":\"remove\",\"path\":\"/spec/gateway/listeners/$((listeners - 2))\"}]" >/dev/null
 k -n shop delete deploy/tunnel service/tunnel secret/tunnel >/dev/null
 k -n edge delete secret secure >/dev/null
 pass "on a port TLS Passthrough and HTTPS listeners share, a TLSRoute's name is carried to its backend's own TLS, a name no route takes closed, the HTTPS listener's served, and the route says it is accepted"
@@ -910,13 +1033,13 @@ spec:
   parentRefs: [{ name: web, namespace: edge, sectionName: tcp }]
   rules: [{ backendRefs: [{ name: older, port: 8080 }] }]
 EOF
-k -n edge patch gateway web --type=json -p '[
-  {"op":"add","path":"/spec/listeners/-","value":{"name":"tcp","port":9300,"protocol":"TCP","allowedRoutes":{"namespaces":{"from":"All"}}}}
+k -n edge patch dataplane web --type=json -p '[
+  {"op":"add","path":"/spec/gateway/listeners/-","value":{"name":"tcp","port":9300,"protocol":"TCP","allowedRoutes":{"namespaces":{"from":"All"}}}}
 ]' >/dev/null
 k -n shop rollout status deploy/older --timeout=120s >/dev/null
 k -n shop rollout status deploy/newer --timeout=120s >/dev/null
-said deploy/edgerush 'listener "port-9300" is on 0.0.0.0:9300' 60 ||
-    fail "the data plane never bound the TCP listener's port: $(k -n edge logs deploy/edgerush | tail -5)"
+said deploy/edgerush-proxy-web 'listener "port-9300" is on 0.0.0.0:9300' 60 ||
+    fail "the data plane never bound the TCP listener's port: $(k -n edge logs deploy/edgerush-proxy-web | tail -5)"
 forward 9300
 # What a connection to the TCP listener is answered for /hostname: the pod that serves it.
 carried() { curl -s --max-time 3 "http://127.0.0.1:$port/hostname" || true; }
@@ -971,8 +1094,8 @@ for _ in $(seq 1 150); do
 done
 [ -z "$(carried)" ] || fail "with no TCPRoute, a connection is answered: $(carried)"
 forward
-listeners=$(k -n edge get gateway web -o jsonpath='{.spec.listeners[*].name}' | wc -w)
-k -n edge patch gateway web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 1))\"}]" >/dev/null
+listeners=$(k -n edge get dataplane web -o jsonpath='{.spec.gateway.listeners[*].name}' | wc -w)
+k -n edge patch dataplane web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/gateway/listeners/$((listeners - 1))\"}]" >/dev/null
 k -n shop delete deploy/older service/older deploy/newer service/newer >/dev/null
 pass "a TCP listener's connections are carried to its oldest TCPRoute's backend, a newer route accepted and counted and reached only once the older is gone, and closed with none"
 
@@ -1019,12 +1142,12 @@ spec:
   parentRefs: [{ name: web, namespace: edge, sectionName: udp }]
   rules: [{ backendRefs: [{ name: echo, port: 8081 }] }]
 EOF
-k -n edge patch gateway web --type=json -p '[
-  {"op":"add","path":"/spec/listeners/-","value":{"name":"udp","port":8080,"protocol":"UDP","allowedRoutes":{"namespaces":{"from":"All"}}}}
+k -n edge patch dataplane web --type=json -p '[
+  {"op":"add","path":"/spec/gateway/listeners/-","value":{"name":"udp","port":8080,"protocol":"UDP","allowedRoutes":{"namespaces":{"from":"All"}}}}
 ]' >/dev/null
 k -n shop rollout status deploy/echo --timeout=120s >/dev/null
-said deploy/edgerush 'listener "port-8080-udp" is on 0.0.0.0:8080, over UDP' 60 ||
-    fail "the data plane never bound the UDP listener's port: $(k -n edge logs deploy/edgerush | tail -5)"
+said deploy/edgerush-proxy-web 'listener "port-8080-udp" is on 0.0.0.0:8080, over UDP' 60 ||
+    fail "the data plane never bound the UDP listener's port: $(k -n edge logs deploy/edgerush-proxy-web | tail -5)"
 client=$(k -n shop get pod -l app=web -o jsonpath='{.items[0].metadata.name}')
 plane=$(k -n edge get pod "$(pod)" -o jsonpath='{.status.podIP}')
 # What netexec's /dial says of a datagram `hostname` sent to the UDP listener: its answers
@@ -1080,7 +1203,7 @@ done
 [ -z "$(echoed)" ] || fail "with no UDPRoute, a datagram is answered: $(dialled)"
 stated 0 '{.status.listeners[?(@.name=="udp")].attachedRoutes}' 30 -n edge gateway web ||
     fail "with no UDPRoute, the UDP listener counts one: $(said_of -n edge gateway web)"
-k -n edge logs deploy/edgerush | grep 'listener "port-8080-udp" has drained' >/dev/null &&
+k -n edge logs deploy/edgerush-proxy-web | grep 'listener "port-8080-udp" has drained' >/dev/null &&
     fail "with no UDPRoute, the UDP listener's port was let go"
 k apply -f - >/dev/null <<EOF
 apiVersion: gateway.networking.k8s.io/v1
@@ -1094,8 +1217,8 @@ stated "True False UnsupportedProtocol" '{.status.parents[0].conditions[?(@.type
     30 -n shop udproute echo ||
     fail "a UDPRoute led to a Service's TCP port says $(said_of -n shop udproute echo)"
 k -n shop delete udproute echo >/dev/null
-listeners=$(k -n edge get gateway web -o jsonpath='{.spec.listeners[*].name}' | wc -w)
-k -n edge patch gateway web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/listeners/$((listeners - 1))\"}]" >/dev/null
+listeners=$(k -n edge get dataplane web -o jsonpath='{.spec.gateway.listeners[*].name}' | wc -w)
+k -n edge patch dataplane web --type=json -p "[{\"op\":\"remove\",\"path\":\"/spec/gateway/listeners/$((listeners - 1))\"}]" >/dev/null
 k -n shop delete deploy/echo service/echo >/dev/null
 listing_one without 8080/UDP 30 && listing_one with 8080/TCP 1 ||
     fail "the UDP listener gone, the data plane's Service lists '$(listed | tr '\n' ' ')'"
@@ -1260,7 +1383,7 @@ pass "left out, the Ingress says no address, and taken back, the address again"
 # resolv.conf names it, and kube-proxy chooses the pod; a data plane that could not would
 # answer 503 for want of an endpoint.
 # How many configs the data plane has run from the control plane.
-ran() { k -n edge logs deploy/edgerush | grep -c "config from the control plane runs"; }
+ran() { k -n edge logs deploy/edgerush-proxy-web | grep -c "config from the control plane runs"; }
 before=$(ran)
 k -n shop annotate ingress web gateway.edgerush.dev/service-upstream=true >/dev/null
 for _ in $(seq 1 150); do
@@ -1307,7 +1430,7 @@ spec:
         paths:
           - { path: /, pathType: Prefix, backend: { service: { name: loop, port: { name: http } } } }
 EOF
-    said deploy/edgerush "upstream shop/loop/http: $1:8080 is not sent to, as $2" 60 ||
+    said deploy/edgerush-proxy-web "upstream shop/loop/http: $1:8080 is not sent to, as $2" 60 ||
         fail "the data plane never said it refuses $1, as $2"
     answers loop.example 503 10 || fail "an Ingress led to $1 answers $(status loop.example)"
     k -n shop delete ingress loop >/dev/null
@@ -1315,9 +1438,9 @@ EOF
     k -n shop delete endpointslice loop-1 >/dev/null
 }
 # The control-plane pod newest made, and its address.
-control() { k -n edge get pod -l app=edgerush-control --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].status.podIP}'; }
+control() { k -n edge get pod -l "$CONTROL" --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].status.podIP}'; }
 
-own=$(k -n edge get pod -l app=edgerush -o jsonpath='{.items[0].status.podIP}')
+own=$(k -n edge get pod -l "$PROXY" -o jsonpath='{.items[0].status.podIP}')
 [ -n "$own" ] || fail "the data plane has no pod address"
 refused "$own" "one of the data plane's own"
 pass "an EndpointSlice pointed at the data plane's own pod is not sent to, and that is said"
@@ -1397,11 +1520,11 @@ pass "requests keep to the endpoints hinted for the data plane's zone, and go to
 
 echo "== the leader gone"
 # Who holds the Lease: a pod's name, and when it started.
-holder() { k -n edge get lease edgerush-control -o jsonpath='{.spec.holderIdentity}'; }
+holder() { k -n edge get lease edgerush-controller-edge -o jsonpath='{.spec.holderIdentity}'; }
 leader=$(holder)
 leader=${leader%_*}
 [ -n "$leader" ] || fail "no replica holds the Lease"
-said "$leader" "leading, by Lease edge/edgerush-control" 10 || fail "the leader never said it leads"
+said "$leader" "leading, by Lease edge/edgerush-controller-edge" 10 || fail "the leader never said it leads"
 k -n edge delete pod "$leader" --wait=false >/dev/null
 # Another takes it once it goes unrenewed for 15 s.
 took=
@@ -1416,12 +1539,12 @@ k -n shop annotate ingress web nginx.ingress.kubernetes.io/rewrite-target=/ >/de
 saying "" 30 || fail "with $took leading, the status still says '$(says)'"
 k -n shop annotate ingress web nginx.ingress.kubernetes.io/rewrite-target- >/dev/null
 saying "$address" 30 || fail "with $took leading, the status says '$(says)'"
-k -n edge rollout status deploy/edgerush-control --timeout=120s >/dev/null
+k -n edge rollout status deploy/edgerush-controller-edge --timeout=120s >/dev/null
 pass "the leader gone, $took took the Lease and writes status"
 # The replica that took the deleted one's place is a new pod, at a new address, which the
 # control plane comes to resolve and sends again.
 for _ in $(seq 1 150); do
-    [ "$(k -n edge get pod -l app=edgerush-control --field-selector=status.phase=Running -o name | grep -c .)" = 2 ] && break
+    [ "$(k -n edge get pod -l "$CONTROL" --field-selector=status.phase=Running -o name | grep -c .)" = 2 ] && break
     sleep 0.2
 done
 newest=$(control)
@@ -1442,21 +1565,22 @@ outage=$(mktemp -d)
     done
 ) >"$outage/answers" &
 loading=$!
-replicas=$(k -n edge get deploy edgerush-control -o jsonpath='{.spec.replicas}')
+replicas=$(k -n edge get deploy edgerush-controller-edge -o jsonpath='{.spec.replicas}')
 sleep 3
-k -n edge scale deploy/edgerush-control --replicas=0 >/dev/null
+operator_stop
+k -n edge scale deploy/edgerush-controller-edge --replicas=0 >/dev/null
 for _ in $(seq 1 300); do
-    [ "$(k -n edge get pod -l app=edgerush-control -o name | grep -c .)" = 0 ] && break
+    [ "$(k -n edge get pod -l "$CONTROL" -o name | grep -c .)" = 0 ] && break
     sleep 0.2
 done
-said deploy/edgerush "dialled again in" 30 || fail "the data plane never said its stream ended"
+said deploy/edgerush-proxy-web "dialled again in" 30 || fail "the data plane never said its stream ended"
 sleep 10
-k -n edge scale deploy/edgerush-control --replicas="$replicas" >/dev/null
-k -n edge rollout status deploy/edgerush-control --timeout=120s >/dev/null
+k -n edge scale deploy/edgerush-controller-edge --replicas="$replicas" >/dev/null
+k -n edge rollout status deploy/edgerush-controller-edge --timeout=120s >/dev/null
 # Back, a replica says the data plane runs its config: the one it ran, kept.
 back=
 for _ in $(seq 1 300); do
-    k -n edge logs -l app=edgerush-control --tail=-1 2>/dev/null | grep -q "runs config" && back=yes && break
+    k -n edge logs -l "$CONTROL" --tail=-1 2>/dev/null | grep -q "runs config" && back=yes && break
     sleep 0.2
 done
 [ -n "$back" ] || fail "no replica back says the data plane runs its config"
@@ -1472,17 +1596,17 @@ rm -r "$outage"
 pass "through the control plane's outage and its return, all $total requests to the Ingress and the HTTPRoute were answered 200"
 
 echo "== the control plane gone"
-k -n edge scale deploy/edgerush-control --replicas=0 >/dev/null
+k -n edge scale deploy/edgerush-controller-edge --replicas=0 >/dev/null
 for _ in $(seq 1 300); do
-    [ "$(k -n edge get pod -l app=edgerush-control -o name | grep -c .)" = 0 ] && break
+    [ "$(k -n edge get pod -l "$CONTROL" -o name | grep -c .)" = 0 ] && break
     sleep 0.2
 done
-said deploy/edgerush "dialled again in" 30 || fail "the data plane never said its stream ended"
+said deploy/edgerush-proxy-web "dialled again in" 30 || fail "the data plane never said its stream ended"
 answers other.example 200 5 || fail "with the control plane gone, $(status other.example)"
 pass "with the control plane gone, the data plane serves on"
 
-k -n edge rollout restart deploy/edgerush >/dev/null
-k -n edge rollout status deploy/edgerush --timeout=120s >/dev/null
+k -n edge rollout restart deploy/edgerush-proxy-web >/dev/null
+k -n edge rollout status deploy/edgerush-proxy-web --timeout=120s >/dev/null
 pod=$(pod)
 said "$pod" "waiting for the first config from the control plane" 30 ||
     fail "a data plane started without its control plane did not say it waits"
@@ -1491,8 +1615,9 @@ k -n edge logs "$pod" | grep " is on " >/dev/null &&
     fail "it bound a listener before its first config"
 pass "a data plane started while it is gone waits, serving nothing"
 
-k -n edge scale deploy/edgerush-control --replicas=1 >/dev/null
-k -n edge rollout status deploy/edgerush-control --timeout=120s >/dev/null
+# The operator back puts the control plane's replicas back.
+operator_start
+k -n edge rollout status deploy/edgerush-controller-edge --timeout=120s >/dev/null
 # Its waits are drawn below a bound that doubles up to 30 s.
 said "$pod" "config from the control plane runs" 45 ||
     fail "it never ran a config once the control plane was back"
@@ -1501,25 +1626,16 @@ answers other.example 200 30 || fail "once the control plane is back, $(status o
 pass "once the control plane is back, it serves"
 
 echo "== the admission webhook"
-k apply -f - >/dev/null <<EOF
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingWebhookConfiguration
-metadata: { name: edgerush }
-webhooks:
-  - name: ingresses.edgerush.dev
-    rules:
-      - apiGroups: [networking.k8s.io]
-        apiVersions: [v1]
-        operations: [CREATE, UPDATE]
-        resources: [ingresses]
-    clientConfig:
-      service: { namespace: edge, name: edgerush-controller-edge, path: /validate, port: 443 }
-      caBundle: $(base64 -w0 "$pki/ca.crt")
-    failurePolicy: Ignore
-    sideEffects: None
-    admissionReviewVersions: [v1]
-    timeoutSeconds: 5
-EOF
+# Turned on, the controller serves it and the operator registers it, once the control
+# plane has published its authority's bundle.
+k -n edge patch controlplane edge --type=merge -p '{"spec":{"webhook":{"enabled":true}}}' >/dev/null
+for _ in $(seq 1 600); do
+    k get validatingwebhookconfiguration edgerush-controller-edge >/dev/null 2>&1 && break
+    sleep 0.2
+done
+k get validatingwebhookconfiguration edgerush-controller-edge >/dev/null 2>&1 ||
+    fail "the operator never registered the webhook"
+k -n edge rollout status deploy/edgerush-controller-edge --timeout=120s >/dev/null
 # The API server takes up a registration within moments; until then it admits all.
 refused=
 for _ in $(seq 1 150); do
