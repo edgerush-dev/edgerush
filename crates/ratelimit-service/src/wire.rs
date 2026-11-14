@@ -22,20 +22,11 @@ pub struct Contract {
     pub burst: u64,
 }
 
-/// A fixed window's numbers, where a key is kept under one rather than a bucket's contract.
-#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
-pub struct FixedWindow {
-    /// Requests a window.
-    #[prost(uint64, tag = "1")]
-    pub limit: u64,
-    /// The window's length, in nanoseconds.
-    #[prost(uint64, tag = "2")]
-    pub length_ns: u64,
-}
-
 /// Hits a data plane admitted.
 #[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
 pub struct Hits {
+    // Tag 7, the window hits were admitted in, is retired with the asynchronous mode's windows
+    // (#389): never reuse it.
     /// The batch's number for the key, one past the last, and never 0.
     #[prost(uint64, tag = "1")]
     pub sequence: u64,
@@ -50,9 +41,6 @@ pub struct Hits {
     /// nanoseconds; 0, from a data plane that does not say, charges them as they arrive.
     #[prost(uint64, tag = "6")]
     pub age_ns: u64,
-    /// For a fixed window, the window they were admitted in, numbered from 1; 0 for a bucket.
-    #[prost(uint64, tag = "7")]
-    pub window: u64,
 }
 
 /// Nothing to report; a fresh copy, please.
@@ -73,18 +61,17 @@ pub enum Report {
 /// One key in a batch.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct Entry {
+    // Tag 6, a fixed window, is retired with the asynchronous mode's windows (#389): never reuse
+    // it.
     /// The key.
     #[prost(bytes = "vec", tag = "1")]
     pub key: Vec<u8>,
-    /// Its bucket's contract, if it is kept under one.
+    /// Its contract.
     #[prost(message, optional, tag = "2")]
     pub contract: Option<Contract>,
     /// What about it.
     #[prost(oneof = "Report", tags = "3, 5")]
     pub report: Option<Report>,
-    /// Its fixed window, if it is kept under one.
-    #[prost(message, optional, tag = "6")]
-    pub fixed_window: Option<FixedWindow>,
 }
 
 /// A data plane's batch.
@@ -262,9 +249,6 @@ pub enum Invalid {
     /// A contract with a limit, window or burst of zero.
     #[error("a contract with a limit, window or burst of zero")]
     ZeroContract,
-    /// A key under a bucket's contract and a fixed window at once.
-    #[error("a key under a bucket and a fixed window at once")]
-    TwoLimits,
     /// An entry that reports nothing.
     #[error("an entry that reports nothing")]
     NoReport,
@@ -366,36 +350,6 @@ pub(crate) fn contract(contract: Option<Contract>) -> Result<service::Contract, 
     })
 }
 
-/// A limit as the wire carries it: a bucket's contract, or a fixed window's numbers.
-pub(crate) fn limit_to_wire(limit: service::Limit) -> (Option<Contract>, Option<FixedWindow>) {
-    match limit {
-        service::Limit::Bucket(contract) => (Some(contract.into()), None),
-        service::Limit::FixedWindow(window) => (
-            None,
-            Some(FixedWindow {
-                limit: window.limit.get(),
-                length_ns: window.length.get(),
-            }),
-        ),
-    }
-}
-
-/// The protocol's limit from the wire's: one of a contract and a fixed window, holding no zero.
-pub(crate) fn limit(
-    contract: Option<Contract>,
-    window: Option<FixedWindow>,
-) -> Result<service::Limit, Invalid> {
-    let n = |n| NonZeroU64::new(n).ok_or(Invalid::ZeroContract);
-    match (contract, window) {
-        (Some(_), Some(_)) => Err(Invalid::TwoLimits),
-        (None, Some(window)) => Ok(service::Limit::FixedWindow(service::FixedWindow {
-            limit: n(window.limit)?,
-            length: n(window.length_ns)?,
-        })),
-        (contract, None) => self::contract(contract).map(service::Limit::Bucket),
-    }
-}
-
 /// The protocol's report as the wire carries it.
 pub(crate) const fn report_to_wire(report: service::Report) -> Report {
     match report {
@@ -404,13 +358,11 @@ pub(crate) const fn report_to_wire(report: service::Report) -> Report {
             count,
             seen,
             age,
-            window,
         } => Report::Hits(Hits {
             sequence,
             count,
             seen,
             age_ns: age,
-            window,
         }),
         service::Report::Poll => Report::Poll(Poll {}),
     }
@@ -427,7 +379,6 @@ pub(crate) fn report(report: Option<Report>) -> Result<service::Report, Invalid>
             count: hits.count,
             seen: hits.seen,
             age: hits.age_ns,
-            window: hits.window,
         },
         Report::Poll(_) => service::Report::Poll,
     })
@@ -445,14 +396,10 @@ impl From<service::Batch> for Batch {
             entries: batch
                 .entries
                 .into_iter()
-                .map(|entry| {
-                    let (contract, fixed_window) = limit_to_wire(entry.limit);
-                    Entry {
-                        key: entry.key.into_vec(),
-                        contract,
-                        report: Some(report_to_wire(entry.report)),
-                        fixed_window,
-                    }
+                .map(|entry| Entry {
+                    key: entry.key.into_vec(),
+                    contract: Some(entry.contract.into()),
+                    report: Some(report_to_wire(entry.report)),
                 })
                 .collect(),
             made_ns: batch.made,
@@ -470,7 +417,7 @@ impl TryFrom<Batch> for service::Batch {
             .map(|entry| {
                 Ok(service::Entry {
                     key: entry.key.into_boxed_slice(),
-                    limit: limit(entry.contract, entry.fixed_window)?,
+                    contract: contract(entry.contract)?,
                     report: report(entry.report)?,
                 })
             })
@@ -616,7 +563,6 @@ mod tests {
                         count,
                         seen: seen % sequence,
                         age,
-                        window: 0,
                     }
                 }
             ),
@@ -632,7 +578,7 @@ mod tests {
         let entry =
             (key(), contract(), report()).prop_map(|(key, contract, report)| service::Entry {
                 key,
-                limit: service::Limit::Bucket(contract),
+                contract,
                 report,
             });
         (
@@ -808,13 +754,12 @@ mod tests {
             from: u64::MAX,
             entries: vec![service::Entry {
                 key,
-                limit: service::Limit::Bucket(contract),
+                contract,
                 report: service::Report::Hits {
                     sequence: u64::MAX,
                     count: u64::MAX,
                     seen: u64::MAX - 1,
                     age: u64::MAX,
-                    window: 0,
                 },
             }],
             made: u64::MAX,
@@ -911,13 +856,12 @@ mod tests {
         loop {
             let entry = service::Entry {
                 key: key(n),
-                limit: service::Limit::Bucket(contract),
+                contract,
                 report: service::Report::Hits {
                     sequence: 1,
                     count: 1,
                     seen: 0,
                     age: 0,
-                    window: 0,
                 },
             };
             if !full(&hits, entry.bytes()) {
@@ -948,7 +892,6 @@ mod tests {
             key: b"k".to_vec(),
             contract,
             report: Some(Report::Poll(Poll {})),
-            fixed_window: None,
         };
         let batch = |entry| Batch {
             from: 1,
@@ -1013,9 +956,7 @@ mod tests {
                     count: 1,
                     seen,
                     age_ns: 0,
-                    window: 0,
                 })),
-                fixed_window: None,
             }],
         };
         for (sequence, seen) in [(0, 0), (1, 1), (5, 5), (5, 6), (5, u64::MAX)] {

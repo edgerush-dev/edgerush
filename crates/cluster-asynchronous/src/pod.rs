@@ -161,7 +161,7 @@ impl Pod {
         let mut unserved = Vec::new();
         for entry in entries {
             let applied = self.node.update(entry.key, now, |kept, wall| {
-                apply(kept, from, entry.limit, entry.report, cycle, wall)
+                apply(kept, from, entry.contract, entry.report, cycle, wall)
             });
             match applied {
                 Some(answered) => answers.push(Answer {
@@ -278,7 +278,7 @@ mod tests {
     use super::*;
     use edgerush_cluster::Message as StoreMessage;
     use edgerush_cluster::{ShardId, Stamp, ms, table};
-    use edgerush_ratelimit::service::{Contract, Limit, Report, Standing};
+    use edgerush_ratelimit::service::{Contract, Report};
     use std::num::NonZeroU64;
 
     const CYCLE: Time = ms(10);
@@ -342,13 +342,12 @@ mod tests {
     fn hits(key: u64, sequence: u64, count: u64) -> Entry {
         Entry {
             key,
-            limit: Limit::Bucket(contract()),
+            contract: contract(),
             report: Report::Hits {
                 sequence,
                 count,
                 seen: sequence - 1,
                 age: 0,
-                window: 0,
             },
         }
     }
@@ -356,7 +355,7 @@ mod tests {
     fn poll(key: u64) -> Entry {
         Entry {
             key,
-            limit: Limit::Bucket(contract()),
+            contract: contract(),
             report: Report::Poll,
         }
     }
@@ -385,10 +384,7 @@ mod tests {
         assert_eq!(answers.entries.len(), 1);
         assert_eq!(answers.entries[0].key, own);
         assert_eq!(answers.entries[0].answered.applied, 1);
-        assert!(
-            matches!(answers.entries[0].answered.standing, Standing::Bucket { behind } if behind > 0),
-            "charged"
-        );
+        assert!(answers.entries[0].answered.behind > 0, "charged");
         assert_eq!(
             answers.unserved,
             vec![Unserved {
@@ -612,11 +608,7 @@ mod tests {
         let own = key_of(1);
         let answers = pod.batch(batch(first().stamp(), 0, vec![poll(own)]), ms(3));
         assert_eq!(answers.entries.len(), 1);
-        assert_eq!(
-            answers.entries[0].answered.standing,
-            Standing::Bucket { behind: 0 },
-            "a full bucket"
-        );
+        assert_eq!(answers.entries[0].answered.behind, 0, "a full bucket");
         assert_eq!(pod.value(own).as_ref().map(Value::counted), Some(0));
         let copied = |out: &Outbox| {
             out.iter().any(|(_, message)| {

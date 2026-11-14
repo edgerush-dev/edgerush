@@ -11,7 +11,7 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_ratelimit::service::{Batch, Contract, Entry, Limit, Report, ServicePod, View};
+use edgerush_ratelimit::service::{Batch, Contract, Entry, Report, ServicePod, View};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
 use std::net::Ipv4Addr;
@@ -60,13 +60,12 @@ fn holding(after: u64) -> (Box<ServicePod>, u64) {
             .step_by(PLANES as usize)
             .map(|k| Entry {
                 key: key(k),
-                limit: Limit::Bucket(contract(k)),
+                contract: contract(k),
                 report: Report::Hits {
                     sequence: 1,
                     count: 1,
                     seen: 0,
                     age: 0,
-                    window: 0,
                 },
             })
             .collect();

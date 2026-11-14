@@ -7,4 +7,3 @@
 cc 1a44743056f4ddf9ecd919688bc773dc42c6ae1b3f7b05be92b0883b2fb87368 # shrinks to steps = [(0, Send { count: 0, lost: false }, 0), (0, Send { count: 1, lost: false }, 0)], seed = 0
 cc 49c8e7e1187629cd11a55534de58c403e8aee4e981a0f50b6c431d2eaa8d9b30 # shrinks to steps = [(0, Send { count: 0, lost: false }, 0), (0, Send { count: 1, lost: false }, 0), (0, Send { count: 0, lost: false }, 0)], pick = (Index(0), Index(6148914691236517206))
 cc eb7c957f5e4f5c64c071507500d7c97b4aa1767035ed66df2e633f8e8ed68309 # shrinks to steps = [(0, Poll, 0)], seed = 0
-cc f60a6b045112d8831944d0b6fe4c362cbcf751c041ee3e73ec51755140e3a1d7 # shrinks to steps = [(0, Send { count: 0, lost: false }, 0), (0, Send { count: 0, lost: false }, 0), (0, Send { count: 1, lost: false }, 0)], pick = (Index(0), Index(12297829382473034411)), windowed = true

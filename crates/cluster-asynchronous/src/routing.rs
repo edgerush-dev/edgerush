@@ -42,7 +42,7 @@ impl Routed {
                 .iter()
                 .map(|answer| Replied {
                     key: answer.key,
-                    standing: answer.answered.standing,
+                    behind: answer.answered.behind,
                     applied: answer.answered.applied,
                     others: answer.answered.others,
                 })
@@ -122,7 +122,7 @@ impl Routing for Routed {
                 .iter()
                 .map(|entry| Entry {
                     key: hash(&entry.key),
-                    limit: entry.limit,
+                    contract: entry.contract,
                     report: entry.report,
                 })
                 .collect(),
@@ -141,7 +141,7 @@ mod tests {
     use crate::message::{Answer, Unserved, Why};
     use crate::owner::Answered;
     use edgerush_cluster::table::first;
-    use edgerush_ratelimit::service::{self, Contract, FixedWindow, Limit, Report, Standing};
+    use edgerush_ratelimit::service::{self, Contract, Report};
     use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroU64;
 
@@ -250,10 +250,7 @@ mod tests {
             Participant::new(1, CYCLE, routed(&[1, 2, 3], 2), Keyed::new([1, 2])).unwrap();
         plane.set_one_in_flight(true);
         for at in 1..=8 {
-            let decided = plane.decide_all(
-                &[(b"k".as_slice(), Limit::Bucket(contract()))],
-                at * CYCLE - 1,
-            );
+            let decided = plane.decide_all(&[(b"k".as_slice(), contract())], at * CYCLE - 1);
             assert_eq!(decided, Decision::Admit);
             plane.on_cycle(at * CYCLE);
             let sent = plane.take_exchanges();
@@ -275,23 +272,18 @@ mod tests {
     fn a_batch_carries_the_keys_hashes_and_the_tables_stamp() {
         let routed = routed(&[1, 2], 1);
         let report = Report::Poll;
-        // A fixed window's limit goes as it is.
-        let window = Limit::FixedWindow(FixedWindow {
-            limit: NonZeroU64::new(10).unwrap(),
-            length: NonZeroU64::new(60_000_000_000).unwrap(),
-        });
         let batch = service::Batch {
             from: 9,
             made: 33,
             entries: vec![
                 service::Entry {
                     key: Box::from(&b"ab"[..]),
-                    limit: Limit::Bucket(contract()),
+                    contract: contract(),
                     report,
                 },
                 service::Entry {
                     key: Box::from(&b"xyz"[..]),
-                    limit: window,
+                    contract: contract(),
                     report,
                 },
             ],
@@ -306,12 +298,12 @@ mod tests {
                 entries: vec![
                     Entry {
                         key: 200,
-                        limit: Limit::Bucket(contract()),
+                        contract: contract(),
                         report
                     },
                     Entry {
                         key: 300,
-                        limit: window,
+                        contract: contract(),
                         report
                     },
                 ],
@@ -330,12 +322,8 @@ mod tests {
     /// left out, the table as the routing; relayed ones as the owner's.
     #[test]
     fn answers_are_replied_as_the_owners_the_unserved_left_out() {
-        let standing = Standing::Window {
-            number: 4,
-            count: 7,
-        };
         let answered = Answered {
-            standing,
+            behind: 7,
             applied: 3,
             others: 2,
         };
@@ -362,7 +350,7 @@ mod tests {
                 made: 13,
                 entries: vec![Replied {
                     key: 5,
-                    standing,
+                    behind: 7,
                     applied: 3,
                     others: 2,
                 }],

@@ -29,18 +29,15 @@ mod loom_tests;
 mod routing_tests;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod window_tests;
 
 pub use routing::{Replied, Reply, Routing};
-pub use word::{fits, window_at};
+pub use word::fits;
 
 use super::{
-    Answers, Batch, CUT_OFF_CYCLES, Entry as BatchEntry, Limit, MOST_UNACKNOWLEDGED, PlaneId,
-    Queued, RESEND_AFTER_CYCLES, Report, Room, Standing, Unseen, View, cut_off_from_owner,
+    Answers, Batch, CUT_OFF_CYCLES, Contract, Entry as BatchEntry, MOST_UNACKNOWLEDGED, PlaneId,
+    Queued, RESEND_AFTER_CYCLES, Report, Room, Unseen, View, cut_off_from_owner,
     encoded_entry_bytes, longest,
 };
-use crate::rate::MASK;
 use chunked::MinHeap;
 use keys::Keys;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -161,8 +158,8 @@ pub struct Registry<S> {
     /// A worker could not hand the transport a key that wanted it: the next cycle visits
     /// every key ([`Self::require_scan`]).
     scan: AtomicBool,
-    /// What keys share, by limit: read when an entry is made.
-    terms: RwLock<HashMap<Limit, Arc<Terms>>>,
+    /// What keys share, by contract: read when an entry is made.
+    terms: RwLock<HashMap<Contract, Arc<Terms>>>,
 }
 
 impl<S: BuildHasher + Default> Default for Registry<S> {
@@ -192,10 +189,9 @@ impl<S: BuildHasher> Registry<S> {
         &self.shards[self.index(key)]
     }
 
-    /// The live entry of `key` under `limit` at `now`, if the participant has made one: under
-    /// a fixed window, one of a window not yet over.
+    /// The live entry of `key` under `contract`, if the participant has made one.
     #[must_use]
-    pub fn find(&self, key: &[u8], limit: Limit, now: u64) -> Option<Arc<Entry>> {
+    pub fn find(&self, key: &[u8], contract: Contract) -> Option<Arc<Entry>> {
         let shard = self
             .shard(key)
             .read()
@@ -203,26 +199,21 @@ impl<S: BuildHasher> Registry<S> {
         shard
             .get(key)
             .map(Handle::entry)
-            .filter(|entry| {
-                entry.terms.limit == limit && !entry.snapshot().closed && entry.current(now)
-            })
+            .filter(|entry| entry.terms.contract == contract && !entry.snapshot().closed)
             .cloned()
     }
 
-    /// The live entry of `key` under `limit`, or, if there is none, one made at `now` — its
-    /// bucket full, or its window `now`'s with nothing counted; its cycle `cycle` — and kept:
-    /// with whether it was made here, for whoever made it to have the participant adopt it
-    /// ([`Participant::adopt`]). `None` if a live entry of the key is under another limit:
-    /// the participant replaces it. Under a fixed window, an entry whose window is over is
-    /// closed and the next made, the others admitting carried over to it, for the participant
-    /// to take the key's record on to (06 §4). Taken by a worker meeting a key its process
-    /// has not, once, or meeting a window's end; under the shard's lock, so that two workers
-    /// meeting it at once share one entry.
+    /// The live entry of `key` under `contract`, or, if there is none, one made at `now` —
+    /// its bucket full, its cycle `cycle` — and kept: with whether it was made here, for whoever made it to have the
+    /// participant adopt it ([`Participant::adopt`]). `None` if a live entry of the key is
+    /// under another contract: the participant replaces it. Taken by a worker meeting a key
+    /// its process has not, once; under the shard's lock, so that two workers meeting it at
+    /// once share one entry.
     #[must_use]
     pub fn find_or_make(
         &self,
         key: &[u8],
-        limit: Limit,
+        contract: Contract,
         cycle: u64,
         now: u64,
     ) -> Option<(Arc<Entry>, bool)> {
@@ -230,46 +221,27 @@ impl<S: BuildHasher> Registry<S> {
             .shard(key)
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut others = 0;
         if let Some(held) = shard.get(key).map(Handle::entry)
             && !held.snapshot().closed
         {
-            if held.terms.limit != limit {
-                return None;
-            }
-            if held.current(now) {
-                return Some((Arc::clone(held), false));
-            }
-            // Its window over: the next, not a cold key.
-            close(held);
-            others = held.others.load(Ordering::Acquire);
+            return (held.terms.contract == contract).then(|| (Arc::clone(held), false));
         }
-        let entry = Arc::new(self.made(key, self.terms(limit, cycle), now));
-        entry.others.store(others, Ordering::Release);
+        let entry = Arc::new(Entry::with_terms(
+            key.into(),
+            self.terms(contract, cycle),
+            now,
+        ));
         shard.replace(Handle(Arc::clone(&entry)));
         Some((entry, true))
     }
 
-    /// An entry of `key` made at `now` under `terms`: under a fixed window, of `now`'s
-    /// window, each key's windows shifted by an offset from its hash so that their ends
-    /// spread, alike on every data plane sharing the key's hash.
-    fn made(&self, key: &[u8], terms: Arc<Terms>, now: u64) -> Entry {
-        let window = match terms.model {
-            Model::Bucket { .. } => None,
-            Model::Window { length, .. } => {
-                Some(word::window_at(keys::hash(&self.hasher, key), length, now))
-            }
-        };
-        Entry::with_terms(key.into(), terms, now, window)
-    }
-
-    /// What keys under `limit` share, at `cycle`: made the first time it is asked for.
-    fn terms(&self, limit: Limit, cycle: u64) -> Arc<Terms> {
+    /// What keys under `contract` share, at `cycle`: made the first time it is asked for.
+    fn terms(&self, contract: Contract, cycle: u64) -> Arc<Terms> {
         let terms = self
             .terms
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&limit)
+            .get(&contract)
             .cloned();
         terms.unwrap_or_else(|| {
             let mut terms = self
@@ -278,8 +250,8 @@ impl<S: BuildHasher> Registry<S> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             Arc::clone(
                 terms
-                    .entry(limit)
-                    .or_insert_with(|| Arc::new(Terms::new(limit, cycle))),
+                    .entry(contract)
+                    .or_insert_with(|| Arc::new(Terms::new(contract, cycle))),
             )
         })
     }
@@ -320,18 +292,11 @@ impl<S: BuildHasher> Registry<S> {
 }
 
 /// One key's shared state, for one incarnation of it: a key evicted and met again is a
-/// new entry, made only once the old one is closed; under a fixed window, one window of it.
+/// new entry, made only once the old one is closed.
 pub struct Entry {
     key: Box<[u8]>,
-    /// What it shares with every key under its limit.
+    /// What it shares with every key under its contract.
     terms: Arc<Terms>,
-    /// Under a fixed window, its window's number, counted from 1; 0 under a bucket.
-    window: u64,
-    /// When its window ends, from when it decides nothing more and the next is made;
-    /// never, under a bucket.
-    ends: u64,
-    /// In its low half the bucket's arrival time, or the window's count as the copy holds
-    /// it ([`Fields::arrival`]).
     word: AtomicU128,
     /// The cycle the word was last advanced to, coarsely ([`word::record_of`]): written
     /// after the compare-and-swap that advanced it, so never ahead of it, and read before
@@ -352,85 +317,30 @@ pub struct Entry {
     signalled: AtomicBool,
 }
 
-/// What every key under one limit shares, made once a limit and pointed to by each key's
-/// entry rather than copied into it: the limit, its model's constants, its refill time, and
-/// the cycle.
+/// What every key under one contract shares, made once a contract and pointed to by each
+/// key's entry rather than copied into it: the contract, its bucket's constants, its refill
+/// time, and the cycle and what the contract refills in one.
 #[derive(Debug)]
 struct Terms {
-    limit: Limit,
-    model: Model,
-    /// The limit's refill time, a window's length: how long a copy stays fresh after an
-    /// answer.
+    contract: Contract,
+    bucket: Rate,
+    /// The contract's refill time: how long a copy stays fresh after an answer.
     hold: u64,
-    /// The protocol's cycle.
+    /// The protocol's cycle, and what the contract refills in one, in requests and in units.
     cycle: u64,
-}
-
-/// A limit's arithmetic, by its model.
-#[derive(Debug)]
-enum Model {
-    /// A bucket's constants, and what it refills in a cycle, in requests and in units.
-    Bucket {
-        bucket: Rate,
-        refill: u64,
-        refill_units: u64,
-    },
-    /// A fixed window's limit and length.
-    Window { limit: u64, length: u64 },
-}
-
-#[cfg(all(test, not(loom)))]
-impl Entry {
-    /// What an advance of its cycle reads besides the word, by its model, for tests.
-    fn advance_now(&self) -> Advance {
-        match self.arith() {
-            Ariths::Bucket(arith) => self.advance(arith),
-            Ariths::Window(arith) => self.advance(arith),
-        }
-    }
-}
-
-#[cfg(all(test, not(loom)))]
-#[allow(
-    clippy::panic,
-    reason = "test set-up: a window's terms asked for a bucket's fails the test"
-)]
-impl Terms {
-    /// A bucket's constants, for tests of buckets.
-    fn bucket(&self) -> &Rate {
-        match &self.model {
-            Model::Bucket { bucket, .. } => bucket,
-            Model::Window { .. } => panic!("a fixed window has no bucket"),
-        }
-    }
-
-    /// What a bucket refills in a cycle, in units, for tests of buckets.
-    fn refill_units(&self) -> u64 {
-        match &self.model {
-            Model::Bucket { refill_units, .. } => *refill_units,
-            Model::Window { .. } => panic!("a fixed window refills nothing"),
-        }
-    }
+    refill: u64,
+    refill_units: u64,
 }
 
 impl Terms {
-    fn new(limit: Limit, cycle: u64) -> Self {
-        let model = match limit {
-            Limit::Bucket(contract) => Model::Bucket {
-                bucket: Rate::new(contract),
-                refill: contract.refilled(cycle),
-                refill_units: Rate::new(contract).units(cycle),
-            },
-            Limit::FixedWindow(window) => Model::Window {
-                limit: window.limit.get(),
-                length: window.length.get(),
-            },
-        };
+    fn new(contract: Contract, cycle: u64) -> Self {
         Self {
-            limit,
-            model,
-            hold: limit.refill_time(),
+            contract,
+            bucket: Rate::new(contract),
+            hold: contract.refill_time(),
             cycle,
+            refill: contract.refilled(cycle),
+            refill_units: Rate::new(contract).units(cycle),
         }
     }
 }
@@ -441,84 +351,6 @@ impl std::fmt::Debug for Entry {
             .field("key", &self.key)
             .field("fields", &Fields::unpack(self.word.load(Ordering::Acquire)))
             .finish_non_exhaustive()
-    }
-}
-
-/// A model's arithmetic on an entry's word: the cycle's refill, its advance, whether the low
-/// half has room for a request, and the low half with one charged.
-trait Arith: Copy {
-    /// What a cycle refills, in requests and in units.
-    fn refill(self) -> (u64, u64);
-    /// `fields` advanced to the cycle of `now` if that is due.
-    fn advanced(self, fields: Fields, advance: Advance, now: u64) -> Fields;
-    /// Whether `arrival`, the low half, admits a request at `now`.
-    fn has_room(self, arrival: u64, now: u64) -> bool;
-    /// `arrival` with one request charged at `now`.
-    fn charged(self, arrival: u64, now: u64) -> u64;
-}
-
-/// An entry's model's arithmetic, one or the other.
-#[derive(Clone, Copy)]
-enum Ariths<'a> {
-    Bucket(BucketArith<'a>),
-    Window(WindowArith),
-}
-
-/// A bucket's arithmetic: its arrival time in the low half.
-#[derive(Clone, Copy)]
-struct BucketArith<'a> {
-    rate: &'a Rate,
-    refill: u64,
-    refill_units: u64,
-}
-
-impl Arith for BucketArith<'_> {
-    #[inline(always)]
-    fn refill(self) -> (u64, u64) {
-        (self.refill, self.refill_units)
-    }
-
-    #[inline(always)]
-    fn advanced(self, fields: Fields, advance: Advance, now: u64) -> Fields {
-        word::advanced(self.rate, fields, advance, now)
-    }
-
-    #[inline(always)]
-    fn has_room(self, arrival: u64, now: u64) -> bool {
-        self.rate.admits(arrival, self.rate.units(now))
-    }
-
-    #[inline(always)]
-    fn charged(self, arrival: u64, now: u64) -> u64 {
-        Rate::charge(arrival, self.rate.units(now), 1)
-    }
-}
-
-/// A fixed window's arithmetic: the copy's count in the low half; no refill within a window.
-#[derive(Clone, Copy)]
-struct WindowArith {
-    limit: u64,
-}
-
-impl Arith for WindowArith {
-    #[inline(always)]
-    fn refill(self) -> (u64, u64) {
-        (0, 0)
-    }
-
-    #[inline(always)]
-    fn advanced(self, fields: Fields, advance: Advance, now: u64) -> Fields {
-        word::window_advanced(self.limit, fields, advance, now)
-    }
-
-    #[inline(always)]
-    fn has_room(self, arrival: u64, _: u64) -> bool {
-        arrival < self.limit
-    }
-
-    #[inline(always)]
-    fn charged(self, arrival: u64, _: u64) -> u64 {
-        (arrival + 1).min(MASK)
     }
 }
 
@@ -536,26 +368,14 @@ enum Taken {
 impl Entry {
     /// An entry with terms of its own, for tests of one key.
     #[cfg(test)]
-    fn new(key: Box<[u8]>, contract: super::Contract, cycle: u64, now: u64) -> Self {
-        Self::with_terms(
-            key,
-            Arc::new(Terms::new(Limit::Bucket(contract), cycle)),
-            now,
-            None,
-        )
+    fn new(key: Box<[u8]>, contract: Contract, cycle: u64, now: u64) -> Self {
+        Self::with_terms(key, Arc::new(Terms::new(contract, cycle)), now)
     }
 
-    /// An entry made at `now` under `terms`: under a fixed window, of `window`, its number and
-    /// when it ends.
-    fn with_terms(key: Box<[u8]>, terms: Arc<Terms>, now: u64, window: Option<(u64, u64)>) -> Self {
+    fn with_terms(key: Box<[u8]>, terms: Arc<Terms>, now: u64) -> Self {
         let cycle = terms.cycle;
-        let arrival = match terms.model {
-            Model::Bucket { bucket, .. } => Rate::full(bucket.units(now)),
-            Model::Window { .. } => 0,
-        };
-        let (window, ends) = window.unwrap_or((0, u64::MAX));
         let fields = Fields {
-            arrival,
+            arrival: Rate::full(terms.bucket.units(now)),
             // No share bound until a cycle sets one, as a new `DataPlane` key has none.
             left: word::MOST_LEFT,
             cycle: word::cycle_of(now, cycle),
@@ -567,8 +387,6 @@ impl Entry {
         Self {
             key,
             terms,
-            window,
-            ends,
             word: AtomicU128::new(fields.pack()),
             record: AtomicU32::new(word::record_of(now, cycle)),
             others: AtomicU64::new(0),
@@ -600,24 +418,10 @@ impl Entry {
         &self.key
     }
 
-    /// Its limit.
+    /// Its contract.
     #[must_use]
-    pub fn limit(&self) -> Limit {
-        self.terms.limit
-    }
-
-    /// Under a fixed window, its window's number; 0 under a bucket.
-    #[must_use]
-    pub const fn window(&self) -> u64 {
-        self.window
-    }
-
-    /// Whether it decides at `now`: always under a bucket; under a fixed window until its
-    /// window ends, the next window another entry.
-    #[must_use]
-    #[inline(always)]
-    pub const fn current(&self, now: u64) -> bool {
-        now < self.ends
+    pub fn contract(&self) -> Contract {
+        self.terms.contract
     }
 
     /// Whether it is closed: evicted or replaced, never to decide again, a worker holding
@@ -633,31 +437,11 @@ impl Entry {
         self.retries.load(Ordering::Relaxed)
     }
 
-    /// Its model's arithmetic: matched on once a decision, so that each model's path is
-    /// compiled apart and a bucket's runs as it would with no window beside it.
-    #[inline(always)]
-    fn arith(&self) -> Ariths<'_> {
-        match &self.terms.model {
-            Model::Bucket {
-                bucket,
-                refill,
-                refill_units,
-            } => Ariths::Bucket(BucketArith {
-                rate: bucket,
-                refill: *refill,
-                refill_units: *refill_units,
-            }),
-            Model::Window { limit, .. } => Ariths::Window(WindowArith { limit: *limit }),
-        }
-    }
-
-    #[inline(always)]
-    fn advance<A: Arith>(&self, arith: A) -> Advance {
-        let (refill, refill_units) = arith.refill();
+    fn advance(&self) -> Advance {
         Advance {
             cycle: self.terms.cycle,
-            refill,
-            refill_units,
+            refill: self.terms.refill,
+            refill_units: self.terms.refill_units,
             others: self.others.load(Ordering::Acquire),
             record: self.record.load(Ordering::Acquire),
         }
@@ -665,23 +449,9 @@ impl Entry {
 
     /// Applies `change` to the word until it holds, the cycle advanced first if it is due:
     /// `change` says the new fields, or none to leave the word as it is.
-    fn update(&self, now: u64, change: impl FnMut(Fields) -> Option<Fields>) -> Option<Fields> {
-        match self.arith() {
-            Ariths::Bucket(arith) => self.update_with(arith, now, change),
-            Ariths::Window(arith) => self.update_with(arith, now, change),
-        }
-    }
-
-    /// [`Self::update`] by `arith`.
-    #[inline(always)]
-    fn update_with<A: Arith>(
-        &self,
-        arith: A,
-        now: u64,
-        mut change: impl FnMut(Fields) -> Option<Fields>,
-    ) -> Option<Fields> {
+    fn update(&self, now: u64, mut change: impl FnMut(Fields) -> Option<Fields>) -> Option<Fields> {
         // The record read before the word, so that it is no later than the word's cycle.
-        let advance = self.advance(arith);
+        let advance = self.advance();
         let mut current = self.word.load(Ordering::Acquire);
         loop {
             let before = Fields::unpack(current);
@@ -689,7 +459,7 @@ impl Entry {
             // a gap of a multiple of its range leaves as it was.
             let moved = word::step(before.cycle, advance.record, now, advance.cycle) != Step::Same;
             let fields = if moved {
-                arith.advanced(before, advance, now)
+                word::advanced(&self.terms.bucket, before, advance, now)
             } else {
                 before
             };
@@ -719,52 +489,39 @@ impl Entry {
     }
 
     /// What it says of a request at `now`, from its word as it is, its cycle advanced if
-    /// that is due, nothing written: room, none, or closed — its window over among them.
-    #[inline(always)]
+    /// that is due, nothing written: room, none, or closed.
     fn look(&self, now: u64) -> Taken {
-        match self.arith() {
-            Ariths::Bucket(arith) => self.look_with(arith, now),
-            Ariths::Window(arith) if self.current(now) => self.look_with(arith, now),
-            Ariths::Window(_) => Taken::Closed,
-        }
-    }
-
-    #[inline(always)]
-    fn look_with<A: Arith>(&self, arith: A, now: u64) -> Taken {
-        let fields = arith.advanced(self.snapshot(), self.advance(arith), now);
+        let fields = word::advanced(&self.terms.bucket, self.snapshot(), self.advance(), now);
         if fields.closed {
             Taken::Closed
-        } else if fields.left > 0 && arith.has_room(fields.arrival, now) {
+        } else if self.has_room(fields, now) {
             Taken::Done
         } else {
             Taken::Refused
         }
     }
 
+    fn has_room(&self, fields: Fields, now: u64) -> bool {
+        fields.left > 0
+            && self
+                .terms
+                .bucket
+                .admits(fields.arrival, self.terms.bucket.units(now))
+    }
+
     /// Takes one request's worth at `now` if it has room, in one compare-and-swap. Taking
     /// does not count as the key's use: a request's arrival does ([`decide`] marks it).
     /// With whether it started the key's count: an admission counted where none was, read
-    /// from the compare-and-swap that took it, never from an attempt. A window's entry takes
-    /// nothing once its window is over.
-    #[inline(always)]
+    /// from the compare-and-swap that took it, never from an attempt.
     fn take(&self, now: u64) -> (Taken, bool) {
-        match self.arith() {
-            Ariths::Bucket(arith) => self.take_with(arith, now),
-            Ariths::Window(arith) if self.current(now) => self.take_with(arith, now),
-            Ariths::Window(_) => (Taken::Closed, false),
-        }
-    }
-
-    #[inline(always)]
-    fn take_with<A: Arith>(&self, arith: A, now: u64) -> (Taken, bool) {
         let mut why = Taken::Refused;
         let mut was = 0;
-        let taken = self.update_with(arith, now, |fields| {
+        let taken = self.update(now, |fields| {
             was = fields.unreported;
             why = if fields.closed {
                 Taken::Closed
-            } else if fields.left > 0 && arith.has_room(fields.arrival, now) {
-                return Some(self.charged(arith, fields, now));
+            } else if self.has_room(fields, now) {
+                return Some(self.charged(fields, now));
             } else {
                 Taken::Refused
             };
@@ -779,38 +536,27 @@ impl Entry {
     /// Charges one request at `now`, room or none, once a read of every key of the request
     /// found room ([`decide`]): a charge that finds the room taken since admits one more
     /// than the key has, never refuses one within it. A closed entry is left as it is, the
-    /// hit never reported: it was idle for two refill times before it closed, or its window
-    /// ended as the request was decided. Whether it started the key's count, as
-    /// [`Self::take`].
-    #[inline(always)]
+    /// hit never reported: it was idle for two refill times before it closed. Whether it
+    /// started the key's count, as [`Self::take`].
     fn charge(&self, now: u64) -> bool {
-        match self.arith() {
-            Ariths::Bucket(arith) => self.charge_with(arith, now),
-            Ariths::Window(arith) => self.current(now) && self.charge_with(arith, now),
-        }
-    }
-
-    #[inline(always)]
-    fn charge_with<A: Arith>(&self, arith: A, now: u64) -> bool {
         let mut was = 0;
-        let charged = self.update_with(arith, now, |fields| {
+        let charged = self.update(now, |fields| {
             was = fields.unreported;
-            (!fields.closed).then(|| self.charged(arith, fields, now))
+            (!fields.closed).then(|| self.charged(fields, now))
         });
         charged.is_some_and(|fields| was == 0 && fields.unreported > 0)
     }
 
-    /// `fields` with one request charged at `now`: the bucket or the window's count, the
-    /// cycle's allowance and the count to report, the count's start noted if it had none. The
-    /// allowance and the count each stop at their ends rather than wrap: a charge past the
-    /// allowance only a race gives, and the count is one the transport never lets fill.
-    #[inline(always)]
-    fn charged<A: Arith>(&self, arith: A, fields: Fields, now: u64) -> Fields {
+    /// `fields` with one request charged at `now`: the bucket, the cycle's allowance and
+    /// the count, the count's start noted if it had none. The allowance and the count each
+    /// stop at their ends rather than wrap: a charge past the allowance only a race gives,
+    /// and the count is one the transport never lets fill.
+    fn charged(&self, fields: Fields, now: u64) -> Fields {
         if fields.unreported == 0 {
             self.started.store(now, Ordering::Relaxed);
         }
         Fields {
-            arrival: arith.charged(fields.arrival, now),
+            arrival: Rate::charge(fields.arrival, self.terms.bucket.units(now), 1),
             left: fields.left.saturating_sub(1),
             unreported: (fields.unreported + 1).min(word::MOST_UNREPORTED),
             ..fields
@@ -843,28 +589,20 @@ impl Entry {
     }
 
     /// How long from `now` it waits to admit a request, if it would refuse one: its
-    /// bucket's refill to one, or its window's end with the window counted full; or, with
-    /// room but the cycle's allowance spent, the cycle. None once its window is over: the
-    /// next window's entry decides.
+    /// bucket's refill to one, or, with room but the cycle's allowance spent, the cycle.
     #[must_use]
     pub fn wait(&self, now: u64) -> Option<u64> {
-        let full = match self.arith() {
-            Ariths::Bucket(arith) => {
-                let fields = arith.advanced(self.snapshot(), self.advance(arith), now);
-                let units = arith.rate.units(now);
-                (arith.rate.wait(fields.arrival, units), fields.left)
-            }
-            Ariths::Window(_) if !self.current(now) => return None,
-            Ariths::Window(arith) => {
-                let fields = arith.advanced(self.snapshot(), self.advance(arith), now);
-                let full = fields.arrival >= arith.limit;
-                (full.then(|| self.ends.saturating_sub(now)), fields.left)
-            }
-        };
-        match full {
-            (Some(wait), _) => Some(wait),
-            (None, 0) => Some(self.terms.cycle),
-            (None, _) => None,
+        let fields = word::advanced(
+            &self.terms.bucket,
+            Fields::unpack(self.word.load(Ordering::Acquire)),
+            self.advance(),
+            now,
+        );
+        let units = self.terms.bucket.units(now);
+        match self.terms.bucket.wait(fields.arrival, units) {
+            Some(wait) => Some(wait),
+            None if fields.left == 0 => Some(self.terms.cycle),
+            None => None,
         }
     }
 
@@ -962,16 +700,6 @@ struct Tracked<P> {
     left_out: bool,
 }
 
-/// What an owner's answer rebases a key's copy on.
-enum Rebase<'a> {
-    /// The bucket, `behind` from full.
-    Bucket(&'a Rate, u128),
-    /// The window's count.
-    Count(u64),
-    /// Nothing: another window's answer.
-    Nothing,
-}
-
 impl<P> Tracked<P> {
     /// Its ledger's hits, as a report numbered after the last, sent at `now`: `None` if
     /// there are none, or [`MOST_UNACKNOWLEDGED`] are out already and they wait.
@@ -988,28 +716,13 @@ impl<P> Tracked<P> {
             admitted: self.unsent_since,
             first: now,
             last: now,
-            window: self.entry.window,
         };
         self.unacknowledged.push(unseen, spare);
         Some(BatchEntry {
             key: self.entry.key.clone(),
-            limit: self.entry.terms.limit,
+            contract: self.entry.terms.contract,
             report: unseen.report(self.seen, now),
         })
-    }
-
-    /// Hits the owner has yet to apply in the entry's window, or under a bucket: reported and
-    /// not seen applied, and not yet reported.
-    fn unapplied(&self) -> u64 {
-        let window = self.entry.window;
-        let unseen: u64 = self
-            .unacknowledged
-            .as_slice()
-            .iter()
-            .filter(|unseen| unseen.window == window)
-            .map(|unseen| unseen.count)
-            .sum();
-        unseen + self.unsent
     }
 
     /// `count` more in the ledger, the earliest of them admitted at `since`.
@@ -1360,7 +1073,7 @@ impl<S: BuildHasher, R: Routing> Visit<'_, S, R> {
                 unseen.last = now;
                 entries.push(BatchEntry {
                     key: key.clone(),
-                    limit: entry.terms.limit,
+                    contract: entry.terms.contract,
                     report: unseen.report(tracked.seen, now),
                 });
                 reported = true;
@@ -1384,7 +1097,7 @@ impl<S: BuildHasher, R: Routing> Visit<'_, S, R> {
             if room.take(bytes) {
                 entries.push(BatchEntry {
                     key: key.clone(),
-                    limit: entry.terms.limit,
+                    contract: entry.terms.contract,
                     report: Report::Poll,
                 });
             } else {
@@ -1662,35 +1375,22 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
 
     /// The entries of `keys` it holds, for a worker to decide from itself from now on.
     #[must_use]
-    pub fn entries(&self, keys: &[(&[u8], Limit)]) -> Vec<Arc<Entry>> {
+    pub fn entries(&self, keys: &[(&[u8], Contract)]) -> Vec<Arc<Entry>> {
         keys.iter()
-            .filter_map(|(key, limit)| {
+            .filter_map(|(key, contract)| {
                 let tracked = self.keys.get(key)?;
-                (tracked.entry.terms.limit == *limit).then(|| Arc::clone(&tracked.entry))
+                (tracked.entry.terms.contract == *contract).then(|| Arc::clone(&tracked.entry))
             })
             .collect()
     }
 
-    /// Makes sure `key` has a live entry under `limit` at `now`: a new key, or one whose limit
-    /// changed, starts afresh, the old entry, if any, closed first; under a fixed window whose
-    /// entry's window is over, the next window's entry takes the key's record on.
-    fn ensure(&mut self, key: &[u8], limit: Limit, now: u64) {
-        let held = self.keys.get(key).map(|tracked| {
-            let entry = &tracked.entry;
-            (
-                entry.terms.limit == limit,
-                !entry.snapshot().closed && entry.current(now),
-            )
-        });
-        match held {
-            Some((true, true)) => return,
-            Some((true, false)) if matches!(limit, Limit::FixedWindow(_)) => {
-                if let Some((next, _)) = self.registry.find_or_make(key, limit, self.cycle, now) {
-                    self.roll(next, now);
-                    return;
-                }
-            }
-            _ => {}
+    /// Makes sure `key` has a live entry under `contract`: a new key, or one whose contract
+    /// changed, starts afresh; the old entry, if any, is closed first.
+    fn ensure(&mut self, key: &[u8], contract: Contract, now: u64) {
+        if self.keys.get(key).is_some_and(|tracked| {
+            tracked.entry.terms.contract == contract && !tracked.entry.snapshot().closed
+        }) {
+            return;
         }
         if let Some(old) = self.keys.remove(key) {
             close(&old.entry);
@@ -1700,93 +1400,34 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
         // A worker may have made the key's entry already: that one.
         let made = self
             .registry
-            .find_or_make(key, limit, self.cycle, now)
+            .find_or_make(key, contract, self.cycle, now)
             .map(|(entry, _)| entry);
         let entry = made.unwrap_or_else(|| {
-            Arc::new(
-                self.registry
-                    .made(key, self.registry.terms(limit, self.cycle), now),
-            )
+            Arc::new(Entry::with_terms(
+                key.into(),
+                self.registry.terms(contract, self.cycle),
+                now,
+            ))
         });
         self.track(entry);
     }
 
     /// A worker made `entry` in the registry ([`Registry::find_or_make`]): kept and reported
-    /// from now on, as one this participant made — unless it is closed, or already kept. The
-    /// next window of a fixed window it keeps takes the key's record on.
+    /// from now on, as one this participant made — unless it is closed, or already kept.
     pub fn adopt(&mut self, entry: Arc<Entry>) {
-        if entry.snapshot().closed {
+        if entry.snapshot().closed
+            || self
+                .keys
+                .get(&entry.key)
+                .is_some_and(|tracked| Arc::ptr_eq(&tracked.entry, &entry))
+        {
             return;
-        }
-        if let Some(tracked) = self.keys.get(&entry.key) {
-            if Arc::ptr_eq(&tracked.entry, &entry) {
-                return;
-            }
-            let held = &tracked.entry;
-            if held.terms.limit == entry.terms.limit && held.window > 0 {
-                // A window before it, or one made after it for a window later still.
-                if entry.window > held.window {
-                    self.roll(entry, self.last_now);
-                }
-                return;
-            }
         }
         if let Some(old) = self.keys.remove(&entry.key) {
             close(&old.entry);
             self.forget(&entry.key);
         }
         self.track(entry);
-    }
-
-    /// `next`, the key's entry for a later window of its fixed window, takes the key's
-    /// record on from the entry it holds at `now` (06 §4): its reports' numbers, those not
-    /// yet acknowledged, its owner and when it was heard of, and the others admitting. The
-    /// old entry, closed, has what it admitted and the ledger had not sent numbered as a
-    /// report of its window, due to go at the next cycle as one sent again is; past
-    /// [`MOST_UNACKNOWLEDGED`] out, an outage's, it is forgiven.
-    fn roll(&mut self, next: Arc<Entry>, now: u64) {
-        let (scheduled, cycle) = (self.scheduled, self.cycle);
-        let Some(tracked) = self.keys.get_mut(&next.key) else {
-            return;
-        };
-        let old = std::mem::replace(&mut tracked.entry, Arc::clone(&next));
-        // A visit queued, or a key left out of its piece, holds a handle to the old entry,
-        // which a cycle skips as no longer the key's: marked so still, the key would never be
-        // queued again, its hits never reported. Queued anew below.
-        tracked.queued = false;
-        tracked.left_out = false;
-        close(&old);
-        let (count, started) = old.drain(now);
-        tracked.unsent_more(count, started);
-        let unsent = std::mem::take(&mut tracked.unsent);
-        if unsent > 0 && tracked.unacknowledged.as_slice().len() < MOST_UNACKNOWLEDGED {
-            tracked.sent += 1;
-            self.numbered += 1;
-            let unseen = Unseen {
-                sequence: tracked.sent,
-                count: unsent,
-                admitted: tracked.unsent_since,
-                first: now,
-                // Due at once.
-                last: now.saturating_sub(RESEND_AFTER_CYCLES * cycle),
-                window: old.window,
-            };
-            tracked.unacknowledged.push(unseen, &mut self.spare);
-        } else {
-            self.forgiven += unsent;
-        }
-        next.others
-            .store(old.others.load(Ordering::Acquire), Ordering::Release);
-        self.registry.insert(Arc::clone(&next));
-        if scheduled {
-            self.stale += entry_bytes(&old.key);
-            self.evictions.push(Due {
-                at: idle_at(&next),
-                entry: Arc::clone(&next),
-            });
-        }
-        let key = next.key.clone();
-        self.run(&key);
     }
 
     /// Takes `key`, no longer kept, off what it holds — but for its entry while scheduled,
@@ -1850,11 +1491,11 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
 
     /// Decides at `now` a request a worker asked about, under `keys`: as
     /// `DataPlane::decide_all` does, from the shared entries, a key not met before made
-    /// with a full bucket, or an empty window.
-    pub fn decide_all(&mut self, keys: &[(&[u8], Limit)], now: u64) -> Decision {
+    /// with a full bucket.
+    pub fn decide_all(&mut self, keys: &[(&[u8], Contract)], now: u64) -> Decision {
         self.last_now = now;
-        for &(key, limit) in keys {
-            self.ensure(key, limit, now);
+        for &(key, contract) in keys {
+            self.ensure(key, contract, now);
             let Some(tracked) = self.keys.get(key) else {
                 return Decision::Refuse;
             };
@@ -2135,48 +1776,24 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             if !current {
                 continue;
             }
-            // What the copy is rebased on: a bucket's distance from full, or its own window's
-            // count; another window's count rebases nothing (06 §4), and a standing of the
-            // other model's is not about this key's copy at all.
-            let entry = &tracked.entry;
-            let rebase = match (&entry.terms.model, answer.standing) {
-                (Model::Bucket { bucket, .. }, Standing::Bucket { behind }) => {
-                    Rebase::Bucket(bucket, behind)
-                }
-                (Model::Window { .. }, Standing::Window { number, count }) => {
-                    if number == entry.window {
-                        Rebase::Count(count)
-                    } else {
-                        Rebase::Nothing
-                    }
-                }
-                _ => continue,
-            };
-            entry.others.store(answer.others, Ordering::Release);
+            tracked.entry.others.store(answer.others, Ordering::Release);
+            let unseen: u64 = tracked
+                .unacknowledged
+                .as_slice()
+                .iter()
+                .map(|unseen| unseen.count)
+                .sum();
             // The hits the owner has yet to apply.
-            let unapplied = tracked.unapplied();
-            match rebase {
-                Rebase::Bucket(bucket, behind) => {
-                    let units = bucket.units(made);
-                    entry.update(now, |fields| {
-                        let extra = unapplied + fields.unreported;
-                        Some(Fields {
-                            arrival: bucket.rebased(units, behind, extra),
-                            ..fields
-                        })
-                    });
-                }
-                Rebase::Count(count) => {
-                    entry.update(now, |fields| {
-                        let extra = unapplied + fields.unreported;
-                        Some(Fields {
-                            arrival: count.saturating_add(extra).min(MASK),
-                            ..fields
-                        })
-                    });
-                }
-                Rebase::Nothing => {}
-            }
+            let unapplied = unseen + tracked.unsent;
+            let entry = &tracked.entry;
+            let units = entry.terms.bucket.units(made);
+            entry.update(now, |fields| {
+                let extra = unapplied + fields.unreported;
+                Some(Fields {
+                    arrival: entry.terms.bucket.rebased(units, answer.behind, extra),
+                    ..fields
+                })
+            });
             tracked.heard = Heard::at(now);
             queue(tracked, &mut self.runnable);
         }
@@ -2216,7 +1833,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
                 let report = unseen.report(tracked.seen, queued.made);
                 queued.push_entry(BatchEntry {
                     key: key.clone(),
-                    limit: tracked.entry.terms.limit,
+                    contract: tracked.entry.terms.contract,
                     report,
                 });
             }
@@ -2226,23 +1843,23 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
     /// Those of `keys` that would refuse at `now`, by position, with how long each waits.
     pub fn waits<'a>(
         &'a self,
-        keys: &'a [(&[u8], Limit)],
+        keys: &'a [(&[u8], Contract)],
         now: u64,
     ) -> impl Iterator<Item = (usize, u64)> + 'a {
         keys.iter()
             .enumerate()
-            .filter_map(move |(at, (key, limit))| {
+            .filter_map(move |(at, (key, contract))| {
                 let tracked = self
                     .keys
                     .get(key)
-                    .filter(|t| t.entry.terms.limit == *limit)?;
+                    .filter(|t| t.entry.terms.contract == *contract)?;
                 Some((at, tracked.entry.wait(now)?))
             })
     }
 
     /// As `DataPlane::retry_after`.
     #[must_use]
-    pub fn retry_after(&self, keys: &[(&[u8], Limit)], now: u64) -> Option<(usize, u64)> {
+    pub fn retry_after(&self, keys: &[(&[u8], Contract)], now: u64) -> Option<(usize, u64)> {
         longest(self.waits(keys, now))
     }
 

@@ -21,7 +21,7 @@ use edgerush_config::CompiledRateLimitService;
 use edgerush_ratelimit::service::pooled::{
     Decision as Pooled, Entry, Levers, Participant, Registry,
 };
-use edgerush_ratelimit::service::{self, Keyed};
+use edgerush_ratelimit::service::{Contract, Keyed};
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::plane::NodeId;
 use edgerush_ratelimit_service::cluster::pod::exchange_stream;
@@ -74,7 +74,7 @@ pub(crate) enum ToHub {
     Ask {
         worker: usize,
         id: u64,
-        keys: Vec<(Box<[u8]>, service::Limit)>,
+        keys: Vec<(Box<[u8]>, Contract)>,
         until: u64,
         decided: Decision,
     },
@@ -510,7 +510,7 @@ fn run(
 struct Asked {
     /// Its worker's number for the request.
     id: u64,
-    keys: Vec<(Box<[u8]>, service::Limit)>,
+    keys: Vec<(Box<[u8]>, Contract)>,
     /// By when it must be decided: its deadline, set by its worker when it first met the
     /// request, whatever has become of it since.
     until: u64,
@@ -1039,7 +1039,7 @@ async fn open(state: &Rc<State>, stream: &Rc<PodStream>, generation: u64) {
 
 /// The decision of request `asked` at `now`, for its worker.
 fn decided(participant: &mut Plane, asked: Asked, now: u64) -> FromHub {
-    let keys: Vec<(&[u8], service::Limit)> = asked
+    let keys: Vec<(&[u8], Contract)> = asked
         .keys
         .iter()
         .map(|(key, contract)| (&**key, *contract))

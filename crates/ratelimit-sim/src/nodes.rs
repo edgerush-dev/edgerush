@@ -9,7 +9,7 @@ use edgerush_ratelimit::service::pooled::{
     self, Decision as Pooled, Entry, Levers, Local, Participant, Registry,
 };
 use edgerush_ratelimit::service::{
-    self, Answers, Batch, DataPlane, Decision, FixedState, Limit, PlaneId, PodId, ServicePod, View,
+    self, Answers, Batch, DataPlane, Decision, FixedState, PlaneId, PodId, ServicePod, View,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -79,13 +79,6 @@ enum Plane {
     Pooled(Box<Participant<FixedState>>),
 }
 
-/// `keys`' contracts as the pooled participant takes them: the simulator's limits are buckets.
-fn buckets<'a>(keys: &[(&'a [u8], service::Contract)]) -> Vec<(&'a [u8], Limit)> {
-    keys.iter()
-        .map(|(key, contract)| (*key, Limit::Bucket(*contract)))
-        .collect()
-}
-
 impl Plane {
     fn decide_all(&mut self, keys: &[(&[u8], service::Contract)], now: u64) -> Pooled {
         match self {
@@ -93,7 +86,7 @@ impl Plane {
                 Decision::Admit => Pooled::Admit,
                 Decision::Refuse => Pooled::Refuse,
             },
-            Self::Pooled(participant) => participant.decide_all(&buckets(keys), now),
+            Self::Pooled(participant) => participant.decide_all(keys, now),
         }
     }
 
@@ -160,12 +153,12 @@ impl Nodes {
         for (key, contract) in &keys {
             let held = pool.handles[worker]
                 .get(*key)
-                .is_some_and(|entry| entry.limit() == Limit::Bucket(*contract));
+                .is_some_and(|entry| entry.contract() == *contract);
             if held {
                 continue;
             }
             let found = pool.registries[process]
-                .find_or_make(key, Limit::Bucket(*contract), cycle, now)
+                .find_or_make(key, *contract, cycle, now)
                 .map(|(entry, fresh)| {
                     if fresh {
                         made.push(Arc::clone(&entry));
@@ -187,7 +180,7 @@ impl Nodes {
             .map(|(key, contract)| {
                 handles
                     .get(*key)
-                    .filter(|entry| entry.limit() == Limit::Bucket(*contract))
+                    .filter(|entry| entry.contract() == *contract)
             })
             .collect();
         if let Some(held) = held {
@@ -353,7 +346,7 @@ impl Nodes {
     /// Pooled, worker `worker` holds the entries participant `plane` has of `keys`.
     fn give_entries(&mut self, plane: usize, worker: usize, keys: &[(&[u8], service::Contract)]) {
         if let Plane::Pooled(participant) = &self.planes[plane] {
-            let given = participant.entries(&buckets(keys));
+            let given = participant.entries(keys);
             if let Some(pool) = &mut self.pool {
                 for entry in given {
                     pool.handles[worker].insert(entry.key().into(), entry);

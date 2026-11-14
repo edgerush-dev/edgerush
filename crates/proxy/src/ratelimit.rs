@@ -27,7 +27,7 @@ use edgerush_ratelimit::local::{Limit, Window};
 use edgerush_ratelimit::service::pooled::{
     self, Entry, Handle, Local as PooledLocal, Outcome as Pooled, Registry,
 };
-use edgerush_ratelimit::service::{self, Contract, Decided, Keyed, longest};
+use edgerush_ratelimit::service::{Contract, Decided, Keyed, longest};
 use edgerush_rules::{Address, Context, KeyValue, Named, Outcome, Text};
 use http::HeaderName;
 use hub::SYNC;
@@ -360,10 +360,10 @@ impl Places {
 
     /// A place for a request under `parts` to wait in, with room for what it carries, if
     /// both are left.
-    fn take(&self, parts: &[(&[u8], service::Limit)]) -> Option<Reservation> {
+    fn take(&self, parts: &[(&[u8], Contract)]) -> Option<Reservation> {
         let bytes = parts
             .iter()
-            .map(|(key, _)| (key.len() + size_of::<(Box<[u8]>, service::Limit)>()) as u64)
+            .map(|(key, _)| (key.len() + size_of::<(Box<[u8]>, Contract)>()) as u64)
             .sum::<u64>()
             + size_of::<ToHub>() as u64;
         let (held, carried) = (self.held.get(), self.bytes.get());
@@ -449,7 +449,7 @@ pub(crate) struct Limiter {
     /// Where each of a request's keys is put together, one for each limit it can be under,
     /// kept so that no request makes them afresh; and their contracts.
     keys: RefCell<Vec<Vec<u8>>>,
-    contracts: RefCell<Vec<service::Limit>>,
+    contracts: RefCell<Vec<Contract>>,
     /// The clock: its process's.
     start: Instant,
     /// Wakes its task to stop.
@@ -610,7 +610,7 @@ impl Limiter {
                     .enumerate()
                     .filter_map(|(at, (key, contract))| {
                         let entry = handles.get(*key)?.entry();
-                        (entry.limit() == *contract).then_some((at, &**entry))
+                        (entry.contract() == *contract).then_some((at, &**entry))
                     })
                     .unzip();
                 pooled::waits(&held, now)
@@ -644,7 +644,7 @@ impl Limiter {
         limits: &[Arc<CompiledLimit>],
         limited: u64,
         client: KeyedBy<'_>,
-        then: impl FnOnce(&[(&[u8], service::Limit)]) -> R,
+        then: impl FnOnce(&[(&[u8], Contract)]) -> R,
     ) -> R {
         with_keys(&self.keys, &self.contracts, limits, limited, client, then)
     }
@@ -713,7 +713,7 @@ fn decide(
     handles: &RefCell<Handles>,
     registry: &Registry<Keyed>,
     (hub, cycle, room): (&Hub, u64, &Arc<Room>),
-    parts: &[(&[u8], service::Limit)],
+    parts: &[(&[u8], Contract)],
     now: u64,
 ) -> Pooled {
     let ask = Pooled {
@@ -723,7 +723,7 @@ fn decide(
     let held = |handles: &Handles, key: &[u8], contract| {
         handles
             .get(key)
-            .is_some_and(|held| held.entry().limit() == contract)
+            .is_some_and(|held| held.entry().contract() == contract)
     };
     {
         let mut handles = handles.borrow_mut();
@@ -735,7 +735,7 @@ fn decide(
             // process to keep, holding room until it is taken in; with no room, only one
             // there already is found, and the request is asked about otherwise.
             let found = match room.take(key) {
-                None => registry.find(key, *contract, now),
+                None => registry.find(key, *contract),
                 Some(room) => {
                     registry
                         .find_or_make(key, *contract, cycle, now)
@@ -787,7 +787,7 @@ impl Limiter {
     /// What a decision asks of others: with keys visited only when they need it, the keys it
     /// signalled kept to hand over — or, with no room left to keep them, every key asked to
     /// be visited.
-    fn signal(&self, outcome: &Pooled, parts: &[(&[u8], service::Limit)]) {
+    fn signal(&self, outcome: &Pooled, parts: &[(&[u8], Contract)]) {
         if outcome.signal != 0 && self.service.schedule_keys {
             let handles = self.handles.borrow();
             let mut signalled = self.signalled.borrow_mut();
@@ -816,7 +816,7 @@ impl Limiter {
 
     /// A request under `parts`, met at `now`, asked of the process; undecided if it has no
     /// place to wait in among `places`, or the process is gone.
-    fn ask(&self, parts: &[(&[u8], service::Limit)], now: u64, places: &Places) -> Limited {
+    fn ask(&self, parts: &[(&[u8], Contract)], now: u64, places: &Places) -> Limited {
         let Some(place) = places.take(parts) else {
             return Limited::Undecided(Undecided::Full);
         };
@@ -836,12 +836,7 @@ impl Limiter {
     /// sent with it, for the process to answer and to see the request gone by; its place kept
     /// until the process answers. False if the process is gone, its decision dropped with
     /// the message: what waits for it is told it is unavailable.
-    fn send_ask(
-        &self,
-        parts: &[(&[u8], service::Limit)],
-        at: u64,
-        (decided, place): Asked,
-    ) -> bool {
+    fn send_ask(&self, parts: &[(&[u8], Contract)], at: u64, (decided, place): Asked) -> bool {
         let id = self.next.get();
         self.next.set(id.wrapping_add(1));
         let keys = parts
@@ -940,14 +935,6 @@ impl Held for Contract {
             window: limit.window,
             burst,
         })
-    }
-}
-
-/// The asynchronous mode's: a bucket's contract. Windows are refused in that mode as the
-/// config is compiled.
-impl Held for service::Limit {
-    fn of(limit: &CompiledLimit, count: NonZeroU64) -> Option<Self> {
-        Contract::of(limit, count).map(Self::Bucket)
     }
 }
 
@@ -1066,7 +1053,7 @@ mod tests {
     }
 
     /// The asynchronous mode holds a bucket alone: a window, which that mode's config refuses,
-    /// is nothing its owners could be sent (06 §4).
+    /// is no contract its owners could be sent (06 §4).
     #[test]
     fn the_asynchronous_mode_holds_a_bucket_alone() {
         let mut config: edgerush_config::Config = serde_saphyr::from_str(
@@ -1093,7 +1080,7 @@ upstreams: {}
             .map(|limit| {
                 (
                     limit.name.as_str(),
-                    <service::Limit as Held>::of(limit, limit.count),
+                    <Contract as Held>::of(limit, limit.count),
                 )
             })
             .collect();
@@ -1103,11 +1090,11 @@ upstreams: {}
             [
                 (
                     "b",
-                    Some(service::Limit::Bucket(Contract {
+                    Some(Contract {
                         limit: n(10),
                         window: n(1_000_000_000),
                         burst: n(20),
-                    }))
+                    })
                 ),
                 ("f", None),
                 ("r", None),

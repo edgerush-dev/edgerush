@@ -11,7 +11,7 @@
 
 use edgerush_cluster::{Config, NodeId, ms};
 use edgerush_cluster_sim::{Asynchronous, Link, Sim};
-use edgerush_ratelimit::service::{Contract, Limit};
+use edgerush_ratelimit::service::Contract;
 use edgerush_ratelimit_sim::worst_excess;
 use std::num::NonZeroU64;
 
@@ -88,7 +88,7 @@ fn world_with(
     assert!(formed.is_some(), "never formed");
     world.set_default_link(link);
     let keys: Vec<u64> = (0..keys).collect();
-    world.add_planes(planes, &keys, rate, Limit::Bucket(contract));
+    world.add_planes(planes, &keys, rate, contract);
     world.start_sampling();
     world.run_for(ms(500));
     let leader = world.leader();

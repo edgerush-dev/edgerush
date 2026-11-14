@@ -9,7 +9,6 @@
 #![cfg(loom)]
 
 use super::*;
-use crate::service::{Contract, FixedWindow};
 use std::num::NonZeroU64;
 
 const MS: u64 = 1_000_000;
@@ -180,39 +179,5 @@ fn loom_two_clocks_leave_the_record_with_the_words_cycle() {
             entry.record.load(Ordering::Acquire),
             word::record_of(late, CYCLE)
         );
-    });
-}
-
-/// A request on a window's entry racing the transport closing it for the next window (06 §4):
-/// either admitted and drained once into the old window's report, or finding the entry closed
-/// and asking; never admitted and left uncounted.
-#[test]
-fn loom_a_request_racing_a_windows_switch_is_counted_once_or_asks() {
-    loom::model(|| {
-        let n = |n| NonZeroU64::new(n).unwrap();
-        let limit = Limit::FixedWindow(FixedWindow {
-            limit: n(10),
-            length: n(60_000 * MS),
-        });
-        let terms = Arc::new(Terms::new(limit, CYCLE));
-        let old = Arc::new(Entry::with_terms(
-            b"w"[..].into(),
-            terms,
-            0,
-            Some((1, 60_000 * MS)),
-        ));
-        let request = {
-            let old = Arc::clone(&old);
-            loom::thread::spawn(move || decide(&[&old], MS).local)
-        };
-        close(&old);
-        let (drained, _) = old.drain(MS);
-        let local = request.join().unwrap();
-        match local {
-            Local::Admit => assert_eq!(drained, 1, "admitted, drained once"),
-            Local::Ask => assert_eq!(drained, 0),
-            Local::Refuse => panic!("refused within the limit"),
-        }
-        assert_eq!(old.snapshot().unreported, 0, "nothing left behind");
     });
 }

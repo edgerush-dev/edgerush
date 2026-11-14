@@ -13,7 +13,7 @@ use edgerush_cluster::Message as StoreMessage;
 use edgerush_cluster::{Config, Node, NodeId, Time, ms};
 use edgerush_cluster_asynchronous::{Answers, Message, Pod, Routed, Value};
 use edgerush_ratelimit::service::pooled::{Decision, Levers, Participant, Routing};
-use edgerush_ratelimit::service::{Keyed, Limit};
+use edgerush_ratelimit::service::{Contract, Keyed};
 use std::collections::BTreeMap;
 
 /// The time between a data plane's batches.
@@ -37,7 +37,7 @@ pub struct Plane {
     /// The keys it takes requests under, in turn.
     keys: Vec<u64>,
     next: usize,
-    limit: Limit,
+    contract: Contract,
     interval: Time,
     /// When each key's requests were admitted, by the world's clock.
     admitted: BTreeMap<u64, Vec<Time>>,
@@ -148,7 +148,7 @@ impl Mode for Asynchronous {
 
 impl Sim<Asynchronous> {
     /// `count` data planes, each taking `rate` requests a second, spread in turn over `keys`
-    /// shared by all, every key held to `limit`; each knowing the latest table, as a data
+    /// shared by all, every key held to `contract`; each knowing the latest table, as a data
     /// plane is told it when its stream to a pod opens.
     ///
     /// # Panics
@@ -158,7 +158,7 @@ impl Sim<Asynchronous> {
         clippy::expect_used,
         reason = "the simulation runs only where the proxy's participant does"
     )]
-    pub fn add_planes(&mut self, count: u64, keys: &[u64], rate: u64, limit: Limit) {
+    pub fn add_planes(&mut self, count: u64, keys: &[u64], rate: u64, contract: Contract) {
         let interval = 1_000_000_000 / rate.max(1);
         let table = self.table().cloned();
         for _ in 0..count {
@@ -175,7 +175,7 @@ impl Sim<Asynchronous> {
                 data,
                 keys: keys.to_vec(),
                 next: usize::try_from(self.rng.below(keys.len() as u64)).unwrap_or(0),
-                limit,
+                contract,
                 interval,
                 admitted: BTreeMap::new(),
                 requests: 0,
@@ -249,7 +249,7 @@ impl Sim<Asynchronous> {
             plane.next += 1;
             plane.requests += 1;
             let bytes = bytes_of(key);
-            match plane.data.decide_all(&[(&bytes, plane.limit)], now) {
+            match plane.data.decide_all(&[(&bytes, plane.contract)], now) {
                 Decision::Admit => plane.admitted.entry(key).or_default().push(now),
                 Decision::Refuse => plane.refused += 1,
             }

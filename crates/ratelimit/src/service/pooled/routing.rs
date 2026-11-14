@@ -5,7 +5,7 @@
 //! for a pod to send a key through when the owner has gone unanswered, for a pod to poll,
 //! and for the batch a pod is sent; answers reach it as a [`Reply`] whichever it is.
 
-use super::super::{Answers, Batch, PodId, Standing, View};
+use super::super::{Answers, Batch, PodId, View};
 
 /// How a participant reaches the service's pods.
 pub trait Routing: Sized {
@@ -67,8 +67,10 @@ pub struct Reply<R: Routing> {
 pub struct Replied {
     /// The key's hash ([`Participant::hash`](super::Participant::hash)).
     pub key: u64,
-    /// Where the key stands as the owner holds it.
-    pub standing: Standing,
+    /// The bucket as the owner holds it: how far from full ([`Answer::behind`]).
+    ///
+    /// [`Answer::behind`]: super::super::Answer::behind
+    pub behind: u128,
     /// The highest of the data plane's batches applied, every one before it too.
     pub applied: u64,
     /// How many other data planes the owner has seen admit the key lately.
@@ -122,9 +124,7 @@ impl Reply<View> {
                 .iter()
                 .map(|answer| Replied {
                     key: hash(&answer.key),
-                    standing: Standing::Bucket {
-                        behind: answer.behind,
-                    },
+                    behind: answer.behind,
                     applied: answer.applied,
                     others: answer.others,
                 })

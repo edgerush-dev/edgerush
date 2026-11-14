@@ -16,7 +16,7 @@
 )]
 
 use edgerush_ratelimit::service::pooled::{Levers, Participant};
-use edgerush_ratelimit::service::{Answers, Contract, Keyed, Limit, ServicePod, View};
+use edgerush_ratelimit::service::{Answers, Contract, Keyed, ServicePod, View};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
 use std::net::Ipv4Addr;
@@ -52,7 +52,7 @@ fn key(k: u32) -> Vec<u8> {
 fn admit(plane: &mut Plane, keys: impl Iterator<Item = u32>, now: u64) {
     let contract = contract();
     for k in keys {
-        plane.decide_all(&[(&key(k), Limit::Bucket(contract))], now);
+        plane.decide_all(&[(&key(k), contract)], now);
     }
 }
 
