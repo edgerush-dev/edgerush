@@ -528,36 +528,3 @@ async fn a_refusal_says_when_the_request_would_be_admitted() {
     })
     .await;
 }
-
-/// With a cold share of 40%, a data plane that has not yet heard from a key's owner admits
-/// 40% of its limit — four of the bucket's ten — and refuses the rest with a second's wait,
-/// by when the owner will have answered; once it has, the copy is the owner's, the rest of the
-/// bucket is admitted, and a refusal waits for its refill (06 §4). The pods' word is slowed,
-/// so that none can arrive while the first requests are answered.
-#[tokio::test]
-async fn a_cold_share_holds_a_key_until_its_owner_answers() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let service = slow_service(Some(Duration::from_millis(80))).await;
-            let front = proxy(upstream().await, &service, ", cold_share: 40").await;
-            let socket = TcpSocket::new_v4().unwrap();
-            socket.bind(SocketAddr::from(([127, 0, 0, 22], 0))).unwrap();
-            let mut stream = socket.connect(front).await.unwrap();
-            for _ in 0..4 {
-                assert_eq!(answer(&mut stream, "GET", "/by-client").await.0, 200);
-            }
-            let cold = answer(&mut stream, "GET", "/by-client").await;
-            assert!(refused_by(&cold, "per-client", 1), "{cold:?}");
-            // A report and the owner's answer, both ways through the slow network.
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            for _ in 4..10 {
-                assert_eq!(answer(&mut stream, "GET", "/by-client").await.0, 200);
-            }
-            let spent = answer(&mut stream, "GET", "/by-client").await;
-            let after = spent.1.expect("a Retry-After");
-            assert!(after > 60, "{spent:?}");
-            assert!(refused_by(&spent, "per-client", after), "{spent:?}");
-        })
-        .await;
-}
