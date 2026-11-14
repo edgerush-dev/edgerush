@@ -182,6 +182,20 @@ spec:
           status:
             description: Status is what the operator and the control plane report of it.
             properties:
+              authority:
+                description: |-
+                  Authority is the control plane's certificate authority, as its leader
+                  publishes it, under a field manager of its own: what the operator registers
+                  its webhook with.
+                properties:
+                  bundle:
+                    description: |-
+                      Bundle is the certificates, PEM, that its own certificate is trusted by:
+                      its authority's, and while a provided one is replaced the one before
+                      too, as each of its workloads is given them.
+                    maxLength: 65536
+                    type: string
+                type: object
               conditions:
                 description: |-
                   Conditions describe the ControlPlane's state. Known condition types are:

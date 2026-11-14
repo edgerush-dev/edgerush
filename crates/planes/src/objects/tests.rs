@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
+    LabelSelector, LabelSelectorRequirement, ObjectMeta,
+};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use super::{Error, Install, Object, ProxyService, Transports, for_control_plane, for_data_plane};
-use crate::control_plane::ControlPlane;
+use crate::control_plane::{ControlPlane, ControlPlaneStatus, ControlPlaneStatusAuthority};
 use crate::data_plane::{DataPlane, DataPlaneIngress, DataPlaneResources};
 
 fn install() -> Install {
@@ -355,4 +358,173 @@ fn an_ip_family_its_schema_does_not_hold_makes_no_service() {
         ProxyService::of(&dp),
         Err(Error::IpFamily("IPv5".to_owned()))
     );
+}
+
+/// A certificate as PEM, as a bundle holds one; its body is never read here.
+const BUNDLE: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+/// `cp` with its webhook on, its status publishing `bundle`, if any.
+fn hooked(mut cp: ControlPlane, bundle: Option<&str>) -> ControlPlane {
+    cp.spec.webhook.enabled = true;
+    cp.status = bundle.map(|bundle| ControlPlaneStatus {
+        authority: Some(ControlPlaneStatusAuthority {
+            bundle: Some(bundle.to_owned()),
+        }),
+        ..ControlPlaneStatus::default()
+    });
+    cp
+}
+
+/// The webhook registration among `objects`, if there is one.
+fn registration(objects: &[Object]) -> Option<&ValidatingWebhookConfiguration> {
+    objects.iter().find_map(|object| match object {
+        Object::ValidatingWebhookConfiguration(registration) => Some(&**registration),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_webhook_is_registered_only_once_its_authority_s_bundle_is_published() {
+    for bundle in [None, Some(""), Some("not a certificate")] {
+        let objects = for_control_plane(
+            &hooked(control_plane(), bundle),
+            &BTreeSet::new(),
+            &install(),
+        )
+        .unwrap();
+        assert_eq!(registration(&objects), None, "{bundle:?}");
+        // Its listener and its Service's port are there all the same, for the API server to
+        // reach once it is registered.
+        assert!(controller_args(&objects).contains(&"--webhook-listen".to_owned()));
+    }
+    let objects = for_control_plane(
+        &hooked(control_plane(), Some(BUNDLE)),
+        &BTreeSet::new(),
+        &install(),
+    )
+    .unwrap();
+    let registered = registration(&objects).unwrap();
+    assert_eq!(
+        registered.metadata.name.as_deref(),
+        Some("edgerush-controller-payments")
+    );
+    // The cluster's, so owned by nothing: found by its labels, as the classes are.
+    assert_eq!(registered.metadata.namespace, None);
+    assert_eq!(registered.metadata.owner_references, None);
+    let labels = registered.metadata.labels.as_ref().unwrap();
+    assert_eq!(labels[super::CONTROL_PLANE_LABEL], "payments");
+    assert_eq!(labels[super::NAMESPACE_LABEL], "edge");
+    let webhooks = registered.webhooks.as_deref().unwrap();
+    assert_eq!(webhooks.len(), 1);
+    let webhook = &webhooks[0];
+    assert_eq!(webhook.name, "payments.ingresses.gateway.edgerush.dev");
+    assert_eq!(
+        webhook
+            .client_config
+            .ca_bundle
+            .as_ref()
+            .map(|bytes| &bytes.0[..]),
+        Some(BUNDLE.as_bytes())
+    );
+    let service = webhook.client_config.service.as_ref().unwrap();
+    assert_eq!(
+        (
+            service.namespace.as_str(),
+            service.name.as_str(),
+            service.path.as_deref(),
+            service.port
+        ),
+        (
+            "edge",
+            "edgerush-controller-payments",
+            Some("/validate"),
+            Some(443)
+        )
+    );
+    assert_eq!(webhook.client_config.url, None);
+    // Fails open, so that a control-plane outage never blocks a deploy (04 §3).
+    assert_eq!(webhook.failure_policy.as_deref(), Some("Ignore"));
+    assert_eq!(webhook.side_effects, "None");
+    assert_eq!(webhook.timeout_seconds, Some(10));
+    let rules = webhook.rules.as_deref().unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(
+        rules[0].api_groups.as_deref(),
+        Some(&["networking.k8s.io".to_owned()][..])
+    );
+    assert_eq!(
+        rules[0].resources.as_deref(),
+        Some(&["ingresses".to_owned()][..])
+    );
+    assert_eq!(
+        rules[0].operations.as_deref(),
+        Some(&["CREATE".to_owned(), "UPDATE".to_owned()][..])
+    );
+}
+
+#[test]
+fn a_webhook_turned_off_is_neither_registered_nor_listened_for() {
+    let mut cp = hooked(control_plane(), Some(BUNDLE));
+    cp.spec.webhook.enabled = false;
+    let objects = for_control_plane(&cp, &BTreeSet::new(), &install()).unwrap();
+    assert_eq!(registration(&objects), None);
+    assert!(!controller_args(&objects).contains(&"--webhook-listen".to_owned()));
+    let ports: Vec<_> = objects
+        .iter()
+        .find_map(|object| match object {
+            Object::Service(service) => service.spec.as_ref()?.ports.clone(),
+            _ => None,
+        })
+        .unwrap()
+        .into_iter()
+        .filter_map(|port| port.name)
+        .collect();
+    assert_eq!(ports, ["stream"]);
+}
+
+/// What the registration of `cp`'s webhook selects namespaces by.
+fn scoped(cp: ControlPlane) -> Option<LabelSelector> {
+    let objects = for_control_plane(
+        &hooked(cp, Some(BUNDLE)),
+        &BTreeSet::from(["shop".to_owned()]),
+        &install(),
+    )
+    .unwrap();
+    registration(&objects).unwrap().webhooks.as_ref().unwrap()[0]
+        .namespace_selector
+        .clone()
+}
+
+#[test]
+fn a_webhook_is_asked_of_its_watch_scope_alone() {
+    let by_name = Some(LabelSelector {
+        match_labels: Some(BTreeMap::from([(
+            "kubernetes.io/metadata.name".to_owned(),
+            "edge".to_owned(),
+        )])),
+        ..LabelSelector::default()
+    });
+    assert_eq!(scoped(control_plane()), by_name);
+    // A scope not known, as the narrowest.
+    let mut cp = control_plane();
+    cp.spec.watch.namespaces.from = "Elsewhere".to_owned();
+    assert_eq!(scoped(cp), by_name);
+    // A selector's, as the selector, never as the namespaces it selects now: one labelled in
+    // or out is asked of or not with no new registration.
+    let selector = "matchLabels: { team: payments }
+matchExpressions: [{ key: env, operator: In, values: [prod] }]";
+    assert_eq!(
+        scoped(selecting(selector)),
+        Some(LabelSelector {
+            match_labels: Some(BTreeMap::from([("team".to_owned(), "payments".to_owned())])),
+            match_expressions: Some(vec![LabelSelectorRequirement {
+                key: "env".to_owned(),
+                operator: "In".to_owned(),
+                values: Some(vec!["prod".to_owned()]),
+            }]),
+        })
+    );
+    let mut cp = control_plane();
+    cp.spec.watch.namespaces.from = "All".to_owned();
+    assert_eq!(scoped(cp), None);
 }

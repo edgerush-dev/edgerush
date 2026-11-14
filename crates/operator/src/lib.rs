@@ -28,6 +28,7 @@ use edgerush_planes::control_plane::ControlPlane;
 use edgerush_planes::data_plane::DataPlane;
 use edgerush_planes::objects::{Install, MANAGED_BY, MANAGED_BY_LABEL};
 use edgerush_planes::platform_defaults::PlatformDefaults;
+use k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::core::v1::{Namespace, Service, ServiceAccount};
@@ -193,6 +194,7 @@ struct Children {
     autoscalers: Followed<HorizontalPodAutoscaler>,
     disruption_budgets: Followed<PodDisruptionBudget>,
     ingress_classes: Followed<IngressClass>,
+    registrations: Followed<ValidatingWebhookConfiguration>,
     gateway_classes: WhileServed<GatewayClass>,
     gateways: WhileServed<Gateway>,
 }
@@ -212,6 +214,7 @@ impl Children {
             each(&self.autoscalers, &mut children),
             each(&self.disruption_budgets, &mut children),
             each(&self.ingress_classes, &mut children),
+            each(&self.registrations, &mut children),
             self.gateway_classes.seen(&mut children),
             self.gateways.seen(&mut children),
         ];
@@ -258,6 +261,7 @@ pub async fn operate(
         autoscalers: followed(&mut tasks, &api, made.clone(), &changed, &say),
         disruption_budgets: followed(&mut tasks, &api, made.clone(), &changed, &say),
         ingress_classes: followed(&mut tasks, &api, made.clone(), &changed, &say),
+        registrations: followed(&mut tasks, &api, made.clone(), &changed, &say),
         gateway_classes: WhileServed::start(
             GatewayKind::GatewayClass,
             &mut tasks,

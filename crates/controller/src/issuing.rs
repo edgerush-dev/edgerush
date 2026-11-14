@@ -8,7 +8,9 @@
 //! for it to mount. The leader writes each DataPlane's certificate into a Secret its pods
 //! mount, owned by the DataPlane, and writes it again at half its life, or once the
 //! authority's bundle changes. Each workload is known by the SPIFFE ID of its
-//! ServiceAccount, in its ControlPlane's own trust domain.
+//! ServiceAccount, in its ControlPlane's own trust domain. The leader publishes that bundle
+//! in its ControlPlane's status too, under a field manager of its own, for the operator to
+//! register its webhook with: the webhook is served with its own certificate.
 //!
 //! What to write is decided without I/O, of the Secrets and DataPlanes as they are and a
 //! time passed in; [`issue`] is the loop that follows them and writes.
@@ -16,8 +18,11 @@
 use crate::data_plane::accepted_ever;
 use edgerush_certificates::authority::{Authority, Kind, Leaf, Written, renewal_due};
 use edgerush_kubernetes::{ApiServer, Listed, Retry, Scope, follow};
+use edgerush_planes::control_plane::ControlPlane;
 use edgerush_planes::data_plane::DataPlane;
-use edgerush_planes::objects::{controller_name, identity_secret, proxy_name, spiffe_id};
+use edgerush_planes::objects::{
+    SERVICE_MANAGED_BY, controller_name, identity_secret, proxy_name, spiffe_id,
+};
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
@@ -33,6 +38,10 @@ const LOOK: Duration = Duration::from_secs(60);
 
 /// The type of every Secret it writes, as cert-manager writes one.
 const TLS: &str = "kubernetes.io/tls";
+
+/// The field manager it publishes its bundle under, its own, as it writes the data plane's
+/// Service: the operator's conditions beside it are the operator's.
+const MANAGER: &str = SERVICE_MANAGED_BY;
 
 /// How long, once a provided authority is replaced, the control plane keeps its own
 /// certificate of the one before: time for the kubelet to put each workload's new bundle,
@@ -355,6 +364,8 @@ pub async fn issue(
     let mut said: Option<String> = None;
     // Until when its own certificate of a provided authority's predecessor is kept.
     let mut switch_at: Option<i64> = None;
+    // The bundle this replica last published while it led, if it leads still.
+    let mut published: Option<String> = None;
     loop {
         if own.is_closed() {
             return;
@@ -364,6 +375,10 @@ pub async fn issue(
         if secrets_now.listed && planes_now.listed {
             let now = unix_now();
             let leads = leading.as_ref().is_none_or(|leads| *leads.borrow());
+            if !leads {
+                // Another may publish meanwhile: published again on leading again.
+                published = None;
+            }
             let find = |name: &str| {
                 secrets_now
                     .objects
@@ -430,6 +445,34 @@ pub async fn issue(
                         .collect();
                     let remembered: Vec<&str> = remembered.iter().map(String::as_str).collect();
                     let authority = authority.trusting(&remembered, now);
+                    // What its own certificate is trusted by, in its ControlPlane's status
+                    // for the operator to register its webhook with (05 §2): the leader's
+                    // to publish, again only once it changes.
+                    let bundle = authority.trusted_pem();
+                    if leads && published.as_deref() != Some(bundle.as_str()) {
+                        let status = serde_json::json!({ "authority": { "bundle": bundle } });
+                        let control_plane =
+                            format!("ControlPlane {}/{}", issuer.namespace, issuer.control_plane);
+                        match api
+                            .apply_status::<ControlPlane>(
+                                MANAGER,
+                                &issuer.namespace,
+                                &issuer.control_plane,
+                                &status,
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                say(&format!(
+                                    "authority's bundle published in the status of {control_plane}"
+                                ));
+                                published = Some(bundle);
+                            }
+                            Err(error) => say(&format!(
+                                "{control_plane}: its authority's bundle cannot be published: {error}"
+                            )),
+                        }
+                    }
                     // Its own, every replica: one of a predecessor's is kept a while, for
                     // its workloads to be given the new bundle first.
                     let current = own.borrow().clone();

@@ -124,6 +124,11 @@ fn object_at(path: &str) -> String {
             r#","spec":{"gatewayClassName":"edge","listeners":[]}"#.to_owned(),
         ),
         "ingressclasses" => ("networking.k8s.io/v1", "IngressClass", String::new()),
+        "validatingwebhookconfigurations" => (
+            "admissionregistration.k8s.io/v1",
+            "ValidatingWebhookConfiguration",
+            String::new(),
+        ),
         "controlplanes" => (
             "gateway.edgerush.dev/v1alpha1",
             "ControlPlane",
@@ -233,6 +238,7 @@ fn path_of(object: &Object) -> String {
         "GatewayClass" => "gatewayclasses",
         "IngressClass" => "ingressclasses",
         "Gateway" => "gateways",
+        "ValidatingWebhookConfiguration" => "validatingwebhookconfigurations",
         other => panic!("{other}"),
     };
     let metadata = object.metadata();
@@ -243,17 +249,42 @@ fn path_of(object: &Object) -> String {
     }
 }
 
+/// An authority's bundle, as a control plane publishes it; its body is never read here.
+const BUNDLE: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+/// `control_plane` with its authority's `bundle` in its status, as its leader publishes it.
+fn published(mut control_plane: ControlPlane, bundle: &str) -> ControlPlane {
+    let status = control_plane.status.get_or_insert_default();
+    status.authority = Some(
+        edgerush_planes::control_plane::ControlPlaneStatusAuthority {
+            bundle: Some(bundle.to_owned()),
+        },
+    );
+    control_plane
+}
+
 /// Every object made for the control plane and data plane of these tests.
 fn made() -> (Vec<Object>, Vec<Object>) {
     made_of(&data_plane())
 }
 
+/// Every object made for the control plane and data plane of these tests once its bundle is
+/// published, as [`after_first`] has them.
+fn made_published() -> (Vec<Object>, Vec<Object>) {
+    made_for(&published(control_plane("Same"), BUNDLE), &data_plane())
+}
+
 /// Every object made for the control plane of these tests, and for `data_plane` of it.
 fn made_of(data_plane: &DataPlane) -> (Vec<Object>, Vec<Object>) {
+    made_for(&control_plane("Same"), data_plane)
+}
+
+/// Every object made for `control_plane`, and for `data_plane` of it.
+fn made_for(control_plane: &ControlPlane, data_plane: &DataPlane) -> (Vec<Object>, Vec<Object>) {
     let selected = BTreeSet::new();
     (
-        objects::for_control_plane(&control_plane("Same"), &selected, &install()).unwrap(),
-        objects::for_data_plane(data_plane, &control_plane("Same"), &selected, &install()).unwrap(),
+        objects::for_control_plane(control_plane, &selected, &install()).unwrap(),
+        objects::for_data_plane(data_plane, control_plane, &selected, &install()).unwrap(),
     )
 }
 
@@ -349,7 +380,8 @@ async fn an_accepted_resource_is_finalized_then_made_then_reported() {
 }
 
 /// The step after the first, of the resources as the first left them, with every object it
-/// made at version `version`, and the proxy's Deployment with `available` replicas.
+/// made at version `version`, and the proxy's Deployment with `available` replicas; the
+/// control plane's bundle published since, and its webhook registered with it.
 fn after_first(version: &str, available: i32) -> Seen {
     after_first_of(data_plane(), SERVED, version, available)
 }
@@ -362,7 +394,8 @@ fn after_first_of(
     version: &str,
     available: i32,
 ) -> Seen {
-    let (for_control_plane, for_data_plane) = made_of(&data_plane);
+    let (for_control_plane, for_data_plane) =
+        made_for(&published(control_plane("Same"), BUNDLE), &data_plane);
     let mut children = children_of(&for_control_plane, version);
     children.extend(children_of(&for_data_plane, version));
     children.retain(|child| match child.kind {
@@ -392,7 +425,9 @@ fn after_first_of(
     };
     cp.status = Some(edgerush_planes::control_plane::ControlPlaneStatus {
         conditions: Some(wanted("edgerush-controller-edge")),
+        authority: None,
     });
+    let cp = published(cp, BUNDLE);
     dp.status = Some(edgerush_planes::data_plane::DataPlaneStatus {
         conditions: Some(wanted("edgerush-proxy-web")),
     });
@@ -418,7 +453,7 @@ async fn nothing_changed_is_applied_once_and_a_hand_edit_is_applied_again() {
         "{:?}",
         said.0
     );
-    let (for_control_plane, for_data_plane) = made();
+    let (for_control_plane, for_data_plane) = made_published();
     assert_eq!(
         writes(&fake.seen()).len(),
         for_control_plane.len() + for_data_plane.len(),
@@ -843,6 +878,9 @@ async fn a_deleted_resource_has_what_no_owner_reaches_deleted_then_its_finalizer
         [
             format!(
                 "DELETE /apis/rbac.authorization.k8s.io/v1/clusterrolebindings?labelSelector={control}&{background}"
+            ),
+            format!(
+                "DELETE /apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations?labelSelector={control}&{background}"
             ),
             format!(
                 "DELETE /apis/gateway.networking.k8s.io/v1/gatewayclasses?labelSelector={control}&{background}"
@@ -1451,4 +1489,165 @@ async fn a_namespace_newly_selected_has_its_bindings_made_with_nothing_else_chan
     let patched = written(&fake.seen()[before..], "PATCH");
     let path = format!("{ROLE_BINDINGS}/search/rolebindings/edgerush-controller-edge");
     assert!(patched.contains(&path), "{patched:?}");
+}
+
+const REGISTRATION: &str = "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations/edgerush-controller-edge";
+
+/// The bundle the last apply of the webhook's registration trusts, decoded.
+fn registered_bundle(asked: &[Asked]) -> Option<String> {
+    let applied = asked
+        .iter()
+        .rev()
+        .find(|asked| asked.method == "PATCH" && asked.path == format!("{REGISTRATION}{APPLY}"))?;
+    let body: serde_json::Value = serde_json::from_str(&applied.body).unwrap();
+    let encoded = body["webhooks"][0]["clientConfig"]["caBundle"].clone();
+    let bytes: k8s_openapi::ByteString = serde_json::from_value(encoded).unwrap();
+    Some(String::from_utf8(bytes.0).unwrap())
+}
+
+/// [`after_first`] as it was before its control plane published its bundle: nothing in its
+/// status but its conditions, and no registration made.
+fn before_bundle() -> Seen {
+    let mut seen = after_first("1", 1);
+    if let Some(status) = seen.control_planes[0].status.as_mut() {
+        status.authority = None;
+    }
+    seen.children
+        .retain(|child| child.kind != "ValidatingWebhookConfiguration");
+    seen
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_webhook_waits_for_its_authority_s_bundle_then_is_registered_with_it() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let waiting = before_bundle();
+    // Not a step left undone: the ControlPlane's follow says when its status changes.
+    assert!(
+        operator.step(&api, &waiting, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    assert_eq!(registered_bundle(&asked), None, "{:?}", writes(&asked));
+    assert!(
+        !writes(&asked)
+            .iter()
+            .any(|write| write.contains("validatingwebhookconfigurations")),
+        "{:?}",
+        writes(&asked)
+    );
+    assert_eq!(
+        status_written(&asked, CONTROL_PLANE),
+        conditions_of(&[
+            ("Accepted", "True", "Accepted"),
+            ("Programmed", "False", "Pending"),
+        ])
+    );
+    assert_eq!(
+        programmed_message(&asked, CONTROL_PLANE),
+        "ValidatingWebhookConfiguration edgerush-controller-edge is not made until the control \
+         plane publishes its authority's bundle in this status; the rest is made."
+    );
+    // The bundle published, its generation the same: registered, trusting it, and
+    // programmed.
+    let mut published_now = waiting.clone();
+    let status = published_now.control_planes[0].status.as_mut().unwrap();
+    status.conditions = Some(status::conditions(
+        Some(1),
+        Ok(()),
+        &Made::Pending(programmed_message(&asked, CONTROL_PLANE)),
+        "edgerush-controller-edge",
+        true,
+        &[],
+        &time(10),
+    ));
+    published_now.control_planes[0] = published(published_now.control_planes[0].clone(), BUNDLE);
+    let before = fake.seen().len();
+    assert!(
+        operator
+            .step(&api, &published_now, &time(20), &said.say())
+            .await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen()[before..].to_vec();
+    assert_eq!(registered_bundle(&asked).as_deref(), Some(BUNDLE));
+    assert_eq!(
+        status_written(&asked, CONTROL_PLANE),
+        conditions_of(&[
+            ("Accepted", "True", "Accepted"),
+            ("Programmed", "True", "Programmed"),
+        ])
+    );
+    // A later bundle, a root signed again or a provided one replaced, applied the same way.
+    let again = format!("{BUNDLE}{BUNDLE}");
+    let mut rotated = published_now.clone();
+    rotated.control_planes[0] = published(rotated.control_planes[0].clone(), &again);
+    let before = fake.seen().len();
+    assert!(operator.step(&api, &rotated, &time(30), &said.say()).await);
+    assert_eq!(
+        registered_bundle(&fake.seen()[before..]).as_deref(),
+        Some(again.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_webhook_turned_off_has_its_registration_deleted() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let mut seen = after_first("1", 1);
+    seen.control_planes[0].spec.webhook.enabled = false;
+    seen.control_planes[0].metadata.generation = Some(2);
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    assert_eq!(registered_bundle(&asked), None);
+    assert_eq!(
+        written(&asked, "DELETE"),
+        BTreeSet::from([REGISTRATION.to_owned()])
+    );
+    assert!(
+        said.any(
+            "ValidatingWebhookConfiguration edgerush-controller-edge deleted, no longer asked for"
+        ),
+        "{:?}",
+        said.0
+    );
+    // Programmed without it, as nothing waits.
+    assert_eq!(
+        status_written(&asked, CONTROL_PLANE),
+        conditions_of(&[
+            ("Accepted", "True", "Accepted"),
+            ("Programmed", "True", "Programmed"),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_plane_no_longer_accepted_has_its_registration_deleted() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    // Registered while All was allowed; now no allowance is for it, and its webhook would
+    // be asked of namespaces it may no longer read.
+    let all = published(control_plane("All"), BUNDLE);
+    let seen = made_then(&all, &BTreeSet::new(), &all, None);
+    assert!(
+        seen.children
+            .iter()
+            .any(|child| child.kind == "ValidatingWebhookConfiguration")
+    );
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let deleted = written(&fake.seen(), "DELETE");
+    assert!(deleted.contains(REGISTRATION), "{deleted:?}");
 }

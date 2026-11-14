@@ -1,0 +1,11 @@
+# Its webhook on, as by default, and its authority's bundle published in its status by its
+# leader: the webhook registered, trusting that bundle, asked of its own namespace alone.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: payments, namespace: payments-edge, uid: 6f1c2b8e-0000-4000-8000-000000000005 }
+status:
+  authority:
+    bundle: |
+      -----BEGIN CERTIFICATE-----
+      MIIBdzCCAR2gAwIBAgIBATAKBggqhkjOPQQDAjAAMB4XDTI2MTExNDAwMDAwMFoX
+      -----END CERTIFICATE-----

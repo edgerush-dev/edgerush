@@ -12,7 +12,7 @@
 # CRDs, the four roles, the admission policy and the operator, and not Gateway API's CRDs,
 # Ingress alone being a valid install. A backend Service in `edge` sits behind an Ingress
 # of class `edge.web`, for host shop.example. Then:
-#   - ControlPlane `edge` (its webhook off, which waits for its registration) and DataPlane
+#   - ControlPlane `edge` (its webhook off, judged below on a ControlPlane of its own) and DataPlane
 #     `web`, with a Gateway, applied are both accepted, the ControlPlane programmed and the
 #     DataPlane not, waiting on Gateway API's CRDs, and the Ingress is served through the
 #     data plane, reached by `kubectl port-forward`, on certificates the control plane
@@ -40,6 +40,14 @@
 #     team shop through DataPlane `front`, its controller told the selector; a namespace
 #     labelled in is bound and served, one labelled out dropped and its bindings gone, and
 #     the controller is neither rolled nor restarted;
+#   - the admission webhook (docs/05 §2, 04 §3): ControlPlane `hooked`, signing with an
+#     authority the platform provides that is not there yet, has no registration and says
+#     it waits for its bundle; the authority made with openssl, the bundle published in its
+#     status, the webhook is registered trusting it and asked of its own namespace alone;
+#     an Ingress of its class that would be left out is refused with why, one that
+#     translates admitted, one of another class admitted however it is; the webhook turned
+#     off, the registration and the listener gone, that Ingress admitted and judged by the
+#     control plane alone; on again and the ControlPlane deleted, the registration gone;
 #   - a ServiceAccount of a name the operator would use, made by hand, is left alone, and
 #     its ControlPlane says so;
 #   - DataPlane `web` deleted takes with it everything made for it, its IngressClass and
@@ -567,6 +575,144 @@ pass "a namespace labelled out of a Selector scope is dropped and its bindings g
 k delete -n teams dataplane front --timeout=90s >/dev/null
 k delete -n teams controlplane teams --timeout=90s >/dev/null
 k delete platformdefaults default >/dev/null
+
+echo "== the admission webhook"
+# ControlPlane `hooked`, its webhook on as by default, signing with an authority the
+# platform provides, not there yet: nothing is registered until the control plane can
+# publish that authority's bundle.
+registration() {
+    k get validatingwebhookconfiguration edgerush-controller-hooked "$@" 2>/dev/null
+}
+k create namespace hooked >/dev/null
+k apply -f - >/dev/null <<'EOF'
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: hooked, namespace: hooked }
+spec:
+  authority: { secretRef: { name: hooked-ca } }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata: { name: front, namespace: hooked }
+spec:
+  controlPlaneRef: { name: hooked }
+  ingress: { httpPort: 80, httpsPort: 443 }
+EOF
+k -n hooked rollout status deploy/edgerush-controller-hooked --timeout=180s >/dev/null ||
+    fail "ControlPlane hooked's controller never ran"
+until_true 'k -n hooked logs deploy/edgerush-controller-hooked | grep -F "Secret hooked/hooked-ca: the authority provided is not there"' 60 ||
+    fail "the controller does not say it waits for the authority provided"
+k -n hooked get controlplane hooked -o jsonpath='{.status.conditions[?(@.type=="Programmed")].message}' |
+    grep -F "ValidatingWebhookConfiguration edgerush-controller-hooked is not made until the control plane publishes its authority's bundle" >/dev/null ||
+    fail "ControlPlane hooked does not say its registration waits for its bundle: $(condition controlplane/hooked hooked Programmed)"
+! registration >/dev/null || fail "the webhook was registered before its authority's bundle was published"
+pass "the webhook is not registered while its authority is not there, and its ControlPlane says it waits"
+
+# The platform's authority: an intermediate its root signed, with that root as the chain.
+pki=target/kind/operator-pki
+rm -rf "$pki" && mkdir -p "$pki"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+    -subj "/CN=platform root" -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    -keyout "$pki/root.key" -out "$pki/root.crt" 2>/dev/null
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=hooked" \
+    -keyout "$pki/hooked.key" -out "$pki/hooked.csr" 2>/dev/null
+openssl x509 -req -in "$pki/hooked.csr" -CA "$pki/root.crt" -CAkey "$pki/root.key" -days 30 \
+    -extfile <(printf 'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n') \
+    -out "$pki/hooked.crt" 2>/dev/null
+k -n hooked create secret generic hooked-ca --type=kubernetes.io/tls \
+    --from-file=tls.crt="$pki/hooked.crt" --from-file=tls.key="$pki/hooked.key" \
+    --from-file=ca.crt="$pki/root.crt" >/dev/null
+until_true 'registration' 90 ||
+    fail "the webhook is not registered once its authority is there: $(condition controlplane/hooked hooked Programmed)"
+published=$(k -n hooked get controlplane hooked -o jsonpath='{.status.authority.bundle}')
+[ -n "$published" ] || fail "ControlPlane hooked's status publishes no bundle"
+[ "$(registration -o jsonpath='{.webhooks[0].clientConfig.caBundle}' | base64 -d)" = "$published" ] ||
+    fail "the registration does not trust the bundle its ControlPlane's status publishes"
+# Its workloads trust the authority provided, not the platform's root (05 §2).
+[ "$(printf '%s\n' "$published" | openssl x509 -noout -subject)" = "$(openssl x509 -noout -subject -in "$pki/hooked.crt")" ] ||
+    fail "the bundle published is not the authority provided: $(printf '%s\n' "$published" | openssl x509 -noout -subject)"
+[ "$(registration -o jsonpath='{.webhooks[0].namespaceSelector.matchLabels.kubernetes\.io/metadata\.name}')" = hooked ] ||
+    fail "the webhook is asked of more than its own namespace: $(registration -o jsonpath='{.webhooks[0].namespaceSelector}')"
+condition_is controlplane/hooked hooked Programmed "True Programmed" 60 ||
+    fail "ControlPlane hooked, registered: $(condition controlplane/hooked hooked Programmed)"
+pass "registered once its authority's bundle is published, trusting that bundle, asked of its own scope"
+
+# An Ingress of the data plane's class that, alone, does not translate.
+bad_ingress() {
+    k -n hooked apply "$@" -f - 2>&1 <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rewritten
+  annotations: { nginx.ingress.kubernetes.io/rewrite-target: / }
+spec:
+  ingressClassName: hooked.front
+  rules: [{ host: rewritten.example }]
+EOF
+}
+# The API server takes up a registration within moments; until then it admits all.
+refused=
+for _ in $(seq 1 150); do
+    if ! refused=$(bad_ingress --dry-run=server); then
+        break
+    fi
+    refused=
+    sleep 0.2
+done
+[ -n "$refused" ] || fail "an Ingress the data plane would leave out was never refused"
+echo "$refused" | grep -q 'denied the request: not supported yet: annotations' ||
+    fail "refused, but not for why: $refused"
+pass "an Ingress of the class that would be left out is refused at admission, with why, through the operator's registration"
+k -n hooked apply --dry-run=server -f - >/dev/null <<'EOF' ||
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: plain }
+spec:
+  ingressClassName: hooked.front
+  rules:
+    - host: plain.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: shop, port: { number: 80 } } }
+EOF
+    fail "an Ingress that translates was refused"
+k -n hooked apply --dry-run=server -f - >/dev/null <<'EOF' ||
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: theirs
+  annotations: { nginx.ingress.kubernetes.io/rewrite-target: / }
+spec:
+  ingressClassName: nginx
+  rules: [{ host: theirs.example }]
+EOF
+    fail "an Ingress of another class was refused"
+pass "an Ingress that translates is admitted, and one of another class, however it is"
+
+# Turned off: no registration, no listener, and the Ingress judged in status alone.
+k -n hooked patch controlplane hooked --type=merge -p '{"spec":{"webhook":{"enabled":false}}}' >/dev/null
+until_true '! registration' 60 || fail "the webhook turned off is still registered"
+k -n hooked get deploy edgerush-controller-hooked -o jsonpath='{.spec.template.spec.containers[0].args}' |
+    grep -F -- --webhook-listen >/dev/null && fail "the webhook turned off is still listened for"
+k -n hooked rollout status deploy/edgerush-controller-hooked --timeout=180s >/dev/null ||
+    fail "ControlPlane hooked's controller, its webhook off, never ran"
+admitted=$(bad_ingress) || fail "with the webhook off, an Ingress that would be left out is refused: $admitted"
+until_true 'k -n hooked logs deploy/edgerush-controller-hooked | grep -F "hooked/rewritten"' 60 ||
+    fail "with the webhook off, the control plane says nothing of the Ingress left out"
+pass "the webhook turned off: no registration and no listener, and the Ingress admitted, judged by the control plane alone"
+k -n hooked delete ingress rewritten >/dev/null
+
+# On again, then the ControlPlane deleted: its registration goes with it.
+k -n hooked patch controlplane hooked --type=merge -p '{"spec":{"webhook":{"enabled":true}}}' >/dev/null
+until_true 'registration' 90 || fail "the webhook turned on again is not registered"
+k -n hooked delete dataplane front --timeout=90s >/dev/null
+k -n hooked delete controlplane hooked --wait=false >/dev/null
+until_true '! registration && ! k -n hooked get controlplane hooked' 90 ||
+    fail "ControlPlane hooked deleted left its registration"
+pass "a ControlPlane deleted takes its webhook's registration"
 
 echo "== not the operator's"
 k create namespace own >/dev/null

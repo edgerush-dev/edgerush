@@ -218,7 +218,8 @@ fn open() -> Answer {
 }
 
 /// Runs [`issue`] against a fake that lists `secrets` and `planes` in `edge` and answers
-/// every write 201, until `done` holds of what it said and what it was asked.
+/// every write 201, and the ControlPlane's status applied 200, until `done` holds of what it
+/// said and what it was asked.
 async fn run(
     name: &str,
     secrets: Vec<serde_json::Value>,
@@ -254,6 +255,7 @@ async fn run_as(
                 page("DataPlane", &planes)
             }
             ("POST" | "PUT", _) => answer(201, "{}"),
+            ("PATCH", path) if path.starts_with(STATUS) => answer(200, "{}"),
             _ => answer(500, ""),
         }
     })
@@ -290,6 +292,77 @@ async fn run_as(
 
 fn json<T: serde::Serialize>(value: &T) -> serde_json::Value {
     serde_json::to_value(value).unwrap()
+}
+
+/// Where its ControlPlane's status is applied.
+const STATUS: &str = "/apis/gateway.edgerush.dev/v1alpha1/namespaces/edge/controlplanes/payments/status?fieldManager=edgerush-controller&force=true";
+
+/// The bundles published in its ControlPlane's status, each as applied.
+fn published(fake: &Fake) -> Vec<String> {
+    fake.seen()
+        .into_iter()
+        .filter(|seen| seen.method == "PATCH" && seen.path == STATUS)
+        .map(|seen| {
+            let body: serde_json::Value = serde_json::from_str(&seen.body).unwrap();
+            assert_eq!(body["kind"], "ControlPlane");
+            // Nothing but its own field: the operator's conditions are left to it.
+            assert_eq!(
+                body["status"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .collect::<Vec<_>>(),
+                ["authority"]
+            );
+            body["status"]["authority"]["bundle"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_leader_alone_publishes_its_authority_s_bundle_once() {
+    let authority = Authority::make("payments", now()).unwrap();
+    let stored = secret(
+        "edgerush-controller-payments-authority",
+        "edge",
+        &authority.written(),
+        None,
+        Some("2".to_owned()),
+    );
+    let (fake, said, own) = run(
+        "issuing-publish",
+        vec![json(&stored)],
+        Vec::new(),
+        true,
+        |said, _, own| own.is_some() && said.iter().any(|line| line.contains("published")),
+    )
+    .await;
+    assert_eq!(
+        said.iter()
+            .filter(|line| line.contains("published"))
+            .collect::<Vec<_>>(),
+        ["authority's bundle published in the status of ControlPlane edge/payments"]
+    );
+    // What its own certificate is trusted by, which the webhook is served with.
+    let bundle = authority.trusted_pem();
+    assert_eq!(published(&fake), std::slice::from_ref(&bundle));
+    assert_eq!(own.unwrap().bundle, bundle);
+    let (fake, said, own) = run(
+        "issuing-publish-follower",
+        vec![json(&stored)],
+        Vec::new(),
+        false,
+        |_, _, own| own.is_some(),
+    )
+    .await;
+    assert!(
+        published(&fake).is_empty(),
+        "a follower published: {said:?}"
+    );
+    assert!(own.is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -482,6 +555,8 @@ async fn a_replaced_provided_authority_is_remembered_from_its_workloads_secrets(
         .trusting(&[&held.bundle], now)
         .trusted_pem();
     assert_eq!(own.bundle, both, "{said:?}");
+    // And so does the webhook's registration, by the bundle published.
+    assert_eq!(published(&fake), std::slice::from_ref(&both));
     // Its certificate, written again of the new, trusting both until it is mounted.
     let put = fake
         .seen()

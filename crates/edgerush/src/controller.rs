@@ -49,7 +49,7 @@ Usage: edgerush controller (--data-plane <FILE> | --control-plane <NAME> [--clus
                               | --authority <SECRET> [--authority-provided])
           [--own-name <NAME>]...]
          [--leader-lease <NAMESPACE>/<NAME>]
-         [--webhook-listen <ADDRESS> --webhook-certificate <FILE> --webhook-key <FILE>]
+         [--webhook-listen <ADDRESS> [--webhook-certificate <FILE> --webhook-key <FILE>]]
          [--metrics <ADDRESS>]
 
 Runs a control plane for one data plane, in a cluster: follows the IngressClasses,
@@ -81,9 +81,11 @@ Lease's namespace, <LEASE>-acks-<HOSTNAME>, owned by its Pod where EDGERUSH_POD_
 the Pod's UID, for the leader to merge.
 With --webhook-listen, it serves the admission webhook there, HTTPS, reviews POSTed to
 /validate: an Ingress of the data plane's class is refused where, alone, it does not
-translate into something the data plane accepts. Its certificate and key are read again
-every second; until the IngressClasses are listed it answers 503, which the API server
-takes as an outage, admitting the Ingress where the webhook fails open.
+translate into something the data plane accepts. Its certificate and key are files read
+again every second, or, with --authority and no files, the control plane's own certificate,
+as the stream is served with, each one signed taking the next connection; nothing is
+answered until the first is. Until the IngressClasses are listed it answers 503, which the
+API server takes as an outage, admitting the Ingress where the webhook fails open.
 A BackendTLSPolicy's `wellKnownCACertificates: System` trusts the authorities its own
 system does, read as it starts: the PEM file SSL_CERT_FILE names, else the system's bundle,
 /etc/ssl/certs/ca-certificates.crt, /etc/ssl/cert.pem or /etc/pki/tls/certs/ca-bundle.crt,
@@ -143,7 +145,7 @@ Options:
                              election
       --webhook-listen <ADDRESS>
                              Serve the admission webhook on ADDRESS, such as [::]:8443;
-                             given with the two below
+                             given with the two below, or with --authority alone
       --webhook-certificate <FILE>
                              The webhook's certificate, then its intermediates
       --webhook-key <FILE>   Its private key
@@ -224,9 +226,11 @@ pub(crate) fn command(
                 }
                 None => None,
             };
-            let webhook = match &options.webhook {
-                Some(webhook) => Some(runtime.block_on(webhook_certificate(&webhook.files))?),
-                None => None,
+            let webhook = match options.webhook.as_deref() {
+                Some(Webhook {
+                    files: Some(files), ..
+                }) => Some(runtime.block_on(webhook_certificate(files))?),
+                _ => None,
             };
             let api = ApiServer::in_cluster().map_err(|error| outside(&error))?;
             Ok((plane, stream, webhook, api))
@@ -277,7 +281,11 @@ pub(crate) fn command(
                             reread: REREAD,
                         }
                     }
-                    (Initial::Signed { api, issuer }, _) => Credentialing::Signed { api, issuer },
+                    (Initial::Signed { api, issuer }, _) => Credentialing::Signed {
+                        api,
+                        issuer,
+                        own: watch::channel(None).0,
+                    },
                     (Initial::Files(_), StreamCredentials::Authority { .. }) => {
                         return writeln!(stderr, "error: the stream's credentials are not its own")
                             .map_or(1, |()| 1);
@@ -293,8 +301,32 @@ pub(crate) fn command(
         }
         _ => None,
     };
-    let hooking = match (&options.webhook, webhook_certificate) {
-        (Some(webhook), Some(certificate)) => {
+    let certifying = match (options.webhook.as_deref(), webhook_certificate) {
+        (
+            Some(Webhook {
+                files: Some(files), ..
+            }),
+            Some(certificate),
+        ) => Some(Certifying::Files {
+            files: files.clone(),
+            certificate,
+            reread: REREAD,
+        }),
+        // The control plane's own certificate, which the issuer signs for the stream too.
+        (Some(Webhook { files: None, .. }), _) => match serving.as_ref().map(|s| &s.credentials) {
+            Some(Credentialing::Signed { own, .. }) => Some(Certifying::Signed(own.subscribe())),
+            _ => {
+                return writeln!(
+                    stderr,
+                    "error: the webhook's certificate is not signed here"
+                )
+                .map_or(1, |()| 1);
+            }
+        },
+        _ => None,
+    };
+    let hooking = match (&options.webhook, certifying) {
+        (Some(webhook), Some(certifying)) => {
             let listener = match std::net::TcpListener::bind(webhook.listen) {
                 Ok(listener) => listener,
                 Err(error) => {
@@ -313,9 +345,7 @@ pub(crate) fn command(
             Some(Hooking {
                 api,
                 listener,
-                files: webhook.files.clone(),
-                certificate,
-                reread: REREAD,
+                certifying,
             })
         }
         _ => None,
@@ -459,22 +489,27 @@ pub(crate) fn own_namespace_name() -> Result<String, String> {
     Ok(name)
 }
 
-/// The next certificate the issuer signs that has not been taken yet, as the stream's
-/// credentials, waited for until it signs one; none once it is gone. Each is taken once.
-async fn next_signed(signed: &mut watch::Receiver<Option<Written>>) -> Option<Credentials> {
+/// The next certificate the issuer signs that has not been taken yet, waited for until it
+/// signs one; none once it is gone. Each is taken once.
+async fn next_written(signed: &mut watch::Receiver<Option<Written>>) -> Option<Written> {
     loop {
         // At once for one not yet seen; else once another comes.
         signed.changed().await.ok()?;
         if let Some(written) = signed.borrow_and_update().clone() {
-            return Some(Credentials {
-                certificate: Certificate {
-                    chain: written.certificate,
-                    key: written.key,
-                },
-                authorities: written.bundle,
-            });
+            return Some(written);
         }
     }
+}
+
+/// [`next_written`], as the stream's credentials.
+async fn next_signed(signed: &mut watch::Receiver<Option<Written>>) -> Option<Credentials> {
+    next_written(signed).await.map(|written| Credentials {
+        certificate: Certificate {
+            chain: written.certificate,
+            key: written.key,
+        },
+        authorities: written.bundle,
+    })
 }
 
 /// The config stream, as the command line gives it.
@@ -497,7 +532,8 @@ enum StreamCredentials {
 #[derive(Debug, PartialEq, Eq)]
 struct Webhook {
     listen: SocketAddr,
-    files: CertificateFiles,
+    /// Its certificate's files; none for the control plane's own, which it signs (05 §2).
+    files: Option<CertificateFiles>,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -542,7 +578,9 @@ enum UsageError {
     WebhookListen(String),
     #[error("'--metrics {0}' is not an address and a port, such as [::]:9090")]
     Metrics(String),
-    #[error("'--webhook-listen', '--webhook-certificate' and '--webhook-key' are given together")]
+    #[error(
+        "'--webhook-listen' is given with '--webhook-certificate' and '--webhook-key', or alone with '--authority'"
+    )]
     WebhookTogether,
     #[error("'--own-name {0}': {1}")]
     OwnName(String, edgerush_config::DnsNameError),
@@ -726,10 +764,22 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         (None, None, None, None, None) => None,
         _ => return Err(UsageError::Together),
     };
+    let signs = matches!(
+        stream.as_deref(),
+        Some(Stream {
+            credentials: StreamCredentials::Authority { .. },
+            ..
+        })
+    );
     let webhook = match (webhook_listen, webhook_certificate, webhook_key) {
         (Some(listen), Some(certificate), Some(key)) => Some(Box::new(Webhook {
             listen,
-            files: CertificateFiles { certificate, key },
+            files: Some(CertificateFiles { certificate, key }),
+        })),
+        // Served with the control plane's own certificate, as the stream is.
+        (Some(listen), None, None) if signs => Some(Box::new(Webhook {
+            listen,
+            files: None,
         })),
         (None, None, None) => None,
         _ => return Err(UsageError::WebhookTogether),
@@ -806,11 +856,19 @@ struct Hooking {
     /// A client of its own, for the IngressClasses it follows.
     api: ApiServer,
     listener: std::net::TcpListener,
-    files: CertificateFiles,
-    /// What the files held as it started.
-    certificate: Certificate,
-    /// How often the files are read again.
-    reread: Duration,
+    certifying: Certifying,
+}
+
+/// Where the webhook's certificate comes from.
+enum Certifying {
+    /// Files, what they held as it started, and how often they are read again.
+    Files {
+        files: CertificateFiles,
+        certificate: Certificate,
+        reread: Duration,
+    },
+    /// The control plane's own, each as the issuer signs it (05 §2).
+    Signed(watch::Receiver<Option<Written>>),
 }
 
 /// The stream's credentials as it starts.
@@ -829,8 +887,13 @@ enum Credentialing {
         credentials: Credentials,
         reread: Duration,
     },
-    /// Signed from the authority, by the issuer (05 §2).
-    Signed { api: Box<ApiServer>, issuer: Issuer },
+    /// Signed from the authority, by the issuer (05 §2), each handed to `own`, which the
+    /// webhook too may be served from.
+    Signed {
+        api: Box<ApiServer>,
+        issuer: Issuer,
+        own: watch::Sender<Option<Written>>,
+    },
 }
 
 /// The config stream, ready to be served.
@@ -1047,10 +1110,10 @@ async fn control_until(
                         move |changed| telling(&replaced(changed, &tls)),
                     )));
                 }
-                Credentialing::Signed { api, issuer } => {
+                Credentialing::Signed { api, issuer, own } => {
                     // Its own certificate, as the issuer signs it: the stream is served from
                     // the first on, each after it taking the next connection (05 §2).
-                    let (own, mut signed) = watch::channel(None);
+                    let mut signed = own.subscribe();
                     let telling = Rc::clone(&say);
                     tasks.push(tokio::task::spawn_local(issuing::issue(
                         *api,
@@ -1329,21 +1392,28 @@ fn said_runs(pods: &watch::Sender<Pods>, runs: &Runs) {
 /// Serves the webhook `hooking` holds on a thread and runtime of its own (04 §3), so that a
 /// flood of reviews, which anyone in the cluster can send, costs only its answers: the
 /// IngressClasses followed on its own client, each review judged for the data plane the
-/// settings `planes` holds as it comes describe, and its certificate files read again. What it says goes to `said`, a line each;
-/// it stops once `stop` is done, or dropped, and tells `ended` as it ends.
+/// settings `planes` holds as it comes describe, and its certificate files read again, or
+/// each certificate the issuer signs taken, nothing answered until the first. What it says
+/// goes to `said`, a line each; it stops once `stop` is done, or dropped, and tells `ended`
+/// as it ends.
 ///
 /// # Errors
 ///
-/// If its certificate cannot be used, its listener cannot be made, or the thread or its
-/// runtime cannot be started.
+/// If its certificate files cannot be used, its listener cannot be made, or the thread or
+/// its runtime cannot be started.
 fn hook(
     hooking: Hooking,
     planes: watch::Receiver<Option<edgerush_controller::Settings>>,
     said: mpsc::UnboundedSender<String>,
-    stop: oneshot::Receiver<()>,
+    mut stop: oneshot::Receiver<()>,
     ended: oneshot::Sender<()>,
 ) -> io::Result<()> {
-    let acceptor = webhook_acceptor(&hooking.certificate).map_err(io::Error::other)?;
+    let from_files = match &hooking.certifying {
+        Certifying::Files { certificate, .. } => {
+            Some(webhook_acceptor(certificate).map_err(io::Error::other)?)
+        }
+        Certifying::Signed(_) => None,
+    };
     hooking.listener.set_nonblocking(true)?;
     let runtime = Builder::new_current_thread().enable_all().build()?;
     std::thread::Builder::new()
@@ -1361,17 +1431,53 @@ fn hook(
                     })
                     .await;
                 });
-                let tls = watch::Sender::new(Arc::new(acceptor));
                 let replacing = said.clone();
-                let accepting = tls.subscribe();
-                let rereading = tokio::task::spawn_local(reread(
-                    hooking.files,
-                    hooking.certificate,
-                    hooking.reread,
-                    move |changed| {
-                        let _gone = replacing.send(webhook_replaced(changed, &tls));
-                    },
-                ));
+                let (accepting, rereading) = match (hooking.certifying, from_files) {
+                    (
+                        Certifying::Files {
+                            files,
+                            certificate,
+                            reread: every,
+                        },
+                        Some(acceptor),
+                    ) => {
+                        let tls = watch::Sender::new(Arc::new(acceptor));
+                        let accepting = tls.subscribe();
+                        let rereading = tokio::task::spawn_local(reread(
+                            files,
+                            certificate,
+                            every,
+                            move |changed| {
+                                let _gone = replacing.send(webhook_replaced(changed, &tls));
+                            },
+                        ));
+                        (accepting, rereading)
+                    }
+                    (Certifying::Signed(mut signed), _) => {
+                        // Nothing taken from the listener until the first it can serve with:
+                        // the API server, unanswered, admits as for an outage.
+                        let first = tokio::select! {
+                            first = first_signed(&mut signed, &replacing) => first,
+                            _ = &mut stop => None,
+                        };
+                        let Some(first) = first else {
+                            following.abort();
+                            return;
+                        };
+                        let tls = watch::Sender::new(Arc::new(first));
+                        let accepting = tls.subscribe();
+                        let rereading = tokio::task::spawn_local(async move {
+                            while let Some(next) = next_written(&mut signed).await {
+                                let _gone = replacing.send(webhook_signed(&next, &tls));
+                            }
+                        });
+                        (accepting, rereading)
+                    }
+                    (Certifying::Files { .. }, None) => {
+                        following.abort();
+                        return;
+                    }
+                };
                 match tokio::net::TcpListener::from_std(hooking.listener) {
                     Ok(listener) => {
                         webhook::serve(
@@ -1430,6 +1536,45 @@ fn review(plane: Option<&Plane>, classes: &Listed<IngressClass>, body: &[u8]) ->
             )
         }
         Err(error) => answer(StatusCode::BAD_REQUEST, error.to_string().into_bytes()),
+    }
+}
+
+/// The first certificate the issuer signs that the webhook can serve with, those it cannot
+/// said to `said`; none once the issuer is gone.
+async fn first_signed(
+    signed: &mut watch::Receiver<Option<Written>>,
+    said: &mpsc::UnboundedSender<String>,
+) -> Option<SslAcceptor> {
+    loop {
+        let written = next_written(signed).await?;
+        match webhook_acceptor(&own_certificate(&written)) {
+            Ok(acceptor) => return Some(acceptor),
+            Err(error) => {
+                let _gone = said.send(format!("the webhook's certificate cannot be used: {error}"));
+            }
+        }
+    }
+}
+
+/// The certificate and key of the control plane's own certificate `written`.
+fn own_certificate(written: &Written) -> Certificate {
+    Certificate {
+        chain: written.certificate.clone(),
+        key: written.key.clone(),
+    }
+}
+
+/// What is said of the issuer signing the control plane's own certificate again: put to use
+/// for the webhook's next connection, or kept from it if it cannot be used.
+fn webhook_signed(written: &Written, tls: &watch::Sender<Arc<SslAcceptor>>) -> String {
+    match webhook_acceptor(&own_certificate(written)) {
+        Ok(replaced) => {
+            tls.send_replace(Arc::new(replaced));
+            "the webhook's certificate is replaced".to_owned()
+        }
+        Err(error) => {
+            format!("the webhook's certificate cannot be used, and the last is kept: {error}")
+        }
     }
 }
 

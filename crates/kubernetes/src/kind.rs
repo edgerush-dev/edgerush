@@ -2,8 +2,8 @@
 //! EndpointSlices; the control plane's Ingresses, IngressClasses, Services and Secrets, the
 //! Gateway API's kinds and their CRDs ([04 §1](../../../docs/04-control-plane.md)), and the
 //! Lease its replicas elect a leader by ([02 §3](../../../docs/02-architecture.md)); and the
-//! ControlPlanes and DataPlanes the operator makes its objects for, and those objects
-//! ([05 §2](../../../docs/05-operator.md)); the DataPlanes a control plane reads its data
+//! ControlPlanes and DataPlanes the operator makes its objects for, and those objects, a
+//! ControlPlane's webhook registration among them ([05 §2](../../../docs/05-operator.md)); the DataPlanes a control plane reads its data
 //! plane's settings from (05 §3).
 
 use crate::ApiError;
@@ -20,6 +20,7 @@ use edgerush_gateway_api::udp_route::UDPRoute;
 use edgerush_planes::control_plane::ControlPlane;
 use edgerush_planes::data_plane::DataPlane;
 use edgerush_planes::platform_defaults::PlatformDefaults;
+use k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::coordination::v1::Lease;
@@ -201,6 +202,10 @@ impl Kind for PodDisruptionBudget {
 }
 
 impl Kind for ClusterRoleBinding {
+    const NAMESPACED: bool = false;
+}
+
+impl Kind for ValidatingWebhookConfiguration {
     const NAMESPACED: bool = false;
 }
 
