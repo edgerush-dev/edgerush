@@ -59,6 +59,7 @@ pub mod data_plane;
 pub mod expiry;
 mod gateway_status;
 pub mod issuing;
+pub mod own_pods;
 pub mod service;
 pub mod status;
 

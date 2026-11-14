@@ -20,6 +20,7 @@ use edgerush_controller::admission::{self, Asked};
 use edgerush_controller::data_plane::{self, follow_data_planes};
 use edgerush_controller::expiry::Expiry;
 use edgerush_controller::issuing::{self, Issuer};
+use edgerush_controller::own_pods::follow_own_pods;
 use edgerush_controller::{
     Acks, Debounce, Membership, Reports, Said, ServiceNow, WatchScope, control,
 };
@@ -29,7 +30,7 @@ use edgerush_translate::{Plane, Translation};
 use http::StatusCode;
 use k8s_openapi::api::networking::v1::IngressClass;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::future::{Future, poll_fn};
 use std::io::{self, Write};
@@ -46,8 +47,7 @@ pub(crate) const USAGE: &str = "\
 Usage: edgerush controller (--data-plane <FILE> | --control-plane <NAME> [--cluster-domain <DOMAIN>])
          [--namespace <NAME>... | --namespace-selector <SELECTOR>] [--write-config <FILE>]
          [--listen <ADDRESS> (--certificate <FILE> --key <FILE> --authorities <FILE>
-                              | --authority <SECRET> [--authority-provided])
-          [--own-name <NAME>]...]
+                              | --authority <SECRET> [--authority-provided])]
          [--leader-lease <NAMESPACE>/<NAME>]
          [--webhook-listen <ADDRESS> [--webhook-certificate <FILE> --webhook-key <FILE>]]
          [--metrics <ADDRESS>]
@@ -64,9 +64,10 @@ its default: no authorities for wss backends, the data plane's own settings left
 With --listen, it serves the config stream there, gRPC over mutual TLS that data planes
 dial: each config translated is offered to every data plane, and what each says of it is
 said on stderr. The certificate, key and authorities are PEM files, read again every
-second, so that ones replaced serve the next connection. With --own-name, the addresses
-the names resolve to, the gateway's own pods, are sent on the stream too, for data planes
-never to send a request to.
+second, so that ones replaced serve the next connection. With --control-plane, the
+addresses of the gateway's own pods, every endpoint of its own Service and of the data
+plane's, ready or not, as the EndpointSlices of the pod's own namespace say them, are sent
+on the stream too, for data planes never to send a request to.
 Where the data plane is a Gateway, its GatewayClass, the Gateway and each HTTPRoute of it
 say in their status what is served of them, the Gateway programmed once every ready pod of
 the data plane runs its generation, as the data planes say on the stream.
@@ -135,10 +136,6 @@ Options:
                              signs its own certificate from it, and the leader writes
                              each DataPlane's into a Secret its pods mount
       --authority-provided   The authority is the platform's, never made or written
-      --own-name <NAME>      A headless Service's name whose pods are the gateway's own:
-                             the data planes', the control plane's or the rate-limiting
-                             service's, given once for each; looked up again as each
-                             answer's time to live runs out, with --listen
       --leader-lease <NAMESPACE>/<NAME>
                              The Lease the controller's replicas elect a leader by, which
                              alone writes the Service and status; left out, there is no
@@ -233,9 +230,19 @@ pub(crate) fn command(
                 _ => None,
             };
             let api = ApiServer::in_cluster().map_err(|error| outside(&error))?;
-            Ok((plane, stream, webhook, api))
+            // The gateway's own pods, where the stream is served of a followed DataPlane, on
+            // a client of their own.
+            let own_pods = match (&options.settings, &options.stream) {
+                (Settings::DataPlane { control_plane, .. }, Some(_)) => Some(OwnPods {
+                    api: ApiServer::in_cluster().map_err(|error| outside(&error))?,
+                    namespace: own_namespace()?,
+                    control_plane: control_plane.clone(),
+                }),
+                _ => None,
+            };
+            Ok((plane, stream, webhook, api, own_pods))
         });
-    let (plane, credentials, webhook_certificate, api) = match started {
+    let (plane, credentials, webhook_certificate, api, own_pods) = match started {
         Ok(started) => started,
         Err(failure) => {
             return writeln!(stderr, "error: {failure}").map_or(1, |()| crate::EXIT_USAGE);
@@ -292,11 +299,7 @@ pub(crate) fn command(
                     }
                 },
                 versions: Versions::new(started_at()),
-                own: Own {
-                    names: options.own_names.clone(),
-                    nameservers: crate::resolver::system_nameservers(),
-                    pace: crate::resolver::Pace::default(),
-                },
+                own: own_pods,
             })
         }
         _ => None,
@@ -440,8 +443,6 @@ struct Options {
     scope: WatchScope,
     write_config: Option<PathBuf>,
     stream: Option<Box<Stream>>,
-    /// The names whose addresses are the gateway's own pods, sent on the stream.
-    own_names: Vec<String>,
     /// The Lease a leader is elected by, as its namespace and name, if one is.
     leader: Option<(String, String)>,
     webhook: Option<Box<Webhook>>,
@@ -582,12 +583,6 @@ enum UsageError {
         "'--webhook-listen' is given with '--webhook-certificate' and '--webhook-key', or alone with '--authority'"
     )]
     WebhookTogether,
-    #[error("'--own-name {0}': {1}")]
-    OwnName(String, edgerush_config::DnsNameError),
-    #[error("'--own-name {0}' is given twice")]
-    OwnNameTwice(String),
-    #[error("'--own-name' is for the config stream, and needs '--listen'")]
-    OwnNameWithoutStream,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
@@ -606,7 +601,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut webhook_certificate = None;
     let mut webhook_key = None;
     let mut metrics = None;
-    let mut own_names: Vec<String> = Vec::new();
     let mut scope = Vec::new();
     let mut selector = None;
     while let Some(arg) = args.next() {
@@ -634,7 +628,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             "--webhook-listen" => "--webhook-listen",
             "--webhook-certificate" => "--webhook-certificate",
             "--webhook-key" => "--webhook-key",
-            "--own-name" => "--own-name",
             "--metrics" => "--metrics",
             _ => return Err(UsageError::Unexpected(arg)),
         };
@@ -681,15 +674,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                 if authority.replace(value).is_some() {
                     return Err(UsageError::Twice(option));
                 }
-                continue;
-            }
-            "--own-name" => {
-                let host = edgerush_config::DnsName::host(&value)
-                    .map_err(|error| UsageError::OwnName(value.clone(), error))?;
-                if own_names.contains(&host) {
-                    return Err(UsageError::OwnNameTwice(value));
-                }
-                own_names.push(host);
                 continue;
             }
             "--leader-lease" => {
@@ -784,9 +768,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         (None, None, None) => None,
         _ => return Err(UsageError::WebhookTogether),
     };
-    if !own_names.is_empty() && stream.is_none() {
-        return Err(UsageError::OwnNameWithoutStream);
-    }
     let settings = match (data_plane, control_plane, cluster_domain) {
         (Some(_), Some(_), _) => return Err(UsageError::Settings),
         (Some(_), None, Some(_)) => return Err(UsageError::ClusterDomainWithoutControlPlane),
@@ -816,7 +797,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         scope,
         write_config,
         stream,
-        own_names,
         leader,
         webhook,
         metrics,
@@ -901,16 +881,16 @@ struct Serving {
     listener: std::net::TcpListener,
     credentials: Credentialing,
     versions: Versions,
-    /// The names whose addresses are the gateway's own pods, the nameservers they are asked
-    /// of, and at what pace.
-    own: Own,
+    /// Where the gateway's own pods are followed, if they are.
+    own: Option<OwnPods>,
 }
 
-/// The names whose addresses are the gateway's own pods, and how they are resolved.
-struct Own {
-    names: Vec<String>,
-    nameservers: Vec<SocketAddr>,
-    pace: crate::resolver::Pace,
+/// Where the gateway's own pods are followed: the EndpointSlices of the pod's own
+/// namespace, for the Services of `control_plane` and its data plane (03 §6).
+struct OwnPods {
+    api: ApiServer,
+    namespace: Scope,
+    control_plane: String,
 }
 
 /// What the control plane serves, besides writing status.
@@ -1064,11 +1044,15 @@ async fn control_until(
         Some(serving) => {
             let (offers, offered) = watch::channel(None);
             let (gateway, addresses) = watch::channel::<Arc<[IpAddr]>>(Arc::from([]));
-            if !serving.own.names.is_empty() {
-                tasks.push(tokio::task::spawn_local(resolve_own(
-                    serving.own,
+            if let Some(own) = serving.own {
+                let telling = Rc::clone(&say);
+                tasks.push(tokio::task::spawn_local(follow_own_pods(
+                    own.api,
+                    own.namespace,
+                    own.control_plane,
+                    planes.clone(),
                     gateway,
-                    Rc::clone(&say),
+                    move |line| telling(line),
                 )));
             }
             let (stopping, stopped) = oneshot::channel::<()>();
@@ -1251,38 +1235,6 @@ async fn control_until(
         task.abort();
     }
     stopped
-}
-
-/// Resolves `own`'s names for as long as it is polled, and hands `gateway` every address
-/// they resolve to, together, in order, each once, each time it changes: the gateway's own
-/// pods, which data planes are sent and never send a request to (03 §6). A name's failure
-/// is said once, with the name.
-async fn resolve_own(own: Own, gateway: watch::Sender<Arc<[IpAddr]>>, say: Rc<dyn Fn(&str)>) {
-    let (_kept, wanted) = watch::channel(own.names.iter().cloned().collect());
-    let by_name: Rc<RefCell<BTreeMap<String, Vec<IpAddr>>>> = Rc::default();
-    let taking = Rc::clone(&by_name);
-    crate::resolver::resolve_names(
-        wanted,
-        own.nameservers,
-        own.pace,
-        move |name, addresses| {
-            let mut by_name = taking.borrow_mut();
-            match addresses {
-                Some(addresses) => by_name.insert(name.to_owned(), addresses),
-                None => by_name.remove(name),
-            };
-            let all: BTreeSet<IpAddr> = by_name.values().flatten().copied().collect();
-            let all: Arc<[IpAddr]> = all.into_iter().collect();
-            gateway.send_if_modified(|sent| {
-                let changed = *sent != all;
-                *sent = Arc::clone(&all);
-                changed
-            });
-            Ok(())
-        },
-        move |name, failure| say(&format!("own name {name}: {failure}")),
-    )
-    .await;
 }
 
 /// The latest offer, as data planes are sent it.

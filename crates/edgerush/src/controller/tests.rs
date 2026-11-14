@@ -23,7 +23,6 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             scope: WatchScope::Parts(vec![Scope::Cluster]),
             write_config: None,
             stream: None,
-            own_names: Vec::new(),
             leader: None,
             webhook: None,
             metrics: None,
@@ -48,7 +47,6 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             ]),
             write_config: Some(PathBuf::from("c")),
             stream: None,
-            own_names: Vec::new(),
             leader: None,
             webhook: None,
             metrics: None,
@@ -239,6 +237,13 @@ async fn cluster() -> Fake {
                 r#"{"metadata":{"name":"web","namespace":"shop"},"spec":{"ports":[{"name":"http","port":80}]}}"#,
             ),
             "/api/v1/secrets" => list("Secret", "v1", ""),
+            // The control plane's own Service's endpoints, one not ready, and another
+            // Service's, which are not the gateway's.
+            "/apis/discovery.k8s.io/v1/namespaces/edge/endpointslices" => list(
+                "EndpointSlice",
+                "discovery.k8s.io/v1",
+                r#"{"metadata":{"name":"edgerush-controller-edge-a1","namespace":"edge","labels":{"kubernetes.io/service-name":"edgerush-controller-edge"}},"addressType":"IPv4","endpoints":[{"addresses":["10.244.0.6"],"conditions":{"ready":true}},{"addresses":["10.244.0.5"],"conditions":{"ready":false}}]},{"metadata":{"name":"web-b2","namespace":"edge","labels":{"kubernetes.io/service-name":"web"}},"addressType":"IPv4","endpoints":[{"addresses":["10.244.0.9"]}]}"#,
+            ),
             _ => answer(500, ""),
         }
     })
@@ -264,7 +269,6 @@ async fn run_until(
         scope: WatchScope::Parts(vec![Scope::Cluster]),
         write_config,
         stream: None,
-        own_names: Vec::new(),
         leader: None,
         webhook: None,
         metrics: None,
@@ -572,7 +576,6 @@ fn the_stream_is_given_whole_or_not_at_all() {
                     authorities: PathBuf::from("a"),
                 }),
             })),
-            own_names: Vec::new(),
             leader: None,
             webhook: None,
             metrics: None,
@@ -599,54 +602,6 @@ fn the_stream_is_given_whole_or_not_at_all() {
 }
 
 #[test]
-fn own_names_go_with_the_stream_each_once_and_each_a_name() {
-    let stream = [
-        "--data-plane",
-        "p",
-        "--listen",
-        "[::]:9443",
-        "--certificate",
-        "c",
-        "--key",
-        "k",
-        "--authorities",
-        "a",
-    ];
-    let with = |names: &[&str]| {
-        let mut args = stream.to_vec();
-        args.extend(names);
-        parsed(&args)
-    };
-    let Ok(Parsed::Control(options)) = with(&[
-        "--own-name",
-        "Peers.Edge.svc.cluster.local.",
-        "--own-name",
-        "edgerush-control.edge.svc.cluster.local",
-    ]) else {
-        panic!("not parsed")
-    };
-    assert_eq!(
-        options.own_names,
-        [
-            "peers.edge.svc.cluster.local",
-            "edgerush-control.edge.svc.cluster.local"
-        ]
-    );
-    assert_eq!(
-        with(&["--own-name", "a.b", "--own-name", "A.B."]),
-        Err(UsageError::OwnNameTwice("A.B.".to_owned()))
-    );
-    assert!(matches!(
-        with(&["--own-name", "10.0.0.1"]),
-        Err(UsageError::OwnName(name, _)) if name == "10.0.0.1"
-    ));
-    assert_eq!(
-        parsed(&["--data-plane", "p", "--own-name", "peers.edge"]),
-        Err(UsageError::OwnNameWithoutStream)
-    );
-}
-
-#[test]
 fn the_webhook_is_given_whole_or_not_at_all() {
     let webhook = [
         "--webhook-listen",
@@ -665,7 +620,6 @@ fn the_webhook_is_given_whole_or_not_at_all() {
             scope: WatchScope::Parts(vec![Scope::Cluster]),
             write_config: None,
             stream: None,
-            own_names: Vec::new(),
             leader: None,
             webhook: Some(Box::new(Webhook {
                 listen: "[::]:8443".parse().unwrap(),
@@ -1159,18 +1113,6 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
     let credentials = files.read().await.unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
-    // The gateway's own pods, a headless Service's, as a nameserver stood in for answers.
-    let nameserver =
-        crate::resolver::tests::nameserver(crate::resolver::tests::replying(|kind, _| {
-            Some(match kind {
-                edgerush_dns::Kind::A => edgerush_dns::testing::Reply::Addresses(
-                    vec!["10.244.0.6".parse().unwrap(), "10.244.0.5".parse().unwrap()],
-                    30,
-                ),
-                edgerush_dns::Kind::Aaaa => edgerush_dns::testing::Reply::NoSuchName(30),
-            })
-        }))
-        .await;
     let serving = Serving {
         listener,
         credentials: Credentialing::Files {
@@ -1179,11 +1121,12 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
             reread: Duration::from_millis(20),
         },
         versions: Versions::new(7),
-        own: Own {
-            names: vec!["peers.edge.svc.cluster.local".to_owned()],
-            nameservers: vec![nameserver],
-            pace: crate::resolver::Pace::default(),
-        },
+        // The gateway's own pods: the control plane's Service's endpoints, ready or not.
+        own: Some(OwnPods {
+            api: fake.client(&token("controller-serves-own", "secret"), Timing::default()),
+            namespace: Scope::Namespace("edge".to_owned()),
+            control_plane: "edge".to_owned(),
+        }),
     };
     // The data plane, dialling as one does.
     let (ran, mut running) = tokio::sync::mpsc::unbounded_channel();

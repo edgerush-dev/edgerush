@@ -62,7 +62,7 @@
 #     cluster's DNS and kube-proxy, and served again once it no longer asks;
 #   - an EndpointSlice written by hand to point at the data plane's own pod is not sent
 #     to, and that is said; nor one pointed at a control-plane pod, whose address the
-#     control plane resolves by its headless Service and sends on the stream, and again
+#     control plane reads from its own Service's EndpointSlices and sends on the stream, and again
 #     once a replica that took over is a new pod;
 #   - with the node labelled with a zone, and the data plane told its own Service, an
 #     EndpointSlice written by hand that hints one backend pod for that zone and another
