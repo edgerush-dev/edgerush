@@ -96,8 +96,10 @@ pub enum Model {
     /// bursting on every data plane at each window's start: a quota there is a bucket, and a
     /// window held exactly takes the synchronous mode.
     FixedWindow(Window),
-    /// At most `limit` requests in any span of `window`, counted to a thousandth of it. In
-    /// no mode yet; never in local mode, nor with `when_unreachable: local`.
+    /// At most `limit` requests in any span of `window`, counted to a thousandth of it. Only
+    /// in the synchronous mode, and not with `when_unreachable: local`: local mode keeps no
+    /// rolling window yet, nor does the asynchronous mode, which decides from local mode's
+    /// keys.
     RollingWindow(Window),
 }
 
@@ -186,7 +188,7 @@ pub enum CompiledModel {
         /// Its window as it was written, `1m`: for telling a person.
         window: String,
     },
-    /// A rolling window, which no mode decides yet.
+    /// A rolling window, which only the synchronous mode decides.
     RollingWindow {
         /// Its window as it was written, `1m`: for telling a person.
         window: String,
