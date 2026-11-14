@@ -4,9 +4,11 @@
 //! its rolling window, counting in a thousandth of the window, and local mode's bucket, its
 //! arrival time in 1/65,536 of a request's interval, admit as many over a run, though not always
 //! the same requests, and those are printed. Neither side is changed to match the other.
+//! Local mode's rolling window, which `when_unreachable: local` falls back to, decides every
+//! request as the service's of the same slots does.
 //!
 //! The service decides by `edgerush_cluster_synchronous::Rule`; local mode, the request path's
-//! limiter, has the bucket alone; the references (`edgerush_ratelimit::reference`) are the
+//! limiter, by its own store; the references (`edgerush_ratelimit::reference`) are the
 //! slow, obvious models of docs/06 §3. A service fixed window is on a phase of its own for each
 //! key, so the reference, aligned to the clock, is asked at times shifted by that phase.
 
@@ -20,7 +22,7 @@
 use edgerush_cluster::table::mix;
 use edgerush_cluster::{Time, ms};
 use edgerush_cluster_synchronous::{Rule, Value};
-use edgerush_ratelimit::local::{Decision, Handles, Local};
+use edgerush_ratelimit::local::{Decision, Handles, Limit as LocalLimit, Local, Rolling};
 use edgerush_ratelimit::reference::{Alignment, FixedWindow, Model, RollingWindow, TokenBucket};
 use edgerush_ratelimit::service::Contract;
 use std::hash::RandomState;
@@ -166,14 +168,10 @@ fn reference(name: &'static str, mut model: impl Model, times: &[Time], shift: T
     }
 }
 
-fn local(limit: Limit, times: &[Time]) -> Run {
+fn local(limit: impl Into<LocalLimit>, times: &[Time]) -> Run {
     let store = Local::new(RandomState::new(), 1);
     let mut handles = Handles::new(RandomState::new());
-    let contract = Contract {
-        limit: nonzero(limit.per),
-        window: nonzero(limit.window),
-        burst: nonzero(limit.burst),
-    };
+    let contract: LocalLimit = limit.into();
     Run {
         name: "local",
         admitted: times
@@ -190,7 +188,8 @@ fn local(limit: Limit, times: &[Time]) -> Run {
 
 /// Every limit under every pattern through each model: the service's fixed window and bucket as
 /// the references decide, request by request; its rolling window and local mode's bucket
-/// admitting as many as the references over each run, the requests they differ on printed.
+/// admitting as many as the references over each run, the requests they differ on printed;
+/// local mode's rolling window as the service's, request by request.
 #[test]
 fn the_services_models_decide_as_the_references_and_local_mode_admits_as_many() {
     let mut lines = Vec::new();
@@ -207,7 +206,12 @@ fn the_services_models_decide_as_the_references_and_local_mode_admits_as_many() 
                     burst: limit.burst,
                 };
                 let served = service(bucket, &times);
-                let local = local(limit, &times);
+                let contract = Contract {
+                    limit: nonzero(limit.per),
+                    window: nonzero(limit.window),
+                    burst: nonzero(limit.burst),
+                };
+                let in_local = local(contract, &times);
                 let exact = reference(
                     "reference",
                     TokenBucket::new(
@@ -221,8 +225,8 @@ fn the_services_models_decide_as_the_references_and_local_mode_admits_as_many() 
                 if let Some(apart) = compare(&times, &served, &exact) {
                     wrong.push(format!("bucket {case}: {apart}"));
                 }
-                if let Some(apart) = compare(&times, &local, &exact) {
-                    if admitted(&local) == admitted(&exact) {
+                if let Some(apart) = compare(&times, &in_local, &exact) {
+                    if admitted(&in_local) == admitted(&exact) {
                         lines.push(format!("bucket {case}: {apart}"));
                     } else {
                         wrong.push(format!("bucket {case}: {apart}"));
@@ -248,6 +252,7 @@ fn the_services_models_decide_as_the_references_and_local_mode_admits_as_many() 
                 let rolling = Rule::Rolling {
                     per: limit.per,
                     window: limit.window,
+                    slots: 1_000,
                 };
                 let served = service(rolling, &times);
                 let exact = reference(
@@ -261,6 +266,28 @@ fn the_services_models_decide_as_the_references_and_local_mode_admits_as_many() 
                         lines.push(format!("rolling window {case}: {apart}"));
                     } else {
                         wrong.push(format!("rolling window {case}: {apart}"));
+                    }
+                }
+                // Local mode's rolling window as the service's, at the default, a few and the
+                // fewest slots config allows.
+                for slots in [1_000, 60, 2] {
+                    let served = service(
+                        Rule::Rolling {
+                            per: limit.per,
+                            window: limit.window,
+                            slots,
+                        },
+                        &times,
+                    );
+                    let rolling = Rolling {
+                        limit: nonzero(limit.per),
+                        window: nonzero(limit.window),
+                        slots: nonzero(slots),
+                    };
+                    if let Some(apart) = compare(&times, &local(rolling, &times), &served) {
+                        wrong.push(format!(
+                            "local rolling window, {slots} slots, {case}: {apart}"
+                        ));
                     }
                 }
             }

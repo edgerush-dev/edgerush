@@ -142,11 +142,12 @@ impl Value {
                     held.0 = held.0.max(*counted);
                     held.1 = held.1.max(*given);
                 }
-                // Only the window's slots back from the newest, as the owner keeps them, or a
-                // replica of a key kept busy would hold a slot for every admission ever: in any
-                // order, as a slot left out is out of every later window too.
+                // Only the most slots any window has back from the newest — no fewer than the
+                // owner keeps — or a replica of a key kept busy would hold a slot for every
+                // admission ever: in any order, as a slot left out is out of every later window
+                // too.
                 if let Some(newest) = slots.keys().next_back().copied() {
-                    let oldest = newest.saturating_sub(SLOTS - 1);
+                    let oldest = newest.saturating_sub(MOST_SLOTS - 1);
                     slots.retain(|slot, _| *slot >= oldest);
                 }
             }
@@ -181,15 +182,18 @@ pub enum Rule {
         /// The window.
         window: Time,
     },
-    /// At most `per` in any trailing window of length `window`, to a thousandth of it: each
-    /// admission counted in a slot a thousandth of the window long, its time rounded down, so
-    /// that it is never stricter than exact, and admits at most `per` in any span of 99.9% of
-    /// the window.
+    /// At most `per` in any trailing window of length `window`, to a slot of it: each
+    /// admission counted in one of `slots` slots a window, its time rounded down, so that it is
+    /// never stricter than exact, and admits at most `per` in any span of (`slots` − 1) /
+    /// `slots` of the window — 99.9% at 1,000 slots.
     Rolling {
         /// Requests admitted in any window.
         per: u64,
         /// The window.
         window: Time,
+        /// The slots a window is counted in: 1 to [`MOST_SLOTS`], any other taken as the
+        /// nearest of those.
+        slots: u64,
     },
     /// A bucket, by GCRA: `per` every `period` on average, `burst` at once from idle — at
     /// most `per` × T / `period` + `burst` in any span T; a new key starts full.
@@ -203,8 +207,25 @@ pub enum Rule {
     },
 }
 
-/// The slots a rolling window counts in.
-const SLOTS: u64 = 1_000;
+/// The most slots a rolling window counts in, and the number a replica's merge keeps back
+/// from the newest, knowing no rule: never fewer than its owner keeps.
+pub const MOST_SLOTS: u64 = 1_000;
+
+/// A rolling window's slots, kept to 1..=[`MOST_SLOTS`]: none would divide by nothing.
+const fn slots_of(slots: u64) -> u64 {
+    if slots == 0 {
+        1
+    } else if slots > MOST_SLOTS {
+        MOST_SLOTS
+    } else {
+        slots
+    }
+}
+
+/// A rolling window's slot length: at least a nanosecond.
+fn slot_length(window: Time, slots: u64) -> Time {
+    (window / slots_of(slots)).max(1)
+}
 
 impl Rule {
     /// The number of the window `key` is in at `at` under a fixed window, counted from 1; for
@@ -216,7 +237,7 @@ impl Rule {
                 let window = window.max(1);
                 (at + mix(key) % window) / window + 1
             }
-            Self::Rolling { window, .. } => at / (window / SLOTS).max(1),
+            Self::Rolling { window, slots, .. } => at / slot_length(window, slots),
             Self::Bucket { .. } => 0,
         }
     }
@@ -260,7 +281,9 @@ impl Rule {
                 *counted += 1;
                 Some(*window)
             }
-            Self::Rolling { per, .. } => {
+            Self::Rolling {
+                per, slots: count, ..
+            } => {
                 let slot = self.window_of(key, at);
                 if !matches!(value, Value::Slots(_)) {
                     *value = Value::Slots(BTreeMap::new());
@@ -270,7 +293,7 @@ impl Rule {
                 };
                 // The slots the window covers: this one and those of the rest of the window
                 // before it; any older forgotten.
-                let oldest = slot.saturating_sub(SLOTS - 1);
+                let oldest = slot.saturating_sub(slots_of(count) - 1);
                 slots.retain(|held, _| *held >= oldest);
                 let standing: u64 = slots
                     .values()
@@ -314,12 +337,18 @@ impl Rule {
                     .saturating_mul(window)
                     .saturating_sub(mix(key) % window)
             }
-            (Self::Rolling { window, .. }, Value::Slots(slots)) => {
-                let length = (window / SLOTS).max(1);
-                slots
-                    .keys()
-                    .next_back()
-                    .map_or(0, |newest| (newest + SLOTS).saturating_mul(length))
+            (
+                Self::Rolling {
+                    window,
+                    slots: count,
+                    ..
+                },
+                Value::Slots(slots),
+            ) => {
+                let length = slot_length(window, count);
+                slots.keys().next_back().map_or(0, |newest| {
+                    (newest + slots_of(count)).saturating_mul(length)
+                })
             }
             (Self::Bucket { .. }, Value::Bucket { due, .. }) => *due,
             _ => 0,
@@ -340,8 +369,15 @@ impl Rule {
                     self.forget_at(key, value)
                 }
             }
-            (Self::Rolling { per, window }, Value::Slots(slots)) => {
-                let length = (window / SLOTS).max(1);
+            (
+                Self::Rolling {
+                    per,
+                    window,
+                    slots: count,
+                },
+                Value::Slots(slots),
+            ) => {
+                let length = slot_length(window, count);
                 let net = |(counted, given): &(u64, u64)| counted.saturating_sub(*given);
                 let standing: u64 = slots.values().map(net).sum();
                 // The oldest slots that must leave the window for one more to fit, the last of
@@ -353,7 +389,7 @@ impl Rule {
                     .find_map(|(slot, counts)| {
                         freed += net(counts);
                         (excess > 0 && freed >= excess)
-                            .then(|| (slot + SLOTS).saturating_mul(length))
+                            .then(|| (slot + slots_of(count)).saturating_mul(length))
                     })
                     .unwrap_or(0)
             }
@@ -410,6 +446,12 @@ mod tests {
             Rule::Rolling {
                 per: 3,
                 window: ms(100),
+                slots: 1_000,
+            },
+            Rule::Rolling {
+                per: 3,
+                window: ms(100),
+                slots: 7,
             },
             Rule::Bucket {
                 per: 3,
@@ -453,6 +495,12 @@ mod tests {
             Rule::Rolling {
                 per: 2,
                 window: ms(1_000),
+                slots: 1_000,
+            },
+            Rule::Rolling {
+                per: 2,
+                window: ms(1_000),
+                slots: 7,
             },
             Rule::Bucket {
                 per: 2,
@@ -572,6 +620,7 @@ mod tests {
         let rule = Rule::Rolling {
             per: 2,
             window: ms(1_000),
+            slots: 1_000,
         };
         let mut value = Value::default();
         assert!(rule.admit(1, &mut value, ms(10)).is_some());
@@ -593,6 +642,35 @@ mod tests {
             rule.admit(1, &mut value, ms(1_502)).is_some(),
             "not given back"
         );
+    }
+
+    /// Fewer slots bring room back sooner: up to a slot early, as each admission's time is
+    /// rounded down to its slot's start — at 4 slots of a second's window, a quarter second.
+    /// Slots past the bounds are taken as the nearest bound, never dividing by none.
+    #[test]
+    fn fewer_slots_bring_room_back_up_to_a_slot_early() {
+        let rolling = |slots| Rule::Rolling {
+            per: 1,
+            window: ms(1_000),
+            slots,
+        };
+        let back = |slots| {
+            let rule = rolling(slots);
+            let mut value = Value::default();
+            assert!(rule.admit(1, &mut value, ms(10_490)).is_some());
+            ms(10_490) + rule.wait(1, &value, ms(10_490))
+        };
+        assert_eq!(back(4), ms(11_250), "4 slots");
+        assert_eq!(back(2), ms(11_000), "2 slots");
+        assert_eq!(back(1_000), ms(11_490), "1,000 slots");
+        assert_eq!(back(0), back(1), "none taken as one");
+        assert_eq!(back(5_000), back(1_000), "past the most taken as the most");
+        // And the wait is right: refused a nanosecond before, admitted at it.
+        let rule = rolling(4);
+        let mut value = Value::default();
+        let _ = rule.admit(1, &mut value, ms(10_490));
+        assert_eq!(rule.admit(1, &mut value.clone(), ms(11_250) - 1), None);
+        assert!(rule.admit(1, &mut value, ms(11_250)).is_some());
     }
 
     /// A bucket, starting full, admits its burst at once, then one an emission interval; a

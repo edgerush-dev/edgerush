@@ -926,6 +926,7 @@ mod tests {
             Rule::Rolling {
                 per: 2,
                 window: ms(1_000),
+                slots: 1_000,
             },
             Rule::Window {
                 per: 2,
@@ -1000,6 +1001,7 @@ mod tests {
         let rule = Rule::Rolling {
             per: 100,
             window: ms(1_000),
+            slots: 1_000,
         };
         let ask = |id| Message::Request {
             client: 1_000_000,

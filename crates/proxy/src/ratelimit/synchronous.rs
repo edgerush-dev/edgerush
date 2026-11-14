@@ -31,7 +31,7 @@ use edgerush_ratelimit::local::{Decision, Limit};
 use edgerush_ratelimit::service::{Decided, longest};
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::plane::{
-    Answer, Due, GIVE_BACK_AGAIN, GIVE_BACK_LATER, Giving, NodeId, Plane, Rule, Told,
+    Answer, Due, GIVE_BACK_AGAIN, GIVE_BACK_LATER, Giving, MOST_SLOTS, NodeId, Plane, Rule, Told,
 };
 use edgerush_ratelimit_service::cluster::pod::decide_stream;
 use edgerush_ratelimit_service::cluster::wire::{self, Asking, Telling};
@@ -649,7 +649,12 @@ impl super::Held for HeldTo {
                 burst: burst.get(),
             },
             CompiledModel::FixedWindow { .. } => Rule::Window { per, window },
-            CompiledModel::RollingWindow { .. } => Rule::Rolling { per, window },
+            // The slots come with config's `slots`; until then, the store's own number.
+            CompiledModel::RollingWindow { .. } => Rule::Rolling {
+                per,
+                window,
+                slots: MOST_SLOTS,
+            },
         };
         Some(Self {
             rule,
@@ -1460,7 +1465,8 @@ upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
             held("r").rule,
             Rule::Rolling {
                 per: 7,
-                window: 3_600_000_000_000
+                window: 3_600_000_000_000,
+                slots: 1_000
             }
         );
         assert!(held("b").local.is_some() && held("f").local.is_some());

@@ -28,7 +28,7 @@ use bytes::Bytes;
 use edgerush_cluster::table::{Changes as StoreChanges, Shard as StoreShard, Table as StoreTable};
 use edgerush_cluster::{Held, Kept, Message, NodeId, ShardId, Stamp as StoreStamp};
 use edgerush_cluster_synchronous::{
-    Answer as SyncAnswer, Message as SyncMessage, Rule as SyncRule, Value as SyncValue,
+    Answer as SyncAnswer, MOST_SLOTS, Message as SyncMessage, Rule as SyncRule, Value as SyncValue,
 };
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -48,6 +48,9 @@ pub enum Invalid {
     /// A rolling window's slot given twice.
     #[error("a slot given twice")]
     SlotTwice,
+    /// A rolling window counted in more slots than any is.
+    #[error("a rolling window of more than 1,000 slots")]
+    Slots,
     /// A member named twice, in a table or a naming.
     #[error("a member named twice")]
     MemberTwice,
@@ -623,7 +626,7 @@ pub enum Limit {
     Window(WindowLimit),
     /// A rolling window.
     #[prost(message, tag = "2")]
-    Rolling(WindowLimit),
+    Rolling(RollingLimit),
     /// A bucket.
     #[prost(message, tag = "3")]
     Bucket(BucketLimit),
@@ -638,6 +641,22 @@ pub struct WindowLimit {
     /// The window.
     #[prost(uint64, tag = "2")]
     pub window: u64,
+}
+
+/// A rolling window's limit: `per` in any `window`, in nanoseconds, counted in `slots` slots.
+/// A window's fields and tags, and one more: a sender of an earlier release, giving none, is
+/// read as giving 1,000, as its pods counted in.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+pub struct RollingLimit {
+    /// Requests in any window.
+    #[prost(uint64, tag = "1")]
+    pub per: u64,
+    /// The window.
+    #[prost(uint64, tag = "2")]
+    pub window: u64,
+    /// The slots a window is counted in; 0 for none given.
+    #[prost(uint64, tag = "3")]
+    pub slots: u64,
 }
 
 /// A bucket's limit: `per` every `period`, in nanoseconds, `burst` at once.
@@ -1303,7 +1322,9 @@ fn request_from(request: Request) -> Result<SyncMessage, Invalid> {
 const fn rule_to_wire(rule: SyncRule) -> Rule {
     let limit = match rule {
         SyncRule::Window { per, window } => Limit::Window(WindowLimit { per, window }),
-        SyncRule::Rolling { per, window } => Limit::Rolling(WindowLimit { per, window }),
+        SyncRule::Rolling { per, window, slots } => {
+            Limit::Rolling(RollingLimit { per, window, slots })
+        }
         SyncRule::Bucket { per, period, burst } => {
             Limit::Bucket(BucketLimit { per, period, burst })
         }
@@ -1314,7 +1335,15 @@ const fn rule_to_wire(rule: SyncRule) -> Rule {
 fn rule_from(rule: Rule) -> Result<SyncRule, Invalid> {
     Ok(match rule.limit.ok_or(Invalid::Missing)? {
         Limit::Window(WindowLimit { per, window }) => SyncRule::Window { per, window },
-        Limit::Rolling(WindowLimit { per, window }) => SyncRule::Rolling { per, window },
+        Limit::Rolling(RollingLimit { per, window, slots }) => SyncRule::Rolling {
+            per,
+            window,
+            slots: match slots {
+                0 => MOST_SLOTS,
+                1..=MOST_SLOTS => slots,
+                _ => return Err(Invalid::Slots),
+            },
+        },
         Limit::Bucket(BucketLimit { per, period, burst }) => {
             SyncRule::Bucket { per, period, burst }
         }
@@ -1920,7 +1949,8 @@ mod tests {
     fn rule() -> impl Strategy<Value = SyncRule> {
         prop_oneof![
             any::<(u64, u64)>().prop_map(|(per, window)| SyncRule::Window { per, window }),
-            any::<(u64, u64)>().prop_map(|(per, window)| SyncRule::Rolling { per, window }),
+            (any::<(u64, u64)>(), 1..=MOST_SLOTS)
+                .prop_map(|((per, window), slots)| { SyncRule::Rolling { per, window, slots } }),
             any::<(u64, u64, u64)>().prop_map(|(per, period, burst)| SyncRule::Bucket {
                 per,
                 period,
@@ -2256,6 +2286,41 @@ mod tests {
             })),
         };
         assert_eq!(SyncValue::from_wire(twice), Err(Invalid::SlotTwice));
+    }
+
+    /// A rolling window's slots: none given, as by a sender of an earlier release, read as
+    /// 1,000; more than 1,000 refused, rather than decided at some other number.
+    #[test]
+    fn a_rolling_windows_slots_default_to_a_thousand_and_are_bounded() {
+        let rolling = |slots| Rule {
+            limit: Some(Limit::Rolling(RollingLimit {
+                per: 5,
+                window: 1_000,
+                slots,
+            })),
+        };
+        let decided = |slots| rule_from(rolling(slots));
+        let rule = |slots| SyncRule::Rolling {
+            per: 5,
+            window: 1_000,
+            slots,
+        };
+        assert_eq!(decided(0), Ok(rule(1_000)));
+        assert_eq!(decided(60), Ok(rule(60)));
+        assert_eq!(decided(1_000), Ok(rule(1_000)));
+        assert_eq!(decided(1_001), Err(Invalid::Slots));
+        // A window's limit, as an earlier release sent a rolling window's, reads as one of
+        // 1,000 slots.
+        let earlier = WindowLimit {
+            per: 5,
+            window: 1_000,
+        };
+        let read = RollingLimit::decode(earlier.encode_to_vec().as_slice());
+        assert_eq!(
+            read.map(|limit| limit.slots),
+            Ok(0),
+            "an earlier release's rolling window not read"
+        );
     }
 
     /// A member named twice, in a table, what changed of one or a naming, is refused, rather

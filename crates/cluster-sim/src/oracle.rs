@@ -4,7 +4,7 @@
 //! its key's owner made it, by that owner's wall clock.
 
 use edgerush_cluster::Time;
-use edgerush_cluster_synchronous::Rule;
+use edgerush_cluster_synchronous::{MOST_SLOTS, Rule};
 use std::collections::BTreeMap;
 
 /// The decisions under one rule.
@@ -78,7 +78,7 @@ impl Oracle {
                     .count();
                 (held as u64) < per
             }
-            Rule::Rolling { per, window } => {
+            Rule::Rolling { per, window, .. } => {
                 let held = before.filter(|time| *time + window > at).count();
                 (held as u64) < per
             }
@@ -192,9 +192,10 @@ impl Oracle {
                 let over = by_window.values().map(|held| held.saturating_sub(per));
                 (over.clone().sum(), over.max().unwrap_or(0))
             }
-            Rule::Rolling { per, window } => {
-                // Within 99.9% of the window, as the slots, rounding down, promise.
-                let span = window - window / 1_000;
+            Rule::Rolling { per, window, slots } => {
+                // Within (slots − 1) / slots of the window, as the slots, rounding down,
+                // promise.
+                let span = window - window / slots.clamp(1, MOST_SLOTS);
                 let mut beyond = 0;
                 let mut most = 0;
                 for (index, time) in history.iter().enumerate() {
@@ -280,6 +281,7 @@ mod tests {
         let rule = Rule::Rolling {
             per: 2,
             window: ms(1_000),
+            slots: 1_000,
         };
         let full = [ms(10), ms(500)];
         assert_eq!(shaved(rule, &full, &[ms(1_009)]), 0);
