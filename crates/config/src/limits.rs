@@ -98,8 +98,8 @@ pub enum Model {
     FixedWindow(Window),
     /// At most `limit` requests in any span of `window`, counted to a thousandth of it. Only
     /// in the synchronous mode, and not with `when_unreachable: local`: local mode keeps no
-    /// rolling window yet, nor does the asynchronous mode, which decides from local mode's
-    /// keys.
+    /// rolling window yet, and the asynchronous mode cannot hold one against bursts, as with
+    /// a fixed window.
     RollingWindow(Window),
 }
 

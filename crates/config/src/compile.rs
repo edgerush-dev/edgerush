@@ -705,9 +705,9 @@ fn rule_limits(
 /// The mode, as a refusal says it, if `rate_limiting` cannot run `model`. Local mode keeps a
 /// key in one word, which holds no rolling window's slots, and `when_unreachable: local`
 /// decides from local mode's keys (06 §3, #204); the synchronous mode's store runs both
-/// windows; the asynchronous mode runs no fixed window, which it cannot hold against a
-/// client bursting on every data plane at each window's start (06 §4), and its rolling
-/// window follows local mode's. Off runs none, and refuses none.
+/// windows; the asynchronous mode runs neither, which it cannot hold against a client
+/// bursting on every data plane at each window's start or after a window idle (06 §4).
+/// Off runs none, and refuses none.
 fn unsupported_in(
     model: &CompiledModel,
     rate_limiting: &CompiledRateLimiting,
@@ -719,7 +719,10 @@ fn unsupported_in(
             CompiledModel::FixedWindow { .. },
             CompiledRateLimiting::Local { .. } | CompiledRateLimiting::Synchronous(_),
         ) => None,
-        (CompiledModel::FixedWindow { .. }, CompiledRateLimiting::Asynchronous(_)) => Some(
+        (
+            CompiledModel::FixedWindow { .. } | CompiledModel::RollingWindow { .. },
+            CompiledRateLimiting::Asynchronous(_),
+        ) => Some(
             "in the asynchronous mode, which cannot hold a window against bursts: a quota there is a `bucket`, and a window held exactly takes the synchronous mode",
         ),
         (CompiledModel::RollingWindow { .. }, CompiledRateLimiting::Local { .. }) => {
@@ -728,9 +731,6 @@ fn unsupported_in(
         (CompiledModel::RollingWindow { .. }, CompiledRateLimiting::Synchronous(waiting)) => {
             (waiting.when_unreachable == crate::WhenUnreachable::Local)
                 .then_some("with `when_unreachable: local`, which decides as local mode does")
-        }
-        (CompiledModel::RollingWindow { .. }, CompiledRateLimiting::Asynchronous(_)) => {
-            Some("in the asynchronous mode")
         }
     }
 }
@@ -7725,7 +7725,6 @@ rate_limiting: {{ mode: local{switch} }}
         };
         let falling_back_locally =
             "with `when_unreachable: local`, which decides as local mode does";
-        let not_async = "in the asynchronous mode";
         let no_async_window = "in the asynchronous mode, which cannot hold a window against bursts: a quota there is a `bucket`, and a window held exactly takes the synchronous mode";
         for (mode, model, expected) in [
             ("", bucket, Ok(())),
@@ -7755,7 +7754,11 @@ rate_limiting: {{ mode: local{switch} }}
                 "{ fixed_window: { limit: 10, window: 1d } }",
                 refused("fixed_window", no_async_window),
             ),
-            (&asynchronous, rolling, refused("rolling_window", not_async)),
+            (
+                &asynchronous,
+                rolling,
+                refused("rolling_window", no_async_window),
+            ),
             (
                 &synchronous,
                 "{ fixed_window: { limit: 10, window: 1s } }",
