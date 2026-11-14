@@ -15,7 +15,7 @@
 use edgerush_config::{AccessLog, Forwarding, Http3, ListenerProxyProtocol, RequestId};
 use edgerush_kubernetes::{ApiServer, Listed, Retry, Scope, follow};
 use edgerush_planes::data_plane::{DataPlane, DataPlanePorts};
-use edgerush_planes::objects::{ProxyService, proxy_name};
+use edgerush_planes::objects::{ProxyService, data_plane_id, proxy_name};
 use edgerush_translate::{GatewayName, IpFamily, Plane, PortSettings};
 
 use crate::Settings;
@@ -276,8 +276,8 @@ pub fn settings(data_plane: &DataPlane, own: &Own) -> Result<Settings, Unusable>
     })
 }
 
-/// The settings translation is given of `data_plane`, as it now is (05 §3): its
-/// IngressClass, `<controlplane>.<dataplane>`, with `ingress` alone; its Gateway, of its
+/// The settings translation is given of `data_plane`, as it now is (05 §3): the ID its
+/// certificate carries, which the stream knows its data plane by; its IngressClass, `<controlplane>.<dataplane>`, with `ingress` alone; its Gateway, of its
 /// own name and namespace, with `gateway` alone; and the Service of its own pods, which
 /// says its zone, its own Service's name (05 §3).
 ///
@@ -348,6 +348,12 @@ pub fn plane(data_plane: &DataPlane, own: &Own) -> Result<Plane, Unusable> {
         own.cluster_domain
     );
     Ok(Plane {
+        id: Some(data_plane_id(
+            &own.control_plane,
+            &own.cluster_domain,
+            &namespace,
+            &name,
+        )),
         ingress_class: ingress.map(|_| format!("{}.{name}", own.control_plane)),
         gateway: spec
             .gateway

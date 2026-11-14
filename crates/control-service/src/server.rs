@@ -2,6 +2,7 @@
 
 use crate::{Prost, Received, SERVICE, SUBSCRIBE};
 use boring::ssl::SslAcceptor;
+use edgerush_certificates::spiffe_id;
 use edgerush_control_stream::{Held, MAX_MESSAGE, Offer, OpenError, Report, Session, wire};
 use std::convert::Infallible;
 use std::future::Future;
@@ -52,6 +53,99 @@ pub enum Heard {
     Closed(Option<String>),
 }
 
+/// Which data planes the stream serves, and what each is offered: each known by the SPIFFE
+/// ID its certificate carries, which alone chooses its config, nothing it says doing so
+/// ([05 §3](../../../docs/05-operator.md)).
+#[derive(Debug, Clone, Default)]
+pub enum Served {
+    /// None: every data plane is refused, as no DataPlane is served yet.
+    #[default]
+    Nobody,
+    /// Every data plane the stream's authorities vouch for, each offered this, if anything
+    /// yet: a settings file's data plane, which states no ID.
+    Anyone(Option<Arc<Offer>>),
+    /// The data plane whose certificate carries this ID alone, offered this, if anything yet.
+    One {
+        /// The ID.
+        id: String,
+        /// What is offered to it.
+        offer: Option<Arc<Offer>>,
+    },
+}
+
+/// Why a data plane is not served, as it is told.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Unserved {
+    /// Its certificate carries no SPIFFE ID, or more than one, which no DataPlane's does.
+    #[error("the data plane's certificate carries no SPIFFE ID, or more than one")]
+    NoId,
+    /// Its certificate's ID is no DataPlane's that is served.
+    #[error("{0} is no DataPlane this control plane serves")]
+    NotServed(String),
+}
+
+impl Served {
+    /// The data plane whose certificate carries `id`, or any where none, offered nothing yet.
+    #[must_use]
+    pub fn of(id: Option<&str>) -> Self {
+        match id {
+            Some(id) => Self::One {
+                id: id.to_owned(),
+                offer: None,
+            },
+            None => Self::Anyone(None),
+        }
+    }
+
+    /// What is offered, to whichever data planes it serves.
+    #[must_use]
+    pub fn offer(&self) -> Option<&Arc<Offer>> {
+        match self {
+            Self::Nobody => None,
+            Self::Anyone(offer) | Self::One { offer, .. } => offer.as_ref(),
+        }
+    }
+
+    /// Made to serve the data planes `next` serves: left as it is, what it offers with it,
+    /// where it serves them already, and `next` where not, so that nothing offered to one
+    /// data plane is offered to another. Whether it changed.
+    pub fn serve(&mut self, next: Self) -> bool {
+        let same = match (&*self, &next) {
+            (Self::Nobody, Self::Nobody) | (Self::Anyone(_), Self::Anyone(_)) => true,
+            (Self::One { id, .. }, Self::One { id: next, .. }) => id == next,
+            _ => false,
+        };
+        if !same {
+            *self = next;
+        }
+        !same
+    }
+
+    /// `offer` offered to the data planes it serves, in place of what was; nothing where it
+    /// serves none.
+    pub fn offered(&mut self, offer: Arc<Offer>) {
+        match self {
+            Self::Nobody => {}
+            Self::Anyone(offered) | Self::One { offer: offered, .. } => *offered = Some(offer),
+        }
+    }
+
+    /// What the data plane whose certificate carries `id` is offered, if anything yet; or
+    /// why it is not served.
+    ///
+    /// # Errors
+    ///
+    /// [`Unserved`] for a data plane not served.
+    pub fn offer_to(&self, id: Option<&str>) -> Result<Option<&Arc<Offer>>, Unserved> {
+        match (self, id) {
+            (Self::Anyone(offer), _) => Ok(offer.as_ref()),
+            (Self::One { id: served, offer }, Some(id)) if served == id => Ok(offer.as_ref()),
+            (_, None) => Err(Unserved::NoId),
+            (_, Some(id)) => Err(Unserved::NotServed(id.to_owned())),
+        }
+    }
+}
+
 /// Why the server stopped other than as asked.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
@@ -62,9 +156,10 @@ pub enum ServeError {
 
 /// Serves the config stream on `listener` until `stop`: each data plane that dials it is
 /// sent the latest of `gateway`, the addresses of the gateway's own pods, and each later
-/// one, then the latest of `offers`, and each later one, and what it says goes to `heard`,
-/// with its address. Each connection takes the latest of `tls`, so that certificates
-/// replaced serve the next. Streams end as it stops.
+/// one, then what the latest of `served` offers it, and each later one, and what it says
+/// goes to `heard`, with its address. A data plane `served` does not serve is refused, with
+/// why, as it dials or once `served` no longer serves it. Each connection takes the latest
+/// of `tls`, so that certificates replaced serve the next. Streams end as it stops.
 ///
 /// # Errors
 ///
@@ -72,7 +167,7 @@ pub enum ServeError {
 pub async fn serve(
     listener: TcpListener,
     tls: watch::Receiver<Arc<SslAcceptor>>,
-    offers: watch::Receiver<Option<Arc<Offer>>>,
+    served: watch::Receiver<Served>,
     gateway: watch::Receiver<Arc<[IpAddr]>>,
     heard: impl Fn(SocketAddr, Heard) + Send + Sync + 'static,
     stop: impl Future<Output = ()> + Send,
@@ -83,7 +178,7 @@ pub async fn serve(
     let (secured, incoming) = mpsc::channel(WAITING);
     let accepting = tokio::spawn(accept(listener, tls, secured, heard.clone()));
     let service = Control {
-        offers,
+        served,
         gateway,
         stopped,
         heard,
@@ -125,6 +220,13 @@ async fn accept(
                 tokio::time::timeout(HANDSHAKE, tokio_boring::accept(&acceptor, socket));
             match handshake.await {
                 Ok(Ok(stream)) => {
+                    // Read once: its certificate is the handshake's, for the connection's life.
+                    let id = stream
+                        .ssl()
+                        .peer_certificate()
+                        .as_deref()
+                        .and_then(spiffe_id);
+                    let peer = Peer { address: peer, id };
                     let _stopped = secured.send(Ok(Secured { stream, peer })).await;
                 }
                 Ok(Err(error)) => heard(peer, Heard::Refused(error.to_string())),
@@ -140,18 +242,22 @@ async fn accept(
 /// A data plane's connection, its handshake done.
 struct Secured {
     stream: SslStream<TcpStream>,
-    peer: SocketAddr,
+    peer: Peer,
 }
 
-/// Where a data plane dialled from, as each of its requests carries it.
-#[derive(Debug, Clone, Copy)]
-struct Peer(SocketAddr);
+/// Where a data plane dialled from, and the ID its certificate carries, if one, as each of
+/// its requests carries them.
+#[derive(Debug, Clone)]
+struct Peer {
+    address: SocketAddr,
+    id: Option<String>,
+}
 
 impl Connected for Secured {
     type ConnectInfo = Peer;
 
     fn connect_info(&self) -> Peer {
-        Peer(self.peer)
+        self.peer.clone()
     }
 }
 
@@ -186,7 +292,7 @@ impl AsyncWrite for Secured {
 /// The service, as gRPC serves it.
 #[derive(Clone)]
 struct Control {
-    offers: watch::Receiver<Option<Arc<Offer>>>,
+    served: watch::Receiver<Served>,
     gateway: watch::Receiver<Arc<[IpAddr]>>,
     stopped: watch::Receiver<()>,
     heard: Arc<dyn Fn(SocketAddr, Heard) + Send + Sync>,
@@ -239,13 +345,14 @@ impl tonic::server::StreamingService<wire::FromDataPlane> for Subscribe {
             let peer = request
                 .extensions()
                 .get::<Peer>()
-                .copied()
+                .cloned()
                 .ok_or_else(|| Status::internal("a connection without its address"))?;
             let (sent, sending) = mpsc::channel(WAITING);
             tokio::spawn(async move {
                 let heard = control.heard.clone();
-                let closed = subscribed(control, peer.0, request.into_inner(), sent).await;
-                heard(peer.0, Heard::Closed(closed));
+                let address = peer.address;
+                let closed = subscribed(control, peer, request.into_inner(), sent).await;
+                heard(address, Heard::Closed(closed));
             });
             Ok(Response::new(Received(sending)))
         })
@@ -256,16 +363,22 @@ impl tonic::server::StreamingService<wire::FromDataPlane> for Subscribe {
 /// the data plane closing it.
 async fn subscribed(
     control: Control,
-    peer: SocketAddr,
+    peer: Peer,
     mut said: Streaming<wire::FromDataPlane>,
     sent: mpsc::Sender<Result<wire::ToDataPlane, Status>>,
 ) -> Option<String> {
     let Control {
-        mut offers,
+        mut served,
         mut gateway,
         mut stopped,
         heard,
     } = control;
+    let Peer { address: peer, id } = peer;
+    // Nothing is heard of a data plane not served, nor sent to it.
+    let unserved = served.borrow().offer_to(id.as_deref()).err();
+    if let Some(unserved) = unserved {
+        return Some(refuse(&sent, Status::permission_denied(unserved.to_string())).await);
+    }
     let first = match said.message().await {
         Ok(Some(first)) => first,
         Ok(None) => return None,
@@ -292,6 +405,17 @@ async fn subscribed(
     // the last are all there are, and the stream goes on.
     let mut saying = true;
     loop {
+        // Whether it is served still, and what is offered to it.
+        let offer = served
+            .borrow_and_update()
+            .offer_to(id.as_deref())
+            .map(Option::<&Arc<Offer>>::cloned);
+        let offer = match offer {
+            Ok(offer) => offer,
+            Err(unserved) => {
+                return Some(refuse(&sent, Status::permission_denied(unserved.to_string())).await);
+            }
+        };
         // The gateway's addresses first, so that none is sent to by a config it runs.
         let addresses = Arc::clone(&gateway.borrow_and_update());
         if let Some(message) = session.gateway(&addresses)
@@ -300,7 +424,6 @@ async fn subscribed(
             return Some("the data plane is gone".to_owned());
         }
         // The latest offer, as far as the data plane does not hold it already.
-        let offer = offers.borrow_and_update().clone();
         if let Some(offer) = offer {
             for message in session.send(&offer) {
                 if sent.send(Ok(message)).await.is_err() {
@@ -309,7 +432,7 @@ async fn subscribed(
             }
         }
         tokio::select! {
-            changed = offers.changed() => {
+            changed = served.changed() => {
                 if changed.is_err() {
                     return Some("the control plane stopped offering".to_owned());
                 }

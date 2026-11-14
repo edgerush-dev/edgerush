@@ -209,11 +209,13 @@ fn acks() -> Acks {
     }
 }
 
-/// What the control plane said, a line each, and its translations.
+/// What the control plane said, a line each, and its translations, each with the ID of
+/// the data plane it is for.
 #[derive(Default)]
 struct Heard {
     lines: Vec<String>,
     translations: Vec<Translation>,
+    ids: Vec<Option<String>>,
 }
 
 fn hear(heard: &Rc<RefCell<Heard>>) -> impl Fn(Said<'_>) + 'static {
@@ -231,8 +233,9 @@ fn hear(heard: &Rc<RefCell<Heard>>) -> impl Fn(Said<'_>) + 'static {
             }
             Said::Failed { followed, failure } => format!("{followed}: {failure}"),
             Said::Namespace { namespace, now } => format!("namespace {namespace}: {now:?}"),
-            Said::Translated(translation) => {
+            Said::Translated { translation, id } => {
                 heard.translations.push(translation.clone());
+                heard.ids.push(id.map(ToOwned::to_owned));
                 "translated".to_owned()
             }
             Said::Refused { problems, .. } => format!("refused: {problems:?}"),
@@ -1091,8 +1094,10 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
 }
 
 /// Settings that change are followed (05 §3): none, and nothing is followed; new settings
-/// that leave what is followed as it was are translated again, the follows as they were; and
-/// settings of another Gateway have the follows begun again for it.
+/// that leave what is followed as it was are translated again, the follows as they were;
+/// those of another data plane's ID alone have the follows begun again, and a translation
+/// said for that ID, though it is the last one's; and settings of another Gateway have the
+/// follows begun again for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_settings_are_followed_as_they_change() {
     let fake = Fake::start(&["127.0.0.1"], |path| {
@@ -1171,10 +1176,26 @@ async fn the_settings_are_followed_as_they_change() {
                 1,
                 "listed again for settings of the same shape"
             );
+            assert_eq!(heard.borrow().ids, [None, None]);
+
+            // Another data plane's ID: what is translated for one is never handed to another.
+            let web = "spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-web";
+            other.id = Some(web.to_owned());
+            settings.send_replace(Some(harness(&other)));
+            until("translated for the ID", || {
+                heard.borrow().translations.len() == 3
+            })
+            .await;
+            assert_eq!(
+                heard.borrow().translations[2],
+                heard.borrow().translations[1]
+            );
+            assert_eq!(heard.borrow().ids[2].as_deref(), Some(web));
+            assert_eq!(ingresses(), 2, "followed again for another ID");
 
             // A Gateway: what is followed changes, and the follows are begun again.
             settings.send_replace(Some(harness(&gateway_plane())));
-            until("followed again", || ingresses() == 2).await;
+            until("followed again", || ingresses() == 3).await;
             until("the Gateway API's CRDs listed", || {
                 lists("/apis/apiextensions.k8s.io/v1/customresourcedefinitions") > 0
             })

@@ -50,7 +50,7 @@ fn credentials(authority: &Authority, names: &[&str]) -> Credentials {
 struct Plane {
     address: String,
     heard: mpsc::UnboundedReceiver<Heard>,
-    offers: watch::Sender<Option<Arc<Offer>>>,
+    offers: watch::Sender<Served>,
     gateway: watch::Sender<Arc<[IpAddr]>>,
     tls: watch::Sender<Arc<SslAcceptor>>,
     stop: Option<oneshot::Sender<()>>,
@@ -58,22 +58,36 @@ struct Plane {
 }
 
 impl Plane {
+    /// One serving any data plane its authorities vouch for, offering `offer`.
     async fn start(credentials: &Credentials, offer: Option<Offer>) -> Self {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        Self::start_on(listener, credentials, offer)
+        Self::serving(credentials, Served::Anyone(offer.map(Arc::new)))
     }
 
-    /// One serving on `listener`, which may have served another before.
+    /// One serving as `served` says.
+    fn serving(credentials: &Credentials, served: Served) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Self::serving_on(listener, credentials, served)
+    }
+
+    /// One serving any data plane on `listener`, which may have served another before.
     fn start_on(
         listener: std::net::TcpListener,
         credentials: &Credentials,
         offer: Option<Offer>,
     ) -> Self {
+        Self::serving_on(listener, credentials, Served::Anyone(offer.map(Arc::new)))
+    }
+
+    fn serving_on(
+        listener: std::net::TcpListener,
+        credentials: &Credentials,
+        served: Served,
+    ) -> Self {
         listener.set_nonblocking(true).unwrap();
         let listener = TcpListener::from_std(listener).unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let (tls, accepting) = watch::channel(Arc::new(acceptor(credentials).unwrap()));
-        let (offers, offered) = watch::channel(offer.map(Arc::new));
+        let (offers, offered) = watch::channel(served);
         let (gateway, addresses) = watch::channel::<Arc<[IpAddr]>>(Arc::from([]));
         let (said, heard) = mpsc::unbounded_channel();
         let (stop, stopped) = oneshot::channel::<()>();
@@ -106,6 +120,12 @@ impl Plane {
             .await
             .expect("nothing heard")
             .expect("the server is gone")
+    }
+
+    /// Offers `offer` to the data planes it serves, in place of what it offered.
+    fn offer(&self, offer: Offer) {
+        self.offers
+            .send_modify(|served| served.offered(Arc::new(offer)));
     }
 
     /// Tells it to stop.
@@ -225,7 +245,7 @@ async fn a_data_plane_runs_each_offer_and_says_so() {
     assert_eq!(report.running.config.as_deref(), Some(first.version()));
     // Each later offer.
     let second = Offer::new(&config(81), Some(&first), &mut versions).unwrap();
-    plane.offers.send_replace(Some(Arc::new(second.clone())));
+    plane.offer(second.clone());
     assert_eq!(ran(&mut running).await, config(81));
     let Heard::Reported(report) = plane.next().await else {
         panic!("no report")
@@ -233,7 +253,7 @@ async fn a_data_plane_runs_each_offer_and_says_so() {
     assert_eq!(report.running.config.as_deref(), Some(second.version()));
     // One that fails to run is said to have.
     let third = Offer::new(&config(82), Some(&second), &mut versions).unwrap();
-    plane.offers.send_replace(Some(Arc::new(third.clone())));
+    plane.offer(third.clone());
     let Heard::Reported(report) = plane.next().await else {
         panic!("no report")
     };
@@ -997,9 +1017,7 @@ async fn a_stream_goes_on_once_the_gateways_addresses_can_no_longer_change() {
     assert_eq!(ran(&mut running).await, config(80));
     assert!(matches!(plane.next().await, Heard::Opened { .. }));
     assert!(matches!(plane.next().await, Heard::Reported(_)));
-    plane.offers.send_replace(Some(Arc::new(
-        Offer::new(&config(81), None, &mut Versions::new(8)).unwrap(),
-    )));
+    plane.offer(Offer::new(&config(81), None, &mut Versions::new(8)).unwrap());
     assert_eq!(ran(&mut running).await, config(81));
     assert!(!following.is_finished());
     plane.signal();
@@ -1060,5 +1078,189 @@ async fn the_gateways_addresses_come_before_the_config_and_again_as_they_change(
     );
     plane.signal();
     ended(following).await;
+    plane.join().await;
+}
+
+/// The ID of DataPlane `web`, of ControlPlane `edge`, as its certificate carries it.
+const WEB: &str = "spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-web";
+
+/// The ID of DataPlane `api`, of the same ControlPlane.
+const API: &str = "spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-api";
+
+/// Each data plane is offered what is offered to its own ID, and nothing of another's; one
+/// whose ID is not served, or that carries none, is told why. Whom it serves is changed
+/// only to serve others, so that an offer stays with the data planes it was made for.
+#[test]
+fn a_data_plane_is_offered_its_own_or_told_why_not() {
+    let offer = Arc::new(Offer::new(&config(80), None, &mut Versions::new(7)).unwrap());
+    let other_domain = "spiffe://other.cluster.local/ns/edge/sa/edgerush-proxy-web";
+    let not_served = |id: &str| Err(Unserved::NotServed(id.to_owned()));
+    let web = Served::One {
+        id: WEB.to_owned(),
+        offer: Some(Arc::clone(&offer)),
+    };
+    assert_eq!(web.offer_to(Some(WEB)), Ok(Some(&offer)));
+    assert_eq!(web.offer_to(Some(API)), not_served(API));
+    assert_eq!(web.offer_to(Some(other_domain)), not_served(other_domain));
+    assert_eq!(web.offer_to(None), Err(Unserved::NoId));
+    assert_eq!(Served::of(Some(WEB)).offer_to(Some(WEB)), Ok(None));
+    assert_eq!(Served::Nobody.offer_to(Some(WEB)), not_served(WEB));
+    assert_eq!(Served::Nobody.offer_to(None), Err(Unserved::NoId));
+    let anyone = Served::Anyone(Some(Arc::clone(&offer)));
+    for id in [Some(WEB), Some(API), None] {
+        assert_eq!(anyone.offer_to(id), Ok(Some(&offer)), "{id:?}");
+    }
+    assert_eq!(Served::of(None).offer_to(None), Ok(None));
+    // The same data planes: what was offered stays.
+    let mut served = web.clone();
+    assert!(!served.serve(Served::of(Some(WEB))));
+    assert_eq!(served.offer(), Some(&offer));
+    let mut served = anyone.clone();
+    assert!(!served.serve(Served::of(None)));
+    assert_eq!(served.offer(), Some(&offer));
+    // Others: nothing yet.
+    for next in [Served::of(Some(API)), Served::of(None), Served::Nobody] {
+        let mut served = web.clone();
+        assert!(served.serve(next.clone()), "{next:?}");
+        assert!(served.offer().is_none(), "{next:?}");
+    }
+    let mut served = anyone;
+    assert!(served.serve(Served::of(Some(WEB))));
+    assert_eq!(served.offer_to(Some(WEB)), Ok(None));
+    // Nothing is offered where nobody is served.
+    let mut served = Served::Nobody;
+    served.offered(Arc::clone(&offer));
+    assert!(served.offer().is_none());
+    let mut served = Served::of(Some(WEB));
+    served.offered(Arc::clone(&offer));
+    assert_eq!(served.offer_to(Some(WEB)), Ok(Some(&offer)));
+}
+
+/// A data plane is served by the ID its certificate carries: the one served runs its
+/// config, and one of another ID, of another trust domain or of none is refused, told why,
+/// and that is heard.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_data_plane_is_known_by_the_id_its_certificate_carries() {
+    let authority = Authority::new("stream");
+    let offer = Offer::new(&config(80), None, &mut Versions::new(7)).unwrap();
+    let mut plane = Plane::serving(
+        &credentials(&authority, &["control.test"]),
+        Served::One {
+            id: WEB.to_owned(),
+            offer: Some(Arc::new(offer)),
+        },
+    );
+    let carrying = |names: &[&str]| connector(&credentials(&authority, names)).unwrap();
+    let (mut running, following) = follower(
+        &plane.address,
+        "control.test",
+        carrying(&["data-plane", WEB]),
+        |_| false,
+    );
+    assert_eq!(ran(&mut running).await, config(80));
+    assert!(matches!(plane.next().await, Heard::Opened { .. }));
+    assert!(matches!(plane.next().await, Heard::Reported(_)));
+    let other_domain = "spiffe://other.cluster.local/ns/edge/sa/edgerush-proxy-web";
+    for (names, why) in [
+        (
+            vec!["data-plane", API],
+            format!("{API} is no DataPlane this control plane serves"),
+        ),
+        (
+            vec!["data-plane", other_domain],
+            format!("{other_domain} is no DataPlane this control plane serves"),
+        ),
+        (
+            vec!["data-plane"],
+            "the data plane's certificate carries no SPIFFE ID, or more than one".to_owned(),
+        ),
+        (
+            vec!["data-plane", WEB, API],
+            "the data plane's certificate carries no SPIFFE ID, or more than one".to_owned(),
+        ),
+    ] {
+        let (mut refused_running, refusing) =
+            follower(&plane.address, "control.test", carrying(&names), |_| false);
+        assert_eq!(
+            ended(refusing).await,
+            Ended::Ended(why.clone()),
+            "{names:?}"
+        );
+        assert_eq!(plane.next().await, Heard::Closed(Some(why)), "{names:?}");
+        assert!(refused_running.try_recv().is_err(), "{names:?}");
+        let status = refused(&plane, &carrying(&names), staging_hello()).await;
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{names:?}");
+        assert!(
+            matches!(plane.next().await, Heard::Closed(Some(_))),
+            "{names:?}"
+        );
+    }
+    // The one served is served on.
+    assert!(!following.is_finished());
+    plane.signal();
+    ended(following).await;
+    plane.join().await;
+}
+
+/// The hello a data plane that holds nothing opens its stream with.
+fn staging_hello() -> wire::FromDataPlane {
+    Staging::new().hello()
+}
+
+/// A data plane refused, as its DataPlane is not served, dials again on its backoff and is
+/// served once it is; and once it is served no longer, its stream is ended, told why, and
+/// what is offered to another never reaches it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_data_plane_is_served_once_its_data_plane_is_and_no_longer_once_it_is_not() {
+    let authority = Authority::new("stream");
+    let mut plane = Plane::serving(&credentials(&authority, &["127.0.0.1"]), Served::Nobody);
+    let files = data_plane_files("served-by-id", &authority, &authority);
+    let issued = authority.issue(&["data-plane", WEB]);
+    std::fs::write(&files.certificate, &issued.chain).unwrap();
+    std::fs::write(&files.key, &issued.key).unwrap();
+    let presented = files.read().await.unwrap();
+    let (mut running, mut told, subscribing) =
+        subscriber(&plane.address, files, presented, quick());
+    let not_served = format!("{WEB} is no DataPlane this control plane serves");
+    let Following::Ended { ended, .. } = within(&mut told).await else {
+        panic!("not ended")
+    };
+    assert_eq!(ended, Ended::Ended(not_served.clone()));
+    assert_eq!(plane.next().await, Heard::Closed(Some(not_served.clone())));
+    // Its DataPlane served: on its next dial, it runs its config.
+    let offer = Offer::new(&config(80), None, &mut Versions::new(7)).unwrap();
+    plane.offers.send_replace(Served::One {
+        id: WEB.to_owned(),
+        offer: Some(Arc::new(offer)),
+    });
+    assert_eq!(within(&mut running).await, config(80));
+    // What was told of the dials before it.
+    while told.try_recv().is_ok() {}
+    // Another served in its place, with a config of its own.
+    let another = Offer::new(&config(81), None, &mut Versions::new(8)).unwrap();
+    plane.offers.send_replace(Served::One {
+        id: API.to_owned(),
+        offer: Some(Arc::new(another)),
+    });
+    let ending = async {
+        loop {
+            if let Following::Ended { ended, .. } = within(&mut told).await
+                && ended == Ended::Ended(not_served.clone())
+            {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), ending)
+        .await
+        .expect("its stream was not ended");
+    // Its next dials are refused as well, and nothing of the other's reaches it.
+    let Following::Ended { ended, .. } = within(&mut told).await else {
+        panic!("not ended")
+    };
+    assert_eq!(ended, Ended::Ended(not_served));
+    assert!(running.try_recv().is_err());
+    subscribing.abort();
+    plane.signal();
     plane.join().await;
 }

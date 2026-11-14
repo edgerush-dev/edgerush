@@ -11,7 +11,7 @@
 
 use edgerush_certificates::testing::Authority;
 use edgerush_config::HarnessFile;
-use edgerush_control_service::{Credentials, Heard, acceptor, serve};
+use edgerush_control_service::{Credentials, Heard, Served, acceptor, serve};
 use edgerush_control_stream::{Listening, Offer, Versions};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -805,7 +805,7 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
     harness.wait_for("waiting for the first config from the control plane at 127.0.0.1:");
     // The control plane, serving no config yet.
     let runtime = tokio::runtime::Runtime::new()?;
-    let (offers, offered_rx) = watch::channel(None);
+    let (offers, offered_rx) = watch::channel(Served::Anyone(None));
     let presented = Credentials {
         certificate: authority.issue(&["127.0.0.1"]),
         authorities: authority.pem(),
@@ -842,7 +842,7 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
         None,
         &mut versions,
     );
-    offers.send_replace(Some(Arc::new(refused.clone())));
+    offers.send_replace(Served::Anyone(Some(Arc::new(refused.clone()))));
     assert_eq!(
         harness.wait_for("config from the control plane refused"),
         "config from the control plane refused:"
@@ -857,7 +857,7 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
         Some(&refused),
         &mut versions,
     );
-    offers.send_replace(Some(Arc::new(first.clone())));
+    offers.send_replace(Served::Anyone(Some(Arc::new(first.clone()))));
     let web = harness.address_after("listener \"web\" is on ");
     harness.wait_for("config from the control plane runs");
     assert!(get(web, "/")?.contains("x-upstream: one"));
@@ -871,7 +871,7 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
         Some(&first),
         &mut versions,
     );
-    offers.send_replace(Some(Arc::new(second.clone())));
+    offers.send_replace(Served::Anyone(Some(Arc::new(second.clone()))));
     harness.wait_for("config from the control plane runs");
     assert!(get(web, "/")?.contains("x-upstream: two"));
     assert_eq!(reported().running.config.as_deref(), Some(second.version()));
@@ -886,7 +886,7 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
         Some(&second),
         &mut versions,
     );
-    offers.send_replace(Some(Arc::new(added.clone())));
+    offers.send_replace(Served::Anyone(Some(Arc::new(added.clone()))));
     harness.wait_for("config from the control plane runs");
     assert_eq!(harness.address_after("listener \"api\" is on "), free);
     assert!(get(free, "/")?.contains("x-upstream: two"));
@@ -899,7 +899,7 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
         Some(&added),
         &mut versions,
     );
-    offers.send_replace(Some(Arc::new(without.clone())));
+    offers.send_replace(Served::Anyone(Some(Arc::new(without.clone()))));
     let mut report = reported();
     assert_eq!(report.running.config.as_deref(), Some(without.version()));
     if report.listening.draining == ["api"] {
@@ -920,7 +920,7 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
             )
     };
     let unbound = offered(&with_busy(one), Some(&without), &mut versions);
-    offers.send_replace(Some(Arc::new(unbound.clone())));
+    offers.send_replace(Served::Anyone(Some(Arc::new(unbound.clone()))));
     let report = reported();
     assert_eq!(report.running.config.as_deref(), Some(unbound.version()));
     let [unserved] = report.listening.unserved.as_slice() else {
@@ -936,7 +936,7 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
     );
     drop(taken);
     let bound = offered(&with_busy(two), Some(&unbound), &mut versions);
-    offers.send_replace(Some(Arc::new(bound.clone())));
+    offers.send_replace(Served::Anyone(Some(Arc::new(bound.clone()))));
     let report = reported();
     assert_eq!(report.running.config.as_deref(), Some(bound.version()));
     assert_eq!(report.listening, Listening::default());
@@ -948,7 +948,7 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
         Some(&bound),
         &mut versions,
     );
-    offers.send_replace(Some(Arc::new(third.clone())));
+    offers.send_replace(Served::Anyone(Some(Arc::new(third.clone()))));
     let report = reported();
     assert_eq!(report.running.config.as_deref(), Some(bound.version()));
     assert_eq!(

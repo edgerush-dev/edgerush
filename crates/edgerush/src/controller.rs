@@ -11,8 +11,8 @@ use edgerush_config::Certificate;
 use edgerush_control_service::metrics;
 use edgerush_control_service::webhook::{self, Bounds};
 use edgerush_control_service::{
-    CertificateFiles, Credentials, Files, FilesError, Heard, SslAcceptor, acceptor, reread, serve,
-    webhook_acceptor,
+    CertificateFiles, Credentials, Files, FilesError, Heard, Served, SslAcceptor, acceptor, reread,
+    serve, webhook_acceptor,
 };
 use edgerush_control_stream::{Offer, OfferError, Versions};
 use edgerush_controller::acks::{Pods, Reporter, Runs};
@@ -62,9 +62,11 @@ of it is acted on once the operator's Accepted condition is of it, the last acce
 meanwhile, and nothing is translated until one is. What a DataPlane has no field for takes
 its default: no authorities for wss backends, the data plane's own settings left out.
 With --listen, it serves the config stream there, gRPC over mutual TLS that data planes
-dial: each config translated is offered to every data plane, and what each says of it is
-said on stderr. The certificate, key and authorities are PEM files, read again every
-second, so that ones replaced serve the next connection. With --control-plane, the
+dial: each config translated is offered to the data plane whose certificate carries the
+SPIFFE ID the settings state, its DataPlane's with --control-plane, or to any where a file
+states none, and what each says of it is said on stderr; another is refused, and told
+why. The certificate, key and authorities are PEM files, read again every second, so that
+ones replaced serve the next connection. With --control-plane, the
 addresses of the gateway's own pods, every endpoint of its own Service and of the data
 plane's, ready or not, as the EndpointSlices of the pod's own namespace say them, are sent
 on the stream too, for data planes never to send a request to.
@@ -1042,7 +1044,19 @@ async fn control_until(
     let mut served = None;
     let offering = match listeners.stream {
         Some(serving) => {
-            let (offers, offered) = watch::channel(None);
+            let (offers, offered) = watch::channel(Served::Nobody);
+            // Whom the stream serves follows the settings, so that a data plane is let in or
+            // refused as its DataPlane is served or not, before anything is translated for it.
+            let (mut told, whose) = (planes.clone(), offers.clone());
+            tasks.push(tokio::task::spawn_local(async move {
+                loop {
+                    let next = whom(told.borrow_and_update().as_ref());
+                    whose.send_if_modified(|served| served.serve(next));
+                    if told.changed().await.is_err() {
+                        return;
+                    }
+                }
+            }));
             let (gateway, addresses) = watch::channel::<Arc<[IpAddr]>>(Arc::from([]));
             if let Some(own) = serving.own {
                 let telling = Rc::clone(&say);
@@ -1155,7 +1169,7 @@ async fn control_until(
             }));
             Some(Offering {
                 versions: RefCell::new(serving.versions),
-                offers,
+                served: offers,
                 runs: Rc::clone(&runs),
                 pods: pods.clone(),
             })
@@ -1191,15 +1205,15 @@ async fn control_until(
             },
             move |said| {
                 let mut text = told(&said, write_config.as_deref());
-                if let (Said::Translated(translation), Some(offering)) = (&said, &offering) {
+                if let (Said::Translated { translation, id }, Some(offering)) = (&said, &offering) {
                     // Writing to a `String` cannot fail.
-                    let _ = match offering.offer(translation) {
+                    let _ = match offering.offer(translation, *id) {
                         Ok(version) => write!(text, "\noffered as config {version}"),
                         Err(error) => write!(text, "\nnot offered: {error}"),
                     };
                 }
                 telling(&text);
-                if let Said::Translated(translation) = &said {
+                if let Said::Translated { translation, .. } = &said {
                     // Without an election, this replica is the only one, and leads.
                     let leading = leads.as_ref().is_none_or(|leads| *leads.borrow());
                     let out_of_date = expiry.borrow_mut().take(
@@ -1240,19 +1254,25 @@ async fn control_until(
 /// The latest offer, as data planes are sent it.
 struct Offering {
     versions: RefCell<Versions>,
-    offers: watch::Sender<Option<Arc<Offer>>>,
+    /// Whom the stream serves, and what it offers them.
+    served: watch::Sender<Served>,
     /// What each data plane runs, each version offered among it.
     runs: Rc<RefCell<Runs>>,
     pods: watch::Sender<Pods>,
 }
 
 impl Offering {
-    /// Offers `translation`'s config to every data plane: its version, said as offered.
-    fn offer(&self, translation: &Translation) -> Result<String, OfferError> {
-        let last = self.offers.borrow().clone();
+    /// Offers `translation`'s config to the data plane whose certificate carries `id`, or to
+    /// any the stream serves where it is none: its version, said as offered. What was
+    /// offered to another data plane is let go of, as it is no longer served.
+    fn offer(&self, translation: &Translation, id: Option<&str>) -> Result<String, OfferError> {
+        // Never a step back to a data plane served before: a translation is said only for
+        // the settings `control` serves now, as it begins again for another ID.
+        let mut served = self.served.borrow().clone();
+        served.serve(Served::of(id));
         let offer = Offer::new(
             &translation.config,
-            last.as_deref(),
+            served.offer().map(Arc::as_ref),
             &mut self.versions.borrow_mut(),
         )?;
         let version = offer.version().to_owned();
@@ -1260,9 +1280,19 @@ impl Offering {
         let mut runs = self.runs.borrow_mut();
         runs.offered(&version, generation);
         said_runs(&self.pods, &runs);
-        self.offers.send_replace(Some(Arc::new(offer)));
+        served.offered(Arc::new(offer));
+        self.served.send_replace(served);
         Ok(version)
     }
+}
+
+/// Whom the stream serves of `settings`: the data plane whose certificate carries the ID
+/// they state, any the stream's authorities vouch for where they state none, and none
+/// without settings (05 §3).
+fn whom(settings: Option<&edgerush_controller::Settings>) -> Served {
+    settings.map_or(Served::Nobody, |settings| {
+        Served::of(settings.plane.id.as_deref())
+    })
 }
 
 /// What a data plane said of the config it holds or runs.
@@ -1652,7 +1682,7 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
                 Err(error) => format!("status of {ingress} cannot be written ({said}): {error}"),
             }
         }
-        Said::Translated(translation) => {
+        Said::Translated { translation, .. } => {
             let mut text = described(translation);
             if let Some(path) = write_config {
                 // Writing to a `String` cannot fail.

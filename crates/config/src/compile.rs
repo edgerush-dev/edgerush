@@ -2346,7 +2346,8 @@ fn is_host_and_port(address: &str) -> bool {
 
 /// Whether `id` is a SPIFFE ID, as a workload is known by (12 item 22): `spiffe://` and a
 /// trust domain, then the workload's path.
-fn is_spiffe_id(id: &str) -> bool {
+#[must_use]
+pub fn is_spiffe_id(id: &str) -> bool {
     id.strip_prefix("spiffe://")
         .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
 }

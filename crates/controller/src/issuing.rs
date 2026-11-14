@@ -21,7 +21,7 @@ use edgerush_kubernetes::{ApiServer, Listed, Retry, Scope, follow};
 use edgerush_planes::control_plane::ControlPlane;
 use edgerush_planes::data_plane::DataPlane;
 use edgerush_planes::objects::{
-    SERVICE_MANAGED_BY, controller_name, identity_secret, proxy_name, spiffe_id,
+    SERVICE_MANAGED_BY, controller_name, data_plane_id, identity_secret, proxy_name, spiffe_id,
 };
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
@@ -134,15 +134,14 @@ impl Issuer {
     /// What DataPlane `data_plane`'s certificate is for: its ServiceAccount's ID.
     #[must_use]
     pub fn data_plane_leaf(&self, data_plane: &str) -> Leaf {
-        let name = proxy_name(data_plane);
         Leaf {
-            common_name: name.clone(),
+            common_name: proxy_name(data_plane),
             dns: Vec::new(),
-            spiffe_id: spiffe_id(
+            spiffe_id: data_plane_id(
                 &self.control_plane,
                 &self.cluster_domain,
                 &self.namespace,
-                &name,
+                data_plane,
             ),
         }
     }

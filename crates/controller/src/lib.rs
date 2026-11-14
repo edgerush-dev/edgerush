@@ -147,8 +147,15 @@ pub enum Said<'a> {
         /// What failed.
         failure: &'a Failure,
     },
-    /// A translation that compiles and differs from the last: the data plane's config.
-    Translated(&'a Translation),
+    /// A translation that compiles and differs from the last: the config of the data plane
+    /// whose certificate carries `id`, or of any the stream serves where its settings state
+    /// none, as the stream offers it to that data plane alone (05 §3).
+    Translated {
+        /// The translation.
+        translation: &'a Translation,
+        /// The data plane's ID.
+        id: Option<&'a str>,
+    },
     /// A translation the data plane would refuse, which is not handed on: the last one
     /// stays. Each object is compiled alone as it is translated, and left out if it is
     /// refused (04 §2), so only the data plane's own settings come to this.
@@ -286,10 +293,19 @@ pub async fn control(
     }
 }
 
-/// What a data plane's settings shape of what is followed: its Gateway, its own Service as
-/// it names its pods, and the namespace of the Service written.
-fn shape(settings: &Settings) -> (Option<GatewayName>, Option<ServiceName>, Option<String>) {
+/// What a data plane's settings shape of what is followed and translated: its ID, which
+/// another data plane's translation is never handed to, its Gateway, its own Service as it
+/// names its pods, and the namespace of the Service written.
+fn shape(
+    settings: &Settings,
+) -> (
+    Option<String>,
+    Option<GatewayName>,
+    Option<ServiceName>,
+    Option<String>,
+) {
     (
+        settings.plane.id.clone(),
         settings.plane.gateway.clone(),
         own_service(&settings.plane),
         settings
@@ -474,7 +490,10 @@ async fn serve(
                         handed_since = Some((generation, Instant::now()));
                     }
                 }
-                said(Said::Translated(translation));
+                said(Said::Translated {
+                    translation,
+                    id: settings.plane.id.as_deref(),
+                });
             }
             Step::Refused {
                 translation,

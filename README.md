@@ -197,6 +197,7 @@ ingress_https_redirect_max_age: 30
 
 | Setting | What it is |
 |---|---|
+| `id` | Optional: the SPIFFE ID the data plane's certificate carries, `spiffe://<trust domain>/<path>`. The config stream serves only the data plane whose certificate carries it, refusing any other with why; left out, any data plane the stream's authorities signed is served. A `DataPlane`'s is its own, written into its certificate. |
 | `ingress_class` | The IngressClass whose Ingresses this data plane serves. |
 | `cluster_domain` | The cluster's DNS domain, which Services' names end in. |
 | `ingress_hosts_fall_through` | Whether an Ingress host stays a candidate on hosts a more specific one also covers; `false` is ingress-nginx's way. |
@@ -225,7 +226,7 @@ translation is reported on stderr as `validate` reports it. The rest is chosen b
 | `--namespace shop`, once for each | Follow these namespaces alone, not the whole cluster. |
 | `--namespace-selector 'team=payments'` | Instead, follow the namespaces whose labels the selector matches, as they come to match and stop: each that comes to match is taken in once all of it has been listed. |
 | `--write-config config.yaml` | Write each config as a file `edgerush proxy --config` reads, without the certificates it names. |
-| `--listen [::]:9443 --certificate tls.crt --key tls.key --authorities ca.crt` | Serve the config stream, gRPC over mutual TLS: each config goes to every data plane that dials with a certificate those authorities signed, and what each says of it is reported. |
+| `--listen [::]:9443 --certificate tls.crt --key tls.key --authorities ca.crt` | Serve the config stream, gRPC over mutual TLS: each config goes to the data plane that dials with a certificate those authorities signed carrying the settings' `id`, or to any they signed where the settings state none, and what each says of it is reported; another is refused, with why. |
 | `--leader-lease edge/edgerush-control` | Replicas elect the one that writes status by this Lease. |
 | `--webhook-listen [::]:8443 --webhook-certificate tls.crt --webhook-key tls.key` | Serve the admission webhook, HTTPS, reviews `POST`ed to `/validate`: an Ingress of the class that would not translate alone is refused, with why. |
 | `--metrics [::]:9090` | Serve the controller's own metrics, plain HTTP at `/metrics`: when each certificate handed to the data plane expires, `edgerush_certificate_expiry_timestamp_seconds`. Every replica serves them. |
