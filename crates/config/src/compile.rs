@@ -702,36 +702,23 @@ fn rule_limits(
     limits
 }
 
-/// The mode, as a refusal says it, if `rate_limiting` cannot run `model`. Local mode keeps a
-/// key in one word, which holds no rolling window's slots, and `when_unreachable: local`
-/// decides from local mode's keys (06 §3, #204); the synchronous mode's store runs both
-/// windows; the asynchronous mode runs neither, which it cannot hold against a client
-/// bursting on every data plane at each window's start or after a window idle (06 §4).
-/// Off runs none, and refuses none.
-fn unsupported_in(
+/// The mode, as a refusal says it, if `rate_limiting` cannot run `model`. Local mode and the
+/// synchronous mode run every model, `when_unreachable: local` as local mode does; the
+/// asynchronous mode runs only buckets, as it cannot hold a window against a client bursting
+/// on every data plane at each window's start or after a window idle (06 §4). Off runs none,
+/// and refuses none.
+const fn unsupported_in(
     model: &CompiledModel,
     rate_limiting: &CompiledRateLimiting,
 ) -> Option<&'static str> {
     match (model, rate_limiting) {
-        (CompiledModel::Bucket { .. }, _)
-        | (_, CompiledRateLimiting::Off)
-        | (
-            CompiledModel::FixedWindow { .. },
-            CompiledRateLimiting::Local { .. } | CompiledRateLimiting::Synchronous(_),
-        ) => None,
         (
             CompiledModel::FixedWindow { .. } | CompiledModel::RollingWindow { .. },
             CompiledRateLimiting::Asynchronous(_),
         ) => Some(
-            "in the asynchronous mode, which cannot hold a window against bursts: a quota there is a `bucket`, and a window held exactly takes the synchronous mode",
+            "in the asynchronous mode, which runs only `bucket` limits: use a `bucket`, or the synchronous mode for a window",
         ),
-        (CompiledModel::RollingWindow { .. }, CompiledRateLimiting::Local { .. }) => {
-            Some("in local mode")
-        }
-        (CompiledModel::RollingWindow { .. }, CompiledRateLimiting::Synchronous(waiting)) => {
-            (waiting.when_unreachable == crate::WhenUnreachable::Local)
-                .then_some("with `when_unreachable: local`, which decides as local mode does")
-        }
+        _ => None,
     }
 }
 
@@ -3233,6 +3220,9 @@ pub enum Problem {
         /// The window as it was written.
         window: String,
     },
+    /// A rolling window of too few slots or too many.
+    #[error("`model.rolling_window.slots` is {0}: from 2 to 1,000, or left out for 1,000")]
+    LimitSlots(u64),
     /// A model the mode does not run.
     #[error("`model`: `{model}` is not supported {mode}")]
     LimitModelUnsupported {
@@ -7655,6 +7645,40 @@ rate_limiting: {{ mode: local{switch} }}
 
     const LOCAL: &str = "rate_limiting: { mode: local }";
 
+    /// A rolling window's slots: 1,000 when left out, from 2 to 1,000 when said; a fixed
+    /// window has none.
+    #[test]
+    fn a_rolling_windows_slots_are_checked() {
+        let slots = |said: &str| {
+            in_mode(
+                LOCAL,
+                &format!("{{ rolling_window: {{ limit: 10, window: 1s{said} }} }}"),
+            )
+            .map(|compiled| match compiled.limits()[0].model {
+                CompiledModel::RollingWindow { slots, .. } => slots.get(),
+                _ => 0,
+            })
+        };
+        assert_eq!(slots(""), Ok(1_000));
+        assert_eq!(slots(", slots: 2"), Ok(2));
+        assert_eq!(slots(", slots: 60"), Ok(60));
+        assert_eq!(slots(", slots: 1000"), Ok(1_000));
+        for wrong in [0, 1, 1_001] {
+            assert_eq!(
+                slots(&format!(", slots: {wrong}")),
+                Err(vec![format!(
+                    "limit `k`: `model.rolling_window.slots` is {wrong}: from 2 to 1,000, or left out for 1,000"
+                )]),
+                "{wrong}"
+            );
+        }
+        let parse = |model: &str| {
+            let limits = format!("limits: [{{ name: k, key: client, model: {model} }}]");
+            serde_saphyr::from_str::<crate::Limits>(&limits).map(|_| ())
+        };
+        assert!(parse("{ fixed_window: { limit: 1, window: 1s, slots: 10 } }").is_err());
+    }
+
     /// A window's numbers are checked as a bucket's are: a limit of at least 1, a window of a
     /// whole number and a unit that the clock holds in nanoseconds.
     #[test]
@@ -7703,9 +7727,9 @@ rate_limiting: {{ mode: local{switch} }}
     }
 
     /// Each mode takes the models it can run, and a limit of another is refused naming it:
-    /// local mode keeps no rolling window, nor does `when_unreachable: local`, the
-    /// synchronous mode's store runs both windows, and the asynchronous mode neither, however
-    /// long. Off runs none and refuses none.
+    /// local mode, `when_unreachable: local` and the synchronous mode run every model, the
+    /// asynchronous mode only buckets, a window refused however long. Off runs none and
+    /// refuses none.
     #[test]
     fn each_mode_takes_the_models_it_runs() {
         let service = format!(r#"service: {{ addresses: ["rl-0:7000"], key_secret: {SECRET} }}"#);
@@ -7723,26 +7747,20 @@ rate_limiting: {{ mode: local{switch} }}
                 "limit `k`: `model`: `{model}` is not supported {mode}"
             )])
         };
-        let falling_back_locally =
-            "with `when_unreachable: local`, which decides as local mode does";
-        let no_async_window = "in the asynchronous mode, which cannot hold a window against bursts: a quota there is a `bucket`, and a window held exactly takes the synchronous mode";
+        let no_async_window = "in the asynchronous mode, which runs only `bucket` limits: use a `bucket`, or the synchronous mode for a window";
         for (mode, model, expected) in [
             ("", bucket, Ok(())),
             ("", fixed, Ok(())),
             ("", rolling, Ok(())),
             (LOCAL, bucket, Ok(())),
             (LOCAL, fixed, Ok(())),
-            (LOCAL, rolling, refused("rolling_window", "in local mode")),
+            (LOCAL, rolling, Ok(())),
             (&synchronous, bucket, Ok(())),
             (&synchronous, fixed, Ok(())),
             (&synchronous, rolling, Ok(())),
             (&falling_back, bucket, Ok(())),
             (&falling_back, fixed, Ok(())),
-            (
-                &falling_back,
-                rolling,
-                refused("rolling_window", falling_back_locally),
-            ),
+            (&falling_back, rolling, Ok(())),
             (&asynchronous, bucket, Ok(())),
             (
                 &asynchronous,

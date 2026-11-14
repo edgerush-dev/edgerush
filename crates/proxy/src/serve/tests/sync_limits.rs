@@ -1102,6 +1102,64 @@ async fn with_local_an_owner_out_of_reach_is_decided_by_the_process_buckets() {
         .await;
 }
 
+/// With `when_unreachable: local`, a rolling window is decided by the process's own keys
+/// too, in the limit's slots: ten an hour in 60 slots, across two workers, the rest told to
+/// come back once the oldest admission's slot has left the window, up to a minute early.
+#[tokio::test]
+async fn with_local_an_owner_out_of_reach_decides_a_rolling_window_locally() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let closed = {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                listener.local_addr().unwrap().to_string()
+            };
+            let (upstream, _) = counting_upstream().await;
+            let mut config = with_breaker(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 10)],
+                    &[closed],
+                    100,
+                    "local",
+                ),
+                2,
+                60_000,
+            );
+            config.limits = Some(serde_saphyr::from_str("limits:\n  - { name: per-client, key: client, model: { rolling_window: { limit: 10, window: 1h, slots: 60 } } }\n").unwrap());
+            let (proxy, mut sends) = serving(&config, 2).await;
+            let answers = send_round(&mut sends, 16).await;
+            let statuses = statuses(&answers);
+            assert_eq!(
+                statuses.iter().filter(|s| **s == 200).count(),
+                10,
+                "{statuses:?}"
+            );
+            assert_eq!(
+                statuses.iter().filter(|s| **s == 429).count(),
+                6,
+                "{statuses:?}"
+            );
+            for refused in answers.iter().filter(|a| a.status() == 429) {
+                let after = refused.headers()["retry-after"].to_str().unwrap();
+                let seconds: u64 = after.parse().unwrap();
+                assert!((3_540..=3_600).contains(&seconds), "retry-after {after}");
+                assert_eq!(
+                    refused.headers()["ratelimit"],
+                    format!(r#""per-client";r=0;t={after}"#).as_str()
+                );
+            }
+            assert_eq!(
+                metric(
+                    &proxy.metrics(),
+                    r#"edgerush_rate_limit_unreachable_total{action="local"}"#
+                ),
+                Some(16)
+            );
+        })
+        .await;
+}
+
 /// The process's own buckets are kept from one outage to the next: a client that spent its
 /// bucket while its owner was out of reach, then was decided by the owner once it was back,
 /// finds the bucket still spent when the owner goes again — not a fresh one.

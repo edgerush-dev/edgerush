@@ -209,6 +209,34 @@ async fn local_mode_holds_a_client_to_one_fixed_window_across_workers() {
         .await;
 }
 
+/// And a rolling window: ten an hour, counted in 60 slots, the rest refused until the
+/// oldest admission's slot has left the window — up to a slot, a minute, early — which
+/// `Retry-After` and `RateLimit` say alike.
+#[tokio::test]
+async fn local_mode_holds_a_client_to_one_rolling_window_across_workers() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let mut config = limited_in(everything_config(upstream), local_mode());
+            config.limits = Some(serde_saphyr::from_str("limits:\n  - { name: per-client, key: client, model: { rolling_window: { limit: 10, window: 1h, slots: 60 } } }\n").unwrap());
+            let (_proxy, mut sends) = serving_workers(&config, 2).await;
+            let (statuses, refusals) = send_round(&mut sends, 16).await;
+            let admitted = statuses.iter().filter(|s| **s == 200).count();
+            assert_eq!((admitted, refusals.len()), (10, 6), "{statuses:?}");
+            for headers in &refusals {
+                let after = headers["retry-after"].to_str().unwrap();
+                let seconds: u64 = after.parse().unwrap();
+                assert!((3_540..=3_600).contains(&seconds), "retry-after {after}");
+                assert_eq!(
+                    headers["ratelimit"],
+                    format!(r#""per-client";r=0;t={after}"#).as_str()
+                );
+            }
+        })
+        .await;
+}
+
 /// With rate limiting off — its section left out, or its mode `off` — a rule's limits are
 /// checked but none is enforced: every request goes on, and no limit is counted.
 #[tokio::test]
