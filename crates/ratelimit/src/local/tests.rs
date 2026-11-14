@@ -14,7 +14,7 @@ use std::num::NonZeroU64;
 const MS: u64 = 1_000_000;
 const SECOND: u64 = 1_000 * MS;
 
-fn contract(limit: u64, window: u64, burst: u64) -> Contract {
+pub(super) fn contract(limit: u64, window: u64, burst: u64) -> Contract {
     let n = |n| NonZeroU64::new(n).unwrap();
     Contract {
         limit: n(limit),
@@ -23,7 +23,7 @@ fn contract(limit: u64, window: u64, burst: u64) -> Contract {
     }
 }
 
-fn local() -> Local<FixedState> {
+pub(super) fn local() -> Local<FixedState> {
     Local::new(FixedState::default(), 1)
 }
 
@@ -276,9 +276,9 @@ fn bytes_are_counted_as_keys_come_and_go() {
     assert_eq!(local.holding(), 0);
     assert!(one(&local, &mut handles, b"k1", c, 0));
     let one_key = local.holding();
-    assert_eq!(one_key, key_bytes(b"k1", 1));
+    assert_eq!(one_key, key_bytes(b"k1", c.into(), 1));
     assert!(one(&local, &mut handles, b"k22", c, 0));
-    assert_eq!(local.holding(), one_key + key_bytes(b"k22", 1));
+    assert_eq!(local.holding(), one_key + key_bytes(b"k22", c.into(), 1));
     local.sweep(10 * SECOND, 0);
     assert_eq!(local.holding(), 0);
 }
@@ -295,7 +295,7 @@ fn past_its_cap_it_evicts_the_keys_full_soonest() {
             assert!(one(&local, &mut handles, key.as_bytes(), c, 0));
         }
     }
-    let each = key_bytes(b"k1", 1);
+    let each = key_bytes(b"k1", c.into(), 1);
     // Room for three keys: nine tenths of it keeps two, those full latest.
     local.set_capacity(3 * each);
     let swept = local.sweep(0, SECOND);

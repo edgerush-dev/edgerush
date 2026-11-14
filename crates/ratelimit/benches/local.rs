@@ -2,7 +2,9 @@
 //! for an existing key): a worker deciding on a key it holds a handle to, admitted and
 //! refused, among a thousand other keys; under two and three limits; and meeting a key it
 //! holds no handle to, in a registry of a hundred thousand: found, and made. And the same
-//! decision under a fixed window, admitted and refused.
+//! decision under a fixed window, admitted and refused; and under a rolling window, admitted,
+//! and refused just after a burst filled its newest slot: the first refusal, which scans the
+//! ring for its wait, and one after, which reads it from the hint, at 1,000 slots and at 60.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-ratelimit --bench local`, see the
 //! repository README.
@@ -12,7 +14,7 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_ratelimit::local::{Decision, Handles, Local, Window};
+use edgerush_ratelimit::local::{Decision, Handles, Local, Rolling, Window};
 use edgerush_ratelimit::service::{Contract, Keyed};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
@@ -93,6 +95,46 @@ fn decide_window(setup: (Worker, Window)) -> (Decision, Worker) {
     (decision, worker)
 }
 
+/// When the rolling windows are decided: some windows on from the clock's origin, so that a
+/// window's slots all lie after it.
+const LATER: u64 = 10_000 * MS;
+
+/// A worker holding handles to a thousand rolling windows of `limit` a second in `slots`
+/// slots and `KEY`'s, each asked about once at `LATER`, the decision measured made then; and,
+/// if `hinted`, `KEY` asked once more, refused, so that its hint holds its newest slot.
+fn held_rolling(limit: u64, slots: u64, hinted: bool) -> (Worker, Rolling) {
+    let n = |n| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
+    let rolling = Rolling {
+        limit: n(limit),
+        window: n(1_000 * MS),
+        slots: n(slots),
+    };
+    let mut worker: Worker = Box::new((Local::new(hasher(), 4), Handles::new(hasher())));
+    let keys = (0..1_000).map(|k| format!("api/0\0key-{k}").into_bytes());
+    for key in keys.chain([KEY.to_vec()]) {
+        let (local, handles) = &mut *worker;
+        local.decide(handles, &[(&key, rolling)], LATER);
+    }
+    if hinted {
+        let (local, handles) = &mut *worker;
+        local.decide(handles, &[(KEY, rolling)], LATER);
+    }
+    (worker, rolling)
+}
+
+#[library_benchmark]
+#[bench::admitted(held_rolling(100, 1_000, false))]
+#[bench::refused_scanning(held_rolling(1, 1_000, false))]
+#[bench::refused_hinted(held_rolling(1, 1_000, true))]
+#[bench::refused_scanning_60(held_rolling(1, 60, false))]
+#[bench::refused_hinted_60(held_rolling(1, 60, true))]
+fn decide_rolling(setup: (Worker, Rolling)) -> (Decision, Worker) {
+    let (mut worker, rolling) = setup;
+    let (local, handles) = &mut *worker;
+    let decision = local.decide(handles, black_box(&[(KEY, rolling)]), black_box(LATER));
+    (decision, worker)
+}
+
 #[library_benchmark]
 #[bench::two(held(100), 2)]
 #[bench::three(held(100), 3)]
@@ -132,6 +174,6 @@ fn first_meeting(setup: (Worker, Contract)) -> (Decision, Worker) {
 
 library_benchmark_group!(
     name = local;
-    benchmarks = decide, decide_window, decide_all, first_meeting
+    benchmarks = decide, decide_window, decide_rolling, decide_all, first_meeting
 );
 main!(library_benchmark_groups = local);
