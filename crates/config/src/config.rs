@@ -223,19 +223,6 @@ pub struct RateLimitService {
     /// client seen in that time. On when left out, the faster.
     #[serde(default)]
     pub schedule_keys: Option<bool>,
-    /// The share of each limit's bucket, in percent, a data plane takes on a key before the
-    /// key's owner first answers about it. Below the whole, a burst landing on several data
-    /// planes at once is held to that share on each, rather than a whole bucket on each,
-    /// though one retried after the owner's first answers can take more; a client whose
-    /// traffic all reaches one data plane is refused past it until the owner answers, about a
-    /// cycle and a round trip, told to come back in a second. Rounded up to one request at
-    /// least. 100, the whole, when left out ([06 §4](../../../docs/06-rate-limiting.md)).
-    #[serde(default)]
-    #[cfg_attr(
-        feature = "schema",
-        schemars(range(min = 1, max = crate::compile::WHOLE_COLD_SHARE))
-    )]
-    pub cold_share: Option<u64>,
     /// Mutual TLS to its pods ([06 §4](../../../docs/06-rate-limiting.md)); plain when left
     /// out, as the pods are then served.
     #[serde(default)]
