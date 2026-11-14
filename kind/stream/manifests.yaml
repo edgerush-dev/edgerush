@@ -258,11 +258,6 @@ spec:
             - edgerush-controller-edge-authority
             - --leader-lease
             - edge/edgerush-control
-            # The gateway's own pods, which no data plane may send to (03 §6).
-            - --own-name
-            - edgerush-control-peers.edge.svc.cluster.local
-            - --own-name
-            - edgerush-proxy-web-peers.edge.svc.cluster.local
             - --webhook-listen
             - "0.0.0.0:8443"
             - --webhook-certificate
@@ -282,7 +277,8 @@ spec:
         - name: webhook
           secret: { secretName: edgerush-control-webhook }
 ---
-# Of the name the operator gives it, which the control plane's own certificate carries.
+# Of the name the operator gives it, which the control plane's own certificate carries;
+# its EndpointSlices, and the data plane's Service's, say the gateway's own pods (03 §6).
 apiVersion: v1
 kind: Service
 metadata: { name: edgerush-controller-edge, namespace: edge }
@@ -291,27 +287,6 @@ spec:
   ports:
     - { name: stream, port: 9443, targetPort: stream }
     - { name: webhook, port: 443, targetPort: webhook }
----
-# The control plane's pods and the data plane's, by headless Services whose names resolve
-# to every pod's address, ready or not: the gateway's own, which it never sends to. The data
-# plane's own Service, whose slices say its zone, is the one the control plane writes.
-apiVersion: v1
-kind: Service
-metadata: { name: edgerush-control-peers, namespace: edge }
-spec:
-  clusterIP: None
-  publishNotReadyAddresses: true
-  selector: { app: edgerush-control }
-  ports: [{ name: stream, port: 9443, targetPort: stream }]
----
-apiVersion: v1
-kind: Service
-metadata: { name: edgerush-proxy-web-peers, namespace: edge }
-spec:
-  clusterIP: None
-  publishNotReadyAddresses: true
-  selector: { app: edgerush }
-  ports: [{ name: http, port: 8080, targetPort: http }]
 ---
 apiVersion: v1
 kind: ServiceAccount
