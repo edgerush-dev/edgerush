@@ -148,6 +148,11 @@ pub struct ControlPlaneWebhook {
 /// Status is what the operator and the control plane report of it.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct ControlPlaneStatus {
+    /// Authority is the control plane's certificate authority, as its leader
+    /// publishes it, under a field manager of its own: what the operator registers
+    /// its webhook with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<ControlPlaneStatusAuthority>,
     /// Conditions describe the ControlPlane's state. Known condition types are:
     ///
     /// * "Accepted": whether the operator accepted it, by the checks only the
@@ -156,6 +161,18 @@ pub struct ControlPlaneStatus {
     ///   replica available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<Condition>>,
+}
+
+/// Authority is the control plane's certificate authority, as its leader
+/// publishes it, under a field manager of its own: what the operator registers
+/// its webhook with.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ControlPlaneStatusAuthority {
+    /// Bundle is the certificates, PEM, that its own certificate is trusted by:
+    /// its authority's, and while a provided one is replaced the one before
+    /// too, as each of its workloads is given them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<String>,
 }
 
 /// The schema's default.

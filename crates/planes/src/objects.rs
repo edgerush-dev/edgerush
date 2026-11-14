@@ -11,13 +11,19 @@
 //!
 //! The data plane's Service is [`ProxyService`], apart, as the control plane writes it, of
 //! the ports its config binds (05 §2); the certificates the workloads mount are the control
-//! plane's too, and the webhook's registration and the probes come with the slices that
-//! build them.
+//! plane's too, and the probes come with the slice that builds them. A ControlPlane's
+//! webhook is registered only once its status holds its authority's bundle, which the
+//! control plane publishes there (05 §2): never with an empty one, filled in later.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use edgerush_gateway_api::gateway::GatewaySpec;
 use edgerush_gateway_api::gateway_class::GatewayClassSpec;
+use k8s_openapi::ByteString;
+use k8s_openapi::api::admissionregistration::v1::{
+    RuleWithOperations, ServiceReference, ValidatingWebhook, ValidatingWebhookConfiguration,
+    WebhookClientConfig,
+};
 use k8s_openapi::api::apps::v1::{
     Deployment, DeploymentSpec, DeploymentStrategy, RollingUpdateDeployment,
 };
@@ -34,7 +40,9 @@ use k8s_openapi::api::networking::v1::{IngressClass, IngressClassSpec};
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
+    LabelSelector, LabelSelectorRequirement, ObjectMeta, OwnerReference,
+};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use serde::Serialize;
 
@@ -85,6 +93,14 @@ const STREAM_PORT: i32 = 9443;
 /// The port its pods serve the admission webhook on, and the Service's for it.
 const WEBHOOK_PORT: i32 = 8443;
 const WEBHOOK_SERVICE_PORT: i32 = 443;
+/// The path its pods answer reviews on.
+const WEBHOOK_PATH: &str = "/validate";
+/// How long the API server waits for an answer before it admits the Ingress as for an
+/// outage: its own default, and the webhook's own bound on a request's head and again on
+/// its body (04 §3).
+const WEBHOOK_TIMEOUT: i32 = 10;
+/// The label every namespace carries of its own name, which a webhook selects one by.
+const NAMESPACE_NAME_LABEL: &str = "kubernetes.io/metadata.name";
 
 /// `nobody`, which the image runs as: stated by number, as `runAsNonRoot` can check only a
 /// number.
@@ -124,6 +140,8 @@ pub enum Object {
     IngressClass(IngressClass),
     /// The data plane's Gateway.
     Gateway(Box<Made<GatewaySpec>>),
+    /// The control plane's webhook registration.
+    ValidatingWebhookConfiguration(Box<ValidatingWebhookConfiguration>),
 }
 
 /// An object of a kind whose type is written from its CRD, and so serialized without its
@@ -156,6 +174,7 @@ impl Object {
             Self::GatewayClass(_) => "GatewayClass",
             Self::IngressClass(_) => "IngressClass",
             Self::Gateway(_) => "Gateway",
+            Self::ValidatingWebhookConfiguration(_) => "ValidatingWebhookConfiguration",
         }
     }
 
@@ -173,6 +192,7 @@ impl Object {
             Self::GatewayClass(object) => &object.metadata,
             Self::IngressClass(object) => &object.metadata,
             Self::Gateway(object) => &object.metadata,
+            Self::ValidatingWebhookConfiguration(object) => &object.metadata,
         }
     }
 }
@@ -650,7 +670,7 @@ pub fn for_control_plane(
         });
     }
     objects.push(Object::Service(Box::new(Service {
-        metadata: metadata(name, Some(cp.namespace), &labels, Some(&owner)),
+        metadata: metadata(name.clone(), Some(cp.namespace), &labels, Some(&owner)),
         spec: Some(ServiceSpec {
             selector: Some(labels.clone()),
             ports: Some(service_ports),
@@ -658,6 +678,12 @@ pub fn for_control_plane(
         }),
         ..Service::default()
     })));
+
+    if webhook && let Some(bundle) = authority_bundle(control_plane) {
+        objects.push(Object::ValidatingWebhookConfiguration(Box::new(
+            registration(control_plane, cp.namespace, cp.name, &name, bundle, &labels),
+        )));
+    }
 
     objects.push(Object::GatewayClass(Box::new(Made {
         api_version: "gateway.networking.k8s.io/v1".to_owned(),
@@ -673,6 +699,104 @@ pub fn for_control_plane(
         },
     })));
     Ok(objects)
+}
+
+/// The bundle of its authority's certificates that `control_plane`'s status publishes, if
+/// it holds one: what its webhook is registered with (05 §2). A bundle with no certificate
+/// in it is none, as the API server would trust nothing by it.
+#[must_use]
+pub fn authority_bundle(control_plane: &ControlPlane) -> Option<&str> {
+    control_plane
+        .status
+        .as_ref()?
+        .authority
+        .as_ref()?
+        .bundle
+        .as_deref()
+        .filter(|bundle| bundle.contains("-----BEGIN CERTIFICATE-----"))
+}
+
+/// The name of ControlPlane `control_plane`'s webhook registration, the cluster's: its
+/// controller's, unique as ControlPlane names are.
+#[must_use]
+pub fn registration_name(control_plane: &str) -> String {
+    controller_name(control_plane)
+}
+
+/// `control_plane`'s webhook registration, trusting `bundle`, its Service named `service`:
+/// Ingresses made or changed in its watch scope sent there for review, and admitted as for
+/// an outage where no answer comes (04 §3).
+fn registration(
+    control_plane: &ControlPlane,
+    namespace: &str,
+    control_plane_name: &str,
+    service: &str,
+    bundle: &str,
+    labels: &BTreeMap<String, String>,
+) -> ValidatingWebhookConfiguration {
+    ValidatingWebhookConfiguration {
+        metadata: metadata(registration_name(control_plane_name), None, labels, None),
+        webhooks: Some(vec![ValidatingWebhook {
+            name: format!("{control_plane_name}.ingresses.gateway.edgerush.dev"),
+            admission_review_versions: vec!["v1".to_owned()],
+            client_config: WebhookClientConfig {
+                ca_bundle: Some(ByteString(bundle.as_bytes().to_vec())),
+                service: Some(ServiceReference {
+                    namespace: namespace.to_owned(),
+                    name: service.to_owned(),
+                    path: Some(WEBHOOK_PATH.to_owned()),
+                    port: Some(WEBHOOK_SERVICE_PORT),
+                }),
+                url: None,
+            },
+            failure_policy: Some("Ignore".to_owned()),
+            namespace_selector: scope_selector(control_plane, namespace),
+            rules: Some(vec![RuleWithOperations {
+                api_groups: Some(vec!["networking.k8s.io".to_owned()]),
+                api_versions: Some(vec!["v1".to_owned()]),
+                operations: Some(vec!["CREATE".to_owned(), "UPDATE".to_owned()]),
+                resources: Some(vec!["ingresses".to_owned()]),
+                scope: Some("Namespaced".to_owned()),
+            }]),
+            side_effects: "None".to_owned(),
+            timeout_seconds: Some(WEBHOOK_TIMEOUT),
+            ..ValidatingWebhook::default()
+        }]),
+    }
+}
+
+/// The namespaces of `control_plane`'s watch scope as a webhook selects them, so that it is
+/// asked of nothing beyond it: its own namespace, `own`, by name; a selector's, by that
+/// selector; every namespace, by none. A scope not known is taken as the narrowest, as
+/// [`watched`] takes it.
+fn scope_selector(control_plane: &ControlPlane, own: &str) -> Option<LabelSelector> {
+    let namespaces = &control_plane.spec.watch.namespaces;
+    match namespaces.from.as_str() {
+        "All" => None,
+        "Selector" => {
+            let selector = namespaces.selector.clone().unwrap_or_default();
+            Some(LabelSelector {
+                match_labels: selector.match_labels,
+                match_expressions: selector.match_expressions.map(|expressions| {
+                    expressions
+                        .into_iter()
+                        .map(|expression| LabelSelectorRequirement {
+                            key: expression.key,
+                            operator: expression.operator,
+                            values: expression.values,
+                        })
+                        .collect()
+                }),
+            })
+        }
+        _ => Some(LabelSelector {
+            match_labels: Some(BTreeMap::from([(
+                NAMESPACE_NAME_LABEL.to_owned(),
+                own.to_owned(),
+            )])),
+            ..LabelSelector::default()
+        }),
+    }
 }
 
 /// Every object the operator makes for `data_plane`, of `control_plane`, whose selector of

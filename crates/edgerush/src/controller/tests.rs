@@ -443,6 +443,59 @@ fn the_streams_certificate_is_signed_from_an_authority_instead_of_files() {
         parsed(&with(&["--authority", "Not_A_Name"])),
         Err(UsageError::Authority("Not_A_Name".to_owned()))
     );
+    // The webhook served with the control plane's own certificate, which it signs, as the
+    // stream is (05 §2); or with files all the same.
+    let webhook_of = |args: &[&str]| match parsed(args) {
+        Ok(Parsed::Control(options)) => options.webhook,
+        other => panic!("not parsed: {other:?}"),
+    };
+    assert_eq!(
+        webhook_of(&with(&[
+            "--authority",
+            "a",
+            "--webhook-listen",
+            "[::]:8443"
+        ])),
+        Some(Box::new(Webhook {
+            listen: "[::]:8443".parse().unwrap(),
+            files: None,
+        }))
+    );
+    assert_eq!(
+        webhook_of(&with(&[
+            "--authority",
+            "a",
+            "--webhook-listen",
+            "[::]:8443",
+            "--webhook-certificate",
+            "c",
+            "--webhook-key",
+            "k"
+        ]))
+        .and_then(|webhook| webhook.files),
+        Some(CertificateFiles {
+            certificate: PathBuf::from("c"),
+            key: PathBuf::from("k"),
+        })
+    );
+    // Not with the stream's files, which sign nothing.
+    assert_eq!(
+        parsed(&[
+            "--control-plane",
+            "edge",
+            "--listen",
+            "[::]:9443",
+            "--certificate",
+            "c",
+            "--key",
+            "k",
+            "--authorities",
+            "a",
+            "--webhook-listen",
+            "[::]:8443"
+        ]),
+        Err(UsageError::WebhookTogether)
+    );
     assert_eq!(
         parsed(&[
             "--data-plane",
@@ -616,15 +669,19 @@ fn the_webhook_is_given_whole_or_not_at_all() {
             leader: None,
             webhook: Some(Box::new(Webhook {
                 listen: "[::]:8443".parse().unwrap(),
-                files: CertificateFiles {
+                files: Some(CertificateFiles {
                     certificate: PathBuf::from("c"),
                     key: PathBuf::from("k"),
-                },
+                }),
             })),
             metrics: None,
         })))
     );
-    // Each of the three left out.
+    // Each of the three left out, the certificate's two too where nothing else signs one.
+    assert_eq!(
+        parsed(&["--data-plane", "p", "--webhook-listen", "[::]:8443"]),
+        Err(UsageError::WebhookTogether)
+    );
     for left_out in [0, 2, 4] {
         let mut args = vec!["--data-plane", "p"];
         for (i, pair) in webhook.chunks(2).enumerate() {
@@ -877,9 +934,11 @@ async fn the_webhook_answers_reviews_and_its_certificate_replaced_serves_the_nex
             Timing::default(),
         ),
         listener,
-        files: files.clone(),
-        certificate,
-        reread: Duration::from_millis(20),
+        certifying: Certifying::Files {
+            files: files.clone(),
+            certificate,
+            reread: Duration::from_millis(20),
+        },
     };
     // The control plane runs until the test is done with it, and holds up its own thread
     // once when asked.
@@ -1526,5 +1585,92 @@ async fn a_certificate_handed_out_expired_is_said_and_its_expiry_scraped() {
              common_name=\"shop.example\"} 1500000000\n"
         ),
         "{scraped}"
+    );
+}
+
+/// Whether a TLS connection to the webhook at `address`, trusting `authority`, is made to
+/// `name` within half a second.
+async fn handshakes(address: &str, authority: &Authority, name: &str) -> bool {
+    let mut builder = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
+    let mut trusted = boring::x509::store::X509StoreBuilder::new().unwrap();
+    for certificate in boring::x509::X509::stack_from_pem(authority.pem().as_bytes()).unwrap() {
+        trusted.add_cert(certificate).unwrap();
+    }
+    builder.set_verify_cert_store(trusted.build()).unwrap();
+    let connector = builder.build();
+    let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let connecting = tokio_boring::connect(connector.configure().unwrap(), name, socket);
+    matches!(
+        tokio::time::timeout(Duration::from_millis(500), connecting).await,
+        Ok(Ok(_))
+    )
+}
+
+/// The control plane's own certificate for `name`, as the issuer hands it out, signed by
+/// `authority`.
+fn own_written(authority: &Authority, name: &str) -> Written {
+    let issued = authority.issue(&[name]);
+    Written {
+        certificate: issued.chain,
+        key: issued.key,
+        bundle: authority.pem(),
+    }
+}
+
+/// Served with the control plane's own certificate, the webhook takes no connection until
+/// the issuer signs the first, and each one signed after it serves the next (05 §2).
+#[tokio::test(flavor = "current_thread")]
+async fn the_webhook_is_served_with_each_certificate_the_issuer_signs() {
+    let fake = cluster().await;
+    let authority = Authority::new("own");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let (own, signed) = watch::channel(None);
+    let hooking = Hooking {
+        api: fake.client(
+            &token("controller-webhook-signed", "secret"),
+            Timing::default(),
+        ),
+        listener,
+        certifying: Certifying::Signed(signed),
+    };
+    let (_settings, planes) = watch::channel(None);
+    let (said, mut hearing) = mpsc::unbounded_channel();
+    let (stopping, stop) = oneshot::channel();
+    let (ending, ended) = oneshot::channel();
+    hook(hooking, planes, said, stop, ending).unwrap();
+    let service = "edgerush-controller-edge.edge.svc";
+    assert!(
+        !handshakes(&address, &authority, service).await,
+        "served before a certificate was signed"
+    );
+    own.send_replace(Some(own_written(&authority, service)));
+    let served = tokio::time::timeout(Duration::from_secs(5), async {
+        while !handshakes(&address, &authority, service).await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    served.await.expect("never served with its own certificate");
+    // Signed again, for another name: the next connection is served with it.
+    own.send_replace(Some(own_written(&authority, "renamed.test")));
+    let renamed = tokio::time::timeout(Duration::from_secs(5), async {
+        while !handshakes(&address, &authority, "renamed.test").await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    renamed
+        .await
+        .expect("the certificate signed again never served");
+    let _ = stopping.send(());
+    ended.await.unwrap();
+    let mut lines = Vec::new();
+    while let Ok(line) = hearing.try_recv() {
+        lines.push(line);
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "the webhook's certificate is replaced"),
+        "{lines:?}"
     );
 }

@@ -8,11 +8,15 @@
 //! objects made for it has changed since it was last applied whole, so that a hand edit
 //! is undone and an object deleted by hand made again; and at every step while anything of
 //! it is not applied. Its GatewayClass or Gateway is left out while the cluster does not
-//! serve the kind, and made once it does. Its bindings it no longer asks for are deleted:
-//! those of namespaces its ControlPlane's selector no longer selects, and, for one whose
+//! serve the kind, and made once it does. A ControlPlane's webhook registration is made
+//! once its status publishes its authority's bundle, and until then its status says it
+//! waits for it (05 §2). Its bindings it no longer asks for are deleted: those of
+//! namespaces its ControlPlane's selector no longer selects, and, for one whose
 //! ControlPlane is not accepted, every right beyond its own namespace, so that an allowance
-//! narrowed takes back what it granted (05 §4). One being deleted has what no owner
-//! reference reaches deleted by its labels, then its finalizer taken away.
+//! narrowed takes back what it granted (05 §4); and so is a webhook registration no longer
+//! asked for, its webhook turned off or its ControlPlane not accepted. One being deleted
+//! has what no owner reference reaches deleted by its labels, then its finalizer taken
+//! away.
 //!
 //! Nothing is kept from step to step but what saves a write: a new leader applies
 //! everything once, and converges from what the cluster holds.
@@ -27,10 +31,12 @@ use edgerush_kubernetes::{ApiError, ApiServer, Kind, Scope};
 use edgerush_planes::control_plane::{ControlPlane, ControlPlaneWatchNamespaces};
 use edgerush_planes::data_plane::DataPlane;
 use edgerush_planes::objects::{
-    self, Install, Object, control_plane_labels, controller_name, data_plane_labels, proxy_name,
+    self, Install, Object, authority_bundle, control_plane_labels, controller_name,
+    data_plane_labels, proxy_name, registration_name,
 };
 use edgerush_planes::platform_defaults::PlatformDefaults;
 use k8s_openapi::Resource;
+use k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
@@ -160,24 +166,32 @@ struct Plane<'a> {
     depends: Option<i64>,
     /// The namespaces its ControlPlane's selector selects, which its bindings follow too.
     selected: BTreeSet<String>,
-    /// The bindings it may keep, each `(kind, namespace, name)`: any other made for it is
-    /// deleted. `None` for one whose rights are not judged here.
-    keep: Option<BTreeSet<Binding>>,
+    /// The bindings and webhook registration it may keep, each `(kind, namespace, name)`:
+    /// any other made for it is deleted. `None` for one whose rights are not judged here.
+    keep: Option<BTreeSet<Withdrawn>>,
+    /// For a ControlPlane whose webhook is on, the bundle its status publishes, which its
+    /// registration trusts, if there is one.
+    bundle: Option<String>,
+    /// For a ControlPlane whose webhook is on, whether it waits for that bundle.
+    waits_for_bundle: bool,
 }
 
-/// A binding, as `(kind, namespace, name)`: empty for a ClusterRoleBinding's namespace.
-type Binding = (&'static str, String, String);
+/// An object deleted once it is no longer asked for, as `(kind, namespace, name)`: a
+/// binding or a webhook registration, the namespace empty for one of the cluster's.
+type Withdrawn = (&'static str, String, String);
 
-/// The bindings of `objects`.
-fn bindings_of(objects: &[Object]) -> BTreeSet<Binding> {
+/// Whether `kind` is of the objects deleted once no longer asked for.
+fn withdrawable(kind: &str) -> bool {
+    kind == RoleBinding::KIND
+        || kind == ClusterRoleBinding::KIND
+        || kind == ValidatingWebhookConfiguration::KIND
+}
+
+/// The bindings and webhook registration of `objects`.
+fn withdrawable_of(objects: &[Object]) -> BTreeSet<Withdrawn> {
     objects
         .iter()
-        .filter(|object| {
-            matches!(
-                object,
-                Object::RoleBinding(_) | Object::ClusterRoleBinding(_)
-            )
-        })
+        .filter(|object| withdrawable(object.kind()))
         .map(|object| {
             let metadata = object.metadata();
             (
@@ -189,14 +203,16 @@ fn bindings_of(objects: &[Object]) -> BTreeSet<Binding> {
         .collect()
 }
 
-/// `control_plane` as it would be watching its own namespace alone: what it keeps while it
-/// is not accepted, the rights beyond its namespace taken back.
+/// `control_plane` as it would be watching its own namespace alone, its webhook off: what
+/// it keeps while it is not accepted, the rights beyond its namespace taken back, and its
+/// webhook no longer asked of the scope it was registered for.
 fn own_namespace_only(control_plane: &ControlPlane) -> ControlPlane {
     let mut own = control_plane.clone();
     own.spec.watch.namespaces = ControlPlaneWatchNamespaces {
         from: "Same".to_owned(),
         selector: None,
     };
+    own.spec.webhook.enabled = false;
     own
 }
 
@@ -210,6 +226,9 @@ struct Applied {
     selected: BTreeSet<String>,
     /// Which kinds were served, so that an object left out is made once its kind is.
     gateway_api: GatewayApi,
+    /// For a ControlPlane, the bundle its webhook was registered with: a status change,
+    /// which changes no generation.
+    bundle: Option<String>,
     /// Each of its objects, by kind, namespace and name, at its version.
     children: Vec<(&'static str, String, String, String)>,
 }
@@ -235,6 +254,7 @@ impl Applied {
             depends: plane.depends,
             selected: plane.selected.clone(),
             gateway_api: seen.gateway_api,
+            bundle: plane.bundle.clone(),
             children,
         }
     }
@@ -289,11 +309,15 @@ impl Operator {
                 .as_deref()
                 .unwrap_or_default();
             let selected = selected(control_plane, verdict.is_ok(), seen);
+            let hooked = control_plane.spec.webhook.enabled;
+            let bundle = authority_bundle(control_plane)
+                .filter(|_| hooked)
+                .map(str::to_owned);
             let (objects, keep) = match verdict {
                 Ok(()) => {
                     let objects =
                         objects::for_control_plane(control_plane, &selected, &self.install);
-                    let keep = objects.as_deref().ok().map(bindings_of);
+                    let keep = objects.as_deref().ok().map(withdrawable_of);
                     (
                         objects.map_err(|error| Made::Refused(error.to_string())),
                         keep,
@@ -303,7 +327,7 @@ impl Operator {
                     let own = own_namespace_only(control_plane);
                     let keep = objects::for_control_plane(&own, &selected, &self.install)
                         .ok()
-                        .map(|objects| bindings_of(&objects));
+                        .map(|objects| withdrawable_of(&objects));
                     (Err(Made::Pending(String::new())), keep)
                 }
             };
@@ -318,6 +342,8 @@ impl Operator {
                 depends: None,
                 selected,
                 keep,
+                waits_for_bundle: hooked && bundle.is_none(),
+                bundle,
             });
         }
         for (data_plane, verdict) in &judged.data_planes {
@@ -337,7 +363,7 @@ impl Operator {
                             &selected,
                             &self.install,
                         );
-                        let keep = objects.as_deref().ok().map(bindings_of);
+                        let keep = objects.as_deref().ok().map(withdrawable_of);
                         let objects = objects.map_err(|error| Made::Refused(error.to_string()));
                         (objects, keep, selected)
                     } else {
@@ -345,7 +371,7 @@ impl Operator {
                         let keep =
                             objects::for_data_plane(data_plane, &own, &selected, &self.install)
                                 .ok()
-                                .map(|objects| bindings_of(&objects));
+                                .map(|objects| withdrawable_of(&objects));
                         let pending = Made::Pending(format!(
                             "ControlPlane {of} is not accepted: nothing of this generation is \
                              made until it is."
@@ -369,6 +395,8 @@ impl Operator {
                     .and_then(|control_plane| control_plane.metadata.generation),
                 selected,
                 keep,
+                bundle: None,
+                waits_for_bundle: false,
             });
         }
         let present: HashSet<String> = planes
@@ -471,7 +499,8 @@ impl Operator {
                 // Without its Gateway, a DataPlane is not programmed, though the rest is
                 // made: not a step left undone, as the CRD's follow says when it is there.
                 // A ControlPlane is programmed without its GatewayClass, as Ingress alone
-                // has none.
+                // has none; not without its webhook's registration, which waits for its
+                // status's bundle, as its follow says when it comes.
                 match left_out
                     .iter()
                     .find(|object| matches!(object, Object::Gateway(_)))
@@ -481,13 +510,21 @@ impl Operator {
                          their CRD at v1; the rest is made.",
                         described(gateway)
                     )),
+                    None if made == Made::Applied && plane.waits_for_bundle => {
+                        Made::Pending(format!(
+                            "ValidatingWebhookConfiguration {} is not made until the control \
+                             plane publishes its authority's bundle in this status; the rest \
+                             is made.",
+                            registration_name(name)
+                        ))
+                    }
                     _ => made,
                 }
             }
             Err(made) => made.clone(),
         };
         if let Some(keep) = &plane.keep {
-            done &= unbind(api, &plane, keep, seen, &what, say).await;
+            done &= withdraw(api, &plane, keep, seen, &what, say).await;
         }
         let available = seen.children.iter().any(|child| {
             child.kind == Deployment::KIND
@@ -560,13 +597,13 @@ fn selected(control_plane: &ControlPlane, accepted: bool, seen: &Seen) -> BTreeS
     }
 }
 
-/// The bindings made for `plane`, said as `what`, that are not among those it may `keep`,
-/// deleted: whether they all were. Each is one the operator made, by its labels, so nothing
-/// else of the name is touched.
-async fn unbind(
+/// The bindings and webhook registration made for `plane`, said as `what`, that are not
+/// among those it may `keep`, deleted: whether they all were. Each is one the operator made,
+/// by its labels, so nothing else of the name is touched.
+async fn withdraw(
     api: &ApiServer,
     plane: &Plane<'_>,
-    keep: &BTreeSet<Binding>,
+    keep: &BTreeSet<Withdrawn>,
     seen: &Seen,
     what: &str,
     say: &dyn Fn(&str),
@@ -575,25 +612,27 @@ async fn unbind(
     let kept =
         |child: &Child| keep.contains(&(child.kind, child.namespace.clone(), child.name.clone()));
     for child in seen.children.iter().filter(|child| {
-        (child.kind == RoleBinding::KIND || child.kind == ClusterRoleBinding::KIND)
-            && carries(&child.labels, &plane.labels)
-            && !kept(child)
+        withdrawable(child.kind) && carries(&child.labels, &plane.labels) && !kept(child)
     }) {
-        let deleted = if child.kind == RoleBinding::KIND {
-            api.delete::<RoleBinding>(&child.namespace, &child.name)
-                .await
+        let (deleted, why) = if child.kind == RoleBinding::KIND {
+            let deleted = api.delete::<RoleBinding>(&child.namespace, &child.name);
+            (deleted.await.map(drop), "no longer granted")
+        } else if child.kind == ClusterRoleBinding::KIND {
+            let deleted = api.delete::<ClusterRoleBinding>("", &child.name);
+            (deleted.await.map(drop), "no longer granted")
         } else {
-            api.delete::<ClusterRoleBinding>("", &child.name).await
+            let deleted = api.delete::<ValidatingWebhookConfiguration>("", &child.name);
+            (deleted.await.map(drop), "no longer asked for")
         };
-        let binding = if child.namespace.is_empty() {
+        let object = if child.namespace.is_empty() {
             format!("{} {}", child.kind, child.name)
         } else {
             format!("{} {}/{}", child.kind, child.namespace, child.name)
         };
         match deleted {
-            Ok(_) => say(&format!("{what}: {binding} deleted, no longer granted")),
+            Ok(()) => say(&format!("{what}: {object} deleted, {why}")),
             Err(error) => {
-                say(&format!("{what}: {binding} cannot be deleted: {error}"));
+                say(&format!("{what}: {object} cannot be deleted: {error}"));
                 done = false;
             }
         }
@@ -658,6 +697,9 @@ async fn apply_all(
             Object::GatewayClass(_) => apply::<GatewayClass>(api, object, labels, uid).await,
             Object::IngressClass(_) => apply::<IngressClass>(api, object, labels, uid).await,
             Object::Gateway(_) => apply::<Gateway>(api, object, labels, uid).await,
+            Object::ValidatingWebhookConfiguration(_) => {
+                apply::<ValidatingWebhookConfiguration>(api, object, labels, uid).await
+            }
         };
         match applied {
             Ok(true) => {}
@@ -744,7 +786,8 @@ async fn unfinalize(
 }
 
 /// What no owner reference reaches deleted by its labels: the resource's cluster-scoped
-/// objects, and its RoleBindings in namespaces other than its own. GatewayClasses only
+/// objects, its webhook registration among them, and its RoleBindings in namespaces other
+/// than its own. GatewayClasses only
 /// where the cluster serves them: without their CRD there are none, and a delete of them
 /// would fail.
 async fn clean(
@@ -757,6 +800,8 @@ async fn clean(
         .await?;
     match plane.kind {
         PlaneKind::ControlPlane => {
+            api.delete_all::<ValidatingWebhookConfiguration>(&Scope::Cluster, &plane.labels)
+                .await?;
             if seen.gateway_api.gateway_classes {
                 api.delete_all::<GatewayClass>(&Scope::Cluster, &plane.labels)
                     .await?;
