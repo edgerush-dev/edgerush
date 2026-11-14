@@ -1,5 +1,6 @@
 # Ingress and Gateway API, a fixed fleet of two (max no more than min), a CPU limit below
-# the request rounded up, of a ControlPlane that watches every namespace.
+# the request rounded up, of a ControlPlane that watches every namespace; its Service's
+# labels beside EdgeRush's own, which win.
 apiVersion: gateway.edgerush.dev/v1alpha1
 kind: ControlPlane
 metadata: { name: edge, namespace: edge-system, uid: 6f1c2b8e-0000-4000-8000-000000000002 }
@@ -16,4 +17,7 @@ spec:
     listeners:
       - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
   ingress: { httpPort: 80, httpsPort: 443, httpsRedirect: false }
+  service:
+    labels: { cost-centre: payments, app.kubernetes.io/name: mine }
+    loadBalancerSourceRanges: [203.0.113.0/24]
   resources: { requests: { cpu: 3200m }, limits: { cpu: "3" } }

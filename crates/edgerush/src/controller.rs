@@ -20,8 +20,9 @@ use edgerush_controller::admission::{self, Asked};
 use edgerush_controller::data_plane::{self, follow_data_planes};
 use edgerush_controller::expiry::Expiry;
 use edgerush_controller::issuing::{self, Issuer};
-use edgerush_controller::status::{Addresses, address};
-use edgerush_controller::{Acks, Debounce, Membership, Reports, Said, WatchScope, control};
+use edgerush_controller::{
+    Acks, Debounce, Membership, Reports, Said, ServiceNow, WatchScope, control,
+};
 use edgerush_kubernetes::lease::{self, elect};
 use edgerush_kubernetes::{ApiError, ApiServer, Listed, Retry, SERVICE_ACCOUNT, Scope, follow};
 use edgerush_translate::{Plane, Translation};
@@ -47,7 +48,6 @@ Usage: edgerush controller (--data-plane <FILE> | --control-plane <NAME> [--clus
          [--listen <ADDRESS> (--certificate <FILE> --key <FILE> --authorities <FILE>
                               | --authority <SECRET> [--authority-provided])
           [--own-name <NAME>]...]
-         [--status-service <NAMESPACE>/<NAME> | --status-address <ADDRESS>...]
          [--leader-lease <NAMESPACE>/<NAME>]
          [--webhook-listen <ADDRESS> --webhook-certificate <FILE> --webhook-key <FILE>]
          [--metrics <ADDRESS>]
@@ -70,10 +70,13 @@ never to send a request to.
 Where the data plane is a Gateway, its GatewayClass, the Gateway and each HTTPRoute of it
 say in their status what is served of them, the Gateway programmed once every ready pod of
 the data plane runs its generation, as the data planes say on the stream.
-With --status-service or --status-address, each Ingress served says the data plane's
-addresses in its status, each of the class that is not says none, and the Gateway says
-them. With --leader-lease, the replicas elect one by that Lease, which alone writes
-status; every one serves, and reports what its data planes run in a ConfigMap of the
+With --control-plane, it writes the data plane's Service, edgerush-proxy-<DATAPLANE>, as
+its DataPlane shapes it, listing the ports each config handed on binds and Ingress's two;
+each Ingress served says that Service's addresses in its status, each of the class that is
+not says none, and the Gateway says them: a LoadBalancer's, once its load balancer gives
+them, any other's its cluster IPs. With --data-plane there is no such Service, and no
+status says an address. With --leader-lease, the replicas elect one by that Lease, which
+alone writes the Service and status; every one serves, and reports what its data planes run in a ConfigMap of the
 Lease's namespace, <LEASE>-acks-<HOSTNAME>, owned by its Pod where EDGERUSH_POD_UID gives
 the Pod's UID, for the leader to merge.
 With --webhook-listen, it serves the admission webhook there, HTTPS, reviews POSTed to
@@ -134,17 +137,10 @@ Options:
                              the data planes', the control plane's or the rate-limiting
                              service's, given once for each; looked up again as each
                              answer's time to live runs out, with --listen
-      --status-service <NAMESPACE>/<NAME>
-                             The data plane's Service, followed: its load balancer's
-                             addresses, else its external IPs, are what each Ingress
-                             served says in its status
-      --status-address <ADDRESS>
-                             An address each Ingress served says in its status, an IP or a
-                             host name, given once for each; for a cluster with no load
-                             balancer, instead of --status-service
       --leader-lease <NAMESPACE>/<NAME>
                              The Lease the controller's replicas elect a leader by, which
-                             alone writes status; left out, there is no election
+                             alone writes the Service and status; left out, there is no
+                             election
       --webhook-listen <ADDRESS>
                              Serve the admission webhook on ADDRESS, such as [::]:8443;
                              given with the two below
@@ -416,8 +412,6 @@ struct Options {
     stream: Option<Box<Stream>>,
     /// The names whose addresses are the gateway's own pods, sent on the stream.
     own_names: Vec<String>,
-    /// Where the addresses Ingress statuses say come from, if they are written.
-    status: Option<Addresses>,
     /// The Lease a leader is elected by, as its namespace and name, if one is.
     leader: Option<(String, String)>,
     webhook: Option<Box<Webhook>>,
@@ -542,10 +536,6 @@ enum UsageError {
     AuthorityProvidedAlone,
     #[error("'--authority' signs in its ControlPlane's trust domain, and needs '--control-plane'")]
     AuthorityWithoutControlPlane,
-    #[error("'--status-service {0}' is not a namespace and a name, as edge/edgerush")]
-    StatusService(String),
-    #[error("'--status-service' and '--status-address' are not given together")]
-    Status,
     #[error("'--leader-lease {0}' is not a namespace and a name, as edge/edgerush-control")]
     LeaderLease(String),
     #[error("'--webhook-listen {0}' is not an address and a port, such as [::]:8443")]
@@ -573,13 +563,11 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut authorities = None;
     let mut authority = None;
     let mut provided = false;
-    let mut status_service = None;
     let mut leader = None;
     let mut webhook_listen = None;
     let mut webhook_certificate = None;
     let mut webhook_key = None;
     let mut metrics = None;
-    let mut status_addresses = Vec::new();
     let mut own_names: Vec<String> = Vec::new();
     let mut scope = Vec::new();
     let mut selector = None;
@@ -604,8 +592,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                 provided = true;
                 continue;
             }
-            "--status-service" => "--status-service",
-            "--status-address" => "--status-address",
             "--leader-lease" => "--leader-lease",
             "--webhook-listen" => "--webhook-listen",
             "--webhook-certificate" => "--webhook-certificate",
@@ -657,19 +643,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                 if authority.replace(value).is_some() {
                     return Err(UsageError::Twice(option));
                 }
-                continue;
-            }
-            "--status-service" => {
-                let named = named(&value)
-                    .map(|(namespace, name)| Addresses::Service { namespace, name })
-                    .ok_or_else(|| UsageError::StatusService(value.clone()))?;
-                if status_service.replace(named).is_some() {
-                    return Err(UsageError::Twice(option));
-                }
-                continue;
-            }
-            "--status-address" => {
-                status_addresses.push(address(&value));
                 continue;
             }
             "--own-name" => {
@@ -764,12 +737,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     if !own_names.is_empty() && stream.is_none() {
         return Err(UsageError::OwnNameWithoutStream);
     }
-    let status = match (status_service, status_addresses.is_empty()) {
-        (Some(_), false) => return Err(UsageError::Status),
-        (Some(service), true) => Some(service),
-        (None, false) => Some(Addresses::Stated(status_addresses)),
-        (None, true) => None,
-    };
     let settings = match (data_plane, control_plane, cluster_domain) {
         (Some(_), Some(_), _) => return Err(UsageError::Settings),
         (Some(_), None, Some(_)) => return Err(UsageError::ClusterDomainWithoutControlPlane),
@@ -800,7 +767,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         write_config,
         stream,
         own_names,
-        status,
         leader,
         webhook,
         metrics,
@@ -907,7 +873,6 @@ async fn control_until(
 ) -> io::Result<()> {
     let say: Rc<dyn Fn(&str)> = Rc::new(say);
     let write_config = options.write_config;
-    let status = options.status;
     let mut electing = Vec::new();
     // What each data plane this replica serves runs, as it says it (04 §6).
     let runs: Rc<RefCell<Runs>> = Rc::default();
@@ -974,7 +939,11 @@ async fn control_until(
     let (settings, planes) = watch::channel(None);
     let _fixed = match source {
         Source::Fixed(plane) => {
-            settings.send_replace(Some(plane));
+            // The development harness's: no Service is written (05 §2).
+            settings.send_replace(Some(edgerush_controller::Settings {
+                plane,
+                service: None,
+            }));
             Some(settings)
         }
         Source::Followed {
@@ -1168,7 +1137,6 @@ async fn control_until(
             &scope,
             planes,
             Debounce::default(),
-            status,
             leading,
             Acks {
                 own: running,
@@ -1370,7 +1338,7 @@ fn said_runs(pods: &watch::Sender<Pods>, runs: &Runs) {
 /// runtime cannot be started.
 fn hook(
     hooking: Hooking,
-    planes: watch::Receiver<Option<Plane>>,
+    planes: watch::Receiver<Option<edgerush_controller::Settings>>,
     said: mpsc::UnboundedSender<String>,
     stop: oneshot::Receiver<()>,
     ended: oneshot::Sender<()>,
@@ -1410,7 +1378,13 @@ fn hook(
                             listener,
                             accepting,
                             Bounds::default(),
-                            move |body| review(planes.borrow().as_ref(), &classes.borrow(), body),
+                            move |body| {
+                                review(
+                                    planes.borrow().as_ref().map(|settings| &settings.plane),
+                                    &classes.borrow(),
+                                    body,
+                                )
+                            },
                             async move {
                                 let _ = stop.await;
                             },
@@ -1549,6 +1523,18 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
         Said::GatewayApiStatus { object, written } => match written {
             Ok(()) => format!("status of {object} written"),
             Err(error) => format!("status of {object} cannot be written: {error}"),
+        },
+        Said::Service { service, now } => match now {
+            ServiceNow::Applied(ports) => {
+                format!("Service {service} written: {}", ports.join(", "))
+            }
+            ServiceNow::Refused(error) => format!("Service {service} cannot be written: {error}"),
+            ServiceNow::NotOurs => format!(
+                "Service {service} is not its DataPlane's, and is left alone; no status says its addresses"
+            ),
+            ServiceNow::NoPort => format!(
+                "Service {service} is left as it is: the config binds no port, and no Service is without one"
+            ),
         },
         Said::Status {
             ingress,

@@ -9,9 +9,10 @@
 //! is told apart and never taken over. What sits in the plane's own namespace has an owner
 //! reference to it.
 //!
-//! The data plane's Service is not here, as the control plane writes it (05 §2); nor are
-//! the certificates the workloads mount, nor the webhook's registration, which come with
-//! the slices that build them, as do the probes.
+//! The data plane's Service is [`ProxyService`], apart, as the control plane writes it, of
+//! the ports its config binds (05 §2); the certificates the workloads mount are the control
+//! plane's too, and the webhook's registration and the probes come with the slices that
+//! build them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -205,6 +206,9 @@ pub enum Error {
     /// not read, which no controller could follow.
     #[error("the ControlPlane's selector of namespaces: {0}")]
     Selector(String),
+    /// The DataPlane's `ipFamily` is none its schema holds.
+    #[error("the DataPlane's ipFamily {0} is not IPv4, IPv6 or Dual")]
+    IpFamily(String),
 }
 
 /// A plane's name, namespace and UID, read from its metadata.
@@ -882,6 +886,169 @@ pub fn for_data_plane(
         })));
     }
     Ok(objects)
+}
+
+/// What a port of the data plane's Service is served over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Transports {
+    /// TCP: any listener but a `udp` one.
+    pub tcp: bool,
+    /// UDP: a `udp` listener, or one serving HTTP/3 ([24](../../../docs/24-udp-proxying.md)).
+    pub udp: bool,
+}
+
+/// What the labels of [`ProxyService`]'s Service say made it: the control plane, not
+/// the operator, which makes everything else of a DataPlane's.
+pub const SERVICE_MANAGED_BY: &str = "edgerush-controller";
+
+/// The data plane's Service, its address, as its `DataPlane` shapes it: all of it but the
+/// ports, which are what the config handed on binds
+/// ([05 §2](../../../docs/05-operator.md)). The control plane writes it, not the operator,
+/// so that a port follows its listener with the operator down. Named as the data plane's
+/// Deployment is, owned by the DataPlane, its pods those of that Deployment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProxyService {
+    name: String,
+    namespace: String,
+    owner: OwnerReference,
+    /// The DataPlane's own, then EdgeRush's, which win.
+    labels: BTreeMap<String, String>,
+    annotations: Option<BTreeMap<String, String>>,
+    /// The data plane's pods: the labels of its Deployment's.
+    selector: BTreeMap<String, String>,
+    type_: String,
+    load_balancer_class: Option<String>,
+    load_balancer_source_ranges: Option<Vec<String>>,
+    ip_family_policy: &'static str,
+    ip_families: Vec<String>,
+    /// Ingress's two ports, listed while the DataPlane has `ingress`, whatever is bound.
+    ingress: Option<(i32, i32)>,
+}
+
+impl ProxyService {
+    /// The Service `data_plane` shapes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Missing`] for a DataPlane without a name, namespace or UID;
+    /// [`Error::IpFamily`] for an `ipFamily` its schema does not hold.
+    pub fn of(data_plane: &DataPlane) -> Result<Self, Error> {
+        let dp = Identity::of(&data_plane.metadata, "DataPlane")?;
+        let spec = &data_plane.spec;
+        let selector = data_plane_labels(dp.namespace, &spec.control_plane_ref.name, dp.name);
+        let mut labels = spec.service.labels.clone().unwrap_or_default();
+        labels.extend(selector.clone());
+        labels.insert(MANAGED_BY_LABEL.to_owned(), SERVICE_MANAGED_BY.to_owned());
+        // Each a policy the API server keeps the families to, never stated apart (05 §2).
+        let (ip_family_policy, ip_families) = match spec.ip_family.as_str() {
+            "IPv4" => ("SingleStack", vec!["IPv4"]),
+            "IPv6" => ("SingleStack", vec!["IPv6"]),
+            "Dual" => ("RequireDualStack", vec!["IPv4", "IPv6"]),
+            other => return Err(Error::IpFamily(other.to_owned())),
+        };
+        Ok(Self {
+            name: proxy_name(dp.name),
+            namespace: dp.namespace.to_owned(),
+            owner: dp.owner("DataPlane"),
+            labels,
+            annotations: spec.service.annotations.clone(),
+            selector,
+            type_: spec.service.r#type.clone(),
+            load_balancer_class: spec.service.load_balancer_class.clone(),
+            load_balancer_source_ranges: spec.service.load_balancer_source_ranges.clone(),
+            ip_family_policy,
+            ip_families: ip_families.into_iter().map(str::to_owned).collect(),
+            ingress: spec
+                .ingress
+                .as_ref()
+                .map(|ingress| (ingress.http_port, ingress.https_port)),
+        })
+    }
+
+    /// Its name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Its namespace, the DataPlane's.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// The UID of the DataPlane that owns it: a Service of its name owned otherwise is not
+    /// this one, and is left alone.
+    #[must_use]
+    pub fn owner_uid(&self) -> &str {
+        &self.owner.uid
+    }
+
+    /// The Service, listing the ports `bound` and Ingress's two, each over what it is served
+    /// on, a port of both named apart (`port-<n>`, `port-<n>-udp`); none where there is no
+    /// port at all, as Kubernetes allows no Service without one.
+    #[must_use]
+    pub fn service(&self, bound: &BTreeMap<u16, Transports>) -> Option<Service> {
+        let mut ports: BTreeMap<i32, Transports> = bound
+            .iter()
+            .map(|(port, transports)| (i32::from(*port), *transports))
+            .collect();
+        if let Some((http, https)) = self.ingress {
+            for port in [http, https] {
+                ports.entry(port).or_default().tcp = true;
+            }
+        }
+        let ports: Vec<ServicePort> = ports
+            .into_iter()
+            .flat_map(|(port, transports)| {
+                let tcp = transports.tcp.then(|| ServicePort {
+                    name: Some(format!("port-{port}")),
+                    port,
+                    protocol: Some("TCP".to_owned()),
+                    // The data plane binds the port a client uses (05 §2).
+                    target_port: Some(IntOrString::Int(port)),
+                    ..ServicePort::default()
+                });
+                let udp = transports.udp.then(|| ServicePort {
+                    name: Some(format!("port-{port}-udp")),
+                    port,
+                    protocol: Some("UDP".to_owned()),
+                    target_port: Some(IntOrString::Int(port)),
+                    ..ServicePort::default()
+                });
+                tcp.into_iter().chain(udp)
+            })
+            .collect();
+        if ports.is_empty() {
+            return None;
+        }
+        // Kubernetes takes a traffic policy only where traffic comes from outside.
+        let external = matches!(self.type_.as_str(), "LoadBalancer" | "NodePort");
+        let mut metadata = metadata(
+            self.name.clone(),
+            Some(&self.namespace),
+            &self.labels,
+            Some(&self.owner),
+        );
+        metadata.annotations.clone_from(&self.annotations);
+        Some(Service {
+            metadata,
+            spec: Some(ServiceSpec {
+                type_: Some(self.type_.clone()),
+                selector: Some(self.selector.clone()),
+                ports: Some(ports),
+                ip_family_policy: Some(self.ip_family_policy.to_owned()),
+                ip_families: Some(self.ip_families.clone()),
+                // The client's address kept, which rate-limit keys need (05 §2).
+                external_traffic_policy: external.then(|| "Local".to_owned()),
+                session_affinity: Some("None".to_owned()),
+                load_balancer_class: self.load_balancer_class.clone(),
+                load_balancer_source_ranges: self.load_balancer_source_ranges.clone(),
+                ..ServiceSpec::default()
+            }),
+            ..Service::default()
+        })
+    }
 }
 
 /// The DataPlane's resources as a container's.

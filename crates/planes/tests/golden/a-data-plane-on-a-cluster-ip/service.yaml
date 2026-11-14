@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-controller
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: inside
+    gateway.edgerush.dev/namespace: edge
+  name: edgerush-proxy-inside
+  namespace: edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: inside
+    uid: 0d6a9f3c-0000-4000-8000-000000000004
+spec:
+  ipFamilies:
+  - IPv6
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: port-5353-udp
+    port: 5353
+    protocol: UDP
+    targetPort: 5353
+  - name: port-8080
+    port: 8080
+    protocol: TCP
+    targetPort: 8080
+  selector:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: inside
+    gateway.edgerush.dev/namespace: edge
+  sessionAffinity: None
+  type: ClusterIP

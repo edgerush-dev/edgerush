@@ -2,6 +2,7 @@ use super::*;
 use bytes::Bytes;
 use edgerush_kubernetes::Timing;
 use edgerush_kubernetes::testing::{Answer, Fake, answer, token};
+use edgerush_planes::objects::ProxyService;
 use edgerush_translate::GATEWAY_CONTROLLER;
 use k8s_openapi::ByteString;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -28,9 +29,80 @@ fn plane() -> Plane {
     plane_with("")
 }
 
-/// Settings that never change: `plane`, its sender gone.
-fn fixed(plane: &Plane) -> watch::Receiver<Option<Plane>> {
-    watch::channel(Some(plane.clone())).1
+/// Settings that never change: `plane`, its sender gone, of no Service, as the development
+/// harness's.
+fn fixed(plane: &Plane) -> watch::Receiver<Option<Settings>> {
+    watch::channel(Some(harness(plane))).1
+}
+
+/// `plane` as the development harness serves it: of no Service.
+fn harness(plane: &Plane) -> Settings {
+    Settings {
+        plane: plane.clone(),
+        service: None,
+    }
+}
+
+/// DataPlane `web` of `edge`, of UID `web-uid`, with these more fields in its spec.
+fn web_data_plane(more: &str) -> edgerush_planes::data_plane::DataPlane {
+    serde_saphyr::from_str(&format!(
+        "metadata: {{ name: web, namespace: edge, uid: web-uid }}
+spec:
+  controlPlaneRef: {{ name: edge }}
+{more}"
+    ))
+    .unwrap()
+}
+
+/// `plane` served under the operator: the data plane's Service, `edge/edgerush-proxy-web`,
+/// written as DataPlane `web`, of these more fields, shapes it.
+fn operated(plane: &Plane, more: &str) -> Settings {
+    Settings {
+        plane: plane.clone(),
+        service: Some(ProxyService::of(&web_data_plane(more)).unwrap()),
+    }
+}
+
+/// The path the data plane's Service is applied at.
+const SERVICE_APPLIED: &str = "/api/v1/namespaces/edge/services/edgerush-proxy-web?fieldManager=edgerush-controller&force=true";
+
+/// The Service `settings` wants of these ports, as its namespace lists it, with these
+/// addresses from its load balancer.
+fn as_wanted(settings: &Settings, ports: &[u16], balanced: &[&str]) -> Service {
+    let bound = ports
+        .iter()
+        .map(|port| {
+            let transports = edgerush_planes::objects::Transports {
+                tcp: true,
+                udp: false,
+            };
+            (*port, transports)
+        })
+        .collect();
+    let mut service = settings.service.as_ref().unwrap().service(&bound).unwrap();
+    if !balanced.is_empty() {
+        let ingress: Vec<String> = balanced
+            .iter()
+            .map(|ip| format!("{{ ip: {ip} }}"))
+            .collect();
+        service.status = Some(
+            serde_saphyr::from_str(&format!(
+                "loadBalancer: {{ ingress: [{}] }}",
+                ingress.join(", ")
+            ))
+            .unwrap(),
+        );
+    }
+    service
+}
+
+/// The bodies of the applies of the data plane's Service the fake was sent.
+fn applied(fake: &Fake) -> Vec<serde_json::Value> {
+    fake.seen()
+        .into_iter()
+        .filter(|seen| seen.method == "PATCH" && seen.path == SERVICE_APPLIED)
+        .map(|seen| serde_json::from_str(&seen.body).unwrap())
+        .collect()
 }
 
 /// IngressClass `edge`, which names this controller.
@@ -168,6 +240,12 @@ fn hear(heard: &Rc<RefCell<Heard>>) -> impl Fn(Said<'_>) + 'static {
                 Ok(()) => format!("status of {object}"),
                 Err(error) => format!("status of {object} not written: {error}"),
             },
+            Said::Service { service, now } => match now {
+                ServiceNow::Applied(ports) => format!("Service {service}: {}", ports.join(", ")),
+                ServiceNow::Refused(error) => format!("Service {service} refused: {error}"),
+                ServiceNow::NotOurs => format!("Service {service} not ours"),
+                ServiceNow::NoPort => format!("Service {service} of no port"),
+            },
             Said::Status {
                 ingress,
                 addresses,
@@ -241,7 +319,7 @@ fn every_follows_objects_are_translated_and_its_secrets_looked_at() {
             true,
             vec![secret("shop", &[])],
         )],
-        status_service: Vec::new(),
+        own_services: Vec::new(),
         gateway_api: None,
         watched: watched(&[
             Scope::Namespace("shop".to_owned()),
@@ -376,7 +454,7 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
         ingresses: Vec::new(),
         services: Vec::new(),
         secrets: Vec::new(),
-        status_service: Vec::new(),
+        own_services: Vec::new(),
         gateway_api: Some(gateway_api),
         watched: None,
         gateway_namespace: None,
@@ -623,7 +701,6 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                         &WatchScope::Parts(vec![Scope::Cluster]),
                         fixed(&plane),
                         Debounce::default(),
-                        None,
                         None,
                         acks(),
                         said,
@@ -941,7 +1018,6 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
                         fixed(&plane),
                         debounce,
                         None,
-                        None,
                         acks(),
                         said,
                     )
@@ -1053,7 +1129,6 @@ async fn the_settings_are_followed_as_they_change() {
                         planes,
                         Debounce::default(),
                         None,
-                        None,
                         acks(),
                         said,
                     )
@@ -1073,7 +1148,7 @@ async fn the_settings_are_followed_as_they_change() {
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert!(fake.seen().is_empty(), "followed without settings");
 
-            settings.send_replace(Some(plane()));
+            settings.send_replace(Some(harness(&plane())));
             until("translated", || heard.borrow().translations.len() == 1).await;
             assert_eq!(
                 routes(&heard.borrow().translations[0]),
@@ -1085,7 +1160,7 @@ async fn the_settings_are_followed_as_they_change() {
             // followed or listed again for it.
             let mut other = plane();
             other.ingress_class = Some("other".to_owned());
-            settings.send_replace(Some(other));
+            settings.send_replace(Some(harness(&other)));
             until("translated again", || {
                 heard.borrow().translations.len() == 2
             })
@@ -1098,7 +1173,7 @@ async fn the_settings_are_followed_as_they_change() {
             );
 
             // A Gateway: what is followed changes, and the follows are begun again.
-            settings.send_replace(Some(gateway_plane()));
+            settings.send_replace(Some(harness(&gateway_plane())));
             until("followed again", || ingresses() == 2).await;
             until("the Gateway API's CRDs listed", || {
                 lists("/apis/apiextensions.k8s.io/v1/customresourcedefinitions") > 0
@@ -1140,7 +1215,6 @@ async fn secrets_are_followed_in_the_gateways_namespace_beside_the_scope() {
                     &scope,
                     fixed(&plane),
                     Debounce::default(),
-                    None,
                     None,
                     acks(),
                     |_| {},
@@ -1210,7 +1284,6 @@ async fn each_namespace_of_the_scope_is_followed_and_all_are_translated_together
                         &scope,
                         fixed(&plane),
                         Debounce::default(),
-                        None,
                         None,
                         acks(),
                         said,
@@ -1356,29 +1429,7 @@ fn a_status_is_written_where_it_says_other_than_what_is_served() {
 }
 
 #[test]
-fn a_services_addresses_are_its_load_balancers_else_its_external_ips() {
-    let service: Service = serde_saphyr::from_str(
-        "{ metadata: { name: edgerush, namespace: edge },
-           spec: { externalIPs: [192.0.2.9] },
-           status: { loadBalancer: { ingress: [{ ip: 203.0.113.7 }, { hostname: lb.example }] } } }",
-    )
-    .unwrap();
-    assert_eq!(
-        status::of_service(Some(&service)),
-        [
-            status::address("203.0.113.7"),
-            status::address("lb.example")
-        ]
-    );
-    let mut pending = service.clone();
-    pending.status = None;
-    assert_eq!(
-        status::of_service(Some(&pending)),
-        [status::address("192.0.2.9")]
-    );
-    pending.spec = None;
-    assert!(status::of_service(Some(&pending)).is_empty());
-    assert!(status::of_service(None).is_empty());
+fn an_address_is_an_ip_else_a_host_name() {
     assert_eq!(
         status::address("2001:db8::1").ip.as_deref(),
         Some("2001:db8::1")
@@ -1414,11 +1465,16 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
         } else if path.starts_with("/api/v1/services?") {
             page(&[service("shop")])
         } else if path.starts_with("/api/v1/namespaces/edge/services?") {
-            let data_plane: Service = serde_saphyr::from_str(
-                "{ metadata: { name: edgerush, namespace: edge }, spec: { externalIPs: [203.0.113.7] } }",
+            page(&[as_wanted(
+                &operated(&plane(), ""),
+                &[80, 443],
+                &["203.0.113.7"],
+            )])
+        } else if path == SERVICE_APPLIED {
+            answer(
+                200,
+                r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"edgerush-proxy-web"}}"#,
             )
-            .unwrap();
-            page(&[data_plane])
         } else if path.starts_with("/api/v1/secrets?") {
             page(&[secret("shop", &["shop.example"])])
         } else {
@@ -1435,16 +1491,11 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
             let controlling = tokio::task::spawn_local({
                 let said = hear(&heard);
                 async move {
-                    let source = Addresses::Service {
-                        namespace: "edge".to_owned(),
-                        name: "edgerush".to_owned(),
-                    };
                     control(
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
-                        fixed(&plane),
+                        watch::channel(Some(operated(&plane, ""))).1,
                         Debounce::default(),
-                        Some(source),
                         None,
                         acks(),
                         said,
@@ -1464,7 +1515,7 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
     let patched: std::collections::BTreeSet<(String, String)> = fake
         .seen()
         .into_iter()
-        .filter(|seen| seen.method == "PATCH")
+        .filter(|seen| seen.method == "PATCH" && seen.path != SERVICE_APPLIED)
         .map(|seen| (seen.path, seen.body))
         .collect();
     let path =
@@ -1484,8 +1535,8 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
     assert_eq!(patched, expected);
 }
 
-/// The data plane's Service not to be read: translation goes on all the same, and no status
-/// is written until it is listed.
+/// The data plane's Service not to be read: translation goes on all the same, and no status,
+/// nor the Service, is written until it is listed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_config_is_not_held_up_by_its_status() {
     let fake = Fake::start(&["127.0.0.1"], move |path| {
@@ -1521,16 +1572,11 @@ async fn a_config_is_not_held_up_by_its_status() {
             let controlling = tokio::task::spawn_local({
                 let said = hear(&heard);
                 async move {
-                    let source = Addresses::Service {
-                        namespace: "edge".to_owned(),
-                        name: "edgerush".to_owned(),
-                    };
                     control(
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
-                        fixed(&plane),
+                        watch::channel(Some(operated(&plane, ""))).1,
                         Debounce::default(),
-                        Some(source),
                         None,
                         acks(),
                         said,
@@ -1561,12 +1607,12 @@ async fn a_config_is_not_held_up_by_its_status() {
     );
     assert!(
         fake.seen().iter().all(|seen| seen.method != "PATCH"),
-        "a status written with no Service listed"
+        "a status, or the Service, written with no Service listed"
     );
 }
 
-/// A replica that does not lead writes no status; as it comes to, it writes each that says
-/// otherwise, nothing else having changed.
+/// A replica that does not lead writes no status, nor the data plane's Service; as it comes
+/// to, it writes each that says otherwise, and the Service, nothing else having changed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
     let fake = Fake::start(&["127.0.0.1"], move |path| {
@@ -1582,6 +1628,17 @@ async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
             page(&[ingress_saying("web", "edge", &[], &[])])
         } else if path.starts_with("/api/v1/services?") {
             page(&[service("shop")])
+        } else if path.starts_with("/api/v1/namespaces/edge/services?") {
+            page(&[as_wanted(
+                &operated(&plane(), ""),
+                &[80, 443],
+                &["203.0.113.7"],
+            )])
+        } else if path == SERVICE_APPLIED {
+            answer(
+                200,
+                r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"edgerush-proxy-web"}}"#,
+            )
         } else if path.starts_with("/api/v1/secrets?") {
             page(&[secret("shop", &["shop.example"])])
         } else {
@@ -1599,13 +1656,11 @@ async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
             let controlling = tokio::task::spawn_local({
                 let said = hear(&heard);
                 async move {
-                    let source = Addresses::Stated(vec![status::address("203.0.113.7")]);
                     control(
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
-                        fixed(&plane),
+                        watch::channel(Some(operated(&plane, ""))).1,
                         Debounce::default(),
-                        Some(source),
                         Some(leading),
                         acks(),
                         said,
@@ -1617,15 +1672,14 @@ async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert!(
                 fake.seen().iter().all(|seen| seen.method != "PATCH"),
-                "a status written by a replica that does not lead"
+                "a status, or the Service, written by a replica that does not lead"
             );
             leads.send_replace(true);
-            until("the status written once it leads", || {
-                heard
-                    .borrow()
-                    .lines
-                    .iter()
-                    .any(|line| line == "status of Ingress shop/web: [203.0.113.7]")
+            until("the Service and the status written once it leads", || {
+                let heard = heard.borrow();
+                let said = |wanted: &str| heard.lines.iter().any(|line| line == wanted);
+                said("status of Ingress shop/web: [203.0.113.7]")
+                    && said("Service edge/edgerush-proxy-web: 80/TCP, 443/TCP")
             })
             .await;
             controlling.abort();
@@ -2085,7 +2139,7 @@ fn the_leader_merges_every_replicas_report_and_counts_the_ready_pods() {
         ingresses: Vec::new(),
         services: Vec::new(),
         secrets: Vec::new(),
-        status_service: Vec::new(),
+        own_services: Vec::new(),
         gateway_api: None,
         watched: None,
         gateway_namespace: None,
@@ -2251,7 +2305,6 @@ async fn a_selectors_namespaces_are_followed_and_each_that_comes_to_match_taken_
                         fixed(&plane),
                         Debounce::default(),
                         None,
-                        None,
                         acks(),
                         said,
                     )
@@ -2405,7 +2458,6 @@ async fn a_selectors_first_namespaces_are_waited_on_as_the_start_is() {
                         fixed(&plane),
                         Debounce::default(),
                         None,
-                        None,
                         acks(),
                         said,
                     )
@@ -2464,7 +2516,7 @@ async fn the_gateways_namespace_joining_keeps_its_secrets_translated() {
                 services: Vec::new(),
                 secrets: vec![secrets],
                 gateway_namespace: Some(edge.clone()),
-                status_service: Vec::new(),
+                own_services: Vec::new(),
                 gateway_api: None,
                 watched: Some(Vec::new()),
                 selected: None,
@@ -2542,6 +2594,220 @@ async fn the_gateways_namespace_joining_keeps_its_secrets_translated() {
                 ]
             );
             assert!(followed.joining.is_empty());
+        })
+        .await;
+}
+
+/// A fake API server of Ingress `web` of class `edge` served, and the data plane's Service
+/// listed as `own` has it, each apply of it answered `applied`.
+async fn serving_web(own: Vec<Service>, applied: u16) -> Fake {
+    Fake::start(&["127.0.0.1"], move |path| {
+        if path.ends_with("/status") {
+            return answer(200, "{}");
+        }
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path == SERVICE_APPLIED {
+            return if applied == 200 {
+                answer(
+                    200,
+                    r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"edgerush-proxy-web"}}"#,
+                )
+            } else {
+                answer(
+                    applied,
+                    r#"{"kind":"Status","code":422,"reason":"Invalid","message":"spec.loadBalancerClass: may not change once set"}"#,
+                )
+            };
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[ingress_saying("web", "edge", &["192.0.2.1"], &[])])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/namespaces/edge/services?") {
+            page(&own)
+        } else if path.starts_with("/api/v1/secrets?") {
+            page(&[secret("shop", &["shop.example"])])
+        } else {
+            answer(500, "")
+        }
+    })
+    .await
+}
+
+/// Each said line that starts so.
+fn said_of(heard: &Rc<RefCell<Heard>>, start: &str) -> Vec<String> {
+    heard
+        .borrow()
+        .lines
+        .iter()
+        .filter(|line| line.starts_with(start))
+        .cloned()
+        .collect()
+}
+
+/// The data plane's Service is written as the config binds, Ingress's two ports beside
+/// those; not again while it is as wanted, however often translated; and again as its
+/// DataPlane changes its shape, what it no longer states taken away by the apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_data_planes_service_is_written_as_wanted_and_not_again_until_that_changes() {
+    // Ingress's ports, stated apart from the 80 and 443 the Ingress is bound on, so that
+    // both sources are seen.
+    let shaped =
+        "  ingress: { httpPort: 8080, httpsPort: 8443 }\n  service:\n    annotations: { a: b }\n";
+    let first = operated(&plane(), shaped);
+    let live = as_wanted(&first, &[80, 443, 8080, 8443], &[]);
+    let fake = serving_web(vec![live], 200).await;
+    let api = fake.client(&token("controller-service", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (settings, planes) = watch::channel(Some(first.clone()));
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        planes,
+                        Debounce::default(),
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("written once", || {
+                !said_of(&heard, "Service edge/edgerush-proxy-web").is_empty()
+            })
+            .await;
+            assert_eq!(
+                said_of(&heard, "Service "),
+                ["Service edge/edgerush-proxy-web: 80/TCP, 443/TCP, 8080/TCP, 8443/TCP"]
+            );
+            // Translated again, the Service as wanted: not written.
+            let mut redirecting = first.clone();
+            redirecting.plane.ingress_https_redirect = true;
+            settings.send_replace(Some(redirecting));
+            until("translated again", || {
+                heard.borrow().translations.len() == 2
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(applied(&fake).len(), 1, "{:?}", heard.borrow().lines);
+            // Its annotation taken away, which the Service there still carries: written.
+            let plain = operated(&plane(), "  ingress: { httpPort: 8080, httpsPort: 8443 }\n");
+            settings.send_replace(Some(plain));
+            until("written again", || applied(&fake).len() == 2).await;
+            controlling.abort();
+        })
+        .await;
+    let applies = applied(&fake);
+    assert_eq!(applies[0]["metadata"]["annotations"]["a"], "b");
+    assert!(
+        applies[1]["metadata"].get("annotations").is_none(),
+        "{}",
+        applies[1]
+    );
+    assert_eq!(
+        applies[1]["metadata"]["ownerReferences"][0]["uid"],
+        "web-uid"
+    );
+    assert_eq!(applies[1]["spec"]["externalTrafficPolicy"], "Local");
+}
+
+/// A Service of the data plane's Service's name that its DataPlane does not own is left
+/// alone, said once, and no status says its addresses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_of_its_name_not_its_data_planes_is_left_alone() {
+    let settings = operated(&plane(), "");
+    let mut theirs = as_wanted(&settings, &[80, 443], &["203.0.113.9"]);
+    theirs.metadata.owner_references = None;
+    let fake = serving_web(vec![theirs], 200).await;
+    let api = fake.client(&token("controller-not-ours", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        watch::channel(Some(settings)).1,
+                        Debounce::default(),
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("the status said with no address", || {
+                heard
+                    .borrow()
+                    .lines
+                    .iter()
+                    .any(|line| line == "status of Ingress shop/web: []")
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            controlling.abort();
+        })
+        .await;
+    assert!(applied(&fake).is_empty(), "another's Service written");
+    assert_eq!(
+        said_of(&heard, "Service "),
+        ["Service edge/edgerush-proxy-web not ours"]
+    );
+}
+
+/// A Service the API server refuses is said, and no status claims an address for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_refused_is_said() {
+    let settings = operated(&plane(), "");
+    let fake = serving_web(Vec::new(), 422).await;
+    let api = fake.client(&token("controller-refused", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        watch::channel(Some(settings)).1,
+                        Debounce::default(),
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("the refusal said", || {
+                said_of(&heard, "Service edge/edgerush-proxy-web refused: ")
+                    .iter()
+                    .any(|line| line.contains("may not change once set"))
+            })
+            .await;
+            until("the status said with no address", || {
+                heard
+                    .borrow()
+                    .lines
+                    .iter()
+                    .any(|line| line == "status of Ingress shop/web: []")
+            })
+            .await;
+            controlling.abort();
         })
         .await;
 }

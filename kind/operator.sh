@@ -20,6 +20,11 @@
 #   - a ControlPlane deleted there, without Gateway API's CRDs, is gone;
 #   - Gateway API's CRDs installed, the operator makes the GatewayClass and the Gateway,
 #     and the DataPlane is programmed, without a restart;
+#   - the control plane writes the data plane's Service (docs/05 §2), owned by DataPlane
+#     `web`, a LoadBalancer that keeps the client's address: Ingress's two ports listed,
+#     and the Gateway's listener's as it is bound, which follows the listener's port as
+#     the DataPlane changes it; the address a load balancer gives it, written by hand as
+#     kind has none, said by the Ingress's status and the Gateway's;
 #   - the data plane's Deployment's image edited by hand is put back, and a label added by
 #     hand is kept;
 #   - a second DataPlane of `edge` is not accepted, and nothing is made for it;
@@ -243,6 +248,36 @@ condition_is dataplane/web edge Programmed "True Programmed" 60 ||
 [ "$(operator_pod)" = "$before" ] ||
     fail "the operator was restarted: before '$before', now '$(operator_pod)'"
 pass "Gateway API's CRDs installed: the GatewayClass and the Gateway made, the DataPlane programmed, no restart"
+
+echo "== the data plane's Service"
+# The ports the data plane's Service lists, as `port/protocol`, in its order.
+ports_of() {
+    k -n edge get service edgerush-proxy-web \
+        -o jsonpath='{range .spec.ports[*]}{.port}/{.protocol}{" "}{end}' 2>/dev/null
+}
+until_true '[ "$(ports_of)" = "80/TCP 443/TCP 8080/TCP " ]' 60 ||
+    fail "the data plane's Service lists '$(ports_of)', not Ingress's two ports and the listener's"
+shape=$(k -n edge get service edgerush-proxy-web -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name} {.spec.type} {.spec.externalTrafficPolicy} {.spec.sessionAffinity}')
+[ "$shape" = "DataPlane/web LoadBalancer Local None" ] ||
+    fail "the data plane's Service is '$shape'"
+pass "the control plane writes the data plane's Service, owned by its DataPlane, Ingress's two ports and the listener's listed"
+k -n edge patch dataplane web --type=json \
+    -p '[{"op":"replace","path":"/spec/gateway/listeners/0/port","value":8081}]' >/dev/null
+until_true '[ "$(ports_of)" = "80/TCP 443/TCP 8081/TCP " ]' 60 ||
+    fail "the listener's port changed, the data plane's Service lists '$(ports_of)'"
+k -n edge patch dataplane web --type=json \
+    -p '[{"op":"replace","path":"/spec/gateway/listeners/0/port","value":8080}]' >/dev/null
+until_true '[ "$(ports_of)" = "80/TCP 443/TCP 8080/TCP " ]' 60 ||
+    fail "the listener's port changed back, the data plane's Service lists '$(ports_of)'"
+pass "the data plane's Service follows the listener's port as the DataPlane changes it"
+# Kind has no load balancer: its address written as a cloud's controller would.
+k -n edge patch service edgerush-proxy-web --subresource=status --type=merge \
+    -p '{"status":{"loadBalancer":{"ingress":[{"ip":"192.0.2.10"}]}}}' >/dev/null
+until_true '[ "$(k -n edge get ingress shop -o jsonpath="{.status.loadBalancer.ingress[0].ip}")" = 192.0.2.10 ]' 60 ||
+    fail "the Ingress's status says '$(k -n edge get ingress shop -o jsonpath='{.status.loadBalancer.ingress}')', not the load balancer's address"
+until_true '[ "$(k -n edge get gateway web -o jsonpath="{.status.addresses[0].value}")" = 192.0.2.10 ]' 60 ||
+    fail "the Gateway's status says '$(k -n edge get gateway web -o jsonpath='{.status.addresses}')', not the load balancer's address"
+pass "the Ingress's status and the Gateway's say the address the data plane's Service's load balancer gives"
 
 echo "== kept as stated"
 k -n edge label deploy/edgerush-proxy-web team=shop >/dev/null

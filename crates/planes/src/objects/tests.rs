@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
-use super::{Error, Install, Object, for_control_plane, for_data_plane};
+use super::{Error, Install, Object, ProxyService, Transports, for_control_plane, for_data_plane};
 use crate::control_plane::ControlPlane;
 use crate::data_plane::{DataPlane, DataPlaneIngress, DataPlaneResources};
 
@@ -36,6 +36,8 @@ fn data_plane() -> DataPlane {
         ..DataPlane::default()
     };
     dp.spec.control_plane_ref.name = "payments".to_owned();
+    // The schema's default, which `Default` does not know.
+    dp.spec.ip_family = "IPv4".to_owned();
     dp.spec.ingress = Some(DataPlaneIngress {
         http_port: 80,
         https_port: 443,
@@ -251,4 +253,106 @@ fn a_selector_the_api_server_would_not_read_makes_nothing() {
             "{selector}"
         );
     }
+}
+
+/// The ports of a data plane's Service, as `(name, port, protocol)`.
+fn service_ports(
+    bound: &[(u16, Transports)],
+    dp: &DataPlane,
+) -> Option<Vec<(String, i32, String)>> {
+    let bound: BTreeMap<u16, Transports> = bound.iter().copied().collect();
+    let service = ProxyService::of(dp).unwrap().service(&bound)?;
+    Some(
+        service
+            .spec
+            .unwrap()
+            .ports
+            .unwrap()
+            .into_iter()
+            .map(|port| (port.name.unwrap(), port.port, port.protocol.unwrap()))
+            .collect(),
+    )
+}
+
+const TCP: Transports = Transports {
+    tcp: true,
+    udp: false,
+};
+const UDP: Transports = Transports {
+    tcp: false,
+    udp: true,
+};
+const BOTH: Transports = Transports {
+    tcp: true,
+    udp: true,
+};
+
+fn port(name: &str, port: i32, protocol: &str) -> (String, i32, String) {
+    (name.to_owned(), port, protocol.to_owned())
+}
+
+#[test]
+fn ingress_ports_are_listed_whatever_is_bound_and_once_beside_a_listener_of_theirs() {
+    let dp = data_plane();
+    assert_eq!(
+        service_ports(&[], &dp),
+        Some(vec![
+            port("port-80", 80, "TCP"),
+            port("port-443", 443, "TCP")
+        ])
+    );
+    assert_eq!(
+        service_ports(&[(443, BOTH), (8080, TCP)], &dp),
+        Some(vec![
+            port("port-80", 80, "TCP"),
+            port("port-443", 443, "TCP"),
+            port("port-443-udp", 443, "UDP"),
+            port("port-8080", 8080, "TCP"),
+        ])
+    );
+}
+
+#[test]
+fn a_data_plane_with_no_port_bound_and_no_ingress_has_no_service() {
+    let mut dp = data_plane();
+    dp.spec.ingress = None;
+    assert_eq!(service_ports(&[], &dp), None);
+    assert_eq!(
+        service_ports(&[(53, UDP)], &dp),
+        Some(vec![port("port-53-udp", 53, "UDP")])
+    );
+}
+
+#[test]
+fn a_service_is_owned_by_its_data_plane_and_named_as_its_deployment() {
+    let dp = data_plane();
+    let shaped = ProxyService::of(&dp).unwrap();
+    assert_eq!(
+        (shaped.name(), shaped.namespace(), shaped.owner_uid()),
+        ("edgerush-proxy-public", "edge", "uid-of-public")
+    );
+    let objects = for_data_plane(&dp, &control_plane(), &BTreeSet::new(), &install()).unwrap();
+    let pods = objects
+        .iter()
+        .find_map(|object| match object {
+            Object::Deployment(deployment) => deployment
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.metadata.as_ref())
+                .and_then(|metadata| metadata.labels.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let service = shaped.service(&BTreeMap::new()).unwrap();
+    assert_eq!(service.spec.unwrap().selector, Some(pods));
+}
+
+#[test]
+fn an_ip_family_its_schema_does_not_hold_makes_no_service() {
+    let mut dp = data_plane();
+    dp.spec.ip_family = "IPv5".to_owned();
+    assert_eq!(
+        ProxyService::of(&dp),
+        Err(Error::IpFamily("IPv5".to_owned()))
+    );
 }

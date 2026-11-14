@@ -224,7 +224,7 @@ fn a_generation_is_acted_on_once_the_operator_accepted_it() {
 }
 
 /// What follows `data_planes` as they are, after `last`.
-fn after(last: Option<Plane>, data_planes: &[DataPlane]) -> Next {
+fn after(last: Option<Settings>, data_planes: &[DataPlane]) -> Next {
     let mut chooser = Chooser { last };
     chooser.next(data_planes, &own())
 }
@@ -233,15 +233,15 @@ fn after(last: Option<Plane>, data_planes: &[DataPlane]) -> Next {
 fn the_data_plane_served_is_the_last_generation_accepted() {
     let spec = |port: u16| format!("  ingress: {{ httpPort: {port}, httpsPort: 443 }}\n");
     let served = |port: u16, generation: i64| {
-        let Next::Serve(plane) = after(
+        let Next::Serve(settings) = after(
             None,
             &[web(generation, &spec(port), &accepted("True", generation))],
         ) else {
             panic!("not served");
         };
-        plane
+        *settings
     };
-    assert_eq!(served(80, 1).ingress_http_port, 80);
+    assert_eq!(served(80, 1).plane.ingress_http_port, 80);
     // An edit not yet accepted keeps the last, which is said as kept.
     let last = served(80, 1);
     assert_eq!(
@@ -262,7 +262,7 @@ fn the_data_plane_served_is_the_last_generation_accepted() {
             Some(last.clone()),
             &[web(2, &spec(8080), &accepted("True", 2))]
         ),
-        Next::Serve(served(8080, 2))
+        Next::Serve(Box::new(served(8080, 2)))
     );
     // Refused, or gone, and nothing is served.
     assert_eq!(
@@ -301,10 +301,10 @@ fn only_a_data_plane_of_its_own_control_plane_is_served() {
         "  ingress: { httpPort: 80, httpsPort: 443 }\n",
         &accepted("True", 1),
     );
-    let Next::Serve(plane) = after(None, &[other, ours]) else {
+    let Next::Serve(settings) = after(None, &[other, ours]) else {
         panic!("not served");
     };
-    assert_eq!(plane.ingress_class.as_deref(), Some("edge.web"));
+    assert_eq!(settings.plane.ingress_class.as_deref(), Some("edge.web"));
 }
 
 #[test]
@@ -318,10 +318,10 @@ fn of_two_accepted_the_oldest_is_served() {
         "  ingress: { httpPort: 80, httpsPort: 443 }\n",
         &accepted("True", 1),
     );
-    let Next::Serve(plane) = after(None, &[younger, older]) else {
+    let Next::Serve(settings) = after(None, &[younger, older]) else {
         panic!("not served");
     };
-    assert_eq!(plane.ingress_class.as_deref(), Some("edge.web"));
+    assert_eq!(settings.plane.ingress_class.as_deref(), Some("edge.web"));
 }
 
 #[test]
