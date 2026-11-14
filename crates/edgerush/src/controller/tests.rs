@@ -19,7 +19,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
         parsed(&["--data-plane", "p"]),
         Ok(Parsed::Control(Box::new(Options {
             settings: Settings::File(PathBuf::from("p")),
-            scope: vec![Scope::Cluster],
+            scope: WatchScope::Parts(vec![Scope::Cluster]),
             write_config: None,
             stream: None,
             own_names: Vec::new(),
@@ -42,10 +42,10 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
         ]),
         Ok(Parsed::Control(Box::new(Options {
             settings: Settings::File(PathBuf::from("p")),
-            scope: vec![
+            scope: WatchScope::Parts(vec![
                 Scope::Namespace("shop".to_owned()),
                 Scope::Namespace("blog".to_owned())
-            ],
+            ]),
             write_config: Some(PathBuf::from("c")),
             stream: None,
             own_names: Vec::new(),
@@ -86,6 +86,60 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
         Err(UsageError::NoValue("--namespace"))
     );
     assert_eq!(parsed(&["p"]), Err(UsageError::Unexpected("p".to_owned())));
+}
+
+#[test]
+fn a_selector_of_namespaces_is_followed_instead_of_namespaces_given() {
+    let scope = |args: &[&str]| match parsed(args) {
+        Ok(Parsed::Control(options)) => Ok(options.scope),
+        Ok(Parsed::Help) => panic!("help"),
+        Err(error) => Err(error),
+    };
+    assert_eq!(
+        scope(&[
+            "--data-plane",
+            "p",
+            "--namespace-selector",
+            "team=payments,env in (canary,prod)"
+        ]),
+        Ok(WatchScope::Selector(
+            "team=payments,env in (canary,prod)".to_owned()
+        ))
+    );
+    // No requirement is every namespace, each followed as it comes and goes.
+    assert_eq!(
+        scope(&["--data-plane", "p", "--namespace-selector", ""]),
+        Ok(WatchScope::Selector(String::new()))
+    );
+    assert_eq!(
+        scope(&[
+            "--data-plane",
+            "p",
+            "--namespace-selector",
+            "a",
+            "--namespace-selector",
+            "b"
+        ]),
+        Err(UsageError::Twice("--namespace-selector"))
+    );
+    for args in [
+        [
+            "--namespace",
+            "shop",
+            "--namespace-selector",
+            "team=payments",
+        ],
+        [
+            "--namespace-selector",
+            "team=payments",
+            "--namespace",
+            "shop",
+        ],
+    ] {
+        let mut args = args.to_vec();
+        args.extend(["--data-plane", "p"]);
+        assert_eq!(scope(&args), Err(UsageError::NamespacesAndSelector));
+    }
 }
 
 /// A file of the tests' own, `name`, holding `contents`.
@@ -208,7 +262,7 @@ async fn run_until(
     let heard = Rc::clone(&lines);
     let options = Options {
         settings: Settings::File(PathBuf::new()),
-        scope: vec![Scope::Cluster],
+        scope: WatchScope::Parts(vec![Scope::Cluster]),
         write_config,
         stream: None,
         own_names: Vec::new(),
@@ -457,7 +511,7 @@ fn the_stream_is_given_whole_or_not_at_all() {
         parsed(&args),
         Ok(Parsed::Control(Box::new(Options {
             settings: Settings::File(PathBuf::from("p")),
-            scope: vec![Scope::Cluster],
+            scope: WatchScope::Parts(vec![Scope::Cluster]),
             write_config: None,
             stream: Some(Box::new(Stream {
                 listen: "[::]:9443".parse().unwrap(),
@@ -558,7 +612,7 @@ fn the_webhook_is_given_whole_or_not_at_all() {
         parsed(&args),
         Ok(Parsed::Control(Box::new(Options {
             settings: Settings::File(PathBuf::from("p")),
-            scope: vec![Scope::Cluster],
+            scope: WatchScope::Parts(vec![Scope::Cluster]),
             write_config: None,
             stream: None,
             own_names: Vec::new(),

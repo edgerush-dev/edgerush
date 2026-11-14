@@ -244,9 +244,10 @@ pub enum Scope {
     /// the CRDs of the Gateway API kinds followed (04 §9). Listed as the cluster's with a
     /// field selector on its name, which a list of no such object answers empty.
     Named(String),
-    /// Every object in the cluster that carries the labels of this selector, written as
-    /// [`Scope::labelled`] writes it: what the operator made, which it alone follows
-    /// ([05 §2](../../../docs/05-operator.md)).
+    /// Every object in the cluster that a label selector matches, written as the API server
+    /// reads one: by [`Scope::labelled`], what the operator made, which it alone follows
+    /// ([05 §2](../../../docs/05-operator.md)); by [`Scope::selected`], the Namespaces of a
+    /// watch scope's selector ([04 §1](../../../docs/04-control-plane.md)).
     Labelled(String),
 }
 
@@ -274,6 +275,15 @@ impl Scope {
             return Err(ApiError::NoLabels);
         }
         Ok(Self::Labelled(selector(labels)))
+    }
+
+    /// Every object in the cluster that `selector` matches, written as the API server reads
+    /// one (`team=payments,env in (canary,prod),!legacy`), and read by the API server alone,
+    /// which refuses one it cannot read: the Namespaces a watch scope's selector follows
+    /// (04 §1). Empty, it is every object.
+    #[must_use]
+    pub fn selected(selector: &str) -> Self {
+        Self::Labelled(selector.to_owned())
     }
 
     /// The object named `name`.

@@ -21,7 +21,7 @@ use edgerush_controller::data_plane::{self, follow_data_planes};
 use edgerush_controller::expiry::Expiry;
 use edgerush_controller::issuing::{self, Issuer};
 use edgerush_controller::status::{Addresses, address};
-use edgerush_controller::{Acks, Debounce, Reports, Said, control};
+use edgerush_controller::{Acks, Debounce, Membership, Reports, Said, WatchScope, control};
 use edgerush_kubernetes::lease::{self, elect};
 use edgerush_kubernetes::{ApiError, ApiServer, Listed, Retry, SERVICE_ACCOUNT, Scope, follow};
 use edgerush_translate::{Plane, Translation};
@@ -43,7 +43,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 pub(crate) const USAGE: &str = "\
 Usage: edgerush controller (--data-plane <FILE> | --control-plane <NAME> [--cluster-domain <DOMAIN>])
-         [--namespace <NAME>]... [--write-config <FILE>]
+         [--namespace <NAME>... | --namespace-selector <SELECTOR>] [--write-config <FILE>]
          [--listen <ADDRESS> (--certificate <FILE> --key <FILE> --authorities <FILE>
                               | --authority <SECRET> [--authority-provided])
           [--own-name <NAME>]...]
@@ -105,6 +105,13 @@ Options:
       --namespace <NAME>     A namespace to watch, given once for each; left out, the
                              whole cluster. IngressClasses are the cluster's, and are
                              followed in it either way
+      --namespace-selector <SELECTOR>
+                             Instead of --namespace: the namespaces whose labels
+                             SELECTOR matches, written as the API server reads one,
+                             such as team=payments,env in (canary,prod),!legacy;
+                             followed as they come to match, each taken in once every
+                             kind of it has been listed, and stop; empty, every
+                             namespace
       --write-config <FILE>  Write each config translated to FILE, replacing it whole:
                              YAML as `edgerush proxy --config` reads it, every field
                              stated, without the certificates it names or the
@@ -403,8 +410,8 @@ enum Parsed {
 #[derive(Debug, PartialEq)]
 struct Options {
     settings: Settings,
-    /// The scope: its namespaces, or the cluster.
-    scope: Vec<Scope>,
+    /// The scope: its namespaces, the cluster, or a selector's namespaces.
+    scope: WatchScope,
     write_config: Option<PathBuf>,
     stream: Option<Box<Stream>>,
     /// The names whose addresses are the gateway's own pods, sent on the stream.
@@ -519,6 +526,8 @@ enum UsageError {
     ClusterDomainWithoutControlPlane,
     #[error("namespace '{0}' is given twice")]
     NamespaceTwice(String),
+    #[error("'--namespace' and '--namespace-selector' are not given together")]
+    NamespacesAndSelector,
     #[error("'--namespace {0}': {1}")]
     Namespace(String, ApiError),
     #[error("'--listen {0}' is not an address and a port, such as [::]:9443")]
@@ -573,6 +582,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut status_addresses = Vec::new();
     let mut own_names: Vec<String> = Vec::new();
     let mut scope = Vec::new();
+    let mut selector = None;
     while let Some(arg) = args.next() {
         let option = match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
@@ -581,6 +591,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             "--cluster-domain" => "--cluster-domain",
             "--write-config" => "--write-config",
             "--namespace" => "--namespace",
+            "--namespace-selector" => "--namespace-selector",
             "--listen" => "--listen",
             "--certificate" => "--certificate",
             "--key" => "--key",
@@ -612,6 +623,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                     return Err(UsageError::NamespaceTwice(value));
                 }
                 scope.push(namespace);
+                continue;
+            }
+            // The API server reads it, and says why where it cannot (04 §1).
+            "--namespace-selector" => {
+                if selector.replace(value).is_some() {
+                    return Err(UsageError::Twice(option));
+                }
                 continue;
             }
             "--control-plane" => {
@@ -705,9 +723,12 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             return Err(UsageError::Twice(option));
         }
     }
-    if scope.is_empty() {
-        scope.push(Scope::Cluster);
-    }
+    let scope = match (selector, scope.is_empty()) {
+        (Some(_), false) => return Err(UsageError::NamespacesAndSelector),
+        (Some(selector), true) => WatchScope::Selector(selector),
+        (None, true) => WatchScope::Parts(vec![Scope::Cluster]),
+        (None, false) => WatchScope::Parts(scope),
+    };
     if provided && authority.is_none() {
         return Err(UsageError::AuthorityProvidedAlone);
     }
@@ -1518,6 +1539,13 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
             format!("the Gateway API's kinds:{}", kinds.concat())
         }
         Said::Failed { followed, failure } => format!("{followed}: {failure}"),
+        Said::Namespace { namespace, now } => match now {
+            Membership::Joining => {
+                format!("namespace {namespace} matches; taken in once every kind of it is listed")
+            }
+            Membership::Joined => format!("namespace {namespace} taken in"),
+            Membership::Left => format!("namespace {namespace} no longer matches; dropped"),
+        },
         Said::GatewayApiStatus { object, written } => match written {
             Ok(()) => format!("status of {object} written"),
             Err(error) => format!("status of {object} cannot be written: {error}"),

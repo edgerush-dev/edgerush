@@ -6,7 +6,7 @@ use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::coordination::v1::Lease;
-use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use k8s_openapi::api::rbac::v1::RoleBinding;
@@ -92,6 +92,33 @@ async fn a_labelled_scope_is_listed_and_watched_over_the_cluster_by_its_labels()
     );
     // No labels would be every object.
     assert_eq!(Scope::labelled(&BTreeMap::new()), Err(ApiError::NoLabels));
+}
+
+#[tokio::test]
+async fn a_selected_scope_is_asked_for_by_its_selector_as_written() {
+    let none = r#"{"apiVersion":"v1","kind":"NamespaceList","metadata":{"resourceVersion":"5"},"items":[]}"#;
+    let fake = Fake::start(&["127.0.0.1"], move |_| answer(200, none)).await;
+    let client = fake.client(&token("selected", "secret"), Timing::default());
+    let selected = Scope::selected("team=payments,env in (canary,prod),!legacy");
+    client.list::<Namespace>(&selected, None).await.unwrap();
+    drop(client.watch::<Namespace>(&selected, "5").await);
+    // No requirement is every Namespace.
+    client
+        .list::<Namespace>(&Scope::selected(""), None)
+        .await
+        .unwrap();
+    let paths: Vec<String> = fake.seen().into_iter().map(|seen| seen.path).collect();
+    let selector = "labelSelector=team%3Dpayments%2Cenv%20in%20%28canary%2Cprod%29%2C%21legacy";
+    assert_eq!(
+        paths,
+        [
+            format!("/api/v1/namespaces?limit=500&{selector}"),
+            format!(
+                "/api/v1/namespaces?watch=true&allowWatchBookmarks=true&timeoutSeconds=300&{selector}&resourceVersion=5"
+            ),
+            "/api/v1/namespaces?limit=500&labelSelector=".to_owned(),
+        ]
+    );
 }
 
 #[tokio::test]

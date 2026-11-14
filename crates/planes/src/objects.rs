@@ -37,7 +37,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, 
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use serde::Serialize;
 
-use crate::control_plane::ControlPlane;
+use crate::control_plane::{ControlPlane, ControlPlaneWatchNamespacesSelector};
 use crate::data_plane::{DataPlane, DataPlaneResources};
 use crate::workers::workers;
 
@@ -201,6 +201,10 @@ pub enum Error {
     /// The DataPlane's `gateway` does not read as a Gateway's spec.
     #[error("the DataPlane's gateway is not a Gateway's: {0}")]
     Gateway(String),
+    /// A requirement of the ControlPlane's selector of namespaces that the API server would
+    /// not read, which no controller could follow.
+    #[error("the ControlPlane's selector of namespaces: {0}")]
+    Selector(String),
 }
 
 /// A plane's name, namespace and UID, read from its metadata.
@@ -302,6 +306,42 @@ fn watched(
         // `Same`, and anything a newer CRD may allow that this does not know: the narrowest.
         _ => Some(BTreeSet::from([own.to_owned()])),
     }
+}
+
+/// The selector a ControlPlane's controller follows its namespaces by, written as the API
+/// server reads one (`env in (canary,prod),!legacy,owner,team=payments`): each requirement
+/// in the order of its key, as Kubernetes writes them, `matchLabels` as `=`. No requirement
+/// is every namespace.
+fn namespace_selector(selector: &ControlPlaneWatchNamespacesSelector) -> Result<String, Error> {
+    let mut each = Vec::new();
+    for (key, value) in selector.match_labels.iter().flatten() {
+        each.push((key.as_str(), format!("{key}={value}")));
+    }
+    for expression in selector.match_expressions.iter().flatten() {
+        let key = expression.key.as_str();
+        let values: BTreeSet<&str> = expression
+            .values
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let values = values.into_iter().collect::<Vec<_>>().join(",");
+        let operator = expression.operator.as_str();
+        let problem = |what: &str| Error::Selector(format!("{operator} of key {key} {what}"));
+        let written = match operator {
+            "In" | "NotIn" if values.is_empty() => return Err(problem("has no values")),
+            "Exists" | "DoesNotExist" if !values.is_empty() => return Err(problem("has values")),
+            "In" => format!("{key} in ({values})"),
+            "NotIn" => format!("{key} notin ({values})"),
+            "Exists" => key.to_owned(),
+            "DoesNotExist" => format!("!{key}"),
+            _ => return Err(problem("is not an operator Kubernetes has")),
+        };
+        each.push((key, written));
+    }
+    each.sort();
+    let written: Vec<String> = each.into_iter().map(|(_, written)| written).collect();
+    Ok(written.join(","))
 }
 
 /// What every object made for ControlPlane `control_plane` of `namespace` is labelled
@@ -467,7 +507,7 @@ fn port(name: &str, number: i32) -> ContainerPort {
 /// # Errors
 ///
 /// [`Error::Missing`], for a ControlPlane the API server did not give a name, namespace or
-/// UID.
+/// UID; [`Error::Selector`], for a selector of namespaces the API server would not read.
 pub fn for_control_plane(
     control_plane: &ControlPlane,
     selected: &BTreeSet<String>,
@@ -534,8 +574,19 @@ pub fn for_control_plane(
         ]),
         None => args.extend(["--authority".to_owned(), authority_secret(cp.name)]),
     }
-    for namespace in watched.iter().flatten() {
-        args.extend(["--namespace".to_owned(), namespace.clone()]);
+    // A selector's namespaces the controller follows itself, so that one labelled in or
+    // out rolls no controller (04 §1).
+    let namespaces = &control_plane.spec.watch.namespaces;
+    if namespaces.from == "Selector" {
+        let selector = namespaces.selector.clone().unwrap_or_default();
+        args.extend([
+            "--namespace-selector".to_owned(),
+            namespace_selector(&selector)?,
+        ]);
+    } else {
+        for namespace in watched.iter().flatten() {
+            args.extend(["--namespace".to_owned(), namespace.clone()]);
+        }
     }
     let mut ports = vec![port("stream", STREAM_PORT)];
     if webhook {

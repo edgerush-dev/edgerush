@@ -1333,7 +1333,8 @@ async fn a_selector_scope_allowed_is_bound_in_each_namespace_it_selects() {
             .any(|path| path.contains("/namespaces/search/")),
         "{patched:?}"
     );
-    // The controller is told the namespaces selected.
+    // The controller is told the selector, which it follows itself, not the namespaces
+    // selected, so that one labelled in or out rolls no controller (04 §1).
     let deployment = asked
         .iter()
         .find(|asked| {
@@ -1343,9 +1344,10 @@ async fn a_selector_scope_allowed_is_bound_in_each_namespace_it_selects() {
     let body: serde_json::Value = serde_json::from_str(&deployment.body).unwrap();
     let args = body["spec"]["template"]["spec"]["containers"][0]["args"].to_string();
     assert!(
-        args.contains(r#""--namespace","bill","--namespace","pay""#),
+        args.contains(r#""--namespace-selector","team=payments""#),
         "{args}"
     );
+    assert!(!args.contains(r#""--namespace""#), "{args}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
