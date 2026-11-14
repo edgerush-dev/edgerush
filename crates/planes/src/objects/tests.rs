@@ -143,3 +143,112 @@ fn nothing_is_bound_but_the_four_shipped_roles() {
         assert!(super::ROLES.contains(&role.name.as_str()), "{}", role.name);
     }
 }
+
+/// A ControlPlane watching the namespaces `selector` selects, written as YAML.
+fn selecting(selector: &str) -> ControlPlane {
+    let mut cp = control_plane();
+    cp.spec.watch.namespaces.from = "Selector".to_owned();
+    cp.spec.watch.namespaces.selector = Some(serde_saphyr::from_str(selector).unwrap());
+    cp
+}
+
+/// The arguments of the controller of `objects`.
+fn controller_args(objects: &[Object]) -> Vec<String> {
+    objects
+        .iter()
+        .find_map(|object| match object {
+            Object::Deployment(deployment) => deployment.spec.as_ref()?.template.spec.as_ref(),
+            _ => None,
+        })
+        .and_then(|pod| pod.containers[0].args.clone())
+        .unwrap()
+}
+
+/// What `--namespace-selector` says in `args`, and whether `--namespace` is among them.
+fn selector_arg(args: &[String]) -> (Option<&str>, bool) {
+    let selector = args
+        .iter()
+        .position(|arg| arg == "--namespace-selector")
+        .map(|at| args[at + 1].as_str());
+    (selector, args.iter().any(|arg| arg == "--namespace"))
+}
+
+#[test]
+fn a_selector_scope_reaches_the_controller_as_its_selector_not_its_namespaces() {
+    let cp = selecting(
+        "matchLabels: { tier: web, team: payments }
+matchExpressions:
+  - { key: zone, operator: NotIn, values: [b, a] }
+  - { key: owner, operator: Exists }
+  - { key: legacy, operator: DoesNotExist }
+  - { key: env, operator: In, values: [prod, canary, prod] }",
+    );
+    let some = for_control_plane(&cp, &BTreeSet::from(["shop".to_owned()]), &install()).unwrap();
+    assert_eq!(
+        selector_arg(&controller_args(&some)),
+        (
+            Some("env in (canary,prod),!legacy,owner,team=payments,tier=web,zone notin (a,b)"),
+            false
+        )
+    );
+    // A namespace labelled in or out changes the bindings alone, never the controller, so
+    // that it is not rolled (04 §1).
+    let more = for_control_plane(
+        &cp,
+        &BTreeSet::from(["shop".to_owned(), "blog".to_owned()]),
+        &install(),
+    )
+    .unwrap();
+    let deployment = |objects: &[Object]| {
+        objects
+            .iter()
+            .find(|object| matches!(object, Object::Deployment(_)))
+            .cloned()
+    };
+    assert_eq!(deployment(&some), deployment(&more));
+    assert_ne!(some, more, "the bindings did not follow the namespaces");
+    // No requirement is every namespace, followed one at a time as any selector's.
+    let every = for_control_plane(&selecting("{}"), &BTreeSet::new(), &install()).unwrap();
+    assert_eq!(selector_arg(&controller_args(&every)), (Some(""), false));
+}
+
+#[test]
+fn a_scope_of_its_own_namespace_or_the_cluster_takes_no_selector() {
+    let own = for_control_plane(&control_plane(), &BTreeSet::new(), &install()).unwrap();
+    let args = controller_args(&own);
+    assert_eq!(selector_arg(&args), (None, true));
+    let at = args.iter().position(|arg| arg == "--namespace").unwrap();
+    assert_eq!(args[at + 1], "edge");
+    let mut cp = control_plane();
+    cp.spec.watch.namespaces.from = "All".to_owned();
+    let all = for_control_plane(&cp, &BTreeSet::new(), &install()).unwrap();
+    assert_eq!(selector_arg(&controller_args(&all)), (None, false));
+}
+
+#[test]
+fn a_selector_the_api_server_would_not_read_makes_nothing() {
+    for (selector, why) in [
+        (
+            "matchExpressions: [{ key: env, operator: In }]",
+            "In of key env has no values",
+        ),
+        (
+            "matchExpressions: [{ key: env, operator: NotIn, values: [] }]",
+            "NotIn of key env has no values",
+        ),
+        (
+            "matchExpressions: [{ key: env, operator: Exists, values: [prod] }]",
+            "Exists of key env has values",
+        ),
+        (
+            "matchExpressions: [{ key: env, operator: Gt, values: ['1'] }]",
+            "Gt of key env is not an operator Kubernetes has",
+        ),
+    ] {
+        assert_eq!(
+            for_control_plane(&selecting(selector), &BTreeSet::new(), &install()),
+            Err(Error::Selector(why.to_owned())),
+            "{selector}"
+        );
+    }
+}

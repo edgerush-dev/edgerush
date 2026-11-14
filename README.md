@@ -223,6 +223,7 @@ translation is reported on stderr as `validate` reports it. The rest is chosen b
 | Flags | What they do |
 |---|---|
 | `--namespace shop`, once for each | Follow these namespaces alone, not the whole cluster. |
+| `--namespace-selector 'team=payments'` | Instead, follow the namespaces whose labels the selector matches, as they come to match and stop: each that comes to match is taken in once all of it has been listed. |
 | `--write-config config.yaml` | Write each config as a file `edgerush proxy --config` reads, without the certificates it names. |
 | `--listen [::]:9443 --certificate tls.crt --key tls.key --authorities ca.crt` | Serve the config stream, gRPC over mutual TLS: each config goes to every data plane that dials with a certificate those authorities signed, and what each says of it is reported. |
 | `--own-name edgerush-peers.edge.svc.cluster.local`, once for each | A headless Service whose pods are the gateway's own: the addresses it resolves to go on the stream, and no data plane sends a request to them. |

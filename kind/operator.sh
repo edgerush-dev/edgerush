@@ -31,6 +31,10 @@
 #     cluster; a Selector scope within a selector allowance bound in the namespaces it
 #     selects alone, one beyond it not accepted and bound nowhere; the allowance narrowed
 #     taking back the rights it granted, the rest kept;
+#   - a Selector scope followed (docs/04 §1): ControlPlane `teams` serves the namespaces of
+#     team shop through DataPlane `front`, its controller told the selector; a namespace
+#     labelled in is bound and served, one labelled out dropped and its bindings gone, and
+#     the controller is neither rolled nor restarted;
 #   - a ServiceAccount of a name the operator would use, made by hand, is left alone, and
 #     its ControlPlane says so;
 #   - DataPlane `web` deleted takes with it everything made for it, its IngressClass and
@@ -398,6 +402,135 @@ until_true '! bound "" wide edgerush-controller-wide' 60 ||
 bound "" wide edgerush-controller-wide-cluster && k -n wide get deploy edgerush-controller-wide >/dev/null ||
     fail "the allowance narrowed took more than the rights it granted"
 pass "an allowance narrowed takes back the rights it granted, and keeps the rest"
+k delete platformdefaults default >/dev/null
+
+echo "== a Selector scope followed"
+# ControlPlane `teams` watches the namespaces of team shop, as an allowance lets it, and
+# serves them through DataPlane `front`: shop-a is of team shop from the start; shop-b is
+# labelled in later, shop-a out, each followed with no restart of the controller.
+k apply -f - >/dev/null <<'EOF'
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: PlatformDefaults
+metadata: { name: default }
+spec:
+  watchScopes:
+    - controlPlanes: { namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: teams } } }
+      namespaces: { from: Selector, selector: { matchLabels: { team: shop } } }
+EOF
+# A backend in namespace $1 behind an Ingress of class teams.front for host $2.
+team_backend() {
+    k apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: shop, namespace: $1 }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: shop } }
+  template:
+    metadata: { labels: { app: shop } }
+    spec:
+      containers:
+        - name: shop
+          image: $AGNHOST
+          args: ["netexec", "--http-port=8080"]
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 1 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: shop, namespace: $1 }
+spec:
+  selector: { app: shop }
+  ports: [{ name: http, port: 80, targetPort: http }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: shop, namespace: $1 }
+spec:
+  ingressClassName: teams.front
+  rules:
+    - host: $2
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: shop, port: { name: http } } }
+EOF
+}
+k create namespace teams >/dev/null
+k create namespace shop-a >/dev/null
+k create namespace shop-b >/dev/null
+k label namespace shop-a team=shop >/dev/null
+team_backend shop-a a.example
+team_backend shop-b b.example
+k apply -f - >/dev/null <<'EOF'
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: teams, namespace: teams }
+spec:
+  watch: { namespaces: { from: Selector, selector: { matchLabels: { team: shop } } } }
+  webhook: { enabled: false }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata: { name: front, namespace: teams }
+spec:
+  controlPlaneRef: { name: teams }
+  ingress: { httpPort: 80, httpsPort: 443 }
+EOF
+condition_is controlplane/teams teams Programmed "True Programmed" 180 ||
+    fail "ControlPlane teams not programmed: $(condition controlplane/teams teams Programmed)"
+k -n teams rollout status deploy/edgerush-proxy-front --timeout=180s >/dev/null ||
+    fail "DataPlane front's data plane never ran"
+k -n shop-a rollout status deploy/shop --timeout=120s >/dev/null
+k -n shop-b rollout status deploy/shop --timeout=120s >/dev/null
+k -n teams get deploy edgerush-controller-teams -o jsonpath='{.spec.template.spec.containers[0].args}' |
+    grep -F '"--namespace-selector","team=shop"' >/dev/null ||
+    fail "the controller is not told its selector: $(k -n teams get deploy edgerush-controller-teams -o jsonpath='{.spec.template.spec.containers[0].args}')"
+front() {
+    [ -n "$forward_pid" ] && kill "$forward_pid" 2>/dev/null || true
+    port=$((port + 1))
+    k -n teams port-forward deploy/edgerush-proxy-front "$port:80" >/dev/null 2>&1 &
+    forward_pid=$!
+}
+# Waits up to $3 seconds, a port-forward begun again every 10, for host $1 to answer $2.
+answers() {
+    for _ in $(seq 1 $(($3 / 10))); do
+        front
+        until_true "[ \"\$(status $1)\" = $2 ]" 10 && return 0
+    done
+    return 1
+}
+answers a.example 200 120 || fail "shop-a, of team shop, is not served: $(status a.example)"
+[ "$(status b.example)" = 404 ] || fail "shop-b, not of team shop, is served: $(status b.example)"
+pass "a Selector scope serves the namespaces it selects alone"
+
+# The controller's pods and the Deployment's generation: the same as namespaces come and go.
+controllers() {
+    echo "$(k -n teams get deploy edgerush-controller-teams -o jsonpath='{.metadata.generation}')" \
+        "$(k -n teams get pods -l gateway.edgerush.dev/control-plane=teams,app.kubernetes.io/component=controller \
+            -o jsonpath='{range .items[*]}{.metadata.name} {.status.containerStatuses[0].restartCount}{" "}{end}')"
+}
+before=$(controllers)
+k label namespace shop-b team=shop >/dev/null
+until_true 'bound shop-b teams edgerush-controller-teams && bound shop-b teams edgerush-proxy-teams.front' 60 ||
+    fail "shop-b, labelled in, is not bound"
+answers b.example 200 120 || fail "shop-b, labelled in, is not served: $(status b.example)"
+[ "$(status a.example)" = 200 ] || fail "shop-a stopped being served as shop-b came in: $(status a.example)"
+[ "$(controllers)" = "$before" ] ||
+    fail "the controller was rolled or restarted: before '$before', now '$(controllers)'"
+pass "a namespace labelled into a Selector scope is bound and served, the controller not restarted"
+
+k label namespace shop-a team- >/dev/null
+answers a.example 404 120 || fail "shop-a, labelled out, is still served: $(status a.example)"
+[ "$(status b.example)" = 200 ] || fail "shop-b stopped being served as shop-a left: $(status b.example)"
+until_true '! bound shop-a teams edgerush-controller-teams && ! bound shop-a teams edgerush-proxy-teams.front' 60 ||
+    fail "shop-a, labelled out, is still bound"
+[ "$(controllers)" = "$before" ] ||
+    fail "the controller was rolled or restarted: before '$before', now '$(controllers)'"
+pass "a namespace labelled out of a Selector scope is dropped and its bindings gone, the controller not restarted"
+k delete -n teams dataplane front --timeout=90s >/dev/null
+k delete -n teams controlplane teams --timeout=90s >/dev/null
 k delete platformdefaults default >/dev/null
 
 echo "== not the operator's"

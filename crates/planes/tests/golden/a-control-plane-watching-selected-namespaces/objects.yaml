@@ -153,10 +153,8 @@ spec:
         - --authority
         - payments-ca
         - --authority-provided
-        - --namespace
-        - payments-api
-        - --namespace
-        - payments-web
+        - --namespace-selector
+        - team=payments
         - --webhook-listen
         - 0.0.0.0:8443
         env:

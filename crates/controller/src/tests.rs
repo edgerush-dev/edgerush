@@ -7,7 +7,7 @@ use k8s_openapi::ByteString;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde::Serialize;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A data plane of class `edge`, of no Gateway, with these more settings.
@@ -158,6 +158,7 @@ fn hear(heard: &Rc<RefCell<Heard>>) -> impl Fn(Said<'_>) + 'static {
                 format!("gateway api: {}", kinds.join("; "))
             }
             Said::Failed { followed, failure } => format!("{followed}: {failure}"),
+            Said::Namespace { namespace, now } => format!("namespace {namespace}: {now:?}"),
             Said::Translated(translation) => {
                 heard.translations.push(translation.clone());
                 "translated".to_owned()
@@ -212,6 +213,8 @@ fn changes_are_translated_once_quiet_and_never_later_than_the_most_after_the_fir
 fn follow_of<K>(name: &str, listed: bool, objects: Vec<K>) -> Follow<K> {
     Follow {
         name: name.to_owned(),
+        part: Scope::Cluster,
+        joining: false,
         objects: watch::channel(Arc::new(Listed { listed, objects })).1,
         _tasks: Tasks(Vec::new()),
     }
@@ -244,6 +247,11 @@ fn every_follows_objects_are_translated_and_its_secrets_looked_at() {
             Scope::Namespace("shop".to_owned()),
             Scope::Namespace("blog".to_owned()),
         ]),
+        gateway_namespace: None,
+        selected: None,
+        parts: Vec::new(),
+        scoped: false,
+        joining: BTreeSet::new(),
         reports: Vec::new(),
         ready: Vec::new(),
     };
@@ -371,6 +379,11 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
         status_service: Vec::new(),
         gateway_api: Some(gateway_api),
         watched: None,
+        gateway_namespace: None,
+        selected: None,
+        parts: Vec::new(),
+        scoped: false,
+        joining: BTreeSet::new(),
         reports: Vec::new(),
         ready: Vec::new(),
     };
@@ -403,15 +416,15 @@ fn listener_sets_and_secrets_are_followed_in_the_scope_and_the_gateways_namespac
     let edge = Scope::Namespace("edge".to_owned());
     let shop = Scope::Namespace("shop".to_owned());
     assert_eq!(
-        with_gateway_namespace(std::slice::from_ref(&shop), &edge),
+        with_gateway_namespace(std::slice::from_ref(&shop), Some(&edge)),
         [shop.clone(), edge.clone()]
     );
     assert_eq!(
-        with_gateway_namespace(&[shop.clone(), edge.clone()], &edge),
+        with_gateway_namespace(&[shop.clone(), edge.clone()], Some(&edge)),
         [shop, edge.clone()]
     );
     assert_eq!(
-        with_gateway_namespace(&[Scope::Cluster], &edge),
+        with_gateway_namespace(&[Scope::Cluster], Some(&edge)),
         [Scope::Cluster]
     );
 }
@@ -607,7 +620,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                 async move {
                     control(
                         api,
-                        &[Scope::Cluster],
+                        &WatchScope::Parts(vec![Scope::Cluster]),
                         fixed(&plane),
                         Debounce::default(),
                         None,
@@ -924,7 +937,7 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
                     };
                     control(
                         api,
-                        &[Scope::Cluster],
+                        &WatchScope::Parts(vec![Scope::Cluster]),
                         fixed(&plane),
                         debounce,
                         None,
@@ -1036,7 +1049,7 @@ async fn the_settings_are_followed_as_they_change() {
                 async move {
                     control(
                         api,
-                        &[Scope::Cluster],
+                        &WatchScope::Parts(vec![Scope::Cluster]),
                         planes,
                         Debounce::default(),
                         None,
@@ -1120,7 +1133,7 @@ async fn secrets_are_followed_in_the_gateways_namespace_beside_the_scope() {
     local
         .run_until(async {
             let plane = gateway_plane();
-            let scope = [Scope::Namespace("shop".to_owned())];
+            let scope = WatchScope::Parts(vec![Scope::Namespace("shop".to_owned())]);
             let controlling = tokio::task::spawn_local(async move {
                 control(
                     api,
@@ -1185,10 +1198,10 @@ async fn each_namespace_of_the_scope_is_followed_and_all_are_translated_together
     local
         .run_until(async {
             let plane = plane();
-            let scope = [
+            let scope = WatchScope::Parts(vec![
                 Scope::Namespace("shop".to_owned()),
                 Scope::Namespace("blog".to_owned()),
-            ];
+            ]);
             let controlling = tokio::task::spawn_local({
                 let said = hear(&heard);
                 async move {
@@ -1428,7 +1441,7 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
                     };
                     control(
                         api,
-                        &[Scope::Cluster],
+                        &WatchScope::Parts(vec![Scope::Cluster]),
                         fixed(&plane),
                         Debounce::default(),
                         Some(source),
@@ -1514,7 +1527,7 @@ async fn a_config_is_not_held_up_by_its_status() {
                     };
                     control(
                         api,
-                        &[Scope::Cluster],
+                        &WatchScope::Parts(vec![Scope::Cluster]),
                         fixed(&plane),
                         Debounce::default(),
                         Some(source),
@@ -1589,7 +1602,7 @@ async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
                     let source = Addresses::Stated(vec![status::address("203.0.113.7")]);
                     control(
                         api,
-                        &[Scope::Cluster],
+                        &WatchScope::Parts(vec![Scope::Cluster]),
                         fixed(&plane),
                         Debounce::default(),
                         Some(source),
@@ -2075,6 +2088,11 @@ fn the_leader_merges_every_replicas_report_and_counts_the_ready_pods() {
         status_service: Vec::new(),
         gateway_api: None,
         watched: None,
+        gateway_namespace: None,
+        selected: None,
+        parts: Vec::new(),
+        scoped: false,
+        joining: BTreeSet::new(),
         reports: vec![follow_of("configmaps in edge", true, reports)],
         ready: vec![follow_of("endpointslices in edge", true, slices)],
     };
@@ -2095,4 +2113,435 @@ fn the_leader_merges_every_replicas_report_and_counts_the_ready_pods() {
     let service =
         edgerush_config::ServiceName::parse("edgerush-peers.edge.svc.cluster.local").unwrap();
     assert_eq!(followed.ready(&service), [pod(1), pod(2)]);
+}
+
+/// Namespace `name`, labelled as a selector of `team=payments` selects it.
+fn team_namespace(name: &str, version: &str) -> Namespace {
+    serde_saphyr::from_str(&format!(
+        "{{ metadata: {{ name: {name}, resourceVersion: '{version}', labels: {{ team: payments }} }} }}"
+    ))
+    .unwrap()
+}
+
+/// One watch event a line, of `kind` (`ADDED`, `MODIFIED`, `DELETED`) and `object`.
+fn event<K: Serialize>(kind: &str, object: &K) -> Bytes {
+    let event = serde_json::json!({ "type": kind, "object": object });
+    Bytes::from(format!("{event}\n"))
+}
+
+/// A watch ended soon, with nothing, to be begun again: what a scripted change is sent on.
+fn short() -> Answer {
+    Answer {
+        pause: Duration::from_millis(50),
+        ..open()
+    }
+}
+
+fn forbidden() -> Answer {
+    answer(403, r#"{"kind":"Status","code":403,"message":"forbidden"}"#)
+}
+
+/// The routes of the last translation, if there is one.
+fn last_routes(heard: &Rc<RefCell<Heard>>) -> Option<Vec<String>> {
+    heard.borrow().translations.last().map(routes)
+}
+
+/// Whether the control plane said `line`.
+fn said_line(heard: &Rc<RefCell<Heard>>, line: &str) -> bool {
+    heard.borrow().lines.iter().any(|said| said == line)
+}
+
+/// Ingress `web` of shop, its rule served on `www.shop.example` too, as a watch sends it
+/// changed.
+fn shop_changed() -> Ingress {
+    let mut changed = ingress("shop", "web", "shop.example");
+    changed.metadata.resource_version = Some("9".to_owned());
+    let rules = changed
+        .spec
+        .as_mut()
+        .and_then(|spec| spec.rules.as_mut())
+        .unwrap();
+    let mut www = rules[0].clone();
+    www.host = Some("www.shop.example".to_owned());
+    rules.push(www);
+    changed
+}
+
+/// The routes of the last translation, in order of their names.
+fn sorted_routes(heard: &Rc<RefCell<Heard>>) -> Vec<String> {
+    let mut routes = last_routes(heard).unwrap_or_default();
+    routes.sort();
+    routes
+}
+
+/// The namespaces of a selector scope are followed as they come to match and stop: shop
+/// matches from the start; blog, labelled in later while its Secrets cannot yet be read, is
+/// held out whole, its Ingress with it, while a change in shop is translated without it,
+/// and joins once its Secrets are listed; shop, labelled out, is dropped with its objects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_selectors_namespaces_are_followed_and_each_that_comes_to_match_taken_in_whole() {
+    #[derive(Default)]
+    struct Script {
+        labelled_in: AtomicBool,
+        shop_changed: AtomicBool,
+        bound: AtomicBool,
+        labelled_out: AtomicBool,
+    }
+    let script = Arc::new(Script::default());
+    let told = Arc::clone(&script);
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        let watching = path.contains("watch=true");
+        let collection = path.split('?').next().unwrap_or_default();
+        let namespace = ["shop", "blog"]
+            .into_iter()
+            .find(|namespace| path.contains(&format!("/namespaces/{namespace}/")));
+        let sent = |chunks| Answer { chunks, ..short() };
+        match (collection, namespace, watching) {
+            ("/api/v1/namespaces", None, false) => {
+                assert!(path.contains("labelSelector=team%3Dpayments"), "{path}");
+                page(&[team_namespace("shop", "5")])
+            }
+            ("/api/v1/namespaces", None, true) => {
+                if told.labelled_out.swap(false, Ordering::SeqCst) {
+                    sent(vec![event("DELETED", &team_namespace("shop", "8"))])
+                } else if told.labelled_in.swap(false, Ordering::SeqCst) {
+                    sent(vec![event("ADDED", &team_namespace("blog", "7"))])
+                } else {
+                    short()
+                }
+            }
+            (_, Some("shop"), true)
+                if collection.ends_with("/ingresses")
+                    && told.shop_changed.swap(false, Ordering::SeqCst) =>
+            {
+                sent(vec![event("MODIFIED", &shop_changed())])
+            }
+            (_, _, true) => short(),
+            ("/apis/networking.k8s.io/v1/ingressclasses", None, false) => page(&[class()]),
+            (_, Some(namespace), false) if collection.ends_with("/ingresses") => {
+                page(&[ingress(namespace, "web", &format!("{namespace}.example"))])
+            }
+            (_, Some(namespace), false) if collection.ends_with("/services") => {
+                page(&[service(namespace)])
+            }
+            (_, Some("blog"), false)
+                if collection.ends_with("/secrets") && !told.bound.load(Ordering::SeqCst) =>
+            {
+                forbidden()
+            }
+            (_, Some(namespace), false) if collection.ends_with("/secrets") => {
+                page(&[secret(namespace, &[&format!("{namespace}.example")])])
+            }
+            _ => answer(500, ""),
+        }
+    })
+    .await;
+    let api = fake.client(&token("controller-selector", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let plane = plane();
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Selector("team=payments".to_owned()),
+                        fixed(&plane),
+                        Debounce::default(),
+                        None,
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("shop translated", || last_routes(&heard).is_some()).await;
+            assert_eq!(
+                last_routes(&heard).unwrap(),
+                ["ingress/shop/web/shop.example"]
+            );
+            assert_eq!(
+                heard.borrow().lines[0],
+                "waiting on namespaces labelled team=payments, ingressclasses in the cluster"
+            );
+
+            script.labelled_in.store(true, Ordering::SeqCst);
+            until("blog's Secrets refused", || {
+                heard
+                    .borrow()
+                    .lines
+                    .iter()
+                    .any(|line| line.starts_with("secrets in blog: "))
+            })
+            .await;
+            assert!(
+                said_line(&heard, "namespace blog: Joining"),
+                "{:?}",
+                heard.borrow().lines
+            );
+            // The rest goes on without it, and nothing of it is taken while a kind of it is
+            // not listed: not its Ingress, listed already.
+            script.shop_changed.store(true, Ordering::SeqCst);
+            until("shop's change translated", || {
+                last_routes(&heard).is_some_and(|routes| routes.len() > 1)
+            })
+            .await;
+            assert_eq!(
+                sorted_routes(&heard),
+                [
+                    "ingress/shop/web/shop.example",
+                    "ingress/shop/web/www.shop.example"
+                ],
+                "{:?}",
+                heard.borrow().lines
+            );
+
+            script.bound.store(true, Ordering::SeqCst);
+            until("blog taken in", || {
+                last_routes(&heard).is_some_and(|routes| routes.len() == 3)
+            })
+            .await;
+            assert_eq!(
+                sorted_routes(&heard),
+                [
+                    "ingress/blog/web/blog.example",
+                    "ingress/shop/web/shop.example",
+                    "ingress/shop/web/www.shop.example"
+                ]
+            );
+            assert_eq!(
+                heard
+                    .borrow()
+                    .translations
+                    .last()
+                    .unwrap()
+                    .config
+                    .certificates
+                    .len(),
+                2,
+                "taken in without its Secrets"
+            );
+            assert!(said_line(&heard, "namespace blog: Joined"));
+
+            script.labelled_out.store(true, Ordering::SeqCst);
+            until("shop dropped", || {
+                last_routes(&heard).is_some_and(|routes| routes.len() == 1)
+            })
+            .await;
+            assert_eq!(
+                last_routes(&heard).unwrap(),
+                ["ingress/blog/web/blog.example"]
+            );
+            assert!(said_line(&heard, "namespace shop: Left"));
+            assert!(
+                !heard
+                    .borrow()
+                    .lines
+                    .iter()
+                    .any(|line| line.starts_with("waiting on") && line.contains("blog")),
+                "a namespace joining was waited on: {:?}",
+                heard.borrow().lines
+            );
+            controlling.abort();
+        })
+        .await;
+}
+
+/// The namespaces a selector matches at its first list are waited on as every kind is at
+/// the start (04 §1): nothing is translated while one of them cannot be read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_selectors_first_namespaces_are_waited_on_as_the_start_is() {
+    let bound = Arc::new(AtomicBool::new(false));
+    let allowed = Arc::clone(&bound);
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        if path.contains("watch=true") {
+            return open();
+        }
+        let collection = path.split('?').next().unwrap_or_default();
+        let namespace = ["shop", "blog"]
+            .into_iter()
+            .find(|namespace| path.contains(&format!("/namespaces/{namespace}/")));
+        match (collection, namespace) {
+            ("/api/v1/namespaces", None) => {
+                page(&[team_namespace("blog", "5"), team_namespace("shop", "5")])
+            }
+            ("/apis/networking.k8s.io/v1/ingressclasses", None) => page(&[class()]),
+            (_, Some(namespace)) if collection.ends_with("/ingresses") => {
+                page(&[ingress(namespace, "web", &format!("{namespace}.example"))])
+            }
+            (_, Some(namespace)) if collection.ends_with("/services") => {
+                page(&[service(namespace)])
+            }
+            (_, Some("blog"))
+                if collection.ends_with("/secrets") && !allowed.load(Ordering::SeqCst) =>
+            {
+                forbidden()
+            }
+            (_, Some(namespace)) if collection.ends_with("/secrets") => {
+                page(&[secret(namespace, &[&format!("{namespace}.example")])])
+            }
+            _ => answer(500, ""),
+        }
+    })
+    .await;
+    let api = fake.client(
+        &token("controller-selector-start", "secret"),
+        Timing::default(),
+    );
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let plane = plane();
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Selector("team=payments".to_owned()),
+                        fixed(&plane),
+                        Debounce::default(),
+                        None,
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("the wait on blog's Secrets said", || {
+                said_line(&heard, "waiting on secrets in blog")
+            })
+            .await;
+            assert!(
+                heard.borrow().translations.is_empty(),
+                "translated without blog: {:?}",
+                heard.borrow().lines
+            );
+            assert!(
+                !heard
+                    .borrow()
+                    .lines
+                    .iter()
+                    .any(|line| line.starts_with("namespace ")),
+                "the first list said as joining: {:?}",
+                heard.borrow().lines
+            );
+            bound.store(true, Ordering::SeqCst);
+            until("translated", || last_routes(&heard).is_some()).await;
+            assert_eq!(
+                last_routes(&heard).unwrap(),
+                [
+                    "ingress/blog/web/blog.example",
+                    "ingress/shop/web/shop.example"
+                ]
+            );
+            controlling.abort();
+        })
+        .await;
+}
+
+/// The Gateway's namespace coming to match a selector: its Secrets, followed whatever the
+/// scope for the Gateway's certificates, go on being translated, while what is followed
+/// there for the scope alone is held out until the namespace joins; one that stops
+/// matching takes those with it, the Secrets staying.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_gateways_namespace_joining_keeps_its_secrets_translated() {
+    let fake = Fake::start(&["127.0.0.1"], |_| open()).await;
+    let api = Rc::new(fake.client(&token("controller-joining", "secret"), Timing::default()));
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let edge = Scope::Namespace("edge".to_owned());
+            let mut secrets = follow_of("secrets in edge", true, vec![secret("edge", &[])]);
+            secrets.part = edge.clone();
+            let mut followed = Followed {
+                ingress_classes: Vec::new(),
+                ingresses: Vec::new(),
+                services: Vec::new(),
+                secrets: vec![secrets],
+                gateway_namespace: Some(edge.clone()),
+                status_service: Vec::new(),
+                gateway_api: None,
+                watched: Some(Vec::new()),
+                selected: None,
+                parts: Vec::new(),
+                scoped: false,
+                joining: BTreeSet::new(),
+                reports: Vec::new(),
+                ready: Vec::new(),
+            };
+            let mut tasks = JoinSet::new();
+            let changed = Rc::new(Notify::new());
+            let said: Rc<dyn Fn(Said<'_>)> = Rc::new(|_| {});
+            let mut start = Start {
+                tasks: &mut tasks,
+                api: &api,
+                changed: &changed,
+                said: &said,
+                joining: BTreeSet::new(),
+            };
+            // The first list: shop, waited on as the start is.
+            let first = followed.rescope(&BTreeSet::from(["shop".to_owned()]), &mut start);
+            assert_eq!(first, []);
+            assert_eq!(
+                followed.unlisted(),
+                ["ingresses in shop", "services in shop", "secrets in shop"]
+            );
+            // Then edge comes to match.
+            let both = BTreeSet::from(["edge".to_owned(), "shop".to_owned()]);
+            let became = followed.rescope(&both, &mut start);
+            assert_eq!(became, [("edge".to_owned(), Membership::Joining)]);
+            let joining = |followed: &Followed| -> Vec<(String, bool)> {
+                followed
+                    .ingresses
+                    .iter()
+                    .map(|follow| (follow.name.clone(), follow.joining))
+                    .chain(
+                        followed
+                            .secrets
+                            .iter()
+                            .map(|follow| (follow.name.clone(), follow.joining)),
+                    )
+                    .collect()
+            };
+            assert_eq!(
+                joining(&followed),
+                [
+                    ("ingresses in edge".to_owned(), true),
+                    ("ingresses in shop".to_owned(), false),
+                    ("secrets in edge".to_owned(), false),
+                    ("secrets in shop".to_owned(), false),
+                ]
+            );
+            assert_eq!(
+                followed.cluster().secrets.len(),
+                1,
+                "the Gateway's Secrets held out"
+            );
+            assert_eq!(followed.cluster().watched, Some(vec!["shop".to_owned()]));
+            assert_eq!(
+                followed.unlisted(),
+                ["ingresses in shop", "services in shop", "secrets in shop"],
+                "a namespace joining waited on"
+            );
+            assert_eq!(followed.join(), Vec::<String>::new(), "joined unlisted");
+            // Edge stops matching: what it was followed for in the scope goes, its Secrets
+            // stay for the Gateway.
+            let became = followed.rescope(&BTreeSet::from(["shop".to_owned()]), &mut start);
+            assert_eq!(became, [("edge".to_owned(), Membership::Left)]);
+            assert_eq!(
+                joining(&followed),
+                [
+                    ("ingresses in shop".to_owned(), false),
+                    ("secrets in edge".to_owned(), false),
+                    ("secrets in shop".to_owned(), false),
+                ]
+            );
+            assert!(followed.joining.is_empty());
+        })
+        .await;
 }

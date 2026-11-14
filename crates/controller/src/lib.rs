@@ -41,6 +41,7 @@ use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -115,6 +116,14 @@ pub enum Said<'a> {
     /// said once each kind's CRD has been listed, and again whenever it changes. A kind not
     /// served is taken as having no objects.
     GatewayApi(&'a [(GatewayKind, Served)]),
+    /// A namespace came to match the watch scope's selector, joined it, or stopped matching
+    /// and was dropped with its objects (04 §1).
+    Namespace {
+        /// The namespace.
+        namespace: &'a str,
+        /// What became of it.
+        now: Membership,
+    },
     /// Asking for what is followed failed, and is asked again after a wait.
     Failed {
         /// What is followed: `secrets in shop`, `ingressclasses in the cluster`.
@@ -153,8 +162,32 @@ pub enum Said<'a> {
     },
 }
 
-/// Follows, through `api`, the kinds `plane`'s config is made of in each of `scope`'s
-/// parts, IngressClasses in the cluster, and translates them for it each time they
+/// Where the objects of a data plane's config are followed (04 §1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchScope {
+    /// These namespaces, or the cluster, for good.
+    Parts(Vec<Scope>),
+    /// The namespaces this label selector of Namespaces matches, written as the API server
+    /// reads one, followed as they come to match and stop. One that comes to match after
+    /// the first list of them is taken in whole, once every kind of it has been listed, the
+    /// rest translated without it meanwhile; those of the first list are waited on as every
+    /// kind is at the start.
+    Selector(String),
+}
+
+/// What became of a namespace of a [`WatchScope::Selector`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Membership {
+    /// It came to match, and is followed, but not yet translated.
+    Joining,
+    /// Every kind of it has been listed, and it is translated with the rest.
+    Joined,
+    /// It no longer matches, and is followed no longer.
+    Left,
+}
+
+/// Follows, through `api`, the kinds `plane`'s config is made of in `scope`,
+/// IngressClasses in the cluster, and translates them for it each time they
 /// change, once every one has been listed whole; says how it goes to `said`. Where `plane`
 /// names a Gateway, the Gateway API's kinds are followed too, GatewayClasses in the
 /// cluster and Gateways in that Gateway's namespace alone, each from when its CRD is listed
@@ -176,7 +209,7 @@ pub enum Said<'a> {
 #[allow(clippy::too_many_arguments)]
 pub async fn control(
     api: ApiServer,
-    scope: &[Scope],
+    scope: &WatchScope,
     mut planes: watch::Receiver<Option<Plane>>,
     debounce: Debounce,
     status: Option<Addresses>,
@@ -222,7 +255,7 @@ fn shape(plane: &Plane) -> (Option<GatewayName>, Option<ServiceName>) {
 #[allow(clippy::too_many_arguments)]
 async fn serve(
     api: &Rc<ApiServer>,
-    scope: &[Scope],
+    scope: &WatchScope,
     mut plane: Plane,
     planes: &mut watch::Receiver<Option<Plane>>,
     debounce: Debounce,
@@ -247,19 +280,31 @@ async fn serve(
         api,
         changed: &changed,
         said,
+        joining: BTreeSet::new(),
     };
+    // A selector's namespaces are followed once its Namespaces are listed.
+    let (parts, selected) = match scope {
+        WatchScope::Parts(parts) => (parts.clone(), None),
+        WatchScope::Selector(selector) => (
+            Vec::new(),
+            start
+                .follows(&[Scope::selected(selector)])
+                .into_iter()
+                .next(),
+        ),
+    };
+    // A Gateway's certificateRefs of its own namespace need no grant, and are read there
+    // whatever the scope (04 §1).
+    let gateway_namespace = plane
+        .gateway
+        .as_ref()
+        .map(|gateway| Scope::Namespace(gateway.namespace.clone()));
     let mut followed = Followed {
         ingress_classes: start.follows(&[Scope::Cluster]),
-        ingresses: start.follows(scope),
-        services: start.follows(scope),
-        // A Gateway's certificateRefs of its own namespace need no grant, and are read
-        // there whatever the scope (04 §1).
-        secrets: start.follows(&match &plane.gateway {
-            Some(gateway) => {
-                with_gateway_namespace(scope, &Scope::Namespace(gateway.namespace.clone()))
-            }
-            None => scope.to_vec(),
-        }),
+        ingresses: start.follows(&parts),
+        services: start.follows(&parts),
+        secrets: start.follows(&with_gateway_namespace(&parts, gateway_namespace.as_ref())),
+        gateway_namespace,
         status_service: match status {
             Some(Addresses::Service { namespace, .. }) => {
                 start.follows(&[Scope::Namespace(namespace.clone())])
@@ -270,7 +315,14 @@ async fn serve(
             .gateway
             .as_ref()
             .map(|gateway| GatewayApi::start(&mut start, gateway)),
-        watched: watched(scope),
+        watched: match scope {
+            WatchScope::Parts(parts) => watched(parts),
+            WatchScope::Selector(_) => Some(Vec::new()),
+        },
+        selected,
+        parts,
+        scoped: false,
+        joining: BTreeSet::new(),
         reports: match &acks.reports {
             Some(reports) => start.follows(&[Scope::Namespace(reports.namespace.clone())]),
             None => Vec::new(),
@@ -316,6 +368,22 @@ async fn serve(
                 _ => return,
             }
         }
+        // The namespaces of a selector, followed as they come to match and stop.
+        if let Some(matching) = followed.matching() {
+            let mut start = Start {
+                tasks: &mut tasks,
+                api,
+                changed: &changed,
+                said,
+                joining: BTreeSet::new(),
+            };
+            for (namespace, now) in followed.rescope(&matching, &mut start) {
+                said(Said::Namespace {
+                    namespace: &namespace,
+                    now,
+                });
+            }
+        }
         // The follows of the Gateway API kinds, started and stopped as their CRDs say.
         if let Some(gateway_api) = &mut followed.gateway_api
             && let Some(served) = gateway_api.served()
@@ -326,10 +394,18 @@ async fn serve(
                 api,
                 changed: &changed,
                 said,
+                joining: followed.joining.clone(),
             };
-            gateway_api.follow(&served, &mut start, scope);
+            gateway_api.follow(&served, &mut start, &followed.parts);
             said(Said::GatewayApi(&served));
             gateway_api.last = Some(served);
+        }
+        // A namespace that came to match joins once every kind of it is listed.
+        for namespace in followed.join() {
+            said(Said::Namespace {
+                namespace: &namespace,
+                now: Membership::Joined,
+            });
         }
         // Follows stopped are aborted: what is left of them is let go of.
         while tasks.try_join_next().is_some() {}
@@ -444,6 +520,9 @@ struct Start<'a> {
     api: &'a Rc<ApiServer>,
     changed: &'a Rc<Notify>,
     said: &'a Rc<dyn Fn(Said<'_>)>,
+    /// The namespaces joining the scope: a follow started in one is held out of
+    /// translation, and not waited on, until the namespace joins.
+    joining: BTreeSet<String>,
 }
 
 impl Start<'_> {
@@ -453,15 +532,17 @@ impl Start<'_> {
             .iter()
             .map(|part| {
                 let name = followed::<K>(part);
+                let joining = matches!(part, Scope::Namespace(namespace)
+                    if self.joining.contains(namespace));
                 let (out, objects) = watch::channel(Arc::new(Listed::default()));
-                let (api, said, part, failed) = (
+                let (api, said, followed_part, failed) = (
                     Rc::clone(self.api),
                     Rc::clone(self.said),
                     part.clone(),
                     name.clone(),
                 );
                 let following = self.tasks.spawn_local(async move {
-                    follow(&api, &part, Retry::default(), out, |failure| {
+                    follow(&api, &followed_part, Retry::default(), out, |failure| {
                         said(Said::Failed {
                             followed: &failed,
                             failure,
@@ -478,6 +559,8 @@ impl Start<'_> {
                 });
                 Follow {
                     name,
+                    part: part.clone(),
+                    joining,
                     objects,
                     _tasks: Tasks(vec![following, telling]),
                 }
@@ -492,6 +575,9 @@ fn followed<K: Kind>(part: &Scope) -> String {
         Scope::Cluster => format!("{} in the cluster", K::URL_PATH_SEGMENT),
         Scope::Namespace(namespace) => format!("{} in {namespace}", K::URL_PATH_SEGMENT),
         Scope::Named(name) => format!("{} named {name}", K::URL_PATH_SEGMENT),
+        Scope::Labelled(labels) if labels.is_empty() => {
+            format!("{} in the cluster", K::URL_PATH_SEGMENT)
+        }
         Scope::Labelled(labels) => format!("{} labelled {labels}", K::URL_PATH_SEGMENT),
     }
 }
@@ -500,8 +586,65 @@ fn followed<K: Kind>(part: &Scope) -> String {
 /// of, it is stopped.
 struct Follow<K> {
     name: String,
+    /// The part of the scope it follows.
+    part: Scope,
+    /// Whether it was started in a namespace joining the scope, which has not joined yet:
+    /// its objects are held out of translation, and not waited on.
+    joining: bool,
     objects: watch::Receiver<Arc<Listed<K>>>,
     _tasks: Tasks,
+}
+
+/// A follow in a part of the scope, of whatever kind.
+trait Part {
+    /// The part of the scope it follows.
+    fn part(&self) -> &Scope;
+    /// Whether it is held out until its namespace joins.
+    fn joining(&self) -> bool;
+    /// Whether it has been listed whole.
+    fn listed(&self) -> bool;
+    /// Its namespace joins the scope.
+    fn join(&mut self);
+}
+
+impl<K> Part for Follow<K> {
+    fn part(&self) -> &Scope {
+        &self.part
+    }
+
+    fn joining(&self) -> bool {
+        self.joining
+    }
+
+    fn listed(&self) -> bool {
+        self.objects.borrow().listed
+    }
+
+    fn join(&mut self) {
+        self.joining = false;
+    }
+}
+
+/// `follows` made to follow `parts`: each of a part no longer among them stopped, and one
+/// started in each part that has none, in the order of their parts.
+fn rescope<K: Kind + 'static>(
+    follows: &mut Vec<Follow<K>>,
+    parts: &[Scope],
+    start: &mut Start<'_>,
+) {
+    follows.retain(|follow| parts.contains(&follow.part));
+    let missing: Vec<Scope> = parts
+        .iter()
+        .filter(|part| !follows.iter().any(|follow| follow.part == **part))
+        .cloned()
+        .collect();
+    follows.extend(start.follows(&missing));
+    follows.sort_by(|a, b| a.part.cmp(&b.part));
+}
+
+/// `follows`, each as a [`Part`], onto `into`.
+fn parts_of<'a, K>(follows: &'a mut [Follow<K>], into: &mut Vec<&'a mut dyn Part>) {
+    into.extend(follows.iter_mut().map(|follow| follow as &mut dyn Part));
 }
 
 /// A follow's tasks, aborted as it is let go of.
@@ -603,7 +746,7 @@ impl GatewayApi {
                     keep(&mut self.gateways, on, || start.follows(namespace));
                 }
                 GatewayKind::ListenerSet => {
-                    let scope = with_gateway_namespace(scope, &self.namespace);
+                    let scope = with_gateway_namespace(scope, Some(&self.namespace));
                     keep(&mut self.listener_sets, on, || start.follows(&scope));
                 }
                 GatewayKind::HTTPRoute => keep(&mut self.http_routes, on, || start.follows(scope)),
@@ -648,6 +791,48 @@ impl GatewayApi {
                 self.backend_tls_policies.as_deref().unwrap_or_default(),
             ))
             .chain(unlisted(self.config_maps.as_deref().unwrap_or_default()))
+    }
+
+    /// The follows of each kind followed in the watch scope made to follow `parts`, and
+    /// ListenerSets the Gateway's namespace beside them.
+    fn rescope(&mut self, parts: &[Scope], start: &mut Start<'_>) {
+        fn each<K: Kind + 'static>(
+            slot: &mut Option<Vec<Follow<K>>>,
+            parts: &[Scope],
+            start: &mut Start<'_>,
+        ) {
+            if let Some(follows) = slot {
+                rescope(follows, parts, start);
+            }
+        }
+        let listener_sets = with_gateway_namespace(parts, Some(&self.namespace));
+        each(&mut self.listener_sets, &listener_sets, start);
+        each(&mut self.http_routes, parts, start);
+        each(&mut self.grpc_routes, parts, start);
+        each(&mut self.tls_routes, parts, start);
+        each(&mut self.tcp_routes, parts, start);
+        each(&mut self.udp_routes, parts, start);
+        each(&mut self.reference_grants, parts, start);
+        each(&mut self.backend_tls_policies, parts, start);
+        each(&mut self.config_maps, parts, start);
+    }
+
+    /// The follows of each kind followed in the watch scope, onto `into`.
+    fn parts<'a>(&'a mut self, into: &mut Vec<&'a mut dyn Part>) {
+        fn each<'a, K>(slot: &'a mut Option<Vec<Follow<K>>>, into: &mut Vec<&'a mut dyn Part>) {
+            if let Some(follows) = slot {
+                parts_of(follows, into);
+            }
+        }
+        each(&mut self.listener_sets, into);
+        each(&mut self.http_routes, into);
+        each(&mut self.grpc_routes, into);
+        each(&mut self.tls_routes, into);
+        each(&mut self.tcp_routes, into);
+        each(&mut self.udp_routes, into);
+        each(&mut self.reference_grants, into);
+        each(&mut self.backend_tls_policies, into);
+        each(&mut self.config_maps, into);
     }
 }
 
@@ -920,11 +1105,12 @@ fn keep<K>(slot: &mut Option<Vec<Follow<K>>>, on: bool, start: impl FnOnce() -> 
     }
 }
 
-/// The names of `follows` that have not been listed whole.
+/// The names of `follows` that have not been listed whole, but for those held out until
+/// their namespace joins, which nothing waits on.
 fn unlisted<K>(follows: &[Follow<K>]) -> impl Iterator<Item = String> + '_ {
     follows
         .iter()
-        .filter(|follow| !follow.objects.borrow().listed)
+        .filter(|follow| !follow.joining && !follow.objects.borrow().listed)
         .map(|follow| follow.name.clone())
 }
 
@@ -934,12 +1120,25 @@ struct Followed {
     ingresses: Vec<Follow<Ingress>>,
     services: Vec<Follow<Service>>,
     secrets: Vec<Follow<Secret>>,
+    /// The data plane's Gateway's namespace, where it names one, whose Secrets are followed
+    /// whatever the scope.
+    gateway_namespace: Option<Scope>,
     /// The namespace of the data plane's Service, followed for its addresses.
     status_service: Vec<Follow<Service>>,
     /// The Gateway API's kinds, where the data plane is a Gateway.
     gateway_api: Option<GatewayApi>,
-    /// The namespaces watched, where not every one is.
+    /// The namespaces watched, where not every one is: of a selector, those joined.
     watched: Option<Vec<String>>,
+    /// The Namespaces a selector scope matches, where the scope is one.
+    selected: Option<Follow<Namespace>>,
+    /// The parts of the scope followed: of a selector, every namespace it matches, joined
+    /// or joining, once its Namespaces are listed.
+    parts: Vec<Scope>,
+    /// Whether a selector's first list of Namespaces has been followed.
+    scoped: bool,
+    /// The namespaces of a selector that came to match after its first list and have not
+    /// joined yet.
+    joining: BTreeSet<String>,
     /// The namespace of the replicas' reports of what their pods run.
     reports: Vec<Follow<ConfigMap>>,
     /// The namespace of the data plane's own Service, for its ready pods.
@@ -949,7 +1148,8 @@ struct Followed {
 impl Followed {
     /// The follows translation waits on that have not been listed whole, by name.
     fn unlisted(&self) -> Vec<String> {
-        unlisted(&self.ingress_classes)
+        unlisted(self.selected.as_slice())
+            .chain(unlisted(&self.ingress_classes))
             .chain(unlisted(&self.ingresses))
             .chain(unlisted(&self.services))
             .chain(unlisted(&self.secrets))
@@ -1054,15 +1254,134 @@ impl Followed {
     }
 }
 
+impl Followed {
+    /// The namespaces a selector scope matches, once its Namespaces are listed whole.
+    fn matching(&self) -> Option<BTreeSet<String>> {
+        let listed = self.selected.as_ref()?.objects.borrow();
+        listed.listed.then(|| {
+            listed
+                .objects
+                .iter()
+                .filter_map(|namespace| namespace.metadata.name.clone())
+                .collect()
+        })
+    }
+
+    /// Follows the namespaces `matching`, where they differ from those followed: each that
+    /// no longer matches stopped, its objects with it; each that comes to match started,
+    /// joining, but for those of the first list, which are waited on as the start is
+    /// (04 §1). What became of each, but those of the first list.
+    fn rescope(
+        &mut self,
+        matching: &BTreeSet<String>,
+        start: &mut Start<'_>,
+    ) -> Vec<(String, Membership)> {
+        let parts: Vec<Scope> = matching
+            .iter()
+            .map(|namespace| Scope::Namespace(namespace.clone()))
+            .collect();
+        if self.scoped && parts == self.parts {
+            return Vec::new();
+        }
+        let mut became = Vec::new();
+        for part in &self.parts {
+            if let Scope::Namespace(namespace) = part
+                && !matching.contains(namespace)
+            {
+                self.joining.remove(namespace);
+                became.push((namespace.clone(), Membership::Left));
+            }
+        }
+        if self.scoped {
+            for part in &parts {
+                if let Scope::Namespace(namespace) = part
+                    && !self.parts.contains(part)
+                {
+                    self.joining.insert(namespace.clone());
+                    became.push((namespace.clone(), Membership::Joining));
+                }
+            }
+        }
+        start.joining = self.joining.clone();
+        rescope(&mut self.ingresses, &parts, start);
+        rescope(&mut self.services, &parts, start);
+        let secrets = with_gateway_namespace(&parts, self.gateway_namespace.as_ref());
+        rescope(&mut self.secrets, &secrets, start);
+        if let Some(gateway_api) = &mut self.gateway_api {
+            gateway_api.rescope(&parts, start);
+        }
+        self.parts = parts;
+        self.scoped = true;
+        self.watched = Some(self.joined());
+        became
+    }
+
+    /// Each namespace joining whose every follow has been listed joins: its objects are
+    /// translated from now on. Those that joined.
+    fn join(&mut self) -> Vec<String> {
+        if self.joining.is_empty() {
+            return Vec::new();
+        }
+        let mut held = BTreeSet::new();
+        for follow in self.namespace_parts() {
+            if let Scope::Namespace(namespace) = follow.part()
+                && follow.joining()
+                && !follow.listed()
+            {
+                held.insert(namespace.clone());
+            }
+        }
+        let joined: Vec<String> = self.joining.difference(&held).cloned().collect();
+        for follow in self.namespace_parts() {
+            if let Scope::Namespace(namespace) = follow.part()
+                && joined.contains(namespace)
+            {
+                follow.join();
+            }
+        }
+        self.joining = held;
+        if !joined.is_empty() {
+            self.watched = Some(self.joined());
+        }
+        joined
+    }
+
+    /// The namespaces of a selector followed that have joined.
+    fn joined(&self) -> Vec<String> {
+        self.parts
+            .iter()
+            .filter_map(|part| match part {
+                Scope::Namespace(namespace) if !self.joining.contains(namespace) => {
+                    Some(namespace.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every follow of a kind followed in the watch scope.
+    fn namespace_parts(&mut self) -> Vec<&mut dyn Part> {
+        let mut parts = Vec::new();
+        parts_of(&mut self.ingresses, &mut parts);
+        parts_of(&mut self.services, &mut parts);
+        parts_of(&mut self.secrets, &mut parts);
+        if let Some(gateway_api) = &mut self.gateway_api {
+            gateway_api.parts(&mut parts);
+        }
+        parts
+    }
+}
+
 /// Where ListenerSets and Secrets are followed: the watch scope, as routes are, and the
 /// Gateway's own namespace, `gateway`, where the scope does not hold it, as a Gateway that
 /// takes ListenerSets `from: Same` takes them there, and its listeners' certificateRefs of
 /// its own namespace need no grant (04 §1).
-fn with_gateway_namespace(scope: &[Scope], gateway: &Scope) -> Vec<Scope> {
+fn with_gateway_namespace(scope: &[Scope], gateway: Option<&Scope>) -> Vec<Scope> {
     let mut followed = scope.to_vec();
-    if !scope
-        .iter()
-        .any(|part| *part == Scope::Cluster || part == gateway)
+    if let Some(gateway) = gateway
+        && !scope
+            .iter()
+            .any(|part| *part == Scope::Cluster || part == gateway)
     {
         followed.push(gateway.clone());
     }
@@ -1088,10 +1407,12 @@ fn own_service(plane: &Plane) -> Option<ServiceName> {
     ServiceName::parse(named).ok()
 }
 
-/// The objects of `follows`, as they last published them.
+/// The objects of `follows`, as they last published them, but for those held out until
+/// their namespace joins.
 fn objects<K: Clone>(follows: &[Follow<K>]) -> Vec<K> {
     follows
         .iter()
+        .filter(|follow| !follow.joining)
         .flat_map(|follow| follow.objects.borrow().objects.clone())
         .collect()
 }
