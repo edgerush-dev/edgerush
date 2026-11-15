@@ -4,6 +4,7 @@ use crate::{Prost, Received, SERVICE, SUBSCRIBE};
 use boring::ssl::SslAcceptor;
 use edgerush_certificates::spiffe_id;
 use edgerush_control_stream::{Held, MAX_MESSAGE, Offer, OpenError, Report, Session, wire};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
@@ -56,21 +57,21 @@ pub enum Heard {
 /// Which data planes the stream serves, and what each is offered: each known by the SPIFFE
 /// ID its certificate carries, which alone chooses its config, nothing it says doing so
 /// ([05 §3](../../../docs/05-operator.md)).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub enum Served {
-    /// None: every data plane is refused, as no DataPlane is served yet.
-    #[default]
-    Nobody,
     /// Every data plane the stream's authorities vouch for, each offered this, if anything
     /// yet: a settings file's data plane, which states no ID.
     Anyone(Option<Arc<Offer>>),
-    /// The data plane whose certificate carries this ID alone, offered this, if anything yet.
-    One {
-        /// The ID.
-        id: String,
-        /// What is offered to it.
-        offer: Option<Arc<Offer>>,
-    },
+    /// The data planes whose certificates carry these IDs alone, each offered its own, if
+    /// anything yet; none, and every data plane is refused, as no DataPlane is served yet.
+    Ids(BTreeMap<String, Option<Arc<Offer>>>),
+}
+
+impl Default for Served {
+    /// Nobody: no DataPlane is served yet.
+    fn default() -> Self {
+        Self::Ids(BTreeMap::new())
+    }
 }
 
 /// Why a data plane is not served, as it is told.
@@ -85,48 +86,59 @@ pub enum Unserved {
 }
 
 impl Served {
-    /// The data plane whose certificate carries `id`, or any where none, offered nothing yet.
+    /// The data planes of `ids`, each offered nothing yet: any where one of them is none,
+    /// as a settings file's data plane may state none, and nobody where there are none.
     #[must_use]
-    pub fn of(id: Option<&str>) -> Self {
-        match id {
-            Some(id) => Self::One {
-                id: id.to_owned(),
-                offer: None,
-            },
-            None => Self::Anyone(None),
+    pub fn of<'a>(ids: impl IntoIterator<Item = Option<&'a str>>) -> Self {
+        let mut served = BTreeMap::new();
+        for id in ids {
+            let Some(id) = id else {
+                return Self::Anyone(None);
+            };
+            served.insert(id.to_owned(), None);
         }
+        Self::Ids(served)
     }
 
-    /// What is offered, to whichever data planes it serves.
-    #[must_use]
-    pub fn offer(&self) -> Option<&Arc<Offer>> {
-        match self {
-            Self::Nobody => None,
-            Self::Anyone(offer) | Self::One { offer, .. } => offer.as_ref(),
-        }
-    }
-
-    /// Made to serve the data planes `next` serves: left as it is, what it offers with it,
-    /// where it serves them already, and `next` where not, so that nothing offered to one
-    /// data plane is offered to another. Whether it changed.
+    /// Made to serve the data planes `next` serves: what it offers each it serves already
+    /// kept, each it no longer serves let go of, and each new one offered nothing yet, so
+    /// that nothing offered to one data plane is offered to another. Whether whom it
+    /// serves changed.
     pub fn serve(&mut self, next: Self) -> bool {
-        let same = match (&*self, &next) {
-            (Self::Nobody, Self::Nobody) | (Self::Anyone(_), Self::Anyone(_)) => true,
-            (Self::One { id, .. }, Self::One { id: next, .. }) => id == next,
-            _ => false,
-        };
-        if !same {
-            *self = next;
+        match (&mut *self, next) {
+            (Self::Anyone(_), Self::Anyone(_)) => false,
+            (Self::Ids(served), Self::Ids(next)) => {
+                let before = served.len();
+                served.retain(|id, _| next.contains_key(id));
+                let mut changed = served.len() != before;
+                for id in next.into_keys() {
+                    if let std::collections::btree_map::Entry::Vacant(new) = served.entry(id) {
+                        new.insert(None);
+                        changed = true;
+                    }
+                }
+                changed
+            }
+            (served, next) => {
+                *served = next;
+                true
+            }
         }
-        !same
     }
 
-    /// `offer` offered to the data planes it serves, in place of what was; nothing where it
-    /// serves none.
-    pub fn offered(&mut self, offer: Arc<Offer>) {
-        match self {
-            Self::Nobody => {}
-            Self::Anyone(offered) | Self::One { offer: offered, .. } => *offered = Some(offer),
+    /// `offer` offered to the data plane whose certificate carries `id`, or to any where
+    /// none, in place of what was: that data plane is served from now on, as each is
+    /// translated for only while it is.
+    pub fn offered(&mut self, id: Option<&str>, offer: Arc<Offer>) {
+        match (&mut *self, id) {
+            (Self::Anyone(offered), None) => *offered = Some(offer),
+            (Self::Ids(served), Some(id)) => {
+                served.insert(id.to_owned(), Some(offer));
+            }
+            (served, None) => *served = Self::Anyone(Some(offer)),
+            (served, Some(id)) => {
+                *served = Self::Ids(BTreeMap::from([(id.to_owned(), Some(offer))]))
+            }
         }
     }
 
@@ -139,9 +151,11 @@ impl Served {
     pub fn offer_to(&self, id: Option<&str>) -> Result<Option<&Arc<Offer>>, Unserved> {
         match (self, id) {
             (Self::Anyone(offer), _) => Ok(offer.as_ref()),
-            (Self::One { id: served, offer }, Some(id)) if served == id => Ok(offer.as_ref()),
-            (_, None) => Err(Unserved::NoId),
-            (_, Some(id)) => Err(Unserved::NotServed(id.to_owned())),
+            (Self::Ids(_), None) => Err(Unserved::NoId),
+            (Self::Ids(served), Some(id)) => served
+                .get(id)
+                .map(Option::as_ref)
+                .ok_or_else(|| Unserved::NotServed(id.to_owned())),
         }
     }
 }

@@ -31,8 +31,13 @@ fn plane() -> Plane {
 
 /// Settings that never change: `plane`, its sender gone, of no Service, as the development
 /// harness's.
-fn fixed(plane: &Plane) -> watch::Receiver<Option<Settings>> {
-    watch::channel(Some(harness(plane))).1
+fn fixed(plane: &Plane) -> watch::Receiver<Planes> {
+    watch::channel(only(harness(plane))).1
+}
+
+/// `settings` as the one data plane served, as the development harness's is, of no name.
+fn only(settings: Settings) -> Planes {
+    Planes::from([(String::new(), settings)])
 }
 
 /// `plane` as the development harness serves it: of no Service.
@@ -209,13 +214,15 @@ fn acks() -> Acks {
     }
 }
 
-/// What the control plane said, a line each, and its translations, each with the ID of
-/// the data plane it is for.
+/// What the control plane said, a line each, and its translations, each with the data
+/// plane it is for and that one's ID, and the data planes a translation was refused for.
 #[derive(Default)]
 struct Heard {
     lines: Vec<String>,
     translations: Vec<Translation>,
+    of: Vec<String>,
     ids: Vec<Option<String>>,
+    refused: Vec<String>,
 }
 
 fn hear(heard: &Rc<RefCell<Heard>>) -> impl Fn(Said<'_>) + 'static {
@@ -233,12 +240,24 @@ fn hear(heard: &Rc<RefCell<Heard>>) -> impl Fn(Said<'_>) + 'static {
             }
             Said::Failed { followed, failure } => format!("{followed}: {failure}"),
             Said::Namespace { namespace, now } => format!("namespace {namespace}: {now:?}"),
-            Said::Translated { translation, id } => {
+            Said::Translated {
+                data_plane,
+                translation,
+                id,
+            } => {
                 heard.translations.push(translation.clone());
+                heard.of.push(data_plane.to_owned());
                 heard.ids.push(id.map(ToOwned::to_owned));
                 "translated".to_owned()
             }
-            Said::Refused { problems, .. } => format!("refused: {problems:?}"),
+            Said::Refused {
+                data_plane,
+                problems,
+                ..
+            } => {
+                heard.refused.push(data_plane.to_owned());
+                format!("refused: {problems:?}")
+            }
             Said::GatewayApiStatus { object, written } => match written {
                 Ok(()) => format!("status of {object}"),
                 Err(error) => format!("status of {object} not written: {error}"),
@@ -328,7 +347,7 @@ fn every_follows_objects_are_translated_and_its_secrets_looked_at() {
             Scope::Namespace("shop".to_owned()),
             Scope::Namespace("blog".to_owned()),
         ]),
-        gateway_namespace: None,
+        shape: Shape::default(),
         selected: None,
         parts: Vec::new(),
         scoped: false,
@@ -337,7 +356,7 @@ fn every_follows_objects_are_translated_and_its_secrets_looked_at() {
         ready: Vec::new(),
     };
     assert_eq!(
-        followed.unlisted(),
+        followed.unlisted().0,
         ["ingresses in blog", "services in shop"]
     );
     let cluster = followed.cluster();
@@ -430,7 +449,7 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
             true,
             vec![serde_saphyr::from_str("metadata: { name: shop }").unwrap()],
         )],
-        namespace: Scope::Namespace("edge".to_owned()),
+        gateway_namespaces: vec![Scope::Namespace("edge".to_owned())],
         last: None,
         gateway_classes: None,
         gateways: None,
@@ -460,7 +479,7 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
         own_services: Vec::new(),
         gateway_api: Some(gateway_api),
         watched: None,
-        gateway_namespace: None,
+        shape: Shape::default(),
         selected: None,
         parts: Vec::new(),
         scoped: false,
@@ -486,27 +505,39 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
     assert!(gateway_api.http_routes.is_none());
     let followed = followed_with(gateway_api);
     assert!(followed.cluster().http_routes.is_empty());
-    assert_eq!(followed.unlisted(), ["crd referencegrants"]);
+    assert_eq!(
+        followed.unlisted(),
+        (Vec::new(), vec!["crd referencegrants".to_owned()])
+    );
 }
 
-/// ListenerSets and Secrets are followed where routes are, and in the Gateway's own
+/// ListenerSets and Secrets are followed where routes are, and in each Gateway's own
 /// namespace too, as a Gateway takes ListenerSets `from: Same` there and its listeners'
 /// certificateRefs there need no grant, whatever the scope.
 #[test]
-fn listener_sets_and_secrets_are_followed_in_the_scope_and_the_gateways_namespace() {
+fn listener_sets_and_secrets_are_followed_in_the_scope_and_the_gateways_namespaces() {
     let edge = Scope::Namespace("edge".to_owned());
     let shop = Scope::Namespace("shop".to_owned());
+    let teams = Scope::Namespace("teams".to_owned());
     assert_eq!(
-        with_gateway_namespace(std::slice::from_ref(&shop), Some(&edge)),
+        with_gateway_namespaces(std::slice::from_ref(&shop), std::slice::from_ref(&edge)),
         [shop.clone(), edge.clone()]
     );
     assert_eq!(
-        with_gateway_namespace(&[shop.clone(), edge.clone()], Some(&edge)),
-        [shop, edge.clone()]
+        with_gateway_namespaces(&[shop.clone(), edge.clone()], std::slice::from_ref(&edge)),
+        [shop.clone(), edge.clone()]
     );
     assert_eq!(
-        with_gateway_namespace(&[Scope::Cluster], Some(&edge)),
+        with_gateway_namespaces(&[Scope::Cluster], std::slice::from_ref(&edge)),
         [Scope::Cluster]
+    );
+    // Each Gateway's namespace, once.
+    assert_eq!(
+        with_gateway_namespaces(
+            std::slice::from_ref(&shop),
+            &[edge.clone(), teams.clone(), shop.clone()]
+        ),
+        [shop, edge, teams]
     );
 }
 
@@ -858,29 +889,36 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
     );
 }
 
+/// What is waited on is said once, and again only as it changes; once nothing is, nothing
+/// is said, and a wait after it is said again.
 #[test]
-fn nothing_is_translated_until_every_follow_is_listed_and_what_is_waited_on_is_said_once() {
-    let plane = plane();
-    let mut translator = Translator::default();
+fn what_is_waited_on_is_said_once() {
+    let mut said = None;
     let unlisted = || vec!["ingresses in shop".to_owned(), "secrets in shop".to_owned()];
-    let untouched = || -> Cluster { panic!("translated before every follow was listed") };
+    let both = unlisted();
+    assert_eq!(wait_said(&mut said, unlisted()), Some(both.as_slice()));
     assert_eq!(
-        translator.step(&plane, unlisted(), untouched),
-        Step::Waiting(&unlisted())
-    );
-    assert_eq!(
-        translator.step(&plane, unlisted(), untouched),
-        Step::Nothing,
+        wait_said(&mut said, unlisted()),
+        None,
         "the same wait said again"
     );
     let secrets = ["secrets in shop".to_owned()];
     assert_eq!(
-        translator.step(&plane, secrets.to_vec(), untouched),
-        Step::Waiting(&secrets)
+        wait_said(&mut said, secrets.to_vec()),
+        Some(secrets.as_slice())
     );
-    let Step::Translated(translation) = translator.step(&plane, Vec::new(), Cluster::default)
-    else {
-        panic!("not translated once every follow was listed");
+    assert_eq!(wait_said(&mut said, Vec::new()), None);
+    assert_eq!(
+        wait_said(&mut said, secrets.to_vec()),
+        Some(secrets.as_slice())
+    );
+}
+
+#[test]
+fn a_translation_of_nothing_routes_nothing() {
+    let mut translator = Translator::default();
+    let Step::Translated(translation) = translator.step(&plane(), &Cluster::default()) else {
+        panic!("not translated");
     };
     assert!(translation.config.routes.is_empty());
 }
@@ -901,19 +939,16 @@ fn a_translation_no_different_from_the_last_is_not_said_again() {
     };
     let mut translator = Translator::default();
     let shop = cluster(&["shop.example"]);
-    let Step::Translated(translation) = translator.step(&plane, Vec::new(), || shop.clone()) else {
+    let Step::Translated(translation) = translator.step(&plane, &shop) else {
         panic!("not translated");
     };
     assert_eq!(
         routes(translation),
         ["ingress/shop/shop.example/shop.example"]
     );
-    assert_eq!(
-        translator.step(&plane, Vec::new(), || shop.clone()),
-        Step::Nothing
-    );
+    assert_eq!(translator.step(&plane, &shop), Step::Nothing);
     let both = cluster(&["shop.example", "blog.example"]);
-    let Step::Translated(translation) = translator.step(&plane, Vec::new(), || both) else {
+    let Step::Translated(translation) = translator.step(&plane, &both) else {
         panic!("a change not translated");
     };
     assert_eq!(translation.config.routes.len(), 2);
@@ -928,14 +963,14 @@ fn a_config_the_data_plane_would_refuse_is_said_once_and_not_handed_on() {
         "ports:
   80: { forwarding: { trusted_proxies: [\"10.1.2.3/8\"], trusted_only_headers: [] } }",
     );
-    let cluster = || Cluster {
+    let cluster = Cluster {
         ingress_classes: vec![class()],
         ingresses: vec![ingress("shop", "shop.example", "shop.example")],
         services: vec![service("shop")],
         ..Cluster::default()
     };
     let mut translator = Translator::default();
-    let Step::Refused { problems, .. } = translator.step(&plane, Vec::new(), cluster) else {
+    let Step::Refused { problems, .. } = translator.step(&plane, &cluster) else {
         panic!("a config of a port's settings the data plane refuses handed on");
     };
     assert!(
@@ -944,7 +979,7 @@ fn a_config_the_data_plane_would_refuse_is_said_once_and_not_handed_on() {
             .any(|problem| problem.to_string().starts_with("listener `port-80`")),
         "{problems:?}"
     );
-    assert_eq!(translator.step(&plane, Vec::new(), cluster), Step::Nothing);
+    assert_eq!(translator.step(&plane, &cluster), Step::Nothing);
 }
 
 /// Every kind is followed in the cluster, nothing translated while one is not listed; once
@@ -1094,10 +1129,9 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
 }
 
 /// Settings that change are followed (05 §3): none, and nothing is followed; new settings
-/// that leave what is followed as it was are translated again, the follows as they were;
-/// those of another data plane's ID alone have the follows begun again, and a translation
-/// said for that ID, though it is the last one's; and settings of another Gateway have the
-/// follows begun again for it.
+/// are translated again, the follows as they were; another data plane's ID has a
+/// translation said for that ID, though it is the last one's; and a Gateway has the Gateway
+/// API's kinds followed beside the rest, nothing begun again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_settings_are_followed_as_they_change() {
     let fake = Fake::start(&["127.0.0.1"], |path| {
@@ -1124,7 +1158,7 @@ async fn the_settings_are_followed_as_they_change() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (settings, planes) = watch::channel(None);
+            let (settings, planes) = watch::channel(Planes::new());
             let controlling = tokio::task::spawn_local({
                 let said = hear(&heard);
                 async move {
@@ -1153,7 +1187,7 @@ async fn the_settings_are_followed_as_they_change() {
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert!(fake.seen().is_empty(), "followed without settings");
 
-            settings.send_replace(Some(harness(&plane())));
+            settings.send_replace(only(harness(&plane())));
             until("translated", || heard.borrow().translations.len() == 1).await;
             assert_eq!(
                 routes(&heard.borrow().translations[0]),
@@ -1165,7 +1199,7 @@ async fn the_settings_are_followed_as_they_change() {
             // followed or listed again for it.
             let mut other = plane();
             other.ingress_class = Some("other".to_owned());
-            settings.send_replace(Some(harness(&other)));
+            settings.send_replace(only(harness(&other)));
             until("translated again", || {
                 heard.borrow().translations.len() == 2
             })
@@ -1181,7 +1215,7 @@ async fn the_settings_are_followed_as_they_change() {
             // Another data plane's ID: what is translated for one is never handed to another.
             let web = "spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-web";
             other.id = Some(web.to_owned());
-            settings.send_replace(Some(harness(&other)));
+            settings.send_replace(only(harness(&other)));
             until("translated for the ID", || {
                 heard.borrow().translations.len() == 3
             })
@@ -1191,15 +1225,16 @@ async fn the_settings_are_followed_as_they_change() {
                 heard.borrow().translations[1]
             );
             assert_eq!(heard.borrow().ids[2].as_deref(), Some(web));
-            assert_eq!(ingresses(), 2, "followed again for another ID");
+            assert_eq!(ingresses(), 1, "followed again for another ID");
 
-            // A Gateway: what is followed changes, and the follows are begun again.
-            settings.send_replace(Some(harness(&gateway_plane())));
-            until("followed again", || ingresses() == 3).await;
+            // A Gateway: the Gateway API's kinds are followed beside what was, which goes on
+            // as it was (05 §3).
+            settings.send_replace(only(harness(&gateway_plane())));
             until("the Gateway API's CRDs listed", || {
                 lists("/apis/apiextensions.k8s.io/v1/customresourcedefinitions") > 0
             })
             .await;
+            assert_eq!(ingresses(), 1, "the Ingresses followed again for a Gateway");
             controlling.abort();
         })
         .await;
@@ -1515,7 +1550,7 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
                     control(
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
-                        watch::channel(Some(operated(&plane, ""))).1,
+                        watch::channel(only(operated(&plane, ""))).1,
                         Debounce::default(),
                         None,
                         acks(),
@@ -1596,7 +1631,7 @@ async fn a_config_is_not_held_up_by_its_status() {
                     control(
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
-                        watch::channel(Some(operated(&plane, ""))).1,
+                        watch::channel(only(operated(&plane, ""))).1,
                         Debounce::default(),
                         None,
                         acks(),
@@ -1680,7 +1715,7 @@ async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
                     control(
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
-                        watch::channel(Some(operated(&plane, ""))).1,
+                        watch::channel(only(operated(&plane, ""))).1,
                         Debounce::default(),
                         Some(leading),
                         acks(),
@@ -1892,7 +1927,7 @@ spec:
         GatewayApi {
             crds: Vec::new(),
             namespaces: Vec::new(),
-            namespace: Scope::Namespace("edge".to_owned()),
+            gateway_namespaces: vec![Scope::Namespace("edge".to_owned())],
             last: Some(served.clone()),
             gateway_classes: Some(vec![follow_of("gatewayclasses", true, classes)]),
             gateways: Some(vec![follow_of("gateways in edge", true, gateways)]),
@@ -2163,7 +2198,7 @@ fn the_leader_merges_every_replicas_report_and_counts_the_ready_pods() {
         own_services: Vec::new(),
         gateway_api: None,
         watched: None,
-        gateway_namespace: None,
+        shape: Shape::default(),
         selected: None,
         parts: Vec::new(),
         scoped: false,
@@ -2536,7 +2571,10 @@ async fn the_gateways_namespace_joining_keeps_its_secrets_translated() {
                 ingresses: Vec::new(),
                 services: Vec::new(),
                 secrets: vec![secrets],
-                gateway_namespace: Some(edge.clone()),
+                shape: Shape {
+                    gateways: vec![edge.clone()],
+                    ..Shape::default()
+                },
                 own_services: Vec::new(),
                 gateway_api: None,
                 watched: Some(Vec::new()),
@@ -2561,7 +2599,7 @@ async fn the_gateways_namespace_joining_keeps_its_secrets_translated() {
             let first = followed.rescope(&BTreeSet::from(["shop".to_owned()]), &mut start);
             assert_eq!(first, []);
             assert_eq!(
-                followed.unlisted(),
+                followed.unlisted().0,
                 ["ingresses in shop", "services in shop", "secrets in shop"]
             );
             // Then edge comes to match.
@@ -2597,7 +2635,7 @@ async fn the_gateways_namespace_joining_keeps_its_secrets_translated() {
             );
             assert_eq!(followed.cluster().watched, Some(vec!["shop".to_owned()]));
             assert_eq!(
-                followed.unlisted(),
+                followed.unlisted().0,
                 ["ingresses in shop", "services in shop", "secrets in shop"],
                 "a namespace joining waited on"
             );
@@ -2687,7 +2725,7 @@ async fn the_data_planes_service_is_written_as_wanted_and_not_again_until_that_c
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (settings, planes) = watch::channel(Some(first.clone()));
+            let (settings, planes) = watch::channel(only(first.clone()));
             let controlling = tokio::task::spawn_local({
                 let said = hear(&heard);
                 async move {
@@ -2714,7 +2752,7 @@ async fn the_data_planes_service_is_written_as_wanted_and_not_again_until_that_c
             // Translated again, the Service as wanted: not written.
             let mut redirecting = first.clone();
             redirecting.plane.ingress_https_redirect = true;
-            settings.send_replace(Some(redirecting));
+            settings.send_replace(only(redirecting));
             until("translated again", || {
                 heard.borrow().translations.len() == 2
             })
@@ -2723,7 +2761,7 @@ async fn the_data_planes_service_is_written_as_wanted_and_not_again_until_that_c
             assert_eq!(applied(&fake).len(), 1, "{:?}", heard.borrow().lines);
             // Its annotation taken away, which the Service there still carries: written.
             let plain = operated(&plane(), "  ingress: { httpPort: 8080, httpsPort: 8443 }\n");
-            settings.send_replace(Some(plain));
+            settings.send_replace(only(plain));
             until("written again", || applied(&fake).len() == 2).await;
             controlling.abort();
         })
@@ -2761,7 +2799,7 @@ async fn a_service_of_its_name_not_its_data_planes_is_left_alone() {
                     control(
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
-                        watch::channel(Some(settings)).1,
+                        watch::channel(only(settings)).1,
                         Debounce::default(),
                         None,
                         acks(),
@@ -2805,7 +2843,7 @@ async fn a_service_refused_is_said() {
                     control(
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
-                        watch::channel(Some(settings)).1,
+                        watch::channel(only(settings)).1,
                         Debounce::default(),
                         None,
                         acks(),
@@ -2828,6 +2866,302 @@ async fn a_service_refused_is_said() {
                     .any(|line| line == "status of Ingress shop/web: []")
             })
             .await;
+            controlling.abort();
+        })
+        .await;
+}
+
+/// DataPlane `name` of `edge` served under the operator: `plane`, its Service
+/// `edge/edgerush-proxy-<name>` as the DataPlane shapes it.
+fn operated_as(name: &str, plane: &Plane) -> Settings {
+    let data_plane: edgerush_planes::data_plane::DataPlane = serde_saphyr::from_str(&format!(
+        "metadata: {{ name: {name}, namespace: edge, uid: {name}-uid }}\nspec:\n  controlPlaneRef: {{ name: edge }}\n"
+    ))
+    .unwrap();
+    Settings {
+        plane: plane.clone(),
+        service: Some(ProxyService::of(&data_plane).unwrap()),
+    }
+}
+
+/// The path DataPlane `name`'s Service is applied at.
+fn service_applied(name: &str) -> String {
+    format!(
+        "/api/v1/namespaces/edge/services/edgerush-proxy-{name}?fieldManager=edgerush-controller&force=true"
+    )
+}
+
+/// Two DataPlanes of one control plane, each of a class of its own: each is translated on
+/// its own from the one set of follows, its Service written, and each Ingress's status says
+/// the addresses of the Service of the DataPlane whose class it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_data_plane_is_translated_and_its_statuses_written_on_its_own() {
+    let api_plane = || {
+        let mut plane = plane();
+        plane.ingress_class = Some("other".to_owned());
+        plane
+    };
+    let web = operated_as("web", &plane());
+    let api = operated_as("api", &api_plane());
+    let (listed_web, listed_api) = (web.clone(), api.clone());
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        if path.ends_with("/status") {
+            return answer(200, "{}");
+        }
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            let other: IngressClass = serde_saphyr::from_str(
+                "{ metadata: { name: other }, spec: { controller: edgerush.dev/ingress-controller } }",
+            )
+            .unwrap();
+            page(&[class(), other])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[
+                ingress_saying("web", "edge", &[], &[]),
+                ingress_saying("theirs", "other", &[], &[]),
+            ])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/namespaces/edge/services?") {
+            page(&[
+                as_wanted(&listed_web, &[80, 443], &["203.0.113.7"]),
+                as_wanted(&listed_api, &[80, 443], &["203.0.113.9"]),
+            ])
+        } else if path == service_applied("web") || path == service_applied("api") {
+            answer(200, r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"x"}}"#)
+        } else if path.starts_with("/api/v1/secrets?") {
+            page(&[secret("shop", &["shop.example"])])
+        } else {
+            answer(500, "")
+        }
+    })
+    .await;
+    let api_server = fake.client(&token("controller-several", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let planes = Planes::from([
+                ("DataPlane edge/api".to_owned(), api),
+                ("DataPlane edge/web".to_owned(), web),
+            ]);
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api_server,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        watch::channel(planes).1,
+                        Debounce::default(),
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            let said = |line: &str| heard.borrow().lines.iter().any(|said| said == line);
+            until("each Ingress's status written", || {
+                said("status of Ingress shop/web: [203.0.113.7]")
+                    && said("status of Ingress shop/theirs: [203.0.113.9]")
+            })
+            .await;
+            controlling.abort();
+        })
+        .await;
+    let heard = heard.borrow();
+    let of: Vec<(&str, Vec<String>)> = heard
+        .of
+        .iter()
+        .zip(&heard.translations)
+        .map(|(of, translation)| (of.as_str(), routes(translation)))
+        .collect();
+    assert_eq!(
+        of,
+        [
+            (
+                "DataPlane edge/api",
+                vec!["ingress/shop/theirs/shop.example".to_owned()]
+            ),
+            (
+                "DataPlane edge/web",
+                vec!["ingress/shop/web/shop.example".to_owned()]
+            ),
+        ]
+    );
+    let applied: BTreeSet<String> = fake
+        .seen()
+        .into_iter()
+        .filter(|seen| seen.method == "PATCH" && seen.path.contains("/services/"))
+        .map(|seen| seen.path)
+        .collect();
+    assert_eq!(
+        applied,
+        BTreeSet::from([service_applied("api"), service_applied("web")])
+    );
+    // Nothing of one written for the other: neither Ingress says both addresses.
+    assert!(!said_both(&heard.lines), "{:?}", heard.lines);
+}
+
+/// Whether a status was said with two addresses.
+fn said_both(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .any(|line| line.starts_with("status of Ingress") && line.contains(", "))
+}
+
+/// Of several data planes, one whose config the data plane would refuse is refused alone,
+/// the others handed theirs; one added, or let go of, leaves the others as they were: not
+/// translated again, and nothing listed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_data_plane_added_refused_or_let_go_of_leaves_the_others_as_they_were() {
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[ingress("shop", "web", "shop.example")])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/secrets?") {
+            page::<Secret>(&[])
+        } else {
+            answer(500, "")
+        }
+    })
+    .await;
+    let api = fake.client(
+        &token("controller-several-come-and-go", "secret"),
+        Timing::default(),
+    );
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (settings, planes) = watch::channel(Planes::new());
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        planes,
+                        Debounce::default(),
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            let lists = || {
+                fake.seen()
+                    .iter()
+                    .filter(|seen| {
+                        seen.path.starts_with("/apis/networking.k8s.io/v1/ingresses?")
+                            && !seen.path.contains("watch=true")
+                    })
+                    .count()
+            };
+            // A data plane whose own settings the data plane would refuse, beside another.
+            let refusing = plane_with(
+                "ports:\n  80: { forwarding: { trusted_proxies: [\"10.1.2.3/8\"], trusted_only_headers: [] } }",
+            );
+            let mut planes = Planes::from([
+                ("a".to_owned(), harness(&plane())),
+                ("b".to_owned(), harness(&refusing)),
+            ]);
+            settings.send_replace(planes.clone());
+            until("translated and refused", || {
+                let heard = heard.borrow();
+                heard.of == ["a"] && heard.refused == ["b"]
+            })
+            .await;
+            assert_eq!(lists(), 1);
+            // Another added: translated alone.
+            planes.insert("c".to_owned(), harness(&plane()));
+            settings.send_replace(planes.clone());
+            until("the one added translated", || heard.borrow().of.len() == 2).await;
+            // Let go of: nothing more of the others.
+            planes.remove("b");
+            settings.send_replace(planes.clone());
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            planes.remove("a");
+            settings.send_replace(planes);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let heard = heard.borrow();
+            assert_eq!(heard.of, ["a", "c"], "{:?}", heard.lines);
+            assert_eq!(heard.refused, ["b"], "{:?}", heard.lines);
+            assert_eq!(lists(), 1, "listed again as data planes came and went");
+            drop(heard);
+            controlling.abort();
+        })
+        .await;
+}
+
+/// A data plane of Ingress alone is translated once what it needs is listed, though a
+/// Gateway beside it waits on the Gateway API's kinds, here never listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_data_plane_of_ingress_alone_does_not_wait_on_the_gateway_apis_kinds() {
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[ingress("shop", "web", "shop.example")])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/secrets?") {
+            page::<Secret>(&[])
+        } else {
+            // The CRDs among it: never listed.
+            answer(500, "")
+        }
+    })
+    .await;
+    let api = fake.client(
+        &token("controller-ingress-alone", "secret"),
+        Timing::default(),
+    );
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let planes = Planes::from([
+                ("gateway".to_owned(), harness(&gateway_plane())),
+                ("ingress".to_owned(), harness(&plane())),
+            ]);
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        watch::channel(planes).1,
+                        Debounce::default(),
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("the Ingress alone translated", || {
+                heard.borrow().of == ["ingress"]
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                heard.borrow().of,
+                ["ingress"],
+                "the Gateway translated unlisted"
+            );
             controlling.abort();
         })
         .await;

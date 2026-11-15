@@ -237,67 +237,108 @@ fn a_generation_is_acted_on_once_the_operator_accepted_it() {
 }
 
 /// What follows `data_planes` as they are, after `last`.
-fn after(last: Option<Settings>, data_planes: &[DataPlane]) -> Next {
-    let mut chooser = Chooser { last };
+fn after(last: &Planes, data_planes: &[DataPlane]) -> Choice {
+    let mut chooser = Chooser { last: last.clone() };
     chooser.next(data_planes, &own())
+}
+
+const WEB: &str = "DataPlane edge/web";
+const API: &str = "DataPlane edge/api";
+
+/// `api` in `edge`, of ControlPlane `edge`, made after `web`, at `generation`, with
+/// `status`.
+fn api(generation: i64, status: &str) -> DataPlane {
+    data_plane(&format!(
+        "metadata: {{ name: api, namespace: edge, generation: {generation}, uid: u2, creationTimestamp: \"2026-11-12T11:00:00Z\" }}\nspec:\n  controlPlaneRef: {{ name: edge }}\n  ingress: {{ httpPort: 80, httpsPort: 443 }}\n{status}"
+    ))
 }
 
 #[test]
 fn the_data_plane_served_is_the_last_generation_accepted() {
     let spec = |port: u16| format!("  ingress: {{ httpPort: {port}, httpsPort: 443 }}\n");
     let served = |port: u16, generation: i64| {
-        let Next::Serve(settings) = after(
-            None,
+        let choice = after(
+            &Planes::new(),
             &[web(generation, &spec(port), &accepted("True", generation))],
-        ) else {
-            panic!("not served");
-        };
-        *settings
+        );
+        assert!(choice.waiting.is_empty(), "{choice:?}");
+        choice.served[WEB].clone()
     };
     assert_eq!(served(80, 1).plane.ingress_http_port, 80);
     // An edit not yet accepted keeps the last, which is said as kept.
-    let last = served(80, 1);
+    let last = Planes::from([(WEB.to_owned(), served(80, 1))]);
+    let kept = after(&last, &[web(2, &spec(8080), &accepted("True", 1))]);
     assert_eq!(
-        after(
-            Some(last.clone()),
-            &[web(2, &spec(8080), &accepted("True", 1))]
-        ),
-        Next::Keep(Waiting::Pending("DataPlane edge/web".to_owned()))
+        kept,
+        Choice {
+            served: last.clone(),
+            waiting: vec![Waiting::Pending(WEB.to_owned())],
+        }
+    );
+    assert_eq!(
+        kept.told(),
+        [
+            "DataPlane edge/web: the operator has yet to accept it; the DataPlane last accepted is served"
+        ]
     );
     // With none before, as after a restart, it is waited on.
+    let waited = after(&Planes::new(), &[web(2, &spec(8080), &accepted("True", 1))]);
     assert_eq!(
-        after(None, &[web(2, &spec(8080), &accepted("True", 1))]),
-        Next::Wait(Waiting::Pending("DataPlane edge/web".to_owned()))
+        waited,
+        Choice {
+            served: Planes::new(),
+            waiting: vec![Waiting::Pending(WEB.to_owned())],
+        }
+    );
+    assert_eq!(
+        waited.told(),
+        [
+            "DataPlane edge/web: the operator has yet to accept it; it is not served until it is accepted"
+        ]
     );
     // Once accepted, served.
     assert_eq!(
-        after(
-            Some(last.clone()),
-            &[web(2, &spec(8080), &accepted("True", 2))]
-        ),
-        Next::Serve(Box::new(served(8080, 2)))
+        after(&last, &[web(2, &spec(8080), &accepted("True", 2))]),
+        Choice {
+            served: Planes::from([(WEB.to_owned(), served(8080, 2))]),
+            waiting: Vec::new(),
+        }
     );
-    // Refused, or gone, and nothing is served.
+    // Refused, or gone, and it is not served.
     assert_eq!(
-        after(
-            Some(last.clone()),
-            &[web(2, &spec(8080), &accepted("False", 2))]
-        ),
-        Next::Wait(Waiting::Refused("DataPlane edge/web".to_owned()))
+        after(&last, &[web(2, &spec(8080), &accepted("False", 2))]),
+        Choice {
+            served: Planes::new(),
+            waiting: vec![Waiting::Refused(WEB.to_owned())],
+        }
     );
-    assert_eq!(after(Some(last.clone()), &[]), Next::Wait(Waiting::None));
+    let none = after(&last, &[]);
+    assert_eq!(
+        none,
+        Choice {
+            served: Planes::new(),
+            waiting: vec![Waiting::None],
+        }
+    );
+    assert_eq!(
+        none.told(),
+        ["no DataPlane names this control plane; nothing is served until one is accepted"]
+    );
     // Accepted, but of a value it cannot take: the last kept, and why said.
-    let Next::Keep(Waiting::Unusable(why)) = after(
-        Some(last),
+    let unusable = after(
+        &last,
         &[web(
             2,
             "  ingress: { httpPort: 80, httpsPort: 443 }\n  ipFamily: IPv5\n",
             &accepted("True", 2),
         )],
-    ) else {
-        panic!("not kept");
+    );
+    assert_eq!(unusable.served, last);
+    let [Waiting::Unusable(why)] = unusable.waiting.as_slice() else {
+        panic!("not kept: {unusable:?}");
     };
-    assert!(why.contains("ipFamily"), "{why}");
+    assert_eq!(why.data_plane, WEB);
+    assert!(why.to_string().contains("ipFamily"), "{why}");
 }
 
 #[test]
@@ -306,54 +347,103 @@ fn only_a_data_plane_of_its_own_control_plane_is_served() {
         "metadata: { name: api, namespace: edge, generation: 1, uid: u2, creationTimestamp: \"2026-11-11T10:00:00Z\" }\nspec:\n  controlPlaneRef: { name: other }\n  ingress: { httpPort: 80, httpsPort: 443 }\nstatus:\n  conditions:\n    - { type: Accepted, status: \"True\", reason: R, message: \"\", lastTransitionTime: \"2026-11-12T10:00:00Z\", observedGeneration: 1 }\n",
     );
     assert_eq!(
-        after(None, std::slice::from_ref(&other)),
-        Next::Wait(Waiting::None)
+        after(&Planes::new(), std::slice::from_ref(&other)),
+        Choice {
+            served: Planes::new(),
+            waiting: vec![Waiting::None],
+        }
     );
     let ours = web(
         1,
         "  ingress: { httpPort: 80, httpsPort: 443 }\n",
         &accepted("True", 1),
     );
-    let Next::Serve(settings) = after(None, &[other, ours]) else {
-        panic!("not served");
-    };
-    assert_eq!(settings.plane.ingress_class.as_deref(), Some("edge.web"));
+    let choice = after(&Planes::new(), &[other, ours]);
+    assert_eq!(choice.served.keys().collect::<Vec<_>>(), [WEB]);
+    assert_eq!(
+        choice.served[WEB].plane.ingress_class.as_deref(),
+        Some("edge.web")
+    );
 }
 
+/// Every DataPlane the operator accepted is served, each by its own last accepted
+/// generation: one waiting on the operator, refused or gone changes nothing of another.
 #[test]
-fn of_two_accepted_the_oldest_is_served() {
-    // The operator accepts one alone; one it accepted before a second came stays first.
-    let younger = data_plane(
-        "metadata: { name: api, namespace: edge, generation: 1, uid: u2, creationTimestamp: \"2026-11-12T11:00:00Z\" }\nspec:\n  controlPlaneRef: { name: edge }\n  ingress: { httpPort: 80, httpsPort: 443 }\nstatus:\n  conditions:\n    - { type: Accepted, status: \"True\", reason: R, message: \"\", lastTransitionTime: \"2026-11-12T10:00:00Z\", observedGeneration: 1 }\n",
+fn every_data_plane_accepted_is_served_on_its_own() {
+    let spec = "  ingress: { httpPort: 80, httpsPort: 443 }\n";
+    let both = after(
+        &Planes::new(),
+        &[
+            api(1, &accepted("True", 1)),
+            web(1, spec, &accepted("True", 1)),
+        ],
     );
-    let older = web(
-        1,
-        "  ingress: { httpPort: 80, httpsPort: 443 }\n",
-        &accepted("True", 1),
+    assert_eq!(both.served.keys().collect::<Vec<_>>(), [API, WEB]);
+    assert!(both.waiting.is_empty(), "{both:?}");
+    assert_eq!(
+        both.served[API].plane.ingress_class.as_deref(),
+        Some("edge.api")
     );
-    let Next::Serve(settings) = after(None, &[younger, older]) else {
-        panic!("not served");
-    };
-    assert_eq!(settings.plane.ingress_class.as_deref(), Some("edge.web"));
+    assert_eq!(
+        both.served[WEB].plane.ingress_class.as_deref(),
+        Some("edge.web")
+    );
+    // An edit of one waiting on the operator keeps its last; the other is as it was.
+    let edited = after(
+        &both.served,
+        &[
+            api(2, &accepted("True", 1)),
+            web(1, spec, &accepted("True", 1)),
+        ],
+    );
+    assert_eq!(edited.served, both.served);
+    assert_eq!(edited.waiting, [Waiting::Pending(API.to_owned())]);
+    // One refused, or gone: the other served still. Said in the operator's order, the
+    // oldest first.
+    let refused = after(
+        &both.served,
+        &[
+            api(2, &accepted("False", 2)),
+            web(1, spec, &accepted("True", 1)),
+        ],
+    );
+    assert_eq!(refused.served.keys().collect::<Vec<_>>(), [WEB]);
+    assert_eq!(refused.served[WEB], both.served[WEB]);
+    assert_eq!(refused.waiting, [Waiting::Refused(API.to_owned())]);
+    let gone = after(&both.served, &[web(1, spec, &accepted("True", 1))]);
+    assert_eq!(gone.served.keys().collect::<Vec<_>>(), [WEB]);
+    assert!(gone.waiting.is_empty(), "{gone:?}");
+    let both_waiting = after(&Planes::new(), &[api(1, ""), web(1, spec, "")]);
+    assert_eq!(
+        both_waiting.waiting,
+        [
+            Waiting::Pending(WEB.to_owned()),
+            Waiting::Pending(API.to_owned())
+        ]
+    );
 }
 
 #[test]
 fn once_refused_nothing_is_kept_for_a_later_edit() {
     let spec = "  ingress: { httpPort: 80, httpsPort: 443 }\n";
     let mut chooser = Chooser::default();
-    assert!(matches!(
-        chooser.next(&[web(1, spec, &accepted("True", 1))], &own()),
-        Next::Serve(_)
-    ));
+    let first = chooser.next(&[web(1, spec, &accepted("True", 1))], &own());
+    assert!(first.served.contains_key(WEB));
     assert_eq!(
         chooser.next(&[web(2, spec, &accepted("False", 2))], &own()),
-        Next::Wait(Waiting::Refused("DataPlane edge/web".to_owned()))
+        Choice {
+            served: Planes::new(),
+            waiting: vec![Waiting::Refused(WEB.to_owned())],
+        }
     );
     // Refused, the last accepted is let go of: an edit the operator has yet to look at is
     // waited on, not served by what was refused before.
     assert_eq!(
         chooser.next(&[web(3, spec, &accepted("False", 2))], &own()),
-        Next::Wait(Waiting::Pending("DataPlane edge/web".to_owned()))
+        Choice {
+            served: Planes::new(),
+            waiting: vec![Waiting::Pending(WEB.to_owned())],
+        }
     );
-    assert_eq!(chooser.last, None);
+    assert!(chooser.last.is_empty());
 }

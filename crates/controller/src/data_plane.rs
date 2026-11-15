@@ -1,12 +1,12 @@
-//! The data plane's settings as its `DataPlane` states them
+//! The data planes' settings as their `DataPlane`s state them
 //! ([05 §3](../../../docs/05-operator.md)): which of the DataPlanes of the control plane's
-//! namespace is served, and what translation is given of it. The choice is made of the
-//! DataPlanes as they are handed to it, without I/O; [`follow_data_planes`] is the follow
-//! that hands them on.
+//! namespace are served, each on its own, and what translation is given of each. The choice
+//! is made of the DataPlanes as they are handed to it, without I/O; [`follow_data_planes`]
+//! is the follow that hands them on.
 //!
-//! **Every change goes through the operator** (05 §3): a generation is acted on only once
-//! the operator's `Accepted` condition is of it. Until then the last accepted is kept; with
-//! none, as after a restart, nothing is served until it is. What a DataPlane has no field
+//! **Every change goes through the operator** (05 §3): a generation of a DataPlane is acted
+//! on only once the operator's `Accepted` condition is of it. Until then its last accepted
+//! is kept; with none, as after a restart, it is not served until it is. What a DataPlane has no field
 //! for stays at its default: the authorities trusted for `wss` backends none, and the data
 //! plane's own settings the config's defaults, but for the Service of its own pods, which
 //! says its zone: the data plane's Service, of the name the control plane gives it, and
@@ -18,7 +18,7 @@ use edgerush_planes::data_plane::{DataPlane, DataPlanePorts};
 use edgerush_planes::objects::{ProxyService, data_plane_id, proxy_name};
 use edgerush_translate::{GatewayName, IpFamily, Plane, PortSettings};
 
-use crate::Settings;
+use crate::{Planes, Settings};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
@@ -87,7 +87,7 @@ pub fn accepted_ever(data_plane: &DataPlane) -> bool {
         })
 }
 
-/// Why nothing new is served.
+/// Why a DataPlane is not served as it now is, or why none is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Waiting {
     /// No DataPlane names this control plane.
@@ -96,8 +96,20 @@ pub enum Waiting {
     Pending(String),
     /// The operator refused this DataPlane as it now is.
     Refused(String),
-    /// Accepted, but of a value the data plane cannot take, as said.
-    Unusable(String),
+    /// Accepted, but of a value the data plane cannot take.
+    Unusable(Unusable),
+}
+
+impl Waiting {
+    /// The DataPlane it is of, as it is said, where it is of one.
+    #[must_use]
+    pub fn data_plane(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Pending(name) | Self::Refused(name) => Some(name),
+            Self::Unusable(unusable) => Some(&unusable.data_plane),
+        }
+    }
 }
 
 impl fmt::Display for Waiting {
@@ -106,35 +118,54 @@ impl fmt::Display for Waiting {
             Self::None => write!(f, "no DataPlane names this control plane"),
             Self::Pending(name) => write!(f, "{name}: the operator has yet to accept it"),
             Self::Refused(name) => write!(f, "{name}: the operator did not accept it"),
-            Self::Unusable(why) => write!(f, "{why}"),
+            Self::Unusable(unusable) => write!(f, "{unusable}"),
         }
     }
 }
 
-/// What is to be served next.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Next {
-    /// These settings, a new generation accepted.
-    Serve(Box<Settings>),
-    /// Those last served, kept, and why nothing new.
-    Keep(Waiting),
-    /// Nothing, and why.
-    Wait(Waiting),
+/// What is served of the DataPlanes, and why any is not as it now is.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Choice {
+    /// The settings of each DataPlane served, by the DataPlane as it is said.
+    pub served: Planes,
+    /// Why each DataPlane naming this control plane that is not served as it now is is
+    /// not, in the operator's order; [`Waiting::None`] alone where none names it.
+    pub waiting: Vec<Waiting>,
 }
 
-/// Which DataPlane is served, as they change.
+impl Choice {
+    /// What is said of each DataPlane not served as it now is: whether its last accepted
+    /// generation is served meanwhile.
+    #[must_use]
+    pub fn told(&self) -> Vec<String> {
+        self.waiting
+            .iter()
+            .map(|waiting| match waiting.data_plane() {
+                Some(name) if self.served.contains_key(name) => {
+                    format!("{waiting}; the DataPlane last accepted is served")
+                }
+                Some(_) => format!("{waiting}; it is not served until it is accepted"),
+                None => format!("{waiting}; nothing is served until one is accepted"),
+            })
+            .collect()
+    }
+}
+
+/// Which DataPlanes are served, as they change: each on its own, by its own last accepted
+/// generation (05 §3).
 #[derive(Debug, Default)]
 pub struct Chooser {
-    /// The settings last served, if any are.
-    pub last: Option<Settings>,
+    /// The settings last served of each DataPlane served, by the DataPlane as it is said.
+    pub last: Planes,
 }
 
 impl Chooser {
     /// What to serve of `data_planes`, those of the control plane's own namespace, as they
-    /// are now. Of those naming this control plane, one accepted, the oldest if the
-    /// operator has left two so; else the oldest waiting on the operator, the last served
-    /// kept meanwhile; else one refused. None is served while none is accepted.
-    pub fn next(&mut self, data_planes: &[DataPlane], own: &Own) -> Next {
+    /// are now. Each naming this control plane is served as its generation the operator
+    /// accepted; one it has yet to look at, or accepted of a value the data plane cannot
+    /// take, as its last accepted, where there is one, and else not; one it refused, or
+    /// gone, not at all, nothing kept of it for a later edit.
+    pub fn next(&mut self, data_planes: &[DataPlane], own: &Own) -> Choice {
         let mut ours: Vec<&DataPlane> = data_planes
             .iter()
             .filter(|data_plane| data_plane.spec.control_plane_ref.name == own.control_plane)
@@ -149,43 +180,40 @@ impl Chooser {
             };
             key(a).cmp(&key(b))
         });
-        let first = |wanted: Verdict| ours.iter().copied().find(|d| verdict(d) == wanted);
-        let next = if let Some(accepted) = first(Verdict::Accepted) {
-            match settings(accepted, own) {
-                Ok(settings) => Next::Serve(Box::new(settings)),
-                Err(unusable) => Next::Keep(Waiting::Unusable(unusable.to_string())),
-            }
-        } else if let Some(pending) = first(Verdict::Pending) {
-            Next::Keep(Waiting::Pending(named(pending)))
-        } else if let Some(refused) = first(Verdict::Refused) {
-            Next::Wait(Waiting::Refused(named(refused)))
-        } else {
-            Next::Wait(Waiting::None)
-        };
-        match next {
-            Next::Serve(settings) => {
-                self.last = Some((*settings).clone());
-                Next::Serve(settings)
-            }
-            Next::Keep(waiting) if self.last.is_none() => Next::Wait(waiting),
-            Next::Keep(waiting) => Next::Keep(waiting),
-            Next::Wait(waiting) => {
-                self.last = None;
-                Next::Wait(waiting)
-            }
+        let mut choice = Choice::default();
+        if ours.is_empty() {
+            choice.waiting.push(Waiting::None);
         }
+        for data_plane in ours {
+            let name = named(data_plane);
+            let kept = || self.last.get(&name).cloned();
+            let (served, waiting) = match verdict(data_plane) {
+                Verdict::Accepted => match settings(data_plane, own) {
+                    Ok(settings) => (Some(settings), None),
+                    Err(unusable) => (kept(), Some(Waiting::Unusable(unusable))),
+                },
+                Verdict::Pending => (kept(), Some(Waiting::Pending(name.clone()))),
+                Verdict::Refused => (None, Some(Waiting::Refused(name.clone()))),
+            };
+            if let Some(settings) = served {
+                choice.served.insert(name, settings);
+            }
+            choice.waiting.extend(waiting);
+        }
+        self.last.clone_from(&choice.served);
+        choice
     }
 }
 
-/// Follows the DataPlanes of `namespace` through `api`, handing `out` the settings to serve
-/// each time they change, none while none is accepted, and saying to `say` why nothing new
-/// is served, once each time that changes, and each failure of the follow. Runs until no
-/// one holds a receiver of `out`. For a `LocalSet`.
+/// Follows the DataPlanes of `namespace` through `api`, handing `out` the settings of each
+/// served each time they change, none while none is accepted, and saying to `say` why one
+/// is not served as it now is, once each time that changes, and each failure of the
+/// follow. Runs until no one holds a receiver of `out`. For a `LocalSet`.
 pub async fn follow_data_planes(
     api: ApiServer,
     namespace: Scope,
     own: Own,
-    out: watch::Sender<Option<Settings>>,
+    out: watch::Sender<Planes>,
     say: impl Fn(&str) + 'static,
 ) {
     let say: Rc<dyn Fn(&str)> = Rc::new(say);
@@ -199,7 +227,7 @@ pub async fn follow_data_planes(
         .await;
     });
     let mut chooser = Chooser::default();
-    let mut said: Option<Waiting> = None;
+    let mut said: Vec<String> = Vec::new();
     loop {
         tokio::select! {
             changed = listed.changed() => if changed.is_err() { return },
@@ -209,30 +237,20 @@ pub async fn follow_data_planes(
         if !now.listed {
             continue;
         }
-        let waiting = match chooser.next(&now.objects, &own) {
-            Next::Serve(settings) => {
-                out.send_if_modified(|served| {
-                    let changed = served.as_ref() != Some(&*settings);
-                    *served = Some(*settings);
-                    changed
-                });
-                None
+        let choice = chooser.next(&now.objects, &own);
+        let told = choice.told();
+        out.send_if_modified(|served| {
+            let changed = *served != choice.served;
+            if changed {
+                *served = choice.served;
             }
-            Next::Keep(waiting) => Some(waiting),
-            Next::Wait(waiting) => {
-                out.send_if_modified(|served| served.take().is_some());
-                Some(waiting)
-            }
-        };
-        if let Some(waiting) = &waiting
-            && said.as_ref() != Some(waiting)
-        {
-            say(&match chooser.last {
-                Some(_) => format!("{waiting}; the DataPlane last accepted is served"),
-                None => format!("{waiting}; nothing is served until one is accepted"),
-            });
+            changed
+        });
+        // Each once, until it changes.
+        for line in told.iter().filter(|line| !said.contains(line)) {
+            say(line);
         }
-        said = waiting;
+        said = told;
     }
 }
 

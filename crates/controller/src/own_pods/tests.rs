@@ -108,20 +108,48 @@ fn a_slice_with_no_endpoints_gives_none() {
     assert!(addresses(&slices, &named(&OURS)).is_empty());
 }
 
-#[test]
-fn the_services_are_the_control_planes_and_its_data_planes_where_it_has_one() {
-    assert_eq!(services("edge", None), named(&["edgerush-controller-edge"]));
-    let web: DataPlane = serde_saphyr::from_str(
-        "metadata: { name: web, namespace: edge, generation: 1, uid: u1 }\nspec:\n  controlPlaneRef: { name: edge }\n  ingress: { httpPort: 80, httpsPort: 443 }\n",
-    )
-    .unwrap();
-    let own = Own {
+/// DataPlane `name` of ControlPlane `edge`.
+fn data_plane(name: &str) -> DataPlane {
+    serde_saphyr::from_str(&format!(
+        "metadata: {{ name: {name}, namespace: edge, generation: 1, uid: u-{name} }}\nspec:\n  controlPlaneRef: {{ name: edge }}\n  ingress: {{ httpPort: 80, httpsPort: 443 }}\n",
+    ))
+    .unwrap()
+}
+
+fn own() -> Own {
+    Own {
         control_plane: "edge".to_owned(),
         cluster_domain: "cluster.local".to_owned(),
         system_authorities: Vec::new(),
-    };
-    let settings = settings(&web, &own).unwrap();
-    assert_eq!(services("edge", Some(&settings)), named(&OURS));
+    }
+}
+
+/// The control plane's Service, and every data plane's it serves: each data plane refuses
+/// the others' pods as its own (03 §6).
+#[test]
+fn the_services_are_the_control_planes_and_every_data_planes() {
+    assert_eq!(
+        services("edge", &Planes::new()),
+        named(&["edgerush-controller-edge"])
+    );
+    let web = Planes::from([(
+        "DataPlane edge/web".to_owned(),
+        settings_of(&data_plane("web"), &own()),
+    )]);
+    assert_eq!(services("edge", &web), named(&OURS));
+    let mut both = web;
+    both.insert(
+        "DataPlane edge/api".to_owned(),
+        settings_of(&data_plane("api"), &own()),
+    );
+    assert_eq!(
+        services("edge", &both),
+        named(&[
+            "edgerush-controller-edge",
+            "edgerush-proxy-api",
+            "edgerush-proxy-web"
+        ])
+    );
 }
 
 /// The follow: the control plane's pods once its namespace is listed, and the data plane's
@@ -158,19 +186,10 @@ async fn a_data_planes_service_named_later_is_followed_with_no_restart() {
     })
     .await;
     let api = fake.client(&token("controller-own-pods", "secret"), Timing::default());
-    let web: DataPlane = serde_saphyr::from_str(
-        "metadata: { name: web, namespace: edge, generation: 1, uid: u1 }\nspec:\n  controlPlaneRef: { name: edge }\n  ingress: { httpPort: 80, httpsPort: 443 }\n",
-    )
-    .unwrap();
-    let own = Own {
-        control_plane: "edge".to_owned(),
-        cluster_domain: "cluster.local".to_owned(),
-        system_authorities: Vec::new(),
-    };
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (settings, planes) = watch::channel(None);
+            let (settings, planes) = watch::channel(Planes::new());
             let (out, found) = watch::channel::<Arc<[IpAddr]>>(Arc::from([]));
             let _following = tokio::task::spawn_local(follow_own_pods(
                 api,
@@ -193,7 +212,10 @@ async fn a_data_planes_service_named_later_is_followed_with_no_restart() {
                 "{:?}",
                 *found.borrow()
             );
-            settings.send_replace(Some(settings_of(&web, &own)));
+            settings.send_replace(Planes::from([(
+                "DataPlane edge/web".to_owned(),
+                settings_of(&data_plane("web"), &own()),
+            )]));
             assert!(
                 until(&found, ips(&["10.0.0.2", "10.0.1.2"])).await,
                 "{:?}",
@@ -203,6 +225,6 @@ async fn a_data_planes_service_named_later_is_followed_with_no_restart() {
         .await;
 }
 
-fn settings_of(data_plane: &DataPlane, own: &Own) -> Settings {
+fn settings_of(data_plane: &DataPlane, own: &Own) -> crate::Settings {
     settings(data_plane, own).unwrap()
 }

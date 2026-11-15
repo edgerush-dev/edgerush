@@ -775,7 +775,7 @@ fn a_control_plane_reads_its_data_plane_or_a_file_is_given_but_not_both() {
 /// a review is answered 503, as there is nothing to judge it for.
 #[test]
 fn a_review_waits_on_the_data_planes_settings() {
-    let answer = review(None, &classes(true), &review_of("u-1", "{}"));
+    let answer = review(&Planes::new(), &classes(true), &review_of("u-1", "{}"));
     assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         String::from_utf8(answer.body).unwrap(),
@@ -785,9 +785,9 @@ fn a_review_waits_on_the_data_planes_settings() {
 
 #[test]
 fn a_review_is_answered_once_the_classes_are_listed_and_what_is_none_is_a_bad_request() {
-    let plane: Plane = serde_saphyr::from_str(&plane()).unwrap();
+    let planes = harness_planes(&[("", &plane())]);
     let answered = |listed: bool, body: &[u8]| {
-        let answer = review(Some(&plane), &classes(listed), body);
+        let answer = review(&planes, &classes(listed), body);
         (answer.status, String::from_utf8(answer.body).unwrap())
     };
     let (status, body) = answered(false, &review_of("u-1", "{}"));
@@ -809,6 +809,48 @@ fn a_review_is_answered_once_the_classes_are_listed_and_what_is_none_is_a_bad_re
     let (status, body) = answered(true, b"not a review");
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.starts_with("not an AdmissionReview"), "{body}");
+}
+
+/// The data planes `planes` names, each of these settings in YAML, of no Service.
+fn harness_planes(planes: &[(&str, &str)]) -> Planes {
+    planes
+        .iter()
+        .map(|(name, yaml)| {
+            let settings = edgerush_controller::Settings {
+                plane: serde_saphyr::from_str(yaml).unwrap(),
+                service: None,
+            };
+            ((*name).to_owned(), settings)
+        })
+        .collect()
+}
+
+/// Of several data planes, an Ingress is judged by the one whose class it is: refused
+/// where that one would leave it out, whatever the others are, and admitted where none is
+/// of its class.
+#[test]
+fn a_review_is_judged_by_the_data_plane_of_the_ingresss_class() {
+    let other = plane_with("").replace("ingress_class: edge", "ingress_class: other");
+    let judged = |planes: &Planes, uid: &str, annotations: &str| {
+        let answer = review(planes, &classes(true), &review_of(uid, annotations));
+        assert_eq!(answer.status, StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+        body["response"]["allowed"].as_bool().unwrap()
+    };
+    let both = harness_planes(&[
+        ("DataPlane edge/api", &other),
+        ("DataPlane edge/web", &plane()),
+    ]);
+    assert!(
+        !judged(&both, "u-1", r#"{"x":"y"}"#),
+        "of edge, which refuses it"
+    );
+    assert!(judged(&both, "u-2", "{}"));
+    let other_alone = harness_planes(&[("DataPlane edge/api", &other)]);
+    assert!(
+        judged(&other_alone, "u-3", r#"{"x":"y"}"#),
+        "of a class no data plane served is"
+    );
 }
 
 /// The webhook's files, of `authority`'s certificate for `name`, in `dir`, each put in
@@ -1261,52 +1303,63 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
     );
 }
 
-/// A translation is offered to the data plane it was made for alone: one made for another
-/// ID than the stream serves serves that ID in its place, and nothing offered before is
-/// kept for it or built on; the stream serves whom the settings say, none without them.
+/// Each translation is offered to the data plane it was made for alone, built on what that
+/// one was offered last, and every other's offer left as it was; the stream serves whom the
+/// settings say, none without them, and lets go of a data plane no longer served.
 #[test]
 fn a_translation_is_offered_to_the_data_plane_it_was_made_for_alone() {
     const WEB: &str = "spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-web";
     const API: &str = "spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-api";
-    let settings = |more: &str| edgerush_controller::Settings {
-        plane: serde_saphyr::from_str(&plane_with(more)).unwrap(),
-        service: None,
-    };
-    assert!(matches!(whom(None), Served::Nobody));
-    assert!(matches!(whom(Some(&settings(""))), Served::Anyone(None)));
-    let web = whom(Some(&settings(&format!("id: {WEB}"))));
-    assert!(
-        matches!(&web, Served::One { id, offer: None } if id == WEB),
-        "{web:?}"
-    );
-    let (served, offered) = watch::channel(web);
+    let web = plane_with(&format!("id: {WEB}"));
+    let api = plane_with(&format!("id: {API}"));
+    assert!(matches!(whom(&Planes::new()), Served::Ids(ids) if ids.is_empty()));
+    assert!(matches!(
+        whom(&harness_planes(&[("", &plane())])),
+        Served::Anyone(None)
+    ));
+    let both = whom(&harness_planes(&[
+        ("DataPlane edge/api", &api),
+        ("DataPlane edge/web", &web),
+    ]));
+    assert_eq!(both.offer_to(Some(WEB)), Ok(None));
+    assert_eq!(both.offer_to(Some(API)), Ok(None));
+    let (served, offered) = watch::channel(both);
     let offering = Offering {
         versions: RefCell::new(Versions::new(7)),
         served,
         runs: Rc::default(),
         pods: watch::channel(edgerush_controller::acks::Pods::new()).0,
     };
+    let plain: Plane = serde_saphyr::from_str(&plane()).unwrap();
     let translation =
-        edgerush_translate::translate(&settings("").plane, &edgerush_translate::Cluster::default());
+        edgerush_translate::translate(&plain, &edgerush_translate::Cluster::default());
+    let version_of = |id: &str| {
+        offered
+            .borrow()
+            .offer_to(Some(id))
+            .unwrap()
+            .map(|offer| offer.version().to_owned())
+    };
     let first = offering.offer(&translation, Some(WEB)).unwrap();
-    let web_offer = offered
-        .borrow()
-        .offer_to(Some(WEB))
-        .unwrap()
-        .cloned()
-        .unwrap();
-    assert_eq!(web_offer.version(), first);
+    assert_eq!(version_of(WEB).as_deref(), Some(first.as_str()));
+    assert_eq!(version_of(API), None, "offered to another");
     // The same config again, for the same data plane, is built on what it holds.
-    let again = offering.offer(&translation, Some(WEB)).unwrap();
-    assert_eq!(again, first);
-    // For another: served in its place, with an offer of its own.
+    assert_eq!(offering.offer(&translation, Some(WEB)).unwrap(), first);
+    // For the other: an offer of its own, built on nothing of the first's.
     let other = offering.offer(&translation, Some(API)).unwrap();
     assert_ne!(other, first);
-    let served = offered.borrow().clone();
+    assert_eq!(version_of(API).as_deref(), Some(other.as_str()));
+    assert_eq!(version_of(WEB).as_deref(), Some(first.as_str()));
+    // One let go of: refused from now on, the other's offer kept.
+    let mut served = offered.borrow().clone();
+    assert!(served.serve(whom(&harness_planes(&[("DataPlane edge/api", &api)]))));
     assert!(served.offer_to(Some(WEB)).is_err());
     assert_eq!(
-        served.offer_to(Some(API)).unwrap().unwrap().version(),
-        other
+        served
+            .offer_to(Some(API))
+            .unwrap()
+            .map(|offer| offer.version()),
+        Some(other.as_str())
     );
 }
 
@@ -1716,7 +1769,7 @@ async fn the_webhook_is_served_with_each_certificate_the_issuer_signs() {
         listener,
         certifying: Certifying::Signed(signed),
     };
-    let (_settings, planes) = watch::channel(None);
+    let (_settings, planes) = watch::channel(Planes::new());
     let (said, mut hearing) = mpsc::unbounded_channel();
     let (stopping, stop) = oneshot::channel();
     let (ending, ended) = oneshot::channel();

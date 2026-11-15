@@ -1,6 +1,6 @@
 //! The gateway's own pods, which no data plane may send to
-//! ([03 §6](../../../docs/03-data-plane.md)): the control plane's replicas and the data
-//! plane's pods, read from the EndpointSlices of their Services in the control plane's own
+//! ([03 §6](../../../docs/03-data-plane.md)): the control plane's replicas and the pods of
+//! every data plane it serves, read from the EndpointSlices of their Services in the control plane's own
 //! namespace, every endpoint, ready or not. The addresses are found without I/O by
 //! [`addresses`]; [`follow_own_pods`] is the follow that hands them on.
 
@@ -8,7 +8,7 @@ use edgerush_kubernetes::{ApiServer, Listed, Retry, Scope, follow};
 use edgerush_planes::objects::controller_name;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 
-use crate::Settings;
+use crate::Planes;
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -42,11 +42,15 @@ pub fn addresses(slices: &[EndpointSlice], services: &BTreeSet<String>) -> Arc<[
 }
 
 /// The Services whose pods are the gateway's own: the control plane's, of the name the
-/// operator gives it for `control_plane`, and the data plane's, where `settings` has one.
+/// operator gives it for `control_plane`, and that of every data plane `planes` has with
+/// one, each refused by every other as by itself (03 §6).
 #[must_use]
-pub fn services(control_plane: &str, settings: Option<&Settings>) -> BTreeSet<String> {
+pub fn services(control_plane: &str, planes: &Planes) -> BTreeSet<String> {
     let mut services = BTreeSet::from([controller_name(control_plane)]);
-    if let Some(service) = settings.and_then(|settings| settings.service.as_ref()) {
+    for service in planes
+        .values()
+        .filter_map(|settings| settings.service.as_ref())
+    {
         services.insert(service.name().to_owned());
     }
     services
@@ -54,14 +58,14 @@ pub fn services(control_plane: &str, settings: Option<&Settings>) -> BTreeSet<St
 
 /// Follows the EndpointSlices of `namespace`, the control plane's own, on `api`, and
 /// publishes on `out` the addresses of [`services`]' endpoints, for `control_plane` and the
-/// data plane `settings` says, each time they change, until no one holds a receiver of
+/// data planes `planes` says, each time they change, until no one holds a receiver of
 /// `out`. Nothing is published until a list has been read whole; while the follow fails,
 /// the last addresses are kept. Each failure is said to `say`.
 pub async fn follow_own_pods(
     api: ApiServer,
     namespace: Scope,
     control_plane: String,
-    mut settings: watch::Receiver<Option<Settings>>,
+    mut planes: watch::Receiver<Planes>,
     out: watch::Sender<Arc<[IpAddr]>>,
     say: impl Fn(&str) + 'static,
 ) {
@@ -75,15 +79,15 @@ pub async fn follow_own_pods(
         })
         .await;
     });
-    let mut wanted = services(&control_plane, settings.borrow_and_update().as_ref());
+    let mut wanted = services(&control_plane, &planes.borrow_and_update());
     loop {
         tokio::select! {
             changed = listed.changed() => if changed.is_err() { return },
-            changed = settings.changed() => {
+            changed = planes.changed() => {
                 if changed.is_err() {
                     return;
                 }
-                wanted = services(&control_plane, settings.borrow_and_update().as_ref());
+                wanted = services(&control_plane, &planes.borrow_and_update());
             }
             () = out.closed() => return,
         }
