@@ -27,7 +27,11 @@
 #     kind has none, said by the Ingress's status and the Gateway's;
 #   - the data plane's Deployment's image edited by hand is put back, and a label added by
 #     hand is kept;
-#   - a second DataPlane of `edge` is not accepted, and nothing is made for it;
+#   - a second DataPlane of `edge`, `api`, is accepted and programmed, its own Service and
+#     address; each data plane serves its own Gateway's routes and not the other's, a route
+#     attached to both Gateways is served by each and its status holds a parent of each;
+#     `api` deleted takes what was made for it and its parent of that route, and `web`
+#     serves on, the controller neither rolled nor restarted;
 #   - a ControlPlane of `edge`'s name in another namespace is not accepted, its status
 #     naming the one that holds it, and nothing is made for it; given the operator's
 #     finalizer by hand and deleted, it deletes nothing of `edge`'s;
@@ -297,23 +301,114 @@ pass "a field the operator states, edited by hand, is put back"
     fail "a label added by hand is gone"
 pass "a label added by hand is kept"
 
-echo "== refused"
+echo "== a second DataPlane"
+# The controller's pods and the Deployment's generation: the same as DataPlanes come and go.
+edge_controllers() {
+    echo "$(k -n edge get deploy edgerush-controller-edge -o jsonpath='{.metadata.generation}')" \
+        "$(k -n edge get pods -l gateway.edgerush.dev/control-plane=edge,app.kubernetes.io/component=controller \
+            -o jsonpath='{range .items[*]}{.metadata.name} {.status.containerStatuses[0].restartCount}{" "}{end}')"
+}
+before=$(edge_controllers)
 k apply -f - >/dev/null <<'EOF'
 apiVersion: gateway.edgerush.dev/v1alpha1
 kind: DataPlane
-metadata: { name: second, namespace: edge }
+metadata: { name: api, namespace: edge }
 spec:
   controlPlaneRef: { name: edge }
+  gateway:
+    listeners: [{ name: http, port: 8080, protocol: HTTP }]
   ingress: { httpPort: 80, httpsPort: 443 }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: web-only, namespace: edge }
+spec:
+  parentRefs: [{ name: web }]
+  hostnames: [web.example]
+  rules: [{ backendRefs: [{ name: shop, port: 80 }] }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: api-only, namespace: edge }
+spec:
+  parentRefs: [{ name: api }]
+  hostnames: [api.example]
+  rules: [{ backendRefs: [{ name: shop, port: 80 }] }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: both, namespace: edge }
+spec:
+  parentRefs: [{ name: web }, { name: api }]
+  hostnames: [both.example]
+  rules: [{ backendRefs: [{ name: shop, port: 80 }] }]
 EOF
-condition_is dataplane/second edge Accepted "False OneDataPlaneOnly" 60 ||
-    fail "a second DataPlane: $(condition dataplane/second edge Accepted)"
-sleep 3
-[ -z "$(k -n edge get deploy,sa -l gateway.edgerush.dev/data-plane=second -o name)" ] ||
-    fail "something was made for the second DataPlane"
-pass "a second DataPlane of one ControlPlane is not accepted, and nothing is made for it"
-k delete -n edge dataplane second >/dev/null
+condition_is dataplane/api edge Accepted "True Accepted" 60 ||
+    fail "a second DataPlane of edge not accepted: $(condition dataplane/api edge Accepted)"
+k -n edge rollout status deploy/edgerush-proxy-api --timeout=180s >/dev/null ||
+    fail "DataPlane api's data plane never ran"
+condition_is dataplane/api edge Programmed "True Programmed" 120 ||
+    fail "DataPlane api not programmed: $(condition dataplane/api edge Programmed)"
+condition_is dataplane/web edge Programmed "True Programmed" 10 ||
+    fail "DataPlane web, beside api: $(condition dataplane/web edge Programmed)"
+until_true '[ "$(k -n edge get service edgerush-proxy-api -o jsonpath="{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}")" = DataPlane/api ]' 60 ||
+    fail "DataPlane api has no Service of its own: $(k -n edge get service edgerush-proxy-api -o name 2>&1)"
+k -n edge patch service edgerush-proxy-api --subresource=status --type=merge \
+    -p '{"status":{"loadBalancer":{"ingress":[{"ip":"192.0.2.11"}]}}}' >/dev/null
+until_true '[ "$(k -n edge get gateway api -o jsonpath="{.status.addresses[0].value}")" = 192.0.2.11 ]' 60 ||
+    fail "Gateway api's status says '$(k -n edge get gateway api -o jsonpath='{.status.addresses}')', not its Service's address"
+[ "$(k -n edge get gateway web -o jsonpath='{.status.addresses[0].value}')" = 192.0.2.10 ] ||
+    fail "Gateway web's status says '$(k -n edge get gateway web -o jsonpath='{.status.addresses}')' beside api"
+pass "a second DataPlane of one ControlPlane is accepted and programmed, its own Service and address"
 
+# Port-forwards to port $2 of DataPlane $1's data plane.
+plane() {
+    [ -n "$forward_pid" ] && kill "$forward_pid" 2>/dev/null || true
+    port=$((port + 1))
+    k -n edge port-forward "deploy/edgerush-proxy-$1" "$port:$2" >/dev/null 2>&1 &
+    forward_pid=$!
+}
+# Waits up to $5 seconds, a port-forward begun again every 10, for host $3 to answer $4
+# through port $2 of DataPlane $1's data plane.
+plane_answers() {
+    for _ in $(seq 1 $(($5 / 10))); do
+        plane "$1" "$2"
+        until_true "[ \"\$(status $3)\" = $4 ]" 10 && return 0
+    done
+    return 1
+}
+plane_answers api 8080 api.example 200 120 || fail "api's route is not served by api: $(status api.example)"
+[ "$(status both.example)" = 200 ] || fail "the route of both is not served by api: $(status both.example)"
+[ "$(status web.example)" = 404 ] || fail "web's route is served by api: $(status web.example)"
+plane_answers web 8080 web.example 200 120 || fail "web's route is not served by web: $(status web.example)"
+[ "$(status both.example)" = 200 ] || fail "the route of both is not served by web: $(status both.example)"
+[ "$(status api.example)" = 404 ] || fail "api's route is served by web: $(status api.example)"
+# Each parent of the route of both, as `name=Accepted`, sorted.
+parents_of_both() {
+    k -n edge get httproute both \
+        -o jsonpath='{range .status.parents[*]}{.parentRef.name}={.conditions[?(@.type=="Accepted")].status}{"\n"}{end}' |
+        sort | tr '\n' ' '
+}
+until_true '[ "$(parents_of_both)" = "api=True web=True " ]' 60 ||
+    fail "the route of both Gateways has parents '$(parents_of_both)'"
+pass "each data plane serves its own Gateway's routes and not the other's, a route of both served by each, a parent of each in its status"
+
+k -n edge delete dataplane api --wait=false >/dev/null
+until_true '[ -z "$(k -n edge get deploy,sa,pdb,rolebindings,gateways,services -l gateway.edgerush.dev/data-plane=api -o name 2>/dev/null)" ] && ! k -n edge get service edgerush-proxy-api && ! k get ingressclass edge.api' 90 ||
+    fail "DataPlane api deleted left: $(k -n edge get deploy,sa,pdb,rolebindings,gateways,services -l gateway.edgerush.dev/data-plane=api -o name; k get ingressclass edge.api -o name 2>&1)"
+until_true '! k -n edge get dataplane api' 30 || fail "DataPlane api is never gone"
+plane_answers web 8080 web.example 200 60 || fail "web's route is not served once api is gone: $(status web.example)"
+[ "$(status both.example)" = 200 ] || fail "the route of both is not served by web once api is gone: $(status both.example)"
+until_true '[ "$(parents_of_both)" = "web=True " ]' 60 ||
+    fail "the route of both, Gateway api gone, has parents '$(parents_of_both)'"
+condition_is dataplane/web edge Programmed "True Programmed" 10 ||
+    fail "DataPlane web, api gone: $(condition dataplane/web edge Programmed)"
+[ "$(edge_controllers)" = "$before" ] ||
+    fail "the controller was rolled or restarted: before '$before', now '$(edge_controllers)'"
+pass "the second DataPlane deleted takes what was made for it, its Gateway's parent gone from the route, and the first serves on, the controller not restarted"
+k -n edge delete httproute web-only api-only both >/dev/null
+
+echo "== refused"
 k create namespace late >/dev/null
 k apply -f - >/dev/null <<'EOF'
 apiVersion: gateway.edgerush.dev/v1alpha1

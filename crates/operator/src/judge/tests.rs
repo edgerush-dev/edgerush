@@ -312,26 +312,26 @@ fn a_data_plane_is_of_the_control_plane_of_its_namespace_that_holds_the_name() {
 }
 
 #[test]
-fn a_control_plane_serves_its_oldest_data_plane_alone() {
-    let control_planes = [control_plane("a", "edge", 10, "u1", "Same")];
+fn a_control_plane_serves_every_data_plane_naming_it() {
+    let control_planes = [
+        control_plane("a", "edge", 10, "u1", "Same"),
+        control_plane("b", "other", 10, "u2", "Same"),
+    ];
     let data_planes = [
         data_plane("a", "second", "edge", 40),
-        // Made at once: by name, as the control plane chooses, whichever is listed first.
+        // Made at once, and one older: each accepted all the same.
         data_plane("a", "zeta", "edge", 30),
         data_plane("a", "first", "edge", 30),
+        data_plane("b", "web", "other", 20),
     ];
     let judged = judged(&control_planes, &data_planes);
-    let one_only = || {
-        Err(Refused::OneDataPlaneOnly {
-            holder: "first".to_owned(),
-        })
-    };
     assert_eq!(
         data_plane_verdicts(&judged),
         [
-            ("a/second".to_owned(), one_only()),
-            ("a/zeta".to_owned(), one_only()),
+            ("a/second".to_owned(), Ok("a/edge".to_owned())),
+            ("a/zeta".to_owned(), Ok("a/edge".to_owned())),
             ("a/first".to_owned(), Ok("a/edge".to_owned())),
+            ("b/web".to_owned(), Ok("b/other".to_owned())),
         ]
     );
 }
@@ -365,13 +365,6 @@ fn each_refusal_has_its_reason_and_says_what_holds_or_is_asked() {
             }),
             "ScopeNotAllowed",
             "All",
-        ),
-        (
-            Refused::OneDataPlaneOnly {
-                holder: "first".to_owned(),
-            },
-            "OneDataPlaneOnly",
-            "first",
         ),
         (
             Refused::NoControlPlane {
