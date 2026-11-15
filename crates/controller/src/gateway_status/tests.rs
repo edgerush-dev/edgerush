@@ -449,6 +449,14 @@ fn parent(controller: &str, namespace: Option<&str>, name: &str) -> HTTPRouteSta
     }
 }
 
+/// Of Gateways followed in no namespace: none can be told gone.
+fn nothing_gone() -> Gateways<'static> {
+    Gateways {
+        namespaces: &[],
+        there: &[],
+    }
+}
+
 /// What translation says of a route of `shop` with one parent, `edge/web`.
 fn wanted_route(generation: i64) -> RouteStatus {
     RouteStatus {
@@ -488,6 +496,7 @@ fn a_routes_parents_are_ours_of_our_gateway_in_place_beside_every_other_kept_who
         "shop",
         &[web()],
         Some(&wanted_route(2)),
+        nothing_gone(),
         at(50),
     );
     assert_eq!(status.parents.len(), 3);
@@ -507,7 +516,7 @@ fn a_routes_parents_are_ours_of_our_gateway_in_place_beside_every_other_kept_who
         ]
     );
     // A route that no longer names the Gateway has no parent of ours there, the rest kept.
-    let gone = route(Some(&live), "shop", &[web()], None, at(60));
+    let gone = route(Some(&live), "shop", &[web()], None, nothing_gone(), at(60));
     assert_eq!(gone.parents, [theirs, another_plane]);
 }
 
@@ -523,17 +532,39 @@ fn two_data_planes_writing_a_routes_status_in_turn_settle() {
     let of_web = wanted_route(2);
     let mut of_other = wanted_route(2);
     of_other.parents[0].name = "other".to_owned();
-    let by_web = route(None, "shop", &[web()], Some(&of_web), at(50));
+    let by_web = route(
+        None,
+        "shop",
+        &[web()],
+        Some(&of_web),
+        nothing_gone(),
+        at(50),
+    );
     let by_other = route(
         Some(&by_web),
         "shop",
         std::slice::from_ref(&other),
         Some(&of_other),
+        nothing_gone(),
         at(51),
     );
-    let again = route(Some(&by_other), "shop", &[web()], Some(&of_web), at(52));
+    let again = route(
+        Some(&by_other),
+        "shop",
+        &[web()],
+        Some(&of_web),
+        nothing_gone(),
+        at(52),
+    );
     assert_eq!(again, by_other, "the first wrote it again");
-    let again = route(Some(&again), "shop", &[other], Some(&of_other), at(53));
+    let again = route(
+        Some(&again),
+        "shop",
+        &[other],
+        Some(&of_other),
+        nothing_gone(),
+        at(53),
+    );
     assert_eq!(again, by_other, "the second wrote it again");
 }
 
@@ -559,7 +590,14 @@ fn a_routes_new_parent_of_ours_goes_after_the_rest() {
     of_set.namespace = None;
     of_set.name = "team".to_owned();
     wanted.parents.insert(0, of_set);
-    let status = route(Some(&live), "shop", &[web(), set], Some(&wanted), at(50));
+    let status = route(
+        Some(&live),
+        "shop",
+        &[web(), set],
+        Some(&wanted),
+        nothing_gone(),
+        at(50),
+    );
     let names: Vec<(&str, &str)> = status
         .parents
         .iter()
@@ -662,14 +700,28 @@ fn a_routes_parent_of_a_listener_set_is_ours_and_said_of_its_kind() {
     wanted.parents[0].kind = "ListenerSet";
     wanted.parents[0].namespace = None;
     wanted.parents[0].name = "team".to_owned();
-    let status = route(None, "shop", &[web(), set.clone()], Some(&wanted), at(50));
+    let status = route(
+        None,
+        "shop",
+        &[web(), set.clone()],
+        Some(&wanted),
+        nothing_gone(),
+        at(50),
+    );
     let ours = &status.parents[0].parent_ref;
     assert_eq!(
         (ours.kind.as_deref(), ours.name.as_str()),
         (Some("ListenerSet"), "team")
     );
     // Written again, it is taken for the same parent, and no other added.
-    let again = route(Some(&status), "shop", &[web(), set], Some(&wanted), at(60));
+    let again = route(
+        Some(&status),
+        "shop",
+        &[web(), set],
+        Some(&wanted),
+        nothing_gone(),
+        at(60),
+    );
     assert_eq!(again.parents.len(), 1);
     assert_eq!(
         again.parents[0].conditions[0].last_transition_time,
@@ -688,7 +740,14 @@ fn a_parent_of_the_routes_own_namespace_is_the_same_written_either_way() {
         ],
     };
     let wanted = wanted_route(2);
-    let status = route(Some(&live), "edge", &[web()], Some(&wanted), at(50));
+    let status = route(
+        Some(&live),
+        "edge",
+        &[web()],
+        Some(&wanted),
+        nothing_gone(),
+        at(50),
+    );
     assert_eq!(status.parents.len(), 1);
     assert_eq!(
         status.parents[0].conditions[0].last_transition_time,
@@ -709,6 +768,7 @@ fn a_routes_parents_are_as_many_as_its_status_holds() {
         "shop",
         &[web()],
         Some(&wanted_route(2)),
+        nothing_gone(),
         at(50),
     );
     assert_eq!(status.parents.len(), MOST_PARENTS);
@@ -862,7 +922,13 @@ fn a_policys_ancestor_of_ours_is_written_in_its_place_beside_every_other_kept_wh
     let live = BackendTLSPolicyStatus {
         ancestors: vec![theirs.clone(), ours, another_plane.clone()],
     };
-    let status = policy(Some(&live), "shop", &web(), Some(&wanted_policy(2)), at(50));
+    let status = policy(
+        Some(&live),
+        "shop",
+        &[(&web(), Some(&wanted_policy(2)))],
+        nothing_gone(),
+        at(50),
+    );
     assert_eq!(status.ancestors.len(), 3);
     assert_eq!(status.ancestors[0], theirs, "another controller's changed");
     assert_eq!(
@@ -888,7 +954,13 @@ fn a_policys_ancestor_of_ours_is_written_in_its_place_beside_every_other_kept_wh
     );
     assert_eq!(ours.conditions[0].observed_generation, Some(2));
     // A policy no route of the Gateway reaches has no ancestor of ours, the rest kept.
-    let gone = policy(Some(&live), "shop", &web(), None, at(60));
+    let gone = policy(
+        Some(&live),
+        "shop",
+        &[(&web(), None)],
+        nothing_gone(),
+        at(60),
+    );
     assert_eq!(gone.ancestors, [theirs, another_plane]);
 }
 
@@ -903,8 +975,8 @@ fn a_policys_ancestor_of_ours_is_added_after_the_rest_where_its_status_has_room(
     let status = policy(
         Some(&roomy),
         "shop",
-        &web(),
-        Some(&wanted_policy(2)),
+        &[(&web(), Some(&wanted_policy(2)))],
+        nothing_gone(),
         at(50),
     );
     assert_eq!(status.ancestors.len(), MOST_ANCESTORS);
@@ -914,12 +986,24 @@ fn a_policys_ancestor_of_ours_is_added_after_the_rest_where_its_status_has_room(
         GATEWAY_CONTROLLER
     );
     let full = others(MOST_ANCESTORS);
-    let status = policy(Some(&full), "shop", &web(), Some(&wanted_policy(2)), at(50));
+    let status = policy(
+        Some(&full),
+        "shop",
+        &[(&web(), Some(&wanted_policy(2)))],
+        nothing_gone(),
+        at(50),
+    );
     assert_eq!(status, full);
     assert_eq!(
-        policy(None, "shop", &web(), Some(&wanted_policy(2)), at(50))
-            .ancestors
-            .len(),
+        policy(
+            None,
+            "shop",
+            &[(&web(), Some(&wanted_policy(2)))],
+            nothing_gone(),
+            at(50)
+        )
+        .ancestors
+        .len(),
         1
     );
 }
@@ -934,7 +1018,13 @@ fn a_policys_ancestor_of_its_own_namespace_is_ours_written_either_way_and_once()
     let live = BackendTLSPolicyStatus {
         ancestors: vec![bare.clone(), bare],
     };
-    let status = policy(Some(&live), "edge", &web(), Some(&wanted_policy(2)), at(50));
+    let status = policy(
+        Some(&live),
+        "edge",
+        &[(&web(), Some(&wanted_policy(2)))],
+        nothing_gone(),
+        at(50),
+    );
     assert_eq!(status.ancestors.len(), 1);
     let ours = &status.ancestors[0];
     assert_eq!(
@@ -945,7 +1035,13 @@ fn a_policys_ancestor_of_its_own_namespace_is_ours_written_either_way_and_once()
     assert_eq!(ours.ancestor_ref.group.as_deref(), Some(GROUP));
     assert_eq!(ours.ancestor_ref.namespace.as_deref(), Some("edge"));
     // Of another namespace, the same bare ancestor is not ours.
-    let elsewhere = policy(Some(&live), "shop", &web(), None, at(50));
+    let elsewhere = policy(
+        Some(&live),
+        "shop",
+        &[(&web(), None)],
+        nothing_gone(),
+        at(50),
+    );
     assert_eq!(elsewhere, live);
 }
 
@@ -959,10 +1055,149 @@ fn two_data_planes_writing_a_policys_status_in_turn_settle() {
         name: "other".to_owned(),
     };
     let wanted = wanted_policy(2);
-    let by_web = policy(None, "shop", &web(), Some(&wanted), at(50));
-    let by_other = policy(Some(&by_web), "shop", &other, Some(&wanted), at(51));
-    let again = policy(Some(&by_other), "shop", &web(), Some(&wanted), at(52));
+    let by_web = policy(
+        None,
+        "shop",
+        &[(&web(), Some(&wanted))],
+        nothing_gone(),
+        at(50),
+    );
+    let by_other = policy(
+        Some(&by_web),
+        "shop",
+        &[(&other, Some(&wanted))],
+        nothing_gone(),
+        at(51),
+    );
+    let again = policy(
+        Some(&by_other),
+        "shop",
+        &[(&web(), Some(&wanted))],
+        nothing_gone(),
+        at(52),
+    );
     assert_eq!(again, by_other, "the first wrote it again");
-    let again = policy(Some(&again), "shop", &other, Some(&wanted), at(53));
+    let again = policy(
+        Some(&again),
+        "shop",
+        &[(&other, Some(&wanted))],
+        nothing_gone(),
+        at(53),
+    );
     assert_eq!(again, by_other, "the second wrote it again");
+}
+
+/// The Gateways of `edge`, the namespace Gateways are followed in, that are there: `web`
+/// and `api`.
+fn web_and_api_there() -> Vec<Object> {
+    let api = Object {
+        name: "api".to_owned(),
+        ..web()
+    };
+    vec![web(), api]
+}
+
+/// Of this controller's entries, that of a Gateway gone from a namespace Gateways are
+/// followed in is taken away, whoever wrote it; that of a Gateway there, or of a namespace
+/// not followed, which another control plane may serve, is kept whole, as is every other
+/// controller's.
+#[test]
+fn a_routes_parent_of_ours_of_a_gateway_gone_is_taken_away_and_no_other() {
+    let there = web_and_api_there();
+    let gateways = Gateways {
+        namespaces: &["edge".to_owned()],
+        there: &there,
+    };
+    let gone = parent(GATEWAY_CONTROLLER, Some("edge"), "gone");
+    let gone_unnamed = parent(GATEWAY_CONTROLLER, None, "gone");
+    let theirs_gone = parent("example.com/other", Some("edge"), "gone");
+    let another_plane = parent(GATEWAY_CONTROLLER, Some("edge"), "api");
+    let elsewhere = parent(GATEWAY_CONTROLLER, Some("teams"), "web");
+    let live = HTTPRouteStatus {
+        parents: vec![
+            gone,
+            theirs_gone.clone(),
+            another_plane.clone(),
+            elsewhere.clone(),
+        ],
+    };
+    let status = route(Some(&live), "shop", &[web()], None, gateways, at(50));
+    assert_eq!(status.parents, [theirs_gone, another_plane, elsewhere]);
+    // A parent of the route's own namespace, written without one, is of that namespace.
+    let live = HTTPRouteStatus {
+        parents: vec![gone_unnamed],
+    };
+    let of_edge = route(Some(&live), "edge", &[web()], None, gateways, at(50));
+    assert!(of_edge.parents.is_empty(), "{of_edge:?}");
+    let of_shop = route(Some(&live), "shop", &[web()], None, gateways, at(50));
+    assert_eq!(of_shop.parents.len(), 1, "of a namespace not followed");
+}
+
+/// A policy's ancestor of each data plane's Gateway is written of that Gateway, in the
+/// place of the first the status holds for it, one wanted of none taken away; this
+/// controller's of a Gateway gone is taken away, and every other kept whole.
+#[test]
+fn a_policys_ancestors_are_one_of_each_gateway_and_none_of_a_gateway_gone() {
+    let there = web_and_api_there();
+    let gateways = Gateways {
+        namespaces: &["edge".to_owned()],
+        there: &there,
+    };
+    let api = Object {
+        name: "api".to_owned(),
+        ..web()
+    };
+    let theirs = ancestor("example.com/other", Some("edge"), "web");
+    let gone = ancestor(GATEWAY_CONTROLLER, Some("edge"), "gone");
+    let elsewhere = ancestor(GATEWAY_CONTROLLER, Some("teams"), "gone");
+    let old_api = ancestor(GATEWAY_CONTROLLER, Some("edge"), "api");
+    let old_web = ancestor(GATEWAY_CONTROLLER, Some("edge"), "web");
+    let live = BackendTLSPolicyStatus {
+        ancestors: vec![theirs.clone(), gone, old_api, elsewhere.clone(), old_web],
+    };
+    // Reached from web's routes, and no longer from api's.
+    let wanted = wanted_policy(2);
+    let status = policy(
+        Some(&live),
+        "shop",
+        &[(&web(), Some(&wanted)), (&api, None)],
+        gateways,
+        at(50),
+    );
+    let names: Vec<(&str, &str)> = status
+        .ancestors
+        .iter()
+        .map(|ancestor| {
+            (
+                ancestor
+                    .ancestor_ref
+                    .namespace
+                    .as_deref()
+                    .unwrap_or_default(),
+                ancestor.ancestor_ref.name.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(names, [("edge", "web"), ("teams", "gone"), ("edge", "web")]);
+    assert_eq!(status.ancestors[0], theirs);
+    assert_eq!(status.ancestors[1], elsewhere);
+    assert_eq!(status.ancestors[2].controller_name, GATEWAY_CONTROLLER);
+    assert_eq!(
+        status.ancestors[2].conditions[0].observed_generation,
+        Some(2)
+    );
+    // Both reached, and none there before: one each, in the order of the data planes.
+    let both = policy(
+        None,
+        "shop",
+        &[(&web(), Some(&wanted)), (&api, Some(&wanted))],
+        gateways,
+        at(50),
+    );
+    let names: Vec<&str> = both
+        .ancestors
+        .iter()
+        .map(|ancestor| ancestor.ancestor_ref.name.as_str())
+        .collect();
+    assert_eq!(names, ["web", "api"]);
 }

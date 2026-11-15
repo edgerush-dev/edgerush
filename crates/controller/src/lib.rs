@@ -592,6 +592,16 @@ async fn serve(
         for served in serving.values_mut() {
             write_statuses(api, &followed, served, acks, leads, &**said).await;
         }
+        // Those the data planes share, once for them all (04 §6).
+        if let (Some(gateway_api), true, true) =
+            (&followed.gateway_api, followed.own_listed(), leads)
+        {
+            let handed: Vec<&Handed> = serving
+                .values()
+                .filter_map(|served| served.handed_api.as_ref())
+                .collect();
+            gateway_api.write_shared(api, &handed, &**said).await;
+        }
         // Until a change comes, or the bound a data plane's pods are waited on to run its
         // Gateway's generation, and then until its moment is over.
         let now = Instant::now();
@@ -626,9 +636,10 @@ async fn serve(
     }
 }
 
-/// Writes, as far as `leads`, each status of `served`'s data plane that says other than
-/// what was handed on for it: its Service, its Gateway's and the Gateway API's objects of
-/// it, and its Ingresses'.
+/// Writes, as far as `leads`, each status of `served`'s data plane alone that says other
+/// than what was handed on for it: its Service, its Gateway's and the ListenerSets naming
+/// it, and its Ingresses'. Those it shares with other data planes are written once for them
+/// all ([`GatewayApi::write_shared`]).
 async fn write_statuses(
     api: &ApiServer,
     followed: &Followed,
@@ -678,7 +689,7 @@ async fn write_statuses(
             .is_some_and(|(_, since)| since.elapsed() >= PROGRAMMED_WITHIN);
         let programmed = Programmed::of(handed.status.generation, &pods, ready.as_deref(), overdue);
         gateway_api
-            .write_statuses(api, handed, &addresses, &programmed, said)
+            .write_own(api, handed, &addresses, &programmed, said)
             .await;
     }
     // An Ingress's only where the control plane writes the Service its addresses are.
@@ -1065,13 +1076,23 @@ impl Handed {
 }
 
 impl GatewayApi {
-    /// Writes, one at a time, each status that says other than `handed` has it: that of
-    /// the data plane's Gateway's class, of the Gateway, `addresses` among it, of each
-    /// ListenerSet naming it, of each route followed, HTTPRoute, GRPCRoute, TLSRoute,
-    /// TCPRoute or UDPRoute, whether or not it still names the Gateway or one of those
-    /// ListenerSets, and
-    /// of each BackendTLSPolicy followed, whether or not a route of the Gateway reaches it.
-    async fn write_statuses(
+    /// The Gateway `handed` is of, as followed, if it is there.
+    fn gateway_of(&self, handed: &Handed) -> Option<Gateway> {
+        self.gateways
+            .as_deref()
+            .map(objects)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|gateway| {
+                gateway.metadata.namespace.as_deref() == Some(handed.gateway.namespace.as_str())
+                    && gateway.metadata.name.as_deref() == Some(handed.gateway.name.as_str())
+            })
+    }
+
+    /// Writes, one at a time, each status of a data plane's own that says other than
+    /// `handed` has it: that of its Gateway, `addresses` among it, and of each ListenerSet
+    /// naming it. Nothing while the Gateway is not there.
+    async fn write_own(
         &self,
         api: &ApiServer,
         handed: &Handed,
@@ -1080,44 +1101,9 @@ impl GatewayApi {
         said: &dyn Fn(Said<'_>),
     ) {
         let now = lease::wall_clock();
-        let gateways = self.gateways.as_deref().map(objects).unwrap_or_default();
-        let Some(gateway) = gateways.iter().find(|gateway| {
-            gateway.metadata.namespace.as_deref() == Some(handed.gateway.namespace.as_str())
-                && gateway.metadata.name.as_deref() == Some(handed.gateway.name.as_str())
-        }) else {
+        let Some(gateway) = self.gateway_of(handed) else {
             return;
         };
-        let classes = self
-            .gateway_classes
-            .as_deref()
-            .map(objects)
-            .unwrap_or_default();
-        let class = classes.iter().find(|class| {
-            class.metadata.name.as_deref() == Some(gateway.spec.gateway_class_name.as_str())
-        });
-        if let (Some(class), Some(served)) = (class, &self.last) {
-            let generation = class.metadata.generation.unwrap_or_default();
-            let status = gateway_status::class(class.status.as_ref(), generation, served, now);
-            if class.status.as_ref() != Some(&status) {
-                let object = Object {
-                    kind: "GatewayClass",
-                    namespace: String::new(),
-                    name: gateway.spec.gateway_class_name.clone(),
-                };
-                let version = class
-                    .metadata
-                    .resource_version
-                    .as_deref()
-                    .unwrap_or_default();
-                let result = api
-                    .replace_status::<GatewayClass>("", &object.name, version, &status)
-                    .await;
-                said(Said::GatewayApiStatus {
-                    object: &object,
-                    written: result.as_ref().map(|_| ()),
-                });
-            }
-        }
         let status = gateway_status::gateway(
             gateway.status.as_ref(),
             &handed.status,
@@ -1170,16 +1156,100 @@ impl GatewayApi {
                 });
             }
         }
-        // A route's parents of this data plane's: its Gateway, and each ListenerSet naming
-        // it, taken or not.
-        let parents_of_ours: Vec<Object> = std::iter::once(handed.gateway.clone())
-            .chain(
-                handed
-                    .status
-                    .listener_sets
-                    .iter()
-                    .map(|set| set.set.clone()),
-            )
+    }
+
+    /// Writes, one at a time and once for every data plane served, each status shared
+    /// between them that says other than they have it, from what was handed on for each,
+    /// `handed` (04 §6): that of each class of their Gateways; of each route followed,
+    /// HTTPRoute, GRPCRoute, TLSRoute, TCPRoute or UDPRoute, its parents of every data
+    /// plane's Gateway and the ListenerSets naming it at once, whether or not it still names
+    /// one; and of each BackendTLSPolicy followed, an ancestor for each Gateway, whether or
+    /// not a route of it reaches the policy. This controller's entries of a Gateway gone are
+    /// taken away. Only Gateways that are there are written of.
+    async fn write_shared(&self, api: &ApiServer, handed: &[&Handed], said: &dyn Fn(Said<'_>)) {
+        let now = lease::wall_clock();
+        let there: Vec<(&Handed, Gateway)> = handed
+            .iter()
+            .filter_map(|handed| Some((*handed, self.gateway_of(handed)?)))
+            .collect();
+        if there.is_empty() {
+            return;
+        }
+        let gateways_there: Vec<Object> = self
+            .gateways
+            .as_deref()
+            .map(objects)
+            .unwrap_or_default()
+            .iter()
+            .map(|gateway| Object {
+                kind: "Gateway",
+                namespace: gateway.metadata.namespace.clone().unwrap_or_default(),
+                name: gateway.metadata.name.clone().unwrap_or_default(),
+            })
+            .collect();
+        let followed: Vec<String> = self
+            .gateway_namespaces
+            .iter()
+            .filter_map(|scope| match scope {
+                Scope::Namespace(namespace) => Some(namespace.clone()),
+                _ => None,
+            })
+            .collect();
+        let gateways = gateway_status::Gateways {
+            namespaces: &followed,
+            there: &gateways_there,
+        };
+        // Each class once, whichever Gateways name it.
+        let classes = self
+            .gateway_classes
+            .as_deref()
+            .map(objects)
+            .unwrap_or_default();
+        let named: BTreeSet<&str> = there
+            .iter()
+            .map(|(_, gateway)| gateway.spec.gateway_class_name.as_str())
+            .collect();
+        for name in named {
+            let class = classes
+                .iter()
+                .find(|class| class.metadata.name.as_deref() == Some(name));
+            if let (Some(class), Some(served)) = (class, &self.last) {
+                let generation = class.metadata.generation.unwrap_or_default();
+                let status = gateway_status::class(class.status.as_ref(), generation, served, now);
+                if class.status.as_ref() != Some(&status) {
+                    let object = Object {
+                        kind: "GatewayClass",
+                        namespace: String::new(),
+                        name: name.to_owned(),
+                    };
+                    let version = class
+                        .metadata
+                        .resource_version
+                        .as_deref()
+                        .unwrap_or_default();
+                    let result = api
+                        .replace_status::<GatewayClass>("", &object.name, version, &status)
+                        .await;
+                    said(Said::GatewayApiStatus {
+                        object: &object,
+                        written: result.as_ref().map(|_| ()),
+                    });
+                }
+            }
+        }
+        // A route's parents of the data planes': their Gateways, and each ListenerSet
+        // naming one, taken or not.
+        let parents_of_ours: Vec<Object> = there
+            .iter()
+            .flat_map(|(handed, _)| {
+                std::iter::once(handed.gateway.clone()).chain(
+                    handed
+                        .status
+                        .listener_sets
+                        .iter()
+                        .map(|set| set.set.clone()),
+                )
+            })
             .collect();
         // A GRPCRoute's, a TLSRoute's, a TCPRoute's and a UDPRoute's status are merged and
         // written as an HTTPRoute's, of one type in the spec (gateway_status::grpc_as_http,
@@ -1214,12 +1284,13 @@ impl GatewayApi {
                 namespace: metadata.namespace.clone().unwrap_or_default(),
                 name: metadata.name.clone().unwrap_or_default(),
             };
-            let wanted = handed.routes.iter().find(|wanted| wanted.route == object);
+            let wanted = wanted_of_every(there.iter().map(|(handed, _)| *handed), &object);
             let status = gateway_status::route(
                 live.as_ref(),
                 &object.namespace,
                 &parents_of_ours,
-                wanted,
+                wanted.as_ref(),
+                gateways,
                 now,
             );
             if live.unwrap_or_default() != status {
@@ -1264,15 +1335,21 @@ impl GatewayApi {
                 namespace: policy.metadata.namespace.clone().unwrap_or_default(),
                 name: policy.metadata.name.clone().unwrap_or_default(),
             };
-            let wanted = handed
-                .policies
+            let wanted: Vec<(&Object, Option<&PolicyStatus>)> = there
                 .iter()
-                .find(|wanted| wanted.policy == object);
+                .map(|(handed, _)| {
+                    let wanted = handed
+                        .policies
+                        .iter()
+                        .find(|wanted| wanted.policy == object);
+                    (&handed.gateway, wanted)
+                })
+                .collect();
             let status = gateway_status::policy(
                 policy.status.as_ref(),
                 &object.namespace,
-                &handed.gateway,
-                wanted,
+                &wanted,
+                gateways,
                 now,
             );
             if policy.status.clone().unwrap_or_default() != status {
@@ -1296,6 +1373,25 @@ impl GatewayApi {
             }
         }
     }
+}
+
+/// What the status of `route` is to say of every data plane's parents, as each of `handed`
+/// has it: their parents one after another, of the one generation the route is of. None
+/// where no data plane's says anything of it.
+fn wanted_of_every<'a>(
+    handed: impl Iterator<Item = &'a Handed>,
+    route: &Object,
+) -> Option<RouteStatus> {
+    let mut merged: Option<RouteStatus> = None;
+    for wanted in
+        handed.filter_map(|handed| handed.routes.iter().find(|wanted| wanted.route == *route))
+    {
+        match &mut merged {
+            Some(merged) => merged.parents.extend(wanted.parents.iter().cloned()),
+            None => merged = Some(wanted.clone()),
+        }
+    }
+    merged
 }
 
 /// `slot`'s follows started where `on` and there are none, and stopped where not `on`.

@@ -1946,7 +1946,7 @@ spec:
     let said = hear(&heard);
     let addresses = gateway_status::addresses(&[status::address("192.0.2.10")]);
     let programmed = Programmed::of(2, &acks::Pods::new(), None, false);
-    following(
+    let kinds = following(
         vec![class.clone()],
         vec![gateway.clone()],
         vec![app.clone(), old.clone()],
@@ -1955,14 +1955,16 @@ spec:
         vec![db.clone()],
         vec![dns.clone()],
         vec![tls.clone(), old_tls.clone(), quiet.clone()],
-    )
-    .write_statuses(&api, &handed, &addresses, &programmed, &said)
-    .await;
+    );
+    kinds
+        .write_own(&api, &handed, &addresses, &programmed, &said)
+        .await;
+    kinds.write_shared(&api, &[&handed], &said).await;
     assert_eq!(
         heard.borrow().lines,
         [
-            "status of GatewayClass edgerush",
             "status of Gateway edge/web",
+            "status of GatewayClass edgerush",
             "status of HTTPRoute shop/app",
             "status of HTTPRoute shop/old",
             "status of GRPCRoute shop/calls",
@@ -1984,18 +1986,18 @@ spec:
         .collect();
     let status = |n: usize| &bodies[n]["status"];
     assert_eq!(
-        bodies[0]["metadata"]["resourceVersion"], "5",
+        bodies[1]["metadata"]["resourceVersion"], "5",
         "written as of the version read"
     );
-    assert_eq!(status(0)["conditions"][0]["type"], "Accepted");
-    assert_eq!(status(0)["conditions"][1]["type"], "SupportedVersion");
-    assert_eq!(status(0)["conditions"][1]["status"], "True");
-    assert_eq!(status(1)["addresses"][0]["value"], "192.0.2.10");
-    assert_eq!(status(1)["listeners"][0]["attachedRoutes"], 2);
-    assert_eq!(status(1)["listeners"][1]["attachedRoutes"], 1);
-    assert_eq!(status(1)["listeners"][2]["attachedRoutes"], 1);
-    assert_eq!(status(1)["listeners"][3]["attachedRoutes"], 1);
-    assert_eq!(status(1)["conditions"][0]["observedGeneration"], 2);
+    assert_eq!(status(1)["conditions"][0]["type"], "Accepted");
+    assert_eq!(status(1)["conditions"][1]["type"], "SupportedVersion");
+    assert_eq!(status(1)["conditions"][1]["status"], "True");
+    assert_eq!(status(0)["addresses"][0]["value"], "192.0.2.10");
+    assert_eq!(status(0)["listeners"][0]["attachedRoutes"], 2);
+    assert_eq!(status(0)["listeners"][1]["attachedRoutes"], 1);
+    assert_eq!(status(0)["listeners"][2]["attachedRoutes"], 1);
+    assert_eq!(status(0)["listeners"][3]["attachedRoutes"], 1);
+    assert_eq!(status(0)["conditions"][0]["observedGeneration"], 2);
     assert_eq!(
         status(2)["parents"][0]["controllerName"],
         GATEWAY_CONTROLLER
@@ -2107,8 +2109,8 @@ spec:
     let (mut class, mut gateway, mut app, mut old) = (class, gateway, app, old);
     let (mut calls, mut gone, mut tunnel, mut db, mut dns) = (calls, gone, tunnel, db, dns);
     let (mut tls, mut old_tls) = (tls, old_tls);
-    class.status = serde_json::from_value(bodies[0]["status"].clone()).unwrap();
-    gateway.status = serde_json::from_value(bodies[1]["status"].clone()).unwrap();
+    class.status = serde_json::from_value(bodies[1]["status"].clone()).unwrap();
+    gateway.status = serde_json::from_value(bodies[0]["status"].clone()).unwrap();
     app.status = serde_json::from_value(bodies[2]["status"].clone()).unwrap();
     old.status = serde_json::from_value(bodies[3]["status"].clone()).unwrap();
     calls.status = serde_json::from_value(bodies[4]["status"].clone()).unwrap();
@@ -2118,7 +2120,7 @@ spec:
     dns.status = serde_json::from_value(bodies[8]["status"].clone()).unwrap();
     tls.status = serde_json::from_value(bodies[9]["status"].clone()).unwrap();
     old_tls.status = serde_json::from_value(bodies[10]["status"].clone()).unwrap();
-    following(
+    let kinds = following(
         vec![class],
         vec![gateway],
         vec![app, old],
@@ -2127,9 +2129,11 @@ spec:
         vec![db],
         vec![dns],
         vec![tls, old_tls, quiet],
-    )
-    .write_statuses(&api, &handed, &addresses, &programmed, &said)
-    .await;
+    );
+    kinds
+        .write_own(&api, &handed, &addresses, &programmed, &said)
+        .await;
+    kinds.write_shared(&api, &[&handed], &said).await;
     assert_eq!(fake.seen().len(), 11, "a status written again");
 }
 
@@ -3165,4 +3169,151 @@ async fn a_data_plane_of_ingress_alone_does_not_wait_on_the_gateway_apis_kinds()
             controlling.abort();
         })
         .await;
+}
+
+/// The statuses data planes share are written once for them all: a route attached to the
+/// Gateways of two data planes, both its parents in one write, and the class they share
+/// once. Of an entry of this controller's, that of a Gateway gone from a namespace Gateways
+/// are followed in is taken away; that of a Gateway of a namespace not followed, which
+/// another control plane may serve, is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_statuses_data_planes_share_are_written_once_for_them_all() {
+    let class: GatewayClass = serde_saphyr::from_str(
+        "metadata: { name: edgerush, generation: 1, resourceVersion: '5' }
+spec: { controllerName: edgerush.dev/gateway-controller }",
+    )
+    .unwrap();
+    let gateway = |name: &str| -> Gateway {
+        serde_saphyr::from_str(&format!(
+            "metadata: {{ name: {name}, namespace: edge, generation: 2, resourceVersion: '6' }}
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - {{ name: http, port: 8080, protocol: HTTP, allowedRoutes: {{ namespaces: {{ from: All }} }} }}"
+        ))
+        .unwrap()
+    };
+    let both: HTTPRoute = serde_saphyr::from_str(
+        "metadata: { name: both, namespace: shop, generation: 3, resourceVersion: '7' }
+spec:
+  parentRefs: [{ name: web, namespace: edge }, { name: api, namespace: edge }]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]",
+    )
+    .unwrap();
+    let left: HTTPRoute = serde_saphyr::from_str(
+        "metadata: { name: left, namespace: shop, generation: 1, resourceVersion: '8' }
+spec: { parentRefs: [{ name: theirs, namespace: teams }] }
+status:
+  parents:
+    - controllerName: edgerush.dev/gateway-controller
+      parentRef: { group: gateway.networking.k8s.io, kind: Gateway, name: gone, namespace: edge }
+      conditions: [{ type: Accepted, status: 'True', reason: Accepted, message: '', lastTransitionTime: '2026-10-01T00:00:00Z', observedGeneration: 1 }]
+    - controllerName: edgerush.dev/gateway-controller
+      parentRef: { group: gateway.networking.k8s.io, kind: Gateway, name: theirs, namespace: teams }
+      conditions: [{ type: Accepted, status: 'True', reason: Accepted, message: '', lastTransitionTime: '2026-10-01T00:00:00Z', observedGeneration: 1 }]",
+    )
+    .unwrap();
+    let known = [
+        "/apis/gateway.networking.k8s.io/v1/gatewayclasses/edgerush/status",
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/httproutes/both/status",
+        "/apis/gateway.networking.k8s.io/v1/namespaces/shop/httproutes/left/status",
+    ];
+    let fake = Fake::start_by_method(&["127.0.0.1"], move |method, path| {
+        if method == "PUT" && known.contains(&path) {
+            answer(200, "{}")
+        } else {
+            answer(404, r#"{"kind":"Status","code":404,"message":"not found"}"#)
+        }
+    })
+    .await;
+    let api = fake.client(
+        &token("controller-shared-status", "secret"),
+        Timing::default(),
+    );
+    let cluster = Cluster {
+        services: vec![service("shop")],
+        gateway_classes: vec![class.clone()],
+        gateways: vec![gateway("web"), gateway("api")],
+        http_routes: vec![both.clone(), left.clone()],
+        ..Cluster::default()
+    };
+    let mut api_plane = gateway_plane();
+    api_plane.gateway =
+        Some(edgerush_translate::GatewayName::try_from("edge/api".to_owned()).unwrap());
+    let web_translation = translate(&gateway_plane(), &cluster);
+    let api_translation = translate(&api_plane, &cluster);
+    let web = Handed::of(&web_translation).expect("web translated");
+    let api_handed = Handed::of(&api_translation).expect("api translated");
+    let served: Vec<(GatewayKind, Served)> = GatewayKind::ALL
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                Served::Served {
+                    release: Some("v1.7.0".to_owned()),
+                },
+            )
+        })
+        .collect();
+    let kinds = GatewayApi {
+        crds: Vec::new(),
+        namespaces: Vec::new(),
+        gateway_namespaces: vec![Scope::Namespace("edge".to_owned())],
+        last: Some(served),
+        gateway_classes: Some(vec![follow_of("gatewayclasses", true, vec![class])]),
+        gateways: Some(vec![follow_of(
+            "gateways in edge",
+            true,
+            vec![gateway("web"), gateway("api")],
+        )]),
+        listener_sets: None,
+        http_routes: Some(vec![follow_of("httproutes", true, vec![both, left])]),
+        grpc_routes: None,
+        tls_routes: None,
+        tcp_routes: None,
+        udp_routes: None,
+        reference_grants: None,
+        backend_tls_policies: None,
+        config_maps: None,
+    };
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let said = hear(&heard);
+    kinds.write_shared(&api, &[&web, &api_handed], &said).await;
+    assert_eq!(
+        heard.borrow().lines,
+        [
+            "status of GatewayClass edgerush",
+            "status of HTTPRoute shop/both",
+            "status of HTTPRoute shop/left",
+        ]
+    );
+    let bodies: Vec<serde_json::Value> = fake
+        .seen()
+        .iter()
+        .map(|seen| serde_json::from_str(&seen.body).unwrap())
+        .collect();
+    let parents = |n: usize| -> Vec<(String, String)> {
+        bodies[n]["status"]["parents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|parent| {
+                (
+                    parent["parentRef"]["namespace"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    parent["parentRef"]["name"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let named = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(namespace, name)| ((*namespace).to_owned(), (*name).to_owned()))
+            .collect()
+    };
+    assert_eq!(parents(1), named(&[("edge", "web"), ("edge", "api")]));
+    assert_eq!(parents(2), named(&[("teams", "theirs")]));
 }
