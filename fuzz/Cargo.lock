@@ -364,6 +364,7 @@ dependencies = [
  "boring",
  "bytes",
  "edgerush-cluster",
+ "edgerush-cluster-asynchronous",
  "edgerush-cluster-synchronous",
  "edgerush-config",
  "edgerush-controller",

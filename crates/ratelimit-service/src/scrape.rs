@@ -1,16 +1,12 @@
-//! A service pod's metrics, served at `/metrics` where `--metrics` says, in the text format
-//! a data plane's scrape uses: whether it serves, and how often and how long it has gone
-//! without hearing a majority (06 §4), and what its keys hold against what they may (06 §8),
-//! for the pod by the view. A pod of the store (`cluster`), either mode's, shows its own: whether
-//! it serves, its keys, what its mode counts, its peers' clocks, what it dropped and the table
-//! it follows; and says at `/ready` whether it is ready, for a readiness probe.
+//! A pod of the store's (`cluster`) metrics, either mode's, served at `/metrics` where its file
+//! says, in the text format a data plane's scrape uses: whether it serves, its keys and what
+//! they hold against what they may (06 §8), what its mode counts, its peers' clocks, what it
+//! dropped and the table it follows; and at `/ready` whether it is ready, for a readiness probe.
 
 use crate::cluster::mode::{DecidedFromCopy, Mode};
 use crate::cluster::pod::{Observed, StorePod};
-use crate::pod::{Pod, Usage};
 use bytes::Bytes;
 use edgerush_cluster_asynchronous::TurnedAway;
-use edgerush_ratelimit::service::membership::Sight;
 use edgerush_telemetry::{Exposition, Kind};
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use http_body_util::Full;
@@ -33,78 +29,6 @@ const WITHIN: Duration = Duration::from_secs(5);
 /// How long to wait after an accept that failed for want of something the whole process
 /// lacks, such as file descriptors, before trying again.
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
-
-/// The text of an asynchronous pod's scrape: what its keys hold, as `usage` says, against
-/// `max_key_bytes`, and whether it is `serving` and how it hears the others, as `sight`
-/// says.
-#[must_use]
-pub fn render(usage: Usage, max_key_bytes: u64, serving: bool, sight: Sight) -> String {
-    let mut scrape = Exposition::new();
-    hearing(&mut scrape, serving, sight);
-    let name = "edgerush_rate_limit_key_bytes";
-    let help = "Bytes the keys hold, owned and copies, as an estimate of their own data.";
-    scrape.family(name, Kind::Gauge, help);
-    scrape.sample(name, &[], usage.key_bytes);
-    let name = "edgerush_rate_limit_max_key_bytes";
-    scrape.family(name, Kind::Gauge, "Bytes the keys may hold.");
-    scrape.sample(name, &[], max_key_bytes);
-    let name = "edgerush_rate_limit_keys";
-    scrape.family(name, Kind::Gauge, "Keys held, owned and copies.");
-    scrape.sample(name, &[], usage.keys);
-    let name = "edgerush_rate_limit_keys_evicted_total";
-    let help = "Keys evicted, least recently changed first, to keep within the bytes they \
-                may hold; each starts again full.";
-    scrape.family(name, Kind::Counter, help);
-    scrape.sample(name, &[], usage.evicted);
-    let name = "edgerush_rate_limit_copies_too_long_total";
-    let help = "Copies of keys not sent to another pod, one alone longer than a message \
-                takes: its records of data planes too many.";
-    scrape.family(name, Kind::Counter, help);
-    scrape.sample(name, &[], usage.copies_too_long);
-    scrape.finish()
-}
-
-/// Whether a pod serves, and how often and how long it has gone without a majority.
-fn hearing(scrape: &mut Exposition, serving: bool, sight: Sight) {
-    let name = "edgerush_rate_limit_pod_serving";
-    let help = "1 while the pod serves data planes: the view takes it in and it hears a \
-                majority of the pods.";
-    scrape.family(name, Kind::Gauge, help);
-    scrape.sample(name, &[], u8::from(serving));
-    let name = "edgerush_rate_limit_majority_lost_total";
-    let help = "Times the pod lost sight of a majority of the pods, after hearing one, and \
-                stopped serving.";
-    scrape.family(name, Kind::Counter, help);
-    scrape.sample(name, &[], sight.lost);
-    let name = "edgerush_rate_limit_majority_regained_total";
-    let help = "Times the pod heard a majority of the pods again, after losing sight of one.";
-    scrape.family(name, Kind::Counter, help);
-    scrape.sample(name, &[], sight.regained);
-    let name = "edgerush_rate_limit_without_majority_seconds_total";
-    let help = "Time the pod has gone without hearing a majority of the pods, from each \
-                time it stopped serving.";
-    scrape.family(name, Kind::Counter, help);
-    scrape.sample(name, &[], Duration::from_nanos(sight.without).as_secs_f64());
-}
-
-/// Serves an asynchronous `pod`'s scrape on `listener` for as long as it runs: `GET
-/// /metrics`, each connection one scrape, at most ten at once, each given five seconds.
-pub async fn serve(listener: TcpListener, pod: Pod, max_key_bytes: u64) {
-    serve_with(listener, move |asked| {
-        let pod = pod.clone();
-        async move {
-            if asked != Asked::Metrics {
-                return Said::NotHere;
-            }
-            let (Some(usage), Some((serving, sight))) = (pod.usage().await, pod.sight().await)
-            else {
-                return Said::Stopped;
-            };
-            Said::Scrape(render(usage, max_key_bytes, serving, sight))
-        }
-    })
-    .await;
-}
 
 /// What a store pod's mode counts of itself, as its scrape shows it.
 pub trait Counted {
@@ -217,9 +141,9 @@ pub fn render_store<C: Counted>(observed: Observed<C>) -> String {
     scrape.finish()
 }
 
-/// Serves a store `pod`'s scrape on `listener` for as long as it runs, as [`serve`] serves an
-/// asynchronous pod's, and its readiness: `GET /ready`, 200 while its store has it ready and
-/// 503 while not, for a readiness probe.
+/// Serves a store `pod`'s scrape on `listener` for as long as it runs, `GET /metrics`, each
+/// connection one scrape, at most ten at once, each given five seconds; and its readiness: `GET
+/// /ready`, 200 while its store has it ready and 503 while not, for a readiness probe.
 pub async fn serve_store<M: Mode<Counted: Counted>>(listener: TcpListener, pod: StorePod<M>) {
     serve_with(listener, move |asked| {
         let pod = pod.clone();
@@ -251,12 +175,10 @@ enum Said {
     Ready(bool),
     /// Nothing: it has stopped.
     Stopped,
-    /// Nothing: it serves no such thing.
-    NotHere,
 }
 
 /// Serves on `listener` what `said` says to each request, nothing once its pod has stopped:
-/// `GET /metrics`, and `GET /ready` where the pod says, each connection one request, at most
+/// `GET /metrics` and `GET /ready`, each connection one request, at most
 /// ten at once, each given five seconds.
 async fn serve_with<F, S>(listener: TcpListener, said: F)
 where
@@ -322,7 +244,6 @@ where
         Said::Ready(false) | Said::Stopped => {
             *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
         }
-        Said::NotHere => *response.status_mut() = StatusCode::NOT_FOUND,
     }
     response
 }
@@ -332,35 +253,6 @@ mod tests {
     use super::*;
     use crate::cluster::link::Dropped;
     use edgerush_cluster_asynchronous::Turned;
-
-    #[test]
-    fn a_scrape_says_what_the_keys_hold_against_their_bound() {
-        let usage = Usage {
-            key_bytes: 9_710,
-            keys: 10,
-            evicted: 4,
-            copies_too_long: 2,
-        };
-        let sight = Sight {
-            lost: 3,
-            regained: 2,
-            without: 1_250_000_000,
-        };
-        let scrape = render(usage, 1 << 20, true, sight);
-        for line in [
-            "edgerush_rate_limit_pod_serving 1\n",
-            "edgerush_rate_limit_majority_lost_total 3\n",
-            "edgerush_rate_limit_majority_regained_total 2\n",
-            "edgerush_rate_limit_without_majority_seconds_total 1.25\n",
-            "edgerush_rate_limit_key_bytes 9710\n",
-            "edgerush_rate_limit_max_key_bytes 1048576\n",
-            "edgerush_rate_limit_keys 10\n",
-            "edgerush_rate_limit_keys_evicted_total 4\n",
-            "edgerush_rate_limit_copies_too_long_total 2\n",
-        ] {
-            assert!(scrape.contains(line), "{line}{scrape}");
-        }
-    }
 
     #[test]
     fn a_store_pods_scrape_says_whether_it_serves_and_what_it_holds_drops_and_follows() {
@@ -404,8 +296,6 @@ mod tests {
         ] {
             assert!(scrape.contains(line), "{line}{scrape}");
         }
-        // The view's, which the store has none of.
-        assert!(!scrape.contains("majority"), "{scrape}");
     }
 
     /// An asynchronous pod's scrape says the entries it turned away and their hits, by why,
