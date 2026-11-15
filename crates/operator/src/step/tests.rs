@@ -1688,3 +1688,134 @@ async fn a_control_plane_no_longer_accepted_has_its_registration_deleted() {
     let deleted = written(&fake.seen(), "DELETE");
     assert!(deleted.contains(REGISTRATION), "{deleted:?}");
 }
+
+const INGRESS_CLASS: &str = "/apis/networking.k8s.io/v1/ingressclasses/edge.web";
+const GATEWAY: &str = "/apis/gateway.networking.k8s.io/v1/namespaces/edge/gateways/web";
+
+/// [`after_first`] of [`data_plane_with_gateway`], its IngressClass and Gateway made, then
+/// its DataPlane's next generation as `change` makes it.
+fn served_both_then(change: impl FnOnce(&mut DataPlane)) -> Seen {
+    let mut seen = after_first_of(data_plane_with_gateway(), SERVED, "1", 1);
+    assert!(
+        ["IngressClass", "Gateway"]
+            .iter()
+            .all(|kind| seen.children.iter().any(|child| child.kind == *kind))
+    );
+    let data_plane = &mut seen.data_planes[0];
+    change(data_plane);
+    data_plane.metadata.generation = Some(2);
+    seen
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingress_no_longer_asked_for_has_its_ingress_class_deleted_and_the_rest_kept() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let seen = served_both_then(|data_plane| data_plane.spec.ingress = None);
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    assert_eq!(
+        written(&asked, "DELETE"),
+        BTreeSet::from([INGRESS_CLASS.to_owned()])
+    );
+    assert!(
+        said.any("IngressClass edge.web deleted, no longer asked for"),
+        "{:?}",
+        said.0
+    );
+    assert!(
+        writes(&asked).contains(&format!("PATCH {GATEWAY}{APPLY}")),
+        "{:?}",
+        writes(&asked)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gateway_no_longer_asked_for_is_deleted_and_the_rest_kept() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let seen = served_both_then(|data_plane| data_plane.spec.gateway = None);
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    assert_eq!(
+        written(&asked, "DELETE"),
+        BTreeSet::from([GATEWAY.to_owned()])
+    );
+    assert!(
+        said.any("Gateway edge/web deleted, no longer asked for"),
+        "{:?}",
+        said.0
+    );
+    assert!(
+        writes(&asked).contains(&format!("PATCH {INGRESS_CLASS}{APPLY}")),
+        "{:?}",
+        writes(&asked)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gateway_that_cannot_be_deleted_is_said_and_tried_again() {
+    let (fake, api) = cluster(|method, path| {
+        (method == "DELETE" && path.starts_with(GATEWAY))
+            .then(|| answer(500, r#"{"kind":"Status","code":500}"#))
+    })
+    .await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let seen = served_both_then(|data_plane| data_plane.spec.gateway = None);
+    assert!(!operator.step(&api, &seen, &time(10), &said.say()).await);
+    assert!(
+        said.any("Gateway edge/web cannot be deleted"),
+        "{:?}",
+        said.0
+    );
+    let before = fake.seen().len();
+    assert!(!operator.step(&api, &seen, &time(20), &said.say()).await);
+    assert!(
+        written(&fake.seen()[before..], "DELETE").contains(GATEWAY),
+        "not tried again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_data_plane_of_a_control_plane_not_accepted_keeps_its_ingress_class_and_gateway() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    // Made while All was allowed; now no allowance is for it. Its rights beyond its own
+    // namespace are taken back, and nothing else it asks for.
+    let all = control_plane("All");
+    let mut seen = made_then(&all, &BTreeSet::new(), &all, None);
+    let data_plane = data_plane_with_gateway();
+    let for_data_plane =
+        objects::for_data_plane(&data_plane, &all, &BTreeSet::new(), &install()).unwrap();
+    seen.children
+        .retain(|child| !child.labels.contains_key(objects::DATA_PLANE_LABEL));
+    seen.children.extend(children_of(&for_data_plane, "1"));
+    seen.data_planes[0].spec = data_plane.spec;
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let deleted = written(&fake.seen(), "DELETE");
+    // Its rights over the cluster taken back: this step withdraws.
+    assert!(
+        deleted
+            .iter()
+            .any(|path| path.starts_with(CLUSTER_ROLE_BINDINGS)),
+        "{deleted:?}"
+    );
+    assert!(!deleted.contains(INGRESS_CLASS), "{deleted:?}");
+    assert!(!deleted.contains(GATEWAY), "{deleted:?}");
+}

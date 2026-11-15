@@ -14,7 +14,8 @@
 //! namespaces its ControlPlane's selector no longer selects, and, for one whose
 //! ControlPlane is not accepted, every right beyond its own namespace, so that an allowance
 //! narrowed takes back what it granted (05 §4); and so is a webhook registration no longer
-//! asked for, its webhook turned off or its ControlPlane not accepted. One being deleted
+//! asked for, its webhook turned off or its ControlPlane not accepted, and a DataPlane's
+//! IngressClass or Gateway once its `ingress` or `gateway` is taken away. One being deleted
 //! has what no owner reference reaches deleted by its labels, then its finalizer taken
 //! away.
 //!
@@ -166,8 +167,9 @@ struct Plane<'a> {
     depends: Option<i64>,
     /// The namespaces its ControlPlane's selector selects, which its bindings follow too.
     selected: BTreeSet<String>,
-    /// The bindings and webhook registration it may keep, each `(kind, namespace, name)`:
-    /// any other made for it is deleted. `None` for one whose rights are not judged here.
+    /// The objects it may keep of those deleted once no longer asked for, each
+    /// `(kind, namespace, name)`: any other of them made for it is deleted. `None` for one
+    /// whose rights are not judged here.
     keep: Option<BTreeSet<Withdrawn>>,
     /// For a ControlPlane whose webhook is on, the bundle its status publishes, which its
     /// registration trusts, if there is one.
@@ -177,17 +179,21 @@ struct Plane<'a> {
 }
 
 /// An object deleted once it is no longer asked for, as `(kind, namespace, name)`: a
-/// binding or a webhook registration, the namespace empty for one of the cluster's.
+/// binding, a webhook registration, an IngressClass or a Gateway, the namespace empty for
+/// one of the cluster's.
 type Withdrawn = (&'static str, String, String);
 
-/// Whether `kind` is of the objects deleted once no longer asked for.
+/// Whether `kind` is of the objects deleted once no longer asked for: those a resource
+/// asks for or not as its spec and its allowance say. The rest it always has while it is.
 fn withdrawable(kind: &str) -> bool {
     kind == RoleBinding::KIND
         || kind == ClusterRoleBinding::KIND
         || kind == ValidatingWebhookConfiguration::KIND
+        || kind == IngressClass::KIND
+        || kind == Gateway::KIND
 }
 
-/// The bindings and webhook registration of `objects`.
+/// Those of `objects` deleted once no longer asked for.
 fn withdrawable_of(objects: &[Object]) -> BTreeSet<Withdrawn> {
     objects
         .iter()
@@ -597,9 +603,9 @@ fn selected(control_plane: &ControlPlane, accepted: bool, seen: &Seen) -> BTreeS
     }
 }
 
-/// The bindings and webhook registration made for `plane`, said as `what`, that are not
-/// among those it may `keep`, deleted: whether they all were. Each is one the operator made,
-/// by its labels, so nothing else of the name is touched.
+/// The objects made for `plane`, said as `what`, of those deleted once no longer asked for,
+/// that are not among those it may `keep`, deleted: whether they all were. Each is one the
+/// operator made, by its labels, so nothing else of the name is touched.
 async fn withdraw(
     api: &ApiServer,
     plane: &Plane<'_>,
@@ -614,16 +620,31 @@ async fn withdraw(
     for child in seen.children.iter().filter(|child| {
         withdrawable(child.kind) && carries(&child.labels, &plane.labels) && !kept(child)
     }) {
-        let (deleted, why) = if child.kind == RoleBinding::KIND {
-            let deleted = api.delete::<RoleBinding>(&child.namespace, &child.name);
-            (deleted.await.map(drop), "no longer granted")
-        } else if child.kind == ClusterRoleBinding::KIND {
-            let deleted = api.delete::<ClusterRoleBinding>("", &child.name);
-            (deleted.await.map(drop), "no longer granted")
-        } else {
-            let deleted = api.delete::<ValidatingWebhookConfiguration>("", &child.name);
-            (deleted.await.map(drop), "no longer asked for")
+        let (namespace, name) = (child.namespace.as_str(), child.name.as_str());
+        let (deleted, why) = match child.kind {
+            RoleBinding::KIND => (
+                api.delete::<RoleBinding>(namespace, name).await,
+                "no longer granted",
+            ),
+            ClusterRoleBinding::KIND => (
+                api.delete::<ClusterRoleBinding>("", name).await,
+                "no longer granted",
+            ),
+            IngressClass::KIND => (
+                api.delete::<IngressClass>("", name).await,
+                "no longer asked for",
+            ),
+            Gateway::KIND => (
+                api.delete::<Gateway>(namespace, name).await,
+                "no longer asked for",
+            ),
+            // A ValidatingWebhookConfiguration, the last of `withdrawable`'s.
+            _ => (
+                api.delete::<ValidatingWebhookConfiguration>("", name).await,
+                "no longer asked for",
+            ),
         };
+        let deleted = deleted.map(drop);
         let object = if child.namespace.is_empty() {
             format!("{} {}", child.kind, child.name)
         } else {
