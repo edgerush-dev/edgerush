@@ -57,9 +57,10 @@ rules:
   - apiGroups: [apps]
     resources: [deployments]
     verbs: [get, list, watch, create, patch]
+  # A DataPlane's autoscaler, also deleted by name once it no longer autoscales (05 §5).
   - apiGroups: [autoscaling]
     resources: [horizontalpodautoscalers]
-    verbs: [get, list, watch, create, patch]
+    verbs: [get, list, watch, create, patch, delete]
   - apiGroups: [policy]
     resources: [poddisruptionbudgets]
     verbs: [get, list, watch, create, patch]
