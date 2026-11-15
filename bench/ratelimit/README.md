@@ -1,6 +1,6 @@
 # Rate limiters compared
 
-Plays the rate-limiting simulator's workloads and faults (`crates/ratelimit-sim`) against
+Plays the rate-limiting simulator's workloads and faults (`crates/cluster-sim`) against
 other gateways' cluster-wide rate limiting, each as it ships, in Docker Compose, so that the
 simulator's numbers have real systems beside them.
 

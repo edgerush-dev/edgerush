@@ -322,7 +322,6 @@ dependencies = [
  "edgerush-cluster-asynchronous",
  "edgerush-cluster-synchronous",
  "edgerush-ratelimit",
- "edgerush-ratelimit-sim",
  "proptest",
 ]
 
@@ -597,14 +596,6 @@ dependencies = [
  "tokio-boring",
  "tonic",
  "tower-service",
-]
-
-[[package]]
-name = "edgerush-ratelimit-sim"
-version = "0.0.0"
-dependencies = [
- "edgerush-ratelimit",
- "proptest",
 ]
 
 [[package]]

@@ -340,7 +340,10 @@ crates/cluster-asynchronous
 crates/cluster-sim the cluster's simulation (`edgerush-cluster-sim`): the store's pods over a
                    network that delays, loses and cuts, with clients standing for data planes,
                    in the synchronous mode and the asynchronous, seeded and deterministic; its scenarios and chaos runs are its tests, and
-                   `cargo run --release -p edgerush-cluster-sim --bin measure` sweeps them
+                   `cargo run --release -p edgerush-cluster-sim --bin measure` sweeps them; the
+                   rate-limit workloads (bursts, skew, data planes of many workers, a second
+                   limit, TCP loss, restarts) measured against the contract, with
+                   `--bin workloads` printing their tables
 crates/cluster-synchronous
                    the synchronous mode on the cluster store (`edgerush-cluster-synchronous`):
                    each request decided by its key's owner, give-backs and requests under
@@ -384,10 +387,6 @@ crates/ratelimit   rate limiting (`edgerush-ratelimit`): pure, no I/O; the admis
                    clients through each (`cargo run -p edgerush-ratelimit --example timelines`),
                    local mode's limiter, and the asynchronous mode's protocol as two state
                    machines
-crates/ratelimit-sim
-                   the rate-limit simulator (`edgerush-ratelimit-sim`): ways of limiting one key
-                   across pods run against the contract, deterministic, no I/O; side by side
-                   with `cargo run --release -p edgerush-ratelimit-sim --example compare`
 crates/ratelimit-service
                    the rate-limiting service (`edgerush-ratelimit-service`): the cluster store's
                    pods, of either mode, over gRPC, the data planes' streams to them, and the

@@ -1,5 +1,5 @@
 """The traffic of a run and how it is judged: the simulator's workloads
-(crates/ratelimit-sim/src/workload.rs) played against real systems.
+(crates/cluster-sim/src/workload.rs) played against real systems.
 
 Times are integer nanoseconds from the start of a run, so that the arithmetic is exact.
 """

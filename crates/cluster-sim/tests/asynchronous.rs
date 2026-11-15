@@ -1,7 +1,7 @@
 //! The asynchronous mode on the store, under the cluster's faults: today's data planes
 //! deciding from their copies and reporting to the owners the table names, measured against
-//! the contract as `ratelimit-sim` measures it — the most admitted over what it allows in any
-//! span, and requests refused while within it.
+//! the contract — the most admitted over what it allows in any span, and requests refused
+//! while within it.
 
 #![allow(
     clippy::unwrap_used,
@@ -10,9 +10,8 @@
 )]
 
 use edgerush_cluster::{Config, NodeId, ms};
-use edgerush_cluster_sim::{Asynchronous, Link, Sim};
+use edgerush_cluster_sim::{Asynchronous, Link, Sim, worst_excess};
 use edgerush_ratelimit::service::Contract;
-use edgerush_ratelimit_sim::worst_excess;
 use std::num::NonZeroU64;
 
 type World = Sim<Asynchronous>;
@@ -30,10 +29,9 @@ fn contract() -> Contract {
     }
 }
 
-/// `contract` as `ratelimit-sim` holds it, `burst` its bucket and its rate `percent` of the
-/// limit.
-fn held_to(contract: Contract, percent: u64, burst: u64) -> edgerush_ratelimit_sim::Contract {
-    edgerush_ratelimit_sim::Contract {
+/// `contract` with `burst` its bucket and its rate `percent` of the limit: what a run is held to.
+fn held_to(contract: Contract, percent: u64, burst: u64) -> Contract {
+    Contract {
         limit: NonZeroU64::new(contract.limit.get() * percent).unwrap(),
         window: NonZeroU64::new(contract.window.get() * 100).unwrap(),
         burst: NonZeroU64::new(burst).unwrap(),
@@ -114,7 +112,7 @@ fn figures(name: &'static str, world: &World) -> Figures {
 fn figures_under(name: &'static str, world: &World, contract: Contract) -> Figures {
     let (requests, refused) = world.decided();
     let admissions = world.admissions();
-    let worst = |contract: &edgerush_ratelimit_sim::Contract| {
+    let worst = |contract: &Contract| {
         admissions
             .values()
             .map(|times| worst_excess(contract, times))

@@ -31,7 +31,7 @@ and NASM on Windows) and the layout of the crates.
   there is the case under test. Never normalise their line endings.
 - The code cites design documents ("03 §6", "15 §3") that are not in this repository. If
   you cannot read one, do not guess what it says; ask.
-- The pure crates (`router`, `config`, `filters`, `ratelimit`, `ratelimit-sim`, `cluster`,
+- The pure crates (`router`, `config`, `filters`, `ratelimit`, `cluster`,
   `cluster-asynchronous`, `cluster-synchronous`, `cluster-sim`, `rules`, `translate`, `planes`) do no I/O: clocks, sockets and randomness are passed in.
 - `schema/config.schema.json` is made from the config model's types and their rustdoc. A
   change to either changes it: write it again with
