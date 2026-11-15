@@ -392,7 +392,10 @@ mod tests {
                 why: Why::Elsewhere
             }]
         );
-        assert_eq!(pod.value(own).as_ref().map(Value::counted), Some(3));
+        assert_eq!(
+            pod.value(own).as_ref().map(|value| value.counted()),
+            Some(3)
+        );
         assert_eq!(pod.value(theirs), None);
         assert_eq!(answers.made, 5, "said back");
         assert_eq!(answers.table, None, "the data plane's table is the pod's");
@@ -609,7 +612,10 @@ mod tests {
         let answers = pod.batch(batch(first().stamp(), 0, vec![poll(own)]), ms(3));
         assert_eq!(answers.entries.len(), 1);
         assert_eq!(answers.entries[0].answered.behind, 0, "a full bucket");
-        assert_eq!(pod.value(own).as_ref().map(Value::counted), Some(0));
+        assert_eq!(
+            pod.value(own).as_ref().map(|value| value.counted()),
+            Some(0)
+        );
         let copied = |out: &Outbox| {
             out.iter().any(|(_, message)| {
                 matches!(message, Message::Store(StoreMessage::Replicate { entries, .. })

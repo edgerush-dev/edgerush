@@ -219,7 +219,7 @@ async fn committed(pod: &StorePod<Pod>) -> Option<Table> {
 
 /// The hits `pod` holds counted under `key`, owned or a copy.
 async fn counted_at(pod: &StorePod<Pod>, key: u64) -> Option<u64> {
-    pod.with(move |node, _| node.value(key).as_ref().map(Value::counted))
+    pod.with(move |node, _| node.value(key).as_ref().map(|value| value.counted()))
         .await
         .flatten()
 }

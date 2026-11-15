@@ -1,10 +1,11 @@
 //! The asynchronous rate-limiting mode, over the cluster store (06 §4): data planes decide every
 //! request from their own copy of a key's bucket and report their hits to the key's owner in
 //! numbered batches; the owner applies each batch once, in order, and answers with the bucket.
-//! Today's asynchronous mode (`edgerush_ratelimit::service`) carried onto the store: the owner's
-//! state of a key is the store's value ([`Value`]), which the store copies to the shard's
-//! replicas, hands on and forgets; its applying of a batch's entry ([`owner::apply`]) runs on
-//! `Node::update`, in the mode's [`Pod`], which answers a data plane's [`Batch`]. A data plane
+//! The owner's state of a key and its applying of a batch's entry are
+//! `edgerush_ratelimit::service::owner`'s; here the state is the store's value ([`Value`]),
+//! which the store copies to the shard's replicas, hands on and forgets, and the applying
+//! ([`owner::apply`]) runs on `Node::update`, in the mode's [`Pod`], which answers a data
+//! plane's [`Batch`]. A data plane
 //! reaches the pods by the table it was told ([`Routed`]).
 //!
 //! Like the store, a pure state machine: messages and the time in, messages out.
