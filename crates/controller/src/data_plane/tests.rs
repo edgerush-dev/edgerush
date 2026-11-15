@@ -423,6 +423,43 @@ fn every_data_plane_accepted_is_served_on_its_own() {
     );
 }
 
+/// The classes kept are those a DataPlane naming this ControlPlane may still serve (04 §6):
+/// each served one's, and that of each listed and not served, whose pods serve their last
+/// config; not one served without `ingress`, nor another ControlPlane's.
+#[test]
+fn the_classes_kept_are_those_a_data_plane_may_still_serve() {
+    let kept = |data_planes: &[DataPlane]| {
+        let choice = after(&Planes::new(), data_planes);
+        super::kept(data_planes, &choice.served, &own())
+    };
+    let classes = |names: &[&str]| -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    };
+    let spec = "  ingress: { httpPort: 80, httpsPort: 443 }\n";
+    // Served with `ingress`, waiting on the operator as after a restart, and refused.
+    assert_eq!(
+        kept(&[api(1, &accepted("True", 1)), web(1, spec, "")]),
+        classes(&["edge.api", "edge.web"])
+    );
+    assert_eq!(
+        kept(&[web(2, spec, &accepted("False", 2))]),
+        classes(&["edge.web"])
+    );
+    // Served without `ingress`: no class of its own.
+    let gateway_only = web(
+        1,
+        "  gateway:\n    listeners: [{ name: http, port: 80, protocol: HTTP }]\n    tls: { frontend: { default: {} } }\n",
+        &accepted("True", 1),
+    );
+    assert_eq!(kept(&[gateway_only]), classes(&[]));
+    // Another ControlPlane's, and none at all.
+    let other = data_plane(
+        "metadata: { name: api, namespace: edge, generation: 1, uid: u2 }\nspec:\n  controlPlaneRef: { name: other }\n  ingress: { httpPort: 80, httpsPort: 443 }\n",
+    );
+    assert_eq!(kept(&[other]), classes(&[]));
+    assert_eq!(kept(&[]), classes(&[]));
+}
+
 #[test]
 fn once_refused_nothing_is_kept_for_a_later_edit() {
     let spec = "  ingress: { httpPort: 80, httpsPort: 443 }\n";

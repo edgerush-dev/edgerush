@@ -2527,8 +2527,10 @@ pub const SERVICE_UPSTREAM_ANNOTATION: &str = "gateway.edgerush.dev/service-upst
 /// where that is left out.
 const CLASS_ANNOTATION: &str = "kubernetes.io/ingress.class";
 
-/// An Ingress's class: its `ingressClassName`, or, without one, the annotation.
-fn class_of(ingress: &Ingress) -> Option<&str> {
+/// An Ingress's class, as translation reads it: its `ingressClassName`, or, without one, the
+/// annotation. `None` for one of no class, which the default class takes.
+#[must_use]
+pub fn class_of(ingress: &Ingress) -> Option<&str> {
     let named = ingress
         .spec
         .as_ref()
