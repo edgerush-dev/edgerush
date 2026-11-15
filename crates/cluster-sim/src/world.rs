@@ -74,6 +74,15 @@ pub trait Mode: Sized {
     fn client_unreachable(world: &mut Sim<Self>, client: NodeId, id: u64, pod: NodeId);
     /// `message` from `from` reaching client `id`.
     fn deliver_to_client(world: &mut Sim<Self>, from: NodeId, id: NodeId, message: Self::Message);
+    /// The keys whose hits `message` brings a pod to apply, as its store keeps them: none, in a
+    /// mode that does not count them.
+    fn reported(_message: &Self::Message) -> Vec<u64> {
+        Vec::new()
+    }
+    /// Hits a pod has applied to `key`, each once, in the value it holds of it now.
+    fn counted(_pod: &Self::Pod, _key: u64) -> u64 {
+        0
+    }
 }
 
 /// How long a drained pod's process goes on before it ends: longer than any request's deadline,
@@ -99,6 +108,35 @@ pub struct Link {
     pub cut: bool,
     /// Bytes a second it carries; messages queue behind one another.
     pub bandwidth: u64,
+    /// As TCP carries a message: one lost is sent again after this long, each retransmission
+    /// lost waiting twice as long as the one before, and given up after fifteen, as Linux
+    /// does; nothing behind it on its lane arrives first. `None`: a message lost is gone.
+    pub retransmit: Option<Time>,
+}
+
+/// How many times TCP sends a segment again before giving the connection up (Linux's
+/// `tcp_retries2`).
+const TCP_RETRANSMISSIONS: u32 = 15;
+
+/// The longest TCP waits between retransmissions (Linux's `TCP_RTO_MAX`).
+const TCP_LONGEST_WAIT: Time = 120_000_000_000;
+
+/// How much later than sent once a message on `link` arrives, retransmissions and all, or
+/// `None` if it is lost.
+fn late_by(link: &Link, rng: &mut Rng) -> Option<Time> {
+    if !rng.chance(link.loss_per_million) {
+        return Some(0);
+    }
+    let mut wait = link.retransmit?;
+    let mut late: Time = 0;
+    for _ in 0..TCP_RETRANSMISSIONS {
+        late = late.saturating_add(wait);
+        if !rng.chance(link.loss_per_million) {
+            return Some(late);
+        }
+        wait = wait.saturating_mul(2).min(TCP_LONGEST_WAIT);
+    }
+    None
 }
 
 impl Link {
@@ -111,6 +149,7 @@ impl Link {
             loss_per_million: 0,
             cut: false,
             bandwidth: 125_000_000,
+            retransmit: None,
         }
     }
 }
@@ -264,6 +303,10 @@ pub struct Sim<M: Mode> {
     default_link: Link,
     links: BTreeMap<(NodeId, NodeId), Link>,
     last_arrival: BTreeMap<(NodeId, NodeId), Time>,
+    /// Hits applied to each key, as its store keeps it, each once by whichever pod applied
+    /// them, over every life of the key and every owner: what each pod's count of it rose by
+    /// as it took a data plane's report.
+    applied: BTreeMap<u64, u64>,
     /// When each link's lane is next free to start sending: bulk copies apart from the rest, as
     /// separate streams over one connection, so that heartbeats and handoffs never queue
     /// behind a replica's snapshot.
@@ -343,6 +386,7 @@ impl<M: Mode> Sim<M> {
             default_link: Link::lan(),
             links: BTreeMap::new(),
             last_arrival: BTreeMap::new(),
+            applied: BTreeMap::new(),
             link_free: BTreeMap::new(),
             lanes: true,
             config,
@@ -837,9 +881,9 @@ impl<M: Mode> Sim<M> {
             M::unreachable(self, from, to, &message);
             return;
         }
-        if self.rng.chance(link.loss_per_million) {
+        let Some(late) = late_by(&link, &mut self.rng) else {
             return;
-        }
+        };
         // Sent once the link has sent what it already had, taking its size's time.
         let bytes = M::size(&message);
         let sending = bytes.saturating_mul(1_000_000_000) / link.bandwidth.max(1);
@@ -858,7 +902,7 @@ impl<M: Mode> Sim<M> {
         // In order along one lane, as along one stream.
         let lane = (from, to.wrapping_add(if bulk { 1 << 62 } else { 0 }));
         let last = self.last_arrival.get(&lane).copied().unwrap_or(0);
-        let at = (sent + delay).max(last);
+        let at = (sent + delay + late).max(last);
         self.last_arrival.insert(lane, at);
         self.schedule(at, Event::Deliver { from, to, message });
     }
@@ -906,8 +950,31 @@ impl<M: Mode> Sim<M> {
         }
         let local = pod.local(now);
         M::store_mut(&mut pod.node).set_wall_offset(wall_offset(now, local, pod.skew));
+        let reported = M::reported(&message);
+        let before: Vec<u64> = reported
+            .iter()
+            .map(|key| M::counted(&pod.node, *key))
+            .collect();
         let out = M::receive(&mut pod.node, from, message, local);
+        for (key, before) in reported.iter().zip(before) {
+            // Lower after, the key was made afresh (its contract changed): what it holds now
+            // was applied in this step.
+            let after = M::counted(&pod.node, *key);
+            let rose = if after >= before {
+                after - before
+            } else {
+                after
+            };
+            *self.applied.entry(*key).or_insert(0) += rose;
+        }
         self.after(to, out);
+    }
+
+    /// Hits applied to `key`, as its store keeps it, each once by whichever pod applied them,
+    /// over every life of the key and every owner.
+    #[must_use]
+    pub fn applied(&self, key: u64) -> u64 {
+        self.applied.get(&key).copied().unwrap_or(0)
     }
 
     fn on_tick(&mut self, id: NodeId) {
@@ -1304,4 +1371,57 @@ fn tell(oracle: &mut Oracle, outcome: Outcome, allow: bool, timed: Timed) {
 fn wall_offset(now: Time, local: Time, skew: i64) -> i64 {
     let gap = i128::from(now) - i128::from(local) + i128::from(skew);
     i64::try_from(gap).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lossy(per_million: u32, retransmit: Option<Time>) -> Link {
+        Link {
+            loss_per_million: per_million,
+            retransmit,
+            ..Link::lan()
+        }
+    }
+
+    /// Without retransmission, about the share lost is lost, and the rest arrives on time.
+    #[test]
+    fn about_the_share_lost_is_lost() {
+        let mut rng = Rng::new(4);
+        let lates: Vec<Option<Time>> = (0..10_000)
+            .map(|_| late_by(&lossy(200_000, None), &mut rng))
+            .collect();
+        let lost = lates.iter().filter(|late| late.is_none()).count();
+        assert!((1_800..=2_200).contains(&lost), "{lost}");
+        assert!(lates.iter().flatten().all(|late| *late == 0));
+        assert!((0..1_000).all(|_| late_by(&Link::lan(), &mut rng) == Some(0)));
+    }
+
+    /// As TCP carries it, a message lost arrives a retransmission timeout late, each
+    /// retransmission lost waiting twice as long again.
+    #[test]
+    fn a_message_lost_over_tcp_arrives_a_timeout_late_doubling() {
+        let mut rng = Rng::new(4);
+        let mut most = 0;
+        for _ in 0..1_000 {
+            let late = late_by(&lossy(500_000, Some(ms(200))), &mut rng).unwrap();
+            // 200 ms, then 400 ms more, then 800 ms more… for each one lost.
+            assert_eq!(late % ms(200), 0, "{late}");
+            let sent = late / ms(200) + 1;
+            assert!(sent.is_power_of_two(), "{late}");
+            most = most.max(sent);
+        }
+        assert!(most >= 8, "three lost in a row, in a thousand: {most}");
+    }
+
+    /// TCP gives a connection up after fifteen retransmissions: what never got through is
+    /// lost.
+    #[test]
+    fn a_message_tcp_cannot_get_through_is_lost() {
+        assert_eq!(
+            late_by(&lossy(1_000_000, Some(ms(200))), &mut Rng::new(4)),
+            None
+        );
+    }
 }
