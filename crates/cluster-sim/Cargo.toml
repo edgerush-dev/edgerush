@@ -15,6 +15,7 @@ edgerush-ratelimit.workspace = true
 
 [dev-dependencies]
 edgerush-ratelimit-sim = { path = "../ratelimit-sim" }
+proptest.workspace = true
 
 [lints]
 workspace = true

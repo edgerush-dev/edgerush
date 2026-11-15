@@ -14,7 +14,7 @@ use std::fmt::Debug;
 mod asynchronous;
 mod synchronous;
 
-pub use asynchronous::{Asynchronous, CYCLE, Plane};
+pub use asynchronous::{Asynchronous, Beside, CYCLE, Fleet, Plane};
 pub use synchronous::Synchronous;
 
 /// A rate-limiting mode as the world runs it: its pods over their stores, the messages they

@@ -9,12 +9,18 @@
 //! until the owner answers directly again.
 
 use super::{Event, Mode, Sim, address, store_kind, store_size};
+use crate::Rng;
+use crate::workload::Workload;
 use edgerush_cluster::Message as StoreMessage;
+use edgerush_cluster::table::shard_of;
 use edgerush_cluster::{Config, Node, NodeId, Time, ms};
 use edgerush_cluster_asynchronous::{Answers, Message, Pod, Routed, Value};
-use edgerush_ratelimit::service::pooled::{Decision, Levers, Participant, Routing};
+use edgerush_ratelimit::service::pooled::{
+    self, Decision, Entry, Levers, Local, Participant, Routing,
+};
 use edgerush_ratelimit::service::{Contract, Keyed};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 /// The time between a data plane's batches.
 pub const CYCLE: Time = ms(10);
@@ -31,19 +37,85 @@ const SECRET: [u64; 2] = [1, 2];
 pub struct Asynchronous;
 
 /// A data plane as the world runs it: the proxy's participant, under keys it shares with the
-/// others.
+/// others, taking requests steadily or as a workload brings them.
 pub struct Plane {
     data: Participant<Keyed, Routed>,
-    /// The keys it takes requests under, in turn.
-    keys: Vec<u64>,
-    next: usize,
-    contract: Contract,
-    interval: Time,
+    feed: Feed,
     /// When each key's requests were admitted, by the world's clock.
     admitted: BTreeMap<u64, Vec<Time>>,
     /// Requests it decided, and refused.
     requests: u64,
     refused: u64,
+    /// Batches it sent.
+    batches: u64,
+}
+
+/// Where a data plane's requests come from.
+enum Feed {
+    /// A steady rate, under its keys in turn, each held to one contract.
+    Steady {
+        keys: Vec<u64>,
+        next: usize,
+        contract: Contract,
+        interval: Time,
+    },
+    /// A workload's arrivals, made beforehand, to its workers.
+    Workload(Box<Fed>),
+}
+
+/// A data plane taking a workload: its workers decide each request from the entries they hold
+/// handles to, as the proxy's do, asking the participant for those they lack.
+struct Fed {
+    /// Arrivals still to come, in order: when, at which of its workers, and of which kind.
+    arrivals: VecDeque<(Time, usize, usize)>,
+    /// The limits of each kind of request: its keys, each with its contract.
+    kinds: Arc<[Vec<(u64, Contract)>]>,
+    /// Each worker's handles to the entries it decides from, by key.
+    handles: Vec<BTreeMap<u64, Arc<Entry>>>,
+    /// Until when its participant's background is held, if it is: no cycles, its answers and
+    /// its workers' asks waiting.
+    paused_until: Option<Time>,
+    /// Answers that came while it was held, from whom, in order.
+    held: Vec<(NodeId, Message)>,
+    /// Asks that came while it was held: when, from which worker, of which kind.
+    pending: Vec<(Time, usize, usize)>,
+    /// Requests whose decision waited for the participant, and the time they waited in all.
+    waited: u64,
+    waited_for: Time,
+}
+
+/// A second limit each request of a workload is under, beside the run's: decided with it, all
+/// or none, its key owned by another pod than the run's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Beside {
+    /// Every request under one more limit, over every data plane.
+    Global(Contract),
+    /// Requests alternate between two routes, each with a limit of its own, `Contract`; the
+    /// run's is shared by both.
+    Routes(Contract),
+}
+
+/// A workload as data planes take it.
+#[derive(Clone, Copy, Debug)]
+pub struct Fleet {
+    /// The data planes.
+    pub planes: usize,
+    /// Each data plane's workers.
+    pub workers: usize,
+    /// The run's limit: every request is under it.
+    pub contract: Contract,
+    /// A limit beside it, if any.
+    pub beside: Option<Beside>,
+    /// The traffic, landing on every data plane's workers in turn.
+    pub workload: Workload,
+    /// What the traffic is drawn from, apart from the world's own draws.
+    pub seed: u64,
+    /// Whether each participant visits only the keys that need it each cycle, as the proxy's
+    /// do unless `schedule_keys` is off, rather than every key.
+    pub scheduled: bool,
+    /// Whether each participant polls a key in use that has nothing to report
+    /// ([`Levers::poll_quiet`]).
+    pub poll_quiet: bool,
 }
 
 /// A key's bytes as a client sends it: the world's key, little-endian. The data plane hashes
@@ -173,13 +245,16 @@ impl Sim<Asynchronous> {
             data.set_scheduled(true);
             let plane = Plane {
                 data,
-                keys: keys.to_vec(),
-                next: usize::try_from(self.rng.below(keys.len() as u64)).unwrap_or(0),
-                contract,
-                interval,
+                feed: Feed::Steady {
+                    keys: keys.to_vec(),
+                    next: usize::try_from(self.rng.below(keys.len() as u64)).unwrap_or(0),
+                    contract,
+                    interval,
+                },
                 admitted: BTreeMap::new(),
                 requests: 0,
                 refused: 0,
+                batches: 0,
             };
             self.clients.insert(id, plane);
             self.asked.extend(keys.iter().copied());
@@ -235,7 +310,8 @@ impl Sim<Asynchronous> {
         all
     }
 
-    /// A request reaches data plane `id`, under its next key: decided from its copy.
+    /// A request reaches data plane `id`: steadily, under its next key, decided from its copy;
+    /// or each of a workload's arrivals now due, at its worker.
     fn on_request(&mut self, id: NodeId) {
         if self.clients_stopped {
             return;
@@ -244,18 +320,394 @@ impl Sim<Asynchronous> {
         let Some(plane) = self.clients.get_mut(&id) else {
             return;
         };
-        let interval = plane.interval;
-        if let Some(&key) = plane.keys.get(plane.next % plane.keys.len().max(1)) {
-            plane.next += 1;
+        let Feed::Steady {
+            keys,
+            next,
+            contract,
+            interval,
+        } = &mut plane.feed
+        else {
+            self.on_arrivals(id);
+            return;
+        };
+        let interval = *interval;
+        if let Some(&key) = keys.get(*next % keys.len().max(1)) {
+            *next += 1;
             plane.requests += 1;
             let bytes = bytes_of(key);
-            match plane.data.decide_all(&[(&bytes, plane.contract)], now) {
+            match plane.data.decide_all(&[(&bytes, *contract)], now) {
                 Decision::Admit => plane.admitted.entry(key).or_default().push(now),
                 Decision::Refuse => plane.refused += 1,
             }
         }
         self.stats.sent += 1;
         self.schedule(now + interval, Event::ClientSend(id));
+    }
+
+    /// `fleet`'s data planes, each its participant and workers, every request of its workload
+    /// under the run's key and the one beside it, if any, each owned by another pod: its keys,
+    /// the run's first. Once the cluster has a table, as a data plane is told it.
+    ///
+    /// # Panics
+    ///
+    /// Where 128-bit atomics are not native, which the participant needs.
+    #[expect(
+        clippy::expect_used,
+        reason = "the simulation runs only where the proxy's participant does"
+    )]
+    pub fn add_fleet(&mut self, fleet: &Fleet) -> Vec<u64> {
+        let table = self.table().cloned();
+        let workers = fleet.workers.max(1);
+        let mut planes = Vec::new();
+        for _ in 0..fleet.planes.max(1) {
+            let id = self.next_client;
+            self.next_client += 1;
+            let mut data =
+                Participant::new(id, CYCLE, Routed::new(table.clone()), Keyed::new(SECRET))
+                    .expect("native 128-bit atomics");
+            data.set_one_in_flight(true);
+            data.set_exchange_timeout(EXCHANGE_TIMEOUT);
+            data.set_levers(Levers {
+                poll_quiet: fleet.poll_quiet,
+            });
+            data.set_scheduled(fleet.scheduled);
+            data.set_workers(workers as u64);
+            planes.push((id, data));
+        }
+        // The run's key, and each beside it the first after it whose owner is another pod.
+        let owner = |key: u64| {
+            let hash = planes[0].1.hash(&bytes_of(key));
+            table
+                .as_ref()
+                .and_then(|table| table.owner(shard_of(hash, table.shards.len() as u16)))
+        };
+        let run = 1;
+        let apart = |after: u64| {
+            (after..)
+                .take(10_000)
+                .find(|key| owner(*key) != owner(run))
+                .unwrap_or(after)
+        };
+        let kinds: Vec<Vec<(u64, Contract)>> = match fleet.beside {
+            None => vec![vec![(run, fleet.contract)]],
+            Some(Beside::Global(global)) => {
+                vec![vec![(run, fleet.contract), (apart(2), global)]]
+            }
+            Some(Beside::Routes(each)) => {
+                let a = apart(2);
+                let b = apart(a + 1);
+                vec![
+                    vec![(a, each), (run, fleet.contract)],
+                    vec![(b, each), (run, fleet.contract)],
+                ]
+            }
+        };
+        let mut keys: Vec<u64> = kinds.iter().flatten().map(|(key, _)| *key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.retain(|key| *key != run);
+        keys.insert(0, run);
+        let kinds: Arc<[Vec<(u64, Contract)>]> = kinds.into();
+        // Every data plane's arrivals, by its workers; each request's kind by its place among
+        // them all, so that kinds alternate across the fleet.
+        let arrivals = fleet.workload.arrivals(
+            &fleet.contract,
+            fleet.planes.max(1) * workers,
+            &mut Rng::new(fleet.seed),
+        );
+        let mut each: Vec<VecDeque<(Time, usize, usize)>> = vec![VecDeque::new(); planes.len()];
+        for (n, arrival) in arrivals.iter().enumerate() {
+            each[arrival.worker / workers].push_back((
+                self.now + arrival.at,
+                arrival.worker % workers,
+                n % kinds.len(),
+            ));
+        }
+        for ((id, data), arrivals) in planes.into_iter().zip(each) {
+            let first = arrivals.front().map(|(at, _, _)| *at);
+            let fed = Fed {
+                arrivals,
+                kinds: Arc::clone(&kinds),
+                handles: vec![BTreeMap::new(); workers],
+                paused_until: None,
+                held: Vec::new(),
+                pending: Vec::new(),
+                waited: 0,
+                waited_for: 0,
+            };
+            self.clients.insert(
+                id,
+                Plane {
+                    data,
+                    feed: Feed::Workload(Box::new(fed)),
+                    admitted: BTreeMap::new(),
+                    requests: 0,
+                    refused: 0,
+                    batches: 0,
+                },
+            );
+            self.asked.extend(keys.iter().copied());
+            if let Some(first) = first {
+                self.schedule(first, Event::ClientSend(id));
+            }
+            let cycle = self.now + self.rng.below(CYCLE);
+            self.schedule(cycle, Event::ClientCheck(id));
+        }
+        keys
+    }
+
+    /// Holds data plane `id`'s participant for `length` from now: no cycles, its answers and
+    /// its workers' asks waiting until it goes on, as when its thread is held up. Its workers
+    /// go on deciding from the entries they hold.
+    pub fn pause_plane(&mut self, id: NodeId, length: Time) {
+        let until = self.now + length;
+        if let Some(Plane {
+            feed: Feed::Workload(fed),
+            ..
+        }) = self.clients.get_mut(&id)
+        {
+            fed.paused_until = Some(until);
+        }
+    }
+
+    /// Requests whose decision waited for a participant held up, and the time they waited in
+    /// all.
+    #[must_use]
+    pub fn waited(&self) -> (u64, Time) {
+        self.clients
+            .values()
+            .fold((0, 0), |(waited, wait), plane| match &plane.feed {
+                Feed::Workload(fed) => (waited + fed.waited, wait + fed.waited_for),
+                Feed::Steady { .. } => (waited, wait),
+            })
+    }
+
+    /// Batches the data planes sent.
+    #[must_use]
+    pub fn batches(&self) -> u64 {
+        self.clients.values().map(|plane| plane.batches).sum()
+    }
+
+    /// The pod the table names `key`'s owner, and the key as the store keeps it: hashed as the
+    /// data planes hash it.
+    fn owned(&self, key: u64) -> Option<(NodeId, u64)> {
+        let plane = self.clients.values().next()?;
+        let hash = plane.data.hash(&bytes_of(key));
+        let table = self.table()?;
+        let owner = table.owner(shard_of(hash, table.shards.len() as u16))?;
+        Some((owner, hash))
+    }
+
+    /// The pod the table names `key`'s owner.
+    #[must_use]
+    pub fn owner_of(&self, key: u64) -> Option<NodeId> {
+        self.owned(key).map(|(owner, _)| owner)
+    }
+
+    /// Hits `key`'s owner, as the table names it, has applied, each once, if it holds the key.
+    #[must_use]
+    pub fn counted(&self, key: u64) -> Option<u64> {
+        let (owner, hash) = self.owned(key)?;
+        let pod = self.pods.get(&owner)?;
+        pod.node.value(hash).map(|value| value.counted())
+    }
+
+    /// The data planes' ids, in order.
+    #[must_use]
+    pub fn plane_ids(&self) -> Vec<NodeId> {
+        self.clients.keys().copied().collect()
+    }
+
+    /// The workload's arrivals now due at data plane `id`, each decided at its worker, and the
+    /// next arrival's turn set.
+    fn on_arrivals(&mut self, id: NodeId) {
+        let now = self.now;
+        self.resume(id);
+        let mut due = Vec::new();
+        let mut next = None;
+        if let Some(Plane {
+            feed: Feed::Workload(fed),
+            ..
+        }) = self.clients.get_mut(&id)
+        {
+            while let Some(&(at, worker, kind)) = fed.arrivals.front() {
+                if at > now {
+                    next = Some(at);
+                    break;
+                }
+                fed.arrivals.pop_front();
+                due.push((at, worker, kind));
+            }
+        }
+        for (at, worker, kind) in due {
+            self.stats.sent += 1;
+            self.decide_at_worker(id, at, worker, kind);
+        }
+        self.flush(id);
+        if let Some(next) = next {
+            self.schedule(next, Event::ClientSend(id));
+        }
+    }
+
+    /// Data plane `id`'s worker `worker` decides a request of kind `kind` that came at `at`:
+    /// from the entries it holds handles to, each it lacks found in its participant's registry
+    /// or made there; the participant asked when an entry cannot decide it, the ask waiting
+    /// while the participant is held.
+    fn decide_at_worker(&mut self, id: NodeId, at: Time, worker: usize, kind: usize) {
+        let now = self.now;
+        let Some(plane) = self.clients.get_mut(&id) else {
+            return;
+        };
+        let Feed::Workload(fed) = &mut plane.feed else {
+            return;
+        };
+        let limits = fed.kinds[kind].clone();
+        let registry = plane.data.registry();
+        let mut made = Vec::new();
+        for &(key, contract) in &limits {
+            let held = fed.handles[worker]
+                .get(&key)
+                .is_some_and(|entry| entry.contract() == contract);
+            if held {
+                continue;
+            }
+            if let Some((entry, fresh)) =
+                registry.find_or_make(&bytes_of(key), contract, CYCLE, now)
+            {
+                if fresh {
+                    made.push(Arc::clone(&entry));
+                }
+                fed.handles[worker].insert(key, entry);
+            }
+        }
+        let held: Option<Vec<Arc<Entry>>> = limits
+            .iter()
+            .map(|(key, contract)| {
+                fed.handles[worker]
+                    .get(key)
+                    .filter(|entry| entry.contract() == *contract)
+                    .cloned()
+            })
+            .collect();
+        let paused = fed.paused_until.is_some_and(|until| until > now);
+        for entry in made {
+            plane.data.adopt(entry);
+        }
+        if let Some(held) = held {
+            let entries: Vec<&Entry> = held.iter().map(|entry| &**entry).collect();
+            let outcome = pooled::decide(&entries, now);
+            // Signals reach the participant at once, as the proxy's do within a tick.
+            if outcome.signal != 0 {
+                let signalled = held
+                    .iter()
+                    .enumerate()
+                    .filter(|(n, _)| outcome.signal & (1 << n) != 0)
+                    .map(|(_, entry)| Arc::clone(entry));
+                plane.data.on_signals(signalled);
+            }
+            match outcome.local {
+                Local::Admit => {
+                    plane.requests += 1;
+                    for (key, _) in &limits {
+                        plane.admitted.entry(*key).or_default().push(at);
+                    }
+                    return;
+                }
+                Local::Refuse => {
+                    plane.requests += 1;
+                    plane.refused += 1;
+                    return;
+                }
+                Local::Ask => {}
+            }
+        }
+        if paused {
+            // Held: the ask waits in its queue, as on the participant's channel.
+            if let Feed::Workload(fed) = &mut plane.feed {
+                fed.pending.push((at, worker, kind));
+            }
+            return;
+        }
+        Self::ask(plane, at, worker, &limits, now);
+    }
+
+    /// `plane`'s participant decides a request of `limits` that came at `at` to `worker`, and
+    /// gives the worker its entries to decide from itself from now on.
+    fn ask(plane: &mut Plane, at: Time, worker: usize, limits: &[(u64, Contract)], now: Time) {
+        let bytes: Vec<[u8; 8]> = limits.iter().map(|(key, _)| bytes_of(*key)).collect();
+        let keys: Vec<(&[u8], Contract)> = bytes
+            .iter()
+            .zip(limits)
+            .map(|(bytes, (_, contract))| (&bytes[..], *contract))
+            .collect();
+        let decision = plane.data.decide_all(&keys, now);
+        let given = plane.data.entries(&keys);
+        plane.requests += 1;
+        match decision {
+            Decision::Admit => {
+                for (key, _) in limits {
+                    plane.admitted.entry(*key).or_default().push(at);
+                }
+            }
+            Decision::Refuse => plane.refused += 1,
+        }
+        if let Feed::Workload(fed) = &mut plane.feed {
+            for entry in given {
+                let mut key = [0; 8];
+                key.copy_from_slice(entry.key());
+                fed.handles[worker].insert(u64::from_le_bytes(key), entry);
+            }
+        }
+    }
+
+    /// Data plane `id`'s participant goes on, if it was held and its time is up: the answers it
+    /// held taken, then the asks that waited.
+    fn resume(&mut self, id: NodeId) {
+        let now = self.now;
+        let Some(plane) = self.clients.get_mut(&id) else {
+            return;
+        };
+        let Feed::Workload(fed) = &mut plane.feed else {
+            return;
+        };
+        if fed.paused_until.is_none_or(|until| until > now) {
+            return;
+        }
+        fed.paused_until = None;
+        let held = std::mem::take(&mut fed.held);
+        let pending = std::mem::take(&mut fed.pending);
+        let kinds = Arc::clone(&fed.kinds);
+        fed.waited += pending.len() as u64;
+        fed.waited_for += pending.iter().map(|(at, _, _)| now - at).sum::<Time>();
+        for (from, message) in held {
+            Self::take_answers(plane, from, message, now);
+        }
+        for (at, worker, kind) in pending {
+            Self::ask(plane, at, worker, &kinds[kind], now);
+        }
+        self.flush(id);
+    }
+
+    /// Whether data plane `id`'s participant is held now.
+    fn held(&self, id: NodeId) -> bool {
+        matches!(
+            self.clients.get(&id),
+            Some(Plane { feed: Feed::Workload(fed), .. })
+                if fed.paused_until.is_some_and(|until| until > self.now)
+        )
+    }
+
+    /// What data plane `id` has to send, sent: each batch to the pod the participant routed
+    /// it to.
+    fn flush(&mut self, id: NodeId) {
+        let Some(plane) = self.clients.get_mut(&id) else {
+            return;
+        };
+        let sends = plane.data.take_outgoing();
+        plane.batches += sends.len() as u64;
+        for (to, batch) in sends {
+            self.send(id, to, Message::Batch(batch));
+        }
     }
 
     /// A data plane's cycle: its batches, each to the pod the participant routed it to. First,
@@ -266,6 +718,12 @@ impl Sim<Asynchronous> {
     /// never hear of the new pods.
     fn on_cycle(&mut self, id: NodeId) {
         let now = self.now;
+        if self.held(id) {
+            // Held up: no cycle, until it goes on.
+            self.schedule(now + CYCLE, Event::ClientCheck(id));
+            return;
+        }
+        self.resume(id);
         let latest = self.table().cloned();
         let Some(plane) = self.clients.get_mut(&id) else {
             return;
@@ -277,10 +735,7 @@ impl Sim<Asynchronous> {
             }
         }
         plane.data.on_cycle(now);
-        let sends = plane.data.take_outgoing();
-        for (to, batch) in sends {
-            self.send(id, to, Message::Batch(batch));
-        }
+        self.flush(id);
         self.schedule(now + CYCLE, Event::ClientCheck(id));
     }
 
@@ -288,9 +743,28 @@ impl Sim<Asynchronous> {
     /// owner, or a table.
     fn on_answers(&mut self, from: NodeId, id: NodeId, message: Message) {
         let now = self.now;
+        if self.held(id) {
+            if let Some(Plane {
+                feed: Feed::Workload(fed),
+                ..
+            }) = self.clients.get_mut(&id)
+            {
+                fed.held.push((from, message));
+            }
+            return;
+        }
+        self.resume(id);
         let Some(plane) = self.clients.get_mut(&id) else {
             return;
         };
+        Self::take_answers(plane, from, message, now);
+        // Answered, what waited for the exchange goes now, as the proxy sends it.
+        self.flush(id);
+    }
+
+    /// `from`'s answers, answers relayed from their owner, or a table, taken by `plane`'s
+    /// participant.
+    fn take_answers(plane: &mut Plane, from: NodeId, message: Message, now: Time) {
         let reply = match message {
             Message::Answers(answers) => Routed::reply(from, None, answers),
             Message::Relayed { owner, answers, .. } => Routed::reply(owner, Some(from), answers),
@@ -301,10 +775,5 @@ impl Sim<Asynchronous> {
             _ => return,
         };
         plane.data.on_reply(reply, now);
-        // Answered, what waited for the exchange goes now, as the proxy sends it.
-        let sends = plane.data.take_outgoing();
-        for (to, batch) in sends {
-            self.send(id, to, Message::Batch(batch));
-        }
     }
 }
