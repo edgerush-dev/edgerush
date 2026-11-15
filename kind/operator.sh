@@ -30,6 +30,7 @@
 #   - a second DataPlane of `edge`, `api`, is accepted and programmed, its own Service and
 #     address; each data plane serves its own Gateway's routes and not the other's, a route
 #     attached to both Gateways is served by each and its status holds a parent of each;
+#     `api`'s `ingress` taken away deletes its IngressClass, its Gateway kept and served;
 #     `api` deleted takes what was made for it and its parent of that route, and `web`
 #     serves on, the controller neither rolled nor restarted;
 #   - a ControlPlane of `edge`'s name in another namespace is not accepted, its status
@@ -54,6 +55,8 @@
 #     control plane alone; on again and the ControlPlane deleted, the registration gone;
 #   - a ServiceAccount of a name the operator would use, made by hand, is left alone, and
 #     its ControlPlane says so;
+#   - `web`'s `gateway` taken away deletes its Gateway, its IngressClass kept, and the
+#     Ingress is still served through it;
 #   - DataPlane `web` deleted takes with it everything made for it, its IngressClass and
 #     bindings included, and, the last of `edge`'s, the Ingress of its class loses the
 #     address it said (docs/04 §6); ControlPlane `edge` deleted, its GatewayClass and its
@@ -393,6 +396,15 @@ parents_of_both() {
 until_true '[ "$(parents_of_both)" = "api=True web=True " ]' 60 ||
     fail "the route of both Gateways has parents '$(parents_of_both)'"
 pass "each data plane serves its own Gateway's routes and not the other's, a route of both served by each, a parent of each in its status"
+
+k -n edge patch dataplane api --type=merge -p '{"spec":{"ingress":null}}' >/dev/null
+until_true '! k get ingressclass edge.api' 60 ||
+    fail "DataPlane api's ingress taken away left its IngressClass: $(k get ingressclass edge.api -o name 2>&1)"
+k -n edge get gateway api >/dev/null || fail "DataPlane api's ingress taken away took its Gateway too"
+condition_is dataplane/api edge Programmed "True Programmed" 60 ||
+    fail "DataPlane api, its ingress taken away: $(condition dataplane/api edge Programmed)"
+plane_answers api 8080 api.example 200 60 || fail "api's route is not served once its ingress is taken away: $(status api.example)"
+pass "a DataPlane's ingress taken away deletes its IngressClass, its Gateway kept and served"
 
 k -n edge delete dataplane api --wait=false >/dev/null
 until_true '[ -z "$(k -n edge get deploy,sa,pdb,rolebindings,gateways,services -l gateway.edgerush.dev/data-plane=api -o name 2>/dev/null)" ] && ! k -n edge get service edgerush-proxy-api && ! k get ingressclass edge.api' 90 ||
@@ -828,6 +840,16 @@ condition_is controlplane/own own Programmed "False NotOurs" 60 ||
 [ -z "$(k -n own get serviceaccount edgerush-controller-own -o jsonpath='{.metadata.labels}')" ] ||
     fail "the ServiceAccount made by hand was taken over"
 pass "an object of a name the operator would use, made by hand, is left alone, and said"
+
+echo "== a Gateway no longer asked for"
+k -n edge patch dataplane web --type=merge -p '{"spec":{"gateway":null}}' >/dev/null
+until_true '! k -n edge get gateway web' 60 ||
+    fail "DataPlane web's gateway taken away left its Gateway: $(k -n edge get gateway web -o name 2>&1)"
+k get ingressclass edge.web >/dev/null || fail "DataPlane web's gateway taken away took its IngressClass too"
+condition_is dataplane/web edge Programmed "True Programmed" 60 ||
+    fail "DataPlane web, its gateway taken away: $(condition dataplane/web edge Programmed)"
+plane_answers web 80 shop.example 200 120 || fail "the Ingress is not served once web's gateway is taken away: $(status shop.example)"
+pass "a DataPlane's gateway taken away deletes its Gateway, its IngressClass kept, the Ingress served"
 
 echo "== deleted"
 shop_says() { k -n edge get ingress shop -o jsonpath='{.status.loadBalancer.ingress}'; }

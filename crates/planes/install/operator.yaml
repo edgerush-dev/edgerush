@@ -3,8 +3,9 @@
 # Its rights are what it writes and nothing it grants: the objects it makes for each
 # ControlPlane and DataPlane, read before each is applied and followed by its label; `bind`
 # on the four shipped ClusterRoles by name, the only rights it grants, and no role made;
-# `deletecollection` on the kinds no owner reference reaches, deleted by label; and no
-# Secrets, routes or Ingresses (05 §2).
+# `deletecollection` on the kinds no owner reference reaches, deleted by label; `delete` on
+# what a plane may stop asking for, deleted by name; and no Secrets, routes or Ingresses
+# (05 §2).
 #
 # Until images are published (docs/12 item 6), the image is built and loaded by hand, as
 # the kind runs do: its name is in two places below, the container's and --image, which
@@ -62,12 +63,14 @@ rules:
   - apiGroups: [policy]
     resources: [poddisruptionbudgets]
     verbs: [get, list, watch, create, patch]
+  # A DataPlane's Gateway, also deleted by name once its `gateway` is taken away (05 §3).
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gateways]
-    verbs: [get, list, watch, create, patch]
+    verbs: [get, list, watch, create, patch, delete]
   # What no owner reference reaches, deleted by label: the classes, ClusterRoleBindings,
   # and RoleBindings in other namespaces. A binding also deleted by name, once what it
-  # grants is no longer asked for or allowed (05 §4).
+  # grants is no longer asked for or allowed (05 §4), and an IngressClass once its
+  # DataPlane's `ingress` is taken away (05 §3).
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [rolebindings, clusterrolebindings]
     verbs: [get, list, watch, create, patch, delete, deletecollection]
@@ -76,7 +79,7 @@ rules:
     verbs: [get, list, watch, create, patch, deletecollection]
   - apiGroups: [networking.k8s.io]
     resources: [ingressclasses]
-    verbs: [get, list, watch, create, patch, deletecollection]
+    verbs: [get, list, watch, create, patch, delete, deletecollection]
   # A ControlPlane's webhook registration, made once its authority's bundle is in its
   # status, and deleted by name once its webhook is turned off (05 §2).
   - apiGroups: [admissionregistration.k8s.io]
