@@ -523,19 +523,59 @@ as_http!(
     UDPRouteStatusParentsParentRef
 );
 
+/// The Gateways a control plane can tell are there or gone: every one of the namespaces it
+/// follows Gateways in, `namespaces`, that is there, `there`. Of any other namespace it can
+/// tell nothing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Gateways<'a> {
+    pub(crate) namespaces: &'a [String],
+    pub(crate) there: &'a [Object],
+}
+
+impl Gateways<'_> {
+    /// Whether Gateway `namespace`/`name` is of a namespace it follows Gateways in, and is
+    /// not there.
+    fn gone(&self, namespace: &str, name: &str) -> bool {
+        self.namespaces.iter().any(|followed| followed == namespace)
+            && !self
+                .there
+                .iter()
+                .any(|gateway| gateway.namespace == namespace && gateway.name == name)
+    }
+
+    /// Whether an entry of `controller` naming `group`, `kind`, `namespace` and `name`
+    /// (defaulted as a reference of `of` is) is of this controller's, and of a Gateway gone:
+    /// one no data plane serves, whoever wrote it, as every control plane writes under one
+    /// controller name (04 §6).
+    fn stale(
+        &self,
+        controller: &str,
+        (group, kind, namespace, name): (Option<&str>, Option<&str>, Option<&str>, &str),
+        of: &str,
+    ) -> bool {
+        controller == GATEWAY_CONTROLLER
+            && group.unwrap_or(GROUP) == GROUP
+            && kind.unwrap_or("Gateway") == "Gateway"
+            && self.gone(namespace.unwrap_or(of), name)
+    }
+}
+
 /// What the status of a route of `namespace`, of any kind, is to say, as `wanted` has it of its
-/// parents that are `parents_of_ours`, the data plane's Gateway and the ListenerSets naming
-/// it, merged with `live`: none wanted where it no longer names one. Other controllers'
-/// parents, and this controller's of other Gateways (other data planes'), are kept whole
-/// where they are. This controller's of `parents_of_ours` are those wanted: each written in
-/// the place of the first the status holds for its parent, any others for it taken away, or
-/// after the rest, in their order, as many as the status can hold. They stay where they are,
-/// so that another writer doing likewise never finds them moved.
+/// parents that are `parents_of_ours`, the Gateways of the data planes served and the
+/// ListenerSets naming them, merged with `live`: none wanted where it no longer names one.
+/// Other controllers' parents, and this controller's of other Gateways (other control
+/// planes'), are kept whole where they are, but for this controller's of a Gateway that
+/// `gateways` says is gone, which are taken away. This controller's of `parents_of_ours`
+/// are those wanted: each written in the place of the first the status holds for its
+/// parent, any others for it taken away, or after the rest, in their order, as many as the
+/// status can hold. They stay where they are, so that another writer doing likewise never
+/// finds them moved.
 pub(crate) fn route(
     live: Option<&HTTPRouteStatus>,
     namespace: &str,
     parents_of_ours: &[Object],
     wanted: Option<&translate::RouteStatus>,
+    gateways: Gateways<'_>,
     now: Timestamp,
 ) -> HTTPRouteStatus {
     let live_parents = live
@@ -582,10 +622,25 @@ pub(crate) fn route(
                 Some((parent_ref, parent))
             })
             .collect();
+    let stale = |parent: &HTTPRouteStatusParents| {
+        let to = &parent.parent_ref;
+        gateways.stale(
+            &parent.controller_name,
+            (
+                to.group.as_deref(),
+                to.kind.as_deref(),
+                to.namespace.as_deref(),
+                &to.name,
+            ),
+            namespace,
+        )
+    };
     let mut parents = Vec::new();
     for old in live_parents {
         if !ours(old) {
-            parents.push(old.clone());
+            if !stale(old) {
+                parents.push(old.clone());
+            }
         } else if let Some(slot) = wanted.iter_mut().find(|slot| {
             slot.as_ref()
                 .is_some_and(|(parent_ref, _)| same(&old.parent_ref, parent_ref, namespace))
@@ -603,33 +658,54 @@ pub(crate) fn route(
     HTTPRouteStatus { parents }
 }
 
-/// What the status of a BackendTLSPolicy of `namespace` is to say, as `wanted` has it of the
-/// data plane's Gateway, `gateway`, merged with `live`: nothing of the Gateway where no route
-/// of it reaches the policy. Every ancestor that is not this controller's of `gateway`, other
-/// controllers' and this controller's of other data planes' Gateways, is kept whole where it
-/// is. This controller's of `gateway` is written in the place of the first the status holds,
-/// any others taken away, or after the rest where the status holds none and has room for it;
-/// it stays where it is, so that another writer doing likewise never finds it moved.
+/// What the status of a BackendTLSPolicy of `namespace` is to say, as `wanted` has it of
+/// each Gateway of a data plane served, merged with `live`: nothing of a Gateway where no
+/// route of it reaches the policy. Every ancestor that is not this controller's of one of
+/// those Gateways, other controllers' and this controller's of other control planes'
+/// Gateways, is kept whole where it is, but for this controller's of a Gateway that
+/// `gateways` says is gone, which is taken away. This controller's of each Gateway is
+/// written in the place of the first the status holds for it, any others taken away, or
+/// after the rest where the status holds none and has room for it; it stays where it is, so
+/// that another writer doing likewise never finds it moved.
 pub(crate) fn policy(
     live: Option<&BackendTLSPolicyStatus>,
     namespace: &str,
-    gateway: &Object,
-    wanted: Option<&translate::PolicyStatus>,
+    wanted: &[(&Object, Option<&translate::PolicyStatus>)],
+    gateways: Gateways<'_>,
     now: Timestamp,
 ) -> BackendTLSPolicyStatus {
     let live_ancestors = live
         .map(|status| status.ancestors.as_slice())
         .unwrap_or_default();
-    let ours = |ancestor: &BackendTLSPolicyStatusAncestors| {
+    // Which Gateway of `wanted` an ancestor is this controller's of, if one.
+    let of = |ancestor: &BackendTLSPolicyStatusAncestors| {
         let to = &ancestor.ancestor_ref;
-        ancestor.controller_name == GATEWAY_CONTROLLER
+        (ancestor.controller_name == GATEWAY_CONTROLLER
             && to.group.as_deref().unwrap_or(GROUP) == GROUP
-            && to.kind.as_deref().unwrap_or("Gateway") == "Gateway"
-            && to.namespace.as_deref().unwrap_or(namespace) == gateway.namespace
-            && to.name == gateway.name
+            && to.kind.as_deref().unwrap_or("Gateway") == "Gateway")
+            .then(|| {
+                wanted.iter().position(|(gateway, _)| {
+                    to.namespace.as_deref().unwrap_or(namespace) == gateway.namespace
+                        && to.name == gateway.name
+                })
+            })
+            .flatten()
     };
-    let made =
-        |old: &[Condition], wanted: &translate::PolicyStatus| BackendTLSPolicyStatusAncestors {
+    let stale = |ancestor: &BackendTLSPolicyStatusAncestors| {
+        let to = &ancestor.ancestor_ref;
+        gateways.stale(
+            &ancestor.controller_name,
+            (
+                to.group.as_deref(),
+                to.kind.as_deref(),
+                to.namespace.as_deref(),
+                &to.name,
+            ),
+            namespace,
+        )
+    };
+    let made = |old: &[Condition], gateway: &Object, wanted: &translate::PolicyStatus| {
+        BackendTLSPolicyStatusAncestors {
             ancestor_ref: BackendTLSPolicyStatusAncestorsAncestorRef {
                 group: Some(GROUP.to_owned()),
                 kind: Some("Gateway".to_owned()),
@@ -646,20 +722,28 @@ pub(crate) fn policy(
                 now,
             ),
             controller_name: GATEWAY_CONTROLLER.to_owned(),
-        };
-    let mut wanted = wanted;
+        }
+    };
+    let mut left: Vec<Option<&translate::PolicyStatus>> =
+        wanted.iter().map(|(_, wanted)| *wanted).collect();
     let mut ancestors = Vec::new();
     for ancestor in live_ancestors {
-        if !ours(ancestor) {
-            ancestors.push(ancestor.clone());
-        } else if let Some(wanted) = wanted.take() {
-            ancestors.push(made(&ancestor.conditions, wanted));
+        match of(ancestor) {
+            Some(at) => {
+                if let Some(status) = left[at].take() {
+                    ancestors.push(made(&ancestor.conditions, wanted[at].0, status));
+                }
+            }
+            None if stale(ancestor) => {}
+            None => ancestors.push(ancestor.clone()),
         }
     }
-    if let Some(wanted) = wanted
-        && ancestors.len() < MOST_ANCESTORS
-    {
-        ancestors.push(made(&[], wanted));
+    for (at, status) in left.into_iter().enumerate() {
+        if let Some(status) = status
+            && ancestors.len() < MOST_ANCESTORS
+        {
+            ancestors.push(made(&[], wanted[at].0, status));
+        }
     }
     BackendTLSPolicyStatus { ancestors }
 }
