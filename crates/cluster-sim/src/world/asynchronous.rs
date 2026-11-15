@@ -48,6 +48,11 @@ pub struct Plane {
     refused: u64,
     /// Batches it sent.
     batches: u64,
+    /// Messages it took from the pods: answers, answers relayed and tables.
+    answers: u64,
+    /// Whether this life of it has ended, its process restarted (`restart_plane`): it decides,
+    /// sends and takes nothing more, and what it did stays counted.
+    gone: bool,
 }
 
 /// Where a data plane's requests come from.
@@ -82,6 +87,10 @@ struct Fed {
     /// Requests whose decision waited for the participant, and the time they waited in all.
     waited: u64,
     waited_for: Time,
+    /// Its participant's levers, for a process restarted to start alike: quiet keys polled,
+    /// keys scheduled.
+    poll_quiet: bool,
+    scheduled: bool,
 }
 
 /// A second limit each request of a workload is under, beside the run's: decided with it, all
@@ -216,6 +225,22 @@ impl Mode for Asynchronous {
     fn deliver_to_client(world: &mut Sim<Self>, from: NodeId, id: NodeId, message: Message) {
         world.on_answers(from, id, message);
     }
+
+    fn reported(message: &Message) -> Vec<u64> {
+        match message {
+            Message::Batch(batch) | Message::Forwarded { batch, .. } => {
+                let mut keys: Vec<u64> = batch.entries.iter().map(|entry| entry.key).collect();
+                keys.sort_unstable();
+                keys.dedup();
+                keys
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn counted(pod: &Pod, key: u64) -> u64 {
+        pod.store().value(key).map_or(0, |value| value.counted())
+    }
 }
 
 impl Sim<Asynchronous> {
@@ -255,6 +280,8 @@ impl Sim<Asynchronous> {
                 requests: 0,
                 refused: 0,
                 batches: 0,
+                answers: 0,
+                gone: false,
             };
             self.clients.insert(id, plane);
             self.asked.extend(keys.iter().copied());
@@ -313,7 +340,7 @@ impl Sim<Asynchronous> {
     /// A request reaches data plane `id`: steadily, under its next key, decided from its copy;
     /// or each of a workload's arrivals now due, at its worker.
     fn on_request(&mut self, id: NodeId) {
-        if self.clients_stopped {
+        if self.clients_stopped || self.gone(id) {
             return;
         }
         let now = self.now;
@@ -351,10 +378,6 @@ impl Sim<Asynchronous> {
     /// # Panics
     ///
     /// Where 128-bit atomics are not native, which the participant needs.
-    #[expect(
-        clippy::expect_used,
-        reason = "the simulation runs only where the proxy's participant does"
-    )]
     pub fn add_fleet(&mut self, fleet: &Fleet) -> Vec<u64> {
         let table = self.table().cloned();
         let workers = fleet.workers.max(1);
@@ -362,16 +385,13 @@ impl Sim<Asynchronous> {
         for _ in 0..fleet.planes.max(1) {
             let id = self.next_client;
             self.next_client += 1;
-            let mut data =
-                Participant::new(id, CYCLE, Routed::new(table.clone()), Keyed::new(SECRET))
-                    .expect("native 128-bit atomics");
-            data.set_one_in_flight(true);
-            data.set_exchange_timeout(EXCHANGE_TIMEOUT);
-            data.set_levers(Levers {
-                poll_quiet: fleet.poll_quiet,
-            });
-            data.set_scheduled(fleet.scheduled);
-            data.set_workers(workers as u64);
+            let data = fed_participant(
+                id,
+                table.clone(),
+                fleet.poll_quiet,
+                fleet.scheduled,
+                workers,
+            );
             planes.push((id, data));
         }
         // The run's key, and each beside it the first after it whose owner is another pod.
@@ -434,6 +454,8 @@ impl Sim<Asynchronous> {
                 pending: Vec::new(),
                 waited: 0,
                 waited_for: 0,
+                poll_quiet: fleet.poll_quiet,
+                scheduled: fleet.scheduled,
             };
             self.clients.insert(
                 id,
@@ -444,6 +466,8 @@ impl Sim<Asynchronous> {
                     requests: 0,
                     refused: 0,
                     batches: 0,
+                    answers: 0,
+                    gone: false,
                 },
             );
             self.asked.extend(keys.iter().copied());
@@ -454,6 +478,70 @@ impl Sim<Asynchronous> {
             self.schedule(cycle, Event::ClientCheck(id));
         }
         keys
+    }
+
+    /// Data plane `id`'s process restarts now, as a proxy's does: a new participant under a new
+    /// id, at a new address, holding nothing, told the latest table, its workers holding no
+    /// handles; the arrivals still to come go to it. The old life ends: what it had admitted
+    /// and not reported is lost with it, requests waiting for it fail (counted refused), and
+    /// answers on their way to it reach no one, as over the connections that died with it.
+    /// The new life's id.
+    pub fn restart_plane(&mut self, id: NodeId) -> Option<NodeId> {
+        let table = self.table().cloned();
+        let new = self.next_client;
+        let old = self.clients.get_mut(&id)?;
+        if old.gone {
+            return None;
+        }
+        let Feed::Workload(fed) = &mut old.feed else {
+            return None;
+        };
+        let failed = fed.pending.len() as u64;
+        let workers = fed.handles.len();
+        let data = fed_participant(new, table, fed.poll_quiet, fed.scheduled, workers);
+        let fresh = Fed {
+            arrivals: std::mem::take(&mut fed.arrivals),
+            kinds: Arc::clone(&fed.kinds),
+            handles: vec![BTreeMap::new(); workers],
+            paused_until: None,
+            held: Vec::new(),
+            pending: Vec::new(),
+            waited: 0,
+            waited_for: 0,
+            poll_quiet: fed.poll_quiet,
+            scheduled: fed.scheduled,
+        };
+        fed.pending.clear();
+        fed.held.clear();
+        old.requests += failed;
+        old.refused += failed;
+        old.gone = true;
+        self.next_client += 1;
+        let next = fresh.arrivals.front().map(|(at, _, _)| *at);
+        self.clients.insert(
+            new,
+            Plane {
+                data,
+                feed: Feed::Workload(Box::new(fresh)),
+                admitted: BTreeMap::new(),
+                requests: 0,
+                refused: 0,
+                batches: 0,
+                answers: 0,
+                gone: false,
+            },
+        );
+        if let Some(next) = next {
+            self.schedule(next.max(self.now), Event::ClientSend(new));
+        }
+        let cycle = self.now + self.rng.below(CYCLE);
+        self.schedule(cycle, Event::ClientCheck(new));
+        Some(new)
+    }
+
+    /// Whether data plane `id` is a life that has ended, or none.
+    fn gone(&self, id: NodeId) -> bool {
+        self.clients.get(&id).is_none_or(|plane| plane.gone)
     }
 
     /// Holds data plane `id`'s participant for `length` from now: no cycles, its answers and
@@ -488,6 +576,16 @@ impl Sim<Asynchronous> {
         self.clients.values().map(|plane| plane.batches).sum()
     }
 
+    /// Messages between the data planes and the pods: the batches sent and what the data
+    /// planes took back.
+    #[must_use]
+    pub fn plane_messages(&self) -> u64 {
+        self.clients
+            .values()
+            .map(|plane| plane.batches + plane.answers)
+            .sum()
+    }
+
     /// The pod the table names `key`'s owner, and the key as the store keeps it: hashed as the
     /// data planes hash it.
     fn owned(&self, key: u64) -> Option<(NodeId, u64)> {
@@ -504,6 +602,13 @@ impl Sim<Asynchronous> {
         self.owned(key).map(|(owner, _)| owner)
     }
 
+    /// Hits applied to `key`, each once by whichever pod applied them, over every life of the key
+    /// and every owner ([`Sim::applied`]).
+    #[must_use]
+    pub fn counted_ever(&self, key: u64) -> u64 {
+        self.owned(key).map_or(0, |(_, hash)| self.applied(hash))
+    }
+
     /// Hits `key`'s owner, as the table names it, has applied, each once, if it holds the key.
     #[must_use]
     pub fn counted(&self, key: u64) -> Option<u64> {
@@ -512,10 +617,15 @@ impl Sim<Asynchronous> {
         pod.node.value(hash).map(|value| value.counted())
     }
 
-    /// The data planes' ids, in order.
+    /// The data planes' ids, in order: of the lives running, a data plane restarted under its
+    /// new id.
     #[must_use]
     pub fn plane_ids(&self) -> Vec<NodeId> {
-        self.clients.keys().copied().collect()
+        self.clients
+            .iter()
+            .filter(|(_, plane)| !plane.gone)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// The workload's arrivals now due at data plane `id`, each decided at its worker, and the
@@ -718,6 +828,9 @@ impl Sim<Asynchronous> {
     /// never hear of the new pods.
     fn on_cycle(&mut self, id: NodeId) {
         let now = self.now;
+        if self.gone(id) {
+            return;
+        }
         if self.held(id) {
             // Held up: no cycle, until it goes on.
             self.schedule(now + CYCLE, Event::ClientCheck(id));
@@ -743,6 +856,9 @@ impl Sim<Asynchronous> {
     /// owner, or a table.
     fn on_answers(&mut self, from: NodeId, id: NodeId, message: Message) {
         let now = self.now;
+        if self.gone(id) {
+            return;
+        }
         if self.held(id) {
             if let Some(Plane {
                 feed: Feed::Workload(fed),
@@ -757,6 +873,7 @@ impl Sim<Asynchronous> {
         let Some(plane) = self.clients.get_mut(&id) else {
             return;
         };
+        plane.answers += 1;
         Self::take_answers(plane, from, message, now);
         // Answered, what waited for the exchange goes now, as the proxy sends it.
         self.flush(id);
@@ -776,4 +893,30 @@ impl Sim<Asynchronous> {
         };
         plane.data.on_reply(reply, now);
     }
+}
+
+/// A data plane's participant as the proxy sets it up, for a workload on `workers` workers.
+///
+/// # Panics
+///
+/// Where 128-bit atomics are not native, which the participant needs.
+#[expect(
+    clippy::expect_used,
+    reason = "the simulation runs only where the proxy's participant does"
+)]
+fn fed_participant(
+    id: NodeId,
+    table: Option<edgerush_cluster::table::Table>,
+    poll_quiet: bool,
+    scheduled: bool,
+    workers: usize,
+) -> Participant<Keyed, Routed> {
+    let mut data = Participant::new(id, CYCLE, Routed::new(table), Keyed::new(SECRET))
+        .expect("native 128-bit atomics");
+    data.set_one_in_flight(true);
+    data.set_exchange_timeout(EXCHANGE_TIMEOUT);
+    data.set_levers(Levers { poll_quiet });
+    data.set_scheduled(scheduled);
+    data.set_workers(workers as u64);
+    data
 }

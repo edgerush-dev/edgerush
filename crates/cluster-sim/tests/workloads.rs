@@ -9,14 +9,11 @@
     reason = "test set-up: the helpers around the tests fail them the way the tests would"
 )]
 
-use edgerush_cluster::{Config, Time, ms};
-use edgerush_cluster_sim::{
-    Asynchronous, Beside, Fleet, Link, Rng, Shape, Sim, Workload, one_bucket_admits, worst_excess,
-};
+use edgerush_cluster::{Time, ms};
+use edgerush_cluster_sim::runs::{self, Fault, Run};
+use edgerush_cluster_sim::{Beside, Fleet, Link, Rng, Shape, Workload};
 use edgerush_ratelimit::service::Contract;
 use std::num::NonZeroU64;
-
-type World = Sim<Asynchronous>;
 
 const SECOND: u64 = 1_000_000_000;
 
@@ -68,121 +65,33 @@ fn workload(shape: Shape, span: u64) -> Workload {
     }
 }
 
-/// What a run did.
-#[derive(Debug)]
-struct Run {
-    /// Requests admitted under each of its keys, the run's first.
-    admitted: Vec<u64>,
-    /// Requests refused.
-    refused: u64,
-    /// Batches the data planes sent.
-    batches: u64,
-    /// The most any key admitted over its own contract, in any span: under the run's key first.
-    worst_excess: Vec<i64>,
-    /// Hits each key's owner applied, each once: as many as were admitted, once the run is over.
-    counted: Vec<u64>,
-    /// Requests whose decision waited for a data plane's participant, and their waits in all.
-    waited: (u64, Time),
-    /// What one bucket holding the run's contract would admit of the same traffic.
-    one_bucket: u64,
-}
-
-/// What can happen while a run goes.
-#[derive(Clone, Copy, Debug)]
-enum Fault {
-    None,
-    /// The run's key's owner crashes at `at` after the traffic starts.
-    OwnerLost {
-        at: Time,
-    },
-    /// Data plane `plane`'s participant is held for `length` at `at` after the traffic starts.
-    Pause {
-        at: Time,
-        length: Time,
-        plane: usize,
-    },
-}
-
-/// `fleet` run on three pods, every link `link`, with `fault`; every request decided, and
-/// measured once every batch has been applied.
+/// `fleet` run on three pods, every link `link`, with `fault`: formed, and every request
+/// decided.
 fn run(fleet: &Fleet, link: Link, fault: Fault) -> Run {
-    let mut config = Config::defaults();
-    config.shards = 64;
-    let mut world = World::new(fleet.seed, config);
-    world.start_cluster(3);
-    assert!(
-        world.run_while_not(ms(10_000), World::settled).is_some(),
-        "never formed"
-    );
-    world.set_default_link(link);
-    let keys = world.add_fleet(fleet);
-    let start = world.now();
-    match fault {
-        Fault::None => {}
-        Fault::OwnerLost { at } => {
-            world.run_until(start + at);
-            let owner = world.owner_of(keys[0]).expect("an owner");
-            world.crash(owner);
-        }
-        Fault::Pause { at, length, plane } => {
-            world.run_until(start + at);
-            let id = world.plane_ids()[plane];
-            world.pause_plane(id, length);
-        }
-    }
-    let arrivals: Vec<u64> = fleet
-        .workload
-        .arrivals(
-            &fleet.contract,
-            fleet.planes * fleet.workers,
-            &mut Rng::new(fleet.seed),
-        )
-        .iter()
-        .map(|arrival| arrival.at)
-        .collect();
-    // Half a second after the last arrival, for every batch to be applied: before a key quiet
-    // for a refill time, and full again, is forgotten, and its count with it.
-    let last = arrivals.last().copied().unwrap_or(0);
-    world.run_until(start + last + SECOND / 2);
-    assert_eq!(
-        world.decided().0,
-        arrivals.len() as u64,
-        "every request decided"
-    );
-    let admissions = world.admissions();
-    let times = |key| admissions.get(&key).cloned().unwrap_or_default();
-    let contracts = world_contracts(fleet, &keys);
-    Run {
-        admitted: keys.iter().map(|key| times(*key).len() as u64).collect(),
-        refused: world.decided().1,
-        batches: world.batches(),
-        worst_excess: keys
-            .iter()
-            .zip(&contracts)
-            .map(|(key, contract)| worst_excess(contract, &times(*key)))
-            .collect(),
-        counted: keys
-            .iter()
-            .map(|key| world.counted(*key).unwrap_or(0))
-            .collect(),
-        waited: world.waited(),
-        one_bucket: one_bucket_admits(&fleet.contract, &arrivals),
-    }
+    checked(runs::run(fleet, link, fault))
 }
 
-/// The contract of each of a run's keys, in the order `add_fleet` gave them.
-fn world_contracts(fleet: &Fleet, keys: &[u64]) -> Vec<Contract> {
-    keys.iter()
-        .enumerate()
-        .map(|(n, _)| match (n, fleet.beside) {
-            (0, _) | (_, None) => fleet.contract,
-            (_, Some(Beside::Global(other) | Beside::Routes(other))) => other,
-        })
-        .collect()
+/// As [`run`], the links between the data planes and the pods, both ways, `planes`, and every
+/// other `pods`.
+fn run_over(fleet: &Fleet, pods: Link, planes: Link, fault: Fault) -> Run {
+    checked(runs::run_over(fleet, pods, planes, fault))
 }
 
-/// Every admission counted once by its key's owner.
+fn checked(run: Option<Run>) -> Run {
+    let run = run.expect("never formed");
+    assert_eq!(run.decided, run.sent, "every request decided");
+    run
+}
+
+/// Every admission applied once, and held by its key's owner at the end.
 fn counted_once(run: &Run, said: &str) {
+    applied_once(run, said);
+    assert_eq!(run.held, run.admitted, "{said}: held against admitted");
+}
+
+/// Every admission applied once by some owner, whatever its key's owner holds by the end: for
+/// a key whose refill time is under the half second a run is measured after, forgotten by then.
+fn applied_once(run: &Run, said: &str) {
     assert_eq!(
         run.counted, run.admitted,
         "{said}: counted against admitted"
@@ -194,8 +103,7 @@ fn counted_once(run: &Run, said: &str) {
 /// allowed, and a conforming client moving between a data plane's workers is never refused, its
 /// participant held for 100 ms across the move or not, the move holding up none of its
 /// requests. Requests that find their key's entry closed while their participant is held wait
-/// for it, and are decided once it goes on. Every admission is counted once, where the owner
-/// still holds the count.
+/// for it, and are decided once it goes on. Every admission is counted once.
 #[test]
 fn a_data_plane_decides_alike_whatever_its_workers_and_refuses_nothing_conforming() {
     for seed in 0..3 {
@@ -275,8 +183,7 @@ fn a_data_plane_decides_alike_whatever_its_workers_and_refuses_nothing_conformin
         );
         // Refilled in a tenth of a second, the key goes quiet between bursts a second apart and
         // its entry closes: the third burst, reaching a data plane while its participant is
-        // held, waits for it, and is decided once it goes on. (Its owner forgets a key so soon
-        // refilled before the run is measured: no counts to compare.)
+        // held, waits for it, and is decided once it goes on.
         let bursts = Fleet {
             contract: limit(1_000, 100),
             ..fleet(4, 8, workload(Shape::Bursts { each: 3 }, 4 * SECOND), seed)
@@ -295,6 +202,7 @@ fn a_data_plane_decides_alike_whatever_its_workers_and_refuses_nothing_conformin
             },
         );
         assert!(closed.waited.0 > 0, "{seed}: {closed:?}");
+        applied_once(&closed, &format!("{seed}: held across a burst"));
     }
 }
 
@@ -591,4 +499,90 @@ fn bursts_arriving_over_a_few_cycles_hold_to_what_is_allowed() {
         admitted <= 10 * allowed(&limit(100, 100), 10 * SECOND, 8),
         "{admitted} against {one_bucket}"
     );
+}
+
+/// Over TCP a lost message holds back what follows it on its connection for a retransmission
+/// timeout: a data plane whose reports are held up must still count as admitting, or every
+/// other one's share grows while it is stalled. At one packet in ten lost between the data
+/// planes and the store, quiet keys polled, whole buckets arriving at once on every data plane
+/// still stay within what is allowed — each spends at most its full copy — and within 5% of
+/// the same bursts without loss, and every admission is counted once.
+#[test]
+fn bursts_hold_with_one_packet_in_ten_lost_over_tcp() {
+    bursts_over_tcp(true);
+}
+
+/// As [`bursts_hold_with_one_packet_in_ten_lost_over_tcp`], at the proxy's levers: quiet keys
+/// not polled, 10 seeds admit some 15,900 against the 14,300 allowed (#137), where polled they
+/// admit about 12,300.
+#[test]
+#[ignore = "over what is allowed with quiet keys not polled, the proxy's default (#137)"]
+fn bursts_hold_with_one_packet_in_ten_lost_over_tcp_with_quiet_keys_not_polled() {
+    bursts_over_tcp(false);
+}
+
+/// Eight data planes of one worker each taking a whole bucket at once every second, one packet
+/// in ten lost between them and the store over TCP, quiet keys polled or not: held, over ten
+/// seeds, to what is allowed and within 5% of the same bursts without loss, and every
+/// admission counted once. The store's pods hear each other without loss.
+fn bursts_over_tcp(poll_quiet: bool) {
+    let tcp = Link {
+        loss_per_million: 100_000,
+        retransmit: Some(ms(200)),
+        ..link(500_000)
+    };
+    let (mut admitted, mut lossless, mut one_bucket) = (0, 0, 0);
+    for seed in 0..10 {
+        let bursts = Fleet {
+            poll_quiet,
+            ..fleet(
+                8,
+                1,
+                workload(Shape::Bursts { each: 100 }, 6 * SECOND),
+                seed,
+            )
+        };
+        let outcome = run_over(&bursts, link(500_000), tcp, Fault::None);
+        counted_once(&outcome, &format!("{seed}"));
+        admitted += outcome.admitted[0];
+        one_bucket += outcome.one_bucket;
+        lossless += run(&bursts, link(500_000), Fault::None).admitted[0];
+    }
+    assert!(
+        admitted <= 10 * allowed(&limit(100, 100), 6 * SECOND, 8),
+        "{admitted} against {one_bucket}"
+    );
+    assert!(
+        admitted * 100 <= lossless * 105,
+        "{admitted} against {lossless} without loss"
+    );
+}
+
+/// A data plane restarted half way, as a proxy's process is, loses at most what it had admitted
+/// and not yet reported, a cycle or so, its workers or not: spread or skewed traffic three
+/// times the limit, on 4 data planes of one worker and of 8.
+#[test]
+fn a_restarted_data_plane_loses_only_its_last_cycle() {
+    for workers in [1, 8] {
+        for shape in [
+            Shape::Spread { per_window: 300 },
+            Shape::Skewed { per_window: 300 },
+        ] {
+            for seed in 0..3 {
+                let outcome = run(
+                    &fleet(4, workers, workload(shape, 10 * SECOND), seed),
+                    link(500_000),
+                    Fault::Restart {
+                        at: 5 * SECOND,
+                        plane: 3,
+                    },
+                );
+                assert!(
+                    outcome.counted[0] <= outcome.admitted[0]
+                        && outcome.admitted[0] - outcome.counted[0] <= 5,
+                    "{workers} {shape:?} {seed}: {outcome:?}"
+                );
+            }
+        }
+    }
 }
