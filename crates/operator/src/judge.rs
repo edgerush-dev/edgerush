@@ -5,9 +5,8 @@
 //! A ControlPlane's name is unique in the cluster: the oldest of a name holds it, by its
 //! creation time, then its UID. It may watch its own namespace, and beyond it what an
 //! allowance of `PlatformDefaults` for its namespace allows ([`allowance`], 05 §4). A
-//! DataPlane names a ControlPlane of its own namespace, which must hold that name; and of
-//! one ControlPlane's DataPlanes the oldest alone is served, by its creation time, then its
-//! name, as the control plane chooses (05 §3).
+//! DataPlane names a ControlPlane of its own namespace, which must hold that name; a
+//! ControlPlane serves every DataPlane that does (05 §3).
 //!
 //! A ControlPlane refused once accepted, for an edit beyond the checks or an allowance
 //! narrowed, refuses none of its DataPlanes: what was made for it is kept, but for the
@@ -32,11 +31,6 @@ pub enum Refused {
     },
     /// A ControlPlane watching beyond its own namespace further than any allowance lets it.
     ScopeNotAllowed(Beyond),
-    /// A DataPlane of a ControlPlane an older DataPlane is served by.
-    OneDataPlaneOnly {
-        /// That DataPlane's name.
-        holder: String,
-    },
     /// A DataPlane naming a ControlPlane that none of its namespace holds the name of.
     NoControlPlane {
         /// The name it names.
@@ -51,7 +45,6 @@ impl Refused {
         match self {
             Self::NameTaken { .. } => "NameTaken",
             Self::ScopeNotAllowed(_) => "ScopeNotAllowed",
-            Self::OneDataPlaneOnly { .. } => "OneDataPlaneOnly",
             Self::NoControlPlane { .. } => "NoControlPlane",
         }
     }
@@ -81,10 +74,6 @@ impl Refused {
                     allowed.join(", or ")
                 )
             }
-            Self::OneDataPlaneOnly { holder } => format!(
-                "DataPlane {holder}, which is older, is its ControlPlane's: a ControlPlane \
-                 serves one DataPlane."
-            ),
             Self::NoControlPlane { name } => {
                 format!("No ControlPlane {name} of this namespace holds that name.")
             }
@@ -158,7 +147,8 @@ pub fn judge<'a>(
         })
         .collect();
 
-    // Each DataPlane's ControlPlane, where one of its namespace holds the name it names.
+    // Each DataPlane's ControlPlane, where one of its namespace holds the name it names:
+    // every one that does is served.
     let of = |data_plane: &DataPlane| -> Result<&'a ControlPlane, Refused> {
         let name = &data_plane.spec.control_plane_ref.name;
         holders
@@ -167,37 +157,9 @@ pub fn judge<'a>(
             .filter(|holder| holder.metadata.namespace == data_plane.metadata.namespace)
             .ok_or_else(|| Refused::NoControlPlane { name: name.clone() })
     };
-    // The DataPlane each ControlPlane serves, by the name it holds: its oldest.
-    let mut served: BTreeMap<&str, &DataPlane> = BTreeMap::new();
-    for data_plane in data_planes {
-        if of(data_plane).is_ok() {
-            match served.entry(data_plane.spec.control_plane_ref.name.as_str()) {
-                Entry::Vacant(vacant) => {
-                    vacant.insert(data_plane);
-                }
-                Entry::Occupied(mut held) => {
-                    if data_plane_age(data_plane) < data_plane_age(held.get()) {
-                        held.insert(data_plane);
-                    }
-                }
-            }
-        }
-    }
     let judged_data_planes = data_planes
         .iter()
-        .map(|data_plane| {
-            let verdict = of(data_plane).and_then(|control_plane| {
-                match served.get(data_plane.spec.control_plane_ref.name.as_str()) {
-                    Some(holder) if !std::ptr::eq(*holder, data_plane) => {
-                        Err(Refused::OneDataPlaneOnly {
-                            holder: holder.metadata.name.clone().unwrap_or_default(),
-                        })
-                    }
-                    _ => Ok(control_plane),
-                }
-            });
-            (data_plane, verdict)
-        })
+        .map(|data_plane| (data_plane, of(data_plane)))
         .collect();
     Judged {
         control_planes: judged_control_planes,
@@ -210,15 +172,6 @@ fn age(control_plane: &ControlPlane) -> (Option<&Time>, Option<&str>) {
     (
         control_plane.metadata.creation_timestamp.as_ref(),
         control_plane.metadata.uid.as_deref(),
-    )
-}
-
-/// What orders the DataPlanes of one ControlPlane: the oldest first, then by name, as the
-/// control plane orders them.
-fn data_plane_age(data_plane: &DataPlane) -> (Option<&Time>, Option<&str>) {
-    (
-        data_plane.metadata.creation_timestamp.as_ref(),
-        data_plane.metadata.name.as_deref(),
     )
 }
 

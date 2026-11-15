@@ -2,17 +2,18 @@
 //! ([10](../../../docs/10-testing.md)).
 //!
 //! Each directory under `tests/golden/` is a case: `resource.yaml`, a ControlPlane and,
-//! where the case is a DataPlane's, the DataPlane after it, as `kubectl apply` would take
-//! them, and as the API server would store them, a name, namespace and UID each; where the
-//! ControlPlane's watch scope is a selector, `selected.txt`, the namespaces it selects, a
-//! line each; and `objects.yaml`, the objects expected for the case's last resource, as
-//! YAML documents in the order they are made. The install's image is `edgerush:golden`.
-//! A DataPlane's case has `service.yaml` too, the data plane's Service its control plane
-//! writes, for the ports `bound.txt` says the config binds, a line each of the port and
-//! `tcp`, `udp` or both (none without the file).
+//! where the case is of DataPlanes, the DataPlanes of it after it, as `kubectl apply` would
+//! take them, and as the API server would store them, a name, namespace and UID each;
+//! where the ControlPlane's watch scope is a selector, `selected.txt`, the namespaces it
+//! selects, a line each; and `objects.yaml`, the objects expected for the ControlPlane, or
+//! else for each DataPlane in turn, as YAML documents in the order they are made. The
+//! install's image is `edgerush:golden`. A case of DataPlanes has `service.yaml` too, each
+//! data plane's Service its control plane writes, for the ports `bound.txt` says each
+//! config binds, a line each of the port and `tcp`, `udp` or both (none without the file).
 //!
-//! Each object says the kind and metadata it is written with, and between them the cases
-//! make every kind the operator makes.
+//! Each object says the kind and metadata it is written with, no two objects of a case are
+//! one object, of one kind, namespace and name, and between them the cases make every kind
+//! the operator makes.
 //!
 //! A case whose objects have changed on purpose is written again, and then read over, with
 //! `EDGERUSH_WRITE_GOLDEN=1 cargo test -p edgerush-planes --test golden`.
@@ -103,22 +104,43 @@ fn every_case_makes_its_objects() {
         } else {
             BTreeSet::new()
         };
-        if let [_, Resource::DataPlane(dp)] = resources.as_slice() {
+        let (control_plane, data_planes) = match resources.as_slice() {
+            [Resource::ControlPlane(cp), rest @ ..] => {
+                let data_planes: Vec<&DataPlane> = rest
+                    .iter()
+                    .map(|resource| match resource {
+                        Resource::DataPlane(dp) => &**dp,
+                        Resource::ControlPlane(_) => {
+                            panic!("{name}: resource.yaml has one ControlPlane, first")
+                        }
+                    })
+                    .collect();
+                (cp, data_planes)
+            }
+            _ => panic!("{name}: resource.yaml is a ControlPlane, then perhaps DataPlanes"),
+        };
+        if !data_planes.is_empty() {
             let bound_at = case.join("bound.txt");
             let bound = if bound_at.exists() {
                 bound(&read(&bound_at))
             } else {
                 BTreeMap::new()
             };
-            let service = ProxyService::of(dp)
-                .unwrap_or_else(|error| panic!("{name}: {error}"))
-                .service(&bound);
-            let made = match service {
-                Some(service) => serde_saphyr::to_string(&service).unwrap(),
-                None => "# No port, so no Service.
+            let made = data_planes
+                .iter()
+                .map(|dp| {
+                    let service = ProxyService::of(dp)
+                        .unwrap_or_else(|error| panic!("{name}: {error}"))
+                        .service(&bound);
+                    match service {
+                        Some(service) => serde_saphyr::to_string(&service).unwrap(),
+                        None => "# No port, so no Service.
 "
-                .to_owned(),
-            };
+                        .to_owned(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("---\n");
             let expected_at = case.join("service.yaml");
             if write {
                 fs::write(&expected_at, &made).unwrap();
@@ -130,16 +152,34 @@ fn every_case_makes_its_objects() {
                 );
             }
         }
-        let objects = match resources.as_slice() {
-            [Resource::ControlPlane(cp)] => for_control_plane(cp, &selected, &install),
-            [Resource::ControlPlane(cp), Resource::DataPlane(dp)] => {
-                for_data_plane(dp, cp, &selected, &install)
-            }
-            _ => panic!("{name}: resource.yaml is a ControlPlane, then perhaps a DataPlane"),
-        }
-        .unwrap_or_else(|error| panic!("{name}: {error}"));
-        // What the operator applies each by: its kind and metadata, as it is written.
+        let objects: Vec<Object> = if data_planes.is_empty() {
+            for_control_plane(control_plane, &selected, &install)
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+        } else {
+            data_planes
+                .iter()
+                .flat_map(|dp| {
+                    for_data_plane(dp, control_plane, &selected, &install)
+                        .unwrap_or_else(|error| panic!("{name}: {error}"))
+                })
+                .collect()
+        };
+        // What the operator applies each by: its kind and metadata, as it is written; and
+        // none another's, which two DataPlanes of one ControlPlane would fight over.
+        let mut seen = BTreeSet::new();
         for object in &objects {
+            let metadata = object.metadata();
+            assert!(
+                seen.insert((
+                    object.kind(),
+                    metadata.namespace.clone(),
+                    metadata.name.clone()
+                )),
+                "{name}: two objects are {} {:?}/{:?}",
+                object.kind(),
+                metadata.namespace,
+                metadata.name
+            );
             let as_written = serde_json::to_value(object).unwrap();
             assert_eq!(as_written["kind"], object.kind(), "{name}");
             assert_eq!(

@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-controller
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: shop
+    gateway.edgerush.dev/data-plane: web
+    gateway.edgerush.dev/namespace: shop-edge
+  name: edgerush-proxy-web
+  namespace: shop-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: web
+    uid: 0d6a9f3c-0000-4000-8000-000000000005
+spec:
+  externalTrafficPolicy: Local
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: port-80
+    port: 80
+    protocol: TCP
+    targetPort: 80
+  - name: port-443
+    port: 443
+    protocol: TCP
+    targetPort: 443
+  selector:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: shop
+    gateway.edgerush.dev/data-plane: web
+    gateway.edgerush.dev/namespace: shop-edge
+  sessionAffinity: None
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-controller
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: shop
+    gateway.edgerush.dev/data-plane: api
+    gateway.edgerush.dev/namespace: shop-edge
+  name: edgerush-proxy-api
+  namespace: shop-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: api
+    uid: 0d6a9f3c-0000-4000-8000-000000000006
+spec:
+  externalTrafficPolicy: Local
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: port-80
+    port: 80
+    protocol: TCP
+    targetPort: 80
+  - name: port-443
+    port: 443
+    protocol: TCP
+    targetPort: 443
+  selector:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: shop
+    gateway.edgerush.dev/data-plane: api
+    gateway.edgerush.dev/namespace: shop-edge
+  sessionAffinity: None
+  type: LoadBalancer

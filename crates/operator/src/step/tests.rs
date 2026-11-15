@@ -778,7 +778,7 @@ async fn a_refused_control_plane_makes_nothing_and_its_data_plane_waits_on_it() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_second_data_plane_and_a_name_taken_are_refused_and_nothing_is_made_for_them() {
+async fn a_name_taken_is_refused_and_nothing_is_made_for_it() {
     let (fake, api) = cluster(|_, _| None).await;
     let said = Said::default();
     let mut operator = Operator::new(install());
@@ -786,13 +786,8 @@ async fn a_second_data_plane_and_a_name_taken_are_refused_and_nothing_is_made_fo
     taken.metadata.namespace = Some("late".to_owned());
     taken.metadata.uid = Some("late-uid".to_owned());
     taken.metadata.creation_timestamp = Some(time(1_000_000_000));
-    let mut second = data_plane();
-    second.metadata.name = Some("second".to_owned());
-    second.metadata.uid = Some("second-uid".to_owned());
-    second.metadata.creation_timestamp = Some(time(1_000_000_000));
     let mut seen = after_first("1", 1);
     seen.control_planes.push(taken);
-    seen.data_planes.push(second);
     assert!(
         operator.step(&api, &seen, &time(10), &said.say()).await,
         "{:?}",
@@ -800,7 +795,6 @@ async fn a_second_data_plane_and_a_name_taken_are_refused_and_nothing_is_made_fo
     );
     let asked = fake.seen();
     let late = "/apis/gateway.edgerush.dev/v1alpha1/namespaces/late/controlplanes/edge";
-    let second = "/apis/gateway.edgerush.dev/v1alpha1/namespaces/edge/dataplanes/second";
     assert_eq!(
         status_written(&asked, late),
         conditions_of(&[
@@ -808,21 +802,64 @@ async fn a_second_data_plane_and_a_name_taken_are_refused_and_nothing_is_made_fo
             ("Programmed", "False", "Pending")
         ])
     );
-    assert_eq!(
-        status_written(&asked, second),
-        conditions_of(&[
-            ("Accepted", "False", "OneDataPlaneOnly"),
-            ("Programmed", "False", "Pending")
-        ])
-    );
     assert!(
         !writes(&asked)
             .iter()
             .any(|write| write.contains("namespaces/late/")
-                && !write.ends_with(&format!("edge/status{APPLY}"))
-                || write.contains("second") && !write.ends_with(&format!("second/status{APPLY}"))),
+                && !write.ends_with(&format!("edge/status{APPLY}"))),
         "made for one refused: {:?}",
         writes(&asked)
+    );
+}
+
+/// A second DataPlane of one ControlPlane is accepted, and has every object of its own
+/// made beside the first's, none of them the first's, whose status is left as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_data_plane_of_a_control_plane_is_accepted_and_has_its_own_objects_made() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let mut value = data_plane_json();
+    value["metadata"]["name"] = "api".into();
+    value["metadata"]["uid"] = "api-uid".into();
+    value["metadata"]["creationTimestamp"] = "2027-01-15T09:00:00Z".into();
+    value["spec"]["gateway"] = serde_json::json!({
+        "listeners": [{ "name": "http", "port": 8080, "protocol": "HTTP" }],
+    });
+    let api_plane: DataPlane = serde_json::from_value(value).unwrap();
+    let mut seen = after_first("1", 1);
+    seen.data_planes.push(api_plane.clone());
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    let second = "/apis/gateway.edgerush.dev/v1alpha1/namespaces/edge/dataplanes/api";
+    assert_eq!(
+        status_written(&asked, second),
+        conditions_of(&[
+            ("Accepted", "True", "Accepted"),
+            ("Programmed", "False", "Pending")
+        ])
+    );
+    let writes = writes(&asked);
+    let (_, for_web) = made_published();
+    let (_, for_api) = made_for(&published(control_plane("Same"), BUNDLE), &api_plane);
+    for object in &for_api {
+        let path = path_of(object);
+        assert!(
+            writes.contains(&format!("PATCH {path}{APPLY}")),
+            "{path} not applied: {writes:?}"
+        );
+        assert!(
+            !for_web.iter().any(|web| path_of(web) == path),
+            "{path} is DataPlane web's too"
+        );
+    }
+    assert!(
+        !writes.contains(&format!("PATCH {DATA_PLANE}/status{APPLY}")),
+        "DataPlane web's status written again: {writes:?}"
     );
 }
 

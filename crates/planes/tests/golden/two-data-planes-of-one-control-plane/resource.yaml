@@ -1,0 +1,32 @@
+# Two DataPlanes of one ControlPlane that watches the namespaces it selects, each serving
+# Ingress and Gateway API, one autoscaled: every object of each its own, none of one name,
+# in the namespaces selected and the cluster alike.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: shop, namespace: shop-edge, uid: 6f1c2b8e-0000-4000-8000-000000000005 }
+spec:
+  watch:
+    namespaces:
+      from: Selector
+      selector: { matchLabels: { team: shop } }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata: { name: web, namespace: shop-edge, uid: 0d6a9f3c-0000-4000-8000-000000000005 }
+spec:
+  controlPlaneRef: { name: shop }
+  replicas: { min: 2, max: 6 }
+  gateway:
+    listeners:
+      - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+  ingress: { httpPort: 80, httpsPort: 443 }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata: { name: api, namespace: shop-edge, uid: 0d6a9f3c-0000-4000-8000-000000000006 }
+spec:
+  controlPlaneRef: { name: shop }
+  gateway:
+    listeners:
+      - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+  ingress: { httpPort: 80, httpsPort: 443 }
