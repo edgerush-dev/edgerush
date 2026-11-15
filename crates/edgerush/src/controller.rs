@@ -22,7 +22,7 @@ use edgerush_controller::expiry::Expiry;
 use edgerush_controller::issuing::{self, Issuer};
 use edgerush_controller::own_pods::follow_own_pods;
 use edgerush_controller::{
-    Acks, Debounce, Membership, Reports, Said, ServiceNow, WatchScope, control,
+    Acks, Debounce, Membership, Planes, Reports, Said, ServiceNow, WatchScope, control,
 };
 use edgerush_kubernetes::lease::{self, elect};
 use edgerush_kubernetes::{ApiError, ApiServer, Listed, Retry, SERVICE_ACCOUNT, Scope, follow};
@@ -52,14 +52,16 @@ Usage: edgerush controller (--data-plane <FILE> | --control-plane <NAME> [--clus
          [--webhook-listen <ADDRESS> [--webhook-certificate <FILE> --webhook-key <FILE>]]
          [--metrics <ADDRESS>]
 
-Runs a control plane for one data plane, in a cluster: follows the IngressClasses,
+Runs a control plane for its data planes, in a cluster: follows the IngressClasses,
 Ingresses, Services and Secrets of its scope through the API server, found as a pod finds
-it, and translates them each time they change, once every kind has been listed whole. What
-each translation came to is said on stderr, as `edgerush validate` says it.
-The data plane's settings are a file's, with --data-plane, or, with --control-plane, the
-DataPlane of the pod's own namespace that names that ControlPlane, followed: a generation
-of it is acted on once the operator's Accepted condition is of it, the last accepted kept
-meanwhile, and nothing is translated until one is. What a DataPlane has no field for takes
+it, and translates them for each data plane on its own each time they change, once every
+kind has been listed whole. What each translation came to is said on stderr, as `edgerush
+validate` says it, under the DataPlane it is of.
+The data planes' settings are a file's, one, with --data-plane, or, with --control-plane,
+those of every DataPlane of the pod's own namespace that names that ControlPlane, followed:
+a generation of each is acted on once the operator's Accepted condition is of it, its last
+accepted kept meanwhile, and nothing is translated for it until one is. One added, edited
+or let go of leaves the others as they were. What a DataPlane has no field for takes
 its default: no authorities for wss backends, the data plane's own settings left out.
 With --listen, it serves the config stream there, gRPC over mutual TLS that data planes
 dial: each config translated is offered to the data plane whose certificate carries the
@@ -67,13 +69,13 @@ SPIFFE ID the settings state, its DataPlane's with --control-plane, or to any wh
 states none, and what each says of it is said on stderr; another is refused, and told
 why. The certificate, key and authorities are PEM files, read again every second, so that
 ones replaced serve the next connection. With --control-plane, the
-addresses of the gateway's own pods, every endpoint of its own Service and of the data
+addresses of the gateway's own pods, every endpoint of its own Service and of each data
 plane's, ready or not, as the EndpointSlices of the pod's own namespace say them, are sent
 on the stream too, for data planes never to send a request to.
-Where the data plane is a Gateway, its GatewayClass, the Gateway and each HTTPRoute of it
+Where a data plane is a Gateway, its GatewayClass, the Gateway and each HTTPRoute of it
 say in their status what is served of them, the Gateway programmed once every ready pod of
-the data plane runs its generation, as the data planes say on the stream.
-With --control-plane, it writes the data plane's Service, edgerush-proxy-<DATAPLANE>, as
+that data plane runs its generation, as the data planes say on the stream.
+With --control-plane, it writes each data plane's Service, edgerush-proxy-<DATAPLANE>, as
 its DataPlane shapes it, listing the ports each config handed on binds and Ingress's two;
 each Ingress served says that Service's addresses in its status, each of the class that is
 not says none, and the Gateway says them: a LoadBalancer's, once its load balancer gives
@@ -83,7 +85,7 @@ alone writes the Service and status; every one serves, and reports what its data
 Lease's namespace, <LEASE>-acks-<HOSTNAME>, owned by its Pod where EDGERUSH_POD_UID gives
 the Pod's UID, for the leader to merge.
 With --webhook-listen, it serves the admission webhook there, HTTPS, reviews POSTed to
-/validate: an Ingress of the data plane's class is refused where, alone, it does not
+/validate: an Ingress of a data plane's class is refused where, alone, it does not
 translate into something the data plane accepts. Its certificate and key are files read
 again every second, or, with --authority and no files, the control plane's own certificate,
 as the stream is served with, each one signed taking the next connection; nothing is
@@ -979,16 +981,20 @@ async fn control_until(
     };
     let scope = options.scope;
     let mut tasks = Vec::new();
-    // The data plane's settings, as they are or as its DataPlane says them. Held for as
+    // The data planes' settings, as they are or as their DataPlanes say them. Held for as
     // long as the control plane runs, as nothing more is said of fixed ones.
-    let (settings, planes) = watch::channel(None);
+    let (settings, planes) = watch::channel(Planes::new());
     let _fixed = match source {
         Source::Fixed(plane) => {
-            // The development harness's: no Service is written (05 §2).
-            settings.send_replace(Some(edgerush_controller::Settings {
-                plane,
-                service: None,
-            }));
+            // The development harness's one data plane, of no name: no Service is written
+            // (05 §2).
+            settings.send_replace(Planes::from([(
+                String::new(),
+                edgerush_controller::Settings {
+                    plane,
+                    service: None,
+                },
+            )]));
             Some(settings)
         }
         Source::Followed {
@@ -1044,13 +1050,13 @@ async fn control_until(
     let mut served = None;
     let offering = match listeners.stream {
         Some(serving) => {
-            let (offers, offered) = watch::channel(Served::Nobody);
+            let (offers, offered) = watch::channel(Served::default());
             // Whom the stream serves follows the settings, so that a data plane is let in or
             // refused as its DataPlane is served or not, before anything is translated for it.
             let (mut told, whose) = (planes.clone(), offers.clone());
             tasks.push(tokio::task::spawn_local(async move {
                 loop {
-                    let next = whom(told.borrow_and_update().as_ref());
+                    let next = whom(&told.borrow_and_update());
                     whose.send_if_modified(|served| served.serve(next));
                     if told.changed().await.is_err() {
                         return;
@@ -1205,7 +1211,13 @@ async fn control_until(
             },
             move |said| {
                 let mut text = told(&said, write_config.as_deref());
-                if let (Said::Translated { translation, id }, Some(offering)) = (&said, &offering) {
+                if let (
+                    Said::Translated {
+                        translation, id, ..
+                    },
+                    Some(offering),
+                ) = (&said, &offering)
+                {
                     // Writing to a `String` cannot fail.
                     let _ = match offering.offer(translation, *id) {
                         Ok(version) => write!(text, "\noffered as config {version}"),
@@ -1263,16 +1275,16 @@ struct Offering {
 
 impl Offering {
     /// Offers `translation`'s config to the data plane whose certificate carries `id`, or to
-    /// any the stream serves where it is none: its version, said as offered. What was
-    /// offered to another data plane is let go of, as it is no longer served.
+    /// any the stream serves where it is none, built on what it was offered last: its
+    /// version, said as offered. Every other data plane's offer is left as it was.
     fn offer(&self, translation: &Translation, id: Option<&str>) -> Result<String, OfferError> {
-        // Never a step back to a data plane served before: a translation is said only for
-        // the settings `control` serves now, as it begins again for another ID.
+        // Never a data plane no longer served: a translation is said only for those
+        // `control` serves now.
         let mut served = self.served.borrow().clone();
-        served.serve(Served::of(id));
+        let last = served.offer_to(id).ok().flatten().cloned();
         let offer = Offer::new(
             &translation.config,
-            served.offer().map(Arc::as_ref),
+            last.as_deref(),
             &mut self.versions.borrow_mut(),
         )?;
         let version = offer.version().to_owned();
@@ -1280,19 +1292,17 @@ impl Offering {
         let mut runs = self.runs.borrow_mut();
         runs.offered(&version, generation);
         said_runs(&self.pods, &runs);
-        served.offered(Arc::new(offer));
+        served.offered(id, Arc::new(offer));
         self.served.send_replace(served);
         Ok(version)
     }
 }
 
-/// Whom the stream serves of `settings`: the data plane whose certificate carries the ID
-/// they state, any the stream's authorities vouch for where they state none, and none
-/// without settings (05 §3).
-fn whom(settings: Option<&edgerush_controller::Settings>) -> Served {
-    settings.map_or(Served::Nobody, |settings| {
-        Served::of(settings.plane.id.as_deref())
-    })
+/// Whom the stream serves of `planes`: each data plane whose certificate carries the ID
+/// its settings state, any the stream's authorities vouch for where a settings file states
+/// none, and none without settings (05 §3).
+fn whom(planes: &Planes) -> Served {
+    Served::of(planes.values().map(|settings| settings.plane.id.as_deref()))
 }
 
 /// What a data plane said of the config it holds or runs.
@@ -1385,7 +1395,7 @@ fn said_runs(pods: &watch::Sender<Pods>, runs: &Runs) {
 /// its runtime cannot be started.
 fn hook(
     hooking: Hooking,
-    planes: watch::Receiver<Option<edgerush_controller::Settings>>,
+    planes: watch::Receiver<Planes>,
     said: mpsc::UnboundedSender<String>,
     mut stop: oneshot::Receiver<()>,
     ended: oneshot::Sender<()>,
@@ -1466,13 +1476,7 @@ fn hook(
                             listener,
                             accepting,
                             Bounds::default(),
-                            move |body| {
-                                review(
-                                    planes.borrow().as_ref().map(|settings| &settings.plane),
-                                    &classes.borrow(),
-                                    body,
-                                )
-                            },
+                            move |body| review(&planes.borrow(), &classes.borrow(), body),
                             async move {
                                 let _ = stop.await;
                             },
@@ -1496,12 +1500,12 @@ fn hook(
 /// describes judged alone, as `classes` say which is its: 503 until there are settings and
 /// the classes are listed, as there is nothing to say which is; 400 for what is not a
 /// review.
-fn review(plane: Option<&Plane>, classes: &Listed<IngressClass>, body: &[u8]) -> webhook::Answer {
+fn review(planes: &Planes, classes: &Listed<IngressClass>, body: &[u8]) -> webhook::Answer {
     let answer = |status, body: Vec<u8>| webhook::Answer { status, body };
-    let Some(plane) = plane else {
+    if planes.is_empty() {
         let why = "the data plane's settings are not known yet";
         return answer(StatusCode::SERVICE_UNAVAILABLE, why.as_bytes().to_vec());
-    };
+    }
     if !classes.listed {
         let why = "the IngressClasses are not listed yet";
         return answer(StatusCode::SERVICE_UNAVAILABLE, why.as_bytes().to_vec());
@@ -1509,7 +1513,10 @@ fn review(plane: Option<&Plane>, classes: &Listed<IngressClass>, body: &[u8]) ->
     match admission::read(body) {
         Ok(review) => {
             let refused = match &review.asked {
-                Asked::Ingress(ingress) => admission::judge(plane, &classes.objects, ingress),
+                // Only the data plane whose class it is says anything of it.
+                Asked::Ingress(ingress) => planes.values().find_map(|settings| {
+                    admission::judge(&settings.plane, &classes.objects, ingress)
+                }),
                 Asked::Other => None,
             };
             answer(
@@ -1626,6 +1633,19 @@ fn told_of(peer: SocketAddr, heard: &Heard) -> String {
     format!("data plane {peer}: {what}")
 }
 
+/// The line that says which data plane a translation is of, where it is of one of several
+/// DataPlanes: none for the development harness's one.
+fn of_data_plane(data_plane: &str) -> String {
+    if data_plane.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{data_plane}:
+"
+        )
+    }
+}
+
 /// What is said of `said`, the translation written to `write_config` first if it is one.
 fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
     match said {
@@ -1682,8 +1702,13 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
                 Err(error) => format!("status of {ingress} cannot be written ({said}): {error}"),
             }
         }
-        Said::Translated { translation, .. } => {
-            let mut text = described(translation);
+        Said::Translated {
+            data_plane,
+            translation,
+            ..
+        } => {
+            let mut text = of_data_plane(data_plane);
+            text.push_str(&described(translation));
             if let Some(path) = write_config {
                 // Writing to a `String` cannot fail.
                 let _ = match written(translation, path) {
@@ -1696,10 +1721,12 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
             text.trim_end().to_owned()
         }
         Said::Refused {
+            data_plane,
             translation,
             problems,
         } => {
-            let mut text = described(translation);
+            let mut text = of_data_plane(data_plane);
+            text.push_str(&described(translation));
             let _ = write!(
                 text,
                 "the data plane would refuse the config, which is not handed on:"

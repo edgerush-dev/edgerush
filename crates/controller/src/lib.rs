@@ -1,15 +1,16 @@
-//! EdgeRush's control plane ([04](../../../docs/04-control-plane.md)): the objects a data
-//! plane's config is made of, followed in the scope the control plane watches, translated
-//! for the data plane once every kind has been listed whole, and each config that compiles
-//! and differs from the last handed on. Where the data plane is a Gateway, the Gateway
-//! API's kinds are followed too, each while its CRD serves the version read
+//! EdgeRush's control plane ([04](../../../docs/04-control-plane.md)): the objects its data
+//! planes' configs are made of, followed once for them all in the scope the control plane
+//! watches, translated for each data plane on its own once every kind it needs has been
+//! listed whole, and each config that compiles and differs from that data plane's last
+//! handed on. Where a data plane is a Gateway, the Gateway API's kinds are followed too,
+//! each while its CRD serves the version read
 //! ([`gateway_api`](edgerush_kubernetes::gateway_api)).
 //!
 //! The changes of a moment make one translation: it waits until no change has come for
 //! [`Debounce::quiet`], and never more than [`Debounce::most`] after the first it waits on
 //! (04 §2). Each translation is whole, of everything followed, and pure
 //! ([`edgerush_translate`]); the follows and the waiting are all that is not. It writes the
-//! status of the data plane's GatewayClass, its Gateway and each route of that Gateway
+//! status of each data plane's GatewayClass, its Gateway and each route of that Gateway
 //! (HTTPRoute, GRPCRoute or TLSRoute) as the config handed on serves them, merged with what each says now as the spec has it;
 //! where it writes the data plane's Service, each Ingress's likewise (04 §6), [`status`],
 //! the addresses that Service gives in both. That Service it writes as the config handed
@@ -35,8 +36,7 @@ use edgerush_kubernetes::{
 };
 use edgerush_planes::objects::{ProxyService, SERVICE_MANAGED_BY, Transports};
 use edgerush_translate::{
-    Cluster, GatewayName, GatewayStatus, Object, Plane, PolicyStatus, RouteStatus, Translation,
-    translate,
+    Cluster, GatewayStatus, Object, Plane, PolicyStatus, RouteStatus, Translation, translate,
 };
 use gateway_status::Programmed;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
@@ -65,10 +65,10 @@ pub mod status;
 
 use edgerush_kubernetes::gateway_api::{GatewayKind, Served};
 
-/// What a control plane serves: the settings its data plane's config is translated for,
-/// and, where its DataPlane states them, the data plane's Service it writes (05 §2), whose
-/// addresses its statuses say. The development harness's settings have no Service, and
-/// its statuses say no address.
+/// What a control plane serves of one data plane: the settings its config is translated
+/// for, and, where its DataPlane states them, the data plane's Service it writes (05 §2),
+/// whose addresses its statuses say. The development harness's settings have no Service,
+/// and its statuses say no address.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     /// What translation is given.
@@ -76,6 +76,10 @@ pub struct Settings {
     /// The data plane's Service, but for its ports.
     pub service: Option<ProxyService>,
 }
+
+/// The data planes a control plane serves, each by its DataPlane as it is said,
+/// `DataPlane <namespace>/<name>`; the development harness's one by no name.
+pub type Planes = BTreeMap<String, Settings>;
 
 /// How long the data plane's pods are waited on to run a generation of its Gateway before
 /// its `Programmed` says false (04 §6).
@@ -151,6 +155,8 @@ pub enum Said<'a> {
     /// whose certificate carries `id`, or of any the stream serves where its settings state
     /// none, as the stream offers it to that data plane alone (05 §3).
     Translated {
+        /// The data plane, as [`Planes`] names it.
+        data_plane: &'a str,
         /// The translation.
         translation: &'a Translation,
         /// The data plane's ID.
@@ -160,6 +166,8 @@ pub enum Said<'a> {
     /// stays. Each object is compiled alone as it is translated, and left out if it is
     /// refused (04 §2), so only the data plane's own settings come to this.
     Refused {
+        /// The data plane, as [`Planes`] names it.
+        data_plane: &'a str,
         /// The translation.
         translation: &'a Translation,
         /// Why the data plane would refuse it.
@@ -233,25 +241,24 @@ pub enum Membership {
     Left,
 }
 
-/// Follows, through `api`, the kinds `plane`'s config is made of in `scope`,
-/// IngressClasses in the cluster, and translates them for it each time they
-/// change, once every one has been listed whole; says how it goes to `said`. Where `plane`
-/// names a Gateway, the Gateway API's kinds are followed too, GatewayClasses in the
-/// cluster and Gateways in that Gateway's namespace alone, each from when its CRD is listed
-/// and serves the version read until it no longer does, and Namespaces in the cluster. Where
-/// the settings hold the data plane's Service, it writes that Service as each config handed
-/// on binds, follows it, and writes each Ingress's status to say the addresses it gives as
-/// the config handed on serves the Ingress, where it says otherwise. It writes that of the
-/// data plane's GatewayClass, its Gateway (those addresses among it, or none without that
-/// Service) and each HTTPRoute, GRPCRoute and TLSRoute that names or named that Gateway
-/// likewise, always. With `leading`,
-/// only while it says this replica leads, every status that says otherwise written as it
-/// comes to (02 §3).
-/// The data plane's settings are what `planes` holds, as it changes: none, and nothing is
-/// followed or translated until it holds some. A change that leaves what is followed as it
-/// was, such as an Ingress's redirect or its Service's type, is translated and written again
-/// as any change is; one that changes it, the data plane's Gateway or its own Service, has
-/// the follows begun again for it
+/// Follows, through `api`, the kinds the configs of the data planes `planes` holds are made
+/// of in `scope`, IngressClasses in the cluster, and translates them for each data plane on
+/// its own each time they change, once every one it needs has been listed whole; says how
+/// it goes to `said`. Where a data plane names a Gateway, the Gateway API's kinds are
+/// followed too, GatewayClasses in the cluster and Gateways in the namespaces of the
+/// Gateways named alone, each from when its CRD is listed and serves the version read until
+/// it no longer does, and Namespaces in the cluster. Where a data plane's settings hold its
+/// Service, it writes that Service as each config handed on for it binds, follows it, and
+/// writes each Ingress's status to say the addresses it gives as that config serves the
+/// Ingress, where it says otherwise. It writes that of each data plane's GatewayClass, its
+/// Gateway (those addresses among it, or none without that Service) and each route that
+/// names or named that Gateway likewise, always. With `leading`, only while it says this
+/// replica leads, every status that says otherwise written as it comes to (02 §3).
+/// The data planes are what `planes` holds, as it changes: none, and nothing is followed or
+/// translated until it holds some. One added, edited or let go of leaves the others as they
+/// were: what is followed for all of them is followed on, and only what that one alone
+/// needed started or stopped; an edit is translated and written again as any change is,
+/// and one of another ID begins its data plane's translation afresh
 /// ([05 §3](../../../docs/05-operator.md)).
 /// Runs for as long as it is polled, its follows ended with it. For a thread and runtime of
 /// its own, in a `LocalSet`.
@@ -259,7 +266,7 @@ pub enum Membership {
 pub async fn control(
     api: ApiServer,
     scope: &WatchScope,
-    mut planes: watch::Receiver<Option<Settings>>,
+    mut planes: watch::Receiver<Planes>,
     debounce: Debounce,
     leading: Option<watch::Receiver<bool>>,
     acks: Acks,
@@ -268,60 +275,126 @@ pub async fn control(
     let api = Rc::new(api);
     let said: Rc<dyn Fn(Said<'_>)> = Rc::new(said);
     loop {
-        let settings = planes.borrow_and_update().clone();
-        match settings {
-            Some(settings) => {
-                serve(
-                    &api,
-                    scope,
-                    settings,
-                    &mut planes,
-                    debounce,
-                    leading.as_ref(),
-                    &acks,
-                    &said,
-                )
-                .await;
-            }
+        if planes.borrow_and_update().is_empty() {
             // Settings that will never come are nothing to serve.
+            if planes.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        serve(
+            &api,
+            scope,
+            &mut planes,
+            debounce,
+            leading.as_ref(),
+            &acks,
+            &said,
+        )
+        .await;
+    }
+}
+
+/// What the data planes served shape of what is followed for them all: the namespaces of
+/// their Gateways, of the Services written, and of their own Services, whose ready pods
+/// are counted, each once and in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Shape {
+    gateways: Vec<Scope>,
+    services: Vec<Scope>,
+    own_services: Vec<Scope>,
+}
+
+impl Shape {
+    fn of(planes: &Planes) -> Self {
+        let namespaces = |of: &dyn Fn(&Settings) -> Option<String>| -> Vec<Scope> {
+            planes
+                .values()
+                .filter_map(of)
+                .collect::<BTreeSet<String>>()
+                .into_iter()
+                .map(Scope::Namespace)
+                .collect()
+        };
+        Self {
+            gateways: namespaces(&|settings| {
+                settings
+                    .plane
+                    .gateway
+                    .as_ref()
+                    .map(|gateway| gateway.namespace.clone())
+            }),
+            services: namespaces(&|settings| {
+                settings
+                    .service
+                    .as_ref()
+                    .map(|service| service.namespace().to_owned())
+            }),
+            own_services: namespaces(&|settings| {
+                own_service(&settings.plane).map(|service| service.namespace)
+            }),
+        }
+    }
+}
+
+/// What is served of one data plane: its settings, and what was last translated, handed
+/// on and written for it, each apart from every other data plane's.
+struct Serving {
+    settings: Settings,
+    translator: Translator,
+    /// What the config handed on serves: the Ingresses claimed, and those served.
+    handed: Option<(Vec<Object>, Vec<Object>)>,
+    /// What the config handed on says the Gateway API's objects' status is to say.
+    handed_api: Option<Handed>,
+    /// The ports the config handed on binds.
+    handed_ports: Option<BTreeMap<u16, Transports>>,
+    /// The generation of the Gateway handed on, and when it was first.
+    handed_since: Option<(i64, Instant)>,
+    /// Its Service as this replica last wrote it while it leads, and what was last said of
+    /// it that is said once.
+    written: Written,
+}
+
+impl Serving {
+    fn new(settings: Settings) -> Self {
+        Self {
+            settings,
+            translator: Translator::default(),
+            handed: None,
+            handed_api: None,
+            handed_ports: None,
+            handed_since: None,
+            written: Written::default(),
+        }
+    }
+}
+
+/// Each data plane served, as `planes` now has them: one of the same ID as before taken
+/// on with its new settings, what was handed for it kept to be bettered, and one of
+/// another ID, or new, begun afresh, so that what is translated for one data plane is
+/// never handed to another.
+fn served_now(serving: &mut BTreeMap<String, Serving>, planes: &Planes) {
+    serving.retain(|name, served| {
+        planes
+            .get(name)
+            .is_some_and(|settings| settings.plane.id == served.settings.plane.id)
+    });
+    for (name, settings) in planes {
+        match serving.get_mut(name) {
+            Some(served) => served.settings.clone_from(settings),
             None => {
-                if planes.changed().await.is_err() {
-                    return;
-                }
+                serving.insert(name.clone(), Serving::new(settings.clone()));
             }
         }
     }
 }
 
-/// What a data plane's settings shape of what is followed and translated: its ID, which
-/// another data plane's translation is never handed to, its Gateway, its own Service as it
-/// names its pods, and the namespace of the Service written.
-fn shape(
-    settings: &Settings,
-) -> (
-    Option<String>,
-    Option<GatewayName>,
-    Option<ServiceName>,
-    Option<String>,
-) {
-    (
-        settings.plane.id.clone(),
-        settings.plane.gateway.clone(),
-        own_service(&settings.plane),
-        settings
-            .service
-            .as_ref()
-            .map(|service| service.namespace().to_owned()),
-    )
-}
-
-/// [`control`] for `plane`, until `planes` holds none, or settings of another [`shape`].
+/// [`control`] for the data planes `planes` holds, until it holds none.
 #[allow(clippy::too_many_arguments)]
 async fn serve(
     api: &Rc<ApiServer>,
     scope: &WatchScope,
-    mut settings: Settings,
-    planes: &mut watch::Receiver<Option<Settings>>,
+    planes: &mut watch::Receiver<Planes>,
     debounce: Debounce,
     leading: Option<&watch::Receiver<bool>>,
     acks: &Acks,
@@ -338,6 +411,8 @@ async fn serve(
             }
         });
     }
+    let first = planes.borrow_and_update().clone();
+    let shape = Shape::of(&first);
     let mut start = Start {
         tasks: &mut tasks,
         api,
@@ -356,28 +431,14 @@ async fn serve(
                 .next(),
         ),
     };
-    // A Gateway's certificateRefs of its own namespace need no grant, and are read there
-    // whatever the scope (04 §1).
-    let gateway_namespace = settings
-        .plane
-        .gateway
-        .as_ref()
-        .map(|gateway| Scope::Namespace(gateway.namespace.clone()));
     let mut followed = Followed {
         ingress_classes: start.follows(&[Scope::Cluster]),
         ingresses: start.follows(&parts),
         services: start.follows(&parts),
-        secrets: start.follows(&with_gateway_namespace(&parts, gateway_namespace.as_ref())),
-        gateway_namespace,
-        own_services: match &settings.service {
-            Some(service) => start.follows(&[Scope::Namespace(service.namespace().to_owned())]),
-            None => Vec::new(),
-        },
-        gateway_api: settings
-            .plane
-            .gateway
-            .as_ref()
-            .map(|gateway| GatewayApi::start(&mut start, gateway)),
+        secrets: start.follows(&with_gateway_namespaces(&parts, &shape.gateways)),
+        own_services: start.follows(&shape.services),
+        gateway_api: (!shape.gateways.is_empty())
+            .then(|| GatewayApi::start(&mut start, &shape.gateways)),
         watched: match scope {
             WatchScope::Parts(parts) => watched(parts),
             WatchScope::Selector(_) => Some(Vec::new()),
@@ -390,10 +451,8 @@ async fn serve(
             Some(reports) => start.follows(&[Scope::Namespace(reports.namespace.clone())]),
             None => Vec::new(),
         },
-        ready: match own_service(&settings.plane) {
-            Some(service) => start.follows(&[Scope::Namespace(service.namespace)]),
-            None => Vec::new(),
-        },
+        ready: start.follows(&shape.own_services),
+        shape,
     };
     // What this replica's pods run changing is a change.
     {
@@ -404,8 +463,6 @@ async fn serve(
             }
         });
     }
-    // The generation of the Gateway handed on, and when it was first.
-    let mut handed_since: Option<(i64, Instant)> = None;
     // Coming to lead is a change: every status is looked at, as the last leader may have
     // left some stale.
     if let Some(leading) = leading {
@@ -416,25 +473,28 @@ async fn serve(
             }
         });
     }
+    let mut serving = BTreeMap::new();
+    served_now(&mut serving, &first);
     let mut waiting = Waiting::default();
-    let mut translator = Translator::default();
-    // What the config handed on serves: the Ingresses claimed, and those served.
-    let mut handed: Option<(Vec<Object>, Vec<Object>)> = None;
-    // What the config handed on says the Gateway API's objects' status is to say.
-    let mut handed_api: Option<Handed> = None;
-    // The ports the config handed on binds.
-    let mut handed_ports: Option<BTreeMap<u16, Transports>> = None;
-    // The data plane's Service as this replica last wrote it while it leads, and what was
-    // last said of it that is said once.
-    let mut written = Written::default();
+    // The follows last said to be waited on.
+    let mut said_unlisted: Option<Vec<String>> = None;
     loop {
-        // New settings: translated as any change is, unless what is followed is theirs no
-        // longer. A sender gone leaves them as they were.
+        // New settings: what they alone need followed started, what none needs any more
+        // stopped, the rest followed on. A sender gone leaves them as they were.
         if planes.has_changed().unwrap_or(false) {
-            match planes.borrow_and_update().clone() {
-                Some(next) if shape(&next) == shape(&settings) => settings = next,
-                _ => return,
+            let now = planes.borrow_and_update().clone();
+            if now.is_empty() {
+                return;
             }
+            let mut start = Start {
+                tasks: &mut tasks,
+                api,
+                changed: &changed,
+                said,
+                joining: followed.joining.clone(),
+            };
+            followed.reshape(Shape::of(&now), &mut start);
+            served_now(&mut serving, &now);
         }
         // The namespaces of a selector, followed as they come to match and stop.
         if let Some(matching) = followed.matching() {
@@ -477,105 +537,70 @@ async fn serve(
         }
         // Follows stopped are aborted: what is left of them is let go of.
         while tasks.try_join_next().is_some() {}
-        match translator.step(&settings.plane, followed.unlisted(), || followed.cluster()) {
-            Step::Nothing => {}
-            Step::Waiting(unlisted) => said(Said::Waiting(unlisted)),
-            Step::Translated(translation) => {
-                handed = Some((translation.claimed.clone(), translation.served.clone()));
-                handed_ports = Some(service::bound(&translation.config));
-                handed_api = Handed::of(translation);
-                if let Some(handed) = &handed_api {
-                    let generation = handed.status.generation;
-                    if handed_since.is_none_or(|(since, _)| since != generation) {
-                        handed_since = Some((generation, Instant::now()));
-                    }
-                }
-                said(Said::Translated {
-                    translation,
-                    id: settings.plane.id.as_deref(),
-                });
+        // Each data plane translated on its own, once what it needs is listed whole: the
+        // Gateway API's kinds only where it is a Gateway. The objects are taken once for
+        // them all.
+        let (unlisted, unlisted_api) = followed.unlisted();
+        let every = unlisted.iter().chain(&unlisted_api).cloned().collect();
+        if let Some(waited) = wait_said(&mut said_unlisted, every) {
+            said(Said::Waiting(waited));
+        }
+        let mut cluster = None;
+        for (name, served) in &mut serving {
+            let is_gateway = served.settings.plane.gateway.is_some();
+            if !unlisted.is_empty() || (is_gateway && !unlisted_api.is_empty()) {
+                continue;
             }
-            Step::Refused {
-                translation,
-                problems,
-            } => said(Said::Refused {
-                translation,
-                problems: &problems,
-            }),
+            let cluster = cluster.get_or_insert_with(|| followed.cluster());
+            match served.translator.step(&served.settings.plane, cluster) {
+                Step::Nothing => {}
+                Step::Translated(translation) => {
+                    served.handed = Some((translation.claimed.clone(), translation.served.clone()));
+                    served.handed_ports = Some(service::bound(&translation.config));
+                    served.handed_api = Handed::of(translation);
+                    if let Some(handed) = &served.handed_api {
+                        let generation = handed.status.generation;
+                        if served
+                            .handed_since
+                            .is_none_or(|(since, _)| since != generation)
+                        {
+                            served.handed_since = Some((generation, Instant::now()));
+                        }
+                    }
+                    said(Said::Translated {
+                        data_plane: name,
+                        translation,
+                        id: served.settings.plane.id.as_deref(),
+                    });
+                }
+                Step::Refused {
+                    translation,
+                    problems,
+                } => said(Said::Refused {
+                    data_plane: name,
+                    translation,
+                    problems: &problems,
+                }),
+            }
         }
         // Every round, so that a status changed by another, or written in vain, is written
         // again; one at a time, which is all the pace there is. A status written is a change
-        // to its object, and the round it brings finds nothing more to write. The data
+        // to its object, and the round it brings finds nothing more to write. Each data
         // plane's addresses, where it writes its Service, once that Service's namespace is
         // listed, from that Service if it is its DataPlane's.
         let leads = leading.is_none_or(|leads| *leads.borrow());
-        let own = settings.service.as_ref();
-        let live = own.and_then(|own| followed.own_service(own));
-        if let (Some(own), Some(ports), true, true) =
-            (own, &handed_ports, followed.own_listed(), leads)
-        {
-            written.write(api, own, live.as_ref(), ports, &**said).await;
-        } else if !leads {
-            // A leader before it may have written it otherwise: looked at afresh as it
-            // comes to lead.
-            written = Written::default();
+        for served in serving.values_mut() {
+            write_statuses(api, &followed, served, acks, leads, &**said).await;
         }
-        let addresses = match own {
-            _ if !followed.own_listed() => None,
-            None => Some(Vec::new()),
-            Some(own) => {
-                let ours = live
-                    .as_ref()
-                    .filter(|live| service::ours(live, own.owner_uid()));
-                Some(
-                    service::addresses(ours)
-                        .iter()
-                        .map(|address| status::address(address))
-                        .collect(),
-                )
-            }
-        };
-        // The Gateway API's, always, as the spec has every controller write them (04 §6).
-        if let (Some(gateway_api), Some(handed), Some(addresses), true) =
-            (&followed.gateway_api, &handed_api, &addresses, leads)
-        {
-            let addresses = gateway_status::addresses(addresses);
-            let pods = followed.pods(acks);
-            let ready = own_service(&settings.plane).map(|service| followed.ready(&service));
-            let overdue =
-                handed_since.is_some_and(|(_, since)| since.elapsed() >= PROGRAMMED_WITHIN);
-            let programmed =
-                Programmed::of(handed.status.generation, &pods, ready.as_deref(), overdue);
-            gateway_api
-                .write_statuses(api, handed, &addresses, &programmed, &**said)
-                .await;
-        }
-        // An Ingress's only where the control plane writes the Service its addresses are.
-        if let (Some(_), Some((claimed, served)), Some(addresses), true) =
-            (own, &handed, &addresses, leads)
-        {
-            let ingresses = followed.ingresses();
-            for change in status::changes(claimed, served, &ingresses, addresses) {
-                let written = match status::patch(&change.addresses) {
-                    Ok(patch) => {
-                        let object = &change.ingress;
-                        api.patch_status::<Ingress>(&object.namespace, &object.name, &patch)
-                            .await
-                    }
-                    Err(error) => Err(ApiError::Unreadable(error.to_string())),
-                };
-                said(Said::Status {
-                    ingress: &change.ingress,
-                    addresses: &change.addresses,
-                    written: written.as_ref().map(|_| ()),
-                });
-            }
-        }
-        // Until a change comes, or the bound its pods are waited on to run the Gateway's
-        // generation, and then until its moment is over.
-        let bound = handed_since
+        // Until a change comes, or the bound a data plane's pods are waited on to run its
+        // Gateway's generation, and then until its moment is over.
+        let now = Instant::now();
+        let bound = serving
+            .values()
+            .filter_map(|served| served.handed_since)
             .map(|(_, since)| since + PROGRAMMED_WITHIN)
-            .filter(|bound| *bound > Instant::now());
+            .filter(|bound| *bound > now)
+            .min();
         match bound {
             Some(bound) => {
                 if tokio::time::timeout_at(bound, changed.notified())
@@ -597,6 +622,84 @@ async fn serve(
             } else {
                 waiting = Waiting::default();
             }
+        }
+    }
+}
+
+/// Writes, as far as `leads`, each status of `served`'s data plane that says other than
+/// what was handed on for it: its Service, its Gateway's and the Gateway API's objects of
+/// it, and its Ingresses'.
+async fn write_statuses(
+    api: &ApiServer,
+    followed: &Followed,
+    served: &mut Serving,
+    acks: &Acks,
+    leads: bool,
+    said: &dyn Fn(Said<'_>),
+) {
+    let own = served.settings.service.as_ref();
+    let live = own.and_then(|own| followed.own_service(own));
+    if let (Some(own), Some(ports), true, true) =
+        (own, &served.handed_ports, followed.own_listed(), leads)
+    {
+        served
+            .written
+            .write(api, own, live.as_ref(), ports, said)
+            .await;
+    } else if !leads {
+        // A leader before it may have written it otherwise: looked at afresh as it comes
+        // to lead.
+        served.written = Written::default();
+    }
+    let addresses = match own {
+        _ if !followed.own_listed() => None,
+        None => Some(Vec::new()),
+        Some(own) => {
+            let ours = live
+                .as_ref()
+                .filter(|live| service::ours(live, own.owner_uid()));
+            Some(
+                service::addresses(ours)
+                    .iter()
+                    .map(|address| status::address(address))
+                    .collect(),
+            )
+        }
+    };
+    // The Gateway API's, always, as the spec has every controller write them (04 §6).
+    if let (Some(gateway_api), Some(handed), Some(addresses), true) =
+        (&followed.gateway_api, &served.handed_api, &addresses, leads)
+    {
+        let addresses = gateway_status::addresses(addresses);
+        let pods = followed.pods(acks);
+        let ready = own_service(&served.settings.plane).map(|service| followed.ready(&service));
+        let overdue = served
+            .handed_since
+            .is_some_and(|(_, since)| since.elapsed() >= PROGRAMMED_WITHIN);
+        let programmed = Programmed::of(handed.status.generation, &pods, ready.as_deref(), overdue);
+        gateway_api
+            .write_statuses(api, handed, &addresses, &programmed, said)
+            .await;
+    }
+    // An Ingress's only where the control plane writes the Service its addresses are.
+    if let (Some(_), Some((claimed, served)), Some(addresses), true) =
+        (own, &served.handed, &addresses, leads)
+    {
+        let ingresses = followed.ingresses();
+        for change in status::changes(claimed, served, &ingresses, addresses) {
+            let written = match status::patch(&change.addresses) {
+                Ok(patch) => {
+                    let object = &change.ingress;
+                    api.patch_status::<Ingress>(&object.namespace, &object.name, &patch)
+                        .await
+                }
+                Err(error) => Err(ApiError::Unreadable(error.to_string())),
+            };
+            said(Said::Status {
+                ingress: &change.ingress,
+                addresses: &change.addresses,
+                written: written.as_ref().map(|_| ()),
+            });
         }
     }
 }
@@ -752,9 +855,9 @@ struct GatewayApi {
     /// Every Namespace, for the labels a listener's selector of namespaces matches: a kind
     /// every cluster has, so followed whatever the CRDs say.
     namespaces: Vec<Follow<Namespace>>,
-    /// The data plane's Gateway's namespace: the one Gateways are followed in, as no other
-    /// Gateway is read (04 §2).
-    namespace: Scope,
+    /// The namespaces of the data planes' Gateways: those Gateways are followed in, as no
+    /// other Gateway is read (04 §2).
+    gateway_namespaces: Vec<Scope>,
     /// What was last said of the kinds, and followed by.
     last: Option<Vec<(GatewayKind, Served)>>,
     gateway_classes: Option<Vec<Follow<GatewayClass>>>,
@@ -774,7 +877,7 @@ struct GatewayApi {
 
 impl GatewayApi {
     /// Starts following each kind's CRD; the kinds wait on what they say.
-    fn start(start: &mut Start<'_>, gateway: &GatewayName) -> Self {
+    fn start(start: &mut Start<'_>, gateways: &[Scope]) -> Self {
         let crds = GatewayKind::ALL
             .into_iter()
             .flat_map(|kind| {
@@ -787,7 +890,7 @@ impl GatewayApi {
         Self {
             crds,
             namespaces: start.follows(&[Scope::Cluster]),
-            namespace: Scope::Namespace(gateway.namespace.clone()),
+            gateway_namespaces: gateways.to_vec(),
             last: None,
             gateway_classes: None,
             gateways: None,
@@ -815,7 +918,7 @@ impl GatewayApi {
     }
 
     /// Follows each kind `served` says is served, in `scope` (GatewayClasses in the
-    /// cluster, Gateways in the data plane's Gateway's namespace; ListenerSets, HTTPRoutes,
+    /// cluster, Gateways in the namespaces of the data planes' Gateways; ListenerSets, HTTPRoutes,
     /// GRPCRoutes, TLSRoutes, TCPRoutes, UDPRoutes, ReferenceGrants and BackendTLSPolicies
     /// in `scope`, with the ConfigMaps there while BackendTLSPolicies are), and stops
     /// following each it says is not.
@@ -829,11 +932,11 @@ impl GatewayApi {
                     });
                 }
                 GatewayKind::Gateway => {
-                    let namespace = std::slice::from_ref(&self.namespace);
-                    keep(&mut self.gateways, on, || start.follows(namespace));
+                    let namespaces = &self.gateway_namespaces;
+                    keep(&mut self.gateways, on, || start.follows(namespaces));
                 }
                 GatewayKind::ListenerSet => {
-                    let scope = with_gateway_namespace(scope, Some(&self.namespace));
+                    let scope = with_gateway_namespaces(scope, &self.gateway_namespaces);
                     keep(&mut self.listener_sets, on, || start.follows(&scope));
                 }
                 GatewayKind::HTTPRoute => keep(&mut self.http_routes, on, || start.follows(scope)),
@@ -880,8 +983,20 @@ impl GatewayApi {
             .chain(unlisted(self.config_maps.as_deref().unwrap_or_default()))
     }
 
+    /// The follows made to follow the Gateways of `gateways`, the namespaces of the data
+    /// planes' Gateways now, Gateways and ListenerSets there, in the watch scope `parts`.
+    fn reshape(&mut self, gateways: &[Scope], parts: &[Scope], start: &mut Start<'_>) {
+        if let Some(follows) = &mut self.gateways {
+            rescope(follows, gateways, start);
+        }
+        if let Some(follows) = &mut self.listener_sets {
+            rescope(follows, &with_gateway_namespaces(parts, gateways), start);
+        }
+        self.gateway_namespaces = gateways.to_vec();
+    }
+
     /// The follows of each kind followed in the watch scope made to follow `parts`, and
-    /// ListenerSets the Gateway's namespace beside them.
+    /// ListenerSets the Gateways' namespaces beside them.
     fn rescope(&mut self, parts: &[Scope], start: &mut Start<'_>) {
         fn each<K: Kind + 'static>(
             slot: &mut Option<Vec<Follow<K>>>,
@@ -892,7 +1007,7 @@ impl GatewayApi {
                 rescope(follows, parts, start);
             }
         }
-        let listener_sets = with_gateway_namespace(parts, Some(&self.namespace));
+        let listener_sets = with_gateway_namespaces(parts, &self.gateway_namespaces);
         each(&mut self.listener_sets, &listener_sets, start);
         each(&mut self.http_routes, parts, start);
         each(&mut self.grpc_routes, parts, start);
@@ -1207,13 +1322,14 @@ struct Followed {
     ingresses: Vec<Follow<Ingress>>,
     services: Vec<Follow<Service>>,
     secrets: Vec<Follow<Secret>>,
-    /// The data plane's Gateway's namespace, where it names one, whose Secrets are followed
-    /// whatever the scope.
-    gateway_namespace: Option<Scope>,
-    /// The namespace of the data plane's Service, where the control plane writes it,
-    /// followed for what it is and the addresses it gives.
+    /// What the data planes shape of what is followed: the namespaces of their Gateways,
+    /// whose Secrets are followed whatever the scope, of the Services written and of their
+    /// own Services.
+    shape: Shape,
+    /// The namespaces of the data planes' Services, where the control plane writes them,
+    /// followed for what they are and the addresses they give.
     own_services: Vec<Follow<Service>>,
-    /// The Gateway API's kinds, where the data plane is a Gateway.
+    /// The Gateway API's kinds, where a data plane is a Gateway.
     gateway_api: Option<GatewayApi>,
     /// The namespaces watched, where not every one is: of a selector, those joined.
     watched: Option<Vec<String>>,
@@ -1229,20 +1345,49 @@ struct Followed {
     joining: BTreeSet<String>,
     /// The namespace of the replicas' reports of what their pods run.
     reports: Vec<Follow<ConfigMap>>,
-    /// The namespace of the data plane's own Service, for its ready pods.
+    /// The namespaces of the data planes' own Services, for their ready pods.
     ready: Vec<Follow<EndpointSlice>>,
 }
 
 impl Followed {
-    /// The follows translation waits on that have not been listed whole, by name.
-    fn unlisted(&self) -> Vec<String> {
-        unlisted(self.selected.as_slice())
-            .chain(unlisted(&self.ingress_classes))
-            .chain(unlisted(&self.ingresses))
-            .chain(unlisted(&self.services))
-            .chain(unlisted(&self.secrets))
-            .chain(self.gateway_api.iter().flat_map(GatewayApi::unlisted))
-            .collect()
+    /// The follows translation waits on that have not been listed whole, by name: those
+    /// every data plane's waits on, and those of the Gateway API's kinds, which only a
+    /// Gateway's waits on.
+    fn unlisted(&self) -> (Vec<String>, Vec<String>) {
+        (
+            unlisted(self.selected.as_slice())
+                .chain(unlisted(&self.ingress_classes))
+                .chain(unlisted(&self.ingresses))
+                .chain(unlisted(&self.services))
+                .chain(unlisted(&self.secrets))
+                .collect(),
+            self.gateway_api
+                .iter()
+                .flat_map(GatewayApi::unlisted)
+                .collect(),
+        )
+    }
+
+    /// The follows made to follow what `next` shapes: what it alone needs started, what it
+    /// no longer needs stopped, and the rest followed on as it was, so that no data plane
+    /// added or let go of begins another's follows again (05 §3). The Gateway API's kinds
+    /// are followed while any data plane is a Gateway.
+    fn reshape(&mut self, next: Shape, start: &mut Start<'_>) {
+        if next == self.shape {
+            return;
+        }
+        let secrets = with_gateway_namespaces(&self.parts, &next.gateways);
+        rescope(&mut self.secrets, &secrets, start);
+        rescope(&mut self.own_services, &next.services, start);
+        rescope(&mut self.ready, &next.own_services, start);
+        if next.gateways.is_empty() {
+            self.gateway_api = None;
+        } else if let Some(gateway_api) = &mut self.gateway_api {
+            gateway_api.reshape(&next.gateways, &self.parts, start);
+        } else {
+            self.gateway_api = Some(GatewayApi::start(start, &next.gateways));
+        }
+        self.shape = next;
     }
 
     /// Whether the data plane's Service's namespace has been listed whole: what statuses
@@ -1256,9 +1401,10 @@ impl Followed {
 
     /// The data plane's Service `own` names, as it is now, if it is there.
     fn own_service(&self, own: &ProxyService) -> Option<Service> {
-        objects(&self.own_services)
-            .into_iter()
-            .find(|service| service.metadata.name.as_deref() == Some(own.name()))
+        objects(&self.own_services).into_iter().find(|service| {
+            service.metadata.namespace.as_deref() == Some(own.namespace())
+                && service.metadata.name.as_deref() == Some(own.name())
+        })
     }
 
     /// What each data-plane pod runs: as this replica's own say, and as every other
@@ -1396,7 +1542,7 @@ impl Followed {
         start.joining = self.joining.clone();
         rescope(&mut self.ingresses, &parts, start);
         rescope(&mut self.services, &parts, start);
-        let secrets = with_gateway_namespace(&parts, self.gateway_namespace.as_ref());
+        let secrets = with_gateway_namespaces(&parts, &self.shape.gateways);
         rescope(&mut self.secrets, &secrets, start);
         if let Some(gateway_api) = &mut self.gateway_api {
             gateway_api.rescope(&parts, start);
@@ -1463,18 +1609,19 @@ impl Followed {
     }
 }
 
-/// Where ListenerSets and Secrets are followed: the watch scope, as routes are, and the
-/// Gateway's own namespace, `gateway`, where the scope does not hold it, as a Gateway that
-/// takes ListenerSets `from: Same` takes them there, and its listeners' certificateRefs of
-/// its own namespace need no grant (04 §1).
-fn with_gateway_namespace(scope: &[Scope], gateway: Option<&Scope>) -> Vec<Scope> {
+/// Where ListenerSets and Secrets are followed: the watch scope, as routes are, and each
+/// Gateway's own namespace of `gateways` the scope does not hold, as a Gateway that takes
+/// ListenerSets `from: Same` takes them there, and its listeners' certificateRefs of its
+/// own namespace need no grant (04 §1).
+fn with_gateway_namespaces(scope: &[Scope], gateways: &[Scope]) -> Vec<Scope> {
     let mut followed = scope.to_vec();
-    if let Some(gateway) = gateway
-        && !scope
-            .iter()
-            .any(|part| *part == Scope::Cluster || part == gateway)
-    {
-        followed.push(gateway.clone());
+    if scope.contains(&Scope::Cluster) {
+        return followed;
+    }
+    for gateway in gateways {
+        if !followed.contains(gateway) {
+            followed.push(gateway.clone());
+        }
     }
     followed
 }
@@ -1609,22 +1756,31 @@ impl Waiting {
     }
 }
 
-/// What was last said of the objects followed, so that nothing is said twice.
+/// What there is to say of the follows waited on, `unlisted` now, `said` being what was
+/// said of them last: each wait once, and again only as it changes; nothing while none is.
+fn wait_said(said: &mut Option<Vec<String>>, unlisted: Vec<String>) -> Option<&[String]> {
+    if unlisted.is_empty() {
+        *said = None;
+        return None;
+    }
+    if said.as_ref() == Some(&unlisted) {
+        return None;
+    }
+    Some(said.insert(unlisted))
+}
+
+/// What was last translated for a data plane, so that nothing is said twice.
 #[derive(Debug, Default)]
 struct Translator {
-    /// The follows last said to be waited on.
-    unlisted: Option<Vec<String>>,
     /// The last translation said, handed on or refused.
     last: Option<Translation>,
 }
 
-/// What there is to say of the objects followed.
+/// What there is to say of the objects followed, for a data plane.
 #[derive(Debug, PartialEq)]
 enum Step<'a> {
     /// Nothing new.
     Nothing,
-    /// Not everything is listed, and these are not: fewer than last said.
-    Waiting(&'a [String]),
     /// A translation that compiles, and differs from the last.
     Translated(&'a Translation),
     /// A translation that differs from the last, which the data plane would refuse.
@@ -1635,20 +1791,9 @@ enum Step<'a> {
 }
 
 impl Translator {
-    /// Translates for `plane` the objects `cluster` gives, once `unlisted` is empty.
-    fn step(
-        &mut self,
-        plane: &Plane,
-        unlisted: Vec<String>,
-        cluster: impl FnOnce() -> Cluster,
-    ) -> Step<'_> {
-        if !unlisted.is_empty() {
-            if self.unlisted.as_ref() == Some(&unlisted) {
-                return Step::Nothing;
-            }
-            return Step::Waiting(self.unlisted.insert(unlisted));
-        }
-        let translation = translate(plane, &cluster());
+    /// Translates for `plane` the objects of `cluster`.
+    fn step(&mut self, plane: &Plane, cluster: &Cluster) -> Step<'_> {
+        let translation = translate(plane, cluster);
         if self.last.as_ref() == Some(&translation) {
             return Step::Nothing;
         }

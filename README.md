@@ -67,7 +67,8 @@ change takes over without dropping a request.
 
 ### In Kubernetes
 
-- **`edgerush controller`**, the control plane for one data plane. It follows
+- **`edgerush controller`**, the control plane for its data planes: one from a settings
+  file, or every `DataPlane` that names its `ControlPlane`, each translated on its own. It follows
   IngressClasses, Ingresses, Services and Secrets and translates them each time they
   change: Ingresses' rules and default backends, paths of every type, Services' ports
   spoken to as their `appProtocol` says, TLS from Secrets, and plain HTTP redirected to
@@ -218,7 +219,8 @@ edgerush controller --data-plane data-plane.yaml
 ```
 
 run in a cluster, follows the IngressClasses, Ingresses, Services and Secrets there and
-translates them for that data plane each time they change, once all have been listed. Each
+translates them for that data plane each time they change, once all have been listed (with
+`--control-plane`, for every `DataPlane` naming it, each on its own). Each
 translation is reported on stderr as `validate` reports it. The rest is chosen by flags:
 
 | Flags | What they do |
@@ -319,7 +321,7 @@ outside the workspace, the package is formatted on its own:
 crates/edgerush    the binary, one subcommand for each part (the operator's to come):
                    `edgerush proxy`, a data plane, its config from a file for development
                    (`--config file.yaml`) or from a control plane (`--control-plane`),
-                   `edgerush controller`, a control plane for one data plane, `edgerush explain`,
+                   `edgerush controller`, a control plane for its data planes, `edgerush explain`,
                    where a request would go and why, `edgerush test`, and `edgerush validate`,
                    which translates Kubernetes manifests
 crates/certificates
