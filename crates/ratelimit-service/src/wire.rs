@@ -1,11 +1,12 @@
-//! The protocol's messages on the wire: protobuf, derived from these structs, and the
-//! conversions to and from the protocol's own types (`edgerush_ratelimit::service`).
+//! What an entry of the asynchronous mode's carries on the wire ([`crate::cluster::wire`]): its
+//! contract and its report, as protobuf derived from these structs, and their conversions to
+//! and from the protocol's own types (`edgerush_ratelimit::service`).
 //!
 //! Protobuf is for version skew: a field a reader does not know is skipped, one it misses
-//! takes its default. A message the protocol cannot use — a key with no contract, a
-//! contract of zero — is refused whole rather than guessed at.
+//! takes its default. What the protocol cannot use — a key with no contract, a contract of
+//! zero — is refused whole rather than guessed at.
 
-use edgerush_ratelimit::service::{self, membership};
+use edgerush_ratelimit::service;
 use std::num::NonZeroU64;
 
 /// A limit's contract.
@@ -58,188 +59,6 @@ pub enum Report {
     Poll(Poll),
 }
 
-/// One key in a batch.
-#[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct Entry {
-    // Tag 6, a fixed window, is retired with the asynchronous mode's windows (#389): never reuse
-    // it.
-    /// The key.
-    #[prost(bytes = "vec", tag = "1")]
-    pub key: Vec<u8>,
-    /// Its contract.
-    #[prost(message, optional, tag = "2")]
-    pub contract: Option<Contract>,
-    /// What about it.
-    #[prost(oneof = "Report", tags = "3, 5")]
-    pub report: Option<Report>,
-}
-
-/// A data plane's batch.
-#[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct Batch {
-    /// The data plane.
-    #[prost(uint64, tag = "1")]
-    pub from: u64,
-    /// One entry per key, or a few.
-    #[prost(message, repeated, tag = "2")]
-    pub entries: Vec<Entry>,
-    // Tags 3 and 4 are not to be used again.
-    /// When the data plane made it, on its own clock, in nanoseconds: said back with the
-    /// answers.
-    #[prost(uint64, tag = "5")]
-    pub made_ns: u64,
-}
-
-/// A service pod's answer about one key.
-#[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct Answer {
-    /// The key.
-    #[prost(bytes = "vec", tag = "1")]
-    pub key: Vec<u8>,
-    /// How far the pod's bucket is from full, in time multiplied by the limit. Beyond
-    /// what 64 bits hold it is sent as the most they do, which only a bucket owing for
-    /// centuries reaches.
-    #[prost(uint64, tag = "2")]
-    pub behind: u64,
-    /// The highest of the receiver's batches applied.
-    #[prost(uint64, tag = "3")]
-    pub applied: u64,
-    /// How many other data planes are admitting the key.
-    #[prost(uint64, tag = "4")]
-    pub others: u64,
-    // Tags 6 and 7 are not to be used again.
-}
-
-/// Which service pods serve, as they agree.
-#[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct View {
-    /// Counted up with each change.
-    #[prost(uint64, tag = "1")]
-    pub epoch: u64,
-    /// The pods serving.
-    #[prost(uint32, repeated, tag = "2")]
-    pub pods: Vec<u32>,
-}
-
-/// A service pod's answers to a batch.
-#[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct Answers {
-    /// The service pod.
-    #[prost(uint32, tag = "1")]
-    pub from: u32,
-    /// One per entry for a key it owns.
-    #[prost(message, repeated, tag = "2")]
-    pub entries: Vec<Answer>,
-    /// The view it holds.
-    #[prost(message, optional, tag = "3")]
-    pub view: Option<View>,
-    // Tag 4 is not to be used again.
-    /// The pod's life; 0 leaves the answers unnumbered.
-    #[prost(uint64, tag = "5")]
-    pub life: u64,
-    /// Counted up with each answer the pod gives in its life.
-    #[prost(uint64, tag = "6")]
-    pub number: u64,
-    /// The batch's `made_ns`, said back; 0 from a pod that does not.
-    #[prost(uint64, tag = "7")]
-    pub made_ns: u64,
-}
-
-/// What an owner knows of one data plane.
-#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
-pub struct PlaneRecord {
-    /// The data plane.
-    #[prost(uint64, tag = "1")]
-    pub plane: u64,
-    /// The highest of its batches applied.
-    #[prost(uint64, tag = "2")]
-    pub applied: u64,
-    /// How long ago it last admitted the key, if it has.
-    #[prost(uint64, optional, tag = "3")]
-    pub admitted_ago: Option<u64>,
-    // Tags 4 to 7 are not to be used again.
-}
-
-/// An owner's copy of one key.
-#[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct Replica {
-    /// The key.
-    #[prost(bytes = "vec", tag = "1")]
-    pub key: Vec<u8>,
-    /// Its contract.
-    #[prost(message, optional, tag = "2")]
-    pub contract: Option<Contract>,
-    /// The bucket, as [`Answer::behind`].
-    #[prost(uint64, tag = "3")]
-    pub behind: u64,
-    /// Hits the count holds.
-    #[prost(uint64, tag = "4")]
-    pub counted: u64,
-    /// Every data plane it knows of.
-    #[prost(message, repeated, tag = "5")]
-    pub planes: Vec<PlaneRecord>,
-}
-
-/// An owner's copies, to another pod; or keys handed over to a new owner.
-#[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct Replicas {
-    /// The owner, or the pod that was.
-    #[prost(uint32, tag = "1")]
-    pub from: u32,
-    /// One per key.
-    #[prost(message, repeated, tag = "2")]
-    pub entries: Vec<Replica>,
-    /// Whether the keys are handed over.
-    #[prost(bool, tag = "3")]
-    pub handover: bool,
-    /// The epoch of the view the sender held.
-    #[prost(uint64, tag = "4")]
-    pub epoch: u64,
-}
-
-/// A pod in one of its lives.
-#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
-pub struct Life {
-    /// The pod.
-    #[prost(uint32, tag = "1")]
-    pub pod: u32,
-    /// Its incarnation.
-    #[prost(uint64, tag = "2")]
-    pub incarnation: u64,
-}
-
-/// A view, and the life of each pod it took in.
-#[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct Agreed {
-    /// The view.
-    #[prost(message, optional, tag = "1")]
-    pub view: Option<View>,
-    /// The lives taken in.
-    #[prost(message, repeated, tag = "2")]
-    pub incarnations: Vec<Life>,
-}
-
-/// A pod's heartbeat.
-#[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct Heartbeat {
-    /// The pod.
-    #[prost(uint32, tag = "1")]
-    pub from: u32,
-    /// Its life.
-    #[prost(uint64, tag = "2")]
-    pub incarnation: u64,
-    /// The view it holds.
-    #[prost(message, optional, tag = "3")]
-    pub agreed: Option<Agreed>,
-    /// The pods it hears from.
-    #[prost(message, repeated, tag = "4")]
-    pub hears: Vec<Life>,
-}
-
-/// Nothing.
-#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
-pub struct Empty {}
-
 /// Why a message on the wire cannot be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Invalid {
@@ -252,9 +71,6 @@ pub enum Invalid {
     /// An entry that reports nothing.
     #[error("an entry that reports nothing")]
     NoReport,
-    /// A heartbeat without a view.
-    #[error("a heartbeat without a view")]
-    NoView,
     /// A request to decide under no keys.
     #[error("a request under no keys")]
     NoKeys,
@@ -264,69 +80,6 @@ pub enum Invalid {
     /// A report of hits numbered 0, or saying it or a later one was applied already.
     #[error("a report of hits numbered 0, or seen applied already")]
     ReportNumbers,
-}
-
-impl From<service::View> for View {
-    fn from(view: service::View) -> Self {
-        Self {
-            epoch: view.epoch,
-            pods: view.pods,
-        }
-    }
-}
-
-impl From<View> for service::View {
-    fn from(view: View) -> Self {
-        Self {
-            epoch: view.epoch,
-            pods: view.pods,
-        }
-    }
-}
-
-fn lives(lives: Vec<(u32, u64)>) -> Vec<Life> {
-    lives
-        .into_iter()
-        .map(|(pod, incarnation)| Life { pod, incarnation })
-        .collect()
-}
-
-fn pairs(lives: Vec<Life>) -> Vec<(u32, u64)> {
-    lives
-        .into_iter()
-        .map(|life| (life.pod, life.incarnation))
-        .collect()
-}
-
-impl From<membership::Heartbeat> for Heartbeat {
-    fn from(beat: membership::Heartbeat) -> Self {
-        Self {
-            from: beat.from,
-            incarnation: beat.incarnation,
-            agreed: Some(Agreed {
-                view: Some(beat.agreed.view.into()),
-                incarnations: lives(beat.agreed.incarnations),
-            }),
-            hears: lives(beat.hears),
-        }
-    }
-}
-
-impl TryFrom<Heartbeat> for membership::Heartbeat {
-    type Error = Invalid;
-
-    fn try_from(beat: Heartbeat) -> Result<Self, Invalid> {
-        let agreed = beat.agreed.ok_or(Invalid::NoView)?;
-        Ok(Self {
-            from: beat.from,
-            incarnation: beat.incarnation,
-            agreed: membership::Agreed {
-                view: agreed.view.ok_or(Invalid::NoView)?.into(),
-                incarnations: pairs(agreed.incarnations),
-            },
-            hears: pairs(beat.hears),
-        })
-    }
 }
 
 impl From<service::Contract> for Contract {
@@ -389,519 +142,13 @@ pub(crate) fn narrow(behind: u128) -> u64 {
     u64::try_from(behind).unwrap_or(u64::MAX)
 }
 
-impl From<service::Batch> for Batch {
-    fn from(batch: service::Batch) -> Self {
-        Self {
-            from: batch.from,
-            entries: batch
-                .entries
-                .into_iter()
-                .map(|entry| Entry {
-                    key: entry.key.into_vec(),
-                    contract: Some(entry.contract.into()),
-                    report: Some(report_to_wire(entry.report)),
-                })
-                .collect(),
-            made_ns: batch.made,
-        }
-    }
-}
-
-impl TryFrom<Batch> for service::Batch {
-    type Error = Invalid;
-
-    fn try_from(batch: Batch) -> Result<Self, Invalid> {
-        let entries = batch
-            .entries
-            .into_iter()
-            .map(|entry| {
-                Ok(service::Entry {
-                    key: entry.key.into_boxed_slice(),
-                    contract: contract(entry.contract)?,
-                    report: report(entry.report)?,
-                })
-            })
-            .collect::<Result<_, Invalid>>()?;
-        Ok(Self {
-            from: batch.from,
-            entries,
-            made: batch.made_ns,
-        })
-    }
-}
-
-impl From<service::Answers> for Answers {
-    fn from(answers: service::Answers) -> Self {
-        Self {
-            from: answers.from,
-            entries: answers
-                .entries
-                .into_iter()
-                .map(|answer| Answer {
-                    key: answer.key.into_vec(),
-                    behind: narrow(answer.behind),
-                    applied: answer.applied,
-                    others: answer.others,
-                })
-                .collect(),
-            view: answers.view.map(View::from),
-            life: answers.life,
-            number: answers.number,
-            made_ns: answers.made,
-        }
-    }
-}
-
-impl From<Answers> for service::Answers {
-    fn from(answers: Answers) -> Self {
-        Self {
-            from: answers.from,
-            entries: answers
-                .entries
-                .into_iter()
-                .map(|answer| service::Answer {
-                    key: answer.key.into_boxed_slice(),
-                    behind: u128::from(answer.behind),
-                    applied: answer.applied,
-                    others: answer.others,
-                })
-                .collect(),
-            view: answers.view.map(service::View::from),
-            life: answers.life,
-            number: answers.number,
-            made: answers.made_ns,
-        }
-    }
-}
-
-impl From<service::Replicas> for Replicas {
-    fn from(replicas: service::Replicas) -> Self {
-        Self {
-            from: replicas.from,
-            entries: replicas
-                .entries
-                .into_iter()
-                .map(|replica| Replica {
-                    key: replica.key.into_vec(),
-                    contract: Some(replica.contract.into()),
-                    behind: narrow(replica.behind),
-                    counted: replica.counted,
-                    planes: replica
-                        .planes
-                        .into_iter()
-                        .map(|record| PlaneRecord {
-                            plane: record.plane,
-                            applied: record.applied,
-                            admitted_ago: record.admitted_ago,
-                        })
-                        .collect(),
-                })
-                .collect(),
-            handover: replicas.handover,
-            epoch: replicas.epoch,
-        }
-    }
-}
-
-impl TryFrom<Replicas> for service::Replicas {
-    type Error = Invalid;
-
-    fn try_from(replicas: Replicas) -> Result<Self, Invalid> {
-        let entries = replicas
-            .entries
-            .into_iter()
-            .map(|replica| {
-                Ok(service::Replica {
-                    key: replica.key.into_boxed_slice(),
-                    contract: contract(replica.contract)?,
-                    behind: u128::from(replica.behind),
-                    counted: replica.counted,
-                    planes: replica
-                        .planes
-                        .into_iter()
-                        .map(|record| service::PlaneRecord {
-                            plane: record.plane,
-                            applied: record.applied,
-                            admitted_ago: record.admitted_ago,
-                        })
-                        .collect(),
-                })
-            })
-            .collect::<Result<_, Invalid>>()?;
-        Ok(Self {
-            from: replicas.from,
-            entries,
-            handover: replicas.handover,
-            epoch: replicas.epoch,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
-    use prost::Message;
-
-    fn contract() -> impl Strategy<Value = service::Contract> {
-        (1..u64::MAX, 1..u64::MAX, 1..u64::MAX).prop_map(|(limit, window, burst)| {
-            let n = |n| NonZeroU64::new(n).unwrap();
-            service::Contract {
-                limit: n(limit),
-                window: n(window),
-                burst: n(burst),
-            }
-        })
-    }
-
-    fn report() -> impl Strategy<Value = service::Report> {
-        prop_oneof![
-            (1..=u64::MAX, any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
-                |(sequence, count, seen, age)| {
-                    service::Report::Hits {
-                        sequence,
-                        count,
-                        seen: seen % sequence,
-                        age,
-                    }
-                }
-            ),
-            Just(service::Report::Poll),
-        ]
-    }
-
-    fn key() -> impl Strategy<Value = Box<[u8]>> {
-        prop::collection::vec(any::<u8>(), 0..40).prop_map(Vec::into_boxed_slice)
-    }
-
-    fn batch() -> impl Strategy<Value = service::Batch> {
-        let entry =
-            (key(), contract(), report()).prop_map(|(key, contract, report)| service::Entry {
-                key,
-                contract,
-                report,
-            });
-        (
-            any::<u64>(),
-            prop::collection::vec(entry, 0..8),
-            any::<u64>(),
-        )
-            .prop_map(|(from, entries, made)| service::Batch {
-                from,
-                entries,
-                made,
-            })
-    }
-
-    fn answers() -> impl Strategy<Value = service::Answers> {
-        let answer = (key(), any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
-            |(key, behind, applied, others)| service::Answer {
-                key,
-                behind: u128::from(behind),
-                applied,
-                others,
-            },
-        );
-        let view = prop::option::of(
-            (any::<u64>(), prop::collection::vec(any::<u32>(), 0..4))
-                .prop_map(|(epoch, pods)| service::View { epoch, pods }),
-        );
-        (
-            any::<u32>(),
-            prop::collection::vec(answer, 0..8),
-            view,
-            any::<(u64, u64, u64)>(),
-        )
-            .prop_map(
-                |(from, entries, view, (life, number, made))| service::Answers {
-                    from,
-                    entries,
-                    view,
-                    life,
-                    number,
-                    made,
-                },
-            )
-    }
-
-    fn replicas() -> impl Strategy<Value = service::Replicas> {
-        let record = (any::<u64>(), any::<u64>(), prop::option::of(any::<u64>())).prop_map(
-            |(plane, applied, admitted_ago)| service::PlaneRecord {
-                plane,
-                applied,
-                admitted_ago,
-            },
-        );
-        let replica = (
-            key(),
-            contract(),
-            any::<u64>(),
-            any::<u64>(),
-            prop::collection::vec(record, 0..4),
-        )
-            .prop_map(
-                |(key, contract, behind, counted, planes)| service::Replica {
-                    key,
-                    contract,
-                    behind: u128::from(behind),
-                    counted,
-                    planes,
-                },
-            );
-        (
-            any::<u32>(),
-            prop::collection::vec(replica, 0..4),
-            any::<bool>(),
-            any::<u64>(),
-        )
-            .prop_map(|(from, entries, handover, epoch)| service::Replicas {
-                from,
-                entries,
-                handover,
-                epoch,
-            })
-    }
-
-    fn heartbeat() -> impl Strategy<Value = membership::Heartbeat> {
-        let lives = || prop::collection::vec(any::<(u32, u64)>(), 0..4);
-        (
-            any::<u32>(),
-            any::<u64>(),
-            any::<u64>(),
-            prop::collection::vec(any::<u32>(), 0..4),
-            lives(),
-            lives(),
-        )
-            .prop_map(|(from, incarnation, epoch, pods, incarnations, hears)| {
-                membership::Heartbeat {
-                    from,
-                    incarnation,
-                    agreed: membership::Agreed {
-                        view: service::View { epoch, pods },
-                        incarnations,
-                    },
-                    hears,
-                }
-            })
-    }
-
-    proptest! {
-        /// What a batch is cut by holds: it never takes more than [`service::Batch::bytes`]
-        /// says, nor does any part of it.
-        #[test]
-        fn a_batch_takes_no_more_than_its_bound(batch in batch()) {
-            prop_assert!(within_bounds(&batch));
-        }
-
-        /// As for a batch, for copies.
-        #[test]
-        fn copies_take_no_more_than_their_bound(replicas in replicas()) {
-            prop_assert!(copies_within_bounds(&replicas));
-        }
-
-        #[test]
-        fn a_heartbeat_comes_through_the_wire_as_it_was_sent(beat in heartbeat()) {
-            let bytes = Heartbeat::from(beat.clone()).encode_to_vec();
-            let decoded = Heartbeat::decode(bytes.as_slice()).unwrap();
-            prop_assert_eq!(membership::Heartbeat::try_from(decoded).unwrap(), beat);
-        }
-
-        #[test]
-        fn a_batch_comes_through_the_wire_as_it_was_sent(batch in batch()) {
-            let bytes = Batch::from(batch.clone()).encode_to_vec();
-            let decoded = Batch::decode(bytes.as_slice()).unwrap();
-            prop_assert_eq!(service::Batch::try_from(decoded).unwrap(), batch);
-        }
-
-        #[test]
-        fn answers_come_through_the_wire_as_they_were_sent(answers in answers()) {
-            let bytes = Answers::from(answers.clone()).encode_to_vec();
-            let decoded = Answers::decode(bytes.as_slice()).unwrap();
-            prop_assert_eq!(service::Answers::from(decoded), answers);
-        }
-
-        #[test]
-        fn copies_come_through_the_wire_as_they_were_sent(replicas in replicas()) {
-            let bytes = Replicas::from(replicas.clone()).encode_to_vec();
-            let decoded = Replicas::decode(bytes.as_slice()).unwrap();
-            prop_assert_eq!(service::Replicas::try_from(decoded).unwrap(), replicas);
-        }
-
-        /// Whatever bytes arrive, decoding and converting them never panics.
-        #[test]
-        fn any_bytes_are_refused_or_taken_without_a_panic(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
-            if let Ok(batch) = Batch::decode(bytes.as_slice()) {
-                let _ = service::Batch::try_from(batch);
-            }
-            if let Ok(replicas) = Replicas::decode(bytes.as_slice()) {
-                let _ = service::Replicas::try_from(replicas);
-            }
-        }
-    }
-
-    /// Every number at its longest and a key long enough for its length to take three
-    /// bytes: still within the bound.
-    #[test]
-    fn a_batch_at_its_longest_takes_no_more_than_its_bound() {
-        let most = NonZeroU64::MAX;
-        let contract = service::Contract {
-            limit: most,
-            window: most,
-            burst: most,
-        };
-        let key: Box<[u8]> = vec![b'k'; 100_000].into();
-        let batch = service::Batch {
-            from: u64::MAX,
-            entries: vec![service::Entry {
-                key,
-                contract,
-                report: service::Report::Hits {
-                    sequence: u64::MAX,
-                    count: u64::MAX,
-                    seen: u64::MAX - 1,
-                    age: u64::MAX,
-                },
-            }],
-            made: u64::MAX,
-        };
-        assert!(within_bounds(&batch));
-    }
-
-    /// Whether `batch` takes no more than its bound, and each entry no more than its own:
-    /// what each adds to the batch without it, its fields' framing included.
-    fn within_bounds(batch: &service::Batch) -> bool {
-        let encoded = |batch: &service::Batch| Batch::from(batch.clone()).encoded_len();
-        let empty = service::Batch {
-            entries: Vec::new(),
-            ..batch.clone()
-        };
-        let alone = encoded(&empty);
-        let entries = batch.entries.iter().all(|entry| {
-            let with = service::Batch {
-                entries: vec![entry.clone()],
-                ..empty.clone()
-            };
-            encoded(&with) - alone <= entry.bytes()
-        });
-        entries && alone <= empty.bytes() && encoded(batch) <= batch.bytes()
-    }
-
-    /// Every number at its longest, keys long enough for their lengths to take three bytes,
-    /// one copy with a hundred records and one with none: still within the bound.
-    #[test]
-    fn copies_at_their_longest_take_no_more_than_their_bound() {
-        let most = NonZeroU64::MAX;
-        let record = service::PlaneRecord {
-            plane: u64::MAX,
-            applied: u64::MAX,
-            admitted_ago: Some(u64::MAX),
-        };
-        let replica = |planes| service::Replica {
-            key: vec![b'k'; 100_000].into(),
-            contract: service::Contract {
-                limit: most,
-                window: most,
-                burst: most,
-            },
-            behind: u128::from(u64::MAX),
-            counted: u64::MAX,
-            planes,
-        };
-        let replicas = service::Replicas {
-            from: u32::MAX,
-            entries: vec![replica(vec![record; 100]), replica(Vec::new())],
-            handover: true,
-            epoch: u64::MAX,
-        };
-        assert!(copies_within_bounds(&replicas));
-    }
-
-    /// Whether `replicas` take no more than their bound, and each copy no more than its
-    /// own, as [`within_bounds`] for a batch.
-    fn copies_within_bounds(replicas: &service::Replicas) -> bool {
-        let encoded = |replicas: &service::Replicas| Replicas::from(replicas.clone()).encoded_len();
-        let empty = service::Replicas {
-            entries: Vec::new(),
-            ..replicas.clone()
-        };
-        let alone = encoded(&empty);
-        let each = replicas.entries.iter().all(|replica| {
-            let with = service::Replicas {
-                entries: vec![replica.clone()],
-                ..empty.clone()
-            };
-            encoded(&with) - alone <= replica.bytes()
-        });
-        each && alone <= empty.bytes() && encoded(replicas) <= replicas.bytes()
-    }
-
-    /// The answers to a full piece of hits are no bigger than it.
-    #[test]
-    fn the_answers_to_a_piece_are_no_bigger_than_it() {
-        let one = NonZeroU64::MIN;
-        let contract = service::Contract {
-            limit: one,
-            window: NonZeroU64::new(1_000_000_000).unwrap(),
-            burst: one,
-        };
-        let key = |n: u64| -> Box<[u8]> { n.to_be_bytes().into() };
-        let full =
-            |batch: &service::Batch, more: usize| batch.bytes() + more <= service::PIECE_BYTES;
-        let mut hits = service::Batch {
-            from: 7,
-            entries: Vec::new(),
-            made: 0,
-        };
-        let mut n = 0;
-        loop {
-            let entry = service::Entry {
-                key: key(n),
-                contract,
-                report: service::Report::Hits {
-                    sequence: 1,
-                    count: 1,
-                    seen: 0,
-                    age: 0,
-                },
-            };
-            if !full(&hits, entry.bytes()) {
-                break;
-            }
-            hits.entries.push(entry);
-            n += 1;
-        }
-        let view = service::View {
-            epoch: 1,
-            pods: vec![0],
-        };
-        let mut pod: service::ServicePod = service::ServicePod::new(0, 10_000_000, view);
-        pod.set_life(u64::MAX);
-        let bound = hits.bytes();
-        let answers = Answers::from(pod.on_batch(hits, 1_000_000_000));
-        assert!(!answers.entries.is_empty());
-        assert!(
-            answers.encoded_len() <= bound,
-            "{} {bound}",
-            answers.encoded_len()
-        );
-    }
 
     #[test]
     fn a_key_without_a_contract_or_with_a_zero_in_it_is_refused() {
-        let entry = |contract| Entry {
-            key: b"k".to_vec(),
-            contract,
-            report: Some(Report::Poll(Poll {})),
-        };
-        let batch = |entry| Batch {
-            from: 1,
-            made_ns: 0,
-            entries: vec![entry],
-        };
-        assert_eq!(
-            service::Batch::try_from(batch(entry(None))),
-            Err(Invalid::NoContract)
-        );
+        assert_eq!(contract(None), Err(Invalid::NoContract));
         for zero in [
             Contract {
                 limit: 0,
@@ -919,21 +166,15 @@ mod tests {
                 burst: 0,
             },
         ] {
-            assert_eq!(
-                service::Batch::try_from(batch(entry(Some(zero)))),
-                Err(Invalid::ZeroContract)
-            );
+            assert_eq!(contract(Some(zero)), Err(Invalid::ZeroContract));
         }
-        let mut nothing = entry(Some(Contract {
+        let one = Contract {
             limit: 1,
             window_ns: 1,
             burst: 1,
-        }));
-        nothing.report = None;
-        assert_eq!(
-            service::Batch::try_from(batch(nothing)),
-            Err(Invalid::NoReport)
-        );
+        };
+        assert_eq!(contract(Some(one)).map(Contract::from), Ok(one));
+        assert_eq!(report(None), Err(Invalid::NoReport));
     }
 
     /// A report of hits numbered 0, or saying it or a later one was applied already, is
@@ -941,34 +182,26 @@ mod tests {
     /// applied, and a pod taking such a report would skip past every report still to come.
     #[test]
     fn a_report_numbered_zero_or_seen_applied_is_refused() {
-        let hits = |sequence, seen| Batch {
-            from: 1,
-            made_ns: 0,
-            entries: vec![Entry {
-                key: b"k".to_vec(),
-                contract: Some(Contract {
-                    limit: 1,
-                    window_ns: 1,
-                    burst: 1,
-                }),
-                report: Some(Report::Hits(Hits {
-                    sequence,
-                    count: 1,
-                    seen,
-                    age_ns: 0,
-                })),
-            }],
+        let hits = |sequence, seen| {
+            Some(Report::Hits(Hits {
+                sequence,
+                count: 1,
+                seen,
+                age_ns: 0,
+            }))
         };
         for (sequence, seen) in [(0, 0), (1, 1), (5, 5), (5, 6), (5, u64::MAX)] {
             assert_eq!(
-                service::Batch::try_from(hits(sequence, seen)),
+                report(hits(sequence, seen)),
                 Err(Invalid::ReportNumbers),
                 "{sequence} seeing {seen}"
             );
         }
         for (sequence, seen) in [(1, 0), (5, 4), (5, 0), (u64::MAX, u64::MAX - 1)] {
-            assert!(
-                service::Batch::try_from(hits(sequence, seen)).is_ok(),
+            let taken = report(hits(sequence, seen)).unwrap();
+            assert_eq!(
+                report_to_wire(taken),
+                hits(sequence, seen).unwrap(),
                 "{sequence} seeing {seen}"
             );
         }

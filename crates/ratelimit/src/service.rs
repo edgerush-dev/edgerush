@@ -29,12 +29,11 @@
 //!   bucket's refill time, and copies every change it makes to every other service pod: the next to own the key takes over from its copy should
 //!   the owner go, with nothing to send anyone.
 //!
-//! Which pods own which keys follows from the [`View`] the service pods agree on: the owner
+//! Which pods own which keys follows from the [`View`] each is given: the owner
 //! of a key is the pod ranking highest for it (rendezvous hashing), and the next in rank
 //! takes it over, so a pod leaving moves only the keys it held.
 
 pub mod keyed;
-pub mod membership;
 pub mod pooled;
 
 pub use keyed::Keyed;
@@ -123,8 +122,8 @@ impl Contract {
     }
 }
 
-/// Which service pods are serving, as they agree on it, and since when: a later epoch
-/// replaces an earlier one.
+/// Which service pods are serving, as whoever runs them sets it, and since when: a later
+/// epoch replaces an earlier one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
     /// Counted up with each change.

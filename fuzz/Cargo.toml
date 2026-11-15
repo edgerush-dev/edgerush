@@ -20,9 +20,9 @@ cargo-fuzz = true
 boring = "5.2"
 # A response head keeps the bytes it was read from, as the proxy's does.
 bytes = "1.12"
-# The cluster store's messages and the synchronous mode's value, as the service's wire
-# carries them.
+# The cluster store's messages and each mode's, as the service's wire carries them.
 edgerush-cluster = { path = "../crates/cluster" }
+edgerush-cluster-asynchronous = { path = "../crates/cluster-asynchronous" }
 edgerush-cluster-synchronous = { path = "../crates/cluster-synchronous" }
 # The model and compiler a harness file is read into.
 edgerush-config = { path = "../crates/config" }

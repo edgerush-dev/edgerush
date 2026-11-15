@@ -1,34 +1,20 @@
-//! The service over gRPC: `edgerush.ratelimit.v1.RateLimit`, written by hand rather than
-//! generated, as its two methods are small.
-//!
-//! - `Exchange`: a data plane's batch, answered by the service pod's answers.
-//! - `Replicate`: an owner's copies, for every other pod, or keys handed over.
-//! - `Heartbeat`: a pod's heartbeat, for every other.
+//! What the store's gRPC calls share (`edgerush.cluster.v1.Cluster`, [`crate::cluster`]),
+//! written by hand rather than generated: protobuf as the codec, the longest message either
+//! side takes, how a call is timed and its connection watched, and a client of one pod for
+//! its unary calls.
 
-use crate::pod::Pod;
-use crate::secure::{self, Caller, Dialler, refused};
-use crate::wire;
+use crate::secure::{self, Dialler};
 use boring::ssl::SslConnector;
 use bytes::Buf;
-use edgerush_ratelimit::service::{self, membership};
 use http::uri::PathAndQuery;
-use std::convert::Infallible;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::watch;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
-use tonic::server::NamedService;
 use tonic::transport::{Channel, Endpoint};
-use tonic::{Request, Response, Status};
-
-/// The service's name, as gRPC calls it.
-pub const SERVICE: &str = "edgerush.ratelimit.v1.RateLimit";
-const EXCHANGE: &str = "/edgerush.ratelimit.v1.RateLimit/Exchange";
-const REPLICATE: &str = "/edgerush.ratelimit.v1.RateLimit/Replicate";
-pub(crate) const HEARTBEAT: &str = "/edgerush.ratelimit.v1.RateLimit/Heartbeat";
+use tonic::{Request, Status};
 
 /// How long a call may take before it is given up: the protocol sends again what matters.
 pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -99,121 +85,11 @@ impl<E, D: prost::Message + Default> Decoder for Prost<E, D> {
 
 pub(crate) type Boxed<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-/// The service as a gRPC server, in front of a service pod.
-#[derive(Clone)]
-pub struct Server {
-    pod: Pod,
-}
-
-impl Server {
-    /// Serves `pod`.
-    #[must_use]
-    pub fn new(pod: Pod) -> Self {
-        Self { pod }
-    }
-}
-
-impl NamedService for Server {
-    const NAME: &'static str = SERVICE;
-}
-
-struct Exchange(Pod);
-
-impl tonic::server::UnaryService<wire::Batch> for Exchange {
-    type Response = wire::Answers;
-    type Future = Boxed<Result<Response<wire::Answers>, Status>>;
-
-    fn call(&mut self, request: Request<wire::Batch>) -> Self::Future {
-        let pod = self.0.clone();
-        Box::pin(async move {
-            let batch = service::Batch::try_from(request.into_inner())
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            let answers = pod
-                .batch(batch)
-                .await
-                .ok_or_else(|| Status::unavailable("the service pod is stopping"))?;
-            Ok(Response::new(answers.into()))
-        })
-    }
-}
-
-struct Replicate(Pod);
-
-impl tonic::server::UnaryService<wire::Replicas> for Replicate {
-    type Response = wire::Empty;
-    type Future = Boxed<Result<Response<wire::Empty>, Status>>;
-
-    fn call(&mut self, request: Request<wire::Replicas>) -> Self::Future {
-        let pod = self.0.clone();
-        Box::pin(async move {
-            let replicas = service::Replicas::try_from(request.into_inner())
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            pod.replicas(replicas).await;
-            Ok(Response::new(wire::Empty {}))
-        })
-    }
-}
-
-struct Beat(Pod);
-
-impl tonic::server::UnaryService<wire::Heartbeat> for Beat {
-    type Response = wire::Empty;
-    type Future = Boxed<Result<Response<wire::Empty>, Status>>;
-
-    fn call(&mut self, request: Request<wire::Heartbeat>) -> Self::Future {
-        let pod = self.0.clone();
-        Box::pin(async move {
-            let beat = membership::Heartbeat::try_from(request.into_inner())
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            pod.heartbeat(beat).await;
-            Ok(Response::new(wire::Empty {}))
-        })
-    }
-}
-
 /// A server's side of a call, held to [`MAX_MESSAGE`] both ways.
 pub(crate) fn limited<C: Codec>(codec: C) -> tonic::server::Grpc<C> {
     tonic::server::Grpc::new(codec)
         .max_decoding_message_size(MAX_MESSAGE)
         .max_encoding_message_size(MAX_MESSAGE)
-}
-
-impl tower_service::Service<http::Request<tonic::body::Body>> for Server {
-    type Response = http::Response<tonic::body::Body>;
-    type Error = Infallible;
-    type Future = Boxed<Result<Self::Response, Infallible>>;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
-        let pod = self.pod.clone();
-        Box::pin(async move {
-            let allowed = match request.uri().path() {
-                EXCHANGE => Caller::DataPlane,
-                _ => Caller::Pod,
-            };
-            if let Some(status) = refused(&request, allowed) {
-                return Ok(status.into_http());
-            }
-            Ok(match request.uri().path() {
-                EXCHANGE => {
-                    let mut grpc = limited(Prost::<wire::Answers, wire::Batch>::default());
-                    grpc.unary(Exchange(pod), request).await
-                }
-                HEARTBEAT => {
-                    let mut grpc = limited(Prost::<wire::Empty, wire::Heartbeat>::default());
-                    grpc.unary(Beat(pod), request).await
-                }
-                REPLICATE => {
-                    let mut grpc = limited(Prost::<wire::Empty, wire::Replicas>::default());
-                    grpc.unary(Replicate(pod), request).await
-                }
-                _ => Status::unimplemented("no such method").into_http(),
-            })
-        })
-    }
 }
 
 /// Why a call to a service pod failed.
@@ -225,9 +101,6 @@ pub enum Error {
     /// The call failed.
     #[error("the call failed: {0}")]
     Status(#[from] Status),
-    /// The answer cannot be used.
-    #[error("an answer that cannot be used: {0}")]
-    Invalid(#[from] wire::Invalid),
     /// The address names no host to check a certificate against.
     #[error("an address with no host")]
     NoHost,
@@ -306,34 +179,85 @@ impl Client {
             .await?;
         Ok(response.into_inner())
     }
+}
 
-    /// Sends a data plane's batch; the service pod's answers come back.
-    ///
-    /// # Errors
-    ///
-    /// When the call fails or its answer cannot be used.
-    pub async fn exchange(&self, batch: service::Batch) -> Result<service::Answers, Error> {
-        let answers: wire::Answers = self.call(wire::Batch::from(batch), EXCHANGE).await?;
-        Ok(answers.into())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+    use std::task::{Context, Poll};
+    use tokio::net::TcpListener;
+    use tonic::Response;
+    use tonic::server::NamedService;
+    use tonic::transport::server::TcpIncoming;
+
+    /// A message of any length.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct Padded {
+        #[prost(bytes = "vec", tag = "1")]
+        body: Vec<u8>,
     }
 
-    /// Sends a pod's heartbeat.
-    ///
-    /// # Errors
-    ///
-    /// When the call fails.
-    pub async fn heartbeat(&self, beat: membership::Heartbeat) -> Result<(), Error> {
-        let _: wire::Empty = self.call(wire::Heartbeat::from(beat), HEARTBEAT).await?;
-        Ok(())
+    const ECHO: &str = "/edgerush.test.v1.Echo/Echo";
+
+    /// A server answering each call with what it was sent, held to [`MAX_MESSAGE`] as the
+    /// store's are ([`limited`]).
+    #[derive(Clone)]
+    struct Echo;
+
+    impl NamedService for Echo {
+        const NAME: &'static str = "edgerush.test.v1.Echo";
     }
 
-    /// Sends copies to another pod, or keys handed over to their new owner.
-    ///
-    /// # Errors
-    ///
-    /// When the call fails.
-    pub async fn replicate(&self, replicas: service::Replicas) -> Result<(), Error> {
-        let _: wire::Empty = self.call(wire::Replicas::from(replicas), REPLICATE).await?;
-        Ok(())
+    impl tonic::server::UnaryService<Padded> for Echo {
+        type Response = Padded;
+        type Future = Boxed<Result<Response<Padded>, Status>>;
+
+        fn call(&mut self, request: Request<Padded>) -> Self::Future {
+            Box::pin(async move { Ok(Response::new(request.into_inner())) })
+        }
+    }
+
+    impl tower_service::Service<http::Request<tonic::body::Body>> for Echo {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = Infallible;
+        type Future = Boxed<Result<Self::Response, Infallible>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+            Box::pin(async move {
+                let mut grpc = limited(Prost::<Padded, Padded>::default());
+                Ok(grpc.unary(Self, request).await)
+            })
+        }
+    }
+
+    /// Messages of up to 4 MiB go through, both ways; a longer one is refused by the client
+    /// that would send it, before it is sent, not by the server after it has been.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn messages_are_held_to_4_mib_by_whoever_sends_them() {
+        assert_eq!(MAX_MESSAGE, 4 << 20);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .serve_with_incoming(Echo, TcpIncoming::from(listener))
+                .await
+                .unwrap();
+        });
+        let client = Client::new(&address).unwrap();
+        let padded = |bytes: usize| Padded {
+            body: vec![b'k'; bytes],
+        };
+        let answer: Padded = client.call(padded(MAX_MESSAGE - 1024), ECHO).await.unwrap();
+        assert_eq!(answer.body.len(), MAX_MESSAGE - 1024);
+        let refused = client.call::<_, Padded>(padded(MAX_MESSAGE), ECHO).await;
+        assert!(
+            matches!(refused, Err(Error::TooLong(length)) if length > MAX_MESSAGE),
+            "{refused:?}"
+        );
     }
 }
