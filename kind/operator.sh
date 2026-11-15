@@ -693,6 +693,9 @@ spec:
   controlPlaneRef: { name: hooked }
   ingress: { httpPort: 80, httpsPort: 443 }
 EOF
+# `rollout status` fails at once on a Deployment not made yet: waited for first.
+until_true 'k -n hooked get deploy edgerush-controller-hooked' 60 ||
+    fail "ControlPlane hooked's controller was never made"
 k -n hooked rollout status deploy/edgerush-controller-hooked --timeout=180s >/dev/null ||
     fail "ControlPlane hooked's controller never ran"
 until_true 'k -n hooked logs deploy/edgerush-controller-hooked | grep -F "Secret hooked/hooked-ca: the authority provided is not there"' 60 ||
