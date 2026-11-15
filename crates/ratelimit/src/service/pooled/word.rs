@@ -208,6 +208,134 @@ mod tests {
 
     const LENGTH: u64 = 10_000_000;
 
+    /// A word at cycle 0 under `bucket`, `charged` taken from a full bucket at `at`, no
+    /// allowance yet set.
+    fn charged_at(bucket: &Rate, charged: u64, at: u64) -> Fields {
+        let now = bucket.units(at);
+        Fields {
+            arrival: Rate::charge(Rate::full(now), now, charged),
+            left: 0,
+            cycle: 0,
+            shared: false,
+            closed: false,
+            unreported: 0,
+            set: false,
+        }
+    }
+
+    /// `fields` with `count` more taken at `now` from what the cycle allows and the bucket.
+    fn spent(bucket: &Rate, fields: Fields, count: u64, now: u64) -> Fields {
+        Fields {
+            arrival: Rate::charge(fields.arrival, bucket.units(now), count),
+            left: fields.left - count,
+            ..fields
+        }
+    }
+
+    /// 100 a second, a bucket of ten, a 10 ms cycle: one refilled a cycle; `others` others
+    /// admitting.
+    fn tenth(others: u64) -> (Rate, Advance) {
+        let bucket = Rate::new(contract(100, 1_000_000_000, 10));
+        let advance = Advance {
+            cycle: LENGTH,
+            refill: 1,
+            refill_units: bucket.units(LENGTH),
+            others,
+            record: 0,
+        };
+        (bucket, advance)
+    }
+
+    /// What the others admit under a share shows in the copy only a cycle later: the cycle
+    /// after a share gets its share of the refill and keeps what it left unspent, and the one
+    /// after that shares out the copy afresh (as `DataPlane` does).
+    #[test]
+    fn the_cycle_after_a_share_gets_the_refill_and_what_was_left() {
+        let (bucket, advance) = tenth(1);
+        let sees = |fields: Fields, now: u64| {
+            bucket.remaining_within(fields.arrival, bucket.units(now), advance.refill_units)
+        };
+        let start = charged_at(&bucket, 1, 0);
+        let first = advanced(&bucket, start, advance, LENGTH);
+        assert!(first.shared, "the first shares out the copy");
+        assert_eq!(
+            first.left,
+            sees(start, LENGTH) / 2,
+            "what it sees, between two"
+        );
+        let used = spent(&bucket, first, 2, LENGTH);
+        let second = advanced(&bucket, used, advance, 2 * LENGTH);
+        assert!(!second.shared);
+        assert_eq!(
+            second.left,
+            1 + used.left,
+            "half the one refilled, at least one, and what was left; not the copy shared again"
+        );
+        let third = advanced(&bucket, second, advance, 3 * LENGTH);
+        assert!(third.shared);
+        assert_eq!(
+            third.left,
+            sees(second, 3 * LENGTH) / 2 + 1,
+            "shared afresh, one carried"
+        );
+    }
+
+    /// Alone in admitting the key, a participant has no one else's hits to wait for: every
+    /// cycle shares out the copy (as `DataPlane` does).
+    #[test]
+    fn a_participant_admitting_alone_shares_every_cycle() {
+        let (bucket, advance) = tenth(0);
+        let first = advanced(&bucket, charged_at(&bucket, 1, 0), advance, LENGTH);
+        let used = spent(&bucket, first, 4, LENGTH);
+        let next = advanced(&bucket, used, advance, 2 * LENGTH);
+        let sees =
+            bucket.remaining_within(used.arrival, bucket.units(2 * LENGTH), advance.refill_units);
+        assert!(next.shared);
+        assert_eq!(
+            next.left,
+            sees + 1,
+            "the copy shared afresh, one carried; not the refill and what was left"
+        );
+    }
+
+    /// Quiet, a key holds back no more than every other cycle, and what it carries does not
+    /// build up: quiet cycles do not leave it a bucket's worth to admit at once (as
+    /// `DataPlane`'s cut-off copy does not).
+    #[test]
+    fn a_quiet_key_does_not_build_up_what_it_carries() {
+        let (bucket, advance) = tenth(7);
+        let mut fields = charged_at(&bucket, 0, 0);
+        let mut most = 0;
+        for cycle in 1..20 {
+            fields = advanced(&bucket, fields, advance, cycle * LENGTH);
+            most = most.max(fields.left);
+        }
+        // A share of a full bucket and a cycle's refill among eight, one carried, and one
+        // held-back cycle's floor.
+        assert!(most <= 11 / 8 + 1 + 1, "{most}");
+    }
+
+    /// What the copy has left and what the cycle refills are counted together and rounded
+    /// once: half a request left and 6.67 refilled, one request every 1.5 ms, is a share of
+    /// 7 — not 0 and 6, which would refuse a client at exactly its rate (as `DataPlane`
+    /// rounds them).
+    #[test]
+    fn a_share_rounds_what_is_left_and_the_refill_together() {
+        let c = contract(2, 3_000_000, 1);
+        let bucket = Rate::new(c);
+        let advance = Advance {
+            cycle: LENGTH,
+            refill: c.refilled(LENGTH),
+            refill_units: bucket.units(LENGTH),
+            others: 0,
+            record: 0,
+        };
+        // Charged three quarters of an interval before the cycle: half a request back.
+        let start = charged_at(&bucket, 1, LENGTH - 750_000);
+        let woken = advanced(&bucket, start, advance, LENGTH);
+        assert_eq!(woken.left, 7);
+    }
+
     /// `step` for a word last advanced to full cycle `last`, its record current, at `now`'s
     /// full cycle `current`.
     fn step_at(last: u64, current: u64) -> Step {

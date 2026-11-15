@@ -28,6 +28,8 @@ mod loom_tests;
 #[cfg(test)]
 mod routing_tests;
 #[cfg(test)]
+mod testing;
+#[cfg(test)]
 mod tests;
 
 pub use routing::{Replied, Reply, Routing};

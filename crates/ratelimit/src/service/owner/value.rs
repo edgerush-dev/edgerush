@@ -866,4 +866,50 @@ mod tests {
         assert_eq!(later.larger(early), later);
         assert_eq!(later.larger(later), later);
     }
+
+    /// A data plane's last admission, kept in eight bytes, reads back as it was set and orders
+    /// as an option of it does: never before any time, time 0 among them.
+    #[test]
+    fn a_last_admission_reads_back_and_orders_as_an_option() {
+        for at in [0, 1, 5 * MS] {
+            assert_eq!(Admitted::at(at).get(), Some(at));
+        }
+        assert_eq!(Admitted::default().get(), None);
+        assert!(Admitted::default() < Admitted::at(0));
+        assert!(Admitted::at(0) < Admitted::at(1));
+    }
+
+    /// A data plane's record takes 32 bytes beside its id: its highest applied, the batches
+    /// waiting kept apart behind a pointer, as they rarely are, and its last admission in eight
+    /// bytes.
+    #[test]
+    fn a_data_planes_record_is_small() {
+        assert_eq!(size_of::<(PlaneId, Record)>(), 32);
+    }
+
+    proptest! {
+        /// A key's records behave as a map from data plane to record: each data plane's found,
+        /// made when first wanted, and gone through in order of data plane.
+        #[test]
+        fn records_are_a_map_of_data_planes(
+            uses in proptest::collection::vec((0u64..24, 1u64..100), 0..64)
+        ) {
+            let mut records = Records::default();
+            let mut model: std::collections::BTreeMap<PlaneId, u64> =
+                std::collections::BTreeMap::new();
+            for (plane, applied) in uses {
+                records.entry(plane).applied += applied;
+                *model.entry(plane).or_default() += applied;
+            }
+            for plane in 0..25 {
+                prop_assert_eq!(
+                    records.get(plane).map(|record| record.applied),
+                    model.get(&plane).copied()
+                );
+            }
+            let seen: Vec<(PlaneId, u64)> =
+                records.iter().map(|(plane, record)| (plane, record.applied)).collect();
+            prop_assert_eq!(seen, model.into_iter().collect::<Vec<_>>());
+        }
+    }
 }

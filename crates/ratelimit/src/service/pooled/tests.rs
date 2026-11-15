@@ -4,10 +4,11 @@
 
 #![cfg(not(loom))]
 
+use super::testing::{Owner, Pods};
 use super::*;
 use crate::service::{
     Answer, CUT_OFF_CYCLES, DataPlane, ENTRY_BYTES, FixedState, Keyed, MOST_UNACKNOWLEDGED,
-    PIECE_BYTES, PodId, ServicePod,
+    PIECE_BYTES, PodId,
 };
 use proptest::prelude::*;
 use std::collections::VecDeque;
@@ -29,6 +30,7 @@ fn contract(limit: u64, burst: u64) -> Contract {
     }
 }
 
+/// The reference's one pod, owning every key: `DataPlane` routes by today's view.
 fn view() -> View {
     View {
         epoch: 1,
@@ -36,16 +38,16 @@ fn view() -> View {
     }
 }
 
-fn participant() -> Participant<FixedState> {
-    Participant::new(7, CYCLE, view(), FixedState::default()).unwrap()
+fn participant() -> Participant<FixedState, Pods> {
+    Participant::new(7, CYCLE, Pods::one(), FixedState::default()).unwrap()
 }
 
 /// The participant and its pod, a worker's handles to the entries it was given, and the
 /// pod's answers not yet delivered: each with its exchange and its place among the answers
 /// the pod gave.
 struct Pooled {
-    participant: Participant<FixedState>,
-    pod: ServicePod,
+    participant: Participant<FixedState, Pods>,
+    pod: Owner,
     handles: HashMap<Box<[u8]>, Arc<Entry>>,
     pending: Vec<(u64, u64, Answers)>,
     /// The answers the pod has given.
@@ -59,7 +61,7 @@ impl Pooled {
     fn new() -> Self {
         Self {
             participant: participant(),
-            pod: ServicePod::new(0, CYCLE, view()),
+            pod: Owner::new(0, CYCLE),
             handles: HashMap::new(),
             pending: Vec::new(),
             given: 0,
@@ -190,7 +192,7 @@ fn in_order(batch: Batch) -> Batch {
 /// The reference: one `DataPlane`, its pod, and the answers not yet delivered.
 struct Reference {
     plane: DataPlane,
-    pod: ServicePod,
+    pod: Owner,
     pending: Vec<Answers>,
 }
 
@@ -198,7 +200,7 @@ impl Reference {
     fn new() -> Self {
         Self {
             plane: DataPlane::new(7, CYCLE, view()),
-            pod: ServicePod::new(0, CYCLE, view()),
+            pod: Owner::new(0, CYCLE),
             pending: Vec::new(),
         }
     }
@@ -968,16 +970,7 @@ fn a_two_key_request_is_charged_on_both_or_neither() {
 #[test]
 fn an_evicted_entry_sends_its_holders_to_the_new_one() {
     // No service pods: a key has no owner and is decided here, warm from the start.
-    let mut participant = Participant::new(
-        7,
-        CYCLE,
-        View {
-            epoch: 1,
-            pods: Vec::new(),
-        },
-        FixedState::default(),
-    )
-    .unwrap();
+    let mut participant = Participant::new(7, CYCLE, Pods::none(), FixedState::default()).unwrap();
     let key: &[u8] = b"k";
     let c = contract(100, 10);
     participant.ensure(key, c, 0);
@@ -1048,16 +1041,7 @@ fn a_stalled_transport_leaves_workers_advancing_cycles_with_one_refill() {
 /// evicted or replaced is no longer found.
 #[test]
 fn a_worker_finds_the_pods_entry_without_asking() {
-    let mut participant = Participant::new(
-        7,
-        CYCLE,
-        View {
-            epoch: 1,
-            pods: Vec::new(),
-        },
-        FixedState::default(),
-    )
-    .unwrap();
+    let mut participant = Participant::new(7, CYCLE, Pods::none(), FixedState::default()).unwrap();
     let registry = participant.registry();
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
     assert!(registry.find(key, c).is_none(), "nothing made yet");
@@ -1093,16 +1077,8 @@ fn a_worker_finds_the_pods_entry_without_asking() {
 )]
 fn a_keys_bytes_count_every_workers_handle() {
     let holding = |workers| {
-        let mut participant = Participant::new(
-            7,
-            CYCLE,
-            View {
-                epoch: 1,
-                pods: Vec::new(),
-            },
-            FixedState::default(),
-        )
-        .unwrap();
+        let mut participant =
+            Participant::new(7, CYCLE, Pods::none(), FixedState::default()).unwrap();
         participant.set_workers(workers);
         participant.ensure(b"k", contract(100, 10), 0);
         participant.holding()
@@ -1125,7 +1101,7 @@ fn a_keys_bytes_count_every_workers_handle() {
 fn one_exchange_in_flight_gathers_what_comes_meanwhile() {
     let mut participant = participant();
     participant.set_one_in_flight(true);
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
+    let mut pod: Owner = Owner::new(0, CYCLE);
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 100));
     // A new key, made and decided here.
     assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
@@ -1176,7 +1152,7 @@ fn slow() -> Contract {
 }
 
 /// A participant with one exchange in flight, quiet keys not polled.
-fn one_in_flight() -> Participant<FixedState> {
+fn one_in_flight() -> Participant<FixedState, Pods> {
     let mut participant = participant();
     participant.set_one_in_flight(true);
     participant.set_levers(Levers { poll_quiet: false });
@@ -1202,14 +1178,14 @@ fn others_hits(key: &[u8], c: Contract, count: u64) -> Batch {
 }
 
 /// Service pod 0 in its life `life`.
-fn pod(life: u64) -> ServicePod {
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
+fn pod(life: u64) -> Owner {
+    let mut pod: Owner = Owner::new(0, CYCLE);
     pod.set_life(life);
     pod
 }
 
 /// The one exchange `participant` starts: its number and batch.
-fn only_exchange(participant: &mut Participant<FixedState>) -> (u64, Batch) {
+fn only_exchange(participant: &mut Participant<FixedState, Pods>) -> (u64, Batch) {
     let mut started = participant.take_exchanges();
     assert_eq!(started.len(), 1, "one exchange");
     let (_, exchange, batch) = started.remove(0);
@@ -1587,7 +1563,7 @@ fn quiet_keys_are_polled_only_when_asked_to_be() {
     for poll_quiet in [true, false] {
         let mut participant = participant();
         participant.set_levers(Levers { poll_quiet });
-        let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
+        let mut pod: Owner = Owner::new(0, CYCLE);
         let (key, c): (&[u8], Contract) = (b"k", contract(100, 100));
         assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
         // Its admission reported and answered; then a cycle with nothing to report.
@@ -1612,11 +1588,7 @@ fn quiet_keys_are_polled_only_when_asked_to_be() {
 #[test]
 fn an_earlier_clock_does_not_move_a_cycle_back() {
     // No pods: the key decided here, nothing asked.
-    let view = View {
-        epoch: 1,
-        pods: Vec::new(),
-    };
-    let mut participant = Participant::new(7, CYCLE, view, FixedState::default()).unwrap();
+    let mut participant = Participant::new(7, CYCLE, Pods::none(), FixedState::default()).unwrap();
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
     participant.ensure(key, c, 0);
     let entry = participant.entries(&[(key, c)]).remove(0);
@@ -1649,16 +1621,8 @@ fn an_earlier_clock_does_not_move_a_cycle_back() {
 fn a_key_untouched_for_the_cycle_numbers_range_gets_a_new_share() {
     let wrap = (1u64 << 16) * CYCLE;
     for transport in [true, false] {
-        let mut participant = Participant::new(
-            7,
-            CYCLE,
-            View {
-                epoch: 1,
-                pods: Vec::new(),
-            },
-            FixedState::default(),
-        )
-        .unwrap();
+        let mut participant =
+            Participant::new(7, CYCLE, Pods::none(), FixedState::default()).unwrap();
         let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
         participant.ensure(key, c, 0);
         let entry = participant.entries(&[(key, c)]).remove(0);
@@ -2004,12 +1968,12 @@ fn replay_a_failure() {
 }
 
 /// A scheduled participant, nothing polled: what each test of scheduling starts from, with `keys` keys made at 0 and their first cycle's visit done.
-fn scheduled(keys: u64) -> (Participant<FixedState>, Vec<Arc<Entry>>) {
+fn scheduled(keys: u64) -> (Participant<FixedState, Pods>, Vec<Arc<Entry>>) {
     scheduled_under(keys, contract(100, 10))
 }
 
 /// As [`scheduled`], the keys under `c`.
-fn scheduled_under(keys: u64, c: Contract) -> (Participant<FixedState>, Vec<Arc<Entry>>) {
+fn scheduled_under(keys: u64, c: Contract) -> (Participant<FixedState, Pods>, Vec<Arc<Entry>>) {
     let mut participant = participant();
     participant.set_scheduled(true);
     participant.set_levers(Levers { poll_quiet: false });
@@ -2239,7 +2203,7 @@ fn the_lists_of_keys_to_visit_keep_their_room() {
         let name = format!("k{n}").into_bytes();
         assert_eq!(participant.decide_all(&[(&name, c)], 0), Decision::Admit);
     }
-    let lists = |participant: &Participant<FixedState>| {
+    let lists = |participant: &Participant<FixedState, Pods>| {
         let (one, other) = (&participant.runnable, &participant.next_runnable);
         let mut blocks = [one.as_ptr() as usize, other.as_ptr() as usize];
         blocks.sort_unstable();
@@ -2275,7 +2239,7 @@ fn a_key_made_again_is_counted_from_its_first_report() {
         participant.set_scheduled(scheduled);
         let mut pod = pod(1);
         let keys: [(&[u8], Contract); 1] = [(b"k", contract(100, 10))];
-        let mut exchange = |participant: &mut Participant<FixedState>, now: u64| {
+        let mut exchange = |participant: &mut Participant<FixedState, Pods>, now: u64| {
             participant.on_cycle(now);
             for (_, exchange, batch) in participant.take_exchanges() {
                 participant.on_answers_to(exchange, pod.on_batch(batch, now), now);
@@ -2361,7 +2325,7 @@ fn a_participant_counts_the_hits_of_a_stale_report_as_forgiven() {
 #[test]
 fn a_participant_keeps_a_bounded_number_of_reports_out() {
     let mut participant = participant();
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
+    let mut pod: Owner = Owner::new(0, CYCLE);
     let (key, c): (&[u8], Contract) = (b"k", contract(100, 100));
     for cycle in 1..=50 {
         let now = cycle * CYCLE;
@@ -2515,7 +2479,7 @@ fn a_backlog_goes_a_piece_an_exchange_and_none_starves(scheduled: bool) {
         .enumerate()
         .map(|(n, name)| (name.as_slice(), n))
         .collect();
-    let mut exchange = |participant: &mut Participant<FixedState>,
+    let mut exchange = |participant: &mut Participant<FixedState, Pods>,
                         reported_at: &mut [u64],
                         cycle: u64,
                         now: u64| {
@@ -2592,9 +2556,9 @@ fn tight() -> Contract {
 
 /// `participant` with `key` under `c` admitted at 0 and reported at the next cycle, and the
 /// pod's answer that three other data planes admit it.
-fn shared_among_four(key: &[u8], c: Contract) -> Participant<FixedState> {
+fn shared_among_four(key: &[u8], c: Contract) -> Participant<FixedState, Pods> {
     let mut participant = participant();
-    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
+    let mut pod: Owner = Owner::new(0, CYCLE);
     for from in 8..=10 {
         let _ = pod.on_batch(
             Batch {
@@ -2617,7 +2581,7 @@ fn shared_among_four(key: &[u8], c: Contract) -> Participant<FixedState> {
 /// What `participant` admits of `key` under `c` over `cycles`, offered three times its rate
 /// each, whatever it sends lost.
 fn flooded(
-    participant: &mut Participant<FixedState>,
+    participant: &mut Participant<FixedState, Pods>,
     key: &[u8],
     c: Contract,
     cycles: std::ops::RangeInclusive<u64>,
@@ -2678,4 +2642,450 @@ fn a_participants_quiet_key_keeps_its_share_when_it_is_next_reported() {
     participant.on_cycle(woken + CYCLE);
     let entry = participant.entries(&[(key, c)]).remove(0);
     assert_eq!(entry.others.load(Ordering::Acquire), 3);
+}
+
+/// 100 a second, a bucket of ten: a refill time of 100 ms.
+fn tenth() -> Contract {
+    Contract {
+        limit: NonZeroU64::new(100).unwrap(),
+        window: NonZeroU64::new(1_000 * MS).unwrap(),
+        burst: NonZeroU64::new(10).unwrap(),
+    }
+}
+
+/// `participant`'s exchanges, each answered by `pod` at `now`, until it has none to start.
+fn settle(participant: &mut Participant<FixedState, Pods>, pod: &mut Owner, now: u64) {
+    for _ in 0..10 {
+        let started = participant.take_exchanges();
+        if started.is_empty() {
+            return;
+        }
+        for (_, exchange, batch) in started {
+            let answers = pod.on_batch(batch, now);
+            participant.on_answers_to(exchange, answers, now);
+        }
+    }
+}
+
+/// As `DataPlane`'s: a participant whose owner still answers about a key keeps its share,
+/// however long one of its reports has waited to be seen applied: it is not cut off.
+#[test]
+fn a_participant_still_answered_keeps_its_share() {
+    let (key, c): (&[u8], Contract) = (b"k", tight());
+    let mut participant = shared_among_four(key, c);
+    // A report that waits: sent, and its answer lost.
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 2 * CYCLE),
+        Decision::Admit
+    );
+    participant.on_cycle(2 * CYCLE);
+    let _lost = participant.take_exchanges();
+    let now = 2 * CUT_OFF_CYCLES * CYCLE;
+    let tracked = participant.keys.get_mut(key).unwrap();
+    assert_eq!(
+        tracked
+            .unacknowledged
+            .as_slice()
+            .first()
+            .map(|unseen| unseen.first),
+        Some(2 * CYCLE)
+    );
+    // Heard of a cycle before: its owner answers still.
+    tracked.heard = Heard::at(now - CYCLE);
+    participant.on_cycle(now);
+    let entry = participant.entries(&[(key, c)]).remove(0);
+    assert_eq!(entry.others.load(Ordering::Acquire), 3);
+}
+
+/// As `DataPlane`'s: a report unseen for its key's refill time is emptied, its hits forgiven,
+/// and still sent, so that the owner holds back none of the reports after it: once the owner
+/// is reached again, the empty one and those after it are applied.
+#[test]
+fn a_participants_stale_report_is_emptied_and_holds_nothing_back() {
+    let mut participant = participant();
+    let mut pod = Owner::new(0, CYCLE);
+    let (key, c): (&[u8], Contract) = (b"k", tenth());
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    participant.on_cycle(CYCLE);
+    settle(&mut participant, &mut pod, CYCLE);
+    assert_eq!(pod.counted(key), Some(1), "warmed");
+    for _ in 0..4 {
+        assert_eq!(participant.decide_all(&[(key, c)], CYCLE), Decision::Admit);
+    }
+    participant.on_cycle(2 * CYCLE);
+    let _lost = participant.take_exchanges();
+    let held = |participant: &Participant<FixedState, Pods>| {
+        participant.keys.get(key).unwrap().unacknowledged.as_slice()[0].count
+    };
+    // First sent at 20 ms, every sending lost: still held a refill time on, then emptied.
+    participant.on_cycle(2 * CYCLE + 100 * MS);
+    let _lost = participant.take_exchanges();
+    assert_eq!(held(&participant), 4, "still held");
+    participant.on_cycle(2 * CYCLE + 100 * MS + 1);
+    let _lost = participant.take_exchanges();
+    assert_eq!(held(&participant), 0, "emptied");
+    assert_eq!(participant.forgiven(), 4);
+    let now = 2 * CYCLE + 120 * MS;
+    for _ in 0..2 {
+        assert_eq!(participant.decide_all(&[(key, c)], now), Decision::Admit);
+    }
+    // The empty one is sent again when due, four cycles after its last sending.
+    for cycle in 1..=10 {
+        participant.on_cycle(now + cycle * CYCLE);
+        settle(&mut participant, &mut pod, now + cycle * CYCLE);
+    }
+    assert_eq!(
+        pod.counted(key),
+        Some(3),
+        "the warming one, the empty one, then the two"
+    );
+    assert!(participant.keys.get(key).unwrap().unacknowledged.is_empty());
+}
+
+/// As `DataPlane`'s: one batch a cycle to each owner, carrying every key it owns.
+#[test]
+fn one_batch_a_cycle_carries_every_key_its_owner_holds() {
+    let keys: Vec<Vec<u8>> = (0..30).map(|k| format!("key-{k}").into_bytes()).collect();
+    let routing = Pods {
+        keyed: keys
+            .iter()
+            .enumerate()
+            .map(|(at, key)| (key.clone().into_boxed_slice(), (at % 3) as PodId))
+            .collect(),
+        pods: vec![0, 1, 2],
+        ..Pods::one()
+    };
+    let mut participant = Participant::new(7, CYCLE, routing, FixedState::default()).unwrap();
+    for key in &keys {
+        assert_eq!(
+            participant.decide_all(&[(key, tenth())], 0),
+            Decision::Admit
+        );
+    }
+    participant.on_cycle(CYCLE);
+    let sent = participant.take_outgoing();
+    assert_eq!(sent.len(), 3, "one batch an owner");
+    for (pod, batch) in &sent {
+        assert_eq!(batch.entries.len(), 10, "pod {pod}");
+        for entry in &batch.entries {
+            let at: usize = std::str::from_utf8(&entry.key[4..])
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(at % 3, *pod as usize, "to its owner");
+        }
+    }
+}
+
+/// As `DataPlane`'s view: a participant takes a later routing from any reply, and moves its
+/// keys with it — here from an answer about another key.
+#[test]
+fn a_participant_takes_a_later_routing_from_a_reply() {
+    let first = Pods {
+        pods: vec![0, 1],
+        ..Pods::one()
+    };
+    let mut participant = Participant::new(7, CYCLE, first.clone(), FixedState::default()).unwrap();
+    let mut pod = Owner::new(0, CYCLE);
+    let (key, other): (&[u8], &[u8]) = (b"k", b"o");
+    assert_eq!(
+        participant.decide_all(&[(key, tenth())], 0),
+        Decision::Admit
+    );
+    participant.on_cycle(CYCLE);
+    settle(&mut participant, &mut pod, CYCLE);
+    assert_eq!(participant.keys.get(key).unwrap().owner, Some(0));
+    let later = Pods {
+        epoch: 2,
+        keyed: [(Box::<[u8]>::from(key), 1)].into(),
+        ..first
+    };
+    assert_eq!(
+        participant.decide_all(&[(other, tenth())], CYCLE),
+        Decision::Admit
+    );
+    participant.on_cycle(2 * CYCLE);
+    // Its report to pod 0, the owner; pod 1, the other pod named, polled beside it.
+    let (_, exchange, batch) = participant
+        .take_exchanges()
+        .into_iter()
+        .find(|(to, _, _)| *to == 0)
+        .unwrap();
+    let answers = pod.on_batch(batch, 2 * CYCLE);
+    let mut reply = super::testing::reply(answers, |bytes| participant.hash(bytes));
+    reply.routing = Some(later.clone());
+    participant.on_reply_to(exchange, reply, 2 * CYCLE);
+    assert_eq!(participant.routing(), &later);
+    assert_eq!(participant.keys.get(key).unwrap().owner, Some(1), "moved");
+}
+
+/// As `DataPlane`'s: any number of limits is decided all or none, and the same key named
+/// twice — a caller's mistake — is decided rather than refused.
+#[test]
+fn any_number_of_limits_is_decided_and_a_key_named_twice_is_no_panic() {
+    let keys: Vec<Vec<u8>> = (0..5).map(|k| format!("limit-{k}").into_bytes()).collect();
+    let mut participant = participant();
+    let decide = |participant: &mut Participant<FixedState, Pods>, list: &[Vec<u8>]| {
+        let under: Vec<(&[u8], Contract)> = list.iter().map(|key| (&key[..], tenth())).collect();
+        participant.decide_all(&under, 0)
+    };
+    for count in 2..=5 {
+        assert_eq!(
+            decide(&mut participant, &keys[..count]),
+            Decision::Admit,
+            "{count}"
+        );
+    }
+    let alone = |participant: &mut Participant<FixedState, Pods>, key: &[u8], most: usize| {
+        (0..most)
+            .filter(|_| participant.decide_all(&[(key, tenth())], 0) == Decision::Admit)
+            .count()
+    };
+    // The fifth charged once of ten, the first four times.
+    assert_eq!(alone(&mut participant, &keys[4], 20), 9);
+    assert_eq!(
+        decide(&mut participant, &keys),
+        Decision::Refuse,
+        "the fifth empty"
+    );
+    assert_eq!(alone(&mut participant, &keys[0], 20), 6, "none charged");
+    let twice = [keys[1].clone(), keys[1].clone()];
+    assert_eq!(decide(&mut participant, &twice), Decision::Admit);
+}
+
+/// As `DataPlane`'s: a key with room whose share of the cycle is spent waits for the next
+/// cycle.
+#[test]
+fn a_key_refused_for_its_share_waits_for_the_next_cycle() {
+    // A bucket of a hundred, which two data planes admitting share half each.
+    let big = Contract {
+        burst: NonZeroU64::new(100).unwrap(),
+        ..tenth()
+    };
+    let key: &[u8] = b"k";
+    let mut participant = participant();
+    assert_eq!(participant.decide_all(&[(key, big)], 0), Decision::Admit);
+    let entry = participant.entries(&[(key, big)]).remove(0);
+    entry.others.store(1, Ordering::Release);
+    let now = 3 * CYCLE;
+    while participant.decide_all(&[(key, big)], now) == Decision::Admit {}
+    let bucket = &entry.terms.bucket;
+    assert!(
+        bucket.admits(entry.snapshot().arrival, bucket.units(now)),
+        "room in the bucket: refused for its share"
+    );
+    assert_eq!(
+        participant.retry_after(&[(key, big)], now),
+        Some((0, CYCLE))
+    );
+}
+
+/// As `DataPlane`'s: past its capacity, a participant evicts the keys it used least recently
+/// down to nine tenths of it, even one with hits still to be acknowledged, which are
+/// forgiven.
+#[test]
+fn a_participant_past_its_capacity_evicts_the_least_recently_used() {
+    let mut participant = participant();
+    let mut pod = Owner::new(0, CYCLE);
+    let keys: Vec<Vec<u8>> = (0..5).map(|at| format!("k{at}").into_bytes()).collect();
+    for (at, key) in keys.iter().enumerate() {
+        let now = at as u64 * MS;
+        assert_eq!(
+            participant.decide_all(&[(key, tenth())], now),
+            Decision::Admit
+        );
+        participant.on_cycle(now);
+        settle(&mut participant, &mut pod, now);
+    }
+    let each = key_bytes::<PodId>(&keys[0], 1);
+    assert_eq!(participant.holding(), 5 * each);
+    // Room for three, nine tenths of that for two: the two used last stay.
+    participant.set_capacity(3 * each);
+    participant.on_cycle(5 * MS);
+    let kept = |participant: &Participant<FixedState, Pods>| -> Vec<bool> {
+        keys.iter()
+            .map(|key| participant.keys.get(key).is_some())
+            .collect()
+    };
+    assert_eq!(kept(&participant), [false, false, false, true, true]);
+    assert_eq!(participant.holding(), 2 * each);
+    assert_eq!(participant.evicted(), 3);
+    assert_eq!(participant.forgiven(), 0, "nothing outstanding");
+    // The newest has two hits not yet acknowledged: room for less than one, and it goes,
+    // its hits forgiven.
+    for _ in 0..2 {
+        assert_eq!(
+            participant.decide_all(&[(&keys[4], tenth())], 6 * MS),
+            Decision::Admit
+        );
+    }
+    participant.set_capacity(each / 2);
+    participant.on_cycle(6 * MS);
+    assert_eq!(kept(&participant), [false; 5]);
+    assert_eq!(participant.evicted(), 5);
+    assert_eq!(participant.forgiven(), 2);
+    assert_eq!(participant.holding(), 0);
+}
+
+/// As `DataPlane`'s: exchanges overlapping, a bucket of one that refills faster than a round
+/// trip: requests at exactly the rate are admitted, the owner holding what it admits for
+/// their hits. A case pinned from a failure.
+#[test]
+fn a_client_at_exactly_its_rate_is_admitted_with_exchanges_overlapping() {
+    let n = |n| NonZeroU64::new(n).unwrap();
+    let interval = 11 * MS + 1;
+    let c = Contract {
+        limit: n(1),
+        window: n(interval),
+        burst: n(1),
+    };
+    let times = [
+        interval,
+        2 * interval,
+        3 * interval,
+        4 * interval,
+        176_494_783,
+        309_000_000,
+        309_000_000 + interval,
+    ];
+    let decided = decided_over_round_trips(c, &times, 4_773_750, 266_466);
+    assert_eq!(decided, [Some(true); 7]);
+}
+
+/// A batch's ages count back from when it was made, the latest anything joined it: entries
+/// that joined earlier age with it.
+#[test]
+fn a_batch_ages_what_joined_it_earlier() {
+    let mut queued = Queued::default();
+    queued.at(10 * MS).entries.push(BatchEntry {
+        key: b"k"[..].into(),
+        contract: tenth(),
+        report: Unseen {
+            sequence: 1,
+            count: 1,
+            admitted: 4 * MS,
+            first: 10 * MS,
+            last: 10 * MS,
+        }
+        .report(0, 10 * MS),
+    });
+    queued.at(25 * MS);
+    queued.at(20 * MS);
+    let batch = queued.batch(100);
+    assert_eq!(batch.made, 25 * MS);
+    assert!(matches!(batch.entries[0].report, Report::Hits { age, .. } if age == 21 * MS));
+}
+
+/// What is queued for a pod goes a piece at a time: its entries in the order they were
+/// queued, each piece no bigger than [`PIECE_BYTES`], and everything once.
+#[test]
+fn a_piece_takes_no_more_than_fits() {
+    let key = |n: usize| -> Box<[u8]> {
+        let mut key = vec![b'k'; 1_000];
+        key[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        key.into()
+    };
+    let mut queued = Queued::default();
+    let entries: Vec<BatchEntry> = (0..3_000)
+        .map(|n| BatchEntry {
+            key: key(n),
+            contract: tenth(),
+            report: Report::Hits {
+                sequence: 1,
+                count: 1,
+                seen: 0,
+                age: 0,
+            },
+        })
+        .collect();
+    for entry in entries.iter().cloned() {
+        queued.at(10 * MS).push_entry(entry);
+    }
+    let whole: usize = entries.iter().map(BatchEntry::bytes).sum();
+    assert!(whole > 3 * PIECE_BYTES, "{whole}: more than three pieces");
+    let mut pieces = Vec::new();
+    while !queued.is_empty() {
+        let piece = queued.take_piece(100);
+        assert!(piece.bytes() <= PIECE_BYTES, "{}", piece.bytes());
+        assert_eq!((piece.from, piece.made), (100, 10 * MS));
+        pieces.push(piece);
+    }
+    assert_eq!(pieces.len(), 4);
+    let sent: Vec<BatchEntry> = pieces.into_iter().flat_map(|piece| piece.entries).collect();
+    assert_eq!(sent, entries, "every entry once, in order");
+}
+
+/// A piece takes at least one thing, however big: an entry bigger than a piece goes alone,
+/// not never.
+#[test]
+fn a_piece_takes_an_entry_bigger_than_itself_alone() {
+    let mut queued = Queued::default();
+    for key in [vec![b'a'; 2 * PIECE_BYTES], vec![b'b'; 10]] {
+        queued.push_entry(BatchEntry {
+            key: key.into(),
+            contract: tenth(),
+            report: Report::Poll,
+        });
+    }
+    let first = queued.take_piece(100);
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(first.entries[0].key.len(), 2 * PIECE_BYTES);
+    let second = queued.take_piece(100);
+    assert_eq!(&*second.entries[0].key, b"bbbbbbbbbb");
+    assert!(queued.is_empty());
+}
+
+/// A refused request waits as long as the longest of its keys, as the proxy reads it from the
+/// entries ([`waits`], [`longest`]): its bucket's refill to one, the latest when several
+/// refuse, whatever their order; that key named, the first of those that wait as long. The
+/// participant keeps time in units of 2^-16 of a contract's interval and pads a wait by two
+/// of them so that it is never short (`rate::WAIT_SLACK`): never shorter than the exact one,
+/// and at most those two units and under one of rounding longer.
+#[test]
+fn a_refused_request_waits_for_the_latest_of_its_keys() {
+    let fast = tenth();
+    let slow = Contract {
+        limit: NonZeroU64::new(10).unwrap(),
+        ..tenth()
+    };
+    // No pods: each key decided where it is met.
+    let mut participant: Participant<FixedState, Pods> =
+        Participant::new(7, CYCLE, Pods::none(), FixedState::default()).unwrap();
+    let (a, b): (&[u8], &[u8]) = (b"a", b"b");
+    let unit = |c: Contract| (c.window.get() / c.limit.get()).div_ceil(1 << 16);
+    let interval = |c: Contract| c.window.get() / c.limit.get();
+    let wait = |participant: &Participant<FixedState, Pods>, keys: &[(&[u8], Contract)]| {
+        let entries = participant.entries(keys);
+        let refs: Vec<&Entry> = entries.iter().map(|entry| &**entry).collect();
+        longest(waits(&refs, 0))
+    };
+    let within = |got: Option<(usize, u64)>, at: usize, c: Contract, said: &str| {
+        let exact = interval(c) - crate::SLACK;
+        let (place, waits) = got.unwrap_or_else(|| panic!("{said}: no wait"));
+        assert_eq!(place, at, "{said}: the key named");
+        assert!(
+            (exact..=exact + 3 * unit(c)).contains(&waits),
+            "{said}: {waits} against {exact}, a unit {}",
+            unit(c)
+        );
+    };
+    let both = [(a, fast), (b, slow)];
+    assert_eq!(participant.decide_all(&both, 0), Decision::Admit);
+    assert_eq!(wait(&participant, &both), None, "both admit");
+    while participant.decide_all(&[(a, fast)], 0) == Decision::Admit {}
+    within(wait(&participant, &both), 0, fast, "the one refusing");
+    within(
+        wait(&participant, &[(a, fast), (a, fast)]),
+        0,
+        fast,
+        "the first",
+    );
+    while participant.decide_all(&[(b, slow)], 0) == Decision::Admit {}
+    within(wait(&participant, &both), 1, slow, "the latest");
+    within(
+        wait(&participant, &[(b, slow), (a, fast)]),
+        0,
+        slow,
+        "whatever the order",
+    );
 }
