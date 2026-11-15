@@ -14,11 +14,15 @@
 //! the store loses track of.
 
 pub mod client;
+pub mod measure;
 pub mod oracle;
 pub mod rng;
 pub mod scenario;
+pub mod workload;
 pub mod world;
 
 pub use client::Outcome;
+pub use measure::{one_bucket_admits, worst_excess};
 pub use rng::Rng;
-pub use world::{Asynchronous, Link, Mode, Plane, Sim, Stats, Synchronous, World};
+pub use workload::{Arrival, Shape, Workload};
+pub use world::{Asynchronous, Beside, Fleet, Link, Mode, Plane, Sim, Stats, Synchronous, World};
