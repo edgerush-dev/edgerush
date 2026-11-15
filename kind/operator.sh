@@ -55,7 +55,8 @@
 #   - a ServiceAccount of a name the operator would use, made by hand, is left alone, and
 #     its ControlPlane says so;
 #   - DataPlane `web` deleted takes with it everything made for it, its IngressClass and
-#     bindings included; ControlPlane `edge` deleted, its GatewayClass and its
+#     bindings included, and, the last of `edge`'s, the Ingress of its class loses the
+#     address it said (docs/04 §6); ControlPlane `edge` deleted, its GatewayClass and its
 #     ClusterRoleBinding too.
 # Each check says PASS or FAIL; the first FAIL ends the run with status 1. Nothing here
 # reads or writes the user's own kubeconfig: every kubectl is given the cluster's.
@@ -829,11 +830,18 @@ condition_is controlplane/own own Programmed "False NotOurs" 60 ||
 pass "an object of a name the operator would use, made by hand, is left alone, and said"
 
 echo "== deleted"
+shop_says() { k -n edge get ingress shop -o jsonpath='{.status.loadBalancer.ingress}'; }
+[ "$(k -n edge get ingress shop -o jsonpath='{.status.loadBalancer.ingress[0].ip}')" = 192.0.2.10 ] ||
+    fail "before DataPlane web is deleted, the Ingress's status says '$(shop_says)'"
 k -n edge delete dataplane web --wait=false >/dev/null
 until_true '[ -z "$(k -n edge get deploy,sa,pdb,hpa,rolebindings,gateways -l gateway.edgerush.dev/data-plane=web -o name 2>/dev/null)" ] && ! k get ingressclass edge.web' 90 ||
     fail "DataPlane web deleted left: $(k -n edge get deploy,sa,pdb,rolebindings -l gateway.edgerush.dev/data-plane=web -o name; k get ingressclass edge.web -o name 2>&1)"
 until_true '! k -n edge get dataplane web' 30 || fail "DataPlane web is never gone"
 pass "a DataPlane deleted takes everything made for it, its IngressClass included"
+# The last DataPlane of ControlPlane edge: its controller, serving none, follows on.
+until_true '[ -z "$(shop_says)" ]' 60 ||
+    fail "DataPlane web deleted, the Ingress of its class still says '$(shop_says)'"
+pass "the last DataPlane deleted, the Ingress of its class loses the address it said"
 k -n edge delete controlplane edge --wait=false >/dev/null
 until_true '! made_in edge edge && ! k get gatewayclass edge && [ -z "$(k get clusterrolebindings -l gateway.edgerush.dev/control-plane=edge -o name)" ]' 90 ||
     fail "ControlPlane edge deleted left: $(k get gatewayclass edge -o name 2>&1; k get clusterrolebindings -l gateway.edgerush.dev/control-plane=edge -o name)"

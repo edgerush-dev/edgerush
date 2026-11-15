@@ -1,11 +1,14 @@
 //! Ingress status ([04 §6](../../../docs/04-control-plane.md)): the data plane's addresses in
 //! `status.loadBalancer.ingress` of each Ingress it serves, and none in that of each of its
 //! class it does not, the addresses the data plane's Service gives
-//! ([`service::addresses`](crate::service::addresses)). Pure: what each Ingress's status should say is a function of what was
-//! translated, what each says now and the addresses.
+//! ([`service::addresses`](crate::service::addresses)); and none in that of each Ingress of a
+//! class of the ControlPlane's that no DataPlane may still serve (`released`). Pure: what
+//! each Ingress's status should say is a function of what was translated, what each says now
+//! and the addresses.
 
-use edgerush_translate::Object;
+use edgerush_translate::{Object, class_of};
 use k8s_openapi::api::networking::v1::{Ingress, IngressLoadBalancerIngress};
+use std::collections::BTreeSet;
 
 /// An address as a status holds it: an IP address, or else a host name.
 #[must_use]
@@ -63,6 +66,44 @@ pub(crate) fn changes(
                 ingress: object.clone(),
                 addresses: wanted,
             })
+        })
+        .collect()
+}
+
+/// Each Ingress of `ingresses` that holds an address and is of a class of
+/// `control_plane`'s, `<control_plane>.<dataplane>` (05 §3), that `kept` does not hold: to
+/// say none (04 §6). In `ingresses`' order. A class of the ControlPlane's is split only one
+/// way, as neither name holds a dot.
+pub(crate) fn released(
+    control_plane: &str,
+    kept: &BTreeSet<String>,
+    ingresses: &[Ingress],
+) -> Vec<Change> {
+    let ours = |class: &str| {
+        class.split_once('.').is_some_and(|(owner, data_plane)| {
+            owner == control_plane && !data_plane.is_empty() && !data_plane.contains('.')
+        })
+    };
+    ingresses
+        .iter()
+        .filter(|ingress| {
+            class_of(ingress).is_some_and(|class| ours(class) && !kept.contains(class))
+        })
+        .filter(|ingress| {
+            ingress
+                .status
+                .as_ref()
+                .and_then(|status| status.load_balancer.as_ref())
+                .and_then(|balancer| balancer.ingress.as_ref())
+                .is_some_and(|held| !held.is_empty())
+        })
+        .map(|ingress| Change {
+            ingress: Object {
+                kind: "Ingress",
+                namespace: ingress.metadata.namespace.clone().unwrap_or_default(),
+                name: ingress.metadata.name.clone().unwrap_or_default(),
+            },
+            addresses: Vec::new(),
         })
         .collect()
 }

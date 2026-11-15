@@ -81,6 +81,18 @@ pub struct Settings {
 /// `DataPlane <namespace>/<name>`; the development harness's one by no name.
 pub type Planes = BTreeMap<String, Settings>;
 
+/// What a ControlPlane's control plane takes Ingresses' addresses away by (04 §6): its
+/// IngressClasses are `<controlplane>.<dataplane>` (05 §3), and an Ingress of one that no
+/// DataPlane may still serve holds none.
+#[derive(Debug, Clone)]
+pub struct Classes {
+    /// The ControlPlane's name.
+    pub control_plane: String,
+    /// The classes its DataPlanes may still serve, as [`data_plane::kept`] has them, beside
+    /// those of the data planes served; `None` until the DataPlanes are listed.
+    pub kept: watch::Receiver<Option<BTreeSet<String>>>,
+}
+
 /// How long the data plane's pods are waited on to run a generation of its Gateway before
 /// its `Programmed` says false (04 §6).
 pub const PROGRAMMED_WITHIN: Duration = Duration::from_secs(30);
@@ -254,8 +266,11 @@ pub enum Membership {
 /// Gateway (those addresses among it, or none without that Service) and each route that
 /// names or named that Gateway likewise, always. With `leading`, only while it says this
 /// replica leads, every status that says otherwise written as it comes to (02 §3).
-/// The data planes are what `planes` holds, as it changes: none, and nothing is followed or
-/// translated until it holds some. One added, edited or let go of leaves the others as they
+/// The data planes are what `planes` holds, as it changes: none, and nothing is translated,
+/// nor, without `classes`, as the development harness has none, followed, until it holds
+/// some. With `classes`, a ControlPlane's, what is followed is followed whether or not it
+/// serves any, and each Ingress of a class of its own that none may still serve has its
+/// address taken away (04 §6). One added, edited or let go of leaves the others as they
 /// were: what is followed for all of them is followed on, and only what that one alone
 /// needed started or stopped; an edit is translated and written again as any change is,
 /// and one of another ID begins its data plane's translation afresh
@@ -267,6 +282,7 @@ pub async fn control(
     api: ApiServer,
     scope: &WatchScope,
     mut planes: watch::Receiver<Planes>,
+    classes: Option<Classes>,
     debounce: Debounce,
     leading: Option<watch::Receiver<bool>>,
     acks: Acks,
@@ -275,7 +291,7 @@ pub async fn control(
     let api = Rc::new(api);
     let said: Rc<dyn Fn(Said<'_>)> = Rc::new(said);
     loop {
-        if planes.borrow_and_update().is_empty() {
+        if planes.borrow_and_update().is_empty() && classes.is_none() {
             // Settings that will never come are nothing to serve.
             if planes.changed().await.is_err() {
                 return;
@@ -286,6 +302,7 @@ pub async fn control(
             &api,
             scope,
             &mut planes,
+            classes.as_ref(),
             debounce,
             leading.as_ref(),
             &acks,
@@ -389,12 +406,14 @@ fn served_now(serving: &mut BTreeMap<String, Serving>, planes: &Planes) {
     }
 }
 
-/// [`control`] for the data planes `planes` holds, until it holds none.
+/// [`control`] for the data planes `planes` holds, until it holds none, or, with `classes`,
+/// for good.
 #[allow(clippy::too_many_arguments)]
 async fn serve(
     api: &Rc<ApiServer>,
     scope: &WatchScope,
     planes: &mut watch::Receiver<Planes>,
+    classes: Option<&Classes>,
     debounce: Debounce,
     leading: Option<&watch::Receiver<bool>>,
     acks: &Acks,
@@ -402,9 +421,17 @@ async fn serve(
 ) {
     let changed = Rc::new(Notify::new());
     let mut tasks = JoinSet::new();
-    // The settings changing is a change.
+    // The settings changing is a change, and so are the classes kept.
     {
         let (mut told, changed) = (planes.clone(), Rc::clone(&changed));
+        tasks.spawn_local(async move {
+            while told.changed().await.is_ok() {
+                changed.notify_one();
+            }
+        });
+    }
+    if let Some(classes) = classes {
+        let (mut told, changed) = (classes.kept.clone(), Rc::clone(&changed));
         tasks.spawn_local(async move {
             while told.changed().await.is_ok() {
                 changed.notify_one();
@@ -483,7 +510,7 @@ async fn serve(
         // stopped, the rest followed on. A sender gone leaves them as they were.
         if planes.has_changed().unwrap_or(false) {
             let now = planes.borrow_and_update().clone();
-            if now.is_empty() {
+            if now.is_empty() && classes.is_none() {
                 return;
             }
             let mut start = Start {
@@ -592,6 +619,21 @@ async fn serve(
         for served in serving.values_mut() {
             write_statuses(api, &followed, served, acks, leads, &**said).await;
         }
+        // Each Ingress of a class of the ControlPlane's that no data plane serves and none
+        // is kept for, once the DataPlanes are listed (04 §6). Taken out of the watch first,
+        // as nothing is held of it across the writes.
+        let kept = classes.and_then(|classes| classes.kept.borrow().clone());
+        if let (Some(classes), Some(mut kept), true) = (classes, kept, leads) {
+            kept.extend(
+                serving
+                    .values()
+                    .filter_map(|served| served.settings.plane.ingress_class.clone()),
+            );
+            let ingresses = followed.ingresses();
+            for change in status::released(&classes.control_plane, &kept, &ingresses) {
+                write_ingress_status(api, &change, &**said).await;
+            }
+        }
         // Those the data planes share, once for them all (04 §6).
         if let (Some(gateway_api), true, true) =
             (&followed.gateway_api, followed.own_listed(), leads)
@@ -698,21 +740,26 @@ async fn write_statuses(
     {
         let ingresses = followed.ingresses();
         for change in status::changes(claimed, served, &ingresses, addresses) {
-            let written = match status::patch(&change.addresses) {
-                Ok(patch) => {
-                    let object = &change.ingress;
-                    api.patch_status::<Ingress>(&object.namespace, &object.name, &patch)
-                        .await
-                }
-                Err(error) => Err(ApiError::Unreadable(error.to_string())),
-            };
-            said(Said::Status {
-                ingress: &change.ingress,
-                addresses: &change.addresses,
-                written: written.as_ref().map(|_| ()),
-            });
+            write_ingress_status(api, &change, said).await;
         }
     }
+}
+
+/// Writes an Ingress's status to say what `change` has it say, and says so.
+async fn write_ingress_status(api: &ApiServer, change: &status::Change, said: &dyn Fn(Said<'_>)) {
+    let written = match status::patch(&change.addresses) {
+        Ok(patch) => {
+            let object = &change.ingress;
+            api.patch_status::<Ingress>(&object.namespace, &object.name, &patch)
+                .await
+        }
+        Err(error) => Err(ApiError::Unreadable(error.to_string())),
+    };
+    said(Said::Status {
+        ingress: &change.ingress,
+        addresses: &change.addresses,
+        written: written.as_ref().map(|_| ()),
+    });
 }
 
 /// What starts the follows.

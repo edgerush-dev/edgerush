@@ -734,6 +734,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
                         fixed(&plane),
+                        None,
                         Debounce::default(),
                         None,
                         acks(),
@@ -1054,6 +1055,7 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
                         fixed(&plane),
+                        None,
                         debounce,
                         None,
                         acks(),
@@ -1166,6 +1168,7 @@ async fn the_settings_are_followed_as_they_change() {
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
                         planes,
+                        None,
                         Debounce::default(),
                         None,
                         acks(),
@@ -1270,6 +1273,7 @@ async fn secrets_are_followed_in_the_gateways_namespace_beside_the_scope() {
                     api,
                     &scope,
                     fixed(&plane),
+                    None,
                     Debounce::default(),
                     None,
                     acks(),
@@ -1339,6 +1343,7 @@ async fn each_namespace_of_the_scope_is_followed_and_all_are_translated_together
                         api,
                         &scope,
                         fixed(&plane),
+                        None,
                         Debounce::default(),
                         None,
                         acks(),
@@ -1484,6 +1489,52 @@ fn a_status_is_written_where_it_says_other_than_what_is_served() {
     );
 }
 
+/// An Ingress of a class of ControlPlane `edge`'s, `edge.<dataplane>`, that no DataPlane
+/// may still serve loses its address (04 §6); every other is left as it is.
+#[test]
+fn an_ingress_of_a_class_no_data_plane_may_serve_is_let_go_of() {
+    let held = ["192.0.2.1"];
+    let ingresses = [
+        // Of a DataPlane gone, holding an address.
+        ingress_saying("gone", "edge.web", &held, &[]),
+        // Of one that may still serve it.
+        ingress_saying("kept", "edge.api", &held, &[]),
+        // Of one gone, but saying nothing already.
+        ingress_saying("quiet", "edge.web", &[], &[]),
+        // Another ControlPlane's, one of a name that begins as this one's does, and
+        // classes no ControlPlane's DataPlane is of.
+        ingress_saying("other", "other.web", &held, &[]),
+        ingress_saying("longer", "edgeless.web", &held, &[]),
+        ingress_saying("bare", "edge", &held, &[]),
+        ingress_saying("dotted", "edge.web.more", &held, &[]),
+        ingress_saying("empty", "edge.", &held, &[]),
+    ];
+    // Named by the old annotation alone, as translation reads it.
+    let mut annotated = ingress_saying(
+        "annotated",
+        "",
+        &held,
+        &[("kubernetes.io/ingress.class", "edge.old")],
+    );
+    annotated.spec.as_mut().unwrap().ingress_class_name = None;
+    // Of no class at all: nothing says whose it was.
+    let mut classless = ingress_saying("classless", "", &held, &[]);
+    classless.spec.as_mut().unwrap().ingress_class_name = None;
+    let ingresses: Vec<Ingress> = ingresses
+        .into_iter()
+        .chain([annotated, classless])
+        .collect();
+    let kept = BTreeSet::from(["edge.api".to_owned()]);
+    let released = |name: &str| status::Change {
+        ingress: object(name),
+        addresses: Vec::new(),
+    };
+    assert_eq!(
+        status::released("edge", &kept, &ingresses),
+        [released("gone"), released("annotated")]
+    );
+}
+
 #[test]
 fn an_address_is_an_ip_else_a_host_name() {
     assert_eq!(
@@ -1551,6 +1602,7 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
                         watch::channel(only(operated(&plane, ""))).1,
+                        None,
                         Debounce::default(),
                         None,
                         acks(),
@@ -1632,6 +1684,7 @@ async fn a_config_is_not_held_up_by_its_status() {
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
                         watch::channel(only(operated(&plane, ""))).1,
+                        None,
                         Debounce::default(),
                         None,
                         acks(),
@@ -1716,6 +1769,7 @@ async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
                         watch::channel(only(operated(&plane, ""))).1,
+                        None,
                         Debounce::default(),
                         Some(leading),
                         acks(),
@@ -2363,6 +2417,7 @@ async fn a_selectors_namespaces_are_followed_and_each_that_comes_to_match_taken_
                         api,
                         &WatchScope::Selector("team=payments".to_owned()),
                         fixed(&plane),
+                        None,
                         Debounce::default(),
                         None,
                         acks(),
@@ -2516,6 +2571,7 @@ async fn a_selectors_first_namespaces_are_waited_on_as_the_start_is() {
                         api,
                         &WatchScope::Selector("team=payments".to_owned()),
                         fixed(&plane),
+                        None,
                         Debounce::default(),
                         None,
                         acks(),
@@ -2737,6 +2793,7 @@ async fn the_data_planes_service_is_written_as_wanted_and_not_again_until_that_c
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
                         planes,
+                        None,
                         Debounce::default(),
                         None,
                         acks(),
@@ -2804,6 +2861,7 @@ async fn a_service_of_its_name_not_its_data_planes_is_left_alone() {
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
                         watch::channel(only(settings)).1,
+                        None,
                         Debounce::default(),
                         None,
                         acks(),
@@ -2848,6 +2906,7 @@ async fn a_service_refused_is_said() {
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
                         watch::channel(only(settings)).1,
+                        None,
                         Debounce::default(),
                         None,
                         acks(),
@@ -2958,6 +3017,7 @@ async fn each_data_plane_is_translated_and_its_statuses_written_on_its_own() {
                         api_server,
                         &WatchScope::Parts(vec![Scope::Cluster]),
                         watch::channel(planes).1,
+                        None,
                         Debounce::default(),
                         None,
                         acks(),
@@ -3016,6 +3076,210 @@ fn said_both(lines: &[String]) -> bool {
         .any(|line| line.starts_with("status of Ingress") && line.contains(", "))
 }
 
+/// A fake API server of IngressClass `edge.web` and two Ingresses holding an address: `web`,
+/// of that class, and `theirs`, of another ControlPlane's; DataPlane `web`'s Service giving
+/// that address; and every status written.
+async fn holding_an_address(web: &Settings) -> Fake {
+    let listed = web.clone();
+    Fake::start(&["127.0.0.1"], move |path| {
+        if path.ends_with("/status") {
+            return answer(200, "{}");
+        }
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            let class: IngressClass = serde_saphyr::from_str(
+                "{ metadata: { name: edge.web }, spec: { controller: edgerush.dev/ingress-controller } }",
+            )
+            .unwrap();
+            page(&[class])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[
+                ingress_saying("web", "edge.web", &["203.0.113.7"], &[]),
+                ingress_saying("theirs", "other.web", &["203.0.113.9"], &[]),
+            ])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/namespaces/edge/services?") {
+            page(&[as_wanted(&listed, &[80, 443], &["203.0.113.7"])])
+        } else if path == service_applied("web") {
+            answer(200, r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"x"}}"#)
+        } else if path.starts_with("/api/v1/secrets?") {
+            page(&[secret("shop", &["shop.example"])])
+        } else {
+            answer(500, "")
+        }
+    })
+    .await
+}
+
+/// The paths of the Ingress statuses written.
+fn ingress_statuses_written(fake: &Fake) -> Vec<String> {
+    fake.seen()
+        .into_iter()
+        .filter(|seen| seen.method == "PATCH" && seen.path.contains("/ingresses/"))
+        .map(|seen| seen.path)
+        .collect()
+}
+
+/// ControlPlane `edge`'s last DataPlane let go of: the control plane follows on, serving
+/// none, and its Ingress loses the address it held, once the class is no longer kept; the
+/// other ControlPlane's is left as it is (04 §6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_last_data_planes_ingresses_lose_their_address_once_it_is_let_go_of() {
+    let mut plane = plane();
+    plane.ingress_class = Some("edge.web".to_owned());
+    let web = operated_as("web", &plane);
+    let fake = holding_an_address(&web).await;
+    let api = fake.client(&token("controller-let-go", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (settings, planes) =
+                watch::channel(Planes::from([("DataPlane edge/web".to_owned(), web)]));
+            let (keeping, kept) = watch::channel(Some(BTreeSet::from(["edge.web".to_owned()])));
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        planes,
+                        Some(Classes {
+                            control_plane: "edge".to_owned(),
+                            kept,
+                        }),
+                        Debounce::default(),
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("served", || !heard.borrow().translations.is_empty()).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                ingress_statuses_written(&fake),
+                Vec::<String>::new(),
+                "a status written while its DataPlane serves it as it says"
+            );
+            // Let go of: no longer kept, as the DataPlanes' follow hands that on first, and
+            // then no longer served. Served alone, it is kept.
+            keeping.send_replace(Some(BTreeSet::new()));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                ingress_statuses_written(&fake),
+                Vec::<String>::new(),
+                "a status taken away while its data plane serves it"
+            );
+            settings.send_replace(Planes::new());
+            until("its address taken away", || {
+                heard
+                    .borrow()
+                    .lines
+                    .iter()
+                    .any(|line| line == "status of Ingress shop/web: []")
+            })
+            .await;
+            controlling.abort();
+        })
+        .await;
+    assert_eq!(
+        ingress_statuses_written(&fake),
+        ["/apis/networking.k8s.io/v1/namespaces/shop/ingresses/web/status"]
+    );
+    // Followed on as the last was let go of, not begun again.
+    let lists = fake
+        .seen()
+        .iter()
+        .filter(|seen| {
+            seen.path
+                .starts_with("/apis/networking.k8s.io/v1/ingresses?")
+                && !seen.path.contains("watch=true")
+        })
+        .count();
+    assert_eq!(lists, 1, "the Ingresses listed again");
+}
+
+/// A control plane of a ControlPlane that serves no DataPlane, as after a restart with its
+/// last gone: it follows its scope all the same, writes nothing until the DataPlanes are
+/// listed, nor while it does not lead, and then takes the address from each Ingress of a
+/// class none keeps (04 §6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_plane_serving_no_data_plane_lets_go_of_its_classes_once_they_are_listed() {
+    let mut plane = plane();
+    plane.ingress_class = Some("edge.web".to_owned());
+    let fake = holding_an_address(&operated_as("web", &plane)).await;
+    let api = fake.client(&token("controller-none", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let (leads, leading) = watch::channel(true);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (keeping, kept) = watch::channel(None);
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        watch::channel(Planes::new()).1,
+                        Some(Classes {
+                            control_plane: "edge".to_owned(),
+                            kept,
+                        }),
+                        Debounce::default(),
+                        Some(leading),
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            let listed = || {
+                fake.seen().iter().any(|seen| {
+                    seen.path
+                        .starts_with("/apis/networking.k8s.io/v1/ingresses?")
+                        && !seen.path.contains("watch=true")
+                })
+            };
+            until("its Ingresses followed", listed).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                ingress_statuses_written(&fake),
+                Vec::<String>::new(),
+                "a status written before the DataPlanes were listed"
+            );
+            // Listed, while another replica leads.
+            leads.send_replace(false);
+            keeping.send_replace(Some(BTreeSet::new()));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                ingress_statuses_written(&fake),
+                Vec::<String>::new(),
+                "a status written by a replica that does not lead"
+            );
+            leads.send_replace(true);
+            until("its address taken away", || {
+                heard
+                    .borrow()
+                    .lines
+                    .iter()
+                    .any(|line| line == "status of Ingress shop/web: []")
+            })
+            .await;
+            controlling.abort();
+        })
+        .await;
+    assert_eq!(
+        ingress_statuses_written(&fake),
+        ["/apis/networking.k8s.io/v1/namespaces/shop/ingresses/web/status"]
+    );
+}
+
 /// Of several data planes, one whose config the data plane would refuse is refused alone,
 /// the others handed theirs; one added, or let go of, leaves the others as they were: not
 /// translated again, and nothing listed again.
@@ -3054,6 +3318,7 @@ async fn a_data_plane_added_refused_or_let_go_of_leaves_the_others_as_they_were(
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
                         planes,
+                        None,
                         Debounce::default(),
                         None,
                         acks(),
@@ -3148,6 +3413,7 @@ async fn a_data_plane_of_ingress_alone_does_not_wait_on_the_gateway_apis_kinds()
                         api,
                         &WatchScope::Parts(vec![Scope::Cluster]),
                         watch::channel(planes).1,
+                        None,
                         Debounce::default(),
                         None,
                         acks(),

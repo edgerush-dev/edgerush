@@ -22,7 +22,7 @@ use edgerush_controller::expiry::Expiry;
 use edgerush_controller::issuing::{self, Issuer};
 use edgerush_controller::own_pods::follow_own_pods;
 use edgerush_controller::{
-    Acks, Debounce, Membership, Planes, Reports, Said, ServiceNow, WatchScope, control,
+    Acks, Classes, Debounce, Membership, Planes, Reports, Said, ServiceNow, WatchScope, control,
 };
 use edgerush_kubernetes::lease::{self, elect};
 use edgerush_kubernetes::{ApiError, ApiServer, Listed, Retry, SERVICE_ACCOUNT, Scope, follow};
@@ -79,7 +79,9 @@ With --control-plane, it writes each data plane's Service, edgerush-proxy-<DATAP
 its DataPlane shapes it, listing the ports each config handed on binds and Ingress's two;
 each Ingress served says that Service's addresses in its status, each of the class that is
 not says none, and the Gateway says them: a LoadBalancer's, once its load balancer gives
-them, any other's its cluster IPs. With --data-plane there is no such Service, and no
+them, any other's its cluster IPs. Each Ingress of a class <CONTROLPLANE>.<NAME> that no
+DataPlane of that name naming the ControlPlane may still serve says none too, its scope
+followed while no DataPlane is served. With --data-plane there is no such Service, and no
 status says an address. With --leader-lease, the replicas elect one by that Lease, which
 alone writes the Service and status; every one serves, and reports what its data planes run in a ConfigMap of the
 Lease's namespace, <LEASE>-acks-<HOSTNAME>, owned by its Pod where EDGERUSH_POD_UID gives
@@ -984,7 +986,9 @@ async fn control_until(
     // The data planes' settings, as they are or as their DataPlanes say them. Held for as
     // long as the control plane runs, as nothing more is said of fixed ones.
     let (settings, planes) = watch::channel(Planes::new());
-    let _fixed = match source {
+    // A ControlPlane's classes, by which the Ingresses no DataPlane may still serve lose
+    // their address (04 §6); the development harness has none.
+    let (_fixed, classes) = match source {
         Source::Fixed(plane) => {
             // The development harness's one data plane, of no name: no Service is written
             // (05 §2).
@@ -995,22 +999,28 @@ async fn control_until(
                     service: None,
                 },
             )]));
-            Some(settings)
+            (Some(settings), None)
         }
         Source::Followed {
             api,
             namespace,
             own,
         } => {
+            let (keeping, kept) = watch::channel(None);
+            let classes = Classes {
+                control_plane: own.control_plane.clone(),
+                kept,
+            };
             let telling = Rc::clone(&say);
             tasks.push(tokio::task::spawn_local(follow_data_planes(
                 api,
                 namespace,
                 own,
                 settings,
+                keeping,
                 move |line| telling(line),
             )));
-            None
+            (None, Some(classes))
         }
     };
     // The dates of the certificates handed out (04 §2, 08 §1): every replica keeps them
@@ -1203,6 +1213,7 @@ async fn control_until(
             api,
             &scope,
             planes,
+            classes,
             Debounce::default(),
             leading,
             Acks {

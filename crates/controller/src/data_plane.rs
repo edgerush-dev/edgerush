@@ -19,7 +19,7 @@ use edgerush_planes::objects::{ProxyService, data_plane_id, proxy_name};
 use edgerush_translate::{GatewayName, IpFamily, Plane, PortSettings};
 
 use crate::{Planes, Settings};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -205,15 +205,37 @@ impl Chooser {
     }
 }
 
+/// The IngressClasses of the control plane's own, `<controlplane>.<dataplane>`, that a
+/// DataPlane of `data_planes` may still serve (04 §6), `served` as [`Chooser::next`] chose:
+/// each served one's, where it serves Ingress, and that of each naming it and not served,
+/// one waiting on the operator or refused, whose pods serve their last config.
+#[must_use]
+pub fn kept(data_planes: &[DataPlane], served: &Planes, own: &Own) -> BTreeSet<String> {
+    data_planes
+        .iter()
+        .filter(|data_plane| data_plane.spec.control_plane_ref.name == own.control_plane)
+        .filter_map(|data_plane| match served.get(&named(data_plane)) {
+            Some(settings) => settings.plane.ingress_class.clone(),
+            None => Some(format!(
+                "{}.{}",
+                own.control_plane,
+                data_plane.metadata.name.as_deref().unwrap_or_default()
+            )),
+        })
+        .collect()
+}
+
 /// Follows the DataPlanes of `namespace` through `api`, handing `out` the settings of each
-/// served each time they change, none while none is accepted, and saying to `say` why one
-/// is not served as it now is, once each time that changes, and each failure of the
-/// follow. Runs until no one holds a receiver of `out`. For a `LocalSet`.
+/// served each time they change, none while none is accepted, and `keeping` the classes
+/// [`kept`] of them, once they are listed; and saying to `say` why one is not served as it
+/// now is, once each time that changes, and each failure of the follow. Runs until no one
+/// holds a receiver of `out`. For a `LocalSet`.
 pub async fn follow_data_planes(
     api: ApiServer,
     namespace: Scope,
     own: Own,
     out: watch::Sender<Planes>,
+    keeping: watch::Sender<Option<BTreeSet<String>>>,
     say: impl Fn(&str) + 'static,
 ) {
     let say: Rc<dyn Fn(&str)> = Rc::new(say);
@@ -239,6 +261,16 @@ pub async fn follow_data_planes(
         }
         let choice = chooser.next(&now.objects, &own);
         let told = choice.told();
+        // Handed on beside the settings, in either order: a class is let go of only once
+        // neither serves nor keeps it (04 §6).
+        let classes = Some(kept(&now.objects, &choice.served, &own));
+        keeping.send_if_modified(|kept| {
+            let changed = *kept != classes;
+            if changed {
+                *kept = classes;
+            }
+            changed
+        });
         out.send_if_modified(|served| {
             let changed = *served != choice.served;
             if changed {
