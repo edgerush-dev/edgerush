@@ -55,6 +55,8 @@
 #     control plane alone; on again and the ControlPlane deleted, the registration gone;
 #   - a ServiceAccount of a name the operator would use, made by hand, is left alone, and
 #     its ControlPlane says so;
+#   - `web` autoscaled from 2 has an autoscaler that scales it to 2; its `max` taken away
+#     and `min` made 1 deletes it, and `web` runs 1, not scaled back;
 #   - `web`'s `gateway` taken away deletes its Gateway, its IngressClass kept, and the
 #     Ingress is still served through it;
 #   - DataPlane `web` deleted takes with it everything made for it, its IngressClass and
@@ -840,6 +842,25 @@ condition_is controlplane/own own Programmed "False NotOurs" 60 ||
 [ -z "$(k -n own get serviceaccount edgerush-controller-own -o jsonpath='{.metadata.labels}')" ] ||
     fail "the ServiceAccount made by hand was taken over"
 pass "an object of a name the operator would use, made by hand, is left alone, and said"
+
+echo "== an autoscaler no longer asked for"
+deployment_replicas() { k -n edge get deploy edgerush-proxy-web -o jsonpath='{.spec.replicas}'; }
+k -n edge patch dataplane web --type=merge -p '{"spec":{"replicas":{"min":2,"max":4}}}' >/dev/null
+until_true 'k -n edge get hpa edgerush-proxy-web' 60 ||
+    fail "DataPlane web autoscaled has no HorizontalPodAutoscaler"
+until_true '[ "$(deployment_replicas)" = 2 ]' 90 ||
+    fail "DataPlane web autoscaled from 2 runs $(deployment_replicas)"
+k -n edge patch dataplane web --type=merge -p '{"spec":{"replicas":{"min":1,"max":null}}}' >/dev/null
+until_true '! k -n edge get hpa edgerush-proxy-web' 60 ||
+    fail "DataPlane web no longer autoscaled left its HorizontalPodAutoscaler: $(k -n edge get hpa edgerush-proxy-web -o name 2>&1)"
+until_true '[ "$(deployment_replicas)" = 1 ]' 60 ||
+    fail "DataPlane web of 1 replica runs $(deployment_replicas)"
+# Past the autoscaler's sync, 15 seconds: one left behind would scale it back to 2.
+sleep 20
+[ "$(deployment_replicas)" = 1 ] || fail "DataPlane web of 1 replica was scaled to $(deployment_replicas)"
+condition_is dataplane/web edge Programmed "True Programmed" 60 ||
+    fail "DataPlane web, no longer autoscaled: $(condition dataplane/web edge Programmed)"
+pass "a DataPlane no longer autoscaled deletes its autoscaler and runs the count it states"
 
 echo "== a Gateway no longer asked for"
 k -n edge patch dataplane web --type=merge -p '{"spec":{"gateway":null}}' >/dev/null

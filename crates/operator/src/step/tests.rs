@@ -6,6 +6,7 @@
 use super::*;
 use edgerush_kubernetes::Timing;
 use edgerush_kubernetes::testing::{Answer, Fake, Seen as Asked, answer, token};
+use edgerush_planes::data_plane::DataPlaneReplicas;
 use k8s_openapi::jiff::Timestamp;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1818,4 +1819,105 @@ async fn a_data_plane_of_a_control_plane_not_accepted_keeps_its_ingress_class_an
     );
     assert!(!deleted.contains(INGRESS_CLASS), "{deleted:?}");
     assert!(!deleted.contains(GATEWAY), "{deleted:?}");
+}
+
+const AUTOSCALER: &str =
+    "/apis/autoscaling/v2/namespaces/edge/horizontalpodautoscalers/edgerush-proxy-web";
+const DEPLOYMENT: &str = "/apis/apps/v1/namespaces/edge/deployments/edgerush-proxy-web";
+
+/// [`after_first`] of [`data_plane`] autoscaled from 2 to 5, its HorizontalPodAutoscaler
+/// made, then its DataPlane's next generation with `replicas` as `change` makes them.
+fn autoscaled_then(change: impl FnOnce(&mut DataPlaneReplicas)) -> Seen {
+    let mut data_plane = data_plane();
+    data_plane.spec.replicas = DataPlaneReplicas {
+        min: 2,
+        max: Some(5),
+    };
+    let mut seen = after_first_of(data_plane, SERVED, "1", 1);
+    assert!(
+        seen.children
+            .iter()
+            .any(|child| child.kind == "HorizontalPodAutoscaler")
+    );
+    let data_plane = &mut seen.data_planes[0];
+    change(&mut data_plane.spec.replicas);
+    data_plane.metadata.generation = Some(2);
+    seen
+}
+
+/// The replicas the last apply of the proxy's Deployment in `asked` states.
+fn deployment_replicas(asked: &[Asked]) -> Option<serde_json::Value> {
+    let applied = asked
+        .iter()
+        .rev()
+        .find(|asked| asked.method == "PATCH" && asked.path.starts_with(DEPLOYMENT))
+        .expect("the Deployment applied");
+    let body: serde_json::Value = serde_json::from_str(&applied.body).unwrap();
+    body["spec"].get("replicas").cloned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_data_plane_no_longer_autoscaled_has_its_autoscaler_deleted() {
+    // Its `max` taken away, or made `min`: either is a fixed count.
+    for (case, change) in [
+        (
+            "max taken away",
+            (|replicas| replicas.max = None) as fn(&mut DataPlaneReplicas),
+        ),
+        ("max made min", |replicas| {
+            replicas.min = 3;
+            replicas.max = Some(3);
+        }),
+    ] {
+        let (fake, api) = cluster(|_, _| None).await;
+        let said = Said::default();
+        let mut operator = Operator::new(install());
+        let seen = autoscaled_then(change);
+        assert!(
+            operator.step(&api, &seen, &time(10), &said.say()).await,
+            "{case}: {:?}",
+            said.0
+        );
+        let asked = fake.seen();
+        assert_eq!(
+            written(&asked, "DELETE"),
+            BTreeSet::from([AUTOSCALER.to_owned()]),
+            "{case}"
+        );
+        assert!(
+            said.any(
+                "HorizontalPodAutoscaler edge/edgerush-proxy-web deleted, no longer asked for"
+            ),
+            "{case}: {:?}",
+            said.0
+        );
+        // The Deployment states its count again, which no autoscaler now undoes.
+        let min = seen.data_planes[0].spec.replicas.min;
+        assert_eq!(
+            deployment_replicas(&asked),
+            Some(serde_json::json!(min)),
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_data_plane_still_autoscaled_keeps_its_autoscaler() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let seen = autoscaled_then(|replicas| replicas.max = Some(8));
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    assert_eq!(written(&asked, "DELETE"), BTreeSet::new());
+    assert!(
+        writes(&asked).contains(&format!("PATCH {AUTOSCALER}{APPLY}")),
+        "{:?}",
+        writes(&asked)
+    );
+    assert_eq!(deployment_replicas(&asked), None);
 }

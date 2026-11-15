@@ -14,8 +14,9 @@
 //! namespaces its ControlPlane's selector no longer selects, and, for one whose
 //! ControlPlane is not accepted, every right beyond its own namespace, so that an allowance
 //! narrowed takes back what it granted (05 §4); and so is a webhook registration no longer
-//! asked for, its webhook turned off or its ControlPlane not accepted, and a DataPlane's
-//! IngressClass or Gateway once its `ingress` or `gateway` is taken away. One being deleted
+//! asked for, its webhook turned off or its ControlPlane not accepted, a DataPlane's
+//! IngressClass or Gateway once its `ingress` or `gateway` is taken away, and its
+//! HorizontalPodAutoscaler once it no longer autoscales. One being deleted
 //! has what no owner reference reaches deleted by its labels, then its finalizer taken
 //! away.
 //!
@@ -179,8 +180,8 @@ struct Plane<'a> {
 }
 
 /// An object deleted once it is no longer asked for, as `(kind, namespace, name)`: a
-/// binding, a webhook registration, an IngressClass or a Gateway, the namespace empty for
-/// one of the cluster's.
+/// binding, a webhook registration, an IngressClass, a Gateway or a HorizontalPodAutoscaler,
+/// the namespace empty for one of the cluster's.
 type Withdrawn = (&'static str, String, String);
 
 /// Whether `kind` is of the objects deleted once no longer asked for: those a resource
@@ -191,6 +192,7 @@ fn withdrawable(kind: &str) -> bool {
         || kind == ValidatingWebhookConfiguration::KIND
         || kind == IngressClass::KIND
         || kind == Gateway::KIND
+        || kind == HorizontalPodAutoscaler::KIND
 }
 
 /// Those of `objects` deleted once no longer asked for.
@@ -636,6 +638,10 @@ async fn withdraw(
             ),
             Gateway::KIND => (
                 api.delete::<Gateway>(namespace, name).await,
+                "no longer asked for",
+            ),
+            HorizontalPodAutoscaler::KIND => (
+                api.delete::<HorizontalPodAutoscaler>(namespace, name).await,
                 "no longer asked for",
             ),
             // A ValidatingWebhookConfiguration, the last of `withdrawable`'s.
