@@ -1,13 +1,15 @@
 //! What a limit rule's decision costs in time, on the machine it runs on: each of the
 //! spike's rules compiled and written by hand in Rust, the rate limiter's decision for a
 //! key it holds, and the two together as a request pays them — the rule's key put
-//! together as the proxy does (the rule's name, a zero, the value) and decided (03 §2: at
-//! most 150 ns for an existing key). Release builds only:
+//! together as the proxy does (the rule's name, a zero, the value) and decided as a proxy's
+//! worker decides it, its handle to the key's entry found among its handles and the entry
+//! decided (03 §2: at most 150 ns for an existing key). Release builds only:
 //! `cargo run --release -p edgerush-rules --example timing`.
 
-use edgerush_ratelimit::service::{Contract, DataPlane, Decision, Keyed, ServicePod, View};
+use edgerush_ratelimit::service::pooled::{self, Handle, Local, Participant, Routing};
+use edgerush_ratelimit::service::{Batch, Contract, Keyed, PodId};
 use edgerush_rules::{Address, Context, KeyValue, Named, Outcome, Rule, Schema, Tables, Text};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hint::black_box;
 use std::net::IpAddr;
 use std::num::NonZeroU64;
@@ -163,27 +165,72 @@ fn contract() -> Contract {
     }
 }
 
-/// A data plane holding a thousand keys and each rule's key warm, as the proxy's worker
-/// would.
-fn warm(keys: &[Vec<u8>]) -> DataPlane<Keyed> {
-    let view = View {
-        epoch: 1,
-        pods: vec![0],
-    };
-    let mut pod: ServicePod = ServicePod::new(0, 10 * MS, view.clone());
+/// The one pod of a service, owning every key.
+#[derive(Clone, Copy, Debug)]
+struct One;
+
+impl Routing for One {
+    type Pod = PodId;
+    type Batch = Batch;
+
+    fn owner(&self, _: &[u8], _: u64) -> Option<PodId> {
+        Some(0)
+    }
+
+    fn through(&self, _: u64, _: PodId) -> Option<PodId> {
+        None
+    }
+
+    fn polled(&self, _: u64) -> Option<PodId> {
+        Some(0)
+    }
+
+    fn later(&self, _: &Self) -> bool {
+        false
+    }
+
+    fn names(&self, pod: PodId) -> bool {
+        pod == 0
+    }
+
+    fn batch(&self, _: PodId, batch: Batch, _: impl Fn(&[u8]) -> u64) -> Batch {
+        batch
+    }
+}
+
+/// A worker's handles to its process's entries, found by key, as the proxy's are.
+type Handles = HashSet<Handle, Keyed>;
+
+/// A worker holding handles to a thousand keys' entries and each rule's key's, as the proxy's
+/// worker would; `None` where 128-bit atomics are not native.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "a handle hashes and compares by its entry's key, which never changes"
+)]
+fn warm(keys: &[Vec<u8>]) -> Option<Handles> {
     let hasher = Keyed::new([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
-    let mut plane = DataPlane::with_hasher(1, 10 * MS, view, hasher);
+    let participant = Participant::new(1, 10 * MS, One, hasher)?;
+    let registry = participant.registry();
+    let mut handles = Handles::with_hasher(hasher);
     let others = (0..1_000).map(|k| format!("other\0key-{k}").into_bytes());
     for key in others.chain(keys.iter().cloned()) {
-        plane.decide(&key, contract(), 0);
+        let (entry, _) = registry.find_or_make(&key, contract(), 10 * MS, 0)?;
+        handles.replace(Handle::new(entry));
     }
-    for (_, batch) in plane.take_outgoing() {
-        let answers = pod.on_batch(batch, 0);
-        plane.on_answers(answers, 0);
-    }
-    plane.on_cycle(MS);
-    plane.take_outgoing();
-    plane
+    Some(handles)
+}
+
+/// A request under `key` decided as a proxy's worker decides one: its handle found, and the
+/// entry decided if it is under `contract`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "a handle hashes and compares by its entry's key, which never changes"
+)]
+fn decide(handles: &Handles, key: &[u8], contract: Contract, now: u64) -> bool {
+    handles
+        .get(key)
+        .filter(|held| held.entry().contract() == contract)
+        .is_some_and(|held| pooled::decide(&[&**held.entry()], now).local == Local::Admit)
 }
 
 /// The rule's key as the proxy puts it together, in a buffer kept for it.
@@ -239,7 +286,10 @@ fn main() {
             _ => None,
         })
         .collect();
-    let mut plane = warm(&keys);
+    let Some(handles) = warm(&keys) else {
+        eprintln!("no native 128-bit compare-and-swap here");
+        return;
+    };
     let contract = contract();
 
     println!("ns a decision, median of {ROUNDS} rounds of {PER_ROUND}");
@@ -262,17 +312,24 @@ fn main() {
         key_of(&mut buffer, rule.name(), key);
         let fixed = buffer.clone();
         let limiter = time(|| {
-            let decision = plane.decide(black_box(&fixed), black_box(contract), black_box(2 * MS));
-            black_box(decision == Decision::Admit);
+            black_box(decide(
+                &handles,
+                black_box(&fixed),
+                black_box(contract),
+                black_box(2 * MS),
+            ));
         });
         let both = time(|| {
             if let Outcome::Applies { key, .. } =
                 rule.evaluate(black_box(&request), black_box(&tables))
             {
                 key_of(&mut buffer, rule.name(), key);
-                let decision =
-                    plane.decide(black_box(&buffer), black_box(contract), black_box(2 * MS));
-                black_box(decision == Decision::Admit);
+                black_box(decide(
+                    &handles,
+                    black_box(&buffer),
+                    black_box(contract),
+                    black_box(2 * MS),
+                ));
             }
         });
         println!(
