@@ -796,11 +796,10 @@ impl<S: BuildHasher + Clone> Local<S> {
     }
 
     /// Forgets the keys whose buckets are full at `now` and that no request used for
-    /// `quiet`; then, past the cap, evicts the keys whose buckets will be full soonest, down
-    /// to nine tenths of it. Lets go of the terms of limits no key holds any longer, as
-    /// after a reload that drops a limit: a key forgotten holds its terms until the workers'
-    /// handles let go of it, so they go at a later sweep. Taken every second or so, off the
-    /// request path.
+    /// `quiet`; then, past the cap, [evicts](Self::evict). Lets go of the terms of limits no
+    /// key holds any longer, as after a reload that drops a limit: a key forgotten holds its
+    /// terms until the workers' handles let go of it, so they go at a later sweep. Taken
+    /// every second or so, off the request path.
     pub fn sweep(&self, now: u64, quiet: u64) -> Swept {
         let mut swept = Swept::default();
         let mut freed = 0;
@@ -818,10 +817,20 @@ impl<S: BuildHasher + Clone> Local<S> {
         // Held by the map alone: no key points to them, and none can be made meanwhile, as
         // making one takes the map's lock to find them.
         write(&self.terms).retain(|_, terms| Arc::strong_count(terms) > 1);
+        swept.evicted = self.evict(now);
+        swept
+    }
+
+    /// Past the cap, evicts the keys whose buckets will be full soonest at `now`, down to
+    /// nine tenths of it; how many. Within it, reads one count and returns, so that it can
+    /// be taken far more often than a sweep, keys being made between sweeps faster than the
+    /// cap allows (GitHub #410). Off the request path.
+    pub fn evict(&self, now: u64) -> u64 {
         let capacity = self.capacity.load(Ordering::Relaxed);
         if self.holding() <= capacity {
-            return swept;
+            return 0;
         }
+        let mut evicted = 0;
         let mut keys: Vec<(u64, Arc<Key>)> = self
             .shards
             .iter()
@@ -851,10 +860,10 @@ impl<S: BuildHasher + Clone> Local<S> {
                     Ordering::Relaxed,
                 );
                 self.evicted.fetch_add(1, Ordering::Relaxed);
-                swept.evicted += 1;
+                evicted += 1;
             }
         }
-        swept
+        evicted
     }
 }
 
