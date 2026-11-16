@@ -1,6 +1,7 @@
-//! What `install/` ships beside the CRDs: the four ClusterRoles the operator binds, the
-//! admission policy on a control plane's Services, as the code names them, and the
-//! operator itself, which grants by binding those four alone.
+//! What `install/` ships: the CRDs' bound on a name, as the code names Services by it; the
+//! four ClusterRoles the operator binds, the admission policy on a control plane's
+//! Services, as the code names them; and the operator itself, which grants by binding those
+//! four alone.
 
 #![allow(
     clippy::unwrap_used,
@@ -8,7 +9,9 @@
     reason = "a file that cannot be read fails the test"
 )]
 
-use edgerush_planes::objects::{GATEWAY_CONTROLLER, INGRESS_CONTROLLER, ROLES, controller_name};
+use edgerush_planes::objects::{
+    GATEWAY_CONTROLLER, INGRESS_CONTROLLER, ROLES, controller_name, proxy_name,
+};
 use k8s_openapi::api::admissionregistration::v1::{
     ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
 };
@@ -19,6 +22,38 @@ fn read(file: &str) -> String {
     std::fs::read_to_string(format!("{}/install/{file}", env!("CARGO_MANIFEST_DIR")))
         .expect("the file is there")
         .replace("\r\n", "\n")
+}
+
+/// The longest name the CRD in `file` admits, by its rule on `metadata.name`.
+fn longest_name(file: &str) -> usize {
+    read(file)
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("rule: size(self.metadata.name) <= ")
+        })
+        .and_then(|rule| rule.split_once(' '))
+        .and_then(|(longest, _)| longest.parse().ok())
+        .expect("the CRD bounds the name")
+}
+
+/// A Service's name is a DNS-1035 label: what each kind's Service is named must fit, for
+/// the longest name its CRD admits, and the CRD must admit every name that fits, or a
+/// resource is admitted whose Service the API server then refuses (05 §1).
+#[test]
+fn the_longest_names_admitted_name_services_of_63_characters() {
+    let control_plane = longest_name("gateway.edgerush.dev_controlplanes.yaml");
+    assert_eq!(
+        controller_name(&"a".repeat(control_plane)).len(),
+        63,
+        "a ControlPlane's controller's Service"
+    );
+    let data_plane = longest_name("gateway.edgerush.dev_dataplanes.yaml");
+    assert_eq!(
+        proxy_name(&"a".repeat(data_plane)).len(),
+        63,
+        "a DataPlane's Service"
+    );
 }
 
 #[test]

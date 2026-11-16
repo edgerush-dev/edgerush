@@ -37,7 +37,8 @@ spec:
           with `gateway`, its Gateway, named as it is, of the GatewayClass of its
           ControlPlane.
 
-          Its name is a DNS label, as it is a label's value on what is made for it.
+          Its name is a DNS label of at most 48 characters, so that its Service,
+          `edgerush-proxy-<name>`, is a DNS label too.
         properties:
           apiVersion:
             description: |-
@@ -1548,8 +1549,8 @@ spec:
         - spec
         type: object
         x-kubernetes-validations:
-        - message: the name of a DataPlane must be a DNS label, at most 63 lower-case letters, digits and '-', starting and ending with a letter or digit
-          rule: size(self.metadata.name) <= 63 && self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+        - message: the name of a DataPlane must be a DNS label of at most 48 lower-case letters, digits and '-', starting and ending with a letter or digit, as its Service, edgerush-proxy-<name>, is a DNS label
+          rule: size(self.metadata.name) <= 48 && self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
     served: true
     storage: true
     subresources:

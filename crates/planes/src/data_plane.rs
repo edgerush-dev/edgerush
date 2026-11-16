@@ -12,7 +12,8 @@ use std::collections::BTreeMap;
 /// with `gateway`, its Gateway, named as it is, of the GatewayClass of its
 /// ControlPlane.
 ///
-/// Its name is a DNS label, as it is a label's value on what is made for it.
+/// Its name is a DNS label of at most 48 characters, so that its Service,
+/// `edgerush-proxy-<name>`, is a DNS label too.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct DataPlane {
     /// The object's metadata.

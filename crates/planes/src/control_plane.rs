@@ -10,8 +10,10 @@ use std::collections::BTreeMap;
 /// it. The operator deploys it, gives it the rights of its scope, and makes the
 /// GatewayClass named as it is.
 ///
-/// Its name is a DNS label, unique in the cluster: the oldest ControlPlane of a name
-/// holds it, and a later one of the same name in another namespace is not accepted.
+/// Its name is a DNS label of at most 43 characters, so that its controller's Service,
+/// `edgerush-controller-<name>`, is a DNS label too. It is unique in the cluster: the
+/// oldest ControlPlane of a name holds it, and a later one of the same name in another
+/// namespace is not accepted.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct ControlPlane {
     /// The object's metadata.
