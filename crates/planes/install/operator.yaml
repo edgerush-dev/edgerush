@@ -78,6 +78,11 @@ rules:
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gatewayclasses]
     verbs: [get, list, watch, create, patch, deletecollection]
+  # A GatewayClass naming EdgeRush's controller that no ControlPlane made, refused: its
+  # Accepted condition alone, applied (05 §3). Every class is read for it, above.
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gatewayclasses/status]
+    verbs: [patch]
   - apiGroups: [networking.k8s.io]
     resources: [ingressclasses]
     verbs: [get, list, watch, create, patch, delete, deletecollection]

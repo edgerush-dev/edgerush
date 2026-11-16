@@ -10,9 +10,11 @@
 //! `PlatformDefaults`, every Namespace for its labels, and every object the operator made, elects a leader among the replicas by a Lease, and has
 //! the leader step each time any of them changes. GatewayClasses and Gateways it follows,
 //! and makes, only while the cluster serves them: Ingress alone needs no Gateway API CRDs
-//! ([05 §6](../../../docs/05-operator.md)).
+//! ([05 §6](../../../docs/05-operator.md)). It follows every GatewayClass, not only those it
+//! made, as [`classes`] refuses those naming EdgeRush's controller that no ControlPlane made.
 
 pub mod allowance;
+pub mod classes;
 pub mod judge;
 pub mod status;
 mod step;
@@ -175,12 +177,35 @@ impl<K: Kind + 'static> WhileServed<K> {
         Some(self.objects.is_some())
     }
 
-    /// Its objects added to `into` as children, none while it is not served: whether they
-    /// are listed whole.
+    /// Those of its objects the operator made, by their label, added to `into` as
+    /// children, none while it is not served: whether they are listed whole.
     fn seen(&self, into: &mut Vec<Child>) -> bool {
+        self.objects.as_ref().is_none_or(|(objects, _)| {
+            let listed = objects.borrow();
+            into.extend(
+                listed
+                    .objects
+                    .iter()
+                    .filter(|object| {
+                        object
+                            .metadata()
+                            .labels
+                            .as_ref()
+                            .and_then(|labels| labels.get(MANAGED_BY_LABEL))
+                            .is_some_and(|by| by == MANAGED_BY)
+                    })
+                    .map(Child::of),
+            );
+            listed.listed
+        })
+    }
+
+    /// Every one of its objects followed, whoever made it; none while it is not served.
+    fn all(&self) -> Vec<K> {
         self.objects
             .as_ref()
-            .is_none_or(|(objects, _)| each(objects, into))
+            .map(|(objects, _)| objects.borrow().objects.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -329,8 +354,11 @@ pub async fn operate(
             Arc::clone(&platform_defaults.borrow()),
             Arc::clone(&namespaces.borrow()),
         );
+        // Every class, those no ControlPlane made among them; only the Gateways it made.
         let (Some(gateway_classes), Some(gateways)) = (
-            children.gateway_classes.keep(&api, &made, &changed, &say),
+            children
+                .gateway_classes
+                .keep(&api, &Scope::Cluster, &changed, &say),
             children.gateways.keep(&api, &made, &changed, &say),
         ) else {
             continue;
@@ -361,6 +389,7 @@ pub async fn operate(
                 })
                 .collect(),
             children: children_now,
+            gateway_classes: children.gateway_classes.all(),
             gateway_api: GatewayApi {
                 gateway_classes,
                 gateways,

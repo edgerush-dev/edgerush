@@ -322,6 +322,12 @@ pub struct Cluster {
     /// object of another is seen, so a reference into one is said as such (04 §9). None for
     /// every namespace, as `edgerush validate` reads them.
     pub watched: Option<Vec<String>>,
+    /// The labels the data plane's GatewayClass carries where a ControlPlane's control
+    /// plane translates it: those the operator makes its class with, so that a class of its
+    /// name it did not make is not taken, as the operator refuses it
+    /// ([05 §3](../../../docs/05-operator.md)). None where classes are written by hand, as
+    /// for the development harness and `edgerush validate`.
+    pub gateway_class_labels: Option<BTreeMap<String, String>>,
 }
 
 /// A data plane's config, and what could not go into it.
@@ -772,6 +778,12 @@ pub enum Problem {
          translated"
     )]
     GatewayClassNotOurs(String),
+    /// The data plane's Gateway's GatewayClass names this controller but is not the one the
+    /// operator made for this control plane's ControlPlane.
+    #[error(
+        "is not the class the operator made for this ControlPlane, so its Gateway is not          translated"
+    )]
+    GatewayClassNotMade,
     /// A listener of the data plane's Gateway is not accepted, or is and serves nothing.
     #[error("listener {name}: {}: {problem}", problem.verdict())]
     Listener {

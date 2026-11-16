@@ -209,6 +209,41 @@ fn the_operator_reads_the_crds_of_the_two_kinds_it_makes_alone() {
 }
 
 #[test]
+fn the_operator_writes_the_status_of_gateway_classes_by_patch_alone() {
+    // A class naming EdgeRush's controller that no ControlPlane made is refused in its
+    // status (05 §3); no other Gateway API status is the operator's.
+    let shipped: Vec<OperatorInstall> =
+        serde_saphyr::from_multiple(&read("operator.yaml")).unwrap();
+    let rules: Vec<_> = shipped
+        .iter()
+        .filter_map(|object| match object {
+            OperatorInstall::ClusterRole(role) => role.rules.clone(),
+            OperatorInstall::Role(role) => role.rules.clone(),
+            _ => None,
+        })
+        .flatten()
+        .filter(|rule| {
+            rule.resources
+                .iter()
+                .flatten()
+                .any(|resource| resource.ends_with("/status") && !resource.contains("planes"))
+        })
+        .collect();
+    let [status] = rules.as_slice() else {
+        panic!("one rule writes Gateway API status: {rules:?}");
+    };
+    assert_eq!(
+        status.api_groups.as_deref(),
+        Some(&["gateway.networking.k8s.io".to_owned()][..])
+    );
+    assert_eq!(
+        status.resources.as_deref(),
+        Some(&["gatewayclasses/status".to_owned()][..])
+    );
+    assert_eq!(status.verbs, ["patch"]);
+}
+
+#[test]
 fn the_operator_reads_platform_defaults_and_never_writes_them() {
     // What the platform allows is the platform's to write (05 §4).
     let shipped: Vec<OperatorInstall> =

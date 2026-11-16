@@ -316,6 +316,7 @@ async fn an_accepted_resource_is_finalized_then_made_then_reported() {
         control_planes: vec![control_plane("Same")],
         data_planes: vec![data_plane()],
         children: Vec::new(),
+        gateway_classes: Vec::new(),
         gateway_api: SERVED,
     };
     let said = Said::default();
@@ -438,6 +439,7 @@ fn after_first_of(
         control_planes: vec![cp],
         data_planes: vec![dp],
         children,
+        gateway_classes: Vec::new(),
         gateway_api,
     }
 }
@@ -649,6 +651,7 @@ async fn an_object_of_its_name_not_the_operators_is_left_alone_and_said() {
         control_planes: vec![control_plane("Same")],
         data_planes: vec![data_plane()],
         children: Vec::new(),
+        gateway_classes: Vec::new(),
         gateway_api: SERVED,
     };
     assert!(
@@ -740,6 +743,7 @@ async fn a_refused_control_plane_makes_nothing_and_its_data_plane_waits_on_it() 
         control_planes: vec![control_plane("All")],
         data_planes: vec![data_plane()],
         children: Vec::new(),
+        gateway_classes: Vec::new(),
         gateway_api: SERVED,
     };
     assert!(
@@ -1090,6 +1094,7 @@ async fn without_gateway_apis_crds_the_rest_is_made_and_a_gateway_waits_on_them(
         control_planes: vec![control_plane("Same")],
         data_planes: vec![data_plane_with_gateway()],
         children: Vec::new(),
+        gateway_classes: Vec::new(),
         gateway_api: NO_GATEWAY_API,
     };
     let said = Said::default();
@@ -2083,4 +2088,168 @@ async fn replicas_the_operator_does_not_leave_out_or_no_longer_holds_are_not_han
             "{case}: {written:?}"
         );
     }
+}
+
+/// GatewayClass `name` of generation `generation`, naming `controller`, holding nothing in
+/// its status.
+fn gateway_class(name: &str, controller: &str, generation: i64) -> GatewayClass {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "GatewayClass",
+        "metadata": { "name": name, "generation": generation },
+        "spec": { "controllerName": controller },
+    }))
+    .unwrap()
+}
+
+const SUITE_CLASS: &str =
+    "/apis/gateway.networking.k8s.io/v1/gatewayclasses/gatewayclass-observed-generation-bump";
+
+/// A cluster of ControlPlane `edge` alone, with three classes: the conformance suite's,
+/// naming EdgeRush's controller; `edge`'s, made for it; and another controller's.
+fn three_classes() -> Seen {
+    Seen {
+        platform_defaults: None,
+        namespaces: BTreeMap::new(),
+        control_planes: vec![control_plane("Same")],
+        data_planes: Vec::new(),
+        children: Vec::new(),
+        gateway_classes: vec![
+            gateway_class(
+                "gatewayclass-observed-generation-bump",
+                "edgerush.dev/gateway-controller",
+                1,
+            ),
+            {
+                let mut edge = gateway_class("edge", "edgerush.dev/gateway-controller", 1);
+                edge.metadata.labels = Some(control_plane_labels("edge", "edge"));
+                edge
+            },
+            gateway_class("other", "example.com/gateway-controller", 1),
+        ],
+        gateway_api: SERVED,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_class_no_control_plane_made_is_refused_and_no_other_written() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let seen = three_classes();
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    assert!(
+        operator.step(&api, &seen, &time(0), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    let classes: Vec<String> = writes(&asked)
+        .into_iter()
+        .filter(|write| write.contains("/gatewayclasses/") && write.contains("/status"))
+        .collect();
+    assert_eq!(classes, [format!("PATCH {SUITE_CLASS}/status{APPLY}")]);
+    assert_eq!(
+        status_written(&asked, SUITE_CLASS),
+        conditions_of(&[("Accepted", "False", "Unsupported")])
+    );
+    let written = asked
+        .iter()
+        .rfind(|asked| asked.path == format!("{SUITE_CLASS}/status{APPLY}"))
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&written.body).unwrap();
+    assert_eq!(body["status"]["conditions"][0]["observedGeneration"], 1);
+    // Its conditions alone: the supported features are another's to write.
+    assert!(body["status"].get("supportedFeatures").is_none());
+    assert!(said.any("GatewayClass gatewayclass-observed-generation-bump: Accepted False"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_class_refused_is_written_again_only_as_its_generation_changes() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let mut seen = three_classes();
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    assert!(operator.step(&api, &seen, &time(0), &said.say()).await);
+    let refusal = classes::accepted(&seen.gateway_classes[0], &time(0));
+    seen.gateway_classes[0]
+        .status
+        .get_or_insert_default()
+        .conditions = Some(vec![refusal]);
+    let status_writes = |asked: &[Asked]| {
+        asked
+            .iter()
+            .filter(|asked| asked.path == format!("{SUITE_CLASS}/status{APPLY}"))
+            .count()
+    };
+    let before = status_writes(&fake.seen());
+
+    // Its status says it: nothing to write.
+    assert!(operator.step(&api, &seen, &time(10), &said.say()).await);
+    assert_eq!(status_writes(&fake.seen()), before);
+
+    // Edited: said of its new generation.
+    seen.gateway_classes[0].metadata.generation = Some(2);
+    assert!(operator.step(&api, &seen, &time(20), &said.say()).await);
+    let asked = fake.seen();
+    assert_eq!(status_writes(&asked), before + 1);
+    let written = asked
+        .iter()
+        .rfind(|asked| asked.path == format!("{SUITE_CLASS}/status{APPLY}"))
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&written.body).unwrap();
+    assert_eq!(body["status"]["conditions"][0]["observedGeneration"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_that_cannot_be_written_is_a_step_left_undone() {
+    let (_fake, api) = cluster(|method, path| {
+        (method == "PATCH" && path.starts_with(&format!("{SUITE_CLASS}/status")))
+            .then(|| answer(500, r#"{"kind":"Status","code":500}"#))
+    })
+    .await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    assert!(
+        !operator
+            .step(&api, &three_classes(), &time(0), &said.say())
+            .await
+    );
+    assert!(
+        said.any(
+            "GatewayClass gatewayclass-observed-generation-bump: its status cannot be written"
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_class_gone_before_its_refusal_is_written_is_nothing_left_undone() {
+    let (_fake, api) = cluster(|method, path| {
+        (method == "PATCH" && path.starts_with(&format!("{SUITE_CLASS}/status")))
+            .then(|| answer(404, r#"{"kind":"Status","code":404}"#))
+    })
+    .await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    assert!(
+        operator
+            .step(&api, &three_classes(), &time(0), &said.say())
+            .await,
+        "{:?}",
+        said.0
+    );
+}
+
+#[test]
+fn the_class_the_operator_makes_is_never_refused() {
+    let (for_control_plane, _) = made();
+    let class = for_control_plane
+        .iter()
+        .find(|object| object.kind() == "GatewayClass")
+        .unwrap();
+    let class: GatewayClass = serde_json::from_value(serde_json::to_value(class).unwrap()).unwrap();
+    assert_eq!(
+        class.spec.controller_name,
+        "edgerush.dev/gateway-controller"
+    );
+    assert!(!classes::refused(&class, &[control_plane("Same")]));
 }

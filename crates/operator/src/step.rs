@@ -19,12 +19,14 @@
 //! IngressClass or Gateway once its `ingress` or `gateway` is taken away, and its
 //! HorizontalPodAutoscaler once it no longer autoscales. One being deleted
 //! has what no owner reference reaches deleted by its labels, then its finalizer taken
-//! away.
+//! away. Last, each GatewayClass naming EdgeRush's controller that no ControlPlane made has
+//! its refusal written, where its status does not say it yet ([`classes`](crate::classes)).
 //!
 //! Nothing is kept from step to step but what saves a write: a new leader applies
 //! everything once, and converges from what the cluster holds.
 
 use crate::allowance::{self, Labels};
+use crate::classes;
 use crate::judge::{Refused, judge};
 use crate::status::{self, Made};
 use crate::{FINALIZER, MANAGER};
@@ -110,6 +112,9 @@ pub struct Seen {
     pub namespaces: BTreeMap<String, Labels>,
     /// Every object the operator made, of every kind it makes.
     pub children: Vec<Child>,
+    /// Every GatewayClass in the cluster, whoever made it; none while the cluster does not
+    /// serve them.
+    pub gateway_classes: Vec<GatewayClass>,
     /// Which of the Gateway API's kinds it makes the cluster serves.
     pub gateway_api: GatewayApi,
 }
@@ -417,7 +422,7 @@ impl Operator {
         for plane in planes {
             done &= self.plane(api, plane, seen, now, say).await;
         }
-        done
+        done & refuse_classes(api, seen, now, say).await
     }
 
     /// One resource's step.
@@ -575,6 +580,36 @@ impl Operator {
         }
         done
     }
+}
+
+/// Each GatewayClass naming EdgeRush's controller that no ControlPlane made, as `seen`, has
+/// its refusal written at `now` where its status does not say it yet, its `Accepted` alone,
+/// under the operator's field manager: what others write of it is left. Whether each was.
+async fn refuse_classes(api: &ApiServer, seen: &Seen, now: &Time, say: &dyn Fn(&str)) -> bool {
+    let mut done = true;
+    for refusal in classes::refusals(&seen.gateway_classes, &seen.control_planes, now) {
+        let status = serde_json::json!({ "conditions": [refusal.accepted] });
+        let name = refusal.name;
+        match api
+            .apply_status::<GatewayClass>(MANAGER, "", name, &status)
+            .await
+        {
+            Ok(()) => say(&format!(
+                "GatewayClass {name}: Accepted False {}: {}",
+                classes::UNSUPPORTED,
+                refusal.accepted.message
+            )),
+            // Gone meanwhile: nothing to say of it.
+            Err(error) if error.is_not_found() => {}
+            Err(error) => {
+                say(&format!(
+                    "GatewayClass {name}: its status cannot be written: {error}"
+                ));
+                done = false;
+            }
+        }
+    }
+    done
 }
 
 /// A resource's conditions, as its status holds them.

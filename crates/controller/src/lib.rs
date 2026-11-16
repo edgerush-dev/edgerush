@@ -34,7 +34,9 @@ use edgerush_gateway_api::udp_route::UDPRoute;
 use edgerush_kubernetes::{
     ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow, lease,
 };
-use edgerush_planes::objects::{ProxyService, SERVICE_MANAGED_BY, Transports};
+use edgerush_planes::objects::{
+    ProxyService, SERVICE_MANAGED_BY, Transports, control_plane_labels,
+};
 use edgerush_translate::{
     Cluster, GatewayStatus, Object, Plane, PolicyStatus, RouteStatus, Translation, translate,
 };
@@ -88,9 +90,24 @@ pub type Planes = BTreeMap<String, Settings>;
 pub struct Classes {
     /// The ControlPlane's name.
     pub control_plane: String,
+    /// Its namespace, the pod's own: with its name, what the GatewayClass the operator makes
+    /// for it is labelled with, the one class its Gateways are translated of (05 §3).
+    pub namespace: String,
     /// The classes its DataPlanes may still serve, as [`data_plane::kept`] has them, beside
     /// those of the data planes served; `None` until the DataPlanes are listed.
     pub kept: watch::Receiver<Option<BTreeSet<String>>>,
+}
+
+/// `cluster` as the control plane of `classes`, a ControlPlane's, translates it: its
+/// Gateways only of the class the operator made for it, by that class's labels, so that one
+/// of its name made by hand is not taken, as the operator refuses it (05 §3). Without
+/// `classes`, as for the development harness, as it is.
+fn of_control_plane(cluster: Cluster, classes: Option<&Classes>) -> Cluster {
+    Cluster {
+        gateway_class_labels: classes
+            .map(|classes| control_plane_labels(&classes.namespace, &classes.control_plane)),
+        ..cluster
+    }
 }
 
 /// How long the data plane's pods are waited on to run a generation of its Gateway before
@@ -578,7 +595,8 @@ async fn serve(
             if !unlisted.is_empty() || (is_gateway && !unlisted_api.is_empty()) {
                 continue;
             }
-            let cluster = cluster.get_or_insert_with(|| followed.cluster());
+            let cluster =
+                cluster.get_or_insert_with(|| of_control_plane(followed.cluster(), classes));
             match served.translator.step(&served.settings.plane, cluster) {
                 Step::Nothing => {}
                 Step::Translated(translation) => {
@@ -1630,6 +1648,7 @@ impl Followed {
                 .map(|g| objects(&g.namespaces))
                 .unwrap_or_default(),
             watched: self.watched.clone(),
+            gateway_class_labels: None,
         }
     }
 }

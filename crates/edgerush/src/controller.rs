@@ -193,6 +193,7 @@ pub(crate) fn command(
                 } => Source::Followed {
                     api: ApiServer::in_cluster().map_err(|error| outside(&error))?,
                     namespace: own_namespace()?,
+                    namespace_name: own_namespace_name()?,
                     own: data_plane::Own {
                         control_plane: control_plane.clone(),
                         cluster_domain: cluster_domain.clone(),
@@ -476,6 +477,8 @@ enum Source {
     Followed {
         api: ApiServer,
         namespace: Scope,
+        /// That namespace's name, the ControlPlane's.
+        namespace_name: String,
         own: data_plane::Own,
     },
 }
@@ -1004,11 +1007,13 @@ async fn control_until(
         Source::Followed {
             api,
             namespace,
+            namespace_name,
             own,
         } => {
             let (keeping, kept) = watch::channel(None);
             let classes = Classes {
                 control_plane: own.control_plane.clone(),
+                namespace: namespace_name,
                 kept,
             };
             let telling = Rc::clone(&say);
