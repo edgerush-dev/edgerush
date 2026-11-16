@@ -56,7 +56,7 @@
       "type": "object",
       "properties": {
         "max_bytes": {
-          "description": "Bytes the keys may hold, past which the least recently changed are evicted. 256 MiB\nwhen left out.",
+          "description": "Bytes the keys may hold, past which those that may be forgotten soonest are evicted,\ndown to nine tenths, a bounded number each cycle. 256 MiB when left out.",
           "type": [
             "integer",
             "null"

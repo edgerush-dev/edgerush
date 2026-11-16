@@ -1,9 +1,10 @@
 //! Instruction counts for a pod of the asynchronous mode's tick over a hundred thousand keys
 //! under three limits, from sixteen data planes: a cycle on, with nothing to copy and none due
-//! to be forgotten, as almost every tick runs; once a second, when it sweeps, the keys of the
-//! shortest limit due to be forgotten; and sweeping past the pod's cap on what its keys hold,
-//! none due, when it evicts down to nine tenths of it. A pod forgets and evicts only as it
-//! sweeps, once a second.
+//! to be forgotten, as almost every tick runs; a second on, the keys of the shortest limit due
+//! to be forgotten, a third of them, of which a cycle forgets at most its share; and past the
+//! pod's cap on what its keys hold, none due, a batch of keys new to it just in, of which a
+//! cycle evicts as many and its share besides, down to nine tenths of the cap. A pod forgets
+//! and evicts at each cycle, a bounded number a cycle, so the last two show that bound.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-cluster-asynchronous --bench tick`, see the
 //! repository README.
@@ -43,7 +44,7 @@ fn contract(k: u64) -> Contract {
     }
 }
 
-/// The two longer of [`contract`]'s limits alone, none of whose keys is due within a sweep.
+/// The two longer of [`contract`]'s limits alone, none of whose keys is due within a minute.
 fn longer(k: u64) -> Contract {
     contract(1 + k % 2)
 }
@@ -69,8 +70,7 @@ fn alone(config: Config, now: Time) -> Pod {
 const SETTLED: Time = 2 * MS + CYCLE;
 
 /// A pod holding `HELD` keys under `contract`, each hit once by one of `PLANES` data planes, at
-/// 1 ms, under `config`; ticked at 2 ms and at [`SETTLED`], its first copy cycle done, and
-/// swept last at 1 ms.
+/// 1 ms, under `config`; ticked at 2 ms and at [`SETTLED`], its first copy cycle done.
 fn filled(config: Config, contract: fn(u64) -> Contract) -> Box<Pod> {
     let mut pod = Box::new(alone(config, MS));
     for plane in 0..PLANES {
@@ -126,42 +126,68 @@ fn holding(after: Time) -> (Box<Pod>, Time) {
     (pod, SETTLED + after)
 }
 
-/// A cycle on: nothing to copy, no sweep due.
+/// A cycle on: nothing to copy, nothing due.
 fn nothing_due() -> (Box<Pod>, Time) {
     let (pod, now) = holding(CYCLE);
     assert_eq!(kept_after(&pod, now), HELD, "nothing forgotten");
     (pod, now)
 }
 
-/// A second on, the sweep due: the shortest limit's keys, a third of them, due to be forgotten.
+/// A second on: the shortest limit's keys, a third of them, due to be forgotten, more than a
+/// cycle forgets.
 fn a_second_on() -> (Box<Pod>, Time) {
     let (pod, now) = holding(1_000 * MS);
     let kept = kept_after(&pod, now);
     assert!(
-        kept < HELD - HELD / 4,
-        "the shortest limit's keys forgotten: {kept} kept"
+        (HELD - HELD / 4..HELD).contains(&kept),
+        "a cycle's share of the shortest limit's keys forgotten: {kept} kept"
     );
     (pod, now)
 }
 
-/// The keys under the two longer limits alone, its cap on what they hold a tenth short of
-/// what they hold, and a second on, the sweep due: the first to find it past its cap, none of
-/// its keys due to be forgotten.
+/// Keys new to the pod in [`over_the_cap`]'s batch.
+const MADE: u64 = 10_000;
+
+/// The keys under the two longer limits alone, none due to be forgotten, its cap on what they
+/// hold a tenth short of what they hold, so that its first cycles evicted down to nine tenths
+/// of it; then [`MADE`] keys new to it in one batch, taking it past its cap again, and a cycle
+/// on: as many to evict as it made, and more than a cycle's share.
 fn over_the_cap() -> (Box<Pod>, Time) {
     let full = filled(config(), longer).store().key_bytes();
     let mut capped = config();
     capped.max_key_bytes = Some(full - full / 10);
-    let pod = filled(capped, longer);
-    assert_eq!(
-        pod.store().key_count() as u64,
-        HELD,
-        "nothing evicted before the sweep"
+    let mut pod = filled(capped, longer);
+    let settled = pod.store().key_count() as u64;
+    assert!(
+        settled < HELD - HELD / 10,
+        "evicted to nine tenths: {settled} kept"
     );
-    let now = SETTLED + 1_000 * MS;
+    let entries = (HELD..HELD + MADE)
+        .map(|k| Entry {
+            key: key(k),
+            contract: longer(k),
+            report: Report::Hits {
+                sequence: 1,
+                count: 1,
+                seen: 0,
+                age: 0,
+            },
+        })
+        .collect();
+    let batch = Batch {
+        from: PlaneId::from(0_u64),
+        stamp: (0, 0),
+        made: 0,
+        entries,
+    };
+    let _ = pod.batch(batch, SETTLED + MS);
+    let made = pod.store().key_count() as u64;
+    assert_eq!(made, settled + MADE, "the batch's keys made");
+    let now = SETTLED + CYCLE;
     let kept = kept_after(&pod, now);
     assert!(
-        (HELD - HELD / 5..HELD).contains(&kept),
-        "the sweep evicts to nine tenths of the cap: {kept} kept"
+        (settled - MADE / 10..made - MADE / 2).contains(&kept),
+        "a cycle evicts the keys made and more, down to nine tenths: {kept} of {made} kept"
     );
     (pod, now)
 }

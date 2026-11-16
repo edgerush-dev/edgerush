@@ -39,6 +39,7 @@
 pub mod authority;
 pub mod config;
 pub mod kept;
+mod keys;
 pub mod message;
 pub mod node;
 pub mod table;
