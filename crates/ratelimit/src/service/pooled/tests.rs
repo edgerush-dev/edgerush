@@ -4,11 +4,12 @@
 
 #![cfg(not(loom))]
 
+use super::reference::{self, Answer, Answers, DataPlane, View};
 use super::testing::{Owner, Pods};
 use super::*;
 use crate::service::{
-    Answer, CUT_OFF_CYCLES, DataPlane, ENTRY_BYTES, FixedState, Keyed, MOST_UNACKNOWLEDGED,
-    PIECE_BYTES, PodId,
+    CUT_OFF_CYCLES, ENTRY_BYTES, FixedState, Keyed, MOST_UNACKNOWLEDGED, PIECE_BYTES, PodId,
+    longest,
 };
 use proptest::prelude::*;
 use std::collections::VecDeque;
@@ -510,11 +511,11 @@ impl From<Decision> for Kind {
     }
 }
 
-impl From<crate::service::Decision> for Kind {
-    fn from(decision: crate::service::Decision) -> Self {
+impl From<reference::Decision> for Kind {
+    fn from(decision: reference::Decision) -> Self {
         match decision {
-            crate::service::Decision::Admit => Self::Admit,
-            crate::service::Decision::Refuse => Self::Refuse,
+            reference::Decision::Admit => Self::Admit,
+            reference::Decision::Refuse => Self::Refuse,
         }
     }
 }
@@ -725,7 +726,7 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
     participant.on_answers(
         Answers {
             from: 0,
-            entries: vec![crate::service::Answer {
+            entries: vec![Answer {
                 key: key.into(),
                 behind: 0,
                 applied: 0,
@@ -748,7 +749,7 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
     participant.on_answers(
         Answers {
             from: 0,
-            entries: vec![crate::service::Answer {
+            entries: vec![Answer {
                 key: key.into(),
                 behind: 3 * u128::from(c.window.get()),
                 applied: 1,
@@ -782,7 +783,7 @@ fn answers_that_do_not_say_when_are_taken_as_they_come() {
     participant.on_answers(
         Answers {
             from: 0,
-            entries: vec![crate::service::Answer {
+            entries: vec![Answer {
                 key: key.into(),
                 behind: 5 * u128::from(c.window.get()),
                 applied: 0,
@@ -816,7 +817,7 @@ fn answers_held_up_are_taken_as_of_no_more_than_a_cycle_before() {
     participant.on_answers(
         Answers {
             from: 0,
-            entries: vec![crate::service::Answer {
+            entries: vec![Answer {
                 key: key.into(),
                 behind: 5 * u128::from(c.window.get()),
                 applied: 0,
@@ -2875,7 +2876,7 @@ fn a_key_refused_for_its_share_waits_for_the_next_cycle() {
         "room in the bucket: refused for its share"
     );
     assert_eq!(
-        participant.retry_after(&[(key, big)], now),
+        longest(participant.waits(&[(key, big)], now)),
         Some((0, CYCLE))
     );
 }

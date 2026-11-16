@@ -385,13 +385,12 @@ crates/planes     EdgeRush's own kinds, ControlPlane and DataPlane (`edgerush-pl
 crates/ratelimit   rate limiting (`edgerush-ratelimit`): pure, no I/O; the admission models as
                    reference implementations behind one interface, an example that runs the same
                    clients through each (`cargo run -p edgerush-ratelimit --example timelines`),
-                   local mode's limiter, and the asynchronous mode's protocol as two state
-                   machines
+                   local mode's limiter, and the asynchronous mode's protocol: the data plane's
+                   participant and the owner's applying of a report
 crates/ratelimit-service
                    the rate-limiting service (`edgerush-ratelimit-service`): the cluster store's
                    pods, of either mode, over gRPC, the data planes' streams to them, and the
-                   `edgerush-ratelimit-service` binary; the protocol's own service pod, by a
-                   view of which pods serve, which the binary no longer runs
+                   `edgerush-ratelimit-service` binary
 crates/proxy       the data plane (`edgerush-proxy`): listeners, TLS, our HTTP/1 server and client,
                    HTTP/2 on h2, HTTP/3 on quiche, upstream pools and the request core between them,
                    and each rate-limiting mode's side of the data plane

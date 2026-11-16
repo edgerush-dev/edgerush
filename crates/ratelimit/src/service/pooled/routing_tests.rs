@@ -4,7 +4,7 @@
 //! nothing through another.
 
 use super::*;
-use crate::service::{FixedState, PodId};
+use crate::service::FixedState;
 use std::num::NonZeroU64;
 
 const CYCLE: u64 = 10_000_000;
@@ -235,15 +235,17 @@ fn a_later_routing_moves_a_key_at_once_and_forgets_a_pod_it_no_longer_names() {
     assert!(!participant.unanswered(u64::MAX).any(|pod| pod == 1));
 }
 
-/// Today's pods forward nothing: a key whose owner never answers goes to it alone.
+/// A routing that forwards nothing: a key whose owner never answers goes to it alone.
 #[test]
-fn todays_pods_are_sent_nothing_through_another() {
-    let view = View {
+fn where_nothing_is_forwarded_an_unanswered_owner_is_sent_its_keys_alone() {
+    let owner = 0;
+    let fixed = Fixed {
         epoch: 1,
+        owner: Some(owner),
+        through: None,
         pods: vec![0, 1],
     };
-    let owner: PodId = view.owners(KEY).0.unwrap();
-    let mut participant = Participant::new(7, CYCLE, view, FixedState::default()).unwrap();
+    let mut participant = Participant::new(7, CYCLE, fixed, FixedState::default()).unwrap();
     for at in 1..=20 {
         let decided = participant.decide_all(&[(KEY, contract())], at * CYCLE - 1);
         assert_eq!(decided, Decision::Admit);

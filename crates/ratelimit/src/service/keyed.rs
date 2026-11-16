@@ -38,7 +38,7 @@ fn four(bytes: &[u8]) -> u64 {
         .map_or(0, |word| u64::from(u32::from_le_bytes(word)))
 }
 
-/// The keyed hash, as a map's hasher: [`DataPlane::with_hasher`](super::DataPlane::with_hasher).
+/// The keyed hash, as a map's hasher: a participant's ([`Participant::new`](super::pooled::Participant::new)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Keyed {
     seed: u64,

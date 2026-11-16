@@ -7,9 +7,9 @@
 //! It holds [`reference`](mod@reference): the admission models of docs/06 §3, each written
 //! as plainly as it can be, so that what each one promises can be read, tested and compared
 //! before any of them is built for the request path; and [`service`](mod@service): the
-//! protocol of the rate-limiting service, a candidate, as two state machines that the
-//! simulator and the prototype both run; and [`local`](mod@local): local mode's limiter, each
-//! process on what it sees alone. The synchronous mode's owner is the cluster store's
+//! asynchronous mode's protocol, the data plane's participant and the owner's applying of a
+//! report, which the proxy and the cluster store's pods run; and [`local`](mod@local): local
+//! mode's limiter, each process on what it sees alone. The synchronous mode's owner is the cluster store's
 //! (`edgerush_cluster_synchronous`).
 
 /// How far, in nanoseconds, a worker's clock may lag the latest charge of a key without a
