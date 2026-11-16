@@ -2,7 +2,8 @@
 //! report with the real owner ([`owner::apply`]), as the store's pods do, answering in the
 //! participant's protocol.
 
-use super::super::{Answer, Answers, Batch, PodId, owner};
+use super::super::{Batch, PodId, owner};
+use super::reference::{Answer, Answers};
 use super::{Participant, Replied, Reply, Routing};
 use std::collections::BTreeMap;
 use std::hash::BuildHasher;

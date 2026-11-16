@@ -26,6 +26,8 @@ mod word;
 #[cfg(test)]
 mod loom_tests;
 #[cfg(test)]
+mod reference;
+#[cfg(test)]
 mod routing_tests;
 #[cfg(test)]
 mod testing;
@@ -36,9 +38,8 @@ pub use routing::{Replied, Reply, Routing};
 pub use word::fits;
 
 use super::{
-    Answers, Batch, CUT_OFF_CYCLES, Contract, Entry as BatchEntry, MOST_UNACKNOWLEDGED, PlaneId,
-    Queued, RESEND_AFTER_CYCLES, Report, Room, Unseen, View, cut_off_from_owner,
-    encoded_entry_bytes, longest,
+    Batch, CUT_OFF_CYCLES, Contract, Entry as BatchEntry, MOST_UNACKNOWLEDGED, PlaneId, Queued,
+    RESEND_AFTER_CYCLES, Report, Room, Unseen, cut_off_from_owner, encoded_entry_bytes,
 };
 use chunked::MinHeap;
 use keys::Keys;
@@ -840,7 +841,7 @@ impl Heard {
 
 /// The answer whose buckets were last taken from a pod.
 struct LastTaken {
-    /// Its pod's life and number ([`Answers::life`]).
+    /// Its pod's life and number ([`Reply::life`]).
     life: u64,
     number: u64,
     /// The latest exchange started with the pod when the first answer of that life was
@@ -882,7 +883,7 @@ pub fn entry_bytes(key: &[u8]) -> u64 {
 
 /// The process's side of the protocol: one participant, its keys shared with its workers,
 /// reaching the service's pods by `R`: today's by the view unless said.
-pub struct Participant<S, R: Routing = View> {
+pub struct Participant<S, R: Routing> {
     id: PlaneId,
     /// The workers that may hold a handle to each entry, which its bytes count.
     workers: u64,
@@ -1859,12 +1860,6 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             })
     }
 
-    /// As `DataPlane::retry_after`.
-    #[must_use]
-    pub fn retry_after(&self, keys: &[(&[u8], Contract)], now: u64) -> Option<(usize, u64)> {
-        longest(self.waits(keys, now))
-    }
-
     /// Messages to send, as `DataPlane::take_outgoing`.
     pub fn take_outgoing(&mut self) -> Vec<(R::Pod, R::Batch)> {
         self.take_exchanges()
@@ -1934,27 +1929,6 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             }
         }
         batches
-    }
-}
-
-impl<S: BuildHasher + Clone> Participant<S, View> {
-    /// Today's pod's answers to the latest exchange started with it reach it at `now`
-    /// ([`Self::on_reply`]).
-    pub fn on_answers(&mut self, answers: Answers, now: u64) {
-        let reply = Reply::of(answers, |bytes| self.hash(bytes));
-        self.on_reply(reply, now);
-    }
-
-    /// Today's pod's answers to exchange `exchange` reach it at `now`
-    /// ([`Self::on_reply_to`]).
-    pub fn on_answers_to(&mut self, exchange: u64, answers: Answers, now: u64) {
-        let reply = Reply::of(answers, |bytes| self.hash(bytes));
-        self.on_reply_to(exchange, reply, now);
-    }
-
-    /// Today's pods change at `now` ([`Self::on_routing`]).
-    pub fn on_view(&mut self, view: View, now: u64) {
-        self.on_routing(view, now);
     }
 }
 

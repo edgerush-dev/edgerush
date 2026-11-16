@@ -41,12 +41,6 @@ impl<T: Ord, const CHUNK: usize> MinHeap<T, CHUNK> {
         self.len == 0
     }
 
-    /// Every item, in no order.
-    #[cfg(test)]
-    pub(in crate::service) fn iter(&self) -> impl Iterator<Item = &T> {
-        self.chunks.iter().flatten()
-    }
-
     pub(in crate::service) fn push(&mut self, item: T) {
         let chunk = self.len / CHUNK;
         if chunk == self.chunks.len() {
