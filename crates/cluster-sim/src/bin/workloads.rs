@@ -12,8 +12,8 @@
 //! 1,000] [no-poll|poll]`: one worker a data plane, keys scheduled, quiet keys not polled
 //! unless said; `RETRANSMIT_MS=200` carries messages as TCP does.
 //!
-//! Lost packets fall between the data planes and the pods only: lost between the pods too,
-//! admissions go uncounted (#421).
+//! Lost packets fall between the data planes and the pods only: one in ten lost between the
+//! pods is a broken network, which the store does not ride out (06 §4).
 
 use edgerush_cluster::{Time, ms};
 use edgerush_cluster_sim::runs::{self, Fault, Run};
