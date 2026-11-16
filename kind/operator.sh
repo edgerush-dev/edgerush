@@ -55,8 +55,10 @@
 #     control plane alone; on again and the ControlPlane deleted, the registration gone;
 #   - a ServiceAccount of a name the operator would use, made by hand, is left alone, and
 #     its ControlPlane says so;
-#   - `web` autoscaled from 2 has an autoscaler that scales it to 2; its `max` taken away
-#     and `min` made 1 deletes it, and `web` runs 1, not scaled back;
+#   - `web` at a fixed 2, then autoscaled from 2, has an autoscaler that runs it at 2, and
+#     its Deployment never states fewer on the way, its replicas handed over to the
+#     autoscaler (docs/05 §2); its `max` taken away and `min` made 1 deletes the autoscaler,
+#     and `web` runs 1, not scaled back;
 #   - `web`'s `gateway` taken away deletes its Gateway, its IngressClass kept, and the
 #     Ingress is still served through it;
 #   - DataPlane `web` deleted takes with it everything made for it, its IngressClass and
@@ -80,8 +82,12 @@ kubeconfig=$(kind/cluster.sh up "$version")
 export KUBECONFIG="$kubeconfig"
 k() { kubectl --kubeconfig "$kubeconfig" "$@"; }
 forward_pid=
+watch_pid=
+counts=$(mktemp)
 finish() {
     [ -n "$forward_pid" ] && kill "$forward_pid" 2>/dev/null || true
+    [ -n "$watch_pid" ] && kill "$watch_pid" 2>/dev/null || true
+    rm -f "$counts"
     if [ "${KEEP:-}" != 1 ]; then kind/cluster.sh down "$version" >/dev/null; fi
 }
 trap finish EXIT
@@ -843,13 +849,31 @@ condition_is controlplane/own own Programmed "False NotOurs" 60 ||
     fail "the ServiceAccount made by hand was taken over"
 pass "an object of a name the operator would use, made by hand, is left alone, and said"
 
-echo "== an autoscaler no longer asked for"
+echo "== an autoscaler taking over the count"
 deployment_replicas() { k -n edge get deploy edgerush-proxy-web -o jsonpath='{.spec.replicas}'; }
+k -n edge patch dataplane web --type=merge -p '{"spec":{"replicas":{"min":2}}}' >/dev/null
+until_true '[ "$(deployment_replicas)" = 2 ]' 60 ||
+    fail "DataPlane web of 2 replicas runs $(deployment_replicas)"
+# Every count the Deployment states from here on, each time it changes.
+k -n edge get deploy edgerush-proxy-web --watch-only \
+    -o jsonpath='{.spec.replicas}{"\n"}' >"$counts" 2>&1 &
+watch_pid=$!
+sleep 2
 k -n edge patch dataplane web --type=merge -p '{"spec":{"replicas":{"min":2,"max":4}}}' >/dev/null
 until_true 'k -n edge get hpa edgerush-proxy-web' 60 ||
     fail "DataPlane web autoscaled has no HorizontalPodAutoscaler"
-until_true '[ "$(deployment_replicas)" = 2 ]' 90 ||
+# Past the autoscaler's first sync, 15 seconds: replicas removed would be 1 until it.
+sleep 20
+kill "$watch_pid" 2>/dev/null || true
+watch_pid=
+[ -s "$counts" ] || fail "the Deployment's watch saw no change at all"
+! grep -qvx 2 "$counts" ||
+    fail "DataPlane web autoscaled from 2 stated other counts on the way: $(tr '\n' ' ' <"$counts")"
+[ "$(deployment_replicas)" = 2 ] ||
     fail "DataPlane web autoscaled from 2 runs $(deployment_replicas)"
+pass "a DataPlane made autoscaled hands its count to its autoscaler, never fewer on the way"
+
+echo "== an autoscaler no longer asked for"
 k -n edge patch dataplane web --type=merge -p '{"spec":{"replicas":{"min":1,"max":null}}}' >/dev/null
 until_true '! k -n edge get hpa edgerush-proxy-web' 60 ||
     fail "DataPlane web no longer autoscaled left its HorizontalPodAutoscaler: $(k -n edge get hpa edgerush-proxy-web -o name 2>&1)"
