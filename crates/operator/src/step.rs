@@ -3,7 +3,8 @@
 //!
 //! For each resource accepted, its finalizer first, so that nothing is made that it could
 //! not delete; then its objects, each read before it is applied, an object of its name
-//! that is not the operator's left alone; then its conditions, where they say something new.
+//! that is not the operator's left alone, and a Deployment's replicas handed over before
+//! they are left out for an autoscaler; then its conditions, where they say something new.
 //! A resource is applied again when it, its ControlPlane for a DataPlane, or one of the
 //! objects made for it has changed since it was last applied whole, so that a hand edit
 //! is undone and an object deleted by hand made again; and at every step while anything of
@@ -713,7 +714,9 @@ async fn apply_all(
             Object::ClusterRoleBinding(_) => {
                 apply::<ClusterRoleBinding>(api, object, labels, uid).await
             }
-            Object::Deployment(_) => apply::<Deployment>(api, object, labels, uid).await,
+            Object::Deployment(deployment) => {
+                apply_deployment(api, deployment, object, labels, uid).await
+            }
             Object::Service(_) => apply::<Service>(api, object, labels, uid).await,
             Object::HorizontalPodAutoscaler(_) => {
                 apply::<HorizontalPodAutoscaler>(api, object, labels, uid).await
@@ -760,6 +763,73 @@ async fn apply<K: Kind>(
     }
     api.apply::<K>(MANAGER, namespace, name, object).await?;
     Ok(true)
+}
+
+/// The field manager that holds a Deployment's replicas from the operator's last apply that
+/// stated them to its autoscaler's first write (05 §2).
+const HANDOVER: &str = "edgerush-operator-handover";
+
+/// `object`, `deployment`, applied as [`apply`] applies any, but that where it leaves out
+/// the replicas the operator's last apply of it stated, for an autoscaler to run, it first
+/// hands them over to a field manager of their own, at the count they are at. Left out by
+/// the only manager that holds them, they would be removed, and the API server would run 1
+/// until the autoscaler's first write; held by another, they stay, until that write takes
+/// them from it, as Kubernetes' server-side apply has it (05 §2).
+async fn apply_deployment(
+    api: &ApiServer,
+    deployment: &Deployment,
+    object: &Object,
+    labels: &BTreeMap<String, String>,
+    uid: &str,
+) -> Result<bool, ApiError> {
+    let namespace = deployment.metadata.namespace.as_deref().unwrap_or_default();
+    let name = deployment.metadata.name.as_deref().unwrap_or_default();
+    if let Some(there) = api.object::<Deployment>(namespace, name).await? {
+        if !ours(&there.metadata, labels, uid) {
+            return Ok(false);
+        }
+        let leaves_out = deployment
+            .spec
+            .as_ref()
+            .is_none_or(|spec| spec.replicas.is_none());
+        let at = there.spec.as_ref().and_then(|spec| spec.replicas);
+        if leaves_out
+            && holds_replicas(&there)
+            && let Some(replicas) = at
+        {
+            let handover = serde_json::json!({
+                "apiVersion": Deployment::API_VERSION,
+                "kind": Deployment::KIND,
+                "metadata": { "name": name, "namespace": namespace },
+                "spec": { "replicas": replicas },
+            });
+            api.apply::<Deployment>(HANDOVER, namespace, name, &handover)
+                .await?;
+        }
+    }
+    api.apply::<Deployment>(MANAGER, namespace, name, object)
+        .await?;
+    Ok(true)
+}
+
+/// Whether the operator's own apply holds `deployment`'s replicas.
+fn holds_replicas(deployment: &Deployment) -> bool {
+    deployment
+        .metadata
+        .managed_fields
+        .iter()
+        .flatten()
+        .any(|entry| {
+            entry.manager.as_deref() == Some(MANAGER)
+                && entry.operation.as_deref() == Some("Apply")
+                && entry.subresource.as_deref().unwrap_or_default().is_empty()
+                && entry
+                    .fields_v1
+                    .as_ref()
+                    .and_then(|fields| fields.0.get("f:spec"))
+                    .and_then(|spec| spec.get("f:replicas"))
+                    .is_some()
+        })
 }
 
 /// The operator's finalizer added to a resource, by an apply of it alone, under its own

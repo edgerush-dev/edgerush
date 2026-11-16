@@ -1921,3 +1921,166 @@ async fn a_data_plane_still_autoscaled_keeps_its_autoscaler() {
     );
     assert_eq!(deployment_replicas(&asked), None);
 }
+
+const HANDED_OVER: &str = "?fieldManager=edgerush-operator-handover&force=true";
+
+/// [`after_first`] of [`data_plane`] at a fixed 2 replicas, then its DataPlane's next
+/// generation with `replicas` as `change` makes them.
+fn fixed_then(change: impl FnOnce(&mut DataPlaneReplicas)) -> Seen {
+    let mut data_plane = data_plane();
+    data_plane.spec.replicas = DataPlaneReplicas { min: 2, max: None };
+    let mut seen = after_first_of(data_plane, SERVED, "1", 2);
+    let data_plane = &mut seen.data_planes[0];
+    change(&mut data_plane.spec.replicas);
+    data_plane.metadata.generation = Some(2);
+    seen
+}
+
+/// The proxy's Deployment as the API server has it, at 2 replicas, its fields held as
+/// `managed` says.
+fn deployment_held(managed: serde_json::Value) -> String {
+    serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": "edgerush-proxy-web",
+            "namespace": "edge",
+            "ownerReferences": [{
+                "apiVersion": "gateway.edgerush.dev/v1alpha1",
+                "kind": "DataPlane",
+                "name": "web",
+                "uid": "dp-uid",
+            }],
+            "managedFields": managed,
+        },
+        "spec": { "replicas": 2, "selector": {}, "template": {} },
+    })
+    .to_string()
+}
+
+/// A `managedFields` entry: `manager`'s `operation`, holding `fields` of the spec.
+fn held_by(manager: &str, operation: &str, fields: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "manager": manager,
+        "operation": operation,
+        "apiVersion": "apps/v1",
+        "fieldsType": "FieldsV1",
+        "fieldsV1": { "f:spec": fields },
+    })
+}
+
+/// The operator's own apply, holding the replicas and the template.
+fn operator_holding_replicas() -> serde_json::Value {
+    held_by(
+        "edgerush-operator",
+        "Apply",
+        serde_json::json!({ "f:replicas": {}, "f:template": {} }),
+    )
+}
+
+/// What a step of `seen` writes, of a cluster whose Deployment is `there`.
+async fn step_over(seen: &Seen, there: String) -> Vec<Asked> {
+    let (fake, api) = cluster(move |method, path| {
+        (method == "GET" && path == DEPLOYMENT).then(|| answer(200, &there))
+    })
+    .await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    assert!(
+        operator.step(&api, seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    fake.seen()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_data_plane_made_autoscaled_hands_its_replicas_over_before_leaving_them_out() {
+    let seen = fixed_then(|replicas| replicas.max = Some(5));
+    let asked = step_over(
+        &seen,
+        deployment_held(serde_json::json!([operator_holding_replicas()])),
+    )
+    .await;
+    let written = writes(&asked);
+    let handover = format!("PATCH {DEPLOYMENT}{HANDED_OVER}");
+    let applied = format!("PATCH {DEPLOYMENT}{APPLY}");
+    let at = |write: &str| written.iter().position(|written| written == write);
+    let (Some(handed), Some(then)) = (at(&handover), at(&applied)) else {
+        panic!("no handover then apply: {written:?}");
+    };
+    assert!(handed < then, "{written:?}");
+    // The count it is at, and nothing else of it.
+    let body: serde_json::Value = serde_json::from_str(
+        &asked
+            .iter()
+            .find(|asked| format!("{} {}", asked.method, asked.path) == handover)
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "edgerush-proxy-web", "namespace": "edge" },
+            "spec": { "replicas": 2 },
+        })
+    );
+    assert_eq!(deployment_replicas(&asked), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replicas_the_operator_does_not_leave_out_or_no_longer_holds_are_not_handed_over() {
+    for (case, seen, managed) in [
+        (
+            "still a fixed count",
+            fixed_then(|replicas| replicas.min = 3),
+            serde_json::json!([operator_holding_replicas()]),
+        ),
+        (
+            "the autoscaler's already",
+            autoscaled_then(|replicas| replicas.max = Some(8)),
+            serde_json::json!([
+                held_by(
+                    "edgerush-operator",
+                    "Apply",
+                    serde_json::json!({ "f:template": {} })
+                ),
+                held_by(
+                    "kube-controller-manager",
+                    "Update",
+                    serde_json::json!({ "f:replicas": {} })
+                ),
+            ]),
+        ),
+        (
+            "handed over already",
+            autoscaled_then(|replicas| replicas.max = Some(8)),
+            serde_json::json!([
+                held_by(
+                    "edgerush-operator",
+                    "Apply",
+                    serde_json::json!({ "f:template": {} })
+                ),
+                held_by(
+                    "edgerush-operator-handover",
+                    "Apply",
+                    serde_json::json!({ "f:replicas": {} })
+                ),
+            ]),
+        ),
+    ] {
+        let asked = step_over(&seen, deployment_held(managed)).await;
+        let written = writes(&asked);
+        assert!(
+            written.contains(&format!("PATCH {DEPLOYMENT}{APPLY}")),
+            "{case}: {written:?}"
+        );
+        assert!(
+            !written.contains(&format!("PATCH {DEPLOYMENT}{HANDED_OVER}")),
+            "{case}: {written:?}"
+        );
+    }
+}

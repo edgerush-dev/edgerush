@@ -51,8 +51,8 @@ pub trait Kind:
     const FIELDS: Option<&'static str> = None;
 
     /// The object as it is kept: without what EdgeRush never reads, so that a list of many
-    /// holds no more than it must. Of every kind, `managedFields` goes, the record of who
-    /// set each field.
+    /// holds no more than it must. Of every kind but Deployments, `managedFields` goes, the
+    /// record of who set each field.
     fn trim(&mut self) {
         self.metadata_mut().managed_fields = None;
     }
@@ -191,6 +191,11 @@ impl Kind for ServiceAccount {
 
 impl Kind for Deployment {
     const NAMESPACED: bool = true;
+
+    /// Kept whole, `managedFields` too: the operator reads who holds a Deployment's
+    /// replicas, so as to hand them over to its autoscaler (05 §2). It follows only the
+    /// Deployments it made, and nothing else reads Deployments.
+    fn trim(&mut self) {}
 }
 
 impl Kind for HorizontalPodAutoscaler {

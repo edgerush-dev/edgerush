@@ -5,6 +5,7 @@ use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_gateway_api::http_route::HTTPRoute;
 use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use k8s_openapi::ByteString;
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -693,7 +694,7 @@ async fn a_namespace_is_kept_for_its_labels_alone() {
 }
 
 #[tokio::test]
-async fn every_kind_is_kept_without_its_managed_fields() {
+async fn a_kind_is_kept_without_its_managed_fields() {
     let ingress = r#"{"metadata":{"name":"web","namespace":"shop","resourceVersion":"2","annotations":{"a":"b"},"managedFields":[{"manager":"kubectl"}]},"spec":{}}"#;
     let fake = Fake::start(&["127.0.0.1"], move |_| {
         answer(
@@ -714,6 +715,29 @@ async fn every_kind_is_kept_without_its_managed_fields() {
     assert_eq!(
         fake.seen()[0].path,
         "/apis/networking.k8s.io/v1/ingresses?limit=500"
+    );
+}
+
+#[tokio::test]
+async fn a_deployment_is_kept_with_its_managed_fields() {
+    let deployment = r#"{"metadata":{"name":"web","namespace":"shop","resourceVersion":"2","managedFields":[{"manager":"edgerush-operator","operation":"Apply","fieldsType":"FieldsV1","fieldsV1":{"f:spec":{"f:replicas":{}}}}]},"spec":{"replicas":3,"selector":{},"template":{}}}"#;
+    let fake = Fake::start(&["127.0.0.1"], move |_| answer(200, deployment)).await;
+    let client = fake.client(&token("deployment", "secret"), Timing::default());
+    let kept = client
+        .object::<Deployment>("shop", "web")
+        .await
+        .unwrap()
+        .unwrap();
+    let managed = kept.metadata.managed_fields.unwrap();
+    assert_eq!(managed.len(), 1);
+    assert_eq!(managed[0].manager.as_deref(), Some("edgerush-operator"));
+    assert_eq!(
+        managed[0].fields_v1.as_ref().map(|fields| &fields.0),
+        Some(&serde_json::json!({ "f:spec": { "f:replicas": {} } }))
+    );
+    assert_eq!(
+        fake.seen()[0].path,
+        "/apis/apps/v1/namespaces/shop/deployments/web"
     );
 }
 
