@@ -308,6 +308,36 @@ fn past_its_cap_it_evicts_the_keys_full_soonest() {
     assert_eq!(local.evicted(), 3);
 }
 
+/// Eviction alone, as the sweep's thread takes it between sweeps: past the cap it evicts the
+/// keys full soonest, down to nine tenths, and forgets no key it is not evicting; within the
+/// cap it evicts none, however many could be forgotten.
+#[test]
+fn eviction_alone_evicts_past_the_cap_and_forgets_nothing() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let c = contract(10, SECOND, 10);
+    for spent in 1..=5_u64 {
+        let key = format!("k{spent}");
+        for _ in 0..spent {
+            assert!(one(&local, &mut handles, key.as_bytes(), c, 0));
+        }
+    }
+    let each = key_bytes(b"k1", c.into(), 1);
+    // Every key full and quiet by then: a sweep would forget them all.
+    let later = 10 * SECOND;
+    local.set_capacity(5 * each);
+    assert_eq!(local.evict(later), 0, "within the cap");
+    assert_eq!(local.key_count(), 5);
+    local.set_capacity(3 * each);
+    assert_eq!(local.evict(0), 3);
+    let kept: Vec<bool> = (1..=5)
+        .map(|spent| local.contains(format!("k{spent}").as_bytes()))
+        .collect();
+    assert_eq!(kept, [false, false, false, true, true]);
+    assert_eq!(local.holding(), 2 * each);
+    assert_eq!(local.evicted(), 3);
+}
+
 #[test]
 fn a_key_quiet_for_longer_than_the_clock_wraps_is_full() {
     let local = local();

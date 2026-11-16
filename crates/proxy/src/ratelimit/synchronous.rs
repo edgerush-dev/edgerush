@@ -23,7 +23,7 @@
 //! without its owner and kept from one outage to the next until the sweep, on the probe
 //! thread, forgets it full and idle. Nothing is charged there while the owners answer.
 
-use super::local::{LocalLimiter, Process as LocalKeys, SWEEP};
+use super::local::{LocalLimiter, Process as LocalKeys};
 use super::{Awaited, Failed, KeyedBy, Later, Limited, Refusal, Undecided, Usage, with_keys};
 use boring::ssl::SslConnector;
 use edgerush_config::{CompiledLimit, CompiledModel, CompiledSynchronous, WhenUnreachable};
@@ -352,8 +352,8 @@ impl Breaker {
 /// was last probed, for as long as the process is kept; tells `failed` if it panics, as
 /// the other rate-limiting threads do (03 §2). A probe opens a stream to the member and
 /// waits for its table: heard, the breaker closes; not, it waits another `probe_after`.
-/// With `when_unreachable: local`, it sweeps the process's own keys every [`SWEEP`] too, as
-/// local mode's thread does.
+/// With `when_unreachable: local`, it takes the process's own keys' turn at every look too
+/// ([`LocalKeys::turn`]), sweeping and evicting as local mode's thread does.
 fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
     struct Watch(Option<Failed>);
     impl Drop for Watch {
@@ -381,11 +381,8 @@ fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
             let Some(held) = process.upgrade() else {
                 return;
             };
-            if let Some(local) = &held.local
-                && swept.elapsed() >= SWEEP
-            {
-                local.sweep_once();
-                swept = Instant::now();
+            if let Some(local) = &held.local {
+                swept = local.turn(swept, Instant::now());
             }
             let probe_after = u64::try_from(held.config.probe_after.as_nanos()).unwrap_or(u64::MAX);
             let now = held.now();
