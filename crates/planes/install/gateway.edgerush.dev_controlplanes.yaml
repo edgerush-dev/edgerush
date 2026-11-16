@@ -31,8 +31,10 @@ spec:
           it. The operator deploys it, gives it the rights of its scope, and makes the
           GatewayClass named as it is.
 
-          Its name is a DNS label, unique in the cluster: the oldest ControlPlane of a name
-          holds it, and a later one of the same name in another namespace is not accepted.
+          Its name is a DNS label of at most 43 characters, so that its controller's Service,
+          `edgerush-controller-<name>`, is a DNS label too. It is unique in the cluster: the
+          oldest ControlPlane of a name holds it, and a later one of the same name in another
+          namespace is not accepted.
         properties:
           apiVersion:
             description: |-
@@ -266,8 +268,8 @@ spec:
             type: object
         type: object
         x-kubernetes-validations:
-        - message: the name of a ControlPlane must be a DNS label, at most 63 lower-case letters, digits and '-', starting and ending with a letter or digit
-          rule: size(self.metadata.name) <= 63 && self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+        - message: the name of a ControlPlane must be a DNS label of at most 43 lower-case letters, digits and '-', starting and ending with a letter or digit, as its controller's Service, edgerush-controller-<name>, is a DNS label
+          rule: size(self.metadata.name) <= 43 && self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
     served: true
     storage: true
     subresources:

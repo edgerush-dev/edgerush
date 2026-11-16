@@ -10,15 +10,16 @@
 #   - a ControlPlane and DataPlanes of each kind (Ingress, Gateway API, both) are admitted,
 #     and so is every golden case's resource of crates/planes;
 #   - each resource the CRDs' schema and CEL rules are to refuse is refused, and says why:
-#     a name that is no DNS label, a watch scope's selector without Selector or Selector
-#     without one, no replicas, a DataPlane with neither ingress nor gateway, a gateway of
-#     no listener or of one the Gateway would refuse, Ingress short of a port or with one
-#     port twice, max below min, one port's settings given twice, an enumerated value
-#     written in another case, a file access log of no path, a LoadBalancer's fields on
-#     another type, and, on an update, a LoadBalancer's class changed; a PlatformDefaults
-#     not named default, an allowance of a selector of no requirement, for ControlPlanes or
-#     for what they watch, with a selector where it takes none or none where it takes one,
-#     of a scope it cannot allow, or of an operator Kubernetes does not have;
+#     a name that is no DNS label or too long for its Service's, a watch scope's selector
+#     without Selector or Selector without one, no replicas, a DataPlane with neither
+#     ingress nor gateway, a gateway of no listener or of one the Gateway would refuse,
+#     Ingress short of a port or with one port twice, max below min, one port's settings
+#     given twice, an enumerated value written in another case, a file access log of no
+#     path, a LoadBalancer's fields on another type, and, on an update, a LoadBalancer's
+#     class changed; a PlatformDefaults not named default, an allowance of a selector of
+#     no requirement, for ControlPlanes or for what they watch, with a selector where it
+#     takes none or none where it takes one, of a scope it cannot allow, or of an operator
+#     Kubernetes does not have;
 #   - a Service holding externalIPs is refused written as a control plane's ServiceAccount,
 #     and admitted written by another; one without them is admitted from either.
 # Nothing is built: no image is needed. Each check says PASS or FAIL; the first FAIL ends
@@ -76,6 +77,8 @@ refused() {
     fi
 }
 
+# `name <n>`: a DNS label of `n` characters, refused, where it is, for its length alone.
+name() { printf 'p%.0s' $(seq "$1"); }
 control_plane() {
     printf 'apiVersion: gateway.edgerush.dev/v1alpha1\nkind: ControlPlane\nmetadata: { name: %s, namespace: edge }\n%s\n' "$1" "${2:-}"
 }
@@ -85,12 +88,14 @@ data_plane() {
 
 # What is to be admitted.
 admitted "a ControlPlane of every default" "$(control_plane payments)"
+admitted "a ControlPlane of the longest name" "$(control_plane "$(name 43)")"
 admitted "a ControlPlane watching what it selects" "$(control_plane payments 'spec:
   watch: { namespaces: { from: Selector, selector: { matchLabels: { team: payments } } } }
   replicas: 2
   authority: { secretRef: { name: payments-ca } }
   webhook: { enabled: false }')"
 admitted "a DataPlane of Ingress" "$(data_plane public '  ingress: { httpPort: 80, httpsPort: 443 }')"
+admitted "a DataPlane of the longest name" "$(data_plane "$(name 48)" '  ingress: { httpPort: 80, httpsPort: 443 }')"
 admitted "a DataPlane of Gateway API" "$(data_plane api '  replicas: { min: 3, max: 20 }
   gateway:
     listeners:
@@ -123,6 +128,7 @@ done
 
 # What the ControlPlane's rules refuse.
 refused "a ControlPlane whose name is no DNS label" "must be a DNS label" "$(control_plane pay.ments)"
+refused "a ControlPlane of a name too long for its Service's" "at most 43" "$(control_plane "$(name 44)")"
 refused "a ControlPlane selecting without a selector" "selector must be given" "$(control_plane payments 'spec: { watch: { namespaces: { from: Selector } } }')"
 refused "a ControlPlane of its own namespace with a selector" "selector must be given" "$(control_plane payments 'spec: { watch: { namespaces: { selector: { matchLabels: { a: b } } } } }')"
 refused "a ControlPlane of no replicas" "spec.replicas" "$(control_plane payments 'spec: { replicas: 0 }')"
@@ -159,6 +165,7 @@ refused "an allowance of an operator Kubernetes does not have" "operator must be
 
 # What the DataPlane's rules refuse.
 refused "a DataPlane whose name is no DNS label" "must be a DNS label" "$(data_plane pub.lic '  ingress: { httpPort: 80, httpsPort: 443 }')"
+refused "a DataPlane of a name too long for its Service's" "at most 48" "$(data_plane "$(name 49)" '  ingress: { httpPort: 80, httpsPort: 443 }')"
 refused "a DataPlane of neither API" "serves ingress, gateway or both" "$(data_plane public '  replicas: { min: 1 }')"
 refused "a DataPlane naming no ControlPlane" "spec.controlPlaneRef" "apiVersion: gateway.edgerush.dev/v1alpha1
 kind: DataPlane
