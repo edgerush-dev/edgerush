@@ -3149,6 +3149,7 @@ async fn the_last_data_planes_ingresses_lose_their_address_once_it_is_let_go_of(
                         planes,
                         Some(Classes {
                             control_plane: "edge".to_owned(),
+                            namespace: "edge".to_owned(),
                             kept,
                         }),
                         Debounce::default(),
@@ -3229,6 +3230,7 @@ async fn a_control_plane_serving_no_data_plane_lets_go_of_its_classes_once_they_
                         watch::channel(Planes::new()).1,
                         Some(Classes {
                             control_plane: "edge".to_owned(),
+                            namespace: "edge".to_owned(),
                             kept,
                         }),
                         Debounce::default(),
@@ -3435,6 +3437,56 @@ async fn a_data_plane_of_ingress_alone_does_not_wait_on_the_gateway_apis_kinds()
             controlling.abort();
         })
         .await;
+}
+
+/// A ControlPlane's control plane translates its Gateway only of the class the operator
+/// made for it, as its labels say; one of the name made by hand is not taken, and no status
+/// of it written, as the operator refuses it (05 §3). The development harness takes either.
+#[test]
+fn a_control_planes_gateway_is_translated_only_of_the_class_made_for_it() {
+    let class = |labels: &str| -> GatewayClass {
+        serde_saphyr::from_str(&format!(
+            "metadata: {{ name: edgerush, generation: 1, labels: {{ {labels} }} }}
+spec: {{ controllerName: edgerush.dev/gateway-controller }}"
+        ))
+        .unwrap()
+    };
+    let made = edgerush_planes::objects::control_plane_labels("edge", "edge")
+        .iter()
+        .map(|(key, value)| format!("{key}: {value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let gateway: Gateway = serde_saphyr::from_str(
+        "metadata: { name: web, namespace: edge, generation: 1 }
+spec:
+  gatewayClassName: edgerush
+  listeners: [{ name: http, port: 8080, protocol: HTTP }]",
+    )
+    .unwrap();
+    let classes = Classes {
+        control_plane: "edge".to_owned(),
+        namespace: "edge".to_owned(),
+        kept: watch::channel(None).1,
+    };
+    let translated = |class: GatewayClass, classes: Option<&Classes>| {
+        let cluster = of_control_plane(
+            Cluster {
+                gateway_classes: vec![class],
+                gateways: vec![gateway.clone()],
+                ..Cluster::default()
+            },
+            classes,
+        );
+        Handed::of(&translate(&gateway_plane(), &cluster)).is_some()
+    };
+    assert!(translated(class(&made), Some(&classes)));
+    assert!(!translated(class(""), Some(&classes)));
+    let elsewhere = Classes {
+        namespace: "teams".to_owned(),
+        ..classes.clone()
+    };
+    assert!(!translated(class(&made), Some(&elsewhere)));
+    assert!(translated(class(""), None));
 }
 
 /// The statuses data planes share are written once for them all: a route attached to the

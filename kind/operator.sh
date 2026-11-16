@@ -20,6 +20,13 @@
 #   - a ControlPlane deleted there, without Gateway API's CRDs, is gone;
 #   - Gateway API's CRDs installed, the operator makes the GatewayClass and the Gateway,
 #     and the DataPlane is programmed, without a restart;
+#   - a GatewayClass naming EdgeRush's controller that no ControlPlane made, as the
+#     conformance suite writes one, is refused, Accepted false of reason Unsupported, of its
+#     generation, and again of the next once edited (docs/05 §3); one of another controller
+#     is left as the API server defaulted it, and `edge`'s is its control plane's, accepted;
+#     one of a ControlPlane's name made by hand before it is refused as well, the
+#     ControlPlane saying it is not the operator's, and its control plane, running, neither
+#     accepts the class nor touches the Gateway of it; the ControlPlane deleted leaves it;
 #   - the control plane writes the data plane's Service (docs/05 §2), owned by DataPlane
 #     `web`, a LoadBalancer that keeps the client's address: Ingress's two ports listed,
 #     and the Gateway's listener's as it is bound, which follows the listener's port as
@@ -272,6 +279,86 @@ condition_is dataplane/web edge Programmed "True Programmed" 60 ||
 [ "$(operator_pod)" = "$before" ] ||
     fail "the operator was restarted: before '$before', now '$(operator_pod)'"
 pass "Gateway API's CRDs installed: the GatewayClass and the Gateway made, the DataPlane programmed, no restart"
+
+echo "== GatewayClasses no ControlPlane made"
+# GatewayClass $1's Accepted: "<status> <reason> <observedGeneration>/<generation>".
+class_accepted() {
+    k get gatewayclass "$1" -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status} {.status.conditions[?(@.type=="Accepted")].reason} {.status.conditions[?(@.type=="Accepted")].observedGeneration}/{.metadata.generation}' 2>/dev/null
+}
+k apply -f - >/dev/null <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: outsider
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: elsewhere
+spec:
+  controllerName: example.com/gateway-controller
+EOF
+until_true '[ "$(class_accepted outsider)" = "False Unsupported 1/1" ]' 60 ||
+    fail "GatewayClass outsider, of no ControlPlane, says '$(class_accepted outsider)'"
+k patch gatewayclass outsider --type=merge -p '{"spec":{"description":"Edited."}}' >/dev/null
+until_true '[ "$(class_accepted outsider)" = "False Unsupported 2/2" ]' 60 ||
+    fail "GatewayClass outsider, edited, says '$(class_accepted outsider)'"
+[ "$(class_accepted elsewhere)" = "Unknown Pending /1" ] ||
+    fail "GatewayClass elsewhere, another controller's, says '$(class_accepted elsewhere)'"
+until_true '[ "$(class_accepted edge | cut -d" " -f1-2)" = "True Accepted" ]' 60 ||
+    fail "GatewayClass edge, its ControlPlane's, says '$(class_accepted edge)'"
+k delete gatewayclass outsider elsewhere >/dev/null
+pass "a class of EdgeRush's controller that no ControlPlane made is refused, Unsupported, of each generation; another controller's left alone, edge's accepted"
+# One of a ControlPlane's name, made by hand before it: refused too, and its control plane
+# neither accepts it nor serves its Gateway, so that the two never write it in turn.
+k create namespace squat >/dev/null
+k apply -f - >/dev/null <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: squat
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: squat, namespace: squat }
+spec:
+  webhook: { enabled: false }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata: { name: front, namespace: squat }
+spec:
+  controlPlaneRef: { name: squat }
+  gateway:
+    listeners: [{ name: http, port: 8080, protocol: HTTP }]
+EOF
+condition_is controlplane/squat squat Programmed "False NotOurs" 60 ||
+    fail "ControlPlane squat, its class made by hand: $(condition controlplane/squat squat Programmed)"
+until_true '[ "$(class_accepted squat)" = "False Unsupported 1/1" ]' 60 ||
+    fail "GatewayClass squat, made by hand, says '$(class_accepted squat)'"
+k -n squat rollout status deploy/edgerush-controller-squat --timeout=120s >/dev/null ||
+    fail "ControlPlane squat's controller never runs"
+# Ten seconds of its controller running: the class stays refused, the Gateway untouched.
+for _ in $(seq 1 50); do
+    [ "$(class_accepted squat)" = "False Unsupported 1/1" ] ||
+        fail "GatewayClass squat, with its ControlPlane's controller running, says '$(class_accepted squat)'"
+    sleep 0.2
+done
+[ "$(condition gateway/front squat Accepted)" = "Unknown Pending" ] ||
+    fail "Gateway squat/front, of a class not made for its ControlPlane, says '$(condition gateway/front squat Accepted)'"
+k -n squat delete controlplane squat --wait=false >/dev/null
+k -n squat delete dataplane front --wait=false >/dev/null
+until_true '! k -n squat get controlplane squat' 90 ||
+    fail "ControlPlane squat, deleted, is never gone"
+k get gatewayclass squat >/dev/null ||
+    fail "GatewayClass squat, made by hand, was deleted with ControlPlane squat"
+k delete gatewayclass squat >/dev/null
+k delete namespace squat --wait=false >/dev/null
+pass "a class of a ControlPlane's name made by hand is refused, and its control plane takes it no more than the operator does"
 
 echo "== the data plane's Service"
 # The ports the data plane's Service lists, as `port/protocol`, in its order.

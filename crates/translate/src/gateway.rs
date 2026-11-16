@@ -731,7 +731,9 @@ fn takes_sets_of(gateway: &Gateway, namespace: &str, cluster: &Cluster) -> bool 
     namespaces(&written, own).0.allow(namespace, cluster)
 }
 
-/// Whether the Gateway's GatewayClass is there and names this controller; said where not.
+/// Whether the Gateway's GatewayClass is there, names this controller and, where a
+/// ControlPlane's control plane translates it, carries the labels its class is made with;
+/// said where not.
 fn class_ours(gateway: &Gateway, cluster: &Cluster, report: &mut Vec<Finding>) -> bool {
     let name = &gateway.spec.gateway_class_name;
     let object = Object {
@@ -756,6 +758,19 @@ fn class_ours(gateway: &Gateway, cluster: &Cluster, report: &mut Vec<Finding>) -
             problem: Problem::GatewayClassNotOurs(class.spec.controller_name.clone()),
         });
         return false;
+    }
+    if let Some(wanted) = &cluster.gateway_class_labels {
+        let held = class.metadata.labels.as_ref();
+        let carries = wanted
+            .iter()
+            .all(|(key, value)| held.and_then(|held| held.get(key)) == Some(value));
+        if !carries {
+            report.push(Finding {
+                object,
+                problem: Problem::GatewayClassNotMade,
+            });
+            return false;
+        }
     }
     true
 }
@@ -1139,6 +1154,62 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// Where a ControlPlane's control plane translates, the Gateway's class is taken only
+    /// where it carries the labels the operator makes its class with; written by hand, as
+    /// for the development harness, any class naming this controller is.
+    #[test]
+    fn a_class_not_made_for_the_control_plane_is_not_taken() {
+        let gateway: crate::Gateway = serde_saphyr::from_str(
+            "{ metadata: { name: web, namespace: edge }, \
+             spec: { gatewayClassName: edge, listeners: [] } }",
+        )
+        .unwrap();
+        let class = |labels: &str| -> crate::GatewayClass {
+            serde_saphyr::from_str(&format!(
+                "{{ metadata: {{ name: edge, labels: {{ {labels} }} }}, \
+                 spec: {{ controllerName: edgerush.dev/gateway-controller }} }}"
+            ))
+            .unwrap()
+        };
+        let made = "app.kubernetes.io/managed-by: edgerush-operator, \
+                    gateway.edgerush.dev/control-plane: edge, gateway.edgerush.dev/namespace: edge";
+        let wanted = labels(&[
+            ("app.kubernetes.io/managed-by", "edgerush-operator"),
+            ("gateway.edgerush.dev/control-plane", "edge"),
+            ("gateway.edgerush.dev/namespace", "edge"),
+        ]);
+        let taken = |class: crate::GatewayClass, wanted: Option<BTreeMap<String, String>>| {
+            let cluster = Cluster {
+                gateway_classes: vec![class],
+                gateway_class_labels: wanted,
+                ..Cluster::default()
+            };
+            let mut report = Vec::new();
+            let taken = super::class_ours(&gateway, &cluster, &mut report);
+            (
+                taken,
+                report
+                    .into_iter()
+                    .map(|finding| finding.problem)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(taken(class(made), Some(wanted.clone())), (true, vec![]));
+        assert_eq!(taken(class(""), None), (true, vec![]));
+        for hand_made in [
+            "",
+            "gateway.edgerush.dev/control-plane: edge",
+            "app.kubernetes.io/managed-by: edgerush-operator, \
+             gateway.edgerush.dev/control-plane: edge, gateway.edgerush.dev/namespace: other",
+        ] {
+            assert_eq!(
+                taken(class(hand_made), Some(wanted.clone())),
+                (false, vec![crate::Problem::GatewayClassNotMade]),
+                "{hand_made}"
+            );
+        }
     }
 
     /// Listeners that clash go to the first: a later one stating a port taken for another
