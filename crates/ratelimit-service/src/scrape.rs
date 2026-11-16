@@ -81,7 +81,8 @@ pub fn render_store<C: Counted>(observed: Observed<C>) -> String {
     scrape.family(name, Kind::Gauge, help);
     scrape.sample(name, &[], u8::from(observed.ready));
     let name = "edgerush_rate_limit_key_bytes";
-    let help = "Bytes the keys hold, owned and copies, as an estimate of their own data.";
+    let help = "Bytes the keys hold, owned and copies, as an estimate of their own data and \
+                of their places in the schedule of when each may be forgotten.";
     scrape.family(name, Kind::Gauge, help);
     scrape.sample(name, &[], observed.key_bytes);
     if let Some(most) = observed.max_key_bytes {
@@ -97,8 +98,8 @@ pub fn render_store<C: Counted>(observed: Observed<C>) -> String {
     scrape.family(name, Kind::Gauge, help);
     scrape.sample(name, &[], observed.owned_keys);
     let name = "edgerush_rate_limit_keys_evicted_total";
-    let help = "Keys evicted, least recently changed first, to keep within the bytes they \
-                may hold; each starts again full.";
+    let help = "Keys evicted, those that may be forgotten soonest first, to keep within the \
+                bytes they may hold; each starts again full.";
     scrape.family(name, Kind::Counter, help);
     scrape.sample(name, &[], observed.evicted);
     let name = "edgerush_rate_limit_keys_forgotten_total";

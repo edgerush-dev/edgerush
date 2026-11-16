@@ -28,9 +28,10 @@ pub struct Config {
     /// latest table any of them had runs, before it names them again without requiring that
     /// table: one cut off from the rest would hold the service down until the cut healed.
     pub form_wait: Time,
-    /// The most a pod's keys may take, owned and copies, as `keys.max_bytes` caps a service
-    /// pod's: past it, at its next sweep, it evicts keys, those it may forget soonest first,
-    /// down to nine tenths, the replicas of its own told; none, no cap.
+    /// The most a pod's keys may take, owned and copies, with their places in its schedule, as
+    /// `keys.max_bytes` caps a service pod's: past it, from its next cycle, it evicts keys,
+    /// those it may forget soonest first, a bounded number a cycle, down to nine tenths, the
+    /// replicas of its own told; none, no cap.
     pub max_key_bytes: Option<u64>,
     /// The most one part of a copy or a handoff carries, by the store's count of its keys'
     /// bytes, at least one key a part: a shard's whole copy goes in as many parts as it takes,

@@ -1,5 +1,6 @@
 //! One pod's part of the cluster: a state machine fed messages and its clock.
 
+use crate::keys::{Keys, seconds_passed};
 use crate::message::{Message, Stamp};
 use crate::table::{self, Table, is_quorum, shard_of};
 use crate::{Config, Held, Kept, NodeId, ShardId, Time, first_term, generation_of};
@@ -216,7 +217,12 @@ pub struct Node<V> {
     /// The highest term it has seen anyone in.
     seen_term: u64,
     /// Each key's value, by shard: its own shards and its copies.
-    data: BTreeMap<ShardId, BTreeMap<u64, Kept<V>>>,
+    data: Keys<V>,
+    /// Keys new to it, made by an update or a copy, since its last cycle: as many more as it
+    /// may evict at its next, past its cap, so that eviction keeps up with them.
+    made: u64,
+    /// Whether it is evicting, past its cap and not yet down to nine tenths of it.
+    evicting: bool,
     /// Keys it changed as owner since its last copies.
     dirty: BTreeMap<ShardId, BTreeSet<u64>>,
     /// Of keys it changed as owner since its last copies only in parts, as their mode numbers
@@ -314,7 +320,9 @@ impl<V: Held> Node<V> {
             lapsed: 0,
             elect_at: None,
             seen_term: 0,
-            data: BTreeMap::new(),
+            data: Keys::default(),
+            made: 0,
+            evicting: false,
             dirty: BTreeMap::new(),
             parts_changed: BTreeMap::new(),
             versions: BTreeMap::new(),
@@ -356,21 +364,18 @@ impl<V: Held> Node<V> {
         self.evicted
     }
 
-    /// About the bytes its keys take, owned and copies: what `max_key_bytes` caps.
+    /// About the bytes its keys take, owned and copies, with what it keeps to know when each
+    /// may be forgotten: what `max_key_bytes` caps. A sum over its shards, not its keys.
     #[must_use]
     pub fn key_bytes(&self) -> u64 {
-        self.data
-            .values()
-            .flat_map(BTreeMap::values)
-            .map(Kept::bytes)
-            .sum()
+        self.data.bytes()
     }
 
     /// The keys it holds of `shard`, owned or a copy.
     #[must_use]
     pub fn keys_of(&self, shard: ShardId) -> BTreeSet<u64> {
         self.data
-            .get(&shard)
+            .shard(shard)
             .map(|keys| keys.keys().copied().collect())
             .unwrap_or_default()
     }
@@ -428,10 +433,7 @@ impl<V: Held> Node<V> {
     /// simulation to start a cluster holding many keys, not for serving.
     pub fn load(&mut self, key: u64, value: V) {
         let shard = shard_of(key, self.config.shards);
-        self.data
-            .entry(shard)
-            .or_default()
-            .insert(key, Kept::new(value));
+        self.data.insert(shard, key, Kept::new(value));
     }
 
     /// Sets its wall clock to its own clock and `offset`, as the clock it decides requests
@@ -467,8 +469,9 @@ impl<V: Held> Node<V> {
             return None;
         }
         let wall = self.wall(now);
-        let kept = self.data.entry(shard).or_default().entry(key).or_default();
-        let (result, changed) = change(kept, wall);
+        let held = self.data.len();
+        let (result, changed) = self.data.change(shard, key, |kept| change(kept, wall));
+        self.made += (self.data.len() - held) as u64;
         match changed {
             Changed::Nothing => {}
             Changed::Whole => {
@@ -517,8 +520,9 @@ impl<V: Held> Node<V> {
             return None;
         }
         let wall = self.wall(now);
-        let kept = self.data.entry(shard).or_default().entry(key).or_default();
-        let (result, _) = change(kept, wall);
+        let held = self.data.len();
+        let (result, _) = self.data.change(shard, key, |kept| change(kept, wall));
+        self.made += (self.data.len() - held) as u64;
         Some(result)
     }
 
@@ -527,7 +531,7 @@ impl<V: Held> Node<V> {
     pub fn value(&self, key: u64) -> Option<V> {
         let shard = shard_of(key, self.config.shards);
         self.data
-            .get(&shard)?
+            .shard(shard)?
             .get(&key)
             .map(|kept| kept.value.clone())
     }
@@ -535,7 +539,7 @@ impl<V: Held> Node<V> {
     /// How many keys it holds, owned and copies.
     #[must_use]
     pub fn key_count(&self) -> usize {
-        self.data.values().map(BTreeMap::len).sum()
+        self.data.len()
     }
 
     /// How many keys it holds of the shards its committed table names it the owner of: none
@@ -545,8 +549,7 @@ impl<V: Held> Node<V> {
         self.committed.as_ref().map_or(0, |table| {
             table
                 .owned_by(self.id)
-                .filter_map(|shard| self.data.get(&shard))
-                .map(BTreeMap::len)
+                .map(|shard| self.data.len_of(shard))
                 .sum()
         })
     }
@@ -814,13 +817,15 @@ impl<V: Held> Node<V> {
             self.cycle_at = Some(now);
             self.replicate(now, &mut out);
             self.hand_on(now, &mut out);
+            self.forget(now);
+            self.evict();
         }
         if self
             .swept_at
             .is_none_or(|at| now.saturating_sub(at) >= SWEEP)
         {
             self.swept_at = Some(now);
-            self.sweep(now);
+            self.sweep();
         }
         match self.role {
             Role::Leader { ref pending } => {
@@ -1314,7 +1319,7 @@ impl<V: Held> Node<V> {
             if !mine && !copy && !taking && !ahead {
                 // What it held of the shard dropped, so is how far it held it: an owner that
                 // never saw it taken off, sending the next copy, is told it holds nothing.
-                self.data.remove(&id);
+                self.data.drop_shard(id);
                 self.dirty.remove(&id);
                 self.have.remove(&id);
                 self.copied_under.remove(&id);
@@ -1406,7 +1411,7 @@ impl<V: Held> Node<V> {
             }
             self.parts_changed
                 .retain(|(changed, _), _| *changed != shard);
-            let held = self.data.get(&shard).map_or(0, BTreeMap::len);
+            let held = self.data.len_of(shard);
             let bytes = part_bytes(&entries, &dropped);
             let alone = entries.len() + dropped.len() <= 1 || bytes <= self.config.part_bytes;
             for replica in &copies_to(&table, shard) {
@@ -1565,7 +1570,7 @@ impl<V: Held> Node<V> {
         out: &mut Outbox<V>,
     ) {
         self.sending.remove(&(replica, shard));
-        let held = self.data.get(&shard);
+        let held = self.data.shard(shard);
         let (keys, bytes) = match &copy.keys {
             None => held.map_or((0, 0), |held| {
                 (held.len(), held.values().map(Kept::bytes).sum())
@@ -1600,7 +1605,7 @@ impl<V: Held> Node<V> {
         let window = self.config.window_bytes;
         let mut unanswered = self.unanswered();
         for ((replica, shard), sending) in &mut self.sending {
-            let held = self.data.get(shard);
+            let held = self.data.shard(*shard);
             let keys = sending.keys.as_ref();
             if !sending.sent.is_empty() && now.saturating_sub(sending.at) >= again {
                 sending.at = now;
@@ -1685,24 +1690,32 @@ impl<V: Held> Node<V> {
         }
     }
 
-    /// Forgets every key whose time has come by its wall clock, owned or a copy, sending
-    /// nothing: every pod holding it forgets it by its own, and from then the key is decided
-    /// as a new one, as it would be had it been kept.
-    fn sweep(&mut self, now: Time) {
-        let wall = self.wall(now);
-        for (shard, keys) in &mut self.data {
-            let before = keys.len();
-            keys.retain(|_, kept| kept.forget_at > wall);
-            if keys.len() < before {
-                self.forgotten += (before - keys.len()) as u64;
-                if let Some(dirty) = self.dirty.get_mut(shard) {
-                    dirty.retain(|key| keys.contains_key(key));
-                }
+    /// Forgets the keys whose time has come by its wall clock, by the second, owned or copies,
+    /// sending nothing: every pod holding one forgets it by its own, and from then the key is
+    /// decided as a new one, as it would be had it been kept. Soonest first, at most
+    /// [`PER_CYCLE`] a cycle, the rest at the cycles after: a key kept past its time changes
+    /// nothing it decides, and a cycle stays short however many fall due together.
+    fn forget(&mut self, now: Time) {
+        let by = seconds_passed(self.wall(now));
+        for _ in 0..PER_CYCLE {
+            let Some((shard, key, _)) = self.data.pop_soonest(by) else {
+                break;
+            };
+            self.forgotten += 1;
+            if let Some(dirty) = self.dirty.get_mut(&shard) {
+                dirty.remove(&key);
             }
         }
+    }
+
+    /// Lets go of what it keeps of copies that will not finish, and of parts changed of keys it
+    /// no longer holds.
+    fn sweep(&mut self) {
         let data = &self.data;
-        self.parts_changed
-            .retain(|(shard, key), _| data.get(shard).is_some_and(|keys| keys.contains_key(key)));
+        self.parts_changed.retain(|(shard, key), _| {
+            data.shard(*shard)
+                .is_some_and(|keys| keys.contains_key(key))
+        });
         // Copies coming in parts that will not finish: their shard's term gone by, or, for a
         // replica's, sent by a pod its table no longer names the owner.
         let table = self.committed.as_deref();
@@ -1717,51 +1730,46 @@ impl<V: Held> Node<V> {
         });
         self.handing_in
             .retain(|(shard, _), (term, _)| *term >= known(*shard));
-        self.evict();
     }
 
-    /// Past `max_key_bytes`, evicts keys, owned or copies, those it may forget soonest first —
-    /// as EdgeRush's pods evict the keys whose buckets are full soonest — down to nine tenths,
-    /// so that its memory stays within the cap. One of its own is a change, so that its
-    /// replicas drop it with the next copy and hold what it holds; a copy goes with no
-    /// message, its owner's to keep, lost only should that owner then fail over, an
-    /// overshoot. A pod evicting is under specified, its counts not guaranteed either way
-    /// (`membership-design.md`).
+    /// Past `max_key_bytes`, evicts keys, owned or copies, those it may forget soonest first,
+    /// by the second — as EdgeRush's pods evict the keys whose buckets are full soonest — down
+    /// to nine tenths, so that its memory stays within the cap. Of the keys due in one second,
+    /// a shard's go before the next shard's. At most [`PER_CYCLE`] a cycle, and as many more
+    /// as keys were made since the last: the rest at the cycles after, so that a cycle stays
+    /// short however far over the cap it is, and eviction keeps up with keys made at any rate.
+    /// One of its own is a change, so that its replicas drop it with the next copy and hold
+    /// what it holds; a copy goes with no message, its owner's to keep, lost only should that
+    /// owner then fail over, an overshoot. A pod evicting is under specified, its counts not
+    /// guaranteed either way (`membership-design.md`).
     fn evict(&mut self) {
+        let made = std::mem::take(&mut self.made);
         let Some(cap) = self.config.max_key_bytes else {
             return;
         };
-        let mut bytes = self.key_bytes();
-        if bytes <= cap {
+        let goal = cap / 10 * 9;
+        self.evicting = if self.evicting {
+            self.data.bytes() > goal
+        } else {
+            self.data.bytes() > cap
+        };
+        if !self.evicting {
             return;
         }
-        let mut held: Vec<(Time, ShardId, u64, u64)> = self
-            .data
-            .iter()
-            .flat_map(|(shard, keys)| {
-                keys.iter()
-                    .map(|(key, kept)| (kept.forget_at, *shard, *key, kept.bytes()))
-            })
-            .collect();
-        held.sort_unstable();
-        let goal = cap / 10 * 9;
-        for (_, shard, key, size) in held {
-            if bytes <= goal {
+        let table = self.committed.as_deref();
+        let most = (PER_CYCLE as u64).saturating_add(made);
+        let mut evicted = 0;
+        while evicted < most && self.data.bytes() > goal {
+            let Some((shard, key, _)) = self.data.pop_soonest(Time::MAX) else {
                 break;
-            }
-            if let Some(keys) = self.data.get_mut(&shard) {
-                keys.remove(&key);
-            }
-            let own = self
-                .committed
-                .as_ref()
-                .is_some_and(|table| table.owner(shard) == Some(self.id));
-            if own {
+            };
+            if table.is_some_and(|table| table.owner(shard) == Some(self.id)) {
                 self.dirty.entry(shard).or_default().insert(key);
             }
-            self.evicted += 1;
-            bytes = bytes.saturating_sub(size);
+            evicted += 1;
         }
+        self.evicted += evicted;
+        self.evicting = self.data.bytes() > goal;
     }
 
     /// Of `keys` of `shard`, those it holds, with their values, and those it no longer holds,
@@ -1771,7 +1779,7 @@ impl<V: Held> Node<V> {
         shard: ShardId,
         keys: impl Iterator<Item = u64>,
     ) -> (Vec<(u64, Kept<V>)>, Vec<u64>) {
-        let held = self.data.get(&shard);
+        let held = self.data.shard(shard);
         let mut entries = Vec::new();
         let mut dropped = Vec::new();
         for key in keys {
@@ -1786,7 +1794,7 @@ impl<V: Held> Node<V> {
     /// Every key it holds of `shard`, with its value.
     fn all_of(&self, shard: ShardId) -> Vec<(u64, Kept<V>)> {
         self.data
-            .get(&shard)
+            .shard(shard)
             .map(|keys| {
                 keys.iter()
                     .map(|(key, value)| (*key, value.clone()))
@@ -2536,21 +2544,22 @@ impl<V: Held> Node<V> {
             return false;
         }
         let mine = entry.is_some_and(|entry| entry.owner == Some(self.id));
-        let keys = self.data.entry(shard).or_default();
+        let held = self.data.len();
         for (key, value) in entries {
             if replace && !mine {
-                keys.insert(key, value);
+                self.data.insert(shard, key, value);
                 continue;
             }
-            let raised = keys.entry(key).or_default().merge(&value);
+            let raised = self.data.change(shard, key, |kept| kept.merge(&value));
             if raised && mine {
                 self.dirty.entry(shard).or_default().insert(key);
                 // Raised by a copy, not a slot it charged: copied on whole.
                 self.parts_changed.remove(&(shard, key));
             }
         }
+        self.made += self.data.len().saturating_sub(held) as u64;
         for key in dropped {
-            if keys.remove(key).is_some() && mine {
+            if self.data.remove(shard, *key).is_some() && mine {
                 self.dirty.entry(shard).or_default().insert(*key);
             }
         }
@@ -2564,8 +2573,8 @@ impl<V: Held> Node<V> {
             .committed
             .as_ref()
             .is_some_and(|table| table.owner(shard) == Some(self.id));
-        if let Some(keys) = self.data.get_mut(&shard).filter(|_| !mine) {
-            keys.retain(|key, _| named.contains(key));
+        if !mine {
+            self.data.retain(shard, |key, _| named.contains(key));
         }
     }
 }
@@ -2790,9 +2799,13 @@ const PART_AGAIN: Time = 25;
 /// within the shard's keys however long a replica goes unanswering.
 const UNACKED_MOST: usize = 64;
 
-/// How often a pod forgets the keys whose time has come, as EdgeRush's pods sweep theirs: a
-/// key is kept up to this long past its time, which changes nothing it decides.
+/// How often a pod lets go of what it keeps of copies that will not finish.
 const SWEEP: Time = 1_000_000_000;
+
+/// The most keys a pod forgets in a cycle, and evicts besides those made since its last:
+/// bounding what a cycle does whatever it holds, about a millisecond's work at ten million
+/// keys, where forgetting one took about 0.9 µs on the Linux benchmark laptop.
+const PER_CYCLE: usize = 1_024;
 
 #[cfg(test)]
 mod tests {
@@ -2954,8 +2967,9 @@ mod tests {
     /// shard to each carries the key as a deletion, so that no replica keeps it.
     #[test]
     fn an_owners_eviction_goes_to_its_replicas_as_a_deletion() {
+        // Three keys of 64 bytes, as in the test below: one evicted brings 192 to 128.
         let mut capped = config();
-        capped.max_key_bytes = Some(100);
+        capped.max_key_bytes = Some(150);
         let mut node = Node::new(1, address(1), capped, [2, 3]);
         let members = named(&[1, 2, 3]);
         let table = table::first(&members, 4, 2, 1);
@@ -2985,7 +2999,7 @@ mod tests {
     #[test]
     fn past_its_cap_a_pod_evicts_the_keys_it_may_forget_soonest() {
         let mut capped = config();
-        capped.max_key_bytes = Some(100);
+        capped.max_key_bytes = Some(150);
         let mut node = Node::new(2, address(2), capped, [1, 3]);
         let members = named(&[1, 2, 3]);
         let table = table::first(&members, 4, 2, 1);
@@ -3012,7 +3026,8 @@ mod tests {
             more: false,
         };
         let _ = node.receive(1, copy, ms(2));
-        // Three keys of 40 bytes, 120 against 100: one evicted brings it to 80, under 90.
+        // Three keys of 64 bytes, 40 their own and 24 their place in the schedule: 192 against
+        // 150, and one evicted brings it to 128, under 135.
         let _ = node.tick(ms(3));
         assert_eq!(node.keys_of(0), [keys[0], keys[2]].into_iter().collect());
         assert_eq!(node.evicted(), 1);
@@ -3043,6 +3058,333 @@ mod tests {
         assert_eq!((node.count(key), node.count(other)), (Some(5), Some(7)));
         let _ = node.receive(1, whole(2), ms(3));
         assert_eq!((node.count(key), node.count(other)), (Some(5), None));
+        assert_agrees(&node);
+    }
+
+    /// Past its cap, the key it may forget soonest goes first whatever shard it is in, not the
+    /// soonest of the first shard.
+    #[test]
+    fn past_its_cap_the_soonest_goes_first_across_shards() {
+        let mut capped = config();
+        // Three keys of 64 bytes, 192 against 150: one evicted brings it to 128, under 135.
+        capped.max_key_bytes = Some(150);
+        let mut node = member_under(capped);
+        let first: Vec<u64> = (0..).filter(|key| shard_of(*key, 4) == 0).take(2).collect();
+        let soonest = key_in(1);
+        let kept = |forget_at| Kept {
+            value: Counts::of(1),
+            forget_at,
+        };
+        let copy = |shard, entries| Message::Replicate {
+            shard,
+            term: 1,
+            assignment: 1,
+            after: None,
+            version: 1,
+            under: (0, 0),
+            entries,
+            dropped: Vec::new(),
+            part: 0,
+            more: false,
+        };
+        let firsts = vec![(first[0], kept(ms(20_000))), (first[1], kept(ms(30_000)))];
+        let _ = node.receive(1, copy(0, firsts), ms(2));
+        let _ = node.receive(1, copy(1, vec![(soonest, kept(ms(10_000)))]), ms(2));
+        assert_eq!(node.key_count(), 3, "every key held before the sweep");
+        let _ = node.tick(ms(3));
+        assert_eq!(node.count(soonest), None, "the soonest, in shard 1, kept");
+        assert_eq!(node.key_count(), 2);
+        assert_eq!(node.evicted(), 1);
+    }
+
+    /// Past its cap, a key never to be forgotten goes after every key that may be: last of
+    /// all, at the end of the schedule.
+    #[test]
+    fn past_its_cap_a_key_never_forgotten_goes_last() {
+        let mut capped = config();
+        // Three keys of 64 bytes, 192 against 100: two evicted bring it to 64, under 90.
+        capped.max_key_bytes = Some(100);
+        let mut node = member_under(capped);
+        let keys: Vec<u64> = (0..).filter(|key| shard_of(*key, 4) == 0).take(3).collect();
+        let kept = |forget_at| Kept {
+            value: Counts::of(1),
+            forget_at,
+        };
+        let copy = Message::Replicate {
+            shard: 0,
+            term: 1,
+            assignment: 1,
+            after: None,
+            version: 1,
+            under: (0, 0),
+            entries: vec![
+                (keys[0], kept(Time::MAX)),
+                (keys[1], kept(ms(20_000))),
+                (keys[2], kept(ms(10_000))),
+            ],
+            dropped: Vec::new(),
+            part: 0,
+            more: false,
+        };
+        let _ = node.receive(1, copy, ms(2));
+        let _ = node.tick(ms(3));
+        assert_eq!(node.keys_of(0), [keys[0]].into_iter().collect());
+        assert_eq!(node.evicted(), 2);
+        assert_agrees(&node);
+    }
+
+    /// A key whose time to be forgotten comes forward, by a whole copy from its owner, is
+    /// forgotten by its new time: its place in the schedule moves with it.
+    #[test]
+    fn a_key_whose_time_comes_forward_is_forgotten_by_its_new_time() {
+        let mut node = member();
+        let key = key_in(0);
+        node.load(key, Counts::of(7));
+        let whole = Message::Replicate {
+            shard: 0,
+            term: 1,
+            assignment: 2,
+            after: None,
+            version: 1,
+            under: (0, 0),
+            entries: vec![(
+                key,
+                Kept {
+                    value: Counts::of(5),
+                    forget_at: ms(1_000),
+                },
+            )],
+            dropped: Vec::new(),
+            part: 0,
+            more: false,
+        };
+        let _ = node.receive(1, whole, ms(3));
+        assert_eq!(node.count(key), Some(5), "replaced by the owner's");
+        let _ = node.tick(ms(2_000));
+        assert_eq!(node.count(key), None, "kept past its new time");
+        assert_eq!(node.forgotten(), 1);
+        assert_eq!(node.key_bytes(), 0);
+    }
+
+    /// Holds `count` keys of the shards below `shards`, each of one count's bytes, 64 with its
+    /// place in the schedule, from `forget_at(key)`, as if it had always held them.
+    fn holding(node: &mut Node, shards: ShardId, count: usize, forget_at: impl Fn(u64) -> Time) {
+        for key in (0..).filter(|key| shard_of(*key, 4) < shards).take(count) {
+            let kept = Kept {
+                value: Counts::of(1),
+                forget_at: forget_at(key),
+            };
+            let _ = node.data.insert(shard_of(key, 4), key, kept);
+        }
+    }
+
+    /// Keys falling due together are forgotten at most [`PER_CYCLE`] a cycle, the rest at the
+    /// cycles after: however many come due at once, a cycle stays short.
+    #[test]
+    fn keys_due_together_are_forgotten_a_bounded_number_a_cycle() {
+        let mut node = member();
+        let due = 2 * PER_CYCLE + 10;
+        holding(&mut node, 2, due, |_| ms(1_000));
+        let forgotten: Vec<u64> = [2_000, 2_010, 2_020, 2_030]
+            .into_iter()
+            .map(|at| {
+                let _ = node.tick(ms(at));
+                node.forgotten()
+            })
+            .collect();
+        let most = PER_CYCLE as u64;
+        assert_eq!(forgotten, [most, 2 * most, due as u64, due as u64]);
+        assert_eq!(node.key_count(), 0);
+        assert_agrees(&node);
+    }
+
+    /// Far past its cap, a pod evicts at most [`PER_CYCLE`] a cycle, and carries on at the
+    /// cycles after down to nine tenths of the cap, though under the cap itself by then.
+    #[test]
+    fn far_past_its_cap_a_pod_evicts_a_bounded_number_a_cycle_down_to_nine_tenths() {
+        let mut capped = config();
+        // 12,000 keys of 64 bytes, 768 kB against 760: down to 684 kB, 10,687 keys, is 1,313
+        // evicted, the 1,024 of the first cycle bringing it under the cap but not to the goal.
+        capped.max_key_bytes = Some(760_000);
+        let mut node = member_under(capped);
+        holding(&mut node, 4, 12_000, |key| ms(60_000 + key % 1_000 * 1_000));
+        let evicted: Vec<u64> = [2, 12, 22]
+            .into_iter()
+            .map(|at| {
+                let _ = node.tick(ms(at));
+                node.evicted()
+            })
+            .collect();
+        assert_eq!(evicted, [1_024, 1_313, 1_313]);
+        assert!(node.key_bytes() <= 684_000, "{}", node.key_bytes());
+        assert_agrees(&node);
+    }
+
+    /// Past its cap, every key made since its last cycle, by a copy here, is evicted for at its
+    /// next besides [`PER_CYCLE`], so that eviction keeps up with keys made at any rate.
+    #[test]
+    fn past_its_cap_keys_made_add_as_many_to_what_a_cycle_evicts() {
+        let mut capped = config();
+        // 20,000 keys of 64 bytes, 1.28 MB against 640 kB: 11,000 to evict, more than two
+        // cycles' worth.
+        capped.max_key_bytes = Some(640_000);
+        let mut node = member_under(capped);
+        let mut ahead = Vec::new();
+        for key in (0..).filter(|key| shard_of(*key, 4) != 0).take(20_000) {
+            ahead.push(key);
+        }
+        for key in &ahead {
+            let kept = Kept {
+                value: Counts::of(1),
+                forget_at: ms(60_000),
+            };
+            let _ = node.data.insert(shard_of(*key, 4), *key, kept);
+        }
+        let _ = node.tick(ms(2));
+        assert_eq!(node.evicted(), PER_CYCLE as u64);
+        let made: Vec<(u64, Kept<Counts>)> = (0..)
+            .filter(|key| shard_of(*key, 4) == 0)
+            .take(1_000)
+            .map(|key| (key, Kept::new(Counts::of(1))))
+            .collect();
+        let copy = Message::Replicate {
+            shard: 0,
+            term: 1,
+            assignment: 1,
+            after: None,
+            version: 1,
+            under: (0, 0),
+            entries: made,
+            dropped: Vec::new(),
+            part: 0,
+            more: false,
+        };
+        let _ = node.receive(3, copy, ms(5));
+        assert_eq!(
+            node.key_count(),
+            20_000 - PER_CYCLE + 1_000,
+            "the copy's keys made"
+        );
+        let _ = node.tick(ms(12));
+        assert_eq!(node.evicted(), 2 * PER_CYCLE as u64 + 1_000);
+        assert_agrees(&node);
+    }
+
+    /// Past its cap, keys an owner makes by updating them count as made too, as a data
+    /// plane's batch makes them, and are evicted for at its next cycle besides [`PER_CYCLE`].
+    #[test]
+    fn past_its_cap_keys_an_owner_makes_add_as_many_to_what_a_cycle_evicts() {
+        let mut capped = config();
+        // As above: 20,000 keys of 64 bytes against 640 kB, more than two cycles' worth.
+        capped.max_key_bytes = Some(640_000);
+        let (mut owner, shard, _, _) = owner_copying_to_2_under(capped);
+        holding(&mut owner, 4, 20_000, |_| ms(60_000));
+        let leased = |owner: &mut Node, now| {
+            for peer in [2, 3] {
+                let heard = Message::Heartbeat {
+                    term: owner.term(),
+                    leader: Some(2),
+                    committed: owner.committed_stamp(),
+                    fresh: false,
+                    sent: now,
+                    wall: 0,
+                    hears: vec![(1, now), (2, now), (3, now)],
+                    leased: true,
+                };
+                let _ = owner.receive(peer, heard, now);
+            }
+        };
+        leased(&mut owner, ms(2));
+        let _ = owner.tick(ms(2));
+        assert_eq!(owner.evicted(), PER_CYCLE as u64);
+        leased(&mut owner, ms(5));
+        let made = (1 << 40..)
+            .filter(|key| shard_of(*key, 4) == shard)
+            .take(1_000)
+            .filter(|key| {
+                owner
+                    .update(*key, ms(5), |kept, _| {
+                        kept.value.add(0);
+                        kept.forget_at = Time::MAX;
+                        ((), Changed::Whole)
+                    })
+                    .is_some()
+            })
+            .count();
+        assert_eq!(made, 1_000, "every key made by its owner");
+        let _ = owner.tick(ms(12));
+        assert_eq!(owner.evicted(), 2 * PER_CYCLE as u64 + 1_000);
+        assert_agrees(&owner);
+    }
+
+    /// Keys are forgotten by the pod's wall clock, wherever that puts them against its own:
+    /// at once when it jumps on past their time, not yet when it lags behind.
+    #[test]
+    fn keys_are_forgotten_by_the_wall_clock_however_it_moves() {
+        let key = key_in(0);
+        let kept = Kept {
+            value: Counts::of(1),
+            forget_at: ms(10_000),
+        };
+        let mut ahead = member();
+        let _ = ahead.data.insert(0, key, kept.clone());
+        ahead.set_wall_offset(i64::try_from(ms(20_000)).unwrap());
+        let _ = ahead.tick(ms(2_000));
+        assert_eq!(
+            ahead.count(key),
+            None,
+            "kept past its time by the wall clock"
+        );
+        let mut behind = member();
+        let _ = behind.data.insert(0, key, kept);
+        behind.set_wall_offset(-i64::try_from(ms(20_000)).unwrap());
+        let _ = behind.tick(ms(25_000));
+        assert_eq!(
+            behind.count(key),
+            Some(1),
+            "forgotten before its time by the wall clock"
+        );
+        let _ = behind.tick(ms(31_000));
+        assert_eq!(behind.count(key), None);
+    }
+
+    /// A shard the table takes a replica off goes whole, and what its keys took with it.
+    #[test]
+    fn a_shard_dropped_takes_its_bytes_with_it() {
+        let mut node = member();
+        let table = node.committed().cloned().unwrap();
+        let Some(shard) = (0..4).find(|shard| {
+            table.owner(*shard) == Some(1)
+                && table.shards[usize::from(*shard)].replicas.contains(&2)
+        }) else {
+            panic!("no shard of 1 copied to 2");
+        };
+        let copy = Message::Replicate {
+            shard,
+            term: table.shards[usize::from(shard)].term,
+            assignment: 1,
+            after: None,
+            version: 1,
+            under: (0, 0),
+            entries: vec![(key_in(shard), Kept::new(Counts::of(5)))],
+            dropped: Vec::new(),
+            part: 0,
+            more: false,
+        };
+        let _ = node.receive(1, copy, ms(2));
+        assert_eq!(
+            node.key_bytes(),
+            64,
+            "one key of 40 bytes and its 24 in the schedule"
+        );
+        let mut off = table;
+        off.version = 2;
+        off.shards[usize::from(shard)]
+            .replicas
+            .retain(|replica| *replica != 2);
+        let _ = node.receive(1, Message::TableReply { table: off }, ms(3));
+        assert_eq!(node.keys_of(shard), BTreeSet::new());
+        assert_eq!(node.key_bytes(), 0);
     }
 
     /// A whole copy overtaken on its way by a later copy only adds: replacing would drop what
@@ -3469,11 +3811,19 @@ mod tests {
                 }
             }
         }
+        assert_agrees(owner);
+        assert_agrees(replica);
         (most, said)
+    }
+
+    /// Every shard's schedule and bytes are what a walk of its keys gives.
+    fn assert_agrees(node: &Node) {
+        assert!(node.data.agrees(), "pod {}: {:?}", node.id(), node.data);
     }
 
     /// What `node` holds of `shard`, each key with its count.
     fn counts_of(node: &Node, shard: ShardId) -> BTreeMap<u64, u64> {
+        assert_agrees(node);
         node.keys_of(shard)
             .into_iter()
             .map(|key| (key, node.count(key).unwrap_or(0)))
@@ -3525,10 +3875,9 @@ mod tests {
             panic!("no first part of shard {shard}: {sent:?}");
         };
         let answers = replica.receive(1, first, ms(2));
-        let held = owner.data.entry(shard).or_default();
-        held.insert(keys[0], Kept::new(Counts::of(9)));
-        held.insert(added, Kept::new(Counts::of(4)));
-        held.remove(&keys[9]);
+        owner.data.insert(shard, keys[0], Kept::new(Counts::of(9)));
+        owner.data.insert(shard, added, Kept::new(Counts::of(4)));
+        owner.data.remove(shard, keys[9]);
         owner
             .dirty
             .entry(shard)
@@ -3579,14 +3928,10 @@ mod tests {
         };
         assert!(said.len() < shards.len(), "every copy in, a part lost");
         let grown = keys[keys.len() - 1];
-        if let Some(kept) = owner
-            .data
-            .get_mut(&shard)
-            .and_then(|held| held.get_mut(&grown))
-        {
+        owner.data.change(shard, grown, |kept| {
             kept.value.add(1);
             kept.value.add(2);
-        }
+        });
         owner.dirty.entry(shard).or_default().insert(grown);
         // Ticked every 5 ms, its copies every 10: parts past the first going to 2 are parts
         // sent again, the grown key's change copy of one part besides.
