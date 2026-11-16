@@ -4,7 +4,9 @@
 //! holds no handle to, in a registry of a hundred thousand: found, and made. And the same
 //! decision under a fixed window, admitted and refused; and under a rolling window, admitted,
 //! and refused just after a burst filled its newest slot: the first refusal, which scans the
-//! ring for its wait, and one after, which reads it from the hint, at 1,000 slots and at 60.
+//! ring for its wait, and one after, which reads it from the hint, at 1,000 slots and at 60;
+//! and admitted when its key comes back half a window on, its decision taking off half the
+//! ring, and two windows on, emptying all of it.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-ratelimit --bench local`, see the
 //! repository README.
@@ -135,6 +137,22 @@ fn decide_rolling(setup: (Worker, Rolling)) -> (Decision, Worker) {
     (decision, worker)
 }
 
+/// `held_rolling`'s worker, and when its key comes back: `gap` after `LATER`.
+fn back_after(gap: u64) -> (Worker, Rolling, u64) {
+    let (worker, rolling) = held_rolling(100, 1_000, false);
+    (worker, rolling, LATER + gap)
+}
+
+#[library_benchmark]
+#[bench::half_a_window(back_after(500 * MS))]
+#[bench::two_windows(back_after(2_000 * MS))]
+fn decide_rolling_back(setup: (Worker, Rolling, u64)) -> (Decision, Worker) {
+    let (mut worker, rolling, at) = setup;
+    let (local, handles) = &mut *worker;
+    let decision = local.decide(handles, black_box(&[(KEY, rolling)]), black_box(at));
+    (decision, worker)
+}
+
 #[library_benchmark]
 #[bench::two(held(100), 2)]
 #[bench::three(held(100), 3)]
@@ -174,6 +192,7 @@ fn first_meeting(setup: (Worker, Contract)) -> (Decision, Worker) {
 
 library_benchmark_group!(
     name = local;
-    benchmarks = decide, decide_window, decide_rolling, decide_all, first_meeting
+    benchmarks = decide, decide_window, decide_rolling, decide_rolling_back, decide_all,
+        first_meeting
 );
 main!(library_benchmark_groups = local);
