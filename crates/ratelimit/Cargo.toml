@@ -23,19 +23,7 @@ name = "decide"
 harness = false
 
 [[bench]]
-name = "batch"
-harness = false
-
-[[bench]]
-name = "cycle"
-harness = false
-
-[[bench]]
 name = "local"
-harness = false
-
-[[bench]]
-name = "timer"
 harness = false
 
 [lints]

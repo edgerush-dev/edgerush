@@ -1,12 +1,10 @@
 //! Instruction counts for a data plane's decision on the request path (03 §2: at most
-//! 150 ns for an existing key): a warm key, its copy bounded by a cycle, admitted; and
-//! refused, its cycle's share spent and its bucket empty; and a request under two and three
-//! limits, all warm, admitted. A thousand other keys held, so that the lookup is not a map
-//! of one. And a worker meeting a key it holds no handle to, in its process's registry of a
-//! hundred thousand: found, made by another worker; and made, cold keys decided locally. And
-//! a worker deciding on a key it holds, as the proxy's do: the first request of a cycle, which
-//! starts the key's count and notes when, one after it, and one refused, the bucket empty;
-//! and a request under two and three keys it holds, admitted.
+//! 150 ns for an existing key), as the proxy's workers decide: a worker meeting a key it holds
+//! no handle to, in its process's registry of a hundred thousand: found, made by another
+//! worker; and made, cold keys decided locally. And a worker deciding on a key it holds: the
+//! first request of a cycle, which starts the key's count and notes when, one after it, and
+//! one refused, the bucket empty; and a request under two and three keys it holds, admitted.
+//! The participant's one pod answers with the real owner (`owner::apply`).
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-ratelimit --bench decide`, see the
 //! repository README.
@@ -20,8 +18,10 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_ratelimit::service::pooled::{self, Entry, Levers, Outcome, Participant, Registry};
-use edgerush_ratelimit::service::{Contract, DataPlane, Decision, Keyed, ServicePod, View};
+use edgerush_ratelimit::service::pooled::{
+    self, Entry, Levers, Outcome, Participant, Registry, Replied, Reply, Routing,
+};
+use edgerush_ratelimit::service::{Batch, Contract, Keyed, PodId, owner};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
 use std::num::NonZeroU64;
@@ -43,60 +43,80 @@ fn contract(burst: u64) -> Contract {
     }
 }
 
-/// A data plane, boxed, so that handing it to what is measured copies no more than a
-/// pointer, hashing its keys as the proxy's does.
-type Plane = Box<DataPlane<Keyed>>;
+/// The one pod of a service, owning every key.
+#[derive(Clone, Copy, Debug)]
+struct One;
 
-/// A data plane holding a thousand keys and `KEY`, `ROUTE` and `GLOBAL` warm: asked about,
-/// answered, and bounded by a cycle after the answer.
-fn warm(burst: u64) -> (Plane, Contract) {
-    let view = View {
-        epoch: 1,
-        pods: vec![0],
-    };
-    let mut pod: ServicePod = ServicePod::new(0, 10 * MS, view.clone());
+impl Routing for One {
+    type Pod = PodId;
+    type Batch = Batch;
+
+    fn owner(&self, _: &[u8], _: u64) -> Option<PodId> {
+        Some(0)
+    }
+
+    fn through(&self, _: u64, _: PodId) -> Option<PodId> {
+        None
+    }
+
+    fn polled(&self, _: u64) -> Option<PodId> {
+        Some(0)
+    }
+
+    fn later(&self, _: &Self) -> bool {
+        false
+    }
+
+    fn names(&self, pod: PodId) -> bool {
+        pod == 0
+    }
+
+    fn batch(&self, _: PodId, batch: Batch, _: impl Fn(&[u8]) -> u64) -> Batch {
+        batch
+    }
+}
+
+/// A participant hashing its keys as the proxy's does, its one pod owning every key.
+fn participant() -> Participant<Keyed, One> {
     let hasher = Keyed::new([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
-    let mut plane: Plane = Box::new(DataPlane::with_hasher(1, 10 * MS, view, hasher));
-    let contract = contract(burst);
-    let keys = (0..1_000).map(|k| format!("api/0\0key-{k}").into_bytes());
-    for key in keys.chain([KEY, ROUTE, GLOBAL].map(<[u8]>::to_vec)) {
-        plane.decide(&key, contract, 0);
+    Participant::new(1, 10 * MS, One, hasher).expect("native 128-bit atomics on Linux")
+}
+
+/// `participant`'s batches for its one key answered at `now` by its owner, each report applied
+/// to the key's `value` with the real owner ([`owner::apply`]).
+fn answer(participant: &mut Participant<Keyed, One>, value: &mut owner::Value, now: u64) {
+    for (_, batch) in participant.take_outgoing() {
+        let entries = batch
+            .entries
+            .iter()
+            .map(|entry| {
+                let applied = owner::apply(
+                    value,
+                    batch.from,
+                    entry.contract,
+                    entry.report,
+                    10 * MS,
+                    now,
+                );
+                Replied {
+                    key: participant.hash(&entry.key),
+                    behind: applied.answered.behind,
+                    applied: applied.answered.applied,
+                    others: applied.answered.others,
+                }
+            })
+            .collect();
+        let reply = Reply {
+            from: 0,
+            via: None,
+            life: 0,
+            number: 0,
+            made: batch.made,
+            entries,
+            routing: None,
+        };
+        participant.on_reply(reply, now);
     }
-    for (_, batch) in plane.take_outgoing() {
-        let answers = pod.on_batch(batch, 0);
-        plane.on_answers(answers, 0);
-    }
-    plane.on_cycle(MS);
-    plane.take_outgoing();
-    (plane, contract)
-}
-
-/// `KEY` warm, its share of the cycle spent.
-fn spent() -> (Plane, Contract) {
-    let (mut plane, contract) = warm(100);
-    while plane.decide(KEY, contract, MS) == Decision::Admit {}
-    (plane, contract)
-}
-
-#[library_benchmark]
-#[bench::admitted(warm(100))]
-#[bench::refused_over_its_share(spent())]
-#[bench::refused_empty(warm(1))]
-fn decide(setup: (Plane, Contract)) -> (Decision, Plane) {
-    let (mut plane, contract) = setup;
-    let decision = plane.decide(black_box(KEY), black_box(contract), black_box(2 * MS));
-    // Handed back, so that its keys are freed outside what is measured.
-    (decision, plane)
-}
-
-#[library_benchmark]
-#[bench::two(warm(100), 2)]
-#[bench::three(warm(100), 3)]
-fn decide_all(setup: (Plane, Contract), limits: usize) -> (Decision, Plane) {
-    let (mut plane, contract) = setup;
-    let keys = [(KEY, contract), (ROUTE, contract), (GLOBAL, contract)];
-    let decision = plane.decide_all(black_box(&keys[..limits]), black_box(2 * MS));
-    (decision, plane)
 }
 
 /// A process's registry of entries, its keys hashed as the proxy's are.
@@ -107,14 +127,7 @@ type Made = Option<(Arc<Entry>, bool)>;
 
 /// A process's registry of a hundred thousand keys, `KEY` among them.
 fn registry() -> Shared {
-    let view = View {
-        epoch: 1,
-        pods: vec![0],
-    };
-    let hasher = Keyed::new([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
-    let participant =
-        Participant::new(1, 10 * MS, view, hasher).expect("native 128-bit atomics on Linux");
-    let registry = participant.registry();
+    let registry = participant().registry();
     let contract = contract(100);
     let keys = (0..100_000).map(|k| format!("api/0\0key-{k}").into_bytes());
     for key in keys.chain([KEY.to_vec()]) {
@@ -146,22 +159,12 @@ fn held(burst: u64, admitted: usize) -> Arc<Entry> {
 
 /// As [`held`], for `key`.
 fn held_key(key: &[u8], burst: u64, admitted: usize) -> Arc<Entry> {
-    let view = View {
-        epoch: 1,
-        pods: vec![0],
-    };
-    let mut pod: ServicePod = ServicePod::new(0, 10 * MS, view.clone());
-    let hasher = Keyed::new([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
-    let mut participant =
-        Participant::new(1, 10 * MS, view, hasher).expect("native 128-bit atomics on Linux");
+    let mut participant = participant();
     participant.set_levers(Levers { poll_quiet: false });
     let contract = contract(burst);
     participant.decide_all(&[(key, contract)], 0);
     participant.on_cycle(10 * MS);
-    for (_, batch) in participant.take_outgoing() {
-        let answers = pod.on_batch(batch, 10 * MS);
-        participant.on_answers(answers, 10 * MS);
-    }
+    answer(&mut participant, &mut owner::Value::default(), 10 * MS);
     participant.on_cycle(20 * MS);
     let entry = participant.entries(&[(key, contract)]).remove(0);
     for _ in 0..admitted {
@@ -202,11 +205,9 @@ fn worker_all(held: Vec<Arc<Entry>>) -> (Outcome, Vec<Arc<Entry>>) {
     (outcome, held)
 }
 
-library_benchmark_group!(name = data_plane; benchmarks = decide, decide_all);
 library_benchmark_group!(name = registry_of_keys; benchmarks = find, find_or_make);
-library_benchmark_group!(name = participant; benchmarks = worker, worker_all);
+library_benchmark_group!(name = participants_worker; benchmarks = worker, worker_all);
 main!(
-    library_benchmark_groups = data_plane,
-    registry_of_keys,
-    participant
+    library_benchmark_groups = registry_of_keys,
+    participants_worker
 );

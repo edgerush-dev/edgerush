@@ -23,5 +23,9 @@ harness = false
 name = "cycle"
 harness = false
 
+[[bench]]
+name = "tick"
+harness = false
+
 [lints]
 workspace = true

@@ -1,8 +1,7 @@
-//! Instruction counts for a data plane's cycle on the store, as `edgerush-ratelimit`'s `cycle`
-//! benchmark counts it by today's view: the proxy's participant routed by the table
-//! ([`Routed`]) — keys scheduled, quiet ones not polled — its hits for a hundred keys of the ten
-//! thousand it holds reported to their owner, the batch made with the keys' hashes, and the
-//! owner's answers to it taken in, each key found by its hash.
+//! Instruction counts for a data plane's cycle on the store: the proxy's participant routed by
+//! the table ([`Routed`]) — keys scheduled, quiet ones not polled — its hits for a hundred keys
+//! of the ten thousand it holds reported to their owner, the batch made with the keys' hashes,
+//! and the owner's answers to it taken in, each key found by its hash.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-cluster-asynchronous --bench cycle`, see
 //! the repository README.

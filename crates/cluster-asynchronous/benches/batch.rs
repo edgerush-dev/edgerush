@@ -1,9 +1,8 @@
 //! Instruction counts for a pod of the asynchronous mode taking in a data plane's batch on the
-//! store, as `edgerush-ratelimit`'s `batch` benchmark counts today's pod (`ServicePod`): hits
-//! for a hundred keys, each among the ten thousand the pod holds, the data plane's record found
-//! among one data plane's or sixteen's; and, a pod among three, a batch for a thousand keys, of
-//! which it owns about a third, its store copying their changes to the other two at its next
-//! tick — measured with the tick, as today's pod copies within the batch.
+//! store: hits for a hundred keys, each among the ten thousand the pod holds, the data plane's
+//! record found among one data plane's or sixteen's; and, a pod among three, a batch for a
+//! thousand keys, of which it owns about a third, its store copying their changes to the other
+//! two at its next tick — measured with the tick too.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-cluster-asynchronous --bench batch`, see the
 //! repository README.
