@@ -30,19 +30,22 @@ pub struct Pod {
     pub unserved: BTreeMap<String, String>,
 }
 
-/// How many of the versions offered last are kept, though no pod says it runs them: a pod
-/// may take one, and say so, after later ones are offered.
+/// How many of the versions offered last to a data plane are kept, though no pod says it
+/// runs them: a pod may take one, and say so, after later ones are offered.
 const KEPT: usize = 8;
 
 /// What the pods a replica serves run, as they have said it.
 #[derive(Debug, Default)]
 pub struct Runs {
     /// The generation of the Gateway in each config version offered and still of use: the
-    /// last [`KEPT`] offered, which a pod may run before it says so, and those a pod runs.
-    /// None where the config serves no Gateway.
+    /// last [`KEPT`] offered to each data plane, which a pod may run before it says so, and
+    /// those a pod runs. None where the config serves no Gateway.
     versions: BTreeMap<String, Option<i64>>,
-    /// The versions offered, the latest last: the last [`KEPT`].
-    offered: VecDeque<String>,
+    /// The versions offered to each data plane, by the ID its certificate carries (none: to
+    /// any the stream serves), the latest last: the last [`KEPT`] of each, so that however
+    /// many are offered to the others, none is forgotten before its pods can say they run
+    /// it.
+    offered: BTreeMap<Option<String>, VecDeque<String>>,
     /// What each pod says it runs: the version, and the latest it refused, if it did.
     said: BTreeMap<IpAddr, Said>,
 }
@@ -57,13 +60,23 @@ struct Said {
 }
 
 impl Runs {
-    /// The config `version` offered, the Gateway at `generation` in it.
-    pub fn offered(&mut self, version: &str, generation: Option<i64>) {
+    /// The config `version` offered to the data plane whose certificate carries `to` (none:
+    /// to any the stream serves), the Gateway at `generation` in it.
+    pub fn offered(&mut self, to: Option<&str>, version: &str, generation: Option<i64>) {
         self.versions.insert(version.to_owned(), generation);
-        self.offered.push_back(version.to_owned());
-        if self.offered.len() > KEPT {
-            self.offered.pop_front();
+        let offered = self.offered.entry(to.map(str::to_owned)).or_default();
+        offered.push_back(version.to_owned());
+        if offered.len() > KEPT {
+            offered.pop_front();
         }
+        self.prune();
+    }
+
+    /// The stream serves the data planes whose certificates carry `ids` (none: any): what
+    /// was offered to any other is forgotten, but what a pod says it runs.
+    pub fn serving<'a>(&mut self, ids: impl IntoIterator<Item = Option<&'a str>>) {
+        let ids: Vec<Option<&str>> = ids.into_iter().collect();
+        self.offered.retain(|id, _| ids.contains(&id.as_deref()));
         self.prune();
     }
 
@@ -93,8 +106,8 @@ impl Runs {
         self.prune();
     }
 
-    /// What each pod runs, by its address: a refusal only of the latest config, as one
-    /// of an earlier is no longer what it is offered.
+    /// What each pod runs, by its address: a refusal only of the latest config offered to
+    /// a data plane, as one of an earlier is no longer what it is offered.
     #[must_use]
     pub fn pods(&self) -> BTreeMap<IpAddr, Pod> {
         self.said
@@ -110,7 +123,11 @@ impl Runs {
                     .and_then(|version| self.versions.get(version).copied().flatten());
                 let refused = refused
                     .as_ref()
-                    .filter(|(version, _)| self.offered.back() == Some(version))
+                    .filter(|(version, _)| {
+                        self.offered
+                            .values()
+                            .any(|offered| offered.back() == Some(version))
+                    })
                     .map(|(_, why)| why.clone());
                 let unserved = unserved.clone();
                 (
@@ -125,11 +142,11 @@ impl Runs {
             .collect()
     }
 
-    /// Forgets the versions no pod runs, but the last [`KEPT`] offered.
+    /// Forgets the versions no pod runs, but the last [`KEPT`] offered to each data plane.
     fn prune(&mut self) {
         let (offered, said) = (&self.offered, &self.said);
         self.versions.retain(|version, _| {
-            offered.contains(version)
+            offered.values().any(|offered| offered.contains(version))
                 || said
                     .values()
                     .any(|said| said.running.as_ref() == Some(version))
@@ -266,10 +283,10 @@ mod tests {
     #[test]
     fn each_pod_runs_the_generation_of_the_config_it_says() {
         let mut runs = Runs::default();
-        runs.offered("a-1", Some(3));
+        runs.offered(None, "a-1", Some(3));
         runs.reported(pod(1), Some("a-1"), None, BTreeMap::new());
         runs.reported(pod(2), None, None, BTreeMap::new());
-        runs.offered("a-2", Some(4));
+        runs.offered(None, "a-2", Some(4));
         assert_eq!(
             runs.pods().into_iter().collect::<Vec<_>>(),
             [
@@ -287,7 +304,7 @@ mod tests {
         runs.reported(pod(1), Some("a-2"), None, BTreeMap::new());
         assert_eq!(runs.pods()[&pod(1)].runs, Some(4));
         // A config of no Gateway runs none.
-        runs.offered("a-3", None);
+        runs.offered(None, "a-3", None);
         runs.reported(pod(2), Some("a-3"), None, BTreeMap::new());
         assert_eq!(runs.pods()[&pod(2)].runs, None);
     }
@@ -295,8 +312,8 @@ mod tests {
     #[test]
     fn a_refusal_is_said_only_of_the_latest_config() {
         let mut runs = Runs::default();
-        runs.offered("a-1", Some(3));
-        runs.offered("a-2", Some(4));
+        runs.offered(None, "a-1", Some(3));
+        runs.offered(None, "a-2", Some(4));
         runs.reported(
             pod(1),
             Some("a-1"),
@@ -311,7 +328,7 @@ mod tests {
                 ..Pod::default()
             }
         );
-        runs.offered("a-3", Some(5));
+        runs.offered(None, "a-3", Some(5));
         assert_eq!(
             runs.pods()[&pod(1)].refused,
             None,
@@ -319,12 +336,48 @@ mod tests {
         );
     }
 
+    /// Each data plane keeps the versions offered to it last, however many are offered to
+    /// the others meanwhile, as when fifty Gateways are made at once: a pod saying it runs
+    /// one after others' offers runs its generation, and a refusal of its data plane's
+    /// latest is said. What was offered to a data plane no longer served is forgotten, but
+    /// what a pod runs.
+    #[test]
+    fn the_versions_offered_to_each_data_plane_are_kept_apart() {
+        let mut runs = Runs::default();
+        runs.offered(Some("web"), "w-1", Some(3));
+        for n in 1..=20 {
+            runs.offered(Some("api"), &format!("a-{n}"), Some(n));
+        }
+        runs.reported(pod(1), Some("w-1"), None, BTreeMap::new());
+        assert_eq!(runs.pods()[&pod(1)].runs, Some(3), "w-1 forgotten");
+        runs.offered(Some("web"), "w-2", Some(4));
+        runs.offered(Some("api"), "a-21", Some(21));
+        runs.reported(
+            pod(1),
+            Some("w-1"),
+            Some(("w-2", "an unknown field")),
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            runs.pods()[&pod(1)].refused.as_deref(),
+            Some("an unknown field"),
+            "a refusal of web's latest config, though api was offered one since"
+        );
+        runs.serving([Some("api")]);
+        assert_eq!(runs.pods()[&pod(1)].runs, Some(3), "w-1 is run by a pod");
+        assert!(
+            !runs.versions.contains_key("w-2"),
+            "web is no longer served"
+        );
+        assert_eq!(runs.versions.len(), 9, "api's last eight, and w-1");
+    }
+
     /// What a pod does not serve of the config it runs is said with it, by listener, and
     /// read back as written; a report that says none, as an older replica's, reads as none.
     #[test]
     fn the_listeners_a_pod_does_not_serve_are_said_with_what_it_runs() {
         let mut runs = Runs::default();
-        runs.offered("a-1", Some(3));
+        runs.offered(None, "a-1", Some(3));
         let unserved = BTreeMap::from([(
             "port-9100".to_owned(),
             "listener \"port-9100\": address in use".to_owned(),
@@ -348,11 +401,11 @@ mod tests {
     #[test]
     fn a_pod_whose_stream_ends_is_said_no_more_and_versions_run_by_none_are_forgotten() {
         let mut runs = Runs::default();
-        runs.offered("a-1", Some(3));
+        runs.offered(None, "a-1", Some(3));
         runs.reported(pod(1), Some("a-1"), None, BTreeMap::new());
-        runs.offered("a-2", Some(4));
+        runs.offered(None, "a-2", Some(4));
         for n in 3..=10 {
-            runs.offered(&format!("a-{n}"), Some(n));
+            runs.offered(None, &format!("a-{n}"), Some(n));
         }
         assert_eq!(
             runs.versions.len(),

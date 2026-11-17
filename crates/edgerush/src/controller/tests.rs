@@ -1539,7 +1539,7 @@ fn the_listeners_a_data_plane_does_not_serve_reach_what_its_pod_runs() {
         certificates: BTreeMap::new(),
     };
     let mut runs = Runs::default();
-    runs.offered("a-1", Some(3));
+    runs.offered(None, "a-1", Some(3));
     let report = Report {
         running: held.clone(),
         refused: None,

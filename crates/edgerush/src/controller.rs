@@ -1063,11 +1063,19 @@ async fn control_until(
         Some(serving) => {
             let (offers, offered) = watch::channel(Served::default());
             // Whom the stream serves follows the settings, so that a data plane is let in or
-            // refused as its DataPlane is served or not, before anything is translated for it.
+            // refused as its DataPlane is served or not, before anything is translated for it;
+            // what was offered to one no longer served is forgotten with it.
             let (mut told, whose) = (planes.clone(), offers.clone());
+            let (forgetting, telling_pods) = (Rc::clone(&runs), pods.clone());
             tasks.push(tokio::task::spawn_local(async move {
                 loop {
-                    let next = whom(&told.borrow_and_update());
+                    let next = {
+                        let now = told.borrow_and_update();
+                        let mut runs = forgetting.borrow_mut();
+                        runs.serving(now.values().map(|settings| settings.plane.id.as_deref()));
+                        said_runs(&telling_pods, &runs);
+                        whom(&now)
+                    };
                     whose.send_if_modified(|served| served.serve(next));
                     if told.changed().await.is_err() {
                         return;
@@ -1302,7 +1310,7 @@ impl Offering {
         let version = offer.version().to_owned();
         let generation = translation.gateway_status.as_ref().map(|s| s.generation);
         let mut runs = self.runs.borrow_mut();
-        runs.offered(&version, generation);
+        runs.offered(id, &version, generation);
         said_runs(&self.pods, &runs);
         served.offered(id, Arc::new(offer));
         self.served.send_replace(served);
