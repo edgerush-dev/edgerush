@@ -238,14 +238,26 @@ impl Seen {
     }
 }
 
-/// What a look at a key found.
+/// What a look at a key found, or a take did.
+// Two words, so that it comes back from a rolling window's out-of-line take in registers:
+// larger, it is returned through memory, and a bucket's and a fixed window's decisions,
+// merged with it into one value, then keep theirs in memory too — a fixed window's
+// decision some 5% more instructions (Callgrind, GitHub #400).
 enum Look {
-    /// A request fits, the state as read and the arrival time or count it would charge from.
-    Fits { seen: Seen, from: u64 },
+    /// A request fits.
+    Fits,
     /// No room: the time until there is.
     Full { wait: u64 },
     /// The key was closed: its successor in the registry is to be used.
     Closed,
+}
+
+/// Whether a request fits a bucket or a fixed window, its word as read.
+enum Room {
+    /// It fits, charged from this arrival time or count.
+    From(u64),
+    /// No room: the time until there is.
+    Full(u64),
 }
 
 impl Key {
@@ -291,16 +303,6 @@ impl Key {
         self.read().word & CLOSED != 0
     }
 
-    /// How long a key goes unused before it is fresh whatever its word says: its bucket's
-    /// refill, or its window.
-    fn refill(&self) -> u64 {
-        match &self.terms.held {
-            Held::Bucket(rate) => rate.refill,
-            Held::Window(span) => span.window,
-            Held::Rolling(ring) => ring.window(),
-        }
-    }
-
     /// `now`'s cycle number.
     fn cycle_of(now: u64) -> u64 {
         now / CYCLE
@@ -318,17 +320,21 @@ impl Key {
         Self::since(seen.cycle, now).saturating_sub(1) * CYCLE
     }
 
-    /// Whether a key `seen` at `now` went unused for longer than its bucket takes to refill
-    /// or than its window: fresh, whatever its word says once its clock or its windows'
-    /// numbers have come round. Read in the same word as the charge, so never older than it.
-    fn idle(&self, seen: Seen, now: u64) -> bool {
-        Self::unused_for(seen, now) > self.refill()
+    /// Whether a key `seen` at `now` went unused for longer than `refill`, the time its
+    /// bucket takes to refill or its window: fresh, whatever its word says once its clock or
+    /// its windows' numbers have come round. Read in the same word as the charge, so never
+    /// older than it.
+    // Handed the refill by the arm that holds it: read from the key's terms again, it is a
+    // match on them in every charge's loop, a bucket's and a window's decisions some 2% more
+    // instructions (Callgrind, GitHub #400).
+    fn idle(seen: Seen, now: u64, refill: u64) -> bool {
+        Self::unused_for(seen, now) > refill
     }
 
     /// The arrival time as of `now` (units `now_units`) from `seen`: as it is, unless the key
     /// is idle, when it is full.
-    fn arrival(&self, seen: Seen, now: u64, now_units: u64) -> u64 {
-        if self.idle(seen, now) {
+    fn arrival(rate: &Rate, seen: Seen, now: u64, now_units: u64) -> u64 {
+        if Self::idle(seen, now, rate.refill) {
             now_units
         } else {
             seen.word
@@ -344,17 +350,22 @@ impl Key {
         if seen.word & CLOSED != 0 {
             return Look::Closed;
         }
-        match &self.terms.held {
+        let room = match &self.terms.held {
             Held::Bucket(rate) => {
                 let now_units = rate.units(now);
-                Self::fits(rate, seen, self.arrival(seen, now, now_units), now_units)
+                Self::fits(rate, Self::arrival(rate, seen, now, now_units), now_units)
             }
             Held::Window(span) => {
                 let span = span.at(self.offset);
-                let (number, count) = Self::window_at(&span, seen.word, self.idle(seen, now), now);
-                Self::window_fits(&span, seen, count, number, now)
+                let (number, count) =
+                    Self::window_at(&span, seen.word, Self::idle(seen, now, span.window), now);
+                Self::window_fits(&span, count, number, now)
             }
-            Held::Rolling(ring) => ring.look(&self.state, now),
+            Held::Rolling(ring) => return ring.look(&self.state, now),
+        };
+        match room {
+            Room::From(_) => Look::Fits,
+            Room::Full(wait) => Look::Full { wait },
         }
     }
 
@@ -376,26 +387,21 @@ impl Key {
     }
 
     /// Whether a request at `now_units` fits, the bucket's arrival time `arrival` as of then.
-    fn fits(rate: &Rate, seen: Seen, arrival: u64, now_units: u64) -> Look {
+    fn fits(rate: &Rate, arrival: u64, now_units: u64) -> Room {
         let ahead = Rate::ahead(arrival, now_units);
         if ahead > rate.tolerance {
-            return Look::Full {
-                wait: rate.nanos(ahead - rate.tolerance),
-            };
+            return Room::Full(rate.nanos(ahead - rate.tolerance));
         }
-        let from = if ahead > 0 { arrival } else { now_units };
-        Look::Fits { seen, from }
+        Room::From(if ahead > 0 { arrival } else { now_units })
     }
 
-    /// Whether a request at `now` fits window `number`, which has counted `count`: `from` is
-    /// the count it charges from. A refusal waits, from `now`, until that window ends.
-    fn window_fits(span: &Span, seen: Seen, count: u64, number: u64, now: u64) -> Look {
+    /// Whether a request at `now` fits window `number`, which has counted `count`, the count
+    /// it charges from. A refusal waits, from `now`, until that window ends.
+    fn window_fits(span: &Span, count: u64, number: u64, now: u64) -> Room {
         if count >= span.limit {
-            return Look::Full {
-                wait: Self::window_left(span, number, now),
-            };
+            return Room::Full(Self::window_left(span, number, now));
         }
-        Look::Fits { seen, from: count }
+        Room::From(count)
     }
 
     /// Nanoseconds from `now` until window `number`, `now`'s or a later one, ends.
@@ -444,14 +450,14 @@ impl Key {
             if seen.word & CLOSED != 0 {
                 return Look::Closed;
             }
-            let arrival = self.arrival(seen, now, now_units);
-            match Self::fits(rate, seen, arrival, now_units) {
-                Look::Fits { seen, from } => {
+            let arrival = Self::arrival(rate, seen, now, now_units);
+            match Self::fits(rate, arrival, now_units) {
+                Room::From(from) => {
                     if self.charge_from(seen, from.wrapping_add(UNITS) & MASK, now) {
-                        return Look::Fits { seen, from };
+                        return Look::Fits;
                     }
                 }
-                other => return other,
+                Room::Full(wait) => return Look::Full { wait },
             }
         }
     }
@@ -465,14 +471,15 @@ impl Key {
             if seen.word & CLOSED != 0 {
                 return Look::Closed;
             }
-            let (number, count) = Self::window_at(span, seen.word, self.idle(seen, now), now);
-            match Self::window_fits(span, seen, count, number, now) {
-                Look::Fits { seen, from } => {
+            let (number, count) =
+                Self::window_at(span, seen.word, Self::idle(seen, now, span.window), now);
+            match Self::window_fits(span, count, number, now) {
+                Room::From(from) => {
                     if self.charge_from(seen, Span::word(number, from + 1), now) {
-                        return Look::Fits { seen, from };
+                        return Look::Fits;
                     }
                 }
-                other => return other,
+                Room::Full(wait) => return Look::Full { wait },
             }
         }
     }
@@ -490,7 +497,7 @@ impl Key {
             let word = match &self.terms.held {
                 Held::Bucket(rate) => {
                     let now_units = rate.units(now);
-                    let arrival = self.arrival(seen, now, now_units);
+                    let arrival = Self::arrival(rate, seen, now, now_units);
                     let from = if Rate::ahead(arrival, now_units) > 0 {
                         arrival
                     } else {
@@ -500,7 +507,7 @@ impl Key {
                 }
                 Held::Window(span) => {
                     let span = span.at(self.offset);
-                    let idle = self.idle(seen, now);
+                    let idle = Self::idle(seen, now, span.window);
                     let (number, count) = Self::window_at(&span, seen.word, idle, now);
                     Span::word(number, count + 1)
                 }
@@ -561,11 +568,14 @@ impl Key {
         match &self.terms.held {
             Held::Bucket(rate) => {
                 let now_units = rate.units(now);
-                rate.nanos(Rate::ahead(self.arrival(seen, now, now_units), now_units))
+                rate.nanos(Rate::ahead(
+                    Self::arrival(rate, seen, now, now_units),
+                    now_units,
+                ))
             }
             Held::Window(span) => {
                 let span = span.at(self.offset);
-                match Self::window_at(&span, seen.word, self.idle(seen, now), now) {
+                match Self::window_at(&span, seen.word, Self::idle(seen, now, span.window), now) {
                     (_, 0) => 0,
                     (number, _) => Self::window_left(&span, number, now),
                 }
@@ -760,7 +770,7 @@ impl<S: BuildHasher + Clone> Local<S> {
                 match handles.with_key(self, key.as_ref(), (*contract).into(), now, |held| {
                     held.take(now)
                 }) {
-                    Look::Fits { .. } => break (Decision::Admit, 0),
+                    Look::Fits => break (Decision::Admit, 0),
                     Look::Full { wait } => break (Decision::Refuse { position: 0, wait }, 1),
                     Look::Closed => handles.forget(key.as_ref()),
                 }
@@ -772,7 +782,7 @@ impl<S: BuildHasher + Clone> Local<S> {
             let wait = loop {
                 let contract = (*contract).into();
                 match handles.with_key(self, key.as_ref(), contract, now, |held| held.look(now)) {
-                    Look::Fits { .. } => break None,
+                    Look::Fits => break None,
                     Look::Full { wait } => break Some(wait),
                     Look::Closed => handles.forget(key.as_ref()),
                 }
