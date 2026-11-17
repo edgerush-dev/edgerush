@@ -7,20 +7,34 @@ use super::*;
 use crate::data_plane::{Own, settings};
 use edgerush_planes::data_plane::DataPlane;
 
-/// An EndpointSlice of Service `service` (none: unlabelled) holding `endpoints`, YAML each.
+/// An EndpointSlice of namespace `edge` of Service `service` (none: unlabelled) holding
+/// `endpoints`, YAML each.
 fn slice(name: &str, service: Option<&str>, endpoints: &[&str]) -> EndpointSlice {
+    slice_in("edge", name, service, endpoints)
+}
+
+/// [`slice`], of namespace `namespace`.
+fn slice_in(
+    namespace: &str,
+    name: &str,
+    service: Option<&str>,
+    endpoints: &[&str],
+) -> EndpointSlice {
     let labels = service.map_or_else(String::new, |service| {
         format!(", labels: {{ kubernetes.io/service-name: {service} }}")
     });
     serde_saphyr::from_str(&format!(
-        "metadata: {{ name: {name}, namespace: edge{labels} }}\naddressType: IPv4\nendpoints: [{}]\n",
+        "metadata: {{ name: {name}, namespace: {namespace}{labels} }}\naddressType: IPv4\nendpoints: [{}]\n",
         endpoints.join(", ")
     ))
     .unwrap()
 }
 
-fn named(names: &[&str]) -> BTreeSet<String> {
-    names.iter().map(|&name| name.to_owned()).collect()
+fn named(names: &[&str]) -> BTreeSet<Named> {
+    names
+        .iter()
+        .map(|&name| ("edge".to_owned(), name.to_owned()))
+        .collect()
 }
 
 fn ips(addresses: &[&str]) -> Arc<[IpAddr]> {
@@ -64,6 +78,26 @@ fn another_services_endpoints_and_an_unlabelled_slice_are_not_the_gateways() {
             &["{ addresses: [10.0.2.2], conditions: { ready: true } }"],
         ),
         slice("loose", None, &["{ addresses: [10.0.2.3] }"]),
+        slice(
+            "edgerush-proxy-web-b2",
+            Some("edgerush-proxy-web"),
+            &["{ addresses: [10.0.1.2] }"],
+        ),
+    ];
+    assert_eq!(addresses(&slices, &named(&OURS)), ips(&["10.0.1.2"]));
+}
+
+/// A Service of a data plane's name in another namespace is not its: only the one of its
+/// DataPlane's namespace is.
+#[test]
+fn a_service_of_the_same_name_in_another_namespace_is_not_the_gateways() {
+    let slices = [
+        slice_in(
+            "blog",
+            "edgerush-proxy-web-b2",
+            Some("edgerush-proxy-web"),
+            &["{ addresses: [10.0.3.2] }"],
+        ),
         slice(
             "edgerush-proxy-web-b2",
             Some("edgerush-proxy-web"),
@@ -119,6 +153,7 @@ fn data_plane(name: &str) -> DataPlane {
 fn own() -> Own {
     Own {
         control_plane: "edge".to_owned(),
+        namespace: "edge".to_owned(),
         cluster_domain: "cluster.local".to_owned(),
         system_authorities: Vec::new(),
     }
@@ -129,21 +164,21 @@ fn own() -> Own {
 #[test]
 fn the_services_are_the_control_planes_and_every_data_planes() {
     assert_eq!(
-        services("edge", &Planes::new()),
+        services("edge", "edge", &Planes::new()),
         named(&["edgerush-controller-edge"])
     );
     let web = Planes::from([(
         "DataPlane edge/web".to_owned(),
         settings_of(&data_plane("web"), &own()),
     )]);
-    assert_eq!(services("edge", &web), named(&OURS));
+    assert_eq!(services("edge", "edge", &web), named(&OURS));
     let mut both = web;
     both.insert(
         "DataPlane edge/api".to_owned(),
         settings_of(&data_plane("api"), &own()),
     );
     assert_eq!(
-        services("edge", &both),
+        services("edge", "edge", &both),
         named(&[
             "edgerush-controller-edge",
             "edgerush-proxy-api",
@@ -152,8 +187,34 @@ fn the_services_are_the_control_planes_and_every_data_planes() {
     );
 }
 
+/// A DataPlane generated for Gateway `web` of namespace `shop` (05 §3), of ControlPlane
+/// `edge` of namespace `edge`.
+fn generated() -> DataPlane {
+    serde_saphyr::from_str(
+        "metadata: { name: web-edge, namespace: shop, generation: 1, uid: u-web-edge }\nspec:\n  controlPlaneRef: { name: edge, namespace: edge }\n  gatewayRef: { name: web }\n",
+    )
+    .unwrap()
+}
+
+/// A generated DataPlane's Service is of its own namespace, the Gateway's.
+#[test]
+fn a_generated_data_planes_service_is_of_its_gateways_namespace() {
+    let planes = Planes::from([(
+        "DataPlane shop/web-edge".to_owned(),
+        settings_of(&generated(), &own()),
+    )]);
+    assert_eq!(
+        services("edge", "edge", &planes),
+        BTreeSet::from([
+            ("edge".to_owned(), "edgerush-controller-edge".to_owned()),
+            ("shop".to_owned(), "edgerush-proxy-web-edge".to_owned()),
+        ])
+    );
+}
+
 /// The follow: the control plane's pods once its namespace is listed, and the data plane's
-/// too once the settings name its Service, with no restart.
+/// too once the settings name its Service, with no restart; a generated one's in its own
+/// namespace, followed once it is named.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_data_planes_service_named_later_is_followed_with_no_restart() {
     use edgerush_kubernetes::Timing;
@@ -170,6 +231,16 @@ async fn a_data_planes_service_named_later_is_followed_with_no_restart() {
         ],
     })
     .to_string();
+    let shop = serde_json::json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSliceList",
+        "metadata": { "resourceVersion": "5" },
+        "items": [
+            slice_in("shop", "edgerush-proxy-web-edge-c3", Some("edgerush-proxy-web-edge"), &["{ addresses: [10.0.4.2] }"]),
+            slice_in("shop", "edgerush-proxy-web-d4", Some("edgerush-proxy-web"), &["{ addresses: [10.0.4.3] }"]),
+        ],
+    })
+    .to_string();
     let fake = Fake::start(&["127.0.0.1"], move |path| {
         if path.contains("watch=true") {
             return Answer {
@@ -180,6 +251,8 @@ async fn a_data_planes_service_named_later_is_followed_with_no_restart() {
         }
         if path.starts_with("/apis/discovery.k8s.io/v1/namespaces/edge/endpointslices?") {
             answer(200, &slices)
+        } else if path.starts_with("/apis/discovery.k8s.io/v1/namespaces/shop/endpointslices?") {
+            answer(200, &shop)
         } else {
             answer(500, "")
         }
@@ -193,7 +266,7 @@ async fn a_data_planes_service_named_later_is_followed_with_no_restart() {
             let (out, found) = watch::channel::<Arc<[IpAddr]>>(Arc::from([]));
             let _following = tokio::task::spawn_local(follow_own_pods(
                 api,
-                Scope::Namespace("edge".to_owned()),
+                "edge".to_owned(),
                 "edge".to_owned(),
                 planes,
                 out,
@@ -218,6 +291,17 @@ async fn a_data_planes_service_named_later_is_followed_with_no_restart() {
             )]));
             assert!(
                 until(&found, ips(&["10.0.0.2", "10.0.1.2"])).await,
+                "{:?}",
+                *found.borrow()
+            );
+            settings.send_modify(|planes| {
+                planes.insert(
+                    "DataPlane shop/web-edge".to_owned(),
+                    settings_of(&generated(), &own()),
+                );
+            });
+            assert!(
+                until(&found, ips(&["10.0.0.2", "10.0.1.2", "10.0.4.2"])).await,
                 "{:?}",
                 *found.borrow()
             );

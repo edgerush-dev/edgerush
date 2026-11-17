@@ -6,6 +6,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-controller
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/control-plane-namespace: edge
     gateway.edgerush.dev/data-plane: inside
     gateway.edgerush.dev/namespace: edge
   name: edgerush-proxy-inside

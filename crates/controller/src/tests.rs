@@ -45,6 +45,7 @@ fn harness(plane: &Plane) -> Settings {
     Settings {
         plane: plane.clone(),
         service: None,
+        generated: false,
     }
 }
 
@@ -65,6 +66,7 @@ fn operated(plane: &Plane, more: &str) -> Settings {
     Settings {
         plane: plane.clone(),
         service: Some(ProxyService::of(&web_data_plane(more)).unwrap()),
+        generated: false,
     }
 }
 
@@ -2944,6 +2946,7 @@ fn operated_as(name: &str, plane: &Plane) -> Settings {
     Settings {
         plane: plane.clone(),
         service: Some(ProxyService::of(&data_plane).unwrap()),
+        generated: false,
     }
 }
 
@@ -3634,4 +3637,60 @@ status:
     };
     assert_eq!(parents(1), named(&[("edge", "web"), ("edge", "api")]));
     assert_eq!(parents(2), named(&[("teams", "theirs")]));
+}
+
+/// A Gateway of a generated DataPlane that sets `infrastructure.parametersRef` is held as
+/// it was: translated no further, its status the operator's (05 §3). One of a DataPlane
+/// written by hand is the operator's own, never held; nor is one not followed.
+#[test]
+fn a_generated_data_planes_gateway_setting_parameters_is_held() {
+    let gateway = |parameters: bool| -> Gateway {
+        let infrastructure = if parameters {
+            "\n  infrastructure: { parametersRef: { group: '', kind: ConfigMap, name: params } }"
+        } else {
+            ""
+        };
+        serde_saphyr::from_str(&format!(
+            "metadata: {{ name: web, namespace: shop, generation: 2 }}
+spec:
+  gatewayClassName: edge
+  listeners: [{{ name: http, port: 80, protocol: HTTP }}]{infrastructure}"
+        ))
+        .unwrap()
+    };
+    let following = |gateways: Vec<Gateway>| GatewayApi {
+        crds: Vec::new(),
+        namespaces: Vec::new(),
+        gateway_namespaces: vec![Scope::Namespace("shop".to_owned())],
+        last: None,
+        gateway_classes: None,
+        gateways: Some(vec![follow_of("gateways in shop", true, gateways)]),
+        listener_sets: None,
+        http_routes: None,
+        grpc_routes: None,
+        tls_routes: None,
+        tcp_routes: None,
+        udp_routes: None,
+        reference_grants: None,
+        backend_tls_policies: None,
+        config_maps: None,
+    };
+    let settings = |generated: bool| Settings {
+        plane: Plane {
+            gateway: Some(edgerush_translate::GatewayName {
+                namespace: "shop".to_owned(),
+                name: "web".to_owned(),
+            }),
+            ..plane()
+        },
+        service: None,
+        generated,
+    };
+    let with = following(vec![gateway(true)]);
+    let without = following(vec![gateway(false)]);
+    assert!(held(Some(&with), &settings(true)));
+    assert!(!held(Some(&without), &settings(true)));
+    assert!(!held(Some(&with), &settings(false)));
+    assert!(!held(Some(&following(Vec::new())), &settings(true)));
+    assert!(!held(None, &settings(true)));
 }

@@ -50,6 +50,40 @@ subjects:
   name: edgerush-proxy-web-edge
   namespace: shop
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  annotations:
+    example.com/owner: shop
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: web-edge
+    gateway.edgerush.dev/namespace: shop
+    gateway.networking.k8s.io/gateway-class-name: edge
+    gateway.networking.k8s.io/gateway-name: web
+    team: shop
+  name: edgerush-controller-edge-generated.web-edge
+  namespace: shop
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: web-edge
+    uid: uid-of-web-edge
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edgerush-control-plane-generated
+subjects:
+- kind: ServiceAccount
+  name: edgerush-controller-edge
+  namespace: edge-system
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -284,6 +318,39 @@ subjects:
   name: edgerush-proxy-long-gateway-name-long-gateway-name-lon-8b3fb21b
   namespace: gateway-conformance-infra
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  annotations:
+    gateway.networking.k8s.io/gateway-name: >-
+      long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.l
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: long-gateway-name-long-gateway-name-lon-8b3fb21b
+    gateway.edgerush.dev/namespace: gateway-conformance-infra
+    gateway.networking.k8s.io/gateway-class-name: edge
+  name: >-
+    edgerush-controller-edge-generated.long-gateway-name-long-gateway-name-lon-8b3fb21b
+  namespace: gateway-conformance-infra
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: long-gateway-name-long-gateway-name-lon-8b3fb21b
+    uid: uid-of-long-gateway-name-long-gateway-name-lon-8b3fb21b
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edgerush-control-plane-generated
+subjects:
+- kind: ServiceAccount
+  name: edgerush-controller-edge
+  namespace: edge-system
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -504,6 +571,36 @@ subjects:
 - kind: ServiceAccount
   name: edgerush-proxy-web-edge
   namespace: blog
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: web-edge
+    gateway.edgerush.dev/namespace: blog
+    gateway.networking.k8s.io/gateway-class-name: edge
+    gateway.networking.k8s.io/gateway-name: web
+  name: edgerush-controller-edge-generated.web-edge
+  namespace: blog
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: web-edge
+    uid: uid-of-web-edge
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edgerush-control-plane-generated
+subjects:
+- kind: ServiceAccount
+  name: edgerush-controller-edge
+  namespace: edge-system
 ---
 apiVersion: apps/v1
 kind: Deployment

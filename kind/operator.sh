@@ -9,7 +9,7 @@
 # host, put alone in an image of this host's distribution (kind/discovery/Dockerfile),
 # tagged edgerush:dev as install/operator.yaml names it, and loaded into the cluster: Linux
 # only, on Ubuntu 26.04 as the laptop is. The install is applied as a user would: the
-# CRDs, the four roles, the admission policy and the operator, and not Gateway API's CRDs,
+# CRDs, the five roles, the admission policies and the operator, and not Gateway API's CRDs,
 # Ingress alone being a valid install. A backend Service in `edge` sits behind an Ingress
 # of class `edge.web`, for host shop.example. Then:
 #   - ControlPlane `edge` (its webhook off, judged below on a ControlPlane of its own) and DataPlane
@@ -29,11 +29,12 @@
 #     accepts the class nor touches the Gateway of it; the ControlPlane deleted leaves it;
 #   - Gateway-first (docs/05 §3): with an entry for class `edge`, Gateway `alone` written
 #     alone gets DataPlane `alone-edge`, accepted, owned by it, labelled for it, its
-#     Deployment made; its spec changed by hand is refused, and the DataPlane deleted by
-#     hand is made again; a Gateway that sets parameters gets nothing and says
-#     InvalidParameters; `alone` given parameters says so too and keeps its DataPlane, not
-#     applied again as the entry changes, until they are taken away; `alone` deleted takes
-#     its DataPlane and all made for it;
+#     Deployment made, and is accepted by its control plane; its spec changed by hand is
+#     refused, and the DataPlane deleted by hand is made again; a Gateway that sets
+#     parameters gets nothing and says InvalidParameters; `alone` given parameters says so
+#     too, its control plane writing nothing over it, and keeps its DataPlane, not applied
+#     again as the entry changes, until they are taken away, when its control plane accepts
+#     it again; `alone` deleted takes its DataPlane and all made for it;
 #   - the control plane writes the data plane's Service (docs/05 §2), owned by DataPlane
 #     `web`, a LoadBalancer that keeps the client's address: Ingress's two ports listed,
 #     and the Gateway's listener's as it is bound, which follows the listener's port as
@@ -56,7 +57,9 @@
 #     selects alone, one beyond it not accepted and bound nowhere; the allowance narrowed
 #     taking back the rights it granted, the rest kept; a Gateway of `wide`'s class in
 #     another namespace given a DataPlane there, accepted, bound by a name of that
-#     namespace's, and gone with its Gateway;
+#     namespace's, its control plane bound there what it writes for it, its certificate and
+#     Service written there labelled as `wide`'s, programmed, and serving its HTTPRoute; and
+#     gone with its Gateway, its bindings too;
 #   - a Selector scope followed (docs/04 §1): ControlPlane `teams` serves the namespaces of
 #     team shop through DataPlane `front`, its controller told the selector; a namespace
 #     labelled in is bound and served, one labelled out dropped and its bindings gone, and
@@ -410,6 +413,9 @@ until_true 'k -n edge get deploy edgerush-proxy-alone-edge' 60 ||
 [ "$(k -n edge get deploy edgerush-proxy-alone-edge -o jsonpath='{.metadata.labels.gateway\.networking\.k8s\.io/gateway-name}')" = alone ] ||
     fail "DataPlane alone-edge's Deployment is not labelled for Gateway alone"
 pass "a Gateway written alone gets a DataPlane, accepted, owned by it and labelled for it, and its Deployment"
+condition_is gateway/alone edge Accepted "True Accepted" 60 ||
+    fail "Gateway alone is not accepted by its control plane: $(condition gateway/alone edge Accepted)"
+pass "a Gateway written alone is served by its class's control plane, its status written"
 out=$(k -n edge patch dataplane alone-edge --type merge -p '{"spec":{"replicas":{"min":3}}}' 2>&1) &&
     fail "DataPlane alone-edge's spec is changed by hand"
 [[ $out == *"is the operator's to write"* ]] ||
@@ -435,16 +441,18 @@ entry 2
 sleep 5
 [ "$(dp_uid alone-edge)" = "$kept" ] ||
     fail "DataPlane alone-edge, its Gateway given parameters, is not kept"
+[ "$(condition gateway/alone edge Accepted)" = "False InvalidParameters" ] ||
+    fail "Gateway alone's refusal is written over by its control plane: $(condition gateway/alone edge Accepted)"
 [ "$(k -n edge get dataplane alone-edge -o jsonpath='{.spec.replicas.min}')" = 1 ] ||
     fail "DataPlane alone-edge, its Gateway given parameters, was applied again as the entry changed"
 alone alone
 until_true '[ "$(k -n edge get dataplane alone-edge -o jsonpath="{.spec.replicas.min}")" = 2 ]' 60 ||
     fail "DataPlane alone-edge, its Gateway's parameters taken away, is not applied as the entry says"
-until_true '[ "$(condition gateway/alone edge Accepted)" != "False InvalidParameters" ]' 60 ||
-    fail "Gateway alone, its parameters taken away, still says InvalidParameters"
+condition_is gateway/alone edge Accepted "True Accepted" 60 ||
+    fail "Gateway alone, its parameters taken away, is not accepted again: $(condition gateway/alone edge Accepted)"
 [ "$(dp_uid alone-edge)" = "$kept" ] ||
     fail "DataPlane alone-edge was made again, not kept, as its Gateway's parameters came and went"
-pass "a Gateway given parameters keeps its DataPlane, not applied again, until they are taken away"
+pass "a Gateway given parameters keeps its DataPlane, not applied again, its status the operator's, until they are taken away"
 k -n edge delete gateway alone params >/dev/null
 until_true '! k -n edge get dataplane alone-edge && ! k -n edge get deploy edgerush-proxy-alone-edge' 120 ||
     fail "Gateway alone deleted, its DataPlane or Deployment is still there"
@@ -701,15 +709,47 @@ until_true 'bound "" wide edgerush-controller-wide' 60 ||
     fail "ControlPlane wide, allowed All, is not bound over the cluster"
 pass "an allowance of All lets a ControlPlane watch every namespace: accepted, bound over the cluster"
 
-# Gateway-first beyond the ControlPlane's namespace: the DataPlane in the Gateway's.
+# Gateway-first beyond the ControlPlane's namespace: the DataPlane in the Gateway's, its
+# control plane's writes there of its own, and its route served.
 until_true 'k get gatewayclass wide' 60 || fail "ControlPlane wide's GatewayClass is not made"
-k apply -f - >/dev/null <<'EOF'
+k apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: shop, namespace: team-b }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: shop } }
+  template:
+    metadata: { labels: { app: shop } }
+    spec:
+      containers:
+        - name: shop
+          image: $AGNHOST
+          args: ["netexec", "--http-port=8080"]
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 1 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: shop, namespace: team-b }
+spec:
+  selector: { app: shop }
+  ports: [{ name: http, port: 80, targetPort: http }]
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata: { name: far, namespace: team-b }
 spec:
   gatewayClassName: wide
   listeners: [{ name: http, port: 8080, protocol: HTTP }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: far, namespace: team-b }
+spec:
+  parentRefs: [{ name: far }]
+  hostnames: [far.example]
+  rules: [{ backendRefs: [{ name: shop, port: 80 }] }]
 EOF
 until_true 'k -n team-b get dataplane far-wide' 60 ||
     fail "Gateway team-b/far, of ControlPlane wide's class, gets no DataPlane"
@@ -719,10 +759,42 @@ condition_is dataplane/far-wide team-b Accepted "True Accepted" 60 ||
     fail "DataPlane team-b/far-wide does not name its ControlPlane's namespace"
 until_true 'bound "" wide edgerush-proxy-wide.team-b.far-wide' 60 ||
     fail "DataPlane team-b/far-wide is not bound by a name of its namespace's"
+until_true 'bound team-b wide edgerush-controller-wide-generated.far-wide' 60 ||
+    fail "ControlPlane wide is not bound in team-b what it writes there for DataPlane far-wide"
+pass "a Gateway in another namespace than its ControlPlane's gets a DataPlane there, accepted, and its control plane what it writes there"
+# Its control plane, in wide, writes there the data plane's certificate and Service, each
+# labelled as its own, as the admission policy asks.
+own_labels='{.metadata.labels.gateway\.edgerush\.dev/control-plane}/{.metadata.labels.gateway\.edgerush\.dev/control-plane-namespace}'
+until_true '[ "$(k -n team-b get secret edgerush-proxy-far-wide-identity -o jsonpath="$own_labels")" = wide/wide ]' 180 ||
+    fail "DataPlane far-wide's certificate is not written in team-b, labelled as ControlPlane wide's"
+until_true '[ "$(k -n team-b get service edgerush-proxy-far-wide -o jsonpath="$own_labels")" = wide/wide ]' 180 ||
+    fail "DataPlane far-wide's Service is not written in team-b, labelled as ControlPlane wide's"
+pass "the control plane writes a generated DataPlane's certificate and Service in its Gateway's namespace, labelled as its own"
+k -n team-b rollout status deploy/edgerush-proxy-far-wide --timeout=180s >/dev/null ||
+    fail "DataPlane far-wide's data plane never ran"
+k -n team-b rollout status deploy/shop --timeout=120s >/dev/null
+condition_is gateway/far team-b Programmed "True Programmed" 120 ||
+    fail "Gateway team-b/far is not programmed: $(condition gateway/far team-b Programmed)"
+far() {
+    [ -n "$forward_pid" ] && kill "$forward_pid" 2>/dev/null || true
+    port=$((port + 1))
+    k -n team-b port-forward deploy/edgerush-proxy-far-wide "$port:8080" >/dev/null 2>&1 &
+    forward_pid=$!
+}
+served=
+for _ in $(seq 1 12); do
+    far
+    if until_true '[ "$(status far.example)" = 200 ]' 10; then
+        served=yes
+        break
+    fi
+done
+[ -n "$served" ] || fail "Gateway team-b/far's route is not served by its data plane: $(status far.example)"
+pass "a Gateway written in a team's namespace gets a data plane there that serves its routes"
 k -n team-b delete gateway far >/dev/null
-until_true '! k -n team-b get dataplane far-wide && ! bound "" wide edgerush-proxy-wide.team-b.far-wide' 120 ||
-    fail "Gateway team-b/far deleted, its DataPlane or its binding is still there"
-pass "a Gateway in another namespace than its ControlPlane's gets a DataPlane there, accepted, and takes it when deleted"
+until_true '! k -n team-b get dataplane far-wide && ! bound "" wide edgerush-proxy-wide.team-b.far-wide && ! bound team-b wide edgerush-controller-wide-generated.far-wide' 120 ||
+    fail "Gateway team-b/far deleted, its DataPlane or a binding of it is still there"
+pass "a Gateway in another namespace deleted takes its DataPlane and its bindings"
 
 k apply -f - >/dev/null <<'EOF'
 apiVersion: gateway.edgerush.dev/v1alpha1

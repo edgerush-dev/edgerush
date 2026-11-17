@@ -1,4 +1,4 @@
-# The rights the operator grants, and the only ones: it holds `bind` on these four by name
+# The rights the operator grants, and the only ones: it holds `bind` on these five by name
 # and creates no role (docs/05 §2). Each is for one place a right is bound, so that no
 # binding grants more than its place needs.
 #
@@ -27,6 +27,22 @@ rules:
   # Backends, the certificates objects name, and the CA certificates of BackendTLSPolicies.
   - apiGroups: [""]
     resources: [services, secrets, configmaps]
+    verbs: [list, watch]
+  # Gateway-first (05 §3): the DataPlanes generated for Gateways of its class, which name
+  # it from their Gateways' namespaces, read as its own are; those Gateways and their
+  # status; and the EndpointSlices of each one's Service, its pods, counted for Programmed
+  # and kept from its data planes' upstreams (03 §6).
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [dataplanes]
+    verbs: [list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gateways]
+    verbs: [list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gateways/status]
+    verbs: [update]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
     verbs: [list, watch]
 ---
 # The control plane's reads of cluster-scoped kinds. Bound by a ClusterRoleBinding.
@@ -112,6 +128,24 @@ rules:
   - apiGroups: [gateway.edgerush.dev]
     resources: [controlplanes/status]
     verbs: [patch]
+---
+# What the control plane writes for a DataPlane generated in a namespace not its own
+# (05 §3): its Service, which the control plane owns (05 §2), and its identity Secret.
+# Bound by a RoleBinding there, owned by that DataPlane, for as long as it lasts. Outside
+# its own namespace a control plane writes only what carries its ControlPlane's labels:
+# admission.yaml refuses the rest, and externalIPs on any Service.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edgerush-control-plane-generated
+  labels: { app.kubernetes.io/part-of: edgerush }
+rules:
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [create, patch]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create, update]
 ---
 # The data plane's one right: its upstreams' EndpointSlices, where they discover Services
 # (02 §4). Bound as edgerush-control-plane is, over its control plane's watch scope, and in

@@ -29,6 +29,7 @@ fn accepted(status: &str, generation: i64) -> String {
 fn own() -> Own {
     Own {
         control_plane: "edge".to_owned(),
+        namespace: "edge".to_owned(),
         cluster_domain: "cluster.example".to_owned(),
         system_authorities: vec!["SYSTEM".to_owned()],
     }
@@ -42,6 +43,7 @@ fn a_data_plane_serving_both_is_its_settings_field_by_field() {
     // The stream knows its data plane by the ID the certificate written for it carries.
     let issuer = crate::issuing::Issuer {
         namespace: "edge".to_owned(),
+        scope: crate::WatchScope::Parts(vec![edgerush_kubernetes::Scope::Cluster]),
         control_plane: "edge".to_owned(),
         cluster_domain: "cluster.example".to_owned(),
         authority: "edge-authority".to_owned(),
@@ -51,7 +53,10 @@ fn a_data_plane_serving_both_is_its_settings_field_by_field() {
         plane.id.as_deref(),
         Some("spiffe://edge.cluster.example/ns/edge/sa/edgerush-proxy-web")
     );
-    assert_eq!(plane.id, Some(issuer.data_plane_leaf("web").spiffe_id));
+    assert_eq!(
+        plane.id,
+        Some(issuer.data_plane_leaf("edge", "web").spiffe_id)
+    );
     assert_eq!(plane.ingress_class.as_deref(), Some("edge.web"));
     assert_eq!(
         plane.gateway,
@@ -483,4 +488,73 @@ fn once_refused_nothing_is_kept_for_a_later_edit() {
         }
     );
     assert!(chooser.last.is_empty());
+}
+
+/// `web-edge` in `shop`, as the operator generates it for Gateway `shop/web` of class
+/// `edge` (05 §3), naming ControlPlane `edge` of namespace `controlPlaneNamespace`, at
+/// generation 1, with `status`.
+fn generated(control_plane_namespace: Option<&str>, status: &str) -> DataPlane {
+    let namespace =
+        control_plane_namespace.map_or_else(String::new, |ns| format!(", namespace: {ns}"));
+    data_plane(&format!(
+        "metadata: {{ name: web-edge, namespace: shop, generation: 1, uid: u3, creationTimestamp: \"2026-11-12T12:00:00Z\" }}\nspec:\n  controlPlaneRef: {{ name: edge{namespace} }}\n  gatewayRef: {{ name: web }}\n{status}"
+    ))
+}
+
+const GENERATED: &str = "DataPlane shop/web-edge";
+
+/// One generated for a Gateway of another namespace is served the Gateway it names, of its
+/// namespace, known by its ServiceAccount there; and is never kept a class.
+#[test]
+fn a_generated_data_plane_is_served_the_gateway_it_names() {
+    let data_planes = [generated(Some("edge"), &accepted("True", 1))];
+    let choice = after(&Planes::new(), &data_planes);
+    let settings = choice.served.get(GENERATED).unwrap();
+    assert!(settings.generated);
+    assert_eq!(
+        settings.plane.gateway,
+        Some(GatewayName {
+            namespace: "shop".to_owned(),
+            name: "web".to_owned()
+        })
+    );
+    assert_eq!(
+        settings.plane.id.as_deref(),
+        Some("spiffe://edge.cluster.example/ns/shop/sa/edgerush-proxy-web-edge")
+    );
+    assert_eq!(settings.plane.ingress_class, None);
+    assert_eq!(
+        settings.service.as_ref().map(ProxyService::namespace),
+        Some("shop")
+    );
+    assert!(super::kept(&data_planes, &choice.served, &own()).is_empty());
+    // Waiting on the operator, it keeps no class either: it has none.
+    let waiting = [generated(Some("edge"), "")];
+    let choice = after(&Planes::new(), &waiting);
+    assert_eq!(choice.waiting, [Waiting::Pending(GENERATED.to_owned())]);
+    assert!(super::kept(&waiting, &choice.served, &own()).is_empty());
+}
+
+/// A DataPlane names this ControlPlane by its name and namespace: one of another namespace
+/// naming no namespace names a ControlPlane of its own namespace, and one naming another
+/// namespace another ControlPlane.
+#[test]
+fn a_data_plane_of_another_namespace_is_ours_only_naming_our_namespace() {
+    assert!(names_us(&generated(Some("edge"), ""), &own()));
+    assert!(!names_us(&generated(None, ""), &own()));
+    assert!(!names_us(&generated(Some("blog"), ""), &own()));
+    assert!(names_us(&web(1, "", ""), &own()));
+    let elsewhere = data_plane(
+        "metadata: { name: web, namespace: edge, generation: 1, uid: u4 }\nspec:\n  controlPlaneRef: { name: edge, namespace: blog }\n",
+    );
+    assert!(!names_us(&elsewhere, &own()));
+    let choice = after(
+        &Planes::new(),
+        &[
+            generated(None, &accepted("True", 1)),
+            generated(Some("blog"), &accepted("True", 1)),
+        ],
+    );
+    assert!(choice.served.is_empty());
+    assert_eq!(choice.waiting, [Waiting::None]);
 }

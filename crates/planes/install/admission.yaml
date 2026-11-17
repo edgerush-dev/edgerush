@@ -36,6 +36,86 @@ spec:
   policyName: edgerush-control-plane-services
   validationActions: [Deny]
 ---
+# Beyond its own namespace a control plane writes only what is its own (docs/05 §2): a
+# DataPlane generated for a Gateway lives in the Gateway's namespace, and its control
+# plane writes its Service and identity Secret there, under a role its team, able to act
+# as its ServiceAccount, holds too. So outside the ServiceAccount's own namespace a Service
+# or Secret is created, changed or deleted by it only where the object, and the one it
+# replaces, carries its ControlPlane's labels: the control plane's name, as its
+# ServiceAccount is named edgerush-controller-<controlplane>, and the namespace that
+# ServiceAccount is in. And what it writes is shaped as the control plane writes it, and
+# nothing else: a Secret a data plane's identity, kubernetes.io/tls, named
+# edgerush-proxy-<dataplane>-identity, never a ServiceAccount's token, which Kubernetes
+# would fill for any ServiceAccount of the namespace; a Service the data plane's,
+# edgerush-proxy-<dataplane>, never ExternalName, selecting that data plane's pods alone,
+# by the labels the operator gives them, never another workload of the namespace. A team
+# writing a Gateway of another team's class gives that team no hold on its namespace
+# beyond what is made for it.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: edgerush-control-plane-beyond-its-namespace
+  labels: { app.kubernetes.io/part-of: edgerush }
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [services, secrets]
+  matchConditions:
+    - name: written-by-a-control-plane
+      expression: request.userInfo.username.matches('^system:serviceaccount:[^:]+:edgerush-controller-[^:]+$')
+    - name: beyond-its-namespace
+      expression: request.namespace != request.userInfo.username.split(':')[2]
+  variables:
+    - name: controlPlaneNamespace
+      expression: request.userInfo.username.split(':')[2]
+    # The name after edgerush-controller-, 20 characters.
+    - name: controlPlane
+      expression: request.userInfo.username.split(':')[3].substring(20)
+    - name: newIsOurs
+      expression: >-
+        object == null || (has(object.metadata.labels) &&
+        'gateway.edgerush.dev/control-plane' in object.metadata.labels && object.metadata.labels['gateway.edgerush.dev/control-plane'] == variables.controlPlane &&
+        'gateway.edgerush.dev/control-plane-namespace' in object.metadata.labels && object.metadata.labels['gateway.edgerush.dev/control-plane-namespace'] == variables.controlPlaneNamespace)
+    - name: oldIsOurs
+      expression: >-
+        oldObject == null || (has(oldObject.metadata.labels) &&
+        'gateway.edgerush.dev/control-plane' in oldObject.metadata.labels && oldObject.metadata.labels['gateway.edgerush.dev/control-plane'] == variables.controlPlane &&
+        'gateway.edgerush.dev/control-plane-namespace' in oldObject.metadata.labels && oldObject.metadata.labels['gateway.edgerush.dev/control-plane-namespace'] == variables.controlPlaneNamespace)
+    - name: shapedAsItsOwn
+      expression: >-
+        object == null ||
+        (request.resource.resource == 'secrets' &&
+        has(object.type) && object.type == 'kubernetes.io/tls' &&
+        object.metadata.name.startsWith('edgerush-proxy-') && object.metadata.name.endsWith('-identity')) ||
+        (request.resource.resource == 'services' &&
+        (!has(object.spec.type) || object.spec.type != 'ExternalName') &&
+        has(object.spec.selector) &&
+        'gateway.edgerush.dev/data-plane' in object.spec.selector &&
+        object.metadata.name == 'edgerush-proxy-' + object.spec.selector['gateway.edgerush.dev/data-plane'] &&
+        'gateway.edgerush.dev/control-plane' in object.spec.selector && object.spec.selector['gateway.edgerush.dev/control-plane'] == variables.controlPlane &&
+        'gateway.edgerush.dev/namespace' in object.spec.selector && object.spec.selector['gateway.edgerush.dev/namespace'] == request.namespace &&
+        'app.kubernetes.io/component' in object.spec.selector && object.spec.selector['app.kubernetes.io/component'] == 'proxy')
+  validations:
+    - expression: variables.newIsOurs && variables.oldIsOurs
+      message: outside its own namespace, an EdgeRush control plane writes only a Service or Secret labelled with its ControlPlane's name and namespace
+      reason: Forbidden
+    - expression: variables.shapedAsItsOwn
+      message: outside its own namespace, an EdgeRush control plane writes only a data plane's identity Secret, kubernetes.io/tls and named edgerush-proxy-<dataplane>-identity, or its Service, edgerush-proxy-<dataplane>, selecting that data plane's pods alone
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: edgerush-control-plane-beyond-its-namespace
+  labels: { app.kubernetes.io/part-of: edgerush }
+spec:
+  policyName: edgerush-control-plane-beyond-its-namespace
+  validationActions: [Deny]
+---
 # A DataPlane naming a Gateway (gatewayRef), or a ControlPlane of another namespace, is one
 # the operator generates for a Gateway written alone, and the operator's alone to write
 # (docs/05 §3): its label, its owner reference to its Gateway and its name can each be

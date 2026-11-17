@@ -13,6 +13,10 @@ use std::cell::RefCell;
 fn issuer(kind: Kind) -> Issuer {
     Issuer {
         namespace: "edge".to_owned(),
+        scope: crate::WatchScope::Parts(vec![
+            Scope::Namespace("edge".to_owned()),
+            Scope::Namespace("shop".to_owned()),
+        ]),
         control_plane: "payments".to_owned(),
         cluster_domain: "cluster.local".to_owned(),
         authority: "edgerush-controller-payments-authority".to_owned(),
@@ -56,7 +60,7 @@ fn each_workload_is_known_by_its_service_accounts_id_in_its_control_planes_trust
         own.spiffe_id,
         "spiffe://payments.cluster.local/ns/edge/sa/edgerush-controller-payments"
     );
-    let web = issuer.data_plane_leaf("web");
+    let web = issuer.data_plane_leaf("edge", "web");
     assert!(web.dns.is_empty());
     assert_eq!(
         web.spiffe_id,
@@ -64,11 +68,60 @@ fn each_workload_is_known_by_its_service_accounts_id_in_its_control_planes_trust
     );
 }
 
+/// One generated for a Gateway of another namespace (05 §3) is known by its
+/// ServiceAccount there.
+#[test]
+fn a_generated_data_plane_is_known_by_its_service_account_in_its_gateways_namespace() {
+    let web = issuer(Kind::Made).data_plane_leaf("shop", "web-payments");
+    assert_eq!(
+        web.spiffe_id,
+        "spiffe://payments.cluster.local/ns/shop/sa/edgerush-proxy-web-payments"
+    );
+}
+
+/// What the shipped admission policy lets it write beyond its own namespace (05 §2).
+#[test]
+fn a_secret_is_labelled_with_its_control_planes_name_and_namespace() {
+    let authority = Authority::make("payments", now()).unwrap();
+    let object = secret(
+        &issuer(Kind::Made),
+        "s",
+        "shop",
+        &authority.written(),
+        None,
+        None,
+    );
+    assert_eq!(
+        object.metadata.labels.unwrap(),
+        BTreeMap::from([
+            (
+                "app.kubernetes.io/managed-by".to_owned(),
+                "edgerush-controller".to_owned()
+            ),
+            (
+                "gateway.edgerush.dev/control-plane".to_owned(),
+                "payments".to_owned()
+            ),
+            (
+                "gateway.edgerush.dev/control-plane-namespace".to_owned(),
+                "edge".to_owned()
+            ),
+        ])
+    );
+}
+
 #[test]
 fn a_secret_holds_what_is_written_as_cert_manager_writes_one() {
     let authority = Authority::make("payments", now()).unwrap();
     let held = authority.written();
-    let object = secret("s", "edge", &held, None, Some("7".to_owned()));
+    let object = secret(
+        &issuer(Kind::Made),
+        "s",
+        "edge",
+        &held,
+        None,
+        Some("7".to_owned()),
+    );
     assert_eq!(object.type_.as_deref(), Some("kubernetes.io/tls"));
     assert_eq!(object.metadata.resource_version.as_deref(), Some("7"));
     let keys: Vec<&String> = object.data.as_ref().unwrap().keys().collect();
@@ -94,7 +147,14 @@ fn only_a_leader_makes_or_signs_again_and_a_provided_authority_is_only_read() {
     assert!(why.contains("the authority provided is not there"), "{why}");
     // There, it is read; due, the leader alone signs it again, as of its version.
     let fresh = Authority::make("payments", now).unwrap().written();
-    let found = secret(&made.authority, "edge", &fresh, None, Some("3".to_owned()));
+    let found = secret(
+        &made,
+        &made.authority,
+        "edge",
+        &fresh,
+        None,
+        Some("3".to_owned()),
+    );
     assert!(matches!(
         step(&made, Some(&found), now, true),
         Step::Ready(_)
@@ -102,7 +162,14 @@ fn only_a_leader_makes_or_signs_again_and_a_provided_authority_is_only_read() {
     let old = Authority::make("payments", now - AUTHORITY_SECONDS + 86_400)
         .unwrap()
         .written();
-    let old = secret(&made.authority, "edge", &old, None, Some("4".to_owned()));
+    let old = secret(
+        &made,
+        &made.authority,
+        "edge",
+        &old,
+        None,
+        Some("4".to_owned()),
+    );
     let Step::Resign(again, version) = step(&made, Some(&old), now, true) else {
         panic!("not signed again");
     };
@@ -125,7 +192,7 @@ fn only_a_leader_makes_or_signs_again_and_a_provided_authority_is_only_read() {
 fn a_certificate_is_issued_again_at_half_its_life_or_once_its_bundle_changes() {
     let now = now();
     let authority = Authority::make("payments", now).unwrap();
-    let leaf = issuer(Kind::Made).data_plane_leaf("web");
+    let leaf = issuer(Kind::Made).data_plane_leaf("edge", "web");
     assert!(reissue(None, &authority, now));
     let issued = authority.issue(&leaf, now).unwrap();
     assert!(!reissue(Some(&issued), &authority, now));
@@ -201,6 +268,28 @@ fn the_data_planes_kept_are_its_own_control_planes_ever_accepted() {
     assert_eq!(names, ["web"]);
 }
 
+/// One of another namespace is its only where it names the ControlPlane's namespace too,
+/// as one generated for a Gateway there does (05 §3).
+#[test]
+fn a_data_plane_of_another_namespace_is_kept_where_it_names_the_control_planes_namespace() {
+    let of = |name: &str, control_plane: &str| -> DataPlane {
+        serde_saphyr::from_str(&format!(
+            "metadata: {{ name: {name}, namespace: shop, generation: 1, uid: uid-{name} }}\nspec:\n  controlPlaneRef: {control_plane}\n  gatewayRef: {{ name: web }}\nstatus:\n  conditions:\n    - {{ type: Accepted, status: \"True\", reason: R, message: \"\", lastTransitionTime: \"2026-11-13T10:00:00Z\", observedGeneration: 1 }}\n"
+        ))
+        .unwrap()
+    };
+    let planes = [
+        of("web-payments", "{ name: payments, namespace: edge }"),
+        of("shops-own", "{ name: payments }"),
+        of("elsewhere", "{ name: payments, namespace: blog }"),
+    ];
+    let names: Vec<&str> = served(&issuer(Kind::Made), &planes)
+        .iter()
+        .map(|data_plane| data_plane.metadata.name.as_deref().unwrap())
+        .collect();
+    assert_eq!(names, ["web-payments"]);
+}
+
 /// A list of `items`, of `kind`.
 fn page(kind: &str, items: &[serde_json::Value]) -> Answer {
     answer(
@@ -243,16 +332,34 @@ async fn run_as(
         if path.contains("watch=true") {
             return open();
         }
+        // Each object in its namespace's list: `edge`, the control plane's, or `shop`.
+        let of = |objects: &[serde_json::Value], namespace: &str| -> Vec<serde_json::Value> {
+            objects
+                .iter()
+                .filter(|object| object["metadata"]["namespace"] == namespace)
+                .cloned()
+                .collect()
+        };
         match (method, path) {
             ("GET", path) if path.starts_with("/api/v1/namespaces/edge/secrets?") => {
-                page("Secret", &secrets)
+                page("Secret", &of(&secrets, "edge"))
+            }
+            ("GET", path) if path.starts_with("/api/v1/namespaces/shop/secrets?") => {
+                page("Secret", &of(&secrets, "shop"))
             }
             ("GET", path)
                 if path.starts_with(
                     "/apis/gateway.edgerush.dev/v1alpha1/namespaces/edge/dataplanes?",
                 ) =>
             {
-                page("DataPlane", &planes)
+                page("DataPlane", &of(&planes, "edge"))
+            }
+            ("GET", path)
+                if path.starts_with(
+                    "/apis/gateway.edgerush.dev/v1alpha1/namespaces/shop/dataplanes?",
+                ) =>
+            {
+                page("DataPlane", &of(&planes, "shop"))
             }
             ("POST" | "PUT", _) => answer(201, "{}"),
             ("PATCH", path) if path.starts_with(STATUS) => answer(200, "{}"),
@@ -326,6 +433,7 @@ fn published(fake: &Fake) -> Vec<String> {
 async fn the_leader_alone_publishes_its_authority_s_bundle_once() {
     let authority = Authority::make("payments", now()).unwrap();
     let stored = secret(
+        &issuer(Kind::Made),
         "edgerush-controller-payments-authority",
         "edge",
         &authority.written(),
@@ -407,10 +515,73 @@ async fn a_leader_makes_the_authority_and_a_follower_waits_on_it() {
     assert_eq!(own, None);
 }
 
+/// A DataPlane generated for a Gateway of namespace `shop` (05 §3) has its certificate
+/// written there, of its ServiceAccount there, labelled as the admission policy asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_generated_data_planes_certificate_is_written_in_its_gateways_namespace() {
+    let authority = Authority::make("payments", now()).unwrap();
+    let stored = secret(
+        &issuer(Kind::Made),
+        "edgerush-controller-payments-authority",
+        "edge",
+        &authority.written(),
+        None,
+        Some("2".to_owned()),
+    );
+    let planes = vec![json(&serde_json::json!({
+        "metadata": { "name": "web-payments", "namespace": "shop", "generation": 1, "uid": "uid-web" },
+        "spec": { "controlPlaneRef": { "name": "payments", "namespace": "edge" }, "gatewayRef": { "name": "web" } },
+        "status": { "conditions": [{ "type": "Accepted", "status": "True", "reason": "R", "message": "", "lastTransitionTime": "2026-11-13T10:00:00Z", "observedGeneration": 1 }] },
+    }))];
+    let (fake, said, _) = run(
+        "issuing-generated",
+        vec![json(&stored)],
+        planes,
+        true,
+        |said, _, _| {
+            said.iter()
+                .any(|line| line.contains("certificate of DataPlane shop/web-payments written"))
+        },
+    )
+    .await;
+    let posts: Vec<_> = fake
+        .seen()
+        .into_iter()
+        .filter(|seen| seen.method == "POST")
+        .collect();
+    let [post] = posts.as_slice() else {
+        panic!("one Secret made: {posts:?} {said:?}");
+    };
+    assert_eq!(post.path, "/api/v1/namespaces/shop/secrets");
+    let made: Secret = serde_json::from_str(&post.body).unwrap();
+    assert_eq!(
+        made.metadata.name.as_deref(),
+        Some("edgerush-proxy-web-payments-identity")
+    );
+    let labels = made.metadata.labels.clone().unwrap();
+    assert_eq!(labels["gateway.edgerush.dev/control-plane"], "payments");
+    assert_eq!(
+        labels["gateway.edgerush.dev/control-plane-namespace"],
+        "edge"
+    );
+    let issued = written(&made).unwrap();
+    let leaf = Identity::read(&edgerush_config::Certificate {
+        chain: issued.certificate,
+        key: issued.key,
+    })
+    .unwrap()
+    .leaf;
+    assert_eq!(
+        id_of(&leaf).as_deref(),
+        Some("spiffe://payments.cluster.local/ns/shop/sa/edgerush-proxy-web-payments")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn its_own_certificate_is_signed_and_each_data_planes_written_by_the_leader() {
     let authority = Authority::make("payments", now()).unwrap();
     let stored = secret(
+        &issuer(Kind::Made),
         "edgerush-controller-payments-authority",
         "edge",
         &authority.written(),
@@ -509,11 +680,12 @@ async fn a_replaced_provided_authority_is_remembered_from_its_workloads_secrets(
     };
     let old = Authority::read(&intermediate("payments"), Kind::Provided, now).unwrap();
     let held = old
-        .issue(&issuer(Kind::Provided).data_plane_leaf("web"), now)
+        .issue(&issuer(Kind::Provided).data_plane_leaf("edge", "web"), now)
         .unwrap();
     let replaced = intermediate("payments");
     let secrets = vec![
         json(&secret(
+            &issuer(Kind::Made),
             "edgerush-controller-payments-authority",
             "edge",
             &replaced,
@@ -521,6 +693,7 @@ async fn a_replaced_provided_authority_is_remembered_from_its_workloads_secrets(
             Some("9".to_owned()),
         )),
         json(&secret(
+            &issuer(Kind::Made),
             "edgerush-proxy-web-identity",
             "edge",
             &held,

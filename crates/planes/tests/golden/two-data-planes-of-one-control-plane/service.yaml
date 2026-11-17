@@ -6,6 +6,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-controller
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: shop
+    gateway.edgerush.dev/control-plane-namespace: shop-edge
     gateway.edgerush.dev/data-plane: web
     gateway.edgerush.dev/namespace: shop-edge
   name: edgerush-proxy-web
@@ -49,6 +50,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-controller
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: shop
+    gateway.edgerush.dev/control-plane-namespace: shop-edge
     gateway.edgerush.dev/data-plane: api
     gateway.edgerush.dev/namespace: shop-edge
   name: edgerush-proxy-api

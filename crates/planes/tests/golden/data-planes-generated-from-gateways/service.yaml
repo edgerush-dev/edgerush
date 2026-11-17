@@ -9,6 +9,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-controller
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/control-plane-namespace: edge-system
     gateway.edgerush.dev/data-plane: web-edge
     gateway.edgerush.dev/namespace: shop
     gateway.networking.k8s.io/gateway-class-name: edge
@@ -63,6 +64,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-controller
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/control-plane-namespace: edge-system
     gateway.edgerush.dev/data-plane: long-gateway-name-long-gateway-name-lon-8b3fb21b
     gateway.edgerush.dev/namespace: gateway-conformance-infra
     gateway.networking.k8s.io/gateway-class-name: edge
@@ -113,6 +115,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-controller
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/control-plane-namespace: edge-system
     gateway.edgerush.dev/data-plane: web-edge
     gateway.edgerush.dev/namespace: blog
     gateway.networking.k8s.io/gateway-class-name: edge
