@@ -1,5 +1,5 @@
 use super::*;
-use edgerush_config::{Certificate, Config};
+use edgerush_config::{Certificate, Config, Limits};
 use proptest::prelude::*;
 use prost::Message;
 use std::collections::BTreeSet;
@@ -31,6 +31,24 @@ upstreams: {{}}
             )
         })
         .collect();
+    config
+}
+
+/// Limits told apart by their burst: one limit, every request under it.
+fn limits(burst: u64) -> Limits {
+    serde_saphyr::from_str(&format!(
+        "global: {{ rate_limits: [per-client] }}
+limits:
+  - {{ name: per-client, key: client, model: {{ bucket: {{ rate: 10/s, burst: {burst} }} }} }}
+"
+    ))
+    .unwrap()
+}
+
+/// [`config`], with the limits of `burst`.
+fn limited(port: u16, certificates: &[(&str, &str)], burst: u64) -> Config {
+    let mut config = config(port, certificates);
+    config.limits = Some(limits(burst));
     config
 }
 
@@ -128,6 +146,7 @@ fn running(offer: &Offer) -> Held {
             .certificates()
             .map(|(name, version)| (name.to_owned(), version.to_owned()))
             .collect(),
+        limits: offer.limits().map(str::to_owned),
     }
 }
 
@@ -151,6 +170,7 @@ fn sent(messages: &[wire::ToDataPlane]) -> Vec<String> {
                 format!("certificate {}", certificate.name)
             }
             Some(wire::Resource::Config(_)) => "config".to_owned(),
+            Some(wire::Resource::Limits(_)) => "limits".to_owned(),
             Some(wire::Resource::Removed(removed)) => {
                 format!("removed {}", removed.names.join(" "))
             }
@@ -324,7 +344,7 @@ fn a_certificate_no_longer_offered_goes_last_and_stays_with_the_config_running()
 
 #[test]
 fn a_config_equal_to_the_one_running_is_kept_under_its_new_versions() {
-    let whole = config(80, &[("a", "1")]);
+    let whole = limited(80, &[("a", "1")], 20);
     let before = Offer::new(&whole, None, &mut Versions::new(7)).unwrap();
     let mut staging = Staging::new();
     let messages = hello(&staging).send(&before);
@@ -335,7 +355,7 @@ fn a_config_equal_to_the_one_running_is_kept_under_its_new_versions() {
     assert_ne!(after.version(), before.version());
     let mut session = hello(&staging);
     let mut taken = take(&mut staging, session.send(&after));
-    assert_eq!(kinds(&taken), ["nothing", "say"]);
+    assert_eq!(kinds(&taken), ["nothing", "nothing", "say"]);
     let Some(Taken::Say(report)) = taken.pop() else {
         unreachable!()
     };
@@ -356,6 +376,7 @@ fn a_config_that_cannot_be_read_is_refused_and_the_last_runs_on() {
             version: "9.1".to_owned(),
             json: br#"{"listeners": {}, "routes": [], "upstreams": {}, "tomorrow": 1}"#.to_vec(),
             requires: BTreeMap::new(),
+            limits: String::new(),
         })),
     };
     let Taken::Say(report) = staging.take(unread).unwrap() else {
@@ -436,12 +457,12 @@ fn a_message_the_protocol_does_not_allow_ends_the_stream() {
         Malformed::HelloAgain
     );
     let unversioned = wire::Held {
-        config: String::new(),
         certificates: [("a".to_owned(), String::new())].into(),
+        ..Default::default()
     };
     let unnamed = wire::Held {
-        config: String::new(),
         certificates: [(String::new(), "1".to_owned())].into(),
+        ..Default::default()
     };
     for (held, expected) in [
         (unversioned, Malformed::Unversioned),
@@ -480,6 +501,10 @@ fn a_message_the_protocol_does_not_allow_ends_the_stream() {
         resource: Some(wire::Resource::Config(wire::Config::default())),
     };
     assert_eq!(staging.take(config).unwrap_err(), Malformed::Unversioned);
+    let limits = wire::ToDataPlane {
+        resource: Some(wire::Resource::Limits(wire::Limits::default())),
+    };
+    assert_eq!(staging.take(limits).unwrap_err(), Malformed::Unversioned);
 }
 
 #[test]
@@ -493,17 +518,188 @@ fn what_one_side_does_not_know_is_passed_over() {
     assert_eq!(session.heard(wire::FromDataPlane::default()).unwrap(), None);
 }
 
+/// Limits go after the certificates and before the config that names them, which waits for
+/// them and runs with them.
 #[test]
-fn a_config_with_limits_is_not_offered() {
-    let mut limited = config(80, &[]);
-    limited.limits = Some(edgerush_config::Limits {
-        global: Default::default(),
-        limits: Vec::new(),
-    });
-    assert!(matches!(
-        Offer::new(&limited, None, &mut Versions::new(7)),
-        Err(OfferError::Limits)
-    ));
+fn a_config_runs_with_its_limits_once_they_are_there() {
+    let mut versions = Versions::new(7);
+    let whole = limited(80, &[("a", "1")], 20);
+    let offer = Offer::new(&whole, None, &mut versions).unwrap();
+    assert!(offer.limits().is_some());
+    let mut staging = Staging::new();
+    let mut session = hello(&staging);
+    let mut messages = session.send(&offer);
+    assert_eq!(sent(&messages), ["certificate a", "limits", "config"]);
+    let config = messages.pop().unwrap();
+    let limits = messages.pop().unwrap();
+    assert_eq!(kinds(&take(&mut staging, messages)), ["nothing"]);
+    // The config, ahead of its limits, waits for them.
+    assert_eq!(kinds(&take(&mut staging, vec![config])), ["nothing"]);
+    let mut taken = take(&mut staging, vec![limits]);
+    let Some(Taken::Run(run)) = taken.pop() else {
+        panic!("not given to run")
+    };
+    assert_eq!(*run, whole);
+    let report = staging.ran().unwrap();
+    assert_eq!(report.running, running(&offer));
+    assert_eq!(report.running.limits.as_deref(), offer.limits());
+    assert_eq!(session.heard((&report).into()).unwrap(), Some(report));
+    assert_eq!(session.held(), &running(&offer));
+}
+
+#[test]
+fn a_config_waits_for_its_limits_at_the_version_it_names() {
+    let mut versions = Versions::new(7);
+    let first = Offer::new(&limited(80, &[], 20), None, &mut versions).unwrap();
+    let second = Offer::new(&limited(80, &[], 21), Some(&first), &mut versions).unwrap();
+    let mut messages = hello(&Staging::new()).send(&second);
+    assert_eq!(sent(&messages), ["limits", "config"]);
+    let mut staging = Staging::new();
+    // The config first, and an older version of its limits.
+    let config = messages.pop().unwrap();
+    let older = hello(&Staging::new()).send(&first).remove(0);
+    assert_eq!(
+        kinds(&take(&mut staging, vec![config, older])),
+        ["nothing", "nothing"]
+    );
+    let mut taken = take(&mut staging, messages);
+    let Some(Taken::Run(run)) = taken.pop() else {
+        panic!("not given to run")
+    };
+    assert_eq!(*run, limited(80, &[], 21));
+}
+
+#[test]
+fn limits_held_are_not_sent_again() {
+    let mut versions = Versions::new(7);
+    let first = Offer::new(&limited(80, &[], 20), None, &mut versions).unwrap();
+    let second = Offer::new(&limited(81, &[], 20), Some(&first), &mut versions).unwrap();
+    assert_ne!(second.version(), first.version());
+    assert_eq!(second.limits(), first.limits());
+    let mut staging = Staging::new();
+    let mut session = hello(&staging);
+    take(&mut staging, session.send(&first));
+    staging.ran().unwrap();
+    let messages = session.send(&second);
+    assert_eq!(sent(&messages), ["config"]);
+    let mut taken = take(&mut staging, messages);
+    let Some(Taken::Run(run)) = taken.pop() else {
+        panic!("not given to run")
+    };
+    assert_eq!(*run, limited(81, &[], 20));
+    staging.ran().unwrap();
+    // A data plane that dials again says it holds them.
+    let mut again = hello(&staging);
+    assert_eq!(again.held().limits.as_deref(), first.limits());
+    let third = Offer::new(&limited(82, &[], 20), Some(&second), &mut versions).unwrap();
+    assert_eq!(sent(&again.send(&third)), ["config"]);
+}
+
+#[test]
+fn limits_changed_alone_are_sent_with_a_new_config_version() {
+    let mut versions = Versions::new(7);
+    let first = Offer::new(&limited(80, &[], 20), None, &mut versions).unwrap();
+    let second = Offer::new(&limited(80, &[], 21), Some(&first), &mut versions).unwrap();
+    assert_ne!(second.version(), first.version());
+    assert_ne!(second.limits(), first.limits());
+    let mut staging = Staging::new();
+    let mut session = hello(&staging);
+    take(&mut staging, session.send(&first));
+    staging.ran().unwrap();
+    let messages = session.send(&second);
+    assert_eq!(sent(&messages), ["limits", "config"]);
+    let mut taken = take(&mut staging, messages);
+    let Some(Taken::Run(run)) = taken.pop() else {
+        panic!("not given to run")
+    };
+    assert_eq!(*run, limited(80, &[], 21));
+    assert_eq!(staging.ran().unwrap().running, running(&second));
+}
+
+#[test]
+fn a_config_without_limits_runs_without_them() {
+    let mut versions = Versions::new(7);
+    let first = Offer::new(&limited(80, &[], 20), None, &mut versions).unwrap();
+    let second = Offer::new(&config(80, &[]), Some(&first), &mut versions).unwrap();
+    assert_eq!(second.limits(), None);
+    let mut staging = Staging::new();
+    let mut session = hello(&staging);
+    take(&mut staging, session.send(&first));
+    staging.ran().unwrap();
+    let messages = session.send(&second);
+    assert_eq!(sent(&messages), ["config"]);
+    let mut taken = take(&mut staging, messages);
+    let Some(Taken::Run(run)) = taken.pop() else {
+        panic!("not given to run")
+    };
+    assert_eq!(run.limits, None);
+    assert_eq!(staging.ran().unwrap().running.limits, None);
+}
+
+#[test]
+fn a_config_whose_limits_cannot_be_read_is_refused_and_the_last_runs_on() {
+    let mut versions = Versions::new(7);
+    let first = Offer::new(&config(80, &[]), None, &mut versions).unwrap();
+    let mut staging = Staging::new();
+    let messages = hello(&staging).send(&first);
+    take(&mut staging, messages);
+    staging.ran().unwrap();
+    let unread = wire::ToDataPlane {
+        resource: Some(wire::Resource::Limits(wire::Limits {
+            version: "9.1".to_owned(),
+            json: br#"{"limits": [], "tomorrow": 1}"#.to_vec(),
+        })),
+    };
+    let naming = wire::ToDataPlane {
+        resource: Some(wire::Resource::Config(wire::Config {
+            version: "9.2".to_owned(),
+            json: serde_json::to_vec(&config(81, &[])).unwrap(),
+            requires: BTreeMap::new(),
+            limits: "9.1".to_owned(),
+        })),
+    };
+    let mut taken = take(&mut staging, vec![unread.clone(), naming]);
+    assert_eq!(kinds(&taken), ["nothing", "say"]);
+    let Some(Taken::Say(report)) = taken.pop() else {
+        unreachable!()
+    };
+    assert_eq!(report.running, running(&first));
+    let refusal = report.refused.unwrap();
+    assert_eq!(refusal.config, "9.2");
+    assert!(refusal.why.contains("tomorrow"), "{}", refusal.why);
+    // Said once: the same limits again leave nothing to do.
+    assert_eq!(kinds(&take(&mut staging, vec![unread])), ["nothing"]);
+    assert_eq!(staging.ran(), None);
+}
+
+#[test]
+fn limits_longer_than_a_message_are_not_offered() {
+    let mut whole = config(80, &[]);
+    let many: String = (0..200)
+        .map(|n| {
+            format!(
+                "  - {{ name: limit-{n}, key: client, model: {{ bucket: {{ rate: 10/s, burst: 20 }} }} }}\n"
+            )
+        })
+        .collect();
+    whole.limits = Some(serde_saphyr::from_str(&format!("limits:\n{many}")).unwrap());
+    let mut versions = Versions::new(7);
+    let lengths: Vec<usize> = Session::holding_nothing(served())
+        .send(&Offer::new(&whole, None, &mut versions).unwrap())
+        .iter()
+        .map(Message::encoded_len)
+        .collect();
+    let [limits, config] = lengths[..] else {
+        panic!("{lengths:?}")
+    };
+    assert!(limits > config, "{lengths:?}");
+    assert!(Offer::within(&whole, None, &mut versions, limits).is_ok());
+    match Offer::within(&whole, None, &mut versions, limits - 1) {
+        Err(OfferError::TooLarge { what, bytes, .. }) => {
+            assert_eq!((what.as_str(), bytes), ("the limits", limits));
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -602,8 +798,9 @@ fn deliver(
 /// What a step of the property test does.
 #[derive(Debug, Clone)]
 enum Step {
-    /// The control plane offers this: a port, and each certificate's content.
-    Offer(u16, Vec<(u8, u8)>),
+    /// The control plane offers this: a port, each certificate's content, and its limits'
+    /// burst, if it has limits.
+    Offer(u16, Vec<(u8, u8)>, Option<u8>),
     /// The data plane takes every message sent.
     Deliver,
     /// The stream breaks after this many messages of those not yet taken, and is dialled
@@ -617,9 +814,10 @@ fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
         3 => (
             80u16..83,
-            proptest::collection::vec((0u8..3, 0u8..3), 0..3)
+            proptest::collection::vec((0u8..3, 0u8..3), 0..3),
+            proptest::option::of(0u8..2),
         )
-            .prop_map(|(port, certificates)| Step::Offer(port, certificates)),
+            .prop_map(|(port, certificates, limits)| Step::Offer(port, certificates, limits)),
         2 => Just(Step::Deliver),
         1 => (0usize..4).prop_map(Step::Break),
         1 => Just(Step::Restart),
@@ -644,14 +842,15 @@ proptest! {
         let mut failures = failures.into_iter().cycle();
         for step in steps {
             match step {
-                Step::Offer(port, certificates) => {
+                Step::Offer(port, certificates, burst) => {
                     let names = ["a", "b", "c"];
                     let contents = ["0", "1", "2"];
                     let certificates: Vec<(&str, &str)> = certificates
                         .iter()
                         .map(|&(name, content)| (names[name as usize], contents[content as usize]))
                         .collect();
-                    let whole = config(port, &certificates);
+                    let mut whole = config(port, &certificates);
+                    whole.limits = burst.map(|burst| limits(20 + u64::from(burst)));
                     let offer = Offer::new(&whole, offers.last().map(|(offer, _)| offer), &mut versions).unwrap();
                     queue.extend(session.send(&offer));
                     offers.push((offer, whole));

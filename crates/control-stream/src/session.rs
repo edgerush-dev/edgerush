@@ -101,8 +101,9 @@ impl Session {
     }
 
     /// What to send for `offer`, in order: each certificate the data plane does not hold
-    /// at its version, then the config, if it does not hold it, then the names of the
-    /// certificates no longer offered. Once sent, it is taken as held.
+    /// at its version, then the limits, if the config has them and the data plane does not
+    /// hold them at their version, then the config, if it does not hold it, then the names
+    /// of the certificates no longer offered. Once sent, it is taken as held.
     pub fn send(&mut self, offer: &Offer) -> Vec<wire::ToDataPlane> {
         let mut messages = Vec::new();
         for (name, certificate) in &offer.certificates {
@@ -121,6 +122,17 @@ impl Session {
                 .certificates
                 .insert(name.clone(), certificate.version.clone());
         }
+        if let Some((limits, json)) = &offer.limits
+            && self.held.limits.as_ref() != Some(&limits.version)
+        {
+            messages.push(wire::ToDataPlane {
+                resource: Some(wire::Resource::Limits(wire::Limits {
+                    version: limits.version.clone(),
+                    json: json.clone(),
+                })),
+            });
+            self.held.limits = Some(limits.version.clone());
+        }
         if self.held.config.as_ref() != Some(&offer.config.version) {
             messages.push(wire::ToDataPlane {
                 resource: Some(wire::Resource::Config(wire::Config {
@@ -132,6 +144,7 @@ impl Session {
                         .iter()
                         .map(|(name, certificate)| (name.clone(), certificate.version.clone()))
                         .collect(),
+                    limits: offer.limits().unwrap_or_default().to_owned(),
                 })),
             });
             self.held.config = Some(offer.config.version.clone());

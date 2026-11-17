@@ -1,5 +1,6 @@
 //! A config sent arrives the same: every example config, and every config the golden
-//! translation cases expect, with certificates of its own, through the wire and run.
+//! translation cases expect, with certificates of its own, and one with limits of every
+//! kind, through the wire and run.
 
 use edgerush_config::{Certificate, Config, HarnessFile};
 use edgerush_control_stream::{Offer, Session, Staging, Taken, Versions, wire};
@@ -61,4 +62,38 @@ fn every_config_sent_arrives_the_same() {
         }
         assert_eq!(ran.as_ref(), Some(&config), "{name}");
     }
+}
+
+/// Limits sent arrive the same, every field of their model stated or left out.
+#[test]
+fn limits_sent_arrive_the_same() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let yaml = fs::read_to_string(root.join("examples/dev-harness.yaml")).unwrap();
+    let file: HarnessFile = serde_saphyr::from_str(&yaml).unwrap();
+    let limits = serde_saphyr::from_str(
+        "global: { rate_limits: [per-client, hourly] }
+limits:
+  - { name: per-client, key: client, model: { bucket: { rate: 100/s, burst: 100 } } }
+  - name: order-writes
+    match: { methods: [POST, PUT], path_prefix: /v1/orders/ }
+    key: client
+    model: { fixed_window: { limit: 1000, window: 1m } }
+    dry_run: true
+  - { name: hourly, match: { methods: [GET] }, key: client, model: { rolling_window: { limit: 100, window: 1h, slots: 60 } } }
+  - { name: daily, key: client, model: { rolling_window: { limit: 5000, window: 1d } } }
+",
+    )
+    .unwrap();
+    let config = file.into_config(BTreeMap::new(), Some(limits));
+    let offer = Offer::new(&config, None, &mut Versions::new(7)).unwrap();
+    let mut staging = Staging::new();
+    let mut session = Session::open(staging.hello()).unwrap();
+    let mut ran = None;
+    for message in session.send(&offer) {
+        let message = wire::ToDataPlane::decode(message.encode_to_vec().as_slice()).unwrap();
+        if let Taken::Run(run) = staging.take(message).unwrap() {
+            ran = Some(*run);
+        }
+    }
+    assert_eq!(ran.as_ref(), Some(&config));
 }

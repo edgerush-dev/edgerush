@@ -10,14 +10,14 @@
 use crate::compile::{ConfigError, Object, Place, Problem};
 use edgerush_rules::plain::{Key, Limit as Count, PlainRule};
 use edgerush_rules::{Rule, Schema};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
 /// The rate-limiting engine's configuration: its limits, and those that apply to every
 /// request.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "schema", schemars(title = "EdgeRush rate limits"))]
 #[serde(deny_unknown_fields)]
@@ -30,7 +30,7 @@ pub struct Limits {
 }
 
 /// What applies to every request through the data plane.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Global {
@@ -40,7 +40,7 @@ pub struct Global {
 }
 
 /// A limit: whose requests it counts together, and how many it allows.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Limit {
@@ -69,7 +69,7 @@ pub struct Limit {
 }
 
 /// The requests a limit applies to: each of what it states holds.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct LimitMatch {
@@ -83,7 +83,7 @@ pub struct LimitMatch {
 }
 
 /// How a limit counts requests: its numbers inside it, as each model has its own.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Model {
@@ -102,7 +102,7 @@ pub enum Model {
 }
 
 /// A token bucket's numbers.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Bucket {
@@ -119,7 +119,7 @@ pub struct Bucket {
 }
 
 /// A window's numbers.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Window {
@@ -132,7 +132,7 @@ pub struct Window {
 }
 
 /// A rolling window's numbers.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Rolling {

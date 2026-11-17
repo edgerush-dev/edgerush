@@ -770,7 +770,8 @@ fn offered(yaml: &str, last: Option<&Offer>, versions: &mut Versions) -> Offer {
 }
 
 /// With `--control-plane`, nothing is served until the first config comes down the stream;
-/// then each config after it takes over, and one that cannot be run is said not to.
+/// then each config after it takes over, with the limits it names, and one that cannot be
+/// run is said not to.
 #[test]
 fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> {
     let (one, two) = (upstream("one")?, upstream("two")?);
@@ -962,6 +963,47 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
     );
     assert!(harness.wait_for("elsewhere").contains("upstream"));
     assert!(get(web, "/")?.contains("x-upstream: two"));
+
+    // Limits come as a resource of their own, and a config naming them runs with them;
+    // another config with the same limits keeps their counts, and changed limits start
+    // afresh.
+    let limited = |backend: SocketAddr| {
+        config("127.0.0.1:0", "up", Some(backend)).replace(
+            "        forward:",
+            "        rate_limits: [per-client]\n        forward:",
+        ) + "rate_limiting: { mode: local }\n"
+    };
+    let with_limits = |yaml: &str, burst: u64, last: &Offer, versions: &mut Versions| {
+        let file: HarnessFile = serde_saphyr::from_str(yaml).expect("a config");
+        let limits = serde_saphyr::from_str(&format!(
+            "limits:\n  - {{ name: per-client, key: client, model: {{ bucket: {{ rate: 10/h, burst: {burst} }} }} }}\n"
+        ))
+        .expect("limits");
+        let config = file.into_config(std::collections::BTreeMap::new(), Some(limits));
+        Offer::new(&config, Some(last), versions).expect("an offer")
+    };
+    let counted = with_limits(&limited(two), 2, &third, &mut versions);
+    offers.send_replace(Served::Anyone(Some(Arc::new(counted.clone()))));
+    let report = reported();
+    assert_eq!(report.running.config.as_deref(), Some(counted.version()));
+    assert_eq!(report.running.limits.as_deref(), counted.limits());
+    assert!(get(web, "/")?.contains("x-upstream: two"));
+    assert!(get(web, "/")?.contains("x-upstream: two"));
+    let refused = get(web, "/")?;
+    assert!(refused.starts_with("HTTP/1.1 429 "), "{refused}");
+    let kept = with_limits(&limited(one), 2, &counted, &mut versions);
+    assert_eq!(kept.limits(), counted.limits());
+    offers.send_replace(Served::Anyone(Some(Arc::new(kept.clone()))));
+    assert_eq!(reported().running.config.as_deref(), Some(kept.version()));
+    let refused = get(web, "/")?;
+    assert!(refused.starts_with("HTTP/1.1 429 "), "{refused}");
+    let changed = with_limits(&limited(one), 3, &kept, &mut versions);
+    offers.send_replace(Served::Anyone(Some(Arc::new(changed.clone()))));
+    assert_eq!(
+        reported().running.config.as_deref(),
+        Some(changed.version())
+    );
+    assert!(get(web, "/")?.contains("x-upstream: one"));
 
     // Certificate files replaced are said to be, by what the stream says as it goes.
     let renewed = authority.issue(&["data-plane"]);
