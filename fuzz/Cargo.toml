@@ -26,6 +26,8 @@ edgerush-cluster-asynchronous = { path = "../crates/cluster-asynchronous" }
 edgerush-cluster-synchronous = { path = "../crates/cluster-synchronous" }
 # The model and compiler a harness file is read into.
 edgerush-config = { path = "../crates/config" }
+# The config stream's messages, taken as each end takes them.
+edgerush-control-stream = { path = "../crates/control-stream" }
 # A nameserver's answers, read as the resolver reads them.
 edgerush-dns = { path = "../crates/dns" }
 # The admission webhook's reviews, read and answered.
@@ -218,6 +220,13 @@ bench = false
 [[bin]]
 name = "limits"
 path = "fuzz_targets/limits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_stream"
+path = "fuzz_targets/config_stream.rs"
 test = false
 doc = false
 bench = false

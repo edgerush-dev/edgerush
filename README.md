@@ -304,6 +304,7 @@ and the filters' `reference` modules, the same ones the property tests use. The 
 | `request_host` | Agrees with the `http` crate's reading of a host. |
 | `quic_header` | Agrees with quiche's parser. |
 | `config` | Reading and compiling a config file never fail, and what compiles is whole. |
+| `config_stream` | Any bytes read as the messages either end of the config stream sends never fail; a config given to run is the latest sent, with every certificate and the limits it names at the versions it names, and each refusal is told. |
 | `test_file` | Reading, checking and running a file of `edgerush test`'s tests never fail. |
 | `rules_compile` | A limit rule's three parts compile or fail with an error placed in the part it is about, and what compiles decides a request without failing. |
 | `admission_review` | Any bytes read as a webhook review never fail, and the answer carries the review's uid. |
