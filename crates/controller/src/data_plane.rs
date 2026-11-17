@@ -14,11 +14,18 @@
 //! says its zone: the data plane's Service, of the name the control plane gives it, and
 //! writes as the DataPlane shapes it (05 §2).
 
-use edgerush_config::{AccessLog, Forwarding, Http3, ListenerProxyProtocol, RequestId};
+use edgerush_config::{
+    AccessLog, Bucket, Forwarding, Http3, Limit, LimitMatch, ListenerProxyProtocol, Model,
+    RequestId, Rolling, Window,
+};
 use edgerush_kubernetes::{ApiServer, Scope};
-use edgerush_planes::data_plane::{DataPlane, DataPlanePorts};
+use edgerush_planes::data_plane::{
+    DataPlane, DataPlanePorts, DataPlaneRateLimiting, DataPlaneRateLimitingGlobal,
+};
 use edgerush_planes::objects::{ProxyService, data_plane_id, proxy_name};
-use edgerush_translate::{GatewayName, IpFamily, Plane, PortSettings};
+use edgerush_translate::{
+    GatewayName, IpFamily, Plane, PlaneRateLimitMode, PlaneRateLimiting, PortSettings,
+};
 
 use crate::across::{Across, follow_across, watch_parts};
 use crate::{Planes, Settings, WatchScope};
@@ -422,6 +429,12 @@ pub fn plane(data_plane: &DataPlane, own: &Own) -> Result<Plane, Unusable> {
             port_settings(settings).map_err(|(field, why)| unusable(at(&field), why))?,
         );
     }
+    let rate_limiting = spec
+        .rate_limiting
+        .as_ref()
+        .map(rate_limiting)
+        .transpose()
+        .map_err(|(field, why)| unusable(format!("rateLimiting.{field}"), why))?;
     let ingress = spec.ingress.as_ref();
     let (http_port, https_port) = match ingress {
         Some(ingress) => {
@@ -485,6 +498,91 @@ pub fn plane(data_plane: &DataPlane, own: &Own) -> Result<Plane, Unusable> {
             own_service: Some(own_service),
             ..edgerush_config::DataPlane::default()
         },
+        rate_limiting,
+    })
+}
+
+/// How the data plane enforces its rate limits, as `limiting` states it, and its global
+/// limits, each the limits file's own (05 §1); or the field, below `rateLimiting`, and why it
+/// cannot be.
+fn rate_limiting(limiting: &DataPlaneRateLimiting) -> Result<PlaneRateLimiting, (String, String)> {
+    let mode = match limiting.mode.as_str() {
+        "Disabled" => PlaneRateLimitMode::Off,
+        "Local" => PlaneRateLimitMode::Local,
+        other => {
+            return Err((
+                "mode".to_owned(),
+                format!("`{other}` is not Disabled or Local"),
+            ));
+        }
+    };
+    let max_key_bytes = limiting
+        .max_key_bytes
+        .map(|bytes| {
+            number(bytes, 1)
+                .ok_or_else(|| ("maxKeyBytes".to_owned(), format!("{bytes} is out of range")))
+        })
+        .transpose()?;
+    let global = limiting
+        .global
+        .iter()
+        .flatten()
+        .map(|limit| {
+            global_limit(limit)
+                .map_err(|(field, why)| (format!("global[{}].{field}", limit.name), why))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(PlaneRateLimiting {
+        mode,
+        max_key_bytes,
+        global,
+    })
+}
+
+/// One of a DataPlane's global limits, written as the limits file writes one; or the field,
+/// below the limit, and why it cannot be.
+fn global_limit(limit: &DataPlaneRateLimitingGlobal) -> Result<Limit, (String, String)> {
+    let key = match limit.key.as_str() {
+        "Client" => "client",
+        other => return Err(("key".to_owned(), format!("`{other}` is not Client"))),
+    };
+    let count = |field: &str, value: i64| {
+        number(value, 1).ok_or_else(|| (field.to_owned(), format!("{value} is out of range")))
+    };
+    let stated = &limit.model;
+    let model = match (&stated.bucket, &stated.fixed_window, &stated.rolling_window) {
+        (Some(bucket), None, None) => Model::Bucket(Bucket {
+            rate: bucket.rate.clone(),
+            burst: count("model.bucket.burst", bucket.burst)?,
+        }),
+        (None, Some(window), None) => Model::FixedWindow(Window {
+            limit: count("model.fixedWindow.limit", window.limit)?,
+            window: window.window.clone(),
+        }),
+        (None, None, Some(window)) => Model::RollingWindow(Rolling {
+            limit: count("model.rollingWindow.limit", window.limit)?,
+            window: window.window.clone(),
+            slots: window
+                .slots
+                .map(|slots| count("model.rollingWindow.slots", slots))
+                .transpose()?,
+        }),
+        _ => {
+            return Err((
+                "model".to_owned(),
+                "one of bucket, fixedWindow and rollingWindow is needed, and only one".to_owned(),
+            ));
+        }
+    };
+    Ok(Limit {
+        name: limit.name.clone(),
+        matches: limit.r#match.as_ref().map(|matches| LimitMatch {
+            methods: matches.methods.clone().unwrap_or_default(),
+            path_prefix: matches.path_prefix.clone(),
+        }),
+        key: key.to_owned(),
+        model,
+        dry_run: limit.dry_run.unwrap_or(false),
     })
 }
 

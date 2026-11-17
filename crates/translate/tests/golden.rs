@@ -3,7 +3,8 @@
 //! Each directory under `tests/golden/` is a case: `manifests.yaml`, the objects as
 //! `kubectl apply` would take them; `config.yaml`, the config expected, written as the
 //! development harness's file is, without the certificates' contents, which a config file
-//! does not hold; `report.txt`, the report expected, a finding a line, what was left out
+//! does not hold, nor its limits; where the case says, `limits.yaml`, the limits the config
+//! carries, written as the limits file is (none otherwise); `report.txt`, the report expected, a finding a line, what was left out
 //! first, then the paths whose backend is not there, then what of a `tls` is not served as
 //! it lists it, then the paths shadowed; where the case says, `certificates.txt`, the names of the
 //! certificates the config carries, a line each (none otherwise); and, where the case says,
@@ -137,8 +138,15 @@ fn every_case_translates_to_its_config_and_report() {
             let expected: usize = read(&passed_over).trim().parse().unwrap();
             assert_eq!(translation.passed_over, expected, "{name}: passed over");
         }
-        let expected: Config = serde_saphyr::from_str(&read(&case.join("config.yaml")))
+        let mut expected: Config = serde_saphyr::from_str(&read(&case.join("config.yaml")))
             .unwrap_or_else(|error| panic!("{name}: config.yaml: {error}"));
+        let limits = case.join("limits.yaml");
+        if limits.exists() {
+            expected.limits = Some(
+                serde_saphyr::from_str(&read(&limits))
+                    .unwrap_or_else(|error| panic!("{name}: limits.yaml: {error}")),
+            );
+        }
         let mut config = translation.config.clone();
         let certificates: Vec<String> = std::mem::take(&mut config.certificates)
             .into_keys()
@@ -147,7 +155,15 @@ fn every_case_translates_to_its_config_and_report() {
         let written = serde_saphyr::to_string(&config).unwrap();
         let read_back: Config = serde_saphyr::from_str(&written)
             .unwrap_or_else(|error| panic!("{name}: the config written: {error}\n{written}"));
-        assert_eq!(read_back, config, "{name}: the config written, read back");
+        // Written, a config holds no limits, as a config file never does.
+        let unlimited = Config {
+            limits: None,
+            ..config.clone()
+        };
+        assert_eq!(
+            read_back, unlimited,
+            "{name}: the config written, read back"
+        );
         let listed = case.join("certificates.txt");
         let expected: Vec<String> = if listed.exists() {
             read(&listed).lines().map(str::to_owned).collect()

@@ -10,7 +10,8 @@
 #
 # Then:
 #   - a ControlPlane and DataPlanes of each kind (Ingress, Gateway API, both) are admitted,
-#     and so is every golden case's resource of crates/planes;
+#     and so is every golden case's resource of crates/planes, and DataPlanes limiting
+#     locally under a limit of each model, and with rate limiting disabled;
 #   - each resource the CRDs' schema and CEL rules are to refuse is refused, and says why:
 #     a name that is no DNS label or too long for its Service's, a watch scope's selector
 #     without Selector or Selector without one, no replicas, a DataPlane with neither
@@ -22,7 +23,11 @@
 #     no requirement, for ControlPlanes or for what they watch, with a selector where it
 #     takes none or none where it takes one, of a scope it cannot allow, or of an operator
 #     Kubernetes does not have; a DataPlane naming a Gateway beside a gateway or ingress of
-#     its own; a Gateway-first entry holding ingress, or two entries of one class;
+#     its own; a Gateway-first entry holding ingress, or two entries of one class; rate
+#     limiting of a mode the DataPlane does not take or of none, a bound on keys with it
+#     disabled, a limit of no model or of two, keyed by what it does not know, a rate or a
+#     window of no unit, a rolling window of one slot, a method in lower case, a path
+#     prefix that is no path, and two limits of one name;
 #   - a Service holding externalIPs is refused written as a control plane's ServiceAccount,
 #     and admitted written by another; one without them is admitted from either;
 #   - beyond its own namespace, under the role bound there for a generated DataPlane, a
@@ -215,6 +220,35 @@ refused "a file access log of no path" "path must be given" "$(data_plane public
   ports: [{ port: 80, accessLog: { type: File } }]')"
 refused "a ClusterIP Service with a load balancer class" "a LoadBalancer's alone" "$(data_plane public '  ingress: { httpPort: 80, httpsPort: 443 }
   service: { type: ClusterIP, loadBalancerClass: example.com/lb }')"
+# A DataPlane's rate limiting: `limiting <rateLimiting>`, a DataPlane of Ingress with it.
+limiting() {
+    data_plane public "  ingress: { httpPort: 80, httpsPort: 443 }
+  rateLimiting: $1"
+}
+# `limit <fields>`: one limit, of name per-client, with `fields`, limited locally.
+limit() {
+    limiting "{ mode: Local, global: [{ name: per-client, $1 }] }"
+}
+admitted "a DataPlane limiting locally under a limit of each model" "$(limiting '
+    mode: Local
+    maxKeyBytes: 1048576
+    global:
+      - { name: per-client, key: Client, model: { bucket: { rate: 100/s, burst: 200 } } }
+      - { name: writes, match: { methods: [POST], pathPrefix: /v1/ }, key: Client, model: { fixedWindow: { limit: 10, window: 1m } }, dryRun: true }
+      - { name: hourly, key: Client, model: { rollingWindow: { limit: 100, window: 1h, slots: 60 } } }')"
+admitted "a DataPlane whose rate limiting is disabled" "$(limiting '{ mode: Disabled }')"
+refused "a rate-limiting mode the DataPlane does not take" "spec.rateLimiting.mode" "$(limiting '{ mode: Asynchronous }')"
+refused "rate limiting of no mode" "spec.rateLimiting.mode" "$(limiting '{ global: [] }')"
+refused "a bound on keys with rate limiting disabled" "not Disabled" "$(limiting '{ mode: Disabled, maxKeyBytes: 1048576 }')"
+refused "a limit of no model" "one of bucket, fixedWindow and rollingWindow" "$(limit 'key: Client, model: {}')"
+refused "a limit of two models" "one of bucket, fixedWindow and rollingWindow" "$(limit 'key: Client, model: { bucket: { rate: 1/s, burst: 1 }, fixedWindow: { limit: 1, window: 1s } }')"
+refused "a limit keyed by what it does not know" "spec.rateLimiting.global[0].key" "$(limit 'key: Header, model: { bucket: { rate: 1/s, burst: 1 } }')"
+refused "a rate of no unit" "spec.rateLimiting.global[0].model.bucket.rate" "$(limit 'key: Client, model: { bucket: { rate: "100", burst: 1 } }')"
+refused "a window of no unit" "spec.rateLimiting.global[0].model.fixedWindow.window" "$(limit 'key: Client, model: { fixedWindow: { limit: 1, window: "60" } }')"
+refused "a rolling window of one slot" "spec.rateLimiting.global[0].model.rollingWindow.slots" "$(limit 'key: Client, model: { rollingWindow: { limit: 1, window: 1s, slots: 1 } }')"
+refused "a method in lower case" "spec.rateLimiting.global[0].match.methods[0]" "$(limit 'match: { methods: [post] }, key: Client, model: { bucket: { rate: 1/s, burst: 1 } }')"
+refused "a path prefix that is no path" "spec.rateLimiting.global[0].match.pathPrefix" "$(limit 'match: { pathPrefix: v1 }, key: Client, model: { bucket: { rate: 1/s, burst: 1 } }')"
+refused "two limits of one name" "Duplicate value" "$(limiting '{ mode: Local, global: [{ name: a, key: Client, model: { bucket: { rate: 1/s, burst: 1 } } }, { name: a, key: Client, model: { bucket: { rate: 2/s, burst: 1 } } }] }')"
 
 # A rule on a change: made, then changed.
 k apply -f - <<<"$(data_plane public '  ingress: { httpPort: 80, httpsPort: 443 }

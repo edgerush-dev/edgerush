@@ -32,11 +32,12 @@
 use backend_tls::{Outcome, Policies};
 use edgerush_certificates::Identity;
 use edgerush_config::{
-    Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, GrpcMethod, Header,
-    HeaderChanges, Hostname, Listener, ListenerCertificate, LoadBalancer, Match, PathMatch,
-    Protocol, Query, Redirect, Route, Rule, Scheme, SharingHostname, SharingListener, StatedNames,
-    TcpRoute, TlsRoute, UdpRoute, Upstream, UpstreamProtocol, UpstreamTls, ValueMatch,
-    WellKnownAuthorities, Wildcard, compile, is_spiffe_id,
+    Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, Global, GrpcMethod,
+    Header, HeaderChanges, Hostname, Limit, Limits, Listener, ListenerCertificate, LoadBalancer,
+    Match, PathMatch, Protocol, Query, RateLimitMode, RateLimiting, Redirect, Route, Rule, Scheme,
+    SharingHostname, SharingListener, StatedNames, TcpRoute, TlsRoute, UdpRoute, Upstream,
+    UpstreamProtocol, UpstreamTls, ValueMatch, WellKnownAuthorities, Wildcard, compile,
+    is_spiffe_id,
 };
 use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use edgerush_gateway_api::gateway::Gateway;
@@ -154,6 +155,63 @@ pub struct Plane {
     /// ([07 §1](../../../docs/07-config-and-dsl.md)), written into every config as they are.
     #[serde(default)]
     pub data_plane: DataPlane,
+    /// How the data plane enforces its rate limits, and the limits every request it forwards
+    /// is under ([05 §1](../../../docs/05-operator.md)), written into every config as they
+    /// are. None, and its configs have no rate limiting and no limits.
+    #[serde(default)]
+    pub rate_limiting: Option<PlaneRateLimiting>,
+}
+
+/// How a data plane enforces its rate limits, and its global limits: a DataPlane's
+/// `rateLimiting` ([05 §1](../../../docs/05-operator.md)). Only the modes that need no
+/// rate-limiting service, until the operator deploys one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlaneRateLimiting {
+    /// Which mode.
+    pub mode: PlaneRateLimitMode,
+    /// Bytes the limits' keys may hold, as the config's `rate_limiting.max_key_bytes`;
+    /// the data plane's own bound when left out.
+    #[serde(default)]
+    pub max_key_bytes: Option<u64>,
+    /// The limits every request the data plane forwards is under, each written as the
+    /// limits file writes one ([07 §2](../../../docs/07-config-and-dsl.md)).
+    #[serde(default)]
+    pub global: Vec<Limit>,
+}
+
+/// A data plane's mode of rate limiting, among those that need no rate-limiting service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaneRateLimitMode {
+    /// None enforced, nothing counted; the limits validated.
+    Off,
+    /// Each process on what it sees alone.
+    Local,
+}
+
+impl PlaneRateLimiting {
+    /// The config's `rate_limiting` of it, and the limits the config carries: the global
+    /// limits, if there are any.
+    fn written(&self) -> (RateLimiting, Option<Limits>) {
+        let rate_limiting = RateLimiting {
+            mode: match self.mode {
+                PlaneRateLimitMode::Off => RateLimitMode::Off,
+                PlaneRateLimitMode::Local => RateLimitMode::Local,
+            },
+            max_key_bytes: self.max_key_bytes,
+            service: None,
+            synchronous: None,
+            experimental_header_keys: None,
+        };
+        let limits = (!self.global.is_empty()).then(|| Limits {
+            global: Global {
+                rate_limits: self.global.iter().map(|limit| limit.name.clone()).collect(),
+            },
+            limits: self.global.clone(),
+        });
+        (rate_limiting, limits)
+    }
 }
 
 /// A [`Plane`]'s `id`, refused unless it is a SPIFFE ID.
@@ -1776,8 +1834,17 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             false
         });
     }
+    let (rate_limiting, limits) = match &plane.rate_limiting {
+        Some(limiting) => {
+            let (rate_limiting, limits) = limiting.written();
+            (Some(rate_limiting), limits)
+        }
+        None => (None, None),
+    };
     let mut config = Config {
         data_plane: plane.data_plane.clone(),
+        rate_limiting,
+        limits,
         ..config_of(
             bound,
             routes,

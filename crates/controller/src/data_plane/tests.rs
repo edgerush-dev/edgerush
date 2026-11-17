@@ -5,7 +5,9 @@
 
 use super::*;
 use edgerush_config::{AccessLog, Forwarding, Http3, ListenerProxyProtocol, RequestId};
-use edgerush_translate::{GatewayName, IpFamily, PortSettings};
+use edgerush_translate::{
+    GatewayName, IpFamily, PlaneRateLimitMode, PlaneRateLimiting, PortSettings,
+};
 
 /// A DataPlane read from YAML, as the API server would give it.
 fn data_plane(yaml: &str) -> DataPlane {
@@ -211,6 +213,133 @@ fn a_value_the_data_plane_cannot_take_is_said_by_its_field() {
         unusable("  ingress: { httpPort: 80, httpsPort: 443 }\n  ipFamily: IPv5\n"),
         "DataPlane edge/web: ipFamily: `IPv5` is not IPv4, IPv6 or Dual"
     );
+}
+
+/// A DataPlane's rate limiting is its plane's: its mode, the config's `off` for `Disabled`,
+/// its bound on keys, and its global limits, each the limits file's own; none, and the plane
+/// has none.
+#[test]
+fn a_data_planes_rate_limiting_is_its_planes() {
+    let of = |rate_limiting: &str| {
+        plane(
+            &web(
+                1,
+                &format!(
+                    "  ingress: {{ httpPort: 80, httpsPort: 443 }}
+{rate_limiting}"
+                ),
+                "",
+            ),
+            &own(),
+        )
+        .unwrap()
+        .rate_limiting
+    };
+    assert_eq!(of(""), None);
+    assert_eq!(
+        of("  rateLimiting: { mode: Disabled }
+"),
+        Some(PlaneRateLimiting {
+            mode: PlaneRateLimitMode::Off,
+            max_key_bytes: None,
+            global: Vec::new(),
+        })
+    );
+    let stated = of("  rateLimiting:
+    mode: Local
+    maxKeyBytes: 1048576
+    global:
+      - { name: per-client, key: Client, model: { bucket: { rate: 100/s, burst: 200 } } }
+      - name: order-writes
+        match: { methods: [POST, PUT], pathPrefix: /v1/orders/ }
+        key: Client
+        model: { fixedWindow: { limit: 1000, window: 1m } }
+        dryRun: true
+      - { name: hourly, key: Client, model: { rollingWindow: { limit: 100, window: 1h, slots: 60 } } }
+      - { name: daily, match: { pathPrefix: /v1/ }, key: Client, model: { rollingWindow: { limit: 5000, window: 1d } } }
+");
+    let limits: edgerush_config::Limits = serde_saphyr::from_str(
+        "limits:
+  - { name: per-client, key: client, model: { bucket: { rate: 100/s, burst: 200 } } }
+  - name: order-writes
+    match: { methods: [POST, PUT], path_prefix: /v1/orders/ }
+    key: client
+    model: { fixed_window: { limit: 1000, window: 1m } }
+    dry_run: true
+  - { name: hourly, key: client, model: { rolling_window: { limit: 100, window: 1h, slots: 60 } } }
+  - { name: daily, match: { path_prefix: /v1/ }, key: client, model: { rolling_window: { limit: 5000, window: 1d } } }
+",
+    )
+    .unwrap();
+    assert_eq!(
+        stated,
+        Some(PlaneRateLimiting {
+            mode: PlaneRateLimitMode::Local,
+            max_key_bytes: Some(1_048_576),
+            global: limits.limits,
+        })
+    );
+}
+
+/// What a DataPlane's rate limiting holds that its schema let through and the data plane
+/// cannot take is said by its field, a limit by its name.
+#[test]
+fn a_rate_limiting_value_the_data_plane_cannot_take_is_said_by_its_field() {
+    let unusable = |rate_limiting: &str| {
+        plane(
+            &web(
+                1,
+                &format!(
+                    "  ingress: {{ httpPort: 80, httpsPort: 443 }}
+  rateLimiting: {rate_limiting}
+"
+                ),
+                "",
+            ),
+            &own(),
+        )
+        .unwrap_err()
+        .to_string()
+    };
+    let limit = |limit: &str| {
+        unusable(&format!(
+            "{{ mode: Local, global: [{{ name: per-client, {limit} }}] }}"
+        ))
+    };
+    assert_eq!(
+        unusable("{ mode: Off }"),
+        "DataPlane edge/web: rateLimiting.mode: `Off` is not Disabled or Local"
+    );
+    assert_eq!(
+        unusable("{ mode: Local, maxKeyBytes: 0 }"),
+        "DataPlane edge/web: rateLimiting.maxKeyBytes: 0 is out of range"
+    );
+    assert_eq!(
+        limit("key: Header, model: { bucket: { rate: 1/s, burst: 1 } }"),
+        "DataPlane edge/web: rateLimiting.global[per-client].key: `Header` is not Client"
+    );
+    assert_eq!(
+        limit("key: Client, model: { bucket: { rate: 1/s, burst: 0 } }"),
+        "DataPlane edge/web: rateLimiting.global[per-client].model.bucket.burst: 0 is out of range"
+    );
+    assert_eq!(
+        limit("key: Client, model: { fixedWindow: { limit: -1, window: 1s } }"),
+        "DataPlane edge/web: rateLimiting.global[per-client].model.fixedWindow.limit: -1 is out of range"
+    );
+    assert_eq!(
+        limit("key: Client, model: { rollingWindow: { limit: 1, window: 1s, slots: 0 } }"),
+        "DataPlane edge/web: rateLimiting.global[per-client].model.rollingWindow.slots: 0 is out of range"
+    );
+    for model in [
+        "{}",
+        "{ bucket: { rate: 1/s, burst: 1 }, fixedWindow: { limit: 1, window: 1s } }",
+    ] {
+        assert_eq!(
+            limit(&format!("key: Client, model: {model}")),
+            "DataPlane edge/web: rateLimiting.global[per-client].model: one of bucket, fixedWindow and rollingWindow is needed, and only one",
+            "{model}"
+        );
+    }
 }
 
 #[test]
