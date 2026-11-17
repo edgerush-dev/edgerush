@@ -38,7 +38,8 @@ use edgerush_planes::objects::{
     ProxyService, SERVICE_MANAGED_BY, Transports, control_plane_labels,
 };
 use edgerush_translate::{
-    Cluster, GatewayStatus, Object, Plane, PolicyStatus, RouteStatus, Translation, translate,
+    Cluster, GATEWAY_CONTROLLER, GatewayStatus, Object, Plane, PolicyStatus, RouteStatus,
+    Translation, translate,
 };
 use gateway_status::Programmed;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
@@ -486,8 +487,9 @@ async fn serve(
         services: start.follows(&parts),
         secrets: start.follows(&with_gateway_namespaces(&parts, &shape.gateways)),
         own_services: start.follows(&shape.services),
-        gateway_api: (!shape.gateways.is_empty())
+        gateway_api: (classes.is_some() || !shape.gateways.is_empty())
             .then(|| GatewayApi::start(&mut start, &shape.gateways)),
+        own_class: classes.is_some(),
         watched: match scope {
             WatchScope::Parts(parts) => watched(parts),
             WatchScope::Selector(_) => Some(Vec::new()),
@@ -670,7 +672,11 @@ async fn serve(
                 .values()
                 .filter_map(|served| served.handed_api.as_ref())
                 .collect();
-            gateway_api.write_shared(api, &handed, &**said).await;
+            let own = classes
+                .map(|classes| control_plane_labels(&classes.namespace, &classes.control_plane));
+            gateway_api
+                .write_shared(api, &handed, own.as_ref(), &**said)
+                .await;
         }
         // Until a change comes, or the bound a data plane's pods are waited on to run its
         // Gateway's generation, and then until its moment is over.
@@ -965,7 +971,8 @@ impl Drop for Tasks {
 struct GatewayApi {
     crds: Vec<(GatewayKind, Follow<CustomResourceDefinition>)>,
     /// Every Namespace, for the labels a listener's selector of namespaces matches: a kind
-    /// every cluster has, so followed whatever the CRDs say.
+    /// every cluster has, so followed whatever the CRDs say, while a data plane is a
+    /// Gateway.
     namespaces: Vec<Follow<Namespace>>,
     /// The namespaces of the data planes' Gateways: those Gateways are followed in, as no
     /// other Gateway is read (04 §2).
@@ -1001,7 +1008,11 @@ impl GatewayApi {
             .collect();
         Self {
             crds,
-            namespaces: start.follows(&[Scope::Cluster]),
+            namespaces: if gateways.is_empty() {
+                Vec::new()
+            } else {
+                start.follows(&[Scope::Cluster])
+            },
             gateway_namespaces: gateways.to_vec(),
             last: None,
             gateway_classes: None,
@@ -1033,10 +1044,12 @@ impl GatewayApi {
     /// cluster, Gateways in the namespaces of the data planes' Gateways; ListenerSets, HTTPRoutes,
     /// GRPCRoutes, TLSRoutes, TCPRoutes, UDPRoutes, ReferenceGrants and BackendTLSPolicies
     /// in `scope`, with the ConfigMaps there while BackendTLSPolicies are), and stops
-    /// following each it says is not.
+    /// following each it says is not; while no data plane is a Gateway, GatewayClasses
+    /// alone.
     fn follow(&mut self, served: &[(GatewayKind, Served)], start: &mut Start<'_>, scope: &[Scope]) {
+        let gateways = !self.gateway_namespaces.is_empty();
         for (kind, served) in served {
-            let on = served.is_served();
+            let on = served.is_served() && (gateways || *kind == GatewayKind::GatewayClass);
             match kind {
                 GatewayKind::GatewayClass => {
                     keep(&mut self.gateway_classes, on, || {
@@ -1096,7 +1109,9 @@ impl GatewayApi {
     }
 
     /// The follows made to follow the Gateways of `gateways`, the namespaces of the data
-    /// planes' Gateways now, Gateways and ListenerSets there, in the watch scope `parts`.
+    /// planes' Gateways now, Gateways and ListenerSets there, in the watch scope `parts`;
+    /// the kinds but GatewayClasses started as the first data plane is a Gateway, and
+    /// stopped as the last is no longer.
     fn reshape(&mut self, gateways: &[Scope], parts: &[Scope], start: &mut Start<'_>) {
         if let Some(follows) = &mut self.gateways {
             rescope(follows, gateways, start);
@@ -1104,7 +1119,18 @@ impl GatewayApi {
         if let Some(follows) = &mut self.listener_sets {
             rescope(follows, &with_gateway_namespaces(parts, gateways), start);
         }
+        let (were, are) = (!self.gateway_namespaces.is_empty(), !gateways.is_empty());
         self.gateway_namespaces = gateways.to_vec();
+        if were != are {
+            self.namespaces = if are {
+                start.follows(&[Scope::Cluster])
+            } else {
+                Vec::new()
+            };
+            if let Some(served) = self.last.clone() {
+                self.follow(&served, start, parts);
+            }
+        }
     }
 
     /// The follows of each kind followed in the watch scope made to follow `parts`, and
@@ -1279,50 +1305,45 @@ impl GatewayApi {
     /// plane's Gateway and the ListenerSets naming it at once, whether or not it still names
     /// one; and of each BackendTLSPolicy followed, an ancestor for each Gateway, whether or
     /// not a route of it reaches the policy. This controller's entries of a Gateway gone are
-    /// taken away. Only Gateways that are there are written of.
-    async fn write_shared(&self, api: &ApiServer, handed: &[&Handed], said: &dyn Fn(Said<'_>)) {
+    /// taken away. Only Gateways that are there are written of. And, of a ControlPlane's
+    /// control plane, `own` the labels the operator makes its class with, that class's
+    /// whether or not a Gateway of it is served: accepted before any is written, as Gateway
+    /// API tooling waits for, and saying nothing of a data plane.
+    async fn write_shared(
+        &self,
+        api: &ApiServer,
+        handed: &[&Handed],
+        own: Option<&BTreeMap<String, String>>,
+        said: &dyn Fn(Said<'_>),
+    ) {
         let now = lease::wall_clock();
         let there: Vec<(&Handed, Gateway)> = handed
             .iter()
             .filter_map(|handed| Some((*handed, self.gateway_of(handed)?)))
             .collect();
-        if there.is_empty() {
-            return;
-        }
-        let gateways_there: Vec<Object> = self
-            .gateways
-            .as_deref()
-            .map(objects)
-            .unwrap_or_default()
-            .iter()
-            .map(|gateway| Object {
-                kind: "Gateway",
-                namespace: gateway.metadata.namespace.clone().unwrap_or_default(),
-                name: gateway.metadata.name.clone().unwrap_or_default(),
-            })
-            .collect();
-        let followed: Vec<String> = self
-            .gateway_namespaces
-            .iter()
-            .filter_map(|scope| match scope {
-                Scope::Namespace(namespace) => Some(namespace.clone()),
-                _ => None,
-            })
-            .collect();
-        let gateways = gateway_status::Gateways {
-            namespaces: &followed,
-            there: &gateways_there,
-        };
-        // Each class once, whichever Gateways name it.
+        // Each class once, whichever Gateways name it, and the ControlPlane's own.
         let classes = self
             .gateway_classes
             .as_deref()
             .map(objects)
             .unwrap_or_default();
-        let named: BTreeSet<&str> = there
+        let mut named: BTreeSet<&str> = there
             .iter()
             .map(|(_, gateway)| gateway.spec.gateway_class_name.as_str())
             .collect();
+        if let Some(own) = own {
+            named.extend(
+                classes
+                    .iter()
+                    .filter(|class| class.spec.controller_name == GATEWAY_CONTROLLER)
+                    .filter(|class| {
+                        let held = class.metadata.labels.as_ref();
+                        own.iter()
+                            .all(|(key, value)| held.and_then(|held| held.get(key)) == Some(value))
+                    })
+                    .filter_map(|class| class.metadata.name.as_deref()),
+            );
+        }
         for name in named {
             let class = classes
                 .iter()
@@ -1351,6 +1372,33 @@ impl GatewayApi {
                 }
             }
         }
+        if there.is_empty() {
+            return;
+        }
+        let gateways_there: Vec<Object> = self
+            .gateways
+            .as_deref()
+            .map(objects)
+            .unwrap_or_default()
+            .iter()
+            .map(|gateway| Object {
+                kind: "Gateway",
+                namespace: gateway.metadata.namespace.clone().unwrap_or_default(),
+                name: gateway.metadata.name.clone().unwrap_or_default(),
+            })
+            .collect();
+        let followed: Vec<String> = self
+            .gateway_namespaces
+            .iter()
+            .filter_map(|scope| match scope {
+                Scope::Namespace(namespace) => Some(namespace.clone()),
+                _ => None,
+            })
+            .collect();
+        let gateways = gateway_status::Gateways {
+            namespaces: &followed,
+            there: &gateways_there,
+        };
         // A route's parents of the data planes': their Gateways, and each ListenerSet
         // naming one, taken or not.
         let parents_of_ours: Vec<Object> = there
@@ -1539,8 +1587,12 @@ struct Followed {
     /// The namespaces of the data planes' Services, where the control plane writes them,
     /// followed for what they are and the addresses they give.
     own_services: Vec<Follow<Service>>,
-    /// The Gateway API's kinds, where a data plane is a Gateway.
+    /// The Gateway API's kinds, where a data plane is a Gateway, and the CRDs and
+    /// GatewayClasses alone where none is but the control plane has a class of its own.
     gateway_api: Option<GatewayApi>,
+    /// Whether the control plane has a class of its own, a ControlPlane's: written whether
+    /// or not a data plane is a Gateway (04 §6).
+    own_class: bool,
     /// The namespaces watched, where not every one is: of a selector, those joined.
     watched: Option<Vec<String>>,
     /// The Namespaces a selector scope matches, where the scope is one.
@@ -1581,7 +1633,8 @@ impl Followed {
     /// The follows made to follow what `next` shapes: what it alone needs started, what it
     /// no longer needs stopped, and the rest followed on as it was, so that no data plane
     /// added or let go of begins another's follows again (05 §3). The Gateway API's kinds
-    /// are followed while any data plane is a Gateway.
+    /// are followed while any data plane is a Gateway, and its CRDs and GatewayClasses
+    /// always where the control plane has a class of its own.
     fn reshape(&mut self, next: Shape, start: &mut Start<'_>) {
         if next == self.shape {
             return;
@@ -1590,7 +1643,7 @@ impl Followed {
         rescope(&mut self.secrets, &secrets, start);
         rescope(&mut self.own_services, &next.services, start);
         rescope(&mut self.ready, &next.own_services, start);
-        if next.gateways.is_empty() {
+        if next.gateways.is_empty() && !self.own_class {
             self.gateway_api = None;
         } else if let Some(gateway_api) = &mut self.gateway_api {
             gateway_api.reshape(&next.gateways, &self.parts, start);

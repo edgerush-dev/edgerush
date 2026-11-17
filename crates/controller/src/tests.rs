@@ -345,6 +345,7 @@ fn every_follows_objects_are_translated_and_its_secrets_looked_at() {
         )],
         own_services: Vec::new(),
         gateway_api: None,
+        own_class: false,
         watched: watched(&[
             Scope::Namespace("shop".to_owned()),
             Scope::Namespace("blog".to_owned()),
@@ -480,6 +481,7 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
         secrets: Vec::new(),
         own_services: Vec::new(),
         gateway_api: Some(gateway_api),
+        own_class: false,
         watched: None,
         shape: Shape::default(),
         selected: None,
@@ -2015,7 +2017,7 @@ spec:
     kinds
         .write_own(&api, &handed, &addresses, &programmed, &said)
         .await;
-    kinds.write_shared(&api, &[&handed], &said).await;
+    kinds.write_shared(&api, &[&handed], None, &said).await;
     assert_eq!(
         heard.borrow().lines,
         [
@@ -2189,7 +2191,7 @@ spec:
     kinds
         .write_own(&api, &handed, &addresses, &programmed, &said)
         .await;
-    kinds.write_shared(&api, &[&handed], &said).await;
+    kinds.write_shared(&api, &[&handed], None, &said).await;
     assert_eq!(fake.seen().len(), 11, "a status written again");
 }
 
@@ -2257,6 +2259,7 @@ fn the_leader_merges_every_replicas_report_and_counts_the_ready_pods() {
         secrets: Vec::new(),
         own_services: Vec::new(),
         gateway_api: None,
+        own_class: false,
         watched: None,
         shape: Shape::default(),
         selected: None,
@@ -2639,6 +2642,7 @@ async fn the_gateways_namespace_joining_keeps_its_secrets_translated() {
                 },
                 own_services: Vec::new(),
                 gateway_api: None,
+                own_class: false,
                 watched: Some(Vec::new()),
                 selected: None,
                 parts: Vec::new(),
@@ -3599,7 +3603,9 @@ status:
     };
     let heard: Rc<RefCell<Heard>> = Rc::default();
     let said = hear(&heard);
-    kinds.write_shared(&api, &[&web, &api_handed], &said).await;
+    kinds
+        .write_shared(&api, &[&web, &api_handed], None, &said)
+        .await;
     assert_eq!(
         heard.borrow().lines,
         [
@@ -3637,6 +3643,202 @@ status:
     };
     assert_eq!(parents(1), named(&[("edge", "web"), ("edge", "api")]));
     assert_eq!(parents(2), named(&[("teams", "theirs")]));
+}
+
+/// A ControlPlane's control plane serving no Gateway, as before the first is written of
+/// its class, accepts the class the operator made for it all the same, as Gateway API
+/// tooling waits for that before it writes one (04 §6): that class alone, not one of its
+/// controller made by hand nor one of another controller carrying its labels. The
+/// development harness, which has no class of its own, writes none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_planes_own_class_is_accepted_before_any_gateway_of_it_is_served() {
+    let own = edgerush_planes::objects::control_plane_labels("edge", "edge");
+    let made = own
+        .iter()
+        .map(|(key, value)| format!("{key}: {value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let class = |name: &str, labels: &str, controller: &str| -> GatewayClass {
+        serde_saphyr::from_str(&format!(
+            "metadata: {{ name: {name}, generation: 2, resourceVersion: '5', labels: {{ {labels} }} }}
+spec: {{ controllerName: {controller} }}"
+        ))
+        .unwrap()
+    };
+    let classes = vec![
+        class("edge", &made, "edgerush.dev/gateway-controller"),
+        class("by-hand", "", "edgerush.dev/gateway-controller"),
+        class("theirs", &made, "example.com/gateway-controller"),
+    ];
+    let fake = Fake::start_by_method(&["127.0.0.1"], move |method, path| {
+        if method == "PUT"
+            && path == "/apis/gateway.networking.k8s.io/v1/gatewayclasses/edge/status"
+        {
+            answer(200, "{}")
+        } else {
+            answer(404, r#"{"kind":"Status","code":404,"message":"not found"}"#)
+        }
+    })
+    .await;
+    let api = fake.client(&token("controller-own-class", "secret"), Timing::default());
+    let served: Vec<(GatewayKind, Served)> = GatewayKind::ALL
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                Served::Served {
+                    release: Some("v1.7.0".to_owned()),
+                },
+            )
+        })
+        .collect();
+    let kinds = GatewayApi {
+        crds: Vec::new(),
+        namespaces: Vec::new(),
+        gateway_namespaces: vec![Scope::Cluster],
+        last: Some(served),
+        gateway_classes: Some(vec![follow_of("gatewayclasses", true, classes)]),
+        gateways: Some(vec![follow_of("gateways", true, Vec::new())]),
+        listener_sets: None,
+        http_routes: None,
+        grpc_routes: None,
+        tls_routes: None,
+        tcp_routes: None,
+        udp_routes: None,
+        reference_grants: None,
+        backend_tls_policies: None,
+        config_maps: None,
+    };
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let said = hear(&heard);
+    kinds.write_shared(&api, &[], None, &said).await;
+    assert!(heard.borrow().lines.is_empty(), "the harness wrote a class");
+    kinds.write_shared(&api, &[], Some(&own), &said).await;
+    assert_eq!(heard.borrow().lines, ["status of GatewayClass edge"]);
+    let written: serde_json::Value = serde_json::from_str(&fake.seen()[0].body).unwrap();
+    let conditions: Vec<(&str, &str, i64)> = written["status"]["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|condition| {
+            (
+                condition["type"].as_str().unwrap(),
+                condition["status"].as_str().unwrap(),
+                condition["observedGeneration"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        conditions,
+        [("Accepted", "True", 2), ("SupportedVersion", "True", 2)]
+    );
+}
+
+/// A ControlPlane's control plane serving no DataPlane follows the Gateway API's CRDs and
+/// GatewayClasses alone, and accepts its own class (04 §2, §6); the first DataPlane that is
+/// a Gateway starts the other kinds' follows, Namespaces among them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_plane_serving_no_gateway_follows_the_classes_alone() {
+    let labels = edgerush_planes::objects::control_plane_labels("edge", "edge");
+    let class = serde_json::json!({
+        "metadata": { "name": "edgerush", "generation": 1, "resourceVersion": "5", "labels": labels },
+        "spec": { "controllerName": "edgerush.dev/gateway-controller" },
+    });
+    let classes = format!(r#"{{"metadata":{{"resourceVersion":"5"}},"items":[{class}]}}"#);
+    let gateway_api = "/apis/gateway.networking.k8s.io/v1/";
+    let fake = Fake::start_by_method(&["127.0.0.1"], move |method, path| {
+        if path.contains("watch=true") {
+            return open();
+        }
+        let named = GatewayKind::ALL.into_iter().find(|kind| {
+            path.starts_with("/apis/apiextensions.k8s.io/v1/customresourcedefinitions?")
+                && path.contains(&format!("metadata.name%3D{}", kind.crd()))
+        });
+        if let Some(kind) = named {
+            page(&[crd(kind, &["v1"])])
+        } else if method == "PUT" && path == format!("{gateway_api}gatewayclasses/edgerush/status")
+        {
+            answer(200, "{}")
+        } else if path.starts_with(&format!("{gateway_api}gatewayclasses?")) {
+            answer(200, &classes)
+        } else if path.starts_with(gateway_api) {
+            answer(200, r#"{"metadata":{"resourceVersion":"5"},"items":[]}"#)
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page::<IngressClass>(&[])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page::<Ingress>(&[])
+        } else if path.starts_with("/api/v1/services?") {
+            page::<Service>(&[])
+        } else if path.starts_with("/api/v1/secrets?") {
+            page::<Secret>(&[])
+        } else if path.starts_with("/api/v1/namespaces?") {
+            page::<Namespace>(&[])
+        } else {
+            answer(500, "")
+        }
+    })
+    .await;
+    let api = fake.client(
+        &token("controller-classes-alone", "secret"),
+        Timing::default(),
+    );
+    let asked = |what: &str| {
+        fake.seen()
+            .iter()
+            .filter(|seen| seen.path.starts_with(what) && !seen.path.contains("watch=true"))
+            .count()
+    };
+    let httproutes = format!("{gateway_api}httproutes?");
+    let class_status = format!("{gateway_api}gatewayclasses/edgerush/status");
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (settings, planes) = watch::channel(Planes::new());
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&Rc::default());
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        planes,
+                        Some(Classes {
+                            control_plane: "edge".to_owned(),
+                            namespace: "edge".to_owned(),
+                            kept: watch::channel(Some(BTreeSet::new())).1,
+                        }),
+                        Debounce::default(),
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("its own class accepted", || asked(&class_status) > 0).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let others: Vec<String> = fake
+                .seen()
+                .iter()
+                .filter(|seen| {
+                    seen.path.starts_with(gateway_api)
+                        && !seen
+                            .path
+                            .starts_with(&format!("{gateway_api}gatewayclasses"))
+                })
+                .map(|seen| seen.path.clone())
+                .collect();
+            assert_eq!(
+                others,
+                Vec::<String>::new(),
+                "a kind but the classes followed"
+            );
+            assert_eq!(asked("/api/v1/namespaces?"), 0, "Namespaces followed");
+            settings.send_replace(only(harness(&gateway_plane())));
+            until("the routes followed", || asked(&httproutes) > 0).await;
+            assert!(asked("/api/v1/namespaces?") > 0, "Namespaces not followed");
+            controlling.abort();
+        })
+        .await;
 }
 
 /// A Gateway of a generated DataPlane that sets `infrastructure.parametersRef` is held as
