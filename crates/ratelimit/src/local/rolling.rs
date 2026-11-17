@@ -18,7 +18,7 @@
 //! one too few, which the other order would leave.
 
 use super::sync::{AtomicU32, AtomicU64, AtomicU128, Ordering};
-use super::{CLOSED, Look, Rolling, Seen};
+use super::{CLOSED, Look, Rolling};
 use crate::word::{local, local_parts};
 
 #[cfg(test)]
@@ -72,11 +72,6 @@ impl Ring {
         // An `Arc`'s two counts beside the terms.
         (2 * size_of::<usize>() + size_of::<super::Terms>() + size_of::<Self>()) as u64
             + slots * entry
-    }
-
-    /// The window as its slots cover it.
-    pub(super) const fn window(&self) -> u64 {
-        self.len * self.slots
     }
 
     /// A new key's word at `now`: nothing counted, nothing to take off.
@@ -203,10 +198,7 @@ impl Ring {
                 wait: self.wait(total, slot, now),
             };
         }
-        Look::Fits {
-            seen: Seen::of(seen),
-            from: total,
-        }
+        Look::Fits
     }
 
     /// One request at `now`, admitted if it fits.
@@ -224,14 +216,10 @@ impl Ring {
         let Some((mut seen, total)) = self.moved_on(state, slot) else {
             return Look::Closed;
         };
-        let uncharged = |seen: u128, low: u64| Look::Fits {
-            seen: Seen::of(seen),
-            from: low,
-        };
         let (_, through) = local_parts(seen);
         if through > slot {
             // Its slot has left the window, a clock a window behind: admitted, uncharged.
-            return uncharged(seen, total);
+            return Look::Fits;
         }
         if checked && total >= self.limit {
             return Look::Full {
@@ -240,7 +228,7 @@ impl Ring {
         }
         if !self.cells.add(slot, self.slots) {
             // Its entry holds a later lap's count: its slot has left the window since.
-            return uncharged(seen, total);
+            return Look::Fits;
         }
         loop {
             let (low, through) = local_parts(seen);
@@ -251,7 +239,7 @@ impl Ring {
             if through > slot {
                 // Its slot left the window while it waited: admitted, uncharged.
                 self.cells.sub(slot, self.slots);
-                return uncharged(seen, low);
+                return Look::Fits;
             }
             if checked && low >= self.limit {
                 self.cells.sub(slot, self.slots);
@@ -265,12 +253,7 @@ impl Ring {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => {
-                    return Look::Fits {
-                        seen: Seen::of(seen),
-                        from: low,
-                    };
-                }
+                Ok(_) => return Look::Fits,
                 Err(now_seen) => seen = now_seen,
             }
         }
