@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 /// translates, behind one address. It serves Ingress, Gateway API or both: with
 /// `ingress`, the operator makes its IngressClass, named `<controlplane>.<dataplane>`;
 /// with `gateway`, its Gateway, named as it is, of the GatewayClass of its
-/// ControlPlane.
+/// ControlPlane. One with `gatewayRef` the operator generates for a Gateway written
+/// alone, from its class's PlatformDefaults entry, and serves that Gateway.
 ///
 /// Its name is a DNS label of at most 48 characters, so that its Service,
 /// `edgerush-proxy-<name>`, is a DNS label too.
@@ -30,7 +31,7 @@ pub struct DataPlane {
 /// Spec is what the data plane is to be.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DataPlaneSpec {
-    /// ControlPlaneRef names the ControlPlane, in the DataPlane's own namespace, that serves it.
+    /// ControlPlaneRef names the ControlPlane that serves it.
     #[serde(rename = "controlPlaneRef")]
     #[serde(default)]
     pub control_plane_ref: DataPlaneControlPlaneRef,
@@ -41,6 +42,14 @@ pub struct DataPlaneSpec {
     /// through ListenerSets attached to it, where allowedListeners lets them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<DataPlaneGateway>,
+    /// GatewayRef, present, has the data plane serve the Gateway of this name in the
+    /// DataPlane's namespace, a Gateway its user wrote, of which the operator makes
+    /// nothing. It marks the DataPlane the operator generates for a Gateway of a
+    /// class whose PlatformDefaults entry asks for one: only the operator may write
+    /// one, and it serves that Gateway alone.
+    #[serde(rename = "gatewayRef")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_ref: Option<DataPlaneGatewayRef>,
     /// Ingress, present, has the data plane serve the Ingresses of its IngressClass,
     /// which the operator makes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,12 +87,18 @@ pub struct DataPlaneSpec {
     pub service: DataPlaneService,
 }
 
-/// ControlPlaneRef names the ControlPlane, in the DataPlane's own namespace, that serves it.
+/// ControlPlaneRef names the ControlPlane that serves it.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DataPlaneControlPlaneRef {
     /// Name is the ControlPlane's name.
     #[serde(default)]
     pub name: String,
+    /// Namespace is the ControlPlane's namespace: the DataPlane's own unless said.
+    /// Another is accepted only for the DataPlane the operator generates for a
+    /// Gateway of that ControlPlane's class, and only the operator may write one
+    /// that names another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 /// Gateway, present, has the data plane serve Gateway API as a Gateway the
@@ -1090,6 +1105,18 @@ pub struct DataPlaneGatewayTlsFrontendPerPortTlsValidationCaCertificateRefs {
     /// Support: Core
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+}
+
+/// GatewayRef, present, has the data plane serve the Gateway of this name in the
+/// DataPlane's namespace, a Gateway its user wrote, of which the operator makes
+/// nothing. It marks the DataPlane the operator generates for a Gateway of a
+/// class whose PlatformDefaults entry asks for one: only the operator may write
+/// one, and it serves that Gateway alone.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct DataPlaneGatewayRef {
+    /// Name is the Gateway's name.
+    #[serde(default)]
+    pub name: String,
 }
 
 /// Ingress, present, has the data plane serve the Ingresses of its IngressClass,

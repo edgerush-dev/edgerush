@@ -317,6 +317,7 @@ async fn an_accepted_resource_is_finalized_then_made_then_reported() {
         data_planes: vec![data_plane()],
         children: Vec::new(),
         gateway_classes: Vec::new(),
+        gateways: Vec::new(),
         gateway_api: SERVED,
     };
     let said = Said::default();
@@ -440,6 +441,7 @@ fn after_first_of(
         data_planes: vec![dp],
         children,
         gateway_classes: Vec::new(),
+        gateways: Vec::new(),
         gateway_api,
     }
 }
@@ -652,6 +654,7 @@ async fn an_object_of_its_name_not_the_operators_is_left_alone_and_said() {
         data_planes: vec![data_plane()],
         children: Vec::new(),
         gateway_classes: Vec::new(),
+        gateways: Vec::new(),
         gateway_api: SERVED,
     };
     assert!(
@@ -744,6 +747,7 @@ async fn a_refused_control_plane_makes_nothing_and_its_data_plane_waits_on_it() 
         data_planes: vec![data_plane()],
         children: Vec::new(),
         gateway_classes: Vec::new(),
+        gateways: Vec::new(),
         gateway_api: SERVED,
     };
     assert!(
@@ -1095,6 +1099,7 @@ async fn without_gateway_apis_crds_the_rest_is_made_and_a_gateway_waits_on_them(
         data_planes: vec![data_plane_with_gateway()],
         children: Vec::new(),
         gateway_classes: Vec::new(),
+        gateways: Vec::new(),
         gateway_api: NO_GATEWAY_API,
     };
     let said = Said::default();
@@ -1181,6 +1186,7 @@ async fn gateway_apis_crds_installed_later_have_what_was_left_out_made() {
     let installed = Seen {
         platform_defaults: None,
         namespaces: BTreeMap::new(),
+        gateways: Vec::new(),
         gateway_api: SERVED,
         ..waiting
     };
@@ -2127,6 +2133,7 @@ fn three_classes() -> Seen {
             },
             gateway_class("other", "example.com/gateway-controller", 1),
         ],
+        gateways: Vec::new(),
         gateway_api: SERVED,
     }
 }
@@ -2252,4 +2259,175 @@ fn the_class_the_operator_makes_is_never_refused() {
         "edgerush.dev/gateway-controller"
     );
     assert!(!classes::refused(&class, &[control_plane("Same")]));
+}
+
+/// The class the operator made for [`control_plane`], as followed.
+fn made_class() -> GatewayClass {
+    let (for_control_plane, _) = made();
+    let class = for_control_plane
+        .iter()
+        .find(|object| object.kind() == "GatewayClass")
+        .unwrap();
+    serde_json::from_value(serde_json::to_value(class).unwrap()).unwrap()
+}
+
+/// Gateway `web` of namespace `edge`, written alone, of the class of [`control_plane`],
+/// with `infrastructure`.
+fn gateway_alone(infrastructure: serde_json::Value) -> Gateway {
+    serde_json::from_value(serde_json::json!({
+        "metadata": { "name": "web", "namespace": "edge", "uid": "gw-uid", "generation": 2 },
+        "spec": {
+            "gatewayClassName": "edge",
+            "infrastructure": infrastructure,
+            "listeners": [{ "name": "http", "port": 80, "protocol": "HTTP" }],
+        },
+    }))
+    .unwrap()
+}
+
+/// What a step sees of [`control_plane`] with its class, an entry for it, and `gateways`
+/// beside `data_planes`.
+fn gateway_first_seen(gateways: Vec<Gateway>, data_planes: Vec<DataPlane>) -> Seen {
+    Seen {
+        platform_defaults: Some(
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "name": "default" },
+                "spec": { "gatewayClasses": [{ "name": "edge", "dataPlane": {} }] },
+            }))
+            .unwrap(),
+        ),
+        namespaces: BTreeMap::new(),
+        control_planes: vec![control_plane("Same")],
+        data_planes,
+        children: Vec::new(),
+        gateway_classes: vec![made_class()],
+        gateways,
+        gateway_api: SERVED,
+    }
+}
+
+const GENERATED: &str = "/apis/gateway.edgerush.dev/v1alpha1/namespaces/edge/dataplanes/web-edge";
+
+/// What a generated DataPlane is applied by: a field manager of its own, apart from the
+/// finalizer's, whose apply of the metadata alone would otherwise take its spec away.
+const GENERATOR_APPLY: &str = "?fieldManager=edgerush-operator-generator&force=true";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gateway_written_alone_gets_its_data_plane_applied_once() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let seen = gateway_first_seen(vec![gateway_alone(serde_json::json!({}))], Vec::new());
+    assert!(
+        operator.step(&api, &seen, &time(0), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    let applied = asked
+        .iter()
+        .find(|asked| {
+            asked.method == "PATCH" && asked.path == format!("{GENERATED}{GENERATOR_APPLY}")
+        })
+        .unwrap_or_else(|| panic!("not applied: {:?}", writes(&asked)));
+    let body: serde_json::Value = serde_json::from_str(&applied.body).unwrap();
+    let wanted = edgerush_planes::gateway_first::data_plane(
+        &seen.gateways[0],
+        &serde_json::from_value(serde_json::json!({})).unwrap(),
+        &seen.control_planes[0],
+    )
+    .unwrap();
+    assert_eq!(
+        body,
+        serde_json::to_value(edgerush_planes::gateway_first::applied(&wanted)).unwrap()
+    );
+    assert!(
+        said.any("DataPlane edge/web-edge: generated for Gateway edge/web"),
+        "{:?}",
+        said.0
+    );
+    // Nothing of it changed: not applied again.
+    let (fake, api) = cluster(|_, _| None).await;
+    assert!(operator.step(&api, &seen, &time(1), &said.say()).await);
+    assert!(
+        !fake
+            .seen()
+            .iter()
+            .any(|asked| asked.path.starts_with(GENERATED) && asked.method == "PATCH"),
+        "applied again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_data_plane_of_the_name_its_gateway_does_not_own_is_left_alone() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let mut theirs = data_plane();
+    theirs.metadata.name = Some("web-edge".to_owned());
+    let seen = gateway_first_seen(vec![gateway_alone(serde_json::json!({}))], vec![theirs]);
+    assert!(!operator.step(&api, &seen, &time(0), &said.say()).await);
+    assert!(
+        !fake
+            .seen()
+            .iter()
+            .any(|asked| asked.path.starts_with(GENERATED) && asked.body.contains("gatewayRef")),
+        "taken over"
+    );
+    assert!(
+        said.any("DataPlane edge/web-edge: not generated for Gateway edge/web"),
+        "{:?}",
+        said.0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gateway_with_parameters_gets_no_data_plane_and_is_told_why() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let infrastructure = serde_json::json!({
+        "parametersRef": { "group": "", "kind": "ConfigMap", "name": "params" },
+    });
+    let seen = gateway_first_seen(vec![gateway_alone(infrastructure)], Vec::new());
+    assert!(operator.step(&api, &seen, &time(0), &said.say()).await);
+    let asked = fake.seen();
+    assert!(
+        !asked.iter().any(|asked| asked.path.starts_with(GENERATED)),
+        "a DataPlane for it: {:?}",
+        writes(&asked)
+    );
+    assert_eq!(
+        status_written(&asked, GATEWAY),
+        conditions_of(&[
+            ("Accepted", "False", "InvalidParameters"),
+            ("Programmed", "False", "InvalidParameters"),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_generated_data_plane_whose_gateway_moved_class_is_deleted() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    let gateway = gateway_alone(serde_json::json!({}));
+    let mut generated = edgerush_planes::gateway_first::data_plane(
+        &gateway,
+        &serde_json::from_value(serde_json::json!({})).unwrap(),
+        &control_plane("Same"),
+    )
+    .unwrap();
+    generated.metadata.uid = Some("generated-uid".to_owned());
+    let mut moved = gateway;
+    moved.spec.gateway_class_name = "other".to_owned();
+    let seen = gateway_first_seen(vec![moved], vec![generated]);
+    operator.step(&api, &seen, &time(0), &said.say()).await;
+    assert!(
+        writes(&fake.seen())
+            .iter()
+            .any(|write| write.starts_with(&format!("DELETE {GENERATED}?"))),
+        "{:?}",
+        said.0
+    );
 }

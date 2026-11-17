@@ -19,14 +19,21 @@
 //! IngressClass or Gateway once its `ingress` or `gateway` is taken away, and its
 //! HorizontalPodAutoscaler once it no longer autoscales. One being deleted
 //! has what no owner reference reaches deleted by its labels, then its finalizer taken
-//! away. Last, each GatewayClass naming EdgeRush's controller that no ControlPlane made has
+//! away. Then each GatewayClass naming EdgeRush's controller that no ControlPlane made has
 //! its refusal written, where its status does not say it yet ([`classes`](crate::classes)).
+//! Last, Gateway-first ([`gateway_first`](crate::gateway_first)): each DataPlane generated
+//! for a Gateway written alone applied, where it, its Gateway or its entry has changed since
+//! it was last applied, one of its name that the Gateway does not own left alone; each
+//! Gateway refused for its parameters told so in its status, and one no longer refused
+//! given its status back; and each generated DataPlane whose Gateway has moved to another
+//! class deleted.
 //!
 //! Nothing is kept from step to step but what saves a write: a new leader applies
 //! everything once, and converges from what the cluster holds.
 
 use crate::allowance::{self, Labels};
 use crate::classes;
+use crate::gateway_first;
 use crate::judge::{Refused, judge};
 use crate::status::{self, Made};
 use crate::{FINALIZER, MANAGER};
@@ -115,6 +122,9 @@ pub struct Seen {
     /// Every GatewayClass in the cluster, whoever made it; none while the cluster does not
     /// serve them.
     pub gateway_classes: Vec<GatewayClass>,
+    /// Every Gateway in the cluster, whoever made it; none while the cluster does not serve
+    /// them.
+    pub gateways: Vec<Gateway>,
     /// Which of the Gateway API's kinds it makes the cluster serves.
     pub gateway_api: GatewayApi,
 }
@@ -275,11 +285,13 @@ impl Applied {
 }
 
 /// The leader's state from step to step: what each resource, by UID, was last applied
-/// whole as.
+/// whole as; and for each Gateway given a DataPlane, by its UID, that DataPlane as last
+/// applied, beside the version of it then seen.
 #[derive(Debug)]
 pub struct Operator {
     install: Install,
     applied: HashMap<String, Applied>,
+    generated: HashMap<String, String>,
 }
 
 impl Operator {
@@ -289,6 +301,7 @@ impl Operator {
         Self {
             install,
             applied: HashMap::new(),
+            generated: HashMap::new(),
         }
     }
 
@@ -296,6 +309,7 @@ impl Operator {
     /// applies everything again once it leads again.
     pub fn forget(&mut self) {
         self.applied.clear();
+        self.generated.clear();
     }
 
     /// One step through `api`, of what was `seen`, at `now`: what it does and what fails
@@ -313,7 +327,13 @@ impl Operator {
             &seen.data_planes,
             seen.platform_defaults.as_ref(),
             &seen.namespaces,
+            &seen.gateways,
         );
+        let accepted: Vec<(&ControlPlane, bool)> = judged
+            .control_planes
+            .iter()
+            .map(|(control_plane, verdict)| (*control_plane, verdict.is_ok()))
+            .collect();
         let mut planes = Vec::new();
         for (control_plane, verdict) in &judged.control_planes {
             let name = control_plane.metadata.name.as_deref().unwrap_or_default();
@@ -422,7 +442,158 @@ impl Operator {
         for plane in planes {
             done &= self.plane(api, plane, seen, now, say).await;
         }
-        done & refuse_classes(api, seen, now, say).await
+        done &= refuse_classes(api, seen, now, say).await;
+        done & self.generate(api, seen, &accepted, now, say).await
+    }
+
+    /// Gateway-first's part of a step, of what was `seen`, its ControlPlanes `accepted` or
+    /// not, at `now`: whether all of it was done.
+    async fn generate(
+        &mut self,
+        api: &ApiServer,
+        seen: &Seen,
+        accepted: &[(&ControlPlane, bool)],
+        now: &Time,
+        say: &dyn Fn(&str),
+    ) -> bool {
+        let generation = gateway_first::generation(
+            &seen.gateways,
+            &seen.data_planes,
+            accepted,
+            &seen.gateway_classes,
+            seen.platform_defaults.as_ref(),
+            &seen.namespaces,
+            now,
+        );
+        let mut done = generation.problems.is_empty();
+        for problem in &generation.problems {
+            say(problem);
+        }
+        let present: HashSet<&str> = generation
+            .data_planes
+            .iter()
+            .filter_map(|(gateway, _)| gateway.metadata.uid.as_deref())
+            .collect();
+        self.generated
+            .retain(|uid, _| present.contains(uid.as_str()));
+        for (gateway, data_plane) in &generation.data_planes {
+            let (Some(uid), Some(namespace), Some(name)) = (
+                gateway.metadata.uid.as_deref(),
+                data_plane.metadata.namespace.as_deref(),
+                data_plane.metadata.name.as_deref(),
+            ) else {
+                continue;
+            };
+            let what = format!("DataPlane {namespace}/{name}");
+            let there = seen.data_planes.iter().find(|there| {
+                there.metadata.namespace.as_deref() == Some(namespace)
+                    && there.metadata.name.as_deref() == Some(name)
+            });
+            if let Some(there) = there {
+                let owned = there
+                    .metadata
+                    .owner_references
+                    .iter()
+                    .flatten()
+                    .any(|owner| owner.uid == uid);
+                if !owned {
+                    say(&format!(
+                        "{what}: not generated for Gateway {namespace}/{}, so left alone",
+                        gateway.metadata.name.as_deref().unwrap_or_default()
+                    ));
+                    done = false;
+                    continue;
+                }
+                // Made again once it is gone.
+                if there.metadata.deletion_timestamp.is_some() {
+                    done = false;
+                    continue;
+                }
+            }
+            let applied = edgerush_planes::gateway_first::applied(data_plane);
+            let version = there
+                .and_then(|there| there.metadata.resource_version.as_deref())
+                .unwrap_or_default();
+            let as_applied = serde_json::to_string(&applied).unwrap_or_default();
+            let fingerprint = format!("{version} {as_applied}");
+            if self.generated.get(uid) == Some(&fingerprint) {
+                continue;
+            }
+            match api
+                .apply::<DataPlane>(GENERATOR, namespace, name, &applied)
+                .await
+            {
+                Ok(_) => {
+                    if there.is_none() {
+                        say(&format!(
+                            "{what}: generated for Gateway {namespace}/{}",
+                            gateway.metadata.name.as_deref().unwrap_or_default()
+                        ));
+                    }
+                    self.generated.insert(uid.to_owned(), fingerprint);
+                }
+                Err(error) => {
+                    say(&format!("{what}: cannot be applied: {error}"));
+                    done = false;
+                }
+            }
+        }
+        let statuses = generation
+            .refused
+            .iter()
+            .map(|(gateway, conditions)| (*gateway, conditions.as_slice()))
+            .chain(
+                generation
+                    .released
+                    .iter()
+                    .map(|gateway| (*gateway, &[][..])),
+            );
+        for (gateway, conditions) in statuses {
+            let (Some(namespace), Some(name)) = (
+                gateway.metadata.namespace.as_deref(),
+                gateway.metadata.name.as_deref(),
+            ) else {
+                continue;
+            };
+            let status = serde_json::json!({ "conditions": conditions });
+            match api
+                .apply_status::<Gateway>(MANAGER, namespace, name, &status)
+                .await
+            {
+                Ok(()) if conditions.is_empty() => say(&format!(
+                    "Gateway {namespace}/{name}: its parameters taken away, its status left to \
+                     its controller"
+                )),
+                Ok(()) => say(&format!(
+                    "Gateway {namespace}/{name}: {}",
+                    summary(conditions)
+                )),
+                // Gone meanwhile: nothing to say of it.
+                Err(error) if error.is_not_found() => {}
+                Err(error) => {
+                    say(&format!(
+                        "Gateway {namespace}/{name}: its status cannot be written: {error}"
+                    ));
+                    done = false;
+                }
+            }
+        }
+        for stale in &generation.stale {
+            let namespace = stale.metadata.namespace.as_deref().unwrap_or_default();
+            let name = stale.metadata.name.as_deref().unwrap_or_default();
+            match api.delete::<DataPlane>(namespace, name).await {
+                Ok(_) => say(&format!(
+                    "DataPlane {namespace}/{name}: deleted, its Gateway of another class now"
+                )),
+                Err(error) => {
+                    say(&format!(
+                        "DataPlane {namespace}/{name}: cannot be deleted: {error}"
+                    ));
+                    done = false;
+                }
+            }
+        }
+        done
     }
 
     /// One resource's step.
@@ -799,6 +970,12 @@ async fn apply<K: Kind>(
     api.apply::<K>(MANAGER, namespace, name, object).await?;
     Ok(true)
 }
+
+/// The field manager a generated DataPlane is applied under (05 §3): one of its own, as the
+/// operator applies its finalizer to every DataPlane under [`MANAGER`], of the metadata
+/// alone, and an apply leaves out what its manager held before, which would take the spec
+/// away from one that manager had also applied.
+pub(crate) const GENERATOR: &str = "edgerush-operator-generator";
 
 /// The field manager that holds a Deployment's replicas from the operator's last apply that
 /// stated them to its autoscaler's first write (05 §2).

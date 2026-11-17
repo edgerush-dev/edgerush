@@ -35,7 +35,8 @@ spec:
           translates, behind one address. It serves Ingress, Gateway API or both: with
           `ingress`, the operator makes its IngressClass, named `<controlplane>.<dataplane>`;
           with `gateway`, its Gateway, named as it is, of the GatewayClass of its
-          ControlPlane.
+          ControlPlane. One with `gatewayRef` the operator generates for a Gateway written
+          alone, from its class's PlatformDefaults entry, and serves that Gateway.
 
           Its name is a DNS label of at most 48 characters, so that its Service,
           `edgerush-proxy-<name>`, is a DNS label too.
@@ -61,10 +62,20 @@ spec:
             description: Spec is what the data plane is to be.
             properties:
               controlPlaneRef:
-                description: ControlPlaneRef names the ControlPlane, in the DataPlane's own namespace, that serves it.
+                description: ControlPlaneRef names the ControlPlane that serves it.
                 properties:
                   name:
                     description: Name is the ControlPlane's name.
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace is the ControlPlane's namespace: the DataPlane's own unless said.
+                      Another is accepted only for the DataPlane the operator generates for a
+                      Gateway of that ControlPlane's class, and only the operator may write one
+                      that names another.
                     maxLength: 63
                     minLength: 1
                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
@@ -1144,6 +1155,23 @@ spec:
                 required:
                 - listeners
                 type: object
+              gatewayRef:
+                description: |-
+                  GatewayRef, present, has the data plane serve the Gateway of this name in the
+                  DataPlane's namespace, a Gateway its user wrote, of which the operator makes
+                  nothing. It marks the DataPlane the operator generates for a Gateway of a
+                  class whose PlatformDefaults entry asks for one: only the operator may write
+                  one, and it serves that Gateway alone.
+                properties:
+                  name:
+                    description: Name is the Gateway's name.
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                required:
+                - name
+                type: object
               ingress:
                 description: |-
                   Ingress, present, has the data plane serve the Ingresses of its IngressClass,
@@ -1472,8 +1500,10 @@ spec:
             - controlPlaneRef
             type: object
             x-kubernetes-validations:
-            - message: a DataPlane serves ingress, gateway or both
-              rule: has(self.ingress) || has(self.gateway)
+            - message: a DataPlane serves ingress, gateway or both, or the Gateway gatewayRef names
+              rule: has(self.ingress) || has(self.gateway) || has(self.gatewayRef)
+            - message: a DataPlane with gatewayRef serves that Gateway alone, with neither gateway nor ingress
+              rule: '!has(self.gatewayRef) || (!has(self.gateway) && !has(self.ingress))'
           status:
             description: Status is what the operator and the control plane report of it.
             properties:

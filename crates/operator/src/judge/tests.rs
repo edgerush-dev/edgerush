@@ -33,7 +33,7 @@ fn data_plane(namespace: &str, name: &str, of: &str, at: i64) -> DataPlane {
 
 /// Judged with no `PlatformDefaults`.
 fn judged<'a>(control_planes: &'a [ControlPlane], data_planes: &'a [DataPlane]) -> Judged<'a> {
-    judge(control_planes, data_planes, None, &BTreeMap::new())
+    judge(control_planes, data_planes, None, &BTreeMap::new(), &[])
 }
 
 /// `control_plane` watching the namespaces of `selector`, as JSON.
@@ -196,7 +196,7 @@ fn an_allowance_lets_the_control_planes_of_the_namespaces_it_picks_watch_what_it
         // A namespace not seen has no labels: no allowance picks it.
         control_plane("gone", "gone-all", 10, "u6", "All"),
     ];
-    let judged = judge(&control_planes, &[], Some(&platform), &namespaces);
+    let judged = judge(&control_planes, &[], Some(&platform), &namespaces, &[]);
     let reasons: Vec<_> = judged
         .control_planes
         .iter()
@@ -232,11 +232,11 @@ fn a_platform_defaults_of_another_name_allows_nothing() {
     let named_so = platform("default", scopes.clone());
     let other = platform("other", scopes);
     assert_eq!(
-        judge(&control_planes, &[], Some(&named_so), &namespaces).control_planes[0].1,
+        judge(&control_planes, &[], Some(&named_so), &namespaces, &[]).control_planes[0].1,
         Ok(())
     );
     assert!(
-        judge(&control_planes, &[], Some(&other), &namespaces).control_planes[0]
+        judge(&control_planes, &[], Some(&other), &namespaces, &[]).control_planes[0]
             .1
             .is_err()
     );
@@ -256,7 +256,7 @@ fn a_refusal_for_its_scope_says_what_was_asked_and_what_is_allowed() {
         control_plane("pay", "pay", 10, "u1", "All"),
         control_plane("other", "other", 10, "u2", "All"),
     ];
-    let judged = judge(&control_planes, &[], Some(&platform), &namespaces);
+    let judged = judge(&control_planes, &[], Some(&platform), &namespaces, &[]);
     let messages: Vec<String> = judged
         .control_planes
         .iter()
@@ -373,9 +373,114 @@ fn each_refusal_has_its_reason_and_says_what_holds_or_is_asked() {
             "NoControlPlane",
             "edge",
         ),
+        (
+            Refused::NotGenerated {
+                control_plane: "edge-system/edge".to_owned(),
+            },
+            "NoControlPlane",
+            "edge-system/edge",
+        ),
     ];
     for (refused, reason, named) in cases {
         assert_eq!(refused.reason(), reason);
         assert!(refused.message().contains(named), "{}", refused.message());
     }
+}
+
+/// Gateway `web` of namespace `shop`, of the class of ControlPlane `edge`.
+fn gateway() -> Gateway {
+    serde_json::from_value(serde_json::json!({
+        "metadata": { "name": "web", "namespace": "shop", "uid": "gw-uid" },
+        "spec": {
+            "gatewayClassName": "edge",
+            "listeners": [{ "name": "http", "port": 80, "protocol": "HTTP" }],
+        },
+    }))
+    .unwrap()
+}
+
+/// The DataPlane the operator generates for [`gateway`], of ControlPlane `edge` of
+/// `edge-system`, as the API server stores it.
+fn generated() -> DataPlane {
+    let control_plane = control_plane("edge-system", "edge", 0, "cp", "All");
+    let entry = serde_json::from_value(serde_json::json!({})).unwrap();
+    let mut data_plane =
+        edgerush_planes::gateway_first::data_plane(&gateway(), &entry, &control_plane).unwrap();
+    data_plane.metadata.uid = Some("dp".to_owned());
+    data_plane
+}
+
+/// Judged with no `PlatformDefaults`, beside [`gateway`].
+fn judged_beside_the_gateway<'a>(
+    control_planes: &'a [ControlPlane],
+    data_planes: &'a [DataPlane],
+) -> Judged<'a> {
+    judge(
+        control_planes,
+        data_planes,
+        None,
+        &BTreeMap::new(),
+        &[gateway()],
+    )
+}
+
+#[test]
+fn a_generated_data_plane_is_its_control_planes_of_the_namespace_it_names() {
+    let control_planes = [control_plane("edge-system", "edge", 0, "cp", "All")];
+    let data_planes = [generated()];
+    let beside = judged_beside_the_gateway(&control_planes, &data_planes);
+    let verdict = beside.data_planes[0]
+        .1
+        .as_ref()
+        .map(|cp| cp.metadata.uid.clone());
+    assert_eq!(verdict, Ok(Some("cp".to_owned())));
+    // Without its Gateway, it is no longer the one a Gateway gets.
+    assert!(matches!(
+        judged(&control_planes, &data_planes).data_planes[0].1,
+        Err(Refused::NotGenerated { .. })
+    ));
+}
+
+#[test]
+fn a_generated_data_plane_whose_control_plane_namespace_holds_none_of_its_name_is_refused() {
+    // The name is held, but in another namespace than the one named.
+    let control_planes = [control_plane("elsewhere", "edge", 0, "cp", "All")];
+    let data_planes = [generated()];
+    assert_eq!(
+        judged_beside_the_gateway(&control_planes, &data_planes).data_planes[0]
+            .1
+            .as_ref()
+            .err(),
+        Some(&Refused::NoControlPlane {
+            name: "edge".to_owned()
+        })
+    );
+}
+
+#[test]
+fn a_data_plane_naming_another_namespace_or_a_gateway_by_hand_is_refused() {
+    let control_planes = [control_plane("edge-system", "edge", 0, "cp", "All")];
+    // Another namespace's ControlPlane, by hand.
+    let mut elsewhere = data_plane("shop", "web", "edge", 0);
+    elsewhere.spec.control_plane_ref.namespace = Some("edge-system".to_owned());
+    // A Gateway, by hand, in the ControlPlane's own namespace.
+    let mut naming_a_gateway = data_plane("edge-system", "web-edge", "edge", 0);
+    naming_a_gateway.spec.ingress = None;
+    naming_a_gateway.spec.gateway_ref = Some(edgerush_planes::data_plane::DataPlaneGatewayRef {
+        name: "web".to_owned(),
+    });
+    // Its own namespace named outright is as left out.
+    let mut own_named = data_plane("edge-system", "own", "edge", 0);
+    own_named.spec.control_plane_ref.namespace = Some("edge-system".to_owned());
+    let data_planes = [elsewhere, naming_a_gateway, own_named];
+    let judged = judged_beside_the_gateway(&control_planes, &data_planes);
+    assert!(matches!(
+        judged.data_planes[0].1,
+        Err(Refused::NotGenerated { .. })
+    ));
+    assert!(matches!(
+        judged.data_planes[1].1,
+        Err(Refused::NotGenerated { .. })
+    ));
+    assert!(judged.data_planes[2].1.is_ok());
 }

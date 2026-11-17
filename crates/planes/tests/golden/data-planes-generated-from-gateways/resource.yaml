@@ -1,0 +1,55 @@
+# Gateway-first: Gateways written alone, of the class of a ControlPlane that watches every
+# namespace, each given a DataPlane in its own namespace from the class's entry. One sets
+# infrastructure labels and annotations, one of them a key of EdgeRush's own, which wins;
+# one has a name of 253 characters, which no label can hold; and two of one name, in
+# namespaces apart, have DataPlanes of one name, whose objects share none.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: edge, namespace: edge-system, uid: 6f1c2b8e-0000-4000-8000-000000000010 }
+spec:
+  watch:
+    namespaces: { from: All }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: PlatformDefaults
+metadata: { name: default }
+spec:
+  gatewayClasses:
+    - name: edge
+      dataPlane:
+        replicas: { min: 2, max: 6 }
+        resources: { requests: { cpu: "1", memory: 512Mi } }
+        ports:
+          - { port: 443, http3: {} }
+        service:
+          annotations: { service.beta.kubernetes.io/aws-load-balancer-type: nlb }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop, uid: 0d6a9f3c-0000-4000-8000-000000000011 }
+spec:
+  gatewayClassName: edge
+  infrastructure:
+    labels: { team: shop, app.kubernetes.io/managed-by: shop }
+    annotations: { example.com/owner: shop, service.beta.kubernetes.io/aws-load-balancer-type: external }
+  listeners:
+    - { name: http, port: 80, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.l
+  namespace: gateway-conformance-infra
+  uid: 0d6a9f3c-0000-4000-8000-000000000012
+spec:
+  gatewayClassName: edge
+  listeners:
+    - { name: http, port: 80, protocol: HTTP }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: blog, uid: 0d6a9f3c-0000-4000-8000-000000000013 }
+spec:
+  gatewayClassName: edge
+  listeners:
+    - { name: http, port: 80, protocol: HTTP }

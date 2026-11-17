@@ -11,6 +11,11 @@
 //! data plane's Service its control plane writes, for the ports `bound.txt` says each
 //! config binds, a line each of the port and `tcp`, `udp` or both (none without the file).
 //!
+//! A case of Gateway-first has, after its ControlPlane, a `PlatformDefaults` and Gateways
+//! of the ControlPlane's class in place of DataPlanes: `data-plane.yaml` is the DataPlane
+//! generated for each Gateway from its class's entry, and the case then goes on as one of
+//! those DataPlanes, each given a UID as the API server would.
+//!
 //! Each object says the kind and metadata it is written with, no two objects of a case are
 //! one object, of one kind, namespace and name, and between them the cases make every kind
 //! the operator makes.
@@ -28,11 +33,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+use edgerush_gateway_api::gateway::Gateway;
 use edgerush_planes::control_plane::ControlPlane;
 use edgerush_planes::data_plane::DataPlane;
+use edgerush_planes::gateway_first;
 use edgerush_planes::objects::{
     Install, Object, ProxyService, Transports, for_control_plane, for_data_plane,
 };
+use edgerush_planes::platform_defaults::PlatformDefaults;
 use serde::Deserialize;
 
 /// A resource of a case.
@@ -41,6 +49,61 @@ use serde::Deserialize;
 enum Resource {
     ControlPlane(Box<ControlPlane>),
     DataPlane(Box<DataPlane>),
+    PlatformDefaults(Box<PlatformDefaults>),
+    Gateway(Box<Gateway>),
+}
+
+/// The DataPlanes generated for `gateways`, each from its class's entry of `platform`, for
+/// `control_plane`, written to or checked against `data-plane.yaml` in `case`; then each
+/// given a UID, as the API server would store it.
+fn generated(
+    case: &Path,
+    write: bool,
+    control_plane: &ControlPlane,
+    platform: &PlatformDefaults,
+    gateways: &[&Gateway],
+) -> Vec<DataPlane> {
+    let name = case.file_name().unwrap().to_string_lossy().into_owned();
+    let entries = platform.spec.gateway_classes.as_deref().unwrap_or_default();
+    let made: Vec<DataPlane> = gateways
+        .iter()
+        .map(|gateway| {
+            let class = &gateway.spec.gateway_class_name;
+            let entry = entries
+                .iter()
+                .find(|entry| &entry.name == class)
+                .unwrap_or_else(|| panic!("{name}: no entry for the class {class}"));
+            gateway_first::data_plane(gateway, &entry.data_plane, control_plane)
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+        })
+        .collect();
+    let written = made
+        .iter()
+        .map(|dp| serde_saphyr::to_string(&gateway_first::applied(dp)).unwrap())
+        .collect::<Vec<_>>()
+        .join("---\n");
+    let expected_at = case.join("data-plane.yaml");
+    if write {
+        fs::write(&expected_at, &written).unwrap();
+    } else {
+        assert_eq!(
+            read(&expected_at),
+            written,
+            "{name} generates other DataPlanes than its data-plane.yaml says; if that is \
+             meant, write them again with EDGERUSH_WRITE_GOLDEN=1 cargo test -p \
+             edgerush-planes --test golden, and read them over"
+        );
+    }
+    made.into_iter()
+        .map(|mut dp| {
+            dp.metadata.uid = dp
+                .metadata
+                .name
+                .as_ref()
+                .map(|name| format!("uid-of-{name}"));
+            dp
+        })
+        .collect()
 }
 
 fn read(path: &Path) -> String {
@@ -104,15 +167,29 @@ fn every_case_makes_its_objects() {
         } else {
             BTreeSet::new()
         };
+        let generated_data_planes: Vec<DataPlane>;
         let (control_plane, data_planes) = match resources.as_slice() {
+            [
+                Resource::ControlPlane(cp),
+                Resource::PlatformDefaults(platform),
+                rest @ ..,
+            ] => {
+                let gateways: Vec<&Gateway> = rest
+                    .iter()
+                    .map(|resource| match resource {
+                        Resource::Gateway(gateway) => &**gateway,
+                        _ => panic!("{name}: after its PlatformDefaults, a case has Gateways"),
+                    })
+                    .collect();
+                generated_data_planes = generated(&case, write, cp, platform, &gateways);
+                (cp, generated_data_planes.iter().collect())
+            }
             [Resource::ControlPlane(cp), rest @ ..] => {
                 let data_planes: Vec<&DataPlane> = rest
                     .iter()
                     .map(|resource| match resource {
                         Resource::DataPlane(dp) => &**dp,
-                        Resource::ControlPlane(_) => {
-                            panic!("{name}: resource.yaml has one ControlPlane, first")
-                        }
+                        _ => panic!("{name}: resource.yaml has one ControlPlane, first"),
                     })
                     .collect();
                 (cp, data_planes)
