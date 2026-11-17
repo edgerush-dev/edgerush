@@ -9,14 +9,17 @@
 //! data plane's ([`CONFIG_VERSION`]), and refuses a stream at a version either end no
 //! longer has. The control plane
 //! sends it what it lacks of the latest [`Offer`], a resource a message: each certificate
-//! at a version it does not hold, then the config, which names each certificate it needs at
-//! its version, then the names of certificates no longer offered ([`Session`]). The stream is ordered and lasts until it breaks, so what is sent
+//! at a version it does not hold, then the rate-limiting engine's limits, if the config has
+//! them and the data plane does not hold them at their version (07 §2), then the config,
+//! which names each certificate it needs and its limits, each at its version, then the names
+//! of certificates no longer offered ([`Session`]). The stream is ordered and lasts until it breaks, so what is sent
 //! is taken as held; a data plane that dials again says again what it holds. The data
-//! plane holds the latest config until it has every certificate the config names, at the
-//! version it names, then runs the two together, whole, and answers with what it runs and the config it refused,
+//! plane holds the latest config until it has every certificate the config names, and its
+//! limits, at the version it names, then runs them together, whole, and answers with what it runs and the config it refused,
 //! if it refused one ([`Report`], [`Staging`]). A config equal to the one running, with
-//! certificates equal to its own, is kept, and acked under its new version. A certificate
-//! the running config uses stays with it until another config runs.
+//! certificates and limits equal to its own, is kept, and acked under its new version. A
+//! certificate the running config uses stays with it until another config runs. Limits are
+//! one resource, never removed: those last sent are held, and replaced by the next.
 //!
 //! Apart from the config, the control plane sends the addresses of the gateway's own pods,
 //! which no route may send to (03 §6): whole, as a stream opens and each time they change.
@@ -35,20 +38,23 @@ pub use offer::{MAX_MESSAGE, Offer, OfferError, Versioned, Versions};
 pub use session::{OpenError, Session};
 pub use staging::{Staging, Taken};
 
-/// What a data plane holds, or runs: a config's version and each certificate's.
+/// What a data plane holds, or runs: a config's version, each certificate's and the
+/// limits'.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Held {
     /// The config's version; none before any.
     pub config: Option<String>,
     /// Each certificate's version, by name.
     pub certificates: BTreeMap<String, String>,
+    /// The limits' version; none where none are held, or the config run has none.
+    pub limits: Option<String>,
 }
 
 /// What a data plane says after a config it was sent, and whenever what it serves of the
 /// config it runs changes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
-    /// The config it runs, and the certificates that config uses.
+    /// The config it runs, and the certificates and limits that config uses.
     pub running: Held,
     /// The latest config, if it refused it.
     pub refused: Option<Refusal>,
@@ -112,6 +118,7 @@ impl From<&Held> for wire::Held {
         Self {
             config: held.config.clone().unwrap_or_default(),
             certificates: held.certificates.clone(),
+            limits: held.limits.clone().unwrap_or_default(),
         }
     }
 }
@@ -131,6 +138,7 @@ impl TryFrom<wire::Held> for Held {
         Ok(Self {
             config: Some(held.config).filter(|version| !version.is_empty()),
             certificates: held.certificates,
+            limits: Some(held.limits).filter(|version| !version.is_empty()),
         })
     }
 }

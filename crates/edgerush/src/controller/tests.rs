@@ -1537,6 +1537,7 @@ fn the_listeners_a_data_plane_does_not_serve_reach_what_its_pod_runs() {
     let held = Held {
         config: Some("a-1".to_owned()),
         certificates: BTreeMap::new(),
+        limits: None,
     };
     let mut runs = Runs::default();
     runs.offered(None, "a-1", Some(3));

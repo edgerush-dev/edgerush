@@ -6,7 +6,10 @@
   "properties": {
     "global": {
       "description": "What applies to every request through the data plane that a route rule forwards.",
-      "$ref": "#/$defs/Global"
+      "$ref": "#/$defs/Global",
+      "default": {
+        "rate_limits": []
+      }
     },
     "limits": {
       "description": "The limits, each by its name; routes and route rules name those that apply to them.",
@@ -80,7 +83,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "model": {
           "description": "How the requests are counted.",

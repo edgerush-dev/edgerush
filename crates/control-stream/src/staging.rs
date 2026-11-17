@@ -2,7 +2,7 @@
 
 use crate::encode::{CONFIG_VERSION, OLDEST_CONFIG_VERSION};
 use crate::{Held, Listening, Malformed, Refusal, Report, Versioned, wire};
-use edgerush_config::{Certificate, Config};
+use edgerush_config::{Certificate, Config, Limits};
 use std::collections::BTreeMap;
 
 /// What a data plane was sent, and what it runs.
@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 pub struct Staging {
     /// The certificates offered, by name.
     certificates: BTreeMap<String, Versioned<Certificate>>,
+    /// The limits last sent, or why they cannot be read.
+    limits: Option<Versioned<Result<Limits, String>>>,
     /// The latest config sent.
     latest: Option<Latest>,
     /// What runs, with its own certificates: one no longer offered stays with it.
@@ -34,14 +36,17 @@ struct Latest {
     config: Option<Config>,
     /// The certificates it needs, at the versions it needs.
     requires: BTreeMap<String, String>,
+    /// The version of the limits it needs, if it needs any.
+    limits: Option<String>,
 }
 
-/// A config, without its certificates, and the certificates it names.
+/// A config, without its certificates or limits, and the certificates and limits it names.
 #[derive(Debug, Clone)]
 struct Run {
     version: String,
     config: Config,
     certificates: BTreeMap<String, Versioned<Certificate>>,
+    limits: Option<Versioned<Limits>>,
 }
 
 impl Run {
@@ -53,13 +58,16 @@ impl Run {
                 .iter()
                 .map(|(name, certificate)| (name.clone(), certificate.version.clone()))
                 .collect(),
+            limits: self.limits.as_ref().map(|limits| limits.version.clone()),
         }
     }
 
-    /// Whether `other` is the same config with the same certificates, whatever their
-    /// versions.
+    /// Whether `other` is the same config with the same certificates and limits, whatever
+    /// their versions.
     fn same(&self, other: &Run) -> bool {
         self.config == other.config
+            && self.limits.as_ref().map(|limits| &limits.value)
+                == other.limits.as_ref().map(|limits| &limits.value)
             && self.certificates.len() == other.certificates.len()
             && self.certificates.iter().zip(&other.certificates).all(
                 |((name, mine), (other_name, theirs))| {
@@ -91,8 +99,9 @@ impl Staging {
         Self::default()
     }
 
-    /// What it holds, to open a stream with: the version of the latest config sent, and
-    /// of each certificate offered; and the config versions this build reads.
+    /// What it holds, to open a stream with: the version of the latest config sent, of
+    /// each certificate offered and of the limits last sent; and the config versions this
+    /// build reads.
     pub fn hello(&self) -> wire::FromDataPlane {
         let held = Held {
             config: self.latest.as_ref().map(|latest| latest.version.clone()),
@@ -101,6 +110,7 @@ impl Staging {
                 .iter()
                 .map(|(name, certificate)| (name.clone(), certificate.version.clone()))
                 .collect(),
+            limits: self.limits.as_ref().map(|limits| limits.version.clone()),
         };
         wire::FromDataPlane {
             said: Some(wire::Said::Hello(wire::Hello {
@@ -160,6 +170,18 @@ impl Staging {
                 );
                 Ok(self.next())
             }
+            Some(wire::Resource::Limits(limits)) => {
+                if limits.version.is_empty() {
+                    return Err(Malformed::Unversioned);
+                }
+                let read = serde_json::from_slice::<Limits>(&limits.json)
+                    .map_err(|error| error.to_string());
+                self.limits = Some(Versioned {
+                    version: limits.version,
+                    value: read,
+                });
+                Ok(self.next())
+            }
             Some(wire::Resource::Config(config)) => {
                 if config.version.is_empty() {
                     return Err(Malformed::Unversioned);
@@ -174,6 +196,7 @@ impl Staging {
                     version: config.version,
                     config: read.ok(),
                     requires: config.requires,
+                    limits: Some(config.limits).filter(|version| !version.is_empty()),
                 });
                 if let Some(refusal) = refused {
                     self.refused = Some(refusal);
@@ -196,6 +219,7 @@ impl Staging {
             version,
             config: Some(config),
             requires,
+            limits: needs,
         }) = &self.latest
         else {
             return Taken::Nothing;
@@ -210,10 +234,34 @@ impl Staging {
                 _ => return Taken::Nothing,
             }
         }
+        let limits = match (needs, &self.limits) {
+            (None, _) => None,
+            (Some(needs), Some(held)) if &held.version == needs => match &held.value {
+                Ok(limits) => Some(Versioned {
+                    version: needs.clone(),
+                    value: limits.clone(),
+                }),
+                Err(why) => {
+                    let refusal = Refusal {
+                        config: version.clone(),
+                        why: format!("its limits cannot be read: {why}"),
+                    };
+                    // Refused once: nothing it waits for can make it run.
+                    if let Some(latest) = &mut self.latest {
+                        latest.config = None;
+                    }
+                    self.refused = Some(refusal);
+                    return Taken::Say(self.report());
+                }
+            },
+            // Held until its limits are here, at the version it names.
+            (Some(_), _) => return Taken::Nothing,
+        };
         let run = Run {
             version: version.clone(),
             config: config.clone(),
             certificates,
+            limits,
         };
         if let Some(running) = &mut self.running
             && running.same(&run)
@@ -234,6 +282,7 @@ impl Staging {
             .iter()
             .map(|(name, certificate)| (name.clone(), certificate.value.clone()))
             .collect();
+        whole.limits = run.limits.as_ref().map(|limits| limits.value.clone());
         self.given = Some(run);
         Taken::Run(Box::new(whole))
     }

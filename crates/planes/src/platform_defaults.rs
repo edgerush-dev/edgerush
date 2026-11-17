@@ -77,6 +77,11 @@ pub struct PlatformDefaultsGatewayClassesDataPlane {
     /// defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ports: Option<Vec<PlatformDefaultsGatewayClassesDataPlanePorts>>,
+    /// RateLimiting is how the data plane enforces its rate limits, and the limits
+    /// every request it forwards is under. Left out, it has no limits.
+    #[serde(rename = "rateLimiting")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limiting: Option<PlatformDefaultsGatewayClassesDataPlaneRateLimiting>,
     /// Replicas is how many proxies run. With max above min, a
     /// HorizontalPodAutoscaler runs the fleet between the two.
     #[serde(default = "default_platform_defaults_gateway_classes_data_plane_replicas")]
@@ -212,6 +217,135 @@ pub struct PlatformDefaultsGatewayClassesDataPlanePortsProxyProtocol {
     /// the header is read and dropped, and whoever connected is the client.
     #[serde(default)]
     pub senders: Vec<String>,
+}
+
+/// RateLimiting is how the data plane enforces its rate limits, and the limits
+/// every request it forwards is under. Left out, it has no limits.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct PlatformDefaultsGatewayClassesDataPlaneRateLimiting {
+    /// Global is the limits every request the data plane forwards is under, each
+    /// counted apart; a request is charged to all of them or to none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global: Option<Vec<PlatformDefaultsGatewayClassesDataPlaneRateLimitingGlobal>>,
+    /// MaxKeyBytes is what the limits' keys may hold, once for the data plane's
+    /// process: past it, keys are evicted, and start again full. 268,435,456
+    /// (256 MiB) unless said. Not under Disabled, which keeps no keys.
+    #[serde(rename = "maxKeyBytes")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_key_bytes: Option<i64>,
+    /// Mode is how the limits are enforced:
+    ///
+    /// * Disabled: none enforced, nothing counted; the limits are still validated, so that enabling them again cannot fail on one.
+    /// * Local: each proxy on what it sees alone, so that a client spread over several proxies gets each one's limit.
+    ///
+    /// The schema's values: `Disabled`, `Local`. Another is read as it is.
+    #[serde(default)]
+    pub mode: String,
+}
+
+/// Limit is one limit, whose requests it counts together and how many it allows.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct PlatformDefaultsGatewayClassesDataPlaneRateLimitingGlobal {
+    /// DryRun counts and reports, never refusing: a request it has no room
+    /// for goes on, and is not charged.
+    #[serde(rename = "dryRun")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+    /// Key is whose requests are counted together:
+    ///
+    /// * Client: the client's address, as the port's forwarding works it out, an IPv6 client by its /64.
+    ///
+    /// The schema's values: `Client`. Another is read as it is.
+    #[serde(default)]
+    pub key: String,
+    /// Match is the requests it applies to; every request when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#match: Option<PlatformDefaultsGatewayClassesDataPlaneRateLimitingGlobalMatch>,
+    /// Model is how it counts requests, one of its fields given.
+    #[serde(default)]
+    pub model: PlatformDefaultsGatewayClassesDataPlaneRateLimitingGlobalModel,
+    /// Name is the limit's, unique among them: what its counts are kept
+    /// under, so that they go on through a change that leaves the limit as
+    /// it was, and what the RateLimit header of a request it refuses calls
+    /// it. Printable ASCII.
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Match is the requests it applies to; every request when left out.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct PlatformDefaultsGatewayClassesDataPlaneRateLimitingGlobalMatch {
+    /// Methods is the methods it applies to, in capitals; any when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub methods: Option<Vec<String>>,
+    /// PathPrefix is the start of the paths it applies to.
+    #[serde(rename = "pathPrefix")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+}
+
+/// Model is how it counts requests, one of its fields given.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct PlatformDefaultsGatewayClassesDataPlaneRateLimitingGlobalModel {
+    /// Bucket is a token bucket: requests at Rate on average, at most Burst
+    /// at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<PlatformDefaultsGatewayClassesDataPlaneRateLimitingGlobalModelBucket>,
+    /// FixedWindow is at most Limit requests in each Window, the count
+    /// starting again as each ends: a whole window's worth may come at once.
+    #[serde(rename = "fixedWindow")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_window:
+        Option<PlatformDefaultsGatewayClassesDataPlaneRateLimitingGlobalModelFixedWindow>,
+    /// RollingWindow is at most Limit requests in any span of Window, each
+    /// counted in one of Slots slots a window: room comes back up to a slot
+    /// early, never late.
+    #[serde(rename = "rollingWindow")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_window:
+        Option<PlatformDefaultsGatewayClassesDataPlaneRateLimitingGlobalModelRollingWindow>,
+}
+
+/// Bucket is a token bucket: requests at Rate on average, at most Burst
+/// at once.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct PlatformDefaultsGatewayClassesDataPlaneRateLimitingGlobalModelBucket {
+    /// Burst is how many requests a client can send at once, from idle.
+    #[serde(default)]
+    pub burst: i64,
+    /// Rate is requests a second, minute, hour or day, on average, such as 100/s, 1000/min, 10/h or 500/d.
+    #[serde(default)]
+    pub rate: String,
+}
+
+/// FixedWindow is at most Limit requests in each Window, the count
+/// starting again as each ends: a whole window's worth may come at once.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct PlatformDefaultsGatewayClassesDataPlaneRateLimitingGlobalModelFixedWindow {
+    /// Limit is requests a window.
+    #[serde(default)]
+    pub limit: i64,
+    /// Window is a whole number and ms, s, m, h or d, such as 500ms, 1m or 1d.
+    #[serde(default)]
+    pub window: String,
+}
+
+/// RollingWindow is at most Limit requests in any span of Window, each
+/// counted in one of Slots slots a window: room comes back up to a slot
+/// early, never late.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct PlatformDefaultsGatewayClassesDataPlaneRateLimitingGlobalModelRollingWindow {
+    /// Limit is requests in any window.
+    #[serde(default)]
+    pub limit: i64,
+    /// Slots is the slots a window is counted in, 1,000 unless said:
+    /// fewer bring room back sooner, and each key holds a count for
+    /// every slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<i64>,
+    /// Window is a whole number and ms, s, m, h or d, such as 500ms, 1m or 1d.
+    #[serde(default)]
+    pub window: String,
 }
 
 /// Replicas is how many proxies run. With max above min, a

@@ -2,7 +2,7 @@
 
 use crate::encode::{ConfigVersion, encode};
 use crate::wire;
-use edgerush_config::{Certificate, Config};
+use edgerush_config::{Certificate, Config, Limits};
 use prost::Message;
 use std::collections::BTreeMap;
 
@@ -41,31 +41,29 @@ pub struct Versioned<T> {
 }
 
 /// What the control plane offers its data planes: the latest config, and each certificate
-/// it names.
+/// it names, and its limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
-    /// The config, without its certificates.
+    /// The config, without its certificates or limits.
     pub(crate) config: Versioned<Config>,
     /// The config as sent to each config version served, oldest first.
     pub(crate) json: Vec<Vec<u8>>,
     /// Its certificates, by name.
     pub(crate) certificates: BTreeMap<String, Versioned<Certificate>>,
+    /// Its limits, if it has them, and their JSON.
+    pub(crate) limits: Option<(Versioned<Limits>, Vec<u8>)>,
 }
 
 /// A config that cannot be offered.
 #[derive(Debug, thiserror::Error)]
 pub enum OfferError {
-    /// Limits travel apart, as a resource of their own (07 §2), which the stream does not
-    /// carry yet.
-    #[error("a config with rate limits cannot be sent yet")]
-    Limits,
     /// The config could not be written as JSON.
     #[error("the config cannot be written: {0}")]
     Written(#[from] serde_json::Error),
     /// A resource, written, is longer than a message may be.
     #[error("{what} is {bytes} bytes written, more than the {limit} a message may hold")]
     TooLarge {
-        /// What: the config, or a certificate by name.
+        /// What: the config, its limits, or a certificate by name.
         what: String,
         /// How long its message is.
         bytes: usize,
@@ -92,9 +90,6 @@ impl Offer {
         versions: &mut Versions,
         limit: usize,
     ) -> Result<Self, OfferError> {
-        if config.limits.is_some() {
-            return Err(OfferError::Limits);
-        }
         let mut bare = config.clone();
         let mut certificates = BTreeMap::new();
         for (name, certificate) in std::mem::take(&mut bare.certificates) {
@@ -107,9 +102,28 @@ impl Offer {
             };
             certificates.insert(name, versioned);
         }
-        // A config names the versions of its certificates, so one changed is a new config.
+        let limits = match bare.limits.take() {
+            None => None,
+            Some(limits) => match last.and_then(|last| last.limits.as_ref()) {
+                Some(kept) if kept.0.value == limits => Some(kept.clone()),
+                _ => {
+                    let json = serde_json::to_vec(&limits)?;
+                    let versioned = Versioned {
+                        version: versions.next(),
+                        value: limits,
+                    };
+                    Some((versioned, json))
+                }
+            },
+        };
+        // A config names the versions of its certificates and limits, so one changed is a
+        // new config.
         let (config, json) = match last {
-            Some(last) if last.config.value == bare && last.certificates == certificates => {
+            Some(last)
+                if last.config.value == bare
+                    && last.certificates == certificates
+                    && last.limits == limits =>
+            {
                 (last.config.clone(), last.json.clone())
             }
             _ => {
@@ -127,6 +141,7 @@ impl Offer {
             config,
             json,
             certificates,
+            limits,
         };
         // Refused here, where it can be said, rather than by the stream as it is sent.
         let too_large = |what: String, bytes: usize| OfferError::TooLarge { what, bytes, limit };
@@ -137,6 +152,9 @@ impl Offer {
                     return Err(match message.resource {
                         Some(wire::Resource::Certificate(certificate)) => {
                             too_large(format!("the certificate {}", certificate.name), bytes)
+                        }
+                        Some(wire::Resource::Limits(_)) => {
+                            too_large("the limits".to_owned(), bytes)
                         }
                         _ => too_large("the config".to_owned(), bytes),
                     });
@@ -149,6 +167,13 @@ impl Offer {
     /// The config's version.
     pub fn version(&self) -> &str {
         &self.config.version
+    }
+
+    /// The limits' version, if the config has limits.
+    pub fn limits(&self) -> Option<&str> {
+        self.limits
+            .as_ref()
+            .map(|(limits, _)| limits.version.as_str())
     }
 
     /// Each certificate's version, by name.

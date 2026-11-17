@@ -1,0 +1,17 @@
+# A data plane limiting locally: its mode written into its config, its global limits as
+# the limits the config carries, every one of them global.
+ingress_class: edge
+cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+ingress_https_redirect: true
+ingress_https_redirect_max_age: 30
+rate_limiting:
+  mode: local
+  max_key_bytes: 1048576
+  global:
+    - { name: per-client, key: client, model: { bucket: { rate: 100/s, burst: 200 } } }
+    - name: order-writes
+      match: { methods: [POST], path_prefix: /v1/orders/ }
+      key: client
+      model: { fixed_window: { limit: 1000, window: 1m } }
+      dry_run: true

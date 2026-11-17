@@ -246,6 +246,169 @@ spec:
                           x-kubernetes-list-map-keys:
                           - port
                           x-kubernetes-list-type: map
+                        rateLimiting:
+                          description: |-
+                            RateLimiting is how the data plane enforces its rate limits, and the limits
+                            every request it forwards is under. Left out, it has no limits.
+                          properties:
+                            global:
+                              description: |-
+                                Global is the limits every request the data plane forwards is under, each
+                                counted apart; a request is charged to all of them or to none.
+                              items:
+                                description: Limit is one limit, whose requests it counts together and how many it allows.
+                                properties:
+                                  dryRun:
+                                    description: |-
+                                      DryRun counts and reports, never refusing: a request it has no room
+                                      for goes on, and is not charged.
+                                    type: boolean
+                                  key:
+                                    description: |-
+                                      Key is whose requests are counted together:
+                                      
+                                      * Client: the client's address, as the port's forwarding works it out, an IPv6 client by its /64.
+                                    enum:
+                                    - Client
+                                    type: string
+                                  match:
+                                    description: Match is the requests it applies to; every request when left out.
+                                    properties:
+                                      methods:
+                                        description: Methods is the methods it applies to, in capitals; any when left out.
+                                        items:
+                                          maxLength: 32
+                                          pattern: ^[A-Z]+$
+                                          type: string
+                                        maxItems: 16
+                                        type: array
+                                        x-kubernetes-list-type: atomic
+                                      pathPrefix:
+                                        description: PathPrefix is the start of the paths it applies to.
+                                        maxLength: 1024
+                                        pattern: ^/
+                                        type: string
+                                    type: object
+                                  model:
+                                    description: Model is how it counts requests, one of its fields given.
+                                    properties:
+                                      bucket:
+                                        description: |-
+                                          Bucket is a token bucket: requests at Rate on average, at most Burst
+                                          at once.
+                                        properties:
+                                          burst:
+                                            description: Burst is how many requests a client can send at once, from idle.
+                                            format: int64
+                                            minimum: 1.0
+                                            type: integer
+                                          rate:
+                                            description: >-
+                                              Rate is requests a second, minute, hour or day, on average, such as 100/s,
+                                              1000/min, 10/h or 500/d.
+                                            maxLength: 32
+                                            pattern: ^[1-9][0-9]*/(s|min|h|d)$
+                                            type: string
+                                        required:
+                                        - burst
+                                        - rate
+                                        type: object
+                                      fixedWindow:
+                                        description: |-
+                                          FixedWindow is at most Limit requests in each Window, the count
+                                          starting again as each ends: a whole window's worth may come at once.
+                                        properties:
+                                          limit:
+                                            description: Limit is requests a window.
+                                            format: int64
+                                            minimum: 1.0
+                                            type: integer
+                                          window:
+                                            description: Window is a whole number and ms, s, m, h or d, such as 500ms, 1m or 1d.
+                                            maxLength: 32
+                                            pattern: ^[1-9][0-9]*(ms|s|m|h|d)$
+                                            type: string
+                                        required:
+                                        - limit
+                                        - window
+                                        type: object
+                                      rollingWindow:
+                                        description: |-
+                                          RollingWindow is at most Limit requests in any span of Window, each
+                                          counted in one of Slots slots a window: room comes back up to a slot
+                                          early, never late.
+                                        properties:
+                                          limit:
+                                            description: Limit is requests in any window.
+                                            format: int64
+                                            minimum: 1.0
+                                            type: integer
+                                          slots:
+                                            description: |-
+                                              Slots is the slots a window is counted in, 1,000 unless said:
+                                              fewer bring room back sooner, and each key holds a count for
+                                              every slot.
+                                            format: int64
+                                            maximum: 1000.0
+                                            minimum: 2.0
+                                            type: integer
+                                          window:
+                                            description: Window is a whole number and ms, s, m, h or d, such as 500ms, 1m or 1d.
+                                            maxLength: 32
+                                            pattern: ^[1-9][0-9]*(ms|s|m|h|d)$
+                                            type: string
+                                        required:
+                                        - limit
+                                        - window
+                                        type: object
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: one of bucket, fixedWindow and rollingWindow must be given, and only one
+                                      rule: "[has(self.bucket), has(self.fixedWindow), has(self.rollingWindow)].filter(given, given).size() == 1"
+                                  name:
+                                    description: |-
+                                      Name is the limit's, unique among them: what its counts are kept
+                                      under, so that they go on through a change that leaves the limit as
+                                      it was, and what the RateLimit header of a request it refuses calls
+                                      it. Printable ASCII.
+                                    maxLength: 253
+                                    minLength: 1
+                                    pattern: ^[ -~]+$
+                                    type: string
+                                required:
+                                - key
+                                - model
+                                - name
+                                type: object
+                              maxItems: 64
+                              type: array
+                              x-kubernetes-list-map-keys:
+                              - name
+                              x-kubernetes-list-type: map
+                            maxKeyBytes:
+                              description: |-
+                                MaxKeyBytes is what the limits' keys may hold, once for the data plane's
+                                process: past it, keys are evicted, and start again full. 268,435,456
+                                (256 MiB) unless said. Not under Disabled, which keeps no keys.
+                              format: int64
+                              minimum: 1.0
+                              type: integer
+                            mode:
+                              description: |-
+                                Mode is how the limits are enforced:
+                                
+                                * Disabled: none enforced, nothing counted; the limits are still validated, so that enabling them again cannot fail on one.
+                                * Local: each proxy on what it sees alone, so that a client spread over several proxies gets each one's limit.
+                              enum:
+                              - Disabled
+                              - Local
+                              type: string
+                          required:
+                          - mode
+                          type: object
+                          x-kubernetes-validations:
+                          - message: maxKeyBytes is for a mode that keeps keys, not Disabled
+                            rule: self.mode != 'Disabled' || !has(self.maxKeyBytes)
                         replicas:
                           default:
                             min: 1

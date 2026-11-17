@@ -12,7 +12,7 @@ use std::fmt;
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ToDataPlane {
     /// The resource; none is one of a kind this data plane does not know.
-    #[prost(oneof = "Resource", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "Resource", tags = "1, 2, 3, 4, 5")]
     pub resource: Option<Resource>,
 }
 
@@ -31,6 +31,9 @@ pub enum Resource {
     /// The addresses of the gateway's own pods, which no route may send to.
     #[prost(message, tag = "4")]
     Gateway(Gateway),
+    /// The rate-limiting engine's limits, at a version the data plane does not hold.
+    #[prost(message, tag = "5")]
+    Limits(Limits),
 }
 
 /// The addresses of the gateway's own pods: the data planes', the control plane's and the
@@ -72,7 +75,20 @@ impl fmt::Debug for Certificate {
     }
 }
 
-/// A config, and the certificates it names, which a data plane must hold to run it.
+/// The rate-limiting engine's limits: a resource of their own, which a config names, as it
+/// names certificates (07 §2).
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Limits {
+    /// Their version.
+    #[prost(string, tag = "1")]
+    pub version: String,
+    /// The limits model's JSON.
+    #[prost(bytes = "vec", tag = "2")]
+    pub json: Vec<u8>,
+}
+
+/// A config, and the certificates and limits it names, which a data plane must hold to run
+/// it.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Config {
     /// Its version.
@@ -84,6 +100,9 @@ pub struct Config {
     /// The certificates it needs, each at the version it needs, by name.
     #[prost(btree_map = "string, string", tag = "3")]
     pub requires: BTreeMap<String, String>,
+    /// The version of the limits it needs; empty for none.
+    #[prost(string, tag = "4")]
+    pub limits: String,
 }
 
 /// Certificates no longer offered, by name.
@@ -128,7 +147,7 @@ pub struct Hello {
     pub oldest_config_version: u32,
 }
 
-/// Resources' versions: a config's and certificates'.
+/// Resources' versions: a config's, certificates' and limits'.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Held {
     /// The config's; empty is none.
@@ -137,6 +156,9 @@ pub struct Held {
     /// Each certificate's, by name.
     #[prost(btree_map = "string, string", tag = "2")]
     pub certificates: BTreeMap<String, String>,
+    /// The limits'; empty is none.
+    #[prost(string, tag = "3")]
+    pub limits: String,
 }
 
 /// What a data plane runs, the config it refused, if it refused the latest, and what of the
@@ -144,7 +166,7 @@ pub struct Held {
 /// last two skips them, as protobuf skips a field it has no tag for.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Report {
-    /// The config it runs and the certificates that config uses.
+    /// The config it runs and the certificates and limits that config uses.
     #[prost(message, optional, tag = "1")]
     pub running: Option<Held>,
     /// The config refused.
