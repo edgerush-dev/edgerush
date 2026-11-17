@@ -24,9 +24,9 @@
 //! Last, Gateway-first ([`gateway_first`](crate::gateway_first)): each DataPlane generated
 //! for a Gateway written alone applied, where it, its Gateway or its entry has changed since
 //! it was last applied, one of its name that the Gateway does not own left alone; each
-//! Gateway refused for its parameters told so in its status, and one no longer refused
-//! given its status back; and each generated DataPlane whose Gateway has moved to another
-//! class deleted.
+//! Gateway refused, for its parameters, beyond its ControlPlane's scope or of a class with
+//! no entry, told so in its status, and one no longer refused given its status back; and
+//! each generated DataPlane whose Gateway has moved to another class deleted.
 //!
 //! Nothing is kept from step to step but what saves a write: a new leader applies
 //! everything once, and converges from what the cluster holds.
@@ -561,8 +561,8 @@ impl Operator {
                 .await
             {
                 Ok(()) if conditions.is_empty() => say(&format!(
-                    "Gateway {namespace}/{name}: its parameters taken away, its status left to \
-                     its controller"
+                    "Gateway {namespace}/{name}: no longer refused, its status left to its \
+                     controller"
                 )),
                 Ok(()) => say(&format!(
                     "Gateway {namespace}/{name}: {}",
