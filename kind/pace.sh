@@ -18,8 +18,11 @@
 #     DataPlane generated, are each Accepted and Programmed of their generation, their
 #     listeners too, with their Service's address, within 180 s, and every Pod of `infra`
 #     Ready; the time the last took is said;
+#   - a request from a Pod in another namespace, as the suite's runner is (docs/04 §7), to
+#     a Gateway's status address reaches the backend of its route;
 #   - a listener added to a live Gateway is Programmed of the new generation within 60 s,
-#     listed on its Service and served; taken away, it is gone from both;
+#     listed on its Service and served at its status address; taken away, it is gone from
+#     both;
 #   - every Gateway deleted at once, each is gone within 30 s, and all made for them within
 #     60 s, none stuck on the operator's finalizer;
 #   - GATEWAYS Gateways made again and Programmed, their namespace deleted is gone within
@@ -41,9 +44,7 @@ name="edgerush-${version//./-}"
 kubeconfig=$(kind/cluster.sh up "$version")
 export KUBECONFIG="$kubeconfig"
 k() { kubectl --kubeconfig "$kubeconfig" "$@"; }
-forward_pid=
 finish() {
-    [ -n "$forward_pid" ] && kill "$forward_pid" 2>/dev/null || true
     if [ "${KEEP:-}" != 1 ]; then kind/cluster.sh down "$version" >/dev/null; fi
 }
 trap finish EXIT
@@ -224,7 +225,13 @@ make_all infra
 all_ready infra 180
 pass "$gateways Gateways made at once are each Accepted and Programmed with their Service's address, and every Pod Ready, within 180 s"
 
-echo "== a listener added to a live Gateway"
+echo "== a request from a Pod to a Gateway's status address"
+# The client, in a namespace other than the Gateways', as the suite's runner is: kind gives
+# no load balancer, so a Gateway's status address is its Service's cluster IP, which only
+# Pods reach (docs/04 §7).
+k -n default run client --image="$AGNHOST" --restart=Never -- pause >/dev/null
+k -n default wait --for condition=Ready pod/client --timeout=120s >/dev/null ||
+    fail "the client Pod is not Ready: $(k -n default get pod client --no-headers 2>&1)"
 k apply -f - >/dev/null <<'EOF'
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -233,6 +240,15 @@ spec:
   parentRefs: [{ name: g1 }]
   rules: [{ backendRefs: [{ name: shop, port: 80 }] }]
 EOF
+address=$(k -n infra get gateway g1 -o jsonpath='{.status.addresses[0].value}')
+[ -n "$address" ] || fail "Gateway g1's status says no address"
+# What the backend answers to a request from the client to $1: the name of its pod.
+fetch() { k -n default exec client -- curl -s --max-time 2 "http://$1/hostname" 2>/dev/null; }
+until_true '[[ "$(fetch "$address:8080")" == shop-* ]]' 60 ||
+    fail "a request from the client to Gateway g1's status address $address:8080 answers '$(fetch "$address:8080")', not the backend"
+pass "a request from a Pod in another namespace to a Gateway's status address reaches its route's backend"
+
+echo "== a listener added to a live Gateway"
 k -n infra patch gateway g1 --type json -p \
     '[{"op":"add","path":"/spec/listeners/-","value":{"name":"extra","port":8082,"protocol":"HTTP"}}]' >/dev/null
 start=$(now)
@@ -241,26 +257,9 @@ until_true '[ "$(ready infra | grep -cx g1)" = 1 ] && [ "$(k -n infra get gatewa
 echo "   Programmed of generation 2 in $(since "$start") s"
 until_true '[ -n "$(k -n infra get service edgerush-proxy-g1-pace -o jsonpath="{.spec.ports[?(@.port==8082)].port}")" ]' 60 ||
     fail "the listener added is not listed on Gateway g1's Service"
-port=18081
-forward() {
-    [ -n "$forward_pid" ] && kill "$forward_pid" 2>/dev/null || true
-    port=$((port + 1))
-    k -n infra port-forward deploy/edgerush-proxy-g1-pace "$port:8082" >/dev/null 2>&1 &
-    forward_pid=$!
-}
-status() { curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/hostname"; }
-served=
-for _ in $(seq 1 6); do
-    forward
-    if until_true '[ "$(status)" = 200 ]' 10; then
-        served=yes
-        break
-    fi
-done
-[ -n "$served" ] || fail "the listener added to Gateway g1 does not serve its route: $(status)"
-kill "$forward_pid" 2>/dev/null || true
-forward_pid=
-pass "a listener added to a live Gateway is Programmed of the new generation, listed on its Service and served"
+until_true '[[ "$(fetch "$address:8082")" == shop-* ]]' 60 ||
+    fail "the listener added to Gateway g1 does not serve its route at $address:8082: '$(fetch "$address:8082")'"
+pass "a listener added to a live Gateway is Programmed of the new generation, listed on its Service and served at its status address"
 k -n infra patch gateway g1 --type json -p '[{"op":"remove","path":"/spec/listeners/1"}]' >/dev/null
 until_true '[ "$(ready infra | grep -cx g1)" = 1 ] && [ "$(k -n infra get gateway g1 -o jsonpath={.metadata.generation})" = 3 ]' 60 ||
     fail "Gateway g1, its listener taken away, is not Programmed of generation 3: $(k -n infra get gateway g1 -o jsonpath='{.status.listeners}')"
