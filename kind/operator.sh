@@ -35,6 +35,11 @@
 #     too, its control plane writing nothing over it, and keeps its DataPlane, not applied
 #     again as the entry changes, until they are taken away, when its control plane accepts
 #     it again; `alone` deleted takes its DataPlane and all made for it;
+#   - Gateway-first's guardrails (docs/05 §4): with no entry, Gateway `lone` gets nothing
+#     and says Invalid, why, of its generation, as does `far`, beyond its ControlPlane's
+#     scope, whatever the entry; the entry written, `lone` gets a DataPlane and its control
+#     plane's status; the entry taken away, its DataPlane is kept and served, and once
+#     deleted by hand not made again, `lone` refused again;
 #   - the control plane writes the data plane's Service (docs/05 §2), owned by DataPlane
 #     `web`, a LoadBalancer that keeps the client's address: Ingress's two ports listed,
 #     and the Gateway's listener's as it is bound, which follows the listener's port as
@@ -458,6 +463,71 @@ until_true '! k -n edge get dataplane alone-edge && ! k -n edge get deploy edger
     fail "Gateway alone deleted, its DataPlane or Deployment is still there"
 k delete platformdefaults default >/dev/null
 pass "a Gateway deleted takes its generated DataPlane and all made for it"
+
+echo "== Gateway-first's guardrails"
+# The message of condition $3 of resource $1 (kind/name) in namespace $2.
+message() {
+    k -n "$2" get "$1" -o jsonpath="{.status.conditions[?(@.type==\"$3\")].message}" 2>/dev/null
+}
+# Whether both conditions of Gateway $1 in $2 are of its generation.
+of_generation() {
+    local at
+    at=$(k -n "$2" get gateway "$1" -o jsonpath='{.metadata.generation}')
+    [ "$(k -n "$2" get gateway "$1" -o jsonpath='{.status.conditions[?(@.type=="Accepted")].observedGeneration} {.status.conditions[?(@.type=="Programmed")].observedGeneration}')" = "$at $at" ]
+}
+alone lone
+condition_is gateway/lone edge Accepted "False Invalid" 60 ||
+    fail "Gateway lone, of a class with no entry: $(condition gateway/lone edge Accepted)"
+[ "$(condition gateway/lone edge Programmed)" = "False Invalid" ] ||
+    fail "Gateway lone, of a class with no entry, is programmed: $(condition gateway/lone edge Programmed)"
+[[ $(message gateway/lone edge Accepted) == *"no gatewayClasses entry"* ]] ||
+    fail "Gateway lone's refusal does not say its class has no entry: $(message gateway/lone edge Accepted)"
+of_generation lone edge || fail "Gateway lone's refusal is not of its generation"
+! k -n edge get dataplane lone-edge >/dev/null 2>&1 ||
+    fail "Gateway lone, of a class with no entry, gets a DataPlane"
+pass "a Gateway of a class with no entry gets nothing, and says Invalid, why, of its generation"
+k create namespace outside >/dev/null
+entry 1
+k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: far, namespace: outside }
+spec:
+  gatewayClassName: edge
+  listeners: [{ name: http, port: 8081, protocol: HTTP }]
+EOF
+condition_is gateway/far outside Accepted "False Invalid" 60 ||
+    fail "Gateway far, beyond its ControlPlane's scope: $(condition gateway/far outside Accepted)"
+[ "$(condition gateway/far outside Programmed)" = "False Invalid" ] ||
+    fail "Gateway far, beyond its ControlPlane's scope, is programmed: $(condition gateway/far outside Programmed)"
+[[ $(message gateway/far outside Accepted) == *"beyond its ControlPlane's watch scope"* ]] ||
+    fail "Gateway far's refusal does not say it is beyond the scope: $(message gateway/far outside Accepted)"
+of_generation far outside || fail "Gateway far's refusal is not of its generation"
+! k -n outside get dataplane far-edge >/dev/null 2>&1 ||
+    fail "Gateway far, beyond its ControlPlane's scope, gets a DataPlane"
+pass "a Gateway beyond its ControlPlane's watch scope gets nothing, whatever the entry, and says Invalid and why"
+until_true 'k -n edge get dataplane lone-edge' 60 ||
+    fail "Gateway lone, its class given an entry, gets no DataPlane"
+condition_is gateway/lone edge Accepted "True Accepted" 60 ||
+    fail "Gateway lone, given a DataPlane, is not accepted by its control plane: $(condition gateway/lone edge Accepted)"
+condition_is gateway/lone edge Programmed "True Programmed" 180 ||
+    fail "Gateway lone, given a DataPlane, is not programmed by its control plane: $(condition gateway/lone edge Programmed)"
+pass "a Gateway refused for its class's entry gets a DataPlane once one is written, its status then its control plane's"
+kept=$(dp_uid lone-edge)
+k delete platformdefaults default >/dev/null
+sleep 5
+[ "$(dp_uid lone-edge)" = "$kept" ] ||
+    fail "DataPlane lone-edge, its class's entry taken away, is not kept"
+[ "$(condition gateway/lone edge Accepted) $(condition gateway/lone edge Programmed)" = "True Accepted True Programmed" ] ||
+    fail "Gateway lone, its class's entry taken away, is not served on: $(condition gateway/lone edge Accepted), $(condition gateway/lone edge Programmed)"
+k -n edge delete dataplane lone-edge --wait=true >/dev/null
+condition_is gateway/lone edge Accepted "False Invalid" 60 ||
+    fail "Gateway lone, its DataPlane deleted with no entry, is not refused: $(condition gateway/lone edge Accepted)"
+! k -n edge get dataplane lone-edge >/dev/null 2>&1 ||
+    fail "DataPlane lone-edge, deleted with no entry for its class, is made again"
+pass "an entry taken away keeps and serves the DataPlanes made for it and makes none again, a Gateway left with none refused"
+k -n edge delete gateway lone >/dev/null
+k delete namespace outside --wait=false >/dev/null
 
 echo "== the data plane's Service"
 # The ports the data plane's Service lists, as `port/protocol`, in its order.

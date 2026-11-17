@@ -5,12 +5,17 @@
 //! A Gateway of an accepted ControlPlane's class, the class the operator made for it,
 //! whose `PlatformDefaults` entry there is, in the ControlPlane's watch scope, and not one
 //! the operator made from a DataPlane, gets the DataPlane `edgerush-planes` generates for
-//! it. One that sets `infrastructure.parametersRef` gets none, and its status says
-//! `InvalidParameters`; a DataPlane it already has is left as it is, neither applied again
-//! nor deleted, and serves its last config until the field is taken away. A generated
-//! DataPlane whose Gateway has moved to another class is another name, so it is deleted,
-//! and the Gateway gets another; one whose Gateway is deleted goes with it, by its owner
-//! reference.
+//! it. The rest of that class's the operator refuses, its status saying why, and a
+//! DataPlane one already has is left as it is, neither applied again nor deleted: one
+//! beyond the scope, `Invalid`, its control plane unable to read it, so that only the pods
+//! running serve, their last config; one that sets `infrastructure.parametersRef`,
+//! `InvalidParameters`, its control plane holding its last config until the field is taken
+//! away; and one whose class has no entry, `Invalid`, where it has no DataPlane. One that
+//! has, made before the entry was taken away, is served as it was last applied, its status
+//! its controller's: an entry taken away makes no more. Once allowed, a Gateway has the
+//! operator's conditions taken back, for its controller to write. A generated DataPlane
+//! whose Gateway has moved to another class is another name, so it is deleted, and the
+//! Gateway gets another; one whose Gateway is deleted goes with it, by its owner reference.
 //!
 //! A generated DataPlane is told apart by its owner, its Gateway, and its name, which that
 //! Gateway's name and class make: the shipped admission policy lets no one but the
@@ -32,11 +37,60 @@ use std::collections::BTreeMap;
 /// The reason a Gateway with parameters is not accepted for, Gateway API's own.
 pub const INVALID_PARAMETERS: &str = "InvalidParameters";
 
-/// What such a Gateway's conditions say.
+/// The reason a Gateway not allowed a data plane is not accepted for: Gateway API's for
+/// one invalid, as it has none for one valid but not allowed (05 §4).
+pub const INVALID: &str = "Invalid";
+
+/// What a Gateway with parameters is told.
 const PARAMETERS: &str = "spec.infrastructure.parametersRef names no kind EdgeRush reads: a \
                           generated data plane is its class's PlatformDefaults entry and \
                           nothing else, so this Gateway gets none; one it already has is left \
                           as it is, serving its last config, until the field is taken away.";
+
+/// What a Gateway of a class with no entry, and with no data plane, is told.
+const NO_ENTRY: &str = "Gateway-first is not on for this Gateway's class: PlatformDefaults \
+                        default has no gatewayClasses entry for it, so no data plane is \
+                        made for it.";
+
+/// What a Gateway beyond its ControlPlane's watch scope is told.
+const BEYOND_SCOPE: &str = "This Gateway's namespace is beyond its ControlPlane's watch scope, \
+                            which its control plane cannot read: no data plane is made for \
+                            it, and one it already has is left as it is, its running pods \
+                            serving their last config and a pod that replaces one getting \
+                            none, until the scope takes the namespace in.";
+
+/// Why the operator refuses a Gateway written alone, of its ControlPlane's class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// Its namespace is beyond the ControlPlane's watch scope.
+    BeyondScope,
+    /// It sets `infrastructure.parametersRef`.
+    Parameters,
+    /// Its class has no entry, and it no DataPlane.
+    NoEntry,
+}
+
+impl Refusal {
+    /// Every refusal, by which a status is known to hold one.
+    const ALL: [Self; 3] = [Self::BeyondScope, Self::Parameters, Self::NoEntry];
+
+    /// Its conditions' reason.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Parameters => INVALID_PARAMETERS,
+            Self::BeyondScope | Self::NoEntry => INVALID,
+        }
+    }
+
+    /// Its conditions' message.
+    fn message(self) -> &'static str {
+        match self {
+            Self::BeyondScope => BEYOND_SCOPE,
+            Self::Parameters => PARAMETERS,
+            Self::NoEntry => NO_ENTRY,
+        }
+    }
+}
 
 /// What a step does for Gateway-first.
 #[derive(Debug, Default)]
@@ -44,7 +98,8 @@ pub struct Generation<'a> {
     /// Each DataPlane to apply, beside the Gateway it is generated for.
     pub data_planes: Vec<(&'a Gateway, DataPlane)>,
     /// Each Gateway refused whose status does not say so yet, with the conditions it is
-    /// to hold.
+    /// to hold: one beyond the scope, one of parameters, or one of a class with no entry
+    /// that has no DataPlane.
     pub refused: Vec<(&'a Gateway, Vec<Condition>)>,
     /// Each Gateway whose status still holds the operator's refusal though it is no longer
     /// refused: the conditions are taken back, for its controller to write.
@@ -77,37 +132,40 @@ pub fn generation<'a>(
         if gateway.metadata.deletion_timestamp.is_some() || made_from_a_data_plane(gateway) {
             continue;
         }
-        let refused = gateway
-            .spec
-            .infrastructure
-            .as_ref()
-            .is_some_and(|infrastructure| infrastructure.parameters_ref.is_some());
-        let generates = class_of(gateway, control_planes, classes)
-            .filter(|control_plane| watches(control_plane, &gateway.metadata, namespaces))
-            .and_then(|control_plane| {
-                let class = &gateway.spec.gateway_class_name;
-                let entry = entries.iter().find(|entry| &entry.name == class)?;
-                Some((control_plane, entry))
-            });
-        match generates {
-            Some(_) if refused => {
-                let conditions = invalid_parameters(gateway, now);
-                if differs(held(gateway), &conditions) {
-                    generation.refused.push((gateway, conditions));
-                }
-            }
-            Some((control_plane, entry)) => {
+        let refusal = class_of(gateway, control_planes, classes).and_then(|control_plane| {
+            let parameters = gateway
+                .spec
+                .infrastructure
+                .as_ref()
+                .is_some_and(|infrastructure| infrastructure.parameters_ref.is_some());
+            let class = &gateway.spec.gateway_class_name;
+            if !watches(control_plane, &gateway.metadata, namespaces) {
+                Some(Refusal::BeyondScope)
+            } else if parameters {
+                Some(Refusal::Parameters)
+            } else if let Some(entry) = entries.iter().find(|entry| &entry.name == class) {
                 match planes::data_plane(gateway, &entry.data_plane, control_plane) {
                     Ok(data_plane) => generation.data_planes.push((gateway, data_plane)),
                     Err(error) => generation
                         .problems
                         .push(format!("{}: {error}", described(&gateway.metadata))),
                 }
+                None
+            } else if has_data_plane(gateway, gateways, data_planes) {
+                None
+            } else {
+                Some(Refusal::NoEntry)
             }
+        });
+        match refusal {
+            Some(refusal) => {
+                let conditions = refused(gateway, refusal, now);
+                if differs(held(gateway), &conditions) {
+                    generation.refused.push((gateway, conditions));
+                }
+            }
+            None if holds_refusal(gateway) => generation.released.push(gateway),
             None => {}
-        }
-        if !refused && holds_refusal(gateway) {
-            generation.released.push(gateway);
         }
     }
     generation.stale = data_planes
@@ -138,6 +196,16 @@ pub fn is_generated(data_plane: &DataPlane, gateways: &[Gateway]) -> bool {
         data_plane.spec.control_plane_ref.name == *class
             && data_plane.spec.control_plane_ref.namespace.is_some()
             && data_plane.metadata.name.as_deref() == Some(data_plane_name(name, class).as_str())
+    })
+}
+
+/// Whether `gateway`, of `gateways`, has the DataPlane of `data_planes` generated for it as
+/// it now is, not being deleted.
+fn has_data_plane(gateway: &Gateway, gateways: &[Gateway], data_planes: &[DataPlane]) -> bool {
+    data_planes.iter().any(|data_plane| {
+        data_plane.metadata.deletion_timestamp.is_none()
+            && is_generated(data_plane, gateways)
+            && owner(data_plane, gateways).is_some_and(|owner| std::ptr::eq(owner, gateway))
     })
 }
 
@@ -242,17 +310,19 @@ fn held(gateway: &Gateway) -> &[Condition] {
         .unwrap_or_default()
 }
 
-/// Whether `gateway`'s status holds the operator's refusal of its parameters.
+/// Whether `gateway`'s status holds a refusal of the operator's.
 fn holds_refusal(gateway: &Gateway) -> bool {
-    held(gateway)
-        .iter()
-        .any(|condition| condition.reason == INVALID_PARAMETERS && condition.message == PARAMETERS)
+    held(gateway).iter().any(|condition| {
+        Refusal::ALL.iter().any(|refusal| {
+            condition.reason == refusal.reason() && condition.message == refusal.message()
+        })
+    })
 }
 
-/// The conditions `gateway`, of parameters EdgeRush does not read, is to hold: `Accepted`
-/// and `Programmed` false, of its generation, each keeping the time of the one it holds
-/// where that is already false, else `now`.
-fn invalid_parameters(gateway: &Gateway, now: &Time) -> Vec<Condition> {
+/// The conditions `gateway`, refused for `refusal`, is to hold: `Accepted` and
+/// `Programmed` false, of its generation, each keeping the time of the one it holds where
+/// that is already false, else `now`.
+fn refused(gateway: &Gateway, refusal: Refusal, now: &Time) -> Vec<Condition> {
     [ACCEPTED, PROGRAMMED]
         .into_iter()
         .map(|type_| {
@@ -266,8 +336,8 @@ fn invalid_parameters(gateway: &Gateway, now: &Time) -> Vec<Condition> {
             Condition {
                 type_: type_.to_owned(),
                 status: "False".to_owned(),
-                reason: INVALID_PARAMETERS.to_owned(),
-                message: PARAMETERS.to_owned(),
+                reason: refusal.reason().to_owned(),
+                message: refusal.message().to_owned(),
                 observed_generation: gateway.metadata.generation,
                 last_transition_time: since,
             }

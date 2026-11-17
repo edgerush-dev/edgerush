@@ -247,6 +247,199 @@ fn a_gateway_whose_parameters_are_taken_away_has_its_refusal_taken_back() {
     assert_eq!(names(&made), ["web-edge"]);
 }
 
+/// The type, status, reason and generation of each of `conditions`.
+fn said(conditions: &[Condition]) -> Vec<(&str, &str, &str, Option<i64>)> {
+    conditions
+        .iter()
+        .map(|c| {
+            (
+                c.type_.as_str(),
+                c.status.as_str(),
+                c.reason.as_str(),
+                c.observed_generation,
+            )
+        })
+        .collect()
+}
+
+/// `gateway` with `conditions` on its status.
+fn told(mut gateway: Gateway, conditions: &[Condition]) -> Gateway {
+    gateway.status =
+        Some(serde_json::from_value(serde_json::json!({ "conditions": conditions })).unwrap());
+    gateway
+}
+
+/// The one Gateway `generation` refuses, with its conditions.
+fn refused_one<'a>(generation: &'a Generation<'_>) -> &'a [Condition] {
+    let [(refused, conditions)] = generation.refused.as_slice() else {
+        panic!("one refused: {:?}", generation.refused);
+    };
+    assert_eq!(refused.metadata.name.as_deref(), Some("web"));
+    conditions
+}
+
+#[test]
+fn a_gateway_of_a_class_with_no_entry_and_no_data_plane_is_refused_invalid() {
+    let gateways = [gateway("web", "edge")];
+    let made = generation_of(&gateways, &[], "All", true, &["other"]);
+    assert!(names(&made).is_empty());
+    let conditions = refused_one(&made);
+    assert_eq!(
+        said(conditions),
+        [
+            ("Accepted", "False", INVALID, Some(3)),
+            ("Programmed", "False", INVALID, Some(3)),
+        ]
+    );
+    assert!(conditions.iter().all(|c| c.message == NO_ENTRY));
+    // No PlatformDefaults at all is no entry either.
+    let control_plane = control_plane("All");
+    let none = generation(
+        &gateways,
+        &[],
+        &[(&control_plane, true)],
+        &[class()],
+        None,
+        &BTreeMap::new(),
+        &time(0),
+    );
+    assert_eq!(refused_one(&none)[0].message, NO_ENTRY);
+    // Its status saying so, nothing is written again.
+    let again = [told(gateway("web", "edge"), conditions)];
+    let again = generation_of(&again, &[], "All", true, &["other"]);
+    assert!(again.refused.is_empty() && again.released.is_empty());
+}
+
+#[test]
+fn a_gateway_beyond_the_scope_is_refused_invalid_whatever_its_entry() {
+    let gateways = [gateway("web", "edge")];
+    let made = generation_of(&gateways, &[], "Same", true, &["edge"]);
+    assert!(names(&made).is_empty());
+    let conditions = refused_one(&made);
+    assert_eq!(
+        said(conditions),
+        [
+            ("Accepted", "False", INVALID, Some(3)),
+            ("Programmed", "False", INVALID, Some(3)),
+        ]
+    );
+    assert!(conditions.iter().all(|c| c.message == BEYOND_SCOPE));
+    // Before its parameters, which its control plane could not hold it for.
+    let with = [with_parameters(gateway("web", "edge"))];
+    let made = generation_of(&with, &[], "Same", true, &["edge"]);
+    assert_eq!(refused_one(&made)[0].message, BEYOND_SCOPE);
+}
+
+#[test]
+fn a_data_plane_generated_before_its_namespace_left_the_scope_is_kept_not_applied_again() {
+    let gateways = [gateway("web", "edge")];
+    let made = generation_of(&gateways, &[], "All", true, &["edge"]);
+    let generated = vec![stored(&made.data_planes[0].1)];
+    let now = generation_of(&gateways, &generated, "Same", true, &["edge"]);
+    assert!(names(&now).is_empty(), "not applied again");
+    assert!(now.stale.is_empty(), "not deleted");
+    assert_eq!(refused_one(&now)[0].message, BEYOND_SCOPE);
+}
+
+#[test]
+fn a_data_plane_generated_before_its_entry_was_removed_is_kept_and_its_gateway_not_refused() {
+    let gateways = [gateway("web", "edge")];
+    let made = generation_of(&gateways, &[], "All", true, &["edge"]);
+    let generated = vec![stored(&made.data_planes[0].1)];
+    let now = generation_of(&gateways, &generated, "All", true, &["other"]);
+    assert!(names(&now).is_empty(), "not applied again");
+    assert!(now.stale.is_empty(), "not deleted");
+    assert!(now.refused.is_empty(), "its status its controller's");
+    // One being deleted is not kept for it.
+    let mut going = generated[0].clone();
+    going.metadata.deletion_timestamp = Some(time(1));
+    let going = [going];
+    let now = generation_of(&gateways, &going, "All", true, &["other"]);
+    assert_eq!(refused_one(&now)[0].message, NO_ENTRY);
+}
+
+#[test]
+fn a_gateway_with_parameters_and_no_entry_is_refused_for_its_parameters() {
+    let gateways = [with_parameters(gateway("web", "edge"))];
+    let made = generation_of(&gateways, &[], "All", true, &["other"]);
+    assert_eq!(
+        said(refused_one(&made)),
+        [
+            ("Accepted", "False", INVALID_PARAMETERS, Some(3)),
+            ("Programmed", "False", INVALID_PARAMETERS, Some(3)),
+        ]
+    );
+    // Nor where it has a data plane, which its controller holds for it.
+    let before = [gateway("web", "edge")];
+    let generated = vec![stored(
+        &generation_of(&before, &[], "All", true, &["edge"]).data_planes[0].1,
+    )];
+    let made = generation_of(&gateways, &generated, "All", true, &["other"]);
+    assert_eq!(refused_one(&made)[0].reason, INVALID_PARAMETERS);
+}
+
+#[test]
+fn a_gateway_allowed_again_has_its_refusal_taken_back() {
+    // No entry, then one written.
+    let no_entry = [gateway("web", "edge")];
+    let conditions = generation_of(&no_entry, &[], "All", true, &[]).refused[0]
+        .1
+        .clone();
+    let allowed = [told(gateway("web", "edge"), &conditions)];
+    let made = generation_of(&allowed, &[], "All", true, &["edge"]);
+    assert_eq!(made.released.len(), 1);
+    assert_eq!(names(&made), ["web-edge"]);
+    // Beyond the scope, then within it.
+    let conditions = generation_of(&no_entry, &[], "Same", true, &["edge"]).refused[0]
+        .1
+        .clone();
+    let allowed = [told(gateway("web", "edge"), &conditions)];
+    let made = generation_of(&allowed, &[], "All", true, &["edge"]);
+    assert_eq!(made.released.len(), 1);
+    assert_eq!(names(&made), ["web-edge"]);
+    // Within it, its data plane kept and its entry gone: its controller's again.
+    let generated = vec![stored(&made.data_planes[0].1)];
+    let made = generation_of(&allowed, &generated, "All", true, &[]);
+    assert_eq!(made.released.len(), 1);
+    assert!(made.refused.is_empty());
+}
+
+#[test]
+fn a_refusal_for_another_cause_is_written_over_the_one_held() {
+    let gateways = [gateway("web", "edge")];
+    let mut conditions = generation_of(&gateways, &[], "All", true, &[]).refused[0]
+        .1
+        .clone();
+    for condition in &mut conditions {
+        condition.last_transition_time = time(-5);
+    }
+    let held = [told(gateway("web", "edge"), &conditions)];
+    let made = generation_of(&held, &[], "Same", true, &[]);
+    assert_eq!(refused_one(&made)[0].message, BEYOND_SCOPE);
+    assert!(made.released.is_empty());
+    // Kept as false since it first was.
+    assert_eq!(
+        refused_one(&made)[0].last_transition_time,
+        conditions[0].last_transition_time
+    );
+}
+
+#[test]
+fn a_gateway_of_a_control_plane_not_accepted_or_of_another_class_is_not_refused() {
+    let gateways = [gateway("web", "edge")];
+    assert!(
+        generation_of(&gateways, &[], "Same", false, &[])
+            .refused
+            .is_empty()
+    );
+    let other = [gateway("web", "other")];
+    assert!(
+        generation_of(&other, &[], "Same", true, &[])
+            .refused
+            .is_empty()
+    );
+}
+
 /// `data_plane` as the API server stores it: with a UID, and, as its spec says, of its
 /// namespace.
 fn stored(data_plane: &DataPlane) -> DataPlane {
