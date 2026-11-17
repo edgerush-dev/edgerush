@@ -8,6 +8,10 @@
 //! and admitted when its key comes back half a window on, its decision taking off half the
 //! ring, and two windows on, emptying all of it.
 //!
+//! Every limit is handed over as a `Limit`, as the proxy hands it: the decision built for
+//! a `Contract`, a `Window` or a `Rolling` is another function, which the proxy never runs
+//! and the compiler inlines otherwise (GitHub #400).
+//!
 //! Linux only (valgrind): `cargo bench -p edgerush-ratelimit --bench local`, see the
 //! repository README.
 
@@ -16,7 +20,7 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_ratelimit::local::{Decision, Handles, Local, Rolling, Window};
+use edgerush_ratelimit::local::{Decision, Handles, Limit, Local, Rolling, Window};
 use edgerush_ratelimit::service::{Contract, Keyed};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
@@ -29,13 +33,13 @@ const KEY: &[u8] = b"api/0\0c3b2a1f0-9e8d-4c7b-a6f5-e4d3c2b1a0f9";
 const ROUTE: &[u8] = b"orders\0c3b2a1f0-9e8d-4c7b-a6f5-e4d3c2b1a0f9";
 const GLOBAL: &[u8] = b"global\0c3b2a1f0-9e8d-4c7b-a6f5-e4d3c2b1a0f9";
 
-fn contract(burst: u64) -> Contract {
+fn contract(burst: u64) -> Limit {
     let n = |n| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
-    Contract {
+    Limit::Bucket(Contract {
         limit: n(100),
         window: n(1_000 * MS),
         burst: n(burst),
-    }
+    })
 }
 
 fn hasher() -> Keyed {
@@ -48,7 +52,7 @@ type Worker = Box<(Local<Keyed>, Handles<Keyed>)>;
 
 /// A worker holding handles to a thousand keys and `KEY`, `ROUTE` and `GLOBAL`, each asked
 /// about once.
-fn held(burst: u64) -> (Worker, Contract) {
+fn held(burst: u64) -> (Worker, Limit) {
     let mut worker: Worker = Box::new((Local::new(hasher(), 4), Handles::new(hasher())));
     let contract = contract(burst);
     let keys = (0..1_000).map(|k| format!("api/0\0key-{k}").into_bytes());
@@ -62,7 +66,7 @@ fn held(burst: u64) -> (Worker, Contract) {
 #[library_benchmark]
 #[bench::admitted(held(100))]
 #[bench::refused_empty(held(1))]
-fn decide(setup: (Worker, Contract)) -> (Decision, Worker) {
+fn decide(setup: (Worker, Limit)) -> (Decision, Worker) {
     let (mut worker, contract) = setup;
     let (local, handles) = &mut *worker;
     let decision = local.decide(handles, black_box(&[(KEY, contract)]), black_box(MS));
@@ -72,12 +76,12 @@ fn decide(setup: (Worker, Contract)) -> (Decision, Worker) {
 
 /// A worker holding handles to a thousand windows of `limit` a second and `KEY`'s, each
 /// asked about once, at the time the decision measured is made.
-fn held_window(limit: u64) -> (Worker, Window) {
+fn held_window(limit: u64) -> (Worker, Limit) {
     let n = |n| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
-    let window = Window {
+    let window = Limit::FixedWindow(Window {
         limit: n(limit),
         window: n(1_000 * MS),
-    };
+    });
     let mut worker: Worker = Box::new((Local::new(hasher(), 4), Handles::new(hasher())));
     let keys = (0..1_000).map(|k| format!("api/0\0key-{k}").into_bytes());
     for key in keys.chain([KEY.to_vec()]) {
@@ -90,7 +94,7 @@ fn held_window(limit: u64) -> (Worker, Window) {
 #[library_benchmark]
 #[bench::admitted(held_window(100))]
 #[bench::refused(held_window(1))]
-fn decide_window(setup: (Worker, Window)) -> (Decision, Worker) {
+fn decide_window(setup: (Worker, Limit)) -> (Decision, Worker) {
     let (mut worker, window) = setup;
     let (local, handles) = &mut *worker;
     let decision = local.decide(handles, black_box(&[(KEY, window)]), black_box(MS));
@@ -104,13 +108,13 @@ const LATER: u64 = 10_000 * MS;
 /// A worker holding handles to a thousand rolling windows of `limit` a second in `slots`
 /// slots and `KEY`'s, each asked about once at `LATER`, the decision measured made then; and,
 /// if `hinted`, `KEY` asked once more, refused, so that its hint holds its newest slot.
-fn held_rolling(limit: u64, slots: u64, hinted: bool) -> (Worker, Rolling) {
+fn held_rolling(limit: u64, slots: u64, hinted: bool) -> (Worker, Limit) {
     let n = |n| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
-    let rolling = Rolling {
+    let rolling = Limit::RollingWindow(Rolling {
         limit: n(limit),
         window: n(1_000 * MS),
         slots: n(slots),
-    };
+    });
     let mut worker: Worker = Box::new((Local::new(hasher(), 4), Handles::new(hasher())));
     let keys = (0..1_000).map(|k| format!("api/0\0key-{k}").into_bytes());
     for key in keys.chain([KEY.to_vec()]) {
@@ -130,7 +134,7 @@ fn held_rolling(limit: u64, slots: u64, hinted: bool) -> (Worker, Rolling) {
 #[bench::refused_hinted(held_rolling(1, 1_000, true))]
 #[bench::refused_scanning_60(held_rolling(1, 60, false))]
 #[bench::refused_hinted_60(held_rolling(1, 60, true))]
-fn decide_rolling(setup: (Worker, Rolling)) -> (Decision, Worker) {
+fn decide_rolling(setup: (Worker, Limit)) -> (Decision, Worker) {
     let (mut worker, rolling) = setup;
     let (local, handles) = &mut *worker;
     let decision = local.decide(handles, black_box(&[(KEY, rolling)]), black_box(LATER));
@@ -138,7 +142,7 @@ fn decide_rolling(setup: (Worker, Rolling)) -> (Decision, Worker) {
 }
 
 /// `held_rolling`'s worker, and when its key comes back: `gap` after `LATER`.
-fn back_after(gap: u64) -> (Worker, Rolling, u64) {
+fn back_after(gap: u64) -> (Worker, Limit, u64) {
     let (worker, rolling) = held_rolling(100, 1_000, false);
     (worker, rolling, LATER + gap)
 }
@@ -146,7 +150,7 @@ fn back_after(gap: u64) -> (Worker, Rolling, u64) {
 #[library_benchmark]
 #[bench::half_a_window(back_after(500 * MS))]
 #[bench::two_windows(back_after(2_000 * MS))]
-fn decide_rolling_back(setup: (Worker, Rolling, u64)) -> (Decision, Worker) {
+fn decide_rolling_back(setup: (Worker, Limit, u64)) -> (Decision, Worker) {
     let (mut worker, rolling, at) = setup;
     let (local, handles) = &mut *worker;
     let decision = local.decide(handles, black_box(&[(KEY, rolling)]), black_box(at));
@@ -156,7 +160,7 @@ fn decide_rolling_back(setup: (Worker, Rolling, u64)) -> (Decision, Worker) {
 #[library_benchmark]
 #[bench::two(held(100), 2)]
 #[bench::three(held(100), 3)]
-fn decide_all(setup: (Worker, Contract), limits: usize) -> (Decision, Worker) {
+fn decide_all(setup: (Worker, Limit), limits: usize) -> (Decision, Worker) {
     let (mut worker, contract) = setup;
     let (local, handles) = &mut *worker;
     let keys = [(KEY, contract), (ROUTE, contract), (GLOBAL, contract)];
@@ -166,7 +170,7 @@ fn decide_all(setup: (Worker, Contract), limits: usize) -> (Decision, Worker) {
 
 /// A registry of a hundred thousand keys, `KEY` among them unless said, and a worker with
 /// no handles.
-fn registry(with_key: bool) -> (Worker, Contract) {
+fn registry(with_key: bool) -> (Worker, Limit) {
     let mut worker: Worker = Box::new((Local::new(hasher(), 4), Handles::new(hasher())));
     let contract = contract(100);
     {
@@ -183,7 +187,7 @@ fn registry(with_key: bool) -> (Worker, Contract) {
 #[library_benchmark]
 #[bench::found(registry(true))]
 #[bench::made(registry(false))]
-fn first_meeting(setup: (Worker, Contract)) -> (Decision, Worker) {
+fn first_meeting(setup: (Worker, Limit)) -> (Decision, Worker) {
     let (mut worker, contract) = setup;
     let (local, handles) = &mut *worker;
     let decision = local.decide(handles, black_box(&[(KEY, contract)]), black_box(MS));
