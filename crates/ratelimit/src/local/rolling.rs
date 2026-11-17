@@ -93,15 +93,28 @@ impl Ring {
         slot.saturating_sub(self.slots - 1)
     }
 
+    /// The slots from `from` to below `to`, as the ring's entries hold them.
+    const fn runs(&self, from: u64, to: u64) -> Runs {
+        Runs {
+            from,
+            to,
+            slots: self.slots,
+        }
+    }
+
     /// The total with the slots from `through` to below `oldest` taken off: none of them
     /// left once the window has moved on by all its slots.
     fn taken_off(&self, total: u64, through: u64, oldest: u64) -> u64 {
         if oldest - through >= self.slots {
             return 0;
         }
-        (through..oldest).fold(total, |total, x| {
-            total - self.cells.counted(x, self.slots).min(total)
-        })
+        let mut left = total;
+        self.cells
+            .oldest_counting(self.runs(through, oldest), |_, count| {
+                left -= count.min(left);
+                left == 0
+            });
+        left
     }
 
     /// Empties the entries of the slots from `through` to below `oldest`, which a total has
@@ -110,9 +123,7 @@ impl Ring {
     /// left their entries, at most a ring's, from `through` on.
     fn empty(&self, through: u64, oldest: u64) {
         let end = oldest.min(through + self.slots);
-        for x in through..end {
-            self.cells.clear(x, self.slots);
-        }
+        self.cells.clear(self.runs(through, end));
     }
 
     /// Takes off what left the window by `now`'s slot and reads the total, closed or not:
@@ -153,24 +164,24 @@ impl Ring {
         };
         let mut counted = 0;
         let mut first = true;
-        for x in start..=slot {
-            let count = self.cells.counted(x, self.slots);
-            if count == 0 {
-                continue;
-            }
-            if first {
-                first = false;
-                if hinted != x + 1 {
-                    self.hint.store(x + 1, Ordering::Relaxed);
+        let enough = self
+            .cells
+            .oldest_counting(self.runs(start, slot + 1), |x, count| {
+                if first {
+                    first = false;
+                    if hinted != x + 1 {
+                        self.hint.store(x + 1, Ordering::Relaxed);
+                    }
                 }
-            }
-            counted += count;
-            if counted >= need {
-                return (x + self.slots) * self.len - now;
-            }
+                counted += count;
+                counted >= need
+            });
+        match enough {
+            Some(x) => (x + self.slots) * self.len - now,
+            // Counts not yet in their slots, of requests between their two writes: a slot's
+            // wait.
+            None => self.len - now % self.len,
         }
-        // Counts not yet in their slots, of requests between their two writes: a slot's wait.
-        self.len - now % self.len
     }
 
     /// Whether a request at `now` fits, nothing charged.
@@ -272,9 +283,8 @@ impl Ring {
         let oldest = self.oldest(slot);
         let (_, through) = local_parts(state.load(Ordering::Acquire));
         let newest = slot.min(through + self.slots - 1);
-        (oldest.max(through)..=newest)
-            .rev()
-            .find(|x| self.cells.counted(*x, self.slots) > 0)
+        self.cells
+            .newest_counting(self.runs(oldest.max(through), newest + 1))
             .map_or(0, |x| (x + self.slots) * self.len - now)
     }
 
@@ -340,7 +350,8 @@ enum Cells {
     Wide(Box<[AtomicU64]>),
 }
 
-/// One entry, as a number of `BITS` bits: its lap above its count.
+/// One entry, as a number of `BITS` bits: its lap above its count. A slot's lap is its number
+/// divided by the slots, of which the entry keeps the low `LAP_BITS`.
 trait Entry {
     const BITS: u32;
     const LAP_BITS: u32;
@@ -351,26 +362,27 @@ trait Entry {
         Self::BITS - Self::LAP_BITS
     }
 
-    /// Slot `x`'s lap, as the entry tags it.
-    fn lap(x: u64, slots: u64) -> u64 {
-        (x / slots) & ((1 << Self::LAP_BITS) - 1)
+    /// `lap` as the entry tags it.
+    fn tag(lap: u64) -> u64 {
+        lap & ((1 << Self::LAP_BITS) - 1)
     }
 
-    /// What slot `x` counted, if the entry holds its lap.
-    fn counted(&self, x: u64, slots: u64) -> u64 {
+    /// What the slot of `lap` here counted, if the entry holds its lap.
+    fn counted(&self, lap: u64) -> u64 {
         let entry = self.get();
-        if entry >> Self::count_bits() == Self::lap(x, slots) {
+        if entry >> Self::count_bits() == Self::tag(lap) {
             entry & ((1 << Self::count_bits()) - 1)
         } else {
             0
         }
     }
 
-    /// One more for slot `x`, the entry taken over if it holds an earlier lap: false, and
-    /// nothing written, if it holds a later one, whose count is in the window and `x`'s not —
-    /// a clock a window behind, which taken over, the total would hold a count no slot does.
-    fn add(&self, x: u64, slots: u64) -> bool {
-        let lap = Self::lap(x, slots);
+    /// One more for the slot of `lap` here, the entry taken over if it holds an earlier lap:
+    /// false, and nothing written, if it holds a later one, whose count is in the window and
+    /// this slot's is not — a clock a window behind, which taken over, the total would hold a
+    /// count no slot does.
+    fn add(&self, lap: u64) -> bool {
+        let lap = Self::tag(lap);
         let half = 1 << (Self::LAP_BITS - 1);
         let mut seen = self.get();
         loop {
@@ -389,9 +401,9 @@ trait Entry {
         }
     }
 
-    /// One fewer for slot `x`, if the entry still holds its lap and a count.
-    fn sub(&self, x: u64, slots: u64) {
-        let lap = Self::lap(x, slots);
+    /// One fewer for the slot of `lap` here, if the entry still holds its lap and a count.
+    fn sub(&self, lap: u64) {
+        let lap = Self::tag(lap);
         let mut seen = self.get();
         while seen >> Self::count_bits() == lap && seen & ((1 << Self::count_bits()) - 1) > 0 {
             match self.swap_if(seen, seen - 1) {
@@ -401,10 +413,11 @@ trait Entry {
         }
     }
 
-    /// Emptied, if it holds slot `x`'s count and nothing has changed it since it was read.
-    fn clear(&self, x: u64, slots: u64) {
+    /// Emptied, if it holds the count of the slot of `lap` here and nothing has changed it
+    /// since it was read.
+    fn clear(&self, lap: u64) {
         let seen = self.get();
-        if seen != 0 && seen >> Self::count_bits() == Self::lap(x, slots) {
+        if seen != 0 && seen >> Self::count_bits() == Self::tag(lap) {
             // Lost to a request counted since, the entry keeps it.
             let _ = self.swap_if(seen, 0);
         }
@@ -442,37 +455,168 @@ impl Entry for AtomicU64 {
     }
 }
 
+/// The slots from `from` to below `to`, as the runs of side-by-side entries they lie in: a
+/// walk over them divides once a run, rather than twice a slot (#401).
+#[derive(Debug, Clone, Copy)]
+struct Runs {
+    from: u64,
+    to: u64,
+    slots: u64,
+}
+
+/// Slots of one lap whose entries lie side by side.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    /// The run's first slot.
+    first: u64,
+    lap: u64,
+    /// Where its entries start, and how many there are.
+    at: usize,
+    len: usize,
+}
+
+impl Run {
+    /// The run's entries among `cells`, the ring's.
+    fn of<E>(self, cells: &[E]) -> &[E] {
+        // A run lies within one lap's entries, all of them there: none were it not.
+        cells.get(self.at..self.at + self.len).unwrap_or_default()
+    }
+}
+
+impl Iterator for Runs {
+    type Item = Run;
+
+    fn next(&mut self) -> Option<Run> {
+        if self.from >= self.to {
+            return None;
+        }
+        let at = self.from % self.slots;
+        let len = (self.slots - at).min(self.to - self.from);
+        let run = Run {
+            first: self.from,
+            lap: self.from / self.slots,
+            // Both are at most the slots, the entries' length.
+            at: at as usize,
+            len: len as usize,
+        };
+        self.from += len;
+        Some(run)
+    }
+}
+
+impl DoubleEndedIterator for Runs {
+    fn next_back(&mut self) -> Option<Run> {
+        if self.from >= self.to {
+            return None;
+        }
+        let last = self.to - 1;
+        let at = last % self.slots;
+        let len = (at + 1).min(self.to - self.from);
+        let first = self.to - len;
+        let run = Run {
+            first,
+            lap: last / self.slots,
+            // Both are at most the slots, the entries' length.
+            at: (at + 1 - len) as usize,
+            len: len as usize,
+        };
+        self.to = first;
+        Some(run)
+    }
+}
+
+/// Calls `f` with each slot of `runs` holding a count, oldest first, and its count, until it
+/// says that is enough: the slot it said so at.
+fn oldest_counting<E: Entry>(
+    cells: &[E],
+    runs: Runs,
+    mut f: impl FnMut(u64, u64) -> bool,
+) -> Option<u64> {
+    for run in runs {
+        for (i, entry) in run.of(cells).iter().enumerate() {
+            let count = entry.counted(run.lap);
+            if count > 0 && f(run.first + i as u64, count) {
+                return Some(run.first + i as u64);
+            }
+        }
+    }
+    None
+}
+
+/// The newest slot of `runs` holding a count.
+fn newest_counting<E: Entry>(cells: &[E], runs: Runs) -> Option<u64> {
+    for run in runs.rev() {
+        for (i, entry) in run.of(cells).iter().enumerate().rev() {
+            if entry.counted(run.lap) > 0 {
+                return Some(run.first + i as u64);
+            }
+        }
+    }
+    None
+}
+
+/// Empties the entries of the slots of `runs` that hold their counts.
+fn clear<E: Entry>(cells: &[E], runs: Runs) {
+    for run in runs {
+        for entry in run.of(cells) {
+            entry.clear(run.lap);
+        }
+    }
+}
+
 impl Cells {
-    fn counted(&self, x: u64, slots: u64) -> u64 {
+    /// Where slot `x`'s entry is, and its lap.
+    const fn place(x: u64, slots: u64) -> (usize, u64) {
         // The index is below the slots, the entries' length.
-        let at = (x % slots) as usize;
+        ((x % slots) as usize, x / slots)
+    }
+
+    #[cfg(test)]
+    fn counted(&self, x: u64, slots: u64) -> u64 {
+        let (at, lap) = Self::place(x, slots);
         match self {
-            Self::Narrow(cells) => cells[at].counted(x, slots),
-            Self::Wide(cells) => cells[at].counted(x, slots),
+            Self::Narrow(cells) => cells[at].counted(lap),
+            Self::Wide(cells) => cells[at].counted(lap),
         }
     }
 
     fn add(&self, x: u64, slots: u64) -> bool {
-        let at = (x % slots) as usize;
+        let (at, lap) = Self::place(x, slots);
         match self {
-            Self::Narrow(cells) => cells[at].add(x, slots),
-            Self::Wide(cells) => cells[at].add(x, slots),
+            Self::Narrow(cells) => cells[at].add(lap),
+            Self::Wide(cells) => cells[at].add(lap),
         }
     }
 
     fn sub(&self, x: u64, slots: u64) {
-        let at = (x % slots) as usize;
+        let (at, lap) = Self::place(x, slots);
         match self {
-            Self::Narrow(cells) => cells[at].sub(x, slots),
-            Self::Wide(cells) => cells[at].sub(x, slots),
+            Self::Narrow(cells) => cells[at].sub(lap),
+            Self::Wide(cells) => cells[at].sub(lap),
         }
     }
 
-    fn clear(&self, x: u64, slots: u64) {
-        let at = (x % slots) as usize;
+    /// See [`oldest_counting`].
+    fn oldest_counting(&self, runs: Runs, f: impl FnMut(u64, u64) -> bool) -> Option<u64> {
         match self {
-            Self::Narrow(cells) => cells[at].clear(x, slots),
-            Self::Wide(cells) => cells[at].clear(x, slots),
+            Self::Narrow(cells) => oldest_counting(cells, runs, f),
+            Self::Wide(cells) => oldest_counting(cells, runs, f),
+        }
+    }
+
+    /// See [`newest_counting`].
+    fn newest_counting(&self, runs: Runs) -> Option<u64> {
+        match self {
+            Self::Narrow(cells) => newest_counting(cells, runs),
+            Self::Wide(cells) => newest_counting(cells, runs),
+        }
+    }
+
+    /// See [`clear`].
+    fn clear(&self, runs: Runs) {
+        match self {
+            Self::Narrow(cells) => clear(cells, runs),
+            Self::Wide(cells) => clear(cells, runs),
         }
     }
 }

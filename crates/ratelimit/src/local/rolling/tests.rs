@@ -6,7 +6,7 @@
 
 use super::super::tests::{contract, local};
 use super::super::*;
-use super::{MOST_SLOTS, NARROW_BELOW};
+use super::{MOST_SLOTS, NARROW_BELOW, Runs};
 use crate::service::FixedState;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -386,5 +386,31 @@ proptest! {
             let (total, counted) = ring.standing(&key.state, now);
             prop_assert_eq!(total, counted, "the total is what the slots count, at {}", now);
         }
+    }
+}
+
+proptest! {
+    /// A span of slots walked as runs, either way, is every slot of it once, in order: each
+    /// in its lap's entry, a run's entries side by side within the ring.
+    #[test]
+    fn runs_are_each_slot_once_in_its_entry(
+        slots in 1_u64..20,
+        from in 0_u64..100,
+        len in 0_u64..60,
+    ) {
+        let to = from + len;
+        let expected: Vec<(u64, usize, u64)> = (from..to)
+            .map(|x| (x, (x % slots) as usize, x / slots))
+            .collect();
+        let laid_out = |run: super::Run| {
+            assert!(run.len > 0 && run.at + run.len <= slots as usize, "{run:?}");
+            (0..run.len).map(move |i| (run.first + i as u64, run.at + i, run.lap))
+        };
+        let runs = Runs { from, to, slots };
+        let forward: Vec<_> = runs.flat_map(laid_out).collect();
+        prop_assert_eq!(&forward, &expected);
+        let mut backward: Vec<_> = runs.rev().flat_map(|run| laid_out(run).rev()).collect();
+        backward.reverse();
+        prop_assert_eq!(&backward, &expected);
     }
 }
