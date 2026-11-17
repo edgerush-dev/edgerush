@@ -8,6 +8,7 @@ metadata:
     app.kubernetes.io/managed-by: edgerush-controller
     app.kubernetes.io/name: edgerush
     gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/control-plane-namespace: payments-edge
     gateway.edgerush.dev/data-plane: api
     gateway.edgerush.dev/namespace: payments-edge
   name: edgerush-proxy-api

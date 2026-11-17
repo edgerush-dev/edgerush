@@ -819,6 +819,7 @@ fn harness_planes(planes: &[(&str, &str)]) -> Planes {
             let settings = edgerush_controller::Settings {
                 plane: serde_saphyr::from_str(yaml).unwrap(),
                 service: None,
+                generated: false,
             };
             ((*name).to_owned(), settings)
         })
@@ -1166,7 +1167,7 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
         // The gateway's own pods: the control plane's Service's endpoints, ready or not.
         own: Some(OwnPods {
             api: fake.client(&token("controller-serves-own", "secret"), Timing::default()),
-            namespace: Scope::Namespace("edge".to_owned()),
+            namespace: "edge".to_owned(),
             control_plane: "edge".to_owned(),
         }),
     };

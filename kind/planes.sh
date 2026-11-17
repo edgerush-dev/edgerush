@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # What the install ships, judged by a real API server in a kind cluster (docs/05 §1, §2;
-# docs/10): the ControlPlane, DataPlane and PlatformDefaults CRDs, the four ClusterRoles and
-# the admission policies, on a control plane's Services and on generated DataPlanes,
-# applied as a user would; beside Gateway API's CRDs, which the golden cases' Gateways need.
+# docs/10): the ControlPlane, DataPlane and PlatformDefaults CRDs, the five ClusterRoles and
+# the admission policies, on a control plane's Services, on what it writes beyond its own
+# namespace and on generated DataPlanes, applied as a user would; beside Gateway API's
+# CRDs, which the golden cases' Gateways need.
 #
 #   kind/planes.sh 1.37          make the cluster, run every check, delete the cluster
 #   KEEP=1 kind/planes.sh 1.37   the same, the cluster left for a look
@@ -24,6 +25,13 @@
 #     its own; a Gateway-first entry holding ingress, or two entries of one class;
 #   - a Service holding externalIPs is refused written as a control plane's ServiceAccount,
 #     and admitted written by another; one without them is admitted from either;
+#   - beyond its own namespace, under the role bound there for a generated DataPlane, a
+#     control plane's ServiceAccount writes a data plane's identity Secret and Service
+#     labelled with its ControlPlane's name and namespace, and is refused one unlabelled,
+#     one labelled as another's, another's Secret relabelled as its own, and, labelled as
+#     its own, a ServiceAccount's token, an opaque Secret or one of another name, and a
+#     Service selecting another workload or nothing, named for other pods, or ExternalName;
+#     in its own namespace, and for anyone else, the policy leaves them alone;
 #   - a DataPlane naming a Gateway, or a ControlPlane of another namespace, is refused
 #     written by anyone but the operator's ServiceAccount, one of its name in another
 #     namespace among them, and admitted from the operator's; its spec changed by another
@@ -246,6 +254,106 @@ pass "a Service without externalIPs is admitted from the control plane's Service
 out=$(k create --dry-run=server -f - <<<"$(service '  externalIPs: [192.0.2.10]')" 2>&1) \
     || fail "a Service with externalIPs is refused from the cluster's admin: $out"
 pass "a Service with externalIPs is admitted from another"
+
+# The policy beyond its own namespace. Namespace team-gateway holds a DataPlane generated
+# for one of its Gateways, and the role the operator binds there for it, to the same
+# ServiceAccount.
+k create namespace team-gateway >/dev/null
+k create rolebinding -n team-gateway edgerush-controller-payments-generated.web-payments \
+    --clusterrole edgerush-control-plane-generated \
+    --serviceaccount edge:edgerush-controller-payments >/dev/null
+# A Secret or Service of `namespace`, labelled `labels`, its data or spec `rest`.
+labelled() {
+    printf 'apiVersion: v1\nkind: %s\nmetadata:\n  name: %s\n  namespace: %s\n  labels: { %s }\n%s\n' \
+        "$1" "$2" "$3" "$4" "$5"
+}
+ours='gateway.edgerush.dev/control-plane: payments, gateway.edgerush.dev/control-plane-namespace: edge'
+theirs='gateway.edgerush.dev/control-plane: blog, gateway.edgerush.dev/control-plane-namespace: blog-system'
+# A data plane's identity, shaped as the control plane writes one.
+identity="type: kubernetes.io/tls
+stringData: { tls.crt: a, tls.key: b, ca.crt: c }"
+# The data plane's Service, selecting `$1`'s pods.
+selecting() {
+    printf 'spec:\n  ports: [{ port: 80 }]\n  selector: { app.kubernetes.io/component: proxy, gateway.edgerush.dev/control-plane: payments, gateway.edgerush.dev/namespace: team-gateway, gateway.edgerush.dev/data-plane: %s }\n%s' \
+        "$1" "${2:-}"
+}
+identity_secret=edgerush-proxy-web-payments-identity
+for _ in $(seq 1 30); do
+    if ! k "${as_control_plane[@]}" create --dry-run=server -f - \
+        <<<"$(labelled Secret "$identity_secret" team-gateway 'a: b' "$identity")" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+beyond() {
+    local what=$1 written=$2 out
+    out=$(k "${as_control_plane[@]}" create --dry-run=server -f - <<<"$written" 2>&1) \
+        && fail "$what is admitted from the control plane's ServiceAccount beyond its namespace"
+    [[ $out == *"outside its own namespace, an EdgeRush control plane writes only"* ]] \
+        || fail "$what is refused beyond its namespace, but not by the policy: $out"
+    pass "$what is refused from the control plane's ServiceAccount beyond its namespace"
+}
+beyond "a Secret not labelled as its own" "$(labelled Secret "$identity_secret" team-gateway 'a: b' "$identity")"
+beyond "a Secret labelled as another ControlPlane's" "$(labelled Secret "$identity_secret" team-gateway "$theirs" "$identity")"
+beyond "a Secret labelled with its name of another namespace" \
+    "$(labelled Secret "$identity_secret" team-gateway 'gateway.edgerush.dev/control-plane: payments, gateway.edgerush.dev/control-plane-namespace: blog-system' "$identity")"
+# Labelled as its own, but no data plane's identity: a token Kubernetes would fill for a
+# ServiceAccount of team-gateway's, and an opaque Secret.
+k -n team-gateway create serviceaccount admin >/dev/null
+beyond "a ServiceAccount's token Secret labelled as its own" "apiVersion: v1
+kind: Secret
+metadata:
+  name: $identity_secret
+  namespace: team-gateway
+  labels: { $ours }
+  annotations: { kubernetes.io/service-account.name: admin }
+type: kubernetes.io/service-account-token"
+beyond "an opaque Secret labelled as its own" "$(labelled Secret "$identity_secret" team-gateway "$ours" 'type: Opaque
+stringData: { a: b }')"
+beyond "a Secret of another name labelled as its own" "$(labelled Secret probe team-gateway "$ours" "$identity")"
+beyond "a Service not labelled as its own" "$(labelled Service edgerush-proxy-web-payments team-gateway 'a: b' "$(selecting web-payments)")"
+# Labelled as its own, but selecting another workload of team-gateway's, of no selector,
+# of another data plane's name, or an ExternalName.
+beyond "a Service labelled as its own selecting another workload" "$(labelled Service edgerush-proxy-web-payments team-gateway "$ours" 'spec:
+  ports: [{ port: 80 }]
+  selector: { app: database }')"
+beyond "a Service labelled as its own selecting nothing" "$(labelled Service edgerush-proxy-web-payments team-gateway "$ours" 'spec:
+  ports: [{ port: 80 }]')"
+beyond "a Service labelled as its own not named for the pods it selects" "$(labelled Service edgerush-proxy-other team-gateway "$ours" "$(selecting web-payments)")"
+beyond "an ExternalName Service labelled as its own" "$(labelled Service edgerush-proxy-web-payments team-gateway "$ours" "$(selecting web-payments '
+  type: ExternalName
+  externalName: example.com')")"
+out=$(k "${as_control_plane[@]}" create --dry-run=server -f - \
+    <<<"$(labelled Service edgerush-proxy-web-payments team-gateway "$ours" "$(selecting web-payments)")" 2>&1) \
+    || fail "the data plane's Service, labelled as its own, is refused beyond its namespace: $out"
+pass "the data plane's Service, labelled as its own, is admitted beyond its namespace"
+# Its own Secret, made and then written again; another's, made by its team, written over.
+k "${as_control_plane[@]}" create -f - \
+    <<<"$(labelled Secret "$identity_secret" team-gateway "$ours" "$identity")" >/dev/null \
+    || fail "the data plane's identity Secret, labelled as its own, is refused beyond its namespace"
+pass "the data plane's identity Secret, labelled as its own, is admitted beyond its namespace"
+out=$(k "${as_control_plane[@]}" replace -f - \
+    <<<"$(labelled Secret "$identity_secret" team-gateway "$ours" 'type: kubernetes.io/tls
+stringData: { tls.crt: d, tls.key: e, ca.crt: f }')" 2>&1) \
+    || fail "its own identity Secret written again is refused beyond its namespace: $out"
+pass "its own identity Secret written again is admitted beyond its namespace"
+k create -f - <<<"$(labelled Secret edgerush-proxy-teams-own-identity team-gateway 'a: b' "$identity")" >/dev/null
+out=$(k "${as_control_plane[@]}" replace -f - \
+    <<<"$(labelled Secret edgerush-proxy-teams-own-identity team-gateway "$ours" "$identity")" 2>&1) \
+    && fail "another's Secret relabelled as its own is admitted from the control plane's ServiceAccount"
+[[ $out == *"labelled with its ControlPlane's name and namespace"* ]] \
+    || fail "another's Secret relabelled is refused, but not by the policy: $out"
+pass "another's Secret relabelled as its own is refused from the control plane's ServiceAccount"
+# In its own namespace, and from anyone else, nothing of it applies.
+out=$(k "${as_control_plane[@]}" create --dry-run=server -f - <<<"$(labelled Secret probe edge 'a: b' 'type: Opaque
+stringData: { a: b }')" 2>&1) \
+    || fail "a Secret not labelled as its own is refused in the control plane's own namespace: $out"
+pass "a Secret not labelled as its own is admitted in the control plane's own namespace"
+out=$(k create --dry-run=server -f - <<<"$(labelled Secret probe team-gateway 'a: b' 'type: Opaque
+stringData: { a: b }')" 2>&1) \
+    || fail "a Secret not labelled as a control plane's is refused from the cluster's admin: $out"
+pass "a Secret not labelled as a control plane's is admitted from another"
+k delete namespace team-gateway --wait=false >/dev/null
 
 # The policy on generated DataPlanes. The operator's ServiceAccount, as operator.yaml names
 # it, given every right here, as the policy and not RBAC is what is judged; and one of its

@@ -60,14 +60,18 @@ pub const CONTROL_PLANE_ROLE: &str = "edgerush-control-plane";
 pub const CONTROL_PLANE_CLUSTER_ROLE: &str = "edgerush-control-plane-cluster";
 /// What the control plane reads and writes in its own namespace.
 pub const CONTROL_PLANE_OWN_ROLE: &str = "edgerush-control-plane-own";
+/// What the control plane writes for a DataPlane generated in another namespace, there
+/// ([05 §3](../../../docs/05-operator.md)): its Service and identity Secret.
+pub const CONTROL_PLANE_GENERATED_ROLE: &str = "edgerush-control-plane-generated";
 /// The data plane's one right, list and watch on EndpointSlices.
 pub const DATA_PLANE_ROLE: &str = "edgerush-data-plane";
 
-/// The four ClusterRoles the install ships, the only ones the operator binds.
-pub const ROLES: [&str; 4] = [
+/// The five ClusterRoles the install ships, the only ones the operator binds.
+pub const ROLES: [&str; 5] = [
     CONTROL_PLANE_ROLE,
     CONTROL_PLANE_CLUSTER_ROLE,
     CONTROL_PLANE_OWN_ROLE,
+    CONTROL_PLANE_GENERATED_ROLE,
     DATA_PLANE_ROLE,
 ];
 
@@ -84,6 +88,11 @@ pub const DATA_PLANE_LABEL: &str = "gateway.edgerush.dev/data-plane";
 /// with it, so that a resource of the same names in another namespace never selects, by
 /// label, what was made for this one (05 §2).
 pub const NAMESPACE_LABEL: &str = "gateway.edgerush.dev/namespace";
+/// The label naming the namespace of the ControlPlane whose control plane wrote an object,
+/// beside [`CONTROL_PLANE_LABEL`], on the data plane's Service and identity Secret: outside
+/// its own namespace, the shipped admission policy lets a control plane write only what
+/// carries both, of its own (05 §2). [`NAMESPACE_LABEL`] there is the DataPlane's.
+pub const CONTROL_PLANE_NAMESPACE_LABEL: &str = "gateway.edgerush.dev/control-plane-namespace";
 /// The label saying the operator made an object.
 pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 /// Its value.
@@ -123,9 +132,9 @@ pub struct Install {
 pub enum Object {
     /// A plane's ServiceAccount.
     ServiceAccount(ServiceAccount),
-    /// A binding of one of the four roles in a namespace.
+    /// A binding of one of the five roles in a namespace.
     RoleBinding(RoleBinding),
-    /// A binding of one of the four roles over the cluster.
+    /// A binding of one of the five roles over the cluster.
     ClusterRoleBinding(ClusterRoleBinding),
     /// A plane's workload.
     Deployment(Box<Deployment>),
@@ -342,8 +351,9 @@ pub fn spiffe_id(
 }
 
 /// The SPIFFE ID DataPlane `data_plane` of ControlPlane `control_plane`'s is known by, its
-/// pods sharing it: its ServiceAccount's, in its ControlPlane's namespace `namespace`. Its
-/// certificate carries it, and the config stream serves it its own config by it
+/// pods sharing it: its ServiceAccount's, in its own namespace `namespace`, its
+/// ControlPlane's or, for one generated, its Gateway's. Its certificate carries it, and the
+/// config stream serves it its own config by it
 /// ([05 §3](../../../docs/05-operator.md)).
 #[must_use]
 pub fn data_plane_id(
@@ -915,6 +925,23 @@ pub fn for_data_plane(
         &labels,
         &owner,
     ));
+    // Generated in a namespace not its ControlPlane's (05 §3): what the control plane
+    // writes for it there, its Service and identity Secret, bound there for as long as it
+    // lasts, and gone with it. Its name holds a dot, as no binding of the ControlPlane's own
+    // does, and the DataPlane's name, unique in its namespace.
+    if dp.namespace != cp.namespace {
+        let controller = controller_name(cp.name);
+        objects.push(Object::RoleBinding(RoleBinding {
+            metadata: metadata(
+                format!("{controller}-generated.{}", dp.name),
+                Some(dp.namespace),
+                &labels,
+                Some(&owner),
+            ),
+            role_ref: role_ref(CONTROL_PLANE_GENERATED_ROLE),
+            subjects: Some(service_account_subject(&controller, cp.namespace)),
+        }));
+    }
 
     let resources = spec.resources.as_ref();
     let workers = workers(
@@ -1144,12 +1171,19 @@ impl ProxyService {
     pub fn of(data_plane: &DataPlane) -> Result<Self, Error> {
         let dp = Identity::of(&data_plane.metadata, "DataPlane")?;
         let spec = &data_plane.spec;
-        let selector = data_plane_labels(dp.namespace, &spec.control_plane_ref.name, dp.name);
+        let of = &spec.control_plane_ref;
+        let selector = data_plane_labels(dp.namespace, &of.name, dp.name);
         // A generated DataPlane's, then the DataPlane's for its Service, then EdgeRush's.
         let (mut labels, mut carried_annotations) = carried(data_plane);
         labels.extend(spec.service.labels.clone().unwrap_or_default());
         labels.extend(selector.clone());
         labels.insert(MANAGED_BY_LABEL.to_owned(), SERVICE_MANAGED_BY.to_owned());
+        // Its ControlPlane's namespace, which the admission policy checks its writer by
+        // (05 §2); never on the selector.
+        labels.insert(
+            CONTROL_PLANE_NAMESPACE_LABEL.to_owned(),
+            of.namespace.as_deref().unwrap_or(dp.namespace).to_owned(),
+        );
         let annotations = if carried_annotations.is_empty() {
             spec.service.annotations.clone()
         } else {

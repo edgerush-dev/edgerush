@@ -56,6 +56,7 @@ use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
 
 pub mod acks;
+pub mod across;
 pub mod admission;
 pub mod data_plane;
 pub mod expiry;
@@ -77,6 +78,10 @@ pub struct Settings {
     pub plane: Plane,
     /// The data plane's Service, but for its ports.
     pub service: Option<ProxyService>,
+    /// Whether its DataPlane is one the operator generated for its Gateway (05 §3): a
+    /// Gateway of that one that sets `infrastructure.parametersRef` is translated no
+    /// further while it does, and its status left to the operator.
+    pub generated: bool,
 }
 
 /// The data planes a control plane serves, each by its DataPlane as it is said,
@@ -595,6 +600,10 @@ async fn serve(
             if !unlisted.is_empty() || (is_gateway && !unlisted_api.is_empty()) {
                 continue;
             }
+            // Its data plane keeps its last config, and the operator says why (05 §3).
+            if held(followed.gateway_api.as_ref(), &served.settings) {
+                continue;
+            }
             let cluster =
                 cluster.get_or_insert_with(|| of_control_plane(followed.cluster(), classes));
             match served.translator.step(&served.settings.plane, cluster) {
@@ -635,7 +644,8 @@ async fn serve(
         // listed, from that Service if it is its DataPlane's.
         let leads = leading.is_none_or(|leads| *leads.borrow());
         for served in serving.values_mut() {
-            write_statuses(api, &followed, served, acks, leads, &**said).await;
+            let is_held = held(followed.gateway_api.as_ref(), &served.settings);
+            write_statuses(api, &followed, served, acks, leads, is_held, &**said).await;
         }
         // Each Ingress of a class of the ControlPlane's that no data plane serves and none
         // is kept for, once the DataPlanes are listed (04 §6). Taken out of the watch first,
@@ -696,16 +706,37 @@ async fn serve(
     }
 }
 
+/// Whether the Gateway of a data plane served as `settings` say is held as it was: one of a
+/// DataPlane generated for it that sets `infrastructure.parametersRef`, which names no kind
+/// EdgeRush reads. While it does, it is translated no further, its data plane keeping its
+/// last config, and its status is the operator's (05 §3).
+fn held(gateway_api: Option<&GatewayApi>, settings: &Settings) -> bool {
+    let (true, Some(gateway_api), Some(name)) =
+        (settings.generated, gateway_api, &settings.plane.gateway)
+    else {
+        return false;
+    };
+    gateway_api.gateway(name).is_some_and(|gateway| {
+        gateway
+            .spec
+            .infrastructure
+            .as_ref()
+            .is_some_and(|infrastructure| infrastructure.parameters_ref.is_some())
+    })
+}
+
 /// Writes, as far as `leads`, each status of `served`'s data plane alone that says other
 /// than what was handed on for it: its Service, its Gateway's and the ListenerSets naming
 /// it, and its Ingresses'. Those it shares with other data planes are written once for them
-/// all ([`GatewayApi::write_shared`]).
+/// all ([`GatewayApi::write_shared`]). Its Gateway's and its ListenerSets' are left alone
+/// while it is `held`.
 async fn write_statuses(
     api: &ApiServer,
     followed: &Followed,
     served: &mut Serving,
     acks: &Acks,
     leads: bool,
+    held: bool,
     said: &dyn Fn(Said<'_>),
 ) {
     let own = served.settings.service.as_ref();
@@ -737,10 +768,15 @@ async fn write_statuses(
             )
         }
     };
-    // The Gateway API's, always, as the spec has every controller write them (04 §6).
-    if let (Some(gateway_api), Some(handed), Some(addresses), true) =
-        (&followed.gateway_api, &served.handed_api, &addresses, leads)
-    {
+    // The Gateway API's, always, as the spec has every controller write them (04 §6), but
+    // for a Gateway held, whose status the operator writes.
+    if let (Some(gateway_api), Some(handed), Some(addresses), true, false) = (
+        &followed.gateway_api,
+        &served.handed_api,
+        &addresses,
+        leads,
+        held,
+    ) {
         let addresses = gateway_status::addresses(addresses);
         let pods = followed.pods(acks);
         let ready = own_service(&served.settings.plane).map(|service| followed.ready(&service));
@@ -914,7 +950,7 @@ fn parts_of<'a, K>(follows: &'a mut [Follow<K>], into: &mut Vec<&'a mut dyn Part
 }
 
 /// A follow's tasks, aborted as it is let go of.
-struct Tasks(Vec<AbortHandle>);
+pub(crate) struct Tasks(pub(crate) Vec<AbortHandle>);
 
 impl Drop for Tasks {
     fn drop(&mut self) {
@@ -1141,6 +1177,19 @@ impl Handed {
 }
 
 impl GatewayApi {
+    /// The Gateway `name`, as followed, if it is there.
+    fn gateway(&self, name: &edgerush_translate::GatewayName) -> Option<Gateway> {
+        self.gateways
+            .as_deref()
+            .map(objects)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|gateway| {
+                gateway.metadata.namespace.as_deref() == Some(name.namespace.as_str())
+                    && gateway.metadata.name.as_deref() == Some(name.name.as_str())
+            })
+    }
+
     /// The Gateway `handed` is of, as followed, if it is there.
     fn gateway_of(&self, handed: &Handed) -> Option<Gateway> {
         self.gateways

@@ -1,8 +1,8 @@
 //! What `install/` ships: the CRDs' bound on a name, as the code names Services by it; the
-//! four ClusterRoles the operator binds, the admission policies on a control plane's
+//! five ClusterRoles the operator binds, the admission policies on a control plane's
 //! Services, as the code names them, and on generated DataPlanes, as `operator.yaml` names
 //! the operator's ServiceAccount; and the operator itself, which grants by binding those
-//! four alone.
+//! five alone.
 
 #![allow(
     clippy::unwrap_used,
@@ -11,7 +11,9 @@
 )]
 
 use edgerush_planes::objects::{
-    GATEWAY_CONTROLLER, INGRESS_CONTROLLER, ROLES, controller_name, proxy_name,
+    CONTROL_PLANE_GENERATED_ROLE, CONTROL_PLANE_LABEL, CONTROL_PLANE_NAMESPACE_LABEL,
+    DATA_PLANE_LABEL, GATEWAY_CONTROLLER, INGRESS_CONTROLLER, NAMESPACE_LABEL, ROLES,
+    controller_name, identity_secret, proxy_name,
 };
 use k8s_openapi::api::admissionregistration::v1::{
     ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
@@ -58,7 +60,7 @@ fn the_longest_names_admitted_name_services_of_63_characters() {
 }
 
 #[test]
-fn the_roles_shipped_are_the_four_the_operator_binds() {
+fn the_roles_shipped_are_the_five_the_operator_binds() {
     let roles: Vec<ClusterRole> = serde_saphyr::from_multiple(&read("roles.yaml")).unwrap();
     let names: Vec<_> = roles
         .iter()
@@ -181,6 +183,168 @@ fn the_generated_data_plane_policy_lets_through_the_operator_alone_and_is_bound(
 }
 
 #[test]
+fn the_policy_beyond_its_namespace_reads_the_control_planes_labels_as_the_code_writes_them() {
+    let shipped: Vec<Admission> = serde_saphyr::from_multiple(&read("admission.yaml")).unwrap();
+    let spec = shipped
+        .into_iter()
+        .find_map(|object| match object {
+            Admission::ValidatingAdmissionPolicy(policy)
+                if policy.metadata.name.as_deref()
+                    == Some("edgerush-control-plane-beyond-its-namespace") =>
+            {
+                policy.spec
+            }
+            _ => None,
+        })
+        .expect("the policy on what a control plane writes beyond its namespace");
+    // Services and Secrets, made, changed and deleted.
+    let rules = spec
+        .match_constraints
+        .and_then(|constraints| constraints.resource_rules)
+        .unwrap();
+    let [rule] = rules.as_slice() else {
+        panic!("one rule: {rules:?}");
+    };
+    assert_eq!(
+        rule.resources.as_deref(),
+        Some(&["services".to_owned(), "secrets".to_owned()][..])
+    );
+    assert_eq!(
+        rule.operations.as_deref(),
+        Some(
+            &[
+                "CREATE".to_owned(),
+                "UPDATE".to_owned(),
+                "DELETE".to_owned()
+            ][..]
+        )
+    );
+    // The control plane's ServiceAccount, as the operator names it, outside its namespace.
+    let prefix = controller_name("");
+    let conditions: Vec<String> = spec
+        .match_conditions
+        .unwrap()
+        .into_iter()
+        .map(|condition| condition.expression)
+        .collect();
+    assert!(
+        conditions
+            .iter()
+            .any(|c| c.contains(&format!(":{prefix}[^:]+$"))),
+        "no condition matches {prefix}<controlplane>"
+    );
+    assert!(
+        conditions
+            .iter()
+            .any(|c| c == "request.namespace != request.userInfo.username.split(':')[2]"),
+        "no condition leaves its own namespace out: {conditions:?}"
+    );
+    let variables: Vec<(String, String)> = spec
+        .variables
+        .unwrap()
+        .into_iter()
+        .map(|variable| (variable.name, variable.expression))
+        .collect();
+    let variable = |name: &str| {
+        variables
+            .iter()
+            .find(|(each, _)| each == name)
+            .map(|(_, expression)| expression.clone())
+            .unwrap_or_else(|| panic!("no variable {name}"))
+    };
+    // Its ControlPlane's name is what follows the prefix.
+    assert!(
+        variable("controlPlane").ends_with(&format!(".substring({})", prefix.len())),
+        "{}",
+        variable("controlPlane")
+    );
+    // Both labels, on the object and on the one it replaces, as the code writes them.
+    for name in ["newIsOurs", "oldIsOurs"] {
+        let expression = variable(name);
+        for label in [CONTROL_PLANE_LABEL, CONTROL_PLANE_NAMESPACE_LABEL] {
+            assert!(
+                expression.contains(&format!("'{label}' in ")),
+                "{name} does not check {label}: {expression}"
+            );
+        }
+    }
+    // And shaped as the code writes them: a data plane's identity Secret, its Service
+    // selecting its pods by the labels the operator gives them.
+    let shaped = variable("shapedAsItsOwn");
+    let identity = identity_secret("");
+    let (prefix, suffix) = identity.split_at(proxy_name("").len());
+    for written in [
+        format!("startsWith('{prefix}')"),
+        format!("endsWith('{suffix}')"),
+        "'kubernetes.io/tls'".to_owned(),
+        "'ExternalName'".to_owned(),
+        format!(
+            "'{}' + object.spec.selector['{DATA_PLANE_LABEL}']",
+            proxy_name("")
+        ),
+        format!("object.spec.selector['{CONTROL_PLANE_LABEL}'] == variables.controlPlane"),
+        format!("object.spec.selector['{NAMESPACE_LABEL}'] == request.namespace"),
+    ] {
+        assert!(
+            shaped.contains(&written),
+            "shapedAsItsOwn does not hold {written}: {shaped}"
+        );
+    }
+    let validations: Vec<String> = spec
+        .validations
+        .unwrap()
+        .into_iter()
+        .map(|validation| validation.expression)
+        .collect();
+    assert_eq!(
+        validations,
+        [
+            "variables.newIsOurs && variables.oldIsOurs",
+            "variables.shapedAsItsOwn"
+        ]
+    );
+}
+
+#[test]
+fn the_generated_role_writes_services_and_secrets_alone() {
+    // What the control plane writes for a DataPlane generated beyond its namespace, and
+    // nothing it reads there, which edgerush-control-plane holds over the watch scope.
+    let roles: Vec<ClusterRole> = serde_saphyr::from_multiple(&read("roles.yaml")).unwrap();
+    let role = roles
+        .iter()
+        .find(|role| role.metadata.name.as_deref() == Some(CONTROL_PLANE_GENERATED_ROLE))
+        .expect("the role");
+    let rules: Vec<(Vec<String>, Vec<String>, Vec<String>)> = role
+        .rules
+        .iter()
+        .flatten()
+        .map(|rule| {
+            (
+                rule.api_groups.clone().unwrap_or_default(),
+                rule.resources.clone().unwrap_or_default(),
+                rule.verbs.clone(),
+            )
+        })
+        .collect();
+    let owned = |items: &[&str]| items.iter().map(|&item| item.to_owned()).collect();
+    assert_eq!(
+        rules,
+        [
+            (
+                owned(&[""]),
+                owned(&["services"]),
+                owned(&["create", "patch"])
+            ),
+            (
+                owned(&[""]),
+                owned(&["secrets"]),
+                owned(&["create", "update"])
+            ),
+        ]
+    );
+}
+
+#[test]
 fn the_classes_name_the_controllers_translation_serves() {
     assert_eq!(INGRESS_CONTROLLER, edgerush_translate::CONTROLLER);
     assert_eq!(GATEWAY_CONTROLLER, edgerush_translate::GATEWAY_CONTROLLER);
@@ -200,7 +364,7 @@ enum OperatorInstall {
 }
 
 #[test]
-fn the_operator_binds_the_four_roles_alone_and_reads_no_secret() {
+fn the_operator_binds_the_five_roles_alone_and_reads_no_secret() {
     let shipped: Vec<OperatorInstall> =
         serde_saphyr::from_multiple(&read("operator.yaml")).unwrap();
     let rules: Vec<_> = shipped

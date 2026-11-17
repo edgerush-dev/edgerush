@@ -2,10 +2,12 @@
 //! ([05 §1](../../../docs/05-operator.md)), the platform's `PlatformDefaults`
 //! ([05 §4](../../../docs/05-operator.md)), and what the install ships beside them.
 //!
-//! `install/` holds what is applied as the operator is installed: the three CRDs; the four
+//! `install/` holds what is applied as the operator is installed: the three CRDs; the five
 //! ClusterRoles, the only rights the operator ever grants, by `bind` (05 §2); the
-//! admission policy that refuses `externalIPs` on a Service a control plane writes; and
-//! the operator itself, its rights and its Deployment. The
+//! admission policies, that refuse `externalIPs` on a Service a control plane writes, any
+//! Service or Secret it writes beyond its own namespace that is not its own, and a
+//! generated DataPlane written by anyone but the operator; and the operator itself, its
+//! rights and its Deployment. The
 //! CRDs are written by hand, and the types here are written from them by `edgerush-crdgen`,
 //! as Gateway API's are ([02 §7](../../../docs/02-architecture.md)); the DataPlane's
 //! `spec.gateway` holds the Gateway's own fields, copied from Gateway API's CRD. The

@@ -6,27 +6,34 @@
 //! and never writes. Every replica reads it and signs its own certificate for the stream
 //! in memory, again at half its life, as istiod does: on first start there is no Secret
 //! for it to mount. The leader writes each DataPlane's certificate into a Secret its pods
-//! mount, owned by the DataPlane, and writes it again at half its life, or once the
-//! authority's bundle changes. Each workload is known by the SPIFFE ID of its
-//! ServiceAccount, in its ControlPlane's own trust domain. The leader publishes that bundle
+//! mount, in the DataPlane's namespace, owned by it, and writes it again at half its life,
+//! or once the authority's bundle changes: those of its own namespace, and those the
+//! operator generates for Gateways of its class across its watch scope
+//! ([05 §3](../../../docs/05-operator.md)), each Secret labelled with its ControlPlane's name
+//! and namespace, as the shipped admission policy asks of what it writes beyond its own.
+//! Each workload is known by the SPIFFE ID of its ServiceAccount, in its ControlPlane's own
+//! trust domain. The leader publishes that bundle
 //! in its ControlPlane's status too, under a field manager of its own, for the operator to
 //! register its webhook with: the webhook is served with its own certificate.
 //!
 //! What to write is decided without I/O, of the Secrets and DataPlanes as they are and a
 //! time passed in; [`issue`] is the loop that follows them and writes.
 
-use crate::data_plane::accepted_ever;
+use crate::WatchScope;
+use crate::across::{Across, follow_across};
+use crate::data_plane::{accepted_ever, follow_ours, in_part};
 use edgerush_certificates::authority::{Authority, Kind, Leaf, Written, renewal_due};
-use edgerush_kubernetes::{ApiServer, Listed, Retry, Scope, follow};
+use edgerush_kubernetes::{ApiServer, Scope};
 use edgerush_planes::control_plane::ControlPlane;
 use edgerush_planes::data_plane::DataPlane;
 use edgerush_planes::objects::{
-    SERVICE_MANAGED_BY, controller_name, data_plane_id, identity_secret, proxy_name, spiffe_id,
+    CONTROL_PLANE_LABEL, CONTROL_PLANE_NAMESPACE_LABEL, MANAGED_BY_LABEL, SERVICE_MANAGED_BY,
+    controller_name, data_plane_id, identity_secret, proxy_name, spiffe_id,
 };
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -97,8 +104,11 @@ pub fn own_step(
 /// Who it is, and the authority it signs with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Issuer {
-    /// Its own namespace, where its authority and its DataPlanes are.
+    /// Its own namespace, where its authority is, and its DataPlanes but those generated.
     pub namespace: String,
+    /// Its watch scope, where the DataPlanes generated for Gateways of its class are
+    /// (05 §3).
+    pub scope: WatchScope,
     /// Its ControlPlane's name.
     pub control_plane: String,
     /// The cluster's DNS domain, which its trust domain ends in.
@@ -131,19 +141,34 @@ impl Issuer {
         }
     }
 
-    /// What DataPlane `data_plane`'s certificate is for: its ServiceAccount's ID.
+    /// What DataPlane `data_plane` of `namespace`'s certificate is for: its
+    /// ServiceAccount's ID, of that namespace.
     #[must_use]
-    pub fn data_plane_leaf(&self, data_plane: &str) -> Leaf {
+    pub fn data_plane_leaf(&self, namespace: &str, data_plane: &str) -> Leaf {
         Leaf {
             common_name: proxy_name(data_plane),
             dns: Vec::new(),
             spiffe_id: data_plane_id(
                 &self.control_plane,
                 &self.cluster_domain,
-                &self.namespace,
+                namespace,
                 data_plane,
             ),
         }
+    }
+
+    /// What every Secret it writes is labelled with: written by the control plane, for its
+    /// ControlPlane, of its name and namespace (05 §2).
+    #[must_use]
+    pub fn labels(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (MANAGED_BY_LABEL.to_owned(), SERVICE_MANAGED_BY.to_owned()),
+            (CONTROL_PLANE_LABEL.to_owned(), self.control_plane.clone()),
+            (
+                CONTROL_PLANE_NAMESPACE_LABEL.to_owned(),
+                self.namespace.clone(),
+            ),
+        ])
     }
 }
 
@@ -162,10 +187,11 @@ pub fn written(secret: &Secret) -> Option<Written> {
     })
 }
 
-/// Secret `name` in `namespace`, of `written`, owned by `owner` if any, as of `version` if
-/// it is there already.
+/// Secret `name` in `namespace`, of `written`, as `issuer` writes it, owned by `owner` if
+/// any, as of `version` if it is there already.
 #[must_use]
 pub fn secret(
+    issuer: &Issuer,
     name: &str,
     namespace: &str,
     written: &Written,
@@ -178,10 +204,7 @@ pub fn secret(
             name: Some(name.to_owned()),
             namespace: Some(namespace.to_owned()),
             resource_version: version,
-            labels: Some(BTreeMap::from([(
-                "app.kubernetes.io/managed-by".to_owned(),
-                "edgerush-controller".to_owned(),
-            )])),
+            labels: Some(issuer.labels()),
             owner_references: owner.map(|owner| vec![owner]),
             ..ObjectMeta::default()
         },
@@ -263,13 +286,33 @@ pub fn step(issuer: &Issuer, found: Option<&Secret>, now: i64, leads: bool) -> S
 }
 
 /// The DataPlanes of `data_planes` whose certificates `issuer` keeps: those that name its
-/// ControlPlane and that the operator has ever accepted.
+/// ControlPlane, of its name and namespace, and that the operator has ever accepted.
 #[must_use]
 pub fn served<'a>(issuer: &Issuer, data_planes: &'a [DataPlane]) -> Vec<&'a DataPlane> {
     data_planes
         .iter()
-        .filter(|data_plane| data_plane.spec.control_plane_ref.name == issuer.control_plane)
+        .filter(|data_plane| {
+            let of = &data_plane.spec.control_plane_ref;
+            let namespace = of
+                .namespace
+                .as_deref()
+                .or(data_plane.metadata.namespace.as_deref());
+            of.name == issuer.control_plane && namespace == Some(issuer.namespace.as_str())
+        })
         .filter(|data_plane| accepted_ever(data_plane))
+        .collect()
+}
+
+/// Where the Secrets `issuer` reads are: its own namespace, where its authority is, and
+/// that of each DataPlane of `served`.
+fn secret_parts(issuer: &Issuer, served: &[&DataPlane]) -> BTreeSet<Scope> {
+    std::iter::once(issuer.namespace.clone())
+        .chain(
+            served
+                .iter()
+                .filter_map(|data_plane| data_plane.metadata.namespace.clone()),
+        )
+        .map(Scope::Namespace)
         .collect()
 }
 
@@ -294,10 +337,12 @@ fn unix_now() -> i64 {
 }
 
 /// Keeps `issuer`'s authority, its own certificate and its DataPlanes' through `api`: the
-/// Secrets and DataPlanes of its namespace followed, its own certificate handed to `own`
-/// each time it is signed, the leader alone writing, where `leading` says this replica
-/// leads (always, without it). What it does and what fails is said to `say`. Runs until
-/// no one holds a receiver of `own`. For a `LocalSet`.
+/// DataPlanes of its namespace and its watch scope followed, and the Secrets of its
+/// namespace and of each served DataPlane's, its own certificate handed to `own` each time
+/// it is signed, the leader alone writing, where `leading` says this replica leads (always,
+/// without it). A DataPlane's certificate is looked at once its namespace's Secrets are
+/// listed. What it does and what fails is said to `say`. Runs until no one holds a
+/// receiver of `own`. For a `LocalSet`.
 pub async fn issue(
     api: ApiServer,
     issuer: Issuer,
@@ -309,34 +354,35 @@ pub async fn issue(
     let say: Rc<dyn Fn(&str)> = Rc::new(say);
     let changed = Rc::new(Notify::new());
     let mut tasks = JoinSet::new();
-    let Ok(namespace) = Scope::namespace(&issuer.namespace) else {
+    if Scope::namespace(&issuer.namespace).is_err() {
         say(&format!("`{}` is not a namespace", issuer.namespace));
         return;
-    };
-    let (secrets_out, secrets) = watch::channel(Arc::new(Listed::<Secret>::default()));
-    let (planes_out, planes) = watch::channel(Arc::new(Listed::<DataPlane>::default()));
-    {
-        let (client, failing, part) = (Rc::clone(&api), Rc::clone(&say), namespace.clone());
-        tasks.spawn_local(async move {
-            follow(&client, &part, Retry::default(), secrets_out, |failure| {
-                failing(&format!("secrets, for the authority: {failure}"));
-            })
-            .await;
-        });
-        let (client, failing) = (Rc::clone(&api), Rc::clone(&say));
-        tasks.spawn_local(async move {
-            follow(
-                &client,
-                &namespace,
-                Retry::default(),
-                planes_out,
-                |failure| {
-                    failing(&format!("dataplanes, for their certificates: {failure}"));
-                },
-            )
-            .await;
-        });
     }
+    let (secrets_out, secrets) = watch::channel(Arc::new(Across::<Secret>::default()));
+    let (parting, held) = watch::channel(Some(secret_parts(&issuer, &[])));
+    {
+        let failing = Rc::clone(&say);
+        tasks.spawn_local(follow_across(
+            Rc::clone(&api),
+            held,
+            secrets_out,
+            move |part, failure| {
+                failing(&format!(
+                    "secrets {}, for the certificates: {failure}",
+                    in_part(part)
+                ));
+            },
+        ));
+    }
+    let failing = Rc::clone(&say);
+    let telling: Rc<dyn Fn(&str)> =
+        Rc::new(move |line: &str| failing(&format!("{line}, for their certificates")));
+    let planes = follow_ours(
+        Rc::clone(&api),
+        issuer.scope.clone(),
+        &issuer.namespace,
+        &telling,
+    );
     // Each change to either is a change to look at.
     {
         let (mut told, notify) = (secrets.clone(), Rc::clone(&changed));
@@ -371,23 +417,38 @@ pub async fn issue(
         }
         let (secrets_now, planes_now) =
             (Arc::clone(&secrets.borrow()), Arc::clone(&planes.borrow()));
-        if secrets_now.listed && planes_now.listed {
+        let planes_now = planes_now.objects_if_listed();
+        // The Secrets of each served DataPlane's namespace, followed as they come and go.
+        if let Some(planes_now) = &planes_now {
+            let parts = secret_parts(&issuer, &served(&issuer, planes_now));
+            parting.send_if_modified(|held| {
+                let changed = held.as_ref() != Some(&parts);
+                if changed {
+                    *held = Some(parts);
+                }
+                changed
+            });
+        }
+        if let (true, Some(planes_now)) = (secrets_now.listed, planes_now) {
             let now = unix_now();
             let leads = leading.as_ref().is_none_or(|leads| *leads.borrow());
             if !leads {
                 // Another may publish meanwhile: published again on leading again.
                 published = None;
             }
-            let find = |name: &str| {
-                secrets_now
-                    .objects
-                    .iter()
-                    .find(|secret| secret.metadata.name.as_deref() == Some(name))
+            let secrets_listed = secrets_now.objects();
+            let find_in = |namespace: &str, name: &str| {
+                secrets_listed.iter().find(|secret| {
+                    secret.metadata.namespace.as_deref() == Some(namespace)
+                        && secret.metadata.name.as_deref() == Some(name)
+                })
             };
+            let find = |name: &str| find_in(&issuer.namespace, name);
             let waiting = match step(&issuer, find(&issuer.authority), now, leads) {
                 Step::Wait(why) => Some(why),
                 Step::Make(authority) => {
                     let made = secret(
+                        &issuer,
                         &issuer.authority,
                         &issuer.namespace,
                         &authority.written(),
@@ -410,6 +471,7 @@ pub async fn issue(
                 }
                 Step::Resign(authority, version) => {
                     let again = secret(
+                        &issuer,
                         &issuer.authority,
                         &issuer.namespace,
                         &authority.written(),
@@ -435,10 +497,15 @@ pub async fn issue(
                 Step::Ready(authority) => {
                     // A provided authority's predecessors, as the Secrets it wrote and its
                     // own certificate remember them, trusted until they expire (05 §2).
-                    let remembered: Vec<String> = served(&issuer, &planes_now.objects)
+                    let remembered: Vec<String> = served(&issuer, &planes_now)
                         .iter()
-                        .filter_map(|data_plane| data_plane.metadata.name.as_deref())
-                        .filter_map(|name| find(&identity_secret(name)).and_then(written))
+                        .filter_map(|data_plane| {
+                            let metadata = &data_plane.metadata;
+                            Some((metadata.namespace.as_deref()?, metadata.name.as_deref()?))
+                        })
+                        .filter_map(|(namespace, name)| {
+                            find_in(namespace, &identity_secret(name)).and_then(written)
+                        })
                         .map(|held| held.bundle)
                         .chain(own.borrow().as_ref().map(|held| held.bundle.clone()))
                         .collect();
@@ -499,23 +566,30 @@ pub async fn issue(
                             }
                         },
                     }
-                    // Each DataPlane's, the leader's alone to write.
+                    // Each DataPlane's, the leader's alone to write, once its namespace's
+                    // Secrets are listed: one not listed yet is not taken for missing.
                     if leads {
-                        for data_plane in served(&issuer, &planes_now.objects) {
-                            let Some(name) = data_plane.metadata.name.as_deref() else {
+                        for data_plane in served(&issuer, &planes_now) {
+                            let metadata = &data_plane.metadata;
+                            let (Some(namespace), Some(name)) =
+                                (metadata.namespace.as_deref(), metadata.name.as_deref())
+                            else {
                                 continue;
                             };
+                            if !secrets_now.listed_in(&Scope::Namespace(namespace.to_owned())) {
+                                continue;
+                            }
                             let secret_name = identity_secret(name);
-                            let found = find(&secret_name);
+                            let found = find_in(namespace, &secret_name);
                             if !reissue(found.and_then(written).as_ref(), &authority, now) {
                                 continue;
                             }
-                            let issued = match authority.issue(&issuer.data_plane_leaf(name), now) {
+                            let leaf = issuer.data_plane_leaf(namespace, name);
+                            let issued = match authority.issue(&leaf, now) {
                                 Ok(issued) => issued,
                                 Err(error) => {
                                     say(&format!(
-                                        "certificate of DataPlane {}/{name} cannot be signed: {error}",
-                                        issuer.namespace
+                                        "certificate of DataPlane {namespace}/{name} cannot be signed: {error}"
                                     ));
                                     continue;
                                 }
@@ -523,28 +597,27 @@ pub async fn issue(
                             let version =
                                 found.and_then(|found| found.metadata.resource_version.clone());
                             let object = secret(
+                                &issuer,
                                 &secret_name,
-                                &issuer.namespace,
+                                namespace,
                                 &issued,
                                 owner(data_plane),
                                 version.clone(),
                             );
                             let written = match version {
                                 Some(_) => api
-                                    .replace(&issuer.namespace, &secret_name, &object)
+                                    .replace(namespace, &secret_name, &object)
                                     .await
                                     .map(|_| ()),
-                                None => api.create(&issuer.namespace, &object).await.map(|_| ()),
+                                None => api.create(namespace, &object).await.map(|_| ()),
                             };
                             match written {
                                 Ok(()) => say(&format!(
-                                    "certificate of DataPlane {}/{name} written, Secret {secret_name}",
-                                    issuer.namespace
+                                    "certificate of DataPlane {namespace}/{name} written, Secret {secret_name}"
                                 )),
                                 Err(error) if error.is_conflict() => {}
                                 Err(error) => say(&format!(
-                                    "Secret {}/{secret_name}: the certificate of DataPlane {name} cannot be written: {error}",
-                                    issuer.namespace
+                                    "Secret {namespace}/{secret_name}: the certificate of DataPlane {name} cannot be written: {error}"
                                 )),
                             }
                         }

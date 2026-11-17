@@ -132,7 +132,7 @@ fn a_watch_scope_not_known_is_taken_as_the_narrowest() {
 }
 
 #[test]
-fn nothing_is_bound_but_the_four_shipped_roles() {
+fn nothing_is_bound_but_the_five_shipped_roles() {
     let dp = data_plane();
     let every = [
         for_control_plane(&control_plane(), &BTreeSet::new(), &install()),
@@ -527,4 +527,108 @@ matchExpressions: [{ key: env, operator: In, values: [prod] }]";
     let mut cp = control_plane();
     cp.spec.watch.namespaces.from = "All".to_owned();
     assert_eq!(scoped(cp), None);
+}
+
+/// `data_plane()` as one the operator generates for Gateway `web` of namespace `shop`
+/// (05 §3), or of the ControlPlane's own namespace.
+fn generated(namespace: &str) -> DataPlane {
+    let mut dp = data_plane();
+    dp.metadata = meta("web-payments", namespace);
+    dp.spec.ingress = None;
+    dp.spec.control_plane_ref.namespace = Some("edge".to_owned());
+    dp.spec.gateway_ref = Some(crate::data_plane::DataPlaneGatewayRef {
+        name: "web".to_owned(),
+    });
+    dp
+}
+
+/// What the control plane writes for a DataPlane generated beyond its namespace is bound
+/// there, owned by that DataPlane, to the control plane's ServiceAccount; one generated in
+/// its own namespace needs nothing more than its own role (05 §2).
+#[test]
+fn a_data_plane_generated_beyond_the_control_planes_namespace_binds_it_the_generated_role() {
+    let generated_bindings = |namespace: &str| -> Vec<k8s_openapi::api::rbac::v1::RoleBinding> {
+        for_data_plane(
+            &generated(namespace),
+            &control_plane(),
+            &BTreeSet::new(),
+            &install(),
+        )
+        .unwrap()
+        .into_iter()
+        .filter_map(|object| match object {
+            Object::RoleBinding(binding)
+                if binding.role_ref.name == super::CONTROL_PLANE_GENERATED_ROLE =>
+            {
+                Some(binding)
+            }
+            _ => None,
+        })
+        .collect()
+    };
+    let [binding] = generated_bindings("shop").try_into().unwrap();
+    assert_eq!(
+        (
+            binding.metadata.name.as_deref(),
+            binding.metadata.namespace.as_deref()
+        ),
+        (
+            Some("edgerush-controller-payments-generated.web-payments"),
+            Some("shop")
+        )
+    );
+    let owners = binding.metadata.owner_references.unwrap();
+    assert_eq!(
+        (owners[0].kind.as_str(), owners[0].uid.as_str()),
+        ("DataPlane", "uid-of-web-payments")
+    );
+    let subjects = binding.subjects.unwrap();
+    assert_eq!(
+        (subjects[0].name.as_str(), subjects[0].namespace.as_deref()),
+        ("edgerush-controller-payments", Some("edge"))
+    );
+    assert!(generated_bindings("edge").is_empty());
+    assert!(
+        for_data_plane(
+            &data_plane(),
+            &control_plane(),
+            &BTreeSet::new(),
+            &install()
+        )
+        .unwrap()
+        .iter()
+        .all(|object| !matches!(object, Object::RoleBinding(binding)
+                if binding.role_ref.name == super::CONTROL_PLANE_GENERATED_ROLE))
+    );
+}
+
+/// The data plane's Service names its ControlPlane's namespace, which the admission policy
+/// checks its writer by, beside the DataPlane's own; never on its selector.
+#[test]
+fn a_service_is_labelled_with_its_control_planes_namespace_off_its_selector() {
+    let service = ProxyService::of(&generated("shop"))
+        .unwrap()
+        .service(&BTreeMap::from([(
+            80,
+            Transports {
+                tcp: true,
+                udp: false,
+            },
+        )]))
+        .unwrap();
+    let labels = service.metadata.labels.unwrap();
+    assert_eq!(labels[super::CONTROL_PLANE_LABEL], "payments");
+    assert_eq!(labels[super::CONTROL_PLANE_NAMESPACE_LABEL], "edge");
+    assert_eq!(labels[super::NAMESPACE_LABEL], "shop");
+    let selector = service.spec.unwrap().selector.unwrap();
+    assert!(!selector.contains_key(super::CONTROL_PLANE_NAMESPACE_LABEL));
+    // One of the ControlPlane's own namespace names it too.
+    let own = ProxyService::of(&data_plane())
+        .unwrap()
+        .service(&BTreeMap::new())
+        .unwrap();
+    assert_eq!(
+        own.metadata.labels.unwrap()[super::CONTROL_PLANE_NAMESPACE_LABEL],
+        "edge"
+    );
 }

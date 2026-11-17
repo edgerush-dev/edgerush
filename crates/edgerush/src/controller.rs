@@ -192,10 +192,10 @@ pub(crate) fn command(
                     cluster_domain,
                 } => Source::Followed {
                     api: ApiServer::in_cluster().map_err(|error| outside(&error))?,
-                    namespace: own_namespace()?,
                     namespace_name: own_namespace_name()?,
                     own: data_plane::Own {
                         control_plane: control_plane.clone(),
+                        namespace: own_namespace_name()?,
                         cluster_domain: cluster_domain.clone(),
                         system_authorities,
                     },
@@ -221,6 +221,7 @@ pub(crate) fn command(
                         api: Box::new(ApiServer::in_cluster().map_err(|error| outside(&error))?),
                         issuer: Issuer {
                             namespace: own_namespace_name()?,
+                            scope: options.scope.clone(),
                             control_plane: control_plane.clone(),
                             cluster_domain: cluster_domain.clone(),
                             authority: secret.clone(),
@@ -242,7 +243,7 @@ pub(crate) fn command(
             let own_pods = match (&options.settings, &options.stream) {
                 (Settings::DataPlane { control_plane, .. }, Some(_)) => Some(OwnPods {
                     api: ApiServer::in_cluster().map_err(|error| outside(&error))?,
-                    namespace: own_namespace()?,
+                    namespace: own_namespace_name()?,
                     control_plane: control_plane.clone(),
                 }),
                 _ => None,
@@ -473,20 +474,14 @@ enum Settings {
 enum Source {
     /// As they are, for good.
     Fixed(Plane),
-    /// As the DataPlanes of `namespace` say them, followed on a client of their own.
+    /// As the DataPlanes of the pod's own namespace and of its watch scope say them,
+    /// followed on a client of their own.
     Followed {
         api: ApiServer,
-        namespace: Scope,
         /// That namespace's name, the ControlPlane's.
         namespace_name: String,
         own: data_plane::Own,
     },
-}
-
-/// The pod's own namespace, as its service account says it.
-fn own_namespace() -> Result<Scope, String> {
-    let name = own_namespace_name()?;
-    Scope::namespace(&name).map_err(|error| format!("the pod's namespace: {error}"))
 }
 
 /// The name of the pod's own namespace, as its service account says it.
@@ -895,10 +890,11 @@ struct Serving {
 }
 
 /// Where the gateway's own pods are followed: the EndpointSlices of the pod's own
-/// namespace, for the Services of `control_plane` and its data plane (03 §6).
+/// namespace, for the Services of `control_plane` and its data planes, and of each data
+/// plane's own namespace, for its Service (03 §6).
 struct OwnPods {
     api: ApiServer,
-    namespace: Scope,
+    namespace: String,
     control_plane: String,
 }
 
@@ -1000,13 +996,13 @@ async fn control_until(
                 edgerush_controller::Settings {
                     plane,
                     service: None,
+                    generated: false,
                 },
             )]));
             (Some(settings), None)
         }
         Source::Followed {
             api,
-            namespace,
             namespace_name,
             own,
         } => {
@@ -1019,7 +1015,7 @@ async fn control_until(
             let telling = Rc::clone(&say);
             tasks.push(tokio::task::spawn_local(follow_data_planes(
                 api,
-                namespace,
+                scope.clone(),
                 own,
                 settings,
                 keeping,
