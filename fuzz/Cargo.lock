@@ -367,6 +367,7 @@ dependencies = [
  "edgerush-cluster-asynchronous",
  "edgerush-cluster-synchronous",
  "edgerush-config",
+ "edgerush-control-stream",
  "edgerush-controller",
  "edgerush-dns",
  "edgerush-explain",
