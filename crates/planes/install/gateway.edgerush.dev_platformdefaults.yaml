@@ -1,5 +1,7 @@
-# EdgeRush's PlatformDefaults, as the install ships it. Written by hand: the Rust types are
-# written from it (crates/planes/tests/generated.rs), never the other way about.
+# EdgeRush's PlatformDefaults, as the install ships it. Written by hand, but for the
+# DataPlane's own fields under `spec.gatewayClasses[].dataPlane`, copied from its CRD by
+# crates/planes/tests/generated.rs, which fails where they differ. The Rust types are
+# written from it, never the other way about.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -48,6 +50,322 @@ spec:
             default: {}
             description: Spec is what the platform allows.
             properties:
+              gatewayClasses:
+                description: |-
+                  GatewayClasses is the classes Gateway-first is on for, each with what a
+                  DataPlane generated for a Gateway of it is: a Gateway of a ControlPlane's
+                  class with an entry here, in that ControlPlane's watch scope, gets a DataPlane
+                  in its own namespace, named `<gateway>-<class>`, from the entry. A class with
+                  no entry has none. An entry edited reaches every DataPlane generated from it.
+                items:
+                  description: GatewayClass is one class's entry.
+                  properties:
+                    dataPlane:
+                      default: {}
+                      description: |-
+                        DataPlane is the fields of a DataPlane generated for a Gateway of the
+                        class, as a DataPlane has them, but for controlPlaneRef and gatewayRef,
+                        which come from the class and the Gateway, and gateway and ingress: a
+                        generated DataPlane serves its Gateway alone.
+                      properties:
+                        # The DataPlane's own: its spec's fields but controlPlaneRef, gateway,
+                        # gatewayRef and ingress, of its CRD beside this one, written by
+                        # `EDGERUSH_WRITE_TYPES=1 cargo test -p edgerush-planes --test generated`.
+                        # Not to be edited.
+                        ipFamily:
+                          default: IPv4
+                          description: |-
+                            IPFamily is what each port is bound on, and the families of the data plane's
+                            Service:
+                            
+                            * IPv4: `0.0.0.0`, which binds wherever there is a network.
+                            * IPv6: `[::]`, which takes IPv4 as well wherever the host has it.
+                            * Dual: the same socket, the Service reached over both.
+                          enum:
+                          - IPv4
+                          - IPv6
+                          - Dual
+                          type: string
+                        ports:
+                          description: |-
+                            Ports is what Gateway API has no field for, by port: each applied to the
+                            listener bound to that port. A port not here has the control plane's
+                            defaults.
+                          items:
+                            description: PortSettings is one port's.
+                            properties:
+                              accessLog:
+                                description: |-
+                                  AccessLog is where a record of each of its requests, or of its UDP
+                                  listener's sessions, is written: nowhere unless said.
+                                properties:
+                                  path:
+                                    description: Path is the file's, where Type is "File", and must be left out otherwise.
+                                    maxLength: 4096
+                                    minLength: 1
+                                    type: string
+                                  type:
+                                    description: |-
+                                      Type is where:
+                                      
+                                      * Stdout: the process's standard output, which the container runtime collects.
+                                      * File: a file, appended to; listeners that name the same path share it.
+                                    enum:
+                                    - Stdout
+                                    - File
+                                    type: string
+                                required:
+                                - type
+                                type: object
+                                x-kubernetes-validations:
+                                - message: path must be given where type is File, and only there
+                                  rule: "self.type == 'File' ? has(self.path) : !has(self.path)"
+                              forwarding:
+                                description: |-
+                                  Forwarding is whom its requests' forwarding headers are believed from.
+                                  Left out, no one's are, and the headers only a trusted proxy may send are
+                                  Forwarded, X-Real-IP and X-Forwarded-*.
+                                properties:
+                                  trustedOnlyHeaders:
+                                    description: |-
+                                      TrustedOnlyHeaders are taken off a request that did not come from a
+                                      trusted proxy: names, or the front of one followed by `*`
+                                      (`X-Forwarded-*`), matched whatever their case.
+                                    items:
+                                      maxLength: 256
+                                      minLength: 1
+                                      type: string
+                                    maxItems: 64
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                  trustedProxies:
+                                    description: |-
+                                      TrustedProxies are the proxies whose X-Forwarded-For is believed, as
+                                      ranges of their addresses: 10.0.4.0/24, 192.0.2.1/32 for one. Empty,
+                                      no one's is.
+                                    items:
+                                      maxLength: 64
+                                      minLength: 1
+                                      type: string
+                                    maxItems: 64
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - trustedOnlyHeaders
+                                - trustedProxies
+                                type: object
+                              http3:
+                                description: |-
+                                  HTTP3, present, serves HTTP/3 as well, on the same port over UDP: an
+                                  HTTPS listener's alone.
+                                properties:
+                                  altSvcMaxAge:
+                                    description: |-
+                                      AltSvcMaxAge is how long, in seconds, a client told over TCP that the
+                                      listener serves HTTP/3 may remember it: a day unless said.
+                                    format: int64
+                                    maximum: 4294967295.0
+                                    minimum: 0.0
+                                    type: integer
+                                  forceRetry:
+                                    description: |-
+                                      ForceRetry has every client prove its address with a Retry before its
+                                      handshake; otherwise only past a threshold of handshakes under way.
+                                      Off unless said.
+                                    type: boolean
+                                type: object
+                              port:
+                                description: Port is the port these settings are for.
+                                format: int32
+                                maximum: 65535.0
+                                minimum: 1.0
+                                type: integer
+                              proxyProtocol:
+                                description: |-
+                                  ProxyProtocol, present, has every connection start with a PROXY protocol
+                                  header, v1 or v2.
+                                properties:
+                                  senders:
+                                    description: |-
+                                      Senders are the ranges, the load balancer's, whose headers' addresses
+                                      are believed (10.0.0.0/16, 192.0.2.1/32 for one). From anywhere else
+                                      the header is read and dropped, and whoever connected is the client.
+                                    items:
+                                      maxLength: 64
+                                      minLength: 1
+                                      type: string
+                                    maxItems: 64
+                                    minItems: 1
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - senders
+                                type: object
+                              requestId:
+                                description: |-
+                                  RequestID is what an HTTP listener does with X-Request-ID, Generate unless
+                                  said:
+                                  
+                                  * Generate: every request gets an ID the gateway makes, in place of any it
+                                    came with; the answer tells the client the same ID.
+                                  * Pass: the header is left as it is, both ways.
+                                enum:
+                                - Generate
+                                - Pass
+                                type: string
+                              sessionAnswers:
+                                description: |-
+                                  SessionAnswers is how many answers a session of the UDP listener on it
+                                  expects for each datagram its client sends. Left out, a session ends when
+                                  idle alone.
+                                format: int64
+                                maximum: 4294967295.0
+                                minimum: 1.0
+                                type: integer
+                              sessionIdleSeconds:
+                                description: |-
+                                  SessionIdleSeconds is how long a session of the UDP listener on it may
+                                  carry nothing before it is ended: the data plane's 60 unless said.
+                                format: int64
+                                minimum: 1.0
+                                type: integer
+                              tunnelIdleSeconds:
+                                description: |-
+                                  TunnelIdleSeconds is how long a tunnel of the TCP or TLS listener on it,
+                                  or of an HTTPS one for the connections it passes through, may carry
+                                  nothing either way before both its ends are closed: the data plane's
+                                  hour unless said.
+                                format: int64
+                                minimum: 1.0
+                                type: integer
+                            required:
+                            - port
+                            type: object
+                          maxItems: 64
+                          type: array
+                          x-kubernetes-list-map-keys:
+                          - port
+                          x-kubernetes-list-type: map
+                        replicas:
+                          default:
+                            min: 1
+                          description: |-
+                            Replicas is how many proxies run. With max above min, a
+                            HorizontalPodAutoscaler runs the fleet between the two.
+                          properties:
+                            max:
+                              description: Max is the most an autoscaler may run. Left out, min run, always.
+                              format: int32
+                              minimum: 1.0
+                              type: integer
+                            min:
+                              default: 1
+                              description: Min is how many run, or the fewest an autoscaler may.
+                              format: int32
+                              minimum: 1.0
+                              type: integer
+                          type: object
+                          x-kubernetes-validations:
+                          - message: max must not be below min
+                            rule: "!has(self.max) || self.max >= self.min"
+                        resources:
+                          description: |-
+                            Resources is each proxy's compute resources. The proxy runs a request
+                            worker for each CPU requested, rounded up; with a CPU limit, no more than the
+                            limit rounded down, and at least one. A CPU limit is not recommended:
+                            throttling hurts tail latency.
+                          properties:
+                            limits:
+                              additionalProperties:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                pattern: >-
+                                  ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: Limits is the most of each resource a proxy may use.
+                              type: object
+                            requests:
+                              additionalProperties:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                pattern: >-
+                                  ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: Requests is how much of each resource a proxy is given.
+                              type: object
+                          type: object
+                        service:
+                          default:
+                            type: LoadBalancer
+                          description: |-
+                            Service is the data plane's Service, its address, which its control plane
+                            writes: its ports are those the data plane binds. It is made with the
+                            DataPlane and lasts as long.
+                          properties:
+                            annotations:
+                              additionalProperties:
+                                type: string
+                              description: Annotations are the Service's, such as a cloud load balancer's settings.
+                              type: object
+                            labels:
+                              additionalProperties:
+                                type: string
+                              description: Labels are the Service's, beside those of EdgeRush's own.
+                              type: object
+                            loadBalancerClass:
+                              description: |-
+                                LoadBalancerClass is the Service's: a LoadBalancer's alone, and fixed while
+                                it is one, as Kubernetes has it.
+                              maxLength: 253
+                              minLength: 1
+                              type: string
+                            loadBalancerSourceRanges:
+                              description: |-
+                                LoadBalancerSourceRanges are the ranges a LoadBalancer's clients may come
+                                from, where its cloud honours them.
+                              items:
+                                maxLength: 64
+                                minLength: 1
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: atomic
+                            type:
+                              default: LoadBalancer
+                              description: Type is the Service's.
+                              enum:
+                              - ClusterIP
+                              - NodePort
+                              - LoadBalancer
+                              type: string
+                          type: object
+                          x-kubernetes-validations:
+                          - message: loadBalancerClass and loadBalancerSourceRanges are a LoadBalancer's alone
+                            rule: >-
+                              self.type == 'LoadBalancer' || (!has(self.loadBalancerClass) &&
+                              !has(self.loadBalancerSourceRanges))
+                          - message: loadBalancerClass is fixed while the Service is a LoadBalancer
+                            rule: >-
+                              oldSelf.type != 'LoadBalancer' || self.type != 'LoadBalancer' ||
+                              (has(self.loadBalancerClass) == has(oldSelf.loadBalancerClass) && (!has(self.loadBalancerClass)
+                              || self.loadBalancerClass == oldSelf.loadBalancerClass))
+                        # End of the DataPlane's own.
+                      type: object
+                    name:
+                      description: Name is the GatewayClass's name.
+                      maxLength: 253
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      type: string
+                  required:
+                  - name
+                  type: object
+                maxItems: 64
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               watchScopes:
                 description: |-
                   WatchScopes is which namespaces ControlPlanes may watch beyond their own,

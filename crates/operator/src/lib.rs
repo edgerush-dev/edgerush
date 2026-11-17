@@ -11,10 +11,12 @@
 //! the leader step each time any of them changes. GatewayClasses and Gateways it follows,
 //! and makes, only while the cluster serves them: Ingress alone needs no Gateway API CRDs
 //! ([05 §6](../../../docs/05-operator.md)). It follows every GatewayClass, not only those it
-//! made, as [`classes`] refuses those naming EdgeRush's controller that no ControlPlane made.
+//! made, as [`classes`] refuses those naming EdgeRush's controller that no ControlPlane made,
+//! and every Gateway, as [`gateway_first`] generates a DataPlane for one written alone.
 
 pub mod allowance;
 pub mod classes;
+pub mod gateway_first;
 pub mod judge;
 pub mod status;
 mod step;
@@ -354,12 +356,15 @@ pub async fn operate(
             Arc::clone(&platform_defaults.borrow()),
             Arc::clone(&namespaces.borrow()),
         );
-        // Every class, those no ControlPlane made among them; only the Gateways it made.
+        // Every class, those no ControlPlane made among them, and every Gateway, those
+        // written alone among them; its children are those it made, by their label.
         let (Some(gateway_classes), Some(gateways)) = (
             children
                 .gateway_classes
                 .keep(&api, &Scope::Cluster, &changed, &say),
-            children.gateways.keep(&api, &made, &changed, &say),
+            children
+                .gateways
+                .keep(&api, &Scope::Cluster, &changed, &say),
         ) else {
             continue;
         };
@@ -390,6 +395,7 @@ pub async fn operate(
                 .collect(),
             children: children_now,
             gateway_classes: children.gateway_classes.all(),
+            gateways: children.gateways.all(),
             gateway_api: GatewayApi {
                 gateway_classes,
                 gateways,

@@ -48,6 +48,7 @@ use serde::Serialize;
 
 use crate::control_plane::{ControlPlane, ControlPlaneWatchNamespacesSelector};
 use crate::data_plane::{DataPlane, DataPlaneResources};
+use crate::gateway_first::carried;
 use crate::workers::workers;
 
 #[cfg(test)]
@@ -195,6 +196,43 @@ impl Object {
             Self::ValidatingWebhookConfiguration(object) => &object.metadata,
         }
     }
+
+    /// Its metadata, to be added to.
+    fn metadata_mut(&mut self) -> &mut ObjectMeta {
+        match self {
+            Self::ServiceAccount(object) => &mut object.metadata,
+            Self::RoleBinding(object) => &mut object.metadata,
+            Self::ClusterRoleBinding(object) => &mut object.metadata,
+            Self::Deployment(object) => &mut object.metadata,
+            Self::Service(object) => &mut object.metadata,
+            Self::HorizontalPodAutoscaler(object) => &mut object.metadata,
+            Self::PodDisruptionBudget(object) => &mut object.metadata,
+            Self::GatewayClass(object) => &mut object.metadata,
+            Self::IngressClass(object) => &mut object.metadata,
+            Self::Gateway(object) => &mut object.metadata,
+            Self::ValidatingWebhookConfiguration(object) => &mut object.metadata,
+        }
+    }
+}
+
+/// `labels` and `annotations` added to `metadata`, under what it already has, which wins.
+fn carry(
+    metadata: &mut ObjectMeta,
+    labels: &BTreeMap<String, String>,
+    annotations: &BTreeMap<String, String>,
+) {
+    for (into, from) in [
+        (&mut metadata.labels, labels),
+        (&mut metadata.annotations, annotations),
+    ] {
+        if from.is_empty() {
+            continue;
+        }
+        let into = into.get_or_insert_with(BTreeMap::new);
+        for (key, value) in from {
+            into.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
 }
 
 /// Why the objects could not be made: each a resource that should not have reached here.
@@ -325,9 +363,22 @@ pub fn data_plane_id(
 /// Where a data plane's pods mount their certificate.
 const IDENTITY_MOUNT: &str = "/etc/edgerush/identity";
 
-/// The name of a data plane's bindings, in namespaces other DataPlanes' may share.
-fn proxy_binding(control_plane: &str, data_plane: &str) -> String {
-    format!("edgerush-proxy-{control_plane}.{data_plane}")
+/// The name of a data plane's bindings, in namespaces other DataPlanes' may share, and of
+/// its ClusterRoleBinding: `edgerush-proxy-<controlplane>.<dataplane>` for one of its
+/// ControlPlane's namespace, and for one generated elsewhere (05 §3), whose name is unique
+/// only in its own, `edgerush-proxy-<controlplane>.<namespace>.<dataplane>`. None of the
+/// three holds a dot, so no two are one name.
+fn proxy_binding(
+    control_plane: &str,
+    control_plane_namespace: &str,
+    namespace: &str,
+    data_plane: &str,
+) -> String {
+    if namespace == control_plane_namespace {
+        format!("edgerush-proxy-{control_plane}.{data_plane}")
+    } else {
+        format!("edgerush-proxy-{control_plane}.{namespace}.{data_plane}")
+    }
 }
 
 /// A data plane's IngressClass: unique, as ControlPlane names are and hold no dot (05 §3).
@@ -833,7 +884,8 @@ pub fn for_data_plane(
 ) -> Result<Vec<Object>, Error> {
     let dp = Identity::of(&data_plane.metadata, "DataPlane")?;
     let cp = Identity::of(&control_plane.metadata, "ControlPlane")?;
-    if dp.namespace != cp.namespace || data_plane.spec.control_plane_ref.name != cp.name {
+    let of = &data_plane.spec.control_plane_ref;
+    if of.namespace.as_deref().unwrap_or(dp.namespace) != cp.namespace || of.name != cp.name {
         return Err(Error::NotItsControlPlane {
             data_plane: format!("{}/{}", dp.namespace, dp.name),
             control_plane: format!("{}/{}", cp.namespace, cp.name),
@@ -855,7 +907,7 @@ pub fn for_data_plane(
         namespaces
     });
     objects.extend(bindings(
-        &proxy_binding(cp.name, dp.name),
+        &proxy_binding(cp.name, cp.namespace, dp.namespace, dp.name),
         DATA_PLANE_ROLE,
         &name,
         dp.namespace,
@@ -1028,6 +1080,20 @@ pub fn for_data_plane(
             spec,
         })));
     }
+    // A generated DataPlane's labels and annotations, on everything made for it and its
+    // pods (05 §3); never on a selector, which a Deployment's cannot change.
+    let (carried_labels, carried_annotations) = carried(data_plane);
+    for object in &mut objects {
+        carry(object.metadata_mut(), &carried_labels, &carried_annotations);
+        if let Object::Deployment(deployment) = object
+            && let Some(template) = deployment
+                .spec
+                .as_mut()
+                .and_then(|spec| spec.template.metadata.as_mut())
+        {
+            carry(template, &carried_labels, &carried_annotations);
+        }
+    }
     Ok(objects)
 }
 
@@ -1079,9 +1145,17 @@ impl ProxyService {
         let dp = Identity::of(&data_plane.metadata, "DataPlane")?;
         let spec = &data_plane.spec;
         let selector = data_plane_labels(dp.namespace, &spec.control_plane_ref.name, dp.name);
-        let mut labels = spec.service.labels.clone().unwrap_or_default();
+        // A generated DataPlane's, then the DataPlane's for its Service, then EdgeRush's.
+        let (mut labels, mut carried_annotations) = carried(data_plane);
+        labels.extend(spec.service.labels.clone().unwrap_or_default());
         labels.extend(selector.clone());
         labels.insert(MANAGED_BY_LABEL.to_owned(), SERVICE_MANAGED_BY.to_owned());
+        let annotations = if carried_annotations.is_empty() {
+            spec.service.annotations.clone()
+        } else {
+            carried_annotations.extend(spec.service.annotations.clone().unwrap_or_default());
+            Some(carried_annotations)
+        };
         // Each a policy the API server keeps the families to, never stated apart (05 §2).
         let (ip_family_policy, ip_families) = match spec.ip_family.as_str() {
             "IPv4" => ("SingleStack", vec!["IPv4"]),
@@ -1094,7 +1168,7 @@ impl ProxyService {
             namespace: dp.namespace.to_owned(),
             owner: dp.owner("DataPlane"),
             labels,
-            annotations: spec.service.annotations.clone(),
+            annotations,
             selector,
             type_: spec.service.r#type.clone(),
             load_balancer_class: spec.service.load_balancer_class.clone(),

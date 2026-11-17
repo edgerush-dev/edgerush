@@ -16,13 +16,15 @@
 //! A resource that cannot be served is refused as it is applied, by its CRD's schema and
 //! CEL rules (05 §1): the types read what the API server admitted.
 //!
-//! [`objects`] is what the operator makes for each resource: a pure function, no I/O.
+//! [`objects`] is what the operator makes for each resource, and [`gateway_first`] the
+//! DataPlane it generates for a Gateway written alone: pure functions, no I/O.
 
 // The CRDs' own prose continues list items without indenting them.
 #[allow(clippy::doc_lazy_continuation)]
 pub mod control_plane;
 #[allow(clippy::doc_lazy_continuation)]
 pub mod data_plane;
+pub mod gateway_first;
 pub mod objects;
 #[allow(clippy::doc_lazy_continuation)]
 pub mod platform_defaults;

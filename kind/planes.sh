@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # What the install ships, judged by a real API server in a kind cluster (docs/05 §1, §2;
 # docs/10): the ControlPlane, DataPlane and PlatformDefaults CRDs, the four ClusterRoles and
-# the admission policy on a control plane's Services, applied as a user would.
+# the admission policies, on a control plane's Services and on generated DataPlanes,
+# applied as a user would; beside Gateway API's CRDs, which the golden cases' Gateways need.
 #
 #   kind/planes.sh 1.37          make the cluster, run every check, delete the cluster
 #   KEEP=1 kind/planes.sh 1.37   the same, the cluster left for a look
@@ -19,9 +20,14 @@
 #     class changed; a PlatformDefaults not named default, an allowance of a selector of
 #     no requirement, for ControlPlanes or for what they watch, with a selector where it
 #     takes none or none where it takes one, of a scope it cannot allow, or of an operator
-#     Kubernetes does not have;
+#     Kubernetes does not have; a DataPlane naming a Gateway beside a gateway or ingress of
+#     its own; a Gateway-first entry holding ingress, or two entries of one class;
 #   - a Service holding externalIPs is refused written as a control plane's ServiceAccount,
-#     and admitted written by another; one without them is admitted from either.
+#     and admitted written by another; one without them is admitted from either;
+#   - a DataPlane naming a Gateway, or a ControlPlane of another namespace, is refused
+#     written by anyone but the operator's ServiceAccount, one of its name in another
+#     namespace among them, and admitted from the operator's; its spec changed by another
+#     is refused, its labels changed admitted.
 # Nothing is built: no image is needed. Each check says PASS or FAIL; the first FAIL ends
 # the run with status 1. Nothing here reads or writes the user's own kubeconfig: every
 # kubectl is given the cluster's.
@@ -45,13 +51,14 @@ fail() {
 }
 
 install=crates/planes/install
+k create -f crates/gateway-api/crds/ >/dev/null
 k apply --server-side -f "$install/gateway.edgerush.dev_controlplanes.yaml" \
     -f "$install/gateway.edgerush.dev_dataplanes.yaml" \
     -f "$install/gateway.edgerush.dev_platformdefaults.yaml" \
     -f "$install/roles.yaml" -f "$install/admission.yaml" >/dev/null
 k wait --for condition=Established --timeout=60s \
     crd/controlplanes.gateway.edgerush.dev crd/dataplanes.gateway.edgerush.dev \
-    crd/platformdefaults.gateway.edgerush.dev >/dev/null
+    crd/platformdefaults.gateway.edgerush.dev crd/gateways.gateway.networking.k8s.io >/dev/null
 k create namespace edge >/dev/null
 
 # `admitted <what> <yaml>`: the object, applied as a dry run on the server, which judges it
@@ -162,11 +169,25 @@ refused "an allowance selecting without a selector" "selector must be given" "$(
 refused "an allowance of All with a selector" "selector must be given" "$(allowing '{ from: All, selector: { matchLabels: { a: b } } }')"
 refused "an allowance of its own namespace alone" "spec.watchScopes[0].namespaces.from" "$(allowing '{ from: Same }')"
 refused "an allowance of an operator Kubernetes does not have" "operator must be" "$(allowing '{ from: Selector, selector: { matchExpressions: [{ key: a, operator: Near }] } }')"
+admitted "PlatformDefaults of a Gateway-first entry" "$(platform_defaults default 'spec:
+  gatewayClasses:
+    - name: payments
+      dataPlane: { replicas: { min: 2, max: 10 }, service: { type: LoadBalancer } }')"
+refused "a Gateway-first entry holding ingress" "unknown field" "$(platform_defaults default 'spec:
+  gatewayClasses:
+    - name: payments
+      dataPlane: { ingress: { httpPort: 80, httpsPort: 443 } }')"
+refused "two Gateway-first entries of one class" "Duplicate value" "$(platform_defaults default 'spec:
+  gatewayClasses: [{ name: payments }, { name: payments }]')"
 
 # What the DataPlane's rules refuse.
 refused "a DataPlane whose name is no DNS label" "must be a DNS label" "$(data_plane pub.lic '  ingress: { httpPort: 80, httpsPort: 443 }')"
 refused "a DataPlane of a name too long for its Service's" "at most 48" "$(data_plane "$(name 49)" '  ingress: { httpPort: 80, httpsPort: 443 }')"
 refused "a DataPlane of neither API" "serves ingress, gateway or both" "$(data_plane public '  replicas: { min: 1 }')"
+refused "a DataPlane naming a Gateway beside a gateway of its own" "serves that Gateway alone" "$(data_plane api '  gatewayRef: { name: web }
+  gateway: { listeners: [{ name: http, port: 80, protocol: HTTP }] }')"
+refused "a DataPlane naming a Gateway beside ingress" "serves that Gateway alone" "$(data_plane api '  gatewayRef: { name: web }
+  ingress: { httpPort: 80, httpsPort: 443 }')"
 refused "a DataPlane naming no ControlPlane" "spec.controlPlaneRef" "apiVersion: gateway.edgerush.dev/v1alpha1
 kind: DataPlane
 metadata: { name: public, namespace: edge }
@@ -225,5 +246,55 @@ pass "a Service without externalIPs is admitted from the control plane's Service
 out=$(k create --dry-run=server -f - <<<"$(service '  externalIPs: [192.0.2.10]')" 2>&1) \
     || fail "a Service with externalIPs is refused from the cluster's admin: $out"
 pass "a Service with externalIPs is admitted from another"
+
+# The policy on generated DataPlanes. The operator's ServiceAccount, as operator.yaml names
+# it, given every right here, as the policy and not RBAC is what is judged; and one of its
+# name in another namespace, which is anyone's.
+k create namespace edgerush-system >/dev/null
+k create serviceaccount -n edgerush-system edgerush-operator >/dev/null
+k create serviceaccount -n edge edgerush-operator >/dev/null
+k create clusterrolebinding edgerush-operator-planes-test --clusterrole cluster-admin \
+    --serviceaccount edgerush-system:edgerush-operator \
+    --serviceaccount edge:edgerush-operator >/dev/null
+as_operator=(--as system:serviceaccount:edgerush-system:edgerush-operator)
+as_impostor=(--as system:serviceaccount:edge:edgerush-operator)
+generated() {
+    printf 'apiVersion: gateway.edgerush.dev/v1alpha1\nkind: DataPlane\nmetadata: { name: web-payments, namespace: edge }\nspec:\n  controlPlaneRef: { name: payments%s }\n%s\n' "$1" "$2"
+}
+naming_a_gateway=$(generated '' '  gatewayRef: { name: web }')
+elsewhere=$(generated ', namespace: edge-system' '  ingress: { httpPort: 80, httpsPort: 443 }')
+for _ in $(seq 1 30); do
+    if ! k create --dry-run=server -f - <<<"$naming_a_gateway" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+refused "a DataPlane naming a Gateway, written by hand" "is the operator's to write" "$naming_a_gateway"
+refused "a DataPlane naming a ControlPlane of another namespace, written by hand" "is the operator's to write" "$elsewhere"
+out=$(k "${as_impostor[@]}" create --dry-run=server -f - <<<"$naming_a_gateway" 2>&1) \
+    && fail "a DataPlane naming a Gateway is admitted from a ServiceAccount of the operator's name in another namespace"
+[[ $out == *"is the operator's to write"* ]] \
+    || fail "a DataPlane naming a Gateway is refused from an impostor, but not by the policy: $out"
+pass "a DataPlane naming a Gateway is refused from a ServiceAccount of the operator's name in another namespace"
+for written in "$naming_a_gateway" "$elsewhere"; do
+    out=$(k "${as_operator[@]}" create --dry-run=server -f - <<<"$written" 2>&1) \
+        || fail "a generated DataPlane is refused from the operator's ServiceAccount: $out"
+done
+pass "a DataPlane naming a Gateway, or a ControlPlane of another namespace, is admitted from the operator's ServiceAccount"
+admitted "a DataPlane naming its own namespace's ControlPlane outright" "$(generated ', namespace: edge' '  ingress: { httpPort: 80, httpsPort: 443 }')"
+# Made by the operator, then changed by another.
+k "${as_operator[@]}" create -f - <<<"$naming_a_gateway" >/dev/null
+out=$(k patch dataplane -n edge web-payments --type merge -p '{"spec":{"replicas":{"min":5}}}' 2>&1) \
+    && fail "a generated DataPlane's spec is changed by hand"
+[[ $out == *"is the operator's to write"* ]] \
+    || fail "a generated DataPlane's spec changed by hand is refused, but not by the policy: $out"
+pass "a generated DataPlane's spec changed by hand is refused"
+out=$(k patch dataplane -n edge web-payments --type merge -p '{"spec":{"gatewayRef":null,"ingress":{"httpPort":80,"httpsPort":443}}}' 2>&1) \
+    && fail "a generated DataPlane is turned into another by hand"
+pass "a generated DataPlane turned into another by hand is refused"
+out=$(k label dataplane -n edge web-payments team=payments 2>&1) \
+    || fail "a generated DataPlane's labels changed by hand are refused: $out"
+pass "a generated DataPlane's labels changed by hand are admitted"
+k "${as_operator[@]}" delete dataplane -n edge web-payments >/dev/null
 
 echo "every check passed"

@@ -33,8 +33,13 @@ rules:
   # finalizers: an owner reference that blocks its owner's deletion, where the cluster
   # checks that (OwnerReferencesPermissionEnforcement).
   - apiGroups: [gateway.edgerush.dev]
-    resources: [controlplanes, dataplanes]
+    resources: [controlplanes]
     verbs: [get, list, watch, patch]
+  # DataPlanes too, which it also generates for a Gateway written alone, applied, and
+  # deletes by name once that Gateway has moved to another class (05 §3).
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [dataplanes]
+    verbs: [get, list, watch, create, patch, delete]
   - apiGroups: [gateway.edgerush.dev]
     resources: [controlplanes/status, dataplanes/status]
     verbs: [patch]
@@ -65,9 +70,19 @@ rules:
     resources: [poddisruptionbudgets]
     verbs: [get, list, watch, create, patch]
   # A DataPlane's Gateway, also deleted by name once its `gateway` is taken away (05 §3).
+  # Every Gateway is read, as one written alone may get a DataPlane generated: one that
+  # sets parameters is refused in its status, its Accepted and Programmed alone, applied;
+  # and the DataPlane generated is owned by its Gateway, an owner reference that blocks its
+  # deletion, `update` on its finalizers where the cluster checks that.
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gateways]
     verbs: [get, list, watch, create, patch, delete]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gateways/status]
+    verbs: [patch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gateways/finalizers]
+    verbs: [update]
   # What no owner reference reaches, deleted by label: the classes, ClusterRoleBindings,
   # and RoleBindings in other namespaces. A binding also deleted by name, once what it
   # grants is no longer asked for or allowed (05 §4), and an IngressClass once its

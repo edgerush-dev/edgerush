@@ -1,6 +1,7 @@
 //! What `install/` ships: the CRDs' bound on a name, as the code names Services by it; the
-//! four ClusterRoles the operator binds, the admission policy on a control plane's
-//! Services, as the code names them; and the operator itself, which grants by binding those
+//! four ClusterRoles the operator binds, the admission policies on a control plane's
+//! Services, as the code names them, and on generated DataPlanes, as `operator.yaml` names
+//! the operator's ServiceAccount; and the operator itself, which grants by binding those
 //! four alone.
 
 #![allow(
@@ -102,32 +103,80 @@ enum Admission {
     ValidatingAdmissionPolicyBinding(Box<ValidatingAdmissionPolicyBinding>),
 }
 
-#[test]
-fn the_admission_policy_matches_the_control_planes_service_accounts_and_is_bound() {
+/// The policies `admission.yaml` ships, each by its name with the expressions of its
+/// match conditions, every one bound to deny.
+fn admission_policies() -> Vec<(String, Vec<String>)> {
     let shipped: Vec<Admission> = serde_saphyr::from_multiple(&read("admission.yaml")).unwrap();
-    let [
-        Admission::ValidatingAdmissionPolicy(policy),
-        Admission::ValidatingAdmissionPolicyBinding(binding),
-    ] = shipped.as_slice()
-    else {
-        panic!("admission.yaml is a policy, then its binding");
-    };
-    let policy_name = policy.metadata.name.as_deref();
-    let spec = &binding.spec;
-    assert_eq!(Some(spec.policy_name.as_str()), policy_name);
-    assert_eq!(spec.validation_actions, ["Deny"]);
-    let conditions = policy
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.match_conditions.as_ref())
-        .expect("the policy matches by condition");
+    let mut policies = Vec::new();
+    let mut bound = Vec::new();
+    for object in shipped {
+        match object {
+            Admission::ValidatingAdmissionPolicy(policy) => {
+                let conditions = policy
+                    .spec
+                    .and_then(|spec| spec.match_conditions)
+                    .expect("each policy matches by condition");
+                policies.push((
+                    policy.metadata.name.expect("a policy is named"),
+                    conditions.into_iter().map(|c| c.expression).collect(),
+                ));
+            }
+            Admission::ValidatingAdmissionPolicyBinding(binding) => {
+                assert_eq!(binding.spec.validation_actions, ["Deny"]);
+                bound.push(binding.spec.policy_name);
+            }
+        }
+    }
+    let mut names: Vec<String> = policies.iter().map(|(name, _)| name.clone()).collect();
+    names.sort();
+    bound.sort();
+    assert_eq!(names, bound, "each policy is bound, once");
+    policies
+}
+
+#[test]
+fn the_service_policy_matches_the_control_planes_service_accounts_and_is_bound() {
+    let policies = admission_policies();
+    let (_, conditions) = policies
+        .iter()
+        .find(|(name, _)| name == "edgerush-control-plane-services")
+        .expect("the policy on a control plane's Services");
     // The control plane's ServiceAccount is named as the policy expects.
     let prefix = controller_name("");
     assert!(
         conditions
             .iter()
-            .any(|c| c.expression.contains(&format!(":{prefix}[^:]+$"))),
+            .any(|c| c.contains(&format!(":{prefix}[^:]+$"))),
         "no condition matches {prefix}<controlplane>"
+    );
+}
+
+#[test]
+fn the_generated_data_plane_policy_lets_through_the_operator_alone_and_is_bound() {
+    let policies = admission_policies();
+    let (_, conditions) = policies
+        .iter()
+        .find(|(name, _)| name == "edgerush-generated-data-planes")
+        .expect("the policy on generated DataPlanes");
+    // The operator's ServiceAccount, by its namespace and name as operator.yaml installs
+    // it: one of its name in another namespace is let through nothing.
+    let shipped: Vec<OperatorInstall> =
+        serde_saphyr::from_multiple(&read("operator.yaml")).unwrap();
+    let (namespace, name) = shipped
+        .iter()
+        .find_map(|object| match object {
+            OperatorInstall::ServiceAccount(account) => Some((
+                account.metadata.namespace.clone().unwrap(),
+                account.metadata.name.clone().unwrap(),
+            )),
+            _ => None,
+        })
+        .expect("the operator's ServiceAccount");
+    let operator = format!("'system:serviceaccount:{namespace}:{name}'");
+    assert_eq!(
+        conditions,
+        &[format!("request.userInfo.username != {operator}")],
+        "the policy is to judge everyone but {operator}"
     );
 }
 
@@ -244,9 +293,10 @@ fn the_operator_reads_the_crds_of_the_two_kinds_it_makes_alone() {
 }
 
 #[test]
-fn the_operator_writes_the_status_of_gateway_classes_by_patch_alone() {
+fn the_operator_writes_the_status_of_gateway_classes_and_gateways_by_patch_alone() {
     // A class naming EdgeRush's controller that no ControlPlane made is refused in its
-    // status (05 §3); no other Gateway API status is the operator's.
+    // status, and so is a Gateway written alone that sets parameters (05 §3); no other
+    // Gateway API status is the operator's.
     let shipped: Vec<OperatorInstall> =
         serde_saphyr::from_multiple(&read("operator.yaml")).unwrap();
     let rules: Vec<_> = shipped
@@ -264,18 +314,19 @@ fn the_operator_writes_the_status_of_gateway_classes_by_patch_alone() {
                 .any(|resource| resource.ends_with("/status") && !resource.contains("planes"))
         })
         .collect();
-    let [status] = rules.as_slice() else {
-        panic!("one rule writes Gateway API status: {rules:?}");
-    };
-    assert_eq!(
-        status.api_groups.as_deref(),
-        Some(&["gateway.networking.k8s.io".to_owned()][..])
-    );
-    assert_eq!(
-        status.resources.as_deref(),
-        Some(&["gatewayclasses/status".to_owned()][..])
-    );
-    assert_eq!(status.verbs, ["patch"]);
+    let mut resources: Vec<&str> = rules
+        .iter()
+        .flat_map(|rule| {
+            assert_eq!(
+                rule.api_groups.as_deref(),
+                Some(&["gateway.networking.k8s.io".to_owned()][..])
+            );
+            assert_eq!(rule.verbs, ["patch"]);
+            rule.resources.iter().flatten().map(String::as_str)
+        })
+        .collect();
+    resources.sort_unstable();
+    assert_eq!(resources, ["gatewayclasses/status", "gateways/status"]);
 }
 
 #[test]

@@ -1,0 +1,121 @@
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata:
+  annotations:
+    example.com/owner: shop
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+  labels:
+    app.kubernetes.io/managed-by: edgerush-operator
+    gateway.networking.k8s.io/gateway-class-name: edge
+    gateway.networking.k8s.io/gateway-name: web
+    team: shop
+  name: web-edge
+  namespace: shop
+  ownerReferences:
+  - apiVersion: gateway.networking.k8s.io/v1
+    blockOwnerDeletion: true
+    controller: true
+    kind: Gateway
+    name: web
+    uid: 0d6a9f3c-0000-4000-8000-000000000011
+spec:
+  controlPlaneRef:
+    name: edge
+    namespace: edge-system
+  gatewayRef:
+    name: web
+  ipFamily: IPv4
+  ports:
+  - http3: {}
+    port: 443
+  replicas:
+    max: 6
+    min: 2
+  resources:
+    requests:
+      cpu: "1"
+      memory: 512Mi
+  service:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    type: LoadBalancer
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata:
+  annotations:
+    gateway.networking.k8s.io/gateway-name: >-
+      long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.l
+  labels:
+    app.kubernetes.io/managed-by: edgerush-operator
+    gateway.networking.k8s.io/gateway-class-name: edge
+  name: long-gateway-name-long-gateway-name-lon-8b3fb21b
+  namespace: gateway-conformance-infra
+  ownerReferences:
+  - apiVersion: gateway.networking.k8s.io/v1
+    blockOwnerDeletion: true
+    controller: true
+    kind: Gateway
+    name: >-
+      long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.l
+    uid: 0d6a9f3c-0000-4000-8000-000000000012
+spec:
+  controlPlaneRef:
+    name: edge
+    namespace: edge-system
+  gatewayRef:
+    name: >-
+      long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.l
+  ipFamily: IPv4
+  ports:
+  - http3: {}
+    port: 443
+  replicas:
+    max: 6
+    min: 2
+  resources:
+    requests:
+      cpu: "1"
+      memory: 512Mi
+  service:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    type: LoadBalancer
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: edgerush-operator
+    gateway.networking.k8s.io/gateway-class-name: edge
+    gateway.networking.k8s.io/gateway-name: web
+  name: web-edge
+  namespace: blog
+  ownerReferences:
+  - apiVersion: gateway.networking.k8s.io/v1
+    blockOwnerDeletion: true
+    controller: true
+    kind: Gateway
+    name: web
+    uid: 0d6a9f3c-0000-4000-8000-000000000013
+spec:
+  controlPlaneRef:
+    name: edge
+    namespace: edge-system
+  gatewayRef:
+    name: web
+  ipFamily: IPv4
+  ports:
+  - http3: {}
+    port: 443
+  replicas:
+    max: 6
+    min: 2
+  resources:
+    requests:
+      cpu: "1"
+      memory: 512Mi
+  service:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    type: LoadBalancer

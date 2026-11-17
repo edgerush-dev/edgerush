@@ -1,0 +1,155 @@
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    example.com/owner: shop
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-controller
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: web-edge
+    gateway.edgerush.dev/namespace: shop
+    gateway.networking.k8s.io/gateway-class-name: edge
+    gateway.networking.k8s.io/gateway-name: web
+    team: shop
+  name: edgerush-proxy-web-edge
+  namespace: shop
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: web-edge
+    uid: uid-of-web-edge
+spec:
+  externalTrafficPolicy: Local
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: port-80
+    port: 80
+    protocol: TCP
+    targetPort: 80
+  - name: port-443
+    port: 443
+    protocol: TCP
+    targetPort: 443
+  - name: port-443-udp
+    port: 443
+    protocol: UDP
+    targetPort: 443
+  selector:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: web-edge
+    gateway.edgerush.dev/namespace: shop
+  sessionAffinity: None
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    gateway.networking.k8s.io/gateway-name: >-
+      long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.long-gateway-name.l
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-controller
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: long-gateway-name-long-gateway-name-lon-8b3fb21b
+    gateway.edgerush.dev/namespace: gateway-conformance-infra
+    gateway.networking.k8s.io/gateway-class-name: edge
+  name: edgerush-proxy-long-gateway-name-long-gateway-name-lon-8b3fb21b
+  namespace: gateway-conformance-infra
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: long-gateway-name-long-gateway-name-lon-8b3fb21b
+    uid: uid-of-long-gateway-name-long-gateway-name-lon-8b3fb21b
+spec:
+  externalTrafficPolicy: Local
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: port-80
+    port: 80
+    protocol: TCP
+    targetPort: 80
+  - name: port-443
+    port: 443
+    protocol: TCP
+    targetPort: 443
+  - name: port-443-udp
+    port: 443
+    protocol: UDP
+    targetPort: 443
+  selector:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: long-gateway-name-long-gateway-name-lon-8b3fb21b
+    gateway.edgerush.dev/namespace: gateway-conformance-infra
+  sessionAffinity: None
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+  labels:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-controller
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: web-edge
+    gateway.edgerush.dev/namespace: blog
+    gateway.networking.k8s.io/gateway-class-name: edge
+    gateway.networking.k8s.io/gateway-name: web
+  name: edgerush-proxy-web-edge
+  namespace: blog
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: DataPlane
+    name: web-edge
+    uid: uid-of-web-edge
+spec:
+  externalTrafficPolicy: Local
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: port-80
+    port: 80
+    protocol: TCP
+    targetPort: 80
+  - name: port-443
+    port: 443
+    protocol: TCP
+    targetPort: 443
+  - name: port-443-udp
+    port: 443
+    protocol: UDP
+    targetPort: 443
+  selector:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: edge
+    gateway.edgerush.dev/data-plane: web-edge
+    gateway.edgerush.dev/namespace: blog
+  sessionAffinity: None
+  type: LoadBalancer

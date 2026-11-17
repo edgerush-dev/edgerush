@@ -27,6 +27,13 @@
 #     one of a ControlPlane's name made by hand before it is refused as well, the
 #     ControlPlane saying it is not the operator's, and its control plane, running, neither
 #     accepts the class nor touches the Gateway of it; the ControlPlane deleted leaves it;
+#   - Gateway-first (docs/05 §3): with an entry for class `edge`, Gateway `alone` written
+#     alone gets DataPlane `alone-edge`, accepted, owned by it, labelled for it, its
+#     Deployment made; its spec changed by hand is refused, and the DataPlane deleted by
+#     hand is made again; a Gateway that sets parameters gets nothing and says
+#     InvalidParameters; `alone` given parameters says so too and keeps its DataPlane, not
+#     applied again as the entry changes, until they are taken away; `alone` deleted takes
+#     its DataPlane and all made for it;
 #   - the control plane writes the data plane's Service (docs/05 §2), owned by DataPlane
 #     `web`, a LoadBalancer that keeps the client's address: Ingress's two ports listed,
 #     and the Gateway's listener's as it is bound, which follows the listener's port as
@@ -47,7 +54,9 @@
 #     not accepted, nothing made for it, until an allowance lets it, then bound over the
 #     cluster; a Selector scope within a selector allowance bound in the namespaces it
 #     selects alone, one beyond it not accepted and bound nowhere; the allowance narrowed
-#     taking back the rights it granted, the rest kept;
+#     taking back the rights it granted, the rest kept; a Gateway of `wide`'s class in
+#     another namespace given a DataPlane there, accepted, bound by a name of that
+#     namespace's, and gone with its Gateway;
 #   - a Selector scope followed (docs/04 §1): ControlPlane `teams` serves the namespaces of
 #     team shop through DataPlane `front`, its controller told the selector; a namespace
 #     labelled in is bound and served, one labelled out dropped and its bindings gone, and
@@ -360,6 +369,88 @@ k delete gatewayclass squat >/dev/null
 k delete namespace squat --wait=false >/dev/null
 pass "a class of a ControlPlane's name made by hand is refused, and its control plane takes it no more than the operator does"
 
+echo "== Gateway-first"
+# The entry for class edge; `$1` the replicas its DataPlanes run.
+entry() {
+    k apply -f - >/dev/null <<EOF
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: PlatformDefaults
+metadata: { name: default }
+spec:
+  gatewayClasses:
+    - name: edge
+      dataPlane: { replicas: { min: $1 }, service: { type: ClusterIP } }
+EOF
+}
+# Gateway $1 of namespace edge, of class edge, written alone; `$2` its infrastructure.
+alone() {
+    local infrastructure=${2:-}
+    [ -n "$infrastructure" ] || infrastructure='{}'
+    k apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: $1, namespace: edge }
+spec:
+  gatewayClassName: edge
+  infrastructure: $infrastructure
+  listeners: [{ name: http, port: 8081, protocol: HTTP }]
+EOF
+}
+dp_uid() { k -n edge get dataplane "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null; }
+entry 1
+alone alone
+until_true 'k -n edge get dataplane alone-edge' 60 ||
+    fail "Gateway alone, written alone, gets no DataPlane"
+condition_is dataplane/alone-edge edge Accepted "True Accepted" 60 ||
+    fail "DataPlane alone-edge, generated: $(condition dataplane/alone-edge edge Accepted)"
+[ "$(k -n edge get dataplane alone-edge -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name} {.metadata.labels.gateway\.networking\.k8s\.io/gateway-name} {.spec.gatewayRef.name}')" = "Gateway/alone alone alone" ] ||
+    fail "DataPlane alone-edge is not owned by, labelled for and naming Gateway alone"
+until_true 'k -n edge get deploy edgerush-proxy-alone-edge' 60 ||
+    fail "DataPlane alone-edge's Deployment is not made"
+[ "$(k -n edge get deploy edgerush-proxy-alone-edge -o jsonpath='{.metadata.labels.gateway\.networking\.k8s\.io/gateway-name}')" = alone ] ||
+    fail "DataPlane alone-edge's Deployment is not labelled for Gateway alone"
+pass "a Gateway written alone gets a DataPlane, accepted, owned by it and labelled for it, and its Deployment"
+out=$(k -n edge patch dataplane alone-edge --type merge -p '{"spec":{"replicas":{"min":3}}}' 2>&1) &&
+    fail "DataPlane alone-edge's spec is changed by hand"
+[[ $out == *"is the operator's to write"* ]] ||
+    fail "DataPlane alone-edge's spec changed by hand is refused, but not by the policy: $out"
+first=$(dp_uid alone-edge)
+k -n edge delete dataplane alone-edge --wait=true >/dev/null
+until_true '[ -n "$(dp_uid alone-edge)" ] && [ "$(dp_uid alone-edge)" != "$first" ]' 90 ||
+    fail "DataPlane alone-edge, deleted by hand, is not made again"
+pass "a generated DataPlane's spec changed by hand is refused, and one deleted by hand is made again"
+alone params '{ parametersRef: { group: "", kind: ConfigMap, name: params } }'
+condition_is gateway/params edge Accepted "False InvalidParameters" 60 ||
+    fail "Gateway params, of parameters: $(condition gateway/params edge Accepted)"
+[ "$(condition gateway/params edge Programmed)" = "False InvalidParameters" ] ||
+    fail "Gateway params, of parameters, is programmed: $(condition gateway/params edge Programmed)"
+! k -n edge get dataplane params-edge >/dev/null 2>&1 ||
+    fail "Gateway params, of parameters, gets a DataPlane"
+pass "a Gateway that sets parameters gets no DataPlane, and says InvalidParameters"
+kept=$(dp_uid alone-edge)
+alone alone '{ parametersRef: { group: "", kind: ConfigMap, name: params } }'
+condition_is gateway/alone edge Accepted "False InvalidParameters" 60 ||
+    fail "Gateway alone, given parameters: $(condition gateway/alone edge Accepted)"
+entry 2
+sleep 5
+[ "$(dp_uid alone-edge)" = "$kept" ] ||
+    fail "DataPlane alone-edge, its Gateway given parameters, is not kept"
+[ "$(k -n edge get dataplane alone-edge -o jsonpath='{.spec.replicas.min}')" = 1 ] ||
+    fail "DataPlane alone-edge, its Gateway given parameters, was applied again as the entry changed"
+alone alone
+until_true '[ "$(k -n edge get dataplane alone-edge -o jsonpath="{.spec.replicas.min}")" = 2 ]' 60 ||
+    fail "DataPlane alone-edge, its Gateway's parameters taken away, is not applied as the entry says"
+until_true '[ "$(condition gateway/alone edge Accepted)" != "False InvalidParameters" ]' 60 ||
+    fail "Gateway alone, its parameters taken away, still says InvalidParameters"
+[ "$(dp_uid alone-edge)" = "$kept" ] ||
+    fail "DataPlane alone-edge was made again, not kept, as its Gateway's parameters came and went"
+pass "a Gateway given parameters keeps its DataPlane, not applied again, until they are taken away"
+k -n edge delete gateway alone params >/dev/null
+until_true '! k -n edge get dataplane alone-edge && ! k -n edge get deploy edgerush-proxy-alone-edge' 120 ||
+    fail "Gateway alone deleted, its DataPlane or Deployment is still there"
+k delete platformdefaults default >/dev/null
+pass "a Gateway deleted takes its generated DataPlane and all made for it"
+
 echo "== the data plane's Service"
 # The ports the data plane's Service lists, as `port/protocol`, in its order.
 ports_of() {
@@ -565,6 +656,9 @@ apiVersion: gateway.edgerush.dev/v1alpha1
 kind: PlatformDefaults
 metadata: { name: default }
 spec:
+  gatewayClasses:
+    - name: wide
+      dataPlane: { service: { type: ClusterIP } }
   watchScopes:
 EOF
         [ "${1:-}" = narrowed ] || cat <<'EOF'
@@ -606,6 +700,29 @@ condition_is controlplane/wide wide Accepted "True Accepted" 60 ||
 until_true 'bound "" wide edgerush-controller-wide' 60 ||
     fail "ControlPlane wide, allowed All, is not bound over the cluster"
 pass "an allowance of All lets a ControlPlane watch every namespace: accepted, bound over the cluster"
+
+# Gateway-first beyond the ControlPlane's namespace: the DataPlane in the Gateway's.
+until_true 'k get gatewayclass wide' 60 || fail "ControlPlane wide's GatewayClass is not made"
+k apply -f - >/dev/null <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: far, namespace: team-b }
+spec:
+  gatewayClassName: wide
+  listeners: [{ name: http, port: 8080, protocol: HTTP }]
+EOF
+until_true 'k -n team-b get dataplane far-wide' 60 ||
+    fail "Gateway team-b/far, of ControlPlane wide's class, gets no DataPlane"
+condition_is dataplane/far-wide team-b Accepted "True Accepted" 60 ||
+    fail "DataPlane team-b/far-wide, generated: $(condition dataplane/far-wide team-b Accepted)"
+[ "$(k -n team-b get dataplane far-wide -o jsonpath='{.spec.controlPlaneRef.namespace}')" = wide ] ||
+    fail "DataPlane team-b/far-wide does not name its ControlPlane's namespace"
+until_true 'bound "" wide edgerush-proxy-wide.team-b.far-wide' 60 ||
+    fail "DataPlane team-b/far-wide is not bound by a name of its namespace's"
+k -n team-b delete gateway far >/dev/null
+until_true '! k -n team-b get dataplane far-wide && ! bound "" wide edgerush-proxy-wide.team-b.far-wide' 120 ||
+    fail "Gateway team-b/far deleted, its DataPlane or its binding is still there"
+pass "a Gateway in another namespace than its ControlPlane's gets a DataPlane there, accepted, and takes it when deleted"
 
 k apply -f - >/dev/null <<'EOF'
 apiVersion: gateway.edgerush.dev/v1alpha1

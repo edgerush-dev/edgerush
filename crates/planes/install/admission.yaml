@@ -35,3 +35,51 @@ metadata:
 spec:
   policyName: edgerush-control-plane-services
   validationActions: [Deny]
+---
+# A DataPlane naming a Gateway (gatewayRef), or a ControlPlane of another namespace, is one
+# the operator generates for a Gateway written alone, and the operator's alone to write
+# (docs/05 §3): its label, its owner reference to its Gateway and its name can each be
+# written by hand, and one written so would be served, for a class the platform gave no
+# entry, of whatever spec its writer liked. So whoever is not the operator's ServiceAccount
+# makes none, and changes the spec of none, nor turns one into another; what changes their
+# metadata alone, a finalizer or an owner reference taken away, is let through. The
+# ServiceAccount is named by its namespace too, as operator.yaml installs it: one of its
+# name in another namespace is anyone's.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: edgerush-generated-data-planes
+  labels: { app.kubernetes.io/part-of: edgerush }
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [gateway.edgerush.dev]
+        apiVersions: [v1alpha1]
+        operations: [CREATE, UPDATE]
+        resources: [dataplanes]
+  matchConditions:
+    - name: not-written-by-the-operator
+      expression: request.userInfo.username != 'system:serviceaccount:edgerush-system:edgerush-operator'
+  variables:
+    - name: generated
+      expression: >-
+        has(object.spec.gatewayRef) ||
+        (has(object.spec.controlPlaneRef.namespace) && object.spec.controlPlaneRef.namespace != request.namespace)
+    - name: wasGenerated
+      expression: >-
+        oldObject != null && (has(oldObject.spec.gatewayRef) ||
+        (has(oldObject.spec.controlPlaneRef.namespace) && oldObject.spec.controlPlaneRef.namespace != request.namespace))
+  validations:
+    - expression: '!(variables.generated || variables.wasGenerated) || (oldObject != null && object.spec == oldObject.spec)'
+      message: a DataPlane with gatewayRef, or naming a ControlPlane of another namespace, is the operator's to write; it generates one for a Gateway of a class whose PlatformDefaults entry asks for it
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: edgerush-generated-data-planes
+  labels: { app.kubernetes.io/part-of: edgerush }
+spec:
+  policyName: edgerush-generated-data-planes
+  validationActions: [Deny]
