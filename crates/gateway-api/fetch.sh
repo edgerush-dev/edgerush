@@ -8,6 +8,13 @@
 #
 #   EDGERUSH_WRITE_TYPES=1 cargo test -p edgerush-gateway-api --test generated
 #
+# And move the conformance runner to the same release, as a test there checks: the two
+# requires of conformance/go.mod, then its go.sum, with the Go of the runner's image (the
+# FROM of conformance/Dockerfile), as no host has Go of its own (docs/04 §7):
+#
+#   docker run --rm -u "$(id -u)" -e GOCACHE=/tmp/go -e GOMODCACHE=/tmp/mod \
+#       -v "$PWD/conformance:/src" -w /src <that image> go mod tidy
+#
 # Only the standard channel is read: its fields are those the types have, and the
 # experimental channel's CRDs hold every one of them (docs/05 §6). A kind joins KINDS when
 # EdgeRush starts to follow it.
