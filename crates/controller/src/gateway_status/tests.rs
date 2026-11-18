@@ -145,7 +145,7 @@ fn the_class_says_whether_every_kinds_release_is_supported() {
         )
     };
     for release in ["v1.7.0", "v1.6.2", "v1.7.0-rc.1"] {
-        let status = class(None, 3, &served(release), at(50));
+        let status = class(None, 3, &served(release), &[], at(50));
         assert_eq!(
             version(&status),
             (
@@ -164,7 +164,7 @@ fn the_class_says_whether_every_kinds_release_is_supported() {
     };
     older[of(GatewayKind::ReferenceGrant)].1 = Served::Missing;
     assert_eq!(
-        version(&class(None, 3, &older, at(50))),
+        version(&class(None, 3, &older, &[], at(50))),
         (
             "False".to_owned(),
             "UnsupportedVersion".to_owned(),
@@ -175,10 +175,65 @@ fn the_class_says_whether_every_kinds_release_is_supported() {
     );
     let unnamed = vec![(GatewayKind::Gateway, Served::Served { release: None })];
     assert_eq!(
-        version(&class(None, 3, &unnamed, at(50))).0,
+        version(&class(None, 3, &unnamed, &[], at(50))).0,
         "False",
         "a CRD naming no release"
     );
+}
+
+#[test]
+fn the_class_claims_the_tables_features_and_only_those() {
+    let served: Vec<_> = GatewayKind::ALL
+        .iter()
+        .map(|&kind| {
+            (
+                kind,
+                Served::Served {
+                    release: Some("v1.7.0".to_owned()),
+                },
+            )
+        })
+        .collect();
+    let names = |status: &GatewayClassStatus| {
+        status
+            .supported_features
+            .as_ref()
+            .map(|features| features.iter().map(|f| f.name.clone()).collect::<Vec<_>>())
+    };
+    let table = ["GRPCRoute", "Gateway", "HTTPRoute"];
+    let claimed = class(None, 3, &served, &table, at(50));
+    assert_eq!(names(&claimed), Some(table.map(str::to_owned).to_vec()));
+    assert_eq!(
+        class(Some(&claimed), 3, &served, &table, at(60)),
+        claimed,
+        "unchanged, nothing to write"
+    );
+    let fewer = class(Some(&claimed), 3, &served, &table[1..], at(60));
+    assert_eq!(
+        names(&fewer),
+        Some(vec!["Gateway".to_owned(), "HTTPRoute".to_owned()]),
+        "a feature taken out of the table is no longer claimed"
+    );
+    // An empty table leaves the field out, and the status is replaced whole, so a class
+    // that claimed features before claims none.
+    let none = class(Some(&claimed), 3, &served, &[], at(60));
+    assert_eq!(none.supported_features, None);
+    assert_eq!(
+        serde_json::to_value(&none)
+            .unwrap()
+            .get("supportedFeatures"),
+        None
+    );
+}
+
+#[test]
+fn the_feature_table_is_sorted_each_name_once() {
+    // Its length is bounded where it is declared, at compile time.
+    assert!(
+        SUPPORTED_FEATURES.windows(2).all(|pair| pair[0] < pair[1]),
+        "sorted, each once: {SUPPORTED_FEATURES:?}"
+    );
+    assert!(SUPPORTED_FEATURES.iter().all(|name| !name.is_empty()));
 }
 
 /// What translation says of a Gateway of two listeners, `http` served and `secure` not.

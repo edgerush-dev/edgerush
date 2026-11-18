@@ -1350,7 +1350,13 @@ impl GatewayApi {
                 .find(|class| class.metadata.name.as_deref() == Some(name));
             if let (Some(class), Some(served)) = (class, &self.last) {
                 let generation = class.metadata.generation.unwrap_or_default();
-                let status = gateway_status::class(class.status.as_ref(), generation, served, now);
+                let status = gateway_status::class(
+                    class.status.as_ref(),
+                    generation,
+                    served,
+                    gateway_status::SUPPORTED_FEATURES,
+                    now,
+                );
                 if class.status.as_ref() != Some(&status) {
                     let object = Object {
                         kind: "GatewayClass",
