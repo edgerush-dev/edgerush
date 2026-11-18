@@ -236,6 +236,15 @@ fn the_feature_table_is_sorted_each_name_once() {
     assert!(SUPPORTED_FEATURES.iter().all(|name| !name.is_empty()));
 }
 
+#[test]
+fn the_table_claims_the_gateway_http_profiles_core() {
+    // GATEWAY-HTTP's core passes `kind/conformance.sh`, which tests what the table claims:
+    // a core feature taken out would leave it untested.
+    for core in ["Gateway", "HTTPRoute", "ReferenceGrant"] {
+        assert!(SUPPORTED_FEATURES.contains(&core), "{core}");
+    }
+}
+
 /// What translation says of a Gateway of two listeners, `http` served and `secure` not.
 fn wanted_gateway() -> translate::GatewayStatus {
     translate::GatewayStatus {

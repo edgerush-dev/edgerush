@@ -60,7 +60,12 @@ const MOST_ANCESTORS: usize = 16;
 /// conformance suite reads from it to know what to test (04 §6, §7). Only what passes its
 /// profile's conformance run is listed. Sorted, as the spec requires the status to be, and
 /// no longer than its CRD allows.
-pub(crate) const SUPPORTED_FEATURES: &[&str] = &[];
+pub(crate) const SUPPORTED_FEATURES: &[&str] = &[
+    // GATEWAY-HTTP's core.
+    "Gateway",
+    "HTTPRoute",
+    "ReferenceGrant",
+];
 
 /// The most features a GatewayClass's status holds, as its CRD has it.
 const MOST_FEATURES: usize = 64;
