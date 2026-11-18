@@ -17,7 +17,9 @@ use edgerush_gateway_api::gateway::{
     GatewayStatus, GatewayStatusAddresses, GatewayStatusListeners,
     GatewayStatusListenersSupportedKinds,
 };
-use edgerush_gateway_api::gateway_class::GatewayClassStatus;
+use edgerush_gateway_api::gateway_class::{
+    GatewayClassStatus, GatewayClassStatusSupportedFeatures,
+};
 use edgerush_gateway_api::grpc_route::{
     GRPCRouteStatus, GRPCRouteStatusParents, GRPCRouteStatusParentsParentRef,
 };
@@ -52,6 +54,19 @@ const MOST_PARENTS: usize = 32;
 
 /// The most ancestors a policy's status holds, as its CRD has it.
 const MOST_ANCESTORS: usize = 16;
+
+/// The Gateway API features EdgeRush claims, by the conformance suite's names: what every
+/// GatewayClass of this controller's says in `status.supportedFeatures`, and what the
+/// conformance suite reads from it to know what to test (04 §6, §7). Only what passes its
+/// profile's conformance run is listed. Sorted, as the spec requires the status to be, and
+/// no longer than its CRD allows.
+pub(crate) const SUPPORTED_FEATURES: &[&str] = &[];
+
+/// The most features a GatewayClass's status holds, as its CRD has it.
+const MOST_FEATURES: usize = 64;
+
+// A longer table would have every class's status refused by the API server.
+const _: () = assert!(SUPPORTED_FEATURES.len() <= MOST_FEATURES);
 
 /// The condition types this controller writes on a GatewayClass.
 const CLASS_TYPES: [&str; 2] = ["Accepted", "SupportedVersion"];
@@ -152,12 +167,14 @@ fn merged(
 }
 
 /// What the data plane's GatewayClass's status is to say, of `generation`, the Gateway API
-/// kinds being as `served` says, merged with `live`. Accepted, as translation reads the
-/// class's Gateway only where it names this controller.
+/// kinds being as `served` says, merged with `live`, claiming the features in `table`
+/// ([`SUPPORTED_FEATURES`]) and only those. Accepted, as translation reads the class's
+/// Gateway only where it names this controller.
 pub(crate) fn class(
     live: Option<&GatewayClassStatus>,
     generation: i64,
     served: &[(GatewayKind, Served)],
+    table: &[&str],
     now: Timestamp,
 ) -> GatewayClassStatus {
     let version = match supported(served) {
@@ -184,9 +201,21 @@ pub(crate) fn class(
             generation,
             now,
         )),
-        // None until conformance runs say which (04 §6).
-        supported_features: None,
+        supported_features: features(table),
     }
+}
+
+/// What a GatewayClass's status says of the features in `table`: each in its order, and the
+/// field left out while there are none.
+fn features(table: &[&str]) -> Option<Vec<GatewayClassStatusSupportedFeatures>> {
+    (!table.is_empty()).then(|| {
+        table
+            .iter()
+            .map(|name| GatewayClassStatusSupportedFeatures {
+                name: (*name).to_owned(),
+            })
+            .collect()
+    })
 }
 
 /// Whether the data plane runs a generation of its Gateway, as its pods say they do: what

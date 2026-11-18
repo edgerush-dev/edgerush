@@ -6,6 +6,11 @@
 #   kind/conformance.sh 1.37 --conformance-profiles=GATEWAY-HTTP --run-test=HTTPRouteSimpleSameNamespace
 #   KEEP=1 kind/conformance.sh 1.37 ...      the cluster left for a look
 #
+# The suite is given no features: it reads them from the class's status.supportedFeatures,
+# written from the controller's table (docs/04 §6, §7), so what it tests is what the class
+# claims. A profile not yet in the table is tried with --supported-features=... given here,
+# as is a single test: with --run-test the suite reads no class.
+#
 # EdgeRush is installed through the operator: a ControlPlane `edgerush` watching every
 # namespace, whose class, `edgerush`, is the suite's, its Gateways' data planes on ClusterIP
 # Services through the class's PlatformDefaults entry. The suite runs as a Pod in the
