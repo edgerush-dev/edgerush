@@ -1,13 +1,15 @@
 # Kubernetes designs — mostly not implemented
 
-These manifests illustrate the planned APIs. EdgeRush does not yet provide the operator,
-its `ControlPlane` and `DataPlane` resources, the rate-limit policies and tables, or the
-ingress-nginx annotation translator they need. Do not apply them expecting a working
-gateway; fields may change before implementation.
+These manifests illustrate planned APIs. Do not apply them expecting a working gateway:
+the rate-limit tables and signals and the ingress-nginx annotation translator they use are
+not built, and the `ControlPlane` and `DataPlane` here are early designs whose fields
+differ from the CRDs the operator now serves.
 
-The control plane itself runs today: it translates Ingresses and Gateway API objects, such
-as the two in [02-routes.yaml](02-routes.yaml), for a data plane and a Gateway deployed by
-hand. [kind/stream.sh](../../kind/stream.sh) does that end to end.
+The operator and control plane run today. The README's
+[In a cluster: the operator](../../README.md#in-a-cluster-the-operator) shows the two
+resources that make a working gateway, and [kind/operator.sh](../../kind/operator.sh) does
+it end to end; the Ingress and HTTPRoute in [02-routes.yaml](02-routes.yaml) are the kind
+of objects it then serves.
 
 | File | Design |
 |---|---|
