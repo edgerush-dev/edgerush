@@ -4,12 +4,13 @@ A Kubernetes-native API gateway written in Rust: an operator, control planes and
 planes in one binary; Ingress and Gateway API served from the same data plane; cluster-wide
 rate limiting with no external store to run.
 
-**Status: the data plane runs, and the control plane runs it in a cluster; the operator is
-next.** The proxy serves traffic from a YAML file, the development harness, or from a
-control plane that translates a cluster's Ingresses and Gateway API objects and streams the
-config to it. Rate
-limiting runs, each pod on its own or through EdgeRush's rate-limiting service. Not for
-production. A hobby project with no timelines.
+**Status: the operator runs a gateway in a cluster from two resources, and Gateway API's
+conformance suite runs against it.** A `ControlPlane` and a `DataPlane` applied, or a
+Gateway of a class the operator made, become a control plane that translates the cluster's
+Ingresses and Gateway API objects and data planes that serve them. The proxy also serves
+traffic from a YAML file, the development harness. Rate limiting runs, each pod on its own
+or through EdgeRush's rate-limiting service. No images are published yet: it is built from
+source. Not for production. A hobby project with no timelines.
 
 ## What it is for
 
@@ -48,8 +49,9 @@ change takes over without dropping a request.
   every upstream; a drain on SIGTERM; Prometheus metrics; access logs, a line of JSON for
   each request, WebSocket and passthrough connection, to stdout or a file reopened on
   SIGUSR1.
-- **Rate limiting:** token-bucket limits on route rules, keyed by the client's address (or,
-  experimentally, by a request header), and dry runs that count without refusing. A
+- **Rate limiting:** limits on route rules, keyed by the client's address (or,
+  experimentally, by a request header), each a token bucket, a fixed window or an exact
+  rolling window, and dry runs that count without refusing. A
   refusal is a 429 with `Retry-After` and the `RateLimit` field. A data plane runs one
   mode, `off` (limits checked, none enforced) unless it says otherwise:
   - `local`: each proxy process limits on what it sees, with no service to run.
@@ -63,10 +65,20 @@ change takes over without dropping a request.
   - `asynchronous`: each process decides every request from its own copy of each key,
     waiting on no one, and shares what it admitted with each key's owner in the service's
     cluster store every cycle, through one of the key's replicas while the owner is out of
-    reach; a burst on a key it has not heard of yet may overshoot a little.
+    reach; a burst on a key it has not heard of yet may overshoot a little. Its limits are
+    token buckets.
 
 ### In Kubernetes
 
+- **`edgerush operator`**, which turns each `ControlPlane` into a control plane's
+  Deployment, the Service its data planes dial and its GatewayClass, and each `DataPlane`
+  naming it into a data plane's Deployment, autoscaler and disruption budget, its
+  IngressClass and its Gateway. The control plane is its planes' certificate authority and
+  writes each data plane's Service. One control plane serves several data planes, each
+  translated on its own. A Gateway written alone, of a class a `ControlPlane` made, gets a
+  `DataPlane` of its own (Gateway-first), within what the class's `PlatformDefaults` allow.
+  A `DataPlane`'s rate limiting is off or local in a cluster; the rate-limiting service is
+  not deployed there yet.
 - **`edgerush controller`**, the control plane for its data planes: one from a settings
   file, or every `DataPlane` that names its `ControlPlane`, each translated on its own. It follows
   IngressClasses, Ingresses, Services and Secrets and translates them each time they
@@ -96,11 +108,16 @@ change takes over without dropping a request.
 - **Default-deny egress:** an address discovered or resolved is never sent to if it is
   loopback, link-local, multicast, the pod's own, the API server's, or one of the gateway's
   own pods, which the control plane names (`--own-name`).
-- Tested end to end in kind (`kind/stream.sh`): each route kind, and the control plane
-  gone and back.
+- **Gateway API conformance:** the upstream suite runs in kind (`kind/conformance.sh`).
+  GATEWAY-HTTP, GATEWAY-GRPC, GATEWAY-TLS and GATEWAY-TCP pass their core tests, and the
+  extended features that pass are listed in each GatewayClass's `supportedFeatures`: only
+  those are claimed.
+- Tested end to end in kind: the operator (`kind/operator.sh`), each route kind and the
+  control plane gone and back (`kind/stream.sh`).
 
-**Not yet:** the operator, and with it Gateway API's conformance runs; ingress-nginx's
-annotations; authentication; CORS.
+**Not yet:** published images; the rate-limiting service deployed in a cluster, and
+`RateLimitPolicy` (being built); GATEWAY-UDP's conformance; ingress-nginx's annotations;
+authentication; CORS.
 
 ## Trying it
 
@@ -185,8 +202,8 @@ directory (`kubectl get -o yaml` output included), with an IngressClass whose co
 TLS Secrets, seldom in a repository, are taken as they will be in the cluster, unless
 `--check-secrets` asks for them to be checked.
 
-`data-plane.yaml` holds the data plane's settings, which stand in for its `DataPlane`
-resource until the operator brings one:
+`data-plane.yaml` holds the data plane's settings, which a `DataPlane` resource states in a
+cluster:
 
 ```yaml
 ingress_class: edge
@@ -212,7 +229,38 @@ ingress_https_redirect_max_age: 30
 | `backend_authorities` | Optional: certificates in PEM trusted for a Service port spoken to over TLS (`appProtocol: kubernetes.io/wss`). |
 | `data_plane` | Optional: the data plane's own settings, as a config states them, written into every config. `own_service: edgerush.edge.svc.cluster.local` names the Service of the data plane's own pods, whose EndpointSlices say its zone. |
 
+### In a cluster: the operator
+
+`kind/operator.sh 1.37` builds the binary into an image, `edgerush:dev`, makes a kind
+cluster, installs the operator from `crates/planes/install/` (the CRDs, roles, admission
+policies and the operator's Deployment) and checks what it makes. With the operator
+installed, two resources make a gateway, serving the Ingresses of class `edge.web` and
+Gateway `web`'s routes. A ControlPlane follows its own namespace unless its `watch` says
+otherwise, so these are in `edge`:
+
+```yaml
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: edge, namespace: edge }
+spec: {}
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata: { name: web, namespace: edge }
+spec:
+  controlPlaneRef: { name: edge }
+  gateway:
+    listeners: [{ name: http, port: 8080, protocol: HTTP }]
+  ingress: { httpPort: 80, httpsPort: 443 }
+```
+
+The admission webhook is on by default, registered once the control plane has published
+its authority's bundle; `webhook: { enabled: false }` turns it off.
+
 ### In a cluster: `controller`
+
+The operator runs the control plane and the data plane as below; they can also be run by
+hand.
 
 ```sh
 edgerush controller --data-plane data-plane.yaml
@@ -319,8 +367,8 @@ outside the workspace, the package is formatted on its own:
 ## Layout
 
 ```
-crates/edgerush    the binary, one subcommand for each part (the operator's to come):
-                   `edgerush proxy`, a data plane, its config from a file for development
+crates/edgerush    the binary, one subcommand for each part: `edgerush operator`, which
+                   makes what runs each ControlPlane and DataPlane, `edgerush proxy`, a data plane, its config from a file for development
                    (`--config file.yaml`) or from a control plane (`--control-plane`),
                    `edgerush controller`, a control plane for its data planes, `edgerush explain`,
                    where a request would go and why, `edgerush test`, and `edgerush validate`,
