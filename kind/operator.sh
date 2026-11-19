@@ -165,10 +165,11 @@ install=crates/planes/install
 k apply --server-side -f "$install/gateway.edgerush.dev_controlplanes.yaml" \
     -f "$install/gateway.edgerush.dev_dataplanes.yaml" \
     -f "$install/gateway.edgerush.dev_platformdefaults.yaml" \
+    -f "$install/gateway.edgerush.dev_ratelimitpolicies.yaml" \
     -f "$install/roles.yaml" -f "$install/admission.yaml" >/dev/null
 k wait --for condition=Established --timeout=60s \
     crd/controlplanes.gateway.edgerush.dev crd/dataplanes.gateway.edgerush.dev \
-    crd/platformdefaults.gateway.edgerush.dev >/dev/null
+    crd/platformdefaults.gateway.edgerush.dev crd/ratelimitpolicies.gateway.edgerush.dev >/dev/null
 k apply --server-side -f "$install/operator.yaml" >/dev/null
 k -n edgerush-system rollout status deploy/edgerush-operator --timeout=120s >/dev/null ||
     fail "the operator never ran"
