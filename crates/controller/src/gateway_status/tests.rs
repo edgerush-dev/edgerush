@@ -301,6 +301,19 @@ fn the_table_claims_the_gateway_grpc_profiles_core_and_grpcroutes_extended_featu
     }
 }
 
+#[test]
+fn the_table_claims_the_gateway_tls_profiles_core_and_no_termination() {
+    // GATEWAY-TLS's core passes every test the suite has of it (#448). TLSRoute's extended
+    // features are both termination, which a TLS listener does not serve (04 §2): claiming
+    // either would have the suite test it, and skip the test that it is refused.
+    for core in ["Gateway", "ReferenceGrant", "TLSRoute"] {
+        assert!(SUPPORTED_FEATURES.contains(&core), "{core}");
+    }
+    for termination in ["TLSRouteModeMixed", "TLSRouteModeTerminate"] {
+        assert!(!SUPPORTED_FEATURES.contains(&termination), "{termination}");
+    }
+}
+
 /// What translation says of a Gateway of two listeners, `http` served and `secure` not.
 fn wanted_gateway() -> translate::GatewayStatus {
     translate::GatewayStatus {
