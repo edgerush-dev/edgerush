@@ -44,6 +44,13 @@ rules:
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
     verbs: [list, watch]
+  # Rate limits on its objects, and their status (04 §4, §6).
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [ratelimitpolicies]
+    verbs: [list, watch]
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [ratelimitpolicies/status]
+    verbs: [update]
 ---
 # The control plane's reads of cluster-scoped kinds. Bound by a ClusterRoleBinding.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -118,6 +125,14 @@ rules:
     verbs: [list, watch]
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gateways/status, listenersets/status]
+    verbs: [update]
+  # The rate limits on those, which a policy holds in its targets' namespace, and their
+  # status (04 §4, §6).
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [ratelimitpolicies]
+    verbs: [list, watch]
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [ratelimitpolicies/status]
     verbs: [update]
   # Its DataPlanes, which it reads itself (05 §3).
   - apiGroups: [gateway.edgerush.dev]

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # What the install ships, judged by a real API server in a kind cluster (docs/05 §1, §2;
-# docs/10): the ControlPlane, DataPlane and PlatformDefaults CRDs, the five ClusterRoles and
-# the admission policies, on a control plane's Services, on what it writes beyond its own
+# docs/10): the ControlPlane, DataPlane, PlatformDefaults and RateLimitPolicy CRDs, the five
+# ClusterRoles and the admission policies, on a control plane's Services, on what it writes beyond its own
 # namespace and on generated DataPlanes, applied as a user would; beside Gateway API's
 # CRDs, which the golden cases' Gateways need.
 #
@@ -11,7 +11,9 @@
 # Then:
 #   - a ControlPlane and DataPlanes of each kind (Ingress, Gateway API, both) are admitted,
 #     and so is every golden case's resource of crates/planes, and DataPlanes limiting
-#     locally under a limit of each model, and with rate limiting disabled;
+#     locally under a limit of each model, and with rate limiting disabled; and
+#     RateLimitPolicies on each level, whole and by section, of limits, of ignore alone, of
+#     both, of either beside the other empty, and of ["*"];
 #   - each resource the CRDs' schema and CEL rules are to refuse is refused, and says why:
 #     a name that is no DNS label or too long for its Service's, a watch scope's selector
 #     without Selector or Selector without one, no replicas, a DataPlane with neither
@@ -27,7 +29,11 @@
 #     limiting of a mode the DataPlane does not take or of none, a bound on keys with it
 #     disabled, a limit of no model or of two, keyed by what it does not know, a rate or a
 #     window of no unit, a rolling window of one slot, a method in lower case, a path
-#     prefix that is no path, and two limits of one name;
+#     prefix that is no path, and two limits of one name; a RateLimitPolicy of no target or
+#     of more than 16, of a kind it does not take or one of another group, of targets of
+#     two levels, of a section on some alone, or naming one twice, naming an Ingress's
+#     section, of neither a limit nor a name to ignore (either list may be empty), of "*"
+#     beside a name, ignoring a name twice, or of a limit a DataPlane's rules would refuse;
 #   - a Service holding externalIPs is refused written as a control plane's ServiceAccount,
 #     and admitted written by another; one without them is admitted from either;
 #   - beyond its own namespace, under the role bound there for a generated DataPlane, a
@@ -68,10 +74,12 @@ k create -f crates/gateway-api/crds/ >/dev/null
 k apply --server-side -f "$install/gateway.edgerush.dev_controlplanes.yaml" \
     -f "$install/gateway.edgerush.dev_dataplanes.yaml" \
     -f "$install/gateway.edgerush.dev_platformdefaults.yaml" \
+    -f "$install/gateway.edgerush.dev_ratelimitpolicies.yaml" \
     -f "$install/roles.yaml" -f "$install/admission.yaml" >/dev/null
 k wait --for condition=Established --timeout=60s \
     crd/controlplanes.gateway.edgerush.dev crd/dataplanes.gateway.edgerush.dev \
-    crd/platformdefaults.gateway.edgerush.dev crd/gateways.gateway.networking.k8s.io >/dev/null
+    crd/platformdefaults.gateway.edgerush.dev crd/ratelimitpolicies.gateway.edgerush.dev \
+    crd/gateways.gateway.networking.k8s.io >/dev/null
 k create namespace edge >/dev/null
 
 # `admitted <what> <yaml>`: the object, applied as a dry run on the server, which judges it
@@ -249,6 +257,102 @@ refused "a rolling window of one slot" "spec.rateLimiting.global[0].model.rollin
 refused "a method in lower case" "spec.rateLimiting.global[0].match.methods[0]" "$(limit 'match: { methods: [post] }, key: Client, model: { bucket: { rate: 1/s, burst: 1 } }')"
 refused "a path prefix that is no path" "spec.rateLimiting.global[0].match.pathPrefix" "$(limit 'match: { pathPrefix: v1 }, key: Client, model: { bucket: { rate: 1/s, burst: 1 } }')"
 refused "two limits of one name" "Duplicate value" "$(limiting '{ mode: Local, global: [{ name: a, key: Client, model: { bucket: { rate: 1/s, burst: 1 } } }, { name: a, key: Client, model: { bucket: { rate: 2/s, burst: 1 } } }] }')"
+
+# What a RateLimitPolicy's rules admit and refuse: `policy <spec>`, a policy of `spec`'s
+# fields, each line indented as spec's.
+policy() {
+    printf 'apiVersion: gateway.edgerush.dev/v1alpha1\nkind: RateLimitPolicy\nmetadata: { name: checkout, namespace: edge }\nspec:\n%s\n' "$1"
+}
+# `target <kind> <name> [section]`: a target of Gateway API's, or Ingress's.
+target() {
+    local group=gateway.networking.k8s.io
+    if [ "$1" = Ingress ]; then group=networking.k8s.io; fi
+    printf '{ group: %s, kind: %s, name: %s%s }' "$group" "$1" "$2" "${3:+, sectionName: $3}"
+}
+per_client='  limits: [{ name: per-client, key: Client, model: { bucket: { rate: 10/s, burst: 10 } } }]'
+admitted "a RateLimitPolicy on a Gateway" "$(policy "  targetRefs: [$(target Gateway web)]
+$per_client")"
+admitted "a RateLimitPolicy on two listeners" "$(policy "  targetRefs: [$(target Gateway web http), $(target Gateway web https)]
+$per_client")"
+admitted "a RateLimitPolicy on a ListenerSet" "$(policy "  targetRefs: [$(target ListenerSet team)]
+$per_client")"
+admitted "a RateLimitPolicy on a ListenerSet's listener" "$(policy "  targetRefs: [$(target ListenerSet team http)]
+$per_client")"
+admitted "a RateLimitPolicy on an HTTPRoute and a GRPCRoute" "$(policy "  targetRefs: [$(target HTTPRoute shop), $(target GRPCRoute orders)]
+$per_client")"
+admitted "a RateLimitPolicy on rules of an HTTPRoute and a GRPCRoute" "$(policy "  targetRefs: [$(target HTTPRoute shop checkout), $(target GRPCRoute orders place)]
+$per_client")"
+admitted "a RateLimitPolicy on an Ingress, of ignore alone" "$(policy "  targetRefs: [$(target Ingress shop)]
+  ignore: [platform-per-ip]")"
+admitted "a RateLimitPolicy of limits and ignore" "$(policy "  targetRefs: [$(target HTTPRoute shop checkout)]
+  limits:
+    - { name: writes, match: { methods: [POST], pathPrefix: /cart/ }, key: Client, model: { fixedWindow: { limit: 10, window: 1m } }, dryRun: true }
+    - { name: hourly, key: Client, model: { rollingWindow: { limit: 100, window: 1h, slots: 60 } } }
+  ignore: [platform-per-ip, platform-writes]")"
+admitted "a RateLimitPolicy of limits, ignoring nothing" "$(policy "  targetRefs: [$(target Gateway web)]
+$per_client
+  ignore: []")"
+admitted "a RateLimitPolicy of no limit, of ignore" "$(policy "  targetRefs: [$(target Gateway web)]
+  limits: []
+  ignore: [platform-per-ip]")"
+admitted "a RateLimitPolicy ignoring every less specific limit" "$(policy "  targetRefs: [$(target HTTPRoute health)]
+  ignore: [\"*\"]")"
+# `routes <n>`: targets of `n` HTTPRoutes, each its own.
+routes() {
+    local i targets
+    targets=$(target HTTPRoute r1)
+    for i in $(seq 2 "$1"); do targets="$targets, $(target HTTPRoute "r$i")"; done
+    printf '%s' "$targets"
+}
+admitted "a RateLimitPolicy of 16 targets" "$(policy "  targetRefs: [$(routes 16)]
+$per_client")"
+refused "a RateLimitPolicy of no target" "spec.targetRefs" "$(policy "  targetRefs: []
+$per_client")"
+refused "a RateLimitPolicy naming no targets" "spec.targetRefs" "$(policy "$per_client")"
+refused "a RateLimitPolicy of 17 targets" "spec.targetRefs" "$(policy "  targetRefs: [$(routes 17)]
+$per_client")"
+refused "a RateLimitPolicy on a Service" "a target is a Gateway, ListenerSet, HTTPRoute or GRPCRoute" "$(policy "  targetRefs: [{ group: '', kind: Service, name: shop }]
+$per_client")"
+refused "a RateLimitPolicy on a TLSRoute" "a target is a Gateway, ListenerSet, HTTPRoute or GRPCRoute" "$(policy "  targetRefs: [$(target TLSRoute shop)]
+$per_client")"
+refused "a RateLimitPolicy on an Ingress of Gateway API's group" "a target is a Gateway, ListenerSet, HTTPRoute or GRPCRoute" "$(policy "  targetRefs: [{ group: gateway.networking.k8s.io, kind: Ingress, name: shop }]
+$per_client")"
+refused "a RateLimitPolicy on a Gateway of Ingress's group" "a target is a Gateway, ListenerSet, HTTPRoute or GRPCRoute" "$(policy "  targetRefs: [{ group: networking.k8s.io, kind: Gateway, name: web }]
+$per_client")"
+refused "a RateLimitPolicy on a Gateway and a route" "of one level" "$(policy "  targetRefs: [$(target Gateway web), $(target HTTPRoute shop)]
+$per_client")"
+refused "a RateLimitPolicy on a Gateway and a ListenerSet" "of one level" "$(policy "  targetRefs: [$(target Gateway web), $(target ListenerSet team)]
+$per_client")"
+refused "a RateLimitPolicy on a route and an Ingress" "of one level" "$(policy "  targetRefs: [$(target HTTPRoute shop), $(target Ingress shop)]
+$per_client")"
+refused "a RateLimitPolicy on a listener and a Gateway" "name a section, or none" "$(policy "  targetRefs: [$(target Gateway web http), $(target Gateway api)]
+$per_client")"
+refused "a RateLimitPolicy on a rule and a route" "name a section, or none" "$(policy "  targetRefs: [$(target HTTPRoute shop checkout), $(target GRPCRoute orders)]
+$per_client")"
+refused "a RateLimitPolicy naming a target twice" "named once" "$(policy "  targetRefs: [$(target HTTPRoute shop), $(target HTTPRoute shop)]
+$per_client")"
+refused "a RateLimitPolicy naming a rule twice" "named once" "$(policy "  targetRefs: [$(target HTTPRoute shop checkout), $(target HTTPRoute shop checkout)]
+$per_client")"
+refused "a RateLimitPolicy naming an Ingress's section" "an Ingress has no sections" "$(policy "  targetRefs: [$(target Ingress shop rule)]
+$per_client")"
+refused "a RateLimitPolicy of neither limits nor ignore" "a limit, a name to ignore, or both" "$(policy "  targetRefs: [$(target Gateway web)]")"
+refused "a RateLimitPolicy of no limit" "a limit, a name to ignore, or both" "$(policy "  targetRefs: [$(target Gateway web)]
+  limits: []")"
+refused "a RateLimitPolicy ignoring nothing" "a limit, a name to ignore, or both" "$(policy "  targetRefs: [$(target Gateway web)]
+  ignore: []")"
+refused "a RateLimitPolicy of no limit, ignoring nothing" "a limit, a name to ignore, or both" "$(policy "  targetRefs: [$(target Gateway web)]
+  limits: []
+  ignore: []")"
+refused "a RateLimitPolicy ignoring \"*\" and a name" "stands alone" "$(policy "  targetRefs: [$(target Gateway web)]
+  ignore: [\"*\", platform-per-ip]")"
+refused "a RateLimitPolicy ignoring a name twice" "Duplicate value" "$(policy "  targetRefs: [$(target Gateway web)]
+  ignore: [platform-per-ip, platform-per-ip]")"
+refused "a RateLimitPolicy's limit of no model" "one of bucket, fixedWindow and rollingWindow" "$(policy "  targetRefs: [$(target Gateway web)]
+  limits: [{ name: per-client, key: Client, model: {} }]")"
+refused "a RateLimitPolicy's limit keyed by what it does not know" "spec.limits[0].key" "$(policy "  targetRefs: [$(target Gateway web)]
+  limits: [{ name: per-client, key: Header, model: { bucket: { rate: 1/s, burst: 1 } } }]")"
+refused "a RateLimitPolicy's two limits of one name" "Duplicate value" "$(policy "  targetRefs: [$(target Gateway web)]
+  limits: [{ name: a, key: Client, model: { bucket: { rate: 1/s, burst: 1 } } }, { name: a, key: Client, model: { bucket: { rate: 2/s, burst: 1 } } }]")"
 
 # A rule on a change: made, then changed.
 k apply -f - <<<"$(data_plane public '  ingress: { httpPort: 80, httpsPort: 443 }

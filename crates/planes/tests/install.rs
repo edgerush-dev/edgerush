@@ -1,5 +1,6 @@
 //! What `install/` ships: the CRDs' bound on a name, as the code names Services by it; the
-//! five ClusterRoles the operator binds, the admission policies on a control plane's
+//! five ClusterRoles the operator binds, the control plane's rights on RateLimitPolicies
+//! among them, the admission policies on a control plane's
 //! Services, as the code names them, and on generated DataPlanes, as `operator.yaml` names
 //! the operator's ServiceAccount; and the operator itself, which grants by binding those
 //! five alone.
@@ -95,6 +96,67 @@ fn only_the_control_plane_cluster_role_reads_cluster_scoped_kinds() {
             }
         }
     }
+}
+
+#[test]
+fn the_control_plane_reads_rate_limit_policies_and_writes_their_status_alone() {
+    // A policy is in its targets' namespace: the watch scope, and the control plane's own
+    // namespace, where its Gateways and their ListenerSets are, which the scope need not
+    // hold (04 §1). The leader writes its ancestors by read-modify-write, as a route's
+    // parents (04 §6); its spec is the team's.
+    let roles: Vec<ClusterRole> = serde_saphyr::from_multiple(&read("roles.yaml")).unwrap();
+    let mut granted = Vec::new();
+    for role in roles {
+        let name = role.metadata.name.unwrap_or_default();
+        for rule in role.rules.unwrap_or_default() {
+            for resource in rule.resources.unwrap_or_default() {
+                if resource.starts_with("ratelimitpolicies") {
+                    granted.push((
+                        name.clone(),
+                        rule.api_groups.clone().unwrap_or_default(),
+                        resource,
+                        rule.verbs.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    let grant = |role: &str, resource: &str, verbs: &[&str]| {
+        (
+            role.to_owned(),
+            vec!["gateway.edgerush.dev".to_owned()],
+            resource.to_owned(),
+            verbs
+                .iter()
+                .map(|&verb| verb.to_owned())
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        granted,
+        [
+            grant(
+                "edgerush-control-plane",
+                "ratelimitpolicies",
+                &["list", "watch"]
+            ),
+            grant(
+                "edgerush-control-plane",
+                "ratelimitpolicies/status",
+                &["update"]
+            ),
+            grant(
+                "edgerush-control-plane-own",
+                "ratelimitpolicies",
+                &["list", "watch"]
+            ),
+            grant(
+                "edgerush-control-plane-own",
+                "ratelimitpolicies/status",
+                &["update"]
+            ),
+        ]
+    );
 }
 
 /// The admission policy and its binding, as `admission.yaml` holds them.
