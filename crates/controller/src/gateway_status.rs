@@ -61,8 +61,9 @@ const MOST_ANCESTORS: usize = 16;
 /// profile's conformance run is listed. Sorted, as the spec requires the status to be, and
 /// no longer than its CRD allows.
 pub(crate) const SUPPORTED_FEATURES: &[&str] = &[
-    // GATEWAY-HTTP's core (Gateway, HTTPRoute, ReferenceGrant) and GATEWAY-GRPC's (Gateway,
-    // GRPCRoute, ReferenceGrant), and the extended features that pass them.
+    // GATEWAY-HTTP's core (Gateway, HTTPRoute, ReferenceGrant), GATEWAY-GRPC's (Gateway,
+    // GRPCRoute, ReferenceGrant) and GATEWAY-TLS's (Gateway, TLSRoute, ReferenceGrant), and
+    // the extended features that pass them.
     "GRPCRoute",
     "GRPCRouteNamedRouteRule",
     "GRPCRouteRequestHeaderModifier",
@@ -98,6 +99,7 @@ pub(crate) const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteRetryConnectionError",
     "HTTPRouteSchemeRedirect",
     "ReferenceGrant",
+    "TLSRoute",
 ];
 
 /// The most features a GatewayClass's status holds, as its CRD has it.
