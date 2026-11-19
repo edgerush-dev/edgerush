@@ -245,6 +245,46 @@ fn the_table_claims_the_gateway_http_profiles_core() {
     }
 }
 
+#[test]
+fn the_table_claims_the_gateway_http_extended_features_that_pass() {
+    // Each passes every test the suite has of it in GATEWAY-HTTP (#446); those that fail
+    // stay out until their issues are settled (#475-#479), as do those the suite has no
+    // test of.
+    for extended in [
+        "GatewayAddressEmpty",
+        "GatewayBackendClientCertificate",
+        "GatewayHTTPListenerIsolation",
+        "GatewayHTTPSListenerDetectMisdirectedRequests",
+        "GatewayInfrastructure",
+        "GatewayPort8080",
+        "HTTPRoute303RedirectStatusCode",
+        "HTTPRoute307RedirectStatusCode",
+        "HTTPRoute308RedirectStatusCode",
+        "HTTPRouteBackendProtocolH2C",
+        "HTTPRouteBackendProtocolWebSocket",
+        "HTTPRouteBackendTimeout",
+        "HTTPRouteDestinationPortMatching",
+        "HTTPRouteHostRewrite",
+        "HTTPRouteMethodMatching",
+        "HTTPRouteNamedRouteRule",
+        "HTTPRouteParentRefPort",
+        "HTTPRoutePathRedirect",
+        "HTTPRoutePathRewrite",
+        "HTTPRoutePortRedirect",
+        "HTTPRouteQueryParamMatching",
+        "HTTPRouteRequestMirror",
+        "HTTPRouteRequestMultipleMirrors",
+        "HTTPRouteRequestPercentageMirror",
+        "HTTPRouteRequestTimeout",
+        "HTTPRouteResponseHeaderModification",
+        "HTTPRouteRetryCodes",
+        "HTTPRouteRetryConnectionError",
+        "HTTPRouteSchemeRedirect",
+    ] {
+        assert!(SUPPORTED_FEATURES.contains(&extended), "{extended}");
+    }
+}
+
 /// What translation says of a Gateway of two listeners, `http` served and `secure` not.
 fn wanted_gateway() -> translate::GatewayStatus {
     translate::GatewayStatus {

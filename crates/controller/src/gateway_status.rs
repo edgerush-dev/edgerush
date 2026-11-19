@@ -61,9 +61,39 @@ const MOST_ANCESTORS: usize = 16;
 /// profile's conformance run is listed. Sorted, as the spec requires the status to be, and
 /// no longer than its CRD allows.
 pub(crate) const SUPPORTED_FEATURES: &[&str] = &[
-    // GATEWAY-HTTP's core.
+    // GATEWAY-HTTP's core (Gateway, HTTPRoute, ReferenceGrant) and the extended features
+    // that pass it.
     "Gateway",
+    "GatewayAddressEmpty",
+    "GatewayBackendClientCertificate",
+    "GatewayHTTPListenerIsolation",
+    "GatewayHTTPSListenerDetectMisdirectedRequests",
+    "GatewayInfrastructure",
+    "GatewayPort8080",
     "HTTPRoute",
+    "HTTPRoute303RedirectStatusCode",
+    "HTTPRoute307RedirectStatusCode",
+    "HTTPRoute308RedirectStatusCode",
+    "HTTPRouteBackendProtocolH2C",
+    "HTTPRouteBackendProtocolWebSocket",
+    "HTTPRouteBackendTimeout",
+    "HTTPRouteDestinationPortMatching",
+    "HTTPRouteHostRewrite",
+    "HTTPRouteMethodMatching",
+    "HTTPRouteNamedRouteRule",
+    "HTTPRouteParentRefPort",
+    "HTTPRoutePathRedirect",
+    "HTTPRoutePathRewrite",
+    "HTTPRoutePortRedirect",
+    "HTTPRouteQueryParamMatching",
+    "HTTPRouteRequestMirror",
+    "HTTPRouteRequestMultipleMirrors",
+    "HTTPRouteRequestPercentageMirror",
+    "HTTPRouteRequestTimeout",
+    "HTTPRouteResponseHeaderModification",
+    "HTTPRouteRetryCodes",
+    "HTTPRouteRetryConnectionError",
+    "HTTPRouteSchemeRedirect",
     "ReferenceGrant",
 ];
 
