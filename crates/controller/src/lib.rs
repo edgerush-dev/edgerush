@@ -423,12 +423,9 @@ pub enum HeldBack {
         /// The policy holding it.
         by: Object,
     },
-    /// Its `global` would put a rule over the most limits a rule takes, and so refuse this
-    /// RateLimitPolicy, which the generation before does not.
-    TooManyLimits {
-        /// The policy it would refuse.
-        refusing: Object,
-    },
+    /// Its `global` would put a rule over the most limits a rule takes where the generation
+    /// before does not: a policy's change refused for it, or the config refused whole.
+    TooManyLimits,
 }
 
 impl fmt::Display for HeldBack {
@@ -440,10 +437,9 @@ impl fmt::Display for HeldBack {
                     "its global limit `{limit}` has the name of {by}'s, which holds it"
                 )
             }
-            Self::TooManyLimits { refusing } => write!(
+            Self::TooManyLimits => write!(
                 f,
-                "its global limits would put a rule over the {} limits a rule takes, refusing \
-                 {refusing}",
+                "its global limits would put a rule over the {} limits a rule takes",
                 edgerush_config::MOST_LIMITS
             ),
         }
@@ -480,28 +476,37 @@ impl Serving {
     }
 
     /// Why `wanted` is held back, translated from `cluster` beside the settings served; none
-    /// where it may be taken on: its `global` takes no name a policy holds, and refuses for
-    /// putting a rule over the most limits no policy that the settings served do not.
-    /// `cluster` is what is followed for the settings served: a generation that would have
-    /// more followed, a Gateway's kinds say, is judged without them, and a rule they bring
-    /// over once it is taken on refuses policies as a route's change does.
+    /// where it may be taken on: its `global` takes no name a policy holds, and puts no rule
+    /// over the most limits that the settings served do not, whether a policy's change is
+    /// refused for it or the config refused whole. `cluster` is what is followed for the
+    /// settings served: a generation that would have more followed, a Gateway's kinds say,
+    /// is judged without them, and a rule they bring over once it is taken on is as a
+    /// route's change.
     fn judge(&self, wanted: &Settings, cluster: &Cluster) -> Option<HeldBack> {
         if let Some((limit, by)) = self.translator.held_by_policy(&wanted.plane) {
             return Some(HeldBack::NameHeld { limit, by });
         }
-        let refused = |plane: &Plane| -> BTreeSet<Object> {
-            translate_from(plane, cluster, &self.translator.accepted)
+        // The changes refused for the most limits, and whether a rule is over all the same.
+        let over = |plane: &Plane| -> (BTreeSet<Object>, bool) {
+            let translation = translate_from(plane, cluster, &self.translator.accepted);
+            let still = translation
+                .config
+                .routes
+                .iter()
+                .flat_map(|route| &route.rules)
+                .any(|rule| rule.rate_limits.len() > edgerush_config::MOST_LIMITS);
+            let refused = translation
                 .report
                 .into_iter()
                 .filter(|finding| matches!(finding.problem, Problem::LimitsTooMany { .. }))
                 .map(|finding| finding.object)
-                .collect()
+                .collect();
+            (refused, still)
         };
-        let before = refused(&self.settings.plane);
-        refused(&wanted.plane)
-            .into_iter()
-            .find(|policy| !before.contains(policy))
-            .map(|refusing| HeldBack::TooManyLimits { refusing })
+        let (refused_before, over_before) = over(&self.settings.plane);
+        let (refused, over) = over(&wanted.plane);
+        (!refused.is_subset(&refused_before) || (over && !over_before))
+            .then_some(HeldBack::TooManyLimits)
     }
 }
 

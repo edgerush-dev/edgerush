@@ -312,24 +312,17 @@ fn round(
     (now, findings)
 }
 
-/// A policy refused for what its judging alone cannot see: a rule it reaches under more
-/// limits than the data plane takes (04 §4), and why.
-#[derive(Debug, Clone)]
-pub(crate) enum Refusal {
-    /// Its spec: its version last accepted applies, where it has one.
-    Spec(Problem),
-    /// Its spec and its version last accepted: it applies nothing.
-    Whole(Problem),
-}
-
-/// The policies refused for what their judging alone cannot see.
-pub(crate) type Forced = BTreeMap<Object, Refusal>;
+/// The policies whose spec is refused for what judging it alone cannot see, and why: a rule
+/// it reaches would be under more limits than the data plane takes (04 §4). Each applies
+/// its version last accepted, or nothing.
+pub(crate) type Forced = BTreeMap<Object, Problem>;
 
 /// Refuses in `forced`, for each rule of `config` under more limits than the data plane
-/// takes, versions of the policies of `applied` whose limits it is under, until it would
-/// not be: the changes first, those not applying their version in `accepted` as it is, then
-/// the rest, the youngest first in each; a spec refused before, its version last accepted.
-/// Whether it refused any.
+/// takes, the specs of the policies of `applied` whose limits it is under that are changes,
+/// not their version in `accepted` as it is, the youngest first, until it would not be.
+/// Only a change is refused: a rule still over with none left, as a route's change brings
+/// it under more policies, is left so, and the config is refused whole (Lucas). Whether it
+/// refused any.
 pub(crate) fn refuse_overfull(
     config: &Config,
     applied: &[AcceptedPolicy],
@@ -344,55 +337,46 @@ pub(crate) fn refuse_overfull(
                 && last.spec == policy.spec
         })
     };
-    let mut now: BTreeSet<Object> = BTreeSet::new();
+    let mut refused = false;
     for route in &config.routes {
         for (at, rule) in route.rules.iter().enumerate() {
             let count = rule.rate_limits.len();
             let Some(mut over) = count.checked_sub(MOST_LIMITS).filter(|over| *over > 0) else {
                 continue;
             };
-            let why = Problem::LimitsTooMany {
-                route: route.name.clone(),
-                rule: at,
-                count,
-            };
-            // Youngest first, then the changes before the rest, each kept in that order.
-            let mut owners: Vec<(&AcceptedPolicy, usize)> = applied
-                .iter()
-                .rev()
-                .filter_map(|policy| {
-                    let on = policy
-                        .spec
-                        .limits
-                        .iter()
-                        .flatten()
-                        .filter(|limit| rule.rate_limits.contains(&limit.name))
-                        .count();
-                    (on > 0).then_some((policy, on))
-                })
-                .collect();
-            owners.sort_by_key(|(policy, _)| unchanged(policy));
-            for (policy, on) in owners {
+            // The changes whose limits the rule is under, the youngest first.
+            for policy in applied.iter().rev().filter(|policy| !unchanged(policy)) {
                 if over == 0 {
                     break;
+                }
+                let on = policy
+                    .spec
+                    .limits
+                    .iter()
+                    .flatten()
+                    .filter(|limit| rule.rate_limits.contains(&limit.name))
+                    .count();
+                if on == 0 {
+                    continue;
                 }
                 let object = Object {
                     kind: "RateLimitPolicy",
                     namespace: policy.namespace.clone(),
                     name: policy.name.clone(),
                 };
-                if now.insert(object.clone()) {
-                    let refusal = match forced.get(&object) {
-                        None => Refusal::Spec(why.clone()),
-                        Some(_) => Refusal::Whole(why.clone()),
-                    };
-                    forced.insert(object, refusal);
-                }
+                forced.entry(object).or_insert_with(|| {
+                    refused = true;
+                    Problem::LimitsTooMany {
+                        route: route.name.clone(),
+                        rule: at,
+                        count,
+                    }
+                });
                 over = over.saturating_sub(on);
             }
         }
     }
-    !now.is_empty()
+    refused
 }
 
 /// What a policy's `ignore` removes.
@@ -523,18 +507,17 @@ impl RateLimits {
                     Some(_) => Applied::Last,
                 });
                 let object = Object::of("RateLimitPolicy", &policy.metadata);
-                let refused = forced.get(&object);
-                let judged = |spec: &RateLimitPolicySpec, whole: bool| match refused {
-                    Some(Refusal::Whole(why)) => Err(why.clone()),
-                    Some(Refusal::Spec(why)) if !whole => Err(why.clone()),
-                    _ => limits_of(limiting, spec).map_err(Problem::Refused),
+                let judged = |spec: &RateLimitPolicySpec| {
+                    limits_of(limiting, spec).map_err(Problem::Refused)
                 };
                 Judged {
                     policy,
-                    spec: judged(&policy.spec, false),
+                    spec: forced
+                        .get(&object)
+                        .map_or_else(|| judged(&policy.spec), |why| Err(why.clone())),
                     last: last
                         .filter(|last| last.spec != policy.spec)
-                        .map(|last| (last, judged(&last.spec, true))),
+                        .map(|last| (last, judged(&last.spec))),
                     object,
                 }
             })
@@ -900,11 +883,12 @@ spec:
 
     /// `policies` translated for a data plane serving the Ingress `shop/web`, `accepted`
     /// being the versions last accepted: each policy's name and generation applied, how many
-    /// limits the Ingress's rule is under, and the report.
+    /// limits the Ingress's rule is under, the report, and whether the data plane takes the
+    /// config.
     fn on_the_rule(
         policies: &[RateLimitPolicy],
         accepted: &[&RateLimitPolicy],
-    ) -> (Vec<(String, i64)>, usize, Vec<String>) {
+    ) -> (Vec<(String, i64)>, usize, Vec<String>, bool) {
         let plane: Plane =
             serde_saphyr::from_str(&format!("ingress_class: edge\n{PLANE}")).unwrap();
         let cluster = Cluster {
@@ -950,7 +934,6 @@ spec:
             .map(|rule| rule.rate_limits.len())
             .collect();
         assert_eq!(rules.len(), 1, "one rule");
-        assert!(compile(&translation.config).is_ok(), "the config refused");
         (
             translation
                 .rate_limit_policies
@@ -959,6 +942,24 @@ spec:
                 .collect(),
             rules[0],
             translation.report.iter().map(ToString::to_string).collect(),
+            compile(&translation.config).is_ok(),
+        )
+    }
+
+    /// The note on a rule of `count` limits on the Ingress `shop/web`.
+    fn noted(count: usize) -> String {
+        format!(
+            "Ingress shop/web: rule 0 of route ingress/shop/web/shop.example is under {count} \
+             limits; past 64 the config is refused"
+        )
+    }
+
+    /// The refusal of `policy`'s change, as it would put the Ingress's rule under `count`.
+    fn too_many(policy: &str, count: usize) -> String {
+        format!(
+            "RateLimitPolicy shop/{policy}: the data plane would refuse it: rule 0 of route \
+             ingress/shop/web/shop.example would be under {count} limits, more than the 64 a \
+             rule takes"
         )
     }
 
@@ -967,17 +968,12 @@ spec:
     #[test]
     fn a_new_policy_putting_a_rule_over_the_most_limits_is_refused() {
         let big = on_ingress("big", 1, 1, 60);
-        let (applied, under, report) =
+        let (applied, under, report, taken) =
             on_the_rule(&[big.clone(), on_ingress("extra", 2, 1, 5)], &[&big]);
         assert_eq!(applied, [("big".to_owned(), 1)]);
         assert_eq!(under, 61);
-        assert_eq!(
-            report,
-            [
-                "RateLimitPolicy shop/extra: the data plane would refuse it: rule 0 of route \
-              ingress/shop/web/shop.example would be under 66 limits, more than the 64 a rule takes"
-            ]
-        );
+        assert_eq!(report, [too_many("extra", 66), noted(61)]);
+        assert!(taken);
     }
 
     /// An edit that would put a rule over is refused, its version last accepted applying;
@@ -987,7 +983,7 @@ spec:
         let older = on_ingress("older", 1, 1, 2);
         let younger = on_ingress("younger", 2, 1, 60);
         let now = [on_ingress("older", 1, 2, 5), younger.clone()];
-        let (applied, under, report) = on_the_rule(&now, &[&older, &younger]);
+        let (applied, under, report, taken) = on_the_rule(&now, &[&older, &younger]);
         assert_eq!(
             applied,
             [("older".to_owned(), 1), ("younger".to_owned(), 1)]
@@ -996,44 +992,60 @@ spec:
         assert_eq!(
             report,
             [
-                "RateLimitPolicy shop/older: the data plane would refuse it: rule 0 of route \
-                 ingress/shop/web/shop.example would be under 66 limits, more than the 64 a rule \
-                 takes",
+                too_many("older", 66),
                 "RateLimitPolicy shop/older: its version last accepted applies instead \
                  (generation 1)"
+                    .to_owned(),
+                noted(63)
             ]
         );
+        assert!(taken);
     }
 
-    /// Policies that all applied as they are, and put a rule over together, as a change to
-    /// a route can have them: the youngest is refused, applying nothing. So is a change
-    /// whose version last accepted puts the rule over as well.
+    /// Policies that all apply as they were accepted, and put a rule over together, as a
+    /// change to a route can have them: none is refused, and the data plane refuses the
+    /// config whole, its last staying (Lucas). So too where a change refused leaves its
+    /// version last accepted putting the rule over.
     #[test]
-    fn of_policies_putting_a_rule_over_unchanged_the_youngest_is_refused() {
+    fn policies_unchanged_putting_a_rule_over_have_the_config_refused() {
         let first = on_ingress("first", 1, 1, 40);
         let second = on_ingress("second", 2, 1, 40);
-        let (applied, under, report) =
+        let (applied, under, report, taken) =
             on_the_rule(&[first.clone(), second.clone()], &[&first, &second]);
-        assert_eq!(applied, [("first".to_owned(), 1)]);
-        assert_eq!(under, 41);
-        assert_eq!(
-            report,
-            [
-                "RateLimitPolicy shop/second: the data plane would refuse it: rule 0 of route \
-              ingress/shop/web/shop.example would be under 81 limits, more than the 64 a rule takes"
-            ]
-        );
-        // Its edit refused, its version last accepted is too.
+        assert_eq!(applied, [("first".to_owned(), 1), ("second".to_owned(), 1)]);
+        assert_eq!(under, 81);
+        assert_eq!(report, Vec::<String>::new());
+        assert!(!taken, "the config taken");
         let edited = on_ingress("second", 2, 2, 45);
-        let (applied, under, report) = on_the_rule(&[first.clone(), edited], &[&first, &second]);
-        assert_eq!(applied, [("first".to_owned(), 1)]);
-        assert_eq!(under, 41);
+        let (applied, under, report, taken) =
+            on_the_rule(&[first.clone(), edited], &[&first, &second]);
+        assert_eq!(applied, [("first".to_owned(), 1), ("second".to_owned(), 1)]);
+        assert_eq!(under, 81);
         assert_eq!(
             report,
             [
-                "RateLimitPolicy shop/second: the data plane would refuse it: rule 0 of route \
-              ingress/shop/web/shop.example would be under 81 limits, more than the 64 a rule takes"
+                too_many("second", 86),
+                "RateLimitPolicy shop/second: its version last accepted applies instead \
+                 (generation 1)"
+                    .to_owned()
             ]
         );
+        assert!(!taken, "the config taken");
+    }
+
+    /// A rule past half the most limits is noted, so that one coming to the most is seen;
+    /// one at half is not.
+    #[test]
+    fn a_rule_past_half_the_most_limits_is_noted() {
+        let half = on_ingress("half", 1, 1, 31);
+        let (_, under, report, taken) = on_the_rule(std::slice::from_ref(&half), &[&half]);
+        assert_eq!(under, 32);
+        assert_eq!(report, Vec::<String>::new());
+        assert!(taken);
+        let past = on_ingress("past", 1, 1, 32);
+        let (_, under, report, taken) = on_the_rule(std::slice::from_ref(&past), &[&past]);
+        assert_eq!(under, 33);
+        assert_eq!(report, [noted(33)]);
+        assert!(taken);
     }
 }

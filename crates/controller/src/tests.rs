@@ -1446,11 +1446,15 @@ fn a_data_plane_held_back_is_taken_on_once_its_name_is_free() {
 }
 
 /// A generation whose global limits would put a rule over the most limits a rule takes,
-/// refusing a policy the generation served does not, is held back; one that fits is not.
+/// where the generation served does not, is held back: whether the config would be refused
+/// whole, as no policy's change is left to refuse, or a policy's change refused for it. One
+/// that fits is taken on, and so is one where a rule is over under the generation served.
 #[test]
 fn a_data_plane_putting_a_rule_over_the_most_limits_is_held_back() {
     let names: Vec<String> = (0..63).map(|n| format!("big-{n}")).collect();
     let limits: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "10/s")).collect();
+    let too_many = Some(HeldBack::TooManyLimits);
+    // A policy as it was accepted: the config would be refused whole.
     let cluster = with_policy(rate_limit_policy("shop", 1, &limits));
     let mut served = Serving::new(harness(&limiting(&[])));
     let Step::Translated(translation) = served.translator.step(&served.settings.plane, &cluster)
@@ -1461,35 +1465,36 @@ fn a_data_plane_putting_a_rule_over_the_most_limits_is_held_back() {
     let fits = harness(&limiting(&["platform"]));
     assert_eq!(served.judge(&fits, &cluster), None);
     let over = harness(&limiting(&["platform", "more"]));
+    assert_eq!(served.judge(&over, &cluster), too_many);
     assert_eq!(
-        served
-            .judge(&over, &cluster)
-            .map(|why| why.to_string())
-            .as_deref(),
-        Some(
-            "its global limits would put a rule over the 64 limits a rule takes, refusing RateLimitPolicy shop/shop"
-        )
+        HeldBack::TooManyLimits.to_string(),
+        "its global limits would put a rule over the 64 limits a rule takes"
     );
-    // A policy refused under the settings served already is no reason to hold one back.
+    // A policy's change, from 60 limits to 62: refused under three global limits, its
+    // version last accepted applying.
+    let accepted = rate_limit_policy("shop", 1, &limits[..60]);
+    let changed = with_policy(rate_limit_policy("shop", 2, &limits[..62]));
+    let mut served = Serving::new(harness(&limiting(&[])));
+    served.translator.accepted = vec![AcceptedPolicy::of(&accepted)];
+    let three = harness(&limiting(&["platform", "more", "most"]));
+    assert_eq!(served.judge(&three, &changed), too_many);
+    assert_eq!(served.judge(&fits, &changed), None);
+    // A rule over under the generation served already is no reason to hold one back.
     let second: Vec<String> = (0..40).map(|n| format!("second-{n}")).collect();
     let second: Vec<(&str, &str)> = second.iter().map(|name| (name.as_str(), "10/s")).collect();
+    let both = [
+        rate_limit_policy("first", 1, &limits[..40]),
+        rate_limit_policy("second", 1, &second),
+    ];
     let crowded = Cluster {
-        rate_limit_policies: vec![
-            rate_limit_policy("first", 1, &limits[..40]),
-            rate_limit_policy("second", 1, &second),
-        ],
+        rate_limit_policies: both.to_vec(),
         ..cluster.clone()
     };
     let mut served = Serving::new(harness(&limiting(&[])));
-    let Step::Translated(translation) = served.translator.step(&served.settings.plane, &crowded)
-    else {
-        panic!("not translated");
+    served.translator.accepted = both.iter().map(AcceptedPolicy::of).collect();
+    let Step::Refused { .. } = served.translator.step(&served.settings.plane, &crowded) else {
+        panic!("a rule under 81 limits not refused");
     };
-    let refused = translation
-        .report
-        .iter()
-        .any(|finding| matches!(finding.problem, Problem::LimitsTooMany { .. }));
-    assert!(refused, "no policy refused under the settings served");
     assert_eq!(served.judge(&fits, &crowded), None);
 }
 
