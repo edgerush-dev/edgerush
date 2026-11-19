@@ -1,9 +1,11 @@
 //! The CRDs in `install/` and the modules of `src/` written from them by `edgerush-crdgen`.
 //!
 //! The DataPlane's `spec.gateway` holds the Gateway's own fields, copied from Gateway API's
-//! Gateway CRD in `crates/gateway-api/crds`, and each `PlatformDefaults` entry's `dataPlane`
-//! the DataPlane's own, but for those that come from the class and the Gateway; this fails
-//! where a copy differs. To write the copies and the modules again, after a Gateway API
+//! Gateway CRD in `crates/gateway-api/crds`; each `PlatformDefaults` entry's `dataPlane` the
+//! DataPlane's own, but for those that come from the class and the Gateway; each
+//! `RateLimitPolicy` limit the DataPlane's own `rateLimiting.global` item, and its status
+//! Gateway API's PolicyStatus, as its BackendTLSPolicy CRD has it. This fails where a copy
+//! differs. To write the copies and the modules again, after a Gateway API
 //! release is fetched or a CRD is changed, from the repository root:
 //! `EDGERUSH_WRITE_TYPES=1 cargo test -p edgerush-planes --test generated`.
 
@@ -20,7 +22,7 @@ use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
 };
 
 /// Each kind's CRD in `install/` and the module written from it, at `v1alpha1`.
-const KINDS: [(&str, &str); 3] = [
+const KINDS: [(&str, &str); 4] = [
     (
         "gateway.edgerush.dev_controlplanes.yaml",
         "control_plane.rs",
@@ -30,6 +32,10 @@ const KINDS: [(&str, &str); 3] = [
         "gateway.edgerush.dev_platformdefaults.yaml",
         "platform_defaults.rs",
     ),
+    (
+        "gateway.edgerush.dev_ratelimitpolicies.yaml",
+        "rate_limit_policy.rs",
+    ),
 ];
 
 /// The DataPlane's CRD.
@@ -37,6 +43,9 @@ const DATA_PLANE: &str = "gateway.edgerush.dev_dataplanes.yaml";
 
 /// The PlatformDefaults' CRD.
 const PLATFORM_DEFAULTS: &str = "gateway.edgerush.dev_platformdefaults.yaml";
+
+/// The RateLimitPolicy's CRD.
+const RATE_LIMIT_POLICY: &str = "gateway.edgerush.dev_ratelimitpolicies.yaml";
 
 /// The Gateway's fields the DataPlane's `spec.gateway` holds.
 const GATEWAY_FIELDS: [&str; 3] = ["allowedListeners", "listeners", "tls"];
@@ -68,6 +77,20 @@ const DATA_PLANE_COPY: Markers = Markers {
     indent: "                        ",
 };
 
+/// The DataPlane's limit in the RateLimitPolicy's CRD, as `spec.limits.items`.
+const LIMIT_COPY: Markers = Markers {
+    starts_after: "                  # The DataPlane's limit, copied by the test; not to be edited.",
+    ends_before: "                  # End of the DataPlane's limit.",
+    indent: "                  ",
+};
+
+/// Gateway API's PolicyStatus in the RateLimitPolicy's CRD, under `status.properties`.
+const POLICY_STATUS_COPY: Markers = Markers {
+    starts_after: "              # Gateway API's PolicyStatus, copied by the test; not to be edited.",
+    ends_before: "              # End of Gateway API's PolicyStatus.",
+    indent: "              ",
+};
+
 fn path(dir: &str, file: &str) -> String {
     format!("{}/{dir}/{file}", env!("CARGO_MANIFEST_DIR"))
 }
@@ -84,6 +107,15 @@ fn crd(yaml: &str) -> CustomResourceDefinition {
 
 /// The properties of `spec` in `crd`'s `version`.
 fn spec(crd: &CustomResourceDefinition, version: &str) -> BTreeMap<String, JSONSchemaProps> {
+    root(crd, version, "spec")
+}
+
+/// The properties of `field`, `spec` or `status`, in `crd`'s `version`.
+fn root(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    field: &str,
+) -> BTreeMap<String, JSONSchemaProps> {
     let schema = crd
         .spec
         .versions
@@ -95,18 +127,33 @@ fn spec(crd: &CustomResourceDefinition, version: &str) -> BTreeMap<String, JSONS
     schema
         .properties
         .as_ref()
-        .and_then(|p| p.get("spec"))
+        .and_then(|p| p.get(field))
         .and_then(|s| s.properties.clone())
-        .expect("the schema has a spec")
+        .unwrap_or_else(|| panic!("the schema has a {field}"))
+}
+
+/// The schema of each item of `array`.
+fn items(array: JSONSchemaProps) -> JSONSchemaProps {
+    match array.items {
+        Some(JSONSchemaPropsOrArray::Schema(item)) => *item,
+        _ => panic!("the array's items are one schema"),
+    }
+}
+
+/// Gateway API's CRD `file`, of `crates/gateway-api/crds`.
+fn gateway_api(file: &str) -> CustomResourceDefinition {
+    crd(&read(&format!(
+        "{}/../gateway-api/crds/{file}",
+        env!("CARGO_MANIFEST_DIR")
+    )))
 }
 
 /// The Gateway's fields as Gateway API's Gateway CRD has them.
 fn gateway_fields() -> BTreeMap<String, JSONSchemaProps> {
-    let yaml = read(&format!(
-        "{}/../gateway-api/crds/gateway.networking.k8s.io_gateways.yaml",
-        env!("CARGO_MANIFEST_DIR")
-    ));
-    let mut spec = spec(&crd(&yaml), "v1");
+    let mut spec = spec(
+        &gateway_api("gateway.networking.k8s.io_gateways.yaml"),
+        "v1",
+    );
     GATEWAY_FIELDS
         .iter()
         .map(|field| {
@@ -152,8 +199,40 @@ fn copied_data_plane_fields(yaml: &str) -> BTreeMap<String, JSONSchemaProps> {
         .unwrap_or_default()
 }
 
-/// `yaml`, a CRD, with `fields` written between `markers`.
-fn with_copy(yaml: &str, markers: &Markers, fields: &BTreeMap<String, JSONSchemaProps>) -> String {
+/// A limit, as the DataPlane's CRD, `yaml`, has it in `spec.rateLimiting.global`.
+fn limit(yaml: &str) -> JSONSchemaProps {
+    spec(&crd(yaml), "v1alpha1")
+        .remove("rateLimiting")
+        .and_then(|limiting| limiting.properties)
+        .and_then(|mut properties| properties.remove("global"))
+        .map(items)
+        .expect("the DataPlane has rateLimiting.global")
+}
+
+/// A limit as the RateLimitPolicy's CRD, `yaml`, holds it in `spec.limits`.
+fn copied_limit(yaml: &str) -> JSONSchemaProps {
+    spec(&crd(yaml), "v1alpha1")
+        .remove("limits")
+        .map(items)
+        .expect("the RateLimitPolicy has limits")
+}
+
+/// Gateway API's PolicyStatus, as its BackendTLSPolicy CRD has it.
+fn policy_status() -> BTreeMap<String, JSONSchemaProps> {
+    root(
+        &gateway_api("gateway.networking.k8s.io_backendtlspolicies.yaml"),
+        "v1",
+        "status",
+    )
+}
+
+/// The status as the RateLimitPolicy's CRD, `yaml`, holds it.
+fn copied_policy_status(yaml: &str) -> BTreeMap<String, JSONSchemaProps> {
+    root(&crd(yaml), "v1alpha1", "status")
+}
+
+/// `yaml`, a CRD, with `copy` written between `markers`.
+fn with_copy(yaml: &str, markers: &Markers, copy: &impl serde::Serialize) -> String {
     let start = yaml
         .find(markers.starts_after)
         .map(|at| at + markers.starts_after.len() + 1)
@@ -161,7 +240,7 @@ fn with_copy(yaml: &str, markers: &Markers, fields: &BTreeMap<String, JSONSchema
     let end = yaml
         .find(markers.ends_before)
         .expect("the CRD marks where the copy ends");
-    let written = serde_saphyr::to_string(fields).expect("the fields are written");
+    let written = serde_saphyr::to_string(copy).expect("the copy is written");
     let indented: String = written
         .lines()
         .map(|line| format!("{}{line}\n", markers.indent))
@@ -186,6 +265,7 @@ fn the_copies_are_what_they_copy_and_the_modules_what_the_crds_make() {
     let write = std::env::var_os("EDGERUSH_WRITE_TYPES").is_some();
     let data_plane = path("install", DATA_PLANE);
     let platform_defaults = path("install", PLATFORM_DEFAULTS);
+    let rate_limit_policy = path("install", RATE_LIMIT_POLICY);
     if write {
         let yaml = with_copy(&read(&data_plane), &GATEWAY_COPY, &gateway_fields());
         std::fs::write(&data_plane, yaml).expect("the CRD is written");
@@ -193,10 +273,17 @@ fn the_copies_are_what_they_copy_and_the_modules_what_the_crds_make() {
         let fields = data_plane_fields(&read(&data_plane));
         let yaml = with_copy(&read(&platform_defaults), &DATA_PLANE_COPY, &fields);
         std::fs::write(&platform_defaults, yaml).expect("the CRD is written");
+        let policy = read(&rate_limit_policy);
+        let policy = with_copy(&policy, &LIMIT_COPY, &limit(&read(&data_plane)));
+        let policy = with_copy(&policy, &POLICY_STATUS_COPY, &policy_status());
+        std::fs::write(&rate_limit_policy, policy).expect("the CRD is written");
     }
     let copy_is_the_gateways = copied_gateway_fields(&read(&data_plane)) == gateway_fields();
     let copy_is_the_data_planes = copied_data_plane_fields(&read(&platform_defaults))
         == data_plane_fields(&read(&data_plane));
+    let limit_is_the_data_planes =
+        copied_limit(&read(&rate_limit_policy)) == limit(&read(&data_plane));
+    let status_is_gateway_apis = copied_policy_status(&read(&rate_limit_policy)) == policy_status();
 
     let mut stale = Vec::new();
     for (crd, module_file) in KINDS {
@@ -220,6 +307,17 @@ fn the_copies_are_what_they_copy_and_the_modules_what_the_crds_make() {
         "the PlatformDefaults' gatewayClasses[].dataPlane is not the DataPlane's own fields; \
          write it again with EDGERUSH_WRITE_TYPES=1 cargo test -p edgerush-planes --test \
          generated"
+    );
+    assert!(
+        limit_is_the_data_planes,
+        "the RateLimitPolicy's spec.limits[] is not the DataPlane's spec.rateLimiting.global[]; \
+         write it again with EDGERUSH_WRITE_TYPES=1 cargo test -p edgerush-planes --test \
+         generated"
+    );
+    assert!(
+        status_is_gateway_apis,
+        "the RateLimitPolicy's status is not Gateway API's PolicyStatus; write it again with \
+         EDGERUSH_WRITE_TYPES=1 cargo test -p edgerush-planes --test generated"
     );
     assert!(
         stale.is_empty(),
