@@ -749,7 +749,7 @@ pub const MOST_LISTENERS: usize = 66;
 
 /// The most limits a rule's requests can be under: which of them a request is under is
 /// told in 64 bits.
-pub(crate) const MOST_LIMITS: usize = 64;
+pub const MOST_LIMITS: usize = 64;
 
 /// How the data plane enforces its rate limits, checked: each mode with what it needs and
 /// nothing it does not; the service, where there is one, with a pod at least and a cycle of

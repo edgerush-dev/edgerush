@@ -275,11 +275,7 @@ fn hear(heard: &Rc<RefCell<Heard>>) -> impl Fn(Said<'_>) + 'static {
                 heard.refused.push(data_plane.to_owned());
                 format!("refused: {problems:?}")
             }
-            Said::HeldBack {
-                data_plane,
-                limit,
-                by,
-            } => format!("{data_plane} held back: {limit} held by {by}"),
+            Said::HeldBack { data_plane, why } => format!("{data_plane} held back: {why}"),
             Said::GatewayApiStatus { object, written } => match written {
                 Ok(()) => format!("status of {object}"),
                 Err(error) => format!("status of {object} not written: {error}"),
@@ -1010,14 +1006,13 @@ fn a_policy_refused_applies_what_the_last_config_handed_on_applied() {
         panic!("not translated");
     };
     assert_eq!(under(translation), ["per-client"]);
-    // Its edit renames the limit, and 64 policies more put the rule under 65 limits: the
-    // config is refused, so the edit never applied.
-    let mut crowded = vec![rate_limit_policy("shop", 2, &[("renamed", "10/s")])];
-    crowded.extend(
-        (0..64)
-            .map(|n| rate_limit_policy(&format!("more-{n}"), 1, &[(&format!("more-{n}"), "1/s")])),
-    );
-    let Step::Refused { .. } = translator.step(&plane, &cluster(crowded)) else {
+    // Its edit renames the limit, translated for settings of 65 global limits, which no
+    // policy refused brings under the most a rule takes: the config is refused, so the edit
+    // never applied.
+    let names: Vec<String> = (0..65).map(|n| format!("global-{n}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let renamed = cluster(vec![rate_limit_policy("shop", 2, &[("renamed", "10/s")])]);
+    let Step::Refused { .. } = translator.step(&limiting(&names), &renamed) else {
         panic!("a rule under 65 limits not refused");
     };
     // An edit the data plane would refuse: the version of the last config handed on applies.
@@ -1366,7 +1361,8 @@ async fn a_data_plane_taking_a_name_a_policy_holds_is_held_back() {
             assert_eq!(under(0), ["per-client"]);
 
             settings.send_replace(only(harness(&wanted)));
-            let held = "held back: per-client held by RateLimitPolicy shop/shop";
+            let held = "held back: its global limit `per-client` has the name of \
+                        RateLimitPolicy shop/shop's, which holds it";
             until("held back", || {
                 heard.borrow().lines.iter().any(|line| line.contains(held))
             })
@@ -1400,42 +1396,101 @@ async fn a_data_plane_taking_a_name_a_policy_holds_is_held_back() {
         .await;
 }
 
-/// A generation held back is taken on once the config handed on lets go of the name it
-/// takes: the policy holding it edited to give it up.
-#[test]
-fn a_data_plane_held_back_is_taken_on_once_its_name_is_free() {
-    let cluster = |policy: RateLimitPolicy| Cluster {
+/// The objects of `shop` with `policy` on the Ingress `shop/web`.
+fn with_policy(policy: RateLimitPolicy) -> Cluster {
+    Cluster {
         ingress_classes: vec![class()],
         ingresses: vec![ingress("shop", "web", "shop.example")],
         services: vec![service("shop")],
         secrets: vec![secret("shop", &["shop.example"])],
         rate_limit_policies: vec![policy],
         ..Cluster::default()
-    };
-    let mut served = Serving::new(harness(&limiting(&[])));
-    let holding = cluster(rate_limit_policy("shop", 1, &[("per-client", "10/s")]));
+    }
+}
+
+/// A generation that adds global limits is not taken on as it is offered but judged; one
+/// that adds none, or none any more, is. Judged, it is held back while a limit's name is a
+/// policy's, and may be taken on once the config handed on lets go of it.
+#[test]
+fn a_data_plane_held_back_is_taken_on_once_its_name_is_free() {
+    let served_with = harness(&limiting(&[]));
+    let mut served = Serving::new(served_with.clone());
+    let holding = with_policy(rate_limit_policy("shop", 1, &[("per-client", "10/s")]));
     let Step::Translated(_) = served.translator.step(&served.settings.plane, &holding) else {
         panic!("not translated");
     };
     let wanted = harness(&limiting(&["per-client"]));
-    let held = served
-        .offer(&wanted)
-        .map(|(limit, by)| format!("{limit} {by}"));
+    served.offer(&wanted);
+    assert_eq!(served.settings, served_with, "taken on unjudged");
+    assert_eq!(served.wanted.as_ref(), Some(&wanted));
     assert_eq!(
-        held.as_deref(),
-        Some("per-client RateLimitPolicy shop/shop")
+        served
+            .judge(&wanted, &holding)
+            .map(|why| why.to_string())
+            .as_deref(),
+        Some(
+            "its global limit `per-client` has the name of RateLimitPolicy shop/shop's, which holds it"
+        )
     );
-    assert_eq!(served.settings, harness(&limiting(&[])));
-    assert_eq!(served.offer(&wanted), None, "said once");
-    assert!(!served.free(), "taken on while the name is held");
-    let freed = cluster(rate_limit_policy("shop", 2, &[("own", "10/s")]));
+    let freed = with_policy(rate_limit_policy("shop", 2, &[("own", "10/s")]));
     let Step::Translated(_) = served.translator.step(&served.settings.plane, &freed) else {
         panic!("not translated");
     };
-    assert!(served.frees());
-    assert!(served.free());
-    assert_eq!(served.settings, wanted);
+    assert_eq!(served.judge(&wanted, &freed), None);
+    // Offered what adds no global limit to what is served, it is taken on there and then.
+    let mut edited = served_with.clone();
+    edited.plane.ingress_https_redirect = true;
+    served.offer(&edited);
+    assert_eq!(served.settings, edited);
     assert_eq!(served.wanted, None);
+}
+
+/// A generation whose global limits would put a rule over the most limits a rule takes,
+/// refusing a policy the generation served does not, is held back; one that fits is not.
+#[test]
+fn a_data_plane_putting_a_rule_over_the_most_limits_is_held_back() {
+    let names: Vec<String> = (0..63).map(|n| format!("big-{n}")).collect();
+    let limits: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "10/s")).collect();
+    let cluster = with_policy(rate_limit_policy("shop", 1, &limits));
+    let mut served = Serving::new(harness(&limiting(&[])));
+    let Step::Translated(translation) = served.translator.step(&served.settings.plane, &cluster)
+    else {
+        panic!("not translated");
+    };
+    assert_eq!(translation.config.routes[0].rules[0].rate_limits.len(), 63);
+    let fits = harness(&limiting(&["platform"]));
+    assert_eq!(served.judge(&fits, &cluster), None);
+    let over = harness(&limiting(&["platform", "more"]));
+    assert_eq!(
+        served
+            .judge(&over, &cluster)
+            .map(|why| why.to_string())
+            .as_deref(),
+        Some(
+            "its global limits would put a rule over the 64 limits a rule takes, refusing RateLimitPolicy shop/shop"
+        )
+    );
+    // A policy refused under the settings served already is no reason to hold one back.
+    let second: Vec<String> = (0..40).map(|n| format!("second-{n}")).collect();
+    let second: Vec<(&str, &str)> = second.iter().map(|name| (name.as_str(), "10/s")).collect();
+    let crowded = Cluster {
+        rate_limit_policies: vec![
+            rate_limit_policy("first", 1, &limits[..40]),
+            rate_limit_policy("second", 1, &second),
+        ],
+        ..cluster.clone()
+    };
+    let mut served = Serving::new(harness(&limiting(&[])));
+    let Step::Translated(translation) = served.translator.step(&served.settings.plane, &crowded)
+    else {
+        panic!("not translated");
+    };
+    let refused = translation
+        .report
+        .iter()
+        .any(|finding| matches!(finding.problem, Problem::LimitsTooMany { .. }));
+    assert!(refused, "no policy refused under the settings served");
+    assert_eq!(served.judge(&fits, &crowded), None);
 }
 
 /// Settings that change are followed (05 §3): none, and nothing is followed; new settings
