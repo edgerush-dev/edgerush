@@ -1,0 +1,89 @@
+# What a policy ignores, it ignores of the levels less specific than its target alone. The
+# route's policy ignores a DataPlane limit by name, a name that is not there, which is no
+# fault, and its own rule's limit, which is more specific and stays; a second policy on the
+# route ignores the first's limit, of its own level, which stays. The `health` rule's
+# ignores everything less specific, `["*"]`, and is under nothing; the `orders` rule's
+# ignores its route's limit and the Gateway's. A rule that redirects is under none, its own
+# policy's limit included, which applies nowhere.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: api, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [api.example.com]
+  rules:
+    - name: health
+      matches: [{ path: { type: PathPrefix, value: /health } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - name: orders
+      matches: [{ path: { type: PathPrefix, value: /orders } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - name: old
+      matches: [{ path: { type: PathPrefix, value: /old } }]
+      filters: [{ type: RequestRedirect, requestRedirect: { hostname: new.example.com, statusCode: 301 } }]
+    - matches: [{ path: { type: PathPrefix, value: / } }]
+      backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: gateway, namespace: edge }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: Gateway, name: web }]
+  limits: [{ name: gateway-burst, key: Client, model: { bucket: { rate: 50/s, burst: 100 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: route, namespace: shop }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: api }]
+  limits: [{ name: api-per-client, key: Client, model: { bucket: { rate: 10/s, burst: 10 } } }]
+  ignore: [platform-writes, not-there, orders-writes]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: route-also, namespace: shop }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: api }]
+  ignore: [api-per-client]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: health, namespace: shop }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: api, sectionName: health }]
+  ignore: ["*"]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: orders, namespace: shop }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: api, sectionName: orders }]
+  limits: [{ name: orders-writes, match: { methods: [POST] }, key: Client, model: { fixedWindow: { limit: 60, window: 1m } } }]
+  ignore: [api-per-client, gateway-burst]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: old, namespace: shop }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: api, sectionName: old }]
+  limits: [{ name: old-per-client, key: Client, model: { bucket: { rate: 1/s, burst: 1 } } }]

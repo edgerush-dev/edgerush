@@ -13,6 +13,9 @@ edgerush-certificates.workspace = true
 edgerush-config.workspace = true
 # The Gateway API kinds translated.
 edgerush-gateway-api.workspace = true
+# RateLimitPolicies, EdgeRush's own kind, as the API server holds them; and the DataPlane's
+# limit, which a policy's limits are copies of, read alike.
+edgerush-planes.workspace = true
 k8s-openapi.workspace = true
 serde.workspace = true
 thiserror.workspace = true

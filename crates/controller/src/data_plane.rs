@@ -14,17 +14,13 @@
 //! says its zone: the data plane's Service, of the name the control plane gives it, and
 //! writes as the DataPlane shapes it (05 §2).
 
-use edgerush_config::{
-    AccessLog, Bucket, Forwarding, Http3, Limit, LimitMatch, ListenerProxyProtocol, Model,
-    RequestId, Rolling, Window,
-};
+use edgerush_config::{AccessLog, Forwarding, Http3, ListenerProxyProtocol, RequestId};
 use edgerush_kubernetes::{ApiServer, Scope};
-use edgerush_planes::data_plane::{
-    DataPlane, DataPlanePorts, DataPlaneRateLimiting, DataPlaneRateLimitingGlobal,
-};
+use edgerush_planes::data_plane::{DataPlane, DataPlanePorts, DataPlaneRateLimiting};
 use edgerush_planes::objects::{ProxyService, data_plane_id, proxy_name};
 use edgerush_translate::{
     GatewayName, IpFamily, Plane, PlaneRateLimitMode, PlaneRateLimiting, PortSettings,
+    data_plane_limit,
 };
 
 use crate::across::{Across, follow_across, watch_parts};
@@ -528,7 +524,7 @@ fn rate_limiting(limiting: &DataPlaneRateLimiting) -> Result<PlaneRateLimiting, 
         .iter()
         .flatten()
         .map(|limit| {
-            global_limit(limit)
+            data_plane_limit(limit)
                 .map_err(|(field, why)| (format!("global[{}].{field}", limit.name), why))
         })
         .collect::<Result<_, _>>()?;
@@ -536,53 +532,6 @@ fn rate_limiting(limiting: &DataPlaneRateLimiting) -> Result<PlaneRateLimiting, 
         mode,
         max_key_bytes,
         global,
-    })
-}
-
-/// One of a DataPlane's global limits, written as the limits file writes one; or the field,
-/// below the limit, and why it cannot be.
-fn global_limit(limit: &DataPlaneRateLimitingGlobal) -> Result<Limit, (String, String)> {
-    let key = match limit.key.as_str() {
-        "Client" => "client",
-        other => return Err(("key".to_owned(), format!("`{other}` is not Client"))),
-    };
-    let count = |field: &str, value: i64| {
-        number(value, 1).ok_or_else(|| (field.to_owned(), format!("{value} is out of range")))
-    };
-    let stated = &limit.model;
-    let model = match (&stated.bucket, &stated.fixed_window, &stated.rolling_window) {
-        (Some(bucket), None, None) => Model::Bucket(Bucket {
-            rate: bucket.rate.clone(),
-            burst: count("model.bucket.burst", bucket.burst)?,
-        }),
-        (None, Some(window), None) => Model::FixedWindow(Window {
-            limit: count("model.fixedWindow.limit", window.limit)?,
-            window: window.window.clone(),
-        }),
-        (None, None, Some(window)) => Model::RollingWindow(Rolling {
-            limit: count("model.rollingWindow.limit", window.limit)?,
-            window: window.window.clone(),
-            slots: window
-                .slots
-                .map(|slots| count("model.rollingWindow.slots", slots))
-                .transpose()?,
-        }),
-        _ => {
-            return Err((
-                "model".to_owned(),
-                "one of bucket, fixedWindow and rollingWindow is needed, and only one".to_owned(),
-            ));
-        }
-    };
-    Ok(Limit {
-        name: limit.name.clone(),
-        matches: limit.r#match.as_ref().map(|matches| LimitMatch {
-            methods: matches.methods.clone().unwrap_or_default(),
-            path_prefix: matches.path_prefix.clone(),
-        }),
-        key: key.to_owned(),
-        model,
-        dry_run: limit.dry_run.unwrap_or(false),
     })
 }
 

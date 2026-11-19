@@ -13,6 +13,7 @@ use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_gateway_api::udp_route::UDPRoute;
+use edgerush_planes::rate_limit_policy::RateLimitPolicy;
 use edgerush_translate::{Cluster, Plane, Translation, translate};
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
@@ -176,6 +177,7 @@ enum Manifest {
     BackendTLSPolicy(Box<BackendTLSPolicy>),
     ConfigMap(Box<ConfigMap>),
     Namespace(Box<Namespace>),
+    RateLimitPolicy(Box<RateLimitPolicy>),
     List {
         items: Vec<Manifest>,
     },
@@ -202,6 +204,7 @@ impl Manifest {
             Self::BackendTLSPolicy(policy) => cluster.backend_tls_policies.push(*policy),
             Self::ConfigMap(map) => cluster.config_maps.push(*map),
             Self::Namespace(namespace) => cluster.namespaces.push(*namespace),
+            Self::RateLimitPolicy(policy) => cluster.rate_limit_policies.push(*policy),
             Self::List { items } => {
                 for item in items {
                     item.into_cluster(cluster);
@@ -561,5 +564,23 @@ metadata: { name: shop, labels: { team: shop } }
             cluster.namespaces.len(),
         );
         assert_eq!(counts, (1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1));
+    }
+
+    /// RateLimitPolicies are read, as the control plane follows them whichever API their
+    /// targets are of.
+    #[test]
+    fn rate_limit_policies_are_read() {
+        let yaml = "apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: per-client, namespace: shop }
+spec:
+  targetRefs: [{ group: networking.k8s.io, kind: Ingress, name: web }]
+  limits: [{ name: per-client, key: Client, model: { bucket: { rate: 10/s, burst: 10 } } }]
+";
+        let mut cluster = Cluster::default();
+        for manifest in serde_saphyr::from_multiple::<Manifest>(yaml).unwrap() {
+            manifest.into_cluster(&mut cluster);
+        }
+        assert_eq!(cluster.rate_limit_policies.len(), 1);
     }
 }

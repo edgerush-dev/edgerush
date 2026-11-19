@@ -1,5 +1,6 @@
 # A data plane limiting locally: its mode written into its config, its global limits as
-# the limits the config carries, every one of them global.
+# the limits the config carries, each named on every rule that forwards, the limits' own
+# `global` empty (07 §2).
 ingress_class: edge
 cluster_domain: cluster.local
 ingress_hosts_fall_through: false

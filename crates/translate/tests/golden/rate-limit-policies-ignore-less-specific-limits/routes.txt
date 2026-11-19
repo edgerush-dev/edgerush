@@ -1,0 +1,1 @@
+HTTPRoute shop/api: attached to http (api.example.com)

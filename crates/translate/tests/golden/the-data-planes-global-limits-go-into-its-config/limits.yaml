@@ -1,4 +1,3 @@
-global: { rate_limits: [per-client, order-writes] }
 limits:
   - { name: per-client, key: client, model: { bucket: { rate: 100/s, burst: 200 } } }
   - name: order-writes

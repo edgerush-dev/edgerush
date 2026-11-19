@@ -1,0 +1,25 @@
+listeners:
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: httproute/shop/api/http
+    listeners: [port-80]
+    hostnames: [{ name: api.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /health } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+      - matches: [{ path: { prefix: /orders } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+        rate_limits: [platform-per-ip, orders-writes]
+      - matches: [{ path: { prefix: /old } }]
+        redirect: { status: 301, host: new.example.com, query: keep }
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+        rate_limits: [platform-per-ip, gateway-burst, api-per-client]
+upstreams:
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }
+rate_limiting: { mode: local }

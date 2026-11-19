@@ -1,0 +1,3 @@
+HTTPRoute shop/team, ListenerSet shop/team: attached to api (api.example.com)
+HTTPRoute shop/web: attached to http (shop.example.com); admin (shop.example.com)
+GRPCRoute shop/calls, section http: attached to http (grpc.example.com)

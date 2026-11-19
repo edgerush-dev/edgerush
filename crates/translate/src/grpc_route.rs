@@ -11,6 +11,7 @@ use crate::http_route::{
     Filtered, Reference, RouteOutcome, Translated, Written, answering, backends, config_routes,
     filtered, header_changes, mirrored, no_extension, no_settings, not_read, predicate,
 };
+use crate::rate_limits::RateLimits;
 use crate::{Cluster, Plane, namespace};
 use edgerush_config::{Filter, Forward, GrpcMethod, Match, PathMatch, Rule, Upstream};
 use edgerush_gateway_api::grpc_route::{
@@ -23,7 +24,9 @@ use std::collections::BTreeMap;
 /// plane would refuse a rule compiled alone with its upstreams, if it would, so that such a
 /// rule is left out by itself; a rule with what translation cannot take answers
 /// `UNAVAILABLE` for every call it matches, never served with part of it ignored; one whose
-/// matches cannot be built is left out (04 §2).
+/// matches cannot be built is left out (04 §2). Each rule is under the limits `rate_limits`
+/// gathers for it where it is served, as an HTTPRoute's (04 §4).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn translated(
     route: &GRPCRoute,
     outcome: &RouteOutcome,
@@ -31,11 +34,13 @@ pub(crate) fn translated(
     plane: &Plane,
     cluster: &Cluster,
     policies: &Policies<'_>,
+    rate_limits: &RateLimits,
     refused: impl Fn(&Rule, &BTreeMap<String, Upstream>) -> Option<String>,
 ) -> Translated {
     let mut translated = Translated::default();
     let route_namespace = namespace(&route.metadata);
-    let mut rules = Vec::new();
+    // Each rule kept, with its name, which a RateLimitPolicy's `sectionName` names it by.
+    let mut rules: Vec<(Rule, Option<&str>)> = Vec::new();
     for (at, rule) in route.spec.rules.iter().flatten().enumerate() {
         let matches = match matches(rule) {
             Ok(matches) => matches,
@@ -103,7 +108,7 @@ pub(crate) fn translated(
                 translated.left_out.push((at, why));
             } else {
                 translated.answered.push((at, why));
-                rules.push(standing);
+                rules.push((standing, rule.name.as_deref()));
             }
             continue;
         }
@@ -119,10 +124,10 @@ pub(crate) fn translated(
             }
         }
         translated.upstreams.extend(upstreams);
-        rules.push(compiled);
+        rules.push((compiled, rule.name.as_deref()));
     }
     if !rules.is_empty() {
-        translated.routes = config_routes("grpcroute", outcome, gateway, &rules);
+        translated.routes = config_routes("grpcroute", outcome, gateway, &rules, rate_limits);
     }
     translated
 }
