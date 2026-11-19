@@ -34,14 +34,14 @@ pub struct RateLimitPolicySpec {
     /// specific level (a Gateway is less specific than its listeners, a route than
     /// its rules). ["*"], alone, ignores them all, those added later included. A
     /// name not there is no fault; a limit of the same level or a more specific one
-    /// is never ignored.
+    /// is never ignored. Empty, as left out, it ignores none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore: Option<Vec<String>>,
     /// Limits is the limits the policy adds, each written as a DataPlane's
     /// `rateLimiting.global` limit is, and each counted once across all of its
     /// targets. A limit's name is unique across the data plane: a change that
     /// brings a name another policy holds is refused whole, and the policy goes on
-    /// as it was last accepted.
+    /// as it was last accepted. Empty, as left out, it adds none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<Vec<RateLimitPolicyLimits>>,
     /// TargetRefs is what the policy applies to, in its own namespace: Gateways,

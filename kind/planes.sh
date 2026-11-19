@@ -13,7 +13,7 @@
 #     and so is every golden case's resource of crates/planes, and DataPlanes limiting
 #     locally under a limit of each model, and with rate limiting disabled; and
 #     RateLimitPolicies on each level, whole and by section, of limits, of ignore alone, of
-#     both, and of ["*"];
+#     both, of either beside the other empty, and of ["*"];
 #   - each resource the CRDs' schema and CEL rules are to refuse is refused, and says why:
 #     a name that is no DNS label or too long for its Service's, a watch scope's selector
 #     without Selector or Selector without one, no replicas, a DataPlane with neither
@@ -32,8 +32,8 @@
 #     prefix that is no path, and two limits of one name; a RateLimitPolicy of no target or
 #     of more than 16, of a kind it does not take or one of another group, of targets of
 #     two levels, of a section on some alone, or naming one twice, naming an Ingress's
-#     section, of neither limits nor ignore, of an empty list of either, of "*" beside a
-#     name, ignoring a name twice, or of a limit a DataPlane's rules would refuse;
+#     section, of neither a limit nor a name to ignore (either list may be empty), of "*"
+#     beside a name, ignoring a name twice, or of a limit a DataPlane's rules would refuse;
 #   - a Service holding externalIPs is refused written as a control plane's ServiceAccount,
 #     and admitted written by another; one without them is admitted from either;
 #   - beyond its own namespace, under the role bound there for a generated DataPlane, a
@@ -289,6 +289,12 @@ admitted "a RateLimitPolicy of limits and ignore" "$(policy "  targetRefs: [$(ta
     - { name: writes, match: { methods: [POST], pathPrefix: /cart/ }, key: Client, model: { fixedWindow: { limit: 10, window: 1m } }, dryRun: true }
     - { name: hourly, key: Client, model: { rollingWindow: { limit: 100, window: 1h, slots: 60 } } }
   ignore: [platform-per-ip, platform-writes]")"
+admitted "a RateLimitPolicy of limits, ignoring nothing" "$(policy "  targetRefs: [$(target Gateway web)]
+$per_client
+  ignore: []")"
+admitted "a RateLimitPolicy of no limit, of ignore" "$(policy "  targetRefs: [$(target Gateway web)]
+  limits: []
+  ignore: [platform-per-ip]")"
 admitted "a RateLimitPolicy ignoring every less specific limit" "$(policy "  targetRefs: [$(target HTTPRoute health)]
   ignore: [\"*\"]")"
 # `routes <n>`: targets of `n` HTTPRoutes, each its own.
@@ -329,10 +335,13 @@ refused "a RateLimitPolicy naming a rule twice" "named once" "$(policy "  target
 $per_client")"
 refused "a RateLimitPolicy naming an Ingress's section" "an Ingress has no sections" "$(policy "  targetRefs: [$(target Ingress shop rule)]
 $per_client")"
-refused "a RateLimitPolicy of neither limits nor ignore" "limits, ignore or both" "$(policy "  targetRefs: [$(target Gateway web)]")"
-refused "a RateLimitPolicy of no limit" "spec.limits" "$(policy "  targetRefs: [$(target Gateway web)]
+refused "a RateLimitPolicy of neither limits nor ignore" "a limit, a name to ignore, or both" "$(policy "  targetRefs: [$(target Gateway web)]")"
+refused "a RateLimitPolicy of no limit" "a limit, a name to ignore, or both" "$(policy "  targetRefs: [$(target Gateway web)]
   limits: []")"
-refused "a RateLimitPolicy ignoring nothing" "spec.ignore" "$(policy "  targetRefs: [$(target Gateway web)]
+refused "a RateLimitPolicy ignoring nothing" "a limit, a name to ignore, or both" "$(policy "  targetRefs: [$(target Gateway web)]
+  ignore: []")"
+refused "a RateLimitPolicy of no limit, ignoring nothing" "a limit, a name to ignore, or both" "$(policy "  targetRefs: [$(target Gateway web)]
+  limits: []
   ignore: []")"
 refused "a RateLimitPolicy ignoring \"*\" and a name" "stands alone" "$(policy "  targetRefs: [$(target Gateway web)]
   ignore: [\"*\", platform-per-ip]")"

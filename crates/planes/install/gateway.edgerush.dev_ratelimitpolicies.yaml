@@ -63,14 +63,13 @@ spec:
                   specific level (a Gateway is less specific than its listeners, a route than
                   its rules). ["*"], alone, ignores them all, those added later included. A
                   name not there is no fault; a limit of the same level or a more specific one
-                  is never ignored.
+                  is never ignored. Empty, as left out, it ignores none.
                 items:
                   maxLength: 253
                   minLength: 1
                   pattern: ^[ -~]+$
                   type: string
                 maxItems: 64
-                minItems: 1
                 type: array
                 x-kubernetes-list-type: set
                 x-kubernetes-validations:
@@ -82,7 +81,7 @@ spec:
                   `rateLimiting.global` limit is, and each counted once across all of its
                   targets. A limit's name is unique across the data plane: a change that
                   brings a name another policy holds is refused whole, and the policy goes on
-                  as it was last accepted.
+                  as it was last accepted. Empty, as left out, it adds none.
                 items:
                   # The DataPlane's limit, copied by the test; not to be edited.
                   description: Limit is one limit, whose requests it counts together and how many it allows.
@@ -211,7 +210,6 @@ spec:
                   type: object
                   # End of the DataPlane's limit.
                 maxItems: 64
-                minItems: 1
                 type: array
                 x-kubernetes-list-map-keys:
                 - name
@@ -280,8 +278,8 @@ spec:
             - targetRefs
             type: object
             x-kubernetes-validations:
-            - message: a policy holds limits, ignore or both
-              rule: has(self.limits) || has(self.ignore)
+            - message: a policy holds a limit, a name to ignore, or both
+              rule: (has(self.limits) && self.limits.size() > 0) || (has(self.ignore) && self.ignore.size() > 0)
           status:
             description: |-
               Status is what each controller reports of the policy, by ancestor, as Gateway
