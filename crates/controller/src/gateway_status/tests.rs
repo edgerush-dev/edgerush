@@ -314,6 +314,16 @@ fn the_table_claims_the_gateway_tls_profiles_core_and_no_termination() {
     }
 }
 
+#[test]
+fn the_table_claims_the_gateway_tcp_profiles_core() {
+    // GATEWAY-TCP's core passes every test the suite has of it (#449). TCPRoute has no
+    // extended feature of its own: the profile's others are the Gateway's, claimed or not as
+    // GATEWAY-HTTP's run found them.
+    for core in ["Gateway", "ReferenceGrant", "TCPRoute"] {
+        assert!(SUPPORTED_FEATURES.contains(&core), "{core}");
+    }
+}
+
 /// What translation says of a Gateway of two listeners, `http` served and `secure` not.
 fn wanted_gateway() -> translate::GatewayStatus {
     translate::GatewayStatus {

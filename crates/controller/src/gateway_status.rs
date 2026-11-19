@@ -62,8 +62,9 @@ const MOST_ANCESTORS: usize = 16;
 /// no longer than its CRD allows.
 pub(crate) const SUPPORTED_FEATURES: &[&str] = &[
     // GATEWAY-HTTP's core (Gateway, HTTPRoute, ReferenceGrant), GATEWAY-GRPC's (Gateway,
-    // GRPCRoute, ReferenceGrant) and GATEWAY-TLS's (Gateway, TLSRoute, ReferenceGrant), and
-    // the extended features that pass them.
+    // GRPCRoute, ReferenceGrant), GATEWAY-TLS's (Gateway, TLSRoute, ReferenceGrant) and
+    // GATEWAY-TCP's (Gateway, TCPRoute, ReferenceGrant), and the extended features that pass
+    // them.
     "GRPCRoute",
     "GRPCRouteNamedRouteRule",
     "GRPCRouteRequestHeaderModifier",
@@ -99,6 +100,7 @@ pub(crate) const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteRetryConnectionError",
     "HTTPRouteSchemeRedirect",
     "ReferenceGrant",
+    "TCPRoute",
     "TLSRoute",
 ];
 
