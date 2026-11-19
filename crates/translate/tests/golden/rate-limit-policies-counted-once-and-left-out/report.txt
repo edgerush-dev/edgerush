@@ -1,0 +1,3 @@
+RateLimitPolicy shop/platform-clash: applies nothing: its limit `platform` has the name of the DataPlane's, which comes first
+RateLimitPolicy shop/later: applies nothing: its limit `shared-per-client` has the name of RateLimitPolicy shop/shared's, which comes first
+RateLimitPolicy shop/invalid: the data plane would refuse it: limits[bad].model.bucket.burst: 0 is out of range

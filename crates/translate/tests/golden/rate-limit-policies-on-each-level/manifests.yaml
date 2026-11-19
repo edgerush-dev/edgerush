@@ -1,0 +1,144 @@
+# A RateLimitPolicy on each level: the Gateway, one of its listeners, a ListenerSet, its
+# listener, an HTTPRoute, a rule of it, another HTTPRoute, a GRPCRoute's rule and an
+# Ingress. Each rule is under the DataPlane's limit and those of every level on its way:
+# the listener's on that listener alone, the ListenerSet's on its own listener, never the
+# Gateway's listener's; the rule's on that rule alone. The Ingress is under the DataPlane's
+# and its own, never the Gateway's: the Gateway is not its parent. Each limit is named on
+# its rules, the config's `global` empty.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  allowedListeners: { namespaces: { from: All } }
+  listeners:
+    - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+    - { name: admin, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: team, namespace: shop }
+spec:
+  parentRef: { name: web, namespace: edge }
+  listeners:
+    - { name: api, port: 9000, protocol: HTTP, hostname: api.example.com }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: web, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [shop.example.com]
+  rules:
+    - name: checkout
+      matches: [{ path: { type: PathPrefix, value: /checkout } }]
+      backendRefs: [{ name: web, port: 80 }]
+    - matches: [{ path: { type: PathPrefix, value: / } }]
+      backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: team, namespace: shop }
+spec:
+  parentRefs: [{ kind: ListenerSet, name: team }]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: calls, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: http }]
+  hostnames: [grpc.example.com]
+  rules: [{ name: place, backendRefs: [{ name: orders, port: 50051 }] }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: ingress.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: orders, namespace: shop }
+spec:
+  ports: [{ name: grpc, port: 50051 }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: on-gateway, namespace: edge }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: Gateway, name: web }]
+  limits: [{ name: gateway-writes, match: { methods: [POST] }, key: Client, model: { bucket: { rate: 50/s, burst: 50 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: on-listener, namespace: edge }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: Gateway, name: web, sectionName: http }]
+  limits: [{ name: http-per-client, key: Client, model: { bucket: { rate: 40/s, burst: 40 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: on-set, namespace: shop }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: ListenerSet, name: team }]
+  limits: [{ name: team-per-client, key: Client, model: { bucket: { rate: 30/s, burst: 30 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: on-set-listener, namespace: shop }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: ListenerSet, name: team, sectionName: api }]
+  limits: [{ name: team-api-per-client, key: Client, model: { fixedWindow: { limit: 1000, window: 1m } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: on-route, namespace: shop }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: web }]
+  limits: [{ name: route-per-client, key: Client, model: { bucket: { rate: 20/s, burst: 20 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: on-rule, namespace: shop }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: web, sectionName: checkout }]
+  limits: [{ name: checkout-per-client, key: Client, model: { rollingWindow: { limit: 100, window: 1h, slots: 60 } }, dryRun: true }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: on-team-route, namespace: shop }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: team }]
+  limits: [{ name: team-route-per-client, key: Client, model: { bucket: { rate: 10/s, burst: 10 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: on-grpc-rule, namespace: shop }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: GRPCRoute, name: calls, sectionName: place }]
+  limits: [{ name: place-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: on-ingress, namespace: shop }
+spec:
+  targetRefs: [{ group: networking.k8s.io, kind: Ingress, name: web }]
+  limits: [{ name: ingress-per-client, key: Client, model: { bucket: { rate: 15/s, burst: 15 } } }]

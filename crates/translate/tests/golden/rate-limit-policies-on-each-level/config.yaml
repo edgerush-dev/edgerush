@@ -1,0 +1,66 @@
+listeners:
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  port-8080:
+    address: "0.0.0.0:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  port-9000:
+    address: "0.0.0.0:9000"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+routes:
+  - name: grpcroute/shop/calls/http
+    listeners: [port-80]
+    hostnames: [{ name: grpc.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/orders/grpc/h2c, weight: 1 }] }
+        rate_limits: [platform-per-client, gateway-writes, http-per-client, place-per-client]
+  - name: httproute/shop/team/shop/team/api
+    listeners: [port-9000]
+    hostnames: [{ name: api.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+        rate_limits: [platform-per-client, gateway-writes, team-per-client, team-api-per-client, team-route-per-client]
+  - name: httproute/shop/web/http
+    listeners: [port-80]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /checkout } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+        rate_limits: [platform-per-client, gateway-writes, http-per-client, route-per-client, checkout-per-client]
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+        rate_limits: [platform-per-client, gateway-writes, http-per-client, route-per-client]
+  - name: httproute/shop/web/admin
+    listeners: [port-8080]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: /checkout } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+        rate_limits: [platform-per-client, gateway-writes, route-per-client, checkout-per-client]
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+        rate_limits: [platform-per-client, gateway-writes, route-per-client]
+  - name: ingress/shop/web/ingress.example.com
+    listeners: [port-80]
+    hostnames: [{ name: ingress.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+        rate_limits: [platform-per-client, ingress-per-client]
+  - { name: listenerset/shop/team/api, listeners: [port-9000], hostnames: [{ name: api.example.com, falls_through: false }], rules: [] }
+upstreams:
+  shop/orders/grpc/h2c: { protocol: http2, load_balancer: p2c, endpoints: { kubernetes: "orders.shop.svc.cluster.local:grpc" } }
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }
+rate_limiting: { mode: local }

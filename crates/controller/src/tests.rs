@@ -178,6 +178,21 @@ fn page<K: Kind + Serialize>(items: &[K]) -> Answer {
     answer(200, &body.to_string())
 }
 
+/// What a fake answers for a path it is not written for: RateLimitPolicies, which every
+/// control plane follows, none, their watch open and quiet; anything else, 500.
+fn otherwise(path: &str) -> Answer {
+    if !path.contains("/ratelimitpolicies?") {
+        answer(500, "")
+    } else if path.contains("watch=true") {
+        open()
+    } else {
+        answer(
+            200,
+            r#"{"kind":"RateLimitPolicyList","metadata":{"resourceVersion":"5"},"items":[]}"#,
+        )
+    }
+}
+
 /// A watch that stays open and quiet.
 fn open() -> Answer {
     Answer {
@@ -343,6 +358,18 @@ fn every_follows_objects_are_translated_and_its_secrets_looked_at() {
             true,
             vec![secret("shop", &[])],
         )],
+        rate_limit_policies: vec![follow_of(
+            "ratelimitpolicies in shop",
+            true,
+            vec![RateLimitPolicy {
+                metadata: ObjectMeta {
+                    name: Some("per-client".to_owned()),
+                    namespace: Some("shop".to_owned()),
+                    ..ObjectMeta::default()
+                },
+                ..RateLimitPolicy::default()
+            }],
+        )],
         own_services: Vec::new(),
         gateway_api: None,
         own_class: false,
@@ -379,6 +406,7 @@ fn every_follows_objects_are_translated_and_its_secrets_looked_at() {
         .collect();
     assert_eq!(services, ["shop", "blog"]);
     assert_eq!(cluster.secrets.len(), 1);
+    assert_eq!(cluster.rate_limit_policies.len(), 1);
     assert_eq!(
         cluster.watched,
         Some(vec!["shop".to_owned(), "blog".to_owned()])
@@ -479,6 +507,7 @@ fn a_gateway_api_kind_is_waited_on_and_translated_only_while_it_is_followed() {
         ingresses: Vec::new(),
         services: Vec::new(),
         secrets: Vec::new(),
+        rate_limit_policies: Vec::new(),
         own_services: Vec::new(),
         gateway_api: Some(gateway_api),
         own_class: false,
@@ -686,7 +715,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
         } else if path.starts_with("/api/v1/secrets?") {
             page(&[secret("shop", &["shop.example"])])
         } else {
-            answer(500, "")
+            otherwise(path)
         }
     })
     .await;
@@ -1037,7 +1066,7 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
         } else if path.starts_with("/api/v1/secrets?") {
             answer(403, r#"{"kind":"Status","code":403,"message":"forbidden"}"#)
         } else {
-            answer(500, "")
+            otherwise(path)
         }
     })
     .await;
@@ -1092,7 +1121,8 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
             assert_eq!(
                 heard.borrow().lines[0],
                 "waiting on ingressclasses in the cluster, ingresses in the cluster, \
-                 services in the cluster, secrets in the cluster"
+                 services in the cluster, secrets in the cluster, \
+                 ratelimitpolicies in the cluster"
             );
 
             secrets_allowed.store(true, Ordering::SeqCst);
@@ -1155,7 +1185,7 @@ async fn the_settings_are_followed_as_they_change() {
         {
             page::<Secret>(&[])
         } else {
-            answer(500, "")
+            otherwise(path)
         }
     })
     .await;
@@ -1259,7 +1289,7 @@ async fn secrets_are_followed_in_the_gateways_namespace_beside_the_scope() {
         if path.starts_with("/api/v1/namespaces/edge/secrets?") {
             page(&[secret("edge", &["secure.example"])])
         } else {
-            answer(500, "")
+            otherwise(path)
         }
     })
     .await;
@@ -1326,7 +1356,7 @@ async fn each_namespace_of_the_scope_is_followed_and_all_are_translated_together
             (Some(namespace), path) if path.ends_with("/secrets") => {
                 page(&[secret(namespace, &[&format!("{namespace}.example")])])
             }
-            _ => answer(500, ""),
+            _ => otherwise(path),
         }
     })
     .await;
@@ -1386,6 +1416,8 @@ async fn each_namespace_of_the_scope_is_followed_and_all_are_translated_together
             "/api/v1/namespaces/blog/services",
             "/api/v1/namespaces/shop/secrets",
             "/api/v1/namespaces/shop/services",
+            "/apis/gateway.edgerush.dev/v1alpha1/namespaces/blog/ratelimitpolicies",
+            "/apis/gateway.edgerush.dev/v1alpha1/namespaces/shop/ratelimitpolicies",
             "/apis/networking.k8s.io/v1/ingressclasses",
             "/apis/networking.k8s.io/v1/namespaces/blog/ingresses",
             "/apis/networking.k8s.io/v1/namespaces/shop/ingresses",
@@ -1589,7 +1621,7 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
         } else if path.starts_with("/api/v1/secrets?") {
             page(&[secret("shop", &["shop.example"])])
         } else {
-            answer(500, "")
+            otherwise(path)
         }
     })
     .await;
@@ -1668,7 +1700,7 @@ async fn a_config_is_not_held_up_by_its_status() {
         } else if path.starts_with("/api/v1/secrets?") {
             page(&[secret("shop", &["shop.example"])])
         } else {
-            answer(500, "")
+            otherwise(path)
         }
     })
     .await;
@@ -1755,7 +1787,7 @@ async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
         } else if path.starts_with("/api/v1/secrets?") {
             page(&[secret("shop", &["shop.example"])])
         } else {
-            answer(500, "")
+            otherwise(path)
         }
     })
     .await;
@@ -2257,6 +2289,7 @@ fn the_leader_merges_every_replicas_report_and_counts_the_ready_pods() {
         ingresses: Vec::new(),
         services: Vec::new(),
         secrets: Vec::new(),
+        rate_limit_policies: Vec::new(),
         own_services: Vec::new(),
         gateway_api: None,
         own_class: false,
@@ -2405,7 +2438,7 @@ async fn a_selectors_namespaces_are_followed_and_each_that_comes_to_match_taken_
             (_, Some(namespace), false) if collection.ends_with("/secrets") => {
                 page(&[secret(namespace, &[&format!("{namespace}.example")])])
             }
-            _ => answer(500, ""),
+            _ => otherwise(path),
         }
     })
     .await;
@@ -2556,7 +2589,7 @@ async fn a_selectors_first_namespaces_are_waited_on_as_the_start_is() {
             (_, Some(namespace)) if collection.ends_with("/secrets") => {
                 page(&[secret(namespace, &[&format!("{namespace}.example")])])
             }
-            _ => answer(500, ""),
+            _ => otherwise(path),
         }
     })
     .await;
@@ -2640,6 +2673,7 @@ async fn the_gateways_namespace_joining_keeps_its_secrets_translated() {
                     gateways: vec![edge.clone()],
                     ..Shape::default()
                 },
+                rate_limit_policies: Vec::new(),
                 own_services: Vec::new(),
                 gateway_api: None,
                 own_class: false,
@@ -2666,7 +2700,13 @@ async fn the_gateways_namespace_joining_keeps_its_secrets_translated() {
             assert_eq!(first, []);
             assert_eq!(
                 followed.unlisted().0,
-                ["ingresses in shop", "services in shop", "secrets in shop"]
+                [
+                    "ingresses in shop",
+                    "services in shop",
+                    "secrets in shop",
+                    "ratelimitpolicies in edge",
+                    "ratelimitpolicies in shop",
+                ]
             );
             // Then edge comes to match.
             let both = BTreeSet::from(["edge".to_owned(), "shop".to_owned()]);
@@ -2702,7 +2742,13 @@ async fn the_gateways_namespace_joining_keeps_its_secrets_translated() {
             assert_eq!(followed.cluster().watched, Some(vec!["shop".to_owned()]));
             assert_eq!(
                 followed.unlisted().0,
-                ["ingresses in shop", "services in shop", "secrets in shop"],
+                [
+                    "ingresses in shop",
+                    "services in shop",
+                    "secrets in shop",
+                    "ratelimitpolicies in edge",
+                    "ratelimitpolicies in shop",
+                ],
                 "a namespace joining waited on"
             );
             assert_eq!(followed.join(), Vec::<String>::new(), "joined unlisted");
@@ -2757,7 +2803,7 @@ async fn serving_web(own: Vec<Service>, applied: u16) -> Fake {
         } else if path.starts_with("/api/v1/secrets?") {
             page(&[secret("shop", &["shop.example"])])
         } else {
-            answer(500, "")
+            otherwise(path)
         }
     })
     .await
@@ -3004,7 +3050,7 @@ async fn each_data_plane_is_translated_and_its_statuses_written_on_its_own() {
         } else if path.starts_with("/api/v1/secrets?") {
             page(&[secret("shop", &["shop.example"])])
         } else {
-            answer(500, "")
+            otherwise(path)
         }
     })
     .await;
@@ -3115,7 +3161,7 @@ async fn holding_an_address(web: &Settings) -> Fake {
         } else if path.starts_with("/api/v1/secrets?") {
             page(&[secret("shop", &["shop.example"])])
         } else {
-            answer(500, "")
+            otherwise(path)
         }
     })
     .await
@@ -3307,7 +3353,7 @@ async fn a_data_plane_added_refused_or_let_go_of_leaves_the_others_as_they_were(
         } else if path.starts_with("/api/v1/secrets?") {
             page::<Secret>(&[])
         } else {
-            answer(500, "")
+            otherwise(path)
         }
     })
     .await;
@@ -3399,7 +3445,7 @@ async fn a_data_plane_of_ingress_alone_does_not_wait_on_the_gateway_apis_kinds()
             page::<Secret>(&[])
         } else {
             // The CRDs among it: never listed.
-            answer(500, "")
+            otherwise(path)
         }
     })
     .await;
@@ -3774,7 +3820,7 @@ async fn a_control_plane_serving_no_gateway_follows_the_classes_alone() {
         } else if path.starts_with("/api/v1/namespaces?") {
             page::<Namespace>(&[])
         } else {
-            answer(500, "")
+            otherwise(path)
         }
     })
     .await;

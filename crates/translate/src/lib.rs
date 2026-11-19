@@ -28,6 +28,10 @@
 //! translated: matches and backends, a rule with what translation does not take yet
 //! answering 500 by itself, one whose matches cannot be built left out.
 //! Every host a claim of one API takes from the other's is said.
+//!
+//! Where the data plane limits, each rule that forwards, of either API, is under the
+//! DataPlane's limits and those of the RateLimitPolicies on its way to it, less those a
+//! more specific one ignores, each named on the rule (`rate_limits`).
 
 use backend_tls::{Outcome, Policies};
 use edgerush_certificates::Identity;
@@ -49,6 +53,7 @@ use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_gateway_api::udp_route::UDPRoute;
+use edgerush_planes::rate_limit_policy::RateLimitPolicy;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{
     Ingress, IngressBackend, IngressClass, IngressServiceBackend,
@@ -65,6 +70,7 @@ pub mod gateway;
 mod grpc_route;
 pub mod http_route;
 pub mod listeners;
+mod rate_limits;
 pub mod status;
 mod tcp_route;
 mod tls_route;
@@ -75,6 +81,7 @@ pub use gateway::{
     SetOutcome,
 };
 pub use http_route::{Attachment, NotAttached, ParentOutcome, RouteOutcome, Taken};
+pub use rate_limits::data_plane_limit;
 pub use status::{
     Condition, GatewayStatus, ListenerSetStatus, ListenerStatus, ParentStatus, PolicyStatus,
     RouteStatus,
@@ -191,10 +198,9 @@ pub enum PlaneRateLimitMode {
 }
 
 impl PlaneRateLimiting {
-    /// The config's `rate_limiting` of it, and the limits the config carries: the global
-    /// limits, if there are any.
-    fn written(&self) -> (RateLimiting, Option<Limits>) {
-        let rate_limiting = RateLimiting {
+    /// The config's `rate_limiting` of it.
+    fn written(&self) -> RateLimiting {
+        RateLimiting {
             mode: match self.mode {
                 PlaneRateLimitMode::Off => RateLimitMode::Off,
                 PlaneRateLimitMode::Local => RateLimitMode::Local,
@@ -203,14 +209,7 @@ impl PlaneRateLimiting {
             service: None,
             synchronous: None,
             experimental_header_keys: None,
-        };
-        let limits = (!self.global.is_empty()).then(|| Limits {
-            global: Global {
-                rate_limits: self.global.iter().map(|limit| limit.name.clone()).collect(),
-            },
-            limits: self.global.clone(),
-        });
-        (rate_limiting, limits)
+        }
     }
 }
 
@@ -373,6 +372,9 @@ pub struct Cluster {
     pub backend_tls_policies: Vec<BackendTLSPolicy>,
     /// Every ConfigMap seen, for the CA certificates BackendTLSPolicies name.
     pub config_maps: Vec<ConfigMap>,
+    /// Every RateLimitPolicy seen: each adds limits to what it targets, and may remove less
+    /// specific ones, on Gateway API's objects and on Ingresses alike (04 §4).
+    pub rate_limit_policies: Vec<RateLimitPolicy>,
     /// Every Namespace seen, where the data plane is a Gateway: their labels are what a
     /// listener's selector of namespaces matches.
     pub namespaces: Vec<Namespace>,
@@ -783,6 +785,12 @@ impl fmt::Display for Object {
     }
 }
 
+/// Who holds a limit's name, as a finding says it: a policy, or the DataPlane.
+fn held_by(by: &Option<Object>) -> String {
+    by.as_ref()
+        .map_or_else(|| "the DataPlane".to_owned(), ToString::to_string)
+}
+
 /// Why an object was left out.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Problem {
@@ -924,6 +932,16 @@ pub enum Problem {
     /// connections.
     #[error("the connections it covers fail: {0}")]
     PolicyFailing(String),
+    /// A RateLimitPolicy's limit of a name another limit holds, which comes first: the
+    /// DataPlane's, or an older policy's. The policy applies nothing, as one name is one
+    /// count across the data plane (04 §4).
+    #[error("applies nothing: its limit `{name}` has the name of {}'s, which comes first", held_by(.by))]
+    LimitNameHeld {
+        /// The name.
+        name: String,
+        /// The policy holding it; none for the DataPlane's own.
+        by: Option<Object>,
+    },
     /// A TLSRoute's hostname on a data-plane listener that an earlier TLSRoute has there
     /// too: the earlier serves it, as the one rule ranks them (04 §2).
     #[error("{hostname} on {listener} is served by {by}, which comes first")]
@@ -1094,6 +1112,9 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             say(Problem::PolicyFailing(why.clone()));
         }
     }
+    // The DataPlane's limits and each RateLimitPolicy's, every rule's whole list gathered
+    // from them as its route is translated (04 §4).
+    let rate_limits = rate_limits::RateLimits::of(plane, cluster, gateway.as_ref(), &mut report);
     // An Ingress is the data plane's when its class is, and its class is when the
     // IngressClass of that name names this controller; one of no class is when that class
     // is the cluster's default.
@@ -1399,6 +1420,14 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         if !served.is_empty() {
             served_ingresses.push(object.clone());
         }
+        // Under the DataPlane's limits and its own policies', never the Gateway's: the
+        // Gateway is not an Ingress's parent (04 §4).
+        let under = rate_limits.of_ingress(&object);
+        for rule in routes.iter_mut().flat_map(|route| &mut route.rules) {
+            if rule.forward.is_some() {
+                rule.rate_limits.clone_from(&under);
+            }
+        }
         ranked.push(Ranked {
             rank,
             object,
@@ -1456,6 +1485,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 plane,
                 cluster,
                 &policies,
+                &rate_limits,
                 |rule, upstreams| refused("httproute", rule, upstreams),
             );
             rules_said(
@@ -1492,6 +1522,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
                 plane,
                 cluster,
                 &policies,
+                &rate_limits,
                 |rule, upstreams| refused("grpcroute", rule, upstreams),
             );
             let rules = route.spec.rules.as_ref().map_or(0, Vec::len);
@@ -1834,16 +1865,15 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
             false
         });
     }
-    let (rate_limiting, limits) = match &plane.rate_limiting {
-        Some(limiting) => {
-            let (rate_limiting, limits) = limiting.written();
-            (Some(rate_limiting), limits)
-        }
-        None => (None, None),
-    };
+    // Every limit is named on the rules it applies to, the DataPlane's own included, so the
+    // limits' `global` is empty (07 §2).
+    let limits = (!rate_limits.limits.is_empty()).then(|| Limits {
+        global: Global::default(),
+        limits: rate_limits.limits.clone(),
+    });
     let mut config = Config {
         data_plane: plane.data_plane.clone(),
-        rate_limiting,
+        rate_limiting: plane.rate_limiting.as_ref().map(PlaneRateLimiting::written),
         limits,
         ..config_of(
             bound,

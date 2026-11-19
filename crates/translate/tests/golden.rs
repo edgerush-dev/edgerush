@@ -37,6 +37,7 @@ use edgerush_gateway_api::reference_grant::ReferenceGrant;
 use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_gateway_api::udp_route::UDPRoute;
+use edgerush_planes::rate_limit_policy::RateLimitPolicy;
 use edgerush_translate::{Cluster, Plane, translate};
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
@@ -62,6 +63,7 @@ enum Manifest {
     UDPRoute(Box<UDPRoute>),
     ReferenceGrant(Box<ReferenceGrant>),
     BackendTLSPolicy(Box<BackendTLSPolicy>),
+    RateLimitPolicy(Box<RateLimitPolicy>),
     ConfigMap(Box<ConfigMap>),
     Namespace(Box<Namespace>),
 }
@@ -91,6 +93,7 @@ fn every_case_translates_to_its_config_and_report() {
                 Manifest::UDPRoute(route) => cluster.udp_routes.push(*route),
                 Manifest::ReferenceGrant(grant) => cluster.reference_grants.push(*grant),
                 Manifest::BackendTLSPolicy(policy) => cluster.backend_tls_policies.push(*policy),
+                Manifest::RateLimitPolicy(policy) => cluster.rate_limit_policies.push(*policy),
                 Manifest::ConfigMap(map) => cluster.config_maps.push(*map),
                 Manifest::Namespace(namespace) => cluster.namespaces.push(*namespace),
             }

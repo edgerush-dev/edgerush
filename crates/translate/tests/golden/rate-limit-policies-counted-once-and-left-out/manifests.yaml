@@ -1,0 +1,96 @@
+# A policy on two routes: its limit named on the rules of both, one limit, one count. A
+# policy whose target is not there, whose target's rule is not, or whose Gateway is not the
+# data plane's is kept, its limit applying nowhere. One with a limit of the name the
+# DataPlane's holds, or an older policy's, written before it or not, applies nothing, any
+# of its other limits included, and is said; so is one with a limit the data plane would
+# refuse.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: a, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [a.example.com]
+  rules: [{ name: main, backendRefs: [{ name: web, port: 80 }] }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: b, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [b.example.com]
+  rules: [{ name: main, backendRefs: [{ name: web, port: 80 }] }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: later, namespace: shop, creationTimestamp: "2026-02-01T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }]
+  limits:
+    - { name: later-own, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }
+    - { name: shared-per-client, key: Client, model: { bucket: { rate: 2/s, burst: 2 } } }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: shared, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: b }
+  limits: [{ name: shared-per-client, key: Client, model: { bucket: { rate: 10/s, burst: 10 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: platform-clash, namespace: shop, creationTimestamp: "2026-01-15T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: b }]
+  limits: [{ name: platform, key: Client, model: { bucket: { rate: 1/s, burst: 1 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: invalid, namespace: shop, creationTimestamp: "2026-03-01T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }]
+  limits:
+    - { name: bad, key: Client, model: { bucket: { rate: 5/s, burst: 0 } } }
+    - { name: invalid-own, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: gone, namespace: shop, creationTimestamp: "2026-03-02T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: gone }]
+  limits: [{ name: gone-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: no-rule, namespace: shop, creationTimestamp: "2026-03-03T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a, sectionName: nope }]
+  limits: [{ name: nope-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: other-gateway, namespace: edge, creationTimestamp: "2026-03-04T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: Gateway, name: other }]
+  limits: [{ name: other-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]

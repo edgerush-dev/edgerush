@@ -37,6 +37,7 @@ use edgerush_kubernetes::{
 use edgerush_planes::objects::{
     ProxyService, SERVICE_MANAGED_BY, Transports, control_plane_labels,
 };
+use edgerush_planes::rate_limit_policy::RateLimitPolicy;
 use edgerush_translate::{
     Cluster, GATEWAY_CONTROLLER, GatewayStatus, Object, Plane, PolicyStatus, RouteStatus,
     Translation, translate,
@@ -486,6 +487,7 @@ async fn serve(
         ingresses: start.follows(&parts),
         services: start.follows(&parts),
         secrets: start.follows(&with_gateway_namespaces(&parts, &shape.gateways)),
+        rate_limit_policies: start.follows(&with_gateway_namespaces(&parts, &shape.gateways)),
         own_services: start.follows(&shape.services),
         gateway_api: (classes.is_some() || !shape.gateways.is_empty())
             .then(|| GatewayApi::start(&mut start, &shape.gateways)),
@@ -1586,6 +1588,9 @@ struct Followed {
     ingresses: Vec<Follow<Ingress>>,
     services: Vec<Follow<Service>>,
     secrets: Vec<Follow<Secret>>,
+    /// RateLimitPolicies, where Secrets are: a policy is in its targets' namespace, a
+    /// Gateway's or a ListenerSet's as well as a route's or an Ingress's (04 §1).
+    rate_limit_policies: Vec<Follow<RateLimitPolicy>>,
     /// What the data planes shape of what is followed: the namespaces of their Gateways,
     /// whose Secrets are followed whatever the scope, of the Services written and of their
     /// own Services.
@@ -1628,6 +1633,7 @@ impl Followed {
                 .chain(unlisted(&self.ingresses))
                 .chain(unlisted(&self.services))
                 .chain(unlisted(&self.secrets))
+                .chain(unlisted(&self.rate_limit_policies))
                 .collect(),
             self.gateway_api
                 .iter()
@@ -1647,6 +1653,7 @@ impl Followed {
         }
         let secrets = with_gateway_namespaces(&self.parts, &next.gateways);
         rescope(&mut self.secrets, &secrets, start);
+        rescope(&mut self.rate_limit_policies, &secrets, start);
         rescope(&mut self.own_services, &next.services, start);
         rescope(&mut self.ready, &next.own_services, start);
         if next.gateways.is_empty() && !self.own_class {
@@ -1752,6 +1759,7 @@ impl Followed {
             reference_grants: of(gateway_api.and_then(|g| g.reference_grants.as_ref())),
             backend_tls_policies: of(gateway_api.and_then(|g| g.backend_tls_policies.as_ref())),
             config_maps: of(gateway_api.and_then(|g| g.config_maps.as_ref())),
+            rate_limit_policies: objects(&self.rate_limit_policies),
             namespaces: gateway_api
                 .map(|g| objects(&g.namespaces))
                 .unwrap_or_default(),
@@ -1814,6 +1822,7 @@ impl Followed {
         rescope(&mut self.services, &parts, start);
         let secrets = with_gateway_namespaces(&parts, &self.shape.gateways);
         rescope(&mut self.secrets, &secrets, start);
+        rescope(&mut self.rate_limit_policies, &secrets, start);
         if let Some(gateway_api) = &mut self.gateway_api {
             gateway_api.rescope(&parts, start);
         }
@@ -1872,6 +1881,7 @@ impl Followed {
         parts_of(&mut self.ingresses, &mut parts);
         parts_of(&mut self.services, &mut parts);
         parts_of(&mut self.secrets, &mut parts);
+        parts_of(&mut self.rate_limit_policies, &mut parts);
         if let Some(gateway_api) = &mut self.gateway_api {
             gateway_api.parts(&mut parts);
         }
@@ -1879,7 +1889,7 @@ impl Followed {
     }
 }
 
-/// Where ListenerSets and Secrets are followed: the watch scope, as routes are, and each
+/// Where ListenerSets, Secrets and RateLimitPolicies are followed: the watch scope, as routes are, and each
 /// Gateway's own namespace of `gateways` the scope does not hold, as a Gateway that takes
 /// ListenerSets `from: Same` takes them there, and its listeners' certificateRefs of its
 /// own namespace need no grant (04 §1).

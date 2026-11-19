@@ -1,0 +1,7 @@
+limits:
+  - { name: platform-per-ip, key: client, model: { bucket: { rate: 100/s, burst: 200 } } }
+  - { name: platform-writes, match: { methods: [POST, PUT] }, key: client, model: { bucket: { rate: 20/s, burst: 20 } } }
+  - { name: gateway-burst, key: client, model: { bucket: { rate: 50/s, burst: 100 } } }
+  - { name: old-per-client, key: client, model: { bucket: { rate: 1/s, burst: 1 } } }
+  - { name: orders-writes, match: { methods: [POST] }, key: client, model: { fixed_window: { limit: 60, window: 1m } } }
+  - { name: api-per-client, key: client, model: { bucket: { rate: 10/s, burst: 10 } } }

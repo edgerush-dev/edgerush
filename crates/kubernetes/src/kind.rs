@@ -20,6 +20,7 @@ use edgerush_gateway_api::udp_route::UDPRoute;
 use edgerush_planes::control_plane::ControlPlane;
 use edgerush_planes::data_plane::DataPlane;
 use edgerush_planes::platform_defaults::PlatformDefaults;
+use edgerush_planes::rate_limit_policy::RateLimitPolicy;
 use k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
@@ -183,6 +184,10 @@ impl Kind for ControlPlane {
 
 impl Kind for PlatformDefaults {
     const NAMESPACED: bool = false;
+}
+
+impl Kind for RateLimitPolicy {
+    const NAMESPACED: bool = true;
 }
 
 impl Kind for ServiceAccount {

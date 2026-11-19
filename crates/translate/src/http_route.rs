@@ -9,6 +9,7 @@
 
 use crate::backend_tls::Policies;
 use crate::gateway::{GatewayOutcome, ListenerOutcome};
+use crate::rate_limits::{Place, RateLimits};
 use crate::{Calls, Cluster, Object, Plane, RefProblem, RefReason, backend_upstream, namespace};
 use edgerush_config::{
     Backend, Filter, Forward, Fraction, Header, HeaderChanges, Hostname, Match, Mirror, PathChange,
@@ -647,7 +648,9 @@ pub(crate) struct Translated {
 /// rule compiled alone with its upstreams, if it would, so that such a rule is left out by
 /// itself. A rule with what translation cannot take answers 500 for all it matches, never
 /// served with part of it ignored nor leaving its requests to another rule; one whose
-/// matches cannot be built is left out (04 §2).
+/// matches cannot be built is left out (04 §2). Each rule that forwards is under the limits
+/// `rate_limits` gathers for it where it is served (04 §4).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn translated(
     route: &HTTPRoute,
     outcome: &RouteOutcome,
@@ -655,11 +658,13 @@ pub(crate) fn translated(
     plane: &Plane,
     cluster: &Cluster,
     policies: &Policies<'_>,
+    rate_limits: &RateLimits,
     refused: impl Fn(&Rule, &BTreeMap<String, Upstream>) -> Option<String>,
 ) -> Translated {
     let mut translated = Translated::default();
     let route_namespace = namespace(&route.metadata);
-    let mut rules = Vec::new();
+    // Each rule kept, with its name, which a RateLimitPolicy's `sectionName` names it by.
+    let mut rules: Vec<(Rule, Option<&str>)> = Vec::new();
     for (at, rule) in route.spec.rules.iter().enumerate() {
         let matches = match matches(rule) {
             Ok(matches) => matches,
@@ -747,7 +752,7 @@ pub(crate) fn translated(
                 translated.left_out.push((at, why));
             } else {
                 translated.answered.push((at, why));
-                rules.push(standing);
+                rules.push((standing, rule.name.as_deref()));
             }
             continue;
         }
@@ -766,10 +771,10 @@ pub(crate) fn translated(
             }
         }
         translated.upstreams.extend(upstreams);
-        rules.push(compiled);
+        rules.push((compiled, rule.name.as_deref()));
     }
     if !rules.is_empty() {
-        translated.routes = config_routes("httproute", outcome, gateway, &rules);
+        translated.routes = config_routes("httproute", outcome, gateway, &rules, rate_limits);
     }
     translated
 }
@@ -799,7 +804,8 @@ pub(crate) fn config_routes(
     kind: &str,
     outcome: &RouteOutcome,
     gateway: &GatewayOutcome,
-    rules: &[Rule],
+    rules: &[(Rule, Option<&str>)],
+    rate_limits: &RateLimits,
 ) -> Vec<Route> {
     let mut routes: Vec<Route> = Vec::new();
     for parent in &outcome.parents {
@@ -825,7 +831,18 @@ pub(crate) fn config_routes(
                 hostnames: attachment.hostnames.iter().map(|h| claim(h)).collect(),
                 rules: rules
                     .iter()
-                    .map(|rule| on_port(rule, listener.port))
+                    .map(|(rule, rule_name)| {
+                        let mut rule = on_port(rule, listener.port);
+                        // A rule that redirects is under none (07 §2).
+                        if rule.forward.is_some() {
+                            rule.rate_limits = rate_limits.of_rule(&Place {
+                                attachment,
+                                route: &outcome.route,
+                                rule: *rule_name,
+                            });
+                        }
+                        rule
+                    })
                     .collect(),
                 rate_limits: Vec::new(),
             });

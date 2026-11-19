@@ -522,6 +522,7 @@ dependencies = [
  "edgerush-certificates",
  "edgerush-config",
  "edgerush-gateway-api",
+ "edgerush-planes",
  "k8s-openapi",
  "serde",
  "thiserror",

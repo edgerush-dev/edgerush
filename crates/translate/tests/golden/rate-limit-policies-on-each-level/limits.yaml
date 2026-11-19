@@ -1,0 +1,11 @@
+limits:
+  - { name: platform-per-client, key: client, model: { bucket: { rate: 100/s, burst: 200 } } }
+  - { name: gateway-writes, match: { methods: [POST] }, key: client, model: { bucket: { rate: 50/s, burst: 50 } } }
+  - { name: http-per-client, key: client, model: { bucket: { rate: 40/s, burst: 40 } } }
+  - { name: place-per-client, key: client, model: { bucket: { rate: 5/s, burst: 5 } } }
+  - { name: ingress-per-client, key: client, model: { bucket: { rate: 15/s, burst: 15 } } }
+  - { name: route-per-client, key: client, model: { bucket: { rate: 20/s, burst: 20 } } }
+  - { name: checkout-per-client, key: client, model: { rolling_window: { limit: 100, window: 1h, slots: 60 } }, dry_run: true }
+  - { name: team-per-client, key: client, model: { bucket: { rate: 30/s, burst: 30 } } }
+  - { name: team-api-per-client, key: client, model: { fixed_window: { limit: 1000, window: 1m } } }
+  - { name: team-route-per-client, key: client, model: { bucket: { rate: 10/s, burst: 10 } } }

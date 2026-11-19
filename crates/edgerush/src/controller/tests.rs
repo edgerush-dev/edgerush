@@ -237,6 +237,9 @@ async fn cluster() -> Fake {
                 r#"{"metadata":{"name":"web","namespace":"shop"},"spec":{"ports":[{"name":"http","port":80}]}}"#,
             ),
             "/api/v1/secrets" => list("Secret", "v1", ""),
+            "/apis/gateway.edgerush.dev/v1alpha1/ratelimitpolicies" => {
+                list("RateLimitPolicy", "gateway.edgerush.dev/v1alpha1", "")
+            }
             // The control plane's own Service's endpoints, one not ready, and another
             // Service's, which are not the gateway's.
             "/apis/discovery.k8s.io/v1/namespaces/edge/endpointslices" => list(
@@ -330,7 +333,7 @@ async fn each_translation_is_said_and_written_as_a_harness_file() {
     assert_eq!(
         lines[0],
         "waiting to have listed ingressclasses in the cluster, ingresses in the cluster, \
-         services in the cluster, secrets in the cluster"
+         services in the cluster, secrets in the cluster, ratelimitpolicies in the cluster"
     );
     assert!(
         lines.iter().any(|line| line.starts_with(
@@ -1641,6 +1644,9 @@ async fn secured_cluster(certificate: &Certificate) -> Fake {
                 r#"{"metadata":{"name":"web","namespace":"shop"},"spec":{"ports":[{"name":"http","port":80}]}}"#,
             ),
             "/api/v1/secrets" => list("Secret", "v1", &secret),
+            "/apis/gateway.edgerush.dev/v1alpha1/ratelimitpolicies" => {
+                list("RateLimitPolicy", "gateway.edgerush.dev/v1alpha1", "")
+            }
             _ => answer(500, ""),
         }
     })

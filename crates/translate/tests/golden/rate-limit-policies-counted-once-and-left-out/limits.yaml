@@ -1,0 +1,6 @@
+limits:
+  - { name: platform, key: client, model: { bucket: { rate: 100/s, burst: 200 } } }
+  - { name: shared-per-client, key: client, model: { bucket: { rate: 10/s, burst: 10 } } }
+  - { name: gone-per-client, key: client, model: { bucket: { rate: 5/s, burst: 5 } } }
+  - { name: nope-per-client, key: client, model: { bucket: { rate: 5/s, burst: 5 } } }
+  - { name: other-per-client, key: client, model: { bucket: { rate: 5/s, burst: 5 } } }
