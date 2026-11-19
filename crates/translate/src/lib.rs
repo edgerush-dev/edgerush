@@ -38,9 +38,9 @@ use edgerush_certificates::Identity;
 use edgerush_config::{
     Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, Global, GrpcMethod,
     Header, HeaderChanges, Hostname, Limit, Limits, Listener, ListenerCertificate, LoadBalancer,
-    Match, PathMatch, Protocol, Query, RateLimitMode, RateLimiting, Redirect, Route, Rule, Scheme,
-    SharingHostname, SharingListener, StatedNames, TcpRoute, TlsRoute, UdpRoute, Upstream,
-    UpstreamProtocol, UpstreamTls, ValueMatch, WellKnownAuthorities, Wildcard, compile,
+    MOST_LIMITS, Match, PathMatch, Protocol, Query, RateLimitMode, RateLimiting, Redirect, Route,
+    Rule, Scheme, SharingHostname, SharingListener, StatedNames, TcpRoute, TlsRoute, UdpRoute,
+    Upstream, UpstreamProtocol, UpstreamTls, ValueMatch, WellKnownAuthorities, Wildcard, compile,
     is_spiffe_id,
 };
 use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
@@ -449,7 +449,7 @@ impl Problem {
     /// Whether this is a note on what is served as the spec has it, not a fault: said, but
     /// no reason for `validate` to fail (04 §3). A retry's attempts taken as the data
     /// plane's most are one, and a host an Ingress serves over plain HTTP alone served over
-    /// HTTPS by a Gateway listener another.
+    /// HTTPS by a Gateway listener another; so is a rule past half the most limits.
     #[must_use]
     pub fn is_note(&self) -> bool {
         matches!(
@@ -458,6 +458,7 @@ impl Problem {
                 | Self::HostOverTls { .. }
                 | Self::Http3GivenWay { .. }
                 | Self::LastAcceptedApplies(_)
+                | Self::LimitsMany { .. }
         )
     }
 }
@@ -955,9 +956,9 @@ pub enum Problem {
     /// said apart.
     #[error("its version last accepted applies instead (generation {})", .0.map_or_else(|| "unknown".to_owned(), |generation| generation.to_string()))]
     LastAcceptedApplies(Option<i64>),
-    /// A RateLimitPolicy refused as a rule it reaches would be under more limits than the
-    /// data plane takes: of the policies that would put it over, the changes are refused
-    /// first, then the rest, the youngest first (04 §4).
+    /// A RateLimitPolicy's change refused as a rule it reaches would be under more limits
+    /// than the data plane takes: of the changes that would put it over, the youngest first
+    /// (04 §4).
     #[error(
         "the data plane would refuse it: rule {rule} of route {route} would be under {count} \
          limits, more than the {} a rule takes",
@@ -969,6 +970,20 @@ pub enum Problem {
         /// The rule's position among the route's.
         rule: usize,
         /// How many limits it would be under.
+        count: usize,
+    },
+    /// A rule under more than half the most limits a rule takes: a note, so that one coming
+    /// to the most is seen before a change takes it over and the config is refused (04 §4).
+    #[error(
+        "rule {rule} of route {route} is under {count} limits; past {} the config is refused",
+        edgerush_config::MOST_LIMITS
+    )]
+    LimitsMany {
+        /// The route, as the config names it.
+        route: String,
+        /// The rule's position among the route's.
+        rule: usize,
+        /// How many limits it is under.
         count: usize,
     },
     /// A TLSRoute's hostname on a data-plane listener that an earlier TLSRoute has there
@@ -1088,10 +1103,11 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
 /// them: each still there keeps the names of its limits, and applies that version where its
 /// spec is now refused (04 §4).
 ///
-/// A rule under more limits than the data plane takes refuses policies that reach it until
-/// it is not, the changes first, then the rest, the youngest first; each pass translates
-/// again with those refused. A refused change applies its version last accepted, and that
-/// is refused too where the rule is still over.
+/// A rule under more limits than the data plane takes refuses the changes of the policies
+/// that reach it until it is not, the youngest first, each pass translating again with
+/// those refused, a refused change applying its version last accepted. A rule still over
+/// with no change left to refuse, as a route's change brings it under more policies, is
+/// left so, and the config is refused whole (Lucas); one past half the most is noted.
 #[must_use]
 pub fn translate_from(
     plane: &Plane,
@@ -1099,9 +1115,9 @@ pub fn translate_from(
     accepted: &[AcceptedPolicy],
 ) -> Translation {
     let mut forced = rate_limits::Forced::new();
-    // Each pass refuses one more version of a policy or none, and then is the last: two a
-    // policy at most, and one more to translate with them all refused.
-    for _ in 0..2 * cluster.rate_limit_policies.len() {
+    // Each pass refuses the change of a policy more or is the last: one a policy at most,
+    // and one more to translate with them all refused.
+    for _ in 0..cluster.rate_limit_policies.len() {
         let translation = translated(plane, cluster, accepted, &forced);
         let applied = &translation.rate_limit_policies;
         if !rate_limits::refuse_overfull(&translation.config, applied, accepted, &mut forced) {
@@ -1612,6 +1628,25 @@ fn translated(
         }
     }
     ranked.sort_by(|a, b| a.rank.cmp(&b.rank));
+    // A rule past half the most limits is noted, so that one coming to the most is seen
+    // before a change takes it over and the config is refused (04 §4).
+    for ranked in &ranked {
+        for route in &ranked.routes {
+            for (at, rule) in route.rules.iter().enumerate() {
+                let count = rule.rate_limits.len();
+                if count > MOST_LIMITS / 2 && count <= MOST_LIMITS {
+                    report.push(Finding {
+                        object: ranked.object.clone(),
+                        problem: Problem::LimitsMany {
+                            route: route.name.clone(),
+                            rule: at,
+                            count,
+                        },
+                    });
+                }
+            }
+        }
+    }
     let (mut routes, shadowed) = in_order(ranked);
     // Each attached TLSRoute's passthrough routes, oldest first, then by namespace and
     // name: of two on one listener whose hostnames are the same, the first takes it, as
