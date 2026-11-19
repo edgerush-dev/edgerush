@@ -81,7 +81,7 @@ pub use gateway::{
     SetOutcome,
 };
 pub use http_route::{Attachment, NotAttached, ParentOutcome, RouteOutcome, Taken};
-pub use rate_limits::data_plane_limit;
+pub use rate_limits::{AcceptedPolicy, data_plane_limit};
 pub use status::{
     Condition, GatewayStatus, ListenerSetStatus, ListenerStatus, ParentStatus, PolicyStatus,
     RouteStatus,
@@ -438,6 +438,11 @@ pub struct Translation {
     /// The hosts a claim of one API takes from a claim of the other, which no longer serves
     /// them: said, so that a move from one API to the other meets no surprise (04).
     pub taken: Vec<Taken>,
+    /// The version of each RateLimitPolicy that applies, oldest first, then by namespace and
+    /// name: its spec, or where that is refused, its version last accepted; none for one
+    /// that applies nothing. What [`translate_from`] is to be given next, once the config is
+    /// served (04 §4).
+    pub rate_limit_policies: Vec<AcceptedPolicy>,
 }
 
 impl Problem {
@@ -449,7 +454,10 @@ impl Problem {
     pub fn is_note(&self) -> bool {
         matches!(
             self,
-            Self::RetryCapped { .. } | Self::HostOverTls { .. } | Self::Http3GivenWay { .. }
+            Self::RetryCapped { .. }
+                | Self::HostOverTls { .. }
+                | Self::Http3GivenWay { .. }
+                | Self::LastAcceptedApplies(_)
         )
     }
 }
@@ -932,15 +940,36 @@ pub enum Problem {
     /// connections.
     #[error("the connections it covers fail: {0}")]
     PolicyFailing(String),
-    /// A RateLimitPolicy's limit of a name another limit holds, which comes first: the
-    /// DataPlane's, or an older policy's. The policy applies nothing, as one name is one
-    /// count across the data plane (04 §4).
-    #[error("applies nothing: its limit `{name}` has the name of {}'s, which comes first", held_by(.by))]
+    /// A RateLimitPolicy's spec with a limit of a name another limit holds: the
+    /// DataPlane's, or another policy's. The spec is refused whole, as one name is one count
+    /// across the data plane (04 §4).
+    #[error("refused: its limit `{name}` has the name of {}'s, which holds it", held_by(.by))]
     LimitNameHeld {
         /// The name.
         name: String,
         /// The policy holding it; none for the DataPlane's own.
         by: Option<Object>,
+    },
+    /// A RateLimitPolicy whose spec is refused applies its version last accepted, of this
+    /// generation, instead; one with none applies nothing (04 §4). A note: the refusal is
+    /// said apart.
+    #[error("its version last accepted applies instead (generation {})", .0.map_or_else(|| "unknown".to_owned(), |generation| generation.to_string()))]
+    LastAcceptedApplies(Option<i64>),
+    /// A RateLimitPolicy refused as a rule it reaches would be under more limits than the
+    /// data plane takes: of the policies that would put it over, the changes are refused
+    /// first, then the rest, the youngest first (04 §4).
+    #[error(
+        "the data plane would refuse it: rule {rule} of route {route} would be under {count} \
+         limits, more than the {} a rule takes",
+        edgerush_config::MOST_LIMITS
+    )]
+    LimitsTooMany {
+        /// The route, as the config names it.
+        route: String,
+        /// The rule's position among the route's.
+        rule: usize,
+        /// How many limits it would be under.
+        count: usize,
     },
     /// A TLSRoute's hostname on a data-plane listener that an earlier TLSRoute has there
     /// too: the earlier serves it, as the one rule ranks them (04 §2).
@@ -1046,9 +1075,49 @@ pub enum Problem {
     },
 }
 
-/// Translates `cluster`'s objects into the config of the data plane `plane` describes.
+/// Translates `cluster`'s objects into the config of the data plane `plane` describes, as
+/// for a data plane that serves none yet: no RateLimitPolicy was accepted before, and those
+/// whose limits' names clash go by age (04 §4).
 #[must_use]
 pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
+    translate_from(plane, cluster, &[])
+}
+
+/// Translates as [`translate`] does, for a data plane served the config in which `accepted`
+/// are the versions of RateLimitPolicies that applied, as the last translation served gave
+/// them: each still there keeps the names of its limits, and applies that version where its
+/// spec is now refused (04 §4).
+///
+/// A rule under more limits than the data plane takes refuses policies that reach it until
+/// it is not, the changes first, then the rest, the youngest first; each pass translates
+/// again with those refused. A refused change applies its version last accepted, and that
+/// is refused too where the rule is still over.
+#[must_use]
+pub fn translate_from(
+    plane: &Plane,
+    cluster: &Cluster,
+    accepted: &[AcceptedPolicy],
+) -> Translation {
+    let mut forced = rate_limits::Forced::new();
+    // Each pass refuses one more version of a policy or none, and then is the last: two a
+    // policy at most, and one more to translate with them all refused.
+    for _ in 0..2 * cluster.rate_limit_policies.len() {
+        let translation = translated(plane, cluster, accepted, &forced);
+        let applied = &translation.rate_limit_policies;
+        if !rate_limits::refuse_overfull(&translation.config, applied, accepted, &mut forced) {
+            return translation;
+        }
+    }
+    translated(plane, cluster, accepted, &forced)
+}
+
+/// One pass of [`translate_from`], the policies `forced` names refused as it says.
+fn translated(
+    plane: &Plane,
+    cluster: &Cluster,
+    accepted: &[AcceptedPolicy],
+    forced: &rate_limits::Forced,
+) -> Translation {
     let mut report = Vec::new();
     let gateway = gateway::outcome(plane, cluster, &mut report);
     let (http_routes, grpc_routes, tls_routes, tcp_routes, udp_routes) = gateway
@@ -1114,7 +1183,14 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
     }
     // The DataPlane's limits and each RateLimitPolicy's, every rule's whole list gathered
     // from them as its route is translated (04 §4).
-    let rate_limits = rate_limits::RateLimits::of(plane, cluster, gateway.as_ref(), &mut report);
+    let rate_limits = rate_limits::RateLimits::of(
+        plane,
+        cluster,
+        accepted,
+        forced,
+        gateway.as_ref(),
+        &mut report,
+    );
     // An Ingress is the data plane's when its class is, and its class is when the
     // IngressClass of that name names this controller; one of no class is when that class
     // is the cluster's default.
@@ -1971,6 +2047,7 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
         route_statuses,
         policy_statuses,
         taken,
+        rate_limit_policies: rate_limits.accepted,
     }
 }
 

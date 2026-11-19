@@ -39,8 +39,8 @@ use edgerush_planes::objects::{
 };
 use edgerush_planes::rate_limit_policy::RateLimitPolicy;
 use edgerush_translate::{
-    Cluster, GATEWAY_CONTROLLER, GatewayStatus, Object, Plane, PolicyStatus, RouteStatus,
-    Translation, translate,
+    AcceptedPolicy, Cluster, GATEWAY_CONTROLLER, GatewayStatus, Object, Plane, PolicyStatus,
+    Problem, RouteStatus, Translation, translate_from,
 };
 use gateway_status::Programmed;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
@@ -49,6 +49,7 @@ use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -208,6 +209,15 @@ pub enum Said<'a> {
         translation: &'a Translation,
         /// Why the data plane would refuse it.
         problems: &'a [ConfigError],
+    },
+    /// A generation of a data plane's DataPlane held back whole, the generation before
+    /// served until it may be taken on (04 §4). Said once for each reason a generation is
+    /// held back.
+    HeldBack {
+        /// The data plane, as [`Planes`] names it.
+        data_plane: &'a str,
+        /// Why.
+        why: &'a HeldBack,
     },
     /// The status of a Gateway API object written, as the config handed on serves it; or
     /// why it could not be, to be written again at the next change.
@@ -382,6 +392,12 @@ impl Shape {
 /// on and written for it, each apart from every other data plane's.
 struct Serving {
     settings: Settings,
+    /// Its DataPlane as it now is, where that generation adds limits to its `global` and is
+    /// not taken on yet: each translation judges whether it may be, and `settings` stay
+    /// until it is (04 §4).
+    wanted: Option<Settings>,
+    /// Why `wanted` was last said to be held back, so that each reason is said once.
+    said_held: Option<HeldBack>,
     translator: Translator,
     /// What the config handed on serves: the Ingresses claimed, and those served.
     handed: Option<(Vec<Object>, Vec<Object>)>,
@@ -396,10 +412,50 @@ struct Serving {
     written: Written,
 }
 
+/// Why a generation of a DataPlane is held back whole, the one before served (04 §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeldBack {
+    /// A limit of its `global` has a name a RateLimitPolicy holds in the config last handed
+    /// on.
+    NameHeld {
+        /// The limit's name.
+        limit: String,
+        /// The policy holding it.
+        by: Object,
+    },
+    /// Its `global` would put a rule over the most limits a rule takes, and so refuse this
+    /// RateLimitPolicy, which the generation before does not.
+    TooManyLimits {
+        /// The policy it would refuse.
+        refusing: Object,
+    },
+}
+
+impl fmt::Display for HeldBack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NameHeld { limit, by } => {
+                write!(
+                    f,
+                    "its global limit `{limit}` has the name of {by}'s, which holds it"
+                )
+            }
+            Self::TooManyLimits { refusing } => write!(
+                f,
+                "its global limits would put a rule over the {} limits a rule takes, refusing \
+                 {refusing}",
+                edgerush_config::MOST_LIMITS
+            ),
+        }
+    }
+}
+
 impl Serving {
     fn new(settings: Settings) -> Self {
         Self {
             settings,
+            wanted: None,
+            said_held: None,
             translator: Translator::default(),
             handed: None,
             handed_api: None,
@@ -408,12 +464,74 @@ impl Serving {
             written: Written::default(),
         }
     }
+
+    /// Takes on `settings`, its DataPlane as it now is, unless they add a limit to its
+    /// `global`: then they are judged as the objects are translated ([`Self::judge`]), and
+    /// the settings served stay until they are taken on.
+    fn offer(&mut self, settings: &Settings) {
+        if !adds_limits(&self.settings.plane, &settings.plane) {
+            self.settings.clone_from(settings);
+            self.wanted = None;
+            self.said_held = None;
+        } else if self.wanted.as_ref() != Some(settings) {
+            self.wanted = Some(settings.clone());
+            self.said_held = None;
+        }
+    }
+
+    /// Why `wanted` is held back, translated from `cluster` beside the settings served; none
+    /// where it may be taken on: its `global` takes no name a policy holds, and refuses for
+    /// putting a rule over the most limits no policy that the settings served do not.
+    /// `cluster` is what is followed for the settings served: a generation that would have
+    /// more followed, a Gateway's kinds say, is judged without them, and a rule they bring
+    /// over once it is taken on refuses policies as a route's change does.
+    fn judge(&self, wanted: &Settings, cluster: &Cluster) -> Option<HeldBack> {
+        if let Some((limit, by)) = self.translator.held_by_policy(&wanted.plane) {
+            return Some(HeldBack::NameHeld { limit, by });
+        }
+        let refused = |plane: &Plane| -> BTreeSet<Object> {
+            translate_from(plane, cluster, &self.translator.accepted)
+                .report
+                .into_iter()
+                .filter(|finding| matches!(finding.problem, Problem::LimitsTooMany { .. }))
+                .map(|finding| finding.object)
+                .collect()
+        };
+        let before = refused(&self.settings.plane);
+        refused(&wanted.plane)
+            .into_iter()
+            .find(|policy| !before.contains(policy))
+            .map(|refusing| HeldBack::TooManyLimits { refusing })
+    }
+}
+
+/// Whether `now`'s global limits have a name `before`'s do not: a generation that could put
+/// a rule over the most limits, or take a name a policy holds.
+fn adds_limits(before: &Plane, now: &Plane) -> bool {
+    let names = |plane: &Plane| -> BTreeSet<String> {
+        plane
+            .rate_limiting
+            .iter()
+            .flat_map(|limiting| &limiting.global)
+            .map(|limit| limit.name.clone())
+            .collect()
+    };
+    !names(now).is_subset(&names(before))
+}
+
+/// The settings each data plane is served with: its DataPlane's, or where a generation of
+/// it is not taken on yet, the one before.
+fn served_planes(serving: &BTreeMap<String, Serving>) -> Planes {
+    serving
+        .iter()
+        .map(|(name, served)| (name.clone(), served.settings.clone()))
+        .collect()
 }
 
 /// Each data plane served, as `planes` now has them: one of the same ID as before taken
-/// on with its new settings, what was handed for it kept to be bettered, and one of
-/// another ID, or new, begun afresh, so that what is translated for one data plane is
-/// never handed to another.
+/// on with its new settings, or offered them where they add global limits, what was handed
+/// for it kept to be bettered, and one of another ID, or new, begun afresh, so that what is
+/// translated for one data plane is never handed to another.
 fn served_now(serving: &mut BTreeMap<String, Serving>, planes: &Planes) {
     serving.retain(|name, served| {
         planes
@@ -422,7 +540,7 @@ fn served_now(serving: &mut BTreeMap<String, Serving>, planes: &Planes) {
     });
     for (name, settings) in planes {
         match serving.get_mut(name) {
-            Some(served) => served.settings.clone_from(settings),
+            Some(served) => served.offer(settings),
             None => {
                 serving.insert(name.clone(), Serving::new(settings.clone()));
             }
@@ -531,14 +649,22 @@ async fn serve(
     let mut waiting = Waiting::default();
     // The follows last said to be waited on.
     let mut said_unlisted: Option<Vec<String>> = None;
+    // A generation of a DataPlane taken on last round, after it was judged.
+    let mut taken_on = false;
     loop {
-        // New settings: what they alone need followed started, what none needs any more
-        // stopped, the rest followed on. A sender gone leaves them as they were.
+        // New settings, or a generation taken on: what those served alone need followed
+        // started, what none needs any more stopped, the rest followed on. A sender gone
+        // leaves them as they were.
+        let mut reshaped = std::mem::take(&mut taken_on);
         if planes.has_changed().unwrap_or(false) {
             let now = planes.borrow_and_update().clone();
             if now.is_empty() && classes.is_none() {
                 return;
             }
+            served_now(&mut serving, &now);
+            reshaped = true;
+        }
+        if reshaped {
             let mut start = Start {
                 tasks: &mut tasks,
                 api,
@@ -546,8 +672,7 @@ async fn serve(
                 said,
                 joining: followed.joining.clone(),
             };
-            followed.reshape(Shape::of(&now), &mut start);
-            served_now(&mut serving, &now);
+            followed.reshape(Shape::of(&served_planes(&serving)), &mut start);
         }
         // The namespaces of a selector, followed as they come to match and stop.
         if let Some(matching) = followed.matching() {
@@ -610,6 +735,30 @@ async fn serve(
             }
             let cluster =
                 cluster.get_or_insert_with(|| of_control_plane(followed.cluster(), classes));
+            // A generation that adds global limits, judged against the objects as they are:
+            // taken on, and translated next round once what it needs is followed; or held
+            // back, which is said, the settings served translated meanwhile (04 §4).
+            if let Some(wanted) = served.wanted.clone() {
+                match served.judge(&wanted, cluster) {
+                    None => {
+                        served.settings = wanted;
+                        served.wanted = None;
+                        served.said_held = None;
+                        taken_on = true;
+                        changed.notify_one();
+                        continue;
+                    }
+                    Some(why) => {
+                        if served.said_held.as_ref() != Some(&why) {
+                            said(Said::HeldBack {
+                                data_plane: name,
+                                why: &why,
+                            });
+                            served.said_held = Some(why);
+                        }
+                    }
+                }
+            }
             match served.translator.step(&served.settings.plane, cluster) {
                 Step::Nothing => {}
                 Step::Translated(translation) => {
@@ -630,6 +779,11 @@ async fn serve(
                         translation,
                         id: served.settings.plane.id.as_deref(),
                     });
+                    // What its policies hold changed: a generation held back is judged
+                    // again.
+                    if served.wanted.is_some() {
+                        changed.notify_one();
+                    }
                 }
                 Step::Refused {
                     translation,
@@ -2049,11 +2203,16 @@ fn wait_said(said: &mut Option<Vec<String>>, unlisted: Vec<String>) -> Option<&[
     Some(said.insert(unlisted))
 }
 
-/// What was last translated for a data plane, so that nothing is said twice.
+/// What was last translated for a data plane, so that nothing is said twice, and what of
+/// the RateLimitPolicies its config served applied.
 #[derive(Debug, Default)]
 struct Translator {
     /// The last translation said, handed on or refused.
     last: Option<Translation>,
+    /// The version of each RateLimitPolicy that applied in the last config handed on: each
+    /// holds its limits' names, and applies where a later spec is refused (04 §4). Kept in
+    /// memory alone, so lost on a restart (docs/12 item 33).
+    accepted: Vec<AcceptedPolicy>,
 }
 
 /// What there is to say of the objects followed, for a data plane.
@@ -2071,21 +2230,53 @@ enum Step<'a> {
 }
 
 impl Translator {
-    /// Translates for `plane` the objects of `cluster`.
+    /// Translates for `plane` the objects of `cluster`, from what the last config handed on
+    /// applied of their RateLimitPolicies; a translation that compiles is handed on, and
+    /// what it applies of them is what the next translates from.
     fn step(&mut self, plane: &Plane, cluster: &Cluster) -> Step<'_> {
-        let translation = translate(plane, cluster);
+        let translation = translate_from(plane, cluster, &self.accepted);
         if self.last.as_ref() == Some(&translation) {
             return Step::Nothing;
         }
         let refused = compile(&translation.config).err();
         let translation = self.last.insert(translation);
         match refused {
-            None => Step::Translated(translation),
+            None => {
+                self.accepted.clone_from(&translation.rate_limit_policies);
+                Step::Translated(translation)
+            }
             Some(problems) => Step::Refused {
                 translation,
                 problems,
             },
         }
+    }
+
+    /// A limit of `plane`'s `global` of a name a RateLimitPolicy holds in the last config
+    /// handed on, and that policy, where there is one: a generation of its DataPlane that
+    /// brings it is held back (04 §4).
+    fn held_by_policy(&self, plane: &Plane) -> Option<(String, Object)> {
+        let global = &plane.rate_limiting.as_ref()?.global;
+        global.iter().find_map(|limit| {
+            self.accepted
+                .iter()
+                .find(|policy| {
+                    policy
+                        .spec
+                        .limits
+                        .iter()
+                        .flatten()
+                        .any(|own| own.name == limit.name)
+                })
+                .map(|policy| {
+                    let by = Object {
+                        kind: "RateLimitPolicy",
+                        namespace: policy.namespace.clone(),
+                        name: policy.name.clone(),
+                    };
+                    (limit.name.clone(), by)
+                })
+        })
     }
 }
 

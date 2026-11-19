@@ -1,0 +1,65 @@
+# Each policy judged alone, as an edit of it is, against the names the others hold. An edit
+# the data plane would refuse leaves its version last accepted applying; a new policy it
+# would refuse applies nothing. An older policy edited to take a name a younger one holds is
+# refused, and applies its version last accepted: the younger keeps the name, untouched.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: a, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [a.example.com]
+  rules: [{ name: main, backendRefs: [{ name: web, port: 80 }] }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata:
+  { name: edited, namespace: shop, uid: edited-1, generation: 2, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }]
+  limits: [{ name: edited-per-client, key: Client, model: { bucket: { rate: 10/fortnight, burst: 10 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata:
+  { name: new-invalid, namespace: shop, uid: new-invalid-1, generation: 1, creationTimestamp: "2026-01-02T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }]
+  limits: [{ name: new-per-client, key: Client, model: { fixedWindow: { limit: 10, window: 1x } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata:
+  { name: older, namespace: shop, uid: older-1, generation: 2, creationTimestamp: "2026-01-03T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }]
+  limits:
+    - { name: older-own, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }
+    - { name: younger-per-client, key: Client, model: { bucket: { rate: 1/s, burst: 1 } } }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata:
+  { name: younger, namespace: shop, uid: younger-1, generation: 1, creationTimestamp: "2026-01-04T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }]
+  limits: [{ name: younger-per-client, key: Client, model: { bucket: { rate: 2/s, burst: 2 } } }]

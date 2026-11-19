@@ -1,0 +1,21 @@
+# The versions that applied in the config last served.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: edited, namespace: shop, uid: edited-1, generation: 1 }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }]
+  limits: [{ name: edited-per-client, key: Client, model: { bucket: { rate: 10/s, burst: 10 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: older, namespace: shop, uid: older-1, generation: 1 }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }]
+  limits: [{ name: older-own, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: younger, namespace: shop, uid: younger-1, generation: 1 }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }]
+  limits: [{ name: younger-per-client, key: Client, model: { bucket: { rate: 2/s, burst: 2 } } }]

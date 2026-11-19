@@ -1756,6 +1756,10 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
             }
             text
         }
+        Said::HeldBack { data_plane, why } => format!(
+            "{}its DataPlane as it now is is held back, the generation before served: {why}",
+            of_data_plane(data_plane)
+        ),
     }
 }
 
