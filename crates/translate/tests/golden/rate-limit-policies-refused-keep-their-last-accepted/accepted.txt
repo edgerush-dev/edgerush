@@ -1,0 +1,3 @@
+RateLimitPolicy shop/edited: generation 1
+RateLimitPolicy shop/older: generation 1
+RateLimitPolicy shop/younger: generation 1

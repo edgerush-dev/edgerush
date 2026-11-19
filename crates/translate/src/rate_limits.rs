@@ -9,17 +9,32 @@
 //! name, limits of the levels less specific than its own on the way to the rule, never one
 //! of its level nor of a more specific one; `["*"]` removes them all.
 //!
-//! Every policy is taken as valid but for what the data plane could not run: a limit it
-//! would refuse, or a name another limit already holds, the DataPlane's or an older
-//! policy's, which would make two counts one. Such a policy is left out whole, and said.
+//! **A policy the data plane cannot serve is refused, and what was there before stays**
+//! (04 §4): its spec is judged alone, compiled in the data plane's mode, so that a limit the
+//! data plane would refuse, or whose model its mode does not run, refuses it; and so does a
+//! limit of a name another limit holds, the DataPlane's or another policy's, which would
+//! make two counts one. Refused, a policy applies its version last accepted, judged
+//! likewise, or nothing; a refusal is said.
+//!
+//! **The incumbent keeps a name.** A policy holds the names of the version it applied in the
+//! config last served, so the change that brings a clash is the one refused, whichever
+//! policy is older. Each policy is judged against what the others hold, then the others
+//! again against what it now applies, until nothing changes: a name one policy lets go of
+//! is free for another in the same translation, whichever is judged first. Where neither
+//! held it, as after a restart, the older takes it, then by namespace and name.
 
 use crate::gateway::GatewayOutcome;
 use crate::http_route::Attachment;
-use crate::{Cluster, Finding, Object, Plane, Problem, namespace};
-use edgerush_config::{Bucket, Limit, LimitMatch, Model, Rolling, Window};
+use crate::{Cluster, Finding, Object, Plane, PlaneRateLimiting, Problem, config_of, namespace};
+use edgerush_config::{
+    Bucket, Config, Global, Limit, LimitMatch, Limits, Model, Rolling, Window, compile,
+};
 use edgerush_planes::data_plane::DataPlaneRateLimitingGlobal;
-use edgerush_planes::rate_limit_policy::{RateLimitPolicy, RateLimitPolicyLimits};
-use std::collections::BTreeSet;
+use edgerush_planes::rate_limit_policy::{
+    RateLimitPolicy, RateLimitPolicyLimits, RateLimitPolicySpec,
+};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The API group of the Gateway API's kinds.
 const GATEWAY_GROUP: &str = "gateway.networking.k8s.io";
@@ -103,6 +118,202 @@ fn number<T: TryFrom<i64>>(value: i64) -> Option<T> {
     T::try_from(value).ok()
 }
 
+/// A version of a RateLimitPolicy that applied: what a later translation needs of it, to
+/// know the names it holds and to apply it where the policy's spec is refused (04 §4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcceptedPolicy {
+    /// The policy's namespace.
+    pub namespace: String,
+    /// The policy's name.
+    pub name: String,
+    /// The policy's UID: a policy made again under the same name is another, and holds
+    /// nothing of the one before.
+    pub uid: Option<String>,
+    /// The generation of the spec.
+    pub generation: Option<i64>,
+    /// The spec.
+    pub spec: RateLimitPolicySpec,
+}
+
+// A spec holds strings, integers and booleans alone, each equal to itself.
+impl Eq for AcceptedPolicy {}
+
+impl AcceptedPolicy {
+    /// `policy`'s spec as it is now.
+    #[must_use]
+    pub fn of(policy: &RateLimitPolicy) -> Self {
+        let metadata = &policy.metadata;
+        Self {
+            namespace: namespace(metadata).to_owned(),
+            name: metadata.name.clone().unwrap_or_default(),
+            uid: metadata.uid.clone(),
+            generation: metadata.generation,
+            spec: policy.spec.clone(),
+        }
+    }
+
+    /// Whether this is a version of `policy`.
+    fn is_of(&self, policy: &RateLimitPolicy) -> bool {
+        let metadata = &policy.metadata;
+        self.namespace == namespace(metadata)
+            && Some(&self.name) == metadata.name.as_ref()
+            && self.uid == metadata.uid
+    }
+}
+
+/// The limits of a policy's spec, as the limits file writes them, if the data plane, in its
+/// mode, would take them; or why not, as compiling them says it.
+fn limits_of(
+    limiting: &PlaneRateLimiting,
+    spec: &RateLimitPolicySpec,
+) -> Result<Vec<Limit>, String> {
+    let limits = spec
+        .limits
+        .iter()
+        .flatten()
+        .map(|limit| {
+            policy_limit(limit)
+                .map_err(|(field, why)| format!("limits[{}].{field}: {why}", limit.name))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let alone = Config {
+        rate_limiting: Some(limiting.written()),
+        limits: Some(Limits {
+            global: Global::default(),
+            limits: limits.clone(),
+        }),
+        ..config_of(
+            BTreeMap::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+    };
+    compile(&alone).map_err(|problems| {
+        problems
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    })?;
+    Ok(limits)
+}
+
+/// Which version of a policy applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Applied {
+    /// Its spec.
+    Spec,
+    /// Its version last accepted.
+    Last,
+    /// None: it applies nothing.
+    Nothing,
+}
+
+/// A policy, its spec and its version last accepted, where that is another, each with its
+/// limits or why the data plane would refuse them.
+struct Judged<'a> {
+    policy: &'a RateLimitPolicy,
+    object: Object,
+    spec: Result<Vec<Limit>, String>,
+    last: Option<(&'a AcceptedPolicy, Result<Vec<Limit>, String>)>,
+}
+
+impl Judged<'_> {
+    /// The limits of the version `applied`: none where it applies none.
+    fn limits(&self, applied: Applied) -> &[Limit] {
+        let limits = match applied {
+            Applied::Spec => Some(&self.spec),
+            Applied::Last => self.last.as_ref().map(|(_, limits)| limits),
+            Applied::Nothing => None,
+        };
+        limits
+            .and_then(|limits| limits.as_deref().ok())
+            .unwrap_or_default()
+    }
+
+    /// The spec of the version `applied`, where it applies one.
+    fn spec(&self, applied: Applied) -> Option<&RateLimitPolicySpec> {
+        match applied {
+            Applied::Spec => Some(&self.policy.spec),
+            Applied::Last => self.last.as_ref().map(|(last, _)| &last.spec),
+            Applied::Nothing => None,
+        }
+    }
+}
+
+/// Which version of each of `judged` applies, given that each held what `before` says, and
+/// what keeps a spec from applying: each judged in turn against the DataPlane's names,
+/// `global`, and the versions the others hold, those judged before it in this round by what
+/// they now apply.
+fn round(
+    judged: &[Judged<'_>],
+    global: &[String],
+    before: &[Applied],
+) -> (Vec<Applied>, Vec<Finding>) {
+    let mut now: Vec<Applied> = Vec::with_capacity(judged.len());
+    let mut findings = Vec::new();
+    for (at, policy) in judged.iter().enumerate() {
+        let applied = {
+            let holder = |name: &str| -> Option<Option<Object>> {
+                if global.iter().any(|held| held == name) {
+                    return Some(None);
+                }
+                judged.iter().enumerate().find_map(|(other, judged)| {
+                    let applied = match other.cmp(&at) {
+                        Ordering::Less => now[other],
+                        Ordering::Equal => return None,
+                        Ordering::Greater => before[other],
+                    };
+                    let holds = judged
+                        .limits(applied)
+                        .iter()
+                        .any(|limit| limit.name == name);
+                    holds.then(|| Some(judged.object.clone()))
+                })
+            };
+            let takes = |limits: &Result<Vec<Limit>, String>| -> Result<(), Problem> {
+                let limits = limits
+                    .as_ref()
+                    .map_err(|why| Problem::Refused(why.clone()))?;
+                for limit in limits {
+                    if let Some(by) = holder(&limit.name) {
+                        return Err(Problem::LimitNameHeld {
+                            name: limit.name.clone(),
+                            by,
+                        });
+                    }
+                }
+                Ok(())
+            };
+            match takes(&policy.spec) {
+                Ok(()) => Applied::Spec,
+                Err(problem) => {
+                    findings.push(Finding {
+                        object: policy.object.clone(),
+                        problem,
+                    });
+                    match &policy.last {
+                        Some((version, last)) if takes(last).is_ok() => {
+                            findings.push(Finding {
+                                object: policy.object.clone(),
+                                problem: Problem::LastAcceptedApplies(version.generation),
+                            });
+                            Applied::Last
+                        }
+                        _ => Applied::Nothing,
+                    }
+                }
+            }
+        };
+        now.push(applied);
+    }
+    (now, findings)
+}
+
 /// What a policy's `ignore` removes.
 #[derive(Debug)]
 enum Ignore {
@@ -173,25 +384,42 @@ pub(crate) struct RateLimits {
     taken: Vec<Taken>,
     /// Every limit: the DataPlane's, then each policy's taken, in the order they rank.
     pub(crate) limits: Vec<Limit>,
+    /// The version of each policy that applies, in the order they rank.
+    pub(crate) accepted: Vec<AcceptedPolicy>,
 }
 
 impl RateLimits {
     /// The DataPlane's limits and every RateLimitPolicy's, oldest first, then by namespace
-    /// and name, each taken unless the data plane could not run it, which is said in
+    /// and name: each policy's spec unless it is refused, and then its version in
+    /// `accepted`, the last accepted, unless that is refused too; each refusal said in
     /// `report`.
     pub(crate) fn of(
         plane: &Plane,
         cluster: &Cluster,
+        accepted: &[AcceptedPolicy],
         gateway: Option<&GatewayOutcome>,
         report: &mut Vec<Finding>,
     ) -> Self {
         let Some(limiting) = &plane.rate_limiting else {
-            return Self::default();
+            // Nothing is judged where nothing limits: each policy keeps what it held.
+            return Self {
+                accepted: accepted
+                    .iter()
+                    .filter(|last| {
+                        cluster
+                            .rate_limit_policies
+                            .iter()
+                            .any(|policy| last.is_of(policy))
+                    })
+                    .cloned()
+                    .collect(),
+                ..Self::default()
+            };
         };
-        let mut limits = limiting.global.clone();
-        let mut held: Vec<(String, Option<Object>)> = limits
+        let global: Vec<String> = limiting
+            .global
             .iter()
-            .map(|limit| (limit.name.clone(), None))
+            .map(|limit| limit.name.clone())
             .collect();
         let mut policies: Vec<&RateLimitPolicy> = cluster.rate_limit_policies.iter().collect();
         policies.sort_by_key(|policy| {
@@ -202,44 +430,55 @@ impl RateLimits {
                 metadata.name.clone(),
             )
         });
-        let mut taken = Vec::new();
-        'policies: for policy in policies {
-            let object = Object::of("RateLimitPolicy", &policy.metadata);
-            let spec = &policy.spec;
-            let mut own = Vec::new();
-            for limit in spec.limits.iter().flatten() {
-                let read = match policy_limit(limit) {
-                    Ok(read) => read,
-                    Err((field, why)) => {
-                        report.push(Finding {
-                            object,
-                            problem: Problem::Refused(format!(
-                                "limits[{}].{field}: {why}",
-                                limit.name
-                            )),
-                        });
-                        continue 'policies;
-                    }
-                };
-                if let Some((_, by)) = held.iter().find(|(name, _)| *name == read.name) {
-                    report.push(Finding {
-                        problem: Problem::LimitNameHeld {
-                            name: read.name,
-                            by: by.clone(),
-                        },
-                        object,
-                    });
-                    continue 'policies;
+        let mut before = Vec::with_capacity(policies.len());
+        let judged: Vec<Judged<'_>> = policies
+            .into_iter()
+            .map(|policy| {
+                let last = accepted.iter().find(|last| last.is_of(policy));
+                before.push(match last {
+                    None => Applied::Nothing,
+                    Some(last) if last.spec == policy.spec => Applied::Spec,
+                    Some(_) => Applied::Last,
+                });
+                Judged {
+                    policy,
+                    object: Object::of("RateLimitPolicy", &policy.metadata),
+                    spec: limits_of(limiting, &policy.spec),
+                    last: last
+                        .filter(|last| last.spec != policy.spec)
+                        .map(|last| (last, limits_of(limiting, &last.spec))),
                 }
-                own.push(read);
+            })
+            .collect();
+        // A policy that applies its spec in one round does in every later one, so the rounds
+        // settle within one a policy; the bound is for certainty.
+        let mut applied = before;
+        let mut rounds = 0;
+        let findings = loop {
+            let (now, findings) = round(&judged, &global, &applied);
+            rounds += 1;
+            let settled = now == applied;
+            applied = now;
+            if settled || rounds > judged.len() {
+                break findings;
             }
-            held.extend(
-                own.iter()
-                    .map(|limit| (limit.name.clone(), Some(object.clone()))),
-            );
+        };
+        report.extend(findings);
+        let mut limits = limiting.global.clone();
+        let mut taken = Vec::new();
+        let mut kept = Vec::new();
+        for (policy, applied) in judged.iter().zip(applied) {
+            let Some(spec) = policy.spec(applied) else {
+                continue;
+            };
+            kept.push(match (applied, &policy.last) {
+                (Applied::Last, Some((last, _))) => (*last).clone(),
+                _ => AcceptedPolicy::of(policy.policy),
+            });
+            let own = policy.limits(applied);
             let ignore = spec.ignore.as_deref().unwrap_or_default();
             taken.push(Taken {
-                namespace: object.namespace.clone(),
+                namespace: policy.object.namespace.clone(),
                 targets: spec
                     .target_refs
                     .iter()
@@ -257,17 +496,14 @@ impl RateLimits {
                     Ignore::Names(ignore.iter().cloned().collect())
                 },
             });
-            limits.extend(own);
+            limits.extend(own.iter().cloned());
         }
         Self {
-            global: limiting
-                .global
-                .iter()
-                .map(|limit| limit.name.clone())
-                .collect(),
+            global,
             gateway: gateway.map(|gateway| gateway.gateway.clone()),
             taken,
             limits,
+            accepted: kept,
         }
     }
 
@@ -376,5 +612,181 @@ impl RateLimits {
             .chain(kept.into_iter().rev().flatten())
             .map(str::to_owned)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A data plane limiting locally under one global limit, `platform`.
+    const PLANE: &str = "cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+ingress_https_redirect: true
+ingress_https_redirect_max_age: 30
+rate_limiting:
+  mode: local
+  global: [{ name: platform, key: client, model: { bucket: { rate: 100/s, burst: 100 } } }]
+";
+
+    /// The policy `name` of namespace `shop`, made on day `day` of 2026, at `generation`,
+    /// with a limit of each of `limits`' names.
+    fn policy(name: &str, day: u8, generation: i64, limits: &[&str]) -> RateLimitPolicy {
+        let limits: Vec<String> = limits
+            .iter()
+            .map(|limit| {
+                format!(
+                    "{{ name: {limit}, key: Client, model: {{ bucket: {{ rate: 1/s, burst: 1 }} }} }}"
+                )
+            })
+            .collect();
+        serde_saphyr::from_str(&format!(
+            "metadata:
+  name: {name}
+  namespace: shop
+  uid: {name}-uid
+  generation: {generation}
+  creationTimestamp: \"2026-01-{day:02}T00:00:00Z\"
+spec:
+  targetRefs: [{{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }}]
+  limits: [{}]
+",
+            limits.join(", ")
+        ))
+        .unwrap()
+    }
+
+    /// What applies of `policies` translated for `plane`, `accepted` being the versions
+    /// last accepted: each policy's name and generation applied, in the order they rank,
+    /// every limit's name, and the report.
+    fn judged(
+        plane: &str,
+        policies: &[RateLimitPolicy],
+        accepted: &[&RateLimitPolicy],
+    ) -> (Vec<(String, i64)>, Vec<String>, Vec<String>) {
+        let plane: Plane = serde_saphyr::from_str(plane).unwrap();
+        let cluster = Cluster {
+            rate_limit_policies: policies.to_vec(),
+            ..Cluster::default()
+        };
+        let accepted: Vec<AcceptedPolicy> = accepted
+            .iter()
+            .map(|policy| AcceptedPolicy::of(policy))
+            .collect();
+        let mut report = Vec::new();
+        let limits = RateLimits::of(&plane, &cluster, &accepted, None, &mut report);
+        (
+            limits
+                .accepted
+                .iter()
+                .map(|kept| (kept.name.clone(), kept.generation.unwrap()))
+                .collect(),
+            limits
+                .limits
+                .iter()
+                .map(|limit| limit.name.clone())
+                .collect(),
+            report.iter().map(ToString::to_string).collect(),
+        )
+    }
+
+    /// Names moved along a chain in one change, each to a policy judged before the one
+    /// letting it go: `y` from `r` to `q`, `x` from `q` to `p`. Each is free once the policy
+    /// holding it applies its new spec, so all three apply theirs in the same translation,
+    /// and nothing is refused.
+    #[test]
+    fn names_moved_along_a_chain_settle_in_one_translation() {
+        let before = [
+            policy("p", 1, 1, &["p-own"]),
+            policy("q", 2, 1, &["x"]),
+            policy("r", 3, 1, &["y", "r-own"]),
+        ];
+        let now = [
+            policy("p", 1, 2, &["p-own", "x"]),
+            policy("q", 2, 2, &["y"]),
+            policy("r", 3, 2, &["r-own"]),
+        ];
+        let (applied, limits, report) = judged(PLANE, &now, &before.iter().collect::<Vec<_>>());
+        assert_eq!(report, Vec::<String>::new());
+        assert_eq!(
+            applied,
+            [
+                ("p".to_owned(), 2),
+                ("q".to_owned(), 2),
+                ("r".to_owned(), 2)
+            ]
+        );
+        assert_eq!(limits, ["platform", "p-own", "x", "y", "r-own"]);
+    }
+
+    /// An older policy edited to take a name a younger one holds is refused, and applies its
+    /// version last accepted; the younger keeps the name, untouched. Where neither held it,
+    /// as after a restart, the older takes it.
+    #[test]
+    fn the_incumbent_keeps_its_name_and_age_decides_only_where_none_held_it() {
+        let older = policy("older", 1, 1, &["older-own"]);
+        let younger = policy("younger", 2, 1, &["shared"]);
+        let edited = policy("older", 1, 2, &["older-own", "shared"]);
+        let now = [edited, younger.clone()];
+        let (applied, limits, report) = judged(PLANE, &now, &[&older, &younger]);
+        assert_eq!(
+            report,
+            [
+                "RateLimitPolicy shop/older: refused: its limit `shared` has the name of \
+                 RateLimitPolicy shop/younger's, which holds it",
+                "RateLimitPolicy shop/older: its version last accepted applies instead \
+                 (generation 1)"
+            ]
+        );
+        assert_eq!(
+            applied,
+            [("older".to_owned(), 1), ("younger".to_owned(), 1)]
+        );
+        assert_eq!(limits, ["platform", "older-own", "shared"]);
+        // Afresh, nothing accepted before: the older's spec takes the name, the younger
+        // applies nothing.
+        let (applied, _, report) = judged(PLANE, &now, &[]);
+        assert_eq!(
+            report,
+            [
+                "RateLimitPolicy shop/younger: refused: its limit `shared` has the name of \
+              RateLimitPolicy shop/older's, which holds it"
+            ]
+        );
+        assert_eq!(applied, [("older".to_owned(), 2)]);
+    }
+
+    /// A policy deleted and made again under its name is another, of another UID: it holds
+    /// nothing of the one before, nor applies its version where its own spec is refused.
+    #[test]
+    fn a_policy_made_again_holds_nothing_of_the_one_before() {
+        let gone = policy("remade", 1, 1, &["kept"]);
+        let mut remade = policy("remade", 1, 1, &["kept", "platform"]);
+        remade.metadata.uid = Some("another-uid".to_owned());
+        let (applied, limits, report) = judged(PLANE, &[remade], &[&gone]);
+        assert_eq!(
+            report,
+            [
+                "RateLimitPolicy shop/remade: refused: its limit `platform` has the name of \
+              the DataPlane's, which holds it"
+            ]
+        );
+        assert_eq!(applied, []);
+        assert_eq!(limits, ["platform"]);
+    }
+
+    /// Where the data plane does not limit, nothing is judged and no policy applies, but
+    /// each keeps the version it held, so that what holds a name is the same once it
+    /// limits again; one no longer there is let go of.
+    #[test]
+    fn a_data_plane_not_limiting_keeps_what_each_policy_held() {
+        let plane = PLANE.split("rate_limiting").next().unwrap();
+        let held = policy("held", 1, 1, &["held"]);
+        let gone = policy("gone", 2, 1, &["gone"]);
+        let edited = policy("held", 1, 2, &["held", "more"]);
+        let (applied, limits, report) = judged(plane, &[edited], &[&held, &gone]);
+        assert_eq!(report, Vec::<String>::new());
+        assert_eq!(applied, [("held".to_owned(), 1)]);
+        assert_eq!(limits, Vec::<String>::new());
     }
 }

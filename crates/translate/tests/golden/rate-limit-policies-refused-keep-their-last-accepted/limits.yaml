@@ -1,0 +1,5 @@
+limits:
+  - { name: platform, key: client, model: { bucket: { rate: 100/s, burst: 200 } } }
+  - { name: edited-per-client, key: client, model: { bucket: { rate: 10/s, burst: 10 } } }
+  - { name: older-own, key: client, model: { bucket: { rate: 5/s, burst: 5 } } }
+  - { name: younger-per-client, key: client, model: { bucket: { rate: 2/s, burst: 2 } } }

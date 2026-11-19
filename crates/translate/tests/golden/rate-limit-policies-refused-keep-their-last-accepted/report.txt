@@ -1,0 +1,5 @@
+RateLimitPolicy shop/edited: the data plane would refuse it: limit `edited-per-client`: `model.bucket.rate`: `10/fortnight` is not a rate: a number of at least 1, `/`, and `s`, `min`, `h` or `d`
+RateLimitPolicy shop/edited: its version last accepted applies instead (generation 1)
+RateLimitPolicy shop/new-invalid: the data plane would refuse it: limit `new-per-client`: `model.fixed_window.window`: `1x` is not a window: a whole number of at least 1 and `ms`, `s`, `m`, `h` or `d`, under 213,503 days
+RateLimitPolicy shop/older: refused: its limit `younger-per-client` has the name of RateLimitPolicy shop/younger's, which holds it
+RateLimitPolicy shop/older: its version last accepted applies instead (generation 1)

@@ -3,7 +3,7 @@ use bytes::Bytes;
 use edgerush_kubernetes::Timing;
 use edgerush_kubernetes::testing::{Answer, Fake, answer, token};
 use edgerush_planes::objects::ProxyService;
-use edgerush_translate::GATEWAY_CONTROLLER;
+use edgerush_translate::{GATEWAY_CONTROLLER, translate};
 use k8s_openapi::ByteString;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde::Serialize;
@@ -955,6 +955,91 @@ fn a_translation_of_nothing_routes_nothing() {
         panic!("not translated");
     };
     assert!(translation.config.routes.is_empty());
+}
+
+/// RateLimitPolicy `name` of `shop`, at `generation`, on the Ingress `shop/web`, with a limit
+/// of each of `limits`, written `<name> <rate>`.
+fn rate_limit_policy(name: &str, generation: i64, limits: &[(&str, &str)]) -> RateLimitPolicy {
+    let limits: Vec<String> = limits
+        .iter()
+        .map(|(limit, rate)| {
+            format!("{{ name: {limit}, key: Client, model: {{ bucket: {{ rate: {rate}, burst: 1 }} }} }}")
+        })
+        .collect();
+    serde_saphyr::from_str(&format!(
+        "metadata: {{ name: {name}, namespace: shop, uid: {name}-uid, generation: {generation} }}
+spec:
+  targetRefs: [{{ group: networking.k8s.io, kind: Ingress, name: web }}]
+  limits: [{}]
+",
+        limits.join(", ")
+    ))
+    .unwrap()
+}
+
+/// A RateLimitPolicy's edit refused keeps its version that applied in the last config handed
+/// on applying, translation after translation; a translation the data plane would refuse
+/// whole is no config handed on, and what applied stays what the next translates from. A
+/// translator afresh, as after a restart, has none to apply (docs/12 item 33).
+#[test]
+fn a_policy_refused_applies_what_the_last_config_handed_on_applied() {
+    let plane = plane_with("rate_limiting: { mode: local }");
+    let cluster = |policies: Vec<RateLimitPolicy>| Cluster {
+        ingress_classes: vec![class()],
+        ingresses: vec![ingress("shop", "web", "shop.example")],
+        services: vec![service("shop")],
+        secrets: vec![secret("shop", &["shop.example"])],
+        rate_limit_policies: policies,
+        ..Cluster::default()
+    };
+    let under = |translation: &Translation| -> Vec<String> {
+        translation.config.routes[0].rules[0].rate_limits.clone()
+    };
+    let mut translator = Translator::default();
+    let first = cluster(vec![rate_limit_policy(
+        "shop",
+        1,
+        &[("per-client", "10/s")],
+    )]);
+    let Step::Translated(translation) = translator.step(&plane, &first) else {
+        panic!("not translated");
+    };
+    assert_eq!(under(translation), ["per-client"]);
+    // Its edit renames the limit, and 64 policies more put the rule under 65 limits: the
+    // config is refused, so the edit never applied.
+    let mut crowded = vec![rate_limit_policy("shop", 2, &[("renamed", "10/s")])];
+    crowded.extend(
+        (0..64)
+            .map(|n| rate_limit_policy(&format!("more-{n}"), 1, &[(&format!("more-{n}"), "1/s")])),
+    );
+    let Step::Refused { .. } = translator.step(&plane, &cluster(crowded)) else {
+        panic!("a rule under 65 limits not refused");
+    };
+    // An edit the data plane would refuse: the version of the last config handed on applies.
+    let refused = cluster(vec![rate_limit_policy(
+        "shop",
+        3,
+        &[("per-client", "10/fortnight")],
+    )]);
+    for _ in 0..2 {
+        let Step::Translated(translation) = translator.step(&plane, &refused) else {
+            panic!("not translated");
+        };
+        assert_eq!(under(translation), ["per-client"]);
+        let generations: Vec<Option<i64>> = translation
+            .rate_limit_policies
+            .iter()
+            .map(|applied| applied.generation)
+            .collect();
+        assert_eq!(generations, [Some(1)]);
+        // Translated again, as a change elsewhere would have it.
+        translator.last = None;
+    }
+    let mut afresh = Translator::default();
+    let Step::Translated(translation) = afresh.step(&plane, &refused) else {
+        panic!("not translated");
+    };
+    assert_eq!(under(translation), Vec::<String>::new());
 }
 
 #[test]

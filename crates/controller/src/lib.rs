@@ -39,8 +39,8 @@ use edgerush_planes::objects::{
 };
 use edgerush_planes::rate_limit_policy::RateLimitPolicy;
 use edgerush_translate::{
-    Cluster, GATEWAY_CONTROLLER, GatewayStatus, Object, Plane, PolicyStatus, RouteStatus,
-    Translation, translate,
+    AcceptedPolicy, Cluster, GATEWAY_CONTROLLER, GatewayStatus, Object, Plane, PolicyStatus,
+    RouteStatus, Translation, translate_from,
 };
 use gateway_status::Programmed;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
@@ -2049,11 +2049,16 @@ fn wait_said(said: &mut Option<Vec<String>>, unlisted: Vec<String>) -> Option<&[
     Some(said.insert(unlisted))
 }
 
-/// What was last translated for a data plane, so that nothing is said twice.
+/// What was last translated for a data plane, so that nothing is said twice, and what of
+/// the RateLimitPolicies its config served applied.
 #[derive(Debug, Default)]
 struct Translator {
     /// The last translation said, handed on or refused.
     last: Option<Translation>,
+    /// The version of each RateLimitPolicy that applied in the last config handed on: each
+    /// holds its limits' names, and applies where a later spec is refused (04 §4). Kept in
+    /// memory alone, so lost on a restart (docs/12 item 33).
+    accepted: Vec<AcceptedPolicy>,
 }
 
 /// What there is to say of the objects followed, for a data plane.
@@ -2071,16 +2076,21 @@ enum Step<'a> {
 }
 
 impl Translator {
-    /// Translates for `plane` the objects of `cluster`.
+    /// Translates for `plane` the objects of `cluster`, from what the last config handed on
+    /// applied of their RateLimitPolicies; a translation that compiles is handed on, and
+    /// what it applies of them is what the next translates from.
     fn step(&mut self, plane: &Plane, cluster: &Cluster) -> Step<'_> {
-        let translation = translate(plane, cluster);
+        let translation = translate_from(plane, cluster, &self.accepted);
         if self.last.as_ref() == Some(&translation) {
             return Step::Nothing;
         }
         let refused = compile(&translation.config).err();
         let translation = self.last.insert(translation);
         match refused {
-            None => Step::Translated(translation),
+            None => {
+                self.accepted.clone_from(&translation.rate_limit_policies);
+                Step::Translated(translation)
+            }
             Some(problems) => Step::Refused {
                 translation,
                 problems,

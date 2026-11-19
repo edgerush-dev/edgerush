@@ -1,0 +1,1 @@
+HTTPRoute shop/a: attached to http (a.example.com)

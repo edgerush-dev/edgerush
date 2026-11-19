@@ -16,12 +16,15 @@
 //! a line each (none otherwise); and, where the case says,
 //! `status.txt`, what the
 //! status of that Gateway, each of its listeners, each route's parent of it and each
-//! BackendTLSPolicy of it as an ancestor is to say, a line each. The report's last lines are the hosts a claim of one API takes from the
-//! other's.
+//! BackendTLSPolicy of it as an ancestor is to say, a line each; and, where the case says,
+//! `accepted.txt`, the version of each RateLimitPolicy that applies, a line each. The
+//! report's last lines are the hosts a claim of one API takes from the other's.
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
 //! the control plane's system trusts no authority, unless the case has `system.pem`, the
 //! certificates it does; the objects of `tests/golden/shared.yaml` go with every case's. Every namespace is
-//! watched, unless the case lists those that are in `watched.txt`, a line each.
+//! watched, unless the case lists those that are in `watched.txt`, a line each. No
+//! RateLimitPolicy was accepted before, unless the case has `accepted.yaml`, the versions
+//! that were, written as their manifests are.
 //! Every config translated must also pass the data plane's own `compile`, and, written as
 //! YAML as the control plane writes it, read back the same; and the Ingresses it says it
 //! served must be those its config's routes are of.
@@ -38,7 +41,7 @@ use edgerush_gateway_api::tcp_route::TCPRoute;
 use edgerush_gateway_api::tls_route::TLSRoute;
 use edgerush_gateway_api::udp_route::UDPRoute;
 use edgerush_planes::rate_limit_policy::RateLimitPolicy;
-use edgerush_translate::{Cluster, Plane, translate};
+use edgerush_translate::{AcceptedPolicy, Cluster, Plane, translate_from};
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use serde::Deserialize;
@@ -134,7 +137,34 @@ fn every_case_translates_to_its_config_and_report() {
         if watched.exists() {
             cluster.watched = Some(read(&watched).lines().map(str::to_owned).collect());
         }
-        let translation = translate(&plane, &cluster);
+        let accepted = case.join("accepted.yaml");
+        let accepted: Vec<AcceptedPolicy> = if accepted.exists() {
+            serde_saphyr::from_multiple::<RateLimitPolicy>(&read(&accepted))
+                .unwrap_or_else(|error| panic!("{name}: accepted.yaml: {error}"))
+                .iter()
+                .map(AcceptedPolicy::of)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let translation = translate_from(&plane, &cluster, &accepted);
+        let listed = case.join("accepted.txt");
+        if listed.exists() {
+            let applied: Vec<String> = translation
+                .rate_limit_policies
+                .iter()
+                .map(|applied| {
+                    format!(
+                        "RateLimitPolicy {}/{}: generation {}",
+                        applied.namespace,
+                        applied.name,
+                        applied.generation.unwrap_or_default()
+                    )
+                })
+                .collect();
+            let expected: Vec<String> = read(&listed).lines().map(str::to_owned).collect();
+            assert_eq!(applied, expected, "{name}: the RateLimitPolicies applied");
+        }
         // How many Ingresses were another data plane's, where the case says.
         let passed_over = case.join("passed-over.txt");
         if passed_over.exists() {
