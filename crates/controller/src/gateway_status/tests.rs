@@ -285,6 +285,22 @@ fn the_table_claims_the_gateway_http_extended_features_that_pass() {
     }
 }
 
+#[test]
+fn the_table_claims_the_gateway_grpc_profiles_core_and_grpcroutes_extended_features() {
+    // GATEWAY-GRPC's core and GRPCRoute's two extended features pass every test the suite
+    // has of them (#447); the profile's other extended features are the Gateway's and
+    // BackendTLSPolicy's, claimed or not as GATEWAY-HTTP's run found them.
+    for feature in [
+        "GRPCRoute",
+        "GRPCRouteNamedRouteRule",
+        "GRPCRouteRequestHeaderModifier",
+        "Gateway",
+        "ReferenceGrant",
+    ] {
+        assert!(SUPPORTED_FEATURES.contains(&feature), "{feature}");
+    }
+}
+
 /// What translation says of a Gateway of two listeners, `http` served and `secure` not.
 fn wanted_gateway() -> translate::GatewayStatus {
     translate::GatewayStatus {
