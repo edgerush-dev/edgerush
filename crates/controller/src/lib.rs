@@ -209,6 +209,18 @@ pub enum Said<'a> {
         /// Why the data plane would refuse it.
         problems: &'a [ConfigError],
     },
+    /// A generation of a data plane's DataPlane held back whole: a limit of its
+    /// `rateLimiting.global` has a name a RateLimitPolicy holds in the config last handed
+    /// on, so the generation before is served until the name is free (04 §4). Said once
+    /// for each generation held back.
+    HeldBack {
+        /// The data plane, as [`Planes`] names it.
+        data_plane: &'a str,
+        /// The limit's name.
+        limit: &'a str,
+        /// The policy holding it.
+        by: &'a Object,
+    },
     /// The status of a Gateway API object written, as the config handed on serves it; or
     /// why it could not be, to be written again at the next change.
     GatewayApiStatus {
@@ -382,6 +394,10 @@ impl Shape {
 /// on and written for it, each apart from every other data plane's.
 struct Serving {
     settings: Settings,
+    /// Its DataPlane as it now is, where that generation is held back: a limit of its
+    /// `global` has a name a RateLimitPolicy holds, and `settings` stay until it is free
+    /// (04 §4).
+    wanted: Option<Settings>,
     translator: Translator,
     /// What the config handed on serves: the Ingresses claimed, and those served.
     handed: Option<(Vec<Object>, Vec<Object>)>,
@@ -400,6 +416,7 @@ impl Serving {
     fn new(settings: Settings) -> Self {
         Self {
             settings,
+            wanted: None,
             translator: Translator::default(),
             handed: None,
             handed_api: None,
@@ -408,13 +425,62 @@ impl Serving {
             written: Written::default(),
         }
     }
+
+    /// Takes on `settings`, its DataPlane as it now is, unless that generation is held
+    /// back, a limit of its `global` of a name a RateLimitPolicy holds: then the settings
+    /// served stay, and that limit's name and the policy are given, once for each
+    /// generation held back.
+    fn offer(&mut self, settings: &Settings) -> Option<(String, Object)> {
+        match self.translator.held_by_policy(&settings.plane) {
+            Some(held) => {
+                let new = self.wanted.as_ref() != Some(settings);
+                self.wanted = Some(settings.clone());
+                new.then_some(held)
+            }
+            None => {
+                self.settings.clone_from(settings);
+                self.wanted = None;
+                None
+            }
+        }
+    }
+
+    /// Whether the settings held back hold no name a policy holds any more.
+    fn frees(&self) -> bool {
+        self.wanted
+            .as_ref()
+            .is_some_and(|wanted| self.translator.held_by_policy(&wanted.plane).is_none())
+    }
+
+    /// Takes on the settings held back where their names are free now; whether it did.
+    fn free(&mut self) -> bool {
+        if !self.frees() {
+            return false;
+        }
+        match self.wanted.take() {
+            Some(wanted) => {
+                self.settings = wanted;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The settings each data plane is served with: its DataPlane's, or where a generation of
+/// it is held back, the one before.
+fn served_planes(serving: &BTreeMap<String, Serving>) -> Planes {
+    serving
+        .iter()
+        .map(|(name, served)| (name.clone(), served.settings.clone()))
+        .collect()
 }
 
 /// Each data plane served, as `planes` now has them: one of the same ID as before taken
-/// on with its new settings, what was handed for it kept to be bettered, and one of
-/// another ID, or new, begun afresh, so that what is translated for one data plane is
-/// never handed to another.
-fn served_now(serving: &mut BTreeMap<String, Serving>, planes: &Planes) {
+/// on with its new settings, unless they are held back, which is said, what was handed for
+/// it kept to be bettered, and one of another ID, or new, begun afresh, so that what is
+/// translated for one data plane is never handed to another.
+fn served_now(serving: &mut BTreeMap<String, Serving>, planes: &Planes, said: &dyn Fn(Said<'_>)) {
     serving.retain(|name, served| {
         planes
             .get(name)
@@ -422,7 +488,15 @@ fn served_now(serving: &mut BTreeMap<String, Serving>, planes: &Planes) {
     });
     for (name, settings) in planes {
         match serving.get_mut(name) {
-            Some(served) => served.settings.clone_from(settings),
+            Some(served) => {
+                if let Some((limit, by)) = served.offer(settings) {
+                    said(Said::HeldBack {
+                        data_plane: name,
+                        limit: &limit,
+                        by: &by,
+                    });
+                }
+            }
             None => {
                 serving.insert(name.clone(), Serving::new(settings.clone()));
             }
@@ -527,18 +601,27 @@ async fn serve(
         });
     }
     let mut serving = BTreeMap::new();
-    served_now(&mut serving, &first);
+    served_now(&mut serving, &first, &**said);
     let mut waiting = Waiting::default();
     // The follows last said to be waited on.
     let mut said_unlisted: Option<Vec<String>> = None;
     loop {
-        // New settings: what they alone need followed started, what none needs any more
-        // stopped, the rest followed on. A sender gone leaves them as they were.
+        // New settings, or settings held back whose names are free now: what those served
+        // alone need followed started, what none needs any more stopped, the rest followed
+        // on. A sender gone leaves them as they were.
+        let mut reshaped = false;
         if planes.has_changed().unwrap_or(false) {
             let now = planes.borrow_and_update().clone();
             if now.is_empty() && classes.is_none() {
                 return;
             }
+            served_now(&mut serving, &now, &**said);
+            reshaped = true;
+        }
+        for served in serving.values_mut() {
+            reshaped |= served.free();
+        }
+        if reshaped {
             let mut start = Start {
                 tasks: &mut tasks,
                 api,
@@ -546,8 +629,7 @@ async fn serve(
                 said,
                 joining: followed.joining.clone(),
             };
-            followed.reshape(Shape::of(&now), &mut start);
-            served_now(&mut serving, &now);
+            followed.reshape(Shape::of(&served_planes(&serving)), &mut start);
         }
         // The namespaces of a selector, followed as they come to match and stop.
         if let Some(matching) = followed.matching() {
@@ -640,6 +722,11 @@ async fn serve(
                     problems: &problems,
                 }),
             }
+        }
+        // A config handed on that lets go of a name a DataPlane held back takes is a change:
+        // that generation is taken on at once.
+        if serving.values().any(Serving::frees) {
+            changed.notify_one();
         }
         // Every round, so that a status changed by another, or written in vain, is written
         // again; one at a time, which is all the pace there is. A status written is a change
@@ -2096,6 +2183,33 @@ impl Translator {
                 problems,
             },
         }
+    }
+
+    /// A limit of `plane`'s `global` of a name a RateLimitPolicy holds in the last config
+    /// handed on, and that policy, where there is one: a generation of its DataPlane that
+    /// brings it is held back (04 §4).
+    fn held_by_policy(&self, plane: &Plane) -> Option<(String, Object)> {
+        let global = &plane.rate_limiting.as_ref()?.global;
+        global.iter().find_map(|limit| {
+            self.accepted
+                .iter()
+                .find(|policy| {
+                    policy
+                        .spec
+                        .limits
+                        .iter()
+                        .flatten()
+                        .any(|own| own.name == limit.name)
+                })
+                .map(|policy| {
+                    let by = Object {
+                        kind: "RateLimitPolicy",
+                        namespace: policy.namespace.clone(),
+                        name: policy.name.clone(),
+                    };
+                    (limit.name.clone(), by)
+                })
+        })
     }
 }
 
