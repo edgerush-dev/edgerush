@@ -4,7 +4,8 @@
 # after it took its port, such a listener still counts in what conflicts, so a later HTTP
 # listener there is refused; and the port is not bound, no listener there being accepted.
 # A ListenerSet's listener there is refused alike, told nothing of the Gateway's
-# ConfigMaps, and of the two not there once. A mode other than AllowValidOnly is not served: 10443's listener is refused.
+# ConfigMaps, and of the two not there once. A mode the gateway does not know is not
+# served: 10443's listener is refused.
 # 11443's one ref is of a kind not read, which alone its listener's refs are said to be
 # (InvalidCACertificateKind).
 apiVersion: gateway.networking.k8s.io/v1
@@ -35,7 +36,7 @@ spec:
           tls:
             validation:
               caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
-              mode: AllowInsecureFallback
+              mode: AllowAnything
         - port: 11443
           tls:
             validation:
@@ -47,7 +48,7 @@ spec:
       protocol: HTTPS
       tls: { certificateRefs: [{ name: shop-tls }] }
     - { name: later, port: 9443, protocol: HTTP }
-    - name: fallback
+    - name: unknown
       port: 10443
       protocol: HTTPS
       tls: { certificateRefs: [{ name: shop-tls }] }

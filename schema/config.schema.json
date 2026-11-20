@@ -170,7 +170,7 @@
       ]
     },
     "ClientValidation": {
-      "description": "Whom a listener trusts to vouch for its clients (Gateway API's frontend validation, in\nits default mode: a client without a valid certificate is refused in the handshake).",
+      "description": "Whom a listener trusts to vouch for its clients (Gateway API's frontend validation), and\nwhat becomes of a client they do not vouch for.",
       "type": "object",
       "properties": {
         "authorities": {
@@ -180,11 +180,31 @@
             "type": "string"
           },
           "minItems": 1
+        },
+        "mode": {
+          "description": "Whether a client the authorities do not vouch for is refused, as unsaid.",
+          "$ref": "#/$defs/ClientValidationMode",
+          "default": "allow_valid_only"
         }
       },
       "additionalProperties": false,
       "required": [
         "authorities"
+      ]
+    },
+    "ClientValidationMode": {
+      "description": "What becomes of a client that shows no certificate the authorities vouch for, by Gateway\nAPI's names for the frontend validation's modes.",
+      "oneOf": [
+        {
+          "description": "Refused in the handshake.",
+          "type": "string",
+          "const": "allow_valid_only"
+        },
+        {
+          "description": "Asked for a certificate, and let through whether it shows one or not, and whether\nthe authorities vouch for it or not: authorizing clients is left to the backends.",
+          "type": "string",
+          "const": "allow_insecure_fallback"
+        }
       ]
     },
     "DataPlane": {

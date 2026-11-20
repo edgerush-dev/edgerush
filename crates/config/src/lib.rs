@@ -36,12 +36,12 @@ pub use compile::{
     compile, compile_with_matches, is_dns_name, is_host_name, is_spiffe_id, is_uri,
 };
 pub use config::{
-    AccessLog, Certificate, ClientValidation, Config, DataPlane, Endpoints, Forwarding,
-    HealthCheck, Http3, Keepalive, Listener, ListenerCertificate, ListenerProxyProtocol,
-    LoadBalancer, Probe, Protection, Protocol, ProxyProtocolVersion, RateLimitBreaker,
-    RateLimitMode, RateLimitService, RateLimitServiceTls, RateLimitSynchronous, RateLimiting,
-    RequestId, SharingHostname, SharingListener, SlowStart, StatedNames, Tls, Upstream,
-    UpstreamProtocol, UpstreamTls, VerifiedName, WellKnownAuthorities, WhenUnreachable,
+    AccessLog, Certificate, ClientValidation, ClientValidationMode, Config, DataPlane, Endpoints,
+    Forwarding, HealthCheck, Http3, Keepalive, Listener, ListenerCertificate,
+    ListenerProxyProtocol, LoadBalancer, Probe, Protection, Protocol, ProxyProtocolVersion,
+    RateLimitBreaker, RateLimitMode, RateLimitService, RateLimitServiceTls, RateLimitSynchronous,
+    RateLimiting, RequestId, SharingHostname, SharingListener, SlowStart, StatedNames, Tls,
+    Upstream, UpstreamProtocol, UpstreamTls, VerifiedName, WellKnownAuthorities, WhenUnreachable,
 };
 pub use dns::{DnsName, DnsNameError};
 pub use harness_file::{CertificateFiles, HarnessFile};

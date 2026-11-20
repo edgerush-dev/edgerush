@@ -1,6 +1,6 @@
 listener plain: served on port-80, taking HTTPRoute, GRPCRoute from namespace shop
 listener invalid: not accepted: none of the CA certificates the Gateway's spec.tls.frontend validates client certificates with on port 9443 can be used
 listener later: not accepted: port 9443 is taken for https by listener invalid, which comes first
-listener fallback: not accepted: the Gateway's spec.tls.frontend validates client certificates on port 10443 in mode `AllowInsecureFallback`, which the gateway does not serve
+listener unknown: not accepted: the Gateway's spec.tls.frontend validates client certificates on port 10443 in mode `AllowAnything`, which the gateway does not serve
 listener service: not accepted: none of the CA certificates the Gateway's spec.tls.frontend validates client certificates with on port 11443 can be used
 listener team of ListenerSet shop/team: not accepted: none of the CA certificates the Gateway's spec.tls.frontend validates client certificates with on port 9443 can be used

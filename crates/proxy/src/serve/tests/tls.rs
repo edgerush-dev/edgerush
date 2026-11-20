@@ -208,6 +208,7 @@ async fn a_listener_that_validates_clients_serves_only_those_it_trusts() {
                 vec![certificate(&["a.test"]), certificate(&["b.test"])],
                 Some(edgerush_config::ClientValidation {
                     authorities: vec![trusted.chain.clone()],
+                    mode: edgerush_config::ClientValidationMode::AllowValidOnly,
                 }),
             );
             let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
@@ -245,6 +246,55 @@ async fn a_listener_that_validates_clients_serves_only_those_it_trusts() {
         .await;
 }
 
+/// A listener that validates clients in the insecure fallback serves every client: one
+/// its authorities vouch for, one that shows no certificate, and one nobody vouches for.
+#[tokio::test]
+async fn a_listener_validating_clients_in_the_insecure_fallback_serves_them_all() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::tls::testing::certificate;
+            let (upstream, _) = counting_upstream().await;
+            let trusted = certificate(&["client"]);
+            let stranger = certificate(&["client"]);
+            let mut config = everything_config(upstream);
+            secured(
+                &mut config,
+                vec![certificate(&["a.test"])],
+                Some(edgerush_config::ClientValidation {
+                    authorities: vec![trusted.chain.clone()],
+                    mode: edgerush_config::ClientValidationMode::AllowInsecureFallback,
+                }),
+            );
+            let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+            let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+            for (shown, who) in [
+                (Some(&trusted), "a trusted client"),
+                (None, "a client of no certificate"),
+                (Some(&stranger), "a client nobody vouches for"),
+            ] {
+                let connected = tls_client(front, "a.test", None, |builder| {
+                    if let Some(shown) = shown {
+                        showing(shown)(builder);
+                    }
+                })
+                .await;
+                let answer = match connected {
+                    Ok(stream) => h1_over_or_nothing(stream).await,
+                    Err(_) => String::new(),
+                };
+                assert!(
+                    answer.starts_with("HTTP/1.1 200 OK\r\n"),
+                    "{who}: {answer:?}"
+                );
+            }
+        })
+        .await;
+}
+
 /// A config of one `https` listener, `web`, presenting `served` and validating clients
 /// against `authority`, that sends everything to `upstream`.
 fn validating_to(
@@ -258,6 +308,7 @@ fn validating_to(
         vec![served.clone()],
         Some(edgerush_config::ClientValidation {
             authorities: vec![authority.chain.clone()],
+            mode: edgerush_config::ClientValidationMode::AllowValidOnly,
         }),
     );
     compile(&config).unwrap()
@@ -419,6 +470,7 @@ async fn an_http3_connection_under_a_replaced_client_validation_is_told_to_go() 
             let web = config.listeners.get_mut("web").unwrap();
             web.tls.as_mut().unwrap().client_validation = Some(edgerush_config::ClientValidation {
                 authorities: vec![authority.chain],
+                mode: edgerush_config::ClientValidationMode::AllowValidOnly,
             });
             worker.proxy().reload(compile(&config).unwrap()).unwrap();
             let reloaded = tokio::time::Instant::now();
@@ -1240,6 +1292,7 @@ fn a_reload_keeps_the_tls_of_certificates_that_have_not_changed() {
         vec![crate::tls::testing::certificate(&["example.test"])],
         Some(edgerush_config::ClientValidation {
             authorities: vec![crate::tls::testing::certificate(&["ca"]).chain],
+            mode: edgerush_config::ClientValidationMode::AllowValidOnly,
         }),
     );
     proxy.reload(compile(&validating).unwrap()).unwrap();

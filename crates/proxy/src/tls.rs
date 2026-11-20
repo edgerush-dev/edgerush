@@ -34,7 +34,8 @@ use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
 use edgerush_certificates::{CertificateError, Identity};
 use edgerush_config::{
-    ClientValidation, CompiledTls, NamedCertificate, PresentedCertificate, SharedListeners,
+    ClientValidation, ClientValidationMode, CompiledTls, NamedCertificate, PresentedCertificate,
+    SharedListeners,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -89,8 +90,8 @@ struct Front {
     acceptor: SslAcceptor,
     /// The clients it was made to validate, which a later config must too to keep it.
     validation: Option<ClientValidation>,
-    /// The authorities those clients are validated against, read.
-    authorities: Option<Vec<X509>>,
+    /// The authorities those clients are validated against, read, and the mode.
+    authorities: Option<Validating>,
     /// The certificates it moves connections to.
     serving: Arc<ArcSwap<Certificates>>,
     /// The certificates a QUIC connection is moved to.
@@ -178,17 +179,17 @@ impl Tls {
         let authorities = authorities_of(source)?;
         let certificates = Arc::new(Certificates::new(
             source,
-            authorities.as_deref(),
+            authorities.as_ref(),
             Transport::Tcp,
         )?);
         let quic_certificates = Arc::new(Certificates::new(
             source,
-            authorities.as_deref(),
+            authorities.as_ref(),
             Transport::Quic,
         )?);
         let serving = Arc::new(ArcSwap::new(Arc::clone(&certificates)));
         let quic_serving = Arc::new(ArcSwap::new(Arc::clone(&quic_certificates)));
-        let front = Front::acceptor(authorities.as_deref(), &serving)?;
+        let front = Front::acceptor(authorities.as_ref(), &serving)?;
         let mut quic_ticket_key = [0; TICKET_KEY];
         boring::rand::rand_bytes(&mut quic_ticket_key)
             .map_err(|error| TlsError::Setup(error.to_string()))?;
@@ -223,12 +224,12 @@ impl Tls {
             front: Arc::clone(&previous.front),
             certificates: Arc::new(Certificates::new(
                 source,
-                authorities.as_deref(),
+                authorities.as_ref(),
                 Transport::Tcp,
             )?),
             quic_certificates: Arc::new(Certificates::new(
                 source,
-                authorities.as_deref(),
+                authorities.as_ref(),
                 Transport::Quic,
             )?),
             source: source.clone(),
@@ -293,7 +294,7 @@ impl Front {
     /// Its context: one with no certificate, which moves every connection to the certificate it
     /// asked for among those `serving` holds at the time.
     fn acceptor(
-        authorities: Option<&[X509]>,
+        authorities: Option<&Validating>,
         serving: &Arc<ArcSwap<Certificates>>,
     ) -> Result<SslAcceptor, TlsError> {
         let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
@@ -395,7 +396,7 @@ fn key_of(leaf: &X509) -> Key {
 impl Certificates {
     fn new(
         source: &CompiledTls,
-        authorities: Option<&[X509]>,
+        authorities: Option<&Validating>,
         transport: Transport,
     ) -> Result<Self, TlsError> {
         let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
@@ -453,12 +454,24 @@ impl Certificates {
     }
 }
 
+/// The authorities a listener's clients are validated against, read, and what becomes of
+/// a client they do not vouch for.
+pub(crate) struct Validating {
+    authorities: Vec<X509>,
+    mode: ClientValidationMode,
+}
+
 /// The authorities `source` trusts to vouch for clients, read, if it validates them.
-fn authorities_of(source: &CompiledTls) -> Result<Option<Vec<X509>>, TlsError> {
+fn authorities_of(source: &CompiledTls) -> Result<Option<Validating>, TlsError> {
     source
         .client_validation
         .as_ref()
-        .map(|validation| authorities(&validation.authorities))
+        .map(|validation| {
+            Ok(Validating {
+                authorities: authorities(&validation.authorities)?,
+                mode: validation.mode,
+            })
+        })
         .transpose()
 }
 
@@ -471,13 +484,18 @@ pub(crate) fn authorities(pems: &[String]) -> Result<Vec<X509>, TlsError> {
     })
 }
 
-/// Has a context refuse a client that does not show a certificate `authorities` vouch
-/// for, and name them to the client, as nginx and HAProxy do, so one with several
-/// certificates can tell which to show.
-fn validate_clients(builder: &mut SslContextBuilder, authorities: &[X509]) -> Result<(), TlsError> {
+/// Has a context ask every client for a certificate the authorities of `validating` vouch
+/// for, naming them to the client, as nginx and HAProxy do, so one with several
+/// certificates can tell which to show; and refuse one that shows none, unless the mode
+/// lets it through, whatever it shows, as nginx's `optional_no_ca` and Envoy's
+/// `ACCEPT_UNTRUSTED` do.
+fn validate_clients(
+    builder: &mut SslContextBuilder,
+    validating: &Validating,
+) -> Result<(), TlsError> {
     let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
     let mut trusted = X509StoreBuilder::new().map_err(setup)?;
-    for authority in authorities {
+    for authority in &validating.authorities {
         trusted.add_cert(authority.clone()).map_err(setup)?;
         builder.add_client_ca(authority).map_err(setup)?;
     }
@@ -485,7 +503,15 @@ fn validate_clients(builder: &mut SslContextBuilder, authorities: &[X509]) -> Re
     builder
         .set_verify_cert_store(trusted.build())
         .map_err(setup)?;
-    builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    match validating.mode {
+        ClientValidationMode::AllowValidOnly => {
+            builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        }
+        // Asked, and let through whatever the chain's verification says of it.
+        ClientValidationMode::AllowInsecureFallback => {
+            builder.set_verify_callback(SslVerifyMode::PEER, |_, _| true);
+        }
+    }
     Ok(())
 }
 
@@ -892,7 +918,10 @@ mod tests {
                 certificates: vec![presented("a", certificate(&["a.test"]))],
                 without_sni: Some(0),
                 refused: Vec::new(),
-                client_validation: Some(edgerush_config::ClientValidation { authorities }),
+                client_validation: Some(edgerush_config::ClientValidation {
+                    authorities,
+                    mode: edgerush_config::ClientValidationMode::AllowValidOnly,
+                }),
                 shared_by: None,
             })
             .map(|_| ())
@@ -1148,6 +1177,7 @@ upstreams: {}
                 refused: Vec::new(),
                 client_validation: Some(edgerush_config::ClientValidation {
                     authorities: vec![trusted.chain.clone()],
+                    mode: edgerush_config::ClientValidationMode::AllowValidOnly,
                 }),
                 shared_by: None,
             })
@@ -1175,6 +1205,43 @@ upstreams: {}
                     );
                     assert!(!pipe.server.is_established(), "{name}: served {shown:?}");
                 }
+            }
+        }
+
+        /// A listener that validates clients in the insecure fallback lets every client
+        /// through over QUIC, as over TCP, having asked each for a certificate: it holds
+        /// whatever one the client showed, vouched for or not.
+        #[test]
+        fn a_listener_validating_clients_in_the_insecure_fallback_lets_them_all_through() {
+            let (trusted, stranger) = (certificate(&["client"]), certificate(&["client"]));
+            let tls = Tls::new(&CompiledTls {
+                certificates: vec![presented("a", certificate(&["a.test"]))],
+                without_sni: Some(0),
+                refused: Vec::new(),
+                client_validation: Some(edgerush_config::ClientValidation {
+                    authorities: vec![trusted.chain.clone()],
+                    mode: edgerush_config::ClientValidationMode::AllowInsecureFallback,
+                }),
+                shared_by: None,
+            })
+            .unwrap();
+            for shown in [Some(&trusted), None, Some(&stranger)] {
+                let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+                if let Some(shown) = shown {
+                    let identity = identity(&named("client", shown.clone())).unwrap();
+                    builder.set_certificate(&identity.leaf).unwrap();
+                    builder.set_private_key(&identity.key).unwrap();
+                }
+                let pipe = handshake(
+                    client_for("a.test", &mut client_config_over(builder)),
+                    &mut worker_config(&tls),
+                );
+                assert!(pipe.server.is_established(), "refused {shown:?}");
+                assert_eq!(
+                    pipe.server.peer_cert().map(<[u8]>::to_vec),
+                    shown.map(der),
+                    "{shown:?}"
+                );
             }
         }
 
