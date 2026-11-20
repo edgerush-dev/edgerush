@@ -78,6 +78,7 @@ pub(crate) const SUPPORTED_FEATURES: &[&str] = &[
     "Gateway",
     "GatewayAddressEmpty",
     "GatewayBackendClientCertificate",
+    "GatewayFrontendClientCertificateValidation",
     "GatewayHTTPListenerIsolation",
     "GatewayHTTPSListenerDetectMisdirectedRequests",
     "GatewayInfrastructure",

@@ -466,9 +466,10 @@ fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
                 | ListenerProblem::Http3 { .. } => "ProtocolConflict",
                 ListenerProblem::PortPastSlots { .. } => "PortUnavailable",
                 ListenerProblem::TooManyListeners { .. } => "TooManyListeners",
+                ListenerProblem::NoValidCaCertificate { .. } => "NoValidCACertificate",
                 ListenerProblem::TlsMode(_)
                 | ListenerProblem::PassthroughOnly(_)
-                | ListenerProblem::ClientValidation { .. }
+                | ListenerProblem::ValidationMode { .. }
                 | ListenerProblem::NoCertificate => "UnsupportedValue",
             };
             conditions.push(Condition::new(
@@ -497,6 +498,7 @@ fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
     let mut unresolved: Vec<String> = listener
         .certificate_problems
         .iter()
+        .chain(&listener.ca_problems)
         .map(|problem| problem.why.clone())
         .collect();
     if !listener.allowed.invalid_kinds.is_empty() {
@@ -506,15 +508,27 @@ fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
         ));
     }
     // A grant missing is said as such, as the spec has it, before a certificate that is
-    // not there and a route kind not taken.
+    // not there, a CA certificate of a kind not read or not usable, and a route kind not
+    // taken.
+    let ca = |reason: RefReason| {
+        listener
+            .ca_problems
+            .iter()
+            .any(|problem| problem.reason == reason)
+    };
     let reason = if listener
         .certificate_problems
         .iter()
         .any(|problem| problem.reason == RefReason::NotPermitted)
+        || ca(RefReason::NotPermitted)
     {
         "RefNotPermitted"
     } else if !listener.certificate_problems.is_empty() {
         "InvalidCertificateRef"
+    } else if ca(RefReason::InvalidKind) {
+        "InvalidCACertificateKind"
+    } else if !listener.ca_problems.is_empty() {
+        "InvalidCACertificateRef"
     } else if !listener.allowed.invalid_kinds.is_empty() {
         "InvalidRouteKinds"
     } else {

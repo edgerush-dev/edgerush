@@ -1,2 +1,0 @@
-Gateway shop/web: listener secure: not accepted: the Gateway's spec.tls.frontend validates client certificates on port 443, which the gateway does not serve yet
-ListenerSet shop/team: listener team: not accepted: the Gateway's spec.tls.frontend validates client certificates on port 9443, which the gateway does not serve yet
