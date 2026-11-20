@@ -42,7 +42,7 @@ pub struct ControlPlaneSpec {
     /// Watch is where the control plane follows Ingresses, routes and what they name.
     #[serde(default = "default_control_plane_spec_watch")]
     pub watch: ControlPlaneWatch,
-    /// Webhook is the control plane's admission webhook, which judges an Ingress as it is written.
+    /// Webhook is the control plane's admission webhook, which judges an Ingress or a RateLimitPolicy as it is written.
     #[serde(default = "default_control_plane_spec_webhook")]
     pub webhook: ControlPlaneWebhook,
 }
@@ -137,12 +137,12 @@ pub struct ControlPlaneWatchNamespacesSelectorMatchExpressions {
     pub values: Option<Vec<String>>,
 }
 
-/// Webhook is the control plane's admission webhook, which judges an Ingress as it is written.
+/// Webhook is the control plane's admission webhook, which judges an Ingress or a RateLimitPolicy as it is written.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct ControlPlaneWebhook {
-    /// Enabled registers the webhook. Off, an Ingress is judged only in its
-    /// status: for a platform that keeps admission webhooks to its own, or a team
-    /// that would rather read status alone.
+    /// Enabled registers the webhook. Off, an Ingress or a RateLimitPolicy is
+    /// judged only in its status: for a platform that keeps admission webhooks to
+    /// its own, or a team that would rather read status alone.
     #[serde(default = "default_control_plane_webhook_enabled")]
     pub enabled: bool,
 }

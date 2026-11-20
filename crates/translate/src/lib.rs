@@ -81,7 +81,7 @@ pub use gateway::{
     SetOutcome,
 };
 pub use http_route::{Attachment, NotAttached, ParentOutcome, RouteOutcome, Taken};
-pub use rate_limits::{AFFECTED, AcceptedPolicy, data_plane_limit};
+pub use rate_limits::{AFFECTED, AcceptedPolicy, data_plane_limit, policy_refused_alone};
 pub use status::{
     Condition, GatewayStatus, LimitPolicyStatus, ListenerSetStatus, ListenerStatus, ParentStatus,
     PolicyStatus, RouteStatus,

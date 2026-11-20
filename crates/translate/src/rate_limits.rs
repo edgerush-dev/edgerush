@@ -26,7 +26,10 @@
 use crate::gateway::GatewayOutcome;
 use crate::http_route::{Attachment, RouteOutcome};
 use crate::status::{Condition, GatewayStatus, LimitPolicyStatus, RouteStatus};
-use crate::{Cluster, Finding, Object, Plane, PlaneRateLimiting, Problem, config_of, namespace};
+use crate::{
+    Cluster, Finding, Object, Plane, PlaneRateLimitMode, PlaneRateLimiting, Problem, config_of,
+    namespace,
+};
 use edgerush_config::{
     Bucket, Config, Global, Limit, LimitMatch, Limits, MOST_LIMITS, Model, Rolling, Window, compile,
 };
@@ -207,6 +210,24 @@ fn limits_of(
             .join("; ")
     })?;
     Ok(limits)
+}
+
+/// Why a RateLimitPolicy's `spec` is refused judged alone, as the admission webhook judges
+/// it ([04 §3](../../../docs/04-control-plane.md)), if it is: its limits do not compile.
+/// Alone means with no other policy, no target and no DataPlane, so a name another limit
+/// holds, a target not there and a model the data plane's mode does not run are not said
+/// here: they hang on what else is in the cluster, and its status says them. Said as the
+/// translation says it, so the webhook and the status agree.
+#[must_use]
+pub fn policy_refused_alone(spec: &RateLimitPolicySpec) -> Option<Problem> {
+    // Off adds nothing to what compiling the limits checks: only another mode refuses a
+    // model, or a bucket of too short a refill, for what it runs.
+    let alone = PlaneRateLimiting {
+        mode: PlaneRateLimitMode::Off,
+        max_key_bytes: None,
+        global: Vec::new(),
+    };
+    limits_of(&alone, spec).err().map(Problem::Refused)
 }
 
 /// Which version of a policy applies.
@@ -1731,5 +1752,71 @@ spec:
         assert_eq!(under, 33);
         assert_eq!(report, [noted(33)]);
         assert!(taken);
+    }
+
+    /// Policy `alone` of namespace `shop`, on route `a`, of the spec's fields `fields`.
+    fn alone(fields: &str) -> RateLimitPolicy {
+        serde_saphyr::from_str(&format!(
+            "metadata: {{ name: alone, namespace: shop, uid: alone-uid, generation: 1 }}
+spec:
+  targetRefs: [{{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }}]
+  {fields}
+"
+        ))
+        .unwrap()
+    }
+
+    /// A policy alone is admitted where its limits compile, whatever its limits' models,
+    /// whatever it ignores, and whatever names it takes: a name the DataPlane's `global`
+    /// holds, as `platform`, is for the translation to say, as the cluster has it.
+    #[test]
+    fn a_policy_alone_whose_limits_compile_is_not_refused() {
+        for fields in [
+            "limits: [{ name: b, key: Client, model: { bucket: { rate: 10/s, burst: 20 } } }]",
+            "limits: [{ name: f, key: Client, model: { fixedWindow: { limit: 10, window: 1m } } }]",
+            "limits: [{ name: r, key: Client, model: { rollingWindow: { limit: 10, window: 1h } } }]",
+            "limits: [{ name: m, key: Client, match: { methods: [POST] }, \
+             model: { bucket: { rate: 1/s, burst: 1 } } }]",
+            "limits: [{ name: platform, key: Client, model: { bucket: { rate: 1/s, burst: 1 } } }]",
+            "ignore: [platform]",
+            "ignore: [\"*\"]",
+        ] {
+            assert_eq!(policy_refused_alone(&alone(fields).spec), None, "{fields}");
+        }
+    }
+
+    /// A policy alone whose limits do not compile is refused, saying why as its status
+    /// says it, whichever field it is.
+    #[test]
+    fn a_policy_alone_is_refused_as_its_status_says() {
+        for (fields, why) in [
+            (
+                "limits: [{ name: bad, key: Client, model: { bucket: { rate: 1/s, burst: 0 } } }]",
+                "the data plane would refuse it: limits[bad].model.bucket.burst: 0 is out of range",
+            ),
+            (
+                "limits: [{ name: bad, key: Client, model: { bucket: { rate: 10/fortnight, burst: 1 } } }]",
+                "the data plane would refuse it: limit `bad`: `model.bucket.rate`: `10/fortnight` is \
+                 not a rate: a number of at least 1, `/`, and `s`, `min`, `h` or `d`",
+            ),
+            (
+                "limits: [{ name: bad, key: Header, model: { bucket: { rate: 1/s, burst: 1 } } }]",
+                "the data plane would refuse it: limits[bad].key: `Header` is not Client",
+            ),
+            // What the CRD's schema lets by.
+            (
+                "limits: [{ name: bad, key: Client, model: { fixedWindow: { limit: 1, window: 300000d } } }]",
+                "the data plane would refuse it: limit `bad`: `model.fixed_window.window`: \
+                 `300000d` is not a window: a whole number of at least 1 and `ms`, `s`, `m`, `h` \
+                 or `d`, under 213,503 days",
+            ),
+        ] {
+            let policy = alone(fields);
+            let refused = policy_refused_alone(&policy.spec).map(|problem| problem.to_string());
+            assert_eq!(refused.as_deref(), Some(why), "{fields}");
+            // As the translation says it of the policy in a data plane limiting.
+            let (_, _, report) = judged(PLANE, &[policy], &[]);
+            assert_eq!(report, [format!("RateLimitPolicy shop/alone: {why}")]);
+        }
     }
 }
