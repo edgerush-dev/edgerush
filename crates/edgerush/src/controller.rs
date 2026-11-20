@@ -7,7 +7,7 @@
 use crate::validate::{described, read};
 use bytes::Bytes;
 use edgerush_certificates::authority::{Kind, Written};
-use edgerush_config::Certificate;
+use edgerush_config::{Certificate, Config};
 use edgerush_control_service::webhook::{self, Bounds};
 use edgerush_control_service::{
     CertificateFiles, Credentials, Files, FilesError, Heard, Served, SslAcceptor, acceptor, reread,
@@ -1049,6 +1049,7 @@ async fn control_until(
                 own,
                 settings,
                 keeping,
+                None,
                 move |line| telling(line),
             )));
             (None, Some(classes))
@@ -1804,7 +1805,7 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
             text.push_str(&described(translation));
             if let Some(path) = write_config {
                 // Writing to a `String` cannot fail.
-                let _ = match written(translation, path) {
+                let _ = match written(&translation.config, path) {
                     Ok(()) => write!(text, "written to {}", path.display()),
                     Err(error) => {
                         write!(text, "error: {} cannot be written: {error}", path.display())
@@ -1829,6 +1830,28 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
             }
             text
         }
+        Said::Kept {
+            data_plane, config, ..
+        } => {
+            let mut text = of_data_plane(data_plane);
+            text.push_str(
+                "the leader's config last handed on is handed on in place of this replica's \
+                 translation, refused whole, or of its Gateway, held",
+            );
+            if let Some(path) = write_config {
+                let _ = match written(config, path) {
+                    Ok(()) => write!(text, "; written to {}", path.display()),
+                    Err(error) => {
+                        write!(
+                            text,
+                            "; error: {} cannot be written: {error}",
+                            path.display()
+                        )
+                    }
+                };
+            }
+            text
+        }
         Said::HeldBack { data_plane, why } => format!(
             "{}its DataPlane as it now is is held back, the generation before served: {why}",
             of_data_plane(data_plane)
@@ -1836,10 +1859,10 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
     }
 }
 
-/// Writes `translation`'s config to `path` whole: into a file beside it, then put in its
-/// place, so that nothing reading `path` ever finds half of one.
-fn written(translation: &Translation, path: &Path) -> io::Result<()> {
-    let yaml = serde_saphyr::to_string(&translation.config).map_err(io::Error::other)?;
+/// Writes `config` to `path` whole: into a file beside it, then put in its place, so that
+/// nothing reading `path` ever finds half of one.
+fn written(config: &Config, path: &Path) -> io::Result<()> {
+    let yaml = serde_saphyr::to_string(config).map_err(io::Error::other)?;
     let mut beside = path.as_os_str().to_owned();
     beside.push(".partial");
     std::fs::write(&beside, yaml)?;

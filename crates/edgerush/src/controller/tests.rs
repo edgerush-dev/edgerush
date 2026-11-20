@@ -2033,3 +2033,36 @@ async fn a_replica_of_no_stream_or_of_certificate_files_is_ready_at_once() {
         assert!(ready, "stream {stream}: {answers:?}");
     }
 }
+
+/// The leader's config kept in place of a follower's translation is said under its data
+/// plane, and written to `--write-config` as a translation's config is, which the
+/// development harness reads back as it was.
+#[test]
+fn the_leaders_config_kept_is_said_and_written_as_a_translation_is() {
+    let plain: Plane = serde_saphyr::from_str(&plane()).unwrap();
+    let config =
+        edgerush_translate::translate(&plain, &edgerush_translate::Cluster::default()).config;
+    let kept = Said::Kept {
+        data_plane: "DataPlane edge/web",
+        config: &config,
+        id: None,
+    };
+    assert_eq!(
+        told(&kept, None),
+        "DataPlane edge/web:\nthe leader's config last handed on is handed on in place of this \
+         replica's translation, refused whole, or of its Gateway, held"
+    );
+    let path = std::env::temp_dir()
+        .join("edgerush-controller-tests")
+        .join("kept.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let said = told(&kept, Some(&path));
+    assert!(
+        said.ends_with(&format!("; written to {}", path.display())),
+        "{said}"
+    );
+    let file: HarnessFile =
+        serde_saphyr::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(file.into_config(BTreeMap::new(), None), config);
+}

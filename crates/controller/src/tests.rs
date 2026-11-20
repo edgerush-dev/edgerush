@@ -242,6 +242,8 @@ struct Heard {
     of: Vec<String>,
     ids: Vec<Option<String>>,
     refused: Vec<String>,
+    /// The leader's configs handed on in place of a translation, each with its ID.
+    kept: Vec<(Config, Option<String>)>,
 }
 
 fn hear(heard: &Rc<RefCell<Heard>>) -> impl Fn(Said<'_>) + 'static {
@@ -276,6 +278,14 @@ fn hear(heard: &Rc<RefCell<Heard>>) -> impl Fn(Said<'_>) + 'static {
             } => {
                 heard.refused.push(data_plane.to_owned());
                 format!("refused: {problems:?}")
+            }
+            Said::Kept {
+                data_plane,
+                config,
+                id,
+            } => {
+                heard.kept.push((config.clone(), id.map(ToOwned::to_owned)));
+                format!("{data_plane}: the leader's kept")
             }
             Said::HeldBack { data_plane, why } => format!("{data_plane} held back: {why}"),
             Said::GatewayApiStatus { object, written } => match written {
@@ -4724,7 +4734,10 @@ async fn the_records_are_taken_into_the_snapshot_each_round() {
                         Debounce::default(),
                         None,
                         acks(),
-                        Some(snapshots),
+                        Some(Snapshots {
+                            snapshot: snapshots,
+                            settings: Rc::new(|_| None),
+                        }),
                         said,
                     )
                     .await;
@@ -4747,6 +4760,228 @@ async fn the_records_are_taken_into_the_snapshot_each_round() {
             .await;
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert_eq!(policies(&mut taken), (count, vec![Some(1)]));
+            controlling.abort();
+        })
+        .await;
+}
+
+/// The leader's record of a data plane of `plane`, once it has translated `cluster`.
+fn leaders_record(plane: &Plane, cluster: &Cluster) -> Record {
+    let mut leader = Serving::new(harness(plane));
+    let Step::Translated(_) = leader.translator.step(plane, cluster) else {
+        panic!("not translated");
+    };
+    leader.record(false)
+}
+
+/// The limits under the first rule of `translation`.
+fn under(translation: &Translation) -> Vec<String> {
+    translation.config.routes[0].rules[0].rate_limits.clone()
+}
+
+/// A follower translates from the leader's record of the policies that applied rather than
+/// its own: started afresh, it applies the version the leader applies of a policy whose
+/// edit is refused, where of its own it would have none to apply (04 §2).
+#[test]
+fn a_follower_translates_from_the_leaders_policies() {
+    let plane = plane_with("rate_limiting: { mode: local }");
+    let accepted = with_policy(rate_limit_policy("shop", 1, &[("per-client", "10/s")]));
+    let record = leaders_record(&plane, &accepted);
+    let refused = with_policy(rate_limit_policy(
+        "shop",
+        3,
+        &[("per-client", "10/fortnight")],
+    ));
+    let mut afresh = Serving::new(harness(&plane));
+    let Step::Translated(translation) = afresh.translator.step(&plane, &refused) else {
+        panic!("not translated");
+    };
+    assert_eq!(under(translation), Vec::<String>::new());
+    let mut follower = Serving::new(harness(&plane));
+    assert!(
+        !follower.follow(&record, &|_| None),
+        "the settings served changed"
+    );
+    let Step::Translated(translation) = follower.translator.step(&plane, &refused) else {
+        panic!("not translated");
+    };
+    assert_eq!(under(translation), ["per-client"]);
+    assert_eq!(generations(&translation.rate_limit_policies), [Some(1)]);
+}
+
+/// A follower serves the generation of a DataPlane the leader serves while it holds a later
+/// one back, the later waiting, and takes that one on once the leader has: the leader
+/// alone judges it.
+#[test]
+fn a_follower_serves_the_data_plane_the_leader_serves() {
+    let served_with = of_generation(&limiting(&[]), 1);
+    let wanted = of_generation(&limiting(&["per-client"]), 2);
+    let made = {
+        let served_with = served_with.clone();
+        move |data_plane: &DataPlane| {
+            (data_plane.metadata.generation == Some(1)).then(|| served_with.clone())
+        }
+    };
+    let mut leader = Serving::new(served_with.clone());
+    leader.offer(&wanted);
+    let held_back = leader.record(false);
+    // Started afresh, as the generation accepted is all it is given.
+    let mut follower = Serving::new(wanted.clone());
+    assert!(follower.follow(&held_back, &made));
+    assert_eq!(follower.settings, served_with);
+    assert_eq!(follower.wanted.as_ref(), Some(&wanted));
+    assert!(
+        !follower.follow(&held_back, &made),
+        "followed again, as it was"
+    );
+    let taken_on = Record {
+        served: None,
+        ..held_back
+    };
+    assert!(follower.follow(&taken_on, &made));
+    assert_eq!(follower.settings, wanted);
+    assert_eq!(follower.wanted, None);
+}
+
+/// A follower hands on the leader's config last handed on, once for each the leader's
+/// record holds, and none where it holds none; what it hands on is in its own record, as it
+/// would be were it to lead.
+#[test]
+fn a_follower_keeps_the_leaders_config_once_for_each() {
+    let plane = plane_with("rate_limiting: { mode: local }");
+    let cluster = with_policy(rate_limit_policy("shop", 1, &[("per-client", "10/s")]));
+    let mut leader = Serving::new(harness(&plane));
+    let Step::Translated(translation) = leader.translator.step(&plane, &cluster) else {
+        panic!("not translated");
+    };
+    let config = translation.config.clone();
+    let mut follower = Serving::new(harness(&plane));
+    assert_eq!(follower.keep(&leader.record(false)), None, "none held");
+    let mut record = leader.record(true);
+    assert_eq!(follower.keep(&record), Some(&config));
+    assert_eq!(follower.keep(&record), None, "kept again");
+    assert_eq!(follower.record(true).config, Some(config.clone()));
+    let mut later = config;
+    later.routes.clear();
+    record.config = Some(later.clone());
+    assert_eq!(follower.keep(&record), Some(&later));
+}
+
+/// A follower translates each data plane from the leader's record in the snapshot it
+/// follows, and hands on the leader's config where its own translation is refused whole;
+/// it takes no snapshot of its own, and takes in each the leader pushes as it runs. Once
+/// it leads, it takes its records, counted on from the one it followed, which hold what it
+/// followed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_follower_translates_from_the_snapshot_and_counts_on_from_it_once_it_leads() {
+    let refused_edit = PER_CLIENT_POLICY
+        .replace(r#""generation":1"#, r#""generation":3"#)
+        .replace("10/s", "10/fortnight");
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[ingress("shop", "web", "shop.example")])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/secrets?") {
+            page(&[secret("shop", &["shop.example"])])
+        } else if path.starts_with("/apis/gateway.edgerush.dev/v1alpha1/ratelimitpolicies?") {
+            answer(200, &refused_edit)
+        } else {
+            otherwise(path)
+        }
+    })
+    .await;
+    let plane = limiting(&[]);
+    let accepted = with_policy(rate_limit_policy("shop", 1, &[("per-client", "10/s")]));
+    let mut leader = Serving::new(harness(&plane));
+    let Step::Translated(translation) = leader.translator.step(&plane, &accepted) else {
+        panic!("not translated");
+    };
+    let leaders_config = translation.config.clone();
+    let record = Record {
+        config: Some(leaders_config.clone()),
+        ..leader.record(false)
+    };
+    let followed = Arc::new(Snapshot {
+        count: 3,
+        planes: BTreeMap::from([(String::new(), record)]),
+    });
+    let api = fake.client(&token("controller-follower", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let (pushed, mut taken) = watch::channel(Some(Arc::clone(&followed)));
+    taken.borrow_and_update();
+    let (leads, leading) = watch::channel(false);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (settings, planes) = watch::channel(only(harness(&plane)));
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                let snapshot = pushed.clone();
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        planes,
+                        None,
+                        Debounce::default(),
+                        Some(leading),
+                        acks(),
+                        Some(Snapshots {
+                            snapshot,
+                            settings: Rc::new(|_| None),
+                        }),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("translated", || heard.borrow().translations.len() == 1).await;
+            assert_eq!(under(&heard.borrow().translations[0]), ["per-client"]);
+            // Settings of 65 global limits: refused whole, the leader's config handed on.
+            let names: Vec<String> = (0..65).map(|n| format!("global-{n}")).collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            settings.send_replace(only(harness(&limiting(&names))));
+            until("kept", || !heard.borrow().kept.is_empty()).await;
+            assert_eq!(heard.borrow().kept, [(leaders_config.clone(), None)]);
+            assert!(!taken.has_changed().unwrap(), "a follower took a snapshot");
+            // The leader's next, pushed as the follower runs: its config handed on too.
+            let mut later = leaders_config.clone();
+            later.routes.clear();
+            let mut next = Snapshot::clone(&followed);
+            next.count = 4;
+            next.planes.get_mut("").unwrap().config = Some(later.clone());
+            pushed.send_replace(Some(Arc::new(next)));
+            taken.borrow_and_update();
+            until("kept again", || heard.borrow().kept.len() == 2).await;
+            assert_eq!(heard.borrow().kept[1], (later, None));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!taken.has_changed().unwrap(), "a follower took a snapshot");
+            // It leads: its records are those it followed, so nothing new is taken, until
+            // one changes, counted on from the one it followed. The settings back, its
+            // translation is handed on, of the version of the policy it followed.
+            leads.send_replace(true);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !taken.has_changed().unwrap(),
+                "the records followed taken again"
+            );
+            settings.send_replace(only(harness(&plane)));
+            until("taken", || taken.has_changed().unwrap()).await;
+            let snapshot = taken.borrow_and_update().clone().unwrap();
+            assert_eq!(snapshot.count, 5);
+            let record = &snapshot.planes[""];
+            assert_eq!(generations(&record.policies), [Some(1)]);
+            assert_eq!(record.config, None);
+            assert_eq!(
+                under(heard.borrow().translations.last().unwrap()),
+                ["per-client"]
+            );
             controlling.abort();
         })
         .await;

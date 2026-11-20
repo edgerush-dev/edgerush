@@ -24,6 +24,7 @@ use edgerush_translate::{
 };
 
 use crate::across::{Across, follow_across, watch_parts};
+use crate::snapshot::Snapshot;
 use crate::{DataPlaneOf, Planes, Settings, WatchScope};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -165,14 +166,20 @@ impl Choice {
 pub struct Chooser {
     /// The settings last served of each DataPlane served, by the DataPlane as it is said.
     pub last: Planes,
+    /// The settings of each DataPlane as the leader's snapshot holds it last accepted
+    /// (04 §2), by the DataPlane as it is said: what one the operator has yet to look at is
+    /// served as, before its own last, so that a replica started afresh serves what the
+    /// leader does.
+    pub leaders: Planes,
 }
 
 impl Chooser {
     /// What to serve of `data_planes`, those the control plane reads, as they are now.
     /// Each naming this control plane's ControlPlane is served as its generation the operator
     /// accepted; one it has yet to look at, or accepted of a value the data plane cannot
-    /// take, as its last accepted, where there is one, and else not; one it refused, or
-    /// gone, not at all, nothing kept of it for a later edit.
+    /// take, as its last accepted, the leader's where its snapshot holds one, where there is
+    /// one, and else not; one it refused, or gone, not at all, nothing kept of it for a later
+    /// edit.
     pub fn next(&mut self, data_planes: &[DataPlane], own: &Own) -> Choice {
         let mut ours: Vec<&DataPlane> = data_planes
             .iter()
@@ -195,7 +202,7 @@ impl Chooser {
         }
         for data_plane in ours {
             let name = named(data_plane);
-            let kept = || self.last.get(&name).cloned();
+            let kept = || self.leaders.get(&name).or(self.last.get(&name)).cloned();
             let (served, waiting) = match verdict(data_plane) {
                 Verdict::Accepted => match settings(data_plane, own) {
                     Ok(settings) => (Some(settings), None),
@@ -255,15 +262,17 @@ pub fn kept(data_planes: &[DataPlane], served: &Planes, own: &Own) -> BTreeSet<S
 /// (05 §3), handing `out` the settings of each served each time they change, none while
 /// none is accepted, and `keeping` the classes [`kept`] of them, once they are listed; and
 /// saying to `say` why one is not served as it now is, once each time that changes, and
-/// each failure of the follow. A namespace that joins the scope is not waited on: its
-/// DataPlanes are taken once listed. Runs until no one holds a receiver of `out`. For a
-/// `LocalSet`.
+/// each failure of the follow. With `snapshots`, one the operator has yet to look at is
+/// served as the latest snapshot holds it last accepted ([`Chooser::leaders`]). A namespace
+/// that joins the scope is not waited on: its DataPlanes are taken once listed. Runs until
+/// no one holds a receiver of `out`. For a `LocalSet`.
 pub async fn follow_data_planes(
     api: ApiServer,
     scope: WatchScope,
     own: Own,
     out: watch::Sender<Planes>,
     keeping: watch::Sender<Option<BTreeSet<String>>>,
+    mut snapshots: Option<watch::Receiver<Option<Arc<Snapshot>>>>,
     say: impl Fn(&str) + 'static,
 ) {
     let say: Rc<dyn Fn(&str)> = Rc::new(say);
@@ -274,6 +283,10 @@ pub async fn follow_data_planes(
         tokio::select! {
             changed = listed.changed() => if changed.is_err() { return },
             () = out.closed() => return,
+            changed = taken(&mut snapshots) => if !changed { snapshots = None },
+        }
+        if let Some(snapshots) = &snapshots {
+            chooser.leaders = leaders(snapshots.borrow().as_deref(), &own);
         }
         let now = Arc::clone(&listed.borrow_and_update());
         if !now.listed {
@@ -305,6 +318,28 @@ pub async fn follow_data_planes(
         }
         said = told;
     }
+}
+
+/// Whether `snapshots` changed, once it does: false once nobody sends on it, and never
+/// without it.
+async fn taken(snapshots: &mut Option<watch::Receiver<Option<Arc<Snapshot>>>>) -> bool {
+    match snapshots {
+        Some(snapshots) => snapshots.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
+/// The settings of each DataPlane `snapshot` holds last accepted, as [`settings`] makes
+/// them: none of one it cannot make them of.
+fn leaders(snapshot: Option<&Snapshot>, own: &Own) -> Planes {
+    snapshot
+        .into_iter()
+        .flat_map(|snapshot| &snapshot.planes)
+        .filter_map(|(name, record)| {
+            let accepted = record.accepted.as_ref()?;
+            Some((name.clone(), settings(accepted, own).ok()?))
+        })
+        .collect()
 }
 
 /// Follows through `api` the DataPlanes the control plane reads, of its own namespace
