@@ -164,7 +164,7 @@ fn configs() -> impl Strategy<Value = Option<Config>> {
 }
 
 fn snapshots() -> impl Strategy<Value = Snapshot> {
-    proptest::collection::btree_map(
+    let planes = proptest::collection::btree_map(
         names(),
         (policies(), data_planes(), data_planes(), configs()).prop_map(
             |(policies, accepted, served, config)| Record {
@@ -175,8 +175,8 @@ fn snapshots() -> impl Strategy<Value = Snapshot> {
             },
         ),
         0..4,
-    )
-    .prop_map(|planes| Snapshot { planes })
+    );
+    (any::<u64>(), planes).prop_map(|(count, planes)| Snapshot { count, planes })
 }
 
 /// `snapshot`, encoded, with `edit` made to its JSON.
@@ -192,6 +192,7 @@ fn edited(snapshot: &Snapshot, edit: impl FnOnce(&mut Value)) -> Vec<u8> {
 fn two_planes() -> Snapshot {
     let limits = [("per-client".to_owned(), "10/s".to_owned())];
     Snapshot {
+        count: 7,
         planes: BTreeMap::from([
             (
                 "shop/web".to_owned(),
@@ -284,7 +285,8 @@ fn a_snapshot_outside_the_window_is_refused() {
 }
 
 /// A snapshot holds what its version writes and nothing else: a field it does not know, or
-/// one it requires missing, is no snapshot of its version (one of none, missing, is none).
+/// one it requires missing, its count or a record's policies, is no snapshot of its
+/// version (one of none, missing, is none).
 #[test]
 fn a_snapshot_not_of_its_versions_shape_is_refused() {
     let added = edited(&two_planes(), |written| {
@@ -296,7 +298,10 @@ fn a_snapshot_not_of_its_versions_shape_is_refused() {
             .unwrap()
             .remove("policies");
     });
-    for bytes in [added, missing] {
+    let uncounted = edited(&two_planes(), |written| {
+        written.as_object_mut().unwrap().remove("count");
+    });
+    for bytes in [added, missing, uncounted] {
         assert!(matches!(
             Snapshot::decode(&bytes),
             Err(SnapshotError::Unreadable(_))
@@ -334,6 +339,7 @@ fn a_data_planes_status_is_not_carried() {
     }))
     .unwrap();
     let snapshot = Snapshot {
+        count: 1,
         planes: BTreeMap::from([(
             "shop/web".to_owned(),
             Record {
@@ -383,6 +389,7 @@ fn a_config_is_carried_whole_with_its_certificates_and_limits() {
     .certificates;
     whole.limits = config(80, &[], Some(5)).limits;
     let snapshot = Snapshot {
+        count: 1,
         planes: BTreeMap::from([(
             "shop/web".to_owned(),
             Record {

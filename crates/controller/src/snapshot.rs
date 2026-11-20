@@ -29,6 +29,10 @@ use std::collections::BTreeMap;
 /// What the leader holds of the data planes it serves that their objects cannot give back.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
+    /// How new it is: raised by the leader at each change, and carried on by a new leader
+    /// from the snapshot it took, so that the replica taking the lease takes the one with
+    /// the highest of those the ready replicas hold.
+    pub count: u64,
     /// Each data plane's, by its DataPlane as [`Planes`](crate::Planes) names it.
     pub planes: BTreeMap<String, Record>,
 }
@@ -80,6 +84,7 @@ impl Snapshot {
         // this build writes.
         let written = Written {
             config_version: version.get(),
+            count: self.count,
             planes: self
                 .planes
                 .iter()
@@ -105,6 +110,7 @@ impl Snapshot {
         }
         let written: Written = serde_json::from_slice(bytes).map_err(SnapshotError::Unreadable)?;
         Ok(Self {
+            count: written.count,
             planes: written
                 .planes
                 .into_iter()
@@ -125,6 +131,7 @@ struct Of {
 #[serde(deny_unknown_fields)]
 struct Written {
     config_version: u32,
+    count: u64,
     planes: BTreeMap<String, WrittenRecord>,
 }
 
