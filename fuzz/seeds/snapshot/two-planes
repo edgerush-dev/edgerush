@@ -1,0 +1,219 @@
+{
+  "config_version": 1,
+  "planes": {
+    "shop/api": {
+      "accepted": {
+        "metadata": {
+          "creationTimestamp": "2026-11-20T10:00:00Z",
+          "generation": 5,
+          "labels": {
+            "team": "shop"
+          },
+          "name": "api",
+          "namespace": "shop",
+          "uid": "api-uid"
+        },
+        "spec": {
+          "controlPlaneRef": {
+            "name": "edge"
+          },
+          "ingress": {
+            "hostFallThrough": false,
+            "httpPort": 8080,
+            "httpsPort": 443,
+            "httpsRedirect": true,
+            "httpsRedirectMaxAge": 30
+          },
+          "ipFamily": "IPv4",
+          "rateLimiting": {
+            "global": [
+              {
+                "key": "Client",
+                "model": {
+                  "bucket": {
+                    "burst": 1,
+                    "rate": "10/s"
+                  }
+                },
+                "name": "per-client"
+              }
+            ],
+            "mode": "local"
+          },
+          "replicas": {
+            "min": 1
+          },
+          "service": {
+            "type": "LoadBalancer"
+          }
+        }
+      },
+      "config": null,
+      "policies": [],
+      "served": {
+        "metadata": {
+          "creationTimestamp": "2026-11-20T10:00:00Z",
+          "generation": 4,
+          "labels": {
+            "team": "shop"
+          },
+          "name": "api",
+          "namespace": "shop",
+          "uid": "api-uid"
+        },
+        "spec": {
+          "controlPlaneRef": {
+            "name": "edge"
+          },
+          "ingress": {
+            "hostFallThrough": false,
+            "httpPort": 8080,
+            "httpsPort": 443,
+            "httpsRedirect": true,
+            "httpsRedirectMaxAge": 30
+          },
+          "ipFamily": "IPv4",
+          "rateLimiting": {
+            "global": [],
+            "mode": "local"
+          },
+          "replicas": {
+            "min": 1
+          },
+          "service": {
+            "type": "LoadBalancer"
+          }
+        }
+      }
+    },
+    "shop/web": {
+      "accepted": {
+        "metadata": {
+          "creationTimestamp": "2026-11-20T10:00:00Z",
+          "generation": 3,
+          "labels": {
+            "team": "shop"
+          },
+          "name": "web",
+          "namespace": "shop",
+          "uid": "web-uid"
+        },
+        "spec": {
+          "controlPlaneRef": {
+            "name": "edge"
+          },
+          "ingress": {
+            "hostFallThrough": false,
+            "httpPort": 80,
+            "httpsPort": 443,
+            "httpsRedirect": true,
+            "httpsRedirectMaxAge": 30
+          },
+          "ipFamily": "IPv4",
+          "rateLimiting": {
+            "global": [],
+            "mode": "local"
+          },
+          "replicas": {
+            "min": 1
+          },
+          "service": {
+            "type": "LoadBalancer"
+          }
+        }
+      },
+      "config": {
+        "certificates": {
+          "shop": {
+            "chain": "-----BEGIN CERTIFICATE-----\nshop\n-----END CERTIFICATE-----\n",
+            "key": "-----BEGIN PRIVATE KEY-----\nshop\n-----END PRIVATE KEY-----\n"
+          }
+        },
+        "config": {
+          "data_plane": {
+            "experimental_unrestricted_egress": null,
+            "own_service": null,
+            "set_aside_ms": null
+          },
+          "listeners": {
+            "http": {
+              "access_log": null,
+              "address": "[::]:8080",
+              "forwarding": {
+                "trusted_only_headers": [
+                  "Forwarded"
+                ],
+                "trusted_proxies": []
+              },
+              "http3": null,
+              "protocol": "http",
+              "proxy_protocol": "off",
+              "request_id": "generate",
+              "session_answers": null,
+              "session_idle_seconds": null,
+              "tls": null,
+              "tunnel_idle_seconds": null
+            }
+          },
+          "rate_limiting": null,
+          "routes": [],
+          "tcp_routes": [],
+          "tls_routes": [],
+          "udp_routes": [],
+          "upstreams": {}
+        },
+        "limits": {
+          "global": {
+            "rate_limits": [
+              "per-client"
+            ]
+          },
+          "limits": [
+            {
+              "dry_run": false,
+              "key": "client",
+              "match": null,
+              "model": {
+                "bucket": {
+                  "burst": 1,
+                  "rate": "10/s"
+                }
+              },
+              "name": "per-client"
+            }
+          ]
+        }
+      },
+      "policies": [
+        {
+          "generation": 1,
+          "name": "shop",
+          "namespace": "shop",
+          "spec": {
+            "limits": [
+              {
+                "key": "Client",
+                "model": {
+                  "bucket": {
+                    "burst": 1,
+                    "rate": "10/s"
+                  }
+                },
+                "name": "per-client"
+              }
+            ],
+            "targetRefs": [
+              {
+                "group": "networking.k8s.io",
+                "kind": "Ingress",
+                "name": "web"
+              }
+            ]
+          },
+          "uid": "shop-uid"
+        }
+      ],
+      "served": null
+    }
+  }
+}

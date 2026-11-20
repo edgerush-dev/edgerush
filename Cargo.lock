@@ -394,6 +394,7 @@ dependencies = [
  "bytes",
  "edgerush-certificates",
  "edgerush-config",
+ "edgerush-control-stream",
  "edgerush-gateway-api",
  "edgerush-kubernetes",
  "edgerush-planes",

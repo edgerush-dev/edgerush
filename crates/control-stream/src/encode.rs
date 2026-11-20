@@ -15,7 +15,8 @@
 use edgerush_config::Config;
 
 /// The config version this build writes and reads: raised by one whenever the encoding
-/// gains or loses something, apart from releases' numbers.
+/// gains or loses something, the controller's snapshot's as well as the config's (04 §2),
+/// apart from releases' numbers.
 pub const CONFIG_VERSION: u32 = 1;
 
 /// The oldest config version this build still writes, as a control plane, and reads, as a

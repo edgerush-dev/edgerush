@@ -16,7 +16,8 @@
 //! the addresses that Service gives in both. That Service it writes as the config handed
 //! on binds, [`service`] (05 §2). The admission
 //! webhook's reviews are read, the Ingress each asks about judged alone, and answered by
-//! [`admission`] (04 §3).
+//! [`admission`] (04 §3). What a translation cannot read back from the objects is the
+//! leader's, written for the other replicas and read by them as a [`snapshot`] (04 §2).
 
 use acks::{Pods, REPORT_LABEL};
 use edgerush_config::ServiceName;
@@ -69,6 +70,7 @@ mod gateway_status;
 pub mod issuing;
 pub mod own_pods;
 pub mod service;
+pub mod snapshot;
 pub mod status;
 pub mod unimplementable;
 
