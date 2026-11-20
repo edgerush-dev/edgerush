@@ -79,6 +79,9 @@ impl Candidates for View<'_> {
     fn serves(&self, _: usize) -> bool {
         true
     }
+    fn has_room(&self, _: usize) -> bool {
+        true
+    }
     fn in_flight(&self, at: usize) -> u32 {
         self.in_flight[at]
     }

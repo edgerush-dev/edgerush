@@ -2,16 +2,22 @@
 //! `p2c`, two different endpoints drawn at random and the one with fewer exchanges in flight,
 //! or `round_robin`, each endpoint in turn.
 //!
-//! Pure: what the endpoints are like — whether they serve, what is in flight to them, how far
-//! into slow start they are — is asked of [`Candidates`], and every random number of a
-//! caller's generator. Both balancers share three rules:
+//! Pure: what the endpoints are like — whether they serve, whether they have room, what is in
+//! flight to them, how far into slow start they are — is asked of [`Candidates`], and every
+//! random number of a caller's generator. Both balancers share four rules:
 //!
 //! - **Health**: an endpoint failing its checks is not taken, unless fewer than half serve,
 //!   when health is ignored and any may be (Envoy's panic threshold at its default): probes
 //!   that fail most of an upstream are likelier wrong, or about to put the rest under a load
 //!   that fails them too, than a reason to answer every request 503.
-//! - **Tried**: a retry takes no endpoint already tried, unless every one health allows has
-//!   been, when any may be taken again (NGINX's tried set).
+//! - **Room**: an endpoint its protection says is full is never taken
+//!   ([25 §4](../../docs/25-backend-protection.md)), and is drawn again (`p2c`) or passed
+//!   over (`round_robin`) as one failing its checks is; when none that health allows has
+//!   room there is no pick. A full endpoint is not a failing one: it does not count against
+//!   the half that health needs, so a backend whose healthy pods are all full is refused
+//!   rather than sent to those its checks fail.
+//! - **Tried**: a retry takes no endpoint already tried, unless every one health and room
+//!   allow has been, when any of them may be taken again (NGINX's tried set).
 //! - **Slow start acts on the draw**: an endpoint in slow start, drawn or reached in turn, is
 //!   kept with the probability of its [`Share`] and otherwise drawn again or passed over, so
 //!   that its part follows the ramp whatever the load. After [`REFUSALS`] refusals the one in
@@ -20,13 +26,16 @@
 //!   first to go alone: drawn from all but the first, it would otherwise be the one other
 //!   endpoint of an upstream of two every time. An upstream of one endpoint never ramps.
 //!
-//! What the common case costs — every endpoint serving, none ramping, a first try — is one
-//! look at each endpoint drawn: no endpoint is counted, and no list is made, unless one drawn
-//! may not be taken.
+//! What the common case costs — every endpoint serving, with room, none ramping, a first try
+//! — is one look at each endpoint drawn: no endpoint is counted, and no list is made, unless
+//! one drawn may not be taken. Full endpoints cost reads, never writes, and only while one is
+//! drawn.
 //!
 //! **Zones**: where an upstream's endpoints hinted for the data plane's zone come first,
 //! [`zone`] says whether a pick keeps to them, which it does while at least half of them
-//! serve and one that serves is not yet tried; the balancer then draws from them alone,
+//! serve with room — a full one counted as failing, so that a zone whose pods fill spills to
+//! the others before its backend is refused (25 §4) — and one that serves with room is not
+//! yet tried; the balancer then draws from them alone,
 //! under the same rules, which neither ignore health nor take one tried again among them.
 //! Otherwise it draws from the whole upstream. That look is one at each of the zone's
 //! endpoints, for an upstream that has a zone; one that has none pays nothing.
@@ -35,6 +44,8 @@
 // The module is public only when they are being built, so in an ordinary build none of this
 // is API.
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
+
+use std::num::NonZeroU32;
 
 #[cfg(test)]
 mod dead_pod;
@@ -76,6 +87,16 @@ impl Share {
         Self::of(u32::try_from(parts).unwrap_or(Self::FULL.0))
     }
 
+    /// A bound on requests in flight, `cap`, as an endpoint of this share has it: the same
+    /// part of it, rounded down, never below one (25 §4). A cold pod that every other pod's
+    /// fullness sends everything to takes no more than its ramp allows; at one it still
+    /// takes a request.
+    pub fn bound(self, cap: NonZeroU32) -> NonZeroU32 {
+        let part = (u64::from(cap.get()) * u64::from(self.0)) >> 16;
+        // At most `cap`, the share being at most a whole one.
+        NonZeroU32::new(u32::try_from(part).unwrap_or(cap.get())).unwrap_or(NonZeroU32::MIN)
+    }
+
     /// Whether an endpoint of this share, drawn, is kept, given a number uniform over `u64`.
     /// Its top sixteen bits are uniform over 0..65,536, so a share of `p` is kept with the
     /// probability `p / 65,536`, and a full one always.
@@ -90,6 +111,9 @@ pub trait Candidates {
     fn count(&self) -> usize;
     /// Whether the endpoint at `at` passes its checks, or has none.
     fn serves(&self, at: usize) -> bool;
+    /// Whether it has room for another exchange: always, unless its upstream is protected
+    /// and it has as many in flight as its bound allows (25 §3).
+    fn has_room(&self, at: usize) -> bool;
     /// How many exchanges this worker has in flight to it.
     fn in_flight(&self, at: usize) -> u32;
     /// How far into slow start it is: [`Share::FULL`] for one that is not.
@@ -144,6 +168,10 @@ impl<C: Candidates> Candidates for Zone<'_, C> {
         self.all.serves(at)
     }
 
+    fn has_room(&self, at: usize) -> bool {
+        self.all.has_room(at)
+    }
+
     fn in_flight(&self, at: usize) -> u32 {
         self.all.in_flight(at)
     }
@@ -154,10 +182,11 @@ impl<C: Candidates> Candidates for Zone<'_, C> {
 }
 
 /// The zone's endpoints, the first `zoned` of `candidates`, if a pick keeps to them
-/// ([03 §6](../../docs/03-data-plane.md)): while at least half of them serve, so that its
-/// survivors do not take its whole load, and one that serves is not yet tried. Otherwise
-/// none, and the whole upstream is drawn from under its rules; none too when the zone is
-/// all of them, or none.
+/// ([03 §6](../../docs/03-data-plane.md)): while at least half of them serve with room, so
+/// that its survivors do not take its whole load and its full pods spill to the other zones
+/// before anything is refused (25 §4), and one that serves with room is not yet tried.
+/// Otherwise none, and the whole upstream is drawn from under its rules; none too when the
+/// zone is all of them, or none.
 pub fn zone<'a, C: Candidates>(
     candidates: &'a C,
     zoned: usize,
@@ -169,7 +198,7 @@ pub fn zone<'a, C: Candidates>(
     let mut serving = 0;
     let mut untried = false;
     for at in 0..zoned {
-        if candidates.serves(at) {
+        if candidates.serves(at) && candidates.has_room(at) {
             serving += 1;
             untried |= !tried.contains(at);
         }
@@ -185,23 +214,40 @@ pub fn zone<'a, C: Candidates>(
 struct Rule {
     /// Fewer than half serve: any may be taken, whatever its checks say.
     health_ignored: bool,
-    /// Every endpoint health allows has been tried: any of them may be taken again.
+    /// Every endpoint health and room allow has been tried: any of them may be taken again.
     tried_ignored: bool,
-    /// How many may be taken.
+    /// How many may be taken: none when every one health allows is full.
     count: usize,
 }
 
 impl Rule {
     fn of(candidates: &impl Candidates, tried: &Tried) -> Self {
         let endpoints = candidates.count();
-        let serving = (0..endpoints).filter(|&at| candidates.serves(at)).count();
+        // Whether each serves, and has room, in one look at each.
+        let (mut serving, mut serving_with_room, mut with_room) = (0, 0, 0);
+        for at in 0..endpoints {
+            let serves = candidates.serves(at);
+            let room = candidates.has_room(at);
+            serving += usize::from(serves);
+            serving_with_room += usize::from(serves && room);
+            with_room += usize::from(room);
+        }
+        // Fullness is not failure: it leaves the half that health needs as it is.
         let health_ignored = serving * 2 < endpoints;
-        let allowed = if health_ignored { endpoints } else { serving };
+        let allowed = if health_ignored {
+            with_room
+        } else {
+            serving_with_room
+        };
         let untried = if tried.is_empty() {
             allowed
         } else {
             (0..endpoints)
-                .filter(|&at| (health_ignored || candidates.serves(at)) && !tried.contains(at))
+                .filter(|&at| {
+                    (health_ignored || candidates.serves(at))
+                        && candidates.has_room(at)
+                        && !tried.contains(at)
+                })
                 .count()
         };
         let tried_ignored = untried == 0;
@@ -214,6 +260,7 @@ impl Rule {
 
     fn allows(&self, candidates: &impl Candidates, tried: &Tried, at: usize) -> bool {
         (self.health_ignored || candidates.serves(at))
+            && candidates.has_room(at)
             && (self.tried_ignored || !tried.contains(at))
     }
 }
@@ -231,10 +278,10 @@ impl<C: Candidates, R: FnMut() -> u64> Pick<'_, C, R> {
         (self.random)()
     }
 
-    /// Whether the endpoint at `at` may be taken. A serving endpoint not yet tried always may,
-    /// whatever the rule, so the rule is worked out only for one that is neither.
+    /// Whether the endpoint at `at` may be taken. A serving endpoint with room not yet tried
+    /// always may, whatever the rule, so the rule is worked out only for one that is not.
     fn allows(&mut self, at: usize) -> bool {
-        if self.candidates.serves(at) && !self.tried.contains(at) {
+        if self.candidates.serves(at) && !self.tried.contains(at) && self.candidates.has_room(at) {
             return true;
         }
         let rule = self.rule();
@@ -314,7 +361,7 @@ fn skip(at: usize, besides: Option<usize>) -> usize {
 /// `p2c`: two different endpoints that may be taken, drawn at random, and of them the one
 /// with fewer exchanges in flight; the first drawn on a tie. The one that may be taken if
 /// there is only one, and the first if slow start refuses the second; `None` only if there
-/// are no endpoints.
+/// are no endpoints, or none that health allows has room.
 ///
 /// Two *different* endpoints: two draws that may land on the same one would give the busier
 /// of two pods a quarter of the requests (Envoy says so of its own).
@@ -363,8 +410,8 @@ impl RoundRobin {
         Self { next: start }
     }
 
-    /// The endpoint whose turn it is; `None` only if there are no endpoints. Random numbers
-    /// are drawn only for an endpoint in slow start.
+    /// The endpoint whose turn it is; `None` only if there are no endpoints, or none that
+    /// health allows has room. Random numbers are drawn only for an endpoint in slow start.
     pub fn pick(
         &mut self,
         candidates: &impl Candidates,
@@ -380,10 +427,15 @@ impl RoundRobin {
             random,
         };
         let mut refusals = 0;
-        // Some endpoint may always be taken, so each round of them finds one, and each
-        // refusal costs at most a round: this many steps always find one.
+        // Unless every one is full, some endpoint may be taken, so each round of them finds
+        // one, and each refusal costs at most a round: this many steps find one.
         for _ in 0..endpoints * (REFUSALS as usize + 1) {
-            if pick.allows(at) {
+            if !pick.allows(at) {
+                // Worked out once, by the look that found this one may not be taken.
+                if pick.rule().count == 0 {
+                    return None;
+                }
+            } else {
                 let share = candidates.share(at);
                 if endpoints == 1
                     || refusals == REFUSALS
@@ -411,6 +463,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct Endpoints {
         serves: Vec<bool>,
+        room: Vec<bool>,
         in_flight: Vec<u32>,
         share: Vec<Share>,
     }
@@ -419,6 +472,7 @@ mod tests {
         fn serving(count: usize) -> Self {
             Self {
                 serves: vec![true; count],
+                room: vec![true; count],
                 in_flight: vec![0; count],
                 share: vec![Share::FULL; count],
             }
@@ -430,6 +484,14 @@ mod tests {
                 ..Self::serving(serves.len())
             }
         }
+
+        /// Every one serving, those whose `room` is false full.
+        fn with_room(room: &[bool]) -> Self {
+            Self {
+                room: room.to_vec(),
+                ..Self::serving(room.len())
+            }
+        }
     }
 
     impl Candidates for Endpoints {
@@ -438,6 +500,9 @@ mod tests {
         }
         fn serves(&self, at: usize) -> bool {
             self.serves[at]
+        }
+        fn has_room(&self, at: usize) -> bool {
+            self.room[at]
         }
         fn in_flight(&self, at: usize) -> u32 {
             self.in_flight[at]
@@ -466,8 +531,8 @@ mod tests {
         tried
     }
 
-    /// The naive reference: which endpoints may be taken, by the rules as 03 §6 states them,
-    /// worked out in full every time.
+    /// The naive reference: which endpoints may be taken, by the rules as 03 §6 and 25 §4
+    /// state them, worked out in full every time.
     fn may_take(endpoints: &Endpoints, tried: &[usize]) -> BTreeSet<usize> {
         let all: BTreeSet<usize> = (0..endpoints.count()).collect();
         let serving: BTreeSet<usize> = all
@@ -475,11 +540,15 @@ mod tests {
             .copied()
             .filter(|&at| endpoints.serves[at])
             .collect();
-        let allowed = if serving.len() * 2 < all.len() {
+        let healthy = if serving.len() * 2 < all.len() {
             all
         } else {
             serving
         };
+        let allowed: BTreeSet<usize> = healthy
+            .into_iter()
+            .filter(|&at| endpoints.room[at])
+            .collect();
         let untried: BTreeSet<usize> = allowed
             .iter()
             .copied()
@@ -679,6 +748,114 @@ mod tests {
     }
 
     #[test]
+    fn a_full_endpoint_is_never_taken_while_another_has_room() {
+        let four = Endpoints::with_room(&[true, false, false, true]);
+        let mut random = generator(18);
+        let counts = tally(4, 20_000, || p2c(&four, &Tried::default(), &mut random));
+        assert_eq!((counts[1], counts[2]), (0, 0), "{counts:?}");
+        assert!((9_500..=10_500).contains(&counts[0]), "{counts:?}");
+        let mut round_robin = RoundRobin::starting_at(0);
+        let picked: Vec<usize> = (0..6)
+            .map(|_| {
+                round_robin
+                    .pick(&four, &Tried::default(), &mut random)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(picked, [0, 3, 0, 3, 0, 3]);
+    }
+
+    #[test]
+    fn p2c_still_compares_two_among_those_with_room() {
+        // The least busy is full: of the three with room, the busiest is never taken, as
+        // it would never be among three that all had room.
+        let mut four = Endpoints::with_room(&[false, true, true, true]);
+        four.in_flight = vec![0, 1, 2, 3];
+        let mut random = generator(19);
+        let counts = tally(4, 30_000, || p2c(&four, &Tried::default(), &mut random));
+        assert_eq!((counts[0], counts[3]), (0, 0), "{counts:?}");
+        assert!((19_000..=21_000).contains(&counts[1]), "{counts:?}");
+    }
+
+    #[test]
+    fn every_endpoint_full_is_no_pick() {
+        let full = Endpoints::with_room(&[false; 4]);
+        let mut random = generator(23);
+        assert_eq!(p2c(&full, &Tried::default(), &mut random), None);
+        let one = Endpoints::with_room(&[false]);
+        assert_eq!(p2c(&one, &Tried::default(), &mut random), None);
+        // Round-robin gives up at the first look that finds every one full, drawing nothing.
+        let mut drawn = 0;
+        let mut counting = || {
+            drawn += 1;
+            0
+        };
+        assert_eq!(
+            RoundRobin::starting_at(1).pick(&full, &Tried::default(), &mut counting),
+            None
+        );
+        assert_eq!(drawn, 0);
+    }
+
+    #[test]
+    fn a_full_endpoint_is_not_a_failing_one() {
+        // Two of four fail their checks, and the two that pass are full: health still holds,
+        // since half serve, and nothing is sent to those it fails.
+        let mut four = Endpoints::with_health(&[true, true, false, false]);
+        four.room = vec![false, false, true, true];
+        let mut random = generator(20);
+        assert_eq!(p2c(&four, &Tried::default(), &mut random), None);
+        assert_eq!(
+            RoundRobin::starting_at(0).pick(&four, &Tried::default(), &mut random),
+            None
+        );
+        // Fewer than half serve: health is ignored, and those with room are taken.
+        let mut three = Endpoints::with_health(&[true, false, false]);
+        three.room = vec![false, true, true];
+        let counts = tally(3, 3_000, || p2c(&three, &Tried::default(), &mut random));
+        assert_eq!(counts[0], 0, "{counts:?}");
+        assert!(counts[1] > 0 && counts[2] > 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_retry_goes_back_to_one_tried_only_when_every_untried_one_is_full() {
+        let mut random = generator(21);
+        let mut round_robin = RoundRobin::starting_at(0);
+        // One untried with room: always that one.
+        let three = Endpoints::with_room(&[true, true, false]);
+        for _ in 0..20 {
+            assert_eq!(p2c(&three, &tried(&[0]), &mut random), Some(1));
+            assert_eq!(round_robin.pick(&three, &tried(&[0]), &mut random), Some(1));
+        }
+        // Every untried one full: the tried one with room again.
+        let three = Endpoints::with_room(&[true, false, false]);
+        for _ in 0..20 {
+            assert_eq!(p2c(&three, &tried(&[0]), &mut random), Some(0));
+            assert_eq!(round_robin.pick(&three, &tried(&[0]), &mut random), Some(0));
+        }
+    }
+
+    #[test]
+    fn a_full_pod_counts_as_failing_for_the_zone() {
+        // The first four of eight are the zone's.
+        let zone_of = |room: [bool; 4]| {
+            let mut all = [true; 8];
+            all[..4].copy_from_slice(&room);
+            Endpoints::with_room(&all)
+        };
+        assert!(zone(&zone_of([true, false, true, false]), 4, &Tried::default()).is_some());
+        assert!(zone(&zone_of([false, false, true, false]), 4, &Tried::default()).is_none());
+        // Half with room, both tried: the whole upstream, for a retry elsewhere.
+        assert!(zone(&zone_of([true, false, true, false]), 4, &tried(&[0, 2])).is_none());
+        // Spilled, a pick goes to the zone's one with room or to the other zones.
+        let spilled = zone_of([false, false, true, false]);
+        let mut random = generator(22);
+        let counts = tally(8, 7_000, || p2c(&spilled, &Tried::default(), &mut random));
+        assert_eq!(counts[0] + counts[1] + counts[3], 0, "{counts:?}");
+        assert!(counts[2] > 0, "{counts:?}");
+    }
+
+    #[test]
     fn a_ramping_endpoint_is_drawn_in_proportion_to_its_share() {
         // Four endpoints, one at a quarter: its part is a quarter of a full one's, 1/13 of
         // the picks, whether nothing is in flight or everything is.
@@ -746,6 +923,22 @@ mod tests {
     }
 
     #[test]
+    fn a_bound_follows_its_share_and_never_falls_below_one() {
+        let cap = |n| NonZeroU32::new(n).unwrap();
+        assert_eq!(Share::FULL.bound(cap(20)), cap(20));
+        assert_eq!(Share::FULL.bound(cap(u32::MAX)), cap(u32::MAX));
+        assert_eq!(Share::of(1 << 15).bound(cap(20)), cap(10));
+        assert_eq!(Share::ramped(0, 30_000).bound(cap(100)), cap(10));
+        assert_eq!(
+            Share::ramped(0, 30_000).bound(cap(5)),
+            cap(1),
+            "rounded down"
+        );
+        assert_eq!(Share::of(0).bound(cap(1)), cap(1), "never below one");
+        assert_eq!(Share::of(0).bound(cap(20)), cap(1), "never below one");
+    }
+
+    #[test]
     fn a_ramp_rises_linearly_from_a_tenth_to_all() {
         assert_eq!(Share::ramped(0, 30_000), Share::of(6_554));
         assert_eq!(Share::ramped(15_000, 30_000), Share::of(6_554 + 58_982 / 2));
@@ -783,6 +976,8 @@ mod tests {
         (1_usize..10).prop_flat_map(|count| {
             (
                 prop::collection::vec(any::<bool>(), count),
+                // Mostly with room, so that most cases have a pick to make.
+                prop::collection::vec(prop::bool::weighted(0.8), count),
                 prop::collection::vec(0_u32..5, count),
                 prop::collection::vec(
                     prop_oneof![Just(Share::FULL), (0_u32..=65_536).prop_map(Share::of)],
@@ -790,10 +985,11 @@ mod tests {
                 ),
                 prop::collection::vec(0..count, 0..6),
             )
-                .prop_map(|(serves, in_flight, share, tried)| {
+                .prop_map(|(serves, room, in_flight, share, tried)| {
                     (
                         Endpoints {
                             serves,
+                            room,
                             in_flight,
                             share,
                         },
@@ -847,8 +1043,9 @@ mod tests {
     }
 
     proptest! {
-        /// A pick that keeps to the zone takes one of its endpoints that serve, untried; one
-        /// that does not keeps to nothing, as its zone is fewer than half serving, or tried.
+        /// A pick that keeps to the zone takes one of its endpoints that serve with room,
+        /// untried; one that does not keeps to nothing, as its zone is fewer than half
+        /// serving with room, or tried.
         #[test]
         fn a_zone_kept_to_gives_only_its_own_that_serve_untried(
             (endpoints, already) in endpoints(),
@@ -857,7 +1054,9 @@ mod tests {
         ) {
             let tried = tried(&already);
             let count = endpoints.count();
-            let serving: Vec<usize> = (0..zoned.min(count)).filter(|&at| endpoints.serves[at]).collect();
+            let serving: Vec<usize> = (0..zoned.min(count))
+                .filter(|&at| endpoints.serves[at] && endpoints.room[at])
+                .collect();
             let untried = serving.iter().any(|at| !already.contains(at));
             let kept = zoned > 0 && zoned < count && serving.len() * 2 >= zoned && untried;
             let found = zone(&endpoints, zoned, &tried);
@@ -870,7 +1069,10 @@ mod tests {
                         p2c(&found, &tried, &mut random).unwrap(),
                         round_robin.pick(&found, &tried, &mut random).unwrap(),
                     ] {
-                        prop_assert!(at < zoned && endpoints.serves[at] && !already.contains(&at), "{at}");
+                        prop_assert!(
+                            at < zoned && endpoints.serves[at] && endpoints.room[at] && !already.contains(&at),
+                            "{at}"
+                        );
                     }
                 }
             }
@@ -895,12 +1097,18 @@ mod tests {
             seed in any::<u64>(),
         ) {
             let allowed = may_take(&endpoints, &already);
-            let busiest = allowed.iter().copied().max_by_key(|&at| endpoints.in_flight[at]).unwrap();
+            let mut random = generator(seed);
+            let Some(busiest) = allowed.iter().copied().max_by_key(|&at| endpoints.in_flight[at]) else {
+                // Every one health allows is full: no pick, ever.
+                for _ in 0..50 {
+                    prop_assert_eq!(p2c(&endpoints, &tried(&already), &mut random), None);
+                }
+                return Ok(());
+            };
             let strictly = allowed.iter().filter(|&&at| endpoints.in_flight[at] == endpoints.in_flight[busiest]).count() == 1;
             // A second candidate slow start refuses leaves the first to go alone, the busiest
             // too: only where nothing else it could be compared with ramps is it never taken.
             let others_full = allowed.iter().all(|&at| at == busiest || endpoints.share[at] == Share::FULL);
-            let mut random = generator(seed);
             for _ in 0..50 {
                 let at = p2c(&endpoints, &tried(&already), &mut random).unwrap();
                 prop_assert!(allowed.contains(&at), "{at} not in {allowed:?}");
@@ -921,7 +1129,7 @@ mod tests {
             let allowed = may_take(&endpoints, &already);
             let mut random = generator(seed);
             let seen: BTreeSet<usize> = (0..2_000)
-                .map(|_| p2c(&endpoints, &tried(&already), &mut random).unwrap())
+                .filter_map(|_| p2c(&endpoints, &tried(&already), &mut random))
                 .collect();
             prop_assert_eq!(seen, allowed);
         }
@@ -937,6 +1145,9 @@ mod tests {
             let allowed = may_take(&endpoints, &already);
             let mut random = generator(seed);
             let mut round_robin = RoundRobin::starting_at(start);
+            if allowed.is_empty() {
+                prop_assert_eq!(round_robin.pick(&endpoints, &tried(&already), &mut random), None);
+            }
             for _ in 0..3 {
                 let round: Vec<usize> = (0..allowed.len())
                     .map(|_| round_robin.pick(&endpoints, &tried(&already), &mut random).unwrap())
@@ -957,8 +1168,11 @@ mod tests {
             let mut random = generator(seed);
             let mut round_robin = RoundRobin::starting_at(start);
             for _ in 0..50 {
-                let at = round_robin.pick(&endpoints, &tried(&already), &mut random).unwrap();
-                prop_assert!(allowed.contains(&at), "{at} not in {allowed:?}");
+                let at = round_robin.pick(&endpoints, &tried(&already), &mut random);
+                prop_assert_eq!(at.is_none(), allowed.is_empty(), "{:?}", at);
+                if let Some(at) = at {
+                    prop_assert!(allowed.contains(&at), "{at} not in {allowed:?}");
+                }
             }
         }
     }

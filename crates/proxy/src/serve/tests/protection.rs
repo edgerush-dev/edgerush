@@ -237,3 +237,84 @@ fn a_reload_keeps_an_endpoints_count() {
         assert_eq!(status_of(front, "/ok").await, StatusCode::OK);
     }));
 }
+
+/// A pod at its bound is passed over: requests from any worker go to the one with room, and
+/// only with both full is the backend refused (25 §4). Neither is set aside for being full:
+/// once their requests end, both take requests again.
+#[test]
+fn a_full_pod_is_passed_over_for_one_with_room() {
+    use tokio::io::AsyncWriteExt;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let (a, held_at_a) = scripted_upstream().await;
+        let (b, held_at_b) = scripted_upstream().await;
+        let held = || held_at_a.borrow().len() + held_at_b.borrow().len();
+        let mut config = everything_config(a);
+        let up = config.upstreams.get_mut("up").unwrap();
+        up.endpoints = edgerush_config::Endpoints::Listed(vec![a, b]);
+        up.protection = Some(edgerush_config::Protection {
+            max_in_flight: std::num::NonZeroU32::MIN,
+        });
+        let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+        let (first, _one) = serving_from(&proxy).await;
+        let (second, _two) = serving_from(&proxy).await;
+        let all_in_flight = || {
+            let snapshot = proxy.current.load();
+            let protected = snapshot.protected[0].as_ref().expect("`up` is protected");
+            protected
+                .counts
+                .iter()
+                .map(|count| count.in_flight())
+                .sum::<u32>()
+        };
+
+        // One pod holds a request from the first worker, which it never answers: each of
+        // the second worker's goes to the other.
+        let mut waiting = TcpStream::connect(first).await.unwrap();
+        waiting.write_all(&asking("/silent")).await.unwrap();
+        until(|| held() == 1).await;
+        for _ in 0..10 {
+            assert_eq!(status_of(second, "/ok").await, StatusCode::OK);
+        }
+
+        // Both full: refused, from either worker.
+        let mut also = TcpStream::connect(second).await.unwrap();
+        also.write_all(&asking("/silent")).await.unwrap();
+        until(|| held() == 2).await;
+        assert_eq!((held_at_a.borrow().len(), held_at_b.borrow().len()), (1, 1));
+        for front in [first, second] {
+            assert_eq!(
+                status_of(front, "/ok").await,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert_eq!(all_in_flight(), 2, "a refusal takes no slot");
+        let snapshot = proxy.current.load();
+        assert!(
+            snapshot
+                .destinations
+                .of(0)
+                .iter()
+                .all(|destination| destination.serves()),
+            "a full pod was set aside"
+        );
+
+        // Their requests ended, both take again.
+        drop((waiting, also));
+        held_at_a.borrow_mut().clear();
+        held_at_b.borrow_mut().clear();
+        until(|| all_in_flight() == 0).await;
+        let mut again: Vec<TcpStream> = Vec::new();
+        for front in [first, second] {
+            let mut client = TcpStream::connect(front).await.unwrap();
+            client.write_all(&asking("/silent")).await.unwrap();
+            again.push(client);
+        }
+        until(|| held() == 2).await;
+        assert_eq!((held_at_a.borrow().len(), held_at_b.borrow().len()), (1, 1));
+    }));
+}
