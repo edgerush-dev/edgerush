@@ -1,0 +1,21 @@
+[package]
+name = "edgerush-protection"
+description = "EdgeRush backend protection: each backend pod's requests in flight, counted by the workers of a data plane together, no I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+iai-callgrind.workspace = true
+
+[target.'cfg(loom)'.dev-dependencies]
+loom.workspace = true
+
+[[bench]]
+name = "take"
+harness = false
+
+[lints]
+workspace = true

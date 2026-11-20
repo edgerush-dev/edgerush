@@ -350,7 +350,10 @@ impl Worker {
         };
         let destinations = snapshot.destinations.of(upstream.0);
         let picked = balance_of(&self.balancing, &snapshot, upstream.0).and_then(|balance| {
-            balance.pick(destinations, snapshot.zoned(upstream.0), &Tried::default())
+            // A TCP or TLS route's upstream is never protected: its config is refused (25 §1).
+            balance
+                .pick(destinations, snapshot.zoned(upstream.0), &Tried::default())
+                .ok()
         });
         let Some((identity, counted)) = picked
             .and_then(|(at, counted)| Some((snapshot.destinations.at(upstream.0, at)?, counted)))

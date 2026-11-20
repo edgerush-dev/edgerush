@@ -396,6 +396,11 @@ impl Snapshot {
             previous.map_or(&nothing_yet, |previous| &previous.destinations);
         let (destinations, retiring) =
             Destinations::prepare(&config, &resolved, previous_destinations, keys, &secure);
+        let (pods, protected) = crate::upstream::protected::protected(
+            &config,
+            &resolved,
+            previous.map(|previous| &previous.pods),
+        );
         let carried = previous.map_or_else(
             || vec![Carry::New; config.upstreams().len()],
             |previous| {
@@ -416,6 +421,8 @@ impl Snapshot {
             zoned,
             refused,
             upstream_slots,
+            protected,
+            pods,
             limit_slots,
             carried,
             destinations,

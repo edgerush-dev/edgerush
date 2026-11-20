@@ -56,6 +56,7 @@ mod local_limits;
 mod mirrors;
 mod passthrough;
 mod plane;
+mod protection;
 mod proxy_headers;
 mod rate_limits;
 mod resources;

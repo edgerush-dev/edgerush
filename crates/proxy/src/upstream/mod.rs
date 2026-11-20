@@ -14,9 +14,14 @@ pub mod auth;
 pub mod balancing;
 #[cfg(not(feature = "fuzzing"))]
 pub(crate) mod balancing;
+// Public with `balancing`, whose state for an upstream holds its protection.
 pub mod destination;
 pub mod dial;
 pub mod h1;
+#[cfg(feature = "fuzzing")]
+pub mod protected;
+#[cfg(not(feature = "fuzzing"))]
+pub(crate) mod protected;
 pub(crate) mod secure;
 // Crate-private even when the fuzz targets are built: nothing of it is theirs.
 pub(crate) mod h2;

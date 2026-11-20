@@ -3360,6 +3360,8 @@ fn backend_upstream(
         load_balancer: LoadBalancer::P2c,
         slow_start: None,
         proxy_protocol: None,
+        // From the Service's annotations once they are read (25 §2).
+        protection: None,
     };
     Ok(Ok((name, upstream)))
 }

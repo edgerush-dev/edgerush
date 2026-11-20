@@ -34,6 +34,8 @@ edgerush-discovery.workspace = true
 # The list and watch of the namespaces discovered upstreams are in.
 edgerush-kubernetes.workspace = true
 edgerush-filters.workspace = true
+# Each backend pod's requests in flight, every worker's together (25).
+edgerush-protection.workspace = true
 # Rules' rate limits: each worker a data plane of the rate-limiting
 # service's protocol, reaching the service through that crate's gRPC client.
 edgerush-ratelimit.workspace = true

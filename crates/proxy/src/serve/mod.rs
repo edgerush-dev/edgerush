@@ -763,6 +763,14 @@ impl Admitted {
     fn count(&mut self) -> Option<InFlight> {
         self.counted.take()
     }
+
+    /// Gives back the exchange's slot in its endpoint's shared count, keeping the rest,
+    /// for an exchange that will send nothing to the endpoint (25 §6).
+    fn unprotect(&mut self) {
+        if let Some(counted) = &mut self.counted {
+            counted.unprotect();
+        }
+    }
 }
 
 /// By slot ([`Proxy::listeners`]): the listeners whose sockets the data plane holds. A
@@ -812,6 +820,11 @@ struct Snapshot {
     refused: Vec<Vec<(std::net::SocketAddr, crate::egress::Refusal)>>,
     /// By position of the upstream: the slot of its counters.
     upstream_slots: Vec<usize>,
+    /// By position of the upstream: its protection, if it has one, its endpoints' counts
+    /// every worker shares (25 §3).
+    protected: Vec<Option<Arc<balancing::Protected>>>,
+    /// Every pod's count still held, for the next snapshot to find again (25 §3).
+    pods: edgerush_protection::Pods<crate::upstream::protected::PodKey>,
     /// By position of the rate limit: the slot of its counters.
     limit_slots: Arc<[usize]>,
     /// By position of the upstream: what became of it at this reload, worked out once for
@@ -1025,9 +1038,12 @@ impl Directed {
         tried: &Tried,
     ) -> Option<(Uri, Arc<ReuseIdentity>, usize, InFlight)> {
         let others = self.others.as_deref()?;
+        // A try that finds its endpoint full is not sent: the client is given the answer it
+        // has (25 §5).
         let (at, counted) = self
             .upstream
-            .pick(&others.destinations, others.zoned, tried)?;
+            .pick(&others.destinations, others.zoned, tried)
+            .ok()?;
         let authority = others.authorities.get(at)?;
         let destination = others.destinations.get(at)?;
         Some((
@@ -1359,6 +1375,7 @@ fn balance_of(
         &snapshot.config,
         &snapshot.destinations,
         &snapshot.upstream_slots,
+        &snapshot.protected,
         &snapshot.carried,
     );
     balancing.upstream(upstream).cloned()

@@ -519,6 +519,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-protection"
+version = "0.0.0"
+dependencies = [
+ "iai-callgrind",
+ "loom",
+]
+
+[[package]]
 name = "edgerush-proxy"
 version = "0.0.0"
 dependencies = [
@@ -532,6 +540,7 @@ dependencies = [
  "edgerush-discovery",
  "edgerush-filters",
  "edgerush-kubernetes",
+ "edgerush-protection",
  "edgerush-ratelimit",
  "edgerush-ratelimit-service",
  "edgerush-router",

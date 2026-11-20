@@ -48,6 +48,7 @@ edgerush-gateway-api = { path = "crates/gateway-api" }
 edgerush-operator = { path = "crates/operator" }
 edgerush-filters = { path = "crates/filters" }
 edgerush-planes = { path = "crates/planes" }
+edgerush-protection = { path = "crates/protection" }
 edgerush-proxy = { path = "crates/proxy" }
 edgerush-ratelimit = { path = "crates/ratelimit" }
 edgerush-ratelimit-service = { path = "crates/ratelimit-service" }
