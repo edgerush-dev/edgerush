@@ -1469,6 +1469,8 @@ pub struct DataPlaneStatus {
     ///   cluster can make; what the control plane acts on.
     /// * "Programmed": whether what it asks for is made, and its workload has a
     ///   replica available.
+    /// * "Served": its control plane's, whether the generation accepted is the
+    ///   one its data planes are given, or one held back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<Condition>>,
 }

@@ -46,7 +46,12 @@
 #   - a DataPlane naming a Gateway, or a ControlPlane of another namespace, is refused
 #     written by anyone but the operator's ServiceAccount, one of its name in another
 #     namespace among them, and admitted from the operator's; its spec changed by another
-#     is refused, its labels changed admitted.
+#     is refused, its labels changed admitted;
+#   - a control plane's ServiceAccount adds Served to the status of a DataPlane of its own,
+#     in its namespace or generated for it, and is refused Served on another control
+#     plane's, and any change to the other conditions: Accepted changed or of another
+#     generation, Programmed taken away, a condition of another type added; the operator
+#     changes them as ever.
 # Nothing is built: no image is needed. Each check says PASS or FAIL; the first FAIL ends
 # the run with status 1. Nothing here reads or writes the user's own kubeconfig: every
 # kubectl is given the cluster's.
@@ -542,5 +547,79 @@ out=$(k label dataplane -n edge web-payments team=payments 2>&1) \
     || fail "a generated DataPlane's labels changed by hand are refused: $out"
 pass "a generated DataPlane's labels changed by hand are admitted"
 k "${as_operator[@]}" delete dataplane -n edge web-payments >/dev/null
+
+# The policy on a control plane's DataPlane status writes. Its roles patch the status, to
+# apply Served (docs/05 §1); the operator's Accepted and Programmed are the operator's.
+# DataPlanes of its own namespace, of another control plane's there, and one generated in
+# team-status, a namespace of its watch scope, where its role is bound; their status the
+# operator's.
+k create namespace team-status >/dev/null
+k create rolebinding -n team-status edgerush-controller-payments-watched \
+    --clusterrole edgerush-control-plane \
+    --serviceaccount edge:edgerush-controller-payments >/dev/null
+# kubectl patch reads what it patches, which the control plane, applying without reading,
+# has no right to: granted here alone, as the policy and not RBAC is what is judged.
+k create clusterrole edgerush-planes-test-status-reader --verb get \
+    --resource dataplanes.gateway.edgerush.dev/status >/dev/null
+for namespace in edge team-status; do
+    k create rolebinding -n "$namespace" edgerush-planes-test-status-reader \
+        --clusterrole edgerush-planes-test-status-reader \
+        --serviceaccount edge:edgerush-controller-payments >/dev/null
+done
+operators_status='{"status":{"conditions":[
+  {"type":"Accepted","status":"True","reason":"Accepted","message":"Accepted.","lastTransitionTime":"2026-11-20T00:00:00Z","observedGeneration":1},
+  {"type":"Programmed","status":"True","reason":"Programmed","message":"Made.","lastTransitionTime":"2026-11-20T00:00:00Z","observedGeneration":1}]}}'
+served='{"type":"Served","status":"True","reason":"Served","message":"generation 1 is what its data planes are given","lastTransitionTime":"2026-11-20T00:00:00Z","observedGeneration":1}'
+k apply -f - <<<"$(data_plane ours '  ingress: { httpPort: 80, httpsPort: 443 }')" >/dev/null
+k apply -f - <<<"$(printf 'apiVersion: gateway.edgerush.dev/v1alpha1\nkind: DataPlane\nmetadata: { name: theirs, namespace: edge }\nspec:\n  controlPlaneRef: { name: blog }\n  ingress: { httpPort: 80, httpsPort: 443 }\n')" >/dev/null
+k "${as_operator[@]}" create -f - <<<"$(printf 'apiVersion: gateway.edgerush.dev/v1alpha1\nkind: DataPlane\nmetadata: { name: web-payments, namespace: team-status }\nspec:\n  controlPlaneRef: { name: payments, namespace: edge }\n  gatewayRef: { name: web }\n')" >/dev/null
+for target in "edge ours" "edge theirs" "team-status web-payments"; do
+    read -r namespace name <<<"$target"
+    k "${as_operator[@]}" patch dataplane -n "$namespace" "$name" --subresource=status \
+        --type merge -p "$operators_status" >/dev/null
+done
+# `$1` as a JSON patch of DataPlane `$3` of `$2`'s status, from the control plane's
+# ServiceAccount, server-side only.
+status_patch() {
+    k "${as_control_plane[@]}" patch dataplane -n "$2" "$3" --subresource=status \
+        --type json -p "$1" --dry-run=server 2>&1
+}
+add_served="[{\"op\":\"add\",\"path\":\"/status/conditions/-\",\"value\":$served}]"
+for _ in $(seq 1 30); do
+    if ! status_patch '[{"op":"replace","path":"/status/conditions/0/status","value":"False"}]' edge ours >/dev/null; then
+        break
+    fi
+    sleep 1
+done
+out=$(status_patch "$add_served" edge ours) \
+    || fail "Served on its own DataPlane is refused from the control plane's ServiceAccount: $out"
+pass "Served on its own DataPlane is admitted from the control plane's ServiceAccount"
+out=$(status_patch "$add_served" team-status web-payments) \
+    || fail "Served on a DataPlane generated for it is refused from the control plane's ServiceAccount: $out"
+pass "Served on a DataPlane generated for it is admitted from the control plane's ServiceAccount"
+for change in \
+    'Accepted changed|[{"op":"replace","path":"/status/conditions/0/status","value":"False"}]' \
+    'Accepted made of another generation|[{"op":"replace","path":"/status/conditions/0/observedGeneration","value":2}]' \
+    'Programmed taken away|[{"op":"remove","path":"/status/conditions/1"}]' \
+    'a condition of another type added|[{"op":"add","path":"/status/conditions/-","value":{"type":"Other","status":"True","reason":"R","message":"","lastTransitionTime":"2026-11-20T00:00:00Z"}}]'; do
+    what=${change%%|*}
+    out=$(status_patch "${change#*|}" edge ours) \
+        && fail "$what is admitted from the control plane's ServiceAccount"
+    [[ $out == *"changes only a DataPlane's Served condition"* ]] \
+        || fail "$what is refused from the control plane's ServiceAccount, but not by the policy: $out"
+    pass "$what is refused from the control plane's ServiceAccount"
+done
+out=$(status_patch "$add_served" edge theirs) \
+    && fail "Served on another control plane's DataPlane is admitted from the control plane's ServiceAccount"
+[[ $out == *"only of a DataPlane naming its ControlPlane"* ]] \
+    || fail "Served on another control plane's DataPlane is refused, but not by the policy: $out"
+pass "Served on another control plane's DataPlane is refused from the control plane's ServiceAccount"
+out=$(k "${as_operator[@]}" patch dataplane -n edge ours --subresource=status --type json \
+    -p '[{"op":"replace","path":"/status/conditions/0/status","value":"False"}]' --dry-run=server 2>&1) \
+    || fail "the operator's Accepted is refused from the operator: $out"
+pass "the operator's Accepted is admitted from the operator"
+k delete dataplane -n edge ours theirs >/dev/null
+k "${as_operator[@]}" delete dataplane -n team-status web-payments >/dev/null
+k delete namespace team-status --wait=false >/dev/null
 
 echo "every check passed"

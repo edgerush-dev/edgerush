@@ -163,3 +163,61 @@ metadata:
 spec:
   policyName: edgerush-generated-data-planes
   validationActions: [Deny]
+---
+# A control plane applies its DataPlanes' Served (docs/05 §1) under the dataplanes/status
+# patch its roles hold, which RBAC cannot narrow to one condition: the status also holds
+# the operator's Accepted, which a control plane acts on (docs/05 §3), and its Programmed.
+# So a control plane's ServiceAccount changes a DataPlane's status only where the DataPlane
+# names its ControlPlane, by the name after edgerush-controller- and the ServiceAccount's
+# namespace, and only its Served: every other condition stays as it was, in whatever order
+# an apply leaves them. Conditions are all the status holds.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: edgerush-control-plane-data-plane-status
+  labels: { app.kubernetes.io/part-of: edgerush }
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [gateway.edgerush.dev]
+        apiVersions: [v1alpha1]
+        operations: [UPDATE]
+        resources: [dataplanes/status]
+  matchConditions:
+    - name: written-by-a-control-plane
+      expression: request.userInfo.username.matches('^system:serviceaccount:[^:]+:edgerush-controller-[^:]+$')
+  variables:
+    - name: controlPlaneNamespace
+      expression: request.userInfo.username.split(':')[2]
+    # The name after edgerush-controller-, 20 characters.
+    - name: controlPlane
+      expression: request.userInfo.username.split(':')[3].substring(20)
+    - name: namesIt
+      expression: >-
+        object.spec.controlPlaneRef.name == variables.controlPlane &&
+        (has(object.spec.controlPlaneRef.namespace) ? object.spec.controlPlaneRef.namespace : object.metadata.namespace) == variables.controlPlaneNamespace
+    - name: others
+      expression: >-
+        has(object.status) && has(object.status.conditions) ? object.status.conditions.filter(c, c.type != 'Served') : []
+    - name: othersBefore
+      expression: >-
+        has(oldObject.status) && has(oldObject.status.conditions) ? oldObject.status.conditions.filter(c, c.type != 'Served') : []
+  validations:
+    - expression: variables.namesIt
+      message: an EdgeRush control plane writes the status only of a DataPlane naming its ControlPlane
+      reason: Forbidden
+    - expression: >-
+        size(variables.others) == size(variables.othersBefore) &&
+        variables.others.all(c, c in variables.othersBefore)
+      message: an EdgeRush control plane changes only a DataPlane's Served condition
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: edgerush-control-plane-data-plane-status
+  labels: { app.kubernetes.io/part-of: edgerush }
+spec:
+  policyName: edgerush-control-plane-data-plane-status
+  validationActions: [Deny]

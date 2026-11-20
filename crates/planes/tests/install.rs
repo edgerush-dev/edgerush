@@ -262,6 +262,45 @@ fn the_service_policy_matches_the_control_planes_service_accounts_and_is_bound()
 }
 
 #[test]
+fn the_data_plane_status_policy_judges_the_control_planes_status_writes_and_is_bound() {
+    let policies = admission_policies();
+    let (_, conditions) = policies
+        .iter()
+        .find(|(name, _)| name == "edgerush-control-plane-data-plane-status")
+        .expect("the policy on a control plane's DataPlane status writes");
+    // The control plane's ServiceAccount is named as the policy expects.
+    let prefix = controller_name("");
+    assert!(
+        conditions
+            .iter()
+            .any(|c| c.contains(&format!(":{prefix}[^:]+$"))),
+        "no condition matches {prefix}<controlplane>"
+    );
+    // What it judges: the status a control plane applies, as its roles grant the patch.
+    let shipped: Vec<Admission> = serde_saphyr::from_multiple(&read("admission.yaml")).unwrap();
+    let rules = shipped
+        .into_iter()
+        .find_map(|object| match object {
+            Admission::ValidatingAdmissionPolicy(policy)
+                if policy.metadata.name.as_deref()
+                    == Some("edgerush-control-plane-data-plane-status") =>
+            {
+                policy.spec?.match_constraints?.resource_rules
+            }
+            _ => None,
+        })
+        .expect("its rules");
+    let [rule] = rules.as_slice() else {
+        panic!("one rule: {rules:?}");
+    };
+    assert_eq!(
+        rule.resources.as_deref(),
+        Some(&["dataplanes/status".to_owned()][..])
+    );
+    assert_eq!(rule.operations.as_deref(), Some(&["UPDATE".to_owned()][..]));
+}
+
+#[test]
 fn the_generated_data_plane_policy_lets_through_the_operator_alone_and_is_bound() {
     let policies = admission_policies();
     let (_, conditions) = policies
