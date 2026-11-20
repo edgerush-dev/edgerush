@@ -34,6 +34,7 @@ use edgerush_gateway_api::udp_route::UDPRoute;
 use edgerush_kubernetes::{
     ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow, lease,
 };
+use edgerush_planes::data_plane::DataPlane;
 use edgerush_planes::objects::{
     ProxyService, SERVICE_MANAGED_BY, Transports, control_plane_labels,
 };
@@ -48,6 +49,7 @@ use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
@@ -86,7 +88,25 @@ pub struct Settings {
     /// Gateway of that one that sets `infrastructure.parametersRef` is translated no
     /// further while it does, and its status left to the operator.
     pub generated: bool,
+    /// The DataPlane they are of, and its generation: what its `Served` condition says of
+    /// (05 §1). None for the development harness, which has none.
+    pub data_plane: Option<DataPlaneOf>,
 }
+
+/// A DataPlane, and the generation of it some settings are of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataPlaneOf {
+    /// Its namespace.
+    pub namespace: String,
+    /// Its name.
+    pub name: String,
+    /// Its generation.
+    pub generation: i64,
+}
+
+/// The condition a control plane writes on each DataPlane it serves, beside the operator's
+/// (05 §1): whether the generation the operator accepted is the one served.
+const SERVED: &str = "Served";
 
 /// The data planes a control plane serves, each by its DataPlane as it is said,
 /// `DataPlane <namespace>/<name>`; the development harness's one by no name.
@@ -399,6 +419,8 @@ struct Serving {
     wanted: Option<Settings>,
     /// Why `wanted` was last said to be held back, so that each reason is said once.
     said_held: Option<HeldBack>,
+    /// Its DataPlane's `Served` as this replica last wrote it while it leads.
+    served_written: Option<Condition>,
     translator: Translator,
     /// What the config handed on serves: the Ingresses claimed, and those served.
     handed: Option<(Vec<Object>, Vec<Object>)>,
@@ -432,6 +454,19 @@ pub enum HeldBack {
     TooManyLimits,
 }
 
+impl HeldBack {
+    /// Why, as the DataPlane's `Served` says it: never naming the policy that holds a name,
+    /// which may be of a namespace the DataPlane's readers do not see (04 §6).
+    fn in_status(&self) -> String {
+        match self {
+            Self::NameHeld { limit, .. } => format!(
+                "its global limit `{limit}` has the name of a limit a RateLimitPolicy holds"
+            ),
+            Self::TooManyLimits => self.to_string(),
+        }
+    }
+}
+
 impl fmt::Display for HeldBack {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -456,6 +491,7 @@ impl Serving {
             settings,
             wanted: None,
             said_held: None,
+            served_written: None,
             translator: Translator::default(),
             handed: None,
             handed_api: None,
@@ -917,6 +953,12 @@ async fn write_statuses(
     held: bool,
     said: &dyn Fn(Said<'_>),
 ) {
+    if leads {
+        write_served(api, served, said).await;
+    } else {
+        // A leader before it may have written it otherwise.
+        served.served_written = None;
+    }
     let own = served.settings.service.as_ref();
     let live = own.and_then(|own| followed.own_service(own));
     if let (Some(own), Some(ports), true, true) =
@@ -974,6 +1016,87 @@ async fn write_statuses(
         for change in status::changes(claimed, served, &ingresses, addresses) {
             write_ingress_status(api, &change, said).await;
         }
+    }
+}
+
+/// Writes `served`'s DataPlane's `Served` where it says other than this replica last wrote
+/// (05 §1): true of the generation served where none is held back; false `HeldBack` of the
+/// one held back, once judged, saying why and which is served. Its own condition alone,
+/// applied under the control plane's field manager, the operator's left to the operator.
+/// Nothing for the development harness, which has no DataPlane.
+async fn write_served(api: &ApiServer, served: &mut Serving, said: &dyn Fn(Said<'_>)) {
+    let Some(of) = &served.settings.data_plane else {
+        return;
+    };
+    let (generation, status, reason, message) = match (&served.wanted, &served.said_held) {
+        (None, _) => (
+            of.generation,
+            "True",
+            "Served",
+            format!(
+                "generation {} is what its data planes are given",
+                of.generation
+            ),
+        ),
+        (Some(wanted), Some(why)) => {
+            let Some(held) = &wanted.data_plane else {
+                return;
+            };
+            (
+                held.generation,
+                "False",
+                "HeldBack",
+                format!(
+                    "generation {} is held back, generation {} served in its place: {}",
+                    held.generation,
+                    of.generation,
+                    why.in_status()
+                ),
+            )
+        }
+        // Not judged yet: what was written stands.
+        (Some(_), None) => return,
+    };
+    let last = served.served_written.as_ref();
+    if last.is_some_and(|last| {
+        last.observed_generation == Some(generation)
+            && last.status == status
+            && last.reason == reason
+            && last.message == message
+    }) {
+        return;
+    }
+    let since = last.filter(|last| last.status == status).map_or_else(
+        || Time(lease::wall_clock()),
+        |last| last.last_transition_time.clone(),
+    );
+    let condition = Condition {
+        last_transition_time: since,
+        message,
+        observed_generation: Some(generation),
+        reason: reason.to_owned(),
+        status: status.to_owned(),
+        type_: SERVED.to_owned(),
+    };
+    let (namespace, name) = (of.namespace.clone(), of.name.clone());
+    let result = api
+        .apply_status::<DataPlane>(
+            SERVICE_MANAGED_BY,
+            &namespace,
+            &name,
+            &serde_json::json!({ "conditions": [&condition] }),
+        )
+        .await;
+    said(Said::GatewayApiStatus {
+        object: &Object {
+            kind: "DataPlane",
+            namespace,
+            name,
+        },
+        written: result.as_ref().map(|_| ()),
+    });
+    if result.is_ok() {
+        served.served_written = Some(condition);
     }
 }
 

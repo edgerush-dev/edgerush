@@ -998,6 +998,7 @@ async fn control_until(
                     plane,
                     service: None,
                     generated: false,
+                    data_plane: None,
                 },
             )]));
             (Some(settings), None)

@@ -823,6 +823,7 @@ fn harness_planes(planes: &[(&str, &str)]) -> Planes {
                 plane: serde_saphyr::from_str(yaml).unwrap(),
                 service: None,
                 generated: false,
+                data_plane: None,
             };
             ((*name).to_owned(), settings)
         })
