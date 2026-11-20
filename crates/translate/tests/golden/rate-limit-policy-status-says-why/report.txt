@@ -1,0 +1,7 @@
+RateLimitPolicy shop/clashing: refused: its limit `platform-per-client` has the name of the DataPlane's, which holds it
+RateLimitPolicy shop/clashing: refused: its limit `taken` has the name of RateLimitPolicy shop/holder's, which holds it
+RateLimitPolicy shop/route-gone: applies nothing to HTTPRoute shop/gone: it is not there
+RateLimitPolicy shop/rule-gone: applies nothing to HTTPRoute shop/a section nope: it has no rule `nope`
+RateLimitPolicy edge/listener-gone: applies nothing to Gateway edge/web section nope: it has no listener `nope`
+RateLimitPolicy shop/on-redirect: applies nothing to HTTPRoute shop/a section old, which forwards nothing: a rule that redirects is under no limits
+RateLimitPolicy shop/on-moved: applies nothing to HTTPRoute shop/moved, which forwards nothing: a rule that redirects is under no limits

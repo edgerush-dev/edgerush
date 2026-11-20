@@ -1,0 +1,148 @@
+listeners:
+  port-80:
+    address: 0.0.0.0:80
+    protocol: http
+    tls: null
+    http3: null
+    tunnel_idle_seconds: null
+    session_idle_seconds: null
+    session_answers: null
+    forwarding:
+      trusted_proxies: []
+      trusted_only_headers:
+      - Forwarded
+      - X-Real-IP
+      - X-Forwarded-*
+    request_id: generate
+    proxy_protocol: "off"
+    access_log: null
+routes:
+- name: httproute/shop/a/http
+  listeners:
+  - port-80
+  hostnames:
+  - name: a.example.com
+    wildcard: null
+    falls_through: false
+  rules:
+  - matches:
+    - path:
+        prefix: /
+      grpc: null
+      method: null
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/web/http
+        invalid: null
+        weight: 1
+      timeouts: null
+      retry: null
+    redirect: null
+    paths: null
+    rate_limits:
+    - platform-per-client
+    - taken
+    - route-gone-per-client
+    - on-redirect-per-client
+  - matches:
+    - path:
+        prefix: /old
+      grpc: null
+      method: null
+      headers: []
+      query: []
+    filters: []
+    forward: null
+    redirect:
+      status: 302
+      scheme: null
+      host: new.example.com
+      port: null
+      path: null
+      query: keep
+    paths: null
+    rate_limits: []
+  rate_limits: []
+- name: httproute/shop/moved/http
+  listeners:
+  - port-80
+  hostnames:
+  - name: moved.example.com
+    wildcard: null
+    falls_through: false
+  rules:
+  - matches:
+    - path:
+        prefix: /
+      grpc: null
+      method: null
+      headers: []
+      query: []
+    filters: []
+    forward: null
+    redirect:
+      status: 302
+      scheme: null
+      host: new.example.com
+      port: null
+      path: null
+      query: keep
+    paths: null
+    rate_limits: []
+  rate_limits: []
+- name: ingress/shop/web/ingress.example.com
+  listeners:
+  - port-80
+  hostnames:
+  - name: ingress.example.com
+    wildcard: null
+    falls_through: false
+  rules:
+  - matches:
+    - path:
+        prefix: /
+      grpc: null
+      method: null
+      headers: []
+      query: []
+    filters: []
+    forward:
+      backends:
+      - upstream: shop/web/http
+        invalid: null
+        weight: 1
+      timeouts: null
+      retry: null
+    redirect: null
+    paths: null
+    rate_limits:
+    - platform-per-client
+    - ingress-per-client
+  rate_limits: []
+tcp_routes: []
+tls_routes: []
+udp_routes: []
+upstreams:
+  shop/web/http:
+    endpoints:
+      kubernetes: web.shop.svc.cluster.local:http
+    protocol: http1
+    tls: null
+    keepalive: null
+    health_check: null
+    load_balancer: p2c
+    slow_start: null
+    proxy_protocol: null
+data_plane:
+  set_aside_ms: null
+  experimental_unrestricted_egress: null
+  own_service: null
+rate_limiting:
+  mode: local
+  max_key_bytes: null
+  service: null
+  synchronous: null
+  experimental_header_keys: null

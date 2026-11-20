@@ -2013,6 +2013,129 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
     assert_eq!(patched, expected);
 }
 
+/// A RateLimitPolicy's status is written of each ancestor it reaches, here the Ingress it
+/// targets, with no Gateway API followed: its `Accepted` alone, under this controller's
+/// name, and once, as nothing changes after; this controller's entry of an Ingress of the
+/// data plane's class it no longer reaches taken away, another controller's kept (04 §6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rate_limit_policys_status_is_written_of_the_ingress_it_reaches_and_once() {
+    let entry = |controller: &str, name: &str| {
+        format!(
+            r#"{{"ancestorRef":{{"group":"networking.k8s.io","kind":"Ingress","name":"{name}","namespace":"shop"}},"controllerName":"{controller}","conditions":[]}}"#
+        )
+    };
+    let theirs = entry("example.com/other", "old");
+    let with_status = PER_CLIENT_POLICY.replace(
+        r#""spec":"#,
+        &format!(
+            r#""status":{{"ancestors":[{},{theirs}]}},"spec":"#,
+            entry(GATEWAY_CONTROLLER, "old")
+        ),
+    );
+    let theirs: serde_json::Value = serde_json::from_str(&theirs).unwrap();
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        if path.ends_with("/status") {
+            return answer(200, "{}");
+        }
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[
+                ingress("shop", "web", "shop.example"),
+                ingress("shop", "old", "old.example"),
+            ])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/secrets?") {
+            page(&[secret("shop", &["shop.example"])])
+        } else if path.starts_with("/apis/gateway.edgerush.dev/v1alpha1/ratelimitpolicies?") {
+            answer(200, &with_status)
+        } else {
+            otherwise(path)
+        }
+    })
+    .await;
+    let api = fake.client(
+        &token("controller-limit-status", "secret"),
+        Timing::default(),
+    );
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        fixed(&limiting(&[])),
+                        None,
+                        Debounce::default(),
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            let written = || {
+                heard
+                    .borrow()
+                    .lines
+                    .iter()
+                    .filter(|line| line.starts_with("status of RateLimitPolicy shop/shop"))
+                    .count()
+            };
+            until("the policy's status written", || written() == 1).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(written(), 1, "written again");
+            controlling.abort();
+        })
+        .await;
+    let bodies: Vec<serde_json::Value> = fake
+        .seen()
+        .iter()
+        .filter(|seen| seen.path.ends_with("/ratelimitpolicies/shop/status"))
+        .map(|seen| {
+            assert_eq!(seen.method, "PUT");
+            assert_eq!(
+                seen.path,
+                "/apis/gateway.edgerush.dev/v1alpha1/namespaces/shop/ratelimitpolicies/shop/status"
+            );
+            serde_json::from_str(&seen.body).unwrap()
+        })
+        .collect();
+    assert_eq!(bodies.len(), 1);
+    let ancestors = &bodies[0]["status"]["ancestors"];
+    assert_eq!(ancestors.as_array().unwrap().len(), 2, "{ancestors}");
+    assert_eq!(ancestors[0], theirs, "another controller's");
+    let ancestors = &ancestors.as_array().unwrap()[1..];
+    assert_eq!(
+        ancestors[0]["ancestorRef"],
+        serde_json::json!({ "group": "networking.k8s.io", "kind": "Ingress", "name": "web",
+                            "namespace": "shop" })
+    );
+    assert_eq!(ancestors[0]["controllerName"], GATEWAY_CONTROLLER);
+    let conditions = ancestors[0]["conditions"].as_array().unwrap();
+    assert_eq!(conditions.len(), 1, "{conditions:?}");
+    assert_eq!(
+        (
+            &conditions[0]["type"],
+            &conditions[0]["status"],
+            &conditions[0]["observedGeneration"]
+        ),
+        (
+            &serde_json::json!("Accepted"),
+            &serde_json::json!("True"),
+            &serde_json::json!(1)
+        )
+    );
+}
+
 /// The data plane's Service not to be read: translation goes on all the same, and no status,
 /// nor the Service, is written until it is listed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

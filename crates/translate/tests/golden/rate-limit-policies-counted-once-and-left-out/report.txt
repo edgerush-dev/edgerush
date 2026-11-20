@@ -1,3 +1,6 @@
 RateLimitPolicy shop/platform-clash: refused: its limit `platform` has the name of the DataPlane's, which holds it
 RateLimitPolicy shop/later: refused: its limit `shared-per-client` has the name of RateLimitPolicy shop/shared's, which holds it
 RateLimitPolicy shop/invalid: the data plane would refuse it: limits[bad].model.bucket.burst: 0 is out of range
+RateLimitPolicy shop/gone: applies nothing to HTTPRoute shop/gone: it is not there
+RateLimitPolicy shop/no-rule: applies nothing to HTTPRoute shop/a section nope: it has no rule `nope`
+RateLimitPolicy edge/other-gateway: applies nothing to Gateway edge/other: it is not there

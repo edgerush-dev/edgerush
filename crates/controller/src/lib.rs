@@ -39,8 +39,8 @@ use edgerush_planes::objects::{
 };
 use edgerush_planes::rate_limit_policy::RateLimitPolicy;
 use edgerush_translate::{
-    AcceptedPolicy, Cluster, GATEWAY_CONTROLLER, GatewayStatus, Object, Plane, PolicyStatus,
-    Problem, RouteStatus, Translation, translate_from,
+    AcceptedPolicy, Cluster, GATEWAY_CONTROLLER, GatewayStatus, LimitPolicyStatus, Object, Plane,
+    PolicyStatus, Problem, RouteStatus, Translation, translate_from,
 };
 use gateway_status::Programmed;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
@@ -403,6 +403,9 @@ struct Serving {
     handed: Option<(Vec<Object>, Vec<Object>)>,
     /// What the config handed on says the Gateway API's objects' status is to say.
     handed_api: Option<Handed>,
+    /// What the config handed on says each RateLimitPolicy's status is to say of the
+    /// ancestors it reaches here.
+    handed_limits: Option<Vec<LimitPolicyStatus>>,
     /// The ports the config handed on binds.
     handed_ports: Option<BTreeMap<u16, Transports>>,
     /// The generation of the Gateway handed on, and when it was first.
@@ -455,6 +458,7 @@ impl Serving {
             translator: Translator::default(),
             handed: None,
             handed_api: None,
+            handed_limits: None,
             handed_ports: None,
             handed_since: None,
             written: Written::default(),
@@ -770,6 +774,7 @@ async fn serve(
                     served.handed = Some((translation.claimed.clone(), translation.served.clone()));
                     served.handed_ports = Some(service::bound(&translation.config));
                     served.handed_api = Handed::of(translation);
+                    served.handed_limits = Some(translation.limit_policy_statuses.clone());
                     if let Some(handed) = &served.handed_api {
                         let generation = handed.status.generation;
                         if served
@@ -838,6 +843,11 @@ async fn serve(
             gateway_api
                 .write_shared(api, &handed, own.as_ref(), &**said)
                 .await;
+        }
+        // Each RateLimitPolicy's, once for every data plane, whether or not the Gateway API
+        // is followed: an Ingress is an ancestor too (04 §6).
+        if leads {
+            write_limit_policies(api, &followed, &serving, &**said).await;
         }
         // Until a change comes, or the bound a data plane's pods are waited on to run its
         // Gateway's generation, and then until its moment is over.
@@ -962,6 +972,141 @@ async fn write_statuses(
         let ingresses = followed.ingresses();
         for change in status::changes(claimed, served, &ingresses, addresses) {
             write_ingress_status(api, &change, said).await;
+        }
+    }
+}
+
+/// Writes, one at a time and once for every data plane `serving`, each RateLimitPolicy's
+/// status that says other than they have it (04 §6): an ancestor of ours for each data
+/// plane's Gateway and each Ingress of its class that a policy reaches, as its translation
+/// handed on says, and none for one it no longer reaches. This controller's entries of a
+/// Gateway gone, or of an Ingress of the policy's namespace that is not there, are taken
+/// away; every other kept whole.
+async fn write_limit_policies(
+    api: &ApiServer,
+    followed: &Followed,
+    serving: &BTreeMap<String, Serving>,
+    said: &dyn Fn(Said<'_>),
+) {
+    let handed: Vec<&Serving> = serving
+        .values()
+        .filter(|served| served.handed_limits.is_some())
+        .collect();
+    if handed.is_empty() {
+        return;
+    }
+    // The ancestors the data planes write of: each one's Gateway, and each Ingress of its
+    // class; and what each policy's status is to say of those it reaches.
+    let mut of_ours: BTreeSet<Object> = BTreeSet::new();
+    let mut reached: BTreeMap<&Object, Vec<(&Object, gateway_status::OfAncestor<'_>)>> =
+        BTreeMap::new();
+    for served in &handed {
+        of_ours.extend(
+            served
+                .handed_api
+                .as_ref()
+                .map(|handed| handed.gateway.clone()),
+        );
+        if let Some((claimed, _)) = &served.handed {
+            of_ours.extend(claimed.iter().cloned());
+        }
+        for status in served.handed_limits.iter().flatten() {
+            let of = gateway_status::OfAncestor {
+                generation: status.generation,
+                conditions: &status.conditions,
+            };
+            reached
+                .entry(&status.policy)
+                .or_default()
+                .extend(status.ancestors.iter().map(|ancestor| (ancestor, of)));
+        }
+    }
+    let (followed_gateways, gateways_there) = followed
+        .gateway_api
+        .as_ref()
+        .map(GatewayApi::gateways_known)
+        .unwrap_or_default();
+    let gateways = gateway_status::Gateways {
+        namespaces: &followed_gateways,
+        there: &gateways_there,
+    };
+    let ingresses_there: BTreeSet<Object> = followed
+        .ingresses()
+        .iter()
+        .map(|ingress| Object {
+            kind: "Ingress",
+            namespace: ingress.metadata.namespace.clone().unwrap_or_default(),
+            name: ingress.metadata.name.clone().unwrap_or_default(),
+        })
+        .collect();
+    let now = lease::wall_clock();
+    for policy in objects(&followed.rate_limit_policies) {
+        let object = Object {
+            kind: "RateLimitPolicy",
+            namespace: policy.metadata.namespace.clone().unwrap_or_default(),
+            name: policy.metadata.name.clone().unwrap_or_default(),
+        };
+        // Those it reaches, and each other of the data planes' its status holds an entry of
+        // ours for, which is to be taken away.
+        let mut wanted: Vec<(Object, Option<gateway_status::OfAncestor<'_>>)> = reached
+            .get(&object)
+            .into_iter()
+            .flatten()
+            .map(|(ancestor, of)| ((*ancestor).clone(), Some(*of)))
+            .collect();
+        for ancestor in policy.status.iter().flat_map(|status| &status.ancestors) {
+            let to = &ancestor.ancestor_ref;
+            let kind = match to.kind.as_deref() {
+                None | Some("Gateway") => "Gateway",
+                Some("Ingress") => "Ingress",
+                Some(_) => continue,
+            };
+            let named = Object {
+                kind,
+                namespace: to
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| object.namespace.clone()),
+                name: to.name.clone(),
+            };
+            if ancestor.controller_name == GATEWAY_CONTROLLER
+                && of_ours.contains(&named)
+                && !wanted.iter().any(|(known, _)| *known == named)
+            {
+                wanted.push((named, None));
+            }
+        }
+        let wanted: Vec<(&Object, Option<gateway_status::OfAncestor<'_>>)> = wanted
+            .iter()
+            .map(|(ancestor, of)| (ancestor, *of))
+            .collect();
+        let live = policy.status.as_ref().map(gateway_status::limits_as_tls);
+        let status = gateway_status::policy_status(
+            live.as_ref(),
+            &object.namespace,
+            &wanted,
+            &gateway_status::LIMIT_ANCESTOR_TYPES,
+            (gateways, Some(&ingresses_there)),
+            now,
+        );
+        if live.unwrap_or_default() != status {
+            let version = policy
+                .metadata
+                .resource_version
+                .as_deref()
+                .unwrap_or_default();
+            let result = api
+                .replace_status::<RateLimitPolicy>(
+                    &object.namespace,
+                    &object.name,
+                    version,
+                    &status,
+                )
+                .await;
+            said(Said::GatewayApiStatus {
+                object: &object,
+                written: result.as_ref().map(|_| ()),
+            });
         }
     }
 }
@@ -1390,6 +1535,32 @@ impl GatewayApi {
             })
     }
 
+    /// The namespaces it follows Gateways in, and the Gateways there: what tells a Gateway
+    /// gone (04 §6).
+    fn gateways_known(&self) -> (Vec<String>, Vec<Object>) {
+        let there = self
+            .gateways
+            .as_deref()
+            .map(objects)
+            .unwrap_or_default()
+            .iter()
+            .map(|gateway| Object {
+                kind: "Gateway",
+                namespace: gateway.metadata.namespace.clone().unwrap_or_default(),
+                name: gateway.metadata.name.clone().unwrap_or_default(),
+            })
+            .collect();
+        let followed = self
+            .gateway_namespaces
+            .iter()
+            .filter_map(|scope| match scope {
+                Scope::Namespace(namespace) => Some(namespace.clone()),
+                _ => None,
+            })
+            .collect();
+        (followed, there)
+    }
+
     /// Writes, one at a time, each status of a data plane's own that says other than
     /// `handed` has it: that of its Gateway, `addresses` among it, and of each ListenerSet
     /// naming it. Nothing while the Gateway is not there.
@@ -1542,26 +1713,7 @@ impl GatewayApi {
         if there.is_empty() {
             return;
         }
-        let gateways_there: Vec<Object> = self
-            .gateways
-            .as_deref()
-            .map(objects)
-            .unwrap_or_default()
-            .iter()
-            .map(|gateway| Object {
-                kind: "Gateway",
-                namespace: gateway.metadata.namespace.clone().unwrap_or_default(),
-                name: gateway.metadata.name.clone().unwrap_or_default(),
-            })
-            .collect();
-        let followed: Vec<String> = self
-            .gateway_namespaces
-            .iter()
-            .filter_map(|scope| match scope {
-                Scope::Namespace(namespace) => Some(namespace.clone()),
-                _ => None,
-            })
-            .collect();
+        let (followed, gateways_there) = self.gateways_known();
         let gateways = gateway_status::Gateways {
             namespaces: &followed,
             there: &gateways_there,

@@ -1,0 +1,2 @@
+HTTPRoute shop/a: attached to http (a.example.com)
+HTTPRoute shop/moved: attached to http (moved.example.com)

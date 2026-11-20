@@ -835,11 +835,14 @@ pub(crate) fn config_routes(
                         let mut rule = on_port(rule, listener.port);
                         // A rule that redirects is under none (07 §2).
                         if rule.forward.is_some() {
+                            rate_limits.forwards(&outcome.route);
                             rule.rate_limits = rate_limits.of_rule(&Place {
                                 attachment,
                                 route: &outcome.route,
                                 rule: *rule_name,
                             });
+                        } else {
+                            rate_limits.redirects(&outcome.route, *rule_name);
                         }
                         rule
                     })

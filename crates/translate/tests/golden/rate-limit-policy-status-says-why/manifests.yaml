@@ -1,0 +1,149 @@
+# What each RateLimitPolicy's status says, of each ancestor its targets reach: the data
+# plane's Gateway, where a target is the Gateway, a listener of it or a route on it, and each
+# Ingress of the data plane's class it targets. Accepted where all is well; false where a
+# limit's name is held, naming each such limit but never what holds it; where a target, or
+# its `sectionName`, is not there; and where a rule it targets redirects, or every rule of a
+# route it targets does, but not where only some do. A policy whose
+# targets reach nothing here has no status of this data plane's, nor does an Ingress of
+# another class.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 80, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: a, namespace: shop, generation: 3 }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [a.example.com]
+  rules:
+    - name: main
+      backendRefs: [{ name: web, port: 80 }]
+    - name: old
+      matches: [{ path: { type: PathPrefix, value: /old } }]
+      filters: [{ type: RequestRedirect, requestRedirect: { hostname: new.example.com } }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: elsewhere, namespace: shop }
+spec:
+  parentRefs: [{ name: other, namespace: edge }]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: moved, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge }]
+  hostnames: [moved.example.com]
+  rules: [{ filters: [{ type: RequestRedirect, requestRedirect: { hostname: new.example.com } }] }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: ingress.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: theirs, namespace: shop }
+spec:
+  ingressClassName: another
+  rules:
+    - host: theirs.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: holder, namespace: shop, generation: 2, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }]
+  limits: [{ name: taken, key: Client, model: { bucket: { rate: 10/s, burst: 10 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: clashing, namespace: shop, generation: 1, creationTimestamp: "2026-01-02T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }]
+  limits:
+    - { name: platform-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }
+    - { name: clashing-own, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }
+    - { name: taken, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: route-gone, namespace: shop, generation: 1, creationTimestamp: "2026-01-03T00:00:00Z" }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: gone }
+  limits: [{ name: route-gone-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: rule-gone, namespace: shop, generation: 1, creationTimestamp: "2026-01-04T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a, sectionName: nope }]
+  limits: [{ name: rule-gone-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: listener-gone, namespace: edge, generation: 1, creationTimestamp: "2026-01-05T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: Gateway, name: web, sectionName: nope }]
+  limits: [{ name: listener-gone-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: on-redirect, namespace: shop, generation: 1, creationTimestamp: "2026-01-06T00:00:00Z" }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: a, sectionName: main }
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: a, sectionName: old }
+  limits: [{ name: on-redirect-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: on-moved, namespace: shop, generation: 1, creationTimestamp: "2026-01-06T12:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: moved }]
+  limits: [{ name: on-moved-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: elsewhere, namespace: shop, generation: 1, creationTimestamp: "2026-01-07T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: elsewhere }]
+  limits: [{ name: elsewhere-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: on-ingresses, namespace: shop, generation: 4, creationTimestamp: "2026-01-08T00:00:00Z" }
+spec:
+  targetRefs:
+    - { group: networking.k8s.io, kind: Ingress, name: web }
+    - { group: networking.k8s.io, kind: Ingress, name: theirs }
+  limits: [{ name: ingress-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]

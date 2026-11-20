@@ -1,0 +1,12 @@
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener http: HTTPRoute, GRPCRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/a, generation 3, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/moved, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+RateLimitPolicy shop/holder, generation 2, of Gateway edge/web: Accepted=True/Accepted
+RateLimitPolicy shop/clashing, generation 1, of Gateway edge/web: Accepted=False/Conflicted (the name of its limit `platform-per-client` is held by the DataPlane's global limits; the name of its limit `taken` is held by another RateLimitPolicy)
+RateLimitPolicy shop/route-gone, generation 1, of Gateway edge/web: Accepted=False/TargetNotFound (applies nothing to HTTPRoute shop/gone: it is not there)
+RateLimitPolicy shop/rule-gone, generation 1, of Gateway edge/web: Accepted=False/TargetNotFound (applies nothing to HTTPRoute shop/a section nope: it has no rule `nope`)
+RateLimitPolicy edge/listener-gone, generation 1, of Gateway edge/web: Accepted=False/TargetNotFound (applies nothing to Gateway edge/web section nope: it has no listener `nope`)
+RateLimitPolicy shop/on-redirect, generation 1, of Gateway edge/web: Accepted=False/NotForwarding (applies nothing to HTTPRoute shop/a section old, which forwards nothing: a rule that redirects is under no limits)
+RateLimitPolicy shop/on-moved, generation 1, of Gateway edge/web: Accepted=False/NotForwarding (applies nothing to HTTPRoute shop/moved, which forwards nothing: a rule that redirects is under no limits)
+RateLimitPolicy shop/on-ingresses, generation 4, of Ingress shop/web: Accepted=True/Accepted
