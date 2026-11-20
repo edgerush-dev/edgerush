@@ -268,7 +268,7 @@ async fn a_follower_outside_the_window_is_refused() {
         ),
     ] {
         let (_took, following) = follower(&replica.address, &own, follow);
-        assert_eq!(ended(following).await, Unfollowed::Ended(why.clone()));
+        assert_eq!(ended(following).await, Unfollowed::Refused(why.clone()));
         assert_eq!(replica.next().await, Followed::Unserved(why));
     }
     assert!(replica.written.try_recv().is_err());

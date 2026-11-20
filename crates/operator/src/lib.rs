@@ -309,6 +309,7 @@ pub async fn operate(
                 &settings.identity,
                 settings.timing,
                 &leading_out,
+                None,
                 |error| failing(&format!("lease {}: {error}", settings.lease)),
             )
             .await;

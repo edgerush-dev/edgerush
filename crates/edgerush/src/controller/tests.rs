@@ -27,6 +27,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             webhook: None,
             metrics: None,
             health: None,
+            peers: None,
         })))
     );
     assert_eq!(
@@ -52,6 +53,7 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             webhook: None,
             metrics: None,
             health: None,
+            peers: None,
         })))
     );
     assert_eq!(parsed(&["--help"]), Ok(Parsed::Help));
@@ -278,6 +280,7 @@ async fn run_until(
         webhook: None,
         metrics: None,
         health: None,
+        peers: None,
     };
     let stop = {
         let lines = Rc::clone(&lines);
@@ -330,6 +333,7 @@ async fn each_translation_is_said_and_written_as_a_harness_file() {
             webhook: None,
             metrics: None,
             health: None,
+            peers: None,
         },
         |lines| lines.iter().any(|line| line.starts_with("written to ")),
     )
@@ -381,6 +385,7 @@ async fn a_config_the_data_plane_would_refuse_is_said_and_not_written() {
             webhook: None,
             metrics: None,
             health: None,
+            peers: None,
         },
         |lines| lines.iter().any(|line| line.contains("listener `port-80`")),
     )
@@ -588,6 +593,7 @@ fn the_stream_is_given_whole_or_not_at_all() {
             webhook: None,
             metrics: None,
             health: None,
+            peers: None,
         })))
     );
     // Each of the four left out.
@@ -639,6 +645,7 @@ fn the_webhook_is_given_whole_or_not_at_all() {
             })),
             metrics: None,
             health: None,
+            peers: None,
         })))
     );
     // Each of the three left out, the certificate's two too where nothing else signs one.
@@ -1045,6 +1052,7 @@ async fn the_webhook_answers_reviews_and_its_certificate_replaced_serves_the_nex
             webhook: Some(hooking),
             metrics: None,
             health: None,
+            peers: None,
         },
         move |_| {
             if hold.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -1264,6 +1272,7 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
             webhook: None,
             metrics: None,
             health: None,
+            peers: None,
         },
         |lines| runs(lines) == 2,
     )
@@ -1437,6 +1446,7 @@ async fn a_data_plane_is_served_only_where_its_certificate_carries_the_id_stated
             webhook: None,
             metrics: None,
             health: None,
+            peers: None,
         },
         |lines| {
             let said = |end: &str| {
@@ -1739,6 +1749,7 @@ async fn a_certificate_handed_out_expired_is_said_and_its_expiry_scraped() {
             webhook: None,
             metrics: Some(listener),
             health: None,
+            peers: None,
         },
         move |lines| {
             lines.iter().any(|line| line.contains("expired at"))
@@ -1957,6 +1968,7 @@ async fn a_replica_is_ready_once_its_stream_serves_with_its_first_certificate() 
             webhook: None,
             metrics: None,
             health: Some(health),
+            peers: None,
         },
         move |_| waiting.lock().unwrap().is_some(),
     )
@@ -2016,6 +2028,7 @@ async fn a_replica_of_no_stream_or_of_certificate_files_is_ready_at_once() {
                 webhook: None,
                 metrics: None,
                 health: Some(health),
+                peers: None,
             },
             move |_| {
                 let mut prober = telling.lock().unwrap();
@@ -2065,4 +2078,125 @@ fn the_leaders_config_kept_is_said_and_written_as_a_translation_is() {
     let file: HarnessFile =
         serde_saphyr::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(file.into_config(BTreeMap::new(), None), config);
+}
+
+/// The replicas share their snapshots only where they know each other by certificates
+/// their authority signs, and elect a leader to follow: `--peers` is for `--authority` and
+/// `--leader-lease`.
+#[test]
+fn the_replicas_share_snapshots_with_an_authority_and_a_lease() {
+    let base = [
+        "--control-plane",
+        "edge",
+        "--listen",
+        "[::]:9443",
+        "--authority",
+        "edgerush-controller-edge-authority",
+        "--leader-lease",
+        "edge/edgerush-controller-edge",
+    ];
+    let with =
+        |more: &[&'static str]| -> Vec<&'static str> { base.iter().chain(more).copied().collect() };
+    let Ok(Parsed::Control(options)) = parsed(&with(&["--peers", "[::]:9444"])) else {
+        panic!("not parsed");
+    };
+    assert_eq!(options.peers, Some("[::]:9444".parse().unwrap()));
+    assert_eq!(
+        parsed(&with(&["--peers", "9444"])),
+        Err(UsageError::Peers("9444".to_owned()))
+    );
+    assert_eq!(
+        parsed(&with(&["--peers", "[::]:9444", "--peers", "[::]:9445"])),
+        Err(UsageError::Twice("--peers"))
+    );
+    let without_lease: Vec<&str> = base[..6]
+        .iter()
+        .chain(&["--peers", "[::]:9444"])
+        .copied()
+        .collect();
+    assert_eq!(parsed(&without_lease), Err(UsageError::PeersAlone));
+    assert_eq!(
+        parsed(&[
+            "--data-plane",
+            "p",
+            "--leader-lease",
+            "edge/lease",
+            "--peers",
+            "[::]:9444"
+        ]),
+        Err(UsageError::PeersAlone)
+    );
+}
+
+/// A replica is ready once its stream serves and, where the replicas share a snapshot,
+/// once it holds one; once the stream is done saying, the last it said stands.
+#[tokio::test]
+async fn a_replica_sharing_snapshots_is_ready_once_it_holds_one() {
+    let wait = |ready: &watch::Receiver<bool>, want: bool| {
+        let mut ready = ready.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), ready.wait_for(|now| *now == want))
+                .await
+                .is_ok()
+        }
+    };
+    let (streams, streaming) = watch::channel(false);
+    let (snapshot, holding) = watch::channel(None::<Arc<Snapshot>>);
+    let (readies, ready) = watch::channel(false);
+    let _readying = tokio::spawn(readiness(streaming, Some(holding), readies));
+    streams.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!*ready.borrow(), "ready before it holds a snapshot");
+    snapshot.send_replace(Some(Arc::new(Snapshot::default())));
+    assert!(wait(&ready, true).await, "not ready once it holds one");
+    drop(streams);
+    snapshot.send_replace(None);
+    assert!(wait(&ready, false).await);
+    snapshot.send_replace(Some(Arc::new(Snapshot::default())));
+    assert!(
+        wait(&ready, true).await,
+        "not ready once the stream is done saying"
+    );
+    // Not sharing them: ready once the stream serves.
+    let (streams, streaming) = watch::channel(false);
+    let (readies, ready) = watch::channel(false);
+    let _readying = tokio::spawn(readiness(streaming, None, readies));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!*ready.borrow());
+    streams.send_replace(true);
+    assert!(wait(&ready, true).await);
+}
+
+/// The leader's config kept in place of a follower's translation is offered to the data
+/// plane it is of alone, as a translation is.
+#[test]
+fn the_leaders_config_kept_is_offered_as_a_translation_is() {
+    const WEB: &str = "spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-web";
+    const API: &str = "spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-api";
+    let web = plane_with(&format!("id: {WEB}"));
+    let api = plane_with(&format!("id: {API}"));
+    let both = whom(&harness_planes(&[
+        ("DataPlane edge/api", &api),
+        ("DataPlane edge/web", &web),
+    ]));
+    let (served, offered) = watch::channel(both);
+    let offering = Offering {
+        versions: RefCell::new(Versions::new(7)),
+        served,
+        runs: Rc::default(),
+        pods: watch::channel(edgerush_controller::acks::Pods::new()).0,
+    };
+    let plain: Plane = serde_saphyr::from_str(&plane()).unwrap();
+    let config =
+        edgerush_translate::translate(&plain, &edgerush_translate::Cluster::default()).config;
+    let version = offering.offer_config(&config, None, Some(WEB)).unwrap();
+    let offered_to = |id: &str| {
+        offered
+            .borrow()
+            .offer_to(Some(id))
+            .unwrap()
+            .map(|offer| offer.version().to_owned())
+    };
+    assert_eq!(offered_to(WEB), Some(version));
+    assert_eq!(offered_to(API), None, "offered to another");
 }

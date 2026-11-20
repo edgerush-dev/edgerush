@@ -326,7 +326,11 @@ pub enum Unfollowed {
     /// this one's.
     #[error("the replica cannot be reached: {0}")]
     Unreachable(String),
-    /// The replica refused to be followed, or ended the stream, saying why.
+    /// The replica refused to be followed: their config versions share none, which no
+    /// dialling again changes while it is the same replica.
+    #[error("the replica refused to be followed: {0}")]
+    Refused(String),
+    /// The replica ended the stream, saying why.
     #[error("the replica ended the stream: {0}")]
     Ended(String),
     /// The replica closed the stream.
@@ -400,6 +404,9 @@ pub(crate) async fn follow_with(
             }
             // A snapshot cut short is none: what was taken before it stands.
             Ok(None) => return Unfollowed::Closed,
+            Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                return Unfollowed::Refused(status.message().to_owned());
+            }
             Err(status) => return Unfollowed::Ended(status.message().to_owned()),
         }
     }

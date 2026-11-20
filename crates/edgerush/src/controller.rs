@@ -20,13 +20,16 @@ use edgerush_controller::admission::{self, Asked};
 use edgerush_controller::data_plane::{self, follow_data_planes};
 use edgerush_controller::expiry::Expiry;
 use edgerush_controller::issuing::{self, Issuer};
-use edgerush_controller::own_pods::follow_own_pods;
+use edgerush_controller::own_pods::{Replica, follow_own_pods};
+use edgerush_controller::snapshot::Snapshot;
 use edgerush_controller::unimplementable::Unimplementable;
 use edgerush_controller::{
-    Acks, Classes, Debounce, Membership, Planes, Reports, Said, ServiceNow, WatchScope, control,
+    Acks, Classes, Debounce, Membership, Planes, Reports, Said, ServiceNow, SettingsOf, Snapshots,
+    WatchScope, control,
 };
 use edgerush_kubernetes::lease::{self, elect};
 use edgerush_kubernetes::{ApiError, ApiServer, Listed, Retry, SERVICE_ACCOUNT, Scope, follow};
+use edgerush_planes::data_plane::DataPlane;
 use edgerush_translate::{Plane, Translation};
 use http::StatusCode;
 use k8s_openapi::api::networking::v1::IngressClass;
@@ -51,7 +54,7 @@ Usage: edgerush controller (--data-plane <FILE> | --control-plane <NAME> [--clus
                               | --authority <SECRET> [--authority-provided])]
          [--leader-lease <NAMESPACE>/<NAME>]
          [--webhook-listen <ADDRESS> [--webhook-certificate <FILE> --webhook-key <FILE>]]
-         [--metrics <ADDRESS>] [--health <ADDRESS>]
+         [--metrics <ADDRESS>] [--health <ADDRESS>] [--peers <ADDRESS>]
 
 Runs a control plane for its data planes, in a cluster: follows the IngressClasses,
 Ingresses, Services and Secrets of its scope through the API server, found as a pod finds
@@ -105,6 +108,11 @@ own metrics there, plain HTTP, at /metrics: when each certificate handed out exp
 With --health, every replica answers its readiness probe there, plain HTTP, at /ready:
 503 until it is ready, once the stream serves with its first certificate or at once
 without --listen, and 200 from then on; each connection one request, done within a second.
+With --peers, the replicas share what translation cannot read back from the objects (04
+§2): each serves the snapshot it holds there, gRPC over mutual TLS with its own certificate,
+taking the control plane's own identity alone; one that follows finds the leader, the pod
+the Lease names among the endpoints of its own Service, follows its snapshot, and translates
+from it; and none is ready until it holds one.
 Runs until Ctrl-C, or SIGTERM on Unix, and then exits 0; exits 2 when the command line, the
 data plane's settings, the system's authorities or the stream's or the webhook's
 certificates cannot be used, or it is not in a cluster.
@@ -158,6 +166,9 @@ Options:
       --webhook-key <FILE>   Its private key
       --metrics <ADDRESS>    Serve /metrics on ADDRESS, such as [::]:9090
       --health <ADDRESS>     Serve /ready on ADDRESS, such as [::]:8081
+      --peers <ADDRESS>      Serve the replicas' snapshots on ADDRESS, such as [::]:9444,
+                             and follow the leader's there; with --authority and
+                             --leader-lease
   -h, --help                 Print help
 ";
 
@@ -380,6 +391,13 @@ pub(crate) fn command(
         },
         None => None,
     };
+    let peers = match options.peers {
+        Some(address) => match std::net::TcpListener::bind(address) {
+            Ok(listener) => Some(listener),
+            Err(error) => return writeln!(stderr, "error: {address}: {error}").map_or(1, |()| 1),
+        },
+        None => None,
+    };
     let stopped = tokio::task::LocalSet::new().block_on(
         &runtime,
         control_until(
@@ -391,6 +409,7 @@ pub(crate) fn command(
                 webhook: hooking,
                 metrics,
                 health,
+                peers,
             },
             elector,
             told_to_stop(),
@@ -471,6 +490,8 @@ struct Options {
     metrics: Option<SocketAddr>,
     /// Where its readiness probe is answered, if it is.
     health: Option<SocketAddr>,
+    /// Where it serves the replicas' snapshots, and follows the leader's, if it does.
+    peers: Option<SocketAddr>,
 }
 
 /// Where the data plane's settings come from.
@@ -600,6 +621,12 @@ enum UsageError {
     Metrics(String),
     #[error("'--health {0}' is not an address and a port, such as [::]:8081")]
     Health(String),
+    #[error("'--peers {0}' is not an address and a port, such as [::]:9444")]
+    Peers(String),
+    #[error(
+        "'--peers' is for '--authority', whose certificates the replicas know each other by, and '--leader-lease'"
+    )]
+    PeersAlone,
     #[error(
         "'--webhook-listen' is given with '--webhook-certificate' and '--webhook-key', or alone with '--authority'"
     )]
@@ -623,6 +650,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut webhook_key = None;
     let mut metrics = None;
     let mut health = None;
+    let mut peers = None;
     let mut scope = Vec::new();
     let mut selector = None;
     while let Some(arg) = args.next() {
@@ -652,6 +680,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             "--webhook-key" => "--webhook-key",
             "--metrics" => "--metrics",
             "--health" => "--health",
+            "--peers" => "--peers",
             _ => return Err(UsageError::Unexpected(arg)),
         };
         let value = args.next().ok_or(UsageError::NoValue(option))?;
@@ -732,6 +761,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             "--health" => {
                 let address = value.parse().map_err(|_| UsageError::Health(value))?;
                 if health.replace(address).is_some() {
+                    return Err(UsageError::Twice(option));
+                }
+                continue;
+            }
+            "--peers" => {
+                let address = value.parse().map_err(|_| UsageError::Peers(value))?;
+                if peers.replace(address).is_some() {
                     return Err(UsageError::Twice(option));
                 }
                 continue;
@@ -822,6 +858,9 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     {
         return Err(UsageError::AuthorityWithoutControlPlane);
     }
+    if peers.is_some() && !(signs && leader.is_some()) {
+        return Err(UsageError::PeersAlone);
+    }
     Ok(Parsed::Control(Box::new(Options {
         settings,
         scope,
@@ -831,6 +870,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         webhook,
         metrics,
         health,
+        peers,
     })))
 }
 
@@ -935,6 +975,8 @@ struct Listeners {
     metrics: Option<std::net::TcpListener>,
     /// Its readiness, if its probe is answered.
     health: Option<std::net::TcpListener>,
+    /// The replicas' snapshots, if they share them.
+    peers: Option<std::net::TcpListener>,
 }
 
 /// Runs the control plane through `api` until `stop` is done, serving what `listeners`
@@ -955,6 +997,9 @@ async fn control_until(
     let runs: Rc<RefCell<Runs>> = Rc::default();
     let (pods, running) = watch::channel(Pods::new());
     let mut reports = None;
+    // Whom the Lease names its holder, where the replicas share a snapshot: the leader a
+    // follower follows (04 §2).
+    let mut holder = None;
     let leading = match (options.leader, elector) {
         (Some((namespace, name)), Some(elector)) => {
             let (leads, leading) = watch::channel(false);
@@ -982,6 +1027,11 @@ async fn control_until(
             }));
             let telling = Rc::clone(&say);
             let failed = lease.clone();
+            let (holding, held) = watch::channel(None);
+            let sharing = options.peers.is_some();
+            if sharing {
+                holder = Some(held);
+            }
             electing.push(tokio::task::spawn_local(async move {
                 elect(
                     &elector.api,
@@ -990,6 +1040,7 @@ async fn control_until(
                     &elector.identity,
                     elector.timing,
                     &leads,
+                    sharing.then_some(&holding),
                     |error| telling(&format!("{failed}: {error}")),
                 )
                 .await;
@@ -1016,6 +1067,13 @@ async fn control_until(
     let (settings, planes) = watch::channel(Planes::new());
     // A ControlPlane's classes, by which the Ingresses no DataPlane may still serve lose
     // their address (04 §6); the development harness has none.
+    // The replicas' snapshot, where they share one (04 §2): the leader takes its records
+    // into it, a follower the leader's; and the settings a record's DataPlane is served with.
+    let snapshot = options
+        .peers
+        .map(|_| watch::channel(None::<Arc<Snapshot>>).0);
+    let mut settings_of: Option<Rc<SettingsOf>> = None;
+    let mut peers_listener = listeners.peers;
     let (_fixed, classes) = match source {
         Source::Fixed(plane) => {
             // The development harness's one data plane, of no name: no Service is written
@@ -1042,6 +1100,10 @@ async fn control_until(
                 namespace: namespace_name,
                 kept,
             };
+            let made = own.clone();
+            settings_of = Some(Rc::new(move |data_plane: &DataPlane| {
+                data_plane::settings(data_plane, &made).ok()
+            }));
             let telling = Rc::clone(&say);
             tasks.push(tokio::task::spawn_local(follow_data_planes(
                 api,
@@ -1049,7 +1111,7 @@ async fn control_until(
                 own,
                 settings,
                 keeping,
-                None,
+                snapshot.as_ref().map(watch::Sender::subscribe),
                 move |line| telling(line),
             )));
             (None, Some(classes))
@@ -1069,7 +1131,11 @@ async fn control_until(
     // Whether this replica is ready, for its readiness probe: once the stream serves, with
     // its first certificate, or at once where it serves none.
     let (readies, ready) = watch::channel(false);
+    // Whether the stream serves, which readiness waits on.
+    let (streams, streaming) = watch::channel(false);
     let mut probed = None;
+    // The replicas' listener, where they share a snapshot.
+    let mut shared = None;
     if let Some(listener) = listeners.health {
         listener.set_nonblocking(true)?;
         let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -1141,6 +1207,7 @@ async fn control_until(
                 }
             }));
             let (gateway, addresses) = watch::channel::<Arc<[IpAddr]>>(Arc::from([]));
+            let (replicas_out, replicas) = watch::channel::<Arc<[Replica]>>(Arc::from([]));
             if let Some(own) = serving.own {
                 let telling = Rc::clone(&say);
                 tasks.push(tokio::task::spawn_local(follow_own_pods(
@@ -1149,6 +1216,7 @@ async fn control_until(
                     own.control_plane,
                     planes.clone(),
                     gateway,
+                    snapshot.is_some().then_some(replicas_out),
                     move |line| telling(line),
                 )));
             }
@@ -1172,7 +1240,7 @@ async fn control_until(
                     let tls = watch::Sender::new(Arc::new(
                         acceptor(&credentials).map_err(io::Error::other)?,
                     ));
-                    readies.send_replace(true);
+                    streams.send_replace(true);
                     served = Some((
                         stopping,
                         tokio::spawn(serve(
@@ -1196,6 +1264,56 @@ async fn control_until(
                     // Its own certificate, as the issuer signs it: the stream is served from
                     // the first on, each after it taking the next connection (05 §2).
                     let mut signed = own.subscribe();
+                    // The replicas' snapshots, served with that certificate too, and the
+                    // leader's followed (04 §2).
+                    if let (Some(snapshot), Some(listener), Some(holder)) =
+                        (&snapshot, peers_listener.take(), holder.take())
+                    {
+                        let leaf = issuer.own_leaf();
+                        let peers = peers::Peers {
+                            id: leaf.spiffe_id.clone(),
+                            name: leaf.dns.first().cloned().unwrap_or_default(),
+                            port: listener.local_addr()?.port(),
+                        };
+                        // One that cannot follow the leader at all starts clean in time.
+                        tasks.push(tokio::task::spawn_local(peers::clean_after(
+                            peers::CLEAN_AFTER,
+                            snapshot.clone(),
+                            Rc::clone(&say),
+                        )));
+                        let (credentialing, credentials) = watch::channel(None);
+                        tasks.push(tokio::task::spawn_local(peers::credentials(
+                            own.subscribe(),
+                            credentialing,
+                        )));
+                        listener.set_nonblocking(true)?;
+                        let listener = tokio::net::TcpListener::from_std(listener)?;
+                        let (stopping, stopped) = oneshot::channel::<()>();
+                        shared = Some((
+                            stopping,
+                            tokio::task::spawn_local(peers::serve_snapshot(
+                                listener,
+                                credentials.clone(),
+                                peers.id.clone(),
+                                snapshot.subscribe(),
+                                Rc::clone(&say),
+                                async move {
+                                    let _ = stopped.await;
+                                },
+                            )),
+                        ));
+                        if let Some(leading) = leading.clone() {
+                            tasks.push(tokio::task::spawn_local(peers::follow_leader(
+                                peers,
+                                leading,
+                                holder,
+                                replicas.clone(),
+                                credentials,
+                                snapshot.clone(),
+                                Rc::clone(&say),
+                            )));
+                        }
+                    }
                     let telling = Rc::clone(&say);
                     tasks.push(tokio::task::spawn_local(issuing::issue(
                         *api,
@@ -1221,7 +1339,7 @@ async fn control_until(
                                     )),
                                 }
                             };
-                            readies.send_replace(true);
+                            streams.send_replace(true);
                             let accepting = tls.subscribe();
                             tokio::task::spawn_local(async move {
                                 while let Some(next) = next_signed(&mut signed).await {
@@ -1260,10 +1378,15 @@ async fn control_until(
             })
         }
         None => {
-            readies.send_replace(true);
+            streams.send_replace(true);
             None
         }
     };
+    tasks.push(tokio::task::spawn_local(readiness(
+        streaming,
+        snapshot.as_ref().map(watch::Sender::subscribe),
+        readies,
+    )));
     // The webhook, on a thread of its own: what it says is said here, where `say` lives.
     let mut hooked = None;
     if let Some(hooking) = listeners.webhook {
@@ -1292,37 +1415,52 @@ async fn control_until(
                 own: running,
                 reports,
             },
-            None,
+            snapshot
+                .clone()
+                .zip(settings_of)
+                .map(|(snapshot, settings)| Snapshots { snapshot, settings }),
             move |said| {
                 let mut text = told(&said, write_config.as_deref());
-                if let (
-                    Said::Translated {
-                        translation, id, ..
-                    },
-                    Some(offering),
-                ) = (&said, &offering)
-                {
-                    // Writing to a `String` cannot fail.
-                    let _ = match offering.offer(translation, *id) {
-                        Ok(version) => write!(text, "\noffered as config {version}"),
-                        Err(error) => write!(text, "\nnot offered: {error}"),
-                    };
-                }
+                let offered = match (&said, &offering) {
+                    (
+                        Said::Translated {
+                            translation, id, ..
+                        },
+                        Some(offering),
+                    ) => Some(offering.offer(translation, *id)),
+                    // The leader's: of no generation this replica knows its Gateway's to be.
+                    (Said::Kept { config, id, .. }, Some(offering)) => {
+                        Some(offering.offer_config(config, None, *id))
+                    }
+                    _ => None,
+                };
+                // Writing to a `String` cannot fail.
+                let _ = match offered {
+                    Some(Ok(version)) => write!(text, "\noffered as config {version}"),
+                    Some(Err(error)) => write!(text, "\nnot offered: {error}"),
+                    None => Ok(()),
+                };
                 telling(&text);
-                if let Said::Translated {
-                    translation,
-                    data_plane,
-                    ..
-                } = &said
-                {
-                    unimplementable.borrow_mut().take(data_plane, translation);
+                // The certificates handed on, the leader's kept among them, for the gauge.
+                let handed = match &said {
+                    Said::Translated {
+                        translation,
+                        data_plane,
+                        ..
+                    } => {
+                        unimplementable.borrow_mut().take(data_plane, translation);
+                        Some(&translation.config)
+                    }
+                    Said::Kept { config, .. } => Some(*config),
+                    _ => None,
+                };
+                if let Some(config) = handed {
                     // Without an election, this replica is the only one, and leads.
                     let leading = leads.as_ref().is_none_or(|leads| *leads.borrow());
-                    let out_of_date = expiry.borrow_mut().take(
-                        &translation.config.certificates,
-                        unix_now(),
-                        leading,
-                    );
+                    let out_of_date =
+                        expiry
+                            .borrow_mut()
+                            .take(&config.certificates, unix_now(), leading);
                     exposed.send_replace(exposed_text(&expiry.borrow(), &unimplementable.borrow()));
                     for line in out_of_date {
                         telling(&line);
@@ -1347,6 +1485,12 @@ async fn control_until(
         let _ = stopping.send(());
         let _ended = server.await;
     }
+    if let Some((stopping, server)) = shared {
+        let _ = stopping.send(());
+        if let Ok(Err(error)) = server.await {
+            say(&format!("error: {error}"));
+        }
+    }
     if let Some((stopping, ended)) = hooked {
         let _ = stopping.send(());
         let _ended = ended.await;
@@ -1355,6 +1499,36 @@ async fn control_until(
         task.abort();
     }
     stopped
+}
+
+/// Publishes on `readies` whether this replica is ready, as each part changes: once the
+/// stream serves, as `streaming` says, and, where the replicas share a snapshot, once this
+/// one holds one in `holding` (04 §2), the leader its own, taken as it translates, a
+/// follower the leader's. Once the stream is done saying, the last it said stands.
+async fn readiness(
+    mut streaming: watch::Receiver<bool>,
+    mut holding: Option<watch::Receiver<Option<Arc<Snapshot>>>>,
+    readies: watch::Sender<bool>,
+) {
+    let mut open = true;
+    loop {
+        let holds = holding
+            .as_mut()
+            .is_none_or(|holding| holding.borrow_and_update().is_some());
+        let now = *streaming.borrow_and_update() && holds;
+        readies.send_if_modified(|ready| std::mem::replace(ready, now) != now);
+        let held = async {
+            match holding.as_mut() {
+                Some(holding) => holding.changed().await.is_ok(),
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            changed = streaming.changed(), if open => open = changed.is_ok(),
+            still = held => if !still { return },
+            () = readies.closed() => return,
+        }
+    }
 }
 
 /// The latest offer, as data planes are sent it.
@@ -1372,17 +1546,24 @@ impl Offering {
     /// any the stream serves where it is none, built on what it was offered last: its
     /// version, said as offered. Every other data plane's offer is left as it was.
     fn offer(&self, translation: &Translation, id: Option<&str>) -> Result<String, OfferError> {
-        // Never a data plane no longer served: a translation is said only for those
-        // `control` serves now.
+        let generation = translation.gateway_status.as_ref().map(|s| s.generation);
+        self.offer_config(&translation.config, generation, id)
+    }
+
+    /// Offers `config` as [`Self::offer`] does a translation's: of its Gateway's
+    /// `generation`, where it serves one whose generation it is known to be of.
+    fn offer_config(
+        &self,
+        config: &Config,
+        generation: Option<i64>,
+        id: Option<&str>,
+    ) -> Result<String, OfferError> {
+        // Never a data plane no longer served: a config is said only for those `control`
+        // serves now.
         let mut served = self.served.borrow().clone();
         let last = served.offer_to(id).ok().flatten().cloned();
-        let offer = Offer::new(
-            &translation.config,
-            last.as_deref(),
-            &mut self.versions.borrow_mut(),
-        )?;
+        let offer = Offer::new(config, last.as_deref(), &mut self.versions.borrow_mut())?;
         let version = offer.version().to_owned();
-        let generation = translation.gateway_status.as_ref().map(|s| s.generation);
         let mut runs = self.runs.borrow_mut();
         runs.offered(id, &version, generation);
         said_runs(&self.pods, &runs);
@@ -1884,6 +2065,8 @@ pub(crate) async fn told_to_stop() -> io::Result<()> {
     })
     .await
 }
+
+mod peers;
 
 #[cfg(test)]
 mod tests;

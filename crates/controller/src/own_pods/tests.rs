@@ -226,7 +226,7 @@ async fn a_data_planes_service_named_later_is_followed_with_no_restart() {
         "kind": "EndpointSliceList",
         "metadata": { "resourceVersion": "5" },
         "items": [
-            slice("edgerush-controller-edge-a1", Some("edgerush-controller-edge"), &["{ addresses: [10.0.0.2] }"]),
+            slice("edgerush-controller-edge-a1", Some("edgerush-controller-edge"), &["{ addresses: [10.0.0.2], targetRef: { kind: Pod, name: controller-a } }"]),
             slice("edgerush-proxy-web-b2", Some("edgerush-proxy-web"), &["{ addresses: [10.0.1.2] }"]),
         ],
     })
@@ -264,14 +264,33 @@ async fn a_data_planes_service_named_later_is_followed_with_no_restart() {
         .run_until(async {
             let (settings, planes) = watch::channel(Planes::new());
             let (out, found) = watch::channel::<Arc<[IpAddr]>>(Arc::from([]));
+            let (replicas_out, mut replicas_found) =
+                watch::channel::<Arc<[Replica]>>(Arc::from([]));
             let _following = tokio::task::spawn_local(follow_own_pods(
                 api,
                 "edge".to_owned(),
                 "edge".to_owned(),
                 planes,
                 out,
+                Some(replicas_out),
                 |_| {},
             ));
+            let replicas = tokio::time::timeout(
+                Duration::from_secs(5),
+                replicas_found.wait_for(|now| !now.is_empty()),
+            )
+            .await
+            .expect("no replica found")
+            .unwrap()
+            .clone();
+            assert_eq!(
+                *replicas,
+                [Replica {
+                    pod: "controller-a".to_owned(),
+                    address: "10.0.0.2".parse().unwrap(),
+                    ready: true,
+                }]
+            );
             let until = |found: &watch::Receiver<Arc<[IpAddr]>>, want: Arc<[IpAddr]>| {
                 let mut found = found.clone();
                 async move {
@@ -311,4 +330,56 @@ async fn a_data_planes_service_named_later_is_followed_with_no_restart() {
 
 fn settings_of(data_plane: &DataPlane, own: &Own) -> crate::Settings {
     settings(data_plane, own).unwrap()
+}
+
+/// The control plane's replicas are the endpoints of its own Service that name their pod,
+/// each by that pod, with whether it is ready: one that says nothing of it taken as ready.
+/// A data plane's endpoints, and one of another namespace's Service of the same name, are
+/// none of them.
+#[test]
+fn the_replicas_are_the_control_planes_endpoints_by_pod() {
+    let slices = [
+        slice(
+            "edgerush-controller-edge-a1",
+            Some("edgerush-controller-edge"),
+            &[
+                "{ addresses: [10.0.0.3], conditions: { ready: false }, targetRef: { kind: Pod, name: controller-b } }",
+                "{ addresses: [10.0.0.2, 10.0.0.9], conditions: { ready: true }, targetRef: { kind: Pod, name: controller-a } }",
+                "{ addresses: [10.0.0.4], targetRef: { kind: Pod, name: controller-c } }",
+                "{ addresses: [10.0.0.5] }",
+                "{ addresses: [10.0.0.6], targetRef: { kind: Node, name: node-a } }",
+            ],
+        ),
+        slice(
+            "edgerush-controller-edge-a2",
+            Some("edgerush-controller-edge"),
+            &[
+                "{ addresses: [10.0.0.2], conditions: { ready: true }, targetRef: { kind: Pod, name: controller-a } }",
+            ],
+        ),
+        slice(
+            "edgerush-proxy-web-b2",
+            Some("edgerush-proxy-web"),
+            &["{ addresses: [10.0.1.2], targetRef: { kind: Pod, name: proxy-a } }"],
+        ),
+        slice_in(
+            "shop",
+            "edgerush-controller-edge-c3",
+            Some("edgerush-controller-edge"),
+            &["{ addresses: [10.0.4.2], targetRef: { kind: Pod, name: elsewhere } }"],
+        ),
+    ];
+    let replica = |pod: &str, address: &str, ready: bool| Replica {
+        pod: pod.to_owned(),
+        address: address.parse().unwrap(),
+        ready,
+    };
+    assert_eq!(
+        replicas(&slices, "edge", "edge"),
+        [
+            replica("controller-a", "10.0.0.2", true),
+            replica("controller-b", "10.0.0.3", false),
+            replica("controller-c", "10.0.0.4", true),
+        ]
+    );
 }
