@@ -1030,6 +1030,128 @@ async fn an_open_breaker_closes_once_a_probe_hears_from_its_owner() {
         .await;
 }
 
+/// A request to a protected upstream holds no slot of its backend while its owner decides
+/// it: one whose answer the relay holds back leaves the backend's one slot free, and takes
+/// it once admitted (25 §5). A slot held while waiting would fill a backend with requests
+/// their limits may yet refuse, and refuse the others as `backend_full` meanwhile.
+#[tokio::test]
+async fn a_request_waiting_on_its_owner_holds_no_slot_of_its_backend() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_store, relay) = behind_a_relay(None).await;
+            let (upstream, held) = scripted_upstream().await;
+            let mut config = synchronous_in(
+                everything_config(upstream),
+                &[("per-client", 10)],
+                std::slice::from_ref(&relay.address),
+                10_000,
+                "deny",
+            );
+            config.upstreams.get_mut("up").unwrap().protection =
+                Some(edgerush_config::Protection {
+                    max_in_flight: std::num::NonZeroU32::MIN,
+                });
+            let (proxy, mut sends) = serving(&config, 1).await;
+            let in_flight = || {
+                let snapshot = proxy.current.load();
+                let protected = snapshot.protected[0].as_ref().expect("`up` is protected");
+                protected.counts[0].in_flight()
+            };
+            relay.shut_all();
+            let send = sends.remove(0);
+            let mut send = within(send.ready()).await.unwrap();
+            let request = Request::get("http://example.test/silent")
+                .version(Version::HTTP_2)
+                .body(())
+                .unwrap();
+            let (_response, _) = send.send_request(request, true).unwrap();
+            // Long past its routing, and well short of its owner's 10 s.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(held.borrow().is_empty(), "sent before its owner answered");
+            assert_eq!(in_flight(), 0, "a slot held while its limits decide");
+            relay.open_all();
+            until(|| held.borrow().len() == 1).await;
+            assert_eq!(in_flight(), 1, "admitted, it takes its slot");
+        })
+        .await;
+}
+
+/// The pod a look chose fills while the request's owner decides it: admitted, the request
+/// takes another pod with room, as its pick would have (25 §4). With every pod full by
+/// then, it is refused `backend_full` — charged, the rare refusal a look cannot rule out
+/// (25 §5).
+#[tokio::test]
+async fn a_pod_that_fills_while_its_owner_decides_is_passed_over_at_the_take() {
+    use edgerush_protection::PodCount;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_store, relay) = behind_a_relay(None).await;
+            let (a, held_at_a) = scripted_upstream().await;
+            let (b, held_at_b) = scripted_upstream().await;
+            let mut config = synchronous_in(
+                everything_config(a),
+                &[("per-client", 10)],
+                std::slice::from_ref(&relay.address),
+                10_000,
+                "deny",
+            );
+            let up = config.upstreams.get_mut("up").unwrap();
+            up.endpoints = edgerush_config::Endpoints::Listed(vec![a, b]);
+            up.protection = Some(edgerush_config::Protection {
+                max_in_flight: std::num::NonZeroU32::MIN,
+            });
+            let (proxy, mut sends) = serving(&config, 1).await;
+            let counts = Arc::clone(proxy.current.load().protected[0].as_ref().unwrap());
+            let fill = |at: usize| PodCount::take(&counts.counts[at], std::num::NonZeroU32::MIN);
+            let mut send = within(sends.remove(0).ready()).await.unwrap();
+            let mut ask = || {
+                let request = Request::get("http://example.test/silent")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                send.send_request(request, true).unwrap().0
+            };
+            let passed = r#"edgerush_upstream_protection_passed_over_total{upstream="up"}"#;
+
+            // `b` full at the look, which chooses `a`; `a` full and `b` free by the take.
+            let held = fill(1).expect("`b` has room");
+            relay.shut_all();
+            let _first = ask();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let also = fill(0).expect("the look took nothing at `a`");
+            drop(held);
+            relay.open_all();
+            until(|| held_at_b.borrow().len() == 1).await;
+            assert!(held_at_a.borrow().is_empty());
+            assert_eq!(
+                metric(&proxy.metrics(), passed),
+                Some(2),
+                "at the look and the take"
+            );
+
+            // Room at `a` at the look, none anywhere by the take.
+            drop(also);
+            relay.shut_all();
+            let second = ask();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _also = fill(0).expect("the look took nothing at `a`");
+            relay.open_all();
+            let answer = within(second).await.unwrap();
+            assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let scrape = proxy.metrics();
+            let refused =
+                r#"edgerush_upstream_protection_refused_total{upstream="up",reason="backend_full"}"#;
+            assert_eq!(metric(&scrape, refused), Some(1), "{scrape}");
+            let admitted =
+                r#"edgerush_rate_limit_decisions_total{limit="per-client",outcome="admitted"}"#;
+            assert_eq!(metric(&scrape, admitted), Some(2), "charged: {scrape}");
+            assert!(held_at_a.borrow().is_empty() && held_at_b.borrow().len() == 1);
+        })
+        .await;
+}
+
 /// With `when_unreachable: local`, a seed out of reach leaves its keys to the process's own
 /// buckets, which its workers share: a client is held to one bucket of ten across two
 /// workers, refusals say when to come back, and the metrics count the requests decided

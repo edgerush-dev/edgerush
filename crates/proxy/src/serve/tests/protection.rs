@@ -318,3 +318,235 @@ fn a_full_pod_is_passed_over_for_one_with_room() {
         assert_eq!((held_at_a.borrow().len(), held_at_b.borrow().len()), (1, 1));
     }));
 }
+
+/// `config` with its upstream `up` protected to `cap` in flight.
+fn protecting(mut config: Config, cap: u32) -> Config {
+    config.upstreams.get_mut("up").unwrap().protection = Some(edgerush_config::Protection {
+        max_in_flight: std::num::NonZeroU32::new(cap).unwrap(),
+    });
+    config
+}
+
+/// `config` with its first route's first rule under `per-client`, `burst` an hour for each
+/// client, in local mode.
+fn limited_locally(mut config: Config, burst: u64) -> Config {
+    config.routes[0].rules[0].rate_limits = vec!["per-client".to_owned()];
+    let limits = format!(
+        "limits:\n  - {{ name: per-client, key: client, model: {{ bucket: {{ rate: {burst}/h, burst: {burst} }} }} }}\n"
+    );
+    config.limits = Some(serde_saphyr::from_str(&limits).unwrap());
+    config.rate_limiting = Some(edgerush_config::RateLimiting {
+        mode: edgerush_config::RateLimitMode::Local,
+        max_key_bytes: None,
+        synchronous: None,
+        experimental_header_keys: None,
+        service: None,
+    });
+    config
+}
+
+/// A data plane of one worker for `config`, its rate limits started.
+fn started(config: &Config) -> Arc<Proxy> {
+    let proxy = Proxy::new(compile(config).unwrap(), NonZeroUsize::MIN).unwrap();
+    proxy.start_rate_limits(|| {}).unwrap();
+    Arc::new(proxy)
+}
+
+/// The line of `scrape` that begins `name`, and its value.
+fn metric(scrape: &str, name: &str) -> Option<u64> {
+    scrape
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+}
+
+/// A backend with no endpoint with room refuses before the rate limits are charged: the
+/// refusal names protection, says nothing of when to come back and nothing of a limit, and
+/// leaves the client's quota as it was — two an hour, both still there for the requests
+/// that reach the backend (25 §5, §8).
+#[test]
+fn a_full_backend_is_refused_before_its_rate_limits_are_charged() {
+    use tokio::io::AsyncWriteExt;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let (upstream, held) = scripted_upstream().await;
+        let config = limited_locally(protecting(everything_config(upstream), 1), 2);
+        let proxy = started(&config);
+        let (front, worker) = serving_from(&proxy).await;
+
+        // The first request takes the one slot, and one of the two an hour.
+        let mut waiting = TcpStream::connect(front).await.unwrap();
+        waiting.write_all(&asking("/silent")).await.unwrap();
+        until(|| held.borrow().len() == 1).await;
+
+        let answer = h1_answer(front, &asking("/ok")).await;
+        assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
+        let head = answer.to_ascii_lowercase();
+        assert!(!head.contains("\r\nretry-after:"), "{answer}");
+        assert!(!head.contains("\r\nratelimit"), "{answer}");
+        let scrape = worker.proxy().metrics();
+        let refused =
+            r#"edgerush_upstream_protection_refused_total{upstream="up",reason="backend_full"}"#;
+        assert_eq!(metric(&scrape, refused), Some(1), "{scrape}");
+        let admitted =
+            r#"edgerush_rate_limit_decisions_total{limit="per-client",outcome="admitted"}"#;
+        assert_eq!(metric(&scrape, admitted), Some(1), "charged: {scrape}");
+
+        // The first ends: the second of the two an hour is still there, and then none is.
+        drop(waiting);
+        held.borrow_mut().clear();
+        until(|| in_flight(&proxy) == 0).await;
+        assert_eq!(status_of(front, "/ok").await, StatusCode::OK);
+        assert_eq!(status_of(front, "/ok").await, StatusCode::TOO_MANY_REQUESTS);
+    }));
+}
+
+/// A retry that finds every endpoint full is not sent: the client is given the answer the
+/// first try had, and the retry is counted as refused for a full backend (25 §5). One
+/// endpoint, held to one: the first try's slot is held until a retry has its own.
+#[tokio::test]
+async fn a_retry_to_a_full_backend_is_not_sent() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, sent) = statuses_upstream(vec![503, 200]).await;
+            let mut config = protecting(everything_config(upstream), 1);
+            config.routes[0].rules[0]
+                .forward
+                .as_mut()
+                .expect("the rule forwards")
+                .retry = Some(retrying(1, &[503], &[], 1));
+            let (front, worker) = serving_config(&config).await;
+            assert_eq!(
+                status_of(front, "/").await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the first try's answer"
+            );
+            assert_eq!(sent.borrow().len(), 1, "the retry was sent");
+            let scrape = worker.proxy().metrics();
+            let full =
+                r#"edgerush_upstream_retries_refused_total{upstream="up",reason="backend_full"}"#;
+            assert_eq!(metric(&scrape, full), Some(1), "{scrape}");
+            let ours =
+                r#"edgerush_listener_local_answers_total{listener="web",reason="backend_full"}"#;
+            assert_eq!(
+                metric(&scrape, ours).unwrap_or(0),
+                0,
+                "the 503 was the backend's"
+            );
+        })
+        .await;
+}
+
+/// A mirror's copy that finds the mirror's backend full is not sent, and the request goes
+/// on untouched; the copy is counted as given up for a full backend (25 §5). Under a rate
+/// limit too, where a copy looks first and takes its slot once the request is admitted.
+#[test]
+fn a_copy_to_a_full_mirror_is_not_sent() {
+    use tokio::io::AsyncWriteExt;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        for limited in [false, true] {
+            let (primary, _) = counting_upstream().await;
+            let (copies, held) = scripted_upstream().await;
+            let mut config = everything_config(primary);
+            let mut mirror = config.upstreams["up"].clone();
+            mirror.endpoints = edgerush_config::Endpoints::Listed(vec![copies]);
+            mirror.protection = Some(edgerush_config::Protection {
+                max_in_flight: std::num::NonZeroU32::MIN,
+            });
+            config.upstreams.insert("copies".to_owned(), mirror);
+            config.routes[0].rules[0].filters.push(
+                serde_saphyr::from_str(
+                    "{ type: request_mirror, upstream: copies, fraction: { numerator: 1, denominator: 1 } }",
+                )
+                .unwrap(),
+            );
+            if limited {
+                config = limited_locally(config, 10);
+            }
+            let (front, worker) = serving_from(&started(&config)).await;
+
+            // A copy of the first request holds the mirror's one slot, never answered.
+            let mut first = TcpStream::connect(front).await.unwrap();
+            first.write_all(&asking("/silent")).await.unwrap();
+            until(|| held.borrow().len() == 1).await;
+
+            assert_eq!(
+                status_of(front, "/silent").await,
+                StatusCode::OK,
+                "limited {limited}"
+            );
+            let scrape = worker.proxy().metrics();
+            let full = r#"edgerush_upstream_mirrors_given_up_total{upstream="copies",reason="backend_full"}"#;
+            assert_eq!(metric(&scrape, full), Some(1), "limited {limited}: {scrape}");
+            assert_eq!(held.borrow().len(), 1, "limited {limited}: a second copy was sent");
+        }
+    }));
+}
+
+/// Protection's own metrics, per upstream and only for one that is protected: the requests
+/// in flight to its endpoints, every worker's, the refusals for a full backend, and the
+/// picks that passed over a full endpoint (25 §8).
+#[test]
+fn protection_is_seen_per_upstream_and_only_where_it_is_set() {
+    use tokio::io::AsyncWriteExt;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let (a, held_at_a) = scripted_upstream().await;
+        let (b, held_at_b) = scripted_upstream().await;
+        let held = || held_at_a.borrow().len() + held_at_b.borrow().len();
+        let mut config = protecting(everything_config(a), 1);
+        config.upstreams.get_mut("up").unwrap().endpoints =
+            edgerush_config::Endpoints::Listed(vec![a, b]);
+        let mut plain = config.upstreams["up"].clone();
+        plain.protection = None;
+        config.upstreams.insert("plain".to_owned(), plain);
+        let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+        let (front, worker) = serving_from(&proxy).await;
+        let seen = |name: &str| metric(&worker.proxy().metrics(), name);
+        let in_flight = r#"edgerush_upstream_protection_in_flight{upstream="up"}"#;
+        let passed = r#"edgerush_upstream_protection_passed_over_total{upstream="up"}"#;
+        let refused =
+            r#"edgerush_upstream_protection_refused_total{upstream="up",reason="backend_full"}"#;
+        assert_eq!(
+            (seen(in_flight), seen(passed), seen(refused)),
+            (Some(0), Some(0), Some(0))
+        );
+        let scrape = worker.proxy().metrics();
+        assert!(
+            !scrape.contains(r#"upstream_protection_in_flight{upstream="plain"}"#),
+            "{scrape}"
+        );
+
+        let mut waiting = Vec::new();
+        for _ in 0..2 {
+            let mut client = TcpStream::connect(front).await.unwrap();
+            client.write_all(&asking("/silent")).await.unwrap();
+            waiting.push(client);
+            until(|| held() == waiting.len()).await;
+        }
+        assert_eq!(seen(in_flight), Some(2));
+        assert_eq!(
+            seen(passed),
+            Some(1),
+            "the second found the first's pod full"
+        );
+        assert_eq!(
+            status_of(front, "/ok").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!((seen(refused), seen(passed)), (Some(1), Some(1)));
+    }));
+}

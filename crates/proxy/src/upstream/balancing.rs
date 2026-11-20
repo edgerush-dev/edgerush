@@ -75,6 +75,35 @@ impl Drop for InFlight {
     }
 }
 
+/// What a pick took.
+#[derive(Debug)]
+pub(crate) struct Picked {
+    /// The endpoint, by position.
+    pub(crate) at: usize,
+    /// Its count while in flight.
+    pub(crate) counted: InFlight,
+    /// Whether the pick drew an endpoint at its bound, or came to one in turn, and passed it
+    /// over for another (25 §8): not one only looked at in working out which may be taken.
+    pub(crate) passed_over: bool,
+}
+
+/// What a look chose without taking it: the endpoint a pick would take, for a request
+/// that takes it only once its rate limits admit it (25 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Looked {
+    /// The endpoint, by position.
+    pub(crate) at: usize,
+    /// Whether the look passed over an endpoint that was full, as for [`Picked`].
+    pub(crate) passed_over: bool,
+}
+
+#[cfg(test)]
+impl Picked {
+    fn pair(self) -> (usize, InFlight) {
+        (self.at, self.counted)
+    }
+}
+
 /// Why no endpoint was picked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unpicked {
@@ -326,19 +355,20 @@ struct Seen<'a> {
     counts: &'a [Rc<Cell<u32>>],
     window: Option<u64>,
     protected: Option<&'a Protected>,
+    /// Whether the balancer passed over an endpoint it drew, or came to in turn, for being
+    /// full.
+    passed: Cell<bool>,
 }
 
-impl Seen<'_> {
-    /// The endpoint at `at`'s bound under `protected`, its upstream's: ramped with its slow
-    /// start, as its share of the draw is, so that a cold pod every other pod's fullness
-    /// sends everything to is not given its whole bound at once (25 §4). An upstream of one
-    /// endpoint never ramps (03 §6).
-    fn bound(&self, protected: &Protected, at: usize) -> NonZeroU32 {
-        if self.count() == 1 {
-            return protected.cap;
-        }
-        self.share(at).bound(protected.cap)
+/// An endpoint's bound under `protected`, its upstream's, of `endpoints`, at `share` of its
+/// slow start: ramped as its share of the draw is, so that a cold pod every other pod's
+/// fullness sends everything to is not given its whole bound at once (25 §4). An upstream of
+/// one endpoint never ramps (03 §6).
+fn bound(protected: &Protected, endpoints: usize, share: Share) -> NonZeroU32 {
+    if endpoints == 1 {
+        return protected.cap;
     }
+    share.bound(protected.cap)
 }
 
 impl Candidates for Seen<'_> {
@@ -358,10 +388,13 @@ impl Candidates for Seen<'_> {
         let Some(protected) = self.protected else {
             return true;
         };
-        protected
-            .counts
-            .get(at)
-            .is_some_and(|pod| pod.in_flight() < self.bound(protected, at).get())
+        protected.counts.get(at).is_some_and(|pod| {
+            pod.in_flight() < bound(protected, self.count(), self.share(at)).get()
+        })
+    }
+
+    fn passed_over(&self, _at: usize) {
+        self.passed.set(true);
     }
 
     fn in_flight(&self, at: usize) -> u32 {
@@ -387,35 +420,85 @@ impl Upstream {
         destinations: &[Arc<ReuseIdentity>],
         zoned: usize,
         tried: &Tried,
-    ) -> Result<(usize, InFlight), Unpicked> {
-        let seen = Seen {
+    ) -> Result<Picked, Unpicked> {
+        let seen = self.seen(destinations);
+        if seen.count() == 0 {
+            return Err(Unpicked::Nowhere);
+        }
+        let (at, counted) = looked(
+            || self.chosen(&seen, zoned, tried),
+            |at| self.take(at, seen.share(at)),
+        )?;
+        Ok(Picked {
+            at,
+            counted,
+            passed_over: seen.passed.get(),
+        })
+    }
+
+    /// The endpoint [`Self::pick`] would take, chosen as it chooses, without taking it: a
+    /// read of the counts every worker shares, for a request on a protected upstream whose
+    /// rate limits are yet to be charged (25 §5). Refused as full as the pick would be.
+    pub(crate) fn look(
+        &self,
+        destinations: &[Arc<ReuseIdentity>],
+        zoned: usize,
+        tried: &Tried,
+    ) -> Result<Looked, Unpicked> {
+        let seen = self.seen(destinations);
+        if seen.count() == 0 {
+            return Err(Unpicked::Nowhere);
+        }
+        let at = self.chosen(&seen, zoned, tried).ok_or(Unpicked::Full)?;
+        Ok(Looked {
+            at,
+            passed_over: seen.passed.get(),
+        })
+    }
+
+    /// The count of an exchange to the endpoint at `at`, whose destination is
+    /// `destination`, that a look of this state chose: none if it is full now.
+    pub(crate) fn take_looked(&self, at: usize, destination: &ReuseIdentity) -> Option<InFlight> {
+        self.take(at, destination.share(self.window))
+    }
+
+    /// Whether its endpoints have a count every worker shares (25 §3).
+    pub(crate) fn is_protected(&self) -> bool {
+        self.protected.is_some()
+    }
+
+    fn seen<'a>(&'a self, destinations: &'a [Arc<ReuseIdentity>]) -> Seen<'a> {
+        Seen {
             destinations,
             counts: &self.counts,
             window: self.window,
             protected: self.protected.as_deref(),
-        };
-        if seen.count() == 0 {
-            return Err(Unpicked::Nowhere);
+            passed: Cell::new(false),
         }
-        looked(
-            // The zone's alone while the pick keeps to them (03 §6).
-            || match balance::zone(&seen, zoned, tried) {
-                Some(zone) => self.choose(&zone, tried),
-                None => self.choose(&seen, tried),
-            },
-            |at| {
-                let count = self.counts.get(at)?;
-                let pod = match seen.protected {
-                    None => None,
-                    // Its counts are by position of the endpoint, as the destinations are.
-                    Some(protected) => Some(PodCount::take(
-                        protected.counts.get(at)?,
-                        seen.bound(protected, at),
-                    )?),
-                };
-                Some(InFlight::new(count, pod))
-            },
-        )
+    }
+
+    /// The endpoint the balancer chooses: the zone's alone while the pick keeps to them
+    /// (03 §6).
+    fn chosen(&self, seen: &Seen<'_>, zoned: usize, tried: &Tried) -> Option<usize> {
+        match balance::zone(seen, zoned, tried) {
+            Some(zone) => self.choose(&zone, tried),
+            None => self.choose(seen, tried),
+        }
+    }
+
+    /// The count of an exchange to the endpoint at `at`, at `share` of its slow start: on a
+    /// protected upstream with a slot in its shared count, none if it is full.
+    fn take(&self, at: usize, share: Share) -> Option<InFlight> {
+        let count = self.counts.get(at)?;
+        let pod = match self.protected.as_deref() {
+            None => None,
+            // Its counts are by position of the endpoint, as the destinations are.
+            Some(protected) => Some(PodCount::take(
+                protected.counts.get(at)?,
+                bound(protected, self.counts.len(), share),
+            )?),
+        };
+        Some(InFlight::new(count, pod))
     }
 
     /// The endpoint the upstream's balancer takes among `candidates`: none only if there are
@@ -491,12 +574,14 @@ mod tests {
         let upstream = Rc::clone(balancing.upstream(0).unwrap());
         let (first, held) = upstream
             .pick(destinations.of(0), 0, &Tried::default())
-            .unwrap();
+            .unwrap()
+            .pair();
         assert_eq!(upstream.counts[first].get(), 1);
         // The other has none in flight, so it is the pick while the first is held.
         let (second, _also) = upstream
             .pick(destinations.of(0), 0, &Tried::default())
-            .unwrap();
+            .unwrap()
+            .pair();
         assert_ne!(first, second);
         drop(held);
         assert_eq!(upstream.counts[first].get(), 0);
@@ -522,7 +607,10 @@ mod tests {
         two.refresh(0, &config, &destinations, &[], &protected, &[]);
         let (one, two) = (one.upstream(0).unwrap(), two.upstream(0).unwrap());
 
-        let (_, mut held) = one.pick(destinations.of(0), 0, &Tried::default()).unwrap();
+        let (_, mut held) = one
+            .pick(destinations.of(0), 0, &Tried::default())
+            .unwrap()
+            .pair();
         assert_eq!(pod.in_flight(), 1);
         assert_eq!(
             two.pick(destinations.of(0), 0, &Tried::default())
@@ -534,7 +622,10 @@ mod tests {
         held.unprotect();
         assert_eq!(pod.in_flight(), 0);
         assert_eq!(one.counts[0].get(), 1, "the worker's own count stays");
-        let (_, also) = two.pick(destinations.of(0), 0, &Tried::default()).unwrap();
+        let (_, also) = two
+            .pick(destinations.of(0), 0, &Tried::default())
+            .unwrap()
+            .pair();
         assert_eq!(pod.in_flight(), 1);
         drop((held, also));
         assert_eq!((pod.in_flight(), one.counts[0].get()), (0, 0));
@@ -568,8 +659,8 @@ mod tests {
             let (one, two) = (one.upstream(0).unwrap(), two.upstream(0).unwrap());
             let all = destinations.of(0);
             for _ in 0..20 {
-                let (first, held) = one.pick(all, 0, &Tried::default()).unwrap();
-                let (second, also) = two.pick(all, 0, &Tried::default()).unwrap();
+                let (first, held) = one.pick(all, 0, &Tried::default()).unwrap().pair();
+                let (second, also) = two.pick(all, 0, &Tried::default()).unwrap().pair();
                 assert_ne!(first, second, "{balancer}: a full endpoint taken");
                 assert_eq!(
                     two.pick(all, 0, &Tried::default()).unwrap_err(),
@@ -584,6 +675,118 @@ mod tests {
                 drop((held, also));
             }
         }
+    }
+
+    /// A look chooses as a pick does and takes nothing: it passes over a full endpoint, is
+    /// refused as full only when every one is, and leaves every count as it was. What it
+    /// chose is taken afterwards, unless it has filled since (25 §5).
+    #[test]
+    fn a_look_chooses_as_a_pick_does_and_takes_nothing() {
+        for balancer in ["p2c", "round_robin"] {
+            let config = compiled(&[("u", balancer, &["10.0.0.1:80", "10.0.0.2:80"])]);
+            let keys = Keys::default();
+            let destinations =
+                Destinations::reconcile(&config, &Destinations::default(), &keys, &[None]);
+            let (protected, pods) = two_protected(1);
+            let mut balancing = Balancing::default();
+            balancing.refresh(0, &config, &destinations, &[], &protected, &[]);
+            let upstream = balancing.upstream(0).unwrap();
+            let all = destinations.of(0);
+            let cap = NonZeroU32::MIN;
+
+            let full = PodCount::take(&pods[0], cap).unwrap();
+            for _ in 0..20 {
+                let looked = upstream.look(all, 0, &Tried::default()).unwrap();
+                assert_eq!(looked.at, 1, "{balancer}");
+                assert_eq!(
+                    (pods[0].in_flight(), pods[1].in_flight()),
+                    (1, 0),
+                    "{balancer}: a look took a slot"
+                );
+                assert_eq!(
+                    upstream.counts[1].get(),
+                    0,
+                    "{balancer}: counted as in flight"
+                );
+            }
+            let taken = upstream.take_looked(1, &all[1]).unwrap();
+            assert_eq!((pods[1].in_flight(), upstream.counts[1].get()), (1, 1));
+            assert_eq!(
+                upstream.look(all, 0, &Tried::default()).unwrap_err(),
+                Unpicked::Full,
+                "{balancer}"
+            );
+            assert!(
+                upstream.take_looked(1, &all[1]).is_none(),
+                "{balancer}: filled since"
+            );
+            drop((full, taken));
+            let looked = upstream.look(all, 0, &Tried::default()).unwrap();
+            assert!(!looked.passed_over, "{balancer}: nothing full to pass over");
+        }
+    }
+
+    /// A full pod in a zone kept to is looked at by every pick, in working out whether the
+    /// zone is kept to, and passed over only by those that draw it (25 §8): of the zone's
+    /// three, P2C draws it two picks in three, so some of a hundred never do.
+    #[test]
+    fn a_full_pod_only_looked_at_is_not_passed_over() {
+        let addresses = ["10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80", "10.0.0.4:80"];
+        let config = compiled(&[("u", "p2c", &addresses)]);
+        let keys = Keys::default();
+        let destinations =
+            Destinations::reconcile(&config, &Destinations::default(), &keys, &[None]);
+        let pods: Vec<Arc<PodCount>> = (0..4).map(|_| PodCount::new()).collect();
+        let protected = vec![Some(Arc::new(Protected {
+            cap: NonZeroU32::MIN,
+            counts: pods.iter().map(Arc::clone).collect(),
+        }))];
+        let mut balancing = Balancing::default();
+        balancing.refresh(0, &config, &destinations, &[], &protected, &[]);
+        let upstream = balancing.upstream(0).unwrap();
+        let _full = PodCount::take(&pods[1], NonZeroU32::MIN).unwrap();
+        let (mut passed, mut not) = (0, 0);
+        for _ in 0..100 {
+            let picked = upstream
+                .pick(destinations.of(0), 3, &Tried::default())
+                .unwrap();
+            assert!(
+                picked.at < 3 && picked.at != 1,
+                "kept to the zone's with room"
+            );
+            if picked.passed_over {
+                passed += 1;
+            } else {
+                not += 1;
+            }
+        }
+        assert!(passed > 0 && not > 0, "passed over {passed}, not {not}");
+    }
+
+    /// A pick says whether it passed over a full endpoint: one that found every endpoint
+    /// with room did not, whichever it took (25 §8).
+    #[test]
+    fn a_pick_says_whether_it_passed_over_a_full_endpoint() {
+        let config = compiled(&[("u", "p2c", &["10.0.0.1:80", "10.0.0.2:80"])]);
+        let keys = Keys::default();
+        let destinations =
+            Destinations::reconcile(&config, &Destinations::default(), &keys, &[None]);
+        let (protected, pods) = two_protected(1);
+        let mut balancing = Balancing::default();
+        balancing.refresh(0, &config, &destinations, &[], &protected, &[]);
+        let upstream = balancing.upstream(0).unwrap();
+        let all = destinations.of(0);
+        for _ in 0..20 {
+            let picked = upstream.pick(all, 0, &Tried::default()).unwrap();
+            assert!(!picked.passed_over);
+            drop(picked);
+        }
+        let full = PodCount::take(&pods[1], NonZeroU32::MIN).unwrap();
+        for _ in 0..20 {
+            let picked = upstream.pick(all, 0, &Tried::default()).unwrap();
+            assert_eq!((picked.at, picked.passed_over), (0, true));
+        }
+        drop(full);
     }
 
     /// A ramping endpoint's bound follows its slow start: beside one that is full it takes a
@@ -612,7 +815,8 @@ mod tests {
             .map(|_| {
                 let (at, held) = upstream
                     .pick(destinations.of(0), 0, &Tried::default())
-                    .unwrap();
+                    .unwrap()
+                    .pair();
                 assert_eq!(at, 1);
                 held
             })
@@ -648,7 +852,7 @@ mod tests {
                 upstream
                     .pick(destinations.of(0), 0, &Tried::default())
                     .unwrap()
-                    .1
+                    .counted
             })
             .collect();
         assert_eq!(pod.in_flight(), 3);
@@ -690,7 +894,7 @@ mod tests {
                 upstream
                     .pick(destinations.of(0), 0, &Tried::default())
                     .unwrap()
-                    .1
+                    .counted
             })
             .collect();
         assert!(held.iter().all(|counted| counted.pod.is_none()));
@@ -705,13 +909,19 @@ mod tests {
         let mut balancing = Balancing::default();
         let first = state(&before, &Destinations::default(), &keys, &mut balancing, 0);
         let upstream = Rc::clone(balancing.upstream(0).unwrap());
-        let (_, held) = upstream.pick(first.of(0), 0, &Tried::default()).unwrap();
+        let (_, held) = upstream
+            .pick(first.of(0), 0, &Tried::default())
+            .unwrap()
+            .pair();
 
         let second = state(&after, &first, &keys, &mut balancing, 1);
         let reloaded = balancing.upstream(0).unwrap();
         // The same destination, the same count: what was in flight before still is.
         assert_eq!(reloaded.counts[0].get(), 1);
-        let (at, _) = reloaded.pick(second.of(0), 0, &Tried::default()).unwrap();
+        let (at, _) = reloaded
+            .pick(second.of(0), 0, &Tried::default())
+            .unwrap()
+            .pair();
         assert_eq!(at, 1, "the endpoint with nothing in flight");
         drop(held);
         assert_eq!(reloaded.counts[0].get(), 0);
@@ -772,7 +982,8 @@ mod tests {
         let upstream = Rc::clone(balancing.upstream(0).unwrap());
         let (at, _) = upstream
             .pick(destinations.of(0), 0, &Tried::default())
-            .unwrap();
+            .unwrap()
+            .pair();
 
         // The same list under a new config: the turn goes on from where it was.
         let same = state(&three, &destinations, &keys, &mut balancing, 1);
@@ -780,7 +991,8 @@ mod tests {
             .upstream(0)
             .unwrap()
             .pick(same.of(0), 0, &Tried::default())
-            .unwrap();
+            .unwrap()
+            .pair();
         assert_eq!(next, (at + 1) % 3);
 
         // A new list: a turn of its own, from wherever it was drawn to start.
@@ -792,7 +1004,13 @@ mod tests {
         let grown = state(&four, &same, &keys, &mut balancing, 2);
         let upstream = balancing.upstream(0).unwrap();
         let round: Vec<usize> = (0..4)
-            .map(|_| upstream.pick(grown.of(0), 0, &Tried::default()).unwrap().0)
+            .map(|_| {
+                upstream
+                    .pick(grown.of(0), 0, &Tried::default())
+                    .unwrap()
+                    .pair()
+                    .0
+            })
             .collect();
         let mut sorted = round.clone();
         sorted.sort_unstable();
@@ -828,6 +1046,7 @@ mod tests {
                 upstream
                     .pick(destinations.of(0), 0, &Tried::default())
                     .unwrap()
+                    .pair()
                     .0
             })
             .collect();
@@ -982,17 +1201,27 @@ mod tests {
         // alternates.
         let b = Rc::clone(balancing.upstream(1).unwrap());
         let held: Vec<(usize, InFlight)> = (0..4)
-            .map(|_| b.pick(destinations.of(1), 0, &Tried::default()).unwrap())
+            .map(|_| {
+                b.pick(destinations.of(1), 0, &Tried::default())
+                    .unwrap()
+                    .pair()
+            })
             .collect();
         let order: Vec<usize> = held.iter().map(|(at, _)| *at).collect();
         assert_ne!(order[0], order[1]);
         assert_eq!(order[0], order[2]);
         // P2C with one of two held always takes the other.
         let a = Rc::clone(balancing.upstream(0).unwrap());
-        let (first, _keep) = a.pick(destinations.of(0), 0, &Tried::default()).unwrap();
+        let (first, _keep) = a
+            .pick(destinations.of(0), 0, &Tried::default())
+            .unwrap()
+            .pair();
         for _ in 0..20 {
             assert_ne!(
-                a.pick(destinations.of(0), 0, &Tried::default()).unwrap().0,
+                a.pick(destinations.of(0), 0, &Tried::default())
+                    .unwrap()
+                    .pair()
+                    .0,
                 first
             );
         }

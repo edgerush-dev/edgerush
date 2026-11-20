@@ -3,8 +3,8 @@
 
 use super::logged::{Logging, logged};
 use super::{
-    Body, Called, Connection, Directed, Directing, Handshake, Mirrored, Others, Proxy, Redirect,
-    Snapshot, TUNNEL_IDLE, Timed, Timing, Toward, Worker, at_endpoint, balance_of,
+    Body, Called, Connection, Directed, Directing, Handshake, Looking, Mirrored, Others, Proxy,
+    Redirect, Snapshot, TUNNEL_IDLE, Timed, Timing, Toward, Worker, at_endpoint, balance_of,
 };
 use crate::balance::Tried;
 use crate::downstream::h1::connection::{self as h1, Answered};
@@ -23,7 +23,8 @@ use crate::request::{Decision, Opening, Rejection, decide};
 use crate::request_body::{Counts, RequestBody};
 use crate::routed::Through;
 use crate::timers::{Alarm, Timers};
-use crate::upstream::balancing::{Balancing, Unpicked};
+use crate::upstream::balancing::{self, Balancing, InFlight, Unpicked};
+use crate::upstream::destination::ReuseIdentity;
 use crate::upstream::h1::codec::Sending;
 use crate::way_back;
 use crate::websocket::{self, Key};
@@ -31,6 +32,7 @@ use arc_swap::Guard;
 use edgerush_config::{CompiledRateLimiting, CompiledRule, RequestId, UpstreamProtocol};
 use edgerush_filters::request_id;
 use edgerush_router::Fields;
+use http::uri::Authority;
 use http::{HeaderValue, Method, Request, Response, Version};
 use http_body::Body as HttpBody;
 use std::cell::{Cell, RefCell};
@@ -565,6 +567,13 @@ impl Worker {
                 self.dry_run(under, by);
             }
         }
+        // Admitted: what its looks chose is taken now (25 §5). Only a request under a rate
+        // limit looked.
+        if directed.limited != 0
+            && let Err(answer) = self.proxy.aim(&mut directed, &mut head)
+        {
+            return self.proxy.answer_to(listener, answer, call).into();
+        }
         // A WebSocket that an HTTP/2 or HTTP/3 client asks for holds a backend of its own
         // beside the client's one connection, which may carry a hundred: it counts as one
         // of the worker's connections for as long as it is open, and is refused, before
@@ -854,12 +863,26 @@ impl Proxy {
         let destinations = snapshot.destinations.of(upstream);
         let balance = balance_of(balancing, &snapshot, upstream).ok_or(Answer::NoEndpoints)?;
         let zoned = snapshot.zoned(upstream);
-        let (at, counted) = balance
-            .pick(destinations, zoned, &Tried::default())
-            .map_err(|unpicked| match unpicked {
+        // A request its rate limits may yet refuse looks at a protected upstream's endpoints
+        // now and takes its slot once they admit it: it holds none while they decide, and a
+        // full backend refuses it before they are charged (25 §5). Any other takes it now.
+        let later = forward.limited != 0 && balance.is_protected();
+        let (at, counted) = self.chosen(&balance, destinations, zoned, later).map_err(
+            |unpicked| match unpicked {
                 Unpicked::Nowhere => Answer::NoEndpoints,
-                Unpicked::Full => Answer::BackendFull,
-            })?;
+                Unpicked::Full => {
+                    if let Some(counters) = self.metrics.upstream(balance.slot()) {
+                        counters.full.inc();
+                    }
+                    Answer::BackendFull
+                }
+            },
+        )?;
+        let looked = later.then_some(Looking {
+            generation: snapshot.generation,
+            upstream,
+            at,
+        });
         let endpoint = endpoints.get(at).ok_or(Answer::NoEndpoints)?;
         let identity = snapshot
             .destinations
@@ -924,29 +947,52 @@ impl Proxy {
                 continue;
             }
             let destinations = snapshot.destinations.of(upstream);
-            let found = balance_of(balancing, &snapshot, upstream).and_then(|balance| {
-                let zoned = snapshot.zoned(upstream);
-                // A copy that finds its endpoint full is not sent (25 §5).
-                let (at, counted) = balance.pick(destinations, zoned, &Tried::default()).ok()?;
-                let authority = snapshot.endpoints.get(upstream)?.get(at)?;
-                Some((
-                    at_endpoint(&target, authority)?,
-                    destinations.get(at)?,
-                    counted,
-                    balance,
-                ))
-            });
             let counters = self.metrics.upstream(slot);
-            let Some((target, destination, counted, balance)) = found else {
+            let nowhere = || {
                 if let Some(counters) = counters {
                     counters.mirrors_nowhere.inc();
                 }
+            };
+            let Some(balance) = balance_of(balancing, &snapshot, upstream) else {
+                nowhere();
+                continue;
+            };
+            // A copy looks and takes as its request does; one that finds its endpoint full
+            // is not sent (25 §5).
+            let later = forward.limited != 0 && balance.is_protected();
+            let zoned = snapshot.zoned(upstream);
+            let (at, counted) = match self.chosen(&balance, destinations, zoned, later) {
+                Ok(chosen) => chosen,
+                Err(Unpicked::Full) => {
+                    if let Some(counters) = counters {
+                        counters.mirrors_full.inc();
+                    }
+                    continue;
+                }
+                Err(Unpicked::Nowhere) => {
+                    nowhere();
+                    continue;
+                }
+            };
+            let found = snapshot
+                .endpoints
+                .get(upstream)
+                .and_then(|authorities| authorities.get(at))
+                .and_then(|authority| at_endpoint(&target, authority))
+                .zip(destinations.get(at));
+            let Some((target, destination)) = found else {
+                nowhere();
                 continue;
             };
             mirrors.push(Mirrored {
                 upstream: balance,
                 endpoint: Arc::clone(destination),
-                counted: Some(counted),
+                counted,
+                looked: later.then_some(Looking {
+                    generation: snapshot.generation,
+                    upstream,
+                    at,
+                }),
                 target,
                 fields,
             });
@@ -971,7 +1017,8 @@ impl Proxy {
             limit_slots: (forward.limited != 0).then(|| Arc::clone(&snapshot.limit_slots)),
             upstream: balance,
             endpoint: Arc::clone(identity),
-            counted: Some(counted),
+            counted,
+            looked,
             others,
             mirrors,
             websocket,
@@ -980,6 +1027,135 @@ impl Proxy {
             logging,
         }))
     }
+
+    /// The endpoint `balance` takes among `destinations`, the first `zoned` of them its
+    /// zone's, and its count; or, `later`, the one a look chose, its count taken once the
+    /// request's rate limits admit it ([`Self::aim`], 25 §5). Counted as passing over a
+    /// full endpoint where it did.
+    fn chosen(
+        &self,
+        balance: &balancing::Upstream,
+        destinations: &[Arc<ReuseIdentity>],
+        zoned: usize,
+        later: bool,
+    ) -> Result<(usize, Option<InFlight>), Unpicked> {
+        let (at, counted, passed_over) = if later {
+            let looked = balance.look(destinations, zoned, &Tried::default())?;
+            (looked.at, None, looked.passed_over)
+        } else {
+            let picked = balance.pick(destinations, zoned, &Tried::default())?;
+            (picked.at, Some(picked.counted), picked.passed_over)
+        };
+        if passed_over && let Some(counters) = self.metrics.upstream(balance.slot()) {
+            counters.passed_over.inc();
+        }
+        Ok((at, counted))
+    }
+
+    /// Takes the slots a request's looks chose, now that its rate limits have admitted it
+    /// (25 §5): its own, and its copies'. A request whose endpoints are all full by now is
+    /// refused `backend_full`, charged — the rare refusal a look cannot rule out; a copy is
+    /// not sent.
+    pub(super) fn aim<H: Forwarded>(
+        &self,
+        directed: &mut Directed,
+        head: &mut H,
+    ) -> Result<(), Answer> {
+        if let Some(looking) = directed.looked.take() {
+            let Some((moved, counted)) =
+                self.taken(&directed.upstream, looking, &directed.endpoint)
+            else {
+                if let Some(counters) = self.metrics.upstream(directed.upstream.slot()) {
+                    counters.full.inc();
+                }
+                return Err(Answer::BackendFull);
+            };
+            if let Some(moved) = moved {
+                let target = at_endpoint(head.uri(), &moved.authority).ok_or(Answer::BadTarget)?;
+                head.set_uri(target);
+                directed.endpoint = moved.destination;
+                if let Some(others) = &mut directed.others {
+                    others.first = moved.at;
+                }
+            }
+            directed.counted = Some(counted);
+        }
+        directed.mirrors.retain_mut(|mirror| {
+            let Some(looking) = mirror.looked.take() else {
+                return true;
+            };
+            let counters = self.metrics.upstream(mirror.upstream.slot());
+            let Some((moved, counted)) = self.taken(&mirror.upstream, looking, &mirror.endpoint)
+            else {
+                if let Some(counters) = counters {
+                    counters.mirrors_full.inc();
+                }
+                return false;
+            };
+            if let Some(moved) = moved {
+                let Some(target) = at_endpoint(&mirror.target, &moved.authority) else {
+                    if let Some(counters) = counters {
+                        counters.mirrors_nowhere.inc();
+                    }
+                    return false;
+                };
+                mirror.target = target;
+                mirror.endpoint = moved.destination;
+            }
+            mirror.counted = Some(counted);
+            true
+        });
+        Ok(())
+    }
+
+    /// The count at the endpoint `looking` chose of `upstream`, whose destination is
+    /// `destination`. If it filled since the look, one at another, picked as the look would
+    /// have chosen, with where that is — on the snapshot looked on, and only while it is
+    /// still the current one, whose destinations the worker's state for `upstream` is of.
+    /// None if every endpoint is full, or the snapshot has gone.
+    fn taken(
+        &self,
+        upstream: &balancing::Upstream,
+        looking: Looking,
+        destination: &ReuseIdentity,
+    ) -> Option<(Option<Moved>, InFlight)> {
+        if let Some(counted) = upstream.take_looked(looking.at, destination) {
+            return Some((None, counted));
+        }
+        let snapshot = self.current.load();
+        if snapshot.generation != looking.generation {
+            return None;
+        }
+        let picked = upstream
+            .pick(
+                snapshot.destinations.of(looking.upstream),
+                snapshot.zoned(looking.upstream),
+                &Tried::default(),
+            )
+            .ok()?;
+        if picked.passed_over
+            && let Some(counters) = self.metrics.upstream(upstream.slot())
+        {
+            counters.passed_over.inc();
+        }
+        let moved = Moved {
+            at: picked.at,
+            destination: Arc::clone(snapshot.destinations.at(looking.upstream, picked.at)?),
+            authority: snapshot
+                .endpoints
+                .get(looking.upstream)?
+                .get(picked.at)?
+                .clone(),
+        };
+        Some((Some(moved), picked.counted))
+    }
+}
+
+/// Where a request or a copy whose looked-at endpoint filled before its take went instead.
+struct Moved {
+    at: usize,
+    destination: Arc<ReuseIdentity>,
+    authority: Authority,
 }
 
 /// `answered`, its body cut off, as a body that failed, if it is still coming at
