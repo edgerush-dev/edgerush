@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use edgerush_gateway_api::gateway::GatewaySpec;
 use edgerush_gateway_api::gateway_class::GatewayClassSpec;
 use k8s_openapi::ByteString;
+use k8s_openapi::Resource;
 use k8s_openapi::api::admissionregistration::v1::{
     RuleWithOperations, ServiceReference, ValidatingWebhook, ValidatingWebhookConfiguration,
     WebhookClientConfig,
@@ -36,7 +37,7 @@ use k8s_openapi::api::core::v1::{
     SecretVolumeSource, SecurityContext, Service, ServiceAccount, ServicePort, ServiceSpec, Sysctl,
     TopologySpreadConstraint, Volume, VolumeMount,
 };
-use k8s_openapi::api::networking::v1::{IngressClass, IngressClassSpec};
+use k8s_openapi::api::networking::v1::{Ingress, IngressClass, IngressClassSpec};
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -49,6 +50,7 @@ use serde::Serialize;
 use crate::control_plane::{ControlPlane, ControlPlaneWatchNamespacesSelector};
 use crate::data_plane::{DataPlane, DataPlaneResources};
 use crate::gateway_first::carried;
+use crate::rate_limit_policy::RateLimitPolicy;
 use crate::workers::workers;
 
 #[cfg(test)]
@@ -804,8 +806,9 @@ pub fn registration_name(control_plane: &str) -> String {
 }
 
 /// `control_plane`'s webhook registration, trusting `bundle`, its Service named `service`:
-/// Ingresses made or changed in its watch scope sent there for review, and admitted as for
-/// an outage where no answer comes (04 §3).
+/// Ingresses and RateLimitPolicies made or changed in its watch scope sent there for
+/// review, and admitted as for an outage where no answer comes (04 §3). Each kind is a
+/// webhook of its own, so that a refusal names what judged it.
 fn registration(
     control_plane: &ControlPlane,
     namespace: &str,
@@ -814,34 +817,43 @@ fn registration(
     bundle: &str,
     labels: &BTreeMap<String, String>,
 ) -> ValidatingWebhookConfiguration {
+    let hook = |group: &str, version: &str, resource: &str| ValidatingWebhook {
+        name: format!("{control_plane_name}.{resource}.gateway.edgerush.dev"),
+        admission_review_versions: vec!["v1".to_owned()],
+        client_config: WebhookClientConfig {
+            ca_bundle: Some(ByteString(bundle.as_bytes().to_vec())),
+            service: Some(ServiceReference {
+                namespace: namespace.to_owned(),
+                name: service.to_owned(),
+                path: Some(WEBHOOK_PATH.to_owned()),
+                port: Some(WEBHOOK_SERVICE_PORT),
+            }),
+            url: None,
+        },
+        failure_policy: Some("Ignore".to_owned()),
+        namespace_selector: scope_selector(control_plane, namespace),
+        // The resource alone, not its status: what a controller writes there is not judged.
+        rules: Some(vec![RuleWithOperations {
+            api_groups: Some(vec![group.to_owned()]),
+            api_versions: Some(vec![version.to_owned()]),
+            operations: Some(vec!["CREATE".to_owned(), "UPDATE".to_owned()]),
+            resources: Some(vec![resource.to_owned()]),
+            scope: Some("Namespaced".to_owned()),
+        }]),
+        side_effects: "None".to_owned(),
+        timeout_seconds: Some(WEBHOOK_TIMEOUT),
+        ..ValidatingWebhook::default()
+    };
     ValidatingWebhookConfiguration {
         metadata: metadata(registration_name(control_plane_name), None, labels, None),
-        webhooks: Some(vec![ValidatingWebhook {
-            name: format!("{control_plane_name}.ingresses.gateway.edgerush.dev"),
-            admission_review_versions: vec!["v1".to_owned()],
-            client_config: WebhookClientConfig {
-                ca_bundle: Some(ByteString(bundle.as_bytes().to_vec())),
-                service: Some(ServiceReference {
-                    namespace: namespace.to_owned(),
-                    name: service.to_owned(),
-                    path: Some(WEBHOOK_PATH.to_owned()),
-                    port: Some(WEBHOOK_SERVICE_PORT),
-                }),
-                url: None,
-            },
-            failure_policy: Some("Ignore".to_owned()),
-            namespace_selector: scope_selector(control_plane, namespace),
-            rules: Some(vec![RuleWithOperations {
-                api_groups: Some(vec!["networking.k8s.io".to_owned()]),
-                api_versions: Some(vec!["v1".to_owned()]),
-                operations: Some(vec!["CREATE".to_owned(), "UPDATE".to_owned()]),
-                resources: Some(vec!["ingresses".to_owned()]),
-                scope: Some("Namespaced".to_owned()),
-            }]),
-            side_effects: "None".to_owned(),
-            timeout_seconds: Some(WEBHOOK_TIMEOUT),
-            ..ValidatingWebhook::default()
-        }]),
+        webhooks: Some(vec![
+            hook(Ingress::GROUP, Ingress::VERSION, Ingress::URL_PATH_SEGMENT),
+            hook(
+                RateLimitPolicy::GROUP,
+                RateLimitPolicy::VERSION,
+                RateLimitPolicy::URL_PATH_SEGMENT,
+            ),
+        ]),
     }
 }
 

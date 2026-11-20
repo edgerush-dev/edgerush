@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration;
+use k8s_openapi::api::admissionregistration::v1::{
+    ValidatingWebhook, ValidatingWebhookConfiguration,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
     LabelSelector, LabelSelectorRequirement, ObjectMeta,
 };
@@ -415,9 +417,30 @@ fn a_webhook_is_registered_only_once_its_authority_s_bundle_is_published() {
     assert_eq!(labels[super::CONTROL_PLANE_LABEL], "payments");
     assert_eq!(labels[super::NAMESPACE_LABEL], "edge");
     let webhooks = registered.webhooks.as_deref().unwrap();
-    assert_eq!(webhooks.len(), 1);
-    let webhook = &webhooks[0];
-    assert_eq!(webhook.name, "payments.ingresses.gateway.edgerush.dev");
+    // A webhook of each kind judged, so that a refusal names which (04 §3).
+    let names: Vec<_> = webhooks
+        .iter()
+        .map(|webhook| webhook.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "payments.ingresses.gateway.edgerush.dev",
+            "payments.ratelimitpolicies.gateway.edgerush.dev"
+        ]
+    );
+    for (webhook, (group, version, resource)) in webhooks.iter().zip([
+        ("networking.k8s.io", "v1", "ingresses"),
+        ("gateway.edgerush.dev", "v1alpha1", "ratelimitpolicies"),
+    ]) {
+        a_webhook_reviewing(webhook, group, version, resource);
+    }
+}
+
+/// That `webhook` asks the control plane's Service to review `resource` of `group` and
+/// `version` made or changed, its status not, trusting the bundle published, and fails
+/// open.
+fn a_webhook_reviewing(webhook: &ValidatingWebhook, group: &str, version: &str, resource: &str) {
     assert_eq!(
         webhook
             .client_config
@@ -447,19 +470,24 @@ fn a_webhook_is_registered_only_once_its_authority_s_bundle_is_published() {
     assert_eq!(webhook.side_effects, "None");
     assert_eq!(webhook.timeout_seconds, Some(10));
     let rules = webhook.rules.as_deref().unwrap();
-    assert_eq!(rules.len(), 1);
+    assert_eq!(rules.len(), 1, "{resource}");
     assert_eq!(
         rules[0].api_groups.as_deref(),
-        Some(&["networking.k8s.io".to_owned()][..])
+        Some(&[group.to_owned()][..])
+    );
+    assert_eq!(
+        rules[0].api_versions.as_deref(),
+        Some(&[version.to_owned()][..])
     );
     assert_eq!(
         rules[0].resources.as_deref(),
-        Some(&["ingresses".to_owned()][..])
+        Some(&[resource.to_owned()][..])
     );
     assert_eq!(
         rules[0].operations.as_deref(),
         Some(&["CREATE".to_owned(), "UPDATE".to_owned()][..])
     );
+    assert_eq!(rules[0].scope.as_deref(), Some("Namespaced"));
 }
 
 #[test]
@@ -482,7 +510,7 @@ fn a_webhook_turned_off_is_neither_registered_nor_listened_for() {
     assert_eq!(ports, ["stream"]);
 }
 
-/// What the registration of `cp`'s webhook selects namespaces by.
+/// What the registration of `cp`'s webhooks select namespaces by, each alike.
 fn scoped(cp: ControlPlane) -> Option<LabelSelector> {
     let objects = for_control_plane(
         &hooked(cp, Some(BUNDLE)),
@@ -490,9 +518,13 @@ fn scoped(cp: ControlPlane) -> Option<LabelSelector> {
         &install(),
     )
     .unwrap();
-    registration(&objects).unwrap().webhooks.as_ref().unwrap()[0]
-        .namespace_selector
-        .clone()
+    let webhooks = registration(&objects).unwrap().webhooks.as_deref().unwrap();
+    let selectors: BTreeSet<_> = webhooks
+        .iter()
+        .map(|webhook| format!("{:?}", webhook.namespace_selector))
+        .collect();
+    assert_eq!(selectors.len(), 1, "{selectors:?}");
+    webhooks[0].namespace_selector.clone()
 }
 
 #[test]

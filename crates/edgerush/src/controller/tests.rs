@@ -814,6 +814,39 @@ fn a_review_is_answered_once_the_classes_are_listed_and_what_is_none_is_a_bad_re
     assert!(body.starts_with("not an AdmissionReview"), "{body}");
 }
 
+/// A review of RateLimitPolicy `checkout`, its one limit a bucket of burst `burst`.
+fn policy_review_of(uid: &str, burst: u32) -> Vec<u8> {
+    format!(
+        r#"{{"apiVersion":"admission.k8s.io/v1","kind":"AdmissionReview","request":{{"uid":"{uid}","kind":{{"group":"gateway.edgerush.dev","version":"v1alpha1","kind":"RateLimitPolicy"}},"operation":"CREATE","object":{{"metadata":{{"name":"checkout","namespace":"shop"}},"spec":{{"targetRefs":[{{"group":"gateway.networking.k8s.io","kind":"HTTPRoute","name":"shop"}}],"limits":[{{"name":"per-client","key":"Client","model":{{"bucket":{{"rate":"10/s","burst":{burst}}}}}}}]}}}}}}}}"#
+    )
+    .into_bytes()
+}
+
+/// A RateLimitPolicy is judged alone, with no DataPlane, so it is answered whether or not
+/// the data plane's settings are known and the IngressClasses listed: admitted where its
+/// limits compile, refused with why where they do not.
+#[test]
+fn a_rate_limit_policy_is_judged_without_waiting_on_settings_or_classes() {
+    let planes = harness_planes(&[("", &plane())]);
+    for (planes, listed) in [(&Planes::new(), false), (&planes, false), (&planes, true)] {
+        let answered = |body: &[u8]| {
+            let answer = review(planes, &classes(listed), body);
+            assert_eq!(answer.status, StatusCode::OK);
+            serde_json::from_slice::<serde_json::Value>(&answer.body).unwrap()
+        };
+        let admitted = answered(&policy_review_of("u-1", 10));
+        assert_eq!(admitted["response"]["uid"], "u-1");
+        assert_eq!(admitted["response"]["allowed"], true);
+        let refused = answered(&policy_review_of("u-2", 0));
+        assert_eq!(refused["response"]["uid"], "u-2");
+        assert_eq!(refused["response"]["allowed"], false);
+        assert_eq!(
+            refused["response"]["status"]["message"],
+            "the data plane would refuse it: limits[per-client].model.bucket.burst: 0 is out of range"
+        );
+    }
+}
+
 /// The data planes `planes` names, each of these settings in YAML, of no Service.
 fn harness_planes(planes: &[(&str, &str)]) -> Planes {
     planes

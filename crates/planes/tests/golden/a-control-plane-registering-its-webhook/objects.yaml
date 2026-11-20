@@ -241,6 +241,34 @@ webhooks:
     scope: Namespaced
   sideEffects: None
   timeoutSeconds: 10
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    caBundle: >-
+      LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUJkekNDQVIyZ0F3SUJBZ0lCQVRBS0JnZ3Foa2pPUFFRREFqQUFNQjRYRFRJMk1URXhOREF3TURBd01Gb1gKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=
+    service:
+      name: edgerush-controller-payments
+      namespace: payments-edge
+      path: /validate
+      port: 443
+  failurePolicy: Ignore
+  name: payments.ratelimitpolicies.gateway.edgerush.dev
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: payments-edge
+  rules:
+  - apiGroups:
+    - gateway.edgerush.dev
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - ratelimitpolicies
+    scope: Namespaced
+  sideEffects: None
+  timeoutSeconds: 10
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass

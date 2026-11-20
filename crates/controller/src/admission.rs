@@ -1,16 +1,20 @@
 //! The admission webhook ([04 §3](../../../docs/04-control-plane.md)): an `AdmissionReview`
-//! the API server sends, read; the Ingress it asks about, judged; and the review answered.
-//! Pure: the listener that takes reviews is elsewhere.
+//! the API server sends, read; the Ingress or RateLimitPolicy it asks about, judged; and the
+//! review answered. Pure: the listener that takes reviews is elsewhere.
 //!
 //! An Ingress is judged alone, translated with no other Ingress, Service or Secret, and
-//! refused only where it does not translate into something the proxy accepts. So nothing
+//! refused only where it does not translate into something the proxy accepts. A
+//! RateLimitPolicy is judged alone likewise, with no other policy, no target and no
+//! DataPlane, and refused only where its limits do not compile. So nothing
 //! is said of what hangs on other objects, and nothing answered names one: anyone who can
 //! reach the webhook can send it a review, not only the API server. For the same reason
 //! what is read is untrusted. A review that is not one is an error, which the listener
 //! answers as a bad request; the API server, for its part, then admits the object as it
 //! would through an outage. An error never repeats what it was sent.
 
-use edgerush_translate::{Cluster, Plane, translate};
+use edgerush_planes::rate_limit_policy::RateLimitPolicy;
+use edgerush_translate::{Cluster, Plane, policy_refused_alone, translate};
+use k8s_openapi::Resource;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use serde::Deserialize;
 use serde_json::json;
@@ -34,6 +38,8 @@ pub struct Review {
 pub enum Asked {
     /// An Ingress, as it is to be made or changed to.
     Ingress(Box<Ingress>),
+    /// A RateLimitPolicy, as it is to be made or changed to.
+    RateLimitPolicy(Box<RateLimitPolicy>),
     /// Anything else, or nothing (a deletion carries no object): not the webhook's to judge.
     Other,
 }
@@ -88,23 +94,32 @@ struct GroupVersionKind {
     kind: String,
 }
 
+impl GroupVersionKind {
+    /// Whether this is `R`'s group, version and kind.
+    fn is<R: Resource>(&self) -> bool {
+        self.group == R::GROUP && self.version == R::VERSION && self.kind == R::KIND
+    }
+}
+
 /// The review `body` holds.
 ///
 /// # Errors
 ///
-/// If it is not an `admission.k8s.io/v1` review with a request, or the Ingress it asks
-/// about is not one.
+/// If it is not an `admission.k8s.io/v1` review with a request, or the Ingress or
+/// RateLimitPolicy it asks about is not one.
 pub fn read(body: &[u8]) -> Result<Review, ReviewError> {
     let received: Received = serde_json::from_slice(body)?;
     if received.api_version != API_VERSION || received.kind != KIND {
         return Err(ReviewError::Version);
     }
     let request = received.request.ok_or(ReviewError::NoRequest)?;
-    let kind = &request.kind;
-    let ingress =
-        kind.group == "networking.k8s.io" && kind.version == "v1" && kind.kind == "Ingress";
     let asked = match request.object {
-        Some(object) if ingress => Asked::Ingress(Box::new(serde_json::from_value(object)?)),
+        Some(object) if request.kind.is::<Ingress>() => {
+            Asked::Ingress(Box::new(serde_json::from_value(object)?))
+        }
+        Some(object) if request.kind.is::<RateLimitPolicy>() => {
+            Asked::RateLimitPolicy(Box::new(serde_json::from_value(object)?))
+        }
         _ => Asked::Other,
     };
     Ok(Review {
@@ -138,6 +153,14 @@ pub fn judge(plane: &Plane, classes: &[IngressClass], ingress: &Ingress) -> Opti
         .map(|finding| finding.problem.to_string())
         .collect();
     (!problems.is_empty()).then(|| problems.join("; "))
+}
+
+/// Why `policy` is refused, if it is: alone, its limits do not compile. Whose data plane
+/// it is for, and in what mode, is not asked: every data plane's would refuse it alike,
+/// and whatever else hangs on its data plane is for its status to say.
+#[must_use]
+pub fn judge_policy(policy: &RateLimitPolicy) -> Option<String> {
+    policy_refused_alone(&policy.spec).map(|problem| problem.to_string())
 }
 
 /// The answer to the review `uid`: admitted, or refused for the reason given.
@@ -205,8 +228,101 @@ mod tests {
         })
     }
 
+    fn policy_kind() -> Value {
+        json!({ "group": "gateway.edgerush.dev", "version": "v1alpha1", "kind": "RateLimitPolicy" })
+    }
+
+    /// RateLimitPolicy `checkout` in `shop`, on HTTPRoute `shop`'s rule `checkout`: a limit
+    /// per client on its POSTs, `platform-per-ip` ignored.
+    fn checkout() -> Value {
+        json!({
+            "apiVersion": "gateway.edgerush.dev/v1alpha1",
+            "kind": "RateLimitPolicy",
+            "metadata": { "name": "checkout", "namespace": "shop" },
+            "spec": {
+                "targetRefs": [{
+                    "group": "gateway.networking.k8s.io", "kind": "HTTPRoute",
+                    "name": "shop", "sectionName": "checkout"
+                }],
+                "limits": [{
+                    "name": "shop-checkout-per-client", "key": "Client",
+                    "match": { "methods": ["POST"] },
+                    "model": { "bucket": { "rate": "10/s", "burst": 10 } }
+                }],
+                "ignore": ["platform-per-ip"]
+            }
+        })
+    }
+
     fn bytes(value: &Value) -> Vec<u8> {
         serde_json::to_vec(value).unwrap()
+    }
+
+    #[test]
+    fn a_rate_limit_policy_asked_about_is_read_with_the_requests_uid() {
+        let review = read(&bytes(&review_of(policy_kind(), checkout()))).unwrap();
+        assert_eq!(review.uid, "705ab4f5-6393-11e8-b7cc-42010a800002");
+        let Asked::RateLimitPolicy(policy) = review.asked else {
+            panic!("not read as a RateLimitPolicy: {:?}", review.asked);
+        };
+        assert_eq!(policy.metadata.name.as_deref(), Some("checkout"));
+        assert_eq!(policy.metadata.namespace.as_deref(), Some("shop"));
+        let limits = policy.spec.limits.unwrap();
+        assert_eq!(limits[0].name, "shop-checkout-per-client");
+        assert_eq!(policy.spec.ignore.unwrap(), ["platform-per-ip"]);
+    }
+
+    fn policy(change: impl FnOnce(&mut Value)) -> RateLimitPolicy {
+        let mut policy = checkout();
+        change(&mut policy);
+        serde_json::from_value(policy).unwrap()
+    }
+
+    #[test]
+    fn a_rate_limit_policy_whose_limits_compile_is_admitted_whatever_else_is_missing() {
+        // Its route is not there, and the name it ignores is nowhere: alone, they never are.
+        assert_eq!(judge_policy(&policy(|_| {})), None);
+        // A window, which the asynchronous mode does not run: its data plane's mode is for
+        // its status to say.
+        let window = policy(|policy| {
+            policy["spec"]["limits"][0]["model"] =
+                json!({ "fixedWindow": { "limit": 100, "window": "1m" } });
+        });
+        assert_eq!(judge_policy(&window), None);
+        // An ignore rule, adding no limit.
+        let ignoring = policy(|policy| {
+            policy["spec"].as_object_mut().unwrap().remove("limits");
+        });
+        assert_eq!(judge_policy(&ignoring), None);
+    }
+
+    /// Refused for what the CRD's schema, which the API server checks first, lets by.
+    #[test]
+    fn a_rate_limit_policy_whose_limits_do_not_compile_is_refused_with_why() {
+        let long = policy(|policy| {
+            policy["spec"]["limits"][0]["model"] =
+                json!({ "fixedWindow": { "limit": 10, "window": "300000d" } });
+        });
+        let fast = policy(|policy| {
+            policy["spec"]["limits"][0]["model"]["bucket"]["rate"] =
+                json!("99999999999999999999999/s");
+        });
+        for (policy, why) in [
+            (
+                long,
+                "the data plane would refuse it: limit `shop-checkout-per-client`: \
+                 `model.fixed_window.window`: `300000d` is not a window: a whole number of at \
+                 least 1 and `ms`, `s`, `m`, `h` or `d`, under 213,503 days",
+            ),
+            (
+                fast,
+                "the data plane would refuse it: limit `shop-checkout-per-client`: \
+                 `model.bucket.rate`: `99999999999999999999999/s` is not a rate: a number of at \
+                 least 1, `/`, and `s`, `min`, `h` or `d`",
+            ),
+        ] {
+            assert_eq!(judge_policy(&policy).as_deref(), Some(why));
+        }
     }
 
     #[test]
@@ -229,13 +345,20 @@ mod tests {
         let class =
             json!({ "group": "networking.k8s.io", "version": "v1", "kind": "IngressClass" });
         let elsewhere = json!({ "group": "example.com", "version": "v1", "kind": "Ingress" });
+        let policy_later =
+            json!({ "group": "gateway.edgerush.dev", "version": "v1", "kind": "RateLimitPolicy" });
+        let policy_elsewhere =
+            json!({ "group": "kuadrant.io", "version": "v1alpha1", "kind": "RateLimitPolicy" });
         for (kind, object) in [
             (service, json!({ "metadata": { "name": "shop" } })),
             (beta, web()),
             (elsewhere, web()),
             (class, json!({ "metadata": { "name": "edgerush" } })),
+            (policy_later, checkout()),
+            (policy_elsewhere, checkout()),
             // A deletion's.
             (ingress_kind(), Value::Null),
+            (policy_kind(), Value::Null),
         ] {
             let review = read(&bytes(&review_of(kind.clone(), object))).unwrap();
             assert_eq!(review.asked, Asked::Other, "{kind}");
@@ -259,6 +382,8 @@ mod tests {
         no_uid["request"].as_object_mut().unwrap().remove("uid");
         let mut not_an_ingress = review_of(ingress_kind(), web());
         not_an_ingress["request"]["object"]["spec"]["rules"] = json!("secret-token-in-a-rule");
+        let mut not_a_policy = review_of(policy_kind(), checkout());
+        not_a_policy["request"]["object"]["spec"]["limits"] = json!("secret-token-in-a-limit");
         for (body, error) in [
             (b"secret-token".to_vec(), "malformed"),
             (b"{\"apiVersion\": \"secret-token\"".to_vec(), "malformed"),
@@ -267,6 +392,7 @@ mod tests {
             (bytes(&no_request), "no request"),
             (bytes(&no_uid), "malformed"),
             (bytes(&not_an_ingress), "malformed"),
+            (bytes(&not_a_policy), "malformed"),
         ] {
             let told = read(&body).unwrap_err().to_string();
             assert!(told.contains(error), "{told}");

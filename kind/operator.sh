@@ -74,9 +74,12 @@
 #     it waits for its bundle; the authority made with openssl, the bundle published in its
 #     status, the webhook is registered trusting it and asked of its own namespace alone;
 #     an Ingress of its class that would be left out is refused with why, one that
-#     translates admitted, one of another class admitted however it is; the webhook turned
-#     off, the registration and the listener gone, that Ingress admitted and judged by the
-#     control plane alone; on again and the ControlPlane deleted, the registration gone;
+#     translates admitted, one of another class admitted however it is; a RateLimitPolicy
+#     whose limit does not compile, though the CRD's schema lets it by, refused with why by
+#     a webhook of its own, one whose limits do admitted; the webhook turned
+#     off, the registration and the listener gone, that Ingress and that policy admitted,
+#     the Ingress judged by the control plane alone; on again and the ControlPlane deleted,
+#     the registration gone;
 #   - a ServiceAccount of a name the operator would use, made by hand, is left alone, and
 #     its ControlPlane says so;
 #   - `web` at a fixed 2, then autoscaled from 2, has an autoscaler that runs it at 2, and
@@ -1158,6 +1161,25 @@ EOF
     fail "an Ingress of another class was refused"
 pass "an Ingress that translates is admitted, and one of another class, however it is"
 
+# A RateLimitPolicy whose window, `$1`, the CRD's schema lets by; judged alone, its route
+# not there.
+windowed_policy() {
+    k -n hooked apply --dry-run=server -f - 2>&1 <<EOF
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: checkout }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: shop }]
+  limits:
+    - { name: hooked-per-client, key: Client, model: { fixedWindow: { limit: 10, window: $1 } } }
+EOF
+}
+refused=$(windowed_policy 300000d) && fail "a RateLimitPolicy whose limit does not compile was admitted: $refused"
+echo "$refused" | grep -qF 'admission webhook "hooked.ratelimitpolicies.gateway.edgerush.dev" denied the request: the data plane would refuse it: limit `hooked-per-client`: `model.fixed_window.window`: `300000d` is not a window' ||
+    fail "a RateLimitPolicy refused, but not by its webhook or not for why: $refused"
+admitted=$(windowed_policy 1m) || fail "a RateLimitPolicy whose limits compile was refused: $admitted"
+pass "a RateLimitPolicy whose limits do not compile is refused at admission, with why, by a webhook of its own; one whose do, admitted"
+
 # Turned off: no registration, no listener, and the Ingress judged in status alone.
 k -n hooked patch controlplane hooked --type=merge -p '{"spec":{"webhook":{"enabled":false}}}' >/dev/null
 until_true '! registration' 60 || fail "the webhook turned off is still registered"
@@ -1166,6 +1188,8 @@ k -n hooked get deploy edgerush-controller-hooked -o jsonpath='{.spec.template.s
 k -n hooked rollout status deploy/edgerush-controller-hooked --timeout=180s >/dev/null ||
     fail "ControlPlane hooked's controller, its webhook off, never ran"
 admitted=$(bad_ingress) || fail "with the webhook off, an Ingress that would be left out is refused: $admitted"
+admitted=$(windowed_policy 300000d) ||
+    fail "with the webhook off, a RateLimitPolicy whose limit does not compile is refused: $admitted"
 until_true 'k -n hooked logs deploy/edgerush-controller-hooked | grep -F "hooked/rewritten"' 60 ||
     fail "with the webhook off, the control plane says nothing of the Ingress left out"
 pass "the webhook turned off: no registration and no listener, and the Ingress admitted, judged by the control plane alone"

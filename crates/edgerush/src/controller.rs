@@ -1531,36 +1531,36 @@ fn hook(
     Ok(())
 }
 
-/// The webhook's answer to the review `body`, an Ingress of the data plane `plane`
-/// describes judged alone, as `classes` say which is its: 503 until there are settings and
-/// the classes are listed, as there is nothing to say which is; 400 for what is not a
-/// review.
+/// The webhook's answer to the review `body`: an Ingress of the data plane `plane`
+/// describes judged alone, as `classes` say which is its, 503 until there are settings and
+/// the classes are listed, as there is nothing to say which is; a RateLimitPolicy judged
+/// alone, which needs neither; 400 for what is not a review.
 fn review(planes: &Planes, classes: &Listed<IngressClass>, body: &[u8]) -> webhook::Answer {
     let answer = |status, body: Vec<u8>| webhook::Answer { status, body };
-    if planes.is_empty() {
-        let why = "the data plane's settings are not known yet";
-        return answer(StatusCode::SERVICE_UNAVAILABLE, why.as_bytes().to_vec());
-    }
-    if !classes.listed {
-        let why = "the IngressClasses are not listed yet";
-        return answer(StatusCode::SERVICE_UNAVAILABLE, why.as_bytes().to_vec());
-    }
-    match admission::read(body) {
-        Ok(review) => {
-            let refused = match &review.asked {
-                // Only the data plane whose class it is says anything of it.
-                Asked::Ingress(ingress) => planes.values().find_map(|settings| {
-                    admission::judge(&settings.plane, &classes.objects, ingress)
-                }),
-                Asked::Other => None,
-            };
-            answer(
-                StatusCode::OK,
-                admission::answer(&review.uid, refused.as_deref()),
-            )
+    let review = match admission::read(body) {
+        Ok(review) => review,
+        Err(error) => return answer(StatusCode::BAD_REQUEST, error.to_string().into_bytes()),
+    };
+    let refused = match &review.asked {
+        Asked::Ingress(_) if planes.is_empty() => {
+            let why = "the data plane's settings are not known yet";
+            return answer(StatusCode::SERVICE_UNAVAILABLE, why.as_bytes().to_vec());
         }
-        Err(error) => answer(StatusCode::BAD_REQUEST, error.to_string().into_bytes()),
-    }
+        Asked::Ingress(_) if !classes.listed => {
+            let why = "the IngressClasses are not listed yet";
+            return answer(StatusCode::SERVICE_UNAVAILABLE, why.as_bytes().to_vec());
+        }
+        // Only the data plane whose class it is says anything of it.
+        Asked::Ingress(ingress) => planes
+            .values()
+            .find_map(|settings| admission::judge(&settings.plane, &classes.objects, ingress)),
+        Asked::RateLimitPolicy(policy) => admission::judge_policy(policy),
+        Asked::Other => None,
+    };
+    answer(
+        StatusCode::OK,
+        admission::answer(&review.uid, refused.as_deref()),
+    )
 }
 
 /// The first certificate the issuer signs that the webhook can serve with, those it cannot
