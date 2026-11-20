@@ -1,6 +1,6 @@
 [package]
 name = "edgerush-control-service"
-description = "EdgeRush's config stream over gRPC and mutual TLS: the control plane's server and the data plane's client"
+description = "EdgeRush's config stream over gRPC and mutual TLS: the control plane's server and the data plane's client, and the controller's replicas' snapshots to each other"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

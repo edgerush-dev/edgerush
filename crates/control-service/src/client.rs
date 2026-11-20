@@ -183,7 +183,7 @@ async fn changed(listening: &mut Option<&mut watch::Receiver<Listening>>) -> Opt
 /// error". A cause that says only what the error before it said is left out: a wrapper
 /// that shows its cause's message as its own, and then has it for its cause, as the
 /// connector's error does, would have it said twice.
-fn error_chain(error: &dyn std::error::Error) -> String {
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
     let mut said = error.to_string();
     let mut last = said.clone();
     let mut cause = error.source();
