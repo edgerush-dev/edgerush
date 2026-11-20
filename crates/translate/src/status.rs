@@ -223,6 +223,36 @@ impl fmt::Display for PolicyStatus {
     }
 }
 
+/// What a RateLimitPolicy's status is to say of each of its ancestors this data plane
+/// serves: its Gateway, where a target of the policy is or is on it, and each Ingress of
+/// its class the policy targets ([04 §6](../../../docs/04-control-plane.md)). One
+/// `Accepted` for them all, as the policy is judged once for the data plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitPolicyStatus {
+    /// The policy.
+    pub policy: Object,
+    /// The generation it says of.
+    pub generation: i64,
+    /// Its ancestors: the Gateway, or Ingresses.
+    pub ancestors: Vec<Object>,
+    /// Its conditions: `Accepted`.
+    pub conditions: Vec<Condition>,
+}
+
+impl fmt::Display for LimitPolicyStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}, generation {}, of ", self.policy, self.generation)?;
+        for (n, ancestor) in self.ancestors.iter().enumerate() {
+            if n > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{ancestor}")?;
+        }
+        f.write_str(": ")?;
+        conditions(f, &self.conditions)
+    }
+}
+
 /// `conditions`, said one after another.
 fn conditions(f: &mut fmt::Formatter<'_>, conditions: &[Condition]) -> fmt::Result {
     for (n, condition) in conditions.iter().enumerate() {

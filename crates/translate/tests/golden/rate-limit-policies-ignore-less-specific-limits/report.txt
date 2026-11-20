@@ -1,0 +1,1 @@
+RateLimitPolicy shop/old: applies nothing to HTTPRoute shop/api section old, which forwards nothing: a rule that redirects is under no limits

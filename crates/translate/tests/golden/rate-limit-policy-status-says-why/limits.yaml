@@ -1,0 +1,75 @@
+global:
+  rate_limits: []
+limits:
+- name: platform-per-client
+  match: null
+  key: client
+  model:
+    bucket:
+      rate: 100/s
+      burst: 200
+  dry_run: false
+- name: taken
+  match: null
+  key: client
+  model:
+    bucket:
+      rate: 10/s
+      burst: 10
+  dry_run: false
+- name: route-gone-per-client
+  match: null
+  key: client
+  model:
+    bucket:
+      rate: 5/s
+      burst: 5
+  dry_run: false
+- name: rule-gone-per-client
+  match: null
+  key: client
+  model:
+    bucket:
+      rate: 5/s
+      burst: 5
+  dry_run: false
+- name: listener-gone-per-client
+  match: null
+  key: client
+  model:
+    bucket:
+      rate: 5/s
+      burst: 5
+  dry_run: false
+- name: on-redirect-per-client
+  match: null
+  key: client
+  model:
+    bucket:
+      rate: 5/s
+      burst: 5
+  dry_run: false
+- name: on-moved-per-client
+  match: null
+  key: client
+  model:
+    bucket:
+      rate: 5/s
+      burst: 5
+  dry_run: false
+- name: elsewhere-per-client
+  match: null
+  key: client
+  model:
+    bucket:
+      rate: 5/s
+      burst: 5
+  dry_run: false
+- name: ingress-per-client
+  match: null
+  key: client
+  model:
+    bucket:
+      rate: 5/s
+      burst: 5
+  dry_run: false

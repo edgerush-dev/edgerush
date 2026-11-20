@@ -24,7 +24,7 @@ use edgerush_translate::{
 };
 
 use crate::across::{Across, follow_across, watch_parts};
-use crate::{Planes, Settings, WatchScope};
+use crate::{DataPlaneOf, Planes, Settings, WatchScope};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::rc::Rc;
@@ -382,6 +382,11 @@ pub fn settings(data_plane: &DataPlane, own: &Own) -> Result<Settings, Unusable>
         plane,
         service: Some(service),
         generated: data_plane.spec.gateway_ref.is_some(),
+        data_plane: Some(DataPlaneOf {
+            namespace: data_plane.metadata.namespace.clone().unwrap_or_default(),
+            name: data_plane.metadata.name.clone().unwrap_or_default(),
+            generation: data_plane.metadata.generation.unwrap_or_default(),
+        }),
     })
 }
 

@@ -39,15 +39,22 @@ use edgerush_gateway_api::udp_route::{
     UDPRouteStatus, UDPRouteStatusParents, UDPRouteStatusParentsParentRef,
 };
 use edgerush_kubernetes::gateway_api::{GatewayKind, Served, supported};
+use edgerush_planes::rate_limit_policy::{
+    RateLimitPolicyStatus, RateLimitPolicyStatusAncestors,
+    RateLimitPolicyStatusAncestorsAncestorRef,
+};
 use edgerush_translate::{self as translate, GATEWAY_CONTROLLER, Object};
 use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use k8s_openapi::jiff::Timestamp;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 /// The API group of the Gateway API's kinds.
 const GROUP: &str = "gateway.networking.k8s.io";
+
+/// The API group of Ingress.
+const INGRESS_GROUP: &str = "networking.k8s.io";
 
 /// The most parents a route's status holds, as its CRD has it.
 const MOST_PARENTS: usize = 32;
@@ -114,15 +121,33 @@ const _: () = assert!(SUPPORTED_FEATURES.len() <= MOST_FEATURES);
 /// The condition types this controller writes on a GatewayClass.
 const CLASS_TYPES: [&str; 2] = ["Accepted", "SupportedVersion"];
 /// On a Gateway.
-const GATEWAY_TYPES: [&str; 3] = ["Accepted", "ResolvedRefs", "Programmed"];
+const GATEWAY_TYPES: [&str; 4] = [
+    "Accepted",
+    "ResolvedRefs",
+    "Programmed",
+    translate::AFFECTED,
+];
 /// On a Gateway's listener.
-const LISTENER_TYPES: [&str; 4] = ["Accepted", "Conflicted", "ResolvedRefs", "Programmed"];
+const LISTENER_TYPES: [&str; 5] = [
+    "Accepted",
+    "Conflicted",
+    "ResolvedRefs",
+    "Programmed",
+    translate::AFFECTED,
+];
 /// On a route's parent.
-const PARENT_TYPES: [&str; 3] = ["Accepted", "ResolvedRefs", "PartiallyInvalid"];
+const PARENT_TYPES: [&str; 4] = [
+    "Accepted",
+    "ResolvedRefs",
+    "PartiallyInvalid",
+    translate::AFFECTED,
+];
 /// On a ListenerSet.
-const SET_TYPES: [&str; 2] = ["Accepted", "Programmed"];
-/// On a policy's ancestor.
+const SET_TYPES: [&str; 3] = ["Accepted", "Programmed", translate::AFFECTED];
+/// On a BackendTLSPolicy's ancestor.
 const ANCESTOR_TYPES: [&str; 2] = ["Accepted", "ResolvedRefs"];
+/// On a RateLimitPolicy's ancestor.
+pub(crate) const LIMIT_ANCESTOR_TYPES: [&str; 1] = ["Accepted"];
 
 /// A condition to write.
 struct Wanted {
@@ -730,74 +755,115 @@ pub(crate) fn route(
     HTTPRouteStatus { parents }
 }
 
-/// What the status of a BackendTLSPolicy of `namespace` is to say, as `wanted` has it of
-/// each Gateway of a data plane served, merged with `live`: nothing of a Gateway where no
-/// route of it reaches the policy. Every ancestor that is not this controller's of one of
-/// those Gateways, other controllers' and this controller's of other control planes'
-/// Gateways, is kept whole where it is, but for this controller's of a Gateway that
-/// `gateways` says is gone, which is taken away. This controller's of each Gateway is
-/// written in the place of the first the status holds for it, any others taken away, or
-/// after the rest where the status holds none and has room for it; it stays where it is, so
-/// that another writer doing likewise never finds it moved.
-pub(crate) fn policy(
+/// What a policy's status is to say of one ancestor: its conditions, of the policy's
+/// generation `generation`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OfAncestor<'a> {
+    pub(crate) generation: i64,
+    pub(crate) conditions: &'a [translate::Condition],
+}
+
+impl<'a> From<&'a translate::PolicyStatus> for OfAncestor<'a> {
+    fn from(status: &'a translate::PolicyStatus) -> Self {
+        Self {
+            generation: status.generation,
+            conditions: &status.conditions,
+        }
+    }
+}
+
+/// The API group of an ancestor of `kind`: an Ingress's, or the Gateway API's.
+fn group_of(kind: &str) -> &'static str {
+    if kind == "Ingress" {
+        INGRESS_GROUP
+    } else {
+        GROUP
+    }
+}
+
+/// What the status of a policy of `namespace`, a BackendTLSPolicy or a RateLimitPolicy, is
+/// to say, as `wanted` has it of each ancestor a data plane served may write of, its
+/// conditions of the types `ours`: a Gateway, or an Ingress; merged with `live`: nothing of
+/// an ancestor where it does not reach the policy. Every ancestor that is not this
+/// controller's of one of those, other controllers' and this controller's of other control
+/// planes' Gateways, is kept whole where it is, but for this controller's of a Gateway that
+/// `gateways` says is gone, or of an Ingress of `namespace` not among `ingresses`, where
+/// they are known, which is taken away. This controller's of each ancestor is written in
+/// the place of the first the status holds for it, any others taken away, or after the
+/// rest where the status holds none and has room for it; it stays where it is, so that
+/// another writer doing likewise never finds it moved.
+pub(crate) fn policy_status(
     live: Option<&BackendTLSPolicyStatus>,
     namespace: &str,
-    wanted: &[(&Object, Option<&translate::PolicyStatus>)],
-    gateways: Gateways<'_>,
+    wanted: &[(&Object, Option<OfAncestor<'_>>)],
+    ours: &[&str],
+    (gateways, ingresses): (Gateways<'_>, Option<&BTreeSet<Object>>),
     now: Timestamp,
 ) -> BackendTLSPolicyStatus {
     let live_ancestors = live
         .map(|status| status.ancestors.as_slice())
         .unwrap_or_default();
-    // Which Gateway of `wanted` an ancestor is this controller's of, if one.
+    // Which ancestor of `wanted` an ancestor is this controller's of, if one.
     let of = |ancestor: &BackendTLSPolicyStatusAncestors| {
         let to = &ancestor.ancestor_ref;
+        let kind = to.kind.as_deref().unwrap_or("Gateway");
         (ancestor.controller_name == GATEWAY_CONTROLLER
-            && to.group.as_deref().unwrap_or(GROUP) == GROUP
-            && to.kind.as_deref().unwrap_or("Gateway") == "Gateway")
-            .then(|| {
-                wanted.iter().position(|(gateway, _)| {
-                    to.namespace.as_deref().unwrap_or(namespace) == gateway.namespace
-                        && to.name == gateway.name
-                })
+            && to.group.as_deref().unwrap_or(GROUP) == group_of(kind))
+        .then(|| {
+            wanted.iter().position(|(object, _)| {
+                object.kind == kind
+                    && to.namespace.as_deref().unwrap_or(namespace) == object.namespace
+                    && to.name == object.name
             })
-            .flatten()
+        })
+        .flatten()
     };
     let stale = |ancestor: &BackendTLSPolicyStatusAncestors| {
         let to = &ancestor.ancestor_ref;
-        gateways.stale(
-            &ancestor.controller_name,
-            (
-                to.group.as_deref(),
-                to.kind.as_deref(),
-                to.namespace.as_deref(),
-                &to.name,
-            ),
-            namespace,
-        )
+        let ingress_gone = ingresses.is_some_and(|there| {
+            ancestor.controller_name == GATEWAY_CONTROLLER
+                && to.group.as_deref() == Some(INGRESS_GROUP)
+                && to.kind.as_deref() == Some("Ingress")
+                && to.namespace.as_deref().unwrap_or(namespace) == namespace
+                && !there.contains(&Object {
+                    kind: "Ingress",
+                    namespace: namespace.to_owned(),
+                    name: to.name.clone(),
+                })
+        });
+        ingress_gone
+            || gateways.stale(
+                &ancestor.controller_name,
+                (
+                    to.group.as_deref(),
+                    to.kind.as_deref(),
+                    to.namespace.as_deref(),
+                    &to.name,
+                ),
+                namespace,
+            )
     };
-    let made = |old: &[Condition], gateway: &Object, wanted: &translate::PolicyStatus| {
+    let made = |old: &[Condition], object: &Object, wanted: OfAncestor<'_>| {
         BackendTLSPolicyStatusAncestors {
             ancestor_ref: BackendTLSPolicyStatusAncestorsAncestorRef {
-                group: Some(GROUP.to_owned()),
-                kind: Some("Gateway".to_owned()),
-                name: gateway.name.clone(),
-                namespace: Some(gateway.namespace.clone()),
+                group: Some(group_of(object.kind).to_owned()),
+                kind: Some(object.kind.to_owned()),
+                name: object.name.clone(),
+                namespace: Some(object.namespace.clone()),
                 port: None,
                 section_name: None,
             },
             conditions: merged(
                 old,
                 wanted.conditions.iter().map(Wanted::from).collect(),
-                &ANCESTOR_TYPES,
+                ours,
                 wanted.generation,
                 now,
             ),
             controller_name: GATEWAY_CONTROLLER.to_owned(),
         }
     };
-    let mut left: Vec<Option<&translate::PolicyStatus>> =
-        wanted.iter().map(|(_, wanted)| *wanted).collect();
+    let mut left: Vec<Option<OfAncestor<'_>>> = wanted.iter().map(|(_, wanted)| *wanted).collect();
     let mut ancestors = Vec::new();
     for ancestor in live_ancestors {
         match of(ancestor) {
@@ -818,6 +884,70 @@ pub(crate) fn policy(
         }
     }
     BackendTLSPolicyStatus { ancestors }
+}
+
+/// What the status of a BackendTLSPolicy of `namespace` is to say, as `wanted` has it of
+/// each Gateway of a data plane served, merged with `live`, as [`policy_status`] merges it:
+/// nothing of a Gateway where no route of it reaches the policy.
+pub(crate) fn policy(
+    live: Option<&BackendTLSPolicyStatus>,
+    namespace: &str,
+    wanted: &[(&Object, Option<&translate::PolicyStatus>)],
+    gateways: Gateways<'_>,
+    now: Timestamp,
+) -> BackendTLSPolicyStatus {
+    let wanted: Vec<(&Object, Option<OfAncestor<'_>>)> = wanted
+        .iter()
+        .map(|(gateway, status)| (*gateway, status.map(OfAncestor::from)))
+        .collect();
+    policy_status(
+        live,
+        namespace,
+        &wanted,
+        &ANCESTOR_TYPES,
+        (gateways, None),
+        now,
+    )
+}
+
+/// A RateLimitPolicy's status as a BackendTLSPolicy's: the spec has one type for every
+/// policy, `PolicyStatus`, of which the generated types are copies, so that each is merged
+/// as the other is and written as the same JSON. Taken apart whole, so that a field one
+/// gains and the other not stops this building.
+pub(crate) fn limits_as_tls(status: &RateLimitPolicyStatus) -> BackendTLSPolicyStatus {
+    let RateLimitPolicyStatus { ancestors } = status;
+    BackendTLSPolicyStatus {
+        ancestors: ancestors
+            .iter()
+            .map(|ancestor| {
+                let RateLimitPolicyStatusAncestors {
+                    ancestor_ref,
+                    conditions,
+                    controller_name,
+                } = ancestor;
+                let RateLimitPolicyStatusAncestorsAncestorRef {
+                    group,
+                    kind,
+                    name,
+                    namespace,
+                    port,
+                    section_name,
+                } = ancestor_ref;
+                BackendTLSPolicyStatusAncestors {
+                    ancestor_ref: BackendTLSPolicyStatusAncestorsAncestorRef {
+                        group: group.clone(),
+                        kind: kind.clone(),
+                        name: name.clone(),
+                        namespace: namespace.clone(),
+                        port: *port,
+                        section_name: section_name.clone(),
+                    },
+                    conditions: conditions.clone(),
+                    controller_name: controller_name.clone(),
+                }
+            })
+            .collect(),
+    }
 }
 
 /// Whether two `parentRef`s of a route of `namespace` name one parent, written alike: their

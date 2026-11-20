@@ -159,6 +159,52 @@ fn the_control_plane_reads_rate_limit_policies_and_writes_their_status_alone() {
     );
 }
 
+#[test]
+fn the_control_plane_reads_data_planes_and_applies_their_status_alone() {
+    // Its own DataPlanes, in its namespace, and those generated for Gateways of its class,
+    // in the watch scope (05 §3): read, and their `Served` applied under a field manager of
+    // its own (05 §1), the operator's conditions left to it; their spec is never its own.
+    let roles: Vec<ClusterRole> = serde_saphyr::from_multiple(&read("roles.yaml")).unwrap();
+    let mut granted = Vec::new();
+    for role in roles {
+        let name = role.metadata.name.unwrap_or_default();
+        for rule in role.rules.unwrap_or_default() {
+            for resource in rule.resources.unwrap_or_default() {
+                if resource.starts_with("dataplanes") {
+                    granted.push((name.clone(), resource, rule.verbs.clone()));
+                }
+            }
+        }
+    }
+    let grant = |role: &str, resource: &str, verbs: &[&str]| {
+        (
+            role.to_owned(),
+            resource.to_owned(),
+            verbs
+                .iter()
+                .map(|&verb| verb.to_owned())
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        granted,
+        [
+            grant("edgerush-control-plane", "dataplanes", &["list", "watch"]),
+            grant("edgerush-control-plane", "dataplanes/status", &["patch"]),
+            grant(
+                "edgerush-control-plane-own",
+                "dataplanes",
+                &["list", "watch"]
+            ),
+            grant(
+                "edgerush-control-plane-own",
+                "dataplanes/status",
+                &["patch"]
+            ),
+        ]
+    );
+}
+
 /// The admission policy and its binding, as `admission.yaml` holds them.
 #[derive(Deserialize)]
 #[serde(tag = "kind")]

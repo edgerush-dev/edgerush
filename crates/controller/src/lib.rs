@@ -34,13 +34,14 @@ use edgerush_gateway_api::udp_route::UDPRoute;
 use edgerush_kubernetes::{
     ApiError, ApiServer, Failure, Kind, Listed, Retry, Scope, follow, lease,
 };
+use edgerush_planes::data_plane::DataPlane;
 use edgerush_planes::objects::{
     ProxyService, SERVICE_MANAGED_BY, Transports, control_plane_labels,
 };
 use edgerush_planes::rate_limit_policy::RateLimitPolicy;
 use edgerush_translate::{
-    AcceptedPolicy, Cluster, GATEWAY_CONTROLLER, GatewayStatus, Object, Plane, PolicyStatus,
-    Problem, RouteStatus, Translation, translate_from,
+    AcceptedPolicy, Cluster, GATEWAY_CONTROLLER, GatewayStatus, LimitPolicyStatus, Object, Plane,
+    PolicyStatus, Problem, RouteStatus, Translation, translate_from,
 };
 use gateway_status::Programmed;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
@@ -48,6 +49,7 @@ use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
@@ -68,6 +70,7 @@ pub mod issuing;
 pub mod own_pods;
 pub mod service;
 pub mod status;
+pub mod unimplementable;
 
 use edgerush_kubernetes::gateway_api::{GatewayKind, Served};
 
@@ -85,7 +88,25 @@ pub struct Settings {
     /// Gateway of that one that sets `infrastructure.parametersRef` is translated no
     /// further while it does, and its status left to the operator.
     pub generated: bool,
+    /// The DataPlane they are of, and its generation: what its `Served` condition says of
+    /// (05 §1). None for the development harness, which has none.
+    pub data_plane: Option<DataPlaneOf>,
 }
+
+/// A DataPlane, and the generation of it some settings are of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataPlaneOf {
+    /// Its namespace.
+    pub namespace: String,
+    /// Its name.
+    pub name: String,
+    /// Its generation.
+    pub generation: i64,
+}
+
+/// The condition a control plane writes on each DataPlane it serves, beside the operator's
+/// (05 §1): whether the generation the operator accepted is the one served.
+const SERVED: &str = "Served";
 
 /// The data planes a control plane serves, each by its DataPlane as it is said,
 /// `DataPlane <namespace>/<name>`; the development harness's one by no name.
@@ -398,11 +419,16 @@ struct Serving {
     wanted: Option<Settings>,
     /// Why `wanted` was last said to be held back, so that each reason is said once.
     said_held: Option<HeldBack>,
+    /// Its DataPlane's `Served` as this replica last wrote it while it leads.
+    served_written: Option<Condition>,
     translator: Translator,
     /// What the config handed on serves: the Ingresses claimed, and those served.
     handed: Option<(Vec<Object>, Vec<Object>)>,
     /// What the config handed on says the Gateway API's objects' status is to say.
     handed_api: Option<Handed>,
+    /// What the config handed on says each RateLimitPolicy's status is to say of the
+    /// ancestors it reaches here.
+    handed_limits: Option<Vec<LimitPolicyStatus>>,
     /// The ports the config handed on binds.
     handed_ports: Option<BTreeMap<u16, Transports>>,
     /// The generation of the Gateway handed on, and when it was first.
@@ -426,6 +452,19 @@ pub enum HeldBack {
     /// Its `global` would put a rule over the most limits a rule takes where the generation
     /// before does not: a policy's change refused for it, or the config refused whole.
     TooManyLimits,
+}
+
+impl HeldBack {
+    /// Why, as the DataPlane's `Served` says it: never naming the policy that holds a name,
+    /// which may be of a namespace the DataPlane's readers do not see (04 §6).
+    fn in_status(&self) -> String {
+        match self {
+            Self::NameHeld { limit, .. } => format!(
+                "its global limit `{limit}` has the name of a limit a RateLimitPolicy holds"
+            ),
+            Self::TooManyLimits => self.to_string(),
+        }
+    }
 }
 
 impl fmt::Display for HeldBack {
@@ -452,9 +491,11 @@ impl Serving {
             settings,
             wanted: None,
             said_held: None,
+            served_written: None,
             translator: Translator::default(),
             handed: None,
             handed_api: None,
+            handed_limits: None,
             handed_ports: None,
             handed_since: None,
             written: Written::default(),
@@ -770,6 +811,7 @@ async fn serve(
                     served.handed = Some((translation.claimed.clone(), translation.served.clone()));
                     served.handed_ports = Some(service::bound(&translation.config));
                     served.handed_api = Handed::of(translation);
+                    served.handed_limits = Some(translation.limit_policy_statuses.clone());
                     if let Some(handed) = &served.handed_api {
                         let generation = handed.status.generation;
                         if served
@@ -839,6 +881,11 @@ async fn serve(
                 .write_shared(api, &handed, own.as_ref(), &**said)
                 .await;
         }
+        // Each RateLimitPolicy's, once for every data plane, whether or not the Gateway API
+        // is followed: an Ingress is an ancestor too (04 §6).
+        if leads {
+            write_limit_policies(api, &followed, &serving, &**said).await;
+        }
         // Until a change comes, or the bound a data plane's pods are waited on to run its
         // Gateway's generation, and then until its moment is over.
         let now = Instant::now();
@@ -906,6 +953,12 @@ async fn write_statuses(
     held: bool,
     said: &dyn Fn(Said<'_>),
 ) {
+    if leads {
+        write_served(api, served, said).await;
+    } else {
+        // A leader before it may have written it otherwise.
+        served.served_written = None;
+    }
     let own = served.settings.service.as_ref();
     let live = own.and_then(|own| followed.own_service(own));
     if let (Some(own), Some(ports), true, true) =
@@ -962,6 +1015,222 @@ async fn write_statuses(
         let ingresses = followed.ingresses();
         for change in status::changes(claimed, served, &ingresses, addresses) {
             write_ingress_status(api, &change, said).await;
+        }
+    }
+}
+
+/// Writes `served`'s DataPlane's `Served` where it says other than this replica last wrote
+/// (05 §1): true of the generation served where none is held back; false `HeldBack` of the
+/// one held back, once judged, saying why and which is served. Its own condition alone,
+/// applied under the control plane's field manager, the operator's left to the operator.
+/// Nothing for the development harness, which has no DataPlane.
+async fn write_served(api: &ApiServer, served: &mut Serving, said: &dyn Fn(Said<'_>)) {
+    let Some(of) = &served.settings.data_plane else {
+        return;
+    };
+    let (generation, status, reason, message) = match (&served.wanted, &served.said_held) {
+        (None, _) => (
+            of.generation,
+            "True",
+            "Served",
+            format!(
+                "generation {} is what its data planes are given",
+                of.generation
+            ),
+        ),
+        (Some(wanted), Some(why)) => {
+            let Some(held) = &wanted.data_plane else {
+                return;
+            };
+            (
+                held.generation,
+                "False",
+                "HeldBack",
+                format!(
+                    "generation {} is held back, generation {} served in its place: {}",
+                    held.generation,
+                    of.generation,
+                    why.in_status()
+                ),
+            )
+        }
+        // Not judged yet: what was written stands.
+        (Some(_), None) => return,
+    };
+    let last = served.served_written.as_ref();
+    if last.is_some_and(|last| {
+        last.observed_generation == Some(generation)
+            && last.status == status
+            && last.reason == reason
+            && last.message == message
+    }) {
+        return;
+    }
+    let since = last.filter(|last| last.status == status).map_or_else(
+        || Time(lease::wall_clock()),
+        |last| last.last_transition_time.clone(),
+    );
+    let condition = Condition {
+        last_transition_time: since,
+        message,
+        observed_generation: Some(generation),
+        reason: reason.to_owned(),
+        status: status.to_owned(),
+        type_: SERVED.to_owned(),
+    };
+    let (namespace, name) = (of.namespace.clone(), of.name.clone());
+    let result = api
+        .apply_status::<DataPlane>(
+            SERVICE_MANAGED_BY,
+            &namespace,
+            &name,
+            &serde_json::json!({ "conditions": [&condition] }),
+        )
+        .await;
+    said(Said::GatewayApiStatus {
+        object: &Object {
+            kind: "DataPlane",
+            namespace,
+            name,
+        },
+        written: result.as_ref().map(|_| ()),
+    });
+    if result.is_ok() {
+        served.served_written = Some(condition);
+    }
+}
+
+/// Writes, one at a time and once for every data plane `serving`, each RateLimitPolicy's
+/// status that says other than they have it (04 §6): an ancestor of ours for each data
+/// plane's Gateway and each Ingress of its class that a policy reaches, as its translation
+/// handed on says, and none for one it no longer reaches. This controller's entries of a
+/// Gateway gone, or of an Ingress of the policy's namespace that is not there, are taken
+/// away; every other kept whole.
+async fn write_limit_policies(
+    api: &ApiServer,
+    followed: &Followed,
+    serving: &BTreeMap<String, Serving>,
+    said: &dyn Fn(Said<'_>),
+) {
+    let handed: Vec<&Serving> = serving
+        .values()
+        .filter(|served| served.handed_limits.is_some())
+        .collect();
+    if handed.is_empty() {
+        return;
+    }
+    // The ancestors the data planes write of: each one's Gateway, and each Ingress of its
+    // class; and what each policy's status is to say of those it reaches.
+    let mut of_ours: BTreeSet<Object> = BTreeSet::new();
+    let mut reached: BTreeMap<&Object, Vec<(&Object, gateway_status::OfAncestor<'_>)>> =
+        BTreeMap::new();
+    for served in &handed {
+        of_ours.extend(
+            served
+                .handed_api
+                .as_ref()
+                .map(|handed| handed.gateway.clone()),
+        );
+        if let Some((claimed, _)) = &served.handed {
+            of_ours.extend(claimed.iter().cloned());
+        }
+        for status in served.handed_limits.iter().flatten() {
+            let of = gateway_status::OfAncestor {
+                generation: status.generation,
+                conditions: &status.conditions,
+            };
+            reached
+                .entry(&status.policy)
+                .or_default()
+                .extend(status.ancestors.iter().map(|ancestor| (ancestor, of)));
+        }
+    }
+    let (followed_gateways, gateways_there) = followed
+        .gateway_api
+        .as_ref()
+        .map(GatewayApi::gateways_known)
+        .unwrap_or_default();
+    let gateways = gateway_status::Gateways {
+        namespaces: &followed_gateways,
+        there: &gateways_there,
+    };
+    let ingresses_there: BTreeSet<Object> = followed
+        .ingresses()
+        .iter()
+        .map(|ingress| Object {
+            kind: "Ingress",
+            namespace: ingress.metadata.namespace.clone().unwrap_or_default(),
+            name: ingress.metadata.name.clone().unwrap_or_default(),
+        })
+        .collect();
+    let now = lease::wall_clock();
+    for policy in objects(&followed.rate_limit_policies) {
+        let object = Object {
+            kind: "RateLimitPolicy",
+            namespace: policy.metadata.namespace.clone().unwrap_or_default(),
+            name: policy.metadata.name.clone().unwrap_or_default(),
+        };
+        // Those it reaches, and each other of the data planes' its status holds an entry of
+        // ours for, which is to be taken away.
+        let mut wanted: Vec<(Object, Option<gateway_status::OfAncestor<'_>>)> = reached
+            .get(&object)
+            .into_iter()
+            .flatten()
+            .map(|(ancestor, of)| ((*ancestor).clone(), Some(*of)))
+            .collect();
+        for ancestor in policy.status.iter().flat_map(|status| &status.ancestors) {
+            let to = &ancestor.ancestor_ref;
+            let kind = match to.kind.as_deref() {
+                None | Some("Gateway") => "Gateway",
+                Some("Ingress") => "Ingress",
+                Some(_) => continue,
+            };
+            let named = Object {
+                kind,
+                namespace: to
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| object.namespace.clone()),
+                name: to.name.clone(),
+            };
+            if ancestor.controller_name == GATEWAY_CONTROLLER
+                && of_ours.contains(&named)
+                && !wanted.iter().any(|(known, _)| *known == named)
+            {
+                wanted.push((named, None));
+            }
+        }
+        let wanted: Vec<(&Object, Option<gateway_status::OfAncestor<'_>>)> = wanted
+            .iter()
+            .map(|(ancestor, of)| (ancestor, *of))
+            .collect();
+        let live = policy.status.as_ref().map(gateway_status::limits_as_tls);
+        let status = gateway_status::policy_status(
+            live.as_ref(),
+            &object.namespace,
+            &wanted,
+            &gateway_status::LIMIT_ANCESTOR_TYPES,
+            (gateways, Some(&ingresses_there)),
+            now,
+        );
+        if live.unwrap_or_default() != status {
+            let version = policy
+                .metadata
+                .resource_version
+                .as_deref()
+                .unwrap_or_default();
+            let result = api
+                .replace_status::<RateLimitPolicy>(
+                    &object.namespace,
+                    &object.name,
+                    version,
+                    &status,
+                )
+                .await;
+            said(Said::GatewayApiStatus {
+                object: &object,
+                written: result.as_ref().map(|_| ()),
+            });
         }
     }
 }
@@ -1390,6 +1659,32 @@ impl GatewayApi {
             })
     }
 
+    /// The namespaces it follows Gateways in, and the Gateways there: what tells a Gateway
+    /// gone (04 §6).
+    fn gateways_known(&self) -> (Vec<String>, Vec<Object>) {
+        let there = self
+            .gateways
+            .as_deref()
+            .map(objects)
+            .unwrap_or_default()
+            .iter()
+            .map(|gateway| Object {
+                kind: "Gateway",
+                namespace: gateway.metadata.namespace.clone().unwrap_or_default(),
+                name: gateway.metadata.name.clone().unwrap_or_default(),
+            })
+            .collect();
+        let followed = self
+            .gateway_namespaces
+            .iter()
+            .filter_map(|scope| match scope {
+                Scope::Namespace(namespace) => Some(namespace.clone()),
+                _ => None,
+            })
+            .collect();
+        (followed, there)
+    }
+
     /// Writes, one at a time, each status of a data plane's own that says other than
     /// `handed` has it: that of its Gateway, `addresses` among it, and of each ListenerSet
     /// naming it. Nothing while the Gateway is not there.
@@ -1542,26 +1837,7 @@ impl GatewayApi {
         if there.is_empty() {
             return;
         }
-        let gateways_there: Vec<Object> = self
-            .gateways
-            .as_deref()
-            .map(objects)
-            .unwrap_or_default()
-            .iter()
-            .map(|gateway| Object {
-                kind: "Gateway",
-                namespace: gateway.metadata.namespace.clone().unwrap_or_default(),
-                name: gateway.metadata.name.clone().unwrap_or_default(),
-            })
-            .collect();
-        let followed: Vec<String> = self
-            .gateway_namespaces
-            .iter()
-            .filter_map(|scope| match scope {
-                Scope::Namespace(namespace) => Some(namespace.clone()),
-                _ => None,
-            })
-            .collect();
+        let (followed, gateways_there) = self.gateways_known();
         let gateways = gateway_status::Gateways {
             namespaces: &followed,
             there: &gateways_there,

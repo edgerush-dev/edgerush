@@ -81,10 +81,10 @@ pub use gateway::{
     SetOutcome,
 };
 pub use http_route::{Attachment, NotAttached, ParentOutcome, RouteOutcome, Taken};
-pub use rate_limits::{AcceptedPolicy, data_plane_limit};
+pub use rate_limits::{AFFECTED, AcceptedPolicy, data_plane_limit};
 pub use status::{
-    Condition, GatewayStatus, ListenerSetStatus, ListenerStatus, ParentStatus, PolicyStatus,
-    RouteStatus,
+    Condition, GatewayStatus, LimitPolicyStatus, ListenerSetStatus, ListenerStatus, ParentStatus,
+    PolicyStatus, RouteStatus,
 };
 
 /// The controller an IngressClass names to be served by EdgeRush (02 §2).
@@ -435,6 +435,10 @@ pub struct Translation {
     /// What each BackendTLSPolicy's status is to say of that Gateway, where a route of it
     /// reaches a target of the policy, oldest first, then by namespace and name.
     pub policy_statuses: Vec<PolicyStatus>,
+    /// What each RateLimitPolicy's status is to say of the ancestors its targets reach that
+    /// this data plane serves: its Gateway, or Ingresses of its class; oldest first, then by
+    /// namespace and name (04 §6).
+    pub limit_policy_statuses: Vec<LimitPolicyStatus>,
     /// The hosts a claim of one API takes from a claim of the other, which no longer serves
     /// them: said, so that a move from one API to the other meets no surprise (04).
     pub taken: Vec<Taken>,
@@ -449,7 +453,9 @@ impl Problem {
     /// Whether this is a note on what is served as the spec has it, not a fault: said, but
     /// no reason for `validate` to fail (04 §3). A retry's attempts taken as the data
     /// plane's most are one, and a host an Ingress serves over plain HTTP alone served over
-    /// HTTPS by a Gateway listener another; so is a rule past half the most limits.
+    /// HTTPS by a Gateway listener another; so is a rule past half the most limits, and a
+    /// RateLimitPolicy's target not there or forwarding nothing, which it applies to once
+    /// it is there and forwards (04 §4).
     #[must_use]
     pub fn is_note(&self) -> bool {
         matches!(
@@ -459,6 +465,8 @@ impl Problem {
                 | Self::Http3GivenWay { .. }
                 | Self::LastAcceptedApplies(_)
                 | Self::LimitsMany { .. }
+                | Self::LimitTargetNotFound { .. }
+                | Self::LimitNotForwarding(_)
         )
     }
 }
@@ -951,6 +959,33 @@ pub enum Problem {
         /// The policy holding it; none for the DataPlane's own.
         by: Option<Object>,
     },
+    /// A RateLimitPolicy whose status holds as many ancestors as it can, none of them one
+    /// this data plane writes, so that it may not add its own: it cannot be implemented
+    /// here, and is left out whole, neither its spec nor its version last accepted applying
+    /// (GEP-713, 04 §6).
+    #[error("left out: {0}")]
+    LimitPolicyUnimplementable(String),
+    /// A RateLimitPolicy's target, or its `sectionName`, that is not there: the policy is
+    /// kept, and applies to it once it is (04 §4).
+    #[error("applies nothing to {target}: {why}")]
+    LimitTargetNotFound {
+        /// The target, as it is written.
+        target: String,
+        /// Why.
+        why: String,
+    },
+    /// A RateLimitPolicy no object of whose targets is there: a fault, unlike a target not
+    /// there beside one that is, or a section not there of one that is, as it is likely a
+    /// mistake, and reaching nothing, the policy has no status to say so (Lucas, 04 §4).
+    #[error("none of its targets is there, so it applies nothing and has no status")]
+    LimitTargetsNoneThere,
+    /// A RateLimitPolicy's target that forwards nothing: a rule that redirects, or a route
+    /// every rule of which does, under no limits (07 §2). The policy applies to it once it
+    /// forwards (04 §4).
+    #[error(
+        "applies nothing to {0}, which forwards nothing: a rule that redirects is under no limits"
+    )]
+    LimitNotForwarding(String),
     /// A RateLimitPolicy whose spec is refused applies its version last accepted, of this
     /// generation, instead; one with none applies nothing (04 §4). A note: the refusal is
     /// said apart.
@@ -1103,6 +1138,10 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
 /// them: each still there keeps the names of its limits, and applies that version where its
 /// spec is now refused (04 §4).
 ///
+/// A policy whose status holds as many ancestors as it can, none of them one this data plane
+/// would write, is left out, as it cannot be implemented here (GEP-713): neither its spec nor
+/// its version last accepted applies, and the report says why (04 §6).
+///
 /// A rule under more limits than the data plane takes refuses the changes of the policies
 /// that reach it until it is not, the youngest first, each pass translating again with
 /// those refused, a refused change applying its version last accepted. A rule still over
@@ -1115,12 +1154,15 @@ pub fn translate_from(
     accepted: &[AcceptedPolicy],
 ) -> Translation {
     let mut forced = rate_limits::Forced::new();
-    // Each pass refuses the change of a policy more or is the last: one a policy at most,
-    // and one more to translate with them all refused.
+    // Each pass leaves out or refuses the change of a policy more or is the last: one a
+    // policy at most, and one more to translate with them all refused.
     for _ in 0..cluster.rate_limit_policies.len() {
         let translation = translated(plane, cluster, accepted, &forced);
         let applied = &translation.rate_limit_policies;
-        if !rate_limits::refuse_overfull(&translation.config, applied, accepted, &mut forced) {
+        let left_out = rate_limits::leave_out_unimplementable(&translation, cluster, &mut forced);
+        let refused =
+            rate_limits::refuse_overfull(&translation.config, applied, accepted, &mut forced);
+        if !left_out && !refused {
             return translation;
         }
     }
@@ -2044,6 +2086,9 @@ fn translated(
             }
         }
     }
+    // Each RateLimitPolicy's targets not there, and rules it targets that redirect, once
+    // every route is translated (04 §4).
+    rate_limits.say_targets(cluster, &mut report);
     // Every route's status, of whichever kind, HTTPRoutes first, then GRPCRoutes,
     // TLSRoutes, TCPRoutes and UDPRoutes; a listener counts them all.
     let routes: Vec<RouteOutcome> = http_routes
@@ -2054,15 +2099,18 @@ fn translated(
         .chain(&udp_routes)
         .cloned()
         .collect();
-    let route_statuses = status::routes(&routes, &report);
-    let gateway_status = gateway
+    let mut route_statuses = status::routes(&routes, &report);
+    let mut gateway_status = gateway
         .as_ref()
         .map(|gateway| status::gateway(gateway, &route_statuses, &routes));
+    rate_limits.mark_affected(cluster, gateway_status.as_mut(), &mut route_statuses);
     let policy_statuses = if gateway.is_some() {
         policies.statuses()
     } else {
         Vec::new()
     };
+    let limit_policy_statuses =
+        rate_limits.statuses(gateway.as_ref(), &routes, &of_the_class, &report);
     Translation {
         config,
         report,
@@ -2081,6 +2129,7 @@ fn translated(
         gateway_status,
         route_statuses,
         policy_statuses,
+        limit_policy_statuses,
         taken,
         rate_limit_policies: rate_limits.accepted,
     }

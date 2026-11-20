@@ -29,12 +29,16 @@ rules:
     resources: [services, secrets, configmaps]
     verbs: [list, watch]
   # Gateway-first (05 §3): the DataPlanes generated for Gateways of its class, which name
-  # it from their Gateways' namespaces, read as its own are; those Gateways and their
-  # status; and the EndpointSlices of each one's Service, its pods, counted for Programmed
-  # and kept from its data planes' upstreams (03 §6).
+  # it from their Gateways' namespaces, read as its own are, and their `Served` (05 §1),
+  # applied under a field manager of its own; those Gateways and their status; and the
+  # EndpointSlices of each one's Service, its pods, counted for Programmed and kept from
+  # its data planes' upstreams (03 §6).
   - apiGroups: [gateway.edgerush.dev]
     resources: [dataplanes]
     verbs: [list, watch]
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [dataplanes/status]
+    verbs: [patch]
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gateways]
     verbs: [list, watch]
@@ -134,10 +138,14 @@ rules:
   - apiGroups: [gateway.edgerush.dev]
     resources: [ratelimitpolicies/status]
     verbs: [update]
-  # Its DataPlanes, which it reads itself (05 §3).
+  # Its DataPlanes, which it reads itself (05 §3), and their `Served` (05 §1), applied
+  # under a field manager of its own.
   - apiGroups: [gateway.edgerush.dev]
     resources: [dataplanes]
     verbs: [list, watch]
+  - apiGroups: [gateway.edgerush.dev]
+    resources: [dataplanes/status]
+    verbs: [patch]
   # Its authority's bundle, published in its ControlPlane's status under a field manager of
   # its own (05 §2).
   - apiGroups: [gateway.edgerush.dev]

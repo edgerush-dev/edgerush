@@ -90,6 +90,21 @@ fn a_data_plane_serving_both_is_its_settings_field_by_field() {
     assert!(plane.ports.is_empty());
 }
 
+/// A DataPlane's settings say which DataPlane, and which generation of it, they are of: what
+/// its `Served` says of (05 §1).
+#[test]
+fn a_data_planes_settings_are_of_its_generation() {
+    let settings = settings(&web(3, BOTH, ""), &own()).unwrap();
+    assert_eq!(
+        settings.data_plane,
+        Some(crate::DataPlaneOf {
+            namespace: "edge".to_owned(),
+            name: "web".to_owned(),
+            generation: 3,
+        })
+    );
+}
+
 #[test]
 fn a_data_plane_serves_only_the_apis_it_names() {
     let ingress = plane(

@@ -1,0 +1,9 @@
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener http: HTTPRoute, GRPCRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/a, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs; gateway.edgerush.dev/RateLimitPolicyAffected=True/Accepted (affected by RateLimitPolicy shop/shared)
+HTTPRoute shop/b, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs; gateway.edgerush.dev/RateLimitPolicyAffected=True/Accepted (affected by RateLimitPolicy shop/shared)
+RateLimitPolicy shop/shared, generation 0, of Gateway edge/web: Accepted=True/Accepted
+RateLimitPolicy shop/platform-clash, generation 0, of Gateway edge/web: Accepted=False/Conflicted (the name of its limit `platform` is held by the DataPlane's global limits)
+RateLimitPolicy shop/later, generation 0, of Gateway edge/web: Accepted=False/Conflicted (the name of its limit `shared-per-client` is held by another RateLimitPolicy)
+RateLimitPolicy shop/invalid, generation 0, of Gateway edge/web: Accepted=False/Invalid (the data plane would refuse it: limits[bad].model.bucket.burst: 0 is out of range)
+RateLimitPolicy shop/no-rule, generation 0, of Gateway edge/web: Accepted=False/TargetNotFound (applies nothing to HTTPRoute shop/a section nope: it has no rule `nope`)

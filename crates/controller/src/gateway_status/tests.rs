@@ -370,6 +370,50 @@ fn wanted_gateway() -> translate::GatewayStatus {
     }
 }
 
+/// `RateLimitPolicyAffected` is this controller's on a Gateway, its listeners and a
+/// ListenerSet: one no policy applies to any longer is taken away.
+#[test]
+fn a_rate_limit_policy_affected_no_longer_wanted_is_taken_away() {
+    let affected = || condition(translate::AFFECTED, "True", "Accepted", 3, 10);
+    let live = GatewayStatus {
+        conditions: Some(vec![affected()]),
+        listeners: Some(vec![GatewayStatusListeners {
+            conditions: vec![affected()],
+            name: "http".to_owned(),
+            ..GatewayStatusListeners::default()
+        }]),
+        ..GatewayStatus::default()
+    };
+    let unknown = Programmed::of(4, &Pods::new(), None, false);
+    let status = gateway(Some(&live), &wanted_gateway(), &[], &unknown, at(50));
+    let has = |conditions: &[Condition]| conditions.iter().any(|c| c.type_ == translate::AFFECTED);
+    assert!(!has(status.conditions.as_deref().unwrap()), "the Gateway's");
+    assert!(
+        !has(&status.listeners.as_deref().unwrap()[0].conditions),
+        "the listener's"
+    );
+    let set = translate::ListenerSetStatus {
+        set: Object {
+            kind: "ListenerSet",
+            namespace: "shop".to_owned(),
+            name: "team".to_owned(),
+        },
+        generation: 2,
+        conditions: vec![said("Accepted", true, "Accepted")],
+        programmable: Ok(()),
+        listeners: Vec::new(),
+    };
+    let live = ListenerSetStatus {
+        conditions: Some(vec![affected()]),
+        ..ListenerSetStatus::default()
+    };
+    let status = listener_set(Some(&live), &set, &unknown, at(50));
+    assert!(
+        !has(status.conditions.as_deref().unwrap()),
+        "the ListenerSet's"
+    );
+}
+
 #[test]
 fn a_gateway_says_its_listeners_as_wanted_and_keeps_what_is_not_ours() {
     let foreign = condition("example.com/Stale", "True", "Stale", 1, 5);
@@ -671,6 +715,56 @@ fn a_routes_parents_are_ours_of_our_gateway_in_place_beside_every_other_kept_who
     // A route that no longer names the Gateway has no parent of ours there, the rest kept.
     let gone = route(Some(&live), "shop", &[web()], None, nothing_gone(), at(60));
     assert_eq!(gone.parents, [theirs, another_plane]);
+}
+
+/// `RateLimitPolicyAffected` is this controller's on a route's parent: written where a
+/// policy applies, taken away once none does, another controller's type kept.
+#[test]
+fn a_routes_rate_limit_policy_affected_is_written_and_taken_away() {
+    let mut live = parent(GATEWAY_CONTROLLER, Some("edge"), "web");
+    live.conditions
+        .push(condition("example.com/Other", "True", "Other", 1, 10));
+    let live = HTTPRouteStatus {
+        parents: vec![live],
+    };
+    let mut affected = wanted_route(2);
+    affected.parents[0]
+        .conditions
+        .push(said(translate::AFFECTED, true, "Accepted"));
+    let written = route(
+        Some(&live),
+        "shop",
+        &[web()],
+        Some(&affected),
+        nothing_gone(),
+        at(50),
+    );
+    let types: Vec<String> = seen(&written.parents[0].conditions)
+        .into_iter()
+        .map(|(kind, ..)| kind)
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "Accepted",
+            "example.com/Other",
+            "ResolvedRefs",
+            translate::AFFECTED
+        ]
+    );
+    let none = route(
+        Some(&written),
+        "shop",
+        &[web()],
+        Some(&wanted_route(2)),
+        nothing_gone(),
+        at(60),
+    );
+    let types: Vec<String> = seen(&none.parents[0].conditions)
+        .into_iter()
+        .map(|(kind, ..)| kind)
+        .collect();
+    assert_eq!(types, ["Accepted", "example.com/Other", "ResolvedRefs"]);
 }
 
 /// Two data planes whose Gateways are both parents of a route each write its status as it
@@ -1238,6 +1332,98 @@ fn two_data_planes_writing_a_policys_status_in_turn_settle() {
         at(53),
     );
     assert_eq!(again, by_other, "the second wrote it again");
+}
+
+/// An Ingress `shop/name` as an ancestor of `controller`'s, its one condition `Accepted`.
+fn ingress_ancestor(controller: &str, name: &str) -> BackendTLSPolicyStatusAncestors {
+    let mut ancestor = ancestor(controller, Some("shop"), name);
+    ancestor.ancestor_ref.group = Some(INGRESS_GROUP.to_owned());
+    ancestor.ancestor_ref.kind = Some("Ingress".to_owned());
+    ancestor
+}
+
+/// The Ingress `shop/name`.
+fn ingress_object(name: &str) -> Object {
+    Object {
+        kind: "Ingress",
+        namespace: "shop".to_owned(),
+        name: name.to_owned(),
+    }
+}
+
+/// A RateLimitPolicy's Ingress ancestor of ours is written of Ingress's group, its
+/// `Accepted` alone; one of ours of an Ingress of the policy's namespace that is not there
+/// is taken away, and one of an Ingress there that the policy no longer reaches; another
+/// controller's of an Ingress gone, and ours of another control plane's Gateway, are kept.
+#[test]
+fn a_rate_limit_policys_ingress_ancestors_are_written_and_ones_gone_taken_away() {
+    let theirs_gone = ingress_ancestor("example.com/other", "gone");
+    let another_plane = ancestor(GATEWAY_CONTROLLER, Some("edge"), "other");
+    let live = BackendTLSPolicyStatus {
+        ancestors: vec![
+            ingress_ancestor(GATEWAY_CONTROLLER, "gone"),
+            theirs_gone.clone(),
+            ingress_ancestor(GATEWAY_CONTROLLER, "left"),
+            another_plane.clone(),
+        ],
+    };
+    let accepted = [said("Accepted", true, "Accepted")];
+    let reached = OfAncestor {
+        generation: 3,
+        conditions: &accepted,
+    };
+    let (web, left) = (ingress_object("web"), ingress_object("left"));
+    let there = BTreeSet::from([web.clone(), left.clone()]);
+    let status = policy_status(
+        Some(&live),
+        "shop",
+        &[(&web, Some(reached)), (&left, None)],
+        &LIMIT_ANCESTOR_TYPES,
+        (nothing_gone(), Some(&there)),
+        at(50),
+    );
+    assert_eq!(status.ancestors.len(), 3);
+    assert_eq!(status.ancestors[0], theirs_gone, "another controller's");
+    assert_eq!(
+        status.ancestors[1], another_plane,
+        "another control plane's"
+    );
+    let ours = &status.ancestors[2];
+    let to = &ours.ancestor_ref;
+    assert_eq!(
+        (
+            to.group.as_deref(),
+            to.kind.as_deref(),
+            to.namespace.as_deref(),
+            to.name.as_str()
+        ),
+        (Some(INGRESS_GROUP), Some("Ingress"), Some("shop"), "web")
+    );
+    assert_eq!(
+        seen(&ours.conditions),
+        [("Accepted".to_owned(), "True".to_owned(), 50)]
+    );
+    assert_eq!(ours.conditions[0].observed_generation, Some(3));
+}
+
+/// A RateLimitPolicy's status, merged as a BackendTLSPolicy's, is written as the same JSON.
+#[test]
+fn a_rate_limit_policys_status_is_merged_as_it_is_written() {
+    let status: RateLimitPolicyStatus = serde_json::from_value(serde_json::json!({
+        "ancestors": [{
+            "ancestorRef": { "group": "networking.k8s.io", "kind": "Ingress", "name": "web",
+                             "namespace": "shop", "port": 80, "sectionName": "http" },
+            "conditions": [{ "type": "Accepted", "status": "True", "reason": "Accepted",
+                             "message": "", "observedGeneration": 2,
+                             "lastTransitionTime": "2026-01-01T00:00:00Z" }],
+            "controllerName": GATEWAY_CONTROLLER
+        }]
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(limits_as_tls(&status)).unwrap(),
+        serde_json::to_value(&status).unwrap()
+    );
 }
 
 /// The Gateways of `edge`, the namespace Gateways are followed in, that are there: `web`

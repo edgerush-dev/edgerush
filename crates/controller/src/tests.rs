@@ -46,6 +46,7 @@ fn harness(plane: &Plane) -> Settings {
         plane: plane.clone(),
         service: None,
         generated: false,
+        data_plane: None,
     }
 }
 
@@ -67,6 +68,7 @@ fn operated(plane: &Plane, more: &str) -> Settings {
         plane: plane.clone(),
         service: Some(ProxyService::of(&web_data_plane(more)).unwrap()),
         generated: false,
+        data_plane: None,
     }
 }
 
@@ -1396,6 +1398,162 @@ async fn a_data_plane_taking_a_name_a_policy_holds_is_held_back() {
         .await;
 }
 
+/// `plane` as DataPlane `edge/web` at `generation` serves it.
+fn of_generation(plane: &Plane, generation: i64) -> Settings {
+    Settings {
+        data_plane: Some(DataPlaneOf {
+            namespace: "edge".to_owned(),
+            name: "web".to_owned(),
+            generation,
+        }),
+        ..harness(plane)
+    }
+}
+
+/// The path DataPlane `edge/web`'s status is applied at.
+const SERVED_APPLIED: &str = "/apis/gateway.edgerush.dev/v1alpha1/namespaces/edge/dataplanes/web/status?fieldManager=edgerush-controller&force=true";
+
+/// The DataPlane's `Served`, written by the leader alone (05 §1): true of the generation
+/// served; false `HeldBack` of one held back, saying why without naming the policy and
+/// which generation is served, once however often it is offered again; true of it once it
+/// is taken on. Its own condition alone, applied under the control plane's field manager.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_data_planes_served_says_which_generation_is_served_and_why_one_is_held_back() {
+    let freeing = Arc::new(AtomicBool::new(false));
+    let told = Arc::clone(&freeing);
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        if path == SERVED_APPLIED {
+            return answer(200, "{}");
+        }
+        if path.contains("/ratelimitpolicies?") && path.contains("watch=true") {
+            if !told.swap(false, Ordering::SeqCst) {
+                return short();
+            }
+            let freed = PER_CLIENT_POLICY
+                .split_once(r#""items":["#)
+                .and_then(|(_, item)| item.strip_suffix("]}"))
+                .unwrap()
+                .replace(
+                    r#""generation":1"#,
+                    r#""generation":2,"resourceVersion":"6""#,
+                )
+                .replace("per-client", "own");
+            return Answer {
+                chunks: vec![Bytes::from(format!(
+                    "{{\"type\":\"MODIFIED\",\"object\":{freed}}}\n"
+                ))],
+                ..short()
+            };
+        }
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[ingress("shop", "web", "shop.example")])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/secrets?") {
+            page(&[secret("shop", &["shop.example"])])
+        } else if path.starts_with("/apis/gateway.edgerush.dev/v1alpha1/ratelimitpolicies?") {
+            answer(200, PER_CLIENT_POLICY)
+        } else {
+            otherwise(path)
+        }
+    })
+    .await;
+    let applied = || -> Vec<serde_json::Value> {
+        fake.seen()
+            .iter()
+            .filter(|seen| seen.path == SERVED_APPLIED)
+            .map(|seen| {
+                assert_eq!(seen.method, "PATCH");
+                serde_json::from_str(&seen.body).unwrap()
+            })
+            .collect()
+    };
+    let api = fake.client(&token("controller-served", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (settings, planes) = watch::channel(only(of_generation(&limiting(&[]), 1)));
+            let (leads, leading) = watch::channel(false);
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        planes,
+                        None,
+                        Debounce::default(),
+                        Some(leading),
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("translated", || heard.borrow().translations.len() == 1).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(applied().len(), 0, "written by a replica not leading");
+            leads.send_replace(true);
+            until("served written as it leads", || applied().len() == 1).await;
+            settings.send_replace(only(of_generation(&limiting(&["per-client"]), 2)));
+            until("held back written", || applied().len() == 2).await;
+            // Offered again, as another DataPlane's change would: written once.
+            settings.send_replace(only(of_generation(&limiting(&["per-client"]), 2)));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(applied().len(), 2, "held back written again");
+            freeing.store(true, Ordering::SeqCst);
+            until("taken on written", || applied().len() == 3).await;
+            controlling.abort();
+        })
+        .await;
+    let said: Vec<(String, String, String, i64)> = applied()
+        .iter()
+        .map(|body| {
+            let conditions = body["status"]["conditions"].as_array().unwrap();
+            assert_eq!(conditions.len(), 1, "its own condition alone: {body}");
+            let served = &conditions[0];
+            assert_eq!(served["type"], "Served");
+            (
+                served["status"].as_str().unwrap().to_owned(),
+                served["reason"].as_str().unwrap().to_owned(),
+                served["message"].as_str().unwrap().to_owned(),
+                served["observedGeneration"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        said,
+        [
+            (
+                "True".to_owned(),
+                "Served".to_owned(),
+                "generation 1 is what its data planes are given".to_owned(),
+                1
+            ),
+            (
+                "False".to_owned(),
+                "HeldBack".to_owned(),
+                "generation 2 is held back, generation 1 served in its place: its global \
+                 limit `per-client` has the name of a limit a RateLimitPolicy holds"
+                    .to_owned(),
+                2
+            ),
+            (
+                "True".to_owned(),
+                "Served".to_owned(),
+                "generation 2 is what its data planes are given".to_owned(),
+                2
+            ),
+        ]
+    );
+}
+
 /// The objects of `shop` with `policy` on the Ingress `shop/web`.
 fn with_policy(policy: RateLimitPolicy) -> Cluster {
     Cluster {
@@ -2011,6 +2169,129 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
     .into_iter()
     .collect();
     assert_eq!(patched, expected);
+}
+
+/// A RateLimitPolicy's status is written of each ancestor it reaches, here the Ingress it
+/// targets, with no Gateway API followed: its `Accepted` alone, under this controller's
+/// name, and once, as nothing changes after; this controller's entry of an Ingress of the
+/// data plane's class it no longer reaches taken away, another controller's kept (04 §6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rate_limit_policys_status_is_written_of_the_ingress_it_reaches_and_once() {
+    let entry = |controller: &str, name: &str| {
+        format!(
+            r#"{{"ancestorRef":{{"group":"networking.k8s.io","kind":"Ingress","name":"{name}","namespace":"shop"}},"controllerName":"{controller}","conditions":[]}}"#
+        )
+    };
+    let theirs = entry("example.com/other", "old");
+    let with_status = PER_CLIENT_POLICY.replace(
+        r#""spec":"#,
+        &format!(
+            r#""status":{{"ancestors":[{},{theirs}]}},"spec":"#,
+            entry(GATEWAY_CONTROLLER, "old")
+        ),
+    );
+    let theirs: serde_json::Value = serde_json::from_str(&theirs).unwrap();
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        if path.ends_with("/status") {
+            return answer(200, "{}");
+        }
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[
+                ingress("shop", "web", "shop.example"),
+                ingress("shop", "old", "old.example"),
+            ])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/secrets?") {
+            page(&[secret("shop", &["shop.example"])])
+        } else if path.starts_with("/apis/gateway.edgerush.dev/v1alpha1/ratelimitpolicies?") {
+            answer(200, &with_status)
+        } else {
+            otherwise(path)
+        }
+    })
+    .await;
+    let api = fake.client(
+        &token("controller-limit-status", "secret"),
+        Timing::default(),
+    );
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        fixed(&limiting(&[])),
+                        None,
+                        Debounce::default(),
+                        None,
+                        acks(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            let written = || {
+                heard
+                    .borrow()
+                    .lines
+                    .iter()
+                    .filter(|line| line.starts_with("status of RateLimitPolicy shop/shop"))
+                    .count()
+            };
+            until("the policy's status written", || written() == 1).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(written(), 1, "written again");
+            controlling.abort();
+        })
+        .await;
+    let bodies: Vec<serde_json::Value> = fake
+        .seen()
+        .iter()
+        .filter(|seen| seen.path.ends_with("/ratelimitpolicies/shop/status"))
+        .map(|seen| {
+            assert_eq!(seen.method, "PUT");
+            assert_eq!(
+                seen.path,
+                "/apis/gateway.edgerush.dev/v1alpha1/namespaces/shop/ratelimitpolicies/shop/status"
+            );
+            serde_json::from_str(&seen.body).unwrap()
+        })
+        .collect();
+    assert_eq!(bodies.len(), 1);
+    let ancestors = &bodies[0]["status"]["ancestors"];
+    assert_eq!(ancestors.as_array().unwrap().len(), 2, "{ancestors}");
+    assert_eq!(ancestors[0], theirs, "another controller's");
+    let ancestors = &ancestors.as_array().unwrap()[1..];
+    assert_eq!(
+        ancestors[0]["ancestorRef"],
+        serde_json::json!({ "group": "networking.k8s.io", "kind": "Ingress", "name": "web",
+                            "namespace": "shop" })
+    );
+    assert_eq!(ancestors[0]["controllerName"], GATEWAY_CONTROLLER);
+    let conditions = ancestors[0]["conditions"].as_array().unwrap();
+    assert_eq!(conditions.len(), 1, "{conditions:?}");
+    assert_eq!(
+        (
+            &conditions[0]["type"],
+            &conditions[0]["status"],
+            &conditions[0]["observedGeneration"]
+        ),
+        (
+            &serde_json::json!("Accepted"),
+            &serde_json::json!("True"),
+            &serde_json::json!(1)
+        )
+    );
 }
 
 /// The data plane's Service not to be read: translation goes on all the same, and no status,
@@ -3331,6 +3612,7 @@ fn operated_as(name: &str, plane: &Plane) -> Settings {
         plane: plane.clone(),
         service: Some(ProxyService::of(&data_plane).unwrap()),
         generated: false,
+        data_plane: None,
     }
 }
 
@@ -4267,6 +4549,7 @@ spec:
         },
         service: None,
         generated,
+        data_plane: None,
     };
     let with = following(vec![gateway(true)]);
     let without = following(vec![gateway(false)]);

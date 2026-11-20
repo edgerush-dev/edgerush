@@ -1,0 +1,1 @@
+RateLimitPolicy shop/app, generation 0, of Ingress shop/app: Accepted=False/NotLimiting (its DataPlane has no rateLimiting)

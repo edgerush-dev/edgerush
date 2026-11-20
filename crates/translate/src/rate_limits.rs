@@ -24,7 +24,8 @@
 //! held it, as after a restart, the older takes it, then by namespace and name.
 
 use crate::gateway::GatewayOutcome;
-use crate::http_route::Attachment;
+use crate::http_route::{Attachment, RouteOutcome};
+use crate::status::{Condition, GatewayStatus, LimitPolicyStatus, RouteStatus};
 use crate::{Cluster, Finding, Object, Plane, PlaneRateLimiting, Problem, config_of, namespace};
 use edgerush_config::{
     Bucket, Config, Global, Limit, LimitMatch, Limits, MOST_LIMITS, Model, Rolling, Window, compile,
@@ -33,6 +34,8 @@ use edgerush_planes::data_plane::DataPlaneRateLimitingGlobal;
 use edgerush_planes::rate_limit_policy::{
     RateLimitPolicy, RateLimitPolicyLimits, RateLimitPolicySpec,
 };
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,6 +44,10 @@ const GATEWAY_GROUP: &str = "gateway.networking.k8s.io";
 
 /// The API group of Ingress.
 const INGRESS_GROUP: &str = "networking.k8s.io";
+
+/// The condition on an object a RateLimitPolicy that applies targets, as GEP-713 has a
+/// policy say so on its target, so that `kubectl describe` shows it (04 §6).
+pub const AFFECTED: &str = "gateway.edgerush.dev/RateLimitPolicyAffected";
 
 /// A limit as a DataPlane or a RateLimitPolicy writes one, which are copies of one schema
 /// generated apart, as the limits file writes it; or the field, below the limit, and why it
@@ -275,25 +282,27 @@ fn round(
                     holds.then(|| Some(judged.object.clone()))
                 })
             };
-            let takes = |limits: &Result<Vec<Limit>, Problem>| -> Result<(), Problem> {
-                let limits = limits.as_ref().map_err(Clone::clone)?;
-                for limit in limits {
-                    if let Some(by) = holder(&limit.name) {
-                        return Err(Problem::LimitNameHeld {
+            // Every name another holds, so that its status names each (04 §6).
+            let takes = |limits: &Result<Vec<Limit>, Problem>| -> Result<(), Vec<Problem>> {
+                let limits = limits.as_ref().map_err(|problem| vec![problem.clone()])?;
+                let held: Vec<Problem> = limits
+                    .iter()
+                    .filter_map(|limit| {
+                        holder(&limit.name).map(|by| Problem::LimitNameHeld {
                             name: limit.name.clone(),
                             by,
-                        });
-                    }
-                }
-                Ok(())
+                        })
+                    })
+                    .collect();
+                if held.is_empty() { Ok(()) } else { Err(held) }
             };
             match takes(&policy.spec) {
                 Ok(()) => Applied::Spec,
-                Err(problem) => {
-                    findings.push(Finding {
+                Err(problems) => {
+                    findings.extend(problems.into_iter().map(|problem| Finding {
                         object: policy.object.clone(),
                         problem,
-                    });
+                    }));
                     match &policy.last {
                         Some((version, last)) if takes(last).is_ok() => {
                             findings.push(Finding {
@@ -379,6 +388,148 @@ pub(crate) fn refuse_overfull(
     refused
 }
 
+/// Why `target`, of a policy of `namespace`, is not in `cluster`, if it is not: the object
+/// it names, or its `sectionName`, a listener of a Gateway or a ListenerSet, or a rule of a
+/// route, by name.
+fn not_there(cluster: &Cluster, namespace: &str, target: &Target) -> Option<String> {
+    let Some(sections) = sections_of(cluster, namespace, target) else {
+        return Some("it is not there".to_owned());
+    };
+    let section = target.section.as_deref()?;
+    let of = if matches!(target.kind.as_str(), "HTTPRoute" | "GRPCRoute") {
+        "rule"
+    } else {
+        "listener"
+    };
+    (!sections.contains(&Some(section))).then(|| format!("it has no {of} `{section}`"))
+}
+
+/// The names of the sections of the object `target`, of a policy of `namespace`, names in
+/// `cluster`, a Gateway's or a ListenerSet's listeners or a route's rules (none for a rule
+/// of no name, and none at all for an Ingress), if it is there.
+fn sections_of<'a>(
+    cluster: &'a Cluster,
+    namespace: &str,
+    target: &Target,
+) -> Option<Vec<Option<&'a str>>> {
+    let is = |metadata: &ObjectMeta| {
+        crate::namespace(metadata) == namespace && metadata.name.as_deref() == Some(&target.name)
+    };
+    match (target.group.as_str(), target.kind.as_str()) {
+        (GATEWAY_GROUP, "Gateway") => cluster
+            .gateways
+            .iter()
+            .find(|gateway| is(&gateway.metadata))
+            .map(|gateway| {
+                let listeners = &gateway.spec.listeners;
+                listeners.iter().map(|l| Some(l.name.as_str())).collect()
+            }),
+        (GATEWAY_GROUP, "ListenerSet") => cluster
+            .listener_sets
+            .iter()
+            .find(|set| is(&set.metadata))
+            .map(|set| {
+                let listeners = &set.spec.listeners;
+                listeners.iter().map(|l| Some(l.name.as_str())).collect()
+            }),
+        (GATEWAY_GROUP, "HTTPRoute") => cluster
+            .http_routes
+            .iter()
+            .find(|route| is(&route.metadata))
+            .map(|route| route.spec.rules.iter().map(|r| r.name.as_deref()).collect()),
+        (GATEWAY_GROUP, "GRPCRoute") => cluster
+            .grpc_routes
+            .iter()
+            .find(|route| is(&route.metadata))
+            .map(|route| {
+                let rules = route.spec.rules.iter().flatten();
+                rules.map(|r| r.name.as_deref()).collect()
+            }),
+        (INGRESS_GROUP, "Ingress") => cluster
+            .ingresses
+            .iter()
+            .find(|ingress| is(&ingress.metadata))
+            .map(|_| Vec::new()),
+        _ => None,
+    }
+}
+
+/// Whether `target`, of a policy of `namespace`, forwards nothing, as the routes translated
+/// say, `redirecting` the rules that redirect and `forwarding` the routes a rule of which
+/// forwards: a rule of a route that redirects, or a route some rule of which redirects and
+/// none forwards.
+fn forwards_nothing(
+    target: &Target,
+    namespace: &str,
+    redirecting: &BTreeSet<(Object, Option<String>)>,
+    forwarding: &BTreeSet<Object>,
+) -> bool {
+    if !matches!(target.kind.as_str(), "HTTPRoute" | "GRPCRoute") {
+        return false;
+    }
+    let is = |route: &Object| {
+        route.kind == target.kind && route.namespace == namespace && route.name == target.name
+    };
+    match &target.section {
+        Some(named) => redirecting
+            .iter()
+            .any(|(route, rule)| is(route) && rule.as_ref() == Some(named)),
+        None => redirecting.iter().any(|(route, _)| is(route)) && !forwarding.iter().any(is),
+    }
+}
+
+/// The most ancestors a policy's status holds, as its CRD has it.
+const MOST_ANCESTORS: usize = 16;
+
+/// Leaves out in `forced` each policy whose status, as `cluster` holds it, holds as many
+/// ancestors as it can, none of them this controller's of an ancestor `translation` says the
+/// policy reaches here: it may not add its own, so cannot be implemented here (GEP-713).
+/// Whether it left out any.
+pub(crate) fn leave_out_unimplementable(
+    translation: &crate::Translation,
+    cluster: &Cluster,
+    forced: &mut Forced,
+) -> bool {
+    let mut left = false;
+    for status in &translation.limit_policy_statuses {
+        let Some(policy) = cluster
+            .rate_limit_policies
+            .iter()
+            .find(|policy| Object::of("RateLimitPolicy", &policy.metadata) == status.policy)
+        else {
+            continue;
+        };
+        let held = policy
+            .status
+            .as_ref()
+            .map(|status| status.ancestors.as_slice())
+            .unwrap_or_default();
+        let ours = held.iter().any(|ancestor| {
+            let to = &ancestor.ancestor_ref;
+            ancestor.controller_name == crate::GATEWAY_CONTROLLER
+                && status.ancestors.iter().any(|reached| {
+                    to.kind.as_deref().unwrap_or("Gateway") == reached.kind
+                        && to.namespace.as_deref().unwrap_or(&status.policy.namespace)
+                            == reached.namespace
+                        && to.name == reached.name
+                })
+        });
+        if ours || held.len() < MOST_ANCESTORS {
+            continue;
+        }
+        let named: Vec<String> = status.ancestors.iter().map(ToString::to_string).collect();
+        forced.entry(status.policy.clone()).or_insert_with(|| {
+            left = true;
+            Problem::LimitPolicyUnimplementable(format!(
+                "its status holds {MOST_ANCESTORS} ancestors already, none of them {}, so it \
+                 cannot be implemented there",
+                named.join(" or ")
+            ))
+        });
+    }
+    left
+}
+
 /// What a policy's `ignore` removes.
 #[derive(Debug)]
 enum Ignore {
@@ -389,7 +540,7 @@ enum Ignore {
 }
 
 /// One of a policy's targets, in the policy's own namespace.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     group: String,
     kind: String,
@@ -400,10 +551,47 @@ struct Target {
 /// A policy taken: its targets, the names of its limits and what it ignores.
 #[derive(Debug)]
 struct Taken {
+    /// The policy.
+    object: Object,
     namespace: String,
     targets: Vec<Target>,
     limits: Vec<String>,
     ignore: Ignore,
+}
+
+impl Target {
+    /// Each of `spec`'s targets.
+    fn of(spec: &RateLimitPolicySpec) -> Vec<Self> {
+        spec.target_refs
+            .iter()
+            .map(|target| Self {
+                group: target.group.clone(),
+                kind: target.kind.clone(),
+                name: target.name.clone(),
+                section: target.section_name.clone(),
+            })
+            .collect()
+    }
+
+    /// The target as a finding says it, of a policy of `namespace`.
+    fn said(&self, namespace: &str) -> String {
+        match &self.section {
+            Some(section) => format!("{} {namespace}/{} section {section}", self.kind, self.name),
+            None => format!("{} {namespace}/{}", self.kind, self.name),
+        }
+    }
+}
+
+/// A policy as its status needs it: what it is, and the targets of its spec and of the
+/// version that applies, where that is another.
+#[derive(Debug)]
+struct Stated {
+    object: Object,
+    generation: i64,
+    /// Its spec's targets.
+    targets: Vec<Target>,
+    /// The targets of its version last accepted, where that applies in its spec's place.
+    applied: Vec<Target>,
 }
 
 impl Taken {
@@ -451,6 +639,16 @@ pub(crate) struct RateLimits {
     pub(crate) limits: Vec<Limit>,
     /// The version of each policy that applies, in the order they rank.
     pub(crate) accepted: Vec<AcceptedPolicy>,
+    /// Whether the data plane limits: where it does not, no policy is judged.
+    limiting: bool,
+    /// Every policy, in the order they rank, as its status needs it.
+    stated: Vec<Stated>,
+    /// The rules that redirect, by route and name (none for a rule of no name), and the
+    /// routes a rule of which forwards, as their routes are translated: a rule that
+    /// redirects is under no limits, so that a policy targeting one, or a route none of whose
+    /// rules forwards, says so.
+    redirecting: RefCell<BTreeSet<(Object, Option<String>)>>,
+    forwarding: RefCell<BTreeSet<Object>>,
 }
 
 impl RateLimits {
@@ -466,9 +664,27 @@ impl RateLimits {
         gateway: Option<&GatewayOutcome>,
         report: &mut Vec<Finding>,
     ) -> Self {
+        let mut policies: Vec<&RateLimitPolicy> = cluster.rate_limit_policies.iter().collect();
+        policies.sort_by_key(|policy| {
+            let metadata = &policy.metadata;
+            (
+                metadata.creation_timestamp.clone(),
+                namespace(metadata).to_owned(),
+                metadata.name.clone(),
+            )
+        });
         let Some(limiting) = &plane.rate_limiting else {
             // Nothing is judged where nothing limits: each policy keeps what it held.
             return Self {
+                stated: policies
+                    .iter()
+                    .map(|policy| Stated {
+                        object: Object::of("RateLimitPolicy", &policy.metadata),
+                        generation: policy.metadata.generation.unwrap_or_default(),
+                        targets: Target::of(&policy.spec),
+                        applied: Vec::new(),
+                    })
+                    .collect(),
                 accepted: accepted
                     .iter()
                     .filter(|last| {
@@ -487,15 +703,6 @@ impl RateLimits {
             .iter()
             .map(|limit| limit.name.clone())
             .collect();
-        let mut policies: Vec<&RateLimitPolicy> = cluster.rate_limit_policies.iter().collect();
-        policies.sort_by_key(|policy| {
-            let metadata = &policy.metadata;
-            (
-                metadata.creation_timestamp.clone(),
-                namespace(metadata).to_owned(),
-                metadata.name.clone(),
-            )
-        });
         let mut before = Vec::with_capacity(policies.len());
         let judged: Vec<Judged<'_>> = policies
             .into_iter()
@@ -515,8 +722,15 @@ impl RateLimits {
                     spec: forced
                         .get(&object)
                         .map_or_else(|| judged(&policy.spec), |why| Err(why.clone())),
+                    // A policy left out applies no version of itself.
                     last: last
                         .filter(|last| last.spec != policy.spec)
+                        .filter(|_| {
+                            !matches!(
+                                forced.get(&object),
+                                Some(Problem::LimitPolicyUnimplementable(_))
+                            )
+                        })
                         .map(|last| (last, judged(&last.spec))),
                     object,
                 }
@@ -539,7 +753,17 @@ impl RateLimits {
         let mut limits = limiting.global.clone();
         let mut taken = Vec::new();
         let mut kept = Vec::new();
+        let mut stated = Vec::with_capacity(judged.len());
         for (policy, applied) in judged.iter().zip(applied) {
+            stated.push(Stated {
+                object: policy.object.clone(),
+                generation: policy.policy.metadata.generation.unwrap_or_default(),
+                targets: Target::of(&policy.policy.spec),
+                applied: match (applied, &policy.last) {
+                    (Applied::Last, Some((last, _))) => Target::of(&last.spec),
+                    _ => Vec::new(),
+                },
+            });
             let Some(spec) = policy.spec(applied) else {
                 continue;
             };
@@ -550,17 +774,9 @@ impl RateLimits {
             let own = policy.limits(applied);
             let ignore = spec.ignore.as_deref().unwrap_or_default();
             taken.push(Taken {
+                object: policy.object.clone(),
                 namespace: policy.object.namespace.clone(),
-                targets: spec
-                    .target_refs
-                    .iter()
-                    .map(|target| Target {
-                        group: target.group.clone(),
-                        kind: target.kind.clone(),
-                        name: target.name.clone(),
-                        section: target.section_name.clone(),
-                    })
-                    .collect(),
+                targets: Target::of(spec),
                 limits: own.iter().map(|limit| limit.name.clone()).collect(),
                 ignore: if ignore.iter().any(|name| name == "*") {
                     Ignore::All
@@ -576,7 +792,307 @@ impl RateLimits {
             taken,
             limits,
             accepted: kept,
+            limiting: true,
+            stated,
+            redirecting: RefCell::default(),
+            forwarding: RefCell::default(),
         }
+    }
+
+    /// Says on each object of the Gateway API a policy that applies targets, as GEP-713
+    /// has it, that it does: `RateLimitPolicyAffected` on the Gateway and on its listeners,
+    /// `gateway`, on each ListenerSet and its listeners, and on each parent of the data
+    /// plane's of each route of `routes` a policy targets, or a rule of (04 §6): only
+    /// where it limits something, its rule there in `cluster` and forwarding, and its route
+    /// forwarding. The policies named, oldest first. Once every route is translated.
+    pub(crate) fn mark_affected(
+        &self,
+        cluster: &Cluster,
+        gateway: Option<&mut GatewayStatus>,
+        routes: &mut [RouteStatus],
+    ) {
+        let redirecting = self.redirecting.borrow();
+        let forwarding = self.forwarding.borrow();
+        let by = |(group, kind): (&str, &str), object: &Object, section: Option<&str>| {
+            let names: Vec<String> = self
+                .taken
+                .iter()
+                .filter(|taken| {
+                    taken.targets((group, kind), &object.namespace, &object.name, section)
+                })
+                .map(|taken| taken.object.to_string())
+                .collect();
+            (!names.is_empty()).then(|| {
+                Condition::new(
+                    AFFECTED,
+                    true,
+                    "Accepted",
+                    format!("affected by {}", names.join(", ")),
+                )
+            })
+        };
+        if let (Some(status), Some(object)) = (gateway, &self.gateway) {
+            let of = (GATEWAY_GROUP, "Gateway");
+            status.conditions.extend(by(of, object, None));
+            for listener in &mut status.listeners {
+                listener
+                    .conditions
+                    .extend(by(of, object, Some(&listener.name)));
+            }
+            for set in &mut status.listener_sets {
+                let of = (GATEWAY_GROUP, "ListenerSet");
+                set.conditions.extend(by(of, &set.set, None));
+                for listener in &mut set.listeners {
+                    listener
+                        .conditions
+                        .extend(by(of, &set.set, Some(&listener.name)));
+                }
+            }
+        }
+        for route in routes {
+            if !matches!(route.route.kind, "HTTPRoute" | "GRPCRoute") {
+                continue;
+            }
+            // A rule has no status of its own: a policy on one says so on its route.
+            let names: Vec<String> = self
+                .taken
+                .iter()
+                .filter(|taken| {
+                    taken.namespace == route.route.namespace
+                        && taken.targets.iter().any(|target| {
+                            target.group == GATEWAY_GROUP
+                                && target.kind == route.route.kind
+                                && target.name == route.route.name
+                                && not_there(cluster, &taken.namespace, target).is_none()
+                                && !forwards_nothing(
+                                    target,
+                                    &taken.namespace,
+                                    &redirecting,
+                                    &forwarding,
+                                )
+                        })
+                })
+                .map(|taken| taken.object.to_string())
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            let affected = Condition::new(
+                AFFECTED,
+                true,
+                "Accepted",
+                format!("affected by {}", names.join(", ")),
+            );
+            for parent in &mut route.parents {
+                let accepted = parent
+                    .conditions
+                    .iter()
+                    .any(|c| c.kind == "Accepted" && c.status);
+                if accepted {
+                    parent.conditions.push(affected.clone());
+                }
+            }
+        }
+    }
+
+    /// Notes that a rule of `route`, named `rule`, redirects, as its route is translated.
+    pub(crate) fn redirects(&self, route: &Object, rule: Option<&str>) {
+        self.redirecting
+            .borrow_mut()
+            .insert((route.clone(), rule.map(str::to_owned)));
+    }
+
+    /// Notes that a rule of `route` forwards, as its route is translated.
+    pub(crate) fn forwards(&self, route: &Object) {
+        self.forwarding.borrow_mut().insert(route.clone());
+    }
+
+    /// Says in `report`, of each policy judged, each target of its spec, or its
+    /// `sectionName`, that `cluster` does not hold, and each rule it targets that redirects,
+    /// or route none of whose rules forwards: the policy applies nothing there (04 §4); and
+    /// a policy none of whose targets is there. Once every route is translated.
+    pub(crate) fn say_targets(&self, cluster: &Cluster, report: &mut Vec<Finding>) {
+        if !self.limiting {
+            return;
+        }
+        let redirecting = self.redirecting.borrow();
+        let forwarding = self.forwarding.borrow();
+        for stated in &self.stated {
+            let namespace = stated.object.namespace.as_str();
+            for target in &stated.targets {
+                let said = target.said(namespace);
+                let problem = match not_there(cluster, namespace, target) {
+                    Some(why) => Problem::LimitTargetNotFound { target: said, why },
+                    None if forwards_nothing(target, namespace, &redirecting, &forwarding) => {
+                        Problem::LimitNotForwarding(said)
+                    }
+                    None => continue,
+                };
+                report.push(Finding {
+                    object: stated.object.clone(),
+                    problem,
+                });
+            }
+            // No object it names there at all is likely a mistake, and no status can say it:
+            // reaching nothing, it has none (Lucas). A section not there is said on the
+            // ancestor its object reaches.
+            let none_there = stated
+                .targets
+                .iter()
+                .all(|target| sections_of(cluster, namespace, target).is_none());
+            if !stated.targets.is_empty() && none_there {
+                report.push(Finding {
+                    object: stated.object.clone(),
+                    problem: Problem::LimitTargetsNoneThere,
+                });
+            }
+        }
+    }
+
+    /// What each policy's status is to say of the ancestors this data plane serves, as
+    /// `report` says of it: those its targets reach, of its spec and of the version that
+    /// applies, its Gateway, `gateway`, where a target is that Gateway, a listener of it, a
+    /// ListenerSet attached to it or a route of `routes` attached to it, or a rule of one;
+    /// and each Ingress of `claimed`, those of the data plane's class, that it targets.
+    /// None for a policy that reaches none.
+    pub(crate) fn statuses(
+        &self,
+        gateway: Option<&GatewayOutcome>,
+        routes: &[RouteOutcome],
+        claimed: &[Object],
+        report: &[Finding],
+    ) -> Vec<LimitPolicyStatus> {
+        self.stated
+            .iter()
+            .filter_map(|stated| {
+                let namespace = stated.object.namespace.as_str();
+                let mut ancestors: Vec<Object> = Vec::new();
+                for target in stated.targets.iter().chain(&stated.applied) {
+                    let is = |object: &Object| {
+                        object.namespace == namespace
+                            && object.name == target.name
+                            && object.kind == target.kind
+                    };
+                    let reached = match (target.group.as_str(), target.kind.as_str()) {
+                        (GATEWAY_GROUP, "Gateway") => gateway
+                            .filter(|gateway| is(&gateway.gateway))
+                            .map(|gateway| gateway.gateway.clone()),
+                        (GATEWAY_GROUP, "ListenerSet") => gateway
+                            .filter(|gateway| {
+                                gateway.sets.iter().any(|set| set.attached && is(&set.set))
+                            })
+                            .map(|gateway| gateway.gateway.clone()),
+                        (GATEWAY_GROUP, "HTTPRoute" | "GRPCRoute") => gateway
+                            .filter(|_| {
+                                routes.iter().any(|route| {
+                                    is(&route.route)
+                                        && route.parents.iter().any(|p| p.attached.is_ok())
+                                })
+                            })
+                            .map(|gateway| gateway.gateway.clone()),
+                        (INGRESS_GROUP, "Ingress") => claimed.iter().find(|i| is(i)).cloned(),
+                        _ => None,
+                    };
+                    if let Some(reached) = reached
+                        && !ancestors.contains(&reached)
+                    {
+                        ancestors.push(reached);
+                    }
+                }
+                if ancestors.is_empty() {
+                    return None;
+                }
+                let said: Vec<&Problem> = report
+                    .iter()
+                    .filter(|finding| finding.object == stated.object)
+                    .map(|finding| &finding.problem)
+                    .collect();
+                // One left out has no room in its status to say so: the report says it.
+                if said
+                    .iter()
+                    .any(|problem| matches!(problem, Problem::LimitPolicyUnimplementable(_)))
+                {
+                    return None;
+                }
+                Some(LimitPolicyStatus {
+                    policy: stated.object.clone(),
+                    generation: stated.generation,
+                    ancestors,
+                    conditions: vec![self.accepted(&said)],
+                })
+            })
+            .collect()
+    }
+
+    /// A policy's `Accepted`, as `said`, the report's findings of it, has it: false
+    /// `NotLimiting` where the data plane does not limit, else `Invalid`, else `Conflicted`, naming each limit whose name another holds but never
+    /// what holds it, else `TooManyLimits`, else `TargetNotFound`, else `NotForwarding`, the
+    /// refusals saying which generation applies in the spec's place; else true (04 §6).
+    fn accepted(&self, said: &[&Problem]) -> Condition {
+        if !self.limiting {
+            return Condition::new(
+                "Accepted",
+                false,
+                "NotLimiting",
+                "its DataPlane has no rateLimiting".to_owned(),
+            );
+        }
+        let instead = said.iter().find_map(|problem| match problem {
+            Problem::LastAcceptedApplies(generation) => Some(*generation),
+            _ => None,
+        });
+        let refused = |reason: &'static str, whys: Vec<String>| {
+            let mut message = whys.join("; ");
+            if let Some(generation) = instead {
+                let generation = generation.map_or_else(|| "unknown".to_owned(), |g| g.to_string());
+                message.push_str(&format!("; generation {generation} applies instead"));
+            }
+            Condition::new("Accepted", false, reason, message)
+        };
+        let of = |pick: fn(&Problem) -> Option<String>| -> Vec<String> {
+            said.iter().filter_map(|problem| pick(problem)).collect()
+        };
+        let invalid = of(|problem| match problem {
+            Problem::Refused(_) => Some(problem.to_string()),
+            _ => None,
+        });
+        if !invalid.is_empty() {
+            return refused("Invalid", invalid);
+        }
+        let held = of(|problem| match problem {
+            Problem::LimitNameHeld { name, by: None } => Some(format!(
+                "the name of its limit `{name}` is held by the DataPlane's global limits"
+            )),
+            Problem::LimitNameHeld { name, by: Some(_) } => Some(format!(
+                "the name of its limit `{name}` is held by another RateLimitPolicy"
+            )),
+            _ => None,
+        });
+        if !held.is_empty() {
+            return refused("Conflicted", held);
+        }
+        let too_many = of(|problem| match problem {
+            Problem::LimitsTooMany { .. } => Some(problem.to_string()),
+            _ => None,
+        });
+        if !too_many.is_empty() {
+            return refused("TooManyLimits", too_many);
+        }
+        let not_found = of(|problem| match problem {
+            Problem::LimitTargetNotFound { .. } => Some(problem.to_string()),
+            _ => None,
+        });
+        if !not_found.is_empty() {
+            return Condition::new("Accepted", false, "TargetNotFound", not_found.join("; "));
+        }
+        let redirects = of(|problem| match problem {
+            Problem::LimitNotForwarding(_) => Some(problem.to_string()),
+            _ => None,
+        });
+        if !redirects.is_empty() {
+            return Condition::new("Accepted", false, "NotForwarding", redirects.join("; "));
+        }
+        Condition::new("Accepted", true, "Accepted", String::new())
     }
 
     /// The limits a rule of an Ingress `ingress` is under: the DataPlane's and the
@@ -1031,6 +1547,174 @@ spec:
             ]
         );
         assert!(!taken, "the config taken");
+    }
+
+    /// A change refused for the most limits says `TooManyLimits`, naming the rule and which
+    /// generation applies in its place, of the Ingress it targets; the policy it leaves
+    /// applying is accepted.
+    #[test]
+    fn a_change_refused_for_the_most_limits_says_too_many_limits_of_its_ingress() {
+        let older = on_ingress("older", 1, 1, 2);
+        let younger = on_ingress("younger", 2, 1, 60);
+        let plane: Plane =
+            serde_saphyr::from_str(&format!("ingress_class: edge\n{PLANE}")).unwrap();
+        let cluster = Cluster {
+            ingress_classes: vec![
+                serde_saphyr::from_str(
+                    "{ metadata: { name: edge }, spec: { controller: edgerush.dev/ingress-controller } }",
+                )
+                .unwrap(),
+            ],
+            ingresses: vec![
+                serde_saphyr::from_str(
+                    "metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+",
+                )
+                .unwrap(),
+            ],
+            rate_limit_policies: vec![on_ingress("older", 1, 2, 5), younger.clone()],
+            ..Cluster::default()
+        };
+        let accepted = [AcceptedPolicy::of(&older), AcceptedPolicy::of(&younger)];
+        let translation = crate::translate_from(&plane, &cluster, &accepted);
+        let said: Vec<String> = translation
+            .limit_policy_statuses
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            said,
+            [
+                format!(
+                    "RateLimitPolicy shop/older, generation 2, of Ingress shop/web: \
+                     Accepted=False/TooManyLimits ({}; generation 1 applies instead)",
+                    too_many("older", 66).trim_start_matches("RateLimitPolicy shop/older: ")
+                ),
+                "RateLimitPolicy shop/younger, generation 1, of Ingress shop/web: \
+                 Accepted=True/Accepted"
+                    .to_owned()
+            ]
+        );
+    }
+
+    /// A refused edit that moved the policy to a target not there says of the ancestor its
+    /// version last accepted still applies to, the generation applying named.
+    #[test]
+    fn a_refused_edit_says_of_the_ancestors_its_last_accepted_reaches() {
+        let last = on_ingress("moved", 1, 1, 1);
+        let mut edited = on_ingress("moved", 1, 2, 1);
+        edited.spec.target_refs[0].name = "elsewhere".to_owned();
+        edited.spec.limits.as_mut().unwrap()[0].key = "Header".to_owned();
+        let plane: Plane =
+            serde_saphyr::from_str(&format!("ingress_class: edge\n{PLANE}")).unwrap();
+        let cluster = Cluster {
+            ingress_classes: vec![
+                serde_saphyr::from_str(
+                    "{ metadata: { name: edge }, spec: { controller: edgerush.dev/ingress-controller } }",
+                )
+                .unwrap(),
+            ],
+            ingresses: vec![
+                serde_saphyr::from_str(
+                    "metadata: { name: web, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+",
+                )
+                .unwrap(),
+            ],
+            rate_limit_policies: vec![edited],
+            ..Cluster::default()
+        };
+        let translation = crate::translate_from(&plane, &cluster, &[AcceptedPolicy::of(&last)]);
+        let said: Vec<String> = translation
+            .limit_policy_statuses
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "RateLimitPolicy shop/moved, generation 2, of Ingress shop/web: \
+                 Accepted=False/Invalid (the data plane would refuse it: limits[moved-0].key: \
+                 `Header` is not Client; generation 1 applies instead)"
+            ]
+        );
+    }
+
+    /// A policy whose status holds as many ancestors as it can, none of them this data
+    /// plane's, is left out whole: its version last accepted applies no more than its spec,
+    /// and it holds no name; one with room for its own entry applies, and so does one whose
+    /// full list holds this data plane's entry already.
+    #[test]
+    fn a_policy_with_a_full_ancestor_list_is_left_out_whole() {
+        let accepted = on_ingress("full", 1, 1, 1);
+        let mut edited = on_ingress("full", 1, 2, 2);
+        let ancestors: Vec<String> = (0..16)
+            .map(|n| {
+                format!(
+                    "{{ ancestorRef: {{ name: gateway-{n}, namespace: edge }}, controllerName: example.com/other, conditions: [] }}"
+                )
+            })
+            .collect();
+        edited.status = Some(
+            serde_saphyr::from_str(&format!("ancestors: [{}]", ancestors.join(", "))).unwrap(),
+        );
+        let (applied, under, report, _) = on_the_rule(&[edited.clone()], &[&accepted]);
+        assert_eq!(applied, []);
+        assert_eq!(under, 1, "the DataPlane's alone");
+        assert_eq!(
+            report,
+            [
+                "RateLimitPolicy shop/full: left out: its status holds 16 ancestors already, \
+                 none of them Ingress shop/web, so it cannot be implemented there"
+            ]
+        );
+        // With room for one more, its spec applies.
+        if let Some(status) = edited.status.as_mut() {
+            status.ancestors.pop();
+        }
+        let (applied, under, _, _) = on_the_rule(&[edited.clone()], &[&accepted]);
+        assert_eq!(applied, [("full".to_owned(), 2)]);
+        assert_eq!(under, 3);
+        // Full again, one of them this controller's of the Ingress.
+        if let Some(status) = edited.status.as_mut() {
+            status.ancestors.push(
+                serde_saphyr::from_str(
+                    "{ ancestorRef: { group: networking.k8s.io, kind: Ingress, name: web },                      controllerName: edgerush.dev/gateway-controller, conditions: [] }",
+                )
+                .unwrap(),
+            );
+        }
+        let (applied, _, _, _) = on_the_rule(&[edited], &[&accepted]);
+        assert_eq!(applied, [("full".to_owned(), 2)], "its own entry is there");
+    }
+
+    /// A target not there, and one forwarding nothing, are notes, not faults: the policy
+    /// applies to it once it is there and forwards, so files applied in any order validate
+    /// (Lucas); none there at all is a fault.
+    #[test]
+    fn a_target_not_there_or_forwarding_nothing_is_a_note() {
+        let not_there = Problem::LimitTargetNotFound {
+            target: "HTTPRoute shop/gone".to_owned(),
+            why: "it is not there".to_owned(),
+        };
+        assert!(not_there.is_note());
+        assert!(Problem::LimitNotForwarding("HTTPRoute shop/moved".to_owned()).is_note());
+        // But none of a policy's targets there is a fault, likely a mistake (Lucas).
+        assert!(!Problem::LimitTargetsNoneThere.is_note());
     }
 
     /// A rule past half the most limits is noted, so that one coming to the most is seen;

@@ -16,7 +16,8 @@
 //! a line each (none otherwise); and, where the case says,
 //! `status.txt`, what the
 //! status of that Gateway, each of its listeners, each route's parent of it and each
-//! BackendTLSPolicy of it as an ancestor is to say, a line each; and, where the case says,
+//! BackendTLSPolicy of it as an ancestor is to say, then each RateLimitPolicy's of the
+//! ancestors it reaches, a line each; and, where the case says,
 //! `accepted.txt`, the version of each RateLimitPolicy that applies, a line each. The
 //! report's last lines are the hosts a claim of one API takes from the other's.
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
@@ -257,6 +258,12 @@ fn every_case_translates_to_its_config_and_report() {
                 .map(ToString::to_string)
                 .chain(translation.route_statuses.iter().map(ToString::to_string))
                 .chain(translation.policy_statuses.iter().map(ToString::to_string))
+                .chain(
+                    translation
+                        .limit_policy_statuses
+                        .iter()
+                        .map(ToString::to_string),
+                )
                 .flat_map(|said| said.lines().map(str::to_owned).collect::<Vec<_>>())
                 .collect();
             let expected: Vec<String> = read(&listed).lines().map(str::to_owned).collect();

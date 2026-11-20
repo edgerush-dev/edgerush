@@ -1,0 +1,9 @@
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs; gateway.edgerush.dev/RateLimitPolicyAffected=True/Accepted (affected by RateLimitPolicy edge/gateway)
+listener http: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/api, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs; gateway.edgerush.dev/RateLimitPolicyAffected=True/Accepted (affected by RateLimitPolicy shop/health, RateLimitPolicy shop/orders, RateLimitPolicy shop/route, RateLimitPolicy shop/route-also)
+RateLimitPolicy edge/gateway, generation 0, of Gateway edge/web: Accepted=True/Accepted
+RateLimitPolicy shop/health, generation 0, of Gateway edge/web: Accepted=True/Accepted
+RateLimitPolicy shop/old, generation 0, of Gateway edge/web: Accepted=False/NotForwarding (applies nothing to HTTPRoute shop/api section old, which forwards nothing: a rule that redirects is under no limits)
+RateLimitPolicy shop/orders, generation 0, of Gateway edge/web: Accepted=True/Accepted
+RateLimitPolicy shop/route, generation 0, of Gateway edge/web: Accepted=True/Accepted
+RateLimitPolicy shop/route-also, generation 0, of Gateway edge/web: Accepted=True/Accepted
