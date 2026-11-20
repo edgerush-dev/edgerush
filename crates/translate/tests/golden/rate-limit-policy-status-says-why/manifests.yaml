@@ -6,7 +6,9 @@
 # route it targets does, but not where only some do. A policy whose
 # targets reach nothing here has no status of this data plane's, nor does an Ingress of
 # another class. Each route, and the Gateway, says which policies that limit something
-# there apply to it, on each parent that takes it.
+# there apply to it, on each parent that takes it. A policy whose status holds as many
+# ancestors as it can, none of them this data plane's, is left out whole, as it cannot be
+# implemented here: the report says so, as its status cannot.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
@@ -148,3 +150,29 @@ spec:
     - { group: networking.k8s.io, kind: Ingress, name: web }
     - { group: networking.k8s.io, kind: Ingress, name: theirs }
   limits: [{ name: ingress-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: full, namespace: shop, generation: 1, creationTimestamp: "2026-01-09T00:00:00Z" }
+spec:
+  targetRefs: [{ group: gateway.networking.k8s.io, kind: HTTPRoute, name: a }]
+  limits: [{ name: full-per-client, key: Client, model: { bucket: { rate: 5/s, burst: 5 } } }]
+status:
+  ancestors: [
+      { ancestorRef: { name: gateway-0, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-1, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-2, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-3, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-4, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-5, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-6, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-7, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-8, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-9, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-10, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-11, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-12, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-13, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-14, namespace: edge }, controllerName: example.com/other, conditions: [] },
+      { ancestorRef: { name: gateway-15, namespace: edge }, controllerName: example.com/other, conditions: [] }
+  ]

@@ -21,6 +21,7 @@ use edgerush_controller::data_plane::{self, follow_data_planes};
 use edgerush_controller::expiry::Expiry;
 use edgerush_controller::issuing::{self, Issuer};
 use edgerush_controller::own_pods::follow_own_pods;
+use edgerush_controller::unimplementable::Unimplementable;
 use edgerush_controller::{
     Acks, Classes, Debounce, Membership, Planes, Reports, Said, ServiceNow, WatchScope, control,
 };
@@ -1027,7 +1028,14 @@ async fn control_until(
     // The dates of the certificates handed out (04 §2, 08 §1): every replica keeps them
     // for its gauge, and the leader says those out of date.
     let expiry = Rc::new(RefCell::new(Expiry::new()));
-    let (exposed, exposition) = watch::channel(Bytes::from(expiry.borrow().exposition()));
+    // The RateLimitPolicies each data plane leaves out, of every replica's translations
+    // (04 §6): served beside the certificates'.
+    let unimplementable = RefCell::new(Unimplementable::new());
+    let exposed_text = |expiry: &Expiry, unimplementable: &Unimplementable| {
+        Bytes::from(expiry.exposition() + &unimplementable.exposition())
+    };
+    let (exposed, exposition) =
+        watch::channel(exposed_text(&expiry.borrow(), &unimplementable.borrow()));
     let mut measured = None;
     if let Some(listener) = listeners.metrics {
         listener.set_nonblocking(true)?;
@@ -1245,7 +1253,13 @@ async fn control_until(
                     };
                 }
                 telling(&text);
-                if let Said::Translated { translation, .. } = &said {
+                if let Said::Translated {
+                    translation,
+                    data_plane,
+                    ..
+                } = &said
+                {
+                    unimplementable.borrow_mut().take(data_plane, translation);
                     // Without an election, this replica is the only one, and leads.
                     let leading = leads.as_ref().is_none_or(|leads| *leads.borrow());
                     let out_of_date = expiry.borrow_mut().take(
@@ -1253,7 +1267,7 @@ async fn control_until(
                         unix_now(),
                         leading,
                     );
-                    exposed.send_replace(Bytes::from(expiry.borrow().exposition()));
+                    exposed.send_replace(exposed_text(&expiry.borrow(), &unimplementable.borrow()));
                     for line in out_of_date {
                         telling(&line);
                     }

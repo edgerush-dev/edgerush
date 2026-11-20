@@ -392,11 +392,30 @@ pub(crate) fn refuse_overfull(
 /// it names, or its `sectionName`, a listener of a Gateway or a ListenerSet, or a rule of a
 /// route, by name.
 fn not_there(cluster: &Cluster, namespace: &str, target: &Target) -> Option<String> {
+    let Some(sections) = sections_of(cluster, namespace, target) else {
+        return Some("it is not there".to_owned());
+    };
+    let section = target.section.as_deref()?;
+    let of = if matches!(target.kind.as_str(), "HTTPRoute" | "GRPCRoute") {
+        "rule"
+    } else {
+        "listener"
+    };
+    (!sections.contains(&Some(section))).then(|| format!("it has no {of} `{section}`"))
+}
+
+/// The names of the sections of the object `target`, of a policy of `namespace`, names in
+/// `cluster`, a Gateway's or a ListenerSet's listeners or a route's rules (none for a rule
+/// of no name, and none at all for an Ingress), if it is there.
+fn sections_of<'a>(
+    cluster: &'a Cluster,
+    namespace: &str,
+    target: &Target,
+) -> Option<Vec<Option<&'a str>>> {
     let is = |metadata: &ObjectMeta| {
         crate::namespace(metadata) == namespace && metadata.name.as_deref() == Some(&target.name)
     };
-    // The names of the sections of the object named, if it is there.
-    let sections: Option<Vec<Option<&str>>> = match (target.group.as_str(), target.kind.as_str()) {
+    match (target.group.as_str(), target.kind.as_str()) {
         (GATEWAY_GROUP, "Gateway") => cluster
             .gateways
             .iter()
@@ -432,17 +451,7 @@ fn not_there(cluster: &Cluster, namespace: &str, target: &Target) -> Option<Stri
             .find(|ingress| is(&ingress.metadata))
             .map(|_| Vec::new()),
         _ => None,
-    };
-    let Some(sections) = sections else {
-        return Some("it is not there".to_owned());
-    };
-    let section = target.section.as_deref()?;
-    let of = if matches!(target.kind.as_str(), "HTTPRoute" | "GRPCRoute") {
-        "rule"
-    } else {
-        "listener"
-    };
-    (!sections.contains(&Some(section))).then(|| format!("it has no {of} `{section}`"))
+    }
 }
 
 /// Whether `target`, of a policy of `namespace`, forwards nothing, as the routes translated
@@ -467,6 +476,58 @@ fn forwards_nothing(
             .any(|(route, rule)| is(route) && rule.as_ref() == Some(named)),
         None => redirecting.iter().any(|(route, _)| is(route)) && !forwarding.iter().any(is),
     }
+}
+
+/// The most ancestors a policy's status holds, as its CRD has it.
+const MOST_ANCESTORS: usize = 16;
+
+/// Leaves out in `forced` each policy whose status, as `cluster` holds it, holds as many
+/// ancestors as it can, none of them this controller's of an ancestor `translation` says the
+/// policy reaches here: it may not add its own, so cannot be implemented here (GEP-713).
+/// Whether it left out any.
+pub(crate) fn leave_out_unimplementable(
+    translation: &crate::Translation,
+    cluster: &Cluster,
+    forced: &mut Forced,
+) -> bool {
+    let mut left = false;
+    for status in &translation.limit_policy_statuses {
+        let Some(policy) = cluster
+            .rate_limit_policies
+            .iter()
+            .find(|policy| Object::of("RateLimitPolicy", &policy.metadata) == status.policy)
+        else {
+            continue;
+        };
+        let held = policy
+            .status
+            .as_ref()
+            .map(|status| status.ancestors.as_slice())
+            .unwrap_or_default();
+        let ours = held.iter().any(|ancestor| {
+            let to = &ancestor.ancestor_ref;
+            ancestor.controller_name == crate::GATEWAY_CONTROLLER
+                && status.ancestors.iter().any(|reached| {
+                    to.kind.as_deref().unwrap_or("Gateway") == reached.kind
+                        && to.namespace.as_deref().unwrap_or(&status.policy.namespace)
+                            == reached.namespace
+                        && to.name == reached.name
+                })
+        });
+        if ours || held.len() < MOST_ANCESTORS {
+            continue;
+        }
+        let named: Vec<String> = status.ancestors.iter().map(ToString::to_string).collect();
+        forced.entry(status.policy.clone()).or_insert_with(|| {
+            left = true;
+            Problem::LimitPolicyUnimplementable(format!(
+                "its status holds {MOST_ANCESTORS} ancestors already, none of them {}, so it \
+                 cannot be implemented there",
+                named.join(" or ")
+            ))
+        });
+    }
+    left
 }
 
 /// What a policy's `ignore` removes.
@@ -661,8 +722,15 @@ impl RateLimits {
                     spec: forced
                         .get(&object)
                         .map_or_else(|| judged(&policy.spec), |why| Err(why.clone())),
+                    // A policy left out applies no version of itself.
                     last: last
                         .filter(|last| last.spec != policy.spec)
+                        .filter(|_| {
+                            !matches!(
+                                forced.get(&object),
+                                Some(Problem::LimitPolicyUnimplementable(_))
+                            )
+                        })
                         .map(|last| (last, judged(&last.spec))),
                     object,
                 }
@@ -841,8 +909,8 @@ impl RateLimits {
 
     /// Says in `report`, of each policy judged, each target of its spec, or its
     /// `sectionName`, that `cluster` does not hold, and each rule it targets that redirects,
-    /// or route none of whose rules forwards: the policy applies nothing there (04 §4). Once
-    /// every route is translated.
+    /// or route none of whose rules forwards: the policy applies nothing there (04 §4); and
+    /// a policy none of whose targets is there. Once every route is translated.
     pub(crate) fn say_targets(&self, cluster: &Cluster, report: &mut Vec<Finding>) {
         if !self.limiting {
             return;
@@ -863,6 +931,19 @@ impl RateLimits {
                 report.push(Finding {
                     object: stated.object.clone(),
                     problem,
+                });
+            }
+            // No object it names there at all is likely a mistake, and no status can say it:
+            // reaching nothing, it has none (Lucas). A section not there is said on the
+            // ancestor its object reaches.
+            let none_there = stated
+                .targets
+                .iter()
+                .all(|target| sections_of(cluster, namespace, target).is_none());
+            if !stated.targets.is_empty() && none_there {
+                report.push(Finding {
+                    object: stated.object.clone(),
+                    problem: Problem::LimitTargetsNoneThere,
                 });
             }
         }
@@ -926,6 +1007,13 @@ impl RateLimits {
                     .filter(|finding| finding.object == stated.object)
                     .map(|finding| &finding.problem)
                     .collect();
+                // One left out has no room in its status to say so: the report says it.
+                if said
+                    .iter()
+                    .any(|problem| matches!(problem, Problem::LimitPolicyUnimplementable(_)))
+                {
+                    return None;
+                }
                 Some(LimitPolicyStatus {
                     policy: stated.object.clone(),
                     generation: stated.generation,
@@ -1566,9 +1654,57 @@ spec:
         );
     }
 
+    /// A policy whose status holds as many ancestors as it can, none of them this data
+    /// plane's, is left out whole: its version last accepted applies no more than its spec,
+    /// and it holds no name; one with room for its own entry applies, and so does one whose
+    /// full list holds this data plane's entry already.
+    #[test]
+    fn a_policy_with_a_full_ancestor_list_is_left_out_whole() {
+        let accepted = on_ingress("full", 1, 1, 1);
+        let mut edited = on_ingress("full", 1, 2, 2);
+        let ancestors: Vec<String> = (0..16)
+            .map(|n| {
+                format!(
+                    "{{ ancestorRef: {{ name: gateway-{n}, namespace: edge }}, controllerName: example.com/other, conditions: [] }}"
+                )
+            })
+            .collect();
+        edited.status = Some(
+            serde_saphyr::from_str(&format!("ancestors: [{}]", ancestors.join(", "))).unwrap(),
+        );
+        let (applied, under, report, _) = on_the_rule(&[edited.clone()], &[&accepted]);
+        assert_eq!(applied, []);
+        assert_eq!(under, 1, "the DataPlane's alone");
+        assert_eq!(
+            report,
+            [
+                "RateLimitPolicy shop/full: left out: its status holds 16 ancestors already, \
+                 none of them Ingress shop/web, so it cannot be implemented there"
+            ]
+        );
+        // With room for one more, its spec applies.
+        if let Some(status) = edited.status.as_mut() {
+            status.ancestors.pop();
+        }
+        let (applied, under, _, _) = on_the_rule(&[edited.clone()], &[&accepted]);
+        assert_eq!(applied, [("full".to_owned(), 2)]);
+        assert_eq!(under, 3);
+        // Full again, one of them this controller's of the Ingress.
+        if let Some(status) = edited.status.as_mut() {
+            status.ancestors.push(
+                serde_saphyr::from_str(
+                    "{ ancestorRef: { group: networking.k8s.io, kind: Ingress, name: web },                      controllerName: edgerush.dev/gateway-controller, conditions: [] }",
+                )
+                .unwrap(),
+            );
+        }
+        let (applied, _, _, _) = on_the_rule(&[edited], &[&accepted]);
+        assert_eq!(applied, [("full".to_owned(), 2)], "its own entry is there");
+    }
+
     /// A target not there, and one forwarding nothing, are notes, not faults: the policy
     /// applies to it once it is there and forwards, so files applied in any order validate
-    /// (Lucas).
+    /// (Lucas); none there at all is a fault.
     #[test]
     fn a_target_not_there_or_forwarding_nothing_is_a_note() {
         let not_there = Problem::LimitTargetNotFound {
@@ -1577,6 +1713,8 @@ spec:
         };
         assert!(not_there.is_note());
         assert!(Problem::LimitNotForwarding("HTTPRoute shop/moved".to_owned()).is_note());
+        // But none of a policy's targets there is a fault, likely a mistake (Lucas).
+        assert!(!Problem::LimitTargetsNoneThere.is_note());
     }
 
     /// A rule past half the most limits is noted, so that one coming to the most is seen;

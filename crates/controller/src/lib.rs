@@ -68,6 +68,7 @@ pub mod issuing;
 pub mod own_pods;
 pub mod service;
 pub mod status;
+pub mod unimplementable;
 
 use edgerush_kubernetes::gateway_api::{GatewayKind, Served};
 

@@ -959,6 +959,12 @@ pub enum Problem {
         /// The policy holding it; none for the DataPlane's own.
         by: Option<Object>,
     },
+    /// A RateLimitPolicy whose status holds as many ancestors as it can, none of them one
+    /// this data plane writes, so that it may not add its own: it cannot be implemented
+    /// here, and is left out whole, neither its spec nor its version last accepted applying
+    /// (GEP-713, 04 §6).
+    #[error("left out: {0}")]
+    LimitPolicyUnimplementable(String),
     /// A RateLimitPolicy's target, or its `sectionName`, that is not there: the policy is
     /// kept, and applies to it once it is (04 §4).
     #[error("applies nothing to {target}: {why}")]
@@ -968,6 +974,11 @@ pub enum Problem {
         /// Why.
         why: String,
     },
+    /// A RateLimitPolicy no object of whose targets is there: a fault, unlike a target not
+    /// there beside one that is, or a section not there of one that is, as it is likely a
+    /// mistake, and reaching nothing, the policy has no status to say so (Lucas, 04 §4).
+    #[error("none of its targets is there, so it applies nothing and has no status")]
+    LimitTargetsNoneThere,
     /// A RateLimitPolicy's target that forwards nothing: a rule that redirects, or a route
     /// every rule of which does, under no limits (07 §2). The policy applies to it once it
     /// forwards (04 §4).
@@ -1127,6 +1138,10 @@ pub fn translate(plane: &Plane, cluster: &Cluster) -> Translation {
 /// them: each still there keeps the names of its limits, and applies that version where its
 /// spec is now refused (04 §4).
 ///
+/// A policy whose status holds as many ancestors as it can, none of them one this data plane
+/// would write, is left out, as it cannot be implemented here (GEP-713): neither its spec nor
+/// its version last accepted applies, and the report says why (04 §6).
+///
 /// A rule under more limits than the data plane takes refuses the changes of the policies
 /// that reach it until it is not, the youngest first, each pass translating again with
 /// those refused, a refused change applying its version last accepted. A rule still over
@@ -1139,12 +1154,15 @@ pub fn translate_from(
     accepted: &[AcceptedPolicy],
 ) -> Translation {
     let mut forced = rate_limits::Forced::new();
-    // Each pass refuses the change of a policy more or is the last: one a policy at most,
-    // and one more to translate with them all refused.
+    // Each pass leaves out or refuses the change of a policy more or is the last: one a
+    // policy at most, and one more to translate with them all refused.
     for _ in 0..cluster.rate_limit_policies.len() {
         let translation = translated(plane, cluster, accepted, &forced);
         let applied = &translation.rate_limit_policies;
-        if !rate_limits::refuse_overfull(&translation.config, applied, accepted, &mut forced) {
+        let left_out = rate_limits::leave_out_unimplementable(&translation, cluster, &mut forced);
+        let refused =
+            rate_limits::refuse_overfull(&translation.config, applied, accepted, &mut forced);
+        if !left_out && !refused {
             return translation;
         }
     }
