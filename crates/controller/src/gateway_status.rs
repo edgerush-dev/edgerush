@@ -62,9 +62,9 @@ const MOST_ANCESTORS: usize = 16;
 /// no longer than its CRD allows.
 pub(crate) const SUPPORTED_FEATURES: &[&str] = &[
     // GATEWAY-HTTP's core (Gateway, HTTPRoute, ReferenceGrant), GATEWAY-GRPC's (Gateway,
-    // GRPCRoute, ReferenceGrant), GATEWAY-TLS's (Gateway, TLSRoute, ReferenceGrant) and
-    // GATEWAY-TCP's (Gateway, TCPRoute, ReferenceGrant), and the extended features that pass
-    // them.
+    // GRPCRoute, ReferenceGrant), GATEWAY-TLS's (Gateway, TLSRoute, ReferenceGrant),
+    // GATEWAY-TCP's (Gateway, TCPRoute, ReferenceGrant) and GATEWAY-UDP's (Gateway, UDPRoute,
+    // ReferenceGrant), and the extended features that pass them.
     "GRPCRoute",
     "GRPCRouteNamedRouteRule",
     "GRPCRouteRequestHeaderModifier",
@@ -102,6 +102,7 @@ pub(crate) const SUPPORTED_FEATURES: &[&str] = &[
     "ReferenceGrant",
     "TCPRoute",
     "TLSRoute",
+    "UDPRoute",
 ];
 
 /// The most features a GatewayClass's status holds, as its CRD has it.
