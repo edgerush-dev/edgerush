@@ -468,6 +468,7 @@ fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
                 ListenerProblem::TooManyListeners { .. } => "TooManyListeners",
                 ListenerProblem::TlsMode(_)
                 | ListenerProblem::PassthroughOnly(_)
+                | ListenerProblem::ClientValidation { .. }
                 | ListenerProblem::NoCertificate => "UnsupportedValue",
             };
             conditions.push(Condition::new(
