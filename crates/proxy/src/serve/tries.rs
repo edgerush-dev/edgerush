@@ -11,6 +11,7 @@ use crate::mirror;
 use crate::random::random;
 use crate::request_body::RequestBody;
 use crate::retry::replay::Tee;
+use crate::upstream::balancing::Unpicked;
 use crate::upstream::h1::codec::{OutgoingFields, Sending};
 use edgerush_config::CompiledRetry;
 use http::{HeaderMap, HeaderName, HeaderValue, Request};
@@ -113,12 +114,24 @@ impl Worker {
                 }
                 return outcome;
             };
-            let Some((target, drawn, at, counted)) = directed.draw(head.uri(), &tried) else {
-                if let Some(upstream) = upstream() {
-                    upstream.retries_nowhere.inc();
+            let (target, drawn, picked) = match directed.draw(head.uri(), &tried) {
+                Ok(drawn) => drawn,
+                Err(unpicked) => {
+                    if let Some(upstream) = upstream() {
+                        match unpicked {
+                            Unpicked::Nowhere => upstream.retries_nowhere.inc(),
+                            Unpicked::Full => upstream.retries_full.inc(),
+                        }
+                    }
+                    return outcome;
                 }
-                return outcome;
             };
+            if picked.passed_over
+                && let Some(upstream) = upstream()
+            {
+                upstream.passed_over.inc();
+            }
+            let (at, counted) = (picked.at, picked.counted);
             if !directed
                 .upstream
                 .budget(|budget| budget.withdraw(Instant::now()))
@@ -250,6 +263,7 @@ impl Worker {
                     alone,
                     endpoint: Arc::clone(&mirror.endpoint),
                     counted: None,
+                    looked: None,
                     others: None,
                     mirrors: Vec::new(),
                     websocket: None,

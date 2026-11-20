@@ -848,6 +848,8 @@ pub(crate) struct UpstreamCounters {
     pub(crate) retries_deadline: Counter,
     pub(crate) retries_busy: Counter,
     pub(crate) retries_nowhere: Counter,
+    /// Retries not sent because every endpoint they could go to was full (25 §5).
+    pub(crate) retries_full: Counter,
     /// Copies a mirror to this upstream did not get, by why: no place for them on the
     /// worker, fallen too far behind, no endpoint to send them to, credentials bound to
     /// the client's connection, or a WebSocket handshake, of which a mirror could never be
@@ -857,6 +859,14 @@ pub(crate) struct UpstreamCounters {
     pub(crate) mirrors_nowhere: Counter,
     pub(crate) mirrors_credentials: Counter,
     pub(crate) mirrors_upgrade: Counter,
+    /// Copies not sent because every endpoint of the mirror's protected upstream they could
+    /// go to was full (25 §5).
+    pub(crate) mirrors_full: Counter,
+    /// Requests a protected upstream refused because every endpoint they could go to was
+    /// full: `backend_full` (25 §8).
+    pub(crate) full: Counter,
+    /// Picks on a protected upstream that found an endpoint full and went to another.
+    pub(crate) passed_over: Counter,
     /// Endpoints set aside because a try could not connect to them (03 §6), counted by the
     /// health checker as it finds them.
     pub(crate) set_asides: Counter,
@@ -1126,6 +1136,64 @@ impl Metrics {
         for (upstream, reason, count) in refused {
             let labels = [("upstream", *upstream), ("reason", *reason)];
             scrape.sample(name, &labels, *count as u64);
+        }
+        scrape.finish()
+    }
+
+    /// The scrape's backend protection (25 §8): for each protected upstream of the current
+    /// config, by its name, the slot it has and the requests in flight to its endpoints,
+    /// every worker's, as their shared counts have them — a count a Service's ports share
+    /// shows under each of them. Nothing per endpoint: pods come and go, and every rollout
+    /// would add series. Upstreams that share a series are shown once, their requests in
+    /// flight summed.
+    pub(crate) fn render_protected(&self, protected: &[(&str, usize, u64)]) -> String {
+        let mut shown: Vec<(&str, usize, u64)> = Vec::new();
+        for (upstream, slot, in_flight) in protected {
+            let upstream = if *slot == OVERFLOW_SLOT {
+                OVERFLOW_NAME
+            } else {
+                upstream
+            };
+            match shown
+                .iter_mut()
+                .find(|(name, at, _)| (*name, *at) == (upstream, *slot))
+            {
+                Some((_, _, sum)) => *sum += in_flight,
+                None => shown.push((upstream, *slot, *in_flight)),
+            }
+        }
+        let mut scrape = Exposition::new();
+        if shown.is_empty() {
+            return scrape.finish();
+        }
+        let series = |slot: usize| self.upstreams.get(slot).and_then(OnceLock::get);
+        let name = "edgerush_upstream_protection_in_flight";
+        let help = "Requests in flight to the upstream's endpoints from this data plane, as \
+                    the counts its protection holds them to have them.";
+        scrape.family(name, Kind::Gauge, help);
+        for (upstream, _, in_flight) in &shown {
+            scrape.sample(name, &[("upstream", *upstream)], *in_flight);
+        }
+        let name = "edgerush_upstream_protection_refused_total";
+        let help = "Requests answered 503 by the upstream's protection, by why: every \
+                    endpoint they could go to was full.";
+        scrape.family(name, Kind::Counter, help);
+        for (upstream, slot, _) in &shown {
+            let Some(series) = series(*slot) else {
+                continue;
+            };
+            let labels = [("upstream", *upstream), ("reason", "backend_full")];
+            scrape.sample(name, &labels, series.sum(|shard| shard.full.get()));
+        }
+        let name = "edgerush_upstream_protection_passed_over_total";
+        let help = "Picks that found an endpoint of the upstream full and went to another.";
+        scrape.family(name, Kind::Counter, help);
+        for (upstream, slot, _) in &shown {
+            let Some(series) = series(*slot) else {
+                continue;
+            };
+            let labels = [("upstream", *upstream)];
+            scrape.sample(name, &labels, series.sum(|shard| shard.passed_over.get()));
         }
         scrape.finish()
     }
@@ -1525,6 +1593,7 @@ impl Metrics {
                 ("deadline", series.sum(|shard| shard.retries_deadline.get())),
                 ("busy", series.sum(|shard| shard.retries_busy.get())),
                 ("nowhere", series.sum(|shard| shard.retries_nowhere.get())),
+                ("backend_full", series.sum(|shard| shard.retries_full.get())),
             ] {
                 scrape.sample(name, &[("upstream", upstream), ("reason", reason)], count);
             }
@@ -1543,6 +1612,7 @@ impl Metrics {
                     series.sum(|shard| shard.mirrors_credentials.get()),
                 ),
                 ("upgrade", series.sum(|shard| shard.mirrors_upgrade.get())),
+                ("backend_full", series.sum(|shard| shard.mirrors_full.get())),
             ] {
                 scrape.sample(name, &[("upstream", upstream), ("reason", reason)], count);
             }

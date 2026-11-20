@@ -355,9 +355,12 @@ impl Worker {
                 .pick(destinations, snapshot.zoned(upstream.0), &Tried::default())
                 .ok()
         });
-        let Some((identity, counted)) = picked
-            .and_then(|(at, counted)| Some((snapshot.destinations.at(upstream.0, at)?, counted)))
-        else {
+        let Some((identity, counted)) = picked.and_then(|picked| {
+            Some((
+                snapshot.destinations.at(upstream.0, picked.at)?,
+                picked.counted,
+            ))
+        }) else {
             return Err(Tunnel::NoBackend);
         };
         // Taken here, of the snapshot the tunnel was routed by, before anything is waited on.

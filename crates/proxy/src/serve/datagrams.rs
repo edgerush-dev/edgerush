@@ -428,9 +428,12 @@ impl Listening {
                 .pick(destinations, snapshot.zoned(upstream.0), &Tried::default())
                 .ok()
         });
-        let Some((endpoint, load)) =
-            picked.and_then(|(at, load)| Some((snapshot.destinations.at(upstream.0, at)?, load)))
-        else {
+        let Some((endpoint, load)) = picked.and_then(|picked| {
+            Some((
+                snapshot.destinations.at(upstream.0, picked.at)?,
+                picked.counted,
+            ))
+        }) else {
             return Err(Dropped::InvalidBackend);
         };
         let Some(file) = worker.files.take() else {

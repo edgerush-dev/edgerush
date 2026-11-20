@@ -114,6 +114,9 @@ pub trait Candidates {
     /// Whether it has room for another exchange: always, unless its upstream is protected
     /// and it has as many in flight as its bound allows (25 §3).
     fn has_room(&self, at: usize) -> bool;
+    /// Told that the endpoint at `at`, drawn or come to in turn, had no room and was passed
+    /// over: not for one only looked at in working out a rule (25 §8). Nothing by default.
+    fn passed_over(&self, _at: usize) {}
     /// How many exchanges this worker has in flight to it.
     fn in_flight(&self, at: usize) -> u32;
     /// How far into slow start it is: [`Share::FULL`] for one that is not.
@@ -170,6 +173,10 @@ impl<C: Candidates> Candidates for Zone<'_, C> {
 
     fn has_room(&self, at: usize) -> bool {
         self.all.has_room(at)
+    }
+
+    fn passed_over(&self, at: usize) {
+        self.all.passed_over(at);
     }
 
     fn in_flight(&self, at: usize) -> u32 {
@@ -283,6 +290,9 @@ impl<C: Candidates, R: FnMut() -> u64> Pick<'_, C, R> {
     fn allows(&mut self, at: usize) -> bool {
         if self.candidates.serves(at) && !self.tried.contains(at) && self.candidates.has_room(at) {
             return true;
+        }
+        if !self.candidates.has_room(at) {
+            self.candidates.passed_over(at);
         }
         let rule = self.rule();
         rule.allows(self.candidates, self.tried, at)
@@ -510,6 +520,75 @@ mod tests {
         fn share(&self, at: usize) -> Share {
             self.share[at]
         }
+    }
+
+    /// `Endpoints`, and which of them the balancer said it passed over.
+    struct Noting {
+        endpoints: Endpoints,
+        passed: std::cell::RefCell<Vec<usize>>,
+    }
+
+    impl Candidates for Noting {
+        fn count(&self) -> usize {
+            self.endpoints.count()
+        }
+        fn serves(&self, at: usize) -> bool {
+            self.endpoints.serves(at)
+        }
+        fn has_room(&self, at: usize) -> bool {
+            self.endpoints.has_room(at)
+        }
+        fn passed_over(&self, at: usize) {
+            self.passed.borrow_mut().push(at);
+        }
+        fn in_flight(&self, at: usize) -> u32 {
+            self.endpoints.in_flight(at)
+        }
+        fn share(&self, at: usize) -> Share {
+            self.endpoints.share(at)
+        }
+    }
+
+    /// A full endpoint is passed over only when it is drawn, or come to in turn: one that the
+    /// zone's rule, or the rule a second draw works out, only looks at is not (25 §8), so a
+    /// full pod beside a zone kept to is not counted at every pick.
+    #[test]
+    fn only_a_full_endpoint_drawn_is_passed_over() {
+        // The first failing its checks, the second full.
+        let noting = || Noting {
+            endpoints: Endpoints {
+                serves: vec![false, true, true, true],
+                ..Endpoints::with_room(&[true, false, true, true])
+            },
+            passed: std::cell::RefCell::new(Vec::new()),
+        };
+        let zoned = Noting {
+            endpoints: Endpoints::with_room(&[true, false, true, true]),
+            passed: std::cell::RefCell::new(Vec::new()),
+        };
+        assert!(zone(&zoned, 3, &Tried::default()).is_some());
+        assert!(zoned.passed.borrow().is_empty(), "the zone's rule looked");
+
+        // Drawn: the failing one first, so the rule is worked out, which looks at the full
+        // one; then the first two with room.
+        let looked = noting();
+        assert_eq!(p2c(&looked, &Tried::default(), &mut || 0), Some(2));
+        assert!(looked.passed.borrow().is_empty(), "the rule looked");
+
+        // Drawn as the first, and again as the second, each time passed over for one with
+        // room: the last and the third.
+        let drawn = noting();
+        assert_eq!(p2c(&drawn, &Tried::default(), &mut || 1), Some(3));
+        assert_eq!(*drawn.passed.borrow(), [1, 1]);
+
+        let mut round_robin = RoundRobin::starting_at(1);
+        let turned = noting();
+        let mut random = generator(7);
+        assert_eq!(
+            round_robin.pick(&turned, &Tried::default(), &mut random),
+            Some(2)
+        );
+        assert_eq!(*turned.passed.borrow(), [1]);
     }
 
     /// SplitMix64, as the data plane's own generator: seeded, so every run draws the same.

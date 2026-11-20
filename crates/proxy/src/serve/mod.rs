@@ -53,7 +53,7 @@ use crate::routed::Routed;
 use crate::slots::{Slots, WorkerSlots};
 use crate::timers::{Alarm, Timers};
 use crate::tls::{self, Tls, TlsError};
-use crate::upstream::balancing::{self, Balancing, InFlight};
+use crate::upstream::balancing::{self, Balancing, InFlight, Picked, Unpicked};
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::dial::Unconnected;
 use crate::upstream::h1::H1Limits;
@@ -915,8 +915,12 @@ struct Directed {
     /// The endpoint this request was directed to, taken from the same snapshot as the
     /// route so that no reload can come between the two.
     endpoint: Arc<ReuseIdentity>,
-    /// Its count at that endpoint, until the place its exchange is given takes it.
+    /// Its count at that endpoint, until the place its exchange is given takes it; none,
+    /// too, until a request that looked takes it.
     counted: Option<InFlight>,
+    /// For a request to a protected upstream that its rate limits may yet refuse, the
+    /// endpoint a look chose, taken once they admit it (25 §5).
+    looked: Option<Looking>,
     /// Every endpoint of the upstream, for a request its rule may send again. Boxed: only
     /// such a request has it.
     others: Option<Box<Others>>,
@@ -1014,14 +1018,28 @@ struct Others {
     first: usize,
 }
 
+/// The endpoint a look chose before a request's rate limits were charged, of the upstream
+/// at `upstream` of the snapshot numbered `generation`: taken once they admit it, or, if it
+/// has filled by then, another picked on that snapshot while it is still the current one
+/// (25 §5).
+#[derive(Debug, Clone, Copy)]
+struct Looking {
+    generation: u64,
+    upstream: usize,
+    at: usize,
+}
+
 /// Where one copy of a request goes: drawn with the request, from the same snapshot.
 struct Mirrored {
     /// The worker's state for the mirror's upstream.
     upstream: Rc<balancing::Upstream>,
     endpoint: Arc<ReuseIdentity>,
     /// Its count at that endpoint, until the place its exchange is given takes it: a copy
-    /// is load on the mirror's backend like any exchange (03 §6).
+    /// is load on the mirror's backend like any exchange (03 §6). None, too, until a copy
+    /// that looked takes it.
     counted: Option<InFlight>,
+    /// As for its request's: the endpoint a look chose, until it is taken.
+    looked: Option<Looking>,
     target: Uri,
     /// The fields as they stood at the mirror's place, before a change after it; none for
     /// a copy of the request as it goes upstream.
@@ -1030,28 +1048,27 @@ struct Mirrored {
 
 impl Directed {
     /// The endpoint for another try, which keeps away from those in `tried`, as the
-    /// upstream's balancer picks it: the target at it, its destination, its position and its
-    /// count.
+    /// upstream's balancer picks it: the target at it, its destination, and what the pick
+    /// took. Full when every endpoint it may go to is: a try that finds them so is not
+    /// sent, and the client is given the answer it has (25 §5).
     fn draw(
         &self,
         target: &Uri,
         tried: &Tried,
-    ) -> Option<(Uri, Arc<ReuseIdentity>, usize, InFlight)> {
-        let others = self.others.as_deref()?;
-        // A try that finds its endpoint full is not sent: the client is given the answer it
-        // has (25 §5).
-        let (at, counted) = self
+    ) -> Result<(Uri, Arc<ReuseIdentity>, Picked), Unpicked> {
+        let others = self.others.as_deref().ok_or(Unpicked::Nowhere)?;
+        let picked = self
             .upstream
-            .pick(&others.destinations, others.zoned, tried)
-            .ok()?;
-        let authority = others.authorities.get(at)?;
-        let destination = others.destinations.get(at)?;
-        Some((
-            at_endpoint(target, authority)?,
-            Arc::clone(destination),
-            at,
-            counted,
-        ))
+            .pick(&others.destinations, others.zoned, tried)?;
+        let authority = others.authorities.get(picked.at);
+        let destination = others.destinations.get(picked.at);
+        let (Some(target), Some(destination)) = (
+            authority.and_then(|authority| at_endpoint(target, authority)),
+            destination,
+        ) else {
+            return Err(Unpicked::Nowhere);
+        };
+        Ok((target, Arc::clone(destination), picked))
     }
 }
 

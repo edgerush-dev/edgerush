@@ -1142,6 +1142,24 @@ impl Proxy {
             }
         }
         scrape.push_str(&Metrics::render_refused(&refused));
+        // Read where the workers write them, at the moment of the scrape.
+        let protected: Vec<(&str, usize, u64)> = snapshot
+            .config
+            .upstreams()
+            .iter()
+            .zip(&snapshot.upstream_slots)
+            .zip(&snapshot.protected)
+            .filter_map(|((upstream, slot), protected)| {
+                let in_flight = protected
+                    .as_ref()?
+                    .counts
+                    .iter()
+                    .map(|pod| u64::from(pod.in_flight()))
+                    .sum();
+                Some((upstream.name.as_str(), *slot, in_flight))
+            })
+            .collect();
+        scrape.push_str(&self.metrics.render_protected(&protected));
         // Only a config that enforces limits shows them.
         let max_key_bytes = match snapshot.config.rate_limiting() {
             CompiledRateLimiting::Local { max_key_bytes } => Some(*max_key_bytes),
