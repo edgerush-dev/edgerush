@@ -1,0 +1,48 @@
+listeners:
+  port-443:
+    address: "0.0.0.0:443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: shop/shop-tls, names: ["*"] }
+        - { certificate: shop/wild, names: [legacy.example.com] }
+      without_sni: shop/shop-tls
+      client_validation: { authorities: ["-----BEGIN CERTIFICATE-----\nMIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw\nDzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0\nMlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj\nhOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv\n/BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd\nvTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD\nAQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw\nRQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi\nMOtcEpdQZB9tO6I1+/uWF+abUlauFQ==\n-----END CERTIFICATE-----\n"], mode: allow_insecure_fallback }
+      shared_by: [{ hostnames: [{ name: "*" }] }, { hostnames: [{ name: legacy.example.com }] }]
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  port-8443:
+    address: "0.0.0.0:8443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    tls:
+      certificates:
+        - { certificate: shop/shop-tls, names: [strict.example.com] }
+      without_sni: none
+      client_validation: { authorities: ["-----BEGIN CERTIFICATE-----\nMIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw\nDzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0\nMlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj\nhOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv\n/BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd\nvTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD\nAQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw\nRQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi\nMOtcEpdQZB9tO6I1+/uWF+abUlauFQ==\n-----END CERTIFICATE-----\n"] }
+routes:
+  - name: ingress/shop/legacy/legacy.example.com
+    listeners: [port-443]
+    hostnames: [{ name: legacy.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/web/http, weight: 1 }] }
+  - name: ingress/shop/legacy/legacy.example.com/https-redirect
+    listeners: [port-80]
+    hostnames: [{ name: legacy.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        filters: [{ type: response_header_modifier, set: [{ name: cache-control, value: "max-age=30" }] }]
+        redirect: { status: 308, scheme: https, query: keep }
+  - { name: gateway/shop/web/strict, listeners: [port-8443], hostnames: [{ name: strict.example.com, falls_through: false }], rules: [] }
+upstreams:
+  shop/web/http: { load_balancer: p2c, endpoints: { kubernetes: "web.shop.svc.cluster.local:http" } }

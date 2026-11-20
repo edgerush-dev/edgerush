@@ -79,6 +79,7 @@ pub(crate) const SUPPORTED_FEATURES: &[&str] = &[
     "GatewayAddressEmpty",
     "GatewayBackendClientCertificate",
     "GatewayFrontendClientCertificateValidation",
+    "GatewayFrontendClientCertificateValidationInsecureFallback",
     "GatewayHTTPListenerIsolation",
     "GatewayHTTPSListenerDetectMisdirectedRequests",
     "GatewayInfrastructure",
@@ -121,12 +122,14 @@ const _: () = assert!(SUPPORTED_FEATURES.len() <= MOST_FEATURES);
 
 /// The condition types this controller writes on a GatewayClass.
 const CLASS_TYPES: [&str; 2] = ["Accepted", "SupportedVersion"];
-/// On a Gateway.
-const GATEWAY_TYPES: [&str; 4] = [
+/// On a Gateway: one not wanted is taken away, as `InsecureFrontendValidationMode` is once
+/// no port is served in the insecure fallback.
+const GATEWAY_TYPES: [&str; 5] = [
     "Accepted",
     "ResolvedRefs",
     "Programmed",
     translate::AFFECTED,
+    "InsecureFrontendValidationMode",
 ];
 /// On a Gateway's listener.
 const LISTENER_TYPES: [&str; 5] = [

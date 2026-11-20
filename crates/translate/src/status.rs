@@ -7,6 +7,7 @@
 use crate::gateway::{GatewayOutcome, ListenerOutcome, ListenerProblem};
 use crate::http_route::{NotAttached, ParentOutcome, RouteOutcome};
 use crate::{Finding, Object, Problem, RefProblem, RefReason};
+use edgerush_config::ClientValidationMode;
 use std::fmt;
 
 /// A condition, as status says it.
@@ -325,14 +326,41 @@ pub(crate) fn gateway(
         })
         .count();
     let resolved = gateway_resolved(gateway, &listeners);
+    let mut conditions = vec![accepted, resolved];
+    conditions.extend(insecure_fallback(gateway));
     GatewayStatus {
         generation: gateway.generation,
-        conditions: vec![accepted, resolved],
+        conditions,
         programmable: listeners.iter().any(|l| l.programmable.is_ok()),
         listeners,
         attached_listener_sets: i32::try_from(attached).unwrap_or(i32::MAX),
         listener_sets,
     }
+}
+
+/// The Gateway's `InsecureFrontendValidationMode`, true `ConfigurationChanged` while a port
+/// it validates clients on is served in `AllowInsecureFallback`, naming each, as the spec
+/// has it; none otherwise, as NGINX Gateway Fabric, Envoy Gateway and Istio write it.
+fn insecure_fallback(gateway: &GatewayOutcome) -> Option<Condition> {
+    let ports: Vec<String> = gateway
+        .validated
+        .iter()
+        .filter(|(_, validation)| validation.mode == ClientValidationMode::AllowInsecureFallback)
+        .map(|(port, _)| port.to_string())
+        .collect();
+    (!ports.is_empty()).then(|| {
+        Condition::new(
+            "InsecureFrontendValidationMode",
+            true,
+            "ConfigurationChanged",
+            format!(
+                "clients are let through without a certificate the client certificate \
+                 validation trusts on {} {}",
+                if ports.len() == 1 { "port" } else { "ports" },
+                ports.join(", ")
+            ),
+        )
+    })
 }
 
 /// The Gateway's own `ResolvedRefs`, as the spec has it: false where its client certificate

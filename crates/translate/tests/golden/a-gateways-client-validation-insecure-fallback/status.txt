@@ -1,0 +1,3 @@
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs; InsecureFrontendValidationMode=True/ConfigurationChanged (clients are let through without a certificate the client certificate validation trusts on port 443)
+listener secure: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener strict: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

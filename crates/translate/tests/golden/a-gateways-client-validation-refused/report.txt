@@ -5,6 +5,6 @@ Gateway shop/web: a CA certificate it validates clients with on port 9443 cannot
 Gateway shop/web: a CA certificate it validates clients with on port 11443 cannot be used: a CA certificate ref of kind Service is not one translation reads
 Gateway shop/web: listener invalid: not accepted: none of the CA certificates the Gateway's spec.tls.frontend validates client certificates with on port 9443 can be used
 Gateway shop/web: listener later: not accepted: port 9443 is taken for https by listener invalid, which comes first
-Gateway shop/web: listener fallback: not accepted: the Gateway's spec.tls.frontend validates client certificates on port 10443 in mode `AllowInsecureFallback`, which the gateway does not serve
+Gateway shop/web: listener unknown: not accepted: the Gateway's spec.tls.frontend validates client certificates on port 10443 in mode `AllowAnything`, which the gateway does not serve
 Gateway shop/web: listener service: not accepted: none of the CA certificates the Gateway's spec.tls.frontend validates client certificates with on port 11443 can be used
 ListenerSet shop/team: listener team: not accepted: none of the CA certificates the Gateway's spec.tls.frontend validates client certificates with on port 9443 can be used
