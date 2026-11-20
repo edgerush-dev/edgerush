@@ -1,3 +1,4 @@
+HTTPRoute shop/a: not attached to the data plane's Gateway: no listener the Gateway serves has the name and port it names
 RateLimitPolicy shop/clashing: refused: its limit `platform-per-client` has the name of the DataPlane's, which holds it
 RateLimitPolicy shop/clashing: refused: its limit `taken` has the name of RateLimitPolicy shop/holder's, which holds it
 RateLimitPolicy shop/route-gone: applies nothing to HTTPRoute shop/gone: it is not there

@@ -25,7 +25,7 @@
 
 use crate::gateway::GatewayOutcome;
 use crate::http_route::{Attachment, RouteOutcome};
-use crate::status::{Condition, LimitPolicyStatus};
+use crate::status::{Condition, GatewayStatus, LimitPolicyStatus, RouteStatus};
 use crate::{Cluster, Finding, Object, Plane, PlaneRateLimiting, Problem, config_of, namespace};
 use edgerush_config::{
     Bucket, Config, Global, Limit, LimitMatch, Limits, MOST_LIMITS, Model, Rolling, Window, compile,
@@ -44,6 +44,10 @@ const GATEWAY_GROUP: &str = "gateway.networking.k8s.io";
 
 /// The API group of Ingress.
 const INGRESS_GROUP: &str = "networking.k8s.io";
+
+/// The condition on an object a RateLimitPolicy that applies targets, as GEP-713 has a
+/// policy say so on its target, so that `kubectl describe` shows it (04 §6).
+pub const AFFECTED: &str = "gateway.edgerush.dev/RateLimitPolicyAffected";
 
 /// A limit as a DataPlane or a RateLimitPolicy writes one, which are copies of one schema
 /// generated apart, as the limits file writes it; or the field, below the limit, and why it
@@ -486,6 +490,8 @@ struct Target {
 /// A policy taken: its targets, the names of its limits and what it ignores.
 #[derive(Debug)]
 struct Taken {
+    /// The policy.
+    object: Object,
     namespace: String,
     targets: Vec<Target>,
     limits: Vec<String>,
@@ -700,6 +706,7 @@ impl RateLimits {
             let own = policy.limits(applied);
             let ignore = spec.ignore.as_deref().unwrap_or_default();
             taken.push(Taken {
+                object: policy.object.clone(),
                 namespace: policy.object.namespace.clone(),
                 targets: Target::of(spec),
                 limits: own.iter().map(|limit| limit.name.clone()).collect(),
@@ -721,6 +728,102 @@ impl RateLimits {
             stated,
             redirecting: RefCell::default(),
             forwarding: RefCell::default(),
+        }
+    }
+
+    /// Says on each object of the Gateway API a policy that applies targets, as GEP-713
+    /// has it, that it does: `RateLimitPolicyAffected` on the Gateway and on its listeners,
+    /// `gateway`, on each ListenerSet and its listeners, and on each parent of the data
+    /// plane's of each route of `routes` a policy targets, or a rule of (04 §6): only
+    /// where it limits something, its rule there in `cluster` and forwarding, and its route
+    /// forwarding. The policies named, oldest first. Once every route is translated.
+    pub(crate) fn mark_affected(
+        &self,
+        cluster: &Cluster,
+        gateway: Option<&mut GatewayStatus>,
+        routes: &mut [RouteStatus],
+    ) {
+        let redirecting = self.redirecting.borrow();
+        let forwarding = self.forwarding.borrow();
+        let by = |(group, kind): (&str, &str), object: &Object, section: Option<&str>| {
+            let names: Vec<String> = self
+                .taken
+                .iter()
+                .filter(|taken| {
+                    taken.targets((group, kind), &object.namespace, &object.name, section)
+                })
+                .map(|taken| taken.object.to_string())
+                .collect();
+            (!names.is_empty()).then(|| {
+                Condition::new(
+                    AFFECTED,
+                    true,
+                    "Accepted",
+                    format!("affected by {}", names.join(", ")),
+                )
+            })
+        };
+        if let (Some(status), Some(object)) = (gateway, &self.gateway) {
+            let of = (GATEWAY_GROUP, "Gateway");
+            status.conditions.extend(by(of, object, None));
+            for listener in &mut status.listeners {
+                listener
+                    .conditions
+                    .extend(by(of, object, Some(&listener.name)));
+            }
+            for set in &mut status.listener_sets {
+                let of = (GATEWAY_GROUP, "ListenerSet");
+                set.conditions.extend(by(of, &set.set, None));
+                for listener in &mut set.listeners {
+                    listener
+                        .conditions
+                        .extend(by(of, &set.set, Some(&listener.name)));
+                }
+            }
+        }
+        for route in routes {
+            if !matches!(route.route.kind, "HTTPRoute" | "GRPCRoute") {
+                continue;
+            }
+            // A rule has no status of its own: a policy on one says so on its route.
+            let names: Vec<String> = self
+                .taken
+                .iter()
+                .filter(|taken| {
+                    taken.namespace == route.route.namespace
+                        && taken.targets.iter().any(|target| {
+                            target.group == GATEWAY_GROUP
+                                && target.kind == route.route.kind
+                                && target.name == route.route.name
+                                && not_there(cluster, &taken.namespace, target).is_none()
+                                && !forwards_nothing(
+                                    target,
+                                    &taken.namespace,
+                                    &redirecting,
+                                    &forwarding,
+                                )
+                        })
+                })
+                .map(|taken| taken.object.to_string())
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            let affected = Condition::new(
+                AFFECTED,
+                true,
+                "Accepted",
+                format!("affected by {}", names.join(", ")),
+            );
+            for parent in &mut route.parents {
+                let accepted = parent
+                    .conditions
+                    .iter()
+                    .any(|c| c.kind == "Accepted" && c.status);
+                if accepted {
+                    parent.conditions.push(affected.clone());
+                }
+            }
         }
     }
 

@@ -1,12 +1,12 @@
-Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
-listener http: HTTPRoute, GRPCRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs; gateway.edgerush.dev/RateLimitPolicyAffected=True/Accepted (affected by RateLimitPolicy edge/on-gateway)
+listener http: HTTPRoute, GRPCRoute, attached 2: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs; gateway.edgerush.dev/RateLimitPolicyAffected=True/Accepted (affected by RateLimitPolicy edge/on-listener)
 listener admin: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 attached ListenerSets: 1
-ListenerSet shop/team, generation 0: Accepted=True/Accepted
-listener api: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
-HTTPRoute shop/team, generation 0, parent ListenerSet team: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
-HTTPRoute shop/web, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
-GRPCRoute shop/calls, generation 0, parent web section http: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+ListenerSet shop/team, generation 0: Accepted=True/Accepted; gateway.edgerush.dev/RateLimitPolicyAffected=True/Accepted (affected by RateLimitPolicy shop/on-set)
+listener api: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs; gateway.edgerush.dev/RateLimitPolicyAffected=True/Accepted (affected by RateLimitPolicy shop/on-set-listener)
+HTTPRoute shop/team, generation 0, parent ListenerSet team: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs; gateway.edgerush.dev/RateLimitPolicyAffected=True/Accepted (affected by RateLimitPolicy shop/on-team-route)
+HTTPRoute shop/web, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs; gateway.edgerush.dev/RateLimitPolicyAffected=True/Accepted (affected by RateLimitPolicy shop/on-route, RateLimitPolicy shop/on-rule)
+GRPCRoute shop/calls, generation 0, parent web section http: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs; gateway.edgerush.dev/RateLimitPolicyAffected=True/Accepted (affected by RateLimitPolicy shop/on-grpc-rule)
 RateLimitPolicy edge/on-gateway, generation 0, of Gateway edge/web: Accepted=True/Accepted
 RateLimitPolicy edge/on-listener, generation 0, of Gateway edge/web: Accepted=True/Accepted
 RateLimitPolicy shop/on-grpc-rule, generation 0, of Gateway edge/web: Accepted=True/Accepted

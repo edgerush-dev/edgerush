@@ -1,2 +1,3 @@
 HTTPRoute shop/a: attached to http (a.example.com)
+HTTPRoute shop/a, section nope: not attached: no listener the Gateway serves has the name and port it names
 HTTPRoute shop/moved: attached to http (moved.example.com)

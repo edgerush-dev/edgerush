@@ -370,6 +370,50 @@ fn wanted_gateway() -> translate::GatewayStatus {
     }
 }
 
+/// `RateLimitPolicyAffected` is this controller's on a Gateway, its listeners and a
+/// ListenerSet: one no policy applies to any longer is taken away.
+#[test]
+fn a_rate_limit_policy_affected_no_longer_wanted_is_taken_away() {
+    let affected = || condition(translate::AFFECTED, "True", "Accepted", 3, 10);
+    let live = GatewayStatus {
+        conditions: Some(vec![affected()]),
+        listeners: Some(vec![GatewayStatusListeners {
+            conditions: vec![affected()],
+            name: "http".to_owned(),
+            ..GatewayStatusListeners::default()
+        }]),
+        ..GatewayStatus::default()
+    };
+    let unknown = Programmed::of(4, &Pods::new(), None, false);
+    let status = gateway(Some(&live), &wanted_gateway(), &[], &unknown, at(50));
+    let has = |conditions: &[Condition]| conditions.iter().any(|c| c.type_ == translate::AFFECTED);
+    assert!(!has(status.conditions.as_deref().unwrap()), "the Gateway's");
+    assert!(
+        !has(&status.listeners.as_deref().unwrap()[0].conditions),
+        "the listener's"
+    );
+    let set = translate::ListenerSetStatus {
+        set: Object {
+            kind: "ListenerSet",
+            namespace: "shop".to_owned(),
+            name: "team".to_owned(),
+        },
+        generation: 2,
+        conditions: vec![said("Accepted", true, "Accepted")],
+        programmable: Ok(()),
+        listeners: Vec::new(),
+    };
+    let live = ListenerSetStatus {
+        conditions: Some(vec![affected()]),
+        ..ListenerSetStatus::default()
+    };
+    let status = listener_set(Some(&live), &set, &unknown, at(50));
+    assert!(
+        !has(status.conditions.as_deref().unwrap()),
+        "the ListenerSet's"
+    );
+}
+
 #[test]
 fn a_gateway_says_its_listeners_as_wanted_and_keeps_what_is_not_ours() {
     let foreign = condition("example.com/Stale", "True", "Stale", 1, 5);
@@ -671,6 +715,56 @@ fn a_routes_parents_are_ours_of_our_gateway_in_place_beside_every_other_kept_who
     // A route that no longer names the Gateway has no parent of ours there, the rest kept.
     let gone = route(Some(&live), "shop", &[web()], None, nothing_gone(), at(60));
     assert_eq!(gone.parents, [theirs, another_plane]);
+}
+
+/// `RateLimitPolicyAffected` is this controller's on a route's parent: written where a
+/// policy applies, taken away once none does, another controller's type kept.
+#[test]
+fn a_routes_rate_limit_policy_affected_is_written_and_taken_away() {
+    let mut live = parent(GATEWAY_CONTROLLER, Some("edge"), "web");
+    live.conditions
+        .push(condition("example.com/Other", "True", "Other", 1, 10));
+    let live = HTTPRouteStatus {
+        parents: vec![live],
+    };
+    let mut affected = wanted_route(2);
+    affected.parents[0]
+        .conditions
+        .push(said(translate::AFFECTED, true, "Accepted"));
+    let written = route(
+        Some(&live),
+        "shop",
+        &[web()],
+        Some(&affected),
+        nothing_gone(),
+        at(50),
+    );
+    let types: Vec<String> = seen(&written.parents[0].conditions)
+        .into_iter()
+        .map(|(kind, ..)| kind)
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "Accepted",
+            "example.com/Other",
+            "ResolvedRefs",
+            translate::AFFECTED
+        ]
+    );
+    let none = route(
+        Some(&written),
+        "shop",
+        &[web()],
+        Some(&wanted_route(2)),
+        nothing_gone(),
+        at(60),
+    );
+    let types: Vec<String> = seen(&none.parents[0].conditions)
+        .into_iter()
+        .map(|(kind, ..)| kind)
+        .collect();
+    assert_eq!(types, ["Accepted", "example.com/Other", "ResolvedRefs"]);
 }
 
 /// Two data planes whose Gateways are both parents of a route each write its status as it

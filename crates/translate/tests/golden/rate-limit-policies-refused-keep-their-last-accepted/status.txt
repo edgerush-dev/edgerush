@@ -1,6 +1,6 @@
 Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener http: HTTPRoute, GRPCRoute, attached 1: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
-HTTPRoute shop/a, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+HTTPRoute shop/a, generation 0, parent web: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs; gateway.edgerush.dev/RateLimitPolicyAffected=True/Accepted (affected by RateLimitPolicy shop/edited, RateLimitPolicy shop/older, RateLimitPolicy shop/younger)
 RateLimitPolicy shop/edited, generation 2, of Gateway edge/web: Accepted=False/Invalid (the data plane would refuse it: limit `edited-per-client`: `model.bucket.rate`: `10/fortnight` is not a rate: a number of at least 1, `/`, and `s`, `min`, `h` or `d`; generation 1 applies instead)
 RateLimitPolicy shop/new-invalid, generation 1, of Gateway edge/web: Accepted=False/Invalid (the data plane would refuse it: limit `new-per-client`: `model.fixed_window.window`: `1x` is not a window: a whole number of at least 1 and `ms`, `s`, `m`, `h` or `d`, under 213,503 days)
 RateLimitPolicy shop/older, generation 2, of Gateway edge/web: Accepted=False/Conflicted (the name of its limit `younger-per-client` is held by another RateLimitPolicy; generation 1 applies instead)

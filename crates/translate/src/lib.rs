@@ -81,7 +81,7 @@ pub use gateway::{
     SetOutcome,
 };
 pub use http_route::{Attachment, NotAttached, ParentOutcome, RouteOutcome, Taken};
-pub use rate_limits::{AcceptedPolicy, data_plane_limit};
+pub use rate_limits::{AFFECTED, AcceptedPolicy, data_plane_limit};
 pub use status::{
     Condition, GatewayStatus, LimitPolicyStatus, ListenerSetStatus, ListenerStatus, ParentStatus,
     PolicyStatus, RouteStatus,
@@ -2081,10 +2081,11 @@ fn translated(
         .chain(&udp_routes)
         .cloned()
         .collect();
-    let route_statuses = status::routes(&routes, &report);
-    let gateway_status = gateway
+    let mut route_statuses = status::routes(&routes, &report);
+    let mut gateway_status = gateway
         .as_ref()
         .map(|gateway| status::gateway(gateway, &route_statuses, &routes));
+    rate_limits.mark_affected(cluster, gateway_status.as_mut(), &mut route_statuses);
     let policy_statuses = if gateway.is_some() {
         policies.statuses()
     } else {

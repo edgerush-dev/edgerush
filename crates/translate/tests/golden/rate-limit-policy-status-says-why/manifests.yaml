@@ -5,7 +5,8 @@
 # its `sectionName`, is not there; and where a rule it targets redirects, or every rule of a
 # route it targets does, but not where only some do. A policy whose
 # targets reach nothing here has no status of this data plane's, nor does an Ingress of
-# another class.
+# another class. Each route, and the Gateway, says which policies that limit something
+# there apply to it, on each parent that takes it.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }
@@ -24,7 +25,7 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata: { name: a, namespace: shop, generation: 3 }
 spec:
-  parentRefs: [{ name: web, namespace: edge }]
+  parentRefs: [{ name: web, namespace: edge }, { name: web, namespace: edge, sectionName: nope }]
   hostnames: [a.example.com]
   rules:
     - name: main

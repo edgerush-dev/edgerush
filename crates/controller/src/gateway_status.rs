@@ -121,13 +121,29 @@ const _: () = assert!(SUPPORTED_FEATURES.len() <= MOST_FEATURES);
 /// The condition types this controller writes on a GatewayClass.
 const CLASS_TYPES: [&str; 2] = ["Accepted", "SupportedVersion"];
 /// On a Gateway.
-const GATEWAY_TYPES: [&str; 3] = ["Accepted", "ResolvedRefs", "Programmed"];
+const GATEWAY_TYPES: [&str; 4] = [
+    "Accepted",
+    "ResolvedRefs",
+    "Programmed",
+    translate::AFFECTED,
+];
 /// On a Gateway's listener.
-const LISTENER_TYPES: [&str; 4] = ["Accepted", "Conflicted", "ResolvedRefs", "Programmed"];
+const LISTENER_TYPES: [&str; 5] = [
+    "Accepted",
+    "Conflicted",
+    "ResolvedRefs",
+    "Programmed",
+    translate::AFFECTED,
+];
 /// On a route's parent.
-const PARENT_TYPES: [&str; 3] = ["Accepted", "ResolvedRefs", "PartiallyInvalid"];
+const PARENT_TYPES: [&str; 4] = [
+    "Accepted",
+    "ResolvedRefs",
+    "PartiallyInvalid",
+    translate::AFFECTED,
+];
 /// On a ListenerSet.
-const SET_TYPES: [&str; 2] = ["Accepted", "Programmed"];
+const SET_TYPES: [&str; 3] = ["Accepted", "Programmed", translate::AFFECTED];
 /// On a BackendTLSPolicy's ancestor.
 const ANCESTOR_TYPES: [&str; 2] = ["Accepted", "ResolvedRefs"];
 /// On a RateLimitPolicy's ancestor.
