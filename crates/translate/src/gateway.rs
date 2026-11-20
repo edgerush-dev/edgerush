@@ -47,6 +47,11 @@ pub struct GatewayOutcome {
     /// `<namespace>/<Secret>`; or why it cannot be used, which leaves those backends reached
     /// without one (04 §2). None where it names none.
     pub client_certificate: Option<Result<String, RefProblem>>,
+    /// Each port its `spec.tls.frontend` validates clients' certificates on, where an HTTPS
+    /// listener of it or of an attached ListenerSet is accepted, by the CA certificates, in
+    /// PEM, that vouch for them: the data plane's listener there validates every client
+    /// (04 §2).
+    pub validated: BTreeMap<u16, Vec<String>>,
 }
 
 /// A ListenerSet naming the data plane's Gateway as its parent.
@@ -96,6 +101,9 @@ pub struct ListenerOutcome {
     pub certificates: Vec<String>,
     /// Its `certificateRefs` that cannot be used, each with why (`ResolvedRefs` false).
     pub certificate_problems: Vec<RefProblem>,
+    /// The CA certificate refs of the Gateway's validation of clients on its port, for an
+    /// HTTPS listener, that cannot be used, each with why (`ResolvedRefs` false).
+    pub ca_problems: Vec<RefProblem>,
 }
 
 impl fmt::Display for ListenerOutcome {
@@ -284,15 +292,27 @@ pub enum ListenerProblem {
     /// A protocol the gateway never serves (the spec's `UnsupportedProtocol`).
     #[error("protocol `{0}` is not one the gateway serves")]
     UnsupportedProtocol(String),
-    /// An HTTPS listener on a port whose clients the Gateway's `spec.tls.frontend` asks to
-    /// show a certificate it validates: that validation is not served yet, and a listener
-    /// served without it would let in every client it asks to be checked
-    /// (`UnsupportedValue`).
+    /// An HTTPS listener on a port whose clients the Gateway's `spec.tls.frontend` validates
+    /// in a mode other than `AllowValidOnly`, which is not served: a listener served in
+    /// another mode would not be validating clients as it asks (`UnsupportedValue`).
     #[error(
-        "the Gateway's spec.tls.frontend validates client certificates on port {port}, which \
-         the gateway does not serve yet"
+        "the Gateway's spec.tls.frontend validates client certificates on port {port} in mode \
+         `{mode}`, which the gateway does not serve"
     )]
-    ClientValidation {
+    ValidationMode {
+        /// The port.
+        port: u16,
+        /// The mode.
+        mode: String,
+    },
+    /// An HTTPS listener on a port whose clients the Gateway's `spec.tls.frontend` validates,
+    /// none of whose CA certificates can be used (`NoValidCACertificate`): no client could
+    /// show a certificate one vouches for.
+    #[error(
+        "none of the CA certificates the Gateway's spec.tls.frontend validates client \
+         certificates with on port {port} can be used"
+    )]
+    NoValidCaCertificate {
         /// The port.
         port: u16,
     },
@@ -398,20 +418,33 @@ impl ListenerProblem {
     }
 }
 
-/// The ports on which the Gateway's `spec.tls.frontend` validates the certificates of the
-/// clients of its HTTPS listeners, and of its ListenerSets': every port, where its
-/// `default` has a `validation`, but those a `perPort` entry names, each of which its own
-/// entry's `validation` says.
+/// The mode in which the gateway validates clients' certificates: a client without a
+/// certificate its authorities vouch for is refused in the handshake.
+const VALID_ONLY: &str = "AllowValidOnly";
+
+/// How the Gateway's `spec.tls.frontend` validates the certificates of the clients of its
+/// HTTPS listeners, and of its ListenerSets', on each port: as its `default` says, but on a
+/// port a `perPort` entry names, as that entry says, one of no `validation` validating none
+/// there.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ValidatedPorts {
-    /// Whether the `default` validates.
-    default: bool,
-    /// Whether each port a `perPort` entry names validates.
-    per_port: BTreeMap<i32, bool>,
+pub(crate) struct Frontend {
+    /// The `default`'s validation.
+    default: Option<Validation>,
+    /// Each port a `perPort` entry names, by its validation.
+    per_port: BTreeMap<i32, Option<Validation>>,
 }
 
-impl ValidatedPorts {
-    /// The ports `gateway`'s `spec.tls.frontend` validates clients on.
+/// A validation of the Gateway's `spec.tls.frontend`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Validation {
+    /// Its CA certificate refs, each as group, kind, name and namespace, if it names one.
+    refs: Vec<(String, String, String, Option<String>)>,
+    /// Its mode.
+    mode: String,
+}
+
+impl Frontend {
+    /// How `gateway`'s `spec.tls.frontend` validates clients.
     pub(crate) fn of(gateway: &Gateway) -> Self {
         let Some(frontend) = gateway
             .spec
@@ -421,21 +454,107 @@ impl ValidatedPorts {
         else {
             return Self::default();
         };
-        Self {
-            default: frontend.default.validation.is_some(),
-            per_port: frontend
-                .per_port
-                .iter()
-                .flatten()
-                .map(|entry| (entry.port, entry.tls.validation.is_some()))
-                .collect(),
-        }
+        // The schema's two kinds of entry are of one shape.
+        let default = frontend
+            .default
+            .validation
+            .as_ref()
+            .map(|validation| Validation {
+                refs: validation
+                    .ca_certificate_refs
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.group.clone(),
+                            r.kind.clone(),
+                            r.name.clone(),
+                            r.namespace.clone(),
+                        )
+                    })
+                    .collect(),
+                mode: validation.mode.clone(),
+            });
+        let per_port = frontend
+            .per_port
+            .iter()
+            .flatten()
+            .map(|entry| {
+                let validation = entry.tls.validation.as_ref().map(|validation| Validation {
+                    refs: validation
+                        .ca_certificate_refs
+                        .iter()
+                        .map(|r| {
+                            (
+                                r.group.clone(),
+                                r.kind.clone(),
+                                r.name.clone(),
+                                r.namespace.clone(),
+                            )
+                        })
+                        .collect(),
+                    mode: validation.mode.clone(),
+                });
+                (entry.port, validation)
+            })
+            .collect();
+        Self { default, per_port }
     }
 
-    /// Whether clients are validated on `port`.
-    pub(crate) fn validates(&self, port: i32) -> bool {
-        self.per_port.get(&port).copied().unwrap_or(self.default)
+    /// How clients are validated on `port`, if they are.
+    pub(crate) fn on(&self, port: i32) -> Option<&Validation> {
+        match self.per_port.get(&port) {
+            Some(entry) => entry.as_ref(),
+            None => self.default.as_ref(),
+        }
     }
+}
+
+/// The CA certificates of a port's validation: those of its refs that can be used, in PEM,
+/// and why each other cannot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Authorities {
+    /// The CA certificates, in PEM, in the order the refs name them.
+    pub pem: Vec<String>,
+    /// Each ref that cannot be used, with why.
+    pub problems: Vec<RefProblem>,
+}
+
+/// The CA certificates of `validation`, the Gateway's of `namespace`: each ref asked first
+/// whether it may be reached, a ConfigMap of the Gateway's namespace or of one whose
+/// ReferenceGrant lets Gateways of `namespace` reach it, as the spec has `RefNotPermitted`
+/// for it; then whether it is a ConfigMap (`InvalidCACertificateKind`), the Core, as a
+/// BackendTLSPolicy's CA certificates are (04 §2); then whether its `ca.crt` holds
+/// certificates the data plane can read (`InvalidCACertificateRef`).
+fn authorities(validation: &Validation, namespace: &str, cluster: &Cluster) -> Authorities {
+    let mut authorities = Authorities::default();
+    for (group, kind, name, in_namespace) in &validation.refs {
+        let in_namespace = in_namespace.as_deref().unwrap_or(namespace);
+        let named = if group.is_empty() {
+            kind.clone()
+        } else {
+            format!("{group}/{kind}")
+        };
+        let read = if let Err(why) = reachable(
+            cluster,
+            ("Gateway", namespace),
+            (named.as_str(), in_namespace, name),
+        ) {
+            Err(RefProblem::new(RefReason::NotPermitted, why))
+        } else if !(group.is_empty() && kind == "ConfigMap") {
+            Err(RefProblem::new(
+                RefReason::InvalidKind,
+                format!("a CA certificate ref of kind {named} is not one translation reads"),
+            ))
+        } else {
+            crate::backend_tls::config_map_authorities(cluster, in_namespace, name)
+                .map_err(|why| RefProblem::new(RefReason::NotFound, why))
+        };
+        match read {
+            Ok(pem) => authorities.pem.push(pem),
+            Err(problem) => authorities.problems.push(problem),
+        }
+    }
+    authorities
 }
 
 /// The data plane's Gateway, its class checked, its listeners accepted or refused: `None`,
@@ -485,8 +604,15 @@ pub(crate) fn outcome(
         .filter(|(_, settings)| settings.http3.is_some())
         .map(|(port, _)| *port)
         .collect();
-    let validated = ValidatedPorts::of(gateway);
-    let mut listeners = listeners(&written, &object, &http3, &validated);
+    let mut listeners = listeners(&written, &object, &http3);
+    let validated = validated(
+        &mut listeners,
+        &written,
+        &Frontend::of(gateway),
+        (&object, &named.namespace),
+        cluster,
+        report,
+    );
     // Bound as long as one listener on them is accepted: one whose certificates cannot be
     // used too, which keeps its port refusing its hostname (04 §2). For HTTPS where an HTTPS
     // listener shares the port with TLS ones.
@@ -584,7 +710,97 @@ pub(crate) fn outcome(
         udp_ports,
         sets,
         client_certificate,
+        validated,
     })
+}
+
+/// The CA certificates clients' certificates are validated with on each port of an HTTPS
+/// listener the Gateway's `spec.tls.frontend` validates clients on (04 §2), as `frontend`
+/// says, the Gateway being `gateway` of `namespace`: each such listener accepted as judged
+/// is given the port's refs that cannot be used, said of the Gateway by name and of a
+/// ListenerSet's listener without, as nothing of its parent is told a ListenerSet
+/// (GEP-1713); and is refused where none can be used, or where the mode is not
+/// `AllowValidOnly`, refused after it took its port, so that it still counts in what
+/// conflicts, and leaves the port unbound unless another listener is accepted there.
+/// A port of no such listener left accepted is not in what this gives.
+fn validated(
+    listeners: &mut [ListenerOutcome],
+    written: &[Written],
+    frontend: &Frontend,
+    (gateway, namespace): (&Object, &str),
+    cluster: &Cluster,
+    report: &mut Vec<Finding>,
+) -> BTreeMap<u16, Vec<String>> {
+    let mut resolved: BTreeMap<u16, Authorities> = BTreeMap::new();
+    let mut served: BTreeSet<u16> = BTreeSet::new();
+    for (listener, written) in listeners.iter_mut().zip(written) {
+        if listener.served.is_err() || written.listener.protocol != "HTTPS" {
+            continue;
+        }
+        let port = listener.port;
+        let Some(validation) = frontend.on(written.listener.port) else {
+            continue;
+        };
+        if validation.mode != VALID_ONLY {
+            listener.served = Err(ListenerProblem::ValidationMode {
+                port,
+                mode: validation.mode.clone(),
+            });
+            continue;
+        }
+        let authorities = resolved.entry(port).or_insert_with(|| {
+            let authorities = authorities(validation, namespace, cluster);
+            for problem in &authorities.problems {
+                report.push(Finding {
+                    object: gateway.clone(),
+                    problem: Problem::ClientAuthority {
+                        port,
+                        why: problem.why.clone(),
+                    },
+                });
+            }
+            authorities
+        });
+        listener.ca_problems = if written.set.is_some() {
+            // One line for each reason, in the order first met, as lines told apart by
+            // nothing but the ref they name would say the same thing over.
+            let mut told: Vec<RefProblem> = Vec::new();
+            for problem in &authorities.problems {
+                if told.iter().all(|said| said.reason != problem.reason) {
+                    told.push(RefProblem::new(problem.reason, unnamed(problem.reason)));
+                }
+            }
+            told
+        } else {
+            authorities.problems.clone()
+        };
+        if authorities.pem.is_empty() {
+            listener.served = Err(ListenerProblem::NoValidCaCertificate { port });
+        } else {
+            served.insert(port);
+        }
+    }
+    resolved
+        .into_iter()
+        .filter(|(port, _)| served.contains(port))
+        .map(|(port, authorities)| (port, authorities.pem))
+        .collect()
+}
+
+/// What a ListenerSet's listener is told of a CA certificate ref of its parent's validation
+/// of clients that cannot be used for `reason`, naming nothing of the parent's (GEP-1713).
+fn unnamed(reason: crate::RefReason) -> String {
+    match reason {
+        crate::RefReason::NotPermitted => {
+            "a CA certificate ref of the Gateway's client certificate validation is not permitted"
+        }
+        crate::RefReason::InvalidKind => {
+            "a CA certificate ref of the Gateway's client certificate validation is of a kind \
+             not read"
+        }
+        _ => "a CA certificate of the Gateway's client certificate validation cannot be used",
+    }
+    .to_owned()
 }
 
 /// The client certificate `gateway`, of `namespace`, shows backends it reaches over TLS, if
@@ -839,9 +1055,7 @@ pub(crate) struct Written {
 /// Each listener's outcome, in the order listeners merge (04 §2): the Gateway's own, then
 /// each attached ListenerSet's. A protocol not taken is refused first, and plays no part in
 /// what conflicts (the spec: a listener of a protocol not supported is not accepted, and
-/// the rules of distinctness are for those that are), as is an HTTPS listener on a port
-/// whose clients' certificates the Gateway's `spec.tls.frontend` validates, which is not
-/// served yet, so that no client reaches it unchecked; then the first listener on a port
+/// the rules of distinctness are for those that are); then the first listener on a port
 /// takes it for its protocol, HTTPS and TLS together, which share a port told apart by
 /// hostname, and a later one stating it for another, or in a place an earlier one has
 /// (port, protocol and hostname, HTTPS and TLS as one), is refused, as the spec has a
@@ -868,11 +1082,10 @@ pub(crate) fn listeners(
     written: &[Written],
     gateway: &Object,
     http3: &BTreeSet<u16>,
-    validated: &ValidatedPorts,
 ) -> Vec<ListenerOutcome> {
     let mut yielded: BTreeSet<usize> = BTreeSet::new();
     loop {
-        let outcomes = judged(written, gateway, &yielded, validated);
+        let outcomes = judged(written, gateway, &yielded);
         let accepted = |protocol: &'static str| {
             outcomes
                 .iter()
@@ -901,13 +1114,11 @@ pub(crate) fn listeners(
 }
 
 /// Each listener's outcome, as `listeners` has it, those at the places `yielded` holds
-/// refused for HTTP/3 before any other judgement, and an HTTPS one on a port `validated`
-/// holds refused as one of a protocol not taken is.
+/// refused for HTTP/3 before any other judgement.
 fn judged(
     written: &[Written],
     gateway: &Object,
     yielded: &BTreeSet<usize>,
-    validated: &ValidatedPorts,
 ) -> Vec<ListenerOutcome> {
     // The ports each resource (the Gateway's own listeners, `None`, or a ListenerSet's)
     // states for TCP and for HTTP, HTTPS or TLS.
@@ -953,9 +1164,6 @@ fn judged(
             let port = u16::try_from(listener.port).unwrap_or_default();
             let set = stated.set.as_ref();
             let served = protocol(listener).and_then(|protocol| {
-                if protocol == Protocol::Https && validated.validates(listener.port) {
-                    return Err(ListenerProblem::ClientValidation { port });
-                }
                 if not_distinct.contains(&(set, listener.port)) {
                     return Err(ListenerProblem::NotDistinct {
                         port,
@@ -1033,6 +1241,7 @@ fn judged(
                 passes_through: listener.protocol == "TLS",
                 certificates: Vec::new(),
                 certificate_problems: Vec::new(),
+                ca_problems: Vec::new(),
             }
         })
         .collect()
@@ -1184,10 +1393,10 @@ fn selector_of(
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayListeners, ListenerOutcome, Namespaces, Requirement, Selector, ValidatedPorts,
-        Written,
+        Frontend, GatewayListeners, ListenerOutcome, Namespaces, Requirement, Selector, Written,
     };
     use crate::{Cluster, Object};
+    use k8s_openapi::serde_json;
 
     /// The outcomes of a Gateway's own listeners, `written`.
     fn listeners(written: &[GatewayListeners]) -> Vec<ListenerOutcome> {
@@ -1204,12 +1413,7 @@ mod tests {
             namespace: "edge".to_owned(),
             name: "web".to_owned(),
         };
-        super::listeners(
-            &written,
-            &gateway,
-            &BTreeSet::new(),
-            &ValidatedPorts::default(),
-        )
+        super::listeners(&written, &gateway, &BTreeSet::new())
     }
     use crate::listeners::MOST_GATEWAY_PORTS;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1332,18 +1536,30 @@ mod tests {
 
     /// A Gateway's `spec.tls.frontend` validates clients on every port where its `default`
     /// has a `validation`, but on a port a `perPort` entry names, as that entry says: one
-    /// of no `validation` validates none there.
+    /// of no `validation` validates none there. Each in its own mode, `AllowValidOnly`
+    /// unless said.
     #[test]
     fn clients_are_validated_on_the_ports_the_frontend_says() {
         let validation = "{ caCertificateRefs: [{ group: \"\", kind: ConfigMap, name: ca }] }";
+        let fallback = "{ caCertificateRefs: [{ group: \"\", kind: ConfigMap, name: other }], \
+                        mode: AllowInsecureFallback }";
         let validated = |tls: &str| {
-            let validated = ValidatedPorts::of(&gateway_of(tls));
+            let frontend = Frontend::of(&gateway_of(tls));
             [443, 8443, 9443]
                 .into_iter()
-                .filter(|port| validated.validates(*port))
-                .collect::<Vec<i32>>()
+                .filter_map(|port| {
+                    frontend.on(port).map(|validation| {
+                        let names: Vec<&str> = validation
+                            .refs
+                            .iter()
+                            .map(|(_, _, name, _)| name.as_str())
+                            .collect();
+                        format!("{port}: {} {}", names.join(","), validation.mode)
+                    })
+                })
+                .collect::<Vec<String>>()
         };
-        let none: Vec<i32> = Vec::new();
+        let none: Vec<String> = Vec::new();
         assert_eq!(validated(""), none);
         assert_eq!(validated("{ backend: {} }"), none);
         assert_eq!(validated("{ frontend: { default: {} } }"), none);
@@ -1351,80 +1567,158 @@ mod tests {
             validated(&format!(
                 "{{ frontend: {{ default: {{ validation: {validation} }} }} }}"
             )),
-            [443, 8443, 9443]
+            [
+                "443: ca AllowValidOnly",
+                "8443: ca AllowValidOnly",
+                "9443: ca AllowValidOnly"
+            ]
         );
         assert_eq!(
             validated(&format!(
-                "{{ frontend: {{ default: {{}}, perPort: [{{ port: 8443, tls: {{ validation: {validation} }} }}] }} }}"
+                "{{ frontend: {{ default: {{}}, perPort: [{{ port: 8443, tls: {{ validation: {fallback} }} }}] }} }}"
             )),
-            [8443]
+            ["8443: other AllowInsecureFallback"]
         );
         assert_eq!(
             validated(&format!(
                 "{{ frontend: {{ default: {{ validation: {validation} }}, perPort: [{{ port: 8443, tls: {{}} }}] }} }}"
             )),
-            [443, 9443]
+            ["443: ca AllowValidOnly", "9443: ca AllowValidOnly"]
         );
     }
 
-    /// An HTTPS listener on a port whose clients the Gateway validates is refused, as
-    /// validation is not served yet, and takes no port, as one of a protocol not taken: a
-    /// later listener of another protocol there is served, and HTTP/3 there takes no UDP
-    /// listener's place. Other protocols on that port, and HTTPS on another, are served.
+    /// A CA certificate ref of a Gateway's validation of clients is asked first whether it
+    /// may be reached, as the spec has `RefNotPermitted`; then whether it is a ConfigMap
+    /// (`InvalidCACertificateKind`); then whether its `ca.crt` holds certificates the data
+    /// plane can read (`InvalidCACertificateRef`). Those that can be used are, the others
+    /// said.
     #[test]
-    fn an_https_listener_whose_clients_are_validated_is_refused() {
-        let validated = ValidatedPorts::of(&gateway_of(
-            "{ frontend: { default: {}, perPort: [{ port: 443, tls: { validation: \
-             { caCertificateRefs: [{ group: \"\", kind: ConfigMap, name: ca }] } } }] } }",
+    fn a_ca_certificate_ref_is_granted_then_of_its_kind_then_usable() {
+        use crate::RefReason::{InvalidKind, NotFound, NotPermitted};
+        use k8s_openapi::api::core::v1::ConfigMap;
+
+        // The test certificate of the Secret shop-tls, a CA of its own.
+        let pem = include_str!("../tests/golden/shared.yaml")
+            .split("\n---\n")
+            .find(|doc| doc.contains("name: shop-tls,"))
+            .and_then(|doc| {
+                let start = doc.find("-----BEGIN CERTIFICATE-----")?;
+                let end = doc.find("-----END CERTIFICATE-----")?;
+                Some(
+                    doc[start..end + "-----END CERTIFICATE-----".len()]
+                        .lines()
+                        .map(str::trim)
+                        .collect::<Vec<&str>>()
+                        .join("\n"),
+                )
+            })
+            .unwrap();
+        let config_map = |namespace: &str, name: &str, ca: Option<&str>| -> ConfigMap {
+            let data = ca.map_or_else(String::new, |ca| {
+                format!(
+                    ", data: {{ ca.crt: {} }}",
+                    serde_json::to_string(ca).unwrap()
+                )
+            });
+            serde_saphyr::from_str(&format!(
+                "{{ metadata: {{ name: {name}, namespace: {namespace} }}{data} }}"
+            ))
+            .unwrap()
+        };
+        let grant = serde_saphyr::from_str(
+            "metadata: { name: gateways-of-edge, namespace: certs }
+spec:
+  from: [{ group: gateway.networking.k8s.io, kind: Gateway, namespace: edge }]
+  to: [{ group: \"\", kind: ConfigMap, name: ca }]
+",
+        )
+        .unwrap();
+        let cluster = Cluster {
+            config_maps: vec![
+                config_map("edge", "ca", Some(&pem)),
+                config_map("edge", "empty", None),
+                config_map("edge", "garbled", Some("not a certificate")),
+                config_map("certs", "ca", Some(&pem)),
+                config_map("certs", "other", Some(&pem)),
+            ],
+            reference_grants: vec![grant],
+            ..Cluster::default()
+        };
+        let read = |reference: &str| {
+            let frontend = Frontend::of(&gateway_of(&format!(
+                "{{ frontend: {{ default: {{ validation: {{ caCertificateRefs: [{reference}] }} }} }} }}"
+            )));
+            let authorities = super::authorities(frontend.on(443).unwrap(), "edge", &cluster);
+            match (authorities.pem.as_slice(), authorities.problems.as_slice()) {
+                ([read], []) => Ok(read.clone()),
+                ([], [problem]) => Err(problem.reason),
+                other => panic!("{reference}: {other:?}"),
+            }
+        };
+        for (reference, read_as) in [
+            (
+                "{ group: \"\", kind: ConfigMap, name: ca }",
+                Ok(pem.clone()),
+            ),
+            (
+                "{ group: \"\", kind: ConfigMap, name: ca, namespace: certs }",
+                Ok(pem.clone()),
+            ),
+            (
+                "{ group: \"\", kind: ConfigMap, name: other, namespace: certs }",
+                Err(NotPermitted),
+            ),
+            (
+                "{ group: \"\", kind: ConfigMap, name: ca, namespace: blog }",
+                Err(NotPermitted),
+            ),
+            // Of a kind the grant does not name: not permitted, before its kind is asked.
+            (
+                "{ group: \"\", kind: Secret, name: ca, namespace: certs }",
+                Err(NotPermitted),
+            ),
+            ("{ group: \"\", kind: Secret, name: ca }", Err(InvalidKind)),
+            (
+                "{ group: example.com, kind: ConfigMap, name: ca }",
+                Err(InvalidKind),
+            ),
+            (
+                "{ group: \"\", kind: ConfigMap, name: absent }",
+                Err(NotFound),
+            ),
+            (
+                "{ group: \"\", kind: ConfigMap, name: empty }",
+                Err(NotFound),
+            ),
+            (
+                "{ group: \"\", kind: ConfigMap, name: garbled }",
+                Err(NotFound),
+            ),
+        ] {
+            assert_eq!(read(reference), read_as, "{reference}");
+        }
+
+        // Some that can be used among some that cannot: those that can are, in order.
+        let frontend = Frontend::of(&gateway_of(
+            "{ frontend: { default: { validation: { caCertificateRefs: [\
+             { group: \"\", kind: ConfigMap, name: absent }, \
+             { group: \"\", kind: ConfigMap, name: ca }, \
+             { group: \"\", kind: Secret, name: ca }, \
+             { group: \"\", kind: ConfigMap, name: ca, namespace: certs }] } } } }",
         ));
-        let said = said_validating(
-            &[
-                "{ name: secure, port: 443, protocol: HTTPS }",
-                "{ name: passed, port: 443, protocol: TLS, hostname: tls.example.com, tls: { mode: Passthrough } }",
-                "{ name: datagrams, port: 443, protocol: UDP }",
-                "{ name: other, port: 8443, protocol: HTTPS }",
-                "{ name: named, port: 8443, protocol: HTTPS, hostname: b.example.com }",
-            ],
-            &[443],
-            &validated,
-        );
-        assert_eq!(
-            said,
-            [
-                "secure: the Gateway's spec.tls.frontend validates client certificates on port \
-                 443, which the gateway does not serve yet",
-                "passed: port-443",
-                "datagrams: port-443-udp",
-                "other: port-8443",
-                "named: port-8443",
-            ]
-        );
-        let said = said_validating(
-            &[
-                "{ name: secure, port: 443, protocol: HTTPS }",
-                "{ name: plain, port: 443, protocol: HTTP }",
-            ],
-            &[],
-            &validated,
-        );
-        assert_eq!(
-            said,
-            [
-                "secure: the Gateway's spec.tls.frontend validates client certificates on port \
-                 443, which the gateway does not serve yet",
-                "plain: port-443",
-            ]
-        );
+        let authorities = super::authorities(frontend.on(443).unwrap(), "edge", &cluster);
+        assert_eq!(authorities.pem, [pem.clone(), pem]);
+        let reasons: Vec<crate::RefReason> = authorities
+            .problems
+            .iter()
+            .map(|problem| problem.reason)
+            .collect();
+        assert_eq!(reasons, [NotFound, InvalidKind]);
     }
 
     /// The outcomes of a Gateway's own listeners, each written as YAML, where `http3` holds
     /// the ports whose settings serve HTTP/3, said a line each.
     fn said_with(written: &[&str], http3: &[u16]) -> Vec<String> {
-        said_validating(written, http3, &ValidatedPorts::default())
-    }
-
-    /// As `said_with`, where clients are validated on the ports `validated` holds.
-    fn said_validating(written: &[&str], http3: &[u16], validated: &ValidatedPorts) -> Vec<String> {
         let written: Vec<Written> = written
             .iter()
             .map(|yaml| Written {
@@ -1438,18 +1732,13 @@ mod tests {
             namespace: "edge".to_owned(),
             name: "web".to_owned(),
         };
-        super::listeners(
-            &written,
-            &gateway,
-            &http3.iter().copied().collect(),
-            validated,
-        )
-        .iter()
-        .map(|o| match &o.served {
-            Ok(on) => format!("{}: {}", o.name, on.join(", ")),
-            Err(why) => format!("{}: {why}", o.name),
-        })
-        .collect()
+        super::listeners(&written, &gateway, &http3.iter().copied().collect())
+            .iter()
+            .map(|o| match &o.served {
+                Ok(on) => format!("{}: {}", o.name, on.join(", ")),
+                Err(why) => format!("{}: {why}", o.name),
+            })
+            .collect()
     }
 
     /// A UDP listener is served on a `udp` listener of its port, apart from one of another
@@ -1614,12 +1903,7 @@ mod tests {
             namespace: of.map_or("edge", |_| "shop").to_owned(),
         })
         .collect();
-        let outcomes = super::listeners(
-            &written,
-            &gateway,
-            &BTreeSet::new(),
-            &ValidatedPorts::default(),
-        );
+        let outcomes = super::listeners(&written, &gateway, &BTreeSet::new());
         let said: Vec<String> = outcomes
             .iter()
             .map(|o| match &o.served {
@@ -1695,12 +1979,7 @@ mod tests {
             set: Some(set),
             namespace: "shop".to_owned(),
         });
-        let outcomes = super::listeners(
-            &written,
-            &gateway,
-            &BTreeSet::new(),
-            &ValidatedPorts::default(),
-        );
+        let outcomes = super::listeners(&written, &gateway, &BTreeSet::new());
         let last = outcomes.last().unwrap();
         assert_eq!(
             last.served

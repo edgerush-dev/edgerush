@@ -286,6 +286,15 @@ fn the_table_claims_the_gateway_http_extended_features_that_pass() {
 }
 
 #[test]
+fn the_table_claims_client_certificate_validation_in_its_default_mode_alone() {
+    // Its three tests pass in GATEWAY-HTTP (#475); AllowInsecureFallback is not served yet.
+    assert!(SUPPORTED_FEATURES.contains(&"GatewayFrontendClientCertificateValidation"));
+    assert!(
+        !SUPPORTED_FEATURES.contains(&"GatewayFrontendClientCertificateValidationInsecureFallback")
+    );
+}
+
+#[test]
 fn the_table_claims_the_gateway_grpc_profiles_core_and_grpcroutes_extended_features() {
     // GATEWAY-GRPC's core and GRPCRoute's two extended features pass every test the suite
     // has of them (#447); the profile's other extended features are the Gateway's and

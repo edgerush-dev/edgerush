@@ -36,12 +36,12 @@
 use backend_tls::{Outcome, Policies};
 use edgerush_certificates::Identity;
 use edgerush_config::{
-    Backend, Certificate, Config, DataPlane, Endpoints, Filter, Forward, Global, GrpcMethod,
-    Header, HeaderChanges, Hostname, Limit, Limits, Listener, ListenerCertificate, LoadBalancer,
-    MOST_LIMITS, Match, PathMatch, Protocol, Query, RateLimitMode, RateLimiting, Redirect, Route,
-    Rule, Scheme, SharingHostname, SharingListener, StatedNames, TcpRoute, TlsRoute, UdpRoute,
-    Upstream, UpstreamProtocol, UpstreamTls, ValueMatch, WellKnownAuthorities, Wildcard, compile,
-    is_spiffe_id,
+    Backend, Certificate, ClientValidation, Config, DataPlane, Endpoints, Filter, Forward, Global,
+    GrpcMethod, Header, HeaderChanges, Hostname, Limit, Limits, Listener, ListenerCertificate,
+    LoadBalancer, MOST_LIMITS, Match, PathMatch, Protocol, Query, RateLimitMode, RateLimiting,
+    Redirect, Route, Rule, Scheme, SharingHostname, SharingListener, StatedNames, TcpRoute,
+    TlsRoute, UdpRoute, Upstream, UpstreamProtocol, UpstreamTls, ValueMatch, WellKnownAuthorities,
+    Wildcard, compile, is_spiffe_id,
 };
 use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use edgerush_gateway_api::gateway::Gateway;
@@ -556,6 +556,18 @@ pub enum TlsProblem {
         /// Its listener naming the host.
         listener: String,
     },
+    /// A host served over TLS on a port whose clients the data plane's Gateway validates
+    /// (`spec.tls.frontend`), sharing that port with its HTTPS listeners: its clients must
+    /// show a certificate the Gateway's CA certificates vouch for, as theirs must, as the
+    /// host is a listener of its own there, as an implicit ListenerSet's would be (04 §2).
+    ClientsValidated {
+        /// The host.
+        host: String,
+        /// The Gateway.
+        gateway: Object,
+        /// The port.
+        port: u16,
+    },
     /// A host an older Ingress states another Secret for, which is the one served.
     Taken {
         /// The host.
@@ -639,6 +651,16 @@ impl fmt::Display for TlsFinding {
                 f,
                 "{object}: {host} is passed through by {gateway}'s TLS listener {listener}, \
                  which names it, and not served over TLS here"
+            ),
+            TlsProblem::ClientsValidated {
+                host,
+                gateway,
+                port,
+            } => write!(
+                f,
+                "{object}: {host}'s clients must show a certificate {gateway}'s client \
+                 certificate validation trusts, as port {port} is shared with its HTTPS \
+                 listeners, which validate clients"
             ),
             TlsProblem::Taken {
                 host,
@@ -1071,6 +1093,16 @@ pub enum Problem {
         /// The listener's name.
         name: String,
         /// Why.
+        why: String,
+    },
+    /// A CA certificate ref of the data plane's Gateway's validation of clients on a port
+    /// (`spec.tls.frontend`) cannot be used: its HTTPS listeners there validate clients with
+    /// the others, and none is accepted if there are none (04 §2).
+    #[error("a CA certificate it validates clients with on port {port} cannot be used: {why}")]
+    ClientAuthority {
+        /// The port.
+        port: u16,
+        /// Why: `ConfigMap shop/ca does not exist`.
         why: String,
     },
     /// The client certificate the data plane's Gateway names for backends cannot be used
@@ -2045,6 +2077,40 @@ fn translated(
         gateway_tls(&mut config, gateway, cluster, &mut report);
         if let Some(Ok(name)) = &gateway.client_certificate {
             client_certificate(&mut config, name, cluster);
+        }
+        // Every client of the data plane's listener on a port the Gateway validates clients
+        // on is validated: an Ingress's TLS hosts sharing it among them, each said (04 §2).
+        for (port, authorities) in &gateway.validated {
+            for tls in https_on(&mut config, *port) {
+                tls.client_validation = Some(ClientValidation {
+                    authorities: authorities.clone(),
+                });
+            }
+        }
+        if gateway.validated.contains_key(&plane.ingress_https_port) && !ingress_https.is_empty() {
+            let passed_over: Vec<&str> = tls
+                .iter()
+                .filter_map(|finding| match &finding.problem {
+                    TlsProblem::PassedOver { host, .. } => Some(host.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let validated: Vec<TlsFinding> = stated
+                .iter()
+                .filter(|(host, _)| {
+                    presented.iter().any(|(_, _, hosts)| hosts.contains(host))
+                        || passed_over.contains(&host.as_str())
+                })
+                .map(|(host, (object, ..))| TlsFinding {
+                    object: object.clone(),
+                    problem: TlsProblem::ClientsValidated {
+                        host: host.clone(),
+                        gateway: gateway.gateway.clone(),
+                        port: plane.ingress_https_port,
+                    },
+                })
+                .collect();
+            tls.extend(validated);
         }
     }
     shared_by(&mut config, gateway.as_ref(), &presented, &ingress_https);

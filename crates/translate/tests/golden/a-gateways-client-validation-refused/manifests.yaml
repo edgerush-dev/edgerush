@@ -1,0 +1,93 @@
+# A Gateway's HTTPS listeners on a port whose clients it validates are refused where none
+# of the CA certificates there can be used (NoValidCACertificate): 9443's are not there, of
+# a kind not read, and another namespace's that no ReferenceGrant lets it reach. Refused
+# after it took its port, such a listener still counts in what conflicts, so a later HTTP
+# listener there is refused; and the port is not bound, no listener there being accepted.
+# A ListenerSet's listener there is refused alike, told nothing of the Gateway's
+# ConfigMaps, and of the two not there once. A mode other than AllowValidOnly is not served: 10443's listener is refused.
+# 11443's one ref is of a kind not read, which alone its listener's refs are said to be
+# (InvalidCACertificateKind).
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  allowedListeners: { namespaces: { from: Same } }
+  tls:
+    frontend:
+      default: {}
+      perPort:
+        - port: 9443
+          tls:
+            validation:
+              caCertificateRefs:
+                - { group: "", kind: ConfigMap, name: absent }
+                - { group: "", kind: Secret, name: shop-tls }
+                - { group: "", kind: ConfigMap, name: ca, namespace: certs }
+                - { group: "", kind: ConfigMap, name: missing }
+        - port: 10443
+          tls:
+            validation:
+              caCertificateRefs: [{ group: "", kind: ConfigMap, name: ca }]
+              mode: AllowInsecureFallback
+        - port: 11443
+          tls:
+            validation:
+              caCertificateRefs: [{ group: "", kind: Service, name: web }]
+  listeners:
+    - { name: plain, port: 80, protocol: HTTP }
+    - name: invalid
+      port: 9443
+      protocol: HTTPS
+      tls: { certificateRefs: [{ name: shop-tls }] }
+    - { name: later, port: 9443, protocol: HTTP }
+    - name: fallback
+      port: 10443
+      protocol: HTTPS
+      tls: { certificateRefs: [{ name: shop-tls }] }
+    - name: service
+      port: 11443
+      protocol: HTTPS
+      tls: { certificateRefs: [{ name: shop-tls }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: team, namespace: shop }
+spec:
+  parentRef: { name: web }
+  listeners:
+    - name: team
+      port: 9443
+      protocol: HTTPS
+      hostname: secure.example.com
+      tls: { certificateRefs: [{ name: secure }] }
+---
+# The test certificate of the Secret shop-tls, a CA of its own.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: ca, namespace: shop }
+data:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+    DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+    MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+    hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+    /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+    vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+    AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+    RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+    MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+    -----END CERTIFICATE-----
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: ca, namespace: certs }
+data:
+  ca.crt: "not read: no ReferenceGrant lets the Gateway reach it"

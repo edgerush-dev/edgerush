@@ -412,27 +412,30 @@ fn authority(
             format!("a CA certificate ref to a {kind}, where a ConfigMap is read"),
         ));
     }
-    let invalid = |why: String| ("InvalidCACertificateRef", why);
-    let name = &reference.name;
+    config_map_authorities(cluster, namespace, &reference.name)
+        .map_err(|why| ("InvalidCACertificateRef", why))
+}
+
+/// The CA certificates, in PEM, of the ConfigMap `name` of `namespace`, its `ca.crt`, read
+/// as the data plane will read them; or why they cannot be used: a BackendTLSPolicy's, and
+/// a Gateway's validation of its clients' (04 §2).
+pub(crate) fn config_map_authorities(
+    cluster: &Cluster,
+    namespace: &str,
+    name: &str,
+) -> Result<String, String> {
     let Some(config_map) = cluster.config_maps.iter().find(|config_map| {
-        config_map.metadata.name.as_deref() == Some(name.as_str())
+        config_map.metadata.name.as_deref() == Some(name)
             && crate::namespace(&config_map.metadata) == namespace
     }) else {
-        return Err(invalid(format!(
-            "ConfigMap {namespace}/{name} does not exist"
-        )));
+        return Err(format!("ConfigMap {namespace}/{name} does not exist"));
     };
     let Some(pem) = config_map.data.as_ref().and_then(|data| data.get(CA_KEY)) else {
-        return Err(invalid(format!(
-            "ConfigMap {namespace}/{name} has no {CA_KEY}"
-        )));
+        return Err(format!("ConfigMap {namespace}/{name} has no {CA_KEY}"));
     };
     // BoringSSL's own reason is not said: it names its parser's state, not the ConfigMap's.
-    edgerush_certificates::authorities(std::slice::from_ref(pem)).map_err(|_| {
-        invalid(format!(
-            "ConfigMap {namespace}/{name}'s {CA_KEY} is not PEM certificates"
-        ))
-    })?;
+    edgerush_certificates::authorities(std::slice::from_ref(pem))
+        .map_err(|_| format!("ConfigMap {namespace}/{name}'s {CA_KEY} is not PEM certificates"))?;
     Ok(pem.clone())
 }
 

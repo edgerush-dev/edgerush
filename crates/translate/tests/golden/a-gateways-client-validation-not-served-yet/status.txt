@@ -1,8 +1,0 @@
-Gateway, generation 0: Accepted=True/ListenersNotValid (listeners not accepted: secure); ResolvedRefs=True/ResolvedRefs
-listener plain: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
-listener secure: no kind, attached 0: Accepted=False/UnsupportedValue (the Gateway's spec.tls.frontend validates client certificates on port 443, which the gateway does not serve yet); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (the Gateway's spec.tls.frontend validates client certificates on port 443, which the gateway does not serve yet)
-listener passed: TLSRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
-listener open: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
-attached ListenerSets: 0
-ListenerSet shop/team, generation 0: Accepted=False/ListenersNotValid (no listener is accepted); Programmed=False/ListenersNotValid (no listener is served)
-listener team: no kind, attached 0: Accepted=False/UnsupportedValue (the Gateway's spec.tls.frontend validates client certificates on port 9443, which the gateway does not serve yet); ResolvedRefs=True/ResolvedRefs; Programmed=False/Invalid (the Gateway's spec.tls.frontend validates client certificates on port 9443, which the gateway does not serve yet)

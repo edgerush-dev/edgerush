@@ -1,0 +1,85 @@
+# A Gateway's spec.tls.frontend validating its clients' certificates: on every port its
+# default's validation is for, 443 here, the data plane's listener refuses a client that
+# shows no certificate its CA certificates vouch for. A ref that cannot be used is said,
+# the listeners there not resolving their refs, and the others used. A perPort entry of no
+# validation leaves its port's clients unchecked: 8443's. A ListenerSet's HTTPS listener on
+# the port is validated as the Gateway's own, told nothing of the Gateway's ConfigMaps; and
+# an Ingress's TLS host sharing the port, a listener of its own there, is validated too,
+# and that is said.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: shop }
+spec:
+  gatewayClassName: edgerush
+  allowedListeners: { namespaces: { from: Same } }
+  tls:
+    frontend:
+      default:
+        validation:
+          caCertificateRefs:
+            - { group: "", kind: ConfigMap, name: ca }
+            - { group: "", kind: ConfigMap, name: absent }
+      perPort:
+        - { port: 8443, tls: {} }
+  listeners:
+    - name: secure
+      port: 443
+      protocol: HTTPS
+      tls: { certificateRefs: [{ name: shop-tls }] }
+    - name: open
+      port: 8443
+      protocol: HTTPS
+      hostname: open.example.com
+      tls: { certificateRefs: [{ name: shop-tls }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: team, namespace: shop }
+spec:
+  parentRef: { name: web }
+  listeners:
+    - name: team
+      port: 443
+      protocol: HTTPS
+      hostname: secure.example.com
+      tls: { certificateRefs: [{ name: secure }] }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: legacy, namespace: shop }
+spec:
+  ingressClassName: edge
+  tls: [{ hosts: [legacy.example.com], secretName: wild }]
+  rules:
+    - host: legacy.example.com
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+# The test certificate of the Secret shop-tls, a CA of its own.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: ca, namespace: shop }
+data:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIBkjCCATigAwIBAgIUU9OGsPkfuxUNCb/16hLH5e9lmT4wCgYIKoZIzj0EAwIw
+    DzENMAsGA1UEAwwEc2hvcDAgFw0yNjEwMjUxNjEyNDJaGA8yMTI2MTAwMTE2MTI0
+    MlowDzENMAsGA1UEAwwEc2hvcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRj
+    hOgcHJS8JzyeXuDeM+NYVtcLHVTEw+mc4lWlH+JJhLBF2q1SS47i85o3QYHHievv
+    /BScfmbrEk/CM5lzOR6jcDBuMB0GA1UdDgQWBBT999uIuH+XGSxwsoCMSpPV+4yd
+    vTAfBgNVHSMEGDAWgBT999uIuH+XGSxwsoCMSpPV+4ydvTAPBgNVHRMBAf8EBTAD
+    AQH/MBsGA1UdEQQUMBKCEHNob3AuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAw
+    RQIhAPlMRRFlTWmO/DTMPVno8x6qUk0Vs+JpEK7V6J0G+lIIAiB4UPMqnzqW3sBi
+    MOtcEpdQZB9tO6I1+/uWF+abUlauFQ==
+    -----END CERTIFICATE-----

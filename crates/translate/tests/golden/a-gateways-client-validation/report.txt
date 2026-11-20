@@ -1,0 +1,2 @@
+Gateway shop/web: a CA certificate it validates clients with on port 443 cannot be used: ConfigMap shop/absent does not exist
+Ingress shop/legacy: legacy.example.com's clients must show a certificate Gateway shop/web's client certificate validation trusts, as port 443 is shared with its HTTPS listeners, which validate clients
