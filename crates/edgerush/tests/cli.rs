@@ -1608,6 +1608,86 @@ spec:
     Ok(())
 }
 
+/// The worked example of rate limits, `examples/kubernetes/rate-limits`, from several paths:
+/// what the teams apply and what the operator makes of its DataPlane translate with nothing
+/// said, and with the mistakes beside them each RateLimitPolicy refused is said with why, a
+/// target not there or forwarding nothing is a note, and validate exits 1, as its README
+/// shows. A file under two of the paths is read once, and one path of several that cannot be
+/// read stops it.
+#[test]
+fn validate_says_each_rate_limit_policy_refused_and_why() -> io::Result<()> {
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/kubernetes/rate-limits");
+    let path = |relative: &str| {
+        example
+            .join(relative)
+            .to_str()
+            .expect("a path that is text")
+            .to_owned()
+    };
+    let validate = |more: &[&str]| {
+        let (manifests, made, data_plane) = (
+            path("manifests"),
+            path("validate/made-by-the-operator.yaml"),
+            path("validate/data-plane.yaml"),
+        );
+        let mut args = vec![
+            "validate",
+            "--from-manifests",
+            &manifests,
+            "--from-manifests",
+            &made,
+            "--data-plane",
+            &data_plane,
+        ];
+        args.extend(more);
+        edgerush(&args)
+    };
+    let summary = |left_out: usize, notes: &str| {
+        format!(
+            "11 routes and 8 upstreams translated; {left_out} left out; 0 paths without their backend; 0 TLS hosts or entries not served as listed; 0 paths shadowed; 0 Ingresses of other classes or none passed over{notes}
+TLS Secrets were taken as they will be in the cluster, not checked: --check-secrets checks them
+"
+        )
+    };
+
+    let output = validate(&[])?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), summary(0, ""));
+
+    // A file under two of the paths is read once: its objects are not two each, a policy
+    // holding a name against itself.
+    let shop = path("manifests/30-shop.yaml");
+    let output = validate(&["--from-manifests", &shop])?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), summary(0, ""));
+
+    let mistakes = path("mistakes.yaml");
+    let output = validate(&["--from-manifests", &mistakes])?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "RateLimitPolicy search/search-bad-rate: the data plane would refuse it: limit `search-suggest-per-ip`: `model.bucket.rate`: `100/sec` is not a rate: a number of at least 1, `/`, and `s`, `min`, `h` or `d`
+RateLimitPolicy shop/shop-products: refused: its limit `search-per-ip` has the name of RateLimitPolicy search/search's, which holds it
+note: RateLimitPolicy edge/platform-redirects: applies nothing to HTTPRoute edge/to-https section redirect, which forwards nothing: a rule that redirects is under no limits
+note: RateLimitPolicy legacy/legacy-billing-backend: applies nothing to Service legacy/billing: it is not there
+RateLimitPolicy legacy/legacy-billing-backend: none of its targets is there, so it applies nothing and has no status
+note: RateLimitPolicy shop/shop-checkout-typo: applies nothing to HTTPRoute shop/storefront section checkuot: it has no rule `checkuot`
+"
+        .to_owned()
+            + &summary(3, "; 3 notes")
+    );
+
+    let nowhere = path("nowhere");
+    let output = validate(&["--from-manifests", &nowhere])?;
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).starts_with("error: "),
+        "{output:?}"
+    );
+    Ok(())
+}
+
 /// A BackendTLSPolicy's `wellKnownCACertificates: System` trusts the authorities of the file
 /// `SSL_CERT_FILE` names, which `validate` reads as the controller does; a file named that
 /// cannot be read stops either at the start.

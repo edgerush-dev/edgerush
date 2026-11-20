@@ -1,0 +1,39 @@
+# Owned by the billing team (namespace `legacy`): an old app still on Ingress, served
+# by the same data plane through the IngressClass `edge.public`. Its host is outside
+# example.com: a host the Gateway's listeners cover is the Gateway's (see the README).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: legacy
+  labels: { edge.example.com/served: "true" }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: billing, namespace: legacy }
+spec:
+  ingressClassName: edge.public
+  tls: [{ hosts: [billing.example.net], secretName: billing-tls }]
+  rules:
+    - host: billing.example.net
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: billing, port: { number: 8080 } } } }
+---
+# Its Deployment is left out.
+apiVersion: v1
+kind: Service
+metadata: { name: billing, namespace: legacy }
+spec: { selector: { app: billing }, ports: [{ port: 8080 }] }
+---
+# An Ingress is a route-level target. The Gateway's limits (20-platform-policies.yaml)
+# never reach it; the DataPlane's `global` does.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: legacy-billing, namespace: legacy }
+spec:
+  targetRefs:
+    - { group: networking.k8s.io, kind: Ingress, name: billing }
+  limits:
+    - name: legacy-billing-per-ip
+      key: Client
+      model: { bucket: { rate: 50/s, burst: 100 } }

@@ -1,0 +1,102 @@
+# Owned by the shop team (namespace `shop`): its own hostname through a ListenerSet,
+# one storefront route split into named rules, and policies at three levels.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+  labels: { edge.example.com/served: "true", edge.example.com/listeners: "true" }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: { name: shop, namespace: shop }
+spec:
+  parentRef: { group: gateway.networking.k8s.io, kind: Gateway, name: public, namespace: edge }
+  listeners:
+    - name: shop-https
+      hostname: shop.example.com
+      port: 443
+      protocol: HTTPS
+      tls: { certificateRefs: [{ name: shop-example-com }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: storefront, namespace: shop }
+spec:
+  parentRefs: [{ group: gateway.networking.k8s.io, kind: ListenerSet, name: shop }]
+  rules:
+    - name: browse
+      matches: [{ path: { type: PathPrefix, value: / }, method: GET }]
+      backendRefs: [{ name: storefront, port: 8080 }]
+    - name: products-api
+      matches: [{ path: { type: PathPrefix, value: /api/products } }]
+      backendRefs: [{ name: catalogue, port: 8080 }]
+    - name: checkout              # its own rule so it can have its own limit
+      matches: [{ path: { type: PathPrefix, value: /checkout }, method: POST }]
+      backendRefs: [{ name: checkout, port: 8080 }]
+    - name: healthz
+      matches: [{ path: { type: Exact, value: /healthz } }]
+      backendRefs: [{ name: storefront, port: 8080 }]
+---
+# Everything arriving on shop.example.com, across all the shop's routes: one count.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: shop-all, namespace: shop }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: ListenerSet, name: shop }
+  limits:
+    - name: shop-per-ip
+      key: Client
+      model: { bucket: { rate: 300/s, burst: 600 } }
+---
+# The storefront route as a whole: every rule of it, one count across them.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: shop-storefront, namespace: shop }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: storefront }
+  limits:
+    - name: shop-storefront-per-ip
+      key: Client
+      model: { bucket: { rate: 200/s, burst: 400 } }
+---
+# Checkout: a tight limit of its own, counted apart from the rest of the storefront
+# (the rule is more specific than its route, so it may ignore the route's limit).
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: shop-checkout, namespace: shop }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: storefront, sectionName: checkout }
+  ignore: [shop-storefront-per-ip]
+  limits:
+    - name: shop-checkout-per-ip
+      key: Client
+      model: { fixedWindow: { limit: 5, window: 1s } }
+---
+# An ignore rule: health checks are never limited, by anything less specific than this
+# rule, today's limits or ones the platform adds later.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: shop-healthz, namespace: shop }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: storefront, sectionName: healthz }
+  ignore: ["*"]
+---
+# The storefront's backends; their Deployments are left out.
+apiVersion: v1
+kind: Service
+metadata: { name: storefront, namespace: shop }
+spec: { selector: { app: storefront }, ports: [{ port: 8080 }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: catalogue, namespace: shop }
+spec: { selector: { app: catalogue }, ports: [{ port: 8080 }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: checkout, namespace: shop }
+spec: { selector: { app: checkout }, ports: [{ port: 8080 }] }

@@ -1,0 +1,13 @@
+# The settings the control plane takes from the DataPlane edge/public
+# (manifests/10-platform.yaml), for `edgerush validate --data-plane`: its IngressClass and
+# Gateway, the defaults of its `ingress`, and its `rateLimiting`.
+ingress_class: edge.public
+gateway: edge/public
+cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+ingress_https_redirect: true
+ingress_https_redirect_max_age: 30
+rate_limiting:
+  mode: local
+  global:
+    - { name: platform-per-ip, key: client, model: { bucket: { rate: 2000/s, burst: 4000 } } }

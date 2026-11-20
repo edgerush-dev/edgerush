@@ -190,17 +190,21 @@ edgerush validate --from-manifests manifests/ --data-plane data-plane.yaml
 ```
 
 translates Kubernetes manifests as the control plane would for one data plane, without a
-cluster, and compiles the config as the data plane would. The manifests are a file or a
-directory (`kubectl get -o yaml` output included), with an IngressClass whose controller is
-`edgerush.dev/ingress-controller`. It reports, and exits 1 for:
+cluster, and compiles the config as the data plane would. The manifests are files or
+directories (`kubectl get -o yaml` output included), `--from-manifests` given once for
+each, with an IngressClass whose controller is `edgerush.dev/ingress-controller`. It
+reports, and exits 1 for:
 
-- each object left out, and why;
+- each object left out, and why, a RateLimitPolicy refused among them;
 - each path whose backend is not there;
 - what of an Ingress's `tls` is not served as it lists it;
 - each path another Ingress already has.
 
 TLS Secrets, seldom in a repository, are taken as they will be in the cluster, unless
-`--check-secrets` asks for them to be checked.
+`--check-secrets` asks for them to be checked. The manifests are taken as the API server
+accepted them: what their resources' schemas forbid is not checked here, and
+`kubectl apply --dry-run=server` checks it. [examples/kubernetes/rate-limits](examples/kubernetes/rate-limits/README.md)
+is a worked example.
 
 `data-plane.yaml` holds the data plane's settings, which a `DataPlane` resource states in a
 cluster:

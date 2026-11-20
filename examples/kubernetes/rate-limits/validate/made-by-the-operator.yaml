@@ -1,0 +1,46 @@
+# What the operator makes of manifests/10-platform.yaml, for `edgerush validate`, which
+# reads no DataPlane: the GatewayClass named after the ControlPlane, the IngressClass
+# `<control plane>.<data plane>` and the Gateway written from the DataPlane's `gateway`.
+# Never apply these: the operator owns them.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edge }
+spec: { controllerName: edgerush.dev/gateway-controller }
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata: { name: edge.public }
+spec: { controller: edgerush.dev/ingress-controller }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: public, namespace: edge }
+spec:
+  gatewayClassName: edge
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      hostname: "*.example.com"
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: "*.example.com"
+      tls: { certificateRefs: [{ name: wildcard-example-com }] }
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector: { matchLabels: { edge.example.com/served: "true" } }
+    - name: internal
+      port: 8443
+      protocol: HTTPS
+      hostname: "*.internal.example.com"
+      tls: { certificateRefs: [{ name: wildcard-internal-example-com }] }
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector: { matchLabels: { edge.example.com/served: "true" } }
+  allowedListeners:
+    namespaces:
+      from: Selector
+      selector: { matchLabels: { edge.example.com/listeners: "true" } }

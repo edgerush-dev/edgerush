@@ -1,0 +1,49 @@
+# Owned by the search team (namespace `search`): a route on the platform's https
+# listener, a limit, and a tighter one tried as a dry run before it is enforced.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: search
+  labels: { edge.example.com/served: "true" }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: search, namespace: search }
+spec:
+  parentRefs: [{ name: public, namespace: edge, sectionName: https }]
+  hostnames: [search.example.com]
+  rules:
+    - name: query
+      matches: [{ path: { type: PathPrefix, value: /api/search } }]
+      backendRefs: [{ name: search, port: 8080 }]
+    - name: suggest
+      matches: [{ path: { type: PathPrefix, value: /api/suggest } }]
+      backendRefs: [{ name: suggest, port: 8080 }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: search, namespace: search }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: search }
+  limits:
+    - name: search-per-ip
+      key: Client
+      model: { bucket: { rate: 100/s, burst: 200 } }
+    # Would 20/s hurt anyone? Counted and reported, never refusing: watch
+    # edgerush_rate_limit_decisions_total{limit="search-per-ip-strict", outcome="dry_run_refused"}.
+    - name: search-per-ip-strict
+      key: Client
+      dryRun: true
+      model: { bucket: { rate: 20/s, burst: 40 } }
+---
+# The search backends; their Deployments are left out.
+apiVersion: v1
+kind: Service
+metadata: { name: search, namespace: search }
+spec: { selector: { app: search }, ports: [{ port: 8080 }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: suggest, namespace: search }
+spec: { selector: { app: suggest }, ports: [{ port: 8080 }] }
