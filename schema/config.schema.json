@@ -1061,6 +1061,22 @@
         }
       ]
     },
+    "Protection": {
+      "description": "Backend protection: what each of an\nupstream's endpoints may have in flight from this data plane, every worker's requests\ntogether. Each data plane counts its own; nothing is shared between data planes.",
+      "type": "object",
+      "properties": {
+        "max_in_flight": {
+          "description": "Requests in flight to one endpoint past which it takes no more until one ends. The\nendpoints of a Kubernetes Service are counted by pod, every upstream of the\nService's ports sharing a pod's count; any other endpoint by its address and port.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_in_flight"
+      ]
+    },
     "Protocol": {
       "description": "What a listener speaks.",
       "oneOf": [
@@ -1953,6 +1969,18 @@
         "load_balancer": {
           "description": "Which endpoint takes each exchange. Always stated: it chooses behaviour.",
           "$ref": "#/$defs/LoadBalancer"
+        },
+        "protection": {
+          "description": "A bound on each endpoint's requests in flight from this data plane; none is no bound. For an upstream of\nHTTP routes only: it counts requests, which TCP, TLS and UDP routes do not have.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Protection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "protocol": {
           "description": "What its endpoints are spoken to in, whatever the client spoke. An upstream of TCP\nand TLS routes is sent their bytes as they come: neither `http2` nor `tls`. One of\nUDP routes is `udp`, and no other route's.",

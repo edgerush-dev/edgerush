@@ -5,7 +5,9 @@
 //!
 //! **A worker's own.** It counts only its own exchanges, and no request writes where another
 //! core writes: a stalled pod shows in every worker's count, since every worker's exchanges
-//! to it stop coming back.
+//! to it stop coming back. A protected upstream's endpoints have a count every worker shares
+//! besides ([`Protected`], 25 §3), which its exchanges take a slot in at the pick: that write
+//! is paid by protected upstreams alone.
 //!
 //! **An upstream is its name.** A reload carries the places and the budget over to the
 //! upstream of the same name, and lets go of those of an upstream no config has once nothing
@@ -24,7 +26,9 @@ use crate::balance::{self, Candidates, RoundRobin, Share, Tried};
 use crate::random::random;
 use crate::retry::budget::Budget;
 use crate::upstream::destination::{Destinations, ReuseIdentity};
+pub use crate::upstream::protected::Protected;
 use edgerush_config::{Compiled, CompiledUpstream, LoadBalancer};
+use edgerush_protection::{PodCount, Slot};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -33,21 +37,45 @@ use tokio::time::Instant;
 
 /// One exchange in flight to an endpoint, counted from its pick until it is let go of:
 /// with the place its exchange holds, which goes with the answer's body to its end, or with
-/// a tunnel until it closes.
+/// a tunnel until it closes. On a protected upstream it holds the exchange's slot in the
+/// endpoint's count every worker shares as well (25 §6).
 #[derive(Debug)]
-pub(crate) struct InFlight(Rc<Cell<u32>>);
+pub(crate) struct InFlight {
+    count: Rc<Cell<u32>>,
+    pod: Option<Slot>,
+}
 
 impl InFlight {
-    fn new(count: &Rc<Cell<u32>>) -> Self {
+    fn new(count: &Rc<Cell<u32>>, pod: Option<Slot>) -> Self {
         count.set(count.get().saturating_add(1));
-        Self(Rc::clone(count))
+        Self {
+            count: Rc::clone(count),
+            pod,
+        }
+    }
+
+    /// Gives back its slot in the endpoint's shared count, for an exchange that will not
+    /// reach its endpoint while what it began goes on without it: a connect kept for the
+    /// pool after its client went away (25 §6). The worker's own count stays.
+    pub(crate) fn unprotect(&mut self) {
+        self.pod = None;
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.0.set(self.0.get().saturating_sub(1));
+        self.count.set(self.count.get().saturating_sub(1));
     }
+}
+
+/// Why no endpoint was picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unpicked {
+    /// There is none to go to.
+    Nowhere,
+    /// The one the balancer chose has as many requests in flight as its protection allows
+    /// (25 §5).
+    Full,
 }
 
 /// What became of an upstream at a reload, worked out once for every worker
@@ -55,7 +83,8 @@ impl Drop for InFlight {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Carry {
     /// The same upstream as the one at this position in the config before: the same name,
-    /// endpoints, balancer and slow start. A worker keeps its state for it as it is.
+    /// endpoints, balancer, slow start and protection. A worker keeps its state for it as it
+    /// is: the same endpoints' protection has the same counts.
     Same(usize),
     /// The upstream of the same name as the one at this position in the config before,
     /// changed: its state is made again, keeping what of it still holds.
@@ -96,6 +125,7 @@ impl Carry {
                 };
                 let same = old.load_balancer == upstream.load_balancer
                     && window(old.slow_start) == window(upstream.slow_start)
+                    && old.protection == upstream.protection
                     && keys(was.of(from)).eq(keys(destinations.of(position)));
                 if same {
                     Self::Same(from)
@@ -144,12 +174,15 @@ pub(crate) struct Upstream {
     /// configs come in the meantime.
     counts: Box<[Rc<Cell<u32>>]>,
     round_robin: Cell<RoundRobin>,
+    /// Its protection, if it has one: its bound and its endpoints' shared counts, of the
+    /// config this state was made for.
+    protected: Option<Arc<Protected>>,
 }
 
 impl Balancing {
     /// Made again for the config numbered `generation`, if it is not the one this was made
-    /// for, whose upstreams are counted in `slots` by position and became what `carried`
-    /// says of the config before it: counts are kept for every destination that is the same
+    /// for, whose upstreams are counted in `slots` and protected as `protected` says, by
+    /// position, and became what `carried` says of the config before it: counts are kept for every destination that is the same
     /// one, the turn for every upstream whose endpoints are all the same, in the same order,
     /// and the places and the budget for every upstream of the same name. An upstream with a
     /// new list starts its turns at a place drawn at random. Once per worker per config.
@@ -163,6 +196,7 @@ impl Balancing {
         config: &Compiled,
         destinations: &Destinations,
         slots: &[usize],
+        protected: &[Option<Arc<Protected>>],
         carried: &[Carry],
     ) {
         if self.generation == Some(generation) {
@@ -203,6 +237,7 @@ impl Balancing {
                     upstream,
                     destinations.of(position),
                     slot,
+                    protected.get(position).cloned().flatten(),
                     was,
                 ))
             })
@@ -217,14 +252,15 @@ impl Balancing {
 }
 
 impl Upstream {
-    /// The state for `upstream`, whose destinations are `destinations` and whose metrics are
-    /// in `slot`, made from what the state `was` for the upstream of its name had: the counts
-    /// of the destinations that stayed, the turn if they all did, in the same order, and the
-    /// places and the budget.
+    /// The state for `upstream`, whose destinations are `destinations`, whose metrics are in
+    /// `slot` and whose protection is `protected`, made from what the state `was` for the
+    /// upstream of its name had: the counts of the destinations that stayed, the turn if
+    /// they all did, in the same order, and the places and the budget.
     fn made(
         upstream: &CompiledUpstream,
         destinations: &[Arc<ReuseIdentity>],
         slot: usize,
+        protected: Option<Arc<Protected>>,
         was: Option<&Self>,
     ) -> Self {
         let keys: Box<[u64]> = keys(destinations).collect();
@@ -255,6 +291,7 @@ impl Upstream {
             keys,
             counts,
             round_robin: Cell::new(round_robin),
+            protected,
         }
     }
 
@@ -308,14 +345,15 @@ impl Candidates for Seen<'_> {
 impl Upstream {
     /// The endpoint an exchange goes to, among `destinations` — this upstream's, of the
     /// config this state was made for, the first `zoned` of them its zone's — keeping away
-    /// from those in `tried`, and the count it holds while in flight. `None` only if there
-    /// are no endpoints.
+    /// from those in `tried`, and the count it holds while in flight: on a protected
+    /// upstream, with a slot in the endpoint's shared count, refused if the endpoint is full
+    /// (25 §3).
     pub(crate) fn pick(
         &self,
         destinations: &[Arc<ReuseIdentity>],
         zoned: usize,
         tried: &Tried,
-    ) -> Option<(usize, InFlight)> {
+    ) -> Result<(usize, InFlight), Unpicked> {
         let seen = Seen {
             destinations,
             counts: &self.counts,
@@ -325,8 +363,18 @@ impl Upstream {
         let at = match balance::zone(&seen, zoned, tried) {
             Some(zone) => self.choose(&zone, tried),
             None => self.choose(&seen, tried),
-        }?;
-        Some((at, InFlight::new(self.counts.get(at)?)))
+        }
+        .ok_or(Unpicked::Nowhere)?;
+        let count = self.counts.get(at).ok_or(Unpicked::Nowhere)?;
+        let pod = match &self.protected {
+            None => None,
+            Some(protected) => {
+                // Its counts are by position of the endpoint, as the destinations are.
+                let pod = protected.counts.get(at).ok_or(Unpicked::Nowhere)?;
+                Some(PodCount::take(pod, protected.cap).ok_or(Unpicked::Full)?)
+            }
+        };
+        Ok((at, InFlight::new(count, pod)))
     }
 
     /// The endpoint the upstream's balancer takes among `candidates`.
@@ -372,7 +420,7 @@ mod tests {
         generation: u64,
     ) -> Destinations {
         let destinations = Destinations::reconcile(config, previous, keys, &[None, None]);
-        balancing.refresh(generation, config, &destinations, &[], &[]);
+        balancing.refresh(generation, config, &destinations, &[], &[], &[]);
         destinations
     }
 
@@ -394,6 +442,65 @@ mod tests {
         assert_ne!(first, second);
         drop(held);
         assert_eq!(upstream.counts[first].get(), 0);
+    }
+
+    /// A protected endpoint's count is every worker's: one worker's exchange fills it for
+    /// another, whose pick is refused as full without counting anything as in flight, and
+    /// the slot given back opens it to both (25 §3). A slot given back by `unprotect`
+    /// leaves the worker's own count as it was.
+    #[test]
+    fn a_protected_endpoint_is_full_for_every_worker_at_once() {
+        let config = compiled(&[("u", "p2c", &["10.0.0.1:80"])]);
+        let keys = Keys::default();
+        let destinations =
+            Destinations::reconcile(&config, &Destinations::default(), &keys, &[None]);
+        let pod = PodCount::new();
+        let protected = vec![Some(Arc::new(Protected {
+            cap: std::num::NonZeroU32::MIN,
+            counts: vec![Arc::clone(&pod)].into(),
+        }))];
+        let (mut one, mut two) = (Balancing::default(), Balancing::default());
+        one.refresh(0, &config, &destinations, &[], &protected, &[]);
+        two.refresh(0, &config, &destinations, &[], &protected, &[]);
+        let (one, two) = (one.upstream(0).unwrap(), two.upstream(0).unwrap());
+
+        let (_, mut held) = one.pick(destinations.of(0), 0, &Tried::default()).unwrap();
+        assert_eq!(pod.in_flight(), 1);
+        assert_eq!(
+            two.pick(destinations.of(0), 0, &Tried::default())
+                .unwrap_err(),
+            Unpicked::Full
+        );
+        assert_eq!(two.counts[0].get(), 0, "a refused pick is not in flight");
+
+        held.unprotect();
+        assert_eq!(pod.in_flight(), 0);
+        assert_eq!(one.counts[0].get(), 1, "the worker's own count stays");
+        let (_, also) = two.pick(destinations.of(0), 0, &Tried::default()).unwrap();
+        assert_eq!(pod.in_flight(), 1);
+        drop((held, also));
+        assert_eq!((pod.in_flight(), one.counts[0].get()), (0, 0));
+    }
+
+    /// An unprotected upstream's pick writes nothing every worker shares: it never refuses
+    /// an endpoint as full, however many exchanges it has (25 §8).
+    #[test]
+    fn an_unprotected_pick_is_never_full() {
+        let config = compiled(&[("u", "p2c", &["10.0.0.1:80"])]);
+        let keys = Keys::default();
+        let mut balancing = Balancing::default();
+        let destinations = state(&config, &Destinations::default(), &keys, &mut balancing, 0);
+        let upstream = balancing.upstream(0).unwrap();
+        let held: Vec<InFlight> = (0..1_000)
+            .map(|_| {
+                upstream
+                    .pick(destinations.of(0), 0, &Tried::default())
+                    .unwrap()
+                    .1
+            })
+            .collect();
+        assert!(held.iter().all(|counted| counted.pod.is_none()));
+        assert_eq!(upstream.counts[0].get(), 1_000);
     }
 
     #[test]
@@ -522,7 +629,7 @@ mod tests {
         let firsts: std::collections::BTreeSet<usize> = (0..16)
             .map(|_| {
                 let mut balancing = Balancing::default();
-                balancing.refresh(0, &config, &destinations, &[], &[]);
+                balancing.refresh(0, &config, &destinations, &[], &[], &[]);
                 let upstream = balancing.upstream(0).unwrap();
                 upstream
                     .pick(destinations.of(0), 0, &Tried::default())
@@ -636,13 +743,13 @@ mod tests {
             let was = Destinations::reconcile(&first, &Destinations::default(), &keys, &[]);
             let now = Destinations::reconcile(&second, &was, &keys, &[]);
             let mut initial = Balancing::default();
-            initial.refresh(0, &first, &was, &[], &[]);
+            initial.refresh(0, &first, &was, &[], &[], &[]);
             let old = initial.upstreams.clone();
             let carried = Carry::between(&first, &was, &second, &now);
             let mut fast = Balancing { generation: Some(0), upstreams: old.clone() };
             let mut by_name = Balancing { generation: Some(0), upstreams: old.clone() };
-            fast.refresh(1, &second, &now, &[], &carried);
-            by_name.refresh(1, &second, &now, &[], &[]);
+            fast.refresh(1, &second, &now, &[], &[], &carried);
+            by_name.refresh(1, &second, &now, &[], &[], &[]);
             prop_assert_eq!(fast.upstreams.len(), by_name.upstreams.len());
             for (fast, by_name) in fast.upstreams.iter().zip(&by_name.upstreams) {
                 prop_assert_eq!(&fast.name, &by_name.name);

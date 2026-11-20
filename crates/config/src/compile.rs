@@ -1027,6 +1027,33 @@ pub struct CompiledUpstream {
     pub slow_start: Option<SlowStart>,
     /// The PROXY protocol header its tunnels send first, if any.
     pub proxy_protocol: Option<ProxyProtocolVersion>,
+    /// The bound on its endpoints' requests in flight, if it has one.
+    pub protection: Option<CompiledProtection>,
+}
+
+/// An upstream's backend protection ([25](../../../docs/25-backend-protection.md)): the
+/// bound, and what its endpoints' counts are filed under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledProtection {
+    /// Requests in flight to one endpoint, every worker's together.
+    pub max_in_flight: NonZeroU32,
+    /// Whose endpoints they are.
+    pub pods_of: PodsOf,
+}
+
+/// Whose pods an upstream's endpoints are, and so which counts they share (25 §3).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PodsOf {
+    /// A Kubernetes Service's: every upstream of its ports shares a pod's count, a pod
+    /// counted by its address alone.
+    Service {
+        /// The namespace it is in.
+        namespace: String,
+        /// Its name.
+        service: String,
+    },
+    /// The upstream's own, by its name: each endpoint counted by its address and port.
+    Upstream(String),
 }
 
 /// A certificate a listener or an upstream names, found among the config's.
@@ -1261,6 +1288,20 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             load_balancer: upstream.load_balancer,
             slow_start: upstream.slow_start,
             proxy_protocol: upstream.proxy_protocol,
+            protection: upstream.protection.map(|protection| CompiledProtection {
+                max_in_flight: protection.max_in_flight,
+                pods_of: match &upstream.endpoints {
+                    Endpoints::Kubernetes(service) => match KubernetesService::parse(service) {
+                        Ok(found) => PodsOf::Service {
+                            namespace: found.namespace,
+                            service: found.service,
+                        },
+                        // Refused below, and nothing is compiled.
+                        Err(_) => PodsOf::Upstream(name.clone()),
+                    },
+                    Endpoints::Listed(_) | Endpoints::Dns(_) => PodsOf::Upstream(name.clone()),
+                },
+            }),
         })
         .collect();
     let data_plane = CompiledDataPlane {
@@ -1369,6 +1410,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                 ("tls", upstream.tls.is_some()),
                 ("health_check", upstream.health_check.is_some()),
                 ("proxy_protocol", upstream.proxy_protocol.is_some()),
+                ("protection", upstream.protection.is_some()),
             ];
             for (field, _) in stated.into_iter().filter(|(_, stated)| *stated) {
                 errors.push(Place::upstream(name).problem(Problem::NotForUdp(field)));
@@ -2261,6 +2303,9 @@ fn l4_backends(
                 _ if upstream.protocol != UpstreamProtocol::Http1 || upstream.tls.is_some() => {
                     Some(Problem::PassthroughUpstream(name.to_owned()))
                 }
+                _ if upstream.protection.is_some() => {
+                    Some(Problem::ProtectedTunnel(name.to_owned()))
+                }
                 _ => None,
             };
             if let Some(problem) = problem {
@@ -3120,6 +3165,10 @@ pub enum Problem {
         "upstream `{0}` is spoken to in HTTP/2 or over TLS, which a TCP or TLS route does not do"
     )]
     PassthroughUpstream(String),
+    /// A TCP or TLS route's backend whose upstream is protected, which counts requests: a
+    /// tunnel has none (25 §1).
+    #[error("upstream `{0}` is protected, which counts requests: a TCP or TLS route has none")]
+    ProtectedTunnel(String),
     /// TLS to an upstream that trusts nobody.
     #[error("`tls` needs an authority to trust")]
     NoAuthority,
@@ -5342,6 +5391,91 @@ upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
         );
     }
 
+    /// Protection counts requests: an HTTP route's upstream takes it, a TCP or TLS route's
+    /// refuses it, and a stated bound is at least one. A Kubernetes upstream's pods are
+    /// filed under its Service, any other's under its own name (25 §3).
+    #[test]
+    fn protection_is_for_http_routes_and_files_pods_by_whose_they_are() {
+        let upstreams = "upstreams:
+  listed: { load_balancer: p2c, endpoints: { listed: [\"127.0.0.1:81\"] }, protection: { max_in_flight: 20 } }
+  found: { load_balancer: p2c, endpoints: { kubernetes: \"search.shop.svc.cluster.local:http\" }, protection: { max_in_flight: 3 } }
+  plain: { load_balancer: p2c, endpoints: { listed: [] } }
+";
+        let http = r#"h: { address: "[::]:3", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#;
+        let served = format!(
+            "listeners: {{ {http} }}
+routes:
+  - {{ name: web, listeners: [h], hostnames: [{{ name: \"*\", falls_through: true }}], rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{{ upstream: listed, weight: 1 }}, {{ upstream: found, weight: 1 }}] }} }}] }}
+{upstreams}"
+        );
+        let compiled = compile(&config(&served)).unwrap();
+        let protection = |name: &str| {
+            compiled
+                .upstreams()
+                .iter()
+                .find(|upstream| upstream.name == name)
+                .unwrap()
+                .protection
+                .clone()
+        };
+        assert_eq!(
+            protection("listed"),
+            Some(CompiledProtection {
+                max_in_flight: NonZeroU32::new(20).unwrap(),
+                pods_of: PodsOf::Upstream("listed".to_owned()),
+            })
+        );
+        assert_eq!(
+            protection("found"),
+            Some(CompiledProtection {
+                max_in_flight: NonZeroU32::new(3).unwrap(),
+                pods_of: PodsOf::Service {
+                    namespace: "shop".to_owned(),
+                    service: "search".to_owned(),
+                },
+            })
+        );
+        assert_eq!(protection("plain"), None);
+
+        let refused = |listener: &str, routes: &str| -> Vec<String> {
+            let yaml = format!(
+                "listeners: {{ {listener} }}
+routes: []
+{routes}
+{upstreams}"
+            );
+            compile(&config(&yaml))
+                .err()
+                .unwrap_or_default()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(
+            refused(
+                r#"t: { address: "[::]:1", protocol: tcp, proxy_protocol: off }"#,
+                "tcp_routes: [{ name: db, listeners: [t], backends: [{ upstream: listed, weight: 1 }] }]"
+            ),
+            [
+                "route `db`, backends[0]: upstream `listed` is protected, which counts requests: a TCP or TLS route has none"
+            ]
+        );
+        assert_eq!(
+            refused(
+                r#"s: { address: "[::]:2", protocol: tls, proxy_protocol: off }"#,
+                "tls_routes: [{ name: db, listeners: [s], hostnames: [{ name: a.test, falls_through: true }], backends: [{ upstream: listed, weight: 1 }] }]"
+            ),
+            [
+                "route `db`, backends[0]: upstream `listed` is protected, which counts requests: a TCP or TLS route has none"
+            ]
+        );
+        let zero = "listeners: {}
+routes: []
+upstreams: { up: { load_balancer: p2c, endpoints: { listed: [] }, protection: { max_in_flight: 0 } } }
+";
+        assert!(serde_saphyr::from_str::<Config>(zero).is_err());
+    }
+
     /// A route goes only to listeners of its kind, a `tcp` listener has exactly one, a
     /// passthrough listener presents no certificate, and a passthrough route has 1 to 16
     /// backends that take plain bytes and a name no other route has.
@@ -5812,6 +5946,10 @@ udp_routes:
             (
                 ", proxy_protocol: v2",
                 "`proxy_protocol` is not for protocol `udp`, whose datagrams are sent as they come",
+            ),
+            (
+                ", protection: { max_in_flight: 20 }",
+                "`protection` is not for protocol `udp`, whose datagrams are sent as they come",
             ),
             (
                 ", keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false }",

@@ -417,6 +417,9 @@ pub(crate) enum Answer {
     /// The backend picked is invalid: a reference the control plane could not follow.
     InvalidBackend,
     NoEndpoints,
+    /// The endpoint picked has as many requests in flight as its upstream's protection
+    /// allows ([25 §5](../../docs/25-backend-protection.md)).
+    BackendFull,
     /// No connection to the endpoint could be opened: refused, reset or out of time while
     /// connecting, or a TLS handshake that failed. Nothing of the request was sent
     /// ([03 §6](../../docs/03-data-plane.md)).
@@ -483,7 +486,7 @@ pub(crate) enum Answer {
 }
 
 impl Answer {
-    const ALL: [Self; 30] = [
+    const ALL: [Self; 31] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -492,6 +495,7 @@ impl Answer {
         Self::NoBackend,
         Self::InvalidBackend,
         Self::NoEndpoints,
+        Self::BackendFull,
         Self::Unreachable,
         Self::UpstreamFailed,
         Self::UpstreamTimedOut,
@@ -529,6 +533,7 @@ impl Answer {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::NoEndpoints
+            | Self::BackendFull
             | Self::TooBusy
             | Self::OverShare
             | Self::Exhausted
@@ -561,6 +566,7 @@ impl Answer {
             Self::NoBackend => "no_backend",
             Self::InvalidBackend => "invalid_backend",
             Self::NoEndpoints => "no_endpoints",
+            Self::BackendFull => "backend_full",
             Self::Unreachable => "upstream_unreachable",
             Self::UpstreamFailed => "upstream_failed",
             Self::UpstreamTimedOut => "upstream_timed_out",
@@ -608,6 +614,10 @@ impl Answer {
             Self::NoBackend | Self::InvalidBackend | Self::NoEndpoints => {
                 (Code::Unavailable, "no upstream can serve the call")
             }
+            Self::BackendFull => (
+                Code::Unavailable,
+                "the backend has as many calls in flight as it takes",
+            ),
             Self::Unreachable => (Code::Unavailable, "the upstream could not be reached"),
             Self::UpstreamFailed => (Code::Unavailable, "the upstream failed to answer"),
             Self::TooBusy | Self::NoRoom | Self::QueueFull | Self::QueueTimedOut => (
@@ -1692,6 +1702,7 @@ mod tests {
             );
         }
         assert_eq!(Answer::NoEndpoints.status(), 503);
+        assert_eq!(Answer::BackendFull.status(), 503, "never 429 (25 §8)");
         assert_eq!(Answer::UpstreamFailed.status(), 502);
     }
 

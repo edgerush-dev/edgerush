@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 /// A data plane's configuration. Filters are to come.
@@ -634,6 +635,24 @@ pub struct Upstream {
     /// route's connections carry many clients' requests, and a UDP route sends none.
     #[serde(default)]
     pub proxy_protocol: Option<ProxyProtocolVersion>,
+    /// A bound on each endpoint's requests in flight from this data plane
+    /// ([25](../../../docs/25-backend-protection.md)); none is no bound. For an upstream of
+    /// HTTP routes only: it counts requests, which TCP, TLS and UDP routes do not have.
+    #[serde(default)]
+    pub protection: Option<Protection>,
+}
+
+/// Backend protection ([25](../../../docs/25-backend-protection.md)): what each of an
+/// upstream's endpoints may have in flight from this data plane, every worker's requests
+/// together. Each data plane counts its own; nothing is shared between data planes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Protection {
+    /// Requests in flight to one endpoint past which it takes no more until one ends. The
+    /// endpoints of a Kubernetes Service are counted by pod, every upstream of the
+    /// Service's ports sharing a pod's count; any other endpoint by its address and port.
+    pub max_in_flight: NonZeroU32,
 }
 
 /// Where an upstream's endpoints come from, one way and stated

@@ -273,7 +273,14 @@ impl Drop for Connecting<'_> {
             settle(self.identity, ended);
             return;
         }
+        // The watcher only sees the connect to its end: no request goes on it, so the try's
+        // slot in its endpoint's shared count is given back now (25 §6). The place and the
+        // worker's own count go with the connect, as the load it still is.
+        let mut admitted = self.admitted.take();
+        if let Some(admitted) = &mut admitted {
+            admitted.unprotect();
+        }
         self.watcher
-            .adopt(connect, self.identity, self.deadline, self.admitted.take());
+            .adopt(connect, self.identity, self.deadline, admitted);
     }
 }

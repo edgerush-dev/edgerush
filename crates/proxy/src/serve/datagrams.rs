@@ -423,7 +423,10 @@ impl Listening {
         // picks again, and is served once one comes (24 §4).
         let destinations = snapshot.destinations.of(upstream.0);
         let picked = balance_of(&worker.balancing, snapshot, upstream.0).and_then(|balance| {
-            balance.pick(destinations, snapshot.zoned(upstream.0), &Tried::default())
+            // A UDP route's upstream is never protected: its config is refused (25 §1).
+            balance
+                .pick(destinations, snapshot.zoned(upstream.0), &Tried::default())
+                .ok()
         });
         let Some((endpoint, load)) =
             picked.and_then(|(at, load)| Some((snapshot.destinations.at(upstream.0, at)?, load)))

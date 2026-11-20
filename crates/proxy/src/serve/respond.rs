@@ -23,7 +23,7 @@ use crate::request::{Decision, Opening, Rejection, decide};
 use crate::request_body::{Counts, RequestBody};
 use crate::routed::Through;
 use crate::timers::{Alarm, Timers};
-use crate::upstream::balancing::Balancing;
+use crate::upstream::balancing::{Balancing, Unpicked};
 use crate::upstream::h1::codec::Sending;
 use crate::way_back;
 use crate::websocket::{self, Key};
@@ -856,7 +856,10 @@ impl Proxy {
         let zoned = snapshot.zoned(upstream);
         let (at, counted) = balance
             .pick(destinations, zoned, &Tried::default())
-            .ok_or(Answer::NoEndpoints)?;
+            .map_err(|unpicked| match unpicked {
+                Unpicked::Nowhere => Answer::NoEndpoints,
+                Unpicked::Full => Answer::BackendFull,
+            })?;
         let endpoint = endpoints.get(at).ok_or(Answer::NoEndpoints)?;
         let identity = snapshot
             .destinations
@@ -923,7 +926,8 @@ impl Proxy {
             let destinations = snapshot.destinations.of(upstream);
             let found = balance_of(balancing, &snapshot, upstream).and_then(|balance| {
                 let zoned = snapshot.zoned(upstream);
-                let (at, counted) = balance.pick(destinations, zoned, &Tried::default())?;
+                // A copy that finds its endpoint full is not sent (25 §5).
+                let (at, counted) = balance.pick(destinations, zoned, &Tried::default()).ok()?;
                 let authority = snapshot.endpoints.get(upstream)?.get(at)?;
                 Some((
                     at_endpoint(&target, authority)?,
