@@ -8,12 +8,12 @@ use crate::validate::{described, read};
 use bytes::Bytes;
 use edgerush_certificates::authority::{Kind, Written};
 use edgerush_config::Certificate;
-use edgerush_control_service::metrics;
 use edgerush_control_service::webhook::{self, Bounds};
 use edgerush_control_service::{
     CertificateFiles, Credentials, Files, FilesError, Heard, Served, SslAcceptor, acceptor, reread,
     serve, webhook_acceptor,
 };
+use edgerush_control_service::{health, metrics};
 use edgerush_control_stream::{Offer, OfferError, Versions};
 use edgerush_controller::acks::{Pods, Reporter, Runs};
 use edgerush_controller::admission::{self, Asked};
@@ -51,7 +51,7 @@ Usage: edgerush controller (--data-plane <FILE> | --control-plane <NAME> [--clus
                               | --authority <SECRET> [--authority-provided])]
          [--leader-lease <NAMESPACE>/<NAME>]
          [--webhook-listen <ADDRESS> [--webhook-certificate <FILE> --webhook-key <FILE>]]
-         [--metrics <ADDRESS>]
+         [--metrics <ADDRESS>] [--health <ADDRESS>]
 
 Runs a control plane for its data planes, in a cluster: follows the IngressClasses,
 Ingresses, Services and Secrets of its scope through the API server, found as a pod finds
@@ -102,6 +102,9 @@ A certificate handed to the data plane expired or not yet valid is served as any
 and said on stderr, once for each version of it handed out, by the leader alone where
 replicas elect one, and again by each new leader. With --metrics, every replica serves its
 own metrics there, plain HTTP, at /metrics: when each certificate handed out expires.
+With --health, every replica answers its readiness probe there, plain HTTP, at /ready:
+503 until it is ready, once the stream serves with its first certificate or at once
+without --listen, and 200 from then on; each connection one request, done within a second.
 Runs until Ctrl-C, or SIGTERM on Unix, and then exits 0; exits 2 when the command line, the
 data plane's settings, the system's authorities or the stream's or the webhook's
 certificates cannot be used, or it is not in a cluster.
@@ -154,6 +157,7 @@ Options:
                              The webhook's certificate, then its intermediates
       --webhook-key <FILE>   Its private key
       --metrics <ADDRESS>    Serve /metrics on ADDRESS, such as [::]:9090
+      --health <ADDRESS>     Serve /ready on ADDRESS, such as [::]:8081
   -h, --help                 Print help
 ";
 
@@ -369,6 +373,13 @@ pub(crate) fn command(
         },
         None => None,
     };
+    let health = match options.health {
+        Some(address) => match std::net::TcpListener::bind(address) {
+            Ok(listener) => Some(listener),
+            Err(error) => return writeln!(stderr, "error: {address}: {error}").map_or(1, |()| 1),
+        },
+        None => None,
+    };
     let stopped = tokio::task::LocalSet::new().block_on(
         &runtime,
         control_until(
@@ -379,6 +390,7 @@ pub(crate) fn command(
                 stream: serving,
                 webhook: hooking,
                 metrics,
+                health,
             },
             elector,
             told_to_stop(),
@@ -457,6 +469,8 @@ struct Options {
     webhook: Option<Box<Webhook>>,
     /// Where its own metrics are served, if they are.
     metrics: Option<SocketAddr>,
+    /// Where its readiness probe is answered, if it is.
+    health: Option<SocketAddr>,
 }
 
 /// Where the data plane's settings come from.
@@ -584,6 +598,8 @@ enum UsageError {
     WebhookListen(String),
     #[error("'--metrics {0}' is not an address and a port, such as [::]:9090")]
     Metrics(String),
+    #[error("'--health {0}' is not an address and a port, such as [::]:8081")]
+    Health(String),
     #[error(
         "'--webhook-listen' is given with '--webhook-certificate' and '--webhook-key', or alone with '--authority'"
     )]
@@ -606,6 +622,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut webhook_certificate = None;
     let mut webhook_key = None;
     let mut metrics = None;
+    let mut health = None;
     let mut scope = Vec::new();
     let mut selector = None;
     while let Some(arg) = args.next() {
@@ -634,6 +651,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             "--webhook-certificate" => "--webhook-certificate",
             "--webhook-key" => "--webhook-key",
             "--metrics" => "--metrics",
+            "--health" => "--health",
             _ => return Err(UsageError::Unexpected(arg)),
         };
         let value = args.next().ok_or(UsageError::NoValue(option))?;
@@ -707,6 +725,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             "--metrics" => {
                 let address = value.parse().map_err(|_| UsageError::Metrics(value))?;
                 if metrics.replace(address).is_some() {
+                    return Err(UsageError::Twice(option));
+                }
+                continue;
+            }
+            "--health" => {
+                let address = value.parse().map_err(|_| UsageError::Health(value))?;
+                if health.replace(address).is_some() {
                     return Err(UsageError::Twice(option));
                 }
                 continue;
@@ -805,6 +830,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         leader,
         webhook,
         metrics,
+        health,
     })))
 }
 
@@ -907,6 +933,8 @@ struct Listeners {
     webhook: Option<Hooking>,
     /// The control plane's own metrics, if they are served.
     metrics: Option<std::net::TcpListener>,
+    /// Its readiness, if its probe is answered.
+    health: Option<std::net::TcpListener>,
 }
 
 /// Runs the control plane through `api` until `stop` is done, serving what `listeners`
@@ -1037,6 +1065,26 @@ async fn control_until(
     };
     let (exposed, exposition) =
         watch::channel(exposed_text(&expiry.borrow(), &unimplementable.borrow()));
+    // Whether this replica is ready, for its readiness probe: once the stream serves, with
+    // its first certificate, or at once where it serves none.
+    let (readies, ready) = watch::channel(false);
+    let mut probed = None;
+    if let Some(listener) = listeners.health {
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        let (stopping, stopped) = oneshot::channel::<()>();
+        probed = Some((
+            stopping,
+            tokio::spawn(health::serve(
+                listener,
+                ready,
+                health::DEADLINE,
+                async move {
+                    let _ = stopped.await;
+                },
+            )),
+        ));
+    }
     let mut measured = None;
     if let Some(listener) = listeners.metrics {
         listener.set_nonblocking(true)?;
@@ -1123,6 +1171,7 @@ async fn control_until(
                     let tls = watch::Sender::new(Arc::new(
                         acceptor(&credentials).map_err(io::Error::other)?,
                     ));
+                    readies.send_replace(true);
                     served = Some((
                         stopping,
                         tokio::spawn(serve(
@@ -1171,6 +1220,7 @@ async fn control_until(
                                     )),
                                 }
                             };
+                            readies.send_replace(true);
                             let accepting = tls.subscribe();
                             tokio::task::spawn_local(async move {
                                 while let Some(next) = next_signed(&mut signed).await {
@@ -1208,7 +1258,10 @@ async fn control_until(
                 pods: pods.clone(),
             })
         }
-        None => None,
+        None => {
+            readies.send_replace(true);
+            None
+        }
     };
     // The webhook, on a thread of its own: what it says is said here, where `say` lives.
     let mut hooked = None;
@@ -1285,6 +1338,10 @@ async fn control_until(
         }
     }
     if let Some((stopping, server)) = measured {
+        let _ = stopping.send(());
+        let _ended = server.await;
+    }
+    if let Some((stopping, server)) = probed {
         let _ = stopping.send(());
         let _ended = server.await;
     }

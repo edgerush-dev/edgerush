@@ -9,8 +9,8 @@
 //! data plane the authorities vouch for is served: none is told apart by its name yet. Each
 //! end's certificate files are read again as they change ([`reread`]).
 //!
-//! Beside it, the control plane serves the admission webhook's listener, [`webhook`], and
-//! its own metrics, [`metrics`].
+//! Beside it, the control plane serves the admission webhook's listener, [`webhook`],
+//! its own metrics, [`metrics`], and its readiness, [`health`].
 
 use bytes::Buf;
 use std::marker::PhantomData;
@@ -22,6 +22,7 @@ use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 
 mod client;
 mod files;
+pub mod health;
 pub mod metrics;
 mod server;
 mod subscribe;

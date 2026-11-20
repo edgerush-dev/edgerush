@@ -109,6 +109,11 @@ spec:
       app.kubernetes.io/name: edgerush
       gateway.edgerush.dev/control-plane: edge
       gateway.edgerush.dev/namespace: edge-system
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
   template:
     metadata:
       labels:
@@ -129,6 +134,8 @@ spec:
         - 0.0.0.0:9443
         - --leader-lease
         - edge-system/edgerush-controller-edge
+        - --health
+        - 0.0.0.0:8081
         - --authority
         - edgerush-controller-edge-authority
         env:
@@ -141,6 +148,12 @@ spec:
         ports:
         - containerPort: 9443
           name: stream
+        - containerPort: 8081
+          name: health
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: health
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

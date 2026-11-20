@@ -117,6 +117,11 @@ spec:
       app.kubernetes.io/name: edgerush
       gateway.edgerush.dev/control-plane: payments
       gateway.edgerush.dev/namespace: payments-edge
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
   template:
     metadata:
       labels:
@@ -137,6 +142,8 @@ spec:
         - 0.0.0.0:9443
         - --leader-lease
         - payments-edge/edgerush-controller-payments
+        - --health
+        - 0.0.0.0:8081
         - --authority
         - edgerush-controller-payments-authority
         - --namespace
@@ -153,8 +160,14 @@ spec:
         ports:
         - containerPort: 9443
           name: stream
+        - containerPort: 8081
+          name: health
         - containerPort: 8443
           name: webhook
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: health
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

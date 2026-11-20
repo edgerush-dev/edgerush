@@ -11,7 +11,8 @@
 //!
 //! The data plane's Service is [`ProxyService`], apart, as the control plane writes it, of
 //! the ports its config binds (05 §2); the certificates the workloads mount are the control
-//! plane's too, and the probes come with the slice that builds them. A ControlPlane's
+//! plane's too, and the data plane's probes come with the slice that builds them; the
+//! controller's readiness probe asks its `/ready`. A ControlPlane's
 //! webhook is registered only once its status holds its authority's bundle, which the
 //! control plane publishes there (05 §2): never with an empty one, filled in later.
 
@@ -31,10 +32,10 @@ use k8s_openapi::api::autoscaling::v2::{
     CrossVersionObjectReference, HorizontalPodAutoscaler, HorizontalPodAutoscalerSpec,
 };
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, ObjectFieldSelector,
-    PodSecurityContext, PodSpec, PodTemplateSpec, ResourceRequirements, SeccompProfile,
-    SecretVolumeSource, SecurityContext, Service, ServiceAccount, ServicePort, ServiceSpec, Sysctl,
-    TopologySpreadConstraint, Volume, VolumeMount,
+    Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
+    ObjectFieldSelector, PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
+    SeccompProfile, SecretVolumeSource, SecurityContext, Service, ServiceAccount, ServicePort,
+    ServiceSpec, Sysctl, TopologySpreadConstraint, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{IngressClass, IngressClassSpec};
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
@@ -100,6 +101,8 @@ pub const MANAGED_BY: &str = "edgerush-operator";
 
 /// The port the control plane serves its data planes' streams on.
 const STREAM_PORT: i32 = 9443;
+/// The port its pods answer their readiness probe on, `/ready`, apart from anything else.
+const HEALTH_PORT: i32 = 8081;
 /// The port its pods serve the admission webhook on, and the Service's for it.
 const WEBHOOK_PORT: i32 = 8443;
 const WEBHOOK_SERVICE_PORT: i32 = 443;
@@ -667,6 +670,9 @@ pub fn for_control_plane(
         format!("0.0.0.0:{STREAM_PORT}"),
         "--leader-lease".to_owned(),
         format!("{}/{name}", cp.namespace),
+        // Its readiness, which its probe asks (04 §2).
+        "--health".to_owned(),
+        format!("0.0.0.0:{HEALTH_PORT}"),
     ];
     // The authority it signs with: its own, or the platform's it is given, never written
     // (05 §2).
@@ -692,7 +698,7 @@ pub fn for_control_plane(
             args.extend(["--namespace".to_owned(), namespace.clone()]);
         }
     }
-    let mut ports = vec![port("stream", STREAM_PORT)];
+    let mut ports = vec![port("stream", STREAM_PORT), port("health", HEALTH_PORT)];
     if webhook {
         args.extend([
             "--webhook-listen".to_owned(),
@@ -707,6 +713,15 @@ pub fn for_control_plane(
         // Its Pod's UID, which owns the report of what its data planes run (04 §6).
         env: Some(vec![from_field("EDGERUSH_POD_UID", "metadata.uid")]),
         ports: Some(ports),
+        // Out of its Service until it may serve (04 §2).
+        readiness_probe: Some(Probe {
+            http_get: Some(HTTPGetAction {
+                path: Some("/ready".to_owned()),
+                port: IntOrString::String("health".to_owned()),
+                ..HTTPGetAction::default()
+            }),
+            ..Probe::default()
+        }),
         security_context: Some(locked_down()),
         ..Container::default()
     };
@@ -718,6 +733,15 @@ pub fn for_control_plane(
                 match_labels: Some(labels.clone()),
                 ..LabelSelector::default()
             },
+            // A new pod is ready before an old one goes, so a single replica's upgrade
+            // keeps what it serves (04 §2).
+            strategy: Some(DeploymentStrategy {
+                type_: Some("RollingUpdate".to_owned()),
+                rolling_update: Some(RollingUpdateDeployment {
+                    max_surge: Some(IntOrString::Int(1)),
+                    max_unavailable: Some(IntOrString::Int(0)),
+                }),
+            }),
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(labels.clone()),
