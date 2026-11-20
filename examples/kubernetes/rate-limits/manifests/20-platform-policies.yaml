@@ -1,0 +1,38 @@
+# Owned by the platform team (namespace `edge`).
+#
+# Limits on the Gateway: every request through any of its listeners, or a ListenerSet
+# attached to it. NOT Ingress traffic: an Ingress is not under a Gateway. For that, the
+# DataPlane's `global` (10-platform.yaml) is the place.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: platform-gateway, namespace: edge }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: Gateway, name: public }
+  limits:
+    # One count per client across every route under /api, whichever team's route
+    # serves it: the only way to count across routes by path.
+    - name: platform-api-per-ip
+      key: Client
+      match: { pathPrefix: /api }
+      model: { bucket: { rate: 1000/s, burst: 1000 } }
+    - name: platform-writes-per-ip
+      key: Client
+      match: { methods: [POST, PUT, PATCH, DELETE] }
+      model: { bucket: { rate: 100/s, burst: 200 } }
+---
+# The internal listener: other clusters and the office come through a handful of NAT
+# addresses, so per-IP limits meant for the internet would throttle whole offices.
+# A listener is more specific than its Gateway (and than the DataPlane), so it may
+# remove their limits by name, and add its own.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: platform-internal, namespace: edge }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: Gateway, name: public, sectionName: internal }
+  ignore: [platform-per-ip, platform-api-per-ip]
+  limits:
+    - name: platform-internal-per-ip
+      key: Client
+      model: { bucket: { rate: 20000/s, burst: 20000 } }

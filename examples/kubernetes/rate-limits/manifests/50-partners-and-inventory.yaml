@@ -1,0 +1,73 @@
+# Owned by the partners team (namespace `partners`): webhooks from a few partner
+# addresses, in bursts far above the platform's per-IP limits. The rule loosens them for
+# itself, deliberately, by removing them by name and adding its own.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: partners
+  labels: { edge.example.com/served: "true" }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: webhooks, namespace: partners }
+spec:
+  parentRefs: [{ name: public, namespace: edge, sectionName: https }]
+  hostnames: [hooks.example.com]
+  rules:
+    - name: inbound
+      matches: [{ path: { type: PathPrefix, value: /webhooks }, method: POST }]
+      backendRefs: [{ name: webhook-receiver, port: 8080 }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: partners-webhooks, namespace: partners }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: webhooks, sectionName: inbound }
+  ignore: [platform-per-ip, platform-writes-per-ip]
+  limits:
+    - name: partners-webhooks-per-ip
+      key: Client
+      model: { bucket: { rate: 5000/s, burst: 10000 } }
+---
+# The receiver; its Deployment is left out.
+apiVersion: v1
+kind: Service
+metadata: { name: webhook-receiver, namespace: partners }
+spec: { selector: { app: webhook-receiver }, ports: [{ port: 8080 }] }
+---
+# Owned by the inventory team (namespace `inventory`): a gRPC service on the internal
+# listener, called by other clusters.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inventory
+  labels: { edge.example.com/served: "true" }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: inventory, namespace: inventory }
+spec:
+  parentRefs: [{ name: public, namespace: edge, sectionName: internal }]
+  hostnames: [inventory.internal.example.com]
+  rules:
+    - name: stock
+      matches: [{ method: { service: inventory.v1.Inventory } }]
+      backendRefs: [{ name: inventory, port: 9090 }]
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: inventory, namespace: inventory }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: GRPCRoute, name: inventory }
+  limits:
+    - name: inventory-per-ip
+      key: Client
+      model: { bucket: { rate: 5000/s, burst: 5000 } }
+---
+# gRPC in the clear to the pods: the port says h2c. Its Deployment is left out.
+apiVersion: v1
+kind: Service
+metadata: { name: inventory, namespace: inventory }
+spec: { selector: { app: inventory }, ports: [{ port: 9090, appProtocol: kubernetes.io/h2c }] }

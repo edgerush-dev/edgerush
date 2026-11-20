@@ -1,0 +1,108 @@
+# Seven mistakes, one per object, and what each one does. Apply them on top of
+# manifests/ to see them in a cluster, or validate them with the rest (README.md shows
+# both).
+#
+# Refused at `kubectl apply` (nothing is stored): 3, 4, 6.
+# Stored, but not applied, with the reason in status: 1, 2, 7.
+# Stored and applied, silently doing less than meant: 5.
+# `edgerush validate` says all but 3 and 5: it takes the manifests as the API server
+# accepted them, and 3 is refused only by the CRD's rules; 5 is no fault anywhere.
+
+# 1. A name taken. The shop team starts a policy for its products API from the search
+#    team's file and keeps `search-per-ip`, which the search team's policy holds. Names
+#    are unique across the data plane and the incumbent keeps a name, so this whole
+#    policy is refused, `shop-products-burst` included, and the search team's limit is
+#    untouched. Had the shop team added the limit to its existing `shop-storefront`
+#    policy instead, that edit would be refused and the policy's last accepted version
+#    would keep applying.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: shop-products, namespace: shop }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: storefront, sectionName: products-api }
+  limits:
+    - name: search-per-ip                # should have been shop-…
+      key: Client
+      model: { bucket: { rate: 50/s, burst: 50 } }
+    - name: shop-products-burst
+      key: Client
+      model: { fixedWindow: { limit: 500, window: 10s } }
+---
+# 2. A typo in sectionName. Kept, applied to nothing (TargetNotFound); it starts working
+#    by itself if a rule named `checkuot` ever appears.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: shop-checkout-typo, namespace: shop }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: storefront, sectionName: checkuot }
+  limits:
+    - name: shop-checkout-strict
+      key: Client
+      model: { fixedWindow: { limit: 2, window: 1s } }
+---
+# 3. Targets at two levels: the route and one of its rules. Refused at apply: `ignore`
+#    would mean one thing for the route and another for the rule. Two policies instead.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: shop-mixed, namespace: shop }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: storefront }
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: storefront, sectionName: browse }
+  limits:
+    - name: shop-mixed-per-ip
+      key: Client
+      model: { bucket: { rate: 100/s, burst: 100 } }
+---
+# 4. A rate that is not one. Refused at apply by the CRD's schema.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: search-bad-rate, namespace: search }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: search }
+  limits:
+    - name: search-suggest-per-ip
+      key: Client
+      model: { bucket: { rate: 100/sec, burst: 100 } }
+---
+# 5. Ignoring a name that is not there. The inventory team meets gotcha 1 in the README
+#    (gRPC is POST, so the platform's writes limit catches every call) and removes that
+#    limit from its route, but misspells it. No error: an ignore of a name not there is
+#    no fault, so a limit renamed later never breaks a policy. The calls are still
+#    limited by `platform-writes-per-ip`, and the 429s' `RateLimit` header and the
+#    metrics both name it.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: inventory-writes, namespace: inventory }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: GRPCRoute, name: inventory }
+  ignore: [platform-write-per-ip]                 # should have been platform-writes-per-ip
+---
+# 6. A Service as target: protecting a backend is not a rate limit. Refused at apply.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: legacy-billing-backend, namespace: legacy }
+spec:
+  targetRefs:
+    - { group: "", kind: Service, name: billing }
+  limits:
+    - name: legacy-billing-total
+      key: Client
+      model: { bucket: { rate: 500/s, burst: 500 } }
+---
+# 7. A limit on a rule that redirects. Redirects are under no limits: kept, applied to
+#    nothing (NotForwarding); it would apply if the rule were changed to forward.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: platform-redirects, namespace: edge }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: to-https, sectionName: redirect }
+  limits:
+    - name: platform-redirects-per-ip
+      key: Client
+      model: { bucket: { rate: 10/s, burst: 10 } }

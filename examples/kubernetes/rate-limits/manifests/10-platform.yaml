@@ -1,0 +1,78 @@
+# Owned by the platform team (namespace `edge`).
+#
+# One control plane, one data plane. From the DataPlane the operator makes the Gateway
+# `edge/public` and the IngressClass `edge.public`, so the same pods serve Gateway API
+# routes and Ingresses. The ControlPlane's watch reaches beyond its own namespace only as
+# far as the platform's PlatformDefaults allows.
+apiVersion: v1
+kind: Namespace
+metadata: { name: edge }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: edge, namespace: edge }
+spec:
+  watch:
+    namespaces:
+      from: Selector
+      selector: { matchLabels: { edge.example.com/served: "true" } }
+  webhook: { enabled: true }        # Ingresses and RateLimitPolicies judged at kubectl apply
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata: { name: public, namespace: edge }
+spec:
+  controlPlaneRef: { name: edge }
+  replicas: { min: 3, max: 20 }
+  gateway:
+    listeners:
+      - name: http
+        port: 80
+        protocol: HTTP
+        hostname: "*.example.com"
+      - name: https
+        port: 443
+        protocol: HTTPS
+        hostname: "*.example.com"
+        tls: { certificateRefs: [{ name: wildcard-example-com }] }
+        allowedRoutes:
+          namespaces:
+            from: Selector
+            selector: { matchLabels: { edge.example.com/served: "true" } }
+      - name: internal                # other clusters and the office, through a NAT
+        port: 8443
+        protocol: HTTPS
+        hostname: "*.internal.example.com"
+        tls: { certificateRefs: [{ name: wildcard-internal-example-com }] }
+        allowedRoutes:
+          namespaces:
+            from: Selector
+            selector: { matchLabels: { edge.example.com/served: "true" } }
+    allowedListeners:                 # teams may bring their own hostnames
+      namespaces:
+        from: Selector
+        selector: { matchLabels: { edge.example.com/listeners: "true" } }
+  ingress:
+    httpPort: 80
+    httpsPort: 443
+  service: { type: LoadBalancer }
+  rateLimiting:
+    mode: Local
+    global:
+      # Every request this data plane forwards: Gateway API's and Ingress's alike.
+      - name: platform-per-ip
+        key: Client
+        model: { bucket: { rate: 2000/s, burst: 4000 } }
+---
+# Plain HTTP is redirected to HTTPS for every example.com host. A rule that redirects is
+# under no limits (see mistakes.yaml, mistake 7).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: to-https, namespace: edge }
+spec:
+  parentRefs: [{ name: public, sectionName: http }]
+  rules:
+    - name: redirect
+      filters:
+        - type: RequestRedirect
+          requestRedirect: { scheme: https, statusCode: 301 }

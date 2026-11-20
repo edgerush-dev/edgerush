@@ -24,12 +24,15 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 pub(crate) const USAGE: &str = "\
-Usage: edgerush validate --from-manifests <PATH> --data-plane <FILE> [--check-secrets]
+Usage: edgerush validate --from-manifests <PATH>... --data-plane <FILE> [--check-secrets]
 
 Translates Kubernetes manifests as the control plane would for one data plane, compiles the
 config as the data plane would, and says what was left out and why, without a cluster.
 Ingresses of another class, or of none, are another data plane's: they are counted, not
-translated.
+translated. RateLimitPolicies are compiled as the control plane compiles them, each one
+refused said with why.
+The manifests are taken as the API server accepted them: the rules their resources'
+schemas state are not checked here; `kubectl apply --dry-run=server` checks them.
 A BackendTLSPolicy's `wellKnownCACertificates: System` trusts the authorities this machine
 does, read as `edgerush controller` reads its own system's.
 Exits 0 when everything was translated and the config compiles, notes aside (a retry's
@@ -40,7 +43,8 @@ authorities could not be read.
 
 Options:
       --from-manifests <PATH>  Manifests in YAML: a file, or a directory read for every
-                               .yaml and .yml file in it and below. A `List`, as
+                               .yaml and .yml file in it and below; given more than
+                               once, every path is read. A `List`, as
                                `kubectl get -o yaml` writes one, is read for its items;
                                kinds that are not translated are passed over. The data
                                plane's IngressClass must be among them, naming
@@ -96,7 +100,8 @@ enum Parsed {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
-    manifests: PathBuf,
+    /// At least one.
+    manifests: Vec<PathBuf>,
     data_plane: PathBuf,
     check_secrets: bool,
 }
@@ -114,7 +119,7 @@ enum UsageError {
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
-    let mut manifests = None;
+    let mut manifests = Vec::new();
     let mut data_plane = None;
     let mut check_secrets = false;
     while let Some(arg) = args.next() {
@@ -125,7 +130,11 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                 check_secrets = true;
                 continue;
             }
-            "--from-manifests" => ("--from-manifests", &mut manifests),
+            "--from-manifests" => {
+                let value = args.next().ok_or(UsageError::NoValue("--from-manifests"))?;
+                manifests.push(PathBuf::from(value));
+                continue;
+            }
             "--data-plane" => ("--data-plane", &mut data_plane),
             _ => return Err(UsageError::Unexpected(arg)),
         };
@@ -134,8 +143,11 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             return Err(UsageError::Twice(option));
         }
     }
+    if manifests.is_empty() {
+        return Err(UsageError::Required("--from-manifests <PATH>"));
+    }
     Ok(Parsed::Validate(Options {
-        manifests: manifests.ok_or(UsageError::Required("--from-manifests <PATH>"))?,
+        manifests,
         data_plane: data_plane.ok_or(UsageError::Required("--data-plane <FILE>"))?,
         check_secrets,
     }))
@@ -226,9 +238,20 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
         secrets_assumed: !options.check_secrets,
         ..Cluster::default()
     };
-    for file in files(&options.manifests)? {
-        for manifest in read_all::<Manifest>(&file)? {
-            manifest.into_cluster(&mut cluster);
+    // A file under two of the paths given is read once, or its objects would be two each.
+    let mut read_already = std::collections::BTreeSet::new();
+    for path in &options.manifests {
+        for file in files(path)? {
+            let same = fs::canonicalize(&file).map_err(|error| Failed::Unreadable {
+                path: file.clone(),
+                error,
+            })?;
+            if !read_already.insert(same) {
+                continue;
+            }
+            for manifest in read_all::<Manifest>(&file)? {
+                manifest.into_cluster(&mut cluster);
+            }
         }
     }
     let translation = translate(&plane, &cluster);
@@ -389,11 +412,11 @@ mod tests {
     }
 
     #[test]
-    fn it_needs_its_manifests_and_its_data_plane_once_each() {
+    fn it_needs_manifests_and_its_data_plane_once() {
         assert_eq!(
             parsed(&["--from-manifests", "m", "--data-plane", "p"]),
             Ok(Parsed::Validate(Options {
-                manifests: PathBuf::from("m"),
+                manifests: vec![PathBuf::from("m")],
                 data_plane: PathBuf::from("p"),
                 check_secrets: false,
             }))
@@ -407,7 +430,7 @@ mod tests {
                 "p"
             ]),
             Ok(Parsed::Validate(Options {
-                manifests: PathBuf::from("m"),
+                manifests: vec![PathBuf::from("m")],
                 data_plane: PathBuf::from("p"),
                 check_secrets: true,
             }))
@@ -430,10 +453,35 @@ mod tests {
             Err(UsageError::NoValue("--from-manifests"))
         );
         assert_eq!(
-            parsed(&["--from-manifests", "m", "--from-manifests", "n"]),
-            Err(UsageError::Twice("--from-manifests"))
+            parsed(&["--data-plane", "p", "--data-plane", "q"]),
+            Err(UsageError::Twice("--data-plane"))
         );
         assert_eq!(parsed(&["m"]), Err(UsageError::Unexpected("m".to_owned())));
+    }
+
+    /// Manifests may come from several paths, as `kubectl apply -f` takes several: what a
+    /// repository holds and what the operator makes of a DataPlane, say.
+    #[test]
+    fn manifests_may_come_from_several_paths() {
+        assert_eq!(
+            parsed(&[
+                "--from-manifests",
+                "m",
+                "--data-plane",
+                "p",
+                "--from-manifests",
+                "n"
+            ]),
+            Ok(Parsed::Validate(Options {
+                manifests: vec![PathBuf::from("m"), PathBuf::from("n")],
+                data_plane: PathBuf::from("p"),
+                check_secrets: false,
+            }))
+        );
+        assert_eq!(
+            parsed(&["--from-manifests", "m", "--from-manifests"]),
+            Err(UsageError::NoValue("--from-manifests"))
+        );
     }
 
     /// Kinds that are not translated are passed over, and a `List`'s items are read as

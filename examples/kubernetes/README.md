@@ -1,9 +1,9 @@
 # Kubernetes designs — mostly not implemented
 
-These manifests illustrate planned APIs. Do not apply them expecting a working gateway:
-the rate-limit tables and signals and the ingress-nginx annotation translator they use are
-not built, and the `ControlPlane` and `DataPlane` here are early designs whose fields
-differ from the CRDs the operator now serves.
+These manifests, but `rate-limits/`, illustrate planned APIs. Do not apply them expecting
+a working gateway: the ingress-nginx annotation translator they use is not built, and the
+`ControlPlane` and `DataPlane` here are early designs whose fields differ from the CRDs the
+operator now serves.
 
 The operator and control plane run today. The README's
 [In a cluster: the operator](../../README.md#in-a-cluster-the-operator) shows the two
@@ -15,7 +15,10 @@ of objects it then serves.
 |---|---|
 | [01-planes.yaml](01-planes.yaml) | A team's control plane and separate data planes for API and WebSocket traffic |
 | [02-routes.yaml](02-routes.yaml) | Ingress and HTTPRoute sharing a data plane |
-| [03-rate-limits.yaml](03-rate-limits.yaml) | Tables, hierarchical rate limits and signal-driven shedding |
 | [04-ingress-nginx.yaml](04-ingress-nginx.yaml) | Planned translation of ingress-nginx annotations |
+
+[rate-limits/](rate-limits/README.md) is built: a data plane shared by several teams, its
+RateLimitPolicies at every level, and common mistakes with what `edgerush validate`, `kubectl`
+and status show of each.
 
 For a working local example, use [Docker Compose](../docker-compose/README.md).
