@@ -324,6 +324,16 @@ fn the_table_claims_the_gateway_tcp_profiles_core() {
     }
 }
 
+#[test]
+fn the_table_claims_the_gateway_udp_profiles_core() {
+    // GATEWAY-UDP's core passes every test the suite has of it (#294). UDPRoute has no
+    // extended feature of its own: the profile's others are the Gateway's, claimed or not as
+    // GATEWAY-HTTP's run found them.
+    for core in ["Gateway", "ReferenceGrant", "UDPRoute"] {
+        assert!(SUPPORTED_FEATURES.contains(&core), "{core}");
+    }
+}
+
 /// What translation says of a Gateway of two listeners, `http` served and `secure` not.
 fn wanted_gateway() -> translate::GatewayStatus {
     translate::GatewayStatus {
