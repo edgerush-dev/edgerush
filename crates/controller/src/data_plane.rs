@@ -386,8 +386,24 @@ pub fn settings(data_plane: &DataPlane, own: &Own) -> Result<Settings, Unusable>
             namespace: data_plane.metadata.namespace.clone().unwrap_or_default(),
             name: data_plane.metadata.name.clone().unwrap_or_default(),
             generation: data_plane.metadata.generation.unwrap_or_default(),
+            object: Arc::new(of_its_generation(data_plane)),
         }),
     })
+}
+
+/// `data_plane` as of its generation: its spec and metadata, without its status, which
+/// says what is made of it now, nor its resourceVersion and managedFields, which every
+/// write to it changes, a status written as much as an edit.
+#[must_use]
+pub fn of_its_generation(data_plane: &DataPlane) -> DataPlane {
+    let mut metadata = data_plane.metadata.clone();
+    metadata.resource_version = None;
+    metadata.managed_fields = None;
+    DataPlane {
+        metadata,
+        spec: data_plane.spec.clone(),
+        status: None,
+    }
 }
 
 /// The settings translation is given of `data_plane`, as it now is (05 §3): the ID its

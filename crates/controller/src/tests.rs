@@ -774,6 +774,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -1179,6 +1180,7 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
                         debounce,
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -1349,6 +1351,7 @@ async fn a_data_plane_taking_a_name_a_policy_holds_is_held_back() {
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -1400,11 +1403,14 @@ async fn a_data_plane_taking_a_name_a_policy_holds_is_held_back() {
 
 /// `plane` as DataPlane `edge/web` at `generation` serves it.
 fn of_generation(plane: &Plane, generation: i64) -> Settings {
+    let mut object = web_data_plane("");
+    object.metadata.generation = Some(generation);
     Settings {
         data_plane: Some(DataPlaneOf {
             namespace: "edge".to_owned(),
             name: "web".to_owned(),
             generation,
+            object: Arc::new(object),
         }),
         ..harness(plane)
     }
@@ -1491,6 +1497,7 @@ async fn a_data_planes_served_says_which_generation_is_served_and_why_one_is_hel
                         Debounce::default(),
                         Some(leading),
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -1698,6 +1705,7 @@ async fn the_settings_are_followed_as_they_change() {
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -1803,6 +1811,7 @@ async fn secrets_are_followed_in_the_gateways_namespace_beside_the_scope() {
                     Debounce::default(),
                     None,
                     acks(),
+                    None,
                     |_| {},
                 )
                 .await;
@@ -1873,6 +1882,7 @@ async fn each_namespace_of_the_scope_is_followed_and_all_are_translated_together
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -2134,6 +2144,7 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -2235,6 +2246,7 @@ async fn a_rate_limit_policys_status_is_written_of_the_ingress_it_reaches_and_on
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -2339,6 +2351,7 @@ async fn a_config_is_not_held_up_by_its_status() {
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -2424,6 +2437,7 @@ async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
                         Debounce::default(),
                         Some(leading),
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -3074,6 +3088,7 @@ async fn a_selectors_namespaces_are_followed_and_each_that_comes_to_match_taken_
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -3228,6 +3243,7 @@ async fn a_selectors_first_namespaces_are_waited_on_as_the_start_is() {
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -3464,6 +3480,7 @@ async fn the_data_planes_service_is_written_as_wanted_and_not_again_until_that_c
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -3532,6 +3549,7 @@ async fn a_service_of_its_name_not_its_data_planes_is_left_alone() {
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -3577,6 +3595,7 @@ async fn a_service_refused_is_said() {
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -3690,6 +3709,7 @@ async fn each_data_plane_is_translated_and_its_statuses_written_on_its_own() {
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -3824,6 +3844,7 @@ async fn the_last_data_planes_ingresses_lose_their_address_once_it_is_let_go_of(
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -3905,6 +3926,7 @@ async fn a_control_plane_serving_no_data_plane_lets_go_of_its_classes_once_they_
                         Debounce::default(),
                         Some(leading),
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -3993,6 +4015,7 @@ async fn a_data_plane_added_refused_or_let_go_of_leaves_the_others_as_they_were(
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -4088,6 +4111,7 @@ async fn a_data_plane_of_ingress_alone_does_not_wait_on_the_gateway_apis_kinds()
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -4471,6 +4495,7 @@ async fn a_control_plane_serving_no_gateway_follows_the_classes_alone() {
                         Debounce::default(),
                         None,
                         acks(),
+                        None,
                         said,
                     )
                     .await;
@@ -4558,4 +4583,171 @@ spec:
     assert!(!held(Some(&with), &settings(false)));
     assert!(!held(Some(&following(Vec::new())), &settings(true)));
     assert!(!held(None, &settings(true)));
+}
+
+/// The versions of the policies `policies` holds, as their generations say them.
+fn generations(policies: &[AcceptedPolicy]) -> Vec<Option<i64>> {
+    policies.iter().map(|policy| policy.generation).collect()
+}
+
+/// A data plane's record holds the version of each policy that applied in the config last
+/// handed on, and that config, its certificates with it, only while it serves in another's
+/// place: the translation since refused whole, or its Gateway held (04 §2).
+#[test]
+fn a_record_holds_the_config_handed_on_only_while_it_serves_in_anothers_place() {
+    let plane = plane_with("rate_limiting: { mode: local }");
+    let mut served = Serving::new(harness(&plane));
+    let first = with_policy(rate_limit_policy("shop", 1, &[("per-client", "10/s")]));
+    let Step::Translated(translation) = served.translator.step(&plane, &first) else {
+        panic!("not translated");
+    };
+    let handed = translation.config.clone();
+    assert!(!handed.certificates.is_empty());
+    let record = served.record(false);
+    assert_eq!(generations(&record.policies), [Some(1)]);
+    assert_eq!(
+        record.config, None,
+        "the config translated is the one handed on"
+    );
+    assert_eq!(served.record(true).config.as_ref(), Some(&handed), "held");
+    // Settings of 65 global limits, which no policy refused brings under the most a rule
+    // takes: refused whole, the config handed on serves in its place.
+    let names: Vec<String> = (0..65).map(|n| format!("global-{n}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let renamed = with_policy(rate_limit_policy("shop", 2, &[("renamed", "10/s")]));
+    let Step::Refused { .. } = served.translator.step(&limiting(&names), &renamed) else {
+        panic!("a rule under 65 limits not refused");
+    };
+    let record = served.record(false);
+    assert_eq!(record.config.as_ref(), Some(&handed), "refused whole");
+    assert_eq!(generations(&record.policies), [Some(1)]);
+    let Step::Translated(_) = served.translator.step(&plane, &renamed) else {
+        panic!("not translated");
+    };
+    let record = served.record(false);
+    assert_eq!(record.config, None, "handed on again");
+    assert_eq!(generations(&record.policies), [Some(2)]);
+}
+
+/// A data plane's record holds its DataPlane as last accepted, and, while that generation
+/// is not taken on, the one served in its place; the development harness's, none.
+#[test]
+fn a_record_holds_the_data_plane_served_while_a_later_one_waits() {
+    let object = |settings: &Settings| {
+        settings
+            .data_plane
+            .as_ref()
+            .map(|of| DataPlane::clone(&of.object))
+    };
+    let served_with = of_generation(&limiting(&[]), 1);
+    let mut served = Serving::new(served_with.clone());
+    let record = served.record(false);
+    assert_eq!(record.accepted, object(&served_with));
+    assert_eq!(record.served, None);
+    // A generation that adds a global limit waits to be judged, the one before served.
+    let wanted = of_generation(&limiting(&["per-client"]), 2);
+    served.offer(&wanted);
+    let record = served.record(false);
+    assert_eq!(record.accepted, object(&wanted));
+    assert_eq!(record.served, object(&served_with));
+    let record = Serving::new(harness(&plane())).record(false);
+    assert_eq!((record.accepted, record.served), (None, None));
+}
+
+/// A snapshot is taken only where its records differ from the last one's, counted on from
+/// it: from one taken from another replica too.
+#[test]
+fn a_snapshot_is_counted_on_only_as_it_changes() {
+    let (snapshots, mut taken) = watch::channel(None);
+    let planes = |served: Option<DataPlane>| {
+        let record = Record {
+            served,
+            ..Record::default()
+        };
+        BTreeMap::from([("DataPlane edge/web".to_owned(), record)])
+    };
+    let count = |taken: &mut watch::Receiver<Option<Arc<Snapshot>>>| {
+        taken.borrow_and_update().as_ref().map(|taken| taken.count)
+    };
+    take(&snapshots, planes(None));
+    assert_eq!(count(&mut taken), Some(1));
+    take(&snapshots, planes(None));
+    assert!(!taken.has_changed().unwrap(), "the same taken again");
+    take(&snapshots, planes(Some(web_data_plane(""))));
+    assert_eq!(count(&mut taken), Some(2));
+    snapshots.send_replace(Some(Arc::new(Snapshot {
+        count: 7,
+        planes: planes(None),
+    })));
+    take(&snapshots, planes(Some(web_data_plane(""))));
+    assert_eq!(count(&mut taken), Some(8));
+}
+
+/// With a snapshot to take, each round's records are taken into it as they change: the
+/// version of each policy that applied, once the objects are translated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_records_are_taken_into_the_snapshot_each_round() {
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[ingress("shop", "web", "shop.example")])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/secrets?") {
+            page(&[secret("shop", &["shop.example"])])
+        } else if path.starts_with("/apis/gateway.edgerush.dev/v1alpha1/ratelimitpolicies?") {
+            answer(200, PER_CLIENT_POLICY)
+        } else {
+            otherwise(path)
+        }
+    })
+    .await;
+    let api = fake.client(&token("controller-snapshot", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let (snapshots, mut taken) = watch::channel(None);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (settings, planes) = watch::channel(only(harness(&limiting(&[]))));
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        planes,
+                        None,
+                        Debounce::default(),
+                        None,
+                        acks(),
+                        Some(snapshots),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("translated", || heard.borrow().translations.len() == 1).await;
+            let policies = |taken: &mut watch::Receiver<Option<Arc<Snapshot>>>| {
+                let taken = taken.borrow_and_update().clone().expect("none taken");
+                (taken.count, generations(&taken.planes[""].policies))
+            };
+            let (count, applied) = policies(&mut taken);
+            assert_eq!(applied, [Some(1)]);
+            // Settings that change no record, translated again: nothing more taken.
+            let mut edited = limiting(&[]);
+            edited.ingress_https_redirect = true;
+            settings.send_replace(only(harness(&edited)));
+            until("translated again", || {
+                heard.borrow().translations.len() == 2
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(policies(&mut taken), (count, vec![Some(1)]));
+            controlling.abort();
+        })
+        .await;
 }

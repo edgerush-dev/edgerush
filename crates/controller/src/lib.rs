@@ -21,7 +21,7 @@
 
 use acks::{Pods, REPORT_LABEL};
 use edgerush_config::ServiceName;
-use edgerush_config::{ConfigError, compile};
+use edgerush_config::{Config, ConfigError, compile};
 use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
 use edgerush_gateway_api::gateway::Gateway;
 use edgerush_gateway_api::gateway_class::GatewayClass;
@@ -51,6 +51,7 @@ use k8s_openapi::api::networking::v1::IngressLoadBalancerIngress;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+use snapshot::{Record, Snapshot};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
@@ -96,7 +97,7 @@ pub struct Settings {
 }
 
 /// A DataPlane, and the generation of it some settings are of.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DataPlaneOf {
     /// Its namespace.
     pub namespace: String,
@@ -104,6 +105,10 @@ pub struct DataPlaneOf {
     pub name: String,
     /// Its generation.
     pub generation: i64,
+    /// The DataPlane itself as of that generation, as a snapshot holds it (04 §2): without
+    /// its status, nor what of its metadata every write to it changes
+    /// ([`data_plane::of_its_generation`]), so that a status written leaves it as it was.
+    pub object: Arc<DataPlane>,
 }
 
 /// The condition a control plane writes on each DataPlane it serves, beside the operator's
@@ -323,6 +328,9 @@ pub enum Membership {
 /// Gateway (those addresses among it, or none without that Service) and each route that
 /// names or named that Gateway likewise, always. With `leading`, only while it says this
 /// replica leads, every status that says otherwise written as it comes to (02 §3).
+/// With `snapshots`, what of each data plane its objects cannot give back is taken into
+/// it each round, as a [`Snapshot`] counted on from the one it holds, where it differs
+/// from that one: the leader's, for the other replicas (04 §2).
 /// The data planes are what `planes` holds, as it changes: none, and nothing is translated,
 /// nor, without `classes`, as the development harness has none, followed, until it holds
 /// some. With `classes`, a ControlPlane's, what is followed is followed whether or not it
@@ -343,6 +351,7 @@ pub async fn control(
     debounce: Debounce,
     leading: Option<watch::Receiver<bool>>,
     acks: Acks,
+    snapshots: Option<watch::Sender<Option<Arc<Snapshot>>>>,
     said: impl Fn(Said<'_>) + 'static,
 ) {
     let api = Rc::new(api);
@@ -363,6 +372,7 @@ pub async fn control(
             debounce,
             leading.as_ref(),
             &acks,
+            snapshots.as_ref(),
             &said,
         )
         .await;
@@ -518,6 +528,31 @@ impl Serving {
         }
     }
 
+    /// What of it a snapshot holds (04 §2): the version of each RateLimitPolicy that
+    /// applied, its DataPlane as last accepted and, where that generation is not taken on
+    /// yet, as served, and the config last handed on where the last translation was
+    /// refused whole or its Gateway is `held`.
+    fn record(&self, held: bool) -> Record {
+        let object = |settings: &Settings| {
+            settings
+                .data_plane
+                .as_ref()
+                .map(|of| DataPlane::clone(&of.object))
+        };
+        let accepted = self.wanted.as_ref().unwrap_or(&self.settings);
+        let translator = &self.translator;
+        Record {
+            policies: translator.accepted.clone(),
+            accepted: object(accepted),
+            served: self.wanted.as_ref().and_then(|_| object(&self.settings)),
+            config: if held || translator.refused {
+                translator.handed.clone()
+            } else {
+                None
+            },
+        }
+    }
+
     /// Why `wanted` is held back, translated from `cluster` beside the settings served; none
     /// where it may be taken on: its `global` takes no name a policy holds, and puts no rule
     /// over the most limits that the settings served do not, whether a policy's change is
@@ -607,6 +642,7 @@ async fn serve(
     debounce: Debounce,
     leading: Option<&watch::Receiver<bool>>,
     acks: &Acks,
+    snapshots: Option<&watch::Sender<Option<Arc<Snapshot>>>>,
     said: &Rc<dyn Fn(Said<'_>)>,
 ) {
     let changed = Rc::new(Notify::new());
@@ -844,6 +880,16 @@ async fn serve(
                 }),
             }
         }
+        if let Some(snapshots) = snapshots {
+            let planes = serving
+                .iter()
+                .map(|(name, served)| {
+                    let held = held(followed.gateway_api.as_ref(), &served.settings);
+                    (name.clone(), served.record(held))
+                })
+                .collect();
+            take(snapshots, planes);
+        }
         // Every round, so that a status changed by another, or written in vain, is written
         // again; one at a time, which is all the pace there is. A status written is a change
         // to its object, and the round it brings finds nothing more to write. Each data
@@ -920,6 +966,19 @@ async fn serve(
             }
         }
     }
+}
+
+/// `planes` taken as the next snapshot where they differ from the last one's, counted on
+/// from it, so that the newest is the highest (04 §2).
+fn take(snapshots: &watch::Sender<Option<Arc<Snapshot>>>, planes: BTreeMap<String, Record>) {
+    snapshots.send_if_modified(|last| {
+        if last.as_ref().is_some_and(|last| last.planes == planes) {
+            return false;
+        }
+        let count = last.as_ref().map_or(0, |last| last.count).saturating_add(1);
+        *last = Some(Arc::new(Snapshot { count, planes }));
+        true
+    });
 }
 
 /// Whether the Gateway of a data plane served as `settings` say is held as it was: one of a
@@ -2486,12 +2545,17 @@ fn wait_said(said: &mut Option<Vec<String>>, unlisted: Vec<String>) -> Option<&[
     Some(said.insert(unlisted))
 }
 
-/// What was last translated for a data plane, so that nothing is said twice, and what of
-/// the RateLimitPolicies its config served applied.
+/// What was last translated for a data plane, so that nothing is said twice, what of the
+/// RateLimitPolicies its config served applied, and that config.
 #[derive(Debug, Default)]
 struct Translator {
     /// The last translation said, handed on or refused.
     last: Option<Translation>,
+    /// The config last handed on, its certificates and limits with it.
+    handed: Option<Config>,
+    /// Whether the last translation said was refused, the config handed on before it
+    /// served in its place.
+    refused: bool,
     /// The version of each RateLimitPolicy that applied in the last config handed on: each
     /// holds its limits' names, and applies where a later spec is refused (04 §4). Kept in
     /// memory alone, so lost on a restart (docs/12 item 33).
@@ -2522,10 +2586,12 @@ impl Translator {
             return Step::Nothing;
         }
         let refused = compile(&translation.config).err();
+        self.refused = refused.is_some();
         let translation = self.last.insert(translation);
         match refused {
             None => {
                 self.accepted.clone_from(&translation.rate_limit_policies);
+                self.handed = Some(translation.config.clone());
                 Step::Translated(translation)
             }
             Some(problems) => Step::Refused {

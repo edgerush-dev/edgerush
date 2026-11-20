@@ -1291,6 +1291,7 @@ async fn control_until(
                 own: running,
                 reports,
             },
+            None,
             move |said| {
                 let mut text = told(&said, write_config.as_deref());
                 if let (

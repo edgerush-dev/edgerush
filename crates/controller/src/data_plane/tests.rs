@@ -91,18 +91,25 @@ fn a_data_plane_serving_both_is_its_settings_field_by_field() {
 }
 
 /// A DataPlane's settings say which DataPlane, and which generation of it, they are of: what
-/// its `Served` says of (05 §1).
+/// its `Served` says of (05 §1). They hold it too, as of that generation, as a snapshot
+/// carries it (04 §2): what every write to it changes left out, its status, its
+/// resourceVersion and its managedFields, so that a status written leaves them as they were.
 #[test]
 fn a_data_planes_settings_are_of_its_generation() {
-    let settings = settings(&web(3, BOTH, ""), &own()).unwrap();
+    let of = settings(&web(3, BOTH, ""), &own()).unwrap();
     assert_eq!(
-        settings.data_plane,
+        of.data_plane,
         Some(crate::DataPlaneOf {
             namespace: "edge".to_owned(),
             name: "web".to_owned(),
             generation: 3,
+            object: Arc::new(web(3, BOTH, "")),
         })
     );
+    let mut written = web(3, BOTH, &accepted("True", 3));
+    written.metadata.resource_version = Some("41".to_owned());
+    written.metadata.managed_fields = Some(vec![Default::default()]);
+    assert_eq!(settings(&written, &own()).unwrap(), of);
 }
 
 #[test]
