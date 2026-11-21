@@ -12,7 +12,7 @@
 use crate::message::{Answer, Answers, Batch, Entry, Message, Outbox, Unserved, Why};
 use crate::{Store, Value, apply};
 use edgerush_cluster::table::shard_of;
-use edgerush_cluster::{Config, NodeId, Time};
+use edgerush_cluster::{Config, Key, NodeId, Time};
 use edgerush_ratelimit::service::Report;
 use std::collections::BTreeMap;
 
@@ -98,7 +98,7 @@ impl Pod {
 
     /// The value it holds for `key`, owned or a copy.
     #[must_use]
-    pub fn value(&self, key: u64) -> Option<Value> {
+    pub fn value(&self, key: Key) -> Option<Value> {
         self.node.value(key)
     }
 
@@ -255,7 +255,7 @@ impl Pod {
 
     /// Why it does not serve `key`: its table names it the owner, but it is not serving; or
     /// names another, or none.
-    fn why_not(&self, key: u64) -> Why {
+    fn why_not(&self, key: Key) -> Why {
         let shard = shard_of(key, self.node.config().shards);
         let owner = self.node.committed().and_then(|table| table.owner(shard));
         if owner == Some(self.node.id()) {
@@ -331,7 +331,7 @@ mod tests {
     }
 
     /// The first key of a shard the first table gives `owner`.
-    fn key_of(owner: NodeId) -> u64 {
+    fn key_of(owner: NodeId) -> Key {
         let table = first();
         let shard: ShardId = (0..4)
             .find(|shard| table.owner(*shard) == Some(owner))
@@ -339,7 +339,7 @@ mod tests {
         (0..).find(|key| shard_of(*key, 4) == shard).unwrap()
     }
 
-    fn hits(key: u64, sequence: u64, count: u64) -> Entry {
+    fn hits(key: Key, sequence: u64, count: u64) -> Entry {
         Entry {
             key,
             contract: contract(),
@@ -352,7 +352,7 @@ mod tests {
         }
     }
 
-    fn poll(key: u64) -> Entry {
+    fn poll(key: Key) -> Entry {
         Entry {
             key,
             contract: contract(),

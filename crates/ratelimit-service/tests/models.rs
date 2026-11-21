@@ -20,7 +20,7 @@
 )]
 
 use edgerush_cluster::table::mix;
-use edgerush_cluster::{Time, ms};
+use edgerush_cluster::{Key, Time, ms};
 use edgerush_cluster_synchronous::{Rule, Value};
 use edgerush_ratelimit::local::{Decision, Handles, Limit as LocalLimit, Local, Rolling};
 use edgerush_ratelimit::reference::{Alignment, FixedWindow, Model, RollingWindow, TokenBucket};
@@ -148,7 +148,7 @@ fn compare(times: &[Time], first: &Run, second: &Run) -> Option<String> {
     ))
 }
 
-const KEY: u64 = 7;
+const KEY: Key = 7;
 
 fn service(rule: Rule, times: &[Time]) -> Run {
     let mut value = Value::default();

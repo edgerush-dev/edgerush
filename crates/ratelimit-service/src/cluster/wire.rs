@@ -26,7 +26,7 @@
 
 use bytes::Bytes;
 use edgerush_cluster::table::{Changes as StoreChanges, Shard as StoreShard, Table as StoreTable};
-use edgerush_cluster::{Held, Kept, Message, NodeId, ShardId, Stamp as StoreStamp};
+use edgerush_cluster::{Held, Kept, Key, Message, NodeId, ShardId, Stamp as StoreStamp};
 use edgerush_cluster_synchronous::{
     Answer as SyncAnswer, MOST_SLOTS, Message as SyncMessage, Rule as SyncRule, Value as SyncValue,
 };
@@ -845,7 +845,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
                 version,
                 under: Some(stamp(under)),
                 entries: entries_to_wire(entries),
-                dropped,
+                dropped: keys_to_wire(dropped),
                 part,
                 more,
             })),
@@ -972,7 +972,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             shard: u32::from(shard),
             term,
             entries: entries_to_wire(entries),
-            dropped,
+            dropped: keys_to_wire(dropped),
             part,
             more,
         })),
@@ -1103,7 +1103,7 @@ pub fn from_peer<V: Value>(sent: ToPeer<V::Wire>) -> Result<(NodeId, Message<V>)
             shard: shard_id(handoff.shard)?,
             term: handoff.term,
             entries: entries_from(handoff.entries)?,
-            dropped: handoff.dropped,
+            dropped: keys_from_wire(handoff.dropped),
             part: handoff.part,
             more: handoff.more,
         },
@@ -1141,7 +1141,7 @@ pub fn from_copy<V: Value>(sent: ToCopy<V::Wire>) -> Result<(NodeId, Message<V>)
             version: copy.version,
             under: stamp_from(copy.under)?,
             entries: entries_from(copy.entries)?,
-            dropped: copy.dropped,
+            dropped: keys_from_wire(copy.dropped),
             part: copy.part,
             more: copy.more,
         },
@@ -1174,7 +1174,7 @@ pub fn mode_wire(from: NodeId, message: SyncMessage) -> Option<Outgoing<Synchron
         } => peer(Control::Request(Request {
             client,
             id,
-            key,
+            key: key_to_wire(key),
             stamp: Some(stamp(asked)),
             hops: u32::from(hops),
             via,
@@ -1248,7 +1248,7 @@ pub fn asked_from(asking: Asking, client: NodeId) -> Result<SyncMessage, Invalid
         Asked::Gather(gather) => Ok(SyncMessage::Gather {
             client,
             id: gather.id,
-            keys: gather.keys,
+            keys: keys_from_wire(gather.keys),
         }),
     }
 }
@@ -1265,7 +1265,10 @@ pub fn asking(message: SyncMessage) -> Option<Asking> {
             })) => Asked::Request(request),
             _ => return None,
         },
-        SyncMessage::Gather { id, keys, .. } => Asked::Gather(Gather { id, keys }),
+        SyncMessage::Gather { id, keys, .. } => Asked::Gather(Gather {
+            id,
+            keys: keys_to_wire(keys),
+        }),
         _ => return None,
     };
     Some(Asking { asked: Some(asked) })
@@ -1309,7 +1312,7 @@ fn request_from(request: Request) -> Result<SyncMessage, Invalid> {
     Ok(SyncMessage::Request {
         client: request.client,
         id: request.id,
-        key: request.key,
+        key: key_from_wire(request.key),
         stamp: stamp_from(request.stamp)?,
         hops: u8::try_from(request.hops).map_err(|_| Invalid::Hops)?,
         via: request.via,
@@ -1472,24 +1475,44 @@ fn table_from(table: Table) -> Result<StoreTable, Invalid> {
     })
 }
 
-fn entries_to_wire<V: Value>(entries: Vec<(u64, Kept<V>)>) -> Vec<Entry<V::Wire>> {
+/// A key as the wire carries it.
+pub(crate) const fn key_to_wire(key: Key) -> u64 {
+    key
+}
+
+/// A key from the wire.
+pub(crate) const fn key_from_wire(wire: u64) -> Key {
+    wire
+}
+
+/// Keys as the wire carries them.
+fn keys_to_wire(keys: Vec<Key>) -> Vec<u64> {
+    keys.into_iter().map(key_to_wire).collect()
+}
+
+/// Keys from the wire.
+fn keys_from_wire(wire: Vec<u64>) -> Vec<Key> {
+    wire.into_iter().map(key_from_wire).collect()
+}
+
+fn entries_to_wire<V: Value>(entries: Vec<(Key, Kept<V>)>) -> Vec<Entry<V::Wire>> {
     entries
         .into_iter()
         .map(|(key, kept)| Entry {
-            key,
+            key: key_to_wire(key),
             value: Some(kept.value.to_wire()),
             forget_at: kept.forget_at,
         })
         .collect()
 }
 
-fn entries_from<V: Value>(entries: Vec<Entry<V::Wire>>) -> Result<Vec<(u64, Kept<V>)>, Invalid> {
+fn entries_from<V: Value>(entries: Vec<Entry<V::Wire>>) -> Result<Vec<(Key, Kept<V>)>, Invalid> {
     entries
         .into_iter()
         .map(|entry| {
             let value = V::from_wire(entry.value.ok_or(Invalid::Missing)?)?;
             Ok((
-                entry.key,
+                key_from_wire(entry.key),
                 Kept {
                     value,
                     forget_at: entry.forget_at,
@@ -1725,9 +1748,9 @@ mod tests {
         ]
     }
 
-    fn entries() -> impl Strategy<Value = Vec<(u64, Kept<SyncValue>)>> {
+    fn entries() -> impl Strategy<Value = Vec<(Key, Kept<SyncValue>)>> {
         prop::collection::vec(
-            (any::<u64>(), value(), any::<u64>())
+            (any::<Key>(), value(), any::<u64>())
                 .prop_map(|(key, value, forget_at)| (key, Kept { value, forget_at })),
             0..5,
         )
@@ -1861,7 +1884,7 @@ mod tests {
                 any::<u64>(),
                 stamps(),
                 entries(),
-                prop::collection::vec(any::<u64>(), 0..4),
+                prop::collection::vec(any::<Key>(), 0..4),
                 any::<(u32, bool)>(),
             )
                 .prop_map(
@@ -1912,7 +1935,7 @@ mod tests {
                 any::<ShardId>(),
                 any::<u64>(),
                 entries(),
-                prop::collection::vec(any::<u64>(), 0..4),
+                prop::collection::vec(any::<Key>(), 0..4),
                 any::<(u32, bool)>(),
             )
                 .prop_map(|(shard, term, entries, dropped, (part, more))| {
@@ -1974,7 +1997,7 @@ mod tests {
         prop_oneof![
             message().prop_map(SyncMessage::Store),
             (
-                any::<(u64, u64, u64)>(),
+                any::<(u64, u64, Key)>(),
                 stamps(),
                 any::<u8>(),
                 prop::option::of(any::<u64>()),
@@ -2092,7 +2115,7 @@ mod tests {
         #[test]
         fn a_request_to_gather_comes_up_as_the_streams_client(
             id in any::<u64>(),
-            keys in prop::collection::vec(any::<u64>(), 0..5),
+            keys in prop::collection::vec(any::<Key>(), 0..5),
             client in any::<u64>(),
         ) {
             let gather = SyncMessage::Gather { client: 0, id, keys: keys.clone() };
@@ -2452,7 +2475,7 @@ mod tests {
             },
             SyncValue::Slots(slots),
         ];
-        let part = |entries: Vec<(u64, Kept<SyncValue>)>, dropped: Vec<u64>| {
+        let part = |entries: Vec<(Key, Kept<SyncValue>)>, dropped: Vec<Key>| {
             let Outgoing::Copy(sent) = wire(
                 u64::MAX,
                 Message::Replicate {
@@ -2479,12 +2502,14 @@ mod tests {
             };
             let count = most / kept.bytes();
             let entries = (0..count)
-                .map(|key| (u64::MAX - key, kept.clone()))
+                .map(|key| (Key::MAX - key, kept.clone()))
                 .collect();
             let encoded = part(entries, Vec::new());
             assert!(encoded <= crate::grpc::MAX_MESSAGE, "{encoded} bytes");
         }
-        let dropped = (0..most / 8).map(|key| u64::MAX - key).collect();
+        let dropped = (0..most / edgerush_cluster::KEY_BYTES)
+            .map(|key| Key::MAX - key)
+            .collect();
         let encoded = part(Vec::new(), dropped);
         assert!(encoded <= crate::grpc::MAX_MESSAGE, "{encoded} bytes");
     }

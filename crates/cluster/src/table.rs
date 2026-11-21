@@ -1,7 +1,7 @@
 //! The table the leader publishes, and the pure rules it is changed by: who votes, who owns
 //! which shard, and who keeps its replicas.
 
-use crate::{NodeId, ShardId};
+use crate::{Key, NodeId, ShardId};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One shard: its owner, its replicas, and its term, raised whenever its owner changes, so that
@@ -169,7 +169,7 @@ impl Table {
 
 /// The shard of `key`, among `shards`.
 #[must_use]
-pub fn shard_of(key: u64, shards: u16) -> ShardId {
+pub fn shard_of(key: Key, shards: u16) -> ShardId {
     let shards = u64::from(shards.max(1));
     // Below `shards`, a u16, so the conversion holds.
     ShardId::try_from(mix(key) % shards).unwrap_or(0)

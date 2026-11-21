@@ -5,7 +5,7 @@
 
 use crate::Rng;
 use edgerush_cluster::table::{Table, shard_of};
-use edgerush_cluster::{NodeId, Time};
+use edgerush_cluster::{Key, NodeId, Time};
 use edgerush_cluster_synchronous::{Answer, Message, Rule};
 use std::collections::BTreeMap;
 
@@ -22,7 +22,7 @@ pub enum Outcome {
 }
 
 /// A request's keys, each with the number of the part asked under it, and how it ended.
-pub type Ended = (Vec<(u64, u64)>, Outcome);
+pub type Ended = (Vec<(Key, u64)>, Outcome);
 
 /// How a client asks under several keys, when it does (Q5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,11 +39,11 @@ pub type Send = (NodeId, Message);
 /// A request on its way.
 #[derive(Clone, Debug)]
 struct Inflight {
-    key: u64,
+    key: Key,
     /// The request it is a part of, split by key, if it is one.
     group: Option<u64>,
     /// Every key, for a request sent whole to be gathered.
-    keys: Vec<u64>,
+    keys: Vec<Key>,
     started: Time,
     /// When the attempt now in flight was sent.
     sent: Time,
@@ -67,7 +67,7 @@ struct Inflight {
 pub struct Client {
     /// Its identity on the network, apart from every pod's.
     pub id: NodeId,
-    keys: Vec<u64>,
+    keys: Vec<Key>,
     /// The time between its requests.
     pub interval: Time,
     /// How long a request may take before it is refused.
@@ -81,7 +81,7 @@ pub struct Client {
     /// When it last sent a request.
     pub last_sent: Option<Time>,
     /// Whether each request is under a second key shared by every client, and how it is asked.
-    multi: Option<(Multi, u64)>,
+    multi: Option<(Multi, Key)>,
     /// Requests split by key: when each began, its parts still out, its keys counted, and
     /// whether a part was refused.
     groups: BTreeMap<u64, Group>,
@@ -103,7 +103,7 @@ pub struct Client {
     /// Requests left to `when_unreachable`, with their keys and the pod each was last sent
     /// to: waited on until answered — a "counted" given back — or its pod is gone, its stream
     /// with it, as an ask given up on stays on its stream in a data plane.
-    left: BTreeMap<u64, (Vec<u64>, NodeId)>,
+    left: BTreeMap<u64, (Vec<Key>, NodeId)>,
     /// The rule its requests are held to by their keys' owners, if any.
     rule: Option<Rule>,
 }
@@ -141,8 +141,8 @@ struct Group {
     out: usize,
     /// Every key it is under, each with its part's number; and those of its parts charged,
     /// each with its receipt.
-    keys: Vec<(u64, u64)>,
-    counted: Vec<(u64, u64)>,
+    keys: Vec<(Key, u64)>,
+    counted: Vec<(Key, u64)>,
     refused: bool,
     /// Whether a part was refused under its rule.
     limited: bool,
@@ -152,7 +152,7 @@ struct Group {
 impl Client {
     /// Client `id`, requesting under `keys` in turn every `interval`, each given `deadline`.
     #[must_use]
-    pub fn new(id: NodeId, keys: Vec<u64>, interval: Time, deadline: Time, shards: u16) -> Self {
+    pub fn new(id: NodeId, keys: Vec<Key>, interval: Time, deadline: Time, shards: u16) -> Self {
         Self {
             id,
             keys,
@@ -183,7 +183,7 @@ impl Client {
     }
 
     /// Each request from now also under `shared`, asked as `multi` says.
-    pub fn set_multi(&mut self, multi: Multi, shared: u64) {
+    pub fn set_multi(&mut self, multi: Multi, shared: Key) {
         self.multi = Some((multi, shared));
     }
 
@@ -201,7 +201,7 @@ impl Client {
 
     /// Where it would send a request under `key`: the owner its table names if that pod is
     /// among `pods`, else one of `pods` at random.
-    fn target(&self, key: u64, pods: &[NodeId], rng: &mut Rng) -> Option<NodeId> {
+    fn target(&self, key: Key, pods: &[NodeId], rng: &mut Rng) -> Option<NodeId> {
         let owner = self
             .table
             .as_ref()
@@ -242,7 +242,7 @@ impl Client {
         }
     }
 
-    fn request(&self, id: u64, key: u64) -> Message {
+    fn request(&self, id: u64, key: Key) -> Message {
         if let Some(inflight) = self.inflight.get(&id)
             && !inflight.keys.is_empty()
         {
@@ -270,7 +270,7 @@ impl Client {
     /// key's owner now, by its table, as a request goes.
     fn give_back(
         &mut self,
-        key: u64,
+        key: Key,
         receipt: u64,
         now: Time,
         pods: &[NodeId],
@@ -412,10 +412,10 @@ impl Client {
     fn part_ended(
         &mut self,
         group: u64,
-        key: u64,
+        key: Key,
         charged: Option<u64>,
         now: Time,
-    ) -> (Option<Ended>, Vec<(u64, u64)>) {
+    ) -> (Option<Ended>, Vec<(Key, u64)>) {
         let Some(entry) = self.groups.get_mut(&group) else {
             return (None, Vec::new());
         };
@@ -448,7 +448,7 @@ impl Client {
     /// Give-backs for each of `keys`, with its receipt.
     fn give_backs(
         &mut self,
-        keys: Vec<(u64, u64)>,
+        keys: Vec<(Key, u64)>,
         now: Time,
         pods: &[NodeId],
         rng: &mut Rng,
@@ -548,7 +548,7 @@ impl Client {
     }
 
     /// The keys of request `id`, each with the request's number.
-    fn parts(inflight: &Inflight, id: u64) -> Vec<(u64, u64)> {
+    fn parts(inflight: &Inflight, id: u64) -> Vec<(Key, u64)> {
         if inflight.keys.is_empty() {
             vec![(inflight.key, id)]
         } else {

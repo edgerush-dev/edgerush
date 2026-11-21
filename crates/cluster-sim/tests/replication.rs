@@ -8,7 +8,7 @@
     reason = "test set-up: the helpers around the tests fail them the way the tests would"
 )]
 
-use edgerush_cluster::{ShardId, ms};
+use edgerush_cluster::{Key, ShardId, ms};
 use edgerush_cluster_sim::scenario::{self, Shape};
 use edgerush_cluster_sim::world::{Link, World};
 
@@ -203,7 +203,7 @@ fn evictions_keep_every_pod_within_its_cap_and_never_come_back() {
     // Preloaded keys, each held by all three pods: 64 KB a pod, against a cap of half that.
     // No clients: keys charged meanwhile would pass the cap between sweeps, once a second, by
     // what they add in one.
-    let preloaded = |key: u64| key > 1 << 40;
+    let preloaded = |key: Key| key > 1 << 40;
     for seed in SEEDS {
         let cap = 32_000;
         let (mut world, _) = scenario::cluster(

@@ -13,7 +13,7 @@ use crate::Rng;
 use crate::workload::Workload;
 use edgerush_cluster::Message as StoreMessage;
 use edgerush_cluster::table::shard_of;
-use edgerush_cluster::{Config, Node, NodeId, Time, ms};
+use edgerush_cluster::{Config, Key, Node, NodeId, Time, ms};
 use edgerush_cluster_asynchronous::{Answers, Message, Pod, Routed, Value};
 use edgerush_ratelimit::service::pooled::{
     self, Decision, Entry, Levers, Local, Participant, Routing,
@@ -226,10 +226,10 @@ impl Mode for Asynchronous {
         world.on_answers(from, id, message);
     }
 
-    fn reported(message: &Message) -> Vec<u64> {
+    fn reported(message: &Message) -> Vec<Key> {
         match message {
             Message::Batch(batch) | Message::Forwarded { batch, .. } => {
-                let mut keys: Vec<u64> = batch.entries.iter().map(|entry| entry.key).collect();
+                let mut keys: Vec<Key> = batch.entries.iter().map(|entry| entry.key).collect();
                 keys.sort_unstable();
                 keys.dedup();
                 keys
@@ -238,7 +238,7 @@ impl Mode for Asynchronous {
         }
     }
 
-    fn counted(pod: &Pod, key: u64) -> u64 {
+    fn counted(pod: &Pod, key: Key) -> u64 {
         pod.store().value(key).map_or(0, |value| value.counted())
     }
 }
@@ -588,7 +588,7 @@ impl Sim<Asynchronous> {
 
     /// The pod the table names `key`'s owner, and the key as the store keeps it: hashed as the
     /// data planes hash it.
-    fn owned(&self, key: u64) -> Option<(NodeId, u64)> {
+    fn owned(&self, key: u64) -> Option<(NodeId, Key)> {
         let plane = self.clients.values().next()?;
         let hash = plane.data.hash(&bytes_of(key));
         let table = self.table()?;

@@ -14,7 +14,7 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_cluster::{Config, Message as StoreMessage, Time, table};
+use edgerush_cluster::{Config, Key, Message as StoreMessage, Time, table};
 use edgerush_cluster_asynchronous::{Batch, Entry, Outbox, Pod};
 use edgerush_ratelimit::service::{Contract, PlaneId, Report};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
@@ -50,7 +50,7 @@ fn longer(k: u64) -> Contract {
 }
 
 /// Key `k` as a data plane hashes one: spread over the shards.
-const fn key(k: u64) -> u64 {
+const fn key(k: u64) -> Key {
     k.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 

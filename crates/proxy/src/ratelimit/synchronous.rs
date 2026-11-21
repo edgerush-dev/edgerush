@@ -26,6 +26,7 @@
 use super::local::{LocalLimiter, Process as LocalKeys};
 use super::{Awaited, Failed, KeyedBy, Later, Limited, Refusal, Undecided, Usage, with_keys};
 use boring::ssl::SslConnector;
+use edgerush_cluster::Key;
 use edgerush_config::{CompiledLimit, CompiledModel, CompiledSynchronous, WhenUnreachable};
 use edgerush_ratelimit::local::{Decision, Limit};
 use edgerush_ratelimit::service::{Decided, longest};
@@ -452,7 +453,7 @@ enum Waiter {
     Asked(oneshot::Sender<Answered>),
     /// A request's key that gave up on it and was refused: an admission that comes late is
     /// given back, under this rule.
-    GivenUp(u64, Rule),
+    GivenUp(Key, Rule),
 }
 
 /// A worker's stream to one pod, by its address, and what waits on its answers, each with the
@@ -788,7 +789,7 @@ impl SyncLimiter {
     /// breaker is open, else another member chosen by the key; with no table yet, a seed chosen
     /// by the key among those not in `avoid_seeds` and with their breakers closed. None when
     /// none is left.
-    fn route(&self, key: u64, avoid: &[NodeId], avoid_seeds: &[usize]) -> Option<(To, String)> {
+    fn route(&self, key: Key, avoid: &[NodeId], avoid_seeds: &[usize]) -> Option<(To, String)> {
         let plane = self.plane.borrow();
         if plane.table().is_none() {
             let open = || {
@@ -931,14 +932,14 @@ impl SyncLimiter {
     /// Gives back one charged under `key` and `rule`, answered with `receipt`, to the key's
     /// owner as the table names it then: sent again at [`GIVE_BACK_AGAIN`] and [`GIVE_BACK_LATER`]
     /// while unanswered, three sends at most (T6a), on a task of the worker's own.
-    fn give_back(self: &Rc<Self>, key: u64, rule: Rule, receipt: u64) {
+    fn give_back(self: &Rc<Self>, key: Key, rule: Rule, receipt: u64) {
         tokio::task::spawn_local(give_back(Rc::downgrade(self), key, rule, receipt));
     }
 
     /// Sends the give-back of `key` once: its answer to come, if it could be sent.
     fn send_give_back(
         self: &Rc<Self>,
-        key: u64,
+        key: Key,
         rule: Rule,
         receipt: u64,
     ) -> Option<oneshot::Receiver<Answered>> {
@@ -1000,7 +1001,7 @@ impl SyncLimiter {
 
 /// Gives back one charged under `key` and `rule` with `receipt`, for `limiter`'s worker:
 /// sent, then sent again while unanswered as [`Giving`] says, until answered or dropped.
-async fn give_back(limiter: Weak<SyncLimiter>, key: u64, rule: Rule, receipt: u64) {
+async fn give_back(limiter: Weak<SyncLimiter>, key: Key, rule: Rule, receipt: u64) {
     giving_back(|| {
         let held = limiter.upgrade()?;
         Some(held.send_give_back(key, rule, receipt))
@@ -1060,7 +1061,7 @@ async fn giving_back(mut send: impl FnMut() -> Option<Option<oneshot::Receiver<A
 /// sends, and where it went last, its answer to come.
 struct Part {
     position: usize,
-    key: u64,
+    key: Key,
     held: HeldTo,
     bytes: Vec<u8>,
     avoid: Vec<NodeId>,
@@ -1092,13 +1093,13 @@ impl Asked {
     /// admitted if all admitted; otherwise, some owner out of reach, as `when_unreachable`
     /// says.
     pub(crate) async fn decided(mut self) -> Result<Decided, Undecided> {
-        let mut admitted: Vec<(u64, Rule, u64)> = Vec::new();
+        let mut admitted: Vec<(Key, Rule, u64)> = Vec::new();
         let mut refused_by = Vec::new();
         let mut unreached = None;
         // The keys out of reach, with their places among the request's.
         let mut out_of_reach: Vec<Part> = Vec::new();
         // The asks given up on: their answers may come yet.
-        let mut given_up: Vec<(Sent, u64, Rule)> = Vec::new();
+        let mut given_up: Vec<(Sent, Key, Rule)> = Vec::new();
         while let Some(mut part) = self.parts.pop_front() {
             let Some(mut sent) = part.sent.take() else {
                 unreached = Some(Undecided::Unavailable);
@@ -1210,13 +1211,13 @@ impl Asked {
     /// answer, those keys `out_of_reach`.
     fn decide(
         &self,
-        admitted: Vec<(u64, Rule, u64)>,
+        admitted: Vec<(Key, Rule, u64)>,
         refused_by: Vec<(usize, u64)>,
         unreached: Option<Undecided>,
         out_of_reach: Vec<Part>,
     ) -> Result<Decided, Undecided> {
         let process = &self.limiter.process;
-        let give_back = |admitted: Vec<(u64, Rule, u64)>| {
+        let give_back = |admitted: Vec<(Key, Rule, u64)>| {
             for (key, rule, receipt) in admitted {
                 self.limiter.give_back(key, rule, receipt);
             }

@@ -5,7 +5,9 @@ use crate::client::Outcome;
 use crate::oracle::Oracle;
 use edgerush_cluster::Message as StoreMessage;
 use edgerush_cluster::table::Table;
-use edgerush_cluster::{Authority, Config, Held, Node, NodeId, ShardId, Time, generation_of, ms};
+use edgerush_cluster::{
+    Authority, Config, Held, KEY_BYTES, Key, Node, NodeId, ShardId, Time, generation_of, ms,
+};
 use edgerush_cluster_synchronous::Rule;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -76,11 +78,11 @@ pub trait Mode: Sized {
     fn deliver_to_client(world: &mut Sim<Self>, from: NodeId, id: NodeId, message: Self::Message);
     /// The keys whose hits `message` brings a pod to apply, as its store keeps them: none, in a
     /// mode that does not count them.
-    fn reported(_message: &Self::Message) -> Vec<u64> {
+    fn reported(_message: &Self::Message) -> Vec<Key> {
         Vec::new()
     }
     /// Hits a pod has applied to `key`, each once, in the value it holds of it now.
-    fn counted(_pod: &Self::Pod, _key: u64) -> u64 {
+    fn counted(_pod: &Self::Pod, _key: Key) -> u64 {
         0
     }
 }
@@ -306,7 +308,7 @@ pub struct Sim<M: Mode> {
     /// Hits applied to each key, as its store keeps it, each once by whichever pod applied
     /// them, over every life of the key and every owner: what each pod's count of it rose by
     /// as it took a data plane's report.
-    applied: BTreeMap<u64, u64>,
+    applied: BTreeMap<Key, u64>,
     /// When each link's lane is next free to start sending: bulk copies apart from the rest, as
     /// separate streams over one connection, so that heartbeats and handoffs never queue
     /// behind a replica's snapshot.
@@ -325,9 +327,9 @@ pub struct Sim<M: Mode> {
     /// What it measured.
     pub stats: Stats,
     /// Admissions per key, as clients were told.
-    truth: BTreeMap<u64, u64>,
+    truth: BTreeMap<Key, u64>,
     /// Every key a client has asked under.
-    asked: BTreeSet<u64>,
+    asked: BTreeSet<Key>,
     leaders: BTreeMap<u64, NodeId>,
     tables: BTreeMap<(u64, u64), Table>,
     /// Each pod's table as last checked.
@@ -865,7 +867,7 @@ impl<M: Mode> Sim<M> {
         ) = M::as_store(&message)
         {
             let bytes = entries.iter().map(|(_, kept)| kept.bytes()).sum::<u64>()
-                + 8 * dropped.len() as u64;
+                + KEY_BYTES * dropped.len() as u64;
             if bytes > self.config.part_bytes && entries.len() + dropped.len() > 1 {
                 self.stats.parts_over += 1;
             }
@@ -973,7 +975,7 @@ impl<M: Mode> Sim<M> {
     /// Hits applied to `key`, as its store keeps it, each once by whichever pod applied them,
     /// over every life of the key and every owner.
     #[must_use]
-    pub fn applied(&self, key: u64) -> u64 {
+    pub fn applied(&self, key: Key) -> u64 {
         self.applied.get(&key).copied().unwrap_or(0)
     }
 
@@ -1140,7 +1142,7 @@ impl<M: Mode> Sim<M> {
     /// as clients were told it, and under a rule, to the oracle, each part at the time its
     /// owner decided it — by its wall clock, and to the true-time oracle by the world's — or
     /// for one left to `when_unreachable`, the time then.
-    fn record(&mut self, client: NodeId, outcome: Outcome, parts: &[(u64, u64)]) {
+    fn record(&mut self, client: NodeId, outcome: Outcome, parts: &[(Key, u64)]) {
         let now = self.now;
         let (own, world): (Timed, Timed) = parts
             .iter()
@@ -1289,8 +1291,8 @@ fn address(id: NodeId) -> String {
 /// a copy in parts is a message of its own, with its own.
 fn store_size<V: Held>(message: &StoreMessage<V>) -> u64 {
     // Each key with its value, as the store sizes it, and each key dropped.
-    let entries = |entries: &[(u64, edgerush_cluster::Kept<V>)], dropped: &[u64]| {
-        entries.iter().map(|(_, kept)| kept.bytes()).sum::<u64>() + 8 * dropped.len() as u64
+    let entries = |entries: &[(Key, edgerush_cluster::Kept<V>)], dropped: &[Key]| {
+        entries.iter().map(|(_, kept)| kept.bytes()).sum::<u64>() + KEY_BYTES * dropped.len() as u64
     };
     32 + match message {
         StoreMessage::Heartbeat { hears, .. } => 8 + 16 * hears.len() as u64,
@@ -1345,7 +1347,7 @@ fn moved_on_badly(base: &Table, next: &Table) -> Option<String> {
 }
 
 /// A request's keys, each with the time its part was decided.
-type Timed = Vec<(u64, Time)>;
+type Timed = Vec<(Key, Time)>;
 
 /// Tells `oracle` how a request ended, each key with the time it was decided.
 fn tell(oracle: &mut Oracle, outcome: Outcome, allow: bool, timed: Timed) {

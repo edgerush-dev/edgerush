@@ -3,7 +3,7 @@
 //! whatever order they meet.
 
 use edgerush_cluster::table::mix;
-use edgerush_cluster::{Held, Time};
+use edgerush_cluster::{Held, Key, Time};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A key's value, its shape the rule's.
@@ -231,7 +231,7 @@ impl Rule {
     /// The number of the window `key` is in at `at` under a fixed window, counted from 1; for
     /// a rolling window the slot; 0 for a bucket.
     #[must_use]
-    pub fn window_of(&self, key: u64, at: Time) -> u64 {
+    pub fn window_of(&self, key: Key, at: Time) -> u64 {
         match *self {
             Self::Window { window, .. } => {
                 let window = window.max(1);
@@ -253,7 +253,7 @@ impl Rule {
 
     /// Charges `value`, under `key`, one at `at` if it has room: the receipt — the window or
     /// slot charged, 0 for a bucket — if so; a refusal charges nothing.
-    pub fn admit(&self, key: u64, value: &mut Value, at: Time) -> Option<u64> {
+    pub fn admit(&self, key: Key, value: &mut Value, at: Time) -> Option<u64> {
         match *self {
             Self::Window { per, .. } => {
                 let now = self.window_of(key, at);
@@ -329,7 +329,7 @@ impl Rule {
     /// window's once its newest slot has left the window, a bucket's once it is due, full
     /// again.
     #[must_use]
-    pub fn forget_at(&self, key: u64, value: &Value) -> Time {
+    pub fn forget_at(&self, key: Key, value: &Value) -> Time {
         match (*self, value) {
             (Self::Window { window, .. }, Value::Count { window: number, .. }) => {
                 let window = window.max(1);
@@ -360,7 +360,7 @@ impl Rule {
     /// of a rolling window's oldest slots have left it; until the bucket's next request is due,
     /// less its tolerance. 0 when one would be admitted at `at`.
     #[must_use]
-    pub fn wait(&self, key: u64, value: &Value, at: Time) -> Time {
+    pub fn wait(&self, key: Key, value: &Value, at: Time) -> Time {
         let until = match (*self, value) {
             (Self::Window { per, .. }, Value::Count { counted, given, .. }) => {
                 if counted.saturating_sub(*given) < per {

@@ -3,7 +3,7 @@
 use crate::keys::{Keys, seconds_passed};
 use crate::message::{Message, Stamp};
 use crate::table::{self, Table, is_quorum, shard_of};
-use crate::{Config, Held, Kept, NodeId, ShardId, Time, first_term, generation_of};
+use crate::{Config, Held, KEY_BYTES, Kept, Key, NodeId, ShardId, Time, first_term, generation_of};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::Arc;
@@ -90,7 +90,7 @@ struct Taking {
     /// The number of the part that comes next in turn.
     next: u32,
     /// Of a whole copy, the keys its parts have named: those the last part keeps.
-    named: BTreeSet<u64>,
+    named: BTreeSet<Key>,
     /// Whether its last part is in: kept so that, sent again, it is answered again.
     done: bool,
 }
@@ -107,9 +107,9 @@ struct Sending {
     version: u64,
     under: Stamp,
     /// The keys it carries, in order: all the shard holds, or, for a repair, those named.
-    keys: Option<BTreeSet<u64>>,
+    keys: Option<BTreeSet<Key>>,
     /// The last key of the parts sent so far, if any is.
-    reached: Option<u64>,
+    reached: Option<Key>,
     /// The number of the next part.
     next: u32,
     /// Whether its last part has gone.
@@ -125,9 +125,9 @@ struct Sending {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Sent {
     part: u32,
-    after: Option<u64>,
+    after: Option<Key>,
     /// Its last key; none for a part that covers no key.
-    to: Option<u64>,
+    to: Option<Key>,
     /// Whether more parts follow it, as it said when first sent.
     more: bool,
     /// What it carried when first sent, by the store's count.
@@ -142,7 +142,7 @@ impl Sending {
         after: Option<u64>,
         version: u64,
         under: Stamp,
-        keys: Option<BTreeSet<u64>>,
+        keys: Option<BTreeSet<Key>>,
     ) -> Self {
         Self {
             term: copy.0,
@@ -165,8 +165,8 @@ impl Sending {
         &self,
         shard: ShardId,
         (part, more): (u32, bool),
-        entries: Vec<(u64, Kept<V>)>,
-        dropped: Vec<u64>,
+        entries: Vec<(Key, Kept<V>)>,
+        dropped: Vec<Key>,
     ) -> Message<V> {
         Message::Replicate {
             shard,
@@ -224,11 +224,11 @@ pub struct Node<V> {
     /// Whether it is evicting, past its cap and not yet down to nine tenths of it.
     evicting: bool,
     /// Keys it changed as owner since its last copies.
-    dirty: BTreeMap<ShardId, BTreeSet<u64>>,
+    dirty: BTreeMap<ShardId, BTreeSet<Key>>,
     /// Of keys it changed as owner since its last copies only in parts, as their mode numbers
     /// them, those parts: all those copies carry of them — a rolling window's slots changed,
     /// not the up to a thousand it holds.
-    parts_changed: BTreeMap<(ShardId, u64), BTreeSet<u64>>,
+    parts_changed: BTreeMap<(ShardId, Key), BTreeSet<u64>>,
     /// As owner: each shard's number for its copies, raised with every copy of what changed,
     /// from 1, a whole copy, when it took the shard.
     versions: BTreeMap<ShardId, u64>,
@@ -238,7 +238,7 @@ pub struct Node<V> {
     behind: BTreeMap<(ShardId, NodeId), Time>,
     /// As owner: for each replica, the keys of each copy it has not yet said it holds, by the
     /// copy's number: what a repair sends again.
-    unacked: BTreeMap<(ShardId, NodeId), BTreeMap<u64, BTreeSet<u64>>>,
+    unacked: BTreeMap<(ShardId, NodeId), BTreeMap<u64, BTreeSet<Key>>>,
     /// As owner: each replica's assignment to each shard, by a number of this pod's that never
     /// repeats, so that its answers from another — before it was taken off the shard and put
     /// back, or before the copies were numbered afresh — count for nothing.
@@ -373,7 +373,7 @@ impl<V: Held> Node<V> {
 
     /// The keys it holds of `shard`, owned or a copy.
     #[must_use]
-    pub fn keys_of(&self, shard: ShardId) -> BTreeSet<u64> {
+    pub fn keys_of(&self, shard: ShardId) -> BTreeSet<Key> {
         self.data
             .shard(shard)
             .map(|keys| keys.keys().copied().collect())
@@ -431,7 +431,7 @@ impl<V: Held> Node<V> {
 
     /// Sets `key`'s value as if it had always held it, owned or a copy, never forgotten: for a
     /// simulation to start a cluster holding many keys, not for serving.
-    pub fn load(&mut self, key: u64, value: V) {
+    pub fn load(&mut self, key: Key, value: V) {
         let shard = shard_of(key, self.config.shards);
         self.data.insert(shard, key, Kept::new(value));
     }
@@ -460,7 +460,7 @@ impl<V: Held> Node<V> {
     /// to the shard's replicas. `None`, and nothing called, if it does not serve the shard.
     pub fn update<R>(
         &mut self,
-        key: u64,
+        key: Key,
         now: Time,
         change: impl FnOnce(&mut Kept<V>, Time) -> (R, Changed),
     ) -> Option<R> {
@@ -505,7 +505,7 @@ impl<V: Held> Node<V> {
     /// takes the shard. `None`, and nothing called, otherwise.
     pub fn update_copy<R>(
         &mut self,
-        key: u64,
+        key: Key,
         now: Time,
         change: impl FnOnce(&mut Kept<V>, Time) -> (R, Changed),
     ) -> Option<R> {
@@ -528,7 +528,7 @@ impl<V: Held> Node<V> {
 
     /// The value it holds for `key`, owned or a copy.
     #[must_use]
-    pub fn value(&self, key: u64) -> Option<V> {
+    pub fn value(&self, key: Key) -> Option<V> {
         let shard = shard_of(key, self.config.shards);
         self.data
             .shard(shard)?
@@ -1430,7 +1430,7 @@ impl<V: Held> Node<V> {
                     // shard holds, gone ones among them: a new assignment in their place, the
                     // repair sending it the whole shard, so that what it keeps stays within
                     // the shard's size.
-                    let kept: BTreeSet<&u64> = unacked.values().flatten().collect();
+                    let kept: BTreeSet<&Key> = unacked.values().flatten().collect();
                     if kept.len() > held {
                         assignment = self.assign(shard, *replica);
                     }
@@ -1498,7 +1498,7 @@ impl<V: Held> Node<V> {
                 let (after, keys) = if acked == 0 {
                     (None, None)
                 } else {
-                    let keys: BTreeSet<u64> = self
+                    let keys: BTreeSet<Key> = self
                         .unacked
                         .get(&copy)
                         .into_iter()
@@ -1578,7 +1578,10 @@ impl<V: Held> Node<V> {
             Some(keys) => (
                 keys.len(),
                 keys.iter()
-                    .map(|key| held.and_then(|held| held.get(key)).map_or(8, Kept::bytes))
+                    .map(|key| {
+                        held.and_then(|held| held.get(key))
+                            .map_or(KEY_BYTES, Kept::bytes)
+                    })
                     .sum(),
             ),
         };
@@ -1777,8 +1780,8 @@ impl<V: Held> Node<V> {
     fn split(
         &self,
         shard: ShardId,
-        keys: impl Iterator<Item = u64>,
-    ) -> (Vec<(u64, Kept<V>)>, Vec<u64>) {
+        keys: impl Iterator<Item = Key>,
+    ) -> (Vec<(Key, Kept<V>)>, Vec<Key>) {
         let held = self.data.shard(shard);
         let mut entries = Vec::new();
         let mut dropped = Vec::new();
@@ -1792,7 +1795,7 @@ impl<V: Held> Node<V> {
     }
 
     /// Every key it holds of `shard`, with its value.
-    fn all_of(&self, shard: ShardId) -> Vec<(u64, Kept<V>)> {
+    fn all_of(&self, shard: ShardId) -> Vec<(Key, Kept<V>)> {
         self.data
             .shard(shard)
             .map(|keys| {
@@ -1880,7 +1883,7 @@ impl<V: Held> Node<V> {
                 continue;
             }
             if before.owner(shard) == Some(self.id) {
-                let keys: BTreeSet<u64> = self
+                let keys: BTreeSet<Key> = self
                     .unacked
                     .get(&(shard, to))
                     .into_iter()
@@ -2131,7 +2134,7 @@ impl<V: Held> Node<V> {
                     );
                     return out;
                 }
-                let named = |entries: &[(u64, Kept<V>)]| -> BTreeSet<u64> {
+                let named = |entries: &[(Key, Kept<V>)]| -> BTreeSet<Key> {
                     if after.is_none() {
                         entries.iter().map(|(key, _)| *key).collect()
                     } else {
@@ -2531,8 +2534,8 @@ impl<V: Held> Node<V> {
         &mut self,
         shard: ShardId,
         term: u64,
-        entries: Vec<(u64, Kept<V>)>,
-        dropped: &[u64],
+        entries: Vec<(Key, Kept<V>)>,
+        dropped: &[Key],
         replace: bool,
     ) -> bool {
         let entry = self
@@ -2568,7 +2571,7 @@ impl<V: Held> Node<V> {
 
     /// Of `shard`, which it does not own, only the keys `named`: what is left of a whole copy
     /// taken from its owner, all its parts in, the keys the owner has since evicted gone.
-    fn keep_only(&mut self, shard: ShardId, named: &BTreeSet<u64>) {
+    fn keep_only(&mut self, shard: ShardId, named: &BTreeSet<Key>) {
         let mine = self
             .committed
             .as_ref()
@@ -2644,23 +2647,23 @@ fn send_in_parts<V: Held>(out: &mut Outbox<V>, to: NodeId, message: Message<V>, 
 
 /// A part cut from a copy: its keys with their values, those it drops, and the last key it
 /// covers, if any.
-type Cut<V> = (Vec<(u64, Kept<V>)>, Vec<u64>, Option<u64>);
+type Cut<V> = (Vec<(Key, Kept<V>)>, Vec<Key>, Option<Key>);
 
 /// The keys of a part of a copy, after `after` and to `to` if given, of `keys` or of all
 /// `held`, each with its value, or dropped if no longer held — up to `most` bytes by the
 /// store's count, at least one key, if given — and the last key it covers.
 fn cut_range<V: Held>(
-    held: Option<&BTreeMap<u64, Kept<V>>>,
-    keys: Option<&BTreeSet<u64>>,
-    after: Option<u64>,
-    to: Option<u64>,
+    held: Option<&BTreeMap<Key, Kept<V>>>,
+    keys: Option<&BTreeSet<Key>>,
+    after: Option<Key>,
+    to: Option<Key>,
     most: Option<u64>,
 ) -> Cut<V> {
     let range = (
         after.map_or(Bound::Unbounded, Bound::Excluded),
         to.map_or(Bound::Unbounded, Bound::Included),
     );
-    let named: Box<dyn Iterator<Item = u64> + '_> = match (keys, held) {
+    let named: Box<dyn Iterator<Item = Key> + '_> = match (keys, held) {
         (Some(keys), _) => Box::new(keys.range(range).copied()),
         (None, Some(held)) => Box::new(held.range(range).map(|(key, _)| *key)),
         (None, None) => Box::new(std::iter::empty()),
@@ -2671,7 +2674,7 @@ fn cut_range<V: Held>(
     let mut last = None;
     for key in named {
         let kept = held.and_then(|held| held.get(&key));
-        let size = kept.map_or(8, Kept::bytes);
+        let size = kept.map_or(KEY_BYTES, Kept::bytes);
         if most.is_some_and(|most| last.is_some() && bytes.saturating_add(size) > most) {
             break;
         }
@@ -2686,20 +2689,20 @@ fn cut_range<V: Held>(
 }
 
 /// What a part carrying `entries` and `dropped` takes by the store's count, a key dropped
-/// counting as the 8 bytes of its number.
-fn part_bytes<V: Held>(entries: &[(u64, Kept<V>)], dropped: &[u64]) -> u64 {
+/// counting as the bytes of its number.
+fn part_bytes<V: Held>(entries: &[(Key, Kept<V>)], dropped: &[Key]) -> u64 {
     entries
         .iter()
         .map(|(_, kept)| kept.bytes())
         .sum::<u64>()
-        .saturating_add(8 * dropped.len() as u64)
+        .saturating_add(KEY_BYTES * dropped.len() as u64)
 }
 
 /// Whether a copy of `keys`, or of all `held`, has a key past `key`.
 fn key_after<V>(
-    held: Option<&BTreeMap<u64, Kept<V>>>,
-    keys: Option<&BTreeSet<u64>>,
-    key: u64,
+    held: Option<&BTreeMap<Key, Kept<V>>>,
+    keys: Option<&BTreeSet<Key>>,
+    key: Key,
 ) -> bool {
     let past = (Bound::Excluded(key), Bound::Unbounded);
     match (keys, held) {
@@ -2717,13 +2720,13 @@ fn part_number(index: usize) -> u32 {
 }
 
 /// A copy's parts, each its keys with their values and the keys it drops.
-type Parts<V> = Vec<(Vec<(u64, Kept<V>)>, Vec<u64>)>;
+type Parts<V> = Vec<(Vec<(Key, Kept<V>)>, Vec<Key>)>;
 
 /// The parts of a copy: its `entries` in order, then the keys `dropped`, each part at most
 /// `most` bytes by the store's count — a key dropped counting as the 8 bytes of its number —
 /// or one key if that one alone passes it; one part, empty, for none, as an empty copy still
 /// says how far the replica holds the shard.
-fn cut<V: Held>(entries: Vec<(u64, Kept<V>)>, dropped: Vec<u64>, most: u64) -> Parts<V> {
+fn cut<V: Held>(entries: Vec<(Key, Kept<V>)>, dropped: Vec<Key>, most: u64) -> Parts<V> {
     let mut parts = vec![(Vec::new(), Vec::new())];
     let mut bytes: u64 = 0;
     let mut room = |size: u64, parts: &mut Parts<V>| {
@@ -2817,11 +2820,11 @@ mod tests {
 
     /// A key's count, as the store's tests keep it.
     trait CountOf {
-        fn count(&self, key: u64) -> Option<u64>;
+        fn count(&self, key: Key) -> Option<u64>;
     }
 
     impl CountOf for Node {
-        fn count(&self, key: u64) -> Option<u64> {
+        fn count(&self, key: Key) -> Option<u64> {
             self.value(key).map(|value| value.total())
         }
     }
@@ -2859,7 +2862,7 @@ mod tests {
         node
     }
 
-    fn key_in(shard: ShardId) -> u64 {
+    fn key_in(shard: ShardId) -> Key {
         (0..).find(|key| shard_of(*key, 4) == shard).unwrap_or(0)
     }
 
@@ -2974,13 +2977,13 @@ mod tests {
         let members = named(&[1, 2, 3]);
         let table = table::first(&members, 4, 2, 1);
         let _ = node.receive(2, Message::TableReply { table }, ms(1));
-        let keys: Vec<u64> = (0..).filter(|key| shard_of(*key, 4) == 0).take(3).collect();
+        let keys: Vec<Key> = (0..).filter(|key| shard_of(*key, 4) == 0).take(3).collect();
         for key in &keys {
             node.load(*key, Counts::of(1));
         }
         let out: Outbox = (2..=40).flat_map(|at| node.tick(ms(at))).collect();
         assert_eq!(node.evicted(), 1);
-        let gone: Vec<u64> = keys
+        let gone: Vec<Key> = keys
             .iter()
             .copied()
             .filter(|key| !node.keys_of(0).contains(key))
@@ -3004,7 +3007,7 @@ mod tests {
         let members = named(&[1, 2, 3]);
         let table = table::first(&members, 4, 2, 1);
         let _ = node.receive(1, Message::TableReply { table }, ms(1));
-        let keys: Vec<u64> = (0..).filter(|key| shard_of(*key, 4) == 0).take(3).collect();
+        let keys: Vec<Key> = (0..).filter(|key| shard_of(*key, 4) == 0).take(3).collect();
         let kept = |forget_at| Kept {
             value: Counts::of(1),
             forget_at,
@@ -3069,7 +3072,7 @@ mod tests {
         // Three keys of 64 bytes, 192 against 150: one evicted brings it to 128, under 135.
         capped.max_key_bytes = Some(150);
         let mut node = member_under(capped);
-        let first: Vec<u64> = (0..).filter(|key| shard_of(*key, 4) == 0).take(2).collect();
+        let first: Vec<Key> = (0..).filter(|key| shard_of(*key, 4) == 0).take(2).collect();
         let soonest = key_in(1);
         let kept = |forget_at| Kept {
             value: Counts::of(1),
@@ -3105,7 +3108,7 @@ mod tests {
         // Three keys of 64 bytes, 192 against 100: two evicted bring it to 64, under 90.
         capped.max_key_bytes = Some(100);
         let mut node = member_under(capped);
-        let keys: Vec<u64> = (0..).filter(|key| shard_of(*key, 4) == 0).take(3).collect();
+        let keys: Vec<Key> = (0..).filter(|key| shard_of(*key, 4) == 0).take(3).collect();
         let kept = |forget_at| Kept {
             value: Counts::of(1),
             forget_at,
@@ -3168,7 +3171,7 @@ mod tests {
 
     /// Holds `count` keys of the shards below `shards`, each of one count's bytes, 64 with its
     /// place in the schedule, from `forget_at(key)`, as if it had always held them.
-    fn holding(node: &mut Node, shards: ShardId, count: usize, forget_at: impl Fn(u64) -> Time) {
+    fn holding(node: &mut Node, shards: ShardId, count: usize, forget_at: impl Fn(Key) -> Time) {
         for key in (0..).filter(|key| shard_of(*key, 4) < shards).take(count) {
             let kept = Kept {
                 value: Counts::of(1),
@@ -3242,7 +3245,7 @@ mod tests {
         }
         let _ = node.tick(ms(2));
         assert_eq!(node.evicted(), PER_CYCLE as u64);
-        let made: Vec<(u64, Kept<Counts>)> = (0..)
+        let made: Vec<(Key, Kept<Counts>)> = (0..)
             .filter(|key| shard_of(*key, 4) == 0)
             .take(1_000)
             .map(|key| (key, Kept::new(Counts::of(1))))
@@ -3463,7 +3466,7 @@ mod tests {
     }
 
     /// The first `count` keys of shard 0.
-    fn keys_in_0(count: usize) -> Vec<u64> {
+    fn keys_in_0(count: usize) -> Vec<Key> {
         (0..)
             .filter(|key| shard_of(*key, 4) == 0)
             .take(count)
@@ -3471,7 +3474,7 @@ mod tests {
     }
 
     /// The parts 1 sends 2 of a whole copy of shard 0 holding `entries`, cut at `most` bytes.
-    fn whole_in_parts(entries: Vec<(u64, Kept<Counts>)>, most: u64) -> Outbox {
+    fn whole_in_parts(entries: Vec<(Key, Kept<Counts>)>, most: u64) -> Outbox {
         let whole = Message::Replicate {
             shard: 0,
             term: 1,
@@ -3504,7 +3507,7 @@ mod tests {
     /// the last saying no more follow; an empty copy is one part, empty.
     #[test]
     fn a_copy_is_cut_into_parts_within_the_bound() {
-        let entries: Vec<(u64, Kept<Counts>)> = keys_in_0(10)
+        let entries: Vec<(Key, Kept<Counts>)> = keys_in_0(10)
             .into_iter()
             .map(|key| (key, Kept::new(Counts::of(key))))
             .collect();
@@ -3513,8 +3516,8 @@ mod tests {
         for most in [1, size, size * 3, size * 3 + 1, u64::MAX] {
             let parts = cut(entries.clone(), dropped.clone(), most);
             for (keys, gone) in &parts {
-                let bytes =
-                    keys.iter().map(|(_, kept)| kept.bytes()).sum::<u64>() + 8 * gone.len() as u64;
+                let bytes = keys.iter().map(|(_, kept)| kept.bytes()).sum::<u64>()
+                    + KEY_BYTES * gone.len() as u64;
                 assert!(
                     bytes <= most || keys.len() + gone.len() == 1,
                     "{bytes} at {most}"
@@ -3523,7 +3526,7 @@ mod tests {
             }
             let again: Vec<_> = parts.iter().flat_map(|(keys, _)| keys.clone()).collect();
             assert_eq!(again, entries, "at {most}");
-            let gone: Vec<u64> = parts.iter().flat_map(|(_, gone)| gone.clone()).collect();
+            let gone: Vec<Key> = parts.iter().flat_map(|(_, gone)| gone.clone()).collect();
             assert_eq!(gone, dropped, "at {most}");
         }
         assert_eq!(
@@ -3547,7 +3550,7 @@ mod tests {
     #[test]
     fn a_whole_copy_in_parts_ends_as_the_copy_whole_does() {
         let keys = keys_in_0(4);
-        let entries: Vec<(u64, Kept<Counts>)> = keys[..3]
+        let entries: Vec<(Key, Kept<Counts>)> = keys[..3]
             .iter()
             .map(|key| (*key, Kept::new(Counts::of(5))))
             .collect();
@@ -3584,7 +3587,7 @@ mod tests {
     #[test]
     fn a_copy_missing_a_part_is_left_unanswered() {
         let keys = keys_in_0(4);
-        let entries: Vec<(u64, Kept<Counts>)> = keys[..3]
+        let entries: Vec<(Key, Kept<Counts>)> = keys[..3]
             .iter()
             .map(|key| (*key, Kept::new(Counts::of(5))))
             .collect();
@@ -3615,7 +3618,7 @@ mod tests {
     #[test]
     fn a_copy_in_parts_from_another_than_the_owner_is_forgotten_at_the_sweep() {
         let keys = keys_in_0(3);
-        let entries: Vec<(u64, Kept<Counts>)> = keys
+        let entries: Vec<(Key, Kept<Counts>)> = keys
             .iter()
             .map(|key| (*key, Kept::new(Counts::of(5))))
             .collect();
@@ -3822,7 +3825,7 @@ mod tests {
     }
 
     /// What `node` holds of `shard`, each key with its count.
-    fn counts_of(node: &Node, shard: ShardId) -> BTreeMap<u64, u64> {
+    fn counts_of(node: &Node, shard: ShardId) -> BTreeMap<Key, u64> {
         assert_agrees(node);
         node.keys_of(shard)
             .into_iter()
@@ -3860,7 +3863,7 @@ mod tests {
     fn keys_changed_mid_copy_end_as_the_owner_holds_them() {
         let (mut owner, mut replica, sent) = owner_of_many_parts(10);
         let shard = owned_by_1(&owner)[0];
-        let keys: Vec<u64> = owner.keys_of(shard).into_iter().collect();
+        let keys: Vec<Key> = owner.keys_of(shard).into_iter().collect();
         let added = (keys[9] + 1..)
             .find(|key| shard_of(*key, 8) == shard)
             .unwrap_or(0);
@@ -3975,7 +3978,7 @@ mod tests {
     #[test]
     fn a_part_taken_twice_is_answered_again() {
         let keys = keys_in_0(3);
-        let entries: Vec<(u64, Kept<Counts>)> = keys
+        let entries: Vec<(Key, Kept<Counts>)> = keys
             .iter()
             .map(|key| (*key, Kept::new(Counts::of(5))))
             .collect();
@@ -4008,7 +4011,7 @@ mod tests {
     #[test]
     fn a_first_part_sent_again_keeps_the_parts_taken() {
         let keys = keys_in_0(4);
-        let entries: Vec<(u64, Kept<Counts>)> = keys
+        let entries: Vec<(Key, Kept<Counts>)> = keys
             .iter()
             .map(|key| (*key, Kept::new(Counts::of(5))))
             .collect();
@@ -4034,7 +4037,7 @@ mod tests {
     #[test]
     fn a_copy_of_one_part_leaves_a_copy_in_parts_going() {
         let keys = keys_in_0(3);
-        let entries: Vec<(u64, Kept<Counts>)> = keys
+        let entries: Vec<(Key, Kept<Counts>)> = keys
             .iter()
             .map(|key| (*key, Kept::new(Counts::of(5))))
             .collect();
@@ -5072,7 +5075,7 @@ mod tests {
                 matches!(message, Message::Replicate { shard: copied, assignment: given, after: None, .. }
                     if *to == 2 && *copied == shard && *given != assignment)
             });
-            let kept: BTreeSet<u64> = owner
+            let kept: BTreeSet<Key> = owner
                 .unacked
                 .get(&(shard, 2))
                 .into_iter()

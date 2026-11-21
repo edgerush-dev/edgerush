@@ -2,7 +2,7 @@
 //! beside the store's own messages, which travel inside them.
 
 use crate::{Rule, Value};
-use edgerush_cluster::{NodeId, Stamp, Table, Time};
+use edgerush_cluster::{Key, NodeId, Stamp, Table, Time};
 
 /// One message between pods, or between a client and a pod.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,7 +16,7 @@ pub enum Message {
         /// The client's number for it.
         id: u64,
         /// The key.
-        key: u64,
+        key: Key,
         /// The client's table.
         stamp: Stamp,
         /// Forwarded this many times already.
@@ -40,7 +40,7 @@ pub enum Message {
         /// The client's number for it.
         id: u64,
         /// The keys.
-        keys: Vec<u64>,
+        keys: Vec<Key>,
     },
     /// The answer to a [`Message::Request`].
     Reply {
