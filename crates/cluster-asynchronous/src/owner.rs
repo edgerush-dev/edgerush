@@ -2,7 +2,7 @@
 //! owner's applying (`edgerush_ratelimit::service::owner::apply`), by the wall clock the store
 //! gives it, told the store as what changed and when the key may be forgotten.
 
-use crate::value::Value;
+use crate::pod::Holds;
 use edgerush_cluster::{Changed, Kept, Time};
 use edgerush_ratelimit::service::owner;
 use edgerush_ratelimit::service::{Contract, PlaneId, Report};
@@ -13,15 +13,22 @@ pub use owner::Answered;
 /// `now`, by the wall clock; its data planes send every `cycle` nanoseconds. The answer to
 /// give, and what changed for the store to copy: hits are a change of the whole; a poll only
 /// keeps the key from being forgotten, and is copied to nobody.
-pub fn apply(
-    kept: &mut Kept<Value>,
+pub fn apply<V: Holds>(
+    kept: &mut Kept<V>,
     from: PlaneId,
     contract: Contract,
     report: Report,
     cycle: u64,
     now: Time,
 ) -> (Answered, Changed) {
-    let applied = owner::apply(&mut kept.value, from, contract, report, cycle, now);
+    let applied = owner::apply(
+        kept.value.asynchronous_mut(),
+        from,
+        contract,
+        report,
+        cycle,
+        now,
+    );
     kept.forget_at = applied.forget_at;
     let changed = if applied.changed {
         Changed::Whole
@@ -34,6 +41,7 @@ pub fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Value;
     use edgerush_ratelimit::reference::Model;
     use std::num::NonZeroU64;
 
@@ -64,7 +72,7 @@ mod tests {
     /// of the whole.
     #[test]
     fn a_key_is_forgotten_a_refill_time_after_its_last_report() {
-        let mut kept = Kept::default();
+        let mut kept = Kept::<Value>::default();
         let (_, changed) = apply(&mut kept, 1, contract(), hits(1, 1, 0), CYCLE, 0);
         assert_eq!(changed, Changed::Whole);
         assert_eq!(kept.forget_at, 100 * MS + 1, "a refill time");

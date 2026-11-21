@@ -9,9 +9,9 @@ use edgerush_ratelimit::service::{Contract, PlaneId, Report};
 
 /// One message between pods, or between a data plane and a pod.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Message {
+pub enum Message<V = Value> {
     /// The store's: membership, tables, copies and handoffs; to a data plane, a table.
-    Store(edgerush_cluster::Message<Value>),
+    Store(edgerush_cluster::Message<V>),
     /// A data plane's reports on keys it believes the pod owns.
     Batch(Batch),
     /// The pod's answers to a batch.
@@ -114,10 +114,10 @@ pub enum Why {
 }
 
 /// What a pod gives back to be sent: each message with whom it is for.
-pub type Outbox = Vec<(NodeId, Message)>;
+pub type Outbox<V = Value> = Vec<(NodeId, Message<V>)>;
 
-impl From<edgerush_cluster::Message<Value>> for Message {
-    fn from(message: edgerush_cluster::Message<Value>) -> Self {
+impl<V> From<edgerush_cluster::Message<V>> for Message<V> {
+    fn from(message: edgerush_cluster::Message<V>) -> Self {
         Self::Store(message)
     }
 }

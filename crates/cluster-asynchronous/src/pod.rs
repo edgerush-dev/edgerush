@@ -13,13 +13,36 @@ use crate::message::{Answer, Answers, Batch, Entry, Message, Outbox, Unserved, W
 use crate::{Store, Value, apply};
 use edgerush_cluster::table::shard_of;
 use edgerush_cluster::{Config, Key, NodeId, Time};
+use edgerush_cluster::{Held, Node};
 use edgerush_ratelimit::service::Report;
 use std::collections::BTreeMap;
+
+/// A value the store may hold under a key that can hold this mode's: what the mode applies a
+/// data plane's report to, changed in place.
+pub trait Holds: Held {
+    /// The mode's value it holds, to change: a key new to the store is made afresh as this
+    /// mode's.
+    fn asynchronous_mut(&mut self) -> &mut Value;
+}
+
+impl Holds for Value {
+    fn asynchronous_mut(&mut self) -> &mut Value {
+        self
+    }
+}
 
 /// One pod of the asynchronous mode in one life: its store, and the batches it answers.
 #[derive(Clone, Debug)]
 pub struct Pod {
     node: Store,
+    applier: Applier,
+}
+
+/// The mode's part of a pod, over a store it is handed each time: the batches it answers,
+/// numbered by its life. Kept apart from the store so that one store can serve this mode
+/// beside another.
+#[derive(Clone, Debug)]
+pub struct Applier {
     /// The time between a data plane's batches, which tells how lately a data plane must have
     /// admitted a key to count among those admitting it.
     cycle: Time,
@@ -65,24 +88,19 @@ impl Pod {
     ) -> Self {
         Self {
             node: Store::new(id, address, config, peers),
-            cycle: cycle.max(1),
-            life: 0,
-            answered: 0,
-            turned_away: TurnedAway::default(),
+            applier: Applier::new(cycle),
         }
     }
 
-    /// Its life, drawn at random when it starts and never 0, which its answers carry: a data
-    /// plane takes an answer's buckets only if it is the pod's latest, and a restart starts the
-    /// numbering again. 0, the default, leaves its answers unnumbered, each taken as it comes.
+    /// As [`Applier::set_life`].
     pub const fn set_life(&mut self, life: u64) {
-        self.life = life;
+        self.applier.set_life(life);
     }
 
     /// What it has answered unserved in this life, by why.
     #[must_use]
     pub const fn turned_away(&self) -> TurnedAway {
-        self.turned_away
+        self.applier.turned_away()
     }
 
     /// Its store.
@@ -107,17 +125,65 @@ impl Pod {
         from_store(self.node.tick(now))
     }
 
-    /// `message` from `from` at `now`: a batch answered to `from`, its entries for keys
-    /// another pod owns forwarded to that owner ([`forward`](Self::forward)); entries
-    /// forwarded to it answered back through the pod that forwarded them, and answers relayed
-    /// through it passed on to their data plane; the store's taken by its store. Answers are
-    /// not a pod's to take.
+    /// `message` from `from` at `now`, as [`Applier::receive`] takes it.
     pub fn receive(&mut self, from: NodeId, message: impl Into<Message>, now: Time) -> Outbox {
-        match message.into() {
-            Message::Batch(batch) => self.forward(from, batch, now),
+        self.applier
+            .receive(&mut self.node, from, message.into(), now)
+    }
+
+    /// As [`Applier::batch`].
+    pub fn batch(&mut self, batch: Batch, now: Time) -> Answers {
+        self.applier.batch(&mut self.node, batch, now)
+    }
+
+    /// As [`Applier::forward`].
+    pub fn forward(&mut self, from: NodeId, batch: Batch, now: Time) -> Outbox {
+        self.applier.forward(&mut self.node, from, batch, now)
+    }
+}
+
+impl Applier {
+    /// One whose data planes send every `cycle` nanoseconds.
+    #[must_use]
+    pub fn new(cycle: Time) -> Self {
+        Self {
+            cycle: cycle.max(1),
+            life: 0,
+            answered: 0,
+            turned_away: TurnedAway::default(),
+        }
+    }
+
+    /// Its life, drawn at random when it starts and never 0, which its answers carry: a data
+    /// plane takes an answer's buckets only if it is the pod's latest, and a restart starts the
+    /// numbering again. 0, the default, leaves its answers unnumbered, each taken as it comes.
+    pub const fn set_life(&mut self, life: u64) {
+        self.life = life;
+    }
+
+    /// What it has answered unserved in this life, by why.
+    #[must_use]
+    pub const fn turned_away(&self) -> TurnedAway {
+        self.turned_away
+    }
+
+    /// `message` from `from` at `now`, over `node`: a batch answered to `from`, its entries for
+    /// keys another pod owns forwarded to that owner ([`forward`](Self::forward)); entries
+    /// forwarded to it answered back through the pod that forwarded them, and answers relayed
+    /// through it passed on to their data plane; the store's taken by the store. Answers are
+    /// not a pod's to take.
+    pub fn receive<V: Holds>(
+        &mut self,
+        node: &mut Node<V>,
+        from: NodeId,
+        message: Message<V>,
+        now: Time,
+    ) -> Outbox<V> {
+        match message {
+            Message::Batch(batch) => self.forward(node, from, batch, now),
             Message::Forwarded { client, via, batch } => {
-                let answers = self.batch(batch, now);
-                let owner = self.node.id();
+                let answers = self.batch(node, batch, now);
+                let owner = node.id();
                 vec![(
                     via,
                     Message::Relayed {
@@ -139,7 +205,7 @@ impl Pod {
                     answers,
                 },
             )],
-            Message::Store(message) => from_store(self.node.receive(from, message, now)),
+            Message::Store(message) => from_store(node.receive(from, message, now)),
             Message::Answers(_) => Outbox::new(),
         }
     }
@@ -149,7 +215,7 @@ impl Pod {
     /// for the data plane to send again to the owner the table names; its table with them if
     /// later than the batch's. What changed goes to the shard's replicas with the store's next
     /// copy.
-    pub fn batch(&mut self, batch: Batch, now: Time) -> Answers {
+    pub fn batch<V: Holds>(&mut self, node: &mut Node<V>, batch: Batch, now: Time) -> Answers {
         let Batch {
             from,
             stamp,
@@ -160,7 +226,7 @@ impl Pod {
         let mut answers = Vec::new();
         let mut unserved = Vec::new();
         for entry in entries {
-            let applied = self.node.update(entry.key, now, |kept, wall| {
+            let applied = node.update(entry.key, now, |kept, wall| {
                 apply(kept, from, entry.contract, entry.report, cycle, wall)
             });
             match applied {
@@ -169,7 +235,7 @@ impl Pod {
                     answered,
                 }),
                 None => {
-                    let why = self.why_not(entry.key);
+                    let why = why_not(node, entry.key);
                     let turned = match why {
                         Why::Elsewhere => &mut self.turned_away.elsewhere,
                         Why::NotServing => &mut self.turned_away.not_serving,
@@ -185,8 +251,7 @@ impl Pod {
                 }
             }
         }
-        let table = self
-            .node
+        let table = node
             .committed()
             .filter(|table| table.stamp() > stamp)
             .cloned();
@@ -204,20 +269,25 @@ impl Pod {
     /// Data plane `from`'s batch reaching it at `now`: the entries of keys its table names
     /// another pod the owner of forwarded to that owner, once, to be answered through it; the
     /// rest answered here, as [`batch`](Self::batch) answers them.
-    pub fn forward(&mut self, from: NodeId, batch: Batch, now: Time) -> Outbox {
+    pub fn forward<V: Holds>(
+        &mut self,
+        node: &mut Node<V>,
+        from: NodeId,
+        batch: Batch,
+        now: Time,
+    ) -> Outbox<V> {
         let Batch {
             from: plane,
             stamp,
             made,
             entries,
         } = batch;
-        let shards = self.node.config().shards;
-        let me = self.node.id();
+        let shards = node.config().shards;
+        let me = node.id();
         let mut kept = Vec::new();
         let mut onward: BTreeMap<NodeId, Vec<Entry>> = BTreeMap::new();
         for entry in entries {
-            let owner = self
-                .node
+            let owner = node
                 .committed()
                 .and_then(|table| table.owner(shard_of(entry.key, shards)));
             match owner {
@@ -226,6 +296,7 @@ impl Pod {
             }
         }
         let answers = self.batch(
+            node,
             Batch {
                 from: plane,
                 stamp,
@@ -252,22 +323,22 @@ impl Pod {
         }
         out
     }
+}
 
-    /// Why it does not serve `key`: its table names it the owner, but it is not serving; or
-    /// names another, or none.
-    fn why_not(&self, key: Key) -> Why {
-        let shard = shard_of(key, self.node.config().shards);
-        let owner = self.node.committed().and_then(|table| table.owner(shard));
-        if owner == Some(self.node.id()) {
-            Why::NotServing
-        } else {
-            Why::Elsewhere
-        }
+/// Why `node` does not serve `key`: its table names it the owner, but it is not serving; or
+/// names another, or none.
+fn why_not<V: Held>(node: &Node<V>, key: Key) -> Why {
+    let shard = shard_of(key, node.config().shards);
+    let owner = node.committed().and_then(|table| table.owner(shard));
+    if owner == Some(node.id()) {
+        Why::NotServing
+    } else {
+        Why::Elsewhere
     }
 }
 
 /// The store's messages as the mode's.
-fn from_store(out: edgerush_cluster::Outbox<Value>) -> Outbox {
+fn from_store<V>(out: edgerush_cluster::Outbox<V>) -> Outbox<V> {
     out.into_iter()
         .map(|(to, message)| (to, Message::Store(message)))
         .collect()
