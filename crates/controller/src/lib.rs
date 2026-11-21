@@ -811,6 +811,8 @@ async fn serve(
     let mut said_unlisted: Option<Vec<String>> = None;
     // A generation of a DataPlane taken on last round, after it was judged.
     let mut taken_on = false;
+    // The count of the snapshot this replica last took, while it leads.
+    let mut took = None;
     loop {
         // New settings, or a generation taken on: what those served alone need followed
         // started, what none needs any more stopped, the rest followed on. A sender gone
@@ -884,11 +886,17 @@ async fn serve(
             said(Said::Waiting(waited));
         }
         let mut cluster = None;
-        // Whether this replica follows, and the leader's snapshot it holds, if one yet.
+        // Whether this replica follows, and the snapshot whose records it takes in place of
+        // its own: following, the leader's it holds, if one yet; leading, one it did not
+        // take itself, as it held as it came to lead or took from the ready replicas, once,
+        // so that the newest there is is what it leads from (04 §2).
         let follows = leading.is_some_and(|leads| !*leads.borrow());
+        if follows {
+            took = None;
+        }
         let following = snapshots
-            .filter(|_| follows)
-            .and_then(|snapshots| snapshots.snapshot.borrow().clone());
+            .and_then(|snapshots| snapshots.snapshot.borrow().clone())
+            .filter(|held| follows || Some(held.count) != took);
         for (name, served) in &mut serving {
             let is_gateway = served.settings.plane.gateway.is_some();
             if !unlisted.is_empty() || (is_gateway && !unlisted_api.is_empty()) {
@@ -1002,6 +1010,11 @@ async fn serve(
                 })
                 .collect();
             take(&snapshots.snapshot, planes);
+            took = snapshots
+                .snapshot
+                .borrow()
+                .as_ref()
+                .map(|taken| taken.count);
         }
         // Every round, so that a status changed by another, or written in vain, is written
         // again; one at a time, which is all the pace there is. A status written is a change

@@ -1289,6 +1289,20 @@ fn limiting(names: &[&str]) -> Plane {
 /// on, with no other change to bring it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_data_plane_taking_a_name_a_policy_holds_is_held_back() {
+    held_back_then_taken_on(false).await;
+}
+
+/// As [`a_data_plane_taking_a_name_a_policy_holds_is_held_back`], of a leader that takes
+/// snapshots: it judges the generation held back itself, round after round, never as a
+/// follower of its own snapshot would, which takes the leader's verdict and judges none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leader_taking_snapshots_judges_what_it_holds_back_itself() {
+    held_back_then_taken_on(true).await;
+}
+
+/// The generation held back, then taken on once its name is free; with `snapshots`, by a
+/// leader that takes them.
+async fn held_back_then_taken_on(snapshots: bool) {
     let freeing = Arc::new(AtomicBool::new(false));
     let told = Arc::clone(&freeing);
     let fake = Fake::start(&["127.0.0.1"], move |path| {
@@ -1361,7 +1375,10 @@ async fn a_data_plane_taking_a_name_a_policy_holds_is_held_back() {
                         Debounce::default(),
                         None,
                         acks(),
-                        None,
+                        snapshots.then(|| Snapshots {
+                            snapshot: watch::channel(None).0,
+                            settings: Rc::new(|_| None),
+                        }),
                         said,
                     )
                     .await;
@@ -4982,6 +4999,98 @@ async fn a_follower_translates_from_the_snapshot_and_counts_on_from_it_once_it_l
                 under(heard.borrow().translations.last().unwrap()),
                 ["per-client"]
             );
+            controlling.abort();
+        })
+        .await;
+}
+
+/// A replica that comes to lead leads from the snapshot it holds as it does, one it took from
+/// the ready replicas in place of the one it followed among it, though both come at once:
+/// it translates from that snapshot's records, not from those it followed, and takes no
+/// snapshot of its own over it that says otherwise (04 §2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_coming_to_lead_leads_from_the_snapshot_it_took() {
+    let refused_edit = PER_CLIENT_POLICY
+        .replace(r#""generation":1"#, r#""generation":3"#)
+        .replace("10/s", "10/fortnight");
+    let fake = Fake::start(&["127.0.0.1"], move |path| {
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[ingress("shop", "web", "shop.example")])
+        } else if path.starts_with("/api/v1/services?") {
+            page(&[service("shop")])
+        } else if path.starts_with("/api/v1/secrets?") {
+            page(&[secret("shop", &["shop.example"])])
+        } else if path.starts_with("/apis/gateway.edgerush.dev/v1alpha1/ratelimitpolicies?") {
+            answer(200, &refused_edit)
+        } else {
+            otherwise(path)
+        }
+    })
+    .await;
+    let plane = limiting(&[]);
+    let accepted = with_policy(rate_limit_policy("shop", 1, &[("per-client", "10/s")]));
+    // Followed: the policy's first version applies.
+    let followed = Arc::new(Snapshot {
+        count: 3,
+        planes: BTreeMap::from([(String::new(), leaders_record(&plane, &accepted))]),
+    });
+    // Taken from a ready replica as it comes to lead, newer: no version of it applies.
+    let gathered = Arc::new(Snapshot {
+        count: 9,
+        planes: BTreeMap::from([(String::new(), Record::default())]),
+    });
+    let api = fake.client(&token("controller-taking", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let (pushed, mut taken) = watch::channel(Some(followed));
+    let (leads, leading) = watch::channel(false);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_settings, planes) = watch::channel(only(harness(&plane)));
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                let snapshot = pushed.clone();
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        planes,
+                        None,
+                        Debounce::default(),
+                        Some(leading),
+                        acks(),
+                        Some(Snapshots {
+                            snapshot,
+                            settings: Rc::new(|_| None),
+                        }),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("translated", || heard.borrow().translations.len() == 1).await;
+            assert_eq!(under(&heard.borrow().translations[0]), ["per-client"]);
+            // Both at once, as the replica taking the lease has them.
+            pushed.send_replace(Some(Arc::clone(&gathered)));
+            leads.send_replace(true);
+            taken.borrow_and_update();
+            until("translated again", || {
+                heard.borrow().translations.len() == 2
+            })
+            .await;
+            assert_eq!(under(&heard.borrow().translations[1]), Vec::<String>::new());
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let held = taken.borrow_and_update().clone().unwrap();
+            assert_eq!(
+                held.count, 9,
+                "a snapshot of its own taken over the one it took"
+            );
+            assert_eq!(held.planes[""], Record::default());
             controlling.abort();
         })
         .await;
