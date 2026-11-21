@@ -22,6 +22,7 @@ use edgerush_controller::expiry::Expiry;
 use edgerush_controller::issuing::{self, Issuer};
 use edgerush_controller::own_pods::follow_own_pods;
 use edgerush_controller::unimplementable::Unimplementable;
+use edgerush_controller::unprotected::Unprotected;
 use edgerush_controller::{
     Acks, Classes, Debounce, Membership, Planes, Reports, Said, ServiceNow, WatchScope, control,
 };
@@ -1032,11 +1033,19 @@ async fn control_until(
     // The RateLimitPolicies each data plane leaves out, of every replica's translations
     // (04 §6): served beside the certificates'.
     let unimplementable = RefCell::new(Unimplementable::new());
-    let exposed_text = |expiry: &Expiry, unimplementable: &Unimplementable| {
-        Bytes::from(expiry.exposition() + &unimplementable.exposition())
+    // The Services each data plane serves unprotected, their protection annotations not
+    // read (25 §2): served beside them.
+    let unprotected = RefCell::new(Unprotected::new());
+    let exposed_text = |expiry: &Expiry,
+                        unimplementable: &Unimplementable,
+                        unprotected: &Unprotected| {
+        Bytes::from(expiry.exposition() + &unimplementable.exposition() + &unprotected.exposition())
     };
-    let (exposed, exposition) =
-        watch::channel(exposed_text(&expiry.borrow(), &unimplementable.borrow()));
+    let (exposed, exposition) = watch::channel(exposed_text(
+        &expiry.borrow(),
+        &unimplementable.borrow(),
+        &unprotected.borrow(),
+    ));
     let mut measured = None;
     if let Some(listener) = listeners.metrics {
         listener.set_nonblocking(true)?;
@@ -1261,6 +1270,7 @@ async fn control_until(
                 } = &said
                 {
                     unimplementable.borrow_mut().take(data_plane, translation);
+                    unprotected.borrow_mut().take(data_plane, translation);
                     // Without an election, this replica is the only one, and leads.
                     let leading = leads.as_ref().is_none_or(|leads| *leads.borrow());
                     let out_of_date = expiry.borrow_mut().take(
@@ -1268,7 +1278,11 @@ async fn control_until(
                         unix_now(),
                         leading,
                     );
-                    exposed.send_replace(exposed_text(&expiry.borrow(), &unimplementable.borrow()));
+                    exposed.send_replace(exposed_text(
+                        &expiry.borrow(),
+                        &unimplementable.borrow(),
+                        &unprotected.borrow(),
+                    ));
                     for line in out_of_date {
                         telling(&line);
                     }

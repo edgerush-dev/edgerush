@@ -1,0 +1,3 @@
+HTTPRoute shop/search, section http: attached to http (search.example.com)
+GRPCRoute shop/search, section http: attached to http (grpc.example.com)
+TCPRoute shop/raw, section tcp: attached to tcp (*)

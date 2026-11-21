@@ -7,6 +7,7 @@
 use crate::backend_tls::Policies;
 use crate::gateway::GatewayOutcome;
 use crate::http_route::{Reference, RouteOutcome, attachment_name, backends, claim};
+use crate::protection::Unprotected;
 use crate::{Cluster, Plane, RefProblem, namespace};
 use edgerush_config::{Backend, TlsRoute, Upstream};
 use edgerush_gateway_api::tls_route::TLSRoute;
@@ -34,6 +35,7 @@ pub(crate) fn translated(
     plane: &Plane,
     cluster: &Cluster,
     policies: &Policies<'_>,
+    unprotected: &Unprotected,
 ) -> Translated {
     let mut translated = Translated::default();
     let rules = &route.spec.rules;
@@ -67,6 +69,7 @@ pub(crate) fn translated(
         plane,
         cluster,
         policies,
+        unprotected,
         (&mut upstreams, &mut invalid),
     );
     for parent in &outcome.parents {

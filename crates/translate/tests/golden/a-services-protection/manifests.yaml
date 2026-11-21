@@ -1,0 +1,142 @@
+# Backend protection from a Service's annotations (25 §2): every upstream of an HTTP or gRPC
+# route that reaches the Service is bounded alike, whichever API, port or mirror reaches
+# it, with a queue where both its size and its timeout are stated; one reached by the
+# Service's cluster IP is bounded as its one endpoint. A TCPRoute's upstream of a protected
+# port is named apart and unprotected, as a tunnel counts no requests. Annotations that do
+# not read, a value or a key of EdgeRush's that is none of protection's, leave their
+# Service unprotected and are said, once, of a Service a route reaches; of one no route
+# reaches, nothing is said.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - { name: http, port: 8080, protocol: HTTP, allowedRoutes: { namespaces: { from: All } } }
+    - { name: tcp, port: 9000, protocol: TCP, allowedRoutes: { namespaces: { from: All } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: search, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: http }]
+  hostnames: [search.example.com]
+  rules:
+    - backendRefs: [{ name: search, port: 80 }]
+    - matches: [{ path: { value: /cart } }]
+      filters: [{ type: RequestMirror, requestMirror: { backendRef: { name: shadow, port: 80 } } }]
+      backendRefs: [{ name: cart, port: 80 }]
+    - matches: [{ path: { value: /broken } }]
+      backendRefs: [{ name: broken, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: { name: search, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: http }]
+  hostnames: [grpc.example.com]
+  rules:
+    - backendRefs: [{ name: search, port: 9090 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: { name: raw, namespace: shop }
+spec:
+  parentRefs: [{ name: web, namespace: edge, sectionName: tcp }]
+  rules:
+    - backendRefs: [{ name: search, port: 80 }, { name: broken, port: 80 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: by-endpoints, namespace: shop, creationTimestamp: "2026-01-01T00:00:00Z" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: search, port: { name: http } } } }
+          - { path: /typo, pathType: Prefix, backend: { service: { name: typo, port: { number: 80 } } } }
+          - { path: /broken, pathType: Prefix, backend: { service: { name: broken, port: { number: 80 } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: by-address
+  namespace: shop
+  creationTimestamp: "2026-02-01T00:00:00Z"
+  annotations: { gateway.edgerush.dev/service-upstream: "true" }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: address.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: search, port: { name: http } } } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: search
+  namespace: shop
+  annotations:
+    gateway.edgerush.dev/max-in-flight-per-pod: "20"
+    gateway.edgerush.dev/queue-size: "100"
+    gateway.edgerush.dev/queue-timeout: 2s
+spec:
+  ports:
+    - { name: http, port: 80 }
+    - { name: grpc, port: 9090, appProtocol: kubernetes.io/h2c }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cart
+  namespace: shop
+  annotations: { gateway.edgerush.dev/max-in-flight-per-pod: "5" }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shadow
+  namespace: shop
+  annotations: { gateway.edgerush.dev/max-in-flight-per-pod: "2" }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: broken
+  namespace: shop
+  annotations:
+    gateway.edgerush.dev/max-in-flight-per-pod: lots
+    gateway.edgerush.dev/queue-size: "10"
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: typo
+  namespace: shop
+  annotations: { gateway.edgerush.dev/max-inflight-per-pod: "20" }
+spec:
+  ports: [{ name: http, port: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: unreached
+  namespace: shop
+  annotations: { gateway.edgerush.dev/max-in-flight-per-pod: "0" }
+spec:
+  ports: [{ name: http, port: 80 }]
