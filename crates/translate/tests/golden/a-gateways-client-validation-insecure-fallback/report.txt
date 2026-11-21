@@ -1,0 +1,1 @@
+Ingress shop/legacy: legacy.example.com's clients are asked for a certificate Gateway shop/web's client certificate validation trusts, and let through without one, as port 443 is shared with its HTTPS listeners, which validate clients in AllowInsecureFallback

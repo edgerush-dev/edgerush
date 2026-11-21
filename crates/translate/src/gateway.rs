@@ -9,7 +9,7 @@ use crate::{
     Cluster, Finding, GATEWAY_CONTROLLER, Object, Plane, Problem, RefProblem, RefReason,
     secret_certificate,
 };
-use edgerush_config::Protocol;
+use edgerush_config::{ClientValidation, ClientValidationMode, Protocol};
 use edgerush_gateway_api::gateway::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespaces,
     GatewayListenersAllowedRoutesNamespacesSelector,
@@ -48,10 +48,10 @@ pub struct GatewayOutcome {
     /// without one (04 §2). None where it names none.
     pub client_certificate: Option<Result<String, RefProblem>>,
     /// Each port its `spec.tls.frontend` validates clients' certificates on, where an HTTPS
-    /// listener of it or of an attached ListenerSet is accepted, by the CA certificates, in
-    /// PEM, that vouch for them: the data plane's listener there validates every client
-    /// (04 §2).
-    pub validated: BTreeMap<u16, Vec<String>>,
+    /// listener of it or of an attached ListenerSet is accepted, by how: the CA
+    /// certificates, in PEM, that vouch for them, and the mode. The data plane's listener
+    /// there validates every client so (04 §2).
+    pub validated: BTreeMap<u16, ClientValidation>,
 }
 
 /// A ListenerSet naming the data plane's Gateway as its parent.
@@ -293,8 +293,9 @@ pub enum ListenerProblem {
     #[error("protocol `{0}` is not one the gateway serves")]
     UnsupportedProtocol(String),
     /// An HTTPS listener on a port whose clients the Gateway's `spec.tls.frontend` validates
-    /// in a mode other than `AllowValidOnly`, which is not served: a listener served in
-    /// another mode would not be validating clients as it asks (`UnsupportedValue`).
+    /// in a mode the gateway does not know, neither `AllowValidOnly` nor
+    /// `AllowInsecureFallback`: a listener served would not be validating clients as it asks
+    /// (`UnsupportedValue`).
     #[error(
         "the Gateway's spec.tls.frontend validates client certificates on port {port} in mode \
          `{mode}`, which the gateway does not serve"
@@ -418,9 +419,15 @@ impl ListenerProblem {
     }
 }
 
-/// The mode in which the gateway validates clients' certificates: a client without a
-/// certificate its authorities vouch for is refused in the handshake.
-const VALID_ONLY: &str = "AllowValidOnly";
+/// The data plane's mode for a validation of `spec.tls.frontend` in `mode`, by Gateway API's
+/// name for it; none for a name the gateway does not know.
+fn mode_of(mode: &str) -> Option<ClientValidationMode> {
+    match mode {
+        "AllowValidOnly" => Some(ClientValidationMode::AllowValidOnly),
+        "AllowInsecureFallback" => Some(ClientValidationMode::AllowInsecureFallback),
+        _ => None,
+    }
+}
 
 /// How the Gateway's `spec.tls.frontend` validates the certificates of the clients of its
 /// HTTPS listeners, and of its ListenerSets', on each port: as its `default` says, but on a
@@ -714,15 +721,15 @@ pub(crate) fn outcome(
     })
 }
 
-/// The CA certificates clients' certificates are validated with on each port of an HTTPS
-/// listener the Gateway's `spec.tls.frontend` validates clients on (04 §2), as `frontend`
-/// says, the Gateway being `gateway` of `namespace`: each such listener accepted as judged
-/// is given the port's refs that cannot be used, said of the Gateway by name and of a
-/// ListenerSet's listener without, as nothing of its parent is told a ListenerSet
-/// (GEP-1713); and is refused where none can be used, or where the mode is not
-/// `AllowValidOnly`, refused after it took its port, so that it still counts in what
-/// conflicts, and leaves the port unbound unless another listener is accepted there.
-/// A port of no such listener left accepted is not in what this gives.
+/// How clients' certificates are validated on each port of an HTTPS listener the Gateway's
+/// `spec.tls.frontend` validates clients on (04 §2), as `frontend` says, the Gateway being
+/// `gateway` of `namespace`: with which CA certificates, and in which mode. Each such
+/// listener accepted as judged is given the port's refs that cannot be used, said of the
+/// Gateway by name and of a ListenerSet's listener without, as nothing of its parent is
+/// told a ListenerSet (GEP-1713); and is refused where none can be used, or where the mode
+/// is not one the gateway knows, refused after it took its port, so that it still counts
+/// in what conflicts, and leaves the port unbound unless another listener is accepted
+/// there. A port of no such listener left accepted is not in what this gives.
 fn validated(
     listeners: &mut [ListenerOutcome],
     written: &[Written],
@@ -730,8 +737,8 @@ fn validated(
     (gateway, namespace): (&Object, &str),
     cluster: &Cluster,
     report: &mut Vec<Finding>,
-) -> BTreeMap<u16, Vec<String>> {
-    let mut resolved: BTreeMap<u16, Authorities> = BTreeMap::new();
+) -> BTreeMap<u16, ClientValidation> {
+    let mut resolved: BTreeMap<u16, (Authorities, ClientValidationMode)> = BTreeMap::new();
     let mut served: BTreeSet<u16> = BTreeSet::new();
     for (listener, written) in listeners.iter_mut().zip(written) {
         if listener.served.is_err() || written.listener.protocol != "HTTPS" {
@@ -741,14 +748,14 @@ fn validated(
         let Some(validation) = frontend.on(written.listener.port) else {
             continue;
         };
-        if validation.mode != VALID_ONLY {
+        let Some(mode) = mode_of(&validation.mode) else {
             listener.served = Err(ListenerProblem::ValidationMode {
                 port,
                 mode: validation.mode.clone(),
             });
             continue;
-        }
-        let authorities = resolved.entry(port).or_insert_with(|| {
+        };
+        let (authorities, _) = resolved.entry(port).or_insert_with(|| {
             let authorities = authorities(validation, namespace, cluster);
             for problem in &authorities.problems {
                 report.push(Finding {
@@ -759,7 +766,7 @@ fn validated(
                     },
                 });
             }
-            authorities
+            (authorities, mode)
         });
         listener.ca_problems = if written.set.is_some() {
             // One line for each reason, in the order first met, as lines told apart by
@@ -783,7 +790,15 @@ fn validated(
     resolved
         .into_iter()
         .filter(|(port, _)| served.contains(port))
-        .map(|(port, authorities)| (port, authorities.pem))
+        .map(|(port, (authorities, mode))| {
+            (
+                port,
+                ClientValidation {
+                    authorities: authorities.pem,
+                    mode,
+                },
+            )
+        })
         .collect()
 }
 

@@ -569,8 +569,8 @@ pub struct StatedNames {
     pub names: Vec<String>,
 }
 
-/// Whom a listener trusts to vouch for its clients (Gateway API's frontend validation, in
-/// its default mode: a client without a valid certificate is refused in the handshake).
+/// Whom a listener trusts to vouch for its clients (Gateway API's frontend validation), and
+/// what becomes of a client they do not vouch for.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -578,6 +578,23 @@ pub struct ClientValidation {
     /// The certificates, in PEM, of the authorities trusted.
     #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub authorities: Vec<String>,
+    /// Whether a client the authorities do not vouch for is refused, as unsaid.
+    #[serde(default)]
+    pub mode: ClientValidationMode,
+}
+
+/// What becomes of a client that shows no certificate the authorities vouch for, by Gateway
+/// API's names for the frontend validation's modes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ClientValidationMode {
+    /// Refused in the handshake.
+    #[default]
+    AllowValidOnly,
+    /// Asked for a certificate, and let through whether it shows one or not, and whether
+    /// the authorities vouch for it or not: authorizing clients is left to the backends.
+    AllowInsecureFallback,
 }
 
 /// A certificate and its private key, in PEM, as they came: reading them is the data

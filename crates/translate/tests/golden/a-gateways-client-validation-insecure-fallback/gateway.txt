@@ -1,0 +1,2 @@
+listener secure: served on port-443, presenting shop/shop-tls, taking HTTPRoute, GRPCRoute from namespace shop
+listener strict: served on port-8443, presenting shop/shop-tls, taking HTTPRoute, GRPCRoute from namespace shop

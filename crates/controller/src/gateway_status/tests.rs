@@ -286,12 +286,14 @@ fn the_table_claims_the_gateway_http_extended_features_that_pass() {
 }
 
 #[test]
-fn the_table_claims_client_certificate_validation_in_its_default_mode_alone() {
-    // Its three tests pass in GATEWAY-HTTP (#475); AllowInsecureFallback is not served yet.
-    assert!(SUPPORTED_FEATURES.contains(&"GatewayFrontendClientCertificateValidation"));
-    assert!(
-        !SUPPORTED_FEATURES.contains(&"GatewayFrontendClientCertificateValidationInsecureFallback")
-    );
+fn the_table_claims_client_certificate_validation_in_both_modes() {
+    // Their four tests pass in GATEWAY-HTTP (#475).
+    for feature in [
+        "GatewayFrontendClientCertificateValidation",
+        "GatewayFrontendClientCertificateValidationInsecureFallback",
+    ] {
+        assert!(SUPPORTED_FEATURES.contains(&feature), "{feature}");
+    }
 }
 
 #[test]
@@ -421,6 +423,33 @@ fn a_rate_limit_policy_affected_no_longer_wanted_is_taken_away() {
         !has(status.conditions.as_deref().unwrap()),
         "the ListenerSet's"
     );
+}
+
+/// `InsecureFrontendValidationMode` is this controller's: written while translation wants
+/// it, and taken away once no port is in the insecure fallback.
+#[test]
+fn insecure_frontend_validation_mode_is_written_while_wanted_and_then_taken_away() {
+    let unknown = Programmed::of(4, &Pods::new(), None, false);
+    let mut wanted = wanted_gateway();
+    wanted.conditions.push(said(
+        "InsecureFrontendValidationMode",
+        true,
+        "ConfigurationChanged",
+    ));
+    let status = gateway(None, &wanted, &[], &unknown, at(50));
+    let insecure = |conditions: &[Condition]| {
+        conditions
+            .iter()
+            .find(|c| c.type_ == "InsecureFrontendValidationMode")
+            .map(|c| (c.status.clone(), c.reason.clone()))
+    };
+    let written = status.conditions.as_deref().unwrap();
+    assert_eq!(
+        insecure(written),
+        Some(("True".to_owned(), "ConfigurationChanged".to_owned()))
+    );
+    let status = gateway(Some(&status), &wanted_gateway(), &[], &unknown, at(60));
+    assert_eq!(insecure(status.conditions.as_deref().unwrap()), None);
 }
 
 #[test]
