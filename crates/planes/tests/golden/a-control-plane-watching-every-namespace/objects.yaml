@@ -136,6 +136,8 @@ spec:
         - edge-system/edgerush-controller-edge
         - --health
         - 0.0.0.0:8081
+        - --peers
+        - 0.0.0.0:9444
         - --authority
         - edgerush-controller-edge-authority
         env:
@@ -150,6 +152,8 @@ spec:
           name: stream
         - containerPort: 8081
           name: health
+        - containerPort: 9444
+          name: peers
         readinessProbe:
           httpGet:
             path: /ready

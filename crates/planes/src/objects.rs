@@ -103,6 +103,9 @@ pub const MANAGED_BY: &str = "edgerush-operator";
 const STREAM_PORT: i32 = 9443;
 /// The port its pods answer their readiness probe on, `/ready`, apart from anything else.
 const HEALTH_PORT: i32 = 8081;
+/// The port its replicas serve each other their snapshots on, apart from the data planes'
+/// stream (04 §2).
+const PEERS_PORT: i32 = 9444;
 /// The port its pods serve the admission webhook on, and the Service's for it.
 const WEBHOOK_PORT: i32 = 8443;
 const WEBHOOK_SERVICE_PORT: i32 = 443;
@@ -673,6 +676,9 @@ pub fn for_control_plane(
         // Its readiness, which its probe asks (04 §2).
         "--health".to_owned(),
         format!("0.0.0.0:{HEALTH_PORT}"),
+        // What its replicas share of what translation cannot read back (04 §2).
+        "--peers".to_owned(),
+        format!("0.0.0.0:{PEERS_PORT}"),
     ];
     // The authority it signs with: its own, or the platform's it is given, never written
     // (05 §2).
@@ -698,7 +704,11 @@ pub fn for_control_plane(
             args.extend(["--namespace".to_owned(), namespace.clone()]);
         }
     }
-    let mut ports = vec![port("stream", STREAM_PORT), port("health", HEALTH_PORT)];
+    let mut ports = vec![
+        port("stream", STREAM_PORT),
+        port("health", HEALTH_PORT),
+        port("peers", PEERS_PORT),
+    ];
     if webhook {
         args.extend([
             "--webhook-listen".to_owned(),

@@ -157,6 +157,8 @@ spec:
         - payments-edge/edgerush-controller-payments
         - --health
         - 0.0.0.0:8081
+        - --peers
+        - 0.0.0.0:9444
         - --authority
         - payments-ca
         - --authority-provided
@@ -176,6 +178,8 @@ spec:
           name: stream
         - containerPort: 8081
           name: health
+        - containerPort: 9444
+          name: peers
         - containerPort: 8443
           name: webhook
         readinessProbe:
