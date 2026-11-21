@@ -60,7 +60,21 @@ say "without test features"
 cargo check --workspace
 
 say "tests"
-cargo test --workspace
+# By cargo-nextest, each test in a process of its own and every binary's tests side by side.
+# `cargo test` runs one binary after another, waiting on each binary's slowest test in turn:
+# on the laptop that made the tests 9 minutes rather than under 5.
+#
+# But for the rate-limiting service's cluster tests, which cargo runs after, as one process
+# with nothing else beside it. Timed in tens of milliseconds, they keep one another apart by
+# a lock in that process (`ALONE`, crates/ratelimit-service/tests/cluster.rs): in a process
+# each, beside the rest of the workspace, the lock would hold nothing back. Named with
+# --workspace, as `-p` would build the crates again with other features.
+cargo nextest run --workspace -E 'not binary_id(edgerush-ratelimit-service::cluster)'
+cargo test --workspace --test cluster
+
+say "doc tests"
+# nextest leaves these out.
+cargo test --workspace --doc
 
 say "vendored quiche's own tests"
 # vendor/quiche is not a member of the workspace, so the tests above never reach it, and its

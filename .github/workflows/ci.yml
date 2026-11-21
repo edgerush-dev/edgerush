@@ -35,9 +35,9 @@ jobs:
       - name: Toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
-      # The dependencies as main last built them (BoringSSL takes minutes) and cargo-deny.
-      # Keyed on the lock files and the toolchain, so a change to either starts a new entry
-      # from the nearest old one.
+      # The dependencies as main last built them (BoringSSL takes minutes), cargo-deny and
+      # cargo-nextest. Keyed on the lock files and the toolchain, so a change to either starts
+      # a new entry from the nearest old one.
       - name: Restore the build cache
         id: cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -47,6 +47,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-nextest
             target
             fuzz/target
           key: ${{ runner.os }}-check-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'fuzz/Cargo.lock') }}
@@ -57,6 +58,14 @@ jobs:
         run: |
           if [ "$(cargo deny --version 2>/dev/null)" != "cargo-deny 0.20.2" ]; then
             cargo install --locked cargo-deny@0.20.2
+          fi
+
+      # The test runner check.sh runs the tests with, in the same way. Its first line goes on
+      # to name the commit it was built from, when it knows it.
+      - name: cargo-nextest
+        run: |
+          if [[ "$(cargo nextest --version 2>/dev/null | head -n 1)" != "cargo-nextest 0.9.152"* ]]; then
+            cargo install --locked cargo-nextest@0.9.152
           fi
 
       - name: Checks
@@ -78,6 +87,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-nextest
             target
             fuzz/target
           key: ${{ steps.cache.outputs.cache-primary-key }}
