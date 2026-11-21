@@ -393,6 +393,11 @@ crates/cluster-asynchronous
                    each part, the mode's pod applying data planes' batches and answering
                    them, and the data planes' routing by the table; pure, no I/O; the service
                    and the proxy run it
+crates/cluster-modes
+                   a pod of both modes over one cluster store (`edgerush-cluster-modes`): each
+                   key holding either mode's value, the mode its key's top bit says, the store
+                   counting each kind's keys apart, and each mode's logic beside the other's;
+                   pure, no I/O
 crates/cluster-sim the cluster's simulation (`edgerush-cluster-sim`): the store's pods over a
                    network that delays, loses and cuts, with clients standing for data planes,
                    in the synchronous mode and the asynchronous, seeded and deterministic; its scenarios and chaos runs are its tests, and

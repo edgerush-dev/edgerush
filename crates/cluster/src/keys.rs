@@ -3,7 +3,7 @@
 //! the bytes they take — kept as the keys change rather than counted by walking them, so that
 //! finding the keys due costs as many steps as there are keys due.
 
-use crate::{Held, KEY_BYTES, Kept, Key, ShardId, Time};
+use crate::{Held, KEY_BYTES, KINDS, Kept, Key, ShardId, Time};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A second, in nanoseconds: what a key's time to be forgotten is rounded up to.
@@ -44,6 +44,28 @@ pub(crate) struct Keys<V> {
     count: usize,
 }
 
+/// What a set of keys takes, and how many there are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Tally {
+    pub(crate) bytes: u64,
+    pub(crate) count: usize,
+}
+
+impl Tally {
+    /// With a key of `bytes` added, as [`bytes_of`] counts it: worked out once by the change
+    /// that adds it, a value's bytes costing a walk of its parts.
+    const fn add(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.count = self.count.saturating_add(1);
+    }
+
+    /// With a key of `bytes` taken out.
+    const fn take(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_sub(bytes);
+        self.count = self.count.saturating_sub(1);
+    }
+}
+
 impl<V> Default for Keys<V> {
     fn default() -> Self {
         Self {
@@ -75,6 +97,20 @@ impl<V: Held> Keys<V> {
     /// What its keys take toward `max_key_bytes`, their places in the schedule with them.
     pub(crate) const fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// What its keys of each kind take, as [`bytes`](Self::bytes) counts them, and how many
+    /// there are: a sum over its shards when asked, as a scrape asks, kept by each shard as its
+    /// keys change, so that a change costs only its shard's count.
+    pub(crate) fn by_kind(&self) -> [Tally; KINDS] {
+        let mut total = [Tally::default(); KINDS];
+        for keys in self.shards.values() {
+            for (total, shard) in total.iter_mut().zip(keys.by_kind) {
+                total.bytes = total.bytes.saturating_add(shard.bytes);
+                total.count = total.count.saturating_add(shard.count);
+            }
+        }
+        total
     }
 
     /// Holds `kept` as `key` of `shard`, in place of what it held of it: what that was.
@@ -176,8 +212,10 @@ struct ShardKeys<V> {
     held: BTreeMap<Key, Kept<V>>,
     /// Each key held, by the second of its time to be forgotten, soonest first.
     due: BTreeSet<(Time, Key)>,
-    /// What the keys take, each as [`bytes_of`] has it.
+    /// What the keys take, each as [`bytes_of`] has it; and the same of each kind, with how
+    /// many there are.
     bytes: u64,
+    by_kind: [Tally; KINDS],
     /// The second of its soonest key, as [`Keys`]'s fronts have it.
     front: Option<Time>,
 }
@@ -188,6 +226,7 @@ impl<V> Default for ShardKeys<V> {
             held: BTreeMap::new(),
             due: BTreeSet::new(),
             bytes: 0,
+            by_kind: [Tally::default(); KINDS],
             front: None,
         }
     }
@@ -196,6 +235,7 @@ impl<V> Default for ShardKeys<V> {
 impl<V: Held> ShardKeys<V> {
     fn insert(&mut self, key: Key, kept: Kept<V>) -> Option<Kept<V>> {
         let (second, bytes) = (second_of(kept.forget_at), bytes_of(&kept));
+        self.by_kind[kept.kind()].add(bytes);
         let old = self.held.insert(key, kept);
         if let Some(old) = &old {
             self.take(key, old);
@@ -218,13 +258,17 @@ impl<V: Held> ShardKeys<V> {
             new = true;
             Kept::default()
         });
-        let before = (!new).then(|| (second_of(kept.forget_at), bytes_of(kept)));
+        let before = (!new).then(|| (second_of(kept.forget_at), bytes_of(kept), kept.kind()));
         let result = change(kept);
         let (second, bytes) = (second_of(kept.forget_at), bytes_of(kept));
+        if let Some((_, was, kind)) = before {
+            self.by_kind[kind].take(was);
+        }
+        self.by_kind[kept.kind()].add(bytes);
         let moved = match before {
             // Its place unchanged, as for a key in use, its time moving on within a second.
-            Some((was, _)) if was == second => false,
-            Some((was, _)) => {
+            Some((was, _, _)) if was == second => false,
+            Some((was, _, _)) => {
                 self.due.remove(&(was, key));
                 self.due.insert((second, key));
                 true
@@ -234,18 +278,20 @@ impl<V: Held> ShardKeys<V> {
                 true
             }
         };
-        let was = before.map_or(0, |(_, bytes)| bytes);
+        let was = before.map_or(0, |(_, bytes, _)| bytes);
         self.bytes = self.bytes.saturating_sub(was).saturating_add(bytes);
         (result, moved)
     }
 
     fn retain(&mut self, mut keep: impl FnMut(&Key, &Kept<V>) -> bool) {
-        let (due, bytes) = (&mut self.due, &mut self.bytes);
+        let (due, bytes, by_kind) = (&mut self.due, &mut self.bytes, &mut self.by_kind);
         self.held.retain(|key, kept| {
             let kept_on = keep(key, kept);
             if !kept_on {
+                let taken = bytes_of(kept);
                 due.remove(&(second_of(kept.forget_at), *key));
-                *bytes = bytes.saturating_sub(bytes_of(kept));
+                *bytes = bytes.saturating_sub(taken);
+                by_kind[kept.kind()].take(taken);
             }
             kept_on
         });
@@ -266,8 +312,10 @@ impl<V: Held> ShardKeys<V> {
 
     /// Counts out `kept`, held as `key` until now.
     fn take(&mut self, key: Key, kept: &Kept<V>) {
+        let taken = bytes_of(kept);
         self.due.remove(&(second_of(kept.forget_at), key));
-        self.bytes = self.bytes.saturating_sub(bytes_of(kept));
+        self.bytes = self.bytes.saturating_sub(taken);
+        self.by_kind[kept.kind()].take(taken);
     }
 }
 
@@ -277,7 +325,16 @@ impl<V: Held> Keys<V> {
     pub(crate) fn agrees(&self) -> bool {
         let mut fronts = BTreeSet::new();
         let (mut bytes, mut count) = (0, 0);
+        let mut by_kind = [Tally::default(); KINDS];
         for (shard, keys) in &self.shards {
+            let mut shard_kinds = [Tally::default(); KINDS];
+            for kept in keys.held.values() {
+                shard_kinds[kept.kind()].add(bytes_of(kept));
+                by_kind[kept.kind()].add(bytes_of(kept));
+            }
+            if shard_kinds != keys.by_kind {
+                return false;
+            }
             let due: BTreeSet<(Time, Key)> = keys
                 .held
                 .iter()
@@ -293,7 +350,10 @@ impl<V: Held> Keys<V> {
             bytes += shard_bytes;
             count += keys.held.len();
         }
-        fronts == self.fronts && bytes == self.bytes && count == self.count
+        fronts == self.fronts
+            && bytes == self.bytes
+            && count == self.count
+            && by_kind == self.by_kind()
     }
 }
 

@@ -3,7 +3,9 @@
 use crate::keys::{Keys, seconds_passed};
 use crate::message::{Message, Stamp};
 use crate::table::{self, Table, is_quorum, shard_of};
-use crate::{Config, Held, KEY_BYTES, Kept, Key, NodeId, ShardId, Time, first_term, generation_of};
+use crate::{
+    Config, Held, KEY_BYTES, KINDS, Kept, Key, NodeId, ShardId, Time, first_term, generation_of,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::Arc;
@@ -207,9 +209,12 @@ pub struct Node<V> {
     beat_at: Option<Time>,
     cycle_at: Option<Time>,
     swept_at: Option<Time>,
-    /// Keys it has forgotten, their time come, and keys it has evicted for the cap.
+    /// Keys it has forgotten, their time come, and keys it has evicted for the cap; and the same
+    /// of each kind.
     forgotten: u64,
     evicted: u64,
+    forgotten_by_kind: [u64; KINDS],
+    evicted_by_kind: [u64; KINDS],
     /// Elections it stood in that came to nothing, for its pod to tell of.
     lapsed: u64,
     /// When it is to stand for election, if no leader is heard by then.
@@ -317,6 +322,8 @@ impl<V: Held> Node<V> {
             swept_at: None,
             forgotten: 0,
             evicted: 0,
+            forgotten_by_kind: [0; KINDS],
+            evicted_by_kind: [0; KINDS],
             lapsed: 0,
             elect_at: None,
             seen_term: 0,
@@ -364,11 +371,30 @@ impl<V: Held> Node<V> {
         self.evicted
     }
 
+    /// Keys it has forgotten of each kind ([`Held::kind`]).
+    #[must_use]
+    pub const fn forgotten_by_kind(&self) -> [u64; KINDS] {
+        self.forgotten_by_kind
+    }
+
+    /// Keys it has evicted of each kind.
+    #[must_use]
+    pub const fn evicted_by_kind(&self) -> [u64; KINDS] {
+        self.evicted_by_kind
+    }
+
     /// About the bytes its keys take, owned and copies, with what it keeps to know when each
     /// may be forgotten: what `max_key_bytes` caps. A sum over its shards, not its keys.
     #[must_use]
     pub fn key_bytes(&self) -> u64 {
         self.data.bytes()
+    }
+
+    /// The keys it holds of each kind, and about the bytes they take, as
+    /// [`key_bytes`](Self::key_bytes) counts them: kept as the keys change, never a walk.
+    #[must_use]
+    pub fn keys_by_kind(&self) -> [(usize, u64); KINDS] {
+        self.data.by_kind().map(|tally| (tally.count, tally.bytes))
     }
 
     /// The keys it holds of `shard`, owned or a copy.
@@ -1701,10 +1727,11 @@ impl<V: Held> Node<V> {
     fn forget(&mut self, now: Time) {
         let by = seconds_passed(self.wall(now));
         for _ in 0..PER_CYCLE {
-            let Some((shard, key, _)) = self.data.pop_soonest(by) else {
+            let Some((shard, key, kept)) = self.data.pop_soonest(by) else {
                 break;
             };
             self.forgotten += 1;
+            self.forgotten_by_kind[kept.kind()] += 1;
             if let Some(dirty) = self.dirty.get_mut(&shard) {
                 dirty.remove(&key);
             }
@@ -1763,13 +1790,14 @@ impl<V: Held> Node<V> {
         let most = (PER_CYCLE as u64).saturating_add(made);
         let mut evicted = 0;
         while evicted < most && self.data.bytes() > goal {
-            let Some((shard, key, _)) = self.data.pop_soonest(Time::MAX) else {
+            let Some((shard, key, kept)) = self.data.pop_soonest(Time::MAX) else {
                 break;
             };
             if table.is_some_and(|table| table.owner(shard) == Some(self.id)) {
                 self.dirty.entry(shard).or_default().insert(key);
             }
             evicted += 1;
+            self.evicted_by_kind[kept.kind()] += 1;
         }
         self.evicted += evicted;
         self.evicting = self.data.bytes() > goal;
@@ -3220,6 +3248,53 @@ mod tests {
             .collect();
         assert_eq!(evicted, [1_024, 1_313, 1_313]);
         assert!(node.key_bytes() <= 684_000, "{}", node.key_bytes());
+        assert_agrees(&node);
+    }
+
+    /// What a pod holds, forgets and evicts is counted by the kind of each key's value, beside
+    /// the totals: two kinds held, evicted past the cap and forgotten, each kind's counts
+    /// summing to the totals, and its keys and bytes what a walk of them gives.
+    #[test]
+    fn what_a_pod_holds_forgets_and_evicts_is_counted_by_kind() {
+        let mut capped = config();
+        capped.max_key_bytes = Some(760_000);
+        let mut node = member_under(capped);
+        // Odd keys of the second kind, as a value counting in part 3 is.
+        for key in (0..).filter(|key| shard_of(*key, 4) < 4).take(12_000) {
+            let mut value = Counts::of(1);
+            if key % 2 == 1 {
+                value.add(3);
+            }
+            let kept = Kept {
+                value,
+                forget_at: ms(60_000 + key % 1_000 * 1_000),
+            };
+            let _ = node.data.insert(shard_of(key, 4), key, kept);
+        }
+        let sums = |node: &Node| {
+            let kinds = node.keys_by_kind();
+            (
+                kinds.iter().map(|(count, _)| count).sum::<usize>(),
+                kinds.iter().map(|(_, bytes)| bytes).sum::<u64>(),
+            )
+        };
+        assert_eq!(node.keys_by_kind()[1].0, 6_000);
+        assert_eq!(sums(&node), (node.key_count(), node.key_bytes()));
+        for at in [2, 12, 22] {
+            let _ = node.tick(ms(at));
+        }
+        let evicted = node.evicted_by_kind();
+        assert!(evicted.iter().all(|kind| *kind > 0), "{evicted:?}");
+        assert_eq!(evicted.iter().sum::<u64>(), node.evicted());
+        assert_eq!(sums(&node), (node.key_count(), node.key_bytes()));
+        // Eviction took those due soonest: some of each kind are due by 600 s.
+        for at in [600_000, 600_010] {
+            let _ = node.tick(ms(at));
+        }
+        let forgotten = node.forgotten_by_kind();
+        assert!(forgotten.iter().all(|kind| *kind > 0), "{forgotten:?}");
+        assert_eq!(forgotten.iter().sum::<u64>(), node.forgotten());
+        assert_eq!(sums(&node), (node.key_count(), node.key_bytes()));
         assert_agrees(&node);
     }
 
