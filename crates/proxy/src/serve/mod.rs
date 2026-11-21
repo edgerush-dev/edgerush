@@ -922,13 +922,9 @@ struct Directed {
     /// Its count at that endpoint, until the place its exchange is given takes it; none,
     /// too, until a request that looked takes it.
     counted: Option<InFlight>,
-    /// For a request to a protected upstream that its rate limits may yet refuse, the
-    /// endpoint a look chose, taken once they admit it (25 §5).
-    looked: Option<Looking>,
-    /// For a request that found every endpoint of its protected upstream full, or others
-    /// waiting for one, its backend's queue, which it waits in once its rate limits admit
-    /// it (25 §5). Boxed: only such a request has it.
-    queued: Option<Box<Queued>>,
+    /// For a request to a protected upstream, what it has still to settle once its rate
+    /// limits admit it (25 §5).
+    pending: Option<Pending>,
     /// Every endpoint of the upstream, for a request its rule may send again. Boxed: only
     /// such a request has it.
     others: Option<Box<Others>>,
@@ -950,6 +946,28 @@ struct Directed {
 }
 
 impl Directed {
+    /// Its backend's queue, for a request that is to wait in one.
+    fn take_line(&mut self) -> Option<Box<Queued>> {
+        match self.pending.take() {
+            Some(Pending::Line(queued)) => Some(queued),
+            other => {
+                self.pending = other;
+                None
+            }
+        }
+    }
+
+    /// The endpoint a look chose, for a request that looked.
+    fn take_look(&mut self) -> Option<Looking> {
+        match self.pending.take() {
+            Some(Pending::Look(looking)) => Some(looking),
+            other => {
+                self.pending = other;
+                None
+            }
+        }
+    }
+
     /// What its upstream's answer is edited by (22 §5): its rule's changes, and what its
     /// client asked; `connected` if a WebSocket handshake went to the backend as an extended
     /// CONNECT.
@@ -1046,6 +1064,19 @@ struct Queued {
     terms: balancing::Terms,
     generation: u64,
     upstream: usize,
+}
+
+/// What a request to a protected upstream settles once its rate limits admit it (25 §5).
+/// One field for the two, as no request has both: a request's future holds its
+/// [`Directed`] across every wait, so what it holds is what every request's future holds
+/// (14 §3).
+enum Pending {
+    /// For a request its rate limits may yet refuse, the endpoint a look chose, taken once
+    /// they admit it.
+    Look(Looking),
+    /// For a request that found every endpoint full, or others waiting for one, its
+    /// backend's queue, which it waits in. Boxed: only such a request has it.
+    Line(Box<Queued>),
 }
 
 /// Where one copy of a request goes: drawn with the request, from the same snapshot.
