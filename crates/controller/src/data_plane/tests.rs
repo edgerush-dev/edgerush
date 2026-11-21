@@ -144,7 +144,7 @@ fn each_ports_settings_are_its_listeners() {
     let plane = plane(
         &web(
             1,
-            "  ingress: { httpPort: 80, httpsPort: 443 }\n  ports:\n    - port: 443\n      http3: { altSvcMaxAge: 600, forceRetry: true }\n      proxyProtocol: { senders: [10.0.0.0/16] }\n      forwarding: { trustedProxies: [10.1.0.0/16], trustedOnlyHeaders: [X-Real-IP] }\n      requestId: Pass\n      accessLog: { type: File, path: /var/log/edge.log }\n      tunnelIdleSeconds: 120\n    - port: 53\n      accessLog: { type: Stdout }\n      sessionIdleSeconds: 30\n      sessionAnswers: 1\n      requestId: Generate\n",
+            "  ingress: { httpPort: 80, httpsPort: 443 }\n  ports:\n    - port: 443\n      http3: { altSvcMaxAge: 600, forceRetry: true }\n      proxyProtocol: { senders: [10.0.0.0/16] }\n      forwarding: { trustedProxies: [10.1.0.0/16], trustedOnlyHeaders: [X-Real-IP] }\n      requestId: Pass\n      forwardClientCertificate: true\n      accessLog: { type: File, path: /var/log/edge.log }\n      tunnelIdleSeconds: 120\n    - port: 53\n      accessLog: { type: Stdout }\n      sessionIdleSeconds: 30\n      sessionAnswers: 1\n      requestId: Generate\n",
             "",
         ),
         &own(),
@@ -165,6 +165,7 @@ fn each_ports_settings_are_its_listeners() {
                 trusted_only_headers: vec!["X-Real-IP".to_owned()],
             }),
             request_id: Some(RequestId::Pass),
+            forward_client_certificate: true,
             access_log: Some(AccessLog::File("/var/log/edge.log".into())),
             tunnel_idle_seconds: Some(120),
             session_idle_seconds: None,

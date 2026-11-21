@@ -120,6 +120,15 @@ spec:
                                 x-kubernetes-validations:
                                 - message: path must be given where type is File, and only there
                                   rule: "self.type == 'File' ? has(self.path) : !has(self.path)"
+                              forwardClientCertificate:
+                                description: |-
+                                  ForwardClientCertificate has its HTTP listener tell upstreams of the
+                                  certificate each request's client showed, in X-Forwarded-Client-Cert as
+                                  Envoy writes it (Hash, Cert, Subject, URI and DNS): the header is always
+                                  the gateway's, the certificate's where it verified against the Gateway's
+                                  client certificate validation and none otherwise, in place of any the
+                                  request came with, a trusted proxy's included. Off unless said.
+                                type: boolean
                               forwarding:
                                 description: |-
                                   Forwarding is whom its requests' forwarding headers are believed from.

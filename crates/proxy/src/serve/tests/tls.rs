@@ -295,6 +295,100 @@ async fn a_listener_validating_clients_in_the_insecure_fallback_serves_them_all(
         .await;
 }
 
+/// On a listener that forwards client certificates, an upstream is told of the one a client
+/// showed where it verified, and of nothing else: under the insecure fallback, not of one
+/// nobody vouches for, nor of a client that showed none. What the request came with is
+/// taken off, from a trusted proxy too; over HTTP/2 as over HTTP/1. A listener that does not
+/// forward them tells of none, and leaves the header to its forwarding rules.
+#[tokio::test]
+async fn only_a_verified_client_certificate_is_forwarded() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::tls::testing::certificate;
+            let trusted = certificate(&["client"]);
+            let stranger = certificate(&["client"]);
+            let told = crate::client_certificate::value(
+                &boring::x509::X509::from_pem(trusted.chain.as_bytes()).unwrap(),
+            )
+            .unwrap();
+            let told = format!(
+                "x-forwarded-client-cert: {}",
+                told.to_str().unwrap().to_lowercase()
+            );
+            let forged = "x-forwarded-client-cert: hash=forged";
+            for (forwards, trusting) in [(true, false), (true, true), (false, false)] {
+                let (upstream, heads) = recording_upstream("200 OK");
+                let mut config = everything_config(upstream);
+                secured(
+                    &mut config,
+                    vec![certificate(&["a.test"])],
+                    Some(edgerush_config::ClientValidation {
+                        authorities: vec![trusted.chain.clone()],
+                        mode: edgerush_config::ClientValidationMode::AllowInsecureFallback,
+                    }),
+                );
+                let web = config.listeners.get_mut("web").unwrap();
+                web.forward_client_certificate = forwards;
+                if trusting {
+                    web.forwarding = Some(edgerush_config::Forwarding {
+                        trusted_proxies: vec!["127.0.0.0/8".to_owned()],
+                        trusted_only_headers: Vec::new(),
+                    });
+                }
+                let (front, _worker) = serving_compiled(compile(&config).unwrap()).await;
+                for (shown, who, expected) in [
+                    (Some(&trusted), "a trusted client", forwards.then_some(told.as_str())),
+                    (None, "a client of no certificate", None),
+                    (Some(&stranger), "a client nobody vouches for", None),
+                ] {
+                    // Without forwarding, the forged header is the forwarding rules' to
+                    // keep, and they keep it.
+                    let expected = expected.or((!forwards).then_some(forged));
+                    let case = format!("{who}, forwarding {forwards}, trusted {trusting}");
+                    for h2 in [false, true] {
+                        let protocols: &[u8] = if h2 { b"\x02h2" } else { b"\x08http/1.1" };
+                        let stream = tls_client(front, "a.test", Some(protocols), |builder| {
+                            if let Some(shown) = shown {
+                                showing(shown)(builder);
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        if h2 {
+                            let (mut send, connection) =
+                                within(::h2::client::handshake(stream)).await.unwrap();
+                            let _driving = tokio::task::spawn_local(async move {
+                                let _ended = connection.await;
+                            });
+                            let request = Request::get("https://a.test/")
+                                .header("x-forwarded-client-cert", "Hash=forged")
+                                .body(())
+                                .unwrap();
+                            let (answer, _) = send.send_request(request, true).unwrap();
+                            let answer = within(answer).await.unwrap();
+                            assert_eq!(answer.status(), StatusCode::OK, "{case}, h2");
+                        } else {
+                            let answer = h1_request_over(
+                                stream,
+                                b"GET / HTTP/1.1\r\nhost: a.test\r\nx-forwarded-client-cert: Hash=forged\r\nconnection: close\r\n\r\n",
+                            )
+                            .await;
+                            assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{case}: {answer}");
+                        }
+                        let head = heads.borrow().last().cloned().unwrap();
+                        let fields: Vec<&str> = head
+                            .lines()
+                            .filter(|line| line.starts_with("x-forwarded-client-cert:"))
+                            .collect();
+                        assert_eq!(fields, Vec::from_iter(expected), "{case}, h2 {h2}");
+                    }
+                }
+            }
+        })
+        .await;
+}
+
 /// A config of one `https` listener, `web`, presenting `served` and validating clients
 /// against `authority`, that sends everything to `upstream`.
 fn validating_to(
@@ -692,6 +786,47 @@ async fn connections_drain_with_the_client_validation_they_were_accepted_under()
         worker.drain_for(0, tls_now().as_ref()).is_on(),
         "a draining worker accepted under a drain not started"
     );
+}
+
+/// Forwarding client certificates goes with the validation: a connection is told of its
+/// certificate, or not, once at its handshake, so a reload that turns it on or off drains
+/// the connections accepted before, as one that replaces the validation does.
+#[test]
+fn a_reload_that_turns_certificate_forwarding_on_or_off_drains_its_connections() {
+    use crate::tls::testing::certificate;
+    let upstream: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let served = certificate(&["example.test"]);
+    let trusted = certificate(&["client"]);
+    let forwarding = |forwards: bool| {
+        let mut config = everything_config(upstream);
+        secured(
+            &mut config,
+            vec![served.clone()],
+            Some(edgerush_config::ClientValidation {
+                authorities: vec![trusted.chain.clone()],
+                mode: edgerush_config::ClientValidationMode::AllowValidOnly,
+            }),
+        );
+        config
+            .listeners
+            .get_mut("web")
+            .unwrap()
+            .forward_client_certificate = forwards;
+        compile(&config).unwrap()
+    };
+    let proxy = Proxy::new(forwarding(false), NonZeroUsize::MIN).unwrap();
+    let worker = Worker::new(Arc::new(proxy));
+    let tls_now = || worker.proxy.current.load().tls[0].clone();
+    let mut before = worker.drain_for(0, tls_now().as_ref());
+    for forwards in [true, false] {
+        worker.proxy.reload(forwarding(forwards)).unwrap();
+        worker.revalidate();
+        assert!(before.is_on(), "turned {forwards}, nothing was drained");
+        let now = worker.drain_for(0, tls_now().as_ref());
+        assert!(!now.is_on());
+        before = now;
+        assert_eq!(tls_now().unwrap().forwards_client_certificate(), forwards);
+    }
 }
 
 /// A config of one `https` listener, `web`, presenting one certificate for `a.test`,

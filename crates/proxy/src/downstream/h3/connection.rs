@@ -526,12 +526,18 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
             delivering,
             sharing,
             asked,
+            certifying,
+            certificate,
             ..
         } = state;
         let established = driving.handshaking && quic.is_established();
-        // The name its client asked for is known from here, before any request.
+        // The name its client asked for is known from here, before any request, and so is
+        // the certificate it showed.
         if established && let Some(sharing) = sharing.take() {
             *asked = Some(Asked::new(&sharing, quic.server_name()));
+        }
+        if established && let Some(tls) = certifying.take() {
+            *certificate = tls.quic_client_certificate(quic);
         }
         // HTTP/3 only where the handshake agreed on it: the interop build offers HTTP/0.9
         // as well.
@@ -799,7 +805,8 @@ fn send_interim(responder: &mut Responder, interim: &Interim) {
 /// Who the requests found now are from: `peer`, the last address proved, which may not be
 /// the one the connection began on (RFC 9000 §9). The client last made is kept while that
 /// stays the same, so that it is not written out again for every request; each made
-/// carries the listener the handshake's name is for, where listeners share the port.
+/// carries the listener the handshake's name is for, where listeners share the port, and
+/// what upstreams are told of the certificate its client showed, where they are.
 fn client_now(peer: SocketAddr, state: &mut State) -> Rc<Client> {
     match &state.client {
         Some(client) if client.peer() == Some(peer) => Rc::clone(client),
@@ -807,6 +814,9 @@ fn client_now(peer: SocketAddr, state: &mut State) -> Rc<Client> {
             let client = Client::connected(peer.ip(), peer);
             if let Some(asked) = &state.asked {
                 client.asked(asked.clone());
+            }
+            if let Some(certificate) = &state.certificate {
+                client.certified(certificate.clone());
             }
             let client = Rc::new(client);
             state.client = Some(Rc::clone(&client));

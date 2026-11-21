@@ -16,6 +16,7 @@ mod access_log;
 pub mod balance;
 #[cfg(not(feature = "fuzzing"))]
 mod balance;
+mod client_certificate;
 pub mod connections;
 mod cookies;
 mod descriptors;

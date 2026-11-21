@@ -732,6 +732,10 @@
           "description": "The address to listen on; `[::]:8080` is every address, IPv4 included. No two\nlisteners have the same one, but for a `udp` listener beside one over TCP: their\nsockets are apart.",
           "type": "string"
         },
+        "forward_client_certificate": {
+          "description": "Whether an `http` or `https` listener tells its upstreams of the certificate each\nrequest's client showed, in `X-Forwarded-Client-Cert` as Envoy writes it (03 §3 in\nthe docs): the header is always the gateway's, the certificate's where it verified\nagainst the listener's client validation and none otherwise, in place of any the\nrequest came with, whoever sent it. Off unless said; no other listener may.",
+          "type": "boolean"
+        },
         "forwarding": {
           "description": "What an `http` or `https` listener, which must have it, tells its upstreams of a\nrequest's client; no other may.",
           "anyOf": [

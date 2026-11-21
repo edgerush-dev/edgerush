@@ -91,11 +91,21 @@ impl Client {
         protocols: &[&[u8]],
         configure: impl FnOnce(&mut quiche::Config),
     ) -> Self {
+        Self::offering_over(server, name, protocols, client_config(), configure).await
+    }
+
+    /// The same over `config`, a client's.
+    async fn offering_over(
+        server: SocketAddr,
+        name: &str,
+        protocols: &[&[u8]],
+        mut config: quiche::Config,
+        configure: impl FnOnce(&mut quiche::Config),
+    ) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let local = socket.local_addr().unwrap();
         let mut scid = [0; 16];
         boring::rand::rand_bytes(&mut scid).unwrap();
-        let mut config = client_config();
         config.set_application_protos(protocols).unwrap();
         // A head of a hundred kilobytes goes in one call or not at all: room for it from
         // the start, which a loopback has anyway.
@@ -151,14 +161,41 @@ impl Client {
         name: &str,
         configure: impl FnOnce(&mut quiche::Config),
     ) -> Self {
-        let mut client =
+        let client =
             Self::offering(server, name, quiche::h3::APPLICATION_PROTOCOL, configure).await;
-        client.until(|client| client.quic.is_established()).await;
+        client.speaking_h3().await
+    }
+
+    /// A client of `server` asking for `name`, showing `shown` when asked who it is,
+    /// through its handshake, speaking HTTP/3.
+    pub(crate) async fn connect_showing(
+        server: SocketAddr,
+        name: &str,
+        shown: &edgerush_config::Certificate,
+    ) -> Self {
+        let mut tls = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
+        let chain = boring::x509::X509::from_pem(shown.chain.as_bytes()).unwrap();
+        let key = boring::pkey::PKey::private_key_from_pem(shown.key.as_bytes()).unwrap();
+        tls.set_certificate(&chain).unwrap();
+        tls.set_private_key(&key).unwrap();
+        let client = Self::offering_over(
+            server,
+            name,
+            quiche::h3::APPLICATION_PROTOCOL,
+            crate::h3_peer::client_config_over(tls),
+            |_| {},
+        )
+        .await;
+        client.speaking_h3().await
+    }
+
+    /// This client, once its handshake is done, speaking HTTP/3.
+    async fn speaking_h3(mut self) -> Self {
+        self.until(|client| client.quic.is_established()).await;
         let config = quiche::h3::Config::new().unwrap();
-        client.h3 =
-            Some(quiche::h3::Connection::with_transport(&mut client.quic, &config).unwrap());
-        client.flush().await;
-        client
+        self.h3 = Some(quiche::h3::Connection::with_transport(&mut self.quic, &config).unwrap());
+        self.flush().await;
+        self
     }
 
     /// A client of `server` asking for `name`, through its handshake, speaking HTTP/0.9 as

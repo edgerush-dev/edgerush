@@ -233,6 +233,15 @@ impl Handshake {
         Some(peer_cert)
     }
 
+    /// EdgeRush: whether the peer showed a certificate that verified, its
+    /// verification's result being `X509_V_OK` (0 in `x509.h`). Where
+    /// the verify callback lets a failure through, the handshake goes on, and
+    /// the verification's result is what still says so.
+    pub fn peer_cert_verified(&self) -> bool {
+        self.peer_cert().is_some() &&
+            unsafe { SSL_get_verify_result(self.as_ptr()) } == 0
+    }
+
     // Only used for testing handling of failure during key signing.
     #[cfg(test)]
     pub fn set_failing_private_key_method(&mut self) {
@@ -334,6 +343,9 @@ extern "C" {
     ) -> *const c_char;
 
     fn SSL_get0_peer_certificates(ssl: *const SSL) -> *const STACK_OF;
+
+    // EdgeRush: for `peer_cert_verified()`, against `X509_V_OK`.
+    fn SSL_get_verify_result(ssl: *const SSL) -> c_long;
 
     pub(super) fn SSL_set_min_proto_version(ssl: *mut SSL, version: u16)
         -> c_int;

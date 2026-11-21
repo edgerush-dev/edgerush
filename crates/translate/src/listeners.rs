@@ -108,6 +108,8 @@ pub(crate) fn listener(plane: &Plane, port: u16, protocol: Protocol) -> Listener
                 .and_then(|settings| settings.request_id)
                 .unwrap_or(RequestId::Generate)
         }),
+        forward_client_certificate: http
+            && settings.is_some_and(|settings| settings.forward_client_certificate),
         proxy_protocol: (!udp).then(|| {
             settings
                 .and_then(|settings| settings.proxy_protocol.clone())
@@ -272,5 +274,38 @@ mod tests {
             (None, None)
         );
         assert_eq!(defaults.access_log, None);
+    }
+
+    /// Forwarding client certificates is an HTTP listener's, where its port says so: never
+    /// a `tcp`, `tls` or `udp` one's, and no listener's by default.
+    #[test]
+    fn client_certificates_are_forwarded_where_an_http_port_says() {
+        let protocols = [
+            (80, Protocol::Http),
+            (443, Protocol::Https),
+            (5432, Protocol::Tcp),
+            (8443, Protocol::Tls),
+        ]
+        .into();
+        let settings: String = [80, 443, 5432, 8443, 53]
+            .map(|port| format!("  {port}: {{ forward_client_certificate: true }}\n"))
+            .concat();
+        let forwarding = |plane: &Plane| -> Vec<(String, bool)> {
+            bound(plane, &protocols, &[53].into())
+                .into_iter()
+                .map(|(name, listener)| (name, listener.forward_client_certificate))
+                .collect()
+        };
+        assert_eq!(
+            forwarding(&plane(&format!("ports:\n{settings}"))),
+            [
+                ("port-443".to_owned(), true),
+                ("port-53-udp".to_owned(), false),
+                ("port-5432".to_owned(), false),
+                ("port-80".to_owned(), true),
+                ("port-8443".to_owned(), false),
+            ]
+        );
+        assert!(forwarding(&plane("")).iter().all(|(_, forwards)| !forwards));
     }
 }

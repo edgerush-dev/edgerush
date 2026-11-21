@@ -313,6 +313,13 @@ pub struct Listener {
     /// its own; no other may.
     #[serde(default)]
     pub request_id: Option<RequestId>,
+    /// Whether an `http` or `https` listener tells its upstreams of the certificate each
+    /// request's client showed, in `X-Forwarded-Client-Cert` as Envoy writes it (03 §3 in
+    /// the docs): the header is always the gateway's, the certificate's where it verified
+    /// against the listener's client validation and none otherwise, in place of any the
+    /// request came with, whoever sent it. Off unless said; no other listener may.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forward_client_certificate: bool,
     /// Whether every connection starts with a PROXY protocol header, and whose to believe
     /// (20 in the docs). Every listener over TCP states it, `off` included: it decides who a
     /// connection is taken to come from. A `udp` listener reads none, and states none.

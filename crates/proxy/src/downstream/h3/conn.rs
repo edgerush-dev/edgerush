@@ -13,8 +13,9 @@ use crate::downstream::h3::listener::Common;
 use crate::drain::Drain;
 use crate::forwarding::{Asked, Client, Cut};
 use crate::storage::{Charge, Storage};
+use crate::tls::Tls;
 use edgerush_config::SharedListeners;
-use http::HeaderMap;
+use http::{HeaderMap, HeaderValue};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -90,6 +91,12 @@ pub(crate) struct State {
     /// The one its handshake's name is for, once the handshake is done: every client made
     /// for its requests carries it (03 §3).
     pub(crate) asked: Option<Asked>,
+    /// Its listener's TLS, where that forwards client certificates, until the handshake
+    /// is done and tells what its client showed.
+    pub(crate) certifying: Option<Arc<Tls>>,
+    /// What upstreams are told of that certificate, once the handshake is done, where it
+    /// verified: every client made for its requests carries it (03 §3).
+    pub(crate) certificate: Option<HeaderValue>,
 }
 
 impl State {
@@ -146,10 +153,12 @@ impl Slot {
 
 impl Conn {
     /// A connection quiche has accepted, which drains with `drain` and counts as `held`
-    /// among its worker's connections.
+    /// among its worker's connections; `certifying`, its listener's TLS where that forwards
+    /// client certificates.
     pub(crate) fn new(
         quic: quiche::Connection,
         sharing: Option<Arc<SharedListeners>>,
+        certifying: Option<Arc<Tls>>,
         drain: Rc<Drain>,
         held: Option<Held>,
     ) -> Rc<Self> {
@@ -164,6 +173,8 @@ impl Conn {
                 client: None,
                 sharing,
                 asked: None,
+                certifying,
+                certificate: None,
             }),
             driver: RefCell::new(None),
             stirred: Cell::new(true),

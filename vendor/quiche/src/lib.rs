@@ -7764,6 +7764,16 @@ impl<F: BufFactory> Connection<F> {
         self.handshake.server_name()
     }
 
+    /// EdgeRush: whether the peer showed a certificate that verified, which
+    /// [`peer_cert()`] alone does not say where the verify callback let a
+    /// failure through.
+    ///
+    /// [`peer_cert()`]: struct.Connection.html#method.peer_cert
+    #[inline]
+    pub fn peer_cert_verified(&self) -> bool {
+        self.handshake.peer_cert_verified()
+    }
+
     /// Returns the peer's leaf certificate (if any) as a DER-encoded buffer.
     #[inline]
     pub fn peer_cert(&self) -> Option<&[u8]> {
