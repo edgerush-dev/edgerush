@@ -44,6 +44,11 @@ Windows too, which works for development but is not a recommended path.
   the test to the code: unit and property tests (`proptest`) for logic, comparison with
   the slow reference implementations for the router and the filters, integration tests
   with real sockets for the proxy, a fuzz target for anything that reads untrusted input.
+- **Each test runs in a process of its own**, beside every other test file's (`check.sh`
+  runs them with cargo-nextest). A lock, counter or cache in a `static` keeps nothing apart
+  there, and a scratch path named by the process ID must start empty: Windows soon gives a
+  finished process's ID to the next. A test that has to run with nothing beside it says so
+  in `check.sh`, as the rate-limiting service's `cluster` tests do.
 - **Never weaken, skip or delete a test** to make something pass. If a test is wrong, say
   why in the commit and fix it on purpose.
 - **A benchmark for code on the request path**, written with it.
