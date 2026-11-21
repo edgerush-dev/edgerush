@@ -26,6 +26,8 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             leader: None,
             webhook: None,
             metrics: None,
+            health: None,
+            peers: None,
         })))
     );
     assert_eq!(
@@ -50,6 +52,8 @@ fn it_needs_its_data_plane_and_watches_the_cluster_or_each_namespace_given() {
             leader: None,
             webhook: None,
             metrics: None,
+            health: None,
+            peers: None,
         })))
     );
     assert_eq!(parsed(&["--help"]), Ok(Parsed::Help));
@@ -275,6 +279,8 @@ async fn run_until(
         leader: None,
         webhook: None,
         metrics: None,
+        health: None,
+        peers: None,
     };
     let stop = {
         let lines = Rc::clone(&lines);
@@ -326,6 +332,8 @@ async fn each_translation_is_said_and_written_as_a_harness_file() {
             stream: None,
             webhook: None,
             metrics: None,
+            health: None,
+            peers: None,
         },
         |lines| lines.iter().any(|line| line.starts_with("written to ")),
     )
@@ -376,6 +384,8 @@ async fn a_config_the_data_plane_would_refuse_is_said_and_not_written() {
             stream: None,
             webhook: None,
             metrics: None,
+            health: None,
+            peers: None,
         },
         |lines| lines.iter().any(|line| line.contains("listener `port-80`")),
     )
@@ -582,6 +592,8 @@ fn the_stream_is_given_whole_or_not_at_all() {
             leader: None,
             webhook: None,
             metrics: None,
+            health: None,
+            peers: None,
         })))
     );
     // Each of the four left out.
@@ -632,6 +644,8 @@ fn the_webhook_is_given_whole_or_not_at_all() {
                 }),
             })),
             metrics: None,
+            health: None,
+            peers: None,
         })))
     );
     // Each of the three left out, the certificate's two too where nothing else signs one.
@@ -1070,6 +1084,8 @@ async fn the_webhook_answers_reviews_and_its_certificate_replaced_serves_the_nex
             stream: None,
             webhook: Some(hooking),
             metrics: None,
+            health: None,
+            peers: None,
         },
         move |_| {
             if hold.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -1288,6 +1304,8 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
             stream: Some(serving),
             webhook: None,
             metrics: None,
+            health: None,
+            peers: None,
         },
         |lines| runs(lines) == 2,
     )
@@ -1460,6 +1478,8 @@ async fn a_data_plane_is_served_only_where_its_certificate_carries_the_id_stated
             stream: Some(serving),
             webhook: None,
             metrics: None,
+            health: None,
+            peers: None,
         },
         |lines| {
             let said = |end: &str| {
@@ -1627,6 +1647,33 @@ fn metrics_are_served_where_given() {
     );
 }
 
+/// `--health` is an address and a port, given once, apart from the metrics'.
+#[test]
+fn readiness_is_answered_where_given() {
+    match parsed(&[
+        "--data-plane",
+        "p",
+        "--health",
+        "[::]:8081",
+        "--metrics",
+        "[::]:9090",
+    ]) {
+        Ok(Parsed::Control(options)) => {
+            assert_eq!(options.health, Some("[::]:8081".parse().unwrap()));
+            assert_eq!(options.metrics, Some("[::]:9090".parse().unwrap()));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        parsed(&["--data-plane", "p", "--health", "8081"]),
+        Err(UsageError::Health("8081".to_owned()))
+    );
+    assert_eq!(
+        parsed(&["--health", "[::]:1", "--health", "[::]:2"]),
+        Err(UsageError::Twice("--health"))
+    );
+}
+
 /// A fake API server as [`cluster`]'s, its Ingress securing `shop.example` with Secret
 /// `shop/tls`, which holds `certificate`.
 async fn secured_cluster(certificate: &Certificate) -> Fake {
@@ -1734,6 +1781,8 @@ async fn a_certificate_handed_out_expired_is_said_and_its_expiry_scraped() {
             stream: None,
             webhook: None,
             metrics: Some(listener),
+            health: None,
+            peers: None,
         },
         move |lines| {
             lines.iter().any(|line| line.contains("expired at"))
@@ -1850,4 +1899,337 @@ async fn the_webhook_is_served_with_each_certificate_the_issuer_signs() {
             .any(|line| line == "the webhook's certificate is replaced"),
         "{lines:?}"
     );
+}
+
+/// The status line `/ready` at `address` is answered with, if it is answered.
+fn probed(address: std::net::SocketAddr) -> Option<String> {
+    use std::io::{Read as _, Write as _};
+    let mut stream = std::net::TcpStream::connect(address).ok()?;
+    stream
+        .write_all(b"GET /ready HTTP/1.1\r\nhost: health.test\r\nconnection: close\r\n\r\n")
+        .ok()?;
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).ok()?;
+    answer.lines().next().map(ToOwned::to_owned)
+}
+
+/// Asks `/ready` at `address` until it is answered 200, within ten seconds: whether it was,
+/// and every answer's status line, in turn.
+fn probed_until_ready(address: std::net::SocketAddr) -> (bool, Vec<String>) {
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    let mut said = Vec::new();
+    while std::time::Instant::now() < until {
+        if let Some(status) = probed(address) {
+            let ready = status == "HTTP/1.1 200 OK";
+            said.push(status);
+            if ready {
+                return (true, said);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (false, said)
+}
+
+/// What a probe was told before a replica's first certificate and after it.
+struct Told {
+    /// Each status line before.
+    before: Vec<String>,
+    /// Whether it was told 200 after.
+    ready: bool,
+    /// Each status line after.
+    after: Vec<String>,
+}
+
+/// A replica whose stream is signed for is not ready until the first certificate is: its
+/// probe is told 503 until then, and 200 once the stream serves with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_is_ready_once_its_stream_serves_with_its_first_certificate() {
+    let fake = cluster().await;
+    let authority = Authority::new("own");
+    let health = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = health.local_addr().unwrap();
+    let (own, _signed) = watch::channel(None);
+    let serving = Serving {
+        listener: std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+        credentials: Credentialing::Signed {
+            api: Box::new(fake.client(&token("controller-ready", "secret"), Timing::default())),
+            // The platform's authority, which is never there: the issuer signs nothing,
+            // and the certificate comes from the test.
+            issuer: Issuer {
+                namespace: "edge".to_owned(),
+                scope: WatchScope::Parts(vec![Scope::Cluster]),
+                control_plane: "edge".to_owned(),
+                cluster_domain: "cluster.local".to_owned(),
+                authority: "platform-ca".to_owned(),
+                kind: Kind::Provided,
+            },
+            own: own.clone(),
+        },
+        versions: Versions::new(7),
+        own: None,
+    };
+    let done: Arc<std::sync::Mutex<Option<Told>>> = Arc::default();
+    let telling = Arc::clone(&done);
+    let prober = std::thread::spawn(move || {
+        // What it is answered for a while before the certificate.
+        let mut before = Vec::new();
+        let until = std::time::Instant::now() + Duration::from_millis(300);
+        while std::time::Instant::now() < until {
+            before.extend(probed(address));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        own.send_replace(Some(own_written(
+            &authority,
+            "edgerush-controller-edge.edge.svc",
+        )));
+        let (after, said) = probed_until_ready(address);
+        *telling.lock().unwrap() = Some(Told {
+            before,
+            ready: after,
+            after: said,
+        });
+    });
+    let waiting = Arc::clone(&done);
+    run_until(
+        &fake,
+        "controller-ready",
+        &plane(),
+        None,
+        Listeners {
+            stream: Some(serving),
+            webhook: None,
+            metrics: None,
+            health: Some(health),
+            peers: None,
+        },
+        move |_| waiting.lock().unwrap().is_some(),
+    )
+    .await;
+    prober.join().unwrap();
+    let told = done.lock().unwrap().take().unwrap();
+    assert!(
+        !told.before.is_empty()
+            && told
+                .before
+                .iter()
+                .all(|status| status == "HTTP/1.1 503 Service Unavailable"),
+        "{:?}",
+        told.before
+    );
+    assert!(
+        told.ready,
+        "never ready with its certificate: {:?}",
+        told.after
+    );
+}
+
+/// A replica that serves no stream, or one from certificate files, is ready at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_of_no_stream_or_of_certificate_files_is_ready_at_once() {
+    let fake = cluster().await;
+    let authority = Authority::new("ready-files");
+    let files = stream_files("ready-files", &authority, "control.test");
+    for stream in [false, true] {
+        let health = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = health.local_addr().unwrap();
+        let serving = if stream {
+            Some(Serving {
+                listener: std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+                credentials: Credentialing::Files {
+                    files: files.clone(),
+                    credentials: files.read().await.unwrap(),
+                    reread: Duration::from_secs(1),
+                },
+                versions: Versions::new(7),
+                own: None,
+            })
+        } else {
+            None
+        };
+        let prober = std::thread::spawn(move || probed_until_ready(address));
+        let probing = Arc::new(std::sync::Mutex::new(Some(prober)));
+        let (said, telling) = (Arc::new(std::sync::Mutex::new(None)), Arc::clone(&probing));
+        let heard = Arc::clone(&said);
+        run_until(
+            &fake,
+            "controller-ready-at-once",
+            &plane(),
+            None,
+            Listeners {
+                stream: serving,
+                webhook: None,
+                metrics: None,
+                health: Some(health),
+                peers: None,
+            },
+            move |_| {
+                let mut prober = telling.lock().unwrap();
+                if prober
+                    .as_ref()
+                    .is_some_and(std::thread::JoinHandle::is_finished)
+                {
+                    *heard.lock().unwrap() = prober.take().map(|p| p.join().unwrap());
+                }
+                heard.lock().unwrap().is_some()
+            },
+        )
+        .await;
+        let (ready, answers) = said.lock().unwrap().take().unwrap();
+        assert!(ready, "stream {stream}: {answers:?}");
+    }
+}
+
+/// The leader's config kept in place of a follower's translation is said under its data
+/// plane, and written to `--write-config` as a translation's config is, which the
+/// development harness reads back as it was.
+#[test]
+fn the_leaders_config_kept_is_said_and_written_as_a_translation_is() {
+    let plain: Plane = serde_saphyr::from_str(&plane()).unwrap();
+    let config =
+        edgerush_translate::translate(&plain, &edgerush_translate::Cluster::default()).config;
+    let kept = Said::Kept {
+        data_plane: "DataPlane edge/web",
+        config: &config,
+        id: None,
+    };
+    assert_eq!(
+        told(&kept, None),
+        "DataPlane edge/web:\nthe leader's config last handed on is handed on in place of this \
+         replica's translation, refused whole, or of its Gateway, held"
+    );
+    let path = std::env::temp_dir()
+        .join("edgerush-controller-tests")
+        .join("kept.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let said = told(&kept, Some(&path));
+    assert!(
+        said.ends_with(&format!("; written to {}", path.display())),
+        "{said}"
+    );
+    let file: HarnessFile =
+        serde_saphyr::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(file.into_config(BTreeMap::new(), None), config);
+}
+
+/// The replicas share their snapshots only where they know each other by certificates
+/// their authority signs, and elect a leader to follow: `--peers` is for `--authority` and
+/// `--leader-lease`.
+#[test]
+fn the_replicas_share_snapshots_with_an_authority_and_a_lease() {
+    let base = [
+        "--control-plane",
+        "edge",
+        "--listen",
+        "[::]:9443",
+        "--authority",
+        "edgerush-controller-edge-authority",
+        "--leader-lease",
+        "edge/edgerush-controller-edge",
+    ];
+    let with =
+        |more: &[&'static str]| -> Vec<&'static str> { base.iter().chain(more).copied().collect() };
+    let Ok(Parsed::Control(options)) = parsed(&with(&["--peers", "[::]:9444"])) else {
+        panic!("not parsed");
+    };
+    assert_eq!(options.peers, Some("[::]:9444".parse().unwrap()));
+    assert_eq!(
+        parsed(&with(&["--peers", "9444"])),
+        Err(UsageError::Peers("9444".to_owned()))
+    );
+    assert_eq!(
+        parsed(&with(&["--peers", "[::]:9444", "--peers", "[::]:9445"])),
+        Err(UsageError::Twice("--peers"))
+    );
+    let without_lease: Vec<&str> = base[..6]
+        .iter()
+        .chain(&["--peers", "[::]:9444"])
+        .copied()
+        .collect();
+    assert_eq!(parsed(&without_lease), Err(UsageError::PeersAlone));
+    assert_eq!(
+        parsed(&[
+            "--data-plane",
+            "p",
+            "--leader-lease",
+            "edge/lease",
+            "--peers",
+            "[::]:9444"
+        ]),
+        Err(UsageError::PeersAlone)
+    );
+}
+
+/// A replica is ready once its stream serves and, where the replicas share a snapshot,
+/// once it holds one; once the stream is done saying, the last it said stands.
+#[tokio::test]
+async fn a_replica_sharing_snapshots_is_ready_once_it_holds_one() {
+    let wait = |ready: &watch::Receiver<bool>, want: bool| {
+        let mut ready = ready.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), ready.wait_for(|now| *now == want))
+                .await
+                .is_ok()
+        }
+    };
+    let (streams, streaming) = watch::channel(false);
+    let (snapshot, holding) = watch::channel(None::<Arc<Snapshot>>);
+    let (readies, ready) = watch::channel(false);
+    let _readying = tokio::spawn(readiness(streaming, Some(holding), readies));
+    streams.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!*ready.borrow(), "ready before it holds a snapshot");
+    snapshot.send_replace(Some(Arc::new(Snapshot::default())));
+    assert!(wait(&ready, true).await, "not ready once it holds one");
+    drop(streams);
+    snapshot.send_replace(None);
+    assert!(wait(&ready, false).await);
+    snapshot.send_replace(Some(Arc::new(Snapshot::default())));
+    assert!(
+        wait(&ready, true).await,
+        "not ready once the stream is done saying"
+    );
+    // Not sharing them: ready once the stream serves.
+    let (streams, streaming) = watch::channel(false);
+    let (readies, ready) = watch::channel(false);
+    let _readying = tokio::spawn(readiness(streaming, None, readies));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!*ready.borrow());
+    streams.send_replace(true);
+    assert!(wait(&ready, true).await);
+}
+
+/// The leader's config kept in place of a follower's translation is offered to the data
+/// plane it is of alone, as a translation is.
+#[test]
+fn the_leaders_config_kept_is_offered_as_a_translation_is() {
+    const WEB: &str = "spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-web";
+    const API: &str = "spiffe://edge.cluster.local/ns/edge/sa/edgerush-proxy-api";
+    let web = plane_with(&format!("id: {WEB}"));
+    let api = plane_with(&format!("id: {API}"));
+    let both = whom(&harness_planes(&[
+        ("DataPlane edge/api", &api),
+        ("DataPlane edge/web", &web),
+    ]));
+    let (served, offered) = watch::channel(both);
+    let offering = Offering {
+        versions: RefCell::new(Versions::new(7)),
+        served,
+        runs: Rc::default(),
+        pods: watch::channel(edgerush_controller::acks::Pods::new()).0,
+    };
+    let plain: Plane = serde_saphyr::from_str(&plane()).unwrap();
+    let config =
+        edgerush_translate::translate(&plain, &edgerush_translate::Cluster::default()).config;
+    let version = offering.offer_config(&config, None, Some(WEB)).unwrap();
+    let offered_to = |id: &str| {
+        offered
+            .borrow()
+            .offer_to(Some(id))
+            .unwrap()
+            .map(|offer| offer.version().to_owned())
+    };
+    assert_eq!(offered_to(WEB), Some(version));
+    assert_eq!(offered_to(API), None, "offered to another");
 }

@@ -31,7 +31,7 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How many messages wait to be sent down one stream: an offer's resources are sent one
 /// after another, each waiting for room.
-const WAITING: usize = 16;
+pub(crate) const WAITING: usize = 16;
 
 /// What the control plane hears of a data plane, for its caller to log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,7 +190,11 @@ pub async fn serve(
     // Nothing is sent on it: each stream ends once it is dropped.
     let (stopping, stopped) = watch::channel(());
     let (secured, incoming) = mpsc::channel(WAITING);
-    let accepting = tokio::spawn(accept(listener, tls, secured, heard.clone()));
+    let refused = {
+        let heard = heard.clone();
+        Arc::new(move |peer, why| heard(peer, Heard::Refused(why)))
+    };
+    let accepting = tokio::spawn(accept(listener, tls, secured, refused));
     let service = Control {
         served,
         gateway,
@@ -211,13 +215,13 @@ pub async fn serve(
     Ok(served?)
 }
 
-/// Takes each connection and its handshake, the handshakes apart, so that one slow data
-/// plane holds up no other.
-async fn accept(
+/// Takes each connection and its handshake, the handshakes apart, so that one slow peer
+/// holds up no other; a handshake that fails is handed to `refused`, with why.
+pub(crate) async fn accept(
     listener: TcpListener,
     tls: watch::Receiver<Arc<SslAcceptor>>,
     secured: mpsc::Sender<Result<Secured, io::Error>>,
-    heard: Arc<dyn Fn(SocketAddr, Heard) + Send + Sync>,
+    refused: Arc<dyn Fn(SocketAddr, String) + Send + Sync>,
 ) {
     loop {
         let (socket, peer) = match listener.accept().await {
@@ -228,7 +232,7 @@ async fn accept(
         let _nodelay = socket.set_nodelay(true);
         let acceptor = tls.borrow().clone();
         let secured = secured.clone();
-        let heard = heard.clone();
+        let refused = refused.clone();
         tokio::spawn(async move {
             let handshake =
                 tokio::time::timeout(HANDSHAKE, tokio_boring::accept(&acceptor, socket));
@@ -243,27 +247,24 @@ async fn accept(
                     let peer = Peer { address: peer, id };
                     let _stopped = secured.send(Ok(Secured { stream, peer })).await;
                 }
-                Ok(Err(error)) => heard(peer, Heard::Refused(error.to_string())),
-                Err(_) => heard(
-                    peer,
-                    Heard::Refused("the handshake took too long".to_owned()),
-                ),
+                Ok(Err(error)) => refused(peer, error.to_string()),
+                Err(_) => refused(peer, "the handshake took too long".to_owned()),
             }
         });
     }
 }
 
-/// A data plane's connection, its handshake done.
-struct Secured {
+/// A peer's connection, its handshake done.
+pub(crate) struct Secured {
     stream: SslStream<TcpStream>,
     peer: Peer,
 }
 
-/// Where a data plane dialled from, and the ID its certificate carries, if one, as each of
-/// its requests carries them.
+/// Where a peer dialled from, and the ID its certificate carries, if one, as each of its
+/// requests carries them.
 #[derive(Debug, Clone)]
-struct Peer {
-    address: SocketAddr,
+pub(crate) struct Peer {
+    pub(crate) address: SocketAddr,
     id: Option<String>,
 }
 

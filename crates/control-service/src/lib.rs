@@ -9,8 +9,9 @@
 //! data plane the authorities vouch for is served: none is told apart by its name yet. Each
 //! end's certificate files are read again as they change ([`reread`]).
 //!
-//! Beside it, the control plane serves the admission webhook's listener, [`webhook`], and
-//! its own metrics, [`metrics`].
+//! Beside it, the control plane serves the admission webhook's listener, [`webhook`],
+//! its own metrics, [`metrics`], its readiness, [`health`], and its replicas' snapshots to
+//! each other, [`serve_peers`] and [`follow_peer`] (04 §2).
 
 use bytes::Buf;
 use std::marker::PhantomData;
@@ -22,7 +23,9 @@ use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 
 mod client;
 mod files;
+pub mod health;
 pub mod metrics;
+mod peers;
 mod server;
 mod subscribe;
 mod tls;
@@ -31,9 +34,12 @@ pub mod webhook;
 pub use boring::ssl::{SslAcceptor, SslConnector};
 pub use client::{Ended, follow};
 pub use files::{CertificateFiles, Files, FilesError, Reread, reread};
+pub use peers::{Followed, PEERS, Unfollowed, follow_peer, serve_peers};
 pub use server::{Heard, ServeError, Served, Unserved, serve};
 pub use subscribe::{Backoff, Following, Subscription, subscribe};
-pub use tls::{Credentials, TlsError, acceptor, connector, connector_to, webhook_acceptor};
+pub use tls::{
+    Credentials, TlsError, acceptor, acceptor_of, connector, connector_to, webhook_acceptor,
+};
 
 /// The service's name, as gRPC calls it.
 pub const SERVICE: &str = "edgerush.control.v1.Control";

@@ -308,6 +308,7 @@ version = "0.0.0"
 dependencies = [
  "edgerush-certificates",
  "edgerush-config",
+ "edgerush-control-stream",
  "edgerush-gateway-api",
  "edgerush-kubernetes",
  "edgerush-planes",

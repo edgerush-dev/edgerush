@@ -1,4 +1,5 @@
-//! The stream's TLS: 1.3 alone, each end checked against the stream's own authorities. And
+//! The stream's TLS: 1.3 alone, each end checked against the stream's own authorities, as
+//! the controller's replicas' among themselves are, which take its own identity alone. And
 //! the admission webhook's: 1.3 alone too, its client not asked for a certificate.
 
 use boring::error::ErrorStack;
@@ -8,7 +9,7 @@ use boring::ssl::{
 };
 use boring::x509::store::X509StoreBuilder;
 use boring::x509::verify::X509VerifyFlags;
-use boring::x509::{X509, X509VerifyError};
+use boring::x509::{X509, X509StoreContextRef, X509VerifyError};
 use edgerush_certificates::{CertificateError, Identity, spiffe_id};
 use edgerush_config::Certificate;
 
@@ -52,6 +53,21 @@ const H2_OR_H1: &[u8] = b"\x02h2\x08http/1.1";
 ///
 /// A [`TlsError`] for credentials that cannot be used.
 pub fn acceptor(credentials: &Credentials) -> Result<SslAcceptor, TlsError> {
+    accepting(credentials, None)
+}
+
+/// An acceptor as [`acceptor`]'s, that also refuses a peer whose certificate does not
+/// carry the SPIFFE ID `peer`: the controller's replicas among themselves, which take the
+/// control plane's own identity alone, never a data plane's (04 §2).
+///
+/// # Errors
+///
+/// A [`TlsError`] for credentials that cannot be used.
+pub fn acceptor_of(credentials: &Credentials, peer: &str) -> Result<SslAcceptor, TlsError> {
+    accepting(credentials, Some(peer))
+}
+
+fn accepting(credentials: &Credentials, peer: Option<&str>) -> Result<SslAcceptor, TlsError> {
     let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
     let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(setup)?;
     common(&mut builder, credentials)?;
@@ -59,7 +75,11 @@ pub fn acceptor(credentials: &Credentials) -> Result<SslAcceptor, TlsError> {
     for authority in &authorities {
         builder.add_client_ca(authority).map_err(setup)?;
     }
-    builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    let mode = SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT;
+    match peer {
+        Some(peer) => builder.set_verify_callback(mode, carrying(peer)),
+        None => builder.set_verify(mode),
+    }
     builder.set_alpn_select_callback(|_ssl, offered| {
         select_next_proto(H2, offered).ok_or(AlpnError::ALERT_FATAL)
     });
@@ -92,8 +112,16 @@ pub fn connector_to(credentials: &Credentials, peer: &str) -> Result<SslConnecto
     let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
     let mut builder = SslConnector::builder(SslMethod::tls()).map_err(setup)?;
     common(&mut builder, credentials)?;
+    builder.set_verify_callback(SslVerifyMode::PEER, carrying(peer));
+    builder.set_alpn_protos(H2).map_err(setup)?;
+    Ok(builder.build())
+}
+
+/// A check of the chain that also refuses a peer whose own certificate does not carry the
+/// SPIFFE ID `peer`.
+fn carrying(peer: &str) -> impl Fn(bool, &mut X509StoreContextRef) -> bool + Send + Sync + 'static {
     let peer = peer.to_owned();
-    builder.set_verify_callback(SslVerifyMode::PEER, move |trusted, context| {
+    move |trusted, context| {
         // Depth 0 is the peer's own certificate, reached once the chain above it is checked.
         if !trusted || context.error_depth() > 0 {
             return trusted;
@@ -106,9 +134,7 @@ pub fn connector_to(credentials: &Credentials, peer: &str) -> Result<SslConnecto
             context.set_error(Err(X509VerifyError::APPLICATION_VERIFICATION));
         }
         named
-    });
-    builder.set_alpn_protos(H2).map_err(setup)?;
-    Ok(builder.build())
+    }
 }
 
 /// The admission webhook's TLS: it asks its client for no certificate, as the API server

@@ -164,13 +164,25 @@ pub fn wall_clock() -> Timestamp {
         .unwrap_or(Timestamp::UNIX_EPOCH)
 }
 
+/// Whom `lease` names as its holder, if anyone.
+fn holder(lease: &Lease) -> Option<String> {
+    lease
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.holder_identity.clone())
+        .filter(|holder| !holder.is_empty())
+}
+
 fn seconds(duration: Duration) -> i32 {
     i32::try_from(duration.as_secs()).unwrap_or(i32::MAX)
 }
 
 /// Elects, through `api`, by Lease `name` in `namespace`, `me` among the replicas, for as
-/// long as it is polled: whether this one leads published on `leading`, and each failure to
-/// read or write the Lease handed to `failed`, the Lease tried again at the next try.
+/// long as it is polled: whether this one leads published on `leading`, with `holding`
+/// whom the Lease names as its holder as last read or written, none where it names none,
+/// and each failure to read or write the Lease handed to `failed`, the Lease tried again at
+/// the next try.
+#[allow(clippy::too_many_arguments)]
 pub async fn elect(
     api: &ApiServer,
     namespace: &str,
@@ -178,6 +190,7 @@ pub async fn elect(
     me: &str,
     timing: Timing,
     leading: &watch::Sender<bool>,
+    holding: Option<&watch::Sender<Option<String>>>,
     failed: impl Fn(&ApiError),
 ) {
     let mut election = Election::new(me.to_owned(), namespace.to_owned(), name.to_owned(), timing);
@@ -188,11 +201,19 @@ pub async fn elect(
         let wall = wall_clock();
         match api.object::<Lease>(namespace, name).await {
             Ok(current) => {
+                let mut held = current.as_ref().and_then(holder);
                 let written = match election.act(current.as_ref(), Instant::now(), wall) {
                     Act::Create(lease) => Some(api.create(namespace, &lease).await),
                     Act::Replace(lease) => Some(api.replace(namespace, name, &lease).await),
                     Act::Wait => None,
                 };
+                if let Some(Ok(lease)) = &written {
+                    held = holder(lease);
+                }
+                if let Some(holding) = holding {
+                    holding
+                        .send_if_modified(|holds| std::mem::replace(holds, held.clone()) != held);
+                }
                 match written {
                     Some(Ok(lease)) => election.written(&lease, Instant::now()),
                     // Another wrote it first: the next try reads what it wrote.
