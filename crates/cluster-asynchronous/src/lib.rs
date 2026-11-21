@@ -20,7 +20,7 @@ pub mod value;
 
 pub use message::{Answer, Answers, Batch, Entry, Message, Outbox, Unserved, Why};
 pub use owner::{Answered, apply};
-pub use pod::{Pod, Turned, TurnedAway};
+pub use pod::{Applier, Holds, Pod, Turned, TurnedAway};
 pub use routing::Routed;
 pub use value::{Parts, PlaneParts, Value};
 

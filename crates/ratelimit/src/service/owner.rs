@@ -42,6 +42,7 @@ pub struct Applied {
 /// order, once each, as of when the earliest was admitted, owing what does not fit while it
 /// would be paid back within a refill time; one ahead of a batch still missing waits for it.
 /// Records of data planes silent for ten minutes, or a refill time if longer, go.
+#[inline]
 pub fn apply(
     value: &mut Value,
     from: PlaneId,
