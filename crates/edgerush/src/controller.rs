@@ -1000,6 +1000,8 @@ async fn control_until(
     // Whom the Lease names its holder, where the replicas share a snapshot: the leader a
     // follower follows (04 §2).
     let mut holder = None;
+    // Where the replicas share a snapshot: whether this one leads, and whether it is elected.
+    let mut taking = None;
     let leading = match (options.leader, elector) {
         (Some((namespace, name)), Some(elector)) => {
             let (leads, leading) = watch::channel(false);
@@ -1029,9 +1031,16 @@ async fn control_until(
             let failed = lease.clone();
             let (holding, held) = watch::channel(None);
             let sharing = options.peers.is_some();
-            if sharing {
+            // Where the replicas share a snapshot, one elected leads only once it has taken
+            // the newest there is (04 §2): until then, the election's word is its own.
+            let elected_out = if sharing {
                 holder = Some(held);
-            }
+                let (elected_out, elected) = watch::channel(false);
+                taking = Some((leads, elected));
+                elected_out
+            } else {
+                leads
+            };
             electing.push(tokio::task::spawn_local(async move {
                 elect(
                     &elector.api,
@@ -1039,7 +1048,7 @@ async fn control_until(
                     &name,
                     &elector.identity,
                     elector.timing,
-                    &leads,
+                    &elected_out,
                     sharing.then_some(&holding),
                     |error| telling(&format!("{failed}: {error}")),
                 )
@@ -1302,10 +1311,23 @@ async fn control_until(
                                 },
                             )),
                         ));
-                        if let Some(leading) = leading.clone() {
+                        if let Some((leads, elected)) = taking.take() {
+                            tasks.push(tokio::task::spawn_local(peers::take_over(
+                                peers.clone(),
+                                std::env::var("HOSTNAME").unwrap_or_default(),
+                                peers::GATHER,
+                                elected.clone(),
+                                replicas.clone(),
+                                credentials.clone(),
+                                snapshot.clone(),
+                                leads,
+                                Rc::clone(&say),
+                            )));
+                            // Followed until elected, not until it leads: one elected asks
+                            // the others itself.
                             tasks.push(tokio::task::spawn_local(peers::follow_leader(
                                 peers,
-                                leading,
+                                elected,
                                 holder,
                                 replicas.clone(),
                                 credentials,

@@ -6,8 +6,8 @@
 
 use edgerush_certificates::authority::Written;
 use edgerush_control_service::{
-    Credentials, Followed, ServeError, Unfollowed, acceptor_of, connector_to, follow_peer,
-    serve_peers,
+    Credentials, Followed, ServeError, SslConnector, Unfollowed, acceptor_of, connector_to,
+    follow_peer, serve_peers,
 };
 use edgerush_controller::own_pods::Replica;
 use edgerush_controller::snapshot::{Snapshot, SnapshotError};
@@ -216,6 +216,148 @@ pub(super) async fn follow_leader(
                     }
                 }
             }
+        }
+    }
+}
+
+/// How long the replica taking the lease waits on each ready replica for its snapshot.
+pub(super) const GATHER: Duration = Duration::from_secs(5);
+
+/// Leads, on `leading`, as `elected` says this replica is elected, once it has taken the
+/// newest snapshot there is into `snapshot` (04 §2): the one of the highest count among its
+/// own and each ready replica's in `replicas` but its own pod `me`'s, each asked for its
+/// latest within `wait`; with none of them holding one, it leads from a clean start,
+/// loudly. One no longer elected by then does not lead. No longer elected, it no longer
+/// leads.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn take_over(
+    peers: Peers,
+    me: String,
+    wait: Duration,
+    mut elected: watch::Receiver<bool>,
+    replicas: watch::Receiver<Arc<[Replica]>>,
+    signed: watch::Receiver<Option<Credentials>>,
+    snapshot: watch::Sender<Option<Arc<Snapshot>>>,
+    leading: watch::Sender<bool>,
+    say: Rc<dyn Fn(&str)>,
+) {
+    loop {
+        let now = *elected.borrow_and_update();
+        if now && !*leading.borrow() {
+            let others: Vec<SocketAddr> = replicas
+                .borrow()
+                .iter()
+                .filter(|replica| replica.ready && replica.pod != me)
+                .map(|replica| SocketAddr::new(replica.address, peers.port))
+                .collect();
+            let credentials = signed.borrow().clone();
+            gather(
+                &peers,
+                &others,
+                credentials.as_ref(),
+                wait,
+                &snapshot,
+                &*say,
+            )
+            .await;
+            if *elected.borrow() {
+                leading.send_replace(true);
+            }
+        } else if !now {
+            leading.send_replace(false);
+        }
+        if elected.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Takes into `snapshot` the newest of its own and those `others` serve, dialled with
+/// `credentials`, each within `wait`: none newer, it is kept; none at all, it is taken as
+/// none of a leader's, a clean start. Says which to `say`.
+async fn gather(
+    peers: &Peers,
+    others: &[SocketAddr],
+    credentials: Option<&Credentials>,
+    wait: Duration,
+    snapshot: &watch::Sender<Option<Arc<Snapshot>>>,
+    say: &dyn Fn(&str),
+) {
+    let mut newest: Option<(Arc<Snapshot>, Option<SocketAddr>)> =
+        snapshot.borrow().clone().map(|own| (own, None));
+    let tls = credentials.map(|credentials| connector_to(credentials, &peers.id));
+    for &other in others {
+        let Some(Ok(tls)) = &tls else {
+            say("the ready replicas' snapshots cannot be asked for: no certificate to dial with");
+            break;
+        };
+        let Some(theirs) = latest(other, &peers.name, tls, wait, say).await else {
+            continue;
+        };
+        if newest
+            .as_ref()
+            .is_none_or(|(newest, _)| theirs.count > newest.count)
+        {
+            newest = Some((theirs, Some(other)));
+        }
+    }
+    match newest {
+        Some((newest, from)) => {
+            let count = newest.count;
+            match from {
+                Some(from) => {
+                    snapshot.send_replace(Some(newest));
+                    say(&format!(
+                        "leading from the snapshot of the replica at {from}, of count {count}"
+                    ));
+                }
+                None => say(&format!(
+                    "leading from this replica's snapshot, of count {count}"
+                )),
+            }
+        }
+        None => {
+            snapshot.send_replace(Some(Arc::new(Snapshot::default())));
+            say("no ready replica holds a snapshot: leading from a clean start");
+        }
+    }
+}
+
+/// The latest snapshot the replica at `address` serves, if it gives one within `wait` that
+/// this one reads; why not is said to `say`.
+async fn latest(
+    address: SocketAddr,
+    name: &str,
+    tls: &SslConnector,
+    wait: Duration,
+    say: &dyn Fn(&str),
+) -> Option<Arc<Snapshot>> {
+    let dialled = address.to_string();
+    let (first, taken) = tokio::sync::oneshot::channel();
+    let mut first = Some(first);
+    let following = follow_peer(&dialled, name, tls, |bytes| {
+        if let Some(first) = first.take() {
+            let _ = first.send(bytes);
+        }
+    });
+    let bytes = tokio::select! {
+        bytes = taken => bytes.ok(),
+        ended = following => {
+            say(&format!("the snapshot of the replica at {dialled}: {ended}"));
+            None
+        }
+        () = tokio::time::sleep(wait) => {
+            say(&format!("the replica at {dialled} gave no snapshot within {} s", wait.as_secs()));
+            None
+        }
+    }?;
+    match Snapshot::decode(&bytes) {
+        Ok(theirs) => Some(Arc::new(theirs)),
+        Err(error) => {
+            say(&format!(
+                "the snapshot of the replica at {dialled} is not taken in: {error}"
+            ));
+            None
         }
     }
 }
