@@ -318,6 +318,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-cluster-modes"
+version = "0.0.0"
+dependencies = [
+ "edgerush-cluster",
+ "edgerush-cluster-asynchronous",
+ "edgerush-cluster-synchronous",
+ "edgerush-ratelimit",
+ "proptest",
+]
+
+[[package]]
 name = "edgerush-cluster-sim"
 version = "0.0.0"
 dependencies = [
