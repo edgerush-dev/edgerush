@@ -4,7 +4,8 @@
 use super::logged::{Logging, logged};
 use super::{
     Body, Called, Connection, Directed, Directing, Handshake, Looking, Mirrored, Others, Proxy,
-    Redirect, Snapshot, TUNNEL_IDLE, Timed, Timing, Toward, Worker, at_endpoint, balance_of,
+    Queued, Redirect, Snapshot, TUNNEL_IDLE, Timed, Timing, Toward, Worker, at_endpoint,
+    balance_of,
 };
 use crate::balance::Tried;
 use crate::downstream::h1::connection::{self as h1, Answered};
@@ -567,9 +568,23 @@ impl Worker {
                 self.dry_run(under, by);
             }
         }
-        // Admitted: what its looks chose is taken now (25 §5). Only a request under a rate
-        // limit looked.
-        if directed.limited != 0
+        // Its deadline counts from here, a wait in its backend's queue among what it bounds
+        // (25 §5).
+        let timing = Timing::of(call, directed.rule.as_deref());
+        // Admitted: a request that found its backend full waits in its queue now, charged,
+        // and what its copies' looks chose is taken once it has its endpoint; what its own
+        // look chose is taken now (25 §5). Only a request under a rate limit, or one that
+        // queued, looked.
+        let queued = directed.queued.take();
+        let waited = queued.is_some();
+        if let Some(queued) = queued
+            && let Err(answer) =
+                Box::pin(self.wait_in_line(&mut directed, &mut head, *queued, timing.deadline))
+                    .await
+        {
+            return self.proxy.answer_to(listener, answer, call).into();
+        }
+        if (directed.limited != 0 || waited)
             && let Err(answer) = self.proxy.aim(&mut directed, &mut head)
         {
             return self.proxy.answer_to(listener, answer, call).into();
@@ -588,7 +603,6 @@ impl Worker {
             };
             handshake.held.set(Some(held));
         }
-        let timing = Timing::of(call, directed.rule.as_deref());
 
         // Credentials can bind the upstream socket to this client, even when the
         // response is successful. Decide after rule filters and before the client
@@ -713,6 +727,161 @@ impl Worker {
             Err(answer) => self.proxy.answer_to(listener, answer, call).into(),
         }
     }
+}
+
+impl Worker {
+    /// Waits in its backend's queue, `queued`, for an endpoint with room, for a request that
+    /// found every one full or others waiting already (25 §5), and sends `directed` and
+    /// `head` to the one it takes once a call finds it. Refused once the queue's wait runs
+    /// out, `backend_queue_timeout`; once the request's own `deadline` passes, if that is
+    /// first, as anywhere; and if the queue filled since the request looked at it, charged
+    /// by then, `backend_queue_full`. A request whose client goes is dropped while it
+    /// waits, and leaves the line.
+    async fn wait_in_line<H: Forwarded>(
+        &self,
+        directed: &mut Directed,
+        head: &mut H,
+        queued: Queued,
+        deadline: Option<Instant>,
+    ) -> Result<(), Answer> {
+        let counters = self.proxy.metrics.upstream(directed.upstream.slot());
+        let Some(in_line) = edgerush_protection::Queue::join(&queued.line, queued.terms.size)
+        else {
+            if let Some(counters) = counters {
+                counters.queue_full.inc();
+            }
+            return Err(Answer::BackendQueueFull);
+        };
+        if let Some(counters) = counters {
+            counters.queued.inc();
+        }
+        let began = Instant::now();
+        // The earlier of the two clocks, and whether it is the queue's own.
+        let (until, queues) = match (began.checked_add(queued.terms.timeout), deadline) {
+            (Some(over), Some(deadline)) if deadline <= over => (Some(deadline), false),
+            (Some(over), _) => (Some(over), true),
+            (None, deadline) => (deadline, false),
+        };
+        let was = Rc::clone(&directed.upstream);
+        let retries = directed.others.is_some();
+        let waiting = in_line.wait(|| self.take_in_line(&queued, &was, retries));
+        let outcome = match until {
+            Some(until) => tokio::time::timeout_at(until, waiting).await.ok(),
+            None => Some(waiting.await),
+        };
+        let waited = || {
+            if let Some(counters) = counters {
+                counters.waited(u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            }
+        };
+        let taken = match outcome {
+            Some(Ok(taken)) => taken,
+            Some(Err(answer)) => return Err(answer),
+            None if queues => {
+                waited();
+                if let Some(counters) = counters {
+                    counters.queue_timeout.inc();
+                }
+                return Err(Answer::BackendQueueTimedOut);
+            }
+            None => {
+                waited();
+                return Err(Answer::DeadlineExceeded);
+            }
+        };
+        waited();
+        let target = at_endpoint(head.uri(), &taken.authority).ok_or(Answer::BadTarget)?;
+        head.set_uri(target);
+        directed.upstream = taken.upstream;
+        directed.endpoint = taken.destination;
+        directed.counted = Some(taken.counted);
+        match taken.others {
+            Some(others) => directed.others = Some(others),
+            None => {
+                if let Some(others) = &mut directed.others {
+                    others.first = taken.at;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// What a request called in `queued`'s line takes: an endpoint of its upstream, `was`,
+    /// picked by this worker's balancer on the snapshot current now: after a reload the
+    /// upstream of `was`'s name, and with it, for a request that may be sent again
+    /// (`retries`), where else it may go. None while every endpoint is full, to wait again;
+    /// refused if the upstream has gone, or has no endpoint.
+    fn take_in_line(
+        &self,
+        queued: &Queued,
+        was: &balancing::Upstream,
+        retries: bool,
+    ) -> Option<Result<Taken, Answer>> {
+        let snapshot = self.proxy.current.load();
+        let reloaded = snapshot.generation != queued.generation;
+        let position = if reloaded {
+            snapshot
+                .config
+                .upstreams()
+                .iter()
+                .position(|upstream| upstream.name == was.name())
+        } else {
+            Some(queued.upstream)
+        };
+        let Some(position) = position else {
+            return Some(Err(Answer::NoBackend));
+        };
+        let Some(balance) = balance_of(&self.balancing, &snapshot, position) else {
+            return Some(Err(Answer::NoEndpoints));
+        };
+        let destinations = snapshot.destinations.of(position);
+        let zoned = snapshot.zoned(position);
+        let picked = match balance.pick(destinations, zoned, &Tried::default()) {
+            Ok(picked) => picked,
+            Err(Unpicked::Full) => return None,
+            Err(Unpicked::Nowhere) => return Some(Err(Answer::NoEndpoints)),
+        };
+        if picked.passed_over
+            && let Some(counters) = self.proxy.metrics.upstream(balance.slot())
+        {
+            counters.passed_over.inc();
+        }
+        let authorities = snapshot.endpoints.get(position);
+        let found = authorities
+            .and_then(|authorities| authorities.get(picked.at))
+            .zip(destinations.get(picked.at));
+        let Some((authority, destination)) = found else {
+            return Some(Err(Answer::NoEndpoints));
+        };
+        let others = (reloaded && retries).then(|| {
+            Box::new(Others {
+                authorities: authorities.cloned().unwrap_or_default(),
+                destinations: destinations.to_vec(),
+                zoned,
+                first: picked.at,
+            })
+        });
+        Some(Ok(Taken {
+            authority: authority.clone(),
+            destination: Arc::clone(destination),
+            upstream: balance,
+            at: picked.at,
+            counted: picked.counted,
+            others,
+        }))
+    }
+}
+
+/// What a request called in its backend's queue took: the endpoint, where it is, its
+/// count, and the worker's state for the upstream it was picked of; after a reload, where
+/// else it may go as well, for a request that may be sent again.
+struct Taken {
+    authority: Authority,
+    destination: Arc<ReuseIdentity>,
+    upstream: Rc<balancing::Upstream>,
+    at: usize,
+    counted: InFlight,
+    others: Option<Box<Others>>,
 }
 
 impl Proxy {
@@ -867,18 +1036,46 @@ impl Proxy {
         // now and takes its slot once they admit it: it holds none while they decide, and a
         // full backend refuses it before they are charged (25 §5). Any other takes it now.
         let later = forward.limited != 0 && balance.is_protected();
-        let (at, counted) = self.chosen(&balance, destinations, zoned, later).map_err(
-            |unpicked| match unpicked {
-                Unpicked::Nowhere => Answer::NoEndpoints,
-                Unpicked::Full => {
-                    if let Some(counters) = self.metrics.upstream(balance.slot()) {
+        let queue = balance.queue();
+        // With others waiting already it waits behind them, whatever room it might find:
+        // first come, first served.
+        let behind = queue.is_some_and(|(line, _)| line.waiting() > 0);
+        let chosen = if behind {
+            Err(Unpicked::Full)
+        } else {
+            self.chosen(&balance, destinations, zoned, later)
+        };
+        let (at, counted, queued) = match chosen {
+            Ok((at, counted)) => (at, counted, None),
+            Err(Unpicked::Nowhere) => return Err(Answer::NoEndpoints),
+            Err(Unpicked::Full) => {
+                let counters = self.metrics.upstream(balance.slot());
+                let Some((line, terms)) = queue else {
+                    if let Some(counters) = counters {
                         counters.full.inc();
                     }
-                    Answer::BackendFull
+                    return Err(Answer::BackendFull);
+                };
+                // Its room looked at before any limit is charged, its place taken after.
+                let room = usize::try_from(terms.size.get()).unwrap_or(usize::MAX);
+                if line.waiting() >= room {
+                    if let Some(counters) = counters {
+                        counters.queue_full.inc();
+                    }
+                    return Err(Answer::BackendQueueFull);
                 }
-            },
-        )?;
-        let looked = later.then_some(Looking {
+                let queued = Box::new(Queued {
+                    line: Arc::clone(line),
+                    terms,
+                    generation: snapshot.generation,
+                    upstream,
+                });
+                // Directed meanwhile at its first endpoint, for whatever is worked out from
+                // one before it has its own: it goes where its call finds room.
+                (0, None, Some(queued))
+            }
+        };
+        let looked = (later && queued.is_none()).then_some(Looking {
             generation: snapshot.generation,
             upstream,
             at,
@@ -957,9 +1154,10 @@ impl Proxy {
                 nowhere();
                 continue;
             };
-            // A copy looks and takes as its request does; one that finds its endpoint full
-            // is not sent (25 §5).
-            let later = forward.limited != 0 && balance.is_protected();
+            // A copy looks and takes as its request does, and takes once its request has its
+            // endpoint, holding nothing while it waits in a queue; one that finds its endpoint
+            // full is not sent, never queued (25 §5).
+            let later = (forward.limited != 0 || queued.is_some()) && balance.is_protected();
             let zoned = snapshot.zoned(upstream);
             let (at, counted) = match self.chosen(&balance, destinations, zoned, later) {
                 Ok(chosen) => chosen,
@@ -1019,6 +1217,7 @@ impl Proxy {
             endpoint: Arc::clone(identity),
             counted,
             looked,
+            queued,
             others,
             mirrors,
             websocket,

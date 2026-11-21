@@ -1,5 +1,7 @@
 //! Instruction counts for what a protected request pays at its pick: a slot taken in its
-//! pod's count and given back, and a full pod found by reading alone (25 §3).
+//! pod's count and given back — reading, as it is given back, whether anyone waits in the
+//! backend's queue — and a full pod found by reading alone (25 §3); and a slot given back
+//! while a request waits, which calls it (25 §5).
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-protection`, see the repository README.
 
@@ -12,7 +14,7 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_protection::{PodCount, Slot};
+use edgerush_protection::{InLine, PodCount, Queue, Slot};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
 use std::num::NonZeroU32;
@@ -46,5 +48,29 @@ fn refused_when_full(held: (Arc<PodCount>, Vec<Slot>)) -> (Arc<PodCount>, Vec<Sl
     held
 }
 
-library_benchmark_group!(name = pick; benchmarks = take_and_give_back, refused_when_full);
+/// A full pod with a request waiting in its backend's queue, and the pod's slots.
+fn waited_on() -> (Arc<PodCount>, Vec<Slot>, InLine) {
+    let queue = Queue::new();
+    let pod = PodCount::of(&queue);
+    let slots = (0..CAP.get())
+        .map(|_| PodCount::take(&pod, CAP).expect("below the cap"))
+        .collect();
+    let in_line = Queue::join(&queue, CAP).expect("the line has room");
+    (pod, slots, in_line)
+}
+
+#[library_benchmark]
+#[bench::one_waiting(waited_on())]
+fn give_back_to_the_line(
+    held: (Arc<PodCount>, Vec<Slot>, InLine),
+) -> (Arc<PodCount>, Vec<Slot>, InLine) {
+    let (pod, mut slots, in_line) = held;
+    drop(black_box(slots.pop()));
+    (pod, slots, in_line)
+}
+
+library_benchmark_group!(
+    name = pick;
+    benchmarks = take_and_give_back, refused_when_full, give_back_to_the_line
+);
 main!(library_benchmark_groups = pick);

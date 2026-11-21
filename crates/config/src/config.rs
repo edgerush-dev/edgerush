@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 
 /// A data plane's configuration. Filters are to come.
@@ -670,6 +670,28 @@ pub struct Protection {
     /// endpoints of a Kubernetes Service are counted by pod, every upstream of the
     /// Service's ports sharing a pod's count; any other endpoint by its address and port.
     pub max_in_flight: NonZeroU32,
+    /// Where a request waits while every endpoint it may go to is full; none refuses it at
+    /// once. A Kubernetes Service has one queue, every upstream of its ports waiting in it;
+    /// any other upstream a queue of its own.
+    #[serde(default)]
+    pub queue: Option<ProtectionQueue>,
+}
+
+/// A full backend's queue ([25 §5](../../../docs/25-backend-protection.md)): first come,
+/// first served, a slot given back calling the request that has waited longest to pick
+/// again. Both bounds are stated: how long a request may be held, and how many, is the
+/// operator's to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ProtectionQueue {
+    /// Requests that may wait at once, counted against the queue as every upstream that
+    /// shares it fills it. A request that finds it full is refused, before any rate limit
+    /// is charged.
+    pub size: NonZeroU32,
+    /// Milliseconds a request may wait before it is refused. Its route's own request
+    /// timeout counts the wait as well, and ends it first if it comes first.
+    pub timeout_ms: NonZeroU64,
 }
 
 /// Where an upstream's endpoints come from, one way and stated

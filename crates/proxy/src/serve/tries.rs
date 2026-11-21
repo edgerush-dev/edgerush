@@ -264,6 +264,7 @@ impl Worker {
                     endpoint: Arc::clone(&mirror.endpoint),
                     counted: None,
                     looked: None,
+                    queued: None,
                     others: None,
                     mirrors: Vec::new(),
                     websocket: None,
