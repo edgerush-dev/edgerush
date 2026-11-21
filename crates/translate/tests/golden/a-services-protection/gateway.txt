@@ -1,0 +1,2 @@
+listener http: served on port-8080, taking HTTPRoute, GRPCRoute from every namespace
+listener tcp: served on port-9000, taking TCPRoute from every namespace

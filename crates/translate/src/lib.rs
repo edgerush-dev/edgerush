@@ -70,6 +70,7 @@ pub mod gateway;
 mod grpc_route;
 pub mod http_route;
 pub mod listeners;
+mod protection;
 mod rate_limits;
 pub mod status;
 mod tcp_route;
@@ -81,6 +82,10 @@ pub use gateway::{
     SetOutcome,
 };
 pub use http_route::{Attachment, NotAttached, ParentOutcome, RouteOutcome, Taken};
+use protection::Unprotected;
+pub use protection::{
+    MAX_IN_FLIGHT_PER_POD_ANNOTATION, QUEUE_SIZE_ANNOTATION, QUEUE_TIMEOUT_ANNOTATION,
+};
 pub use rate_limits::{AFFECTED, AcceptedPolicy, data_plane_limit, policy_refused_alone};
 pub use status::{
     Condition, GatewayStatus, LimitPolicyStatus, ListenerSetStatus, ListenerStatus, ParentStatus,
@@ -991,6 +996,11 @@ pub enum Problem {
     /// connections.
     #[error("the connections it covers fail: {0}")]
     PolicyFailing(String),
+    /// A Service an HTTP or gRPC route reaches whose backend protection annotations do not
+    /// read: it is served unprotected, every pod taking what it is sent, until they do
+    /// ([25 §2](../../../docs/25-backend-protection.md)).
+    #[error("served unprotected, as its backend protection annotations do not read: {0}")]
+    Unprotected(String),
     /// A RateLimitPolicy's spec with a limit of a name another limit holds: the
     /// DataPlane's, or another policy's. The spec is refused whole, as one name is one count
     /// across the data plane (04 §4).
@@ -1266,6 +1276,7 @@ fn translated(
     // Each BackendTLSPolicy chosen where it covers, before any backend is translated; what
     // keeps one from covering, or what it asks from being had, is said.
     let policies = Policies::of(plane, cluster);
+    let unprotected = Unprotected::default();
     for outcome in &policies.outcomes {
         let object = Object::of("BackendTLSPolicy", &outcome.policy.metadata);
         let mut say = |problem| {
@@ -1389,16 +1400,17 @@ fn translated(
     for ingress in ingresses {
         let object = || Object::of("Ingress", &ingress.metadata);
         let dated = ingress.metadata.creation_timestamp.is_some();
-        let translated = match ingress_routes(plane, cluster, &policies, &bound, ingress) {
-            Ok(translated) => translated,
-            Err(problem) => {
-                report.push(Finding {
-                    object: object(),
-                    problem,
-                });
-                continue;
-            }
-        };
+        let translated =
+            match ingress_routes(plane, cluster, &policies, &unprotected, &bound, ingress) {
+                Ok(translated) => translated,
+                Err(problem) => {
+                    report.push(Finding {
+                        object: object(),
+                        problem,
+                    });
+                    continue;
+                }
+            };
         if checked_alone {
             // Checked on every listener it could come to be served on: whether another
             // Ingress secures its hosts is not known yet.
@@ -1671,6 +1683,7 @@ fn translated(
                 plane,
                 cluster,
                 &policies,
+                &unprotected,
                 &rate_limits,
                 |rule, upstreams| refused("httproute", rule, upstreams),
             );
@@ -1708,6 +1721,7 @@ fn translated(
                 plane,
                 cluster,
                 &policies,
+                &unprotected,
                 &rate_limits,
                 |rule, upstreams| refused("grpcroute", rule, upstreams),
             );
@@ -1760,8 +1774,15 @@ fn translated(
             else {
                 continue;
             };
-            let translated =
-                tls_route::translated(route, outcome, gateway, plane, cluster, &policies);
+            let translated = tls_route::translated(
+                route,
+                outcome,
+                gateway,
+                plane,
+                cluster,
+                &policies,
+                &unprotected,
+            );
             if let Some(why) = translated.refused {
                 report.push(Finding {
                     object: outcome.route.clone(),
@@ -1826,8 +1847,15 @@ fn translated(
             else {
                 continue;
             };
-            let translated =
-                tcp_route::translated(route, outcome, gateway, plane, cluster, &policies);
+            let translated = tcp_route::translated(
+                route,
+                outcome,
+                gateway,
+                plane,
+                cluster,
+                &policies,
+                &unprotected,
+            );
             if let Some(why) = translated.refused {
                 report.push(Finding {
                     object: outcome.route.clone(),
@@ -1892,8 +1920,15 @@ fn translated(
             else {
                 continue;
             };
-            let translated =
-                udp_route::translated(route, outcome, gateway, plane, cluster, &policies);
+            let translated = udp_route::translated(
+                route,
+                outcome,
+                gateway,
+                plane,
+                cluster,
+                &policies,
+                &unprotected,
+            );
             if let Some(why) = translated.refused {
                 report.push(Finding {
                     object: outcome.route.clone(),
@@ -2176,6 +2211,14 @@ fn translated(
     // Each RateLimitPolicy's targets not there, and rules it targets that redirect, once
     // every route is translated (04 §4).
     rate_limits.say_targets(cluster, &mut report);
+    // Each Service reached whose protection does not read, once every route is translated
+    // (25 §2).
+    for (object, why) in unprotected.said() {
+        report.push(Finding {
+            object,
+            problem: Problem::Unprotected(why),
+        });
+    }
     // Every route's status, of whichever kind, HTTPRoutes first, then GRPCRoutes,
     // TLSRoutes, TCPRoutes and UDPRoutes; a listener counts them all.
     let routes: Vec<RouteOutcome> = http_routes
@@ -2934,6 +2977,7 @@ fn ingress_routes(
     plane: &Plane,
     cluster: &Cluster,
     policies: &Policies<'_>,
+    unprotected: &Unprotected,
     bound: &BTreeMap<String, Listener>,
     ingress: &Ingress,
 ) -> Result<IngressRoutes, Problem> {
@@ -3029,6 +3073,7 @@ fn ingress_routes(
                 plane,
                 cluster,
                 policies,
+                unprotected,
                 namespace,
                 backend,
                 (Calls::Http, service_upstream),
@@ -3328,11 +3373,13 @@ pub(crate) enum Calls {
 /// which resolves to its cluster IP; spoken to as `calls` and the port's `appProtocol` say.
 /// Or what is not there, when its Service, or that port of it, is not, or it has no cluster
 /// IP to be reached by, or its `appProtocol` is not one `calls` can be spoken in; or why the
-/// Ingress is left out.
+/// Ingress is left out. An HTTP or gRPC route's upstream is protected as the Service's
+/// annotations ask (25 §2), and one whose annotations do not read is said in `unprotected`.
 fn backend_upstream(
     plane: &Plane,
     cluster: &Cluster,
     policies: &Policies<'_>,
+    unprotected: &Unprotected,
     namespace: &str,
     backend: &IngressBackend,
     (calls, by_address): (Calls, bool),
@@ -3346,6 +3393,7 @@ fn backend_upstream(
         number,
         app_protocol,
         headless,
+        service: found,
     } = match service_port(cluster, namespace, backend, calls == Calls::Datagrams)? {
         Ok(port) => port,
         Err(missing) => return Ok(Err(missing)),
@@ -3386,8 +3434,11 @@ fn backend_upstream(
         (Calls::Datagrams, _) => (UpstreamProtocol::Udp, None),
         // Named apart from the HTTP upstream of the same port wherever that one speaks
         // HTTP/2 or TLS, or the port says a protocol HTTP routes cannot reach it by: a
-        // policy's TLS among them.
-        (Calls::Tunnel, None | Some("kubernetes.io/ws")) if policy.is_some() => {
+        // policy's TLS among them. And wherever the HTTP one is protected, which a tunnel's
+        // never is (25 §1).
+        (Calls::Tunnel, None | Some("kubernetes.io/ws"))
+            if policy.is_some() || matches!(protection::asked(found), Ok(Some(_))) =>
+        {
             tunnel_apart = true;
             (UpstreamProtocol::Http1, None)
         }
@@ -3496,8 +3547,12 @@ fn backend_upstream(
         load_balancer: LoadBalancer::P2c,
         slow_start: None,
         proxy_protocol: None,
-        // From the Service's annotations once they are read (25 §2).
-        protection: None,
+        // Requests are counted, which a tunnel's bytes and datagrams are not (25 §1): their
+        // upstreams, named apart, take none, whatever the Service asks.
+        protection: match calls {
+            Calls::Http | Calls::Grpc => unprotected.of(found),
+            Calls::Tunnel | Calls::Datagrams => None,
+        },
     };
     Ok(Ok((name, upstream)))
 }
@@ -3515,6 +3570,8 @@ struct ServicePort<'a> {
     app_protocol: Option<&'a str>,
     /// Whether the Service has no cluster IP.
     headless: bool,
+    /// The Service.
+    service: &'a Service,
 }
 
 /// The Service port a backend names: its UDP one `over_udp`, its TCP one otherwise (04 §2).
@@ -3602,6 +3659,7 @@ fn service_port<'a>(
         number: port.port,
         app_protocol: port.app_protocol.as_deref(),
         headless: spec.and_then(|spec| spec.cluster_ip.as_deref()) == Some("None"),
+        service,
     }))
 }
 

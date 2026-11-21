@@ -23,6 +23,7 @@ use edgerush_controller::issuing::{self, Issuer};
 use edgerush_controller::own_pods::{Replica, follow_own_pods};
 use edgerush_controller::snapshot::Snapshot;
 use edgerush_controller::unimplementable::Unimplementable;
+use edgerush_controller::unprotected::Unprotected;
 use edgerush_controller::{
     Acks, Classes, Debounce, Membership, Planes, Reports, Said, ServiceNow, SettingsOf, Snapshots,
     WatchScope, control,
@@ -1132,11 +1133,19 @@ async fn control_until(
     // The RateLimitPolicies each data plane leaves out, of every replica's translations
     // (04 §6): served beside the certificates'.
     let unimplementable = RefCell::new(Unimplementable::new());
-    let exposed_text = |expiry: &Expiry, unimplementable: &Unimplementable| {
-        Bytes::from(expiry.exposition() + &unimplementable.exposition())
+    // The Services each data plane serves unprotected, their protection annotations not
+    // read (25 §2): served beside them.
+    let unprotected = RefCell::new(Unprotected::new());
+    let exposed_text = |expiry: &Expiry,
+                        unimplementable: &Unimplementable,
+                        unprotected: &Unprotected| {
+        Bytes::from(expiry.exposition() + &unimplementable.exposition() + &unprotected.exposition())
     };
-    let (exposed, exposition) =
-        watch::channel(exposed_text(&expiry.borrow(), &unimplementable.borrow()));
+    let (exposed, exposition) = watch::channel(exposed_text(
+        &expiry.borrow(),
+        &unimplementable.borrow(),
+        &unprotected.borrow(),
+    ));
     // Whether this replica is ready, for its readiness probe: once the stream serves, with
     // its first certificate, or at once where it serves none.
     let (readies, ready) = watch::channel(false);
@@ -1471,6 +1480,7 @@ async fn control_until(
                         ..
                     } => {
                         unimplementable.borrow_mut().take(data_plane, translation);
+                        unprotected.borrow_mut().take(data_plane, translation);
                         Some(&translation.config)
                     }
                     Said::Kept { config, .. } => Some(*config),
@@ -1483,7 +1493,11 @@ async fn control_until(
                         expiry
                             .borrow_mut()
                             .take(&config.certificates, unix_now(), leading);
-                    exposed.send_replace(exposed_text(&expiry.borrow(), &unimplementable.borrow()));
+                    exposed.send_replace(exposed_text(
+                        &expiry.borrow(),
+                        &unimplementable.borrow(),
+                        &unprotected.borrow(),
+                    ));
                     for line in out_of_date {
                         telling(&line);
                     }

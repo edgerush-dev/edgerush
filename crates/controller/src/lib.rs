@@ -74,6 +74,7 @@ pub mod service;
 pub mod snapshot;
 pub mod status;
 pub mod unimplementable;
+pub mod unprotected;
 
 use edgerush_kubernetes::gateway_api::{GatewayKind, Served};
 

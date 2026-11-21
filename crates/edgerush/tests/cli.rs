@@ -1447,6 +1447,41 @@ spec:
     );
     std::fs::remove_file(manifests.join("gone.yml"))?;
 
+    // A Service whose backend protection annotations do not read is served unprotected,
+    // and said, before it is applied (25 §2).
+    std::fs::write(
+        manifests.join("unprotected.yml"),
+        "apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: guarded, namespace: shop }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: guarded.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: guarded, port: { number: 80 } } } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: guarded
+  namespace: shop
+  annotations: { gateway.edgerush.dev/max-in-flight-per-pod: lots }
+spec:
+  ports: [{ name: http, port: 80 }]
+",
+    )?;
+    let output = validate(&manifests)?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with(
+            "Service shop/guarded: served unprotected, as its backend protection annotations do not read: `gateway.edgerush.dev/max-in-flight-per-pod` is `lots`, not a whole number from 1 to 4294967295\n"
+        ),
+        "{output:?}"
+    );
+    std::fs::remove_file(manifests.join("unprotected.yml"))?;
+
     // The data plane a Gateway whose listener claims `*.example.com` on the port Ingress's
     // `http` is bound to: the Ingress's shop.example.com takes that host from it there, which
     // is said, and validate exits 1.

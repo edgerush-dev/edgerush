@@ -1,0 +1,80 @@
+listeners:
+  port-80:
+    address: "0.0.0.0:80"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  port-8080:
+    address: "0.0.0.0:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+  port-9000:
+    address: "0.0.0.0:9000"
+    protocol: tcp
+    proxy_protocol: off
+routes:
+  - name: httproute/shop/search/http
+    listeners: [port-8080]
+    hostnames: [{ name: search.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/search/http, weight: 1 }] }
+      - matches: [{ path: { prefix: /cart } }]
+        filters: [{ type: request_mirror, upstream: shop/shadow/http, fraction: { numerator: 1, denominator: 1 } }]
+        forward: { backends: [{ upstream: shop/cart/http, weight: 1 }] }
+      - matches: [{ path: { prefix: /broken } }]
+        forward: { backends: [{ upstream: shop/broken/http, weight: 1 }] }
+  - name: grpcroute/shop/search/http
+    listeners: [port-8080]
+    hostnames: [{ name: grpc.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/search/grpc, weight: 1 }] }
+  - name: ingress/shop/by-endpoints/shop.example.com
+    listeners: [port-80]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/search/http, weight: 1 }] }
+      - matches: [{ path: { prefix: /typo } }]
+        forward: { backends: [{ upstream: shop/typo/http, weight: 1 }] }
+      - matches: [{ path: { prefix: /broken } }]
+        forward: { backends: [{ upstream: shop/broken/http, weight: 1 }] }
+  - name: ingress/shop/by-address/address.example.com
+    listeners: [port-80]
+    hostnames: [{ name: address.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: shop/search/http/service, weight: 1 }] }
+tcp_routes:
+  - name: tcproute/shop/raw/tcp
+    listeners: [port-9000]
+    backends: [{ upstream: shop/search/http/tcp, weight: 1 }, { upstream: shop/broken/http, weight: 1 }]
+upstreams:
+  shop/search/http:
+    load_balancer: p2c
+    endpoints: { kubernetes: "search.shop.svc.cluster.local:http" }
+    protection: { max_in_flight: 20, queue: { size: 100, timeout_ms: 2000 } }
+  shop/search/grpc:
+    load_balancer: p2c
+    protocol: http2
+    endpoints: { kubernetes: "search.shop.svc.cluster.local:grpc" }
+    protection: { max_in_flight: 20, queue: { size: 100, timeout_ms: 2000 } }
+  shop/search/http/service:
+    load_balancer: p2c
+    endpoints: { dns: "search.shop.svc.cluster.local:80" }
+    protection: { max_in_flight: 20, queue: { size: 100, timeout_ms: 2000 } }
+  shop/search/http/tcp: { load_balancer: p2c, endpoints: { kubernetes: "search.shop.svc.cluster.local:http" } }
+  shop/cart/http:
+    load_balancer: p2c
+    endpoints: { kubernetes: "cart.shop.svc.cluster.local:http" }
+    protection: { max_in_flight: 5 }
+  shop/shadow/http:
+    load_balancer: p2c
+    endpoints: { kubernetes: "shadow.shop.svc.cluster.local:http" }
+    protection: { max_in_flight: 2 }
+  shop/broken/http: { load_balancer: p2c, endpoints: { kubernetes: "broken.shop.svc.cluster.local:http" } }
+  shop/typo/http: { load_balancer: p2c, endpoints: { kubernetes: "typo.shop.svc.cluster.local:http" } }

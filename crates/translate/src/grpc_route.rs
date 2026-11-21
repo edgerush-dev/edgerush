@@ -11,6 +11,7 @@ use crate::http_route::{
     Filtered, Reference, RouteOutcome, Translated, Written, answering, backends, config_routes,
     filtered, header_changes, mirrored, no_extension, no_settings, not_read, predicate,
 };
+use crate::protection::Unprotected;
 use crate::rate_limits::RateLimits;
 use crate::{Cluster, Plane, namespace};
 use edgerush_config::{Filter, Forward, GrpcMethod, Match, PathMatch, Rule, Upstream};
@@ -34,6 +35,7 @@ pub(crate) fn translated(
     plane: &Plane,
     cluster: &Cluster,
     policies: &Policies<'_>,
+    unprotected: &Unprotected,
     rate_limits: &RateLimits,
     refused: impl Fn(&Rule, &BTreeMap<String, Upstream>) -> Option<String>,
 ) -> Translated {
@@ -60,6 +62,7 @@ pub(crate) fn translated(
                 plane,
                 cluster,
                 policies,
+                unprotected,
                 &mut upstreams,
                 &mut left_off,
             ),
@@ -90,6 +93,7 @@ pub(crate) fn translated(
                         plane,
                         cluster,
                         policies,
+                        unprotected,
                         (&mut upstreams, &mut invalid),
                     ),
                     timeouts: None,

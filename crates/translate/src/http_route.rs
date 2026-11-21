@@ -9,6 +9,7 @@
 
 use crate::backend_tls::Policies;
 use crate::gateway::{GatewayOutcome, ListenerOutcome};
+use crate::protection::Unprotected;
 use crate::rate_limits::{Place, RateLimits};
 use crate::{Calls, Cluster, Object, Plane, RefProblem, RefReason, backend_upstream, namespace};
 use edgerush_config::{
@@ -658,6 +659,7 @@ pub(crate) fn translated(
     plane: &Plane,
     cluster: &Cluster,
     policies: &Policies<'_>,
+    unprotected: &Unprotected,
     rate_limits: &RateLimits,
     refused: impl Fn(&Rule, &BTreeMap<String, Upstream>) -> Option<String>,
 ) -> Translated {
@@ -684,6 +686,7 @@ pub(crate) fn translated(
                 plane,
                 cluster,
                 policies,
+                unprotected,
                 &mut upstreams,
                 &mut left_off,
             )
@@ -734,6 +737,7 @@ pub(crate) fn translated(
                         plane,
                         cluster,
                         policies,
+                        unprotected,
                         (&mut upstreams, &mut invalid),
                     ),
                     timeouts: settings.timeouts.clone(),
@@ -1070,12 +1074,14 @@ pub(crate) fn not_read(kind: &str) -> String {
 /// are left out, as nothing goes upstream for them to change and nothing a client sees
 /// differs; a mirror beside one cannot be, as its upstream would be sent nothing
 /// ([18 §2](../../../docs/18-redirects-and-rewrites.md)).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn filtered<'a>(
     written: impl Iterator<Item = Result<Written<'a>, String>>,
     route: (&str, &str),
     plane: &Plane,
     cluster: &Cluster,
     policies: &Policies<'_>,
+    unprotected: &Unprotected,
     upstreams: &mut BTreeMap<String, Upstream>,
     left_off: &mut Vec<RefProblem>,
 ) -> Result<Filtered, String> {
@@ -1086,7 +1092,7 @@ pub(crate) fn filtered<'a>(
             Written::Done(filter) => filters.push(filter),
             Written::Redirect(written) => redirect = Some(written),
             Written::Mirror(reference, fraction) => {
-                match backend(&reference, route, plane, cluster, policies) {
+                match backend(&reference, route, plane, cluster, policies, unprotected) {
                     Ok((name, upstream)) => {
                         upstreams.insert(name.clone(), upstream);
                         filters.push(Filter::RequestMirror(Mirror {
@@ -1303,7 +1309,7 @@ fn retry(
 /// A Gateway API duration in milliseconds (GEP-2257): one to four parts, each a number of
 /// one to five digits and its unit, `h`, `m`, `s` or `ms`, `1h2m3s4ms`; or why it is not
 /// one.
-fn milliseconds(written: &str) -> Result<u64, String> {
+pub(crate) fn milliseconds(written: &str) -> Result<u64, String> {
     let bad = || format!("a duration of `{written}` is not one translation reads");
     let mut total: u64 = 0;
     let mut rest = written;
@@ -1346,13 +1352,14 @@ pub(crate) fn backends<'a>(
     plane: &Plane,
     cluster: &Cluster,
     policies: &Policies<'_>,
+    unprotected: &Unprotected,
     (upstreams, invalid): (&mut BTreeMap<String, Upstream>, &mut Vec<RefProblem>),
 ) -> Vec<Backend> {
     let mut backends = Vec::new();
     for (weight, reference) in written {
         // The schema holds a weight to 0–1,000,000.
         let weight = u32::try_from(weight).unwrap_or_default();
-        match backend(&reference, route, plane, cluster, policies) {
+        match backend(&reference, route, plane, cluster, policies, unprotected) {
             Ok((name, upstream)) => {
                 upstreams.insert(name.clone(), upstream);
                 backends.push(Backend {
@@ -1424,6 +1431,7 @@ fn backend(
     plane: &Plane,
     cluster: &Cluster,
     policies: &Policies<'_>,
+    unprotected: &Unprotected,
 ) -> Result<(String, Upstream), RefProblem> {
     if !(written.group.is_empty() && written.kind == "Service") {
         return Err(RefProblem {
@@ -1478,6 +1486,7 @@ fn backend(
         plane,
         cluster,
         policies,
+        unprotected,
         namespace,
         &reference,
         (calls, false),
