@@ -1,9 +1,11 @@
 //! Instruction counts for picking an endpoint, once per exchange
 //! ([03 §6](../../../docs/03-data-plane.md)): `p2c` and `round_robin`, in the common case —
-//! every endpoint serving, none ramping, a first try — and in the cases that cost more: an
+//! an unprotected upstream, every endpoint serving, none ramping, a first try — and in the
+//! cases that cost more: an
 //! endpoint failing its checks drawn, a retry that keeps away from what it tried, an
-//! endpoint in slow start, and a protected upstream's full endpoint drawn or every one of
-//! them full ([25 §4](../../../docs/25-backend-protection.md)); and with a zone kept to,
+//! endpoint in slow start, and a protected upstream's endpoints all with room, its full
+//! endpoint drawn, or every one of them full
+//! ([25 §4](../../../docs/25-backend-protection.md)); and with a zone kept to,
 //! whose rule looks at each of its endpoints, beside an upstream whose endpoints are all its
 //! zone's, which has none.
 //!
@@ -23,7 +25,9 @@ use std::hint::black_box;
 /// Endpoints as the benchmark states them.
 pub struct Endpoints {
     serves: Vec<bool>,
-    room: Vec<bool>,
+    /// Whether each has room, on a protected upstream; on an unprotected one, none, and every
+    /// endpoint has room without a look, as the data plane's own unprotected upstream does.
+    room: Option<Vec<bool>>,
     in_flight: Vec<u32>,
     share: Vec<Share>,
 }
@@ -36,7 +40,10 @@ impl Candidates for Endpoints {
         self.serves.get(at).copied().unwrap_or(false)
     }
     fn has_room(&self, at: usize) -> bool {
-        self.room.get(at).copied().unwrap_or(false)
+        let Some(room) = &self.room else {
+            return true;
+        };
+        room.get(at).copied().unwrap_or(false)
     }
     fn in_flight(&self, at: usize) -> u32 {
         self.in_flight.get(at).copied().unwrap_or(0)
@@ -46,13 +53,22 @@ impl Candidates for Endpoints {
     }
 }
 
-/// `count` endpoints, all serving, a few in flight to each, none ramping.
+/// `count` endpoints of an unprotected upstream, all serving, a few in flight to each, none
+/// ramping.
 fn serving(count: usize) -> Endpoints {
     Endpoints {
         serves: vec![true; count],
-        room: vec![true; count],
+        room: None,
         in_flight: (0..count).map(|at| (at % 3) as u32).collect(),
         share: vec![Share::FULL; count],
+    }
+}
+
+/// `count` endpoints of a protected upstream, as `serving`, each with room.
+fn protected(count: usize) -> Endpoints {
+    Endpoints {
+        room: Some(vec![true; count]),
+        ..serving(count)
     }
 }
 
@@ -63,18 +79,22 @@ fn one_failing() -> Endpoints {
     endpoints
 }
 
-/// Sixteen, the first drawn full.
+/// Sixteen, protected, the first drawn full.
 fn one_full() -> Endpoints {
-    let mut endpoints = serving(16);
-    endpoints.room[7] = false;
-    endpoints
+    let mut room = vec![true; 16];
+    room[7] = false;
+    Endpoints {
+        room: Some(room),
+        ..serving(16)
+    }
 }
 
-/// Sixteen, every one full: a backend refused.
+/// Sixteen, protected, every one full: a backend refused.
 fn all_full() -> Endpoints {
-    let mut endpoints = serving(16);
-    endpoints.room.fill(false);
-    endpoints
+    Endpoints {
+        room: Some(vec![false; 16]),
+        ..serving(16)
+    }
 }
 
 /// Sixteen, the first drawn in slow start at a tenth.
@@ -110,6 +130,7 @@ fn tried(positions: &[usize]) -> Tried {
 #[bench::sixteen_one_failing_drawn(one_failing(), Tried::default())]
 #[bench::sixteen_one_ramping_drawn(one_ramping(), Tried::default())]
 #[bench::sixteen_retry_two_tried(serving(16), tried(&[7, 3]))]
+#[bench::sixteen_protected(protected(16), Tried::default())]
 #[bench::sixteen_one_full_drawn(one_full(), Tried::default())]
 #[bench::sixteen_all_full(all_full(), Tried::default())]
 fn pick_p2c(endpoints: Endpoints, tried: Tried) -> (Endpoints, Option<usize>) {
@@ -125,6 +146,7 @@ fn pick_p2c(endpoints: Endpoints, tried: Tried) -> (Endpoints, Option<usize>) {
 #[bench::sixteen_one_failing_reached(one_failing(), Tried::default())]
 #[bench::sixteen_one_ramping_reached(one_ramping(), Tried::default())]
 #[bench::sixteen_retry_two_tried(serving(16), tried(&[7, 3]))]
+#[bench::sixteen_protected(protected(16), Tried::default())]
 #[bench::sixteen_one_full_reached(one_full(), Tried::default())]
 #[bench::sixteen_all_full(all_full(), Tried::default())]
 fn pick_round_robin(endpoints: Endpoints, tried: Tried) -> (Endpoints, Option<usize>) {

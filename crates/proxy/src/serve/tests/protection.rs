@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod scenarios;
+
 /// `everything_config`'s upstream `up` at `upstream`, protected to `cap` in flight.
 fn protected(upstream: SocketAddr, cap: u32) -> Compiled {
     let mut config = everything_config(upstream);
