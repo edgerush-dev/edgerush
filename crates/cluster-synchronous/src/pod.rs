@@ -6,7 +6,7 @@
 use crate::message::{Answer, Message, Outbox};
 use crate::{Rule, Store, Value};
 use edgerush_cluster::table::shard_of;
-use edgerush_cluster::{Changed, Config, Kept, Key, NodeId, Stamp, Time};
+use edgerush_cluster::{Changed, Config, Held, Kept, Key, Node, NodeId, Stamp, Time};
 use std::collections::BTreeMap;
 
 /// A request under several keys this pod gathers: who asked, and each part still to count,
@@ -38,10 +38,32 @@ struct Ask {
     receipt: u64,
 }
 
+/// A value the store may hold under a key that can hold this mode's: what the mode decides a
+/// request by, read and changed in place.
+pub trait Holds: Held {
+    /// The mode's value it holds, to change: a key new to the store is made afresh as this
+    /// mode's.
+    fn synchronous_mut(&mut self) -> &mut Value;
+}
+
+impl Holds for Value {
+    fn synchronous_mut(&mut self) -> &mut Value {
+        self
+    }
+}
+
 /// One pod of the synchronous mode in one life: its store, and the requests it decides.
 #[derive(Clone, Debug)]
 pub struct Pod {
     node: Store,
+    decider: Decider,
+}
+
+/// The mode's part of a pod, over a store it is handed each time: the requests it decides,
+/// gathers and gives back. Kept apart from the store so that one store can serve this mode
+/// beside another.
+#[derive(Clone, Debug, Default)]
+pub struct Decider {
     /// Whether it forwards a request for a shard not its own to its owner.
     forwarding: bool,
     /// Whether it decides a request it would forward from its copy, the owner unheard.
@@ -73,14 +95,7 @@ impl Pod {
     ) -> Self {
         Self {
             node: Store::new(id, address, config, peers),
-            forwarding: false,
-            forwarder_decides: false,
-            decided_from_copy: 0,
-            gathering: BTreeMap::new(),
-            parts: BTreeMap::new(),
-            giving: BTreeMap::new(),
-            next_part: 0,
-            orphaned: 0,
+            decider: Decider::default(),
         }
     }
 
@@ -95,6 +110,50 @@ impl Pod {
         &mut self.node
     }
 
+    /// As [`Decider::set_forwarding`].
+    pub const fn set_forwarding(&mut self, forwarding: bool) {
+        self.decider.set_forwarding(forwarding);
+    }
+
+    /// As [`Decider::set_forwarder_decides`].
+    pub const fn set_forwarder_decides(&mut self, decides: bool) {
+        self.decider.set_forwarder_decides(decides);
+    }
+
+    /// As [`Decider::decided_from_copy`].
+    #[must_use]
+    pub const fn decided_from_copy(&self) -> u64 {
+        self.decider.decided_from_copy()
+    }
+
+    /// As [`Decider::orphaned`].
+    #[must_use]
+    pub const fn orphaned(&self) -> u64 {
+        self.decider.orphaned()
+    }
+
+    /// The count it holds for `key`, owned or a copy: what was counted under it less what was
+    /// given back.
+    #[must_use]
+    pub fn count(&self, key: Key) -> Option<u64> {
+        self.node.value(key).map(|value| value.net())
+    }
+
+    /// Its timer at `now`: its store's, then the requests it gathers.
+    pub fn tick(&mut self, now: Time) -> Outbox {
+        let mut out = from_store(self.node.tick(now));
+        out.extend(self.decider.tick(&mut self.node, now));
+        out
+    }
+
+    /// `message` from `from` at `now`, as [`Decider::receive`] takes it.
+    pub fn receive(&mut self, from: NodeId, message: impl Into<Message>, now: Time) -> Outbox {
+        self.decider
+            .receive(&mut self.node, from, message.into(), now)
+    }
+}
+
+impl Decider {
     /// Whether it forwards a request for a shard not its own to the owner its table names, for
     /// at most one hop, rather than answer [`Answer::Elsewhere`].
     pub const fn set_forwarding(&mut self, forwarding: bool) {
@@ -122,27 +181,26 @@ impl Pod {
         self.orphaned
     }
 
-    /// The count it holds for `key`, owned or a copy: what was counted under it less what was
-    /// given back.
-    #[must_use]
-    pub fn count(&self, key: Key) -> Option<u64> {
-        self.node.value(key).map(|value| value.net())
-    }
-
-    /// Its timer at `now`: its store's, then the requests it gathers.
-    pub fn tick(&mut self, now: Time) -> Outbox {
-        let mut out = from_store(self.node.tick(now));
+    /// Its timer at `now`, over `node`, whose own timer has run: the requests it gathers.
+    pub fn tick<V: Holds>(&mut self, node: &mut Node<V>, now: Time) -> Outbox<V> {
+        let mut out = Outbox::new();
         self.parts
             .retain(|_, part| now.saturating_sub(part.at) <= PART_FOR);
-        self.gather(now, &mut out);
+        self.gather(node, now, &mut out);
         out
     }
 
-    /// `message` from `from` at `now`: a request, an answer or a request to gather taken here,
-    /// the store's by its store.
-    pub fn receive(&mut self, from: NodeId, message: impl Into<Message>, now: Time) -> Outbox {
+    /// `message` from `from` at `now`, over `node`: a request, an answer or a request to gather
+    /// taken here, the store's by the store.
+    pub fn receive<V: Holds>(
+        &mut self,
+        node: &mut Node<V>,
+        from: NodeId,
+        message: Message<V>,
+        now: Time,
+    ) -> Outbox<V> {
         let mut out = Outbox::new();
-        match message.into() {
+        match message {
             Message::Request {
                 client,
                 id,
@@ -159,7 +217,7 @@ impl Pod {
                     rule,
                     receipt,
                 };
-                self.on_request(client, id, key, stamp, hops, ask, now, &mut out);
+                self.on_request(node, client, id, key, stamp, hops, ask, now, &mut out);
                 // Answered through the pod that forwarded it, if one did.
                 if let Some(via) = via {
                     for (to, message) in &mut out {
@@ -172,8 +230,8 @@ impl Pod {
             // An answer passed on by this pod, to the client it is for; or, for this pod, a part
             // of a request it gathers.
             Message::Reply { client, id, answer } => {
-                if client == self.node.id() {
-                    self.on_part(id, &answer, now, &mut out);
+                if client == node.id() {
+                    self.on_part(node, id, &answer, now, &mut out);
                 } else {
                     out.push((client, Message::Reply { client, id, answer }));
                 }
@@ -187,9 +245,9 @@ impl Pod {
                         waiting: keys.iter().map(|key| (*key, (0, 0))).collect(),
                         counted: Vec::new(),
                     });
-                self.gather(now, &mut out);
+                self.gather(node, now, &mut out);
             }
-            Message::Store(message) => out = from_store(self.node.receive(from, message, now)),
+            Message::Store(message) => out = from_store(node.receive(from, message, now)),
         }
         out
     }
@@ -198,8 +256,9 @@ impl Pod {
         clippy::too_many_arguments,
         reason = "a request's fields, as they come"
     )]
-    fn on_request(
+    fn on_request<V: Holds>(
         &mut self,
+        node: &mut Node<V>,
         client: NodeId,
         id: u64,
         key: Key,
@@ -207,25 +266,21 @@ impl Pod {
         hops: u8,
         ask: Ask,
         now: Time,
-        out: &mut Outbox,
+        out: &mut Outbox<V>,
     ) {
-        let mut decided = self
-            .node
-            .update(key, now, |kept, wall| decide(key, kept, ask, wall));
+        let mut decided = node.update(key, now, |kept, wall| decide(key, kept, ask, wall));
         if decided.is_none() && self.forwarder_decides && self.forwarding && hops == 0 {
             // A request it would forward: decided from its copy, its owner unheard.
-            decided = self
-                .node
-                .update_copy(key, now, |kept, wall| decide(key, kept, ask, wall));
+            decided = node.update_copy(key, now, |kept, wall| decide(key, kept, ask, wall));
             self.decided_from_copy += u64::from(decided.is_some());
         }
         let answer = if let Some(answer) = decided {
             answer
         } else {
-            let shard = shard_of(key, self.node.config().shards);
-            let table = self.node.committed();
+            let shard = shard_of(key, node.config().shards);
+            let table = node.committed();
             let owner = table.and_then(|table| table.owner(shard));
-            if owner == Some(self.node.id()) {
+            if owner == Some(node.id()) {
                 Answer::NotServing
             } else if let Some(owner) = owner.filter(|_| self.forwarding && hops == 0) {
                 out.push((
@@ -236,7 +291,7 @@ impl Pod {
                         key,
                         stamp,
                         hops: hops + 1,
-                        via: Some(self.node.id()),
+                        via: Some(node.id()),
                         give_back: ask.give_back,
                         rule: ask.rule,
                         receipt: ask.receipt,
@@ -261,44 +316,28 @@ impl Pod {
         out.push((client, Message::Reply { client, id, answer }));
     }
 
-    /// Counts one under `key` with no rule, as its owner, if it serves the key: whether it did.
-    fn count_here(&mut self, key: Key, now: Time) -> bool {
-        self.node
-            .update(key, now, |kept, _| {
-                kept.value.count_one();
-                kept.forget_at = Time::MAX;
-                ((), Changed::Whole)
-            })
-            .is_some()
-    }
-
-    /// Gives one back under `key`, as its owner, if it serves the key: whether it did.
-    fn give_here(&mut self, key: Key, now: Time) -> bool {
-        self.node
-            .update(key, now, |kept, _| {
-                kept.value.give_one();
-                kept.forget_at = Time::MAX;
-                ((), Changed::Whole)
-            })
-            .is_some()
-    }
-
     /// Gives back one counted under `key` for a request it gathered and reported not counted:
     /// at once if it serves the key's shard, else asked of its owner by its table, and again
     /// every [`GIVE_BACK_AGAIN`] until answered.
-    fn give_back(&mut self, key: Key, now: Time, out: &mut Outbox) {
-        if self.give_here(key, now) {
+    fn give_back<V: Holds>(
+        &mut self,
+        node: &mut Node<V>,
+        key: Key,
+        now: Time,
+        out: &mut Outbox<V>,
+    ) {
+        if give_here(node, key, now) {
             return;
         }
         self.next_part += 1;
         self.giving.insert(self.next_part, (key, 0, 0));
-        self.give_backs(now, out);
+        self.give_backs(node, now, out);
     }
 
     /// Sends each give-back not yet answered, due: never sent, or unanswered for
     /// [`GIVE_BACK_AGAIN`], then [`GIVE_BACK_LATER`] — dropped once [`GIVE_BACK_SENDS`] have
     /// gone unanswered; one whose shard it now serves it gives back itself.
-    fn give_backs(&mut self, now: Time, out: &mut Outbox) {
+    fn give_backs<V: Holds>(&mut self, node: &mut Node<V>, now: Time, out: &mut Outbox<V>) {
         let due: Vec<(u64, Key, u8)> = self
             .giving
             .iter()
@@ -315,21 +354,21 @@ impl Pod {
                 self.giving.remove(&id);
                 continue;
             }
-            if self.give_here(key, now) {
+            if give_here(node, key, now) {
                 self.giving.remove(&id);
                 continue;
             }
-            let Some(owner) = self.owner_elsewhere(key) else {
+            let Some(owner) = owner_elsewhere(node, key) else {
                 continue;
             };
             self.giving.insert(id, (key, now.max(1), unanswered));
             out.push((
                 owner,
                 Message::Request {
-                    client: self.node.id(),
+                    client: node.id(),
                     id,
                     key,
-                    stamp: self.node.committed_stamp(),
+                    stamp: node.committed_stamp(),
                     hops: 0,
                     via: None,
                     give_back: true,
@@ -340,21 +379,12 @@ impl Pod {
         }
     }
 
-    /// The owner its table names for `key`, if another pod.
-    fn owner_elsewhere(&self, key: Key) -> Option<NodeId> {
-        let shard = shard_of(key, self.node.config().shards);
-        self.node
-            .committed()
-            .and_then(|table| table.owner(shard))
-            .filter(|owner| *owner != self.node.id())
-    }
-
     /// Advances every request it gathers: parts it serves counted at once, the others asked of
     /// their owners, again if unanswered for [`PART_AGAIN`]; each request answered once every
     /// part is counted, or reported not counted after [`GATHER_FOR`], what was counted for it
     /// given back.
-    fn gather(&mut self, now: Time, out: &mut Outbox) {
-        self.give_backs(now, out);
+    fn gather<V: Holds>(&mut self, node: &mut Node<V>, now: Time, out: &mut Outbox<V>) {
+        self.give_backs(node, now, out);
         let requests: Vec<(NodeId, u64)> = self.gathering.keys().copied().collect();
         for (client, id) in requests {
             let Some(gathering) = self.gathering.get(&(client, id)).cloned() else {
@@ -376,7 +406,7 @@ impl Pod {
                 self.gathering.remove(&(client, id));
                 self.orphaned += gathering.counted.len() as u64;
                 for key in gathering.counted {
-                    self.give_back(key, now, out);
+                    self.give_back(node, key, now, out);
                 }
                 out.push((
                     client,
@@ -389,7 +419,7 @@ impl Pod {
                 continue;
             }
             for (key, (sent, _)) in gathering.waiting {
-                if self.count_here(key, now) {
+                if count_here(node, key, now) {
                     if let Some(gathering) = self.gathering.get_mut(&(client, id)) {
                         gathering.waiting.remove(&key);
                         gathering.counted.push(key);
@@ -399,7 +429,7 @@ impl Pod {
                 if sent != 0 && now.saturating_sub(sent) < PART_AGAIN {
                     continue;
                 }
-                let Some(owner) = self.owner_elsewhere(key) else {
+                let Some(owner) = owner_elsewhere(node, key) else {
                     continue;
                 };
                 self.next_part += 1;
@@ -418,10 +448,10 @@ impl Pod {
                 out.push((
                     owner,
                     Message::Request {
-                        client: self.node.id(),
+                        client: node.id(),
                         id: part,
                         key,
-                        stamp: self.node.committed_stamp(),
+                        stamp: node.committed_stamp(),
                         hops: 1,
                         via: None,
                         give_back: false,
@@ -449,7 +479,14 @@ impl Pod {
     }
 
     /// An owner's answer to part `part` of a request it gathers, or to a give-back of its.
-    fn on_part(&mut self, part: u64, answer: &Answer, now: Time, out: &mut Outbox) {
+    fn on_part<V: Holds>(
+        &mut self,
+        node: &mut Node<V>,
+        part: u64,
+        answer: &Answer,
+        now: Time,
+        out: &mut Outbox<V>,
+    ) {
         if let Some((key, _, unanswered)) = self.giving.remove(&part) {
             // Not given back — the pod not serving, or not the owner — sent again soon, an
             // answered send taking nothing of its tries.
@@ -465,7 +502,7 @@ impl Pod {
             // The request is answered already: a part counted now is an orphan, given back.
             if matches!(answer, Answer::Counted(_)) {
                 self.orphaned += 1;
-                self.give_back(key, now, out);
+                self.give_back(node, key, now, out);
             }
             return;
         };
@@ -477,7 +514,7 @@ impl Pod {
                     gathering.counted.push(key);
                 } else {
                     self.orphaned += 1;
-                    self.give_back(key, now, out);
+                    self.give_back(node, key, now, out);
                 }
             }
             Answer::Elsewhere(table) => {
@@ -486,26 +523,54 @@ impl Pod {
                     *sent = 0;
                 }
                 if let Some(table) = table {
-                    let from = self.node.id();
+                    let from = node.id();
                     let table = edgerush_cluster::Message::TableReply {
                         table: table.clone(),
                     };
-                    out.extend(from_store(self.node.receive(from, table, now)));
+                    out.extend(from_store(node.receive(from, table, now)));
                 }
             }
             // A gathering pod asks its parts under no rule: never answered so.
             Answer::NotServing | Answer::Admitted(_) | Answer::Limited { .. } => {}
         }
-        self.gather(now, out);
+        self.gather(node, now, out);
     }
+}
+/// Counts one under `key` with no rule, as `node`, its owner, if it serves the key: whether it
+/// did.
+fn count_here<V: Holds>(node: &mut Node<V>, key: Key, now: Time) -> bool {
+    node.update(key, now, |kept, _| {
+        kept.value.synchronous_mut().count_one();
+        kept.forget_at = Time::MAX;
+        ((), Changed::Whole)
+    })
+    .is_some()
+}
+
+/// Gives one back under `key`, as `node`, its owner, if it serves the key: whether it did.
+fn give_here<V: Holds>(node: &mut Node<V>, key: Key, now: Time) -> bool {
+    node.update(key, now, |kept, _| {
+        kept.value.synchronous_mut().give_one();
+        kept.forget_at = Time::MAX;
+        ((), Changed::Whole)
+    })
+    .is_some()
+}
+
+/// The owner `node`'s table names for `key`, if another pod.
+fn owner_elsewhere<V: Held>(node: &Node<V>, key: Key) -> Option<NodeId> {
+    let shard = shard_of(key, node.config().shards);
+    node.committed()
+        .and_then(|table| table.owner(shard))
+        .filter(|owner| *owner != node.id())
 }
 
 /// A request decided by its key's owner, by the wall clock `wall`: its answer, and what it
 /// changed of the key for its next copy.
-fn decide(key: Key, kept: &mut Kept<Value>, ask: Ask, wall: Time) -> (Answer, Changed) {
+fn decide<V: Holds>(key: Key, kept: &mut Kept<V>, ask: Ask, wall: Time) -> (Answer, Changed) {
     // A give-back is counted apart, a part of the value that only rises, so that copies merge
     // by keeping the larger of each part.
-    let value = &mut kept.value;
+    let value = kept.value.synchronous_mut();
     let answer = match (ask.rule, ask.give_back) {
         (None, false) => {
             value.count_one();
@@ -529,7 +594,7 @@ fn decide(key: Key, kept: &mut Kept<Value>, ask: Ask, wall: Time) -> (Answer, Ch
     };
     // Forgettable from when its rule says; under none, never.
     kept.forget_at = ask.rule.map_or(Time::MAX, |rule| {
-        kept.forget_at.max(rule.forget_at(key, &kept.value))
+        kept.forget_at.max(rule.forget_at(key, value))
     });
     // A refusal charges nothing: no change for a replica, which a saturated rolling window
     // would otherwise be sent whole of with every refusal. Of a rolling window, the slot
@@ -550,7 +615,7 @@ fn decide(key: Key, kept: &mut Kept<Value>, ask: Ask, wall: Time) -> (Answer, Ch
 }
 
 /// The store's messages, as this mode's.
-fn from_store(out: edgerush_cluster::Outbox<Value>) -> Outbox {
+fn from_store<V>(out: edgerush_cluster::Outbox<V>) -> Outbox<V> {
     out.into_iter()
         .map(|(to, message)| (to, Message::Store(message)))
         .collect()
@@ -712,7 +777,7 @@ mod tests {
         }
         assert_eq!(sends, [62, 162, 1_162]);
         assert_eq!(sends.len(), usize::from(GIVE_BACK_SENDS));
-        assert!(node.giving.is_empty(), "{:?}", node.giving);
+        assert!(node.decider.giving.is_empty(), "{:?}", node.decider.giving);
     }
 
     /// A pod gathering a request under keys of pods 2 and 3 asks a part again after
@@ -858,20 +923,24 @@ mod tests {
             heard(&mut node, &[2, 3], now);
             let _ = node.tick(now);
             if at == 100 {
-                kept_at_5_s = node.parts.len();
+                kept_at_5_s = node.decider.parts.len();
             }
         }
         assert_eq!(
             kept_at_5_s, 1,
             "a part counted late could not be given back"
         );
-        assert!(node.parts.is_empty(), "{:?} kept past PART_FOR", node.parts);
+        assert!(
+            node.decider.parts.is_empty(),
+            "{:?} kept past PART_FOR",
+            node.decider.parts
+        );
         // Pod 2 cut off: heard no more, and the table leaves it out, a new pod having taken its
         // vote, so that it is forgotten; its answer, only late, comes 2 s on.
         let start = ms(10_600);
         let part = gather(&mut node, 2, start);
         let _ = node.tick(start + ms(20));
-        assert_eq!(node.parts.len(), 1);
+        assert_eq!(node.decider.parts.len(), 1);
         let survivors = [1, 3, 4].into_iter().collect();
         let joining = [(4, "pod-4:7000".to_owned())].into();
         let mut without = table::repair(&first, &survivors, &survivors, &joining, 2)

@@ -13,14 +13,14 @@ pub mod pod;
 pub mod value;
 
 pub use message::{Answer, Message, Outbox};
-pub use pod::Pod;
+pub use pod::{Decider, Holds, Pod};
 pub use value::{MOST_SLOTS, Rule, Value};
 
 /// The store as this mode keeps it.
 pub type Store = edgerush_cluster::Node<Value>;
 
-impl From<edgerush_cluster::Message<Value>> for Message {
-    fn from(message: edgerush_cluster::Message<Value>) -> Self {
+impl<V> From<edgerush_cluster::Message<V>> for Message<V> {
+    fn from(message: edgerush_cluster::Message<V>) -> Self {
         Self::Store(message)
     }
 }
