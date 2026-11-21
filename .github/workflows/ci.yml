@@ -107,7 +107,7 @@ jobs:
           fuzz=$(ours fuzz/Cargo.toml) && [ -n "$fuzz" ]
           du -sh target fuzz/target
           cargo clean $workspace
-          cargo clean --target-dir target/loom $workspace
+          cargo clean --release --target-dir target/loom $workspace
           cargo clean --manifest-path fuzz/Cargo.toml $fuzz
           rm -rf target/doc
           du -sh target fuzz/target
