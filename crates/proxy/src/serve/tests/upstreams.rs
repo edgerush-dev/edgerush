@@ -499,8 +499,15 @@ pub(super) async fn statuses_upstream(
 /// `endless` with a body that never ends, `short` with a body that stops part way, and
 /// anything else not at all, its connection held open in what is returned.
 pub(super) async fn scripted_upstream() -> (SocketAddr, Rc<RefCell<Vec<TcpStream>>>) {
+    scripted_upstream_on(TcpListener::bind("127.0.0.1:0").await.unwrap())
+}
+
+/// `scripted_upstream`, on a listener of the test's own: for an address other than
+/// `127.0.0.1`, or a port shared with another address.
+pub(super) fn scripted_upstream_on(
+    backend: TcpListener,
+) -> (SocketAddr, Rc<RefCell<Vec<TcpStream>>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = backend.local_addr().unwrap();
     let held = Rc::new(RefCell::new(Vec::new()));
     let holding = Rc::clone(&held);
