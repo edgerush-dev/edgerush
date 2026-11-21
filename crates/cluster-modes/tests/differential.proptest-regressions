@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc e4d1274c340da882e07269fa770be327f3ee029b2583b48b71d62f48945f185a # shrinks to reported = [Reported { key: 0, plane: 0, hits: 0, after: 0 }]
