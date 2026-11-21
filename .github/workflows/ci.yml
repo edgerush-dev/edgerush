@@ -59,6 +59,22 @@ jobs:
             cargo install --locked cargo-deny@0.20.2
           fi
 
+      # The test runner check.sh runs the tests with: the same version, as nextest releases it
+      # built, checked against the SHA-256 published beside it. Seconds, where building it took
+      # three minutes, and nothing for the cache to carry: an entry is found only by the paths
+      # it was saved with, and one more would leave every entry saved before it unread.
+      - name: cargo-nextest
+        env:
+          VERSION: 0.9.152
+          SHA256: d039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a
+        run: |
+          archive="cargo-nextest-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$VERSION/$archive"
+          echo "$SHA256  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C ~/.cargo/bin cargo-nextest
+          cargo nextest --version
+
       - name: Checks
         run: ./check.sh
 

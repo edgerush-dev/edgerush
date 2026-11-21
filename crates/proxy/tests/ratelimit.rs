@@ -61,13 +61,17 @@ async fn upstream() -> SocketAddr {
     address
 }
 
-/// A naming file of the scratch directory's, apart from every other test's.
+/// A naming file of the scratch directory's, apart from every other test's, and empty: the
+/// directory is named by the process's ID, which an earlier process may have had and left a
+/// naming under, and `Forming` would take that naming up as its own.
 fn naming_file() -> std::path::PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let directory =
         std::env::temp_dir().join(format!("edgerush-ratelimit-test-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
-    directory.join(NEXT.fetch_add(1, Ordering::Relaxed).to_string())
+    let file = directory.join(NEXT.fetch_add(1, Ordering::Relaxed).to_string());
+    let _ = std::fs::remove_file(&file);
+    file
 }
 
 /// Three pods of the store, asynchronous, formed as the bench's example program forms them,
