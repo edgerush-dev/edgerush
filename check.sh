@@ -92,6 +92,26 @@ say "loom"
 RUSTFLAGS="${RUSTFLAGS:-} --cfg loom" cargo test --release -p edgerush-ratelimit \
     -p edgerush-protection --lib --target-dir "${CARGO_TARGET_DIR:-target}/loom" loom
 
+say "a request's future, made in its slot"
+# A request's future is made in its slot only while its head comes first in it, and the
+# order is rustc's choice: as little as 16 bytes more in the future it awaits has had all
+# 6 KB of it made beside the slot and copied in, some 600 more instructions an HTTP/1
+# request, with every test passing (docs 14 §3). So the layout the binary is built with is
+# read, as rustc's -Zprint-type-sizes prints it. Only a nightly compiler prints it, and
+# RUSTC_BOOTSTRAP lets the pinned one, in a target directory of its own, as it rebuilds
+# every crate; rustc prints only what it compiles, so the binary's own crate is built
+# afresh each time. A debug build lays the future out as release does. Linux alone: the
+# layout is the target's, and Windows' types are of other sizes.
+if [ "$(uname -s)" = Linux ]; then
+    layout="${CARGO_TARGET_DIR:-target}/layout"
+    cargo clean -q -p edgerush --target-dir "$layout"
+    RUSTC_BOOTSTRAP=1 cargo rustc -q -p edgerush --bin edgerush --target-dir "$layout" \
+        -- -Zprint-type-sizes \
+        | python3 bench/layout.py \
+            '{async fn body of edgerush_proxy::serve::respond::<impl edgerush_proxy::Worker>::handle_head<edgerush_proxy::raw::RawHead>()}' \
+            .head
+fi
+
 say "docs"
 # Rustdoc's warnings are not failures by default, and a stale link is exactly the kind of
 # thing nobody reads a log to find.

@@ -3,8 +3,8 @@
 
 use super::logged::{Logging, logged};
 use super::{
-    Body, Called, Connection, Directed, Directing, Handshake, Looking, Mirrored, Others, Proxy,
-    Queued, Redirect, Snapshot, TUNNEL_IDLE, Timed, Timing, Toward, Worker, at_endpoint,
+    Body, Called, Connection, Directed, Directing, Handshake, Looking, Mirrored, Others, Pending,
+    Proxy, Queued, Redirect, Snapshot, TUNNEL_IDLE, Timed, Timing, Toward, Worker, at_endpoint,
     balance_of,
 };
 use crate::balance::Tried;
@@ -575,15 +575,19 @@ impl Worker {
         // and what its copies' looks chose is taken once it has its endpoint; what its own
         // look chose is taken now (25 §5). Only a request under a rate limit, or one that
         // queued, looked.
-        let queued = directed.queued.take();
-        let waited = queued.is_some();
-        if let Some(queued) = queued
-            && let Err(answer) =
-                Box::pin(self.wait_in_line(&mut directed, &mut head, *queued, timing.deadline))
-                    .await
-        {
-            return self.proxy.answer_to(listener, answer, call).into();
-        }
+        // The line is held only for the wait: a local moved out of stays in the future to
+        // the end of its scope, and kept across the waits after this one, it would be
+        // in every request's future (14 §3).
+        let waited = match directed.take_line() {
+            Some(queued) => {
+                let waiting = self.wait_in_line(&mut directed, &mut head, *queued, timing.deadline);
+                if let Err(answer) = Box::pin(waiting).await {
+                    return self.proxy.answer_to(listener, answer, call).into();
+                }
+                true
+            }
+            None => false,
+        };
         if (directed.limited != 0 || waited)
             && let Err(answer) = self.proxy.aim(&mut directed, &mut head)
         {
@@ -1216,8 +1220,7 @@ impl Proxy {
             upstream: balance,
             endpoint: Arc::clone(identity),
             counted,
-            looked,
-            queued,
+            pending: queued.map(Pending::Line).or(looked.map(Pending::Look)),
             others,
             mirrors,
             websocket,
@@ -1260,7 +1263,7 @@ impl Proxy {
         directed: &mut Directed,
         head: &mut H,
     ) -> Result<(), Answer> {
-        if let Some(looking) = directed.looked.take() {
+        if let Some(looking) = directed.take_look() {
             let Some((moved, counted)) =
                 self.taken(&directed.upstream, looking, &directed.endpoint)
             else {
