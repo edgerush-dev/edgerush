@@ -4,11 +4,12 @@
 use crate::{Rule, Value};
 use edgerush_cluster::{Key, NodeId, Stamp, Table, Time};
 
-/// One message between pods, or between a client and a pod.
+/// One message between pods, or between a client and a pod, the store's values `V`: the
+/// mode's own, or those of a store holding this mode's beside another's.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Message {
+pub enum Message<V = Value> {
     /// The store's: membership, tables, copies and handoffs; to a client, a table.
-    Store(edgerush_cluster::Message<Value>),
+    Store(edgerush_cluster::Message<V>),
     /// A client's request under `key`: count one.
     Request {
         /// The client, to be answered whoever answers.
@@ -72,4 +73,4 @@ pub enum Answer {
 }
 
 /// What a pod gives back to be sent: each message with whom it is for.
-pub type Outbox = Vec<(NodeId, Message)>;
+pub type Outbox<V = Value> = Vec<(NodeId, Message<V>)>;
