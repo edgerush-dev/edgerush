@@ -14,9 +14,9 @@ use crate::route::{
 use crate::{
     AccessLog, Backend, Certificate, ClientValidation, Config, DnsName, DnsNameError, Endpoints,
     Forwarding, HealthCheck, Http3, Keepalive, KubernetesService, Listener, ListenerProxyProtocol,
-    LoadBalancer, Probe, Protocol, ProxyProtocolVersion, RateLimitMode, RequestId, Rule,
-    ServiceName, ServiceNameError, SharingListener, SlowStart, UpstreamProtocol, VerifiedName,
-    WellKnownAuthorities,
+    LoadBalancer, Probe, ProtectionQueue, Protocol, ProxyProtocolVersion, RateLimitMode, RequestId,
+    Rule, ServiceName, ServiceNameError, SharingListener, SlowStart, UpstreamProtocol,
+    VerifiedName, WellKnownAuthorities,
 };
 use edgerush_filters::forwarding::{ForwardingError, HeaderNames, TrustedProxies};
 use edgerush_filters::{
@@ -1032,16 +1032,19 @@ pub struct CompiledUpstream {
 }
 
 /// An upstream's backend protection ([25](../../../docs/25-backend-protection.md)): the
-/// bound, and what its endpoints' counts are filed under.
+/// bound, its queue, and what its endpoints' counts and its queue are filed under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledProtection {
     /// Requests in flight to one endpoint, every worker's together.
     pub max_in_flight: NonZeroU32,
-    /// Whose endpoints they are.
+    /// Where a request waits while every endpoint is full, if anywhere.
+    pub queue: Option<ProtectionQueue>,
+    /// Whose endpoints they are: whose counts they share, and whose queue.
     pub pods_of: PodsOf,
 }
 
-/// Whose pods an upstream's endpoints are, and so which counts they share (25 §3).
+/// Whose pods an upstream's endpoints are, and so which counts they share, and which queue
+/// (25 §3, §5).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PodsOf {
     /// A Kubernetes Service's: every upstream of its ports shares a pod's count, a pod
@@ -1290,6 +1293,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             proxy_protocol: upstream.proxy_protocol,
             protection: upstream.protection.map(|protection| CompiledProtection {
                 max_in_flight: protection.max_in_flight,
+                queue: protection.queue,
                 pods_of: match &upstream.endpoints {
                     Endpoints::Kubernetes(service) => match KubernetesService::parse(service) {
                         Ok(found) => PodsOf::Service {
@@ -5392,12 +5396,13 @@ upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
     }
 
     /// Protection counts requests: an HTTP route's upstream takes it, a TCP or TLS route's
-    /// refuses it, and a stated bound is at least one. A Kubernetes upstream's pods are
-    /// filed under its Service, any other's under its own name (25 §3).
+    /// refuses it, and a stated bound is at least one, a queue's too. A Kubernetes
+    /// upstream's pods, and its queue, are filed under its Service, any other's under its
+    /// own name (25 §3, §5).
     #[test]
     fn protection_is_for_http_routes_and_files_pods_by_whose_they_are() {
         let upstreams = "upstreams:
-  listed: { load_balancer: p2c, endpoints: { listed: [\"127.0.0.1:81\"] }, protection: { max_in_flight: 20 } }
+  listed: { load_balancer: p2c, endpoints: { listed: [\"127.0.0.1:81\"] }, protection: { max_in_flight: 20, queue: { size: 100, timeout_ms: 2000 } } }
   found: { load_balancer: p2c, endpoints: { kubernetes: \"search.shop.svc.cluster.local:http\" }, protection: { max_in_flight: 3 } }
   plain: { load_balancer: p2c, endpoints: { listed: [] } }
 ";
@@ -5422,6 +5427,10 @@ routes:
             protection("listed"),
             Some(CompiledProtection {
                 max_in_flight: NonZeroU32::new(20).unwrap(),
+                queue: Some(ProtectionQueue {
+                    size: NonZeroU32::new(100).unwrap(),
+                    timeout_ms: std::num::NonZeroU64::new(2000).unwrap(),
+                }),
                 pods_of: PodsOf::Upstream("listed".to_owned()),
             })
         );
@@ -5429,6 +5438,7 @@ routes:
             protection("found"),
             Some(CompiledProtection {
                 max_in_flight: NonZeroU32::new(3).unwrap(),
+                queue: None,
                 pods_of: PodsOf::Service {
                     namespace: "shop".to_owned(),
                     service: "search".to_owned(),
@@ -5474,6 +5484,19 @@ routes: []
 upstreams: { up: { load_balancer: p2c, endpoints: { listed: [] }, protection: { max_in_flight: 0 } } }
 ";
         assert!(serde_saphyr::from_str::<Config>(zero).is_err());
+        for queue in [
+            "{ size: 0, timeout_ms: 1 }",
+            "{ size: 1, timeout_ms: 0 }",
+            "{ size: 1 }",
+        ] {
+            let yaml = format!(
+                "listeners: {{}}
+routes: []
+upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, protection: {{ max_in_flight: 1, queue: {queue} }} }} }}
+"
+            );
+            assert!(serde_saphyr::from_str::<Config>(&yaml).is_err(), "{queue}");
+        }
     }
 
     /// A route goes only to listeners of its kind, a `tcp` listener has exactly one, a

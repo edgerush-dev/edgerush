@@ -823,8 +823,9 @@ struct Snapshot {
     /// By position of the upstream: its protection, if it has one, its endpoints' counts
     /// every worker shares (25 §3).
     protected: Vec<Option<Arc<balancing::Protected>>>,
-    /// Every pod's count still held, for the next snapshot to find again (25 §3).
-    pods: edgerush_protection::Pods<crate::upstream::protected::PodKey>,
+    /// Every pod's count and backend's queue still held, for the next snapshot to find
+    /// again (25 §3, §7).
+    pods: crate::upstream::protected::Backends,
     /// By position of the rate limit: the slot of its counters.
     limit_slots: Arc<[usize]>,
     /// By position of the upstream: what became of it at this reload, worked out once for
@@ -921,6 +922,10 @@ struct Directed {
     /// For a request to a protected upstream that its rate limits may yet refuse, the
     /// endpoint a look chose, taken once they admit it (25 §5).
     looked: Option<Looking>,
+    /// For a request that found every endpoint of its protected upstream full, or others
+    /// waiting for one, its backend's queue, which it waits in once its rate limits admit
+    /// it (25 §5). Boxed: only such a request has it.
+    queued: Option<Box<Queued>>,
     /// Every endpoint of the upstream, for a request its rule may send again. Boxed: only
     /// such a request has it.
     others: Option<Box<Others>>,
@@ -1027,6 +1032,17 @@ struct Looking {
     generation: u64,
     upstream: usize,
     at: usize,
+}
+
+/// The queue a request waits in for an endpoint of the upstream at `upstream` of the
+/// snapshot numbered `generation`, under what its upstream's protection said then (25 §5,
+/// §7). Called, it picks on whichever snapshot is current by then: the same upstream's,
+/// found again by its name after a reload.
+struct Queued {
+    line: Arc<edgerush_protection::Queue>,
+    terms: balancing::Terms,
+    generation: u64,
+    upstream: usize,
 }
 
 /// Where one copy of a request goes: drawn with the request, from the same snapshot.

@@ -9,13 +9,17 @@
 //!
 //! **A pod is whose it is.** A Kubernetes Service's pods are counted by address alone,
 //! every upstream of the Service's ports sharing a pod's count; any other endpoint by its
-//! address and port, its upstream's own (25 §3).
+//! address and port, its upstream's own (25 §3). So is a queue: one for a Service, every
+//! upstream of its ports waiting in it, and one for any other upstream (25 §5). Every
+//! protected upstream has its backend's queue, asked for or not: a slot given back calls
+//! the next in it, whatever config the slot was taken under.
 
-use edgerush_config::{Compiled, PodsOf};
-use edgerush_protection::{PodCount, Pods};
+use edgerush_config::{Compiled, PodsOf, ProtectionQueue};
+use edgerush_protection::{PodCount, Pods, Queue};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// What a pod's count is filed under.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -46,25 +50,51 @@ impl PodKey {
     }
 }
 
-/// A protected upstream in one config: its bound, and by position of the endpoint each
-/// one's count.
+/// A protected upstream in one config: its bound, by position of the endpoint each one's
+/// count, and its backend's queue.
 #[derive(Debug)]
 pub struct Protected {
     /// Requests in flight to one endpoint, every worker's together.
     pub cap: NonZeroU32,
     /// By position of the endpoint, as the config's endpoints are.
     pub counts: Box<[Arc<PodCount>]>,
+    /// Its backend's line, which its endpoints' slots call the next of as they are given
+    /// back.
+    pub line: Arc<Queue>,
+    /// What a request may wait in the line for, if it may.
+    pub queue: Option<Terms>,
 }
 
+/// What a request may wait in its backend's line for (25 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Terms {
+    /// How many may wait at once.
+    pub size: NonZeroU32,
+    /// How long one may.
+    pub timeout: Duration,
+}
+
+impl From<ProtectionQueue> for Terms {
+    fn from(queue: ProtectionQueue) -> Self {
+        Self {
+            size: queue.size,
+            timeout: Duration::from_millis(queue.timeout_ms.get()),
+        }
+    }
+}
+
+/// Every pod's count and every backend's queue still held.
+pub type Backends = Pods<PodsOf, PodKey>;
+
 /// By position of the upstream of `config`, whose endpoints are `endpoints`, its
-/// protection if it has one; and every pod's count, found again from what the config
-/// before had (`previous`).
+/// protection if it has one; and every pod's count and backend's queue, found again from
+/// what the config before had (`previous`).
 #[must_use]
 pub fn protected(
     config: &Compiled,
     endpoints: &[Vec<SocketAddr>],
-    previous: Option<&Pods<PodKey>>,
-) -> (Pods<PodKey>, Vec<Option<Arc<Protected>>>) {
+    previous: Option<&Backends>,
+) -> (Backends, Vec<Option<Arc<Protected>>>) {
     let mut pods = Pods::after(previous);
     let protected = config
         .upstreams()
@@ -76,11 +106,18 @@ pub fn protected(
                 .get(position)
                 .into_iter()
                 .flatten()
-                .map(|&address| pods.count(PodKey::of(&protection.pods_of, address)))
+                .map(|&address| {
+                    pods.count(
+                        &protection.pods_of,
+                        PodKey::of(&protection.pods_of, address),
+                    )
+                })
                 .collect();
             Some(Arc::new(Protected {
                 cap: protection.max_in_flight,
                 counts,
+                line: pods.queue(&protection.pods_of),
+                queue: protection.queue.map(Terms::from),
             }))
         })
         .collect();
@@ -140,6 +177,9 @@ mod tests {
             "not the Service's"
         );
         assert_eq!(pods.len(), 3);
+        let line = |at: usize| &protected[at].as_ref().unwrap().line;
+        assert!(Arc::ptr_eq(line(0), line(1)), "one line for the Service");
+        assert!(!Arc::ptr_eq(line(0), line(2)), "the listed upstream's own");
     }
 
     #[test]

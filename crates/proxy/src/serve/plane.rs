@@ -680,6 +680,18 @@ impl Proxy {
         self.reload_with(config, &Changes::default()).map(|_| ())
     }
 
+    /// Puts `snapshot` in force, and calls every request waiting in a protected backend's
+    /// queue to pick again on it: a new config may make room with no slot given back — a
+    /// cap raised, a pod added — and the line hears of room only from a slot given back
+    /// otherwise (25 §7).
+    fn install(&self, snapshot: Snapshot) {
+        let snapshot = Arc::new(snapshot);
+        self.current.store(Arc::clone(&snapshot));
+        for protected in snapshot.protected.iter().flatten() {
+            protected.line.call_all();
+        }
+    }
+
     /// Runs `config` from now on, as [`Proxy::reload`] does, with the listeners' sockets
     /// changed as `changes` says: each listener opened takes the first slot that is free,
     /// its counters at zero and its access log with it; each closed drains in its slot,
@@ -805,7 +817,7 @@ impl Proxy {
         }
         let namespaces = namespaces_of(&snapshot.config);
         let names = names_of(&snapshot.config);
-        self.current.store(Arc::new(snapshot));
+        self.install(snapshot);
         // Followed and resolved from now on, and those it no longer names forgotten.
         self.namespaces.send_if_modified(|followed| {
             let changed = *followed != namespaces;
@@ -890,7 +902,7 @@ impl Proxy {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         retiring.retire();
-        self.current.store(Arc::new(snapshot));
+        self.install(snapshot);
         drop(rate_limits);
         tell(told.as_ref(), refusals);
         Ok(true)
@@ -964,7 +976,7 @@ impl Proxy {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         retiring.retire();
-        self.current.store(Arc::new(snapshot));
+        self.install(snapshot);
         drop(rate_limits);
         tell(told.as_ref(), refusals);
         Ok(true)
@@ -1035,7 +1047,7 @@ impl Proxy {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             retiring.retire();
-            self.current.store(Arc::new(snapshot));
+            self.install(snapshot);
             drop(rate_limits);
             tell(told.as_ref(), refusals);
         }

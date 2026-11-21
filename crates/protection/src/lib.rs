@@ -3,9 +3,11 @@
 //!
 //! A pure crate: it counts and does nothing else — no sockets, clocks or async runtime.
 //! [`PodCount`] is one pod's requests in flight from this data plane, shared by its
-//! workers, and [`Slot`] one request's place in it, given back when dropped. [`Pods`] finds
-//! each pod's count again in the next config, so that a reload never starts a pod at zero
-//! beside the requests it still has.
+//! workers, and [`Slot`] one request's place in it, given back when dropped. [`Queue`] is
+//! the line of requests waiting for a slot in any pod of a full backend, called in turn as
+//! slots are given back. [`Pods`] finds each pod's count, and each backend's queue, again
+//! in the next config, so that a reload never starts a pod at zero beside the requests it
+//! still has, nor a line afresh beside the requests waiting in it.
 //!
 //! The data plane's own count of an endpoint's exchanges, which its balancer compares, is
 //! each worker's alone, so that no request writes where another core writes
@@ -13,7 +15,10 @@
 //! two atomic writes a request, taking and giving back — only on an upstream that is
 //! protected (25 §8).
 
+mod queue;
 mod sync;
+
+pub use queue::{InLine, Queue};
 
 #[cfg(not(loom))]
 mod pods;
@@ -27,17 +32,27 @@ use std::num::NonZeroU32;
 use sync::{Arc, AtomicU32, Ordering};
 
 /// One backend pod's requests in flight from this data plane, every worker's together
-/// (25 §3).
-#[derive(Debug, Default)]
+/// (25 §3), and its backend's queue, which a slot given back calls the next of (25 §5).
+#[derive(Debug)]
 pub struct PodCount {
     in_flight: AtomicU32,
+    queue: Arc<Queue>,
 }
 
 impl PodCount {
-    /// A pod with nothing in flight.
+    /// A pod with nothing in flight, of a backend of its own.
     #[must_use]
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Self::of(&Queue::new())
+    }
+
+    /// A pod with nothing in flight, of the backend whose queue is `queue`.
+    #[must_use]
+    pub fn of(queue: &Arc<Queue>) -> Arc<Self> {
+        Arc::new(Self {
+            in_flight: AtomicU32::new(0),
+            queue: Arc::clone(queue),
+        })
     }
 
     /// A slot in `count`, if its pod has fewer than `cap` in flight; none if it is full.
@@ -46,8 +61,9 @@ impl PodCount {
     /// passes its cap. A full pod is found by reading its count, with nothing written, so
     /// the requests that find it full do not write where the requests it serves do; one
     /// below its cap is taken by compare-and-swap, tried again with the count another
-    /// worker left. Relaxed throughout: the count orders nothing but itself, and every
-    /// change to one atomic is seen in one order by every thread.
+    /// worker left. Relaxed: the count orders nothing but itself, and every change to one
+    /// atomic is seen in one order by every thread; a request in a backend's queue fences
+    /// before it looks ([`Queue::join`]).
     #[must_use]
     pub fn take(count: &Arc<Self>, cap: NonZeroU32) -> Option<Slot> {
         let mut seen = count.in_flight.load(Ordering::Relaxed);
@@ -76,14 +92,18 @@ impl PodCount {
 
 /// One request's place in a pod's count, from the pick that took it until it is dropped:
 /// with the exchange's end, or at once if the request never reached the pod (25 §6).
+/// Given back, it calls the next request in its backend's queue, if any waits (25 §5).
 #[derive(Debug)]
 pub struct Slot(Arc<PodCount>);
 
 impl Drop for Slot {
     fn drop(&mut self) {
         // Only a slot taken adds to the count, and each is given back once: never below
-        // zero.
-        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+        // zero. `SeqCst`, with the read of whether anyone waits after it, so that a request
+        // joining the queue as this is given back is either read as waiting or sees the
+        // room (`Queue::release` says why). The same instruction as a relaxed one on x86.
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.0.queue.release();
     }
 }
 

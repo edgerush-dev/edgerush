@@ -38,10 +38,10 @@ pub use compile::{
 pub use config::{
     AccessLog, Certificate, ClientValidation, Config, DataPlane, Endpoints, Forwarding,
     HealthCheck, Http3, Keepalive, Listener, ListenerCertificate, ListenerProxyProtocol,
-    LoadBalancer, Probe, Protection, Protocol, ProxyProtocolVersion, RateLimitBreaker,
-    RateLimitMode, RateLimitService, RateLimitServiceTls, RateLimitSynchronous, RateLimiting,
-    RequestId, SharingHostname, SharingListener, SlowStart, StatedNames, Tls, Upstream,
-    UpstreamProtocol, UpstreamTls, VerifiedName, WellKnownAuthorities, WhenUnreachable,
+    LoadBalancer, Probe, Protection, ProtectionQueue, Protocol, ProxyProtocolVersion,
+    RateLimitBreaker, RateLimitMode, RateLimitService, RateLimitServiceTls, RateLimitSynchronous,
+    RateLimiting, RequestId, SharingHostname, SharingListener, SlowStart, StatedNames, Tls,
+    Upstream, UpstreamProtocol, UpstreamTls, VerifiedName, WellKnownAuthorities, WhenUnreachable,
 };
 pub use dns::{DnsName, DnsNameError};
 pub use harness_file::{CertificateFiles, HarnessFile};

@@ -420,6 +420,11 @@ pub(crate) enum Answer {
     /// The endpoint picked has as many requests in flight as its upstream's protection
     /// allows ([25 §5](../../docs/25-backend-protection.md)).
     BackendFull,
+    /// Every endpoint was full, and as many requests waited in the backend's queue as it
+    /// holds (25 §5).
+    BackendQueueFull,
+    /// The request waited in its backend's queue as long as it may (25 §5).
+    BackendQueueTimedOut,
     /// No connection to the endpoint could be opened: refused, reset or out of time while
     /// connecting, or a TLS handshake that failed. Nothing of the request was sent
     /// ([03 §6](../../docs/03-data-plane.md)).
@@ -486,7 +491,7 @@ pub(crate) enum Answer {
 }
 
 impl Answer {
-    const ALL: [Self; 31] = [
+    const ALL: [Self; 33] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -496,6 +501,8 @@ impl Answer {
         Self::InvalidBackend,
         Self::NoEndpoints,
         Self::BackendFull,
+        Self::BackendQueueFull,
+        Self::BackendQueueTimedOut,
         Self::Unreachable,
         Self::UpstreamFailed,
         Self::UpstreamTimedOut,
@@ -534,6 +541,8 @@ impl Answer {
             }
             Self::NoEndpoints
             | Self::BackendFull
+            | Self::BackendQueueFull
+            | Self::BackendQueueTimedOut
             | Self::TooBusy
             | Self::OverShare
             | Self::Exhausted
@@ -567,6 +576,8 @@ impl Answer {
             Self::InvalidBackend => "invalid_backend",
             Self::NoEndpoints => "no_endpoints",
             Self::BackendFull => "backend_full",
+            Self::BackendQueueFull => "backend_queue_full",
+            Self::BackendQueueTimedOut => "backend_queue_timeout",
             Self::Unreachable => "upstream_unreachable",
             Self::UpstreamFailed => "upstream_failed",
             Self::UpstreamTimedOut => "upstream_timed_out",
@@ -614,7 +625,7 @@ impl Answer {
             Self::NoBackend | Self::InvalidBackend | Self::NoEndpoints => {
                 (Code::Unavailable, "no upstream can serve the call")
             }
-            Self::BackendFull => (
+            Self::BackendFull | Self::BackendQueueFull | Self::BackendQueueTimedOut => (
                 Code::Unavailable,
                 "the backend has as many calls in flight as it takes",
             ),
@@ -693,7 +704,7 @@ pub(crate) struct ListenerCounters {
     pub(crate) accept_errors: Counter,
     paused: [Counter; AcceptPause::ALL.len()],
     responses: [Counter; 5],
-    answers: [Counter; Answer::ALL.len()],
+    answers: Answers,
     /// Connections the gateway closed with requests under way, by why.
     closed: [Counter; Cut::ALL.len()],
     /// Heads refused before the core had a request, by the reasons of
@@ -714,7 +725,7 @@ impl ListenerCounters {
         let arrays = [
             &self.paused[..],
             &self.responses[..],
-            &self.answers[..],
+            &self.answers.0[..],
             &self.closed[..],
             &self.refusals[..],
             &self.grpc[..],
@@ -819,9 +830,20 @@ impl ListenerCounters {
     /// The response is one of the data plane's own.
     pub(crate) fn answered(&self, answer: Answer) {
         let position = Answer::ALL.iter().position(|other| *other == answer);
-        if let Some(counter) = position.and_then(|position| self.answers.get(position)) {
+        if let Some(counter) = position.and_then(|position| self.answers.0.get(position)) {
             counter.inc();
         }
+    }
+}
+
+/// A listener's answers of its own, one count for each [`Answer`]: more than the 32 an
+/// array is `Default` for.
+#[derive(Debug)]
+struct Answers([Counter; Answer::ALL.len()]);
+
+impl Default for Answers {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| Counter::default()))
     }
 }
 
@@ -865,6 +887,15 @@ pub(crate) struct UpstreamCounters {
     /// Requests a protected upstream refused because every endpoint they could go to was
     /// full: `backend_full` (25 §8).
     pub(crate) full: Counter,
+    /// The same, its queue full too: `backend_queue_full`.
+    pub(crate) queue_full: Counter,
+    /// Requests that waited in its queue as long as they may: `backend_queue_timeout`.
+    pub(crate) queue_timeout: Counter,
+    /// Requests that joined its queue.
+    pub(crate) queued: Counter,
+    /// How long requests waited in its queue, in nanoseconds: those that left it with a
+    /// slot or out of time, not those whose clients went.
+    pub(crate) queue_wait: Histogram<14>,
     /// Picks on a protected upstream that found an endpoint full and went to another.
     pub(crate) passed_over: Counter,
     /// Endpoints set aside because a try could not connect to them (03 §6), counted by the
@@ -879,6 +910,12 @@ impl UpstreamCounters {
         if let Some(class) = self.responses.get(class_of(status)) {
             class.inc();
         }
+    }
+
+    /// A request left the upstream's queue after `nanoseconds`, for an endpoint or out of
+    /// time (25 §8).
+    pub(crate) fn waited(&self, nanoseconds: u64) {
+        self.queue_wait.observe(&HEAD_TIME_BOUNDS, nanoseconds);
     }
 }
 
@@ -1176,14 +1213,62 @@ impl Metrics {
         }
         let name = "edgerush_upstream_protection_refused_total";
         let help = "Requests answered 503 by the upstream's protection, by why: every \
-                    endpoint they could go to was full.";
+                    endpoint they could go to was full, and its queue too or it has none; or \
+                    they waited in its queue as long as they may.";
         scrape.family(name, Kind::Counter, help);
         for (upstream, slot, _) in &shown {
             let Some(series) = series(*slot) else {
                 continue;
             };
-            let labels = [("upstream", *upstream), ("reason", "backend_full")];
-            scrape.sample(name, &labels, series.sum(|shard| shard.full.get()));
+            let reasons = [
+                ("backend_full", series.sum(|shard| shard.full.get())),
+                (
+                    "backend_queue_full",
+                    series.sum(|shard| shard.queue_full.get()),
+                ),
+                (
+                    "backend_queue_timeout",
+                    series.sum(|shard| shard.queue_timeout.get()),
+                ),
+            ];
+            for (reason, count) in reasons {
+                let labels = [("upstream", *upstream), ("reason", reason)];
+                scrape.sample(name, &labels, count);
+            }
+        }
+        let name = "edgerush_upstream_protection_queued_total";
+        let help = "Requests that found every endpoint of the upstream full and waited in \
+                    its queue.";
+        scrape.family(name, Kind::Counter, help);
+        for (upstream, slot, _) in &shown {
+            let Some(series) = series(*slot) else {
+                continue;
+            };
+            let labels = [("upstream", *upstream)];
+            scrape.sample(name, &labels, series.sum(|shard| shard.queued.get()));
+        }
+        let name = "edgerush_upstream_protection_queue_wait_seconds";
+        let help = "How long requests waited in the upstream's queue: those that left it \
+                    for an endpoint or out of time.";
+        scrape.family(name, Kind::Histogram, help);
+        for (upstream, slot, _) in &shown {
+            let Some(series) = series(*slot) else {
+                continue;
+            };
+            // Added up bucket by bucket over the shards.
+            let mut counts = [0_u64; HEAD_TIME_BOUNDS.len() + 1];
+            for shard in series.shards() {
+                for (total, count) in counts.iter_mut().zip(shard.queue_wait.counts()) {
+                    *total = total.wrapping_add(count);
+                }
+            }
+            scrape.histogram(
+                name,
+                &[("upstream", *upstream)],
+                HEAD_TIME_BOUNDS.map(seconds),
+                counts,
+                seconds(series.sum(|shard| shard.queue_wait.sum())),
+            );
         }
         let name = "edgerush_upstream_protection_passed_over_total";
         let help = "Picks that found an endpoint of the upstream full and went to another.";
@@ -1383,8 +1468,9 @@ impl Metrics {
         for (listener, series) in listeners() {
             for (position, answer) in Answer::ALL.iter().enumerate() {
                 let labels = [("listener", listener.as_str()), ("reason", answer.label())];
-                let count =
-                    |shard: &ListenerCounters| shard.answers.get(position).map_or(0, Counter::get);
+                let count = |shard: &ListenerCounters| {
+                    shard.answers.0.get(position).map_or(0, Counter::get)
+                };
                 scrape.sample(name, &labels, series.sum(count));
             }
             for (position, why) in RequestError::NAMES.iter().enumerate() {

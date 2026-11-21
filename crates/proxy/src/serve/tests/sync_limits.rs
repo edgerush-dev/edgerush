@@ -1051,6 +1051,7 @@ async fn a_request_waiting_on_its_owner_holds_no_slot_of_its_backend() {
             config.upstreams.get_mut("up").unwrap().protection =
                 Some(edgerush_config::Protection {
                     max_in_flight: std::num::NonZeroU32::MIN,
+                    queue: None,
                 });
             let (proxy, mut sends) = serving(&config, 1).await;
             let in_flight = || {
@@ -1101,6 +1102,7 @@ async fn a_pod_that_fills_while_its_owner_decides_is_passed_over_at_the_take() {
             up.endpoints = edgerush_config::Endpoints::Listed(vec![a, b]);
             up.protection = Some(edgerush_config::Protection {
                 max_in_flight: std::num::NonZeroU32::MIN,
+                queue: None,
             });
             let (proxy, mut sends) = serving(&config, 1).await;
             let counts = Arc::clone(proxy.current.load().protected[0].as_ref().unwrap());

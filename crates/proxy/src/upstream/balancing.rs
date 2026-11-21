@@ -26,9 +26,9 @@ use crate::balance::{self, Candidates, RoundRobin, Share, Tried};
 use crate::random::random;
 use crate::retry::budget::Budget;
 use crate::upstream::destination::{Destinations, ReuseIdentity};
-pub use crate::upstream::protected::Protected;
+pub use crate::upstream::protected::{Protected, Terms};
 use edgerush_config::{Compiled, CompiledUpstream, LoadBalancer};
-use edgerush_protection::{PodCount, Slot};
+use edgerush_protection::{PodCount, Queue, Slot};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -467,6 +467,18 @@ impl Upstream {
         self.protected.is_some()
     }
 
+    /// Its backend's line and what a request may wait in it for, if its protection has a
+    /// queue (25 §5).
+    pub(crate) fn queue(&self) -> Option<(&Arc<Queue>, Terms)> {
+        let protected = self.protected.as_deref()?;
+        Some((&protected.line, protected.queue?))
+    }
+
+    /// Its name.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
     fn seen<'a>(&'a self, destinations: &'a [Arc<ReuseIdentity>]) -> Seen<'a> {
         Seen {
             destinations,
@@ -601,6 +613,8 @@ mod tests {
         let protected = vec![Some(Arc::new(Protected {
             cap: NonZeroU32::MIN,
             counts: vec![Arc::clone(&pod)].into(),
+            line: edgerush_protection::Queue::new(),
+            queue: None,
         }))];
         let (mut one, mut two) = (Balancing::default(), Balancing::default());
         one.refresh(0, &config, &destinations, &[], &protected, &[]);
@@ -638,6 +652,8 @@ mod tests {
         let protected = vec![Some(Arc::new(Protected {
             cap: NonZeroU32::new(cap).unwrap(),
             counts: pods.iter().map(Arc::clone).collect(),
+            line: edgerush_protection::Queue::new(),
+            queue: None,
         }))];
         (protected, pods)
     }
@@ -740,6 +756,8 @@ mod tests {
         let protected = vec![Some(Arc::new(Protected {
             cap: NonZeroU32::MIN,
             counts: pods.iter().map(Arc::clone).collect(),
+            line: edgerush_protection::Queue::new(),
+            queue: None,
         }))];
         let mut balancing = Balancing::default();
         balancing.refresh(0, &config, &destinations, &[], &protected, &[]);
@@ -842,6 +860,8 @@ mod tests {
         let protected = vec![Some(Arc::new(Protected {
             cap: NonZeroU32::new(3).unwrap(),
             counts: vec![Arc::clone(&pod)].into(),
+            line: edgerush_protection::Queue::new(),
+            queue: None,
         }))];
         let mut balancing = Balancing::default();
         balancing.refresh(0, &config, &destinations, &[], &protected, &[]);
