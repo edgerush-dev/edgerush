@@ -2,7 +2,7 @@
 //! messages, its requests and their answers, are its own.
 
 use crate::table::{Changes, Table};
-use crate::{Kept, NodeId, ShardId, Time};
+use crate::{Kept, Key, NodeId, ShardId, Time};
 use std::collections::BTreeMap;
 
 /// A table's number, `(term, version)`: `(0, 0)` for no table. The term's upper half is the
@@ -148,10 +148,10 @@ pub enum Message<V> {
         /// The number of the owner's table it was sent under.
         under: Stamp,
         /// Each key, with its value and when it may be forgotten.
-        entries: Vec<(u64, Kept<V>)>,
+        entries: Vec<(Key, Kept<V>)>,
         /// Keys the owner no longer holds, evicted: dropped by a replica holding the copies
         /// before this one, as a deletion is not to be taken out of order.
-        dropped: Vec<u64>,
+        dropped: Vec<Key>,
         /// The part's number in the copy, from 0.
         part: u32,
         /// Whether more parts follow: the copy is held, and said held, only once its last
@@ -203,9 +203,9 @@ pub enum Message<V> {
         /// Its term, as the owner knows it.
         term: u64,
         /// Every key it holds, with its value and when it may be forgotten.
-        entries: Vec<(u64, Kept<V>)>,
+        entries: Vec<(Key, Kept<V>)>,
         /// Keys it no longer holds, evicted, that the taker may hold as a replica.
-        dropped: Vec<u64>,
+        dropped: Vec<Key>,
         /// The part's number, from 0.
         part: u32,
         /// Whether more parts follow: the changes are in only once the last is, with every

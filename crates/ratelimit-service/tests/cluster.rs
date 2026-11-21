@@ -17,8 +17,8 @@
 
 use edgerush_cluster::table::shard_of;
 use edgerush_cluster::{
-    Authority, Changed, Config, Kept, Message as StoreMessage, Node, NodeId, Stamp, Table, Time,
-    generation_of, ms,
+    Authority, Changed, Config, Kept, Key, Message as StoreMessage, Node, NodeId, Stamp, Table,
+    Time, generation_of, ms,
 };
 use edgerush_cluster_synchronous::{Answer, Message as ModeMessage, Rule, Value};
 use edgerush_ratelimit_service::cluster::forming::{self, Forming};
@@ -407,8 +407,8 @@ async fn elected(cluster: &Cluster, ids: &BTreeSet<NodeId>) -> NodeId {
 }
 
 /// The keys the tests write: eight in every shard.
-fn keys() -> Vec<u64> {
-    (0..u64::from(SHARDS) * 8).collect()
+fn keys() -> Vec<Key> {
+    (0..Key::from(SHARDS) * 8).collect()
 }
 
 /// A key's value, counted `counted`.
@@ -424,7 +424,7 @@ fn count(counted: u64) -> Value {
 /// each key was written with at a pod serving it.
 struct Sampled {
     unserved: Duration,
-    written: BTreeMap<u64, u64>,
+    written: BTreeMap<Key, u64>,
 }
 
 /// Round after round until `done`, asks each pod `live` holds which shards it serves, and
@@ -475,9 +475,9 @@ async fn sample(
 fn write_served(
     node: &mut Node<Value>,
     now: Time,
-    keys: &[u64],
+    keys: &[Key],
     round: u64,
-) -> (Vec<u16>, Vec<u64>) {
+) -> (Vec<u16>, Vec<Key>) {
     let serving: Vec<u16> = (0..SHARDS)
         .filter(|shard| node.serves(*shard, now))
         .collect();
@@ -620,7 +620,7 @@ async fn ready(count: NodeId) -> Cluster {
 }
 
 /// The first key `table` has `owner` own.
-fn key_owned_by(table: &Table, owner: NodeId) -> u64 {
+fn key_owned_by(table: &Table, owner: NodeId) -> Key {
     (0..)
         .find(|key| table.owner(shard_of(*key, SHARDS)) == Some(owner))
         .unwrap()
@@ -630,7 +630,7 @@ fn key_owned_by(table: &Table, owner: NodeId) -> u64 {
 const fn request(
     client: NodeId,
     id: u64,
-    key: u64,
+    key: Key,
     stamp: Stamp,
     rule: Option<Rule>,
 ) -> ModeMessage {
@@ -692,7 +692,7 @@ async fn told_answer(stream: &mut DecideStream, id: u64, most: Duration) -> Opti
 }
 
 /// What `pod` holds counted under `key`, less what was given back.
-async fn held_at(pod: &StorePod, key: u64) -> Option<u64> {
+async fn held_at(pod: &StorePod, key: Key) -> Option<u64> {
     pod.with(move |node, _| node.value(key).map(|value| value.net()))
         .await
         .flatten()
@@ -767,7 +767,7 @@ async fn when_a_follower_crashes_its_keys_are_held_by_their_new_owners() {
     let leading = elected(&cluster, &ids).await;
     let crashed = *ids.iter().find(|id| **id != leading).unwrap();
     // A key in every shard, each counted at its owner, once that owner serves it.
-    let keys: Vec<u64> = (0..u64::from(SHARDS) * 8).collect();
+    let keys: Vec<Key> = (0..Key::from(SHARDS) * 8).collect();
     for key in &keys {
         let counted = *key + 1;
         let mut owner = 0;
@@ -999,7 +999,7 @@ async fn a_request_under_several_keys_is_gathered_and_counted_at_each_owner() {
     let _alone = ALONE.write().await;
     let cluster = ready(3).await;
     let table = committed(cluster.pod(1)).await.unwrap();
-    let keys: Vec<(NodeId, u64)> = (1..=3)
+    let keys: Vec<(NodeId, Key)> = (1..=3)
         .map(|owner| (owner, key_owned_by(&table, owner)))
         .collect();
     let mut client = cluster.pod(1).client().await.unwrap();
@@ -1027,7 +1027,7 @@ async fn a_request_gathered_with_a_parts_owner_crashed_is_not_counted_and_given_
     let _alone = ALONE.write().await;
     let mut cluster = ready(3).await;
     let table = committed(cluster.pod(1)).await.unwrap();
-    let keys: Vec<(NodeId, u64)> = (1..=3)
+    let keys: Vec<(NodeId, Key)> = (1..=3)
         .map(|owner| (owner, key_owned_by(&table, owner)))
         .collect();
     cluster.crash(3).await;
@@ -1101,7 +1101,7 @@ async fn a_data_planes_stream_is_told_the_table_and_answered_by_number() {
         told_answer(&mut stream, 7, ANSWERED).await,
         Some(Answer::Counted(1))
     );
-    let others: Vec<(NodeId, u64)> = (2..=3)
+    let others: Vec<(NodeId, Key)> = (2..=3)
         .map(|owner| (owner, key_owned_by(&table, owner)))
         .collect();
     let gather = ModeMessage::Gather {
@@ -1249,7 +1249,7 @@ impl DataPlane {
     }
 
     /// The key of a client of `owner`'s, as the data plane hashes it.
-    fn key_of(&self, owner: NodeId) -> u64 {
+    fn key_of(&self, owner: NodeId) -> Key {
         (0..)
             .map(|n| self.plane.key(format!("api\0client-{n}").as_bytes()))
             .find(|key| self.plane.owner(*key) == Some(owner))

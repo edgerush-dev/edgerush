@@ -3,16 +3,16 @@
 //! the bytes they take — kept as the keys change rather than counted by walking them, so that
 //! finding the keys due costs as many steps as there are keys due.
 
-use crate::{Held, Kept, ShardId, Time};
+use crate::{Held, KEY_BYTES, Kept, Key, ShardId, Time};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A second, in nanoseconds: what a key's time to be forgotten is rounded up to.
 const SECOND: Time = 1_000_000_000;
 
 /// About the bytes a key's place in the schedule takes, counted with the key toward
-/// `max_key_bytes`: the second and the key, 16 bytes, in a B-tree's nodes, which keys made in
-/// no order leave some two thirds full.
-pub(crate) const SCHEDULED_BYTES: u64 = 24;
+/// `max_key_bytes`: the second and the key, in a B-tree's nodes, which keys made in no order
+/// leave some two thirds full.
+pub(crate) const SCHEDULED_BYTES: u64 = (8 + KEY_BYTES) * 3 / 2;
 
 /// The second `forget_at` falls in, rounded up: a key is looked at once that second has
 /// passed, so never before its time, and at most a second after it.
@@ -58,7 +58,7 @@ impl<V> Default for Keys<V> {
 impl<V: Held> Keys<V> {
     /// The keys of `shard` and their values, in key order, to read; `None` if it never held
     /// one of it since it last dropped the shard.
-    pub(crate) fn shard(&self, shard: ShardId) -> Option<&BTreeMap<u64, Kept<V>>> {
+    pub(crate) fn shard(&self, shard: ShardId) -> Option<&BTreeMap<Key, Kept<V>>> {
         self.shards.get(&shard).map(|keys| &keys.held)
     }
 
@@ -78,12 +78,12 @@ impl<V: Held> Keys<V> {
     }
 
     /// Holds `kept` as `key` of `shard`, in place of what it held of it: what that was.
-    pub(crate) fn insert(&mut self, shard: ShardId, key: u64, kept: Kept<V>) -> Option<Kept<V>> {
+    pub(crate) fn insert(&mut self, shard: ShardId, key: Key, kept: Kept<V>) -> Option<Kept<V>> {
         self.with_shard(shard, |keys| (keys.insert(key, kept), true))
     }
 
     /// Lets go of `key` of `shard`: what it held of it.
-    pub(crate) fn remove(&mut self, shard: ShardId, key: u64) -> Option<Kept<V>> {
+    pub(crate) fn remove(&mut self, shard: ShardId, key: Key) -> Option<Kept<V>> {
         if !self.shards.contains_key(&shard) {
             return None;
         }
@@ -95,14 +95,14 @@ impl<V: Held> Keys<V> {
     pub(crate) fn change<R>(
         &mut self,
         shard: ShardId,
-        key: u64,
+        key: Key,
         change: impl FnOnce(&mut Kept<V>) -> R,
     ) -> R {
         self.with_shard(shard, |keys| keys.change(key, change))
     }
 
     /// Keeps only the keys of `shard` that `keep` says to.
-    pub(crate) fn retain(&mut self, shard: ShardId, keep: impl FnMut(&u64, &Kept<V>) -> bool) {
+    pub(crate) fn retain(&mut self, shard: ShardId, keep: impl FnMut(&Key, &Kept<V>) -> bool) {
         if self.shards.contains_key(&shard) {
             self.with_shard(shard, |keys| (keys.retain(keep), true));
         }
@@ -123,7 +123,7 @@ impl<V: Held> Keys<V> {
     /// Lets go of the key it may forget soonest of all, if that is due by second `by`: its
     /// shard, the key and what it held of it. Of the keys due in one second, a shard's go
     /// before the next shard's, and within a shard the lowest first.
-    pub(crate) fn pop_soonest(&mut self, by: Time) -> Option<(ShardId, u64, Kept<V>)> {
+    pub(crate) fn pop_soonest(&mut self, by: Time) -> Option<(ShardId, Key, Kept<V>)> {
         let (second, shard) = *self.fronts.first()?;
         if second > by {
             return None;
@@ -173,9 +173,9 @@ impl<V: Held> Keys<V> {
 /// what they take.
 #[derive(Clone, Debug)]
 struct ShardKeys<V> {
-    held: BTreeMap<u64, Kept<V>>,
+    held: BTreeMap<Key, Kept<V>>,
     /// Each key held, by the second of its time to be forgotten, soonest first.
-    due: BTreeSet<(Time, u64)>,
+    due: BTreeSet<(Time, Key)>,
     /// What the keys take, each as [`bytes_of`] has it.
     bytes: u64,
     /// The second of its soonest key, as [`Keys`]'s fronts have it.
@@ -194,7 +194,7 @@ impl<V> Default for ShardKeys<V> {
 }
 
 impl<V: Held> ShardKeys<V> {
-    fn insert(&mut self, key: u64, kept: Kept<V>) -> Option<Kept<V>> {
+    fn insert(&mut self, key: Key, kept: Kept<V>) -> Option<Kept<V>> {
         let (second, bytes) = (second_of(kept.forget_at), bytes_of(&kept));
         let old = self.held.insert(key, kept);
         if let Some(old) = &old {
@@ -205,14 +205,14 @@ impl<V: Held> ShardKeys<V> {
         old
     }
 
-    fn remove(&mut self, key: u64) -> Option<Kept<V>> {
+    fn remove(&mut self, key: Key) -> Option<Kept<V>> {
         let old = self.held.remove(&key)?;
         self.take(key, &old);
         Some(old)
     }
 
     /// What `change` gives, and whether the key's place in the schedule changed.
-    fn change<R>(&mut self, key: u64, change: impl FnOnce(&mut Kept<V>) -> R) -> (R, bool) {
+    fn change<R>(&mut self, key: Key, change: impl FnOnce(&mut Kept<V>) -> R) -> (R, bool) {
         let mut new = false;
         let kept = self.held.entry(key).or_insert_with(|| {
             new = true;
@@ -239,7 +239,7 @@ impl<V: Held> ShardKeys<V> {
         (result, moved)
     }
 
-    fn retain(&mut self, mut keep: impl FnMut(&u64, &Kept<V>) -> bool) {
+    fn retain(&mut self, mut keep: impl FnMut(&Key, &Kept<V>) -> bool) {
         let (due, bytes) = (&mut self.due, &mut self.bytes);
         self.held.retain(|key, kept| {
             let kept_on = keep(key, kept);
@@ -255,7 +255,7 @@ impl<V: Held> ShardKeys<V> {
         self.due.first().map(|(second, _)| *second)
     }
 
-    fn pop_due(&mut self, by: Time) -> Option<(u64, Kept<V>)> {
+    fn pop_due(&mut self, by: Time) -> Option<(Key, Kept<V>)> {
         let (second, key) = *self.due.first()?;
         if second > by {
             return None;
@@ -265,7 +265,7 @@ impl<V: Held> ShardKeys<V> {
     }
 
     /// Counts out `kept`, held as `key` until now.
-    fn take(&mut self, key: u64, kept: &Kept<V>) {
+    fn take(&mut self, key: Key, kept: &Kept<V>) {
         self.due.remove(&(second_of(kept.forget_at), key));
         self.bytes = self.bytes.saturating_sub(bytes_of(kept));
     }
@@ -278,7 +278,7 @@ impl<V: Held> Keys<V> {
         let mut fronts = BTreeSet::new();
         let (mut bytes, mut count) = (0, 0);
         for (shard, keys) in &self.shards {
-            let due: BTreeSet<(Time, u64)> = keys
+            let due: BTreeSet<(Time, Key)> = keys
                 .held
                 .iter()
                 .map(|(key, kept)| (second_of(kept.forget_at), *key))
@@ -311,7 +311,7 @@ mod tests {
         }
     }
 
-    fn popped(keys: &mut Keys<Counts>, by: Time) -> Option<(ShardId, u64)> {
+    fn popped(keys: &mut Keys<Counts>, by: Time) -> Option<(ShardId, Key)> {
         keys.pop_soonest(by).map(|(shard, key, _)| (shard, key))
     }
 
@@ -388,18 +388,19 @@ mod tests {
 
     #[derive(Clone, Debug)]
     enum Step {
-        Insert(ShardId, u64, u64, Time),
-        Remove(ShardId, u64),
-        Change(ShardId, u64, u64, Option<Time>),
-        Merge(ShardId, u64, u64, Time),
-        Retain(ShardId, u64),
+        Insert(ShardId, Key, u64, Time),
+        Remove(ShardId, Key),
+        Change(ShardId, Key, u64, Option<Time>),
+        Merge(ShardId, Key, u64, Time),
+        Retain(ShardId, Key),
         Drop(ShardId),
         Pop(Time),
     }
 
     fn step() -> impl Strategy<Value = Step> {
         let shard = 0..3u16;
-        let key = 0..16u64;
+        let key: std::ops::Range<Key> = 0..16;
+        let every: std::ops::Range<Key> = 1..4;
         let at = prop_oneof![0..ms(10_000), Just(Time::MAX)];
         prop_oneof![
             (shard.clone(), key.clone(), 0..4u64, at.clone())
@@ -413,7 +414,7 @@ mod tests {
             )
                 .prop_map(|(s, k, p, t)| Step::Change(s, k, p, t)),
             (shard.clone(), key, 0..4u64, at).prop_map(|(s, k, p, t)| Step::Merge(s, k, p, t)),
-            (shard.clone(), 1..4u64).prop_map(|(s, every)| Step::Retain(s, every)),
+            (shard.clone(), every).prop_map(|(s, every)| Step::Retain(s, every)),
             shard.prop_map(Step::Drop),
             (0..12u64).prop_map(Step::Pop),
         ]

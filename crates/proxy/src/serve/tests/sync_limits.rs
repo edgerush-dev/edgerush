@@ -206,7 +206,11 @@ async fn directly(
     address: &str,
     key: &[u8],
     count: u64,
-    make: impl Fn(&Plane, u64, u64) -> Option<edgerush_ratelimit_service::cluster::wire::Asking>,
+    make: impl Fn(
+        &Plane,
+        u64,
+        edgerush_cluster::Key,
+    ) -> Option<edgerush_ratelimit_service::cluster::wire::Asking>,
 ) -> Vec<Answer> {
     let mut stream = decide_stream(address, &Dial::Plain).await.unwrap();
     let mut plane = plane();

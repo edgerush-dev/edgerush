@@ -15,7 +15,7 @@
 
 use edgerush_cluster::table::shard_of;
 use edgerush_cluster::{
-    Authority, Config, Message as StoreMessage, NodeId, Stamp, Table, Time, ms,
+    Authority, Config, Key, Message as StoreMessage, NodeId, Stamp, Table, Time, ms,
 };
 use edgerush_cluster_asynchronous::{
     Answers, Batch, Entry, Message, Pod, Turned, TurnedAway, Unserved, Value, Why,
@@ -218,7 +218,7 @@ async fn committed(pod: &StorePod<Pod>) -> Option<Table> {
 }
 
 /// The hits `pod` holds counted under `key`, owned or a copy.
-async fn counted_at(pod: &StorePod<Pod>, key: u64) -> Option<u64> {
+async fn counted_at(pod: &StorePod<Pod>, key: Key) -> Option<u64> {
     pod.with(move |node, _| node.value(key).as_ref().map(|value| value.counted()))
         .await
         .flatten()
@@ -276,14 +276,14 @@ async fn control_plane(running: Arc<Mutex<BTreeMap<NodeId, String>>>) {
 }
 
 /// The first key `table` has `owner` own.
-fn key_owned_by(table: &Table, owner: NodeId) -> u64 {
+fn key_owned_by(table: &Table, owner: NodeId) -> Key {
     (0..)
         .find(|key| table.owner(shard_of(*key, SHARDS)) == Some(owner))
         .unwrap()
 }
 
 /// The data plane's batch `sequence` of `count` hits under `key`, its table `stamp`.
-fn batch(stamp: Stamp, key: u64, sequence: u64, count: u64) -> Batch {
+fn batch(stamp: Stamp, key: Key, sequence: u64, count: u64) -> Batch {
     Batch {
         from: PLANE,
         stamp,

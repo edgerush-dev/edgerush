@@ -6,7 +6,7 @@
 use crate::message::{Answer, Message, Outbox};
 use crate::{Rule, Store, Value};
 use edgerush_cluster::table::shard_of;
-use edgerush_cluster::{Changed, Config, Kept, NodeId, Stamp, Time};
+use edgerush_cluster::{Changed, Config, Kept, Key, NodeId, Stamp, Time};
 use std::collections::BTreeMap;
 
 /// A request under several keys this pod gathers: who asked, and each part still to count,
@@ -15,9 +15,9 @@ use std::collections::BTreeMap;
 struct Gathering {
     started: Time,
     /// Each key not yet counted, with when its part was last sent and its number.
-    waiting: BTreeMap<u64, (Time, u64)>,
+    waiting: BTreeMap<Key, (Time, u64)>,
     /// Keys counted: given back if the request is reported not counted.
-    counted: Vec<u64>,
+    counted: Vec<Key>,
 }
 
 /// A part of a gathered request asked of a key's owner.
@@ -25,7 +25,7 @@ struct Gathering {
 struct Part {
     /// The request, by client and the client's number.
     request: (NodeId, u64),
-    key: u64,
+    key: Key,
     at: Time,
 }
 
@@ -56,7 +56,7 @@ pub struct Pod {
     parts: BTreeMap<u64, Part>,
     /// Give-backs it has asked of owners, by number: the key, when last sent (0 for not yet, or
     /// to be sent again at once), and how many sends have gone unanswered.
-    giving: BTreeMap<u64, (u64, Time, u8)>,
+    giving: BTreeMap<u64, (Key, Time, u8)>,
     next_part: u64,
     /// Parts counted for requests it then reported not counted.
     orphaned: u64,
@@ -125,7 +125,7 @@ impl Pod {
     /// The count it holds for `key`, owned or a copy: what was counted under it less what was
     /// given back.
     #[must_use]
-    pub fn count(&self, key: u64) -> Option<u64> {
+    pub fn count(&self, key: Key) -> Option<u64> {
         self.node.value(key).map(|value| value.net())
     }
 
@@ -202,7 +202,7 @@ impl Pod {
         &mut self,
         client: NodeId,
         id: u64,
-        key: u64,
+        key: Key,
         stamp: Stamp,
         hops: u8,
         ask: Ask,
@@ -262,7 +262,7 @@ impl Pod {
     }
 
     /// Counts one under `key` with no rule, as its owner, if it serves the key: whether it did.
-    fn count_here(&mut self, key: u64, now: Time) -> bool {
+    fn count_here(&mut self, key: Key, now: Time) -> bool {
         self.node
             .update(key, now, |kept, _| {
                 kept.value.count_one();
@@ -273,7 +273,7 @@ impl Pod {
     }
 
     /// Gives one back under `key`, as its owner, if it serves the key: whether it did.
-    fn give_here(&mut self, key: u64, now: Time) -> bool {
+    fn give_here(&mut self, key: Key, now: Time) -> bool {
         self.node
             .update(key, now, |kept, _| {
                 kept.value.give_one();
@@ -286,7 +286,7 @@ impl Pod {
     /// Gives back one counted under `key` for a request it gathered and reported not counted:
     /// at once if it serves the key's shard, else asked of its owner by its table, and again
     /// every [`GIVE_BACK_AGAIN`] until answered.
-    fn give_back(&mut self, key: u64, now: Time, out: &mut Outbox) {
+    fn give_back(&mut self, key: Key, now: Time, out: &mut Outbox) {
         if self.give_here(key, now) {
             return;
         }
@@ -299,7 +299,7 @@ impl Pod {
     /// [`GIVE_BACK_AGAIN`], then [`GIVE_BACK_LATER`] — dropped once [`GIVE_BACK_SENDS`] have
     /// gone unanswered; one whose shard it now serves it gives back itself.
     fn give_backs(&mut self, now: Time, out: &mut Outbox) {
-        let due: Vec<(u64, u64, u8)> = self
+        let due: Vec<(u64, Key, u8)> = self
             .giving
             .iter()
             .filter(|(_, (_, sent, unanswered))| {
@@ -341,7 +341,7 @@ impl Pod {
     }
 
     /// The owner its table names for `key`, if another pod.
-    fn owner_elsewhere(&self, key: u64) -> Option<NodeId> {
+    fn owner_elsewhere(&self, key: Key) -> Option<NodeId> {
         let shard = shard_of(key, self.node.config().shards);
         self.node
             .committed()
@@ -502,7 +502,7 @@ impl Pod {
 
 /// A request decided by its key's owner, by the wall clock `wall`: its answer, and what it
 /// changed of the key for its next copy.
-fn decide(key: u64, kept: &mut Kept<Value>, ask: Ask, wall: Time) -> (Answer, Changed) {
+fn decide(key: Key, kept: &mut Kept<Value>, ask: Ask, wall: Time) -> (Answer, Changed) {
     // A give-back is counted apart, a part of the value that only rises, so that copies merge
     // by keeping the larger of each part.
     let value = &mut kept.value;
@@ -611,7 +611,7 @@ mod tests {
     }
 
     /// The first key of `shard`.
-    fn key_in(shard: ShardId) -> u64 {
+    fn key_in(shard: ShardId) -> Key {
         (0..).find(|key| shard_of(*key, 4) == shard).unwrap_or(0)
     }
 
@@ -751,7 +751,7 @@ mod tests {
                 let _ = node.receive(peer, heard, now);
             }
         };
-        let asked = |out: &Outbox, pod: NodeId, wanted: u64| {
+        let asked = |out: &Outbox, pod: NodeId, wanted: Key| {
             out.iter()
                 .filter_map(|(to, message)| match message {
                     Message::Request {

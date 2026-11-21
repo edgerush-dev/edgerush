@@ -4,7 +4,7 @@
 use super::{CLIENT_BASE, Event, Mode, Sim, store_kind, store_size};
 use crate::client::{Client, Multi};
 use edgerush_cluster::Message as StoreMessage;
-use edgerush_cluster::{Config, Node, NodeId, ShardId, Time, ms};
+use edgerush_cluster::{Config, Key, Node, NodeId, ShardId, Time, ms};
 use edgerush_cluster_synchronous::{Answer, Message, Pod, Value};
 use std::collections::BTreeMap;
 
@@ -153,7 +153,7 @@ impl Sim<Synchronous> {
             .sum()
     }
     /// A client under `keys`, a request every `interval`, each refused after `deadline`.
-    pub fn add_client(&mut self, keys: Vec<u64>, interval: Time, deadline: Time) -> NodeId {
+    pub fn add_client(&mut self, keys: Vec<Key>, interval: Time, deadline: Time) -> NodeId {
         let id = self.next_client;
         self.next_client += 1;
         let mut client = Client::new(id, keys, interval, deadline, self.config.shards);
@@ -181,7 +181,7 @@ impl Sim<Synchronous> {
         rate: u64,
         deadline: Time,
         multi: Multi,
-        shared: u64,
+        shared: Key,
     ) {
         let first = self.next_client;
         self.add_clients(count, rate, deadline);
@@ -240,7 +240,7 @@ impl Sim<Synchronous> {
             return;
         };
         let shards = u64::from(self.config.shards);
-        let mut key = 1_u64 << 40;
+        let mut key: Key = 1 << 40;
         let mut placed = 0;
         while placed < per_shard * shards {
             key += 1;

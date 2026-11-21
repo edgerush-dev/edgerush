@@ -4,7 +4,7 @@
 
 use crate::Value;
 use crate::owner::Answered;
-use edgerush_cluster::{NodeId, Stamp, Table};
+use edgerush_cluster::{Key, NodeId, Stamp, Table};
 use edgerush_ratelimit::service::{Contract, PlaneId, Report};
 
 /// One message between pods, or between a data plane and a pod.
@@ -60,7 +60,7 @@ pub struct Batch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
     /// The key, as the data plane hashed it.
-    pub key: u64,
+    pub key: Key,
     /// Its contract, as the data plane holds it: a contract changed anywhere starts the key
     /// afresh.
     pub contract: Contract,
@@ -90,7 +90,7 @@ pub struct Answers {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Answer {
     /// The key.
-    pub key: u64,
+    pub key: Key,
     /// The bucket, the data plane's highest batch applied, and the others admitting.
     pub answered: Answered,
 }
@@ -99,7 +99,7 @@ pub struct Answer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Unserved {
     /// The key.
-    pub key: u64,
+    pub key: Key,
     /// Why.
     pub why: Why,
 }

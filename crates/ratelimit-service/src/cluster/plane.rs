@@ -9,7 +9,7 @@
 
 use super::wire::{self, Asking, Invalid, Telling};
 use edgerush_cluster::table::shard_of;
-use edgerush_cluster::{Message as StoreMessage, Stamp, Table};
+use edgerush_cluster::{Key, Message as StoreMessage, Stamp, Table};
 /// What a data plane names, asks and is told in the store's terms, for its side to use with
 /// these pieces: a member's id, a time in nanoseconds, the limit a key is held to and an
 /// owner's answer.
@@ -69,7 +69,7 @@ impl Plane {
     /// secret. Written in whole rather than through `Hash`, whose framing of a slice is the
     /// standard library's to change, and two data planes built apart must agree.
     #[must_use]
-    pub fn key(&self, bytes: &[u8]) -> u64 {
+    pub fn key(&self, bytes: &[u8]) -> Key {
         let mut hasher = self.keyed.build_hasher();
         hasher.write(bytes);
         hasher.finish()
@@ -100,7 +100,7 @@ impl Plane {
 
     /// The owner its table names for `key`, if it has a table and the key's shard an owner.
     #[must_use]
-    pub fn owner(&self, key: u64) -> Option<NodeId> {
+    pub fn owner(&self, key: Key) -> Option<NodeId> {
         let table = self.table.as_ref()?;
         table.owner(shard_of(key, shard_count(table)))
     }
@@ -121,7 +121,7 @@ impl Plane {
     /// its owner is failed over; else another member not avoided. Each is chosen by the key,
     /// not at random, so that an owner's keys spread over those it may go through rather than
     /// falling on one. None with no table, or with every member avoided.
-    pub fn through(&self, key: u64, avoid: impl Fn(NodeId) -> bool) -> Option<NodeId> {
+    pub fn through(&self, key: Key, avoid: impl Fn(NodeId) -> bool) -> Option<NodeId> {
         let table = self.table.as_ref()?;
         if let Some(owner) = self.owner(key).filter(|owner| !avoid(*owner)) {
             return Some(owner);
@@ -149,7 +149,7 @@ impl Plane {
 
     /// The request `id` under `key`, held to `rule` if it has one, as the stream carries it up.
     #[must_use]
-    pub fn request(&self, id: u64, key: u64, rule: Option<Rule>) -> Option<Asking> {
+    pub fn request(&self, id: u64, key: Key, rule: Option<Rule>) -> Option<Asking> {
         self.asking(id, key, rule, false, 0)
     }
 
@@ -157,14 +157,14 @@ impl Plane {
     /// request then refused or given up on, as the stream carries it up: to be sent to the
     /// key's owner now, as any request is, whoever charged it.
     #[must_use]
-    pub fn give_back(&self, id: u64, key: u64, rule: Option<Rule>, receipt: u64) -> Option<Asking> {
+    pub fn give_back(&self, id: u64, key: Key, rule: Option<Rule>, receipt: u64) -> Option<Asking> {
         self.asking(id, key, rule, true, receipt)
     }
 
     fn asking(
         &self,
         id: u64,
-        key: u64,
+        key: Key,
         rule: Option<Rule>,
         give_back: bool,
         receipt: u64,
@@ -212,7 +212,7 @@ impl Plane {
 }
 
 /// The one of `among` that `key` chooses, if there is any.
-fn chosen_by<I: Iterator<Item = NodeId>>(key: u64, among: impl Fn() -> I) -> Option<NodeId> {
+fn chosen_by<I: Iterator<Item = NodeId>>(key: Key, among: impl Fn() -> I) -> Option<NodeId> {
     let count = u64::try_from(among().count())
         .ok()
         .filter(|count| *count > 0)?;
@@ -305,7 +305,7 @@ mod tests {
     }
 
     /// A key whose shard `owner` owns.
-    fn key_of(plane: &Plane, owner: NodeId, from: u64) -> u64 {
+    fn key_of(plane: &Plane, owner: NodeId, from: Key) -> Key {
         (from..)
             .find(|key| plane.owner(*key) == Some(owner))
             .unwrap()

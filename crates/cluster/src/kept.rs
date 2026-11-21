@@ -1,7 +1,7 @@
 //! What the store holds for each key: a value of the mode's own, which the store copies, hands
 //! on, forgets and evicts without reading, and the time from which it may be forgotten.
 
-use crate::Time;
+use crate::{KEY_BYTES, Time};
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 
@@ -53,7 +53,7 @@ impl<V: Held> Kept<V> {
     /// the value's parts.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        16 + self.value.bytes()
+        KEY_BYTES + 8 + self.value.bytes()
     }
 
     /// Merges `other` in, the value as [`Held::merge`] has it and the later time to forget at:

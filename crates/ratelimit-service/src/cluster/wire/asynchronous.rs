@@ -10,8 +10,8 @@
 //! commits one ([`Answering`]).
 
 use super::{
-    Control, Invalid, Outgoing, Stamp, Table, ToCopy, ToPeer, Value, from_copy, from_peer, stamp,
-    stamp_from, table_from, table_to_wire, wire,
+    Control, Invalid, Outgoing, Stamp, Table, ToCopy, ToPeer, Value, from_copy, from_peer,
+    key_from_wire, key_to_wire, stamp, stamp_from, table_from, table_to_wire, wire,
 };
 use crate::grpc::MAX_MESSAGE;
 use crate::wire::{Contract, Report, contract, narrow, report, report_to_wire};
@@ -292,7 +292,7 @@ pub enum Answered {
 
 fn entry_to_wire(entry: AsyncEntry) -> Entry {
     Entry {
-        key: entry.key,
+        key: key_to_wire(entry.key),
         contract: Some(entry.contract.into()),
         report: Some(report_to_wire(entry.report)),
     }
@@ -300,7 +300,7 @@ fn entry_to_wire(entry: AsyncEntry) -> Entry {
 
 fn entry_from(entry: Entry) -> Result<AsyncEntry, Invalid> {
     Ok(AsyncEntry {
-        key: entry.key,
+        key: key_from_wire(entry.key),
         contract: contract(entry.contract).map_err(Invalid::Entry)?,
         report: report(entry.report).map_err(Invalid::Entry)?,
     })
@@ -353,7 +353,7 @@ pub fn answers_to_wire(answers: AsyncAnswers) -> Answers {
             .entries
             .into_iter()
             .map(|answer| Answer {
-                key: answer.key,
+                key: key_to_wire(answer.key),
                 behind: narrow(answer.answered.behind),
                 applied: answer.answered.applied,
                 others: answer.answered.others,
@@ -363,7 +363,7 @@ pub fn answers_to_wire(answers: AsyncAnswers) -> Answers {
             .unserved
             .into_iter()
             .map(|unserved| Unserved {
-                key: unserved.key,
+                key: key_to_wire(unserved.key),
                 not_serving: unserved.why == Why::NotServing,
             })
             .collect(),
@@ -385,7 +385,7 @@ pub fn answers_from(answers: Answers) -> Result<AsyncAnswers, Invalid> {
             .entries
             .into_iter()
             .map(|answer| AsyncAnswer {
-                key: answer.key,
+                key: key_from_wire(answer.key),
                 answered: AsyncAnswered {
                     behind: u128::from(answer.behind),
                     applied: answer.applied,
@@ -397,7 +397,7 @@ pub fn answers_from(answers: Answers) -> Result<AsyncAnswers, Invalid> {
             .unserved
             .into_iter()
             .map(|unserved| AsyncUnserved {
-                key: unserved.key,
+                key: key_from_wire(unserved.key),
                 why: if unserved.not_serving {
                     Why::NotServing
                 } else {
@@ -525,6 +525,7 @@ pub fn answered_from(answering: Answering) -> Result<AsyncMessage, Invalid> {
 mod tests {
     use super::*;
     use crate::cluster::wire::{Request, Synchronous};
+    use edgerush_cluster::Key;
     use edgerush_cluster::table::first;
     use edgerush_ratelimit::service::{
         Contract as ServiceContract, MOST_UNACKNOWLEDGED, Report as ServiceReport,
@@ -560,7 +561,7 @@ mod tests {
 
     fn batches() -> impl Strategy<Value = AsyncBatch> {
         let entry =
-            (any::<u64>(), contracts(), reports()).prop_map(|(key, contract, report)| AsyncEntry {
+            (any::<Key>(), contracts(), reports()).prop_map(|(key, contract, report)| AsyncEntry {
                 key,
                 contract,
                 report,
@@ -588,8 +589,8 @@ mod tests {
     fn answers() -> impl Strategy<Value = AsyncAnswers> {
         (
             any::<(u64, u64, u64)>(),
-            prop::collection::vec(any::<(u64, u64, u64, u64)>(), 0..4),
-            prop::collection::vec((any::<u64>(), any::<bool>()), 0..4),
+            prop::collection::vec(any::<(Key, u64, u64, u64)>(), 0..4),
+            prop::collection::vec((any::<Key>(), any::<bool>()), 0..4),
             any::<bool>(),
         )
             .prop_map(

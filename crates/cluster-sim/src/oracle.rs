@@ -3,7 +3,7 @@
 //! refusal it would admit is a refusal within the rate. Every decision is judged at the time
 //! its key's owner made it, by that owner's wall clock.
 
-use edgerush_cluster::Time;
+use edgerush_cluster::{Key, Time};
 use edgerush_cluster_synchronous::{MOST_SLOTS, Rule};
 use std::collections::BTreeMap;
 
@@ -13,11 +13,11 @@ pub struct Oracle {
     rule: Rule,
     /// Each key's admissions as clients were told, when, and whether `when_unreachable`
     /// admitted it without a count.
-    admitted: BTreeMap<u64, Vec<(Time, bool)>>,
+    admitted: BTreeMap<Key, Vec<(Time, bool)>>,
     /// Requests refused under the rule, each key with when its owner refused or admitted it.
-    limited: Vec<Vec<(u64, Time)>>,
+    limited: Vec<Vec<(Key, Time)>>,
     /// Requests `when_unreachable` refused, each key with the time.
-    refused: Vec<Vec<(u64, Time)>>,
+    refused: Vec<Vec<(Key, Time)>>,
 }
 
 impl Oracle {
@@ -33,22 +33,22 @@ impl Oracle {
     }
 
     /// `key` admitted at `at`, counted by its owner or, `uncounted`, by nobody.
-    pub fn admitted(&mut self, key: u64, at: Time, uncounted: bool) {
+    pub fn admitted(&mut self, key: Key, at: Time, uncounted: bool) {
         self.admitted.entry(key).or_default().push((at, uncounted));
     }
 
     /// A request refused under the rule, each key with its decision's time.
-    pub fn limited(&mut self, parts: Vec<(u64, Time)>) {
+    pub fn limited(&mut self, parts: Vec<(Key, Time)>) {
         self.limited.push(parts);
     }
 
     /// A request `when_unreachable` refused, each key with the time.
-    pub fn refused(&mut self, parts: Vec<(u64, Time)>) {
+    pub fn refused(&mut self, parts: Vec<(Key, Time)>) {
         self.refused.push(parts);
     }
 
     /// `key`'s admissions in time order.
-    fn history(&self, key: u64) -> Vec<(Time, bool)> {
+    fn history(&self, key: Key) -> Vec<(Time, bool)> {
         let mut history = self.admitted.get(&key).cloned().unwrap_or_default();
         history.sort_unstable();
         history
@@ -56,7 +56,7 @@ impl Oracle {
 
     /// Whether the rule's reference, fed every admission told under `key` before `at`, would
     /// admit one at `at`.
-    fn room(&self, key: u64, at: Time) -> bool {
+    fn room(&self, key: Key, at: Time) -> bool {
         let before: Vec<Time> = self
             .history(key)
             .into_iter()
@@ -68,7 +68,7 @@ impl Oracle {
 
     /// Whether the rule's reference, having admitted `before` under `key`, in time order,
     /// admits one at `at`.
-    fn admits(&self, key: u64, before: &[Time], at: Time) -> bool {
+    fn admits(&self, key: Key, before: &[Time], at: Time) -> bool {
         let before = before.iter().copied();
         match self.rule {
             Rule::Window { per, .. } => {
@@ -104,7 +104,7 @@ impl Oracle {
                 .map(|(time, _)| *time)
                 .collect::<Vec<_>>()
         };
-        let mut asked: BTreeMap<u64, Vec<Time>> = BTreeMap::new();
+        let mut asked: BTreeMap<Key, Vec<Time>> = BTreeMap::new();
         for (key, admitted) in &self.admitted {
             asked.entry(*key).or_default().extend(counted(admitted));
         }
@@ -143,7 +143,7 @@ impl Oracle {
         self.within(&self.refused)
     }
 
-    fn within(&self, requests: &[Vec<(u64, Time)>]) -> u64 {
+    fn within(&self, requests: &[Vec<(Key, Time)>]) -> u64 {
         requests
             .iter()
             .filter(|parts| !parts.is_empty() && parts.iter().all(|(key, at)| self.room(*key, *at)))
@@ -174,7 +174,7 @@ impl Oracle {
 
     /// For `key`: admissions the reference refuses, and the most beyond the rule at once —
     /// counting what `when_unreachable` admitted, if `all`.
-    fn beyond(&self, key: u64, all: bool) -> (u64, u64) {
+    fn beyond(&self, key: Key, all: bool) -> (u64, u64) {
         let history: Vec<Time> = self
             .history(key)
             .into_iter()
@@ -231,7 +231,7 @@ impl Oracle {
     /// What a key's owner holds beyond what clients were told, for a window: the requests it
     /// counted in its window `window`, `held`, less those told in it.
     #[must_use]
-    pub fn beyond_told(&self, key: u64, window: u64, held: u64) -> u64 {
+    pub fn beyond_told(&self, key: Key, window: u64, held: u64) -> u64 {
         let told = self
             .history(key)
             .iter()

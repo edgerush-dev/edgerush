@@ -54,6 +54,14 @@ pub use table::{Shard, Table};
 /// A member: one pod in one life.
 pub type NodeId = u64;
 
+/// A key, as the store holds it: a mode's hash of what its data planes limit by, which the
+/// store reads only to place it in a shard.
+pub type Key = u64;
+
+/// The bytes a key takes, held or sent, by the store's count: what `max_key_bytes` counts
+/// each key as, beside its value, and each key dropped from a copy as.
+pub const KEY_BYTES: u64 = size_of::<Key>() as u64;
+
 /// One of the table's shards, by number.
 pub type ShardId = u16;
 
