@@ -1608,6 +1608,104 @@ spec:
     Ok(())
 }
 
+/// One object written twice, of one kind and name and in one namespace, in two files or in
+/// one, stops `validate` with both places named, as a cluster would keep one of them, not
+/// two: an object without a namespace is in `default`, and the kinds outside namespaces are
+/// one of each name. Of another kind, name or namespace, it is another object.
+#[test]
+fn validate_refuses_an_object_written_twice() -> io::Result<()> {
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("validate-twice");
+    let manifests = root.join("manifests");
+    // Afresh: a run that failed half way leaves its files behind.
+    if root.exists() {
+        std::fs::remove_dir_all(&root)?;
+    }
+    std::fs::create_dir_all(&manifests)?;
+    let data_plane = root.join("data-plane.yaml");
+    std::fs::write(
+        &data_plane,
+        "ingress_class: edge\ncluster_domain: cluster.local\ningress_hosts_fall_through: false\ningress_https_redirect: true\ningress_https_redirect_max_age: 30\n",
+    )?;
+    let class = "apiVersion: networking.k8s.io/v1\nkind: IngressClass\nmetadata: { name: edge }\nspec: { controller: edgerush.dev/ingress-controller }\n";
+    let ingress = |namespace: &str, host: &str| {
+        format!(
+            "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: {{ name: web{namespace} }}\nspec:\n  ingressClassName: edge\n  rules:\n    - host: {host}\n      http:\n        paths:\n          - {{ path: /, pathType: Prefix, backend: {{ service: {{ name: web, port: {{ number: 80 }} }} }} }}\n"
+        )
+    };
+    let service = |namespace: &str| {
+        format!(
+            "apiVersion: v1\nkind: Service\nmetadata: {{ name: web, namespace: {namespace} }}\nspec: {{ ports: [{{ name: http, port: 80 }}] }}\n"
+        )
+    };
+    let file = |name: &str| manifests.join(name);
+    let validate = || {
+        edgerush(&[
+            "validate",
+            "--from-manifests",
+            manifests.to_str().expect("a path that is text"),
+            "--data-plane",
+            data_plane.to_str().expect("a path that is text"),
+        ])
+    };
+    let refused = |output: &Output, object: &str, first: &str, second: &str| {
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!(
+                "error: {object} is written twice, {}, where a cluster keeps one\n",
+                if first == second {
+                    format!("in {}", file(first).display())
+                } else {
+                    format!(
+                        "in {} and in {}",
+                        file(first).display(),
+                        file(second).display()
+                    )
+                }
+            ),
+        );
+    };
+
+    // Of another namespace, kind or name, it is another object: a Service and an Ingress
+    // `web` in `shop`, and in `default`, the Ingress there without its namespace.
+    std::fs::write(
+        file("a.yaml"),
+        format!("{class}---\n{}---\n{}", service("shop"), service("default")),
+    )?;
+    let shop = ingress(", namespace: shop", "shop.example.com");
+    let other = ingress("", "other.example.com");
+    std::fs::write(file("b.yaml"), format!("{shop}---\n{other}"))?;
+    let output = validate()?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "2 routes and 2 upstreams translated; 0 left out; 0 paths without their backend; 0 TLS hosts or entries not served as listed; 0 paths shadowed; 0 Ingresses of other classes or none passed over\n"
+    );
+
+    // In two files: an edited copy beside the original.
+    std::fs::write(file("c.yaml"), &shop)?;
+    refused(&validate()?, "Ingress shop/web", "b.yaml", "c.yaml");
+    std::fs::remove_file(file("c.yaml"))?;
+
+    // Twice in one file, the second without its namespace, which is `default`.
+    std::fs::write(
+        file("b.yaml"),
+        format!(
+            "{}---\n{other}",
+            ingress(", namespace: default", "other.example.com")
+        ),
+    )?;
+    refused(&validate()?, "Ingress default/web", "b.yaml", "b.yaml");
+
+    // A kind outside namespaces, one in a `List`.
+    std::fs::write(
+        file("b.yaml"),
+        "apiVersion: v1\nkind: List\nitems:\n  - { apiVersion: networking.k8s.io/v1, kind: IngressClass, metadata: { name: edge }, spec: { controller: edgerush.dev/ingress-controller } }\n",
+    )?;
+    refused(&validate()?, "IngressClass edge", "a.yaml", "b.yaml");
+    Ok(())
+}
+
 /// The worked example of rate limits, `examples/kubernetes/rate-limits`, from several paths:
 /// what the teams apply and what the operator makes of its DataPlane translate with nothing
 /// said, and with the mistakes beside them each RateLimitPolicy refused is said with why, a

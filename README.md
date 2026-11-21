@@ -203,7 +203,9 @@ reports, and exits 1 for:
 TLS Secrets, seldom in a repository, are taken as they will be in the cluster, unless
 `--check-secrets` asks for them to be checked. The manifests are taken as the API server
 accepted them: what their resources' schemas forbid is not checked here, and
-`kubectl apply --dry-run=server` checks it. [examples/kubernetes/rate-limits](examples/kubernetes/rate-limits/README.md)
+`kubectl apply --dry-run=server` checks it. An object written twice, of one kind, namespace
+and name, in two files or in one, stops it, as a cluster would keep one of them.
+[examples/kubernetes/rate-limits](examples/kubernetes/rate-limits/README.md)
 is a worked example.
 
 `data-plane.yaml` holds the data plane's settings, which a `DataPlane` resource states in a

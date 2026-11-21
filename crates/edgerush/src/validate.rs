@@ -18,6 +18,7 @@ use edgerush_translate::{Cluster, Plane, Translation, translate};
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -39,7 +40,8 @@ Exits 0 when everything was translated and the config compiles, notes aside (a r
 attempts taken as the data plane's most), 1 when something was left out, a path's backend
 is not there, a host or entry `tls` lists is not served as listed, a path is shadowed by
 another Ingress's or the config would be refused, and 2 when the files or the system's
-authorities could not be read.
+authorities could not be read, or an object is written twice: of one kind and name, in one
+namespace, where a cluster keeps one.
 
 Options:
       --from-manifests <PATH>  Manifests in YAML: a file, or a directory read for every
@@ -165,9 +167,28 @@ pub(crate) enum Failed {
     },
     #[error("{} holds no .yaml or .yml file", .0.display())]
     NoManifests(PathBuf),
+    #[error("{kind} {name} is written twice, {}, where a cluster keeps one", places(.first, .second))]
+    Twice {
+        kind: &'static str,
+        name: String,
+        first: PathBuf,
+        second: PathBuf,
+    },
     #[error("the system's authorities: {0}")]
     SystemAuthorities(#[from] crate::system_authorities::Error),
 }
+
+/// Where an object written twice is: in one file, or in two.
+fn places(first: &Path, second: &Path) -> String {
+    if first == second {
+        format!("in {}", first.display())
+    } else {
+        format!("in {} and in {}", first.display(), second.display())
+    }
+}
+
+/// The objects read so far, by kind and name, each with the file it is in.
+type Objects = BTreeMap<(&'static str, String), PathBuf>;
 
 /// A manifest of a kind translation reads, a `List` of them, or anything else, passed over.
 #[derive(Deserialize)]
@@ -198,7 +219,61 @@ enum Manifest {
 }
 
 impl Manifest {
-    fn into_cluster(self, cluster: &mut Cluster) {
+    /// Its kind and its name, `namespace/name` where the kind is in namespaces and
+    /// `default/name` for an object without one, as Kubernetes takes it. `None` for a `List`,
+    /// a kind passed over, or an object without a name, which a cluster names afresh each
+    /// time it makes one.
+    fn named(&self) -> Option<(&'static str, String)> {
+        let (kind, namespaced, metadata) = match self {
+            Self::IngressClass(class) => ("IngressClass", false, &class.metadata),
+            Self::Ingress(ingress) => ("Ingress", true, &ingress.metadata),
+            Self::Service(service) => ("Service", true, &service.metadata),
+            Self::Secret(secret) => ("Secret", true, &secret.metadata),
+            Self::GatewayClass(class) => ("GatewayClass", false, &class.metadata),
+            Self::Gateway(gateway) => ("Gateway", true, &gateway.metadata),
+            Self::ListenerSet(set) => ("ListenerSet", true, &set.metadata),
+            Self::HTTPRoute(route) => ("HTTPRoute", true, &route.metadata),
+            Self::GRPCRoute(route) => ("GRPCRoute", true, &route.metadata),
+            Self::TLSRoute(route) => ("TLSRoute", true, &route.metadata),
+            Self::TCPRoute(route) => ("TCPRoute", true, &route.metadata),
+            Self::UDPRoute(route) => ("UDPRoute", true, &route.metadata),
+            Self::ReferenceGrant(grant) => ("ReferenceGrant", true, &grant.metadata),
+            Self::BackendTLSPolicy(policy) => ("BackendTLSPolicy", true, &policy.metadata),
+            Self::ConfigMap(map) => ("ConfigMap", true, &map.metadata),
+            Self::Namespace(namespace) => ("Namespace", false, &namespace.metadata),
+            Self::RateLimitPolicy(policy) => ("RateLimitPolicy", true, &policy.metadata),
+            Self::List { .. } | Self::Other => return None,
+        };
+        let name = metadata.name.as_deref()?;
+        Some((
+            kind,
+            if namespaced {
+                let namespace = metadata.namespace.as_deref().unwrap_or("default");
+                format!("{namespace}/{name}")
+            } else {
+                name.to_owned()
+            },
+        ))
+    }
+
+    /// Adds it to `cluster`, read from `file`. An object already among `read` is refused:
+    /// the cluster would keep one of them, and translation would take them as two.
+    fn into_cluster(
+        self,
+        file: &Path,
+        read: &mut Objects,
+        cluster: &mut Cluster,
+    ) -> Result<(), Failed> {
+        if let Some((kind, name)) = self.named()
+            && let Some(first) = read.insert((kind, name.clone()), file.to_owned())
+        {
+            return Err(Failed::Twice {
+                kind,
+                name,
+                first,
+                second: file.to_owned(),
+            });
+        }
         match self {
             Self::IngressClass(class) => cluster.ingress_classes.push(*class),
             Self::Ingress(ingress) => cluster.ingresses.push(*ingress),
@@ -219,11 +294,12 @@ impl Manifest {
             Self::RateLimitPolicy(policy) => cluster.rate_limit_policies.push(*policy),
             Self::List { items } => {
                 for item in items {
-                    item.into_cluster(cluster);
+                    item.into_cluster(file, read, cluster)?;
                 }
             }
             Self::Other => {}
         }
+        Ok(())
     }
 }
 
@@ -240,6 +316,7 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
     };
     // A file under two of the paths given is read once, or its objects would be two each.
     let mut read_already = std::collections::BTreeSet::new();
+    let mut objects = Objects::new();
     for path in &options.manifests {
         for file in files(path)? {
             let same = fs::canonicalize(&file).map_err(|error| Failed::Unreadable {
@@ -250,7 +327,7 @@ fn run(options: &Options) -> Result<(String, bool), Failed> {
                 continue;
             }
             for manifest in read_all::<Manifest>(&file)? {
-                manifest.into_cluster(&mut cluster);
+                manifest.into_cluster(&file, &mut objects, &mut cluster)?;
             }
         }
     }
@@ -407,6 +484,89 @@ fn read_all<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, Failed>
 mod tests {
     use super::*;
 
+    /// The cluster of the manifests in `yaml`, as one file.
+    fn cluster_of(yaml: &str) -> Result<Cluster, Failed> {
+        let mut cluster = Cluster::default();
+        let mut objects = Objects::new();
+        for manifest in serde_saphyr::from_multiple::<Manifest>(yaml).unwrap() {
+            manifest.into_cluster(Path::new("manifests.yaml"), &mut objects, &mut cluster)?;
+        }
+        Ok(cluster)
+    }
+
+    /// An object of every kind read, written twice, is refused under its kind and name, in
+    /// its namespace where the kind is in namespaces; written once, it is read.
+    #[test]
+    fn an_object_of_every_kind_written_twice_is_refused() {
+        let named = [
+            ("networking.k8s.io/v1", "IngressClass", "edge"),
+            ("networking.k8s.io/v1", "Ingress", "shop/web"),
+            ("v1", "Service", "shop/web"),
+            ("v1", "Secret", "shop/web"),
+            ("gateway.networking.k8s.io/v1", "GatewayClass", "edge"),
+            ("gateway.networking.k8s.io/v1", "Gateway", "shop/web"),
+            ("gateway.networking.k8s.io/v1", "ListenerSet", "shop/web"),
+            ("gateway.networking.k8s.io/v1", "HTTPRoute", "shop/web"),
+            ("gateway.networking.k8s.io/v1", "GRPCRoute", "shop/web"),
+            ("gateway.networking.k8s.io/v1", "TLSRoute", "shop/web"),
+            ("gateway.networking.k8s.io/v1", "TCPRoute", "shop/web"),
+            ("gateway.networking.k8s.io/v1", "UDPRoute", "shop/web"),
+            ("gateway.networking.k8s.io/v1", "ReferenceGrant", "shop/web"),
+            (
+                "gateway.networking.k8s.io/v1",
+                "BackendTLSPolicy",
+                "shop/web",
+            ),
+            ("v1", "ConfigMap", "shop/web"),
+            ("v1", "Namespace", "edge"),
+            (
+                "gateway.edgerush.dev/v1alpha1",
+                "RateLimitPolicy",
+                "shop/web",
+            ),
+        ];
+        for (version, kind, name) in named {
+            let metadata = match name.split_once('/') {
+                Some((namespace, name)) => format!("{{ name: {name}, namespace: {namespace} }}"),
+                None => format!("{{ name: {name} }}"),
+            };
+            let object = format!(
+                "apiVersion: {version}
+kind: {kind}
+metadata: {metadata}
+"
+            );
+            assert!(cluster_of(&object).is_ok(), "{kind}");
+            match cluster_of(&format!(
+                "{object}---
+{object}"
+            )) {
+                Err(Failed::Twice {
+                    kind: twice,
+                    name: of,
+                    ..
+                }) => assert_eq!((twice, of.as_str()), (kind, name)),
+                Err(other) => panic!("{kind}: {other}"),
+                Ok(_) => panic!("{kind} is read twice"),
+            }
+        }
+        // Without a name it is not one object written twice, as the cluster names each afresh.
+        let nameless = "apiVersion: v1
+kind: ConfigMap
+metadata: { generateName: settings- }
+";
+        assert_eq!(
+            cluster_of(&format!(
+                "{nameless}---
+{nameless}"
+            ))
+            .unwrap()
+            .config_maps
+            .len(),
+            2
+        );
+    }
+
     fn parsed(args: &[&str]) -> Result<Parsed, UsageError> {
         parse(args.iter().map(ToString::to_string))
     }
@@ -504,10 +664,7 @@ items:
     items:
       - { apiVersion: networking.k8s.io/v1, kind: Ingress, metadata: { name: web, namespace: shop } }
 ";
-        let mut cluster = Cluster::default();
-        for manifest in serde_saphyr::from_multiple::<Manifest>(yaml).unwrap() {
-            manifest.into_cluster(&mut cluster);
-        }
+        let cluster = cluster_of(yaml).unwrap();
         let names = |metadata: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta| {
             metadata.name.clone().unwrap()
         };
@@ -593,10 +750,7 @@ apiVersion: v1
 kind: Namespace
 metadata: { name: shop, labels: { team: shop } }
 ";
-        let mut cluster = Cluster::default();
-        for manifest in serde_saphyr::from_multiple::<Manifest>(yaml).unwrap() {
-            manifest.into_cluster(&mut cluster);
-        }
+        let cluster = cluster_of(yaml).unwrap();
         let counts = (
             cluster.gateway_classes.len(),
             cluster.gateways.len(),
@@ -625,10 +779,7 @@ spec:
   targetRefs: [{ group: networking.k8s.io, kind: Ingress, name: web }]
   limits: [{ name: per-client, key: Client, model: { bucket: { rate: 10/s, burst: 10 } } }]
 ";
-        let mut cluster = Cluster::default();
-        for manifest in serde_saphyr::from_multiple::<Manifest>(yaml).unwrap() {
-            manifest.into_cluster(&mut cluster);
-        }
+        let cluster = cluster_of(yaml).unwrap();
         assert_eq!(cluster.rate_limit_policies.len(), 1);
     }
 }
