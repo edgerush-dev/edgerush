@@ -35,9 +35,9 @@ jobs:
       - name: Toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
-      # The third-party dependencies as main last built them (BoringSSL takes minutes) and
-      # cargo-deny. Keyed on the lock files and the toolchain, so a change to either starts a
-      # new entry from the nearest old one.
+      # The third-party dependencies as main last built them (BoringSSL takes minutes). Keyed
+      # on the lock files and the toolchain, so a change to either starts a new entry from the
+      # nearest old one.
       - name: Restore the build cache
         id: cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -46,23 +46,27 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            ~/.cargo/bin/cargo-deny
             target
             fuzz/target
           key: ${{ runner.os }}-deps-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'fuzz/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-deps-
 
-      # The version check.sh is run with, from crates.io rather than a third-party action.
+      # The tools check.sh runs, at the versions it is run with, as each project releases them
+      # built and checked against the SHA-256 published beside them: seconds, where building
+      # them took two and three minutes. Not cached: an entry is found only by the paths it was
+      # saved with, so a tool's path in it would tie the entry to the tool.
       - name: cargo-deny
+        env:
+          VERSION: 0.20.2
+          SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
         run: |
-          if [ "$(cargo deny --version 2>/dev/null)" != "cargo-deny 0.20.2" ]; then
-            cargo install --locked cargo-deny@0.20.2
-          fi
+          name="cargo-deny-$VERSION-x86_64-unknown-linux-musl"
+          curl -fsSL -o "$RUNNER_TEMP/$name.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$VERSION/$name.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/$name.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$name.tar.gz" -C ~/.cargo/bin --strip-components=1 "$name/cargo-deny"
+          cargo deny --version
 
-      # The test runner check.sh runs the tests with: the same version, as nextest releases it
-      # built, checked against the SHA-256 published beside it. Seconds, where building it took
-      # three minutes, and nothing for the cache to carry: an entry is found only by the paths
-      # it was saved with, and one more would leave every entry saved before it unread.
       - name: cargo-nextest
         env:
           VERSION: 0.9.152
@@ -117,7 +121,6 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            ~/.cargo/bin/cargo-deny
             target
             fuzz/target
           key: ${{ steps.cache.outputs.cache-primary-key }}
