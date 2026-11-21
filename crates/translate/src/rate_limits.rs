@@ -130,7 +130,9 @@ fn number<T: TryFrom<i64>>(value: i64) -> Option<T> {
 
 /// A version of a RateLimitPolicy that applied: what a later translation needs of it, to
 /// know the names it holds and to apply it where the policy's spec is refused (04 §4).
-#[derive(Debug, Clone, PartialEq)]
+/// Written and read as JSON in the leader's snapshot, which its other replicas translate
+/// from (04 §2).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedPolicy {
     /// The policy's namespace.
     pub namespace: String,

@@ -11,6 +11,8 @@ publish.workspace = true
 # Each certificate handed out read for its dates, and the gauge of them written (08 §1).
 edgerush-certificates.workspace = true
 edgerush-config.workspace = true
+# The config versions a snapshot may be of: the stream's window (04 §2, 02 §4).
+edgerush-control-stream.workspace = true
 # The Gateway API kinds followed.
 edgerush-gateway-api.workspace = true
 edgerush-kubernetes.workspace = true

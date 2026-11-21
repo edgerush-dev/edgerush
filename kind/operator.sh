@@ -71,8 +71,10 @@
 #     the controller is neither rolled nor restarted;
 #   - the admission webhook (docs/05 §2, 04 §3): ControlPlane `hooked`, signing with an
 #     authority the platform provides that is not there yet, has no registration and says
-#     it waits for its bundle; the authority made with openssl, the bundle published in its
-#     status, the webhook is registered trusting it and asked of its own namespace alone;
+#     it waits for its bundle, its controller not ready, having no certificate to serve the
+#     stream with (04 §2); the authority made with openssl, the controller ready, the
+#     bundle published in its status, the webhook is registered trusting it and asked of
+#     its own namespace alone;
 #     an Ingress of its class that would be left out is refused with why, one that
 #     translates admitted, one of another class admitted however it is; a RateLimitPolicy
 #     whose limit does not compile, though the CRD's schema lets it by, refused with why by
@@ -1064,18 +1066,19 @@ spec:
   controlPlaneRef: { name: hooked }
   ingress: { httpPort: 80, httpsPort: 443 }
 EOF
-# `rollout status` fails at once on a Deployment not made yet: waited for first.
 until_true 'k -n hooked get deploy edgerush-controller-hooked' 60 ||
     fail "ControlPlane hooked's controller was never made"
-k -n hooked rollout status deploy/edgerush-controller-hooked --timeout=180s >/dev/null ||
-    fail "ControlPlane hooked's controller never ran"
-until_true 'k -n hooked logs deploy/edgerush-controller-hooked | grep -F "Secret hooked/hooked-ca: the authority provided is not there"' 60 ||
+# Running, but not ready: with no certificate, its stream does not serve (04 §2).
+until_true 'k -n hooked logs deploy/edgerush-controller-hooked | grep -F "Secret hooked/hooked-ca: the authority provided is not there"' 180 ||
     fail "the controller does not say it waits for the authority provided"
+# Longer than its probe's period, so the probe has been asked.
+! until_true '[ -n "$(k -n hooked get deploy edgerush-controller-hooked -o jsonpath="{.status.readyReplicas}")" ]' 15 ||
+    fail "ControlPlane hooked's controller is ready with no certificate to serve its stream with"
 k -n hooked get controlplane hooked -o jsonpath='{.status.conditions[?(@.type=="Programmed")].message}' |
     grep -F "ValidatingWebhookConfiguration edgerush-controller-hooked is not made until the control plane publishes its authority's bundle" >/dev/null ||
     fail "ControlPlane hooked does not say its registration waits for its bundle: $(condition controlplane/hooked hooked Programmed)"
 ! registration >/dev/null || fail "the webhook was registered before its authority's bundle was published"
-pass "the webhook is not registered while its authority is not there, and its ControlPlane says it waits"
+pass "while its authority is not there, the controller is not ready, the webhook not registered, and its ControlPlane says it waits"
 
 # The platform's authority: an intermediate its root signed, with that root as the chain.
 pki=target/kind/operator-pki
@@ -1092,6 +1095,8 @@ openssl x509 -req -in "$pki/hooked.csr" -CA "$pki/root.crt" -CAkey "$pki/root.ke
 k -n hooked create secret generic hooked-ca --type=kubernetes.io/tls \
     --from-file=tls.crt="$pki/hooked.crt" --from-file=tls.key="$pki/hooked.key" \
     --from-file=ca.crt="$pki/root.crt" >/dev/null
+k -n hooked rollout status deploy/edgerush-controller-hooked --timeout=180s >/dev/null ||
+    fail "ControlPlane hooked's controller is not ready once its authority is there"
 until_true 'registration' 90 ||
     fail "the webhook is not registered once its authority is there: $(condition controlplane/hooked hooked Programmed)"
 published=$(k -n hooked get controlplane hooked -o jsonpath='{.status.authority.bundle}')

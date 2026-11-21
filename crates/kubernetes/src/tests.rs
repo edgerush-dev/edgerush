@@ -1388,13 +1388,26 @@ async fn a_replica_makes_the_lease_leads_renews_and_stops_when_it_cannot() {
         retry: Duration::from_millis(50),
     };
     let (leading, mut leads) = watch::channel(false);
+    let (holding, holder) = watch::channel(None);
     let electing = tokio::spawn(async move {
-        crate::lease::elect(&api, "edge", "edgerush", "me", timing, &leading, |_| {}).await;
+        crate::lease::elect(
+            &api,
+            "edge",
+            "edgerush",
+            "me",
+            timing,
+            &leading,
+            Some(&holding),
+            |_| {},
+        )
+        .await;
     });
     tokio::time::timeout(Duration::from_secs(5), leads.wait_for(|leads| *leads))
         .await
         .expect("never led")
         .unwrap();
+    // The holder it wrote, which followers find the leader by.
+    assert_eq!(holder.borrow().as_deref(), Some("me"));
     until("renewed", || {
         fake.seen()
             .iter()

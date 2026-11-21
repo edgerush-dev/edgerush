@@ -71,6 +71,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "snapshot"
+path = "fuzz_targets/snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "host_index"
 path = "fuzz_targets/host_index.rs"
 test = false

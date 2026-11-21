@@ -91,18 +91,25 @@ fn a_data_plane_serving_both_is_its_settings_field_by_field() {
 }
 
 /// A DataPlane's settings say which DataPlane, and which generation of it, they are of: what
-/// its `Served` says of (05 §1).
+/// its `Served` says of (05 §1). They hold it too, as of that generation, as a snapshot
+/// carries it (04 §2): what every write to it changes left out, its status, its
+/// resourceVersion and its managedFields, so that a status written leaves them as they were.
 #[test]
 fn a_data_planes_settings_are_of_its_generation() {
-    let settings = settings(&web(3, BOTH, ""), &own()).unwrap();
+    let of = settings(&web(3, BOTH, ""), &own()).unwrap();
     assert_eq!(
-        settings.data_plane,
+        of.data_plane,
         Some(crate::DataPlaneOf {
             namespace: "edge".to_owned(),
             name: "web".to_owned(),
             generation: 3,
+            object: Arc::new(web(3, BOTH, "")),
         })
     );
+    let mut written = web(3, BOTH, &accepted("True", 3));
+    written.metadata.resource_version = Some("41".to_owned());
+    written.metadata.managed_fields = Some(vec![Default::default()]);
+    assert_eq!(settings(&written, &own()).unwrap(), of);
 }
 
 #[test]
@@ -387,7 +394,10 @@ fn a_generation_is_acted_on_once_the_operator_accepted_it() {
 
 /// What follows `data_planes` as they are, after `last`.
 fn after(last: &Planes, data_planes: &[DataPlane]) -> Choice {
-    let mut chooser = Chooser { last: last.clone() };
+    let mut chooser = Chooser {
+        last: last.clone(),
+        ..Chooser::default()
+    };
     chooser.next(data_planes, &own())
 }
 
@@ -701,4 +711,34 @@ fn a_data_plane_of_another_namespace_is_ours_only_naming_our_namespace() {
     );
     assert!(choice.served.is_empty());
     assert_eq!(choice.waiting, [Waiting::None]);
+}
+
+/// A DataPlane the operator has yet to look at is served as the leader's snapshot holds it
+/// last accepted, where this replica has none of its own, as after a restart (04 §2); of
+/// none, it is not served until it is accepted.
+#[test]
+fn one_waiting_on_the_operator_is_served_as_the_leader_accepted_it() {
+    let pending = web(2, BOTH, &accepted("True", 1));
+    let mut chooser = Chooser::default();
+    assert!(
+        chooser
+            .next(std::slice::from_ref(&pending), &own())
+            .served
+            .is_empty()
+    );
+    let record = crate::snapshot::Record {
+        accepted: Some(of_its_generation(&web(1, BOTH, ""))),
+        ..crate::snapshot::Record::default()
+    };
+    let snapshot = Snapshot {
+        count: 1,
+        planes: BTreeMap::from([(WEB.to_owned(), record)]),
+    };
+    chooser.leaders = leaders(Some(&snapshot), &own());
+    let served = chooser.next(&[pending], &own()).served;
+    assert_eq!(
+        served.get(WEB),
+        Some(&settings(&web(1, BOTH, ""), &own()).unwrap())
+    );
+    assert_eq!(leaders(None, &own()), Planes::new());
 }
