@@ -233,6 +233,7 @@ where
             without_sni: Some(0),
             refused: Vec::new(),
             client_validation: None,
+            forwards_client_certificate: false,
             shared_by: None,
         })
         .unwrap(),

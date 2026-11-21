@@ -256,6 +256,10 @@ pub struct PortSettings {
     /// Whether each request is given an ID of its own; `generate` by default.
     #[serde(default)]
     pub request_id: Option<edgerush_config::RequestId>,
+    /// Whether its HTTP listener's `X-Forwarded-Client-Cert` is the gateway's alone, telling
+    /// upstreams of the certificate a client showed where it verified; off by default.
+    #[serde(default)]
+    pub forward_client_certificate: bool,
     /// Where a record of each of its requests, or of its UDP listener's sessions, is
     /// written; nowhere by default.
     #[serde(default)]

@@ -358,6 +358,10 @@ pub struct CompiledListener {
     /// What it does with `X-Request-ID`; [`RequestId::Pass`] for a `tcp`, `tls` or `udp`
     /// listener, which carries no requests.
     pub request_id: RequestId,
+    /// Whether `X-Forwarded-Client-Cert` is the gateway's alone: what any request came with
+    /// taken off, and the certificate its client showed put on where it verified. False for
+    /// a `tcp`, `tls` or `udp` listener, which carries no requests.
+    pub forward_client_certificate: bool,
     /// The senders whose PROXY protocol headers are believed, on a listener that reads one
     /// at the start of every connection; `None` for a listener that reads none.
     pub proxy_senders: Option<TrustedProxies>,
@@ -1089,6 +1093,10 @@ pub struct CompiledTls {
     /// Clients must show a certificate these authorities vouch for (mTLS); none, and any
     /// client is served.
     pub client_validation: Option<ClientValidation>,
+    /// Whether its listener forwards the certificate a client showed
+    /// ([`CompiledListener::forward_client_certificate`]): kept here as well, since the
+    /// handshake is where it is read, once for the connection.
+    pub forwards_client_certificate: bool,
     /// The listeners sharing its port, where two or more do: `None` checks nothing.
     pub shared_by: Option<Arc<SharedListeners>>,
 }
@@ -1644,6 +1652,14 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             }
             _ => {}
         }
+        if listener.forward_client_certificate
+            && matches!(
+                listener.protocol,
+                Protocol::Tcp | Protocol::Tls | Protocol::Udp
+            )
+        {
+            errors.push(Place::listener(name).problem(Problem::ClientCertificateUnwanted));
+        }
         // A `udp` listener reads no PROXY protocol header (24 §1).
         match (listener.protocol, &listener.proxy_protocol) {
             (Protocol::Udp, None) => {}
@@ -1837,6 +1853,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                             .flatten(),
                         refused: tls.refused.clone(),
                         client_validation: tls.client_validation.clone(),
+                        forwards_client_certificate: listener.forward_client_certificate,
                         shared_by: SharedListeners::new(&tls.shared_by).map(Arc::new),
                     }),
                     http3: listener.http3,
@@ -1862,6 +1879,8 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                         .unwrap_or_default(),
                     // Said for every HTTP listener, or there would have been an error.
                     request_id: listener.request_id.unwrap_or(RequestId::Pass),
+                    // Refused above for a listener that carries no requests.
+                    forward_client_certificate: listener.forward_client_certificate,
                     // Found to compile above, or there would have been an error.
                     proxy_senders: match &listener.proxy_protocol {
                         Some(ListenerProxyProtocol::Senders(senders)) => senders_of(senders).ok(),
@@ -3132,6 +3151,9 @@ pub enum Problem {
     /// A request ID on a listener that carries no requests.
     #[error("`request_id` is for protocols `http` and `https`")]
     RequestIdUnwanted,
+    /// A client certificate forwarded by a listener that carries no requests.
+    #[error("`forward_client_certificate` is for protocols `http` and `https`")]
+    ClientCertificateUnwanted,
     /// A listener's access log names a file by an empty path.
     #[error("`access_log` names a file by an empty path")]
     EmptyAccessLogPath,
@@ -5757,6 +5779,10 @@ udp_routes:
                 "`request_id` is for protocols `http` and `https`",
             ),
             (
+                ", forward_client_certificate: true",
+                "`forward_client_certificate` is for protocols `http` and `https`",
+            ),
+            (
                 ", proxy_protocol: off",
                 "`proxy_protocol` is for listeners over TCP; a `udp` listener reads none",
             ),
@@ -6292,6 +6318,39 @@ upstreams:
             .unwrap();
             assert_eq!(listener(&compiled, "l").request_id, meant, "{written}");
         }
+    }
+
+    /// Only a listener that carries requests may forward its clients' certificates, and
+    /// one that says nothing forwards none.
+    #[test]
+    fn only_an_http_listener_forwards_client_certificates() {
+        const HTTP: &str = r#"address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass"#;
+        let compiled = |more: &str| {
+            compile(&config(&format!(
+                "listeners: {{ l: {{ {HTTP}{more} }} }}\nroutes: []\nupstreams: {{}}\n"
+            )))
+            .unwrap()
+        };
+        assert!(!listener(&compiled(""), "l").forward_client_certificate);
+        assert!(
+            listener(&compiled(", forward_client_certificate: true"), "l")
+                .forward_client_certificate
+        );
+        let refused = compile(&config(
+            "listeners: { l: { address: \"[::]:80\", protocol: tcp, proxy_protocol: off, forward_client_certificate: true } }\nroutes: []\nupstreams: {}\n",
+        ))
+        .err()
+        .unwrap_or_default()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            refused,
+            [
+                "listener `l`: `forward_client_certificate` is for protocols `http` and `https`",
+                "listener `l`: a `tcp` listener needs exactly one TCP route; it has 0",
+            ]
+        );
     }
 
     /// A listener of any protocol may say where its access log goes, stdout or a file, and

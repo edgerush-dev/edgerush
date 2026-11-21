@@ -19,6 +19,7 @@
 //! client resumes whichever worker it reaches. That key is not rotated, where BoringSSL
 //! rotates the TCP front's every two days.
 
+use crate::client_certificate;
 use crate::offered::{Curve, Hello, Key, Offered};
 use arc_swap::ArcSwap;
 use boring::error::ErrorStack;
@@ -27,7 +28,7 @@ use boring::nid::Nid;
 use boring::pkey::Id;
 use boring::ssl::{
     AlpnError, ExtensionType, NameType, SniError, Ssl, SslAcceptor, SslAlert, SslContext,
-    SslContextBuilder, SslMethod, SslSessionCacheMode, SslVerifyMode, SslVersion,
+    SslContextBuilder, SslMethod, SslRef, SslSessionCacheMode, SslVerifyMode, SslVersion,
     select_next_proto,
 };
 use boring::x509::X509;
@@ -37,6 +38,7 @@ use edgerush_config::{
     ClientValidation, ClientValidationMode, CompiledTls, NamedCertificate, PresentedCertificate,
     SharedListeners,
 };
+use http::HeaderValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -92,6 +94,10 @@ struct Front {
     validation: Option<ClientValidation>,
     /// The authorities those clients are validated against, read, and the mode.
     authorities: Option<Validating>,
+    /// Whether upstreams are told of the certificate a client showed: kept with the
+    /// validation, so that a config that changes it drains the connections, which were told
+    /// of it, or not, once at their handshake.
+    forwards: bool,
     /// The certificates it moves connections to.
     serving: Arc<ArcSwap<Certificates>>,
     /// The certificates a QUIC connection is moved to.
@@ -198,6 +204,7 @@ impl Tls {
                 acceptor: front,
                 validation: source.client_validation.clone(),
                 authorities,
+                forwards: source.forwards_client_certificate,
                 serving,
                 quic_serving,
                 quic_ticket_key,
@@ -209,14 +216,17 @@ impl Tls {
     }
 
     /// What `source` is served with where `previous` was: behind `previous`'s front, and
-    /// so with its ticket keys, if both validate clients alike; otherwise as new. The
-    /// certificates are served once [`Tls::install`] is called.
+    /// so with its ticket keys, if both validate clients alike and forward their
+    /// certificates alike; otherwise as new. The certificates are served once
+    /// [`Tls::install`] is called.
     ///
     /// # Errors
     ///
     /// A [`TlsError`] for the first certificate or authority that cannot be used.
     pub(crate) fn after(previous: &Self, source: &CompiledTls) -> Result<Self, TlsError> {
-        if previous.front.validation != source.client_validation {
+        if previous.front.validation != source.client_validation
+            || previous.front.forwards != source.forwards_client_certificate
+        {
             return Self::new(source);
         }
         let authorities = authorities_of(source)?;
@@ -265,6 +275,33 @@ impl Tls {
     /// What connections are accepted with.
     pub(crate) fn acceptor(&self) -> &SslAcceptor {
         &self.front.acceptor
+    }
+
+    /// What upstreams are told of the certificate the client of `ssl`, its handshake done,
+    /// showed: where this forwards client certificates, and the certificate verified. A
+    /// verify callback that lets any through (`AllowInsecureFallback`) leaves the
+    /// verification's result to say so.
+    pub(crate) fn client_certificate(&self, ssl: &SslRef) -> Option<HeaderValue> {
+        if !self.front.forwards {
+            return None;
+        }
+        let certificate = ssl.peer_certificate()?;
+        ssl.verify_result().ok()?;
+        client_certificate::value(&certificate)
+    }
+
+    /// Whether upstreams are told of the certificates its clients show.
+    pub(crate) fn forwards_client_certificate(&self) -> bool {
+        self.front.forwards
+    }
+
+    /// The same over QUIC, for `quic`, its handshake done.
+    pub(crate) fn quic_client_certificate(&self, quic: &quiche::Connection) -> Option<HeaderValue> {
+        if !self.front.forwards || !quic.peer_cert_verified() {
+            return None;
+        }
+        let certificate = X509::from_der(quic.peer_cert()?).ok()?;
+        client_certificate::value(&certificate)
     }
 
     /// Whether this was made from `source`, and can serve a snapshot that has it.
@@ -843,6 +880,7 @@ mod tests {
             without_sni: Some(0),
             refused: Vec::new(),
             client_validation: None,
+            forwards_client_certificate: false,
             shared_by: None,
         };
         let tls = Tls::new(&source).unwrap();
@@ -852,6 +890,7 @@ mod tests {
             without_sni: Some(0),
             refused: Vec::new(),
             client_validation: None,
+            forwards_client_certificate: false,
             shared_by: None,
         };
         assert!(!tls.is_for(&other));
@@ -871,6 +910,7 @@ mod tests {
                 without_sni: Some(0),
                 refused: Vec::new(),
                 client_validation: None,
+                forwards_client_certificate: false,
                 shared_by: None,
             })
             .map(|_| ())
@@ -922,6 +962,7 @@ mod tests {
                     authorities,
                     mode: edgerush_config::ClientValidationMode::AllowValidOnly,
                 }),
+                forwards_client_certificate: false,
                 shared_by: None,
             })
             .map(|_| ())
@@ -980,6 +1021,7 @@ mod tests {
                     without_sni,
                     refused: Vec::new(),
                     client_validation: None,
+                    forwards_client_certificate: false,
                     shared_by: None,
                 })
                 .unwrap()
@@ -1037,6 +1079,7 @@ upstreams: {}
                 without_sni: None,
                 refused: Vec::new(),
                 client_validation: None,
+                forwards_client_certificate: false,
                 shared_by,
             })
             .unwrap();
@@ -1077,6 +1120,7 @@ upstreams: {}
                 without_sni: None,
                 refused: Vec::new(),
                 client_validation: None,
+                forwards_client_certificate: false,
                 shared_by: None,
             })
             .unwrap();
@@ -1113,6 +1157,7 @@ upstreams: {}
                 without_sni: None,
                 refused: Vec::new(),
                 client_validation: None,
+                forwards_client_certificate: false,
                 shared_by: None,
             })
             .unwrap();
@@ -1140,6 +1185,7 @@ upstreams: {}
                 without_sni: None,
                 refused: Vec::new(),
                 client_validation: None,
+                forwards_client_certificate: false,
                 shared_by: None,
             })
             .unwrap();
@@ -1179,6 +1225,7 @@ upstreams: {}
                     authorities: vec![trusted.chain.clone()],
                     mode: edgerush_config::ClientValidationMode::AllowValidOnly,
                 }),
+                forwards_client_certificate: false,
                 shared_by: None,
             })
             .unwrap();
@@ -1210,7 +1257,8 @@ upstreams: {}
 
         /// A listener that validates clients in the insecure fallback lets every client
         /// through over QUIC, as over TCP, having asked each for a certificate: it holds
-        /// whatever one the client showed, vouched for or not.
+        /// whatever one the client showed, vouched for or not, and knows which, so that
+        /// upstreams are told of the one vouched for alone.
         #[test]
         fn a_listener_validating_clients_in_the_insecure_fallback_lets_them_all_through() {
             let (trusted, stranger) = (certificate(&["client"]), certificate(&["client"]));
@@ -1222,6 +1270,7 @@ upstreams: {}
                     authorities: vec![trusted.chain.clone()],
                     mode: edgerush_config::ClientValidationMode::AllowInsecureFallback,
                 }),
+                forwards_client_certificate: true,
                 shared_by: None,
             })
             .unwrap();
@@ -1242,6 +1291,13 @@ upstreams: {}
                     shown.map(der),
                     "{shown:?}"
                 );
+                let vouched = shown == Some(&trusted);
+                assert_eq!(pipe.server.peer_cert_verified(), vouched, "{shown:?}");
+                assert_eq!(
+                    tls.quic_client_certificate(&pipe.server).is_some(),
+                    vouched,
+                    "{shown:?}"
+                );
             }
         }
 
@@ -1254,6 +1310,7 @@ upstreams: {}
                 without_sni: Some(0),
                 refused: Vec::new(),
                 client_validation: None,
+                forwards_client_certificate: false,
                 shared_by: None,
             };
             let tls = Tls::new(&source).unwrap();
@@ -1269,6 +1326,7 @@ upstreams: {}
                     without_sni: Some(0),
                     refused: Vec::new(),
                     client_validation: None,
+                    forwards_client_certificate: false,
                     shared_by: None,
                 },
             )

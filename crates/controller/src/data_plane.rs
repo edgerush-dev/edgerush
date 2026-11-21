@@ -614,6 +614,7 @@ fn port_settings(settings: &DataPlanePorts) -> Result<PortSettings, (String, Str
             trusted_only_headers: forwarding.trusted_only_headers.clone(),
         }),
         request_id,
+        forward_client_certificate: settings.forward_client_certificate.unwrap_or(false),
         access_log,
         tunnel_idle_seconds: seconds(settings.tunnel_idle_seconds, "tunnelIdleSeconds")?,
         session_idle_seconds: seconds(settings.session_idle_seconds, "sessionIdleSeconds")?,

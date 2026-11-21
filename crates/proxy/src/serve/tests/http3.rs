@@ -158,6 +158,64 @@ async fn an_http3_request_is_answered_by_the_upstream() {
         .await;
 }
 
+/// Over HTTP/3, as over TCP, a listener that forwards client certificates tells an
+/// upstream of the one its client showed where it verified, and of nothing else: under the
+/// insecure fallback, not of one nobody vouches for, nor of a client that showed none; what
+/// the request came with is taken off.
+#[tokio::test]
+async fn only_a_verified_client_certificate_is_forwarded_over_http3() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::{Client, get};
+            use crate::tls::testing::certificate;
+            let (trusted, stranger) = (certificate(&["client"]), certificate(&["client"]));
+            let told = crate::client_certificate::value(
+                &boring::x509::X509::from_pem(trusted.chain.as_bytes()).unwrap(),
+            )
+            .unwrap();
+            let told = format!(
+                "x-forwarded-client-cert: {}",
+                told.to_str().unwrap().to_lowercase()
+            );
+            let (upstream, heads) = recording_upstream("200 OK");
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let mut config = h3_config(upstream, http3);
+            let web = config.listeners.get_mut("web").unwrap();
+            web.forward_client_certificate = true;
+            web.tls.as_mut().unwrap().client_validation = Some(edgerush_config::ClientValidation {
+                authorities: vec![trusted.chain.clone()],
+                mode: edgerush_config::ClientValidationMode::AllowInsecureFallback,
+            });
+            let front = serving_h3(&config).await.0;
+            for (shown, who, expected) in [
+                (Some(&trusted), "a trusted client", Some(told.as_str())),
+                (None, "a client of no certificate", None),
+                (Some(&stranger), "a client nobody vouches for", None),
+            ] {
+                let mut client = match shown {
+                    Some(shown) => Client::connect_showing(front, "a.test", shown).await,
+                    None => Client::connect(front, "a.test").await,
+                };
+                let mut fields = get("a.test", "/");
+                fields.push(("x-forwarded-client-cert", "Hash=forged"));
+                let id = client.request(&fields, true);
+                let answer = client.answer(id).await;
+                assert_eq!(answer.final_status(), Some("200"), "{who}");
+                let head = heads.borrow().last().cloned().unwrap();
+                let forwarded: Vec<&str> = head
+                    .lines()
+                    .filter(|line| line.starts_with("x-forwarded-client-cert:"))
+                    .collect();
+                assert_eq!(forwarded, Vec::from_iter(expected), "{who}");
+            }
+        })
+        .await;
+}
+
 /// An HTTP/3 connection is open, as a TCP one is, until it has gone: a request held
 /// through the drain keeps it so, and a draining process waits on it (03 §10).
 #[tokio::test]

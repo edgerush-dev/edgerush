@@ -107,6 +107,15 @@ pub struct PlatformDefaultsGatewayClassesDataPlanePorts {
     #[serde(rename = "accessLog")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_log: Option<PlatformDefaultsGatewayClassesDataPlanePortsAccessLog>,
+    /// ForwardClientCertificate has its HTTP listener tell upstreams of the
+    /// certificate each request's client showed, in X-Forwarded-Client-Cert as
+    /// Envoy writes it (Hash, Cert, Subject, URI and DNS): the header is always
+    /// the gateway's, the certificate's where it verified against the Gateway's
+    /// client certificate validation and none otherwise, in place of any the
+    /// request came with, a trusted proxy's included. Off unless said.
+    #[serde(rename = "forwardClientCertificate")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_client_certificate: Option<bool>,
     /// Forwarding is whom its requests' forwarding headers are believed from.
     /// Left out, no one's are, and the headers only a trusted proxy may send are
     /// Forwarded, X-Real-IP and X-Forwarded-*.

@@ -10,10 +10,13 @@
 //! gateway's entry after whatever came before it (RFC 9110 §7.6.3).
 //!
 //! A request given an ID (08 §3) has it in `X-Request-ID`, in place of whatever it came
-//! with, from a trusted proxy too.
+//! with, from a trusted proxy too. On a listener that forwards client certificates (03 §3),
+//! `X-Forwarded-Client-Cert` is likewise the gateway's alone: the certificate its client
+//! showed, where it verified, and otherwise none.
 //!
 //! A rule's own changes to the headers come after, and may change any of these but the ID.
 
+use crate::client_certificate;
 use crate::head::Head;
 use crate::request::Rejection;
 use edgerush_config::{CompiledListener, Protocol, SharedListeners};
@@ -47,6 +50,10 @@ pub struct Client {
     /// The listener its handshake's name is for, where listeners share the port; set once
     /// the handshake is done, and never where none do.
     asked: OnceCell<Asked>,
+    /// What `X-Forwarded-Client-Cert` says of the certificate its client showed, on a
+    /// listener that forwards it: set once the handshake is done, where the certificate
+    /// verified, and never otherwise.
+    certificate: OnceCell<HeaderValue>,
 }
 
 /// Which of the listeners sharing a port a connection was made for: the one the name its
@@ -87,6 +94,7 @@ impl Client {
             value: address_value(address),
             peer: None,
             asked: OnceCell::new(),
+            certificate: OnceCell::new(),
         }
     }
 
@@ -95,6 +103,19 @@ impl Client {
     pub fn asked(&self, asked: Asked) {
         // Only the handshake sets it, once for the connection.
         let _ = self.asked.set(asked);
+    }
+
+    /// Its client showed a certificate that verified, which `value` tells upstreams of, on
+    /// a listener that forwards it. Once; a second time is not taken.
+    pub fn certified(&self, value: HeaderValue) {
+        // Only the handshake sets it, once for the connection.
+        let _ = self.certificate.set(value);
+    }
+
+    /// What `X-Forwarded-Client-Cert` says of its client's certificate, if it is told.
+    #[must_use]
+    pub fn certificate(&self) -> Option<&HeaderValue> {
+        self.certificate.get()
     }
 
     /// Whether a request for `host` is for another listener than its connection was made
@@ -208,18 +229,36 @@ pub(crate) fn forward<H: Head>(
         if let Some(id) = id {
             head.set_field(request_id::HEADER, id.clone())?;
         }
+        // Even a trusted proxy's is replaced: the certificate is the one shown here.
+        if listener.forward_client_certificate {
+            match client.certificate() {
+                Some(value) => head.set_field(client_certificate::HEADER, value.clone())?,
+                None if has(head, &client_certificate::HEADER) => {
+                    head.remove_where(is_client_certificate)?;
+                }
+                None => {}
+            }
+        }
         found
     } else {
         // One pass over the names takes off what the client said of forwarding, its ID if
-        // the gateway gives one, and what only a trusted proxy may send; what the gateway
-        // says is then added, with nothing of the same name left to look for.
+        // the gateway gives one, its certificate if the gateway tells of it, and what only
+        // a trusted proxy may send; what the gateway says is then added, with nothing of
+        // the same name left to look for.
         let only = &forwarding.trusted_only_headers;
         let ids = id.is_some();
+        let certificates = listener.forward_client_certificate;
         head.remove_where(|name| {
-            is_the_gateways(name) || (ids && is_request_id(name)) || only.matches(name)
+            is_the_gateways(name)
+                || (ids && is_request_id(name))
+                || (certificates && is_client_certificate(name))
+                || only.matches(name)
         })?;
         if let Some(id) = id {
             head.append_field(request_id::HEADER, id.clone())?;
+        }
+        if certificates && let Some(value) = client.certificate() {
+            head.append_field(client_certificate::HEADER, value.clone())?;
         }
         head.append_field(FORWARDED_FOR, client.value.clone())?;
         head.append_field(FORWARDED_PROTO, proto)?;
@@ -282,6 +321,11 @@ fn is_the_gateways(name: &[u8]) -> bool {
 /// Whether `name`, in whatever case, is `X-Request-ID`.
 fn is_request_id(name: &[u8]) -> bool {
     name.eq_ignore_ascii_case(request_id::HEADER.as_str().as_bytes())
+}
+
+/// Whether `name`, in whatever case, is `X-Forwarded-Client-Cert`.
+fn is_client_certificate(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(client_certificate::HEADER.as_str().as_bytes())
 }
 
 /// Whether `head` has a field called `name`.

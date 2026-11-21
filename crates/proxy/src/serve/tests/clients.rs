@@ -98,15 +98,25 @@ pub(super) async fn tls_client(
 }
 
 /// Sends one HTTP/1.1 request on `stream` and reads the answer to its end.
-pub(super) async fn h1_over<S>(mut stream: S) -> String
+pub(super) async fn h1_over<S>(stream: S) -> String
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    h1_request_over(
+        stream,
+        b"GET / HTTP/1.1\r\nhost: example.test\r\nconnection: close\r\n\r\n",
+    )
+    .await
+}
+
+/// Sends `request`, one HTTP/1.1 request that closes, on `stream`, and reads the answer to
+/// its end.
+pub(super) async fn h1_request_over<S>(mut stream: S, request: &[u8]) -> String
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    stream
-        .write_all(b"GET / HTTP/1.1\r\nhost: example.test\r\nconnection: close\r\n\r\n")
-        .await
-        .unwrap();
+    stream.write_all(request).await.unwrap();
     let mut answer = Vec::new();
     let _ended = within(stream.read_to_end(&mut answer)).await;
     String::from_utf8_lossy(&answer).into_owned()

@@ -148,6 +148,14 @@ Every change is marked `EdgeRush:` in the source.
   as a literal with the bit set, even one the static table holds whole
   (`src/h3/qpack/`). `never_indexed_fields_keep_the_mark` in `src/h3/qpack/mod.rs` covers
   it.
+- **Whether the peer's certificate verified can be asked.** A server that lets a client
+  through whatever its certificate's verification says (Gateway API's
+  `AllowInsecureFallback`) needs the verdict to forward only a certificate that verified
+  (03 §3 in the docs), and quiche gave the certificate alone.
+  `Connection::peer_cert_verified()` reads BoringSSL's `SSL_get_verify_result` for a peer
+  that showed one (`src/tls/boringssl.rs`, `src/lib.rs`).
+  `a_listener_validating_clients_in_the_insecure_fallback_lets_them_all_through` in
+  `crates/proxy/src/tls.rs` covers it.
 
 ## Why
 

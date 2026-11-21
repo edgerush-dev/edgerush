@@ -662,6 +662,9 @@ async fn serve_tls(
         let name = secured.ssl().servername(NameType::HOST_NAME);
         client.asked(Asked::new(shared, name));
     }
+    if let Some(certificate) = tls.client_certificate(secured.ssl()) {
+        client.certified(certificate);
+    }
     if secured.ssl().selected_alpn_protocol() == Some(tls::H2) {
         serve_h2(ours, client, asking, deadlines, secured).await;
     } else {
