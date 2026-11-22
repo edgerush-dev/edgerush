@@ -3084,8 +3084,8 @@ fn a_refused_request_waits_for_the_latest_of_its_keys() {
     let mut participant: Participant<FixedState, Pods> =
         Participant::new(7, CYCLE, Pods::none(), FixedState::default()).unwrap();
     let (a, b): (&[u8], &[u8]) = (b"a", b"b");
-    let unit = |c: Contract| (c.window.get() / c.limit.get()).div_ceil(1 << 16);
-    let interval = |c: Contract| c.window.get() / c.limit.get();
+    let unit = |c: Contract| (c.window.get() / c.limit).div_ceil(1 << 16);
+    let interval = |c: Contract| c.window.get() / c.limit;
     let wait = |participant: &Participant<FixedState, Pods>, keys: &[(&[u8], Contract)]| {
         let entries = participant.entries(keys);
         let refs: Vec<&Entry> = entries.iter().map(|entry| &**entry).collect();

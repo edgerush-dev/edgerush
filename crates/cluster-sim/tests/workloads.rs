@@ -29,7 +29,7 @@ fn limit(limit: u64, burst: u64) -> Contract {
 /// What a run of `span` on `planes` data planes may admit under `contract` (06 §1): its rate
 /// over the whole run and 5% more, and a bucket for each data plane.
 fn allowed(contract: &Contract, span: u64, planes: u64) -> u64 {
-    let rate = contract.limit.get() * span / contract.window.get();
+    let rate = contract.limit.get() * span / contract.window;
     rate + rate / 20 + planes * contract.burst.get()
 }
 

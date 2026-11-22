@@ -189,7 +189,7 @@ impl ReuseIdentity {
             Aside::NoPort => now | NO_PORT,
         };
         self.standing
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |standing| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |standing| {
                 (standing & !UNHEALTHY == 0).then_some(standing | mark)
             })
             .is_ok()
@@ -218,7 +218,7 @@ impl ReuseIdentity {
         let now = now() & !MARKS;
         let _unless_brought_back =
             self.standing
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |standing| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |standing| {
                     (standing & !UNHEALTHY != 0).then_some((standing & MARKS) | now)
                 });
     }
