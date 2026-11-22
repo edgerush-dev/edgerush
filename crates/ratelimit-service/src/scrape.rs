@@ -7,6 +7,7 @@ use crate::cluster::mode::{DecidedFromCopy, Mode};
 use crate::cluster::pod::{Observed, StorePod};
 use bytes::Bytes;
 use edgerush_cluster_asynchronous::TurnedAway;
+use edgerush_control_service::accept;
 use edgerush_telemetry::{Exposition, Kind};
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use http_body_util::Full;
@@ -25,10 +26,6 @@ const MOST: usize = 10;
 
 /// How long a scrape has, from its connection to its answer sent.
 const WITHIN: Duration = Duration::from_secs(5);
-
-/// How long to wait after an accept that failed for want of something the whole process
-/// lacks, such as file descriptors, before trying again.
-const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
 /// What a store pod's mode counts of itself, as its scrape shows it.
 pub trait Counted {
@@ -188,13 +185,9 @@ where
 {
     let room = Arc::new(Semaphore::new(MOST));
     loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
-            Err(_) => {
-                tokio::time::sleep(ACCEPT_PAUSE).await;
-                continue;
-            }
-        };
+        // A connection that cannot be taken, out of files most likely, is tried again only
+        // after a pause, as on the pod's gRPC listener.
+        let (stream, _) = accept::next(|| listener.accept()).await;
         // Past the most at once, closed unanswered.
         let Ok(permit) = Arc::clone(&room).try_acquire_owned() else {
             continue;

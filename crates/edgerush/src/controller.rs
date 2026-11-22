@@ -8,6 +8,7 @@ use crate::validate::{described, read};
 use bytes::Bytes;
 use edgerush_certificates::authority::{Kind, Written};
 use edgerush_config::{Certificate, Config};
+use edgerush_control_service::open_files::{self, OpenFiles};
 use edgerush_control_service::webhook::{self, Bounds};
 use edgerush_control_service::{
     CertificateFiles, Credentials, Files, FilesError, Heard, Served, SslAcceptor, acceptor, reread,
@@ -193,10 +194,8 @@ pub(crate) fn command(
     // containerd 2.x the soft limit is 1,024, for every data plane's stream, the webhook,
     // the probes and the API server's watches. Said only where it could not be raised, as
     // nothing here is sized by it.
-    let open_files = crate::limits::raise_open_files();
-    if let (crate::limits::OpenFiles::Kept { .. }, Some(files)) =
-        (open_files, crate::limits::described_open_files(open_files))
-    {
+    let open_files = open_files::raise();
+    if let (OpenFiles::Kept { .. }, Some(files)) = (open_files, open_files.described()) {
         let _nobody_reads = writeln!(stderr, "warning: {files}");
     }
     let runtime = match Builder::new_current_thread().enable_all().build() {

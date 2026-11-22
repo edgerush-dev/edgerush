@@ -45,5 +45,9 @@ proptest.workspace = true
 # "io-util": the socket tests' relays, copying both ways.
 tokio = { workspace = true, features = ["io-util"] }
 
+# The pod's open-file limit lowered, to see it raised as it starts.
+[target.'cfg(unix)'.dev-dependencies]
+rustix.workspace = true
+
 [lints]
 workspace = true

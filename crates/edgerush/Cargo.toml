@@ -47,10 +47,6 @@ thiserror.workspace = true
 # worker runs a single-threaded runtime, so the multi-thread one is not built.
 tokio = { workspace = true, features = ["io-util", "signal", "sync"] }
 
-# The open-file limit, raised at the start (03 §9). There is none to raise on Windows.
-[target.'cfg(unix)'.dependencies]
-rustix.workspace = true
-
 [dev-dependencies]
 # A nameserver stood in for.
 edgerush-dns = { workspace = true, features = ["testing"] }
@@ -68,6 +64,10 @@ schemars.workspace = true
 serde_json.workspace = true
 # The fake API server answers on a runtime with threads of its own.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# The controller's open-file limit lowered, to see it raised as it starts.
+[target.'cfg(unix)'.dev-dependencies]
+rustix.workspace = true
 
 [lints]
 workspace = true
