@@ -104,10 +104,10 @@ socket2 = { version = "0.6.5", features = ["all"] }
 # socket2 cannot set and `unsafe` is forbidden for (16 §3). Linux only, the proxy crate
 # only. tokio-quiche uses the same crate for this.
 nix = { version = "0.31.3", features = ["net", "socket", "uio"] }
-# The open-file limit, raised by the binary at its start (03 §9): a container under
+# The open-file limit, raised by each process at its start (03 §9): a container under
 # containerd 2.x is given a soft limit of 1,024. Safe calls, by raw system calls on Linux;
 # chosen over `rlimit`, and over an exception to the ban on `unsafe`.
-# Only the binary may depend on it.
+# Only `edgerush-control-service::open_files` may depend on it, and tests that lower the limit.
 rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
 regex = { version = "1.13", default-features = false, features = ["std", "perf"] }
 # Finding the line feeds of a head a vector at a time; regex brings it in already.

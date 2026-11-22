@@ -30,6 +30,11 @@ tokio-boring.workspace = true
 tonic.workspace = true
 tower-service.workspace = true
 
+# The open-file limit, raised as each process starts (`open_files`, 03 §9). There is none
+# to raise on Windows.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 edgerush-certificates = { workspace = true, features = ["testing"] }
 # The webhook asked over HTTP/2, as the API server asks it.

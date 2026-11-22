@@ -1,13 +1,9 @@
 //! The open files and the memory the process may hold, and what that allows each worker:
 //! connections, and storage for requests ([03 §9] in the docs).
 //!
-//! A container is given the open-file limits of whatever starts it, and under containerd
-//! 2.x that is a soft limit of 1,024 with a hard limit of 524,288: about a thousand
-//! sockets for the whole process, clients and upstreams together, and nothing in a pod's
-//! spec can change it. So the process raises its soft limit to its hard limit as it
-//! starts, as Go's runtime does for every Go program and HAProxy does for itself. The hard
-//! limit is the administrator's, and it is never asked for more.
-//!
+//! The process raises its soft open-file limit to its hard limit as it starts, before it
+//! opens a socket ([`edgerush_control_service::open_files`]): under containerd 2.x a
+//! container is given 1,024, about a thousand sockets for clients and upstreams together.
 //! What a worker may then hold follows from what was got, so that a worker stops at its
 //! cap — where the fair share between listeners and the pause that costs nothing are —
 //! rather than at the descriptors running out, where accepting fails and is tried again.
@@ -28,6 +24,7 @@
 //! [03 §9]: ../../../docs/03-data-plane.md
 
 use crate::per_core::CONNECTIONS_PER_WORKER;
+use edgerush_control_service::open_files::OpenFiles;
 use edgerush_proxy::H1Limits;
 use edgerush_proxy::connections::{CONNECTION, QUIC_MOST};
 use std::num::NonZeroUsize;
@@ -54,70 +51,6 @@ const RESERVE: u64 = 1024;
 
 /// Open files a client's connection takes: its own, and in most cases one to its upstream.
 const PER_CONNECTION: u64 = 2;
-
-/// What became of the open-file limit at the start.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpenFiles {
-    /// The platform has no such limit (Windows).
-    #[cfg_attr(unix, allow(dead_code, reason = "Unix has a limit"))]
-    NoLimit,
-    /// The soft limit was `was`, and is `now`; `None` is no limit at all.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "only Unix has a limit to raise"))]
-    Raised { was: Option<u64>, now: Option<u64> },
-    /// The soft limit is `now`, and could not be raised to the hard limit.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "only Unix has a limit to keep"))]
-    Kept {
-        now: Option<u64>,
-        why: std::io::ErrorKind,
-    },
-}
-
-impl OpenFiles {
-    /// The soft limit the process runs under, `None` where there is none.
-    fn limit(self) -> Option<u64> {
-        match self {
-            Self::NoLimit => None,
-            Self::Raised { now, .. } | Self::Kept { now, .. } => now,
-        }
-    }
-}
-
-/// Raises the soft open-file limit to the hard limit, where the platform has one.
-#[cfg(unix)]
-pub(crate) fn raise_open_files() -> OpenFiles {
-    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
-    let before = getrlimit(Resource::Nofile);
-    // A hard limit of none cannot be the soft one: Linux holds the soft limit to
-    // `fs.nr_open`, 1,048,576 unless changed.
-    let wanted = before.maximum.or(Some(1 << 20));
-    // `None` is no limit at all: there is nothing to raise it to.
-    if before.current.is_none() || before.current >= wanted {
-        return OpenFiles::Raised {
-            was: before.current,
-            now: before.current,
-        };
-    }
-    let raised = Rlimit {
-        current: wanted,
-        maximum: before.maximum,
-    };
-    match setrlimit(Resource::Nofile, raised) {
-        Ok(()) => OpenFiles::Raised {
-            was: before.current,
-            now: getrlimit(Resource::Nofile).current,
-        },
-        Err(error) => OpenFiles::Kept {
-            now: before.current,
-            why: std::io::Error::from(error).kind(),
-        },
-    }
-}
-
-/// There is no open-file limit to raise.
-#[cfg(not(unix))]
-pub(crate) fn raise_open_files() -> OpenFiles {
-    OpenFiles::NoLimit
-}
 
 /// How many connections each of `workers` may hold, and what set it: under `open_files`,
 /// what the limit leaves after the reserve, two open files to a connection, shared out; and
@@ -326,30 +259,9 @@ pub(crate) fn described(open_files: OpenFiles, connections: Connections) -> Stri
         "{} connections a worker, by {}",
         connections.each, connections.set_by
     );
-    match described_open_files(open_files) {
+    match open_files.described() {
         Some(files) => format!("{files}; {each}"),
         None => each,
-    }
-}
-
-/// What a start says of the open files: the soft limit found, and what it was raised to or
-/// why not. Nothing where the platform has no limit.
-pub(crate) fn described_open_files(open_files: OpenFiles) -> Option<String> {
-    let shown = |limit: Option<u64>| limit.map_or("none".to_owned(), |limit| limit.to_string());
-    match open_files {
-        OpenFiles::NoLimit => None,
-        OpenFiles::Raised { was, now } if was == now => {
-            Some(format!("open files: soft limit {}", shown(now)))
-        }
-        OpenFiles::Raised { was, now } => Some(format!(
-            "open files: soft limit {} raised to {}",
-            shown(was),
-            shown(now)
-        )),
-        OpenFiles::Kept { now, why } => Some(format!(
-            "open files: soft limit {}, not raised ({why})",
-            shown(now)
-        )),
     }
 }
 
@@ -580,16 +492,6 @@ mod tests {
         );
     }
 
-    /// The controller says the open files alone, having no workers to share them out.
-    #[test]
-    fn the_open_files_are_said_alone_where_there_is_a_limit() {
-        assert_eq!(
-            described_open_files(limit(524_288)).as_deref(),
-            Some("open files: soft limit 1024 raised to 524288")
-        );
-        assert_eq!(described_open_files(OpenFiles::NoLimit), None);
-    }
-
     const MIB: u64 = 1024 * 1024;
 
     fn limited(bytes: u64) -> Memory {
@@ -693,21 +595,5 @@ mod tests {
             lower(file("memory.max"), file("memory.high"))
         });
         assert_eq!(memory(), expected);
-    }
-
-    /// The soft limit is the hard limit once it has been raised, or as near as the kernel
-    /// lets it be where the hard limit is none.
-    #[cfg(unix)]
-    #[test]
-    fn raising_takes_the_soft_limit_to_the_hard_one() {
-        use rustix::process::{Resource, getrlimit};
-        let opened = raise_open_files();
-        let now = getrlimit(Resource::Nofile);
-        assert!(matches!(opened, OpenFiles::Raised { .. }), "{opened:?}");
-        match now.maximum {
-            Some(hard) => assert_eq!(now.current, Some(hard)),
-            None => assert!(now.current >= Some(1 << 20), "{now:?}"),
-        }
-        assert_eq!(opened.limit(), now.current);
     }
 }

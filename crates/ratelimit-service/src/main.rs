@@ -60,6 +60,7 @@ use boring::ssl::SslConnector;
 use edgerush_cluster::Time;
 use edgerush_cluster_asynchronous::Pod as AsyncPod;
 use edgerush_config::{ServiceFile, ServiceMode};
+use edgerush_control_service::open_files::{self, OpenFiles};
 use edgerush_control_service::reread;
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::mode::Mode;
@@ -77,7 +78,6 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tonic::server::NamedService;
-use tonic::transport::server::TcpIncoming;
 
 /// What `keys.max_bytes` is when left out: 256 MiB.
 const MAX_KEY_BYTES: u64 = 256 << 20;
@@ -217,7 +217,27 @@ fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
 }
 
 fn main() -> ExitCode {
-    let args = match config_path(std::env::args().skip(1)).and_then(|path| read(&path)) {
+    run(std::env::args().skip(1))
+}
+
+/// The pod, from its command line `args` to its end.
+fn run(args: impl Iterator<Item = String>) -> ExitCode {
+    let path = match config_path(args) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("edgerush-ratelimit-service: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    // Before a file is opened, its config and its runtime's own among them, as the data
+    // plane does: under containerd 2.x the soft limit is 1,024, for every data plane's
+    // connection, the other pods', and the scrape's. Said only where it could not be raised,
+    // as nothing here is sized by it.
+    let open_files = open_files::raise();
+    if let (OpenFiles::Kept { .. }, Some(files)) = (open_files, open_files.described()) {
+        eprintln!("edgerush-ratelimit-service: warning: {files}");
+    }
+    let args = match read(&path) {
         Ok(args) => args,
         Err(error) => {
             eprintln!("edgerush-ratelimit-service: {error}");
@@ -373,12 +393,7 @@ where
             };
             secure::serve(listener, tls, service, refused, stop).await
         }
-        None => {
-            let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
-            tonic::transport::Server::builder()
-                .serve_with_incoming_shutdown(service, incoming, stop)
-                .await
-        }
+        None => secure::serve_plain(listener, service, stop).await,
     }
 }
 
@@ -433,6 +448,35 @@ mod tests {
             &["--id", "0"][..],
         ] {
             assert_eq!(given(args), Err(USAGE.to_owned()), "{args:?}");
+        }
+    }
+
+    /// It raises its soft open-file limit to the hard one before it opens anything, its
+    /// config file first, as the data plane does: a container's soft limit of 1,024 would
+    /// leave it a thousand files for every data plane's connection, the other pods' and
+    /// the scrape's.
+    #[cfg(unix)]
+    #[test]
+    fn it_raises_its_open_file_limit_as_it_starts() {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let before = getrlimit(Resource::Nofile);
+        // One below what it can be raised to: harmless to tests beside it in one process.
+        let lowered = before.maximum.unwrap_or(1 << 20) - 1;
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(lowered),
+                maximum: before.maximum,
+            },
+        )
+        .unwrap();
+        let missing = std::env::temp_dir().join("edgerush-no-such-service.yaml");
+        let args = ["--config".to_owned(), missing.display().to_string()];
+        assert_eq!(run(args.into_iter()), ExitCode::from(2));
+        let now = getrlimit(Resource::Nofile);
+        match now.maximum {
+            Some(hard) => assert_eq!(now.current, Some(hard)),
+            None => assert!(now.current >= Some(1 << 20), "{now:?}"),
         }
     }
 

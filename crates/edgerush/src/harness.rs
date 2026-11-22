@@ -379,7 +379,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         .or_else(|| thread::available_parallelism().ok())
         .unwrap_or(NonZeroUsize::MIN);
     // Before a socket is opened, as every socket is an open file.
-    let open_files = crate::limits::raise_open_files();
+    let open_files = edgerush_control_service::open_files::raise();
     let memory = crate::limits::memory();
     let connections = crate::limits::connections_per_worker(open_files, memory, workers);
     let mut limits = limits;
