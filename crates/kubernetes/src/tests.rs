@@ -238,6 +238,23 @@ async fn a_certificate_not_for_the_address_or_not_trusted_is_refused() {
     assert!(fake.seen().is_empty());
 }
 
+/// Each token file is its call's own, whatever name it is given: tests run each in a
+/// process of its own, side by side, and two that shared one would read the other's token
+/// half written, empty between its truncate and its write.
+#[test]
+fn each_token_file_is_its_calls_own() {
+    let first = token("shared", "one");
+    let second = token("shared", "two");
+    assert_ne!(first, second);
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "one");
+    assert_eq!(std::fs::read_to_string(&second).unwrap(), "two");
+    let process = std::process::id().to_string();
+    for path in [&first, &second] {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.contains(&process), "{name}");
+    }
+}
+
 #[tokio::test]
 async fn the_token_is_read_again_once_it_is_old_and_kept_if_it_cannot_be() {
     let fake = Fake::start(&["127.0.0.1"], |_| answer(200, &list("1", None))).await;
@@ -262,11 +279,12 @@ async fn the_token_is_read_again_once_it_is_old_and_kept_if_it_cannot_be() {
         .await
         .unwrap();
 
-    let held = fake.client(&token("held", "first"), Timing::default());
+    let held_path = token("held", "first");
+    let held = fake.client(&held_path, Timing::default());
     held.list::<EndpointSlice>(&namespace("shop"), None)
         .await
         .unwrap();
-    token("held", "second");
+    std::fs::write(&held_path, "second").unwrap();
     held.list::<EndpointSlice>(&namespace("shop"), None)
         .await
         .unwrap();

@@ -199,11 +199,15 @@ impl Fake {
     }
 }
 
-/// A token file of the test's own, `name` in a directory of these tests', holding `token`.
+/// A token file of this call's own, holding `token`: named for `name`, the process and a
+/// count within it, so that no two calls share one, whatever name they are given, in one
+/// process or in tests running side by side, each in a process of its own.
 pub fn token(name: &str, token: &str) -> PathBuf {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join("edgerush-kubernetes-tests");
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(name);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{name}-{}-{call}", std::process::id()));
     std::fs::write(&path, token).unwrap();
     path
 }

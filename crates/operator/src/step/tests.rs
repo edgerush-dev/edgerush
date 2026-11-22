@@ -9,7 +9,6 @@ use edgerush_kubernetes::testing::{Answer, Fake, Seen as Asked, answer, token};
 use edgerush_planes::data_plane::DataPlaneReplicas;
 use k8s_openapi::jiff::Timestamp;
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 const APPLY: &str = "?fieldManager=edgerush-operator&force=true";
 
@@ -159,11 +158,7 @@ async fn cluster(
         }
     })
     .await;
-    // A token file of each fake's own: tests run at once, and one written while another
-    // reads it reads empty.
-    static FAKES: AtomicUsize = AtomicUsize::new(0);
-    let name = format!("operator-{}", FAKES.fetch_add(1, Ordering::Relaxed));
-    let api = fake.client(&token(&name, "secret"), Timing::default());
+    let api = fake.client(&token("operator", "secret"), Timing::default());
     (fake, api)
 }
 
