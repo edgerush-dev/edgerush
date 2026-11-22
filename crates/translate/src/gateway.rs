@@ -341,7 +341,8 @@ pub enum ListenerProblem {
     #[error("TLS mode `{0}` is not served: a TLS listener passes its connections through")]
     PassthroughOnly(String),
     /// Its Gateway or ListenerSet states its port for TCP and for HTTP, HTTPS or TLS, which
-    /// the spec counts not distinct and has none of accepted (`ProtocolConflict`, Q-c1).
+    /// the spec counts not distinct and has none of accepted (`ProtocolConflict`, Q-c1),
+    /// where no earlier resource has the port.
     #[error(
         "its {kind} states port {port} for TCP and for HTTP, HTTPS or TLS, which the spec does \
          not let share a port: no listener of it there is accepted"
@@ -1081,9 +1082,11 @@ pub(crate) struct Written {
 ///
 /// A TCP listener is distinct by port alone (the spec): its `hostname`, which its schema
 /// forbids, is not read. Where one resource's listeners state a port for TCP and for HTTP,
-/// HTTPS or TLS, none of them on it is accepted, as the spec has it (Q-c1), and, refused,
-/// they take no port: a later resource's listener there is judged as any (Q-c1b), so that
-/// one team's ListenerSet never keeps a port from another's.
+/// HTTPS or TLS, and no earlier resource has it, none of them on it is accepted, as the
+/// spec has it (Q-c1), and, refused, they take no port: a later resource's listener there
+/// is judged as any (Q-c1b), so that one team's ListenerSet never keeps a port from
+/// another's. Where an earlier resource has it, each is judged against that one, as GEP-1713
+/// keeps the first and conformance has it (`ListenerSetProtocolConflict`).
 ///
 /// A UDP listener is distinct by port alone, as a TCP one, its port number another
 /// protocol's too, whose socket is not its (04 §2); except where an HTTPS listener accepted
@@ -1179,7 +1182,12 @@ fn judged(
             let port = u16::try_from(listener.port).unwrap_or_default();
             let set = stated.set.as_ref();
             let served = protocol(listener).and_then(|protocol| {
-                if not_distinct.contains(&(set, listener.port)) {
+                // A port an earlier resource has is its, each listener here judged against
+                // it; the resource's own listeners there are all refused, so none of them
+                // has it.
+                if not_distinct.contains(&(set, listener.port))
+                    && !ports.contains_key(&(listener.port, false))
+                {
                     return Err(ListenerProblem::NotDistinct {
                         port,
                         kind: if set.is_some() {
@@ -1854,9 +1862,11 @@ spec:
     }
 
     /// A TCP listener is distinct by port alone, its hostname not read; where one resource
-    /// states a port for TCP and for HTTP, HTTPS or TLS, none of its listeners there is
-    /// accepted (the spec, Q-c1); an earlier resource's listener there keeps it, as GEP-1713
-    /// has the first kept, and a later's is judged as any, the refused taking no port (Q-c1b).
+    /// states a port for TCP and for HTTP, HTTPS or TLS that no earlier resource has, none
+    /// of its listeners there is accepted (the spec, Q-c1); an earlier resource's listener
+    /// there keeps it, as GEP-1713 has the first kept, a later resource's listeners judged
+    /// against it one by one, as conformance has them (`ListenerSetProtocolConflict`), and a
+    /// later's is judged as any, the refused taking no port (Q-c1b).
     #[test]
     fn listeners_beside_a_tcp_listener_on_its_port_are_not_accepted() {
         let gateway = Object {
@@ -1910,6 +1920,18 @@ spec:
                 Some("two"),
                 "{ name: two-8080, port: 8080, protocol: HTTP, hostname: c.example.com }",
             ),
+            (
+                Some("three"),
+                "{ name: three-9000h, port: 9000, protocol: HTTPS, hostname: f.example.com }",
+            ),
+            (
+                Some("three"),
+                "{ name: three-9000t, port: 9000, protocol: TCP }",
+            ),
+            (
+                Some("three"),
+                "{ name: three-9000t2, port: 9000, protocol: TCP }",
+            ),
         ]
         .iter()
         .map(|(of, yaml)| Written {
@@ -1952,12 +1974,23 @@ spec:
                 format!("g-secure: {}", gateway_s(7443)),
                 format!("g-raw2: {}", gateway_s(7443)),
                 "one-80: port-80".to_owned(),
-                format!("one-8080: {}", set_s(8080)),
-                format!("one-8080h: {}", set_s(8080)),
+                "one-8080: port 8080 is taken for http by a listener of Gateway edge/web, which \
+                 comes first"
+                    .to_owned(),
+                "one-8080h: port-8080".to_owned(),
                 format!("one-9000: {}", set_s(9000)),
                 format!("one-9000t: {}", set_s(9000)),
                 "two-9000: port-9000".to_owned(),
                 "two-8080: port-8080".to_owned(),
+                "three-9000h: port 9000 is taken for tcp by a listener of another ListenerSet \
+                 attached to the same Gateway, which comes first"
+                    .to_owned(),
+                "three-9000t: a listener of another ListenerSet attached to the same Gateway, \
+                 which comes first, has its port, protocol and hostname"
+                    .to_owned(),
+                "three-9000t2: a listener of another ListenerSet attached to the same Gateway, \
+                 which comes first, has its port, protocol and hostname"
+                    .to_owned(),
             ]
         );
         // A TCP listener's hostname is not read: none claimed, none intersected.
