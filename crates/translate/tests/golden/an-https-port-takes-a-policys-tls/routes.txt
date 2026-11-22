@@ -1,0 +1,2 @@
+HTTPRoute shop/pages, section http: attached to http (shop.example.com)
+GRPCRoute shop/calls, section http: attached to http (calls.example.com)
