@@ -8,6 +8,7 @@
 //! until one ends, and each request's head within a deadline, the wait for the next one
 //! on a connection kept open included.
 
+use crate::accept;
 use bytes::Bytes;
 use http::header::{ALLOW, CONTENT_TYPE, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
@@ -53,11 +54,7 @@ pub async fn serve(
         let socket = tokio::select! {
             () = &mut stop => break,
             Some(_) = connections.join_next(), if !connections.is_empty() => continue,
-            accepted = listener.accept(), if room => match accepted {
-                Ok((socket, _)) => socket,
-                // A connection that failed before it was taken: the next is taken as usual.
-                Err(_) => continue,
-            },
+            (socket, _) = accept::next(|| listener.accept()), if room => socket,
         };
         let _nodelay = socket.set_nodelay(true);
         let text = text.clone();

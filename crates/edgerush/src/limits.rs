@@ -326,21 +326,30 @@ pub(crate) fn described(open_files: OpenFiles, connections: Connections) -> Stri
         "{} connections a worker, by {}",
         connections.each, connections.set_by
     );
+    match described_open_files(open_files) {
+        Some(files) => format!("{files}; {each}"),
+        None => each,
+    }
+}
+
+/// What a start says of the open files: the soft limit found, and what it was raised to or
+/// why not. Nothing where the platform has no limit.
+pub(crate) fn described_open_files(open_files: OpenFiles) -> Option<String> {
     let shown = |limit: Option<u64>| limit.map_or("none".to_owned(), |limit| limit.to_string());
     match open_files {
-        OpenFiles::NoLimit => each,
+        OpenFiles::NoLimit => None,
         OpenFiles::Raised { was, now } if was == now => {
-            format!("open files: soft limit {}; {each}", shown(now))
+            Some(format!("open files: soft limit {}", shown(now)))
         }
-        OpenFiles::Raised { was, now } => format!(
-            "open files: soft limit {} raised to {}; {each}",
+        OpenFiles::Raised { was, now } => Some(format!(
+            "open files: soft limit {} raised to {}",
             shown(was),
             shown(now)
-        ),
-        OpenFiles::Kept { now, why } => format!(
-            "open files: soft limit {}, not raised ({why}); {each}",
+        )),
+        OpenFiles::Kept { now, why } => Some(format!(
+            "open files: soft limit {}, not raised ({why})",
             shown(now)
-        ),
+        )),
     }
 }
 
@@ -569,6 +578,16 @@ mod tests {
             described(OpenFiles::NoLimit, bound(32_768, "memory", QUIC_MOST)),
             "32768 connections a worker, by memory"
         );
+    }
+
+    /// The controller says the open files alone, having no workers to share them out.
+    #[test]
+    fn the_open_files_are_said_alone_where_there_is_a_limit() {
+        assert_eq!(
+            described_open_files(limit(524_288)).as_deref(),
+            Some("open files: soft limit 1024 raised to 524288")
+        );
+        assert_eq!(described_open_files(OpenFiles::NoLimit), None);
     }
 
     const MIB: u64 = 1024 * 1024;

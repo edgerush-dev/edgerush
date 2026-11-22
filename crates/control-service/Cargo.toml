@@ -36,7 +36,8 @@ edgerush-certificates = { workspace = true, features = ["testing"] }
 h2.workspace = true
 # The configs sent, read as the development harness reads one.
 serde-saphyr.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# "test-util": a stopped clock, so that the pauses after failed accepts are timed exactly.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true

@@ -1,5 +1,6 @@
 //! The control plane's side: the server data planes dial.
 
+use crate::accept;
 use crate::{Prost, Received, SERVICE, SUBSCRIBE};
 use boring::ssl::SslAcceptor;
 use edgerush_certificates::spiffe_id;
@@ -224,11 +225,7 @@ pub(crate) async fn accept(
     refused: Arc<dyn Fn(SocketAddr, String) + Send + Sync>,
 ) {
     loop {
-        let (socket, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            // A connection that failed before it was taken: the next is taken as usual.
-            Err(_) => continue,
-        };
+        let (socket, peer) = accept::next(|| listener.accept()).await;
         let _nodelay = socket.set_nodelay(true);
         let acceptor = tls.borrow().clone();
         let secured = secured.clone();
