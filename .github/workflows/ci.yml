@@ -36,8 +36,9 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       # The third-party dependencies as main last built them (BoringSSL takes minutes). Keyed
-      # on the lock files and the toolchain, so a change to either starts a new entry from the
-      # nearest old one.
+      # on the lock files and the toolchain, and found by that key alone: a change to either
+      # starts an entry afresh, as an entry grown from an older one would keep the builds of
+      # every version since replaced, and nothing would take them out.
       - name: Restore the build cache
         id: cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -49,7 +50,6 @@ jobs:
             target
             fuzz/target
           key: ${{ runner.os }}-deps-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'fuzz/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-deps-
 
       # The tools check.sh runs, at the versions it is run with, as each project releases them
       # built and checked against the SHA-256 published beside them: seconds, where building
