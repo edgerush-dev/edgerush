@@ -8,19 +8,71 @@
 //! has its keys' entries sent through one of the shard's replicas too, which forwards them,
 //! until the owner answers directly again.
 
-use super::{Event, Mode, Sim, address, store_kind, store_size};
+use super::both::{Caller, asynchronous_of};
+use super::{Asynchronous, Event, Sim, store_kind, store_size};
 use crate::Rng;
 use crate::workload::Workload;
 use edgerush_cluster::Message as StoreMessage;
 use edgerush_cluster::table::shard_of;
-use edgerush_cluster::{Config, Key, Node, NodeId, Time, ms};
-use edgerush_cluster_asynchronous::{Answers, Message, Pod, Routed, Value};
+use edgerush_cluster::{Key, NodeId, Time, ms};
+use edgerush_cluster_asynchronous::{Answers, Routed};
+use edgerush_cluster_modes::KIND_BIT;
+use edgerush_ratelimit::service::keyed::KeyedHasher;
 use edgerush_ratelimit::service::pooled::{
     self, Decision, Entry, Levers, Local, Participant, Routing,
 };
 use edgerush_ratelimit::service::{Contract, Keyed};
 use std::collections::{BTreeMap, VecDeque};
+use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
+
+/// The mode's messages, over the store of both modes' values.
+type Message = edgerush_cluster_asynchronous::Message<edgerush_cluster_modes::Value>;
+
+/// The data planes' keyed hash, the asynchronous mode's bit set in each key ([`KIND_BIT`]), so
+/// that a pod of both modes takes their keys as this mode's. The simulation's own: the proxy's
+/// participant matches the owner's answers by its 64-bit hash, so its keys take the bit with
+/// the 128-bit key, in the half beyond that hash.
+#[derive(Clone, Copy, Debug)]
+pub struct KindKeyed(Keyed);
+
+impl KindKeyed {
+    /// The hash under `key`, as [`Keyed::new`], with the mode's bit.
+    #[must_use]
+    pub fn new(key: [u64; 2]) -> Self {
+        Self(Keyed::new(key))
+    }
+}
+
+impl BuildHasher for KindKeyed {
+    type Hasher = KindHasher;
+
+    fn build_hasher(&self) -> KindHasher {
+        KindHasher(self.0.build_hasher())
+    }
+}
+
+/// A [`KindKeyed`] hash under way: the keyed hash's, its last bit the mode's.
+#[derive(Clone, Debug)]
+pub struct KindHasher(KeyedHasher);
+
+impl Hasher for KindHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0.write_u64(n);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.0.write_usize(n);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0.finish() | KIND_BIT
+    }
+}
 
 /// The time between a data plane's batches.
 pub const CYCLE: Time = ms(10);
@@ -32,14 +84,10 @@ const EXCHANGE_TIMEOUT: Time = ms(300);
 /// What every data plane hashes its keys under, as the proxy's share `key_secret`.
 const SECRET: [u64; 2] = [1, 2];
 
-/// The asynchronous mode: data planes decide, owners apply.
-#[derive(Clone, Copy, Debug)]
-pub struct Asynchronous;
-
 /// A data plane as the world runs it: the proxy's participant, under keys it shares with the
 /// others, taking requests steadily or as a workload brings them.
 pub struct Plane {
-    data: Participant<Keyed, Routed>,
+    data: Participant<KindKeyed, Routed>,
     feed: Feed,
     /// When each key's requests were admitted, by the world's clock.
     admitted: BTreeMap<u64, Vec<Time>>,
@@ -133,113 +181,47 @@ fn bytes_of(key: u64) -> [u8; 8] {
     key.to_le_bytes()
 }
 
-impl Mode for Asynchronous {
-    type Value = Value;
-    type Pod = Pod;
-    type Message = Message;
-    type Client = Plane;
-
-    fn pod(id: NodeId, config: Config, peers: Vec<NodeId>, _: bool, _: bool) -> Pod {
-        let mut pod = Pod::new(id, address(id), config, peers, CYCLE);
-        // A pod is a member in one life only, and no pod is 0: its id serves as its life.
-        pod.set_life(id);
-        pod
+/// The name of `message`'s kind.
+pub(super) const fn kind(message: &Message) -> &'static str {
+    match message {
+        Message::Store(message) => store_kind(message),
+        Message::Batch(_) => "batch",
+        Message::Answers(Answers { table: Some(_), .. }) => "answers with a table",
+        Message::Answers(_) => "answers",
+        Message::Forwarded { .. } => "batch forwarded",
+        Message::Relayed { .. } => "answers relayed",
     }
+}
 
-    fn store(pod: &Pod) -> &Node<Value> {
-        pod.store()
-    }
-
-    fn store_mut(pod: &mut Pod) -> &mut Node<Value> {
-        pod.store_mut()
-    }
-
-    fn tick(pod: &mut Pod, now: Time) -> Vec<(NodeId, Message)> {
-        pod.tick(now)
-    }
-
-    fn receive(pod: &mut Pod, from: NodeId, message: Message, now: Time) -> Vec<(NodeId, Message)> {
-        pod.receive(from, message, now)
-    }
-
-    fn as_store(message: &Message) -> Option<&StoreMessage<Value>> {
-        match message {
-            Message::Store(message) => Some(message),
-            _ => None,
+/// A batch's entry as today's wire bounds it less its key's bytes (an eight-byte key), an
+/// answer a key and three numbers, and a table as the synchronous mode's reply carries it.
+pub(super) fn size(message: &Message) -> u64 {
+    match message {
+        Message::Store(message) => store_size(message),
+        Message::Batch(batch) | Message::Forwarded { batch, .. } => {
+            64 + 136 * batch.entries.len() as u64
+        }
+        Message::Answers(answers) | Message::Relayed { answers, .. } => {
+            64 + 48 * answers.entries.len() as u64
+                + 16 * answers.unserved.len() as u64
+                + answers
+                    .table
+                    .as_ref()
+                    .map_or(0, |table| table.shards.len() as u64 * 24)
         }
     }
+}
 
-    fn into_store(message: Message) -> Option<StoreMessage<Value>> {
-        match message {
-            Message::Store(message) => Some(message),
-            _ => None,
+/// The keys whose hits `message` brings a pod to apply.
+pub(super) fn reported(message: &Message) -> Vec<Key> {
+    match message {
+        Message::Batch(batch) | Message::Forwarded { batch, .. } => {
+            let mut keys: Vec<Key> = batch.entries.iter().map(|entry| entry.key).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            keys
         }
-    }
-
-    fn kind(message: &Message) -> &'static str {
-        match message {
-            Message::Store(message) => store_kind(message),
-            Message::Batch(_) => "batch",
-            Message::Answers(Answers { table: Some(_), .. }) => "answers with a table",
-            Message::Answers(_) => "answers",
-            Message::Forwarded { .. } => "batch forwarded",
-            Message::Relayed { .. } => "answers relayed",
-        }
-    }
-
-    /// A batch's entry as today's wire bounds it less its key's bytes (an eight-byte key), an
-    /// answer a key and three numbers, and a table as the synchronous mode's reply carries it.
-    fn size(message: &Message) -> u64 {
-        match message {
-            Message::Store(message) => store_size(message),
-            Message::Batch(batch) | Message::Forwarded { batch, .. } => {
-                64 + 136 * batch.entries.len() as u64
-            }
-            Message::Answers(answers) | Message::Relayed { answers, .. } => {
-                64 + 48 * answers.entries.len() as u64
-                    + 16 * answers.unserved.len() as u64
-                    + answers
-                        .table
-                        .as_ref()
-                        .map_or(0, |table| table.shards.len() as u64 * 24)
-            }
-        }
-    }
-
-    fn on_send(_: &mut Sim<Self>, _: NodeId, _: NodeId, _: &Message) {}
-
-    /// Lost, as a batch is when its exchange fails: the data plane sends it again after four
-    /// cycles unseen.
-    fn unreachable(_: &mut Sim<Self>, _: NodeId, _: NodeId, _: &Message) {}
-
-    fn client_send(world: &mut Sim<Self>, id: NodeId) {
-        world.on_request(id);
-    }
-
-    fn client_check(world: &mut Sim<Self>, id: NodeId) {
-        world.on_cycle(id);
-    }
-
-    fn client_unreachable(_: &mut Sim<Self>, _: NodeId, _: u64, _: NodeId) {}
-
-    fn deliver_to_client(world: &mut Sim<Self>, from: NodeId, id: NodeId, message: Message) {
-        world.on_answers(from, id, message);
-    }
-
-    fn reported(message: &Message) -> Vec<Key> {
-        match message {
-            Message::Batch(batch) | Message::Forwarded { batch, .. } => {
-                let mut keys: Vec<Key> = batch.entries.iter().map(|entry| entry.key).collect();
-                keys.sort_unstable();
-                keys.dedup();
-                keys
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    fn counted(pod: &Pod, key: Key) -> u64 {
-        pod.store().value(key).map_or(0, |value| value.counted())
+        _ => Vec::new(),
     }
 }
 
@@ -261,9 +243,13 @@ impl Sim<Asynchronous> {
         for _ in 0..count {
             let id = self.next_client;
             self.next_client += 1;
-            let mut data =
-                Participant::new(id, CYCLE, Routed::new(table.clone()), Keyed::new(SECRET))
-                    .expect("native 128-bit atomics");
+            let mut data = Participant::new(
+                id,
+                CYCLE,
+                Routed::new(table.clone()),
+                KindKeyed::new(SECRET),
+            )
+            .expect("native 128-bit atomics");
             data.set_one_in_flight(true);
             data.set_exchange_timeout(EXCHANGE_TIMEOUT);
             data.set_levers(Levers { poll_quiet: false });
@@ -283,7 +269,7 @@ impl Sim<Asynchronous> {
                 answers: 0,
                 gone: false,
             };
-            self.clients.insert(id, plane);
+            self.clients.insert(id, Caller::Asynchronous(plane));
             self.asked.extend(keys.iter().copied());
             let first = self.now + self.rng.below(interval.max(1));
             self.schedule(first, Event::ClientSend(id));
@@ -297,6 +283,7 @@ impl Sim<Asynchronous> {
     pub fn decided(&self) -> (u64, u64) {
         self.clients
             .values()
+            .filter_map(Caller::asynchronous)
             .fold((0, 0), |(requests, refused), plane| {
                 (requests + plane.requests, refused + plane.refused)
             })
@@ -308,6 +295,7 @@ impl Sim<Asynchronous> {
     pub fn forgiven(&self) -> u64 {
         self.clients
             .values()
+            .filter_map(Caller::asynchronous)
             .map(|plane| plane.data.forgiven())
             .sum()
     }
@@ -318,6 +306,7 @@ impl Sim<Asynchronous> {
     pub fn unanswered(&self, id: NodeId) -> Vec<NodeId> {
         self.clients
             .get(&id)
+            .and_then(Caller::asynchronous)
             .map(|plane| plane.data.unanswered(self.now).collect())
             .unwrap_or_default()
     }
@@ -326,7 +315,7 @@ impl Sim<Asynchronous> {
     #[must_use]
     pub fn admissions(&self) -> BTreeMap<u64, Vec<Time>> {
         let mut all: BTreeMap<u64, Vec<Time>> = BTreeMap::new();
-        for plane in self.clients.values() {
+        for plane in self.clients.values().filter_map(Caller::asynchronous) {
             for (key, times) in &plane.admitted {
                 all.entry(*key).or_default().extend(times);
             }
@@ -339,12 +328,12 @@ impl Sim<Asynchronous> {
 
     /// A request reaches data plane `id`: steadily, under its next key, decided from its copy;
     /// or each of a workload's arrivals now due, at its worker.
-    fn on_request(&mut self, id: NodeId) {
+    pub(super) fn on_request(&mut self, id: NodeId) {
         if self.clients_stopped || self.gone(id) {
             return;
         }
         let now = self.now;
-        let Some(plane) = self.clients.get_mut(&id) else {
+        let Some(plane) = self.clients.get_mut(&id).and_then(Caller::asynchronous_mut) else {
             return;
         };
         let Feed::Steady {
@@ -459,7 +448,7 @@ impl Sim<Asynchronous> {
             };
             self.clients.insert(
                 id,
-                Plane {
+                Caller::Asynchronous(Plane {
                     data,
                     feed: Feed::Workload(Box::new(fed)),
                     admitted: BTreeMap::new(),
@@ -468,7 +457,7 @@ impl Sim<Asynchronous> {
                     batches: 0,
                     answers: 0,
                     gone: false,
-                },
+                }),
             );
             self.asked.extend(keys.iter().copied());
             if let Some(first) = first {
@@ -489,7 +478,10 @@ impl Sim<Asynchronous> {
     pub fn restart_plane(&mut self, id: NodeId) -> Option<NodeId> {
         let table = self.table().cloned();
         let new = self.next_client;
-        let old = self.clients.get_mut(&id)?;
+        let old = self
+            .clients
+            .get_mut(&id)
+            .and_then(Caller::asynchronous_mut)?;
         if old.gone {
             return None;
         }
@@ -520,7 +512,7 @@ impl Sim<Asynchronous> {
         let next = fresh.arrivals.front().map(|(at, _, _)| *at);
         self.clients.insert(
             new,
-            Plane {
+            Caller::Asynchronous(Plane {
                 data,
                 feed: Feed::Workload(Box::new(fresh)),
                 admitted: BTreeMap::new(),
@@ -529,7 +521,7 @@ impl Sim<Asynchronous> {
                 batches: 0,
                 answers: 0,
                 gone: false,
-            },
+            }),
         );
         if let Some(next) = next {
             self.schedule(next.max(self.now), Event::ClientSend(new));
@@ -541,7 +533,10 @@ impl Sim<Asynchronous> {
 
     /// Whether data plane `id` is a life that has ended, or none.
     fn gone(&self, id: NodeId) -> bool {
-        self.clients.get(&id).is_none_or(|plane| plane.gone)
+        self.clients
+            .get(&id)
+            .and_then(Caller::asynchronous)
+            .is_none_or(|plane| plane.gone)
     }
 
     /// Holds data plane `id`'s participant for `length` from now: no cycles, its answers and
@@ -552,7 +547,7 @@ impl Sim<Asynchronous> {
         if let Some(Plane {
             feed: Feed::Workload(fed),
             ..
-        }) = self.clients.get_mut(&id)
+        }) = self.clients.get_mut(&id).and_then(Caller::asynchronous_mut)
         {
             fed.paused_until = Some(until);
         }
@@ -562,18 +557,23 @@ impl Sim<Asynchronous> {
     /// all.
     #[must_use]
     pub fn waited(&self) -> (u64, Time) {
-        self.clients
-            .values()
-            .fold((0, 0), |(waited, wait), plane| match &plane.feed {
+        self.clients.values().filter_map(Caller::asynchronous).fold(
+            (0, 0),
+            |(waited, wait), plane| match &plane.feed {
                 Feed::Workload(fed) => (waited + fed.waited, wait + fed.waited_for),
                 Feed::Steady { .. } => (waited, wait),
-            })
+            },
+        )
     }
 
     /// Batches the data planes sent.
     #[must_use]
     pub fn batches(&self) -> u64 {
-        self.clients.values().map(|plane| plane.batches).sum()
+        self.clients
+            .values()
+            .filter_map(Caller::asynchronous)
+            .map(|plane| plane.batches)
+            .sum()
     }
 
     /// Messages between the data planes and the pods: the batches sent and what the data
@@ -582,6 +582,7 @@ impl Sim<Asynchronous> {
     pub fn plane_messages(&self) -> u64 {
         self.clients
             .values()
+            .filter_map(Caller::asynchronous)
             .map(|plane| plane.batches + plane.answers)
             .sum()
     }
@@ -589,7 +590,11 @@ impl Sim<Asynchronous> {
     /// The pod the table names `key`'s owner, and the key as the store keeps it: hashed as the
     /// data planes hash it.
     fn owned(&self, key: u64) -> Option<(NodeId, Key)> {
-        let plane = self.clients.values().next()?;
+        let plane = self
+            .clients
+            .values()
+            .filter_map(Caller::asynchronous)
+            .next()?;
         let hash = plane.data.hash(&bytes_of(key));
         let table = self.table()?;
         let owner = table.owner(shard_of(hash, table.shards.len() as u16))?;
@@ -614,7 +619,18 @@ impl Sim<Asynchronous> {
     pub fn counted(&self, key: u64) -> Option<u64> {
         let (owner, hash) = self.owned(key)?;
         let pod = self.pods.get(&owner)?;
-        pod.node.value(hash).map(|value| value.counted())
+        pod.node
+            .value(hash)
+            .and_then(asynchronous_of)
+            .map(|value| value.counted())
+    }
+
+    /// Data plane `id` stops, as one whose DataPlane leaves the mode: it decides, sends and takes
+    /// nothing more, and what it did stays counted.
+    pub fn end_plane(&mut self, id: NodeId) {
+        if let Some(plane) = self.clients.get_mut(&id).and_then(Caller::asynchronous_mut) {
+            plane.gone = true;
+        }
     }
 
     /// The data planes' ids, in order: of the lives running, a data plane restarted under its
@@ -623,6 +639,7 @@ impl Sim<Asynchronous> {
     pub fn plane_ids(&self) -> Vec<NodeId> {
         self.clients
             .iter()
+            .filter_map(|(id, caller)| Some((id, caller.asynchronous()?)))
             .filter(|(_, plane)| !plane.gone)
             .map(|(id, _)| *id)
             .collect()
@@ -638,7 +655,7 @@ impl Sim<Asynchronous> {
         if let Some(Plane {
             feed: Feed::Workload(fed),
             ..
-        }) = self.clients.get_mut(&id)
+        }) = self.clients.get_mut(&id).and_then(Caller::asynchronous_mut)
         {
             while let Some(&(at, worker, kind)) = fed.arrivals.front() {
                 if at > now {
@@ -665,7 +682,7 @@ impl Sim<Asynchronous> {
     /// while the participant is held.
     fn decide_at_worker(&mut self, id: NodeId, at: Time, worker: usize, kind: usize) {
         let now = self.now;
-        let Some(plane) = self.clients.get_mut(&id) else {
+        let Some(plane) = self.clients.get_mut(&id).and_then(Caller::asynchronous_mut) else {
             return;
         };
         let Feed::Workload(fed) = &mut plane.feed else {
@@ -774,7 +791,7 @@ impl Sim<Asynchronous> {
     /// held taken, then the asks that waited.
     fn resume(&mut self, id: NodeId) {
         let now = self.now;
-        let Some(plane) = self.clients.get_mut(&id) else {
+        let Some(plane) = self.clients.get_mut(&id).and_then(Caller::asynchronous_mut) else {
             return;
         };
         let Feed::Workload(fed) = &mut plane.feed else {
@@ -801,7 +818,7 @@ impl Sim<Asynchronous> {
     /// Whether data plane `id`'s participant is held now.
     fn held(&self, id: NodeId) -> bool {
         matches!(
-            self.clients.get(&id),
+            self.clients.get(&id).and_then(Caller::asynchronous),
             Some(Plane { feed: Feed::Workload(fed), .. })
                 if fed.paused_until.is_some_and(|until| until > self.now)
         )
@@ -810,13 +827,13 @@ impl Sim<Asynchronous> {
     /// What data plane `id` has to send, sent: each batch to the pod the participant routed
     /// it to.
     fn flush(&mut self, id: NodeId) {
-        let Some(plane) = self.clients.get_mut(&id) else {
+        let Some(plane) = self.clients.get_mut(&id).and_then(Caller::asynchronous_mut) else {
             return;
         };
         let sends = plane.data.take_outgoing();
         plane.batches += sends.len() as u64;
         for (to, batch) in sends {
-            self.send(id, to, Message::Batch(batch));
+            self.send(id, to, Message::Batch(batch).into());
         }
     }
 
@@ -826,7 +843,7 @@ impl Sim<Asynchronous> {
     /// address whatever its keys are doing, and opening it again on a pod alive should the one
     /// it reached go. Without it, a data plane whose keys sent nothing through a rollout would
     /// never hear of the new pods.
-    fn on_cycle(&mut self, id: NodeId) {
+    pub(super) fn on_cycle(&mut self, id: NodeId) {
         let now = self.now;
         if self.gone(id) {
             return;
@@ -838,7 +855,7 @@ impl Sim<Asynchronous> {
         }
         self.resume(id);
         let latest = self.table().cloned();
-        let Some(plane) = self.clients.get_mut(&id) else {
+        let Some(plane) = self.clients.get_mut(&id).and_then(Caller::asynchronous_mut) else {
             return;
         };
         if let Some(table) = latest {
@@ -854,7 +871,17 @@ impl Sim<Asynchronous> {
 
     /// Pod `from`'s message reaches a data plane: its own answers, answers relayed from their
     /// owner, or a table.
-    fn on_answers(&mut self, from: NodeId, id: NodeId, message: Message) {
+    pub(super) fn on_answers(
+        &mut self,
+        from: NodeId,
+        id: NodeId,
+        message: edgerush_cluster_modes::Message,
+    ) {
+        let message = match message {
+            edgerush_cluster_modes::Message::Asynchronous(message) => message,
+            edgerush_cluster_modes::Message::Store(message) => Message::Store(message),
+            edgerush_cluster_modes::Message::Synchronous(_) => return,
+        };
         let now = self.now;
         if self.gone(id) {
             return;
@@ -863,14 +890,14 @@ impl Sim<Asynchronous> {
             if let Some(Plane {
                 feed: Feed::Workload(fed),
                 ..
-            }) = self.clients.get_mut(&id)
+            }) = self.clients.get_mut(&id).and_then(Caller::asynchronous_mut)
             {
                 fed.held.push((from, message));
             }
             return;
         }
         self.resume(id);
-        let Some(plane) = self.clients.get_mut(&id) else {
+        let Some(plane) = self.clients.get_mut(&id).and_then(Caller::asynchronous_mut) else {
             return;
         };
         plane.answers += 1;
@@ -910,8 +937,8 @@ fn fed_participant(
     poll_quiet: bool,
     scheduled: bool,
     workers: usize,
-) -> Participant<Keyed, Routed> {
-    let mut data = Participant::new(id, CYCLE, Routed::new(table), Keyed::new(SECRET))
+) -> Participant<KindKeyed, Routed> {
+    let mut data = Participant::new(id, CYCLE, Routed::new(table), KindKeyed::new(SECRET))
         .expect("native 128-bit atomics");
     data.set_one_in_flight(true);
     data.set_exchange_timeout(EXCHANGE_TIMEOUT);

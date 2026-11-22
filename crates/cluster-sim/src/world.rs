@@ -14,10 +14,17 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fmt::Debug;
 
 mod asynchronous;
+mod both;
 mod synchronous;
 
-pub use asynchronous::{Asynchronous, Beside, CYCLE, Fleet, Plane};
-pub use synchronous::Synchronous;
+pub use asynchronous::{Beside, CYCLE, Fleet, KindKeyed, Plane};
+pub use both::{Both, Caller};
+
+/// The world of the synchronous mode's clients: a world of both modes' pods, as every world is.
+pub type Synchronous = Both;
+
+/// The world of the asynchronous mode's data planes, likewise.
+pub type Asynchronous = Both;
 
 /// A rate-limiting mode as the world runs it: its pods over their stores, the messages they
 /// and its clients send, and its clients, standing for data planes. The world's network,

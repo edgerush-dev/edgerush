@@ -403,8 +403,8 @@ crates/cluster-modes
                    counting each kind's keys apart, and each mode's logic beside the other's;
                    pure, no I/O
 crates/cluster-sim the cluster's simulation (`edgerush-cluster-sim`): the store's pods over a
-                   network that delays, loses and cuts, with clients standing for data planes,
-                   in the synchronous mode and the asynchronous, seeded and deterministic; its scenarios and chaos runs are its tests, and
+                   network that delays, loses and cuts, each pod both modes', with clients
+                   standing for data planes of either mode or of both, seeded and deterministic; its scenarios and chaos runs are its tests, and
                    `cargo run --release -p edgerush-cluster-sim --bin measure` sweeps them; the
                    rate-limit workloads (bursts, skew, data planes of many workers, a second
                    limit, TCP loss, restarts) measured against the contract, with

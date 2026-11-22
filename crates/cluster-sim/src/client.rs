@@ -6,7 +6,10 @@
 use crate::Rng;
 use edgerush_cluster::table::{Table, shard_of};
 use edgerush_cluster::{Key, NodeId, Time};
-use edgerush_cluster_synchronous::{Answer, Message, Rule};
+use edgerush_cluster_synchronous::{Answer, Rule};
+
+/// The synchronous mode's messages, over the store of both modes' values.
+pub type Message = edgerush_cluster_synchronous::Message<edgerush_cluster_modes::Value>;
 use std::collections::BTreeMap;
 
 /// How one request ended.

@@ -334,6 +334,7 @@ version = "0.0.0"
 dependencies = [
  "edgerush-cluster",
  "edgerush-cluster-asynchronous",
+ "edgerush-cluster-modes",
  "edgerush-cluster-synchronous",
  "edgerush-ratelimit",
  "proptest",

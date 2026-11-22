@@ -1,98 +1,22 @@
-//! The synchronous mode as the world runs it: its clients send requests to keys' owners, are
+//! The synchronous mode's part of the world: its clients send requests to keys' owners, are
 //! answered admitted, refused or counted, and give back what a refused request was charged.
 
-use super::{CLIENT_BASE, Event, Mode, Sim, store_kind, store_size};
+use super::both::{Caller, synchronous_of};
+use super::{CLIENT_BASE, Event, Sim, Synchronous, store_kind, store_size};
 use crate::client::{Client, Multi};
 use edgerush_cluster::Message as StoreMessage;
-use edgerush_cluster::{Config, Key, Node, NodeId, ShardId, Time, ms};
-use edgerush_cluster_synchronous::{Answer, Message, Pod, Value};
+use edgerush_cluster::{Key, NodeId, ShardId, Time, ms};
+use edgerush_cluster_synchronous::{Answer, Value};
 use std::collections::BTreeMap;
 
-/// The synchronous mode: each request decided by its key's owner.
-#[derive(Clone, Copy, Debug)]
-pub struct Synchronous;
-
-impl Mode for Synchronous {
-    type Value = Value;
-    type Pod = Pod;
-    type Message = Message;
-    type Client = Client;
-
-    fn pod(id: NodeId, config: Config, peers: Vec<NodeId>, forwarding: bool, decides: bool) -> Pod {
-        let mut pod = Pod::new(id, super::address(id), config, peers);
-        pod.set_forwarding(forwarding);
-        pod.set_forwarder_decides(decides);
-        pod
-    }
-
-    fn store(pod: &Pod) -> &Node<Value> {
-        pod.store()
-    }
-
-    fn store_mut(pod: &mut Pod) -> &mut Node<Value> {
-        pod.store_mut()
-    }
-
-    fn tick(pod: &mut Pod, now: Time) -> Vec<(NodeId, Message)> {
-        pod.tick(now)
-    }
-
-    fn receive(pod: &mut Pod, from: NodeId, message: Message, now: Time) -> Vec<(NodeId, Message)> {
-        pod.receive(from, message, now)
-    }
-
-    fn as_store(message: &Message) -> Option<&StoreMessage<Value>> {
-        match message {
-            Message::Store(message) => Some(message),
-            _ => None,
-        }
-    }
-
-    fn into_store(message: Message) -> Option<StoreMessage<Value>> {
-        match message {
-            Message::Store(message) => Some(message),
-            _ => None,
-        }
-    }
-
-    fn kind(message: &Message) -> &'static str {
-        kind(message)
-    }
-
-    fn size(message: &Message) -> u64 {
-        size(message)
-    }
-
-    fn on_send(world: &mut Sim<Self>, from: NodeId, to: NodeId, message: &Message) {
-        world.watch_sent(from, to, message);
-    }
-
-    fn unreachable(world: &mut Sim<Self>, from: NodeId, to: NodeId, message: &Message) {
-        world.unreachable(from, to, message);
-    }
-
-    fn client_send(world: &mut Sim<Self>, id: NodeId) {
-        world.on_client_send(id);
-    }
-
-    fn client_check(world: &mut Sim<Self>, id: NodeId) {
-        world.on_client_check(id);
-    }
-
-    fn client_unreachable(world: &mut Sim<Self>, client: NodeId, id: u64, pod: NodeId) {
-        world.on_unreachable(client, id, pod);
-    }
-
-    fn deliver_to_client(world: &mut Sim<Self>, _: NodeId, id: NodeId, message: Message) {
-        world.deliver_to_client(id, message);
-    }
-}
+/// The mode's messages, over the store of both modes' values.
+type Message = edgerush_cluster_synchronous::Message<edgerush_cluster_modes::Value>;
 
 impl Sim<Synchronous> {
     /// What the mode watches of every message sent: a give-back sent, as many times as it is;
     /// when an answer under a rule first leaves its owner, by its wall clock; and a request
     /// answered "counted" twice.
-    fn watch_sent(&mut self, from: NodeId, to: NodeId, message: &Message) {
+    pub(super) fn watch_sent(&mut self, from: NodeId, to: NodeId, message: &Message) {
         if let Message::Request {
             client,
             id,
@@ -160,7 +84,7 @@ impl Sim<Synchronous> {
         if let Some((rule, _)) = self.limit {
             client.set_rule(rule);
         }
-        self.clients.insert(id, client);
+        self.clients.insert(id, Caller::Synchronous(client));
         let first = self.now + self.rng.below(interval.max(1));
         self.schedule(first, Event::ClientSend(id));
         self.schedule(self.now + ms(1), Event::ClientCheck(id));
@@ -186,7 +110,7 @@ impl Sim<Synchronous> {
         let first = self.next_client;
         self.add_clients(count, rate, deadline);
         for id in first..self.next_client {
-            if let Some(client) = self.clients.get_mut(&id) {
+            if let Some(client) = self.clients.get_mut(&id).and_then(Caller::synchronous_mut) {
                 client.set_multi(multi, shared);
             }
         }
@@ -208,12 +132,19 @@ impl Sim<Synchronous> {
                     .and_then(|owner| self.node(owner));
                 // Under a window, the owner holds the window it last counted in.
                 if let Some(oracle) = &self.oracle {
-                    let held = owner.and_then(|node| node.value(*key)).unwrap_or_default();
+                    let held = owner
+                        .and_then(|node| node.value(*key))
+                        .and_then(synchronous_of)
+                        .unwrap_or_default();
                     return oracle.beyond_told(*key, held.window(), held.net());
                 }
                 let told = self.truth.get(key).copied().unwrap_or(0);
                 let held = owner
-                    .and_then(|node| node.value(*key).map(|value| value.net()))
+                    .and_then(|node| {
+                        node.value(*key)
+                            .and_then(synchronous_of)
+                            .map(|value| value.net())
+                    })
                     .unwrap_or(0);
                 held.saturating_sub(told)
             })
@@ -224,6 +155,7 @@ impl Sim<Synchronous> {
     pub fn orphaned(&self) -> u64 {
         self.clients
             .values()
+            .filter_map(Caller::synchronous)
             .map(|client| client.orphaned)
             .sum::<u64>()
             + self
@@ -250,7 +182,10 @@ impl Sim<Synchronous> {
             };
             for holder in entry.owner.iter().chain(&entry.replicas) {
                 if let Some(pod) = self.pods.get_mut(holder) {
-                    pod.node.store_mut().load(key, Value::counted(1));
+                    pod.node.store_mut().load(
+                        key,
+                        edgerush_cluster_modes::Value::Synchronous(Value::counted(1)),
+                    );
                 }
             }
             placed += 1;
@@ -274,12 +209,20 @@ impl Sim<Synchronous> {
                 let held = entry
                     .owner
                     .and_then(|owner| self.node(owner))
-                    .and_then(|node| node.value(*key).map(|value| value.net()))
+                    .and_then(|node| {
+                        node.value(*key)
+                            .and_then(synchronous_of)
+                            .map(|value| value.net())
+                    })
                     .unwrap_or(0);
                 let behind = entry.replicas.iter().filter(|replica| {
                     self.is_alive(**replica)
                         && self.node(**replica).is_some_and(|node| {
-                            node.value(*key).map(|value| value.net()).unwrap_or(0) < held
+                            node.value(*key)
+                                .and_then(synchronous_of)
+                                .map(|value| value.net())
+                                .unwrap_or(0)
+                                < held
                         })
                 });
                 behind.count() as u64
@@ -300,7 +243,11 @@ impl Sim<Synchronous> {
                 let owner = table.owner(edgerush_cluster::table::shard_of(*key, shards));
                 let held = owner
                     .and_then(|owner| self.node(owner))
-                    .and_then(|node| node.value(*key).map(|value| value.net()))
+                    .and_then(|node| {
+                        node.value(*key)
+                            .and_then(synchronous_of)
+                            .map(|value| value.net())
+                    })
                     .unwrap_or(0);
                 told.saturating_sub(held)
             })
@@ -320,7 +267,11 @@ impl Sim<Synchronous> {
             let held = table
                 .owner(shard)
                 .and_then(|owner| self.node(owner))
-                .and_then(|node| node.value(*key).map(|value| value.net()))
+                .and_then(|node| {
+                    node.value(*key)
+                        .and_then(synchronous_of)
+                        .map(|value| value.net())
+                })
                 .unwrap_or(0);
             let entry = by.entry(shard).or_insert((0, 0));
             entry.0 += told;
@@ -331,13 +282,13 @@ impl Sim<Synchronous> {
             .map(|(shard, (told, held))| (shard, table.owner(shard), told, held))
             .collect()
     }
-    fn on_client_send(&mut self, id: NodeId) {
+    pub(super) fn on_client_send(&mut self, id: NodeId) {
         if self.clients_stopped {
             return;
         }
         let pods = self.live_pods();
         let now = self.now;
-        let Some(client) = self.clients.get_mut(&id) else {
+        let Some(client) = self.clients.get_mut(&id).and_then(Caller::synchronous_mut) else {
             return;
         };
         let interval = client.interval;
@@ -356,14 +307,14 @@ impl Sim<Synchronous> {
             if let Message::Gather { keys, .. } = &message {
                 self.asked.extend(keys.iter().copied());
             }
-            self.send(id, to, message);
+            self.send(id, to, message.into());
         }
         self.schedule(now + interval, Event::ClientSend(id));
     }
-    fn on_client_check(&mut self, id: NodeId) {
+    pub(super) fn on_client_check(&mut self, id: NodeId) {
         let pods = self.live_pods();
         let now = self.now;
-        let Some(client) = self.clients.get_mut(&id) else {
+        let Some(client) = self.clients.get_mut(&id).and_then(Caller::synchronous_mut) else {
             return;
         };
         let (ended, sends) = client.check(now, &pods, &mut self.rng);
@@ -371,12 +322,12 @@ impl Sim<Synchronous> {
             self.record(id, outcome, &keys);
         }
         for (to, message) in sends {
-            self.send(id, to, message);
+            self.send(id, to, message.into());
         }
         self.schedule(now + ms(1), Event::ClientCheck(id));
     }
     /// `from`, a client, told soon that `message` could not reach pod `to`.
-    fn unreachable(&mut self, from: NodeId, to: NodeId, message: &Message) {
+    pub(super) fn unreachable(&mut self, from: NodeId, to: NodeId, message: &Message) {
         if from < CLIENT_BASE || to >= CLIENT_BASE {
             return;
         }
@@ -395,20 +346,33 @@ impl Sim<Synchronous> {
             },
         );
     }
-    fn on_unreachable(&mut self, client: NodeId, id: u64, pod: NodeId) {
+    pub(super) fn on_unreachable(&mut self, client: NodeId, id: u64, pod: NodeId) {
         let pods = self.live_pods();
         let now = self.now;
-        let Some(entry) = self.clients.get_mut(&client) else {
+        let Some(entry) = self
+            .clients
+            .get_mut(&client)
+            .and_then(Caller::synchronous_mut)
+        else {
             return;
         };
         if let Some((to, message)) = entry.unreachable(id, pod, now, &pods, &mut self.rng) {
-            self.send(client, to, message);
+            self.send(client, to, message.into());
         }
     }
-    fn deliver_to_client(&mut self, id: NodeId, message: Message) {
+    pub(super) fn deliver_to_client(
+        &mut self,
+        id: NodeId,
+        message: edgerush_cluster_modes::Message,
+    ) {
+        let message = match message {
+            edgerush_cluster_modes::Message::Synchronous(message) => message,
+            edgerush_cluster_modes::Message::Store(message) => Message::Store(message),
+            edgerush_cluster_modes::Message::Asynchronous(_) => return,
+        };
         let pods = self.live_pods();
         let now = self.now;
-        let Some(client) = self.clients.get_mut(&id) else {
+        let Some(client) = self.clients.get_mut(&id).and_then(Caller::synchronous_mut) else {
             return;
         };
         match message {
@@ -419,7 +383,7 @@ impl Sim<Synchronous> {
             } => {
                 let (ended, sends) = client.answered(request, answer, now, &pods, &mut self.rng);
                 for (to, message) in sends {
-                    self.send(id, to, message);
+                    self.send(id, to, message.into());
                 }
                 if let Some((keys, outcome)) = ended {
                     self.record(id, outcome, &keys);
@@ -432,7 +396,7 @@ impl Sim<Synchronous> {
 }
 
 /// The name of `message`'s kind, and for an answer, which answer.
-const fn kind(message: &Message) -> &'static str {
+pub(super) const fn kind(message: &Message) -> &'static str {
     match message {
         Message::Store(message) => store_kind(message),
         Message::Request { .. } | Message::Gather { .. } => "request",
@@ -445,7 +409,7 @@ const fn kind(message: &Message) -> &'static str {
 }
 
 /// About how many bytes `message` takes on the wire: what a link's bandwidth is spent on.
-fn size(message: &Message) -> u64 {
+pub(super) fn size(message: &Message) -> u64 {
     match message {
         Message::Store(message) => store_size(message),
         Message::Reply {
