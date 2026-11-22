@@ -1,7 +1,7 @@
 //! What the store holds for each key: a value of the mode's own, which the store copies, hands
 //! on, forgets and evicts without reading, and the time from which it may be forgotten.
 
-use crate::{KEY_BYTES, Time};
+use crate::{KEY_BYTES, KINDS, Time};
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 
@@ -16,6 +16,12 @@ pub trait Held: Clone + Debug + Default + PartialEq {
     /// About the bytes its parts take, held or sent: what `max_key_bytes` counts, with the key
     /// and its time to forget at.
     fn bytes(&self) -> u64;
+
+    /// Its kind, below [`KINDS`]: what the store counts it apart as, in its keys, their bytes
+    /// and those forgotten and evicted. 0 for a store of one kind of value.
+    fn kind(&self) -> usize {
+        0
+    }
 
     /// Of it, only `parts`, as the mode numbers its value's parts — a rolling window's slots:
     /// what the next copy carries of a key changed only there. Parts merge each by the larger,
@@ -49,6 +55,12 @@ impl<V> Kept<V> {
 }
 
 impl<V: Held> Kept<V> {
+    /// Its value's kind, as the store counts it: past [`KINDS`] taken as the last.
+    #[must_use]
+    pub fn kind(&self) -> usize {
+        self.value.kind().min(KINDS - 1)
+    }
+
     /// About the bytes it takes with its key, held or sent: the key, the time to forget at and
     /// the value's parts.
     #[must_use]
@@ -94,6 +106,12 @@ impl Counts {
 
 #[cfg(test)]
 impl Held for Counts {
+    /// Of the second kind while it counts in part 3: a value whose kind changes, as no mode's
+    /// does, so that the store's counts by kind are seen to follow one that did.
+    fn kind(&self) -> usize {
+        usize::from(self.0.contains_key(&3))
+    }
+
     fn merge(&mut self, other: &Self) -> bool {
         let mut raised = false;
         for (part, count) in &other.0 {

@@ -62,6 +62,10 @@ pub type Key = u64;
 /// each key as, beside its value, and each key dropped from a copy as.
 pub const KEY_BYTES: u64 = size_of::<Key>() as u64;
 
+/// The kinds of value a store counts apart, beside its totals: each value's [`Held::kind`],
+/// below this — one for a store of one mode's values, two for one holding both modes'.
+pub const KINDS: usize = 2;
+
 /// One of the table's shards, by number.
 pub type ShardId = u16;
 

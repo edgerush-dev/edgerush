@@ -140,9 +140,10 @@ async fn h2(
         .body(())
         .unwrap();
     let (response, mut sending) = client.send_request(request, false).unwrap();
-    sending
-        .send_data(Bytes::copy_from_slice(body), true)
-        .unwrap();
+    // The webhook may answer before it reads the body, as it answers a method it does not
+    // serve, and end the stream: the body then has nowhere to go, and the answer is what is
+    // tested. A body that should have arrived and did not fails on the answer instead.
+    let _unless_answered_first = sending.send_data(Bytes::copy_from_slice(body), true);
     let response = tokio::time::timeout(Duration::from_secs(5), response)
         .await
         .expect("no answer")

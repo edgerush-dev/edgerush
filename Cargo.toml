@@ -35,6 +35,7 @@ bytes = "1.12"
 edgerush-certificates = { path = "crates/certificates" }
 edgerush-cluster = { path = "crates/cluster" }
 edgerush-cluster-asynchronous = { path = "crates/cluster-asynchronous" }
+edgerush-cluster-modes = { path = "crates/cluster-modes" }
 edgerush-cluster-synchronous = { path = "crates/cluster-synchronous" }
 edgerush-config = { path = "crates/config" }
 edgerush-control-service = { path = "crates/control-service" }
@@ -169,6 +170,9 @@ debug = 0
 opt-level = 3
 
 [profile.dev.package.edgerush-cluster-asynchronous]
+opt-level = 3
+
+[profile.dev.package.edgerush-cluster-modes]
 opt-level = 3
 
 [profile.dev.package.edgerush-cluster-synchronous]
