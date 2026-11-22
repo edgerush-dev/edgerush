@@ -243,30 +243,52 @@ fn every_pod_forgets_a_key_once_its_time_has_come() {
     assert_eq!(held(&world), before, "keys under no rule forgotten");
 }
 
-/// Requests under two keys, split, under every rule, under `allow`, steady, a pod crashing or
+/// Seeds for split requests through a fault: what a crash costs turns on which requests come
+/// first in each window of the key every client shares while the pod is down, and three seeds
+/// missed every case that costs most.
+const SPLIT_SEEDS: std::ops::RangeInclusive<u64> = 1..=20;
+
+/// Requests under two keys, split, under `rule`, under `allow`, steady, a pod crashing or
 /// clients cut from a pod: a part charged for a request then refused holds allowance until it
 /// is given back, so a few requests are refused within the rule — never more than one in a
-/// hundred of those refused under it. Under `deny` a crash may cost a window of the
-/// key every client shares, the rule for answers lost after the owner charged.
-#[test]
-fn split_requests_shave_at_most_a_hundredth_under_allow() {
-    for rule in RULES {
-        for seed in 1..=3 {
-            for trouble in [Trouble::None, Trouble::Crash, Trouble::ClientsCut] {
-                let shape = Shape {
-                    forwarding: true,
-                    ..limited(rule, true)
-                };
-                let report = scenario::multi_key(seed, shape, Multi::Split, trouble);
-                assert!(report.limited > 0, "{rule:?} never bit: {}", line(&report));
-                assert!(
-                    report.shaved * 100 <= report.limited,
-                    "{rule:?} seed {seed}: {}",
-                    line(&report)
-                );
-            }
+/// hundred of those refused under it. A request left to `allow` with a part charged is
+/// admitted, its charge judged when its owner made it, as every decision is: not when its
+/// other part's deadline passed. Under `deny` a crash may cost a window of the key every
+/// client shares, the rule for answers lost after the owner charged.
+fn split_requests_shave_at_most_a_hundredth_under_allow(rule: Rule) {
+    for seed in SPLIT_SEEDS {
+        for trouble in [Trouble::None, Trouble::Crash, Trouble::ClientsCut] {
+            let shape = Shape {
+                forwarding: true,
+                ..limited(rule, true)
+            };
+            let report = scenario::multi_key(seed, shape, Multi::Split, trouble);
+            assert!(report.limited > 0, "{rule:?} never bit: {}", line(&report));
+            assert!(
+                report.shaved * 100 <= report.limited,
+                "{rule:?} seed {seed} {trouble:?}: {}",
+                line(&report)
+            );
         }
     }
+}
+
+/// [`split_requests_shave_at_most_a_hundredth_under_allow`] under a fixed window.
+#[test]
+fn split_requests_shave_at_most_a_hundredth_under_allow_in_a_fixed_window() {
+    split_requests_shave_at_most_a_hundredth_under_allow(RULES[0]);
+}
+
+/// [`split_requests_shave_at_most_a_hundredth_under_allow`] under a rolling window.
+#[test]
+fn split_requests_shave_at_most_a_hundredth_under_allow_in_a_rolling_window() {
+    split_requests_shave_at_most_a_hundredth_under_allow(RULES[1]);
+}
+
+/// [`split_requests_shave_at_most_a_hundredth_under_allow`] under a bucket.
+#[test]
+fn split_requests_shave_at_most_a_hundredth_under_allow_in_a_bucket() {
+    split_requests_shave_at_most_a_hundredth_under_allow(RULES[2]);
 }
 
 /// One pod's wall clock off the rest by up to a fifth of a second, ahead or behind, the pod
