@@ -467,7 +467,7 @@ fn listener_conditions(
     let mut conditions: Vec<Wanted> = wanted.conditions.iter().map(Wanted::from).collect();
     conditions.push(match &wanted.programmable {
         Ok(served_on) => programmed.of_listener(served_on),
-        Err(why) => Wanted::new("Programmed", "False", "Invalid", why.clone()),
+        Err(condition) => Wanted::from(condition),
     });
     merged(old, conditions, &LISTENER_TYPES, generation, now)
 }

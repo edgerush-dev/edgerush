@@ -1,0 +1,10 @@
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener http: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+attached ListenerSets: 2
+ListenerSet shop/zz-older, generation 0: Accepted=True/ListenersNotValid (listeners not accepted: secure, www)
+listener secure: no kind, attached 0: Accepted=False/ProtocolConflict (port 80 is taken for http by a listener of Gateway edge/web, which comes first); Conflicted=True/ProtocolConflict (port 80 is taken for http by a listener of Gateway edge/web, which comes first); ResolvedRefs=True/ResolvedRefs; Programmed=False/ProtocolConflict (port 80 is taken for http by a listener of Gateway edge/web, which comes first)
+listener www: no kind, attached 0: Accepted=False/HostnameConflict (a listener of Gateway edge/web, which comes first, has its port, protocol and hostname); Conflicted=True/HostnameConflict (a listener of Gateway edge/web, which comes first, has its port, protocol and hostname); ResolvedRefs=True/ResolvedRefs; Programmed=False/HostnameConflict (a listener of Gateway edge/web, which comes first, has its port, protocol and hostname)
+listener shop: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+ListenerSet blog/aa-younger, generation 0: Accepted=True/ListenersNotValid (listeners not accepted: shop)
+listener shop: no kind, attached 0: Accepted=False/HostnameConflict (a listener of another ListenerSet attached to the same Gateway, which comes first, has its port, protocol and hostname); Conflicted=True/HostnameConflict (a listener of another ListenerSet attached to the same Gateway, which comes first, has its port, protocol and hostname); ResolvedRefs=True/ResolvedRefs; Programmed=False/HostnameConflict (a listener of another ListenerSet attached to the same Gateway, which comes first, has its port, protocol and hostname)
+listener blog: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
