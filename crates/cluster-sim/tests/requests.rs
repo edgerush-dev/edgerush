@@ -21,6 +21,38 @@ fn shape() -> Shape {
     }
 }
 
+/// A follower crashing, pods forwarding: until clients learn a table that moves its shards,
+/// they send its keys another way, and each key one way, as a data plane does — to a replica
+/// of its shard chosen by the key, the same from every client — rather than spreading a key's
+/// requests over the pods, which would have a replica deciding from its copy see a part of
+/// them alone.
+#[test]
+fn a_key_whose_owner_is_out_of_reach_goes_one_way() {
+    for seed in SEEDS {
+        let forwarding = Shape {
+            forwarding: true,
+            ..shape()
+        };
+        let (mut world, _) = scenario::cluster(seed, forwarding);
+        let victim = world
+            .alive()
+            .find(|pod| Some(*pod) != world.leader())
+            .unwrap();
+        world.crash(victim);
+        world.run_for(ms(2_000));
+        let long_way = world.long_way();
+        assert!(!long_way.is_empty(), "seed {seed}: no key sent another way");
+        let spread: Vec<_> = long_way.iter().filter(|(_, pods)| pods.len() > 1).collect();
+        assert!(
+            spread.is_empty(),
+            "seed {seed}: {} of {} keys sent more than one way: {:?}",
+            spread.len(),
+            long_way.len(),
+            spread.iter().take(5).collect::<Vec<_>>()
+        );
+    }
+}
+
 /// A pod's answers to the data planes lost, what they send it still arriving: a request the
 /// owner had, its answer lost, is left to its deadline, never asked again elsewhere — where it
 /// would be counted a second time.
@@ -273,7 +305,6 @@ fn a_pod_a_client_cannot_reach_is_left_alone_while_its_stream_is_down() {
 #[test]
 fn a_late_answer_does_not_open_a_stream_that_is_down() {
     use edgerush_cluster::table;
-    use edgerush_cluster_sim::Rng;
     use edgerush_cluster_sim::client::{Client, Message};
     use edgerush_cluster_synchronous::Answer;
     let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
@@ -284,19 +315,67 @@ fn a_late_answer_does_not_open_a_stream_that_is_down() {
     };
     let mut client = Client::new(1_000_000, vec![key], ms(5), ms(20), 16);
     client.learn(first);
-    let mut rng = Rng::new(1);
     let pods = [1, 2, 3];
     let id_of = |send: &(NodeId, Message)| match send.1 {
         Message::Request { id, .. } => id,
         _ => u64::MAX,
     };
-    let early = client.send(ms(1), &pods, &mut rng).unwrap();
-    let cut = client.send(ms(2), &pods, &mut rng).unwrap();
+    let early = client.send(ms(1), &pods).unwrap();
+    let cut = client.send(ms(2), &pods).unwrap();
     assert_eq!((early.0, cut.0), (1, 1), "sent to the owner");
-    let _ = client.unreachable(id_of(&cut), 1, ms(3), &pods, &mut rng);
-    let _ = client.answered(id_of(&early), Answer::Counted(1), ms(4), &pods, &mut rng);
-    let next = client.send(ms(5), &pods, &mut rng).unwrap();
+    let _ = client.unreachable(id_of(&cut), 1, ms(3), &pods);
+    let _ = client.answered(id_of(&early), Answer::Counted(1), ms(4), &pods);
+    let next = client.send(ms(5), &pods).unwrap();
     assert_ne!(next.0, 1, "sent to a pod its stream to is down");
+}
+
+/// A data plane whose stream to a key's owner is down sends the key through another pod, to be
+/// forwarded: attempts there left unanswered — the owner perhaps the one gone and failing over
+/// — say nothing of that pod, so it is not avoided for them, as a data plane's breaker does not
+/// count them, and the key goes on through it.
+#[test]
+fn a_pod_only_forwarding_is_not_avoided_for_answers_missing() {
+    use edgerush_cluster::table;
+    use edgerush_cluster_sim::client::{Client, Message};
+    use edgerush_cluster_synchronous::Answer;
+    let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
+    let first = table::first(&members, 16, 2, 1);
+    let Some(key) = (0..).find(|key| first.owner(table::shard_of(*key, 16)) == Some(1)) else {
+        panic!("pod 1 owns nothing");
+    };
+    let mut client = Client::new(1_000_000, vec![key], ms(5), ms(20), 16);
+    client.learn(first);
+    let pods = [1, 2, 3];
+    let id_of = |send: &(NodeId, Message)| match send.1 {
+        Message::Request { id, .. } => id,
+        _ => u64::MAX,
+    };
+    let cut = client.send(ms(1), &pods).unwrap();
+    assert_eq!(cut.0, 1, "sent to the owner");
+    // Its stream to the owner down: sent through another pod, and more after it, each sent
+    // elsewhere answered, so that only the pod forwarding could be avoided.
+    let (through, _) = client.unreachable(id_of(&cut), 1, ms(2), &pods).unwrap();
+    let mut at = ms(2);
+    let mut unanswered = 1;
+    while unanswered < 3 {
+        at += ms(1);
+        let send = client.send(at, &pods).unwrap();
+        if send.0 == through {
+            unanswered += 1;
+        } else {
+            let _ = client.answered(id_of(&send), Answer::Counted(1), at, &pods);
+        }
+    }
+    // Every attempt through it past its time unanswered.
+    at += ms(6);
+    let _ = client.check(at, &pods);
+    let later: Vec<NodeId> = (1..=20)
+        .map(|n| client.send(at + n * ms(1), &pods).unwrap().0)
+        .collect();
+    assert!(
+        later.contains(&through),
+        "{through} avoided for answers missing: {later:?}"
+    );
 }
 
 /// Clients cut off from every pod: with no pod to send to, a request waits — tried again as

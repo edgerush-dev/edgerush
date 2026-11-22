@@ -363,6 +363,9 @@ pub struct Sim<M: Mode> {
     answered_counted: BTreeSet<(NodeId, u64)>,
     /// Every give-back a client has sent, which it may send more than once.
     give_backs: BTreeSet<(NodeId, u64)>,
+    /// Each key clients sent another way than to the owner their table names, with that
+    /// table's number: the pods it went to.
+    long_way: BTreeMap<(Key, (u64, u64)), BTreeSet<NodeId>>,
     /// Pods stopped, when, and whether they drained first.
     pub stopped: Vec<(NodeId, Time, bool)>,
     /// How long a pod told to drain is given before it is killed.
@@ -422,6 +425,7 @@ impl<M: Mode> Sim<M> {
             copies: BTreeSet::new(),
             answered_counted: BTreeSet::new(),
             give_backs: BTreeSet::new(),
+            long_way: BTreeMap::new(),
             stopped: Vec::new(),
             grace: ms(30_000),
             authority: Authority::new(&config),
@@ -830,6 +834,13 @@ impl<M: Mode> Sim<M> {
     #[must_use]
     pub fn give_backs(&self) -> u64 {
         self.give_backs.len() as u64
+    }
+
+    /// Each key clients sent another way than to the owner their table names, with that
+    /// table's number, and the pods it went to: a data plane sends a key one way.
+    #[must_use]
+    pub const fn long_way(&self) -> &BTreeMap<(Key, (u64, u64)), BTreeSet<NodeId>> {
+        &self.long_way
     }
 
     fn handle(&mut self, event: Event<M::Message>) {

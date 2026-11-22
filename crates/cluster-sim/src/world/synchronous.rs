@@ -14,9 +14,15 @@ type Message = edgerush_cluster_synchronous::Message<edgerush_cluster_modes::Val
 
 impl Sim<Synchronous> {
     /// What the mode watches of every message sent: a give-back sent, as many times as it is;
-    /// when an answer under a rule first leaves its owner, by its wall clock; and a request
-    /// answered "counted" twice.
+    /// a request a client sent another way than to its key's owner; when an answer under a
+    /// rule first leaves its owner, by its wall clock; and a request answered "counted" twice.
     pub(super) fn watch_sent(&mut self, from: NodeId, to: NodeId, message: &Message) {
+        if let Message::Request { key, stamp, .. } = message
+            && let Some(client) = self.clients.get(&from).and_then(Caller::synchronous)
+            && client.owner(*key) != Some(to)
+        {
+            self.long_way.entry((*key, *stamp)).or_default().insert(to);
+        }
         if let Message::Request {
             client,
             id,
@@ -294,9 +300,9 @@ impl Sim<Synchronous> {
         let interval = client.interval;
         let before = client.requests;
         let sent: Vec<(NodeId, Message)> = if client.splits() {
-            client.send_split(now, &pods, &mut self.rng)
+            client.send_split(now, &pods)
         } else {
-            client.send(now, &pods, &mut self.rng).into_iter().collect()
+            client.send(now, &pods).into_iter().collect()
         };
         // Made, whether sent or waiting for a stream to some pod.
         self.stats.sent += client.requests - before;
@@ -317,7 +323,7 @@ impl Sim<Synchronous> {
         let Some(client) = self.clients.get_mut(&id).and_then(Caller::synchronous_mut) else {
             return;
         };
-        let (ended, sends) = client.check(now, &pods, &mut self.rng);
+        let (ended, sends) = client.check(now, &pods);
         for (keys, outcome) in ended {
             self.record(id, outcome, &keys);
         }
@@ -356,7 +362,7 @@ impl Sim<Synchronous> {
         else {
             return;
         };
-        if let Some((to, message)) = entry.unreachable(id, pod, now, &pods, &mut self.rng) {
+        if let Some((to, message)) = entry.unreachable(id, pod, now, &pods) {
             self.send(client, to, message.into());
         }
     }
@@ -381,7 +387,7 @@ impl Sim<Synchronous> {
                 answer,
                 ..
             } => {
-                let (ended, sends) = client.answered(request, answer, now, &pods, &mut self.rng);
+                let (ended, sends) = client.answered(request, answer, now, &pods);
                 for (to, message) in sends {
                     self.send(id, to, message.into());
                 }
