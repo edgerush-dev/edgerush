@@ -8,11 +8,17 @@
 //! dialled and for the pods' ID.
 //!
 //! TLS is the operator's choice: a pod served plain takes any call from anyone, as before.
+//!
+//! Served either way, a connection that cannot be taken, out of files most likely, is
+//! tried again only after a pause (`edgerush_control_service::accept`), not straight away:
+//! tonic's own listener retries at once, and would spin a core until a file frees.
 
 use boring::ssl::{SslAcceptor, SslConnector, SslRef};
 use edgerush_certificates::{Identity, spiffe_id};
 use edgerush_config::Certificate;
-use edgerush_control_service::{Credentials, FilesError, Reread, TlsError, acceptor, connector_to};
+use edgerush_control_service::{
+    Credentials, FilesError, Reread, TlsError, accept, acceptor, connector_to,
+};
 use http::Uri;
 use hyper_util::rt::TokioIo;
 use std::future::Future;
@@ -203,7 +209,8 @@ async fn read(path: &Path) -> Result<String, FilesError> {
 /// How long a caller has to finish its handshake.
 const HANDSHAKE: Duration = Duration::from_secs(10);
 
-/// How many connections, their handshakes done, wait for the server to take them.
+/// How many connections taken, with TLS their handshakes done, wait for the server to take
+/// them.
 const WAITING: usize = 16;
 
 /// Serves `service` on `listener` with TLS until `stop`, each connection with the latest of
@@ -250,11 +257,7 @@ async fn accept(
     refused: Arc<dyn Fn(SocketAddr, String) + Send + Sync>,
 ) {
     loop {
-        let (socket, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            // A connection that failed before it was taken: the next is taken as usual.
-            Err(_) => continue,
-        };
+        let (socket, peer) = accept::next(|| listener.accept()).await;
         let _nodelay = socket.set_nodelay(true);
         let tls = tls.borrow().clone();
         let secured = secured.clone();
@@ -277,11 +280,51 @@ async fn accept(
     }
 }
 
-/// The connections taken, as the stream tonic serves from.
-struct Incoming(mpsc::Receiver<Result<Secured, io::Error>>);
+/// Serves `service` on `listener` plain until `stop`: any call from anyone, its requests
+/// told no caller.
+///
+/// # Errors
+///
+/// When gRPC's server fails.
+pub async fn serve_plain<S>(
+    listener: TcpListener,
+    service: S,
+    stop: impl Future<Output = ()>,
+) -> Result<(), tonic::transport::Error>
+where
+    S: tower_service::Service<
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
+            Error = std::convert::Infallible,
+        > + NamedService
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let (taken, incoming) = mpsc::channel(WAITING);
+    let accepting = tokio::spawn(async move {
+        loop {
+            let (socket, _peer) = accept::next(|| listener.accept()).await;
+            let _nodelay = socket.set_nodelay(true);
+            if taken.send(Ok(socket)).await.is_err() {
+                return;
+            }
+        }
+    });
+    let served = tonic::transport::Server::builder()
+        .serve_with_incoming_shutdown(service, Incoming(incoming), stop)
+        .await;
+    accepting.abort();
+    served
+}
 
-impl futures_core::Stream for Incoming {
-    type Item = Result<Secured, io::Error>;
+/// The connections taken, as the stream tonic serves from.
+struct Incoming<T>(mpsc::Receiver<Result<T, io::Error>>);
+
+impl<T> futures_core::Stream for Incoming<T> {
+    type Item = Result<T, io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.0.poll_recv(cx)

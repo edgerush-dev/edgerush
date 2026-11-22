@@ -128,6 +128,27 @@ async fn a_data_plane_may_only_decide_and_a_pod_only_make_the_pods_calls() {
     assert!(denied(decide(&address, &pod).await));
 }
 
+/// Served plain, a pod takes every call from anyone: the data plane's and the pods' alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_served_plain_takes_any_call() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let pod = StorePod::spawn(
+        1,
+        address.clone(),
+        edgerush_cluster::Config::defaults(),
+        Dial::Plain,
+        Vec::new(),
+    );
+    tokio::spawn(secure::serve_plain(
+        listener,
+        StoreServer::new(pod),
+        std::future::pending(),
+    ));
+    decide(&address, &Dial::Plain).await.unwrap();
+    probe(&client(&address, &Dial::Plain)).await.unwrap();
+}
+
 /// The authority vouches only that a caller is one of its workloads: one with another
 /// workload's ID, with none, or with two, is refused once its handshake is done, whatever
 /// it would call; one the authority does not vouch for, or without a certificate, in the

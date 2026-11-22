@@ -11,7 +11,9 @@
 //!
 //! Beside it, the control plane serves the admission webhook's listener, [`webhook`],
 //! its own metrics, [`metrics`], its readiness, [`health`], and its replicas' snapshots to
-//! each other, [`serve_peers`] and [`follow_peer`] (04 §2).
+//! each other, [`serve_peers`] and [`follow_peer`] (04 §2). And what each of EdgeRush's
+//! processes does to keep serving with its files short: raise their limit as it starts,
+//! [`open_files`], and pause after a connection it could not take, [`accept`].
 
 use bytes::Buf;
 use std::marker::PhantomData;
@@ -21,11 +23,12 @@ use tokio::sync::mpsc;
 use tonic::Status;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 
-mod accept;
+pub mod accept;
 mod client;
 mod files;
 pub mod health;
 pub mod metrics;
+pub mod open_files;
 mod peers;
 mod server;
 mod subscribe;
