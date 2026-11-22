@@ -2,7 +2,7 @@
 //! plane's Gateway's, each of its listeners', and each HTTPRoute's for each of its parents
 //! that is that Gateway. Each condition without its times, which the controller keeps as it
 //! writes them, and without `Programmed`, which the data plane's acks say: only whether
-//! there is anything to program.
+//! there is anything to program, and the `Programmed` of what is not.
 
 use crate::gateway::{GatewayOutcome, ListenerOutcome, ListenerProblem};
 use crate::http_route::{NotAttached, ParentOutcome, RouteOutcome};
@@ -97,8 +97,8 @@ pub struct ListenerStatus {
     /// Its conditions.
     pub conditions: Vec<Condition>,
     /// The data plane's listeners it is served on, whose pods' serving them its
-    /// `Programmed` waits on; or why it is not served (`Programmed` false, `Invalid`).
-    pub programmable: Result<Vec<String>, String>,
+    /// `Programmed` waits on; or its `Programmed` where it is not served.
+    pub programmable: Result<Vec<String>, Condition>,
 }
 
 impl fmt::Display for GatewayStatus {
@@ -146,8 +146,8 @@ fn listener_line(f: &mut fmt::Formatter<'_>, listener: &ListenerStatus) -> fmt::
         listener.name, listener.attached_routes
     )?;
     conditions(f, &listener.conditions)?;
-    if let Err(why) = &listener.programmable {
-        write!(f, "; Programmed=False/Invalid ({why})")?;
+    if let Err(programmed) = &listener.programmable {
+        write!(f, "; {programmed}")?;
     }
     Ok(())
 }
@@ -443,7 +443,7 @@ fn of_listeners(
             conditions: listener_conditions(listener),
             programmable: match &listener.served {
                 Ok(served) => Ok(served.clone()),
-                Err(problem) => Err(problem.to_string()),
+                Err(problem) => Err(not_programmed(problem)),
             },
         })
         .collect();
@@ -481,6 +481,37 @@ fn accepted(parent: &ParentStatus) -> bool {
         .any(|c| c.kind == "Accepted" && c.status)
 }
 
+/// The reason of a listener's conflict, where `problem` is one: what its `Conflicted` and
+/// its `Programmed` say.
+fn conflict(problem: &ListenerProblem) -> Option<&'static str> {
+    match problem {
+        ListenerProblem::HostnameConflict { .. } => Some("HostnameConflict"),
+        ListenerProblem::ProtocolConflict { .. }
+        | ListenerProblem::NotDistinct { .. }
+        | ListenerProblem::Http3 { .. } => Some("ProtocolConflict"),
+        ListenerProblem::UnsupportedProtocol(_)
+        | ListenerProblem::PortPastSlots { .. }
+        | ListenerProblem::TooManyListeners { .. }
+        | ListenerProblem::NoValidCaCertificate { .. }
+        | ListenerProblem::TlsMode(_)
+        | ListenerProblem::PassthroughOnly(_)
+        | ListenerProblem::ValidationMode { .. }
+        | ListenerProblem::NoCertificate => None,
+    }
+}
+
+/// The `Programmed` of a listener not served for `problem`: false with its conflict's
+/// reason where it is in conflict, as conformance has it of a ListenerSet's listener and
+/// NGINX Gateway Fabric writes of every listener, else `Invalid`, the spec's reason.
+fn not_programmed(problem: &ListenerProblem) -> Condition {
+    Condition::new(
+        "Programmed",
+        false,
+        conflict(problem).unwrap_or("Invalid"),
+        problem.to_string(),
+    )
+}
+
 /// A listener's conditions: `Accepted`, `Conflicted` where it is, and `ResolvedRefs`.
 fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
     let mut conditions = Vec::new();
@@ -506,17 +537,11 @@ fn listener_conditions(listener: &ListenerOutcome) -> Vec<Condition> {
                 reason,
                 problem.to_string(),
             ));
-            if matches!(
-                problem,
-                ListenerProblem::HostnameConflict { .. }
-                    | ListenerProblem::ProtocolConflict { .. }
-                    | ListenerProblem::NotDistinct { .. }
-                    | ListenerProblem::Http3 { .. }
-            ) {
+            if let Some(conflict) = conflict(problem) {
                 conditions.push(Condition::new(
                     "Conflicted",
                     true,
-                    reason,
+                    conflict,
                     problem.to_string(),
                 ));
             }
