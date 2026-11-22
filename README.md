@@ -364,6 +364,7 @@ and the filters' `reference` modules, the same ones the property tests use. The 
 | `config` | Reading and compiling a config file never fail, and what compiles is whole. |
 | `config_stream` | Any bytes read as the messages either end of the config stream sends never fail; a config given to run is the latest sent, with every certificate and the limits it names at the versions it names, and each refusal is told. |
 | `test_file` | Reading, checking and running a file of `edgerush test`'s tests never fail. |
+| `service_file` | Reading and checking the rate-limiting service pod's config file never fail, and the pod runs what the file says, on a store the store would take. |
 | `rules_compile` | A limit rule's three parts compile or fail with an error placed in the part it is about, and what compiles decides a request without failing. |
 | `admission_review` | Any bytes read as a webhook review never fail, and the answer carries the review's uid. |
 | `snapshot` | Any bytes read as a controller replica's snapshot never fail, and a snapshot read is written and read back the same. |

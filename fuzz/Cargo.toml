@@ -36,7 +36,8 @@ edgerush-controller = { path = "../crates/controller" }
 edgerush-explain = { path = "../crates/explain" }
 edgerush-filters = { path = "../crates/filters", features = ["reference"] }
 edgerush-proxy = { path = "../crates/proxy", features = ["fuzzing"] }
-# The rate-limiting service's messages, decoded as the service decodes them.
+# The rate-limiting service's messages, decoded as the service decodes them, and its pod's
+# config file, read and checked as the pod reads it.
 edgerush-ratelimit = { path = "../crates/ratelimit" }
 edgerush-ratelimit-service = { path = "../crates/ratelimit-service" }
 edgerush-router = { path = "../crates/router", features = ["reference"] }
@@ -241,6 +242,13 @@ bench = false
 [[bin]]
 name = "test_file"
 path = "fuzz_targets/test_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "service_file"
+path = "fuzz_targets/service_file.rs"
 test = false
 doc = false
 bench = false
