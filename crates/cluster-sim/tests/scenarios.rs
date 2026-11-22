@@ -11,6 +11,7 @@
 use edgerush_cluster::{Time, ms};
 use edgerush_cluster_sim::World;
 use edgerush_cluster_sim::scenario::{self, Report, Shape};
+use edgerush_cluster_sim::world::Link;
 
 /// Sixteen shards rather than 256: the same rules, measured faster.
 fn shape() -> Shape {
@@ -197,7 +198,12 @@ fn a_ready_pod_stays_ready_while_another_goes_quiet() {
 /// all, is told skewed by none; nor is it once it has drained and been forgotten.
 #[test]
 fn a_pod_whose_wall_clock_is_off_is_told_skewed_by_the_others() {
-    let near = |told: i64, skew: i64| (told - skew).unsigned_abs() <= ms(50);
+    // A skew is told from the middle of the round trip a heartbeat's echo measures, the sending
+    // anywhere within it: off by half the trip at most. The echo rides the peer's next
+    // heartbeat, so a trip is up to a heartbeat and a link crossed each way.
+    let lan = Link::lan();
+    let trip = edgerush_cluster::Config::defaults().heartbeat + 2 * (lan.delay + lan.jitter);
+    let near = |told: i64, skew: i64| (told - skew).unsigned_abs() <= trip / 2;
     for seed in SEEDS {
         for skew in [0, ms(100), ms(400)] {
             for ahead in [true, false] {

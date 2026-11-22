@@ -1,9 +1,9 @@
 //! A client standing for a data plane: requests at a steady rate under keys of its own, each
 //! sent to the owner its table names, sent another way only when it could not reach the pod
 //! — never when its answer is late, as the owner may have counted it — and given up at its
-//! deadline.
+//! deadline. Another way is the pod a data plane would choose, by the key, so that every
+//! client sends a key the same way.
 
-use crate::Rng;
 use edgerush_cluster::table::{Table, shard_of};
 use edgerush_cluster::{Key, NodeId, Time};
 use edgerush_cluster_synchronous::{Answer, Rule};
@@ -91,7 +91,7 @@ pub struct Client {
     /// Parts counted for requests then refused.
     pub orphaned: u64,
     /// Pods it has stopped asking, each until when, as a data plane's breaker does: one left
-    /// [`AVOID_AFTER`] attempts in a row unanswered. Their keys go to another pod meanwhile, to
+    /// [`AVOID_AFTER`] attempts in a row unanswered, each sent to it as the key's owner. Their keys go to another pod meanwhile, to
     /// be forwarded.
     avoiding: BTreeMap<NodeId, Time>,
     /// Attempts each pod has left unanswered in a row.
@@ -104,11 +104,15 @@ pub struct Client {
     /// Requests it has made, parts and give-backs aside.
     pub requests: u64,
     /// Requests left to `when_unreachable`, with their keys and the pod each was last sent
-    /// to: waited on until answered — a "counted" given back — or its pod is gone, its stream
-    /// with it, as an ask given up on stays on its stream in a data plane.
+    /// to: waited on until answered — a "counted" given back, unless `allow` admitted it — or
+    /// its pod is gone, its stream with it, as an ask given up on stays on its stream in a data
+    /// plane.
     left: BTreeMap<u64, (Vec<Key>, NodeId)>,
     /// The rule its requests are held to by their keys' owners, if any.
     rule: Option<Rule>,
+    /// Whether `when_unreachable` admits a request left to it, under the rule: one that then
+    /// goes on, what its owners charged standing, as a data plane's does.
+    allow: bool,
 }
 
 /// How long a give-back goes unanswered before it is sent again the first time: far beyond a
@@ -177,12 +181,15 @@ impl Client {
             requests: 0,
             left: BTreeMap::new(),
             rule: None,
+            allow: false,
         }
     }
 
-    /// Each request from now held to `rule` by its key's owner.
-    pub const fn set_rule(&mut self, rule: Rule) {
+    /// Each request from now held to `rule` by its key's owner, one left to
+    /// `when_unreachable` admitted if `allow`.
+    pub const fn set_limit(&mut self, rule: Rule, allow: bool) {
         self.rule = Some(rule);
+        self.allow = allow;
     }
 
     /// Each request from now also under `shared`, asked as `multi` says.
@@ -202,36 +209,70 @@ impl Client {
         }
     }
 
-    /// Where it would send a request under `key`: the owner its table names if that pod is
-    /// among `pods`, else one of `pods` at random.
-    fn target(&self, key: Key, pods: &[NodeId], rng: &mut Rng) -> Option<NodeId> {
-        let owner = self
-            .table
-            .as_ref()
-            .and_then(|table| table.owner(shard_of(key, self.shards)));
-        let avoided = |pod: &NodeId| {
-            self.avoiding
-                .get(pod)
-                .is_some_and(|until| *until > self.now)
-        };
-        // Never a pod its stream to is down; none at all if every one's is.
+    /// Where it would send a request under `key`: of `pods`, those it does not avoid, as
+    /// [`choose`](Self::choose) chooses; every one avoided, of those whose stream is up; none
+    /// if every one's is down.
+    fn target(&self, key: Key, pods: &[NodeId]) -> Option<NodeId> {
         let reachable: Vec<NodeId> = pods
             .iter()
             .copied()
             .filter(|pod| !self.is_down(*pod))
             .collect();
-        owner
-            .filter(|owner| reachable.contains(owner) && !avoided(owner))
-            .or_else(|| {
-                let open: Vec<NodeId> = reachable
-                    .iter()
-                    .copied()
-                    .filter(|pod| !avoided(pod))
-                    .collect();
-                let pool = if open.is_empty() { &reachable } else { &open };
-                let index = usize::try_from(rng.below(pool.len() as u64)).ok()?;
-                pool.get(index).copied()
-            })
+        let open: Vec<NodeId> = reachable
+            .iter()
+            .copied()
+            .filter(|pod| !self.avoided(*pod))
+            .collect();
+        self.choose(key, if open.is_empty() { &reachable } else { &open })
+    }
+
+    /// Of `open`, the pods `key` may be sent to now, the one a data plane's `Plane::through`
+    /// chooses: the key's owner, as its table names it; else a replica of the key's shard,
+    /// holding a copy, chosen by the key; else another member, chosen by the key; else, its
+    /// table naming none of them, one of `open` chosen by the key. Chosen by the key, every
+    /// client sends a key the same way, as every data plane does.
+    fn choose(&self, key: Key, open: &[NodeId]) -> Option<NodeId> {
+        let shard = self
+            .table
+            .as_ref()
+            .and_then(|table| table.shards.get(usize::from(shard_of(key, self.shards))));
+        if let Some(owner) = shard
+            .and_then(|shard| shard.owner)
+            .filter(|owner| open.contains(owner))
+        {
+            return Some(owner);
+        }
+        let replicas: Vec<NodeId> = shard
+            .into_iter()
+            .flat_map(|shard| &shard.replicas)
+            .copied()
+            .filter(|replica| open.contains(replica))
+            .collect();
+        let members: Vec<NodeId> = self
+            .table
+            .iter()
+            .flat_map(|table| table.members.keys())
+            .copied()
+            .filter(|member| open.contains(member))
+            .collect();
+        chosen_by(key, &replicas)
+            .or_else(|| chosen_by(key, &members))
+            .or_else(|| chosen_by(key, open))
+    }
+
+    /// The pod its table names as `key`'s owner, if any.
+    #[must_use]
+    pub fn owner(&self, key: Key) -> Option<NodeId> {
+        self.table
+            .as_ref()
+            .and_then(|table| table.owner(shard_of(key, self.shards)))
+    }
+
+    /// Whether it avoids `pod` now, for answers missing.
+    fn avoided(&self, pod: NodeId) -> bool {
+        self.avoiding
+            .get(&pod)
+            .is_some_and(|until| *until > self.now)
     }
 
     /// Request `id` with no pod to send it to, every stream down: waits, tried again in a
@@ -271,17 +312,10 @@ impl Client {
 
     /// Gives back one charged under `key`, with `receipt`, for a request then refused: to the
     /// key's owner now, by its table, as a request goes.
-    fn give_back(
-        &mut self,
-        key: Key,
-        receipt: u64,
-        now: Time,
-        pods: &[NodeId],
-        rng: &mut Rng,
-    ) -> Option<Send> {
+    fn give_back(&mut self, key: Key, receipt: u64, now: Time, pods: &[NodeId]) -> Option<Send> {
         let id = self.next;
         self.next += 1;
-        let to = self.target(key, pods, rng);
+        let to = self.target(key, pods);
         self.inflight.insert(
             id,
             Inflight {
@@ -306,7 +340,7 @@ impl Client {
     }
 
     /// Its next request, at `now`, to one of `pods`.
-    pub fn send(&mut self, now: Time, pods: &[NodeId], rng: &mut Rng) -> Option<(NodeId, Message)> {
+    pub fn send(&mut self, now: Time, pods: &[NodeId]) -> Option<(NodeId, Message)> {
         self.now = now;
         self.last_sent = Some(now);
         let key = *self
@@ -315,7 +349,7 @@ impl Client {
         let id = self.next;
         self.next += 1;
         self.requests += 1;
-        let to = self.target(key, pods, rng);
+        let to = self.target(key, pods);
         let keys = match self.multi {
             Some((Multi::Gather, shared)) => vec![key, shared],
             _ => Vec::new(),
@@ -344,16 +378,11 @@ impl Client {
     }
 
     /// Its next request split by key, at `now`: a part to each key's owner.
-    pub fn send_split(
-        &mut self,
-        now: Time,
-        pods: &[NodeId],
-        rng: &mut Rng,
-    ) -> Vec<(NodeId, Message)> {
+    pub fn send_split(&mut self, now: Time, pods: &[NodeId]) -> Vec<(NodeId, Message)> {
         self.now = now;
         self.last_sent = Some(now);
         let Some((Multi::Split, shared)) = self.multi else {
-            return self.send(now, pods, rng).into_iter().collect();
+            return self.send(now, pods).into_iter().collect();
         };
         let Some(key) = usize::try_from(self.next)
             .ok()
@@ -378,7 +407,7 @@ impl Client {
         );
         let mut sends = Vec::new();
         for (part, id) in parts {
-            let to = self.target(part, pods, rng);
+            let to = self.target(part, pods);
             self.inflight.insert(
                 id,
                 Inflight {
@@ -438,6 +467,10 @@ impl Client {
             return (Some((entry.keys, Outcome::Limited)), entry.counted);
         }
         if entry.refused {
+            // Admitted under `allow`, it went on: what its owners charged stands.
+            if self.allow {
+                return (Some((entry.keys, Outcome::Refused)), Vec::new());
+            }
             self.orphaned += entry.counted.len() as u64;
             return (Some((entry.keys, Outcome::Refused)), entry.counted);
         }
@@ -449,34 +482,28 @@ impl Client {
     }
 
     /// Give-backs for each of `keys`, with its receipt.
-    fn give_backs(
-        &mut self,
-        keys: Vec<(Key, u64)>,
-        now: Time,
-        pods: &[NodeId],
-        rng: &mut Rng,
-    ) -> Vec<Send> {
+    fn give_backs(&mut self, keys: Vec<(Key, u64)>, now: Time, pods: &[NodeId]) -> Vec<Send> {
         keys.into_iter()
-            .filter_map(|(key, receipt)| self.give_back(key, receipt, now, pods, rng))
+            .filter_map(|(key, receipt)| self.give_back(key, receipt, now, pods))
             .collect()
     }
 
     /// A pod's `answer` to request `id`: done, or sent again where the answer points; and what
     /// to send, give-backs among it. The key of a request counted is given back with how it
     /// ended; a "counted" coming after its request was left to `when_unreachable` is given
-    /// back to the keys' owners.
+    /// back to the keys' owners, unless `allow` admitted it.
     pub fn answered(
         &mut self,
         id: u64,
         answer: Answer,
         now: Time,
         pods: &[NodeId],
-        rng: &mut Rng,
     ) -> (Option<Ended>, Vec<Send>) {
         self.now = now;
         let Some(inflight) = self.inflight.get(&id).cloned() else {
-            // A request left to `when_unreachable` answered at last: given back if charged,
-            // settled either way.
+            // A request left to `when_unreachable` answered at last: given back if charged and
+            // refused, settled either way; admitted under `allow`, it went on, the charge
+            // standing.
             let receipt = match answer {
                 Answer::Counted(_) => Some(0),
                 Answer::Admitted(receipt) => Some(receipt),
@@ -484,9 +511,10 @@ impl Client {
             };
             if let Some((keys, _)) = self.left.remove(&id)
                 && let Some(receipt) = receipt
+                && !self.allow
             {
                 let back = keys.into_iter().map(|key| (key, receipt)).collect();
-                return (None, self.give_backs(back, now, pods, rng));
+                return (None, self.give_backs(back, now, pods));
             }
             return (None, Vec::new());
         };
@@ -505,7 +533,7 @@ impl Client {
                 }
                 if let Some(group) = inflight.group {
                     let (ended, back) = self.part_ended(group, inflight.key, Some(receipt), now);
-                    return (ended, self.give_backs(back, now, pods, rng));
+                    return (ended, self.give_backs(back, now, pods));
                 }
                 (
                     Some((
@@ -525,7 +553,7 @@ impl Client {
                         entry.limited = true;
                     }
                     let (ended, back) = self.part_ended(group, inflight.key, None, now);
-                    return (ended, self.give_backs(back, now, pods, rng));
+                    return (ended, self.give_backs(back, now, pods));
                 }
                 (
                     Some((Self::parts(&inflight, id), Outcome::Limited)),
@@ -536,7 +564,7 @@ impl Client {
                 if let Some(table) = table {
                     self.learn(table);
                 }
-                let resend = self.retry(id, now, pods, rng, Some(inflight.to));
+                let resend = self.retry(id, now, pods, Some(inflight.to));
                 (None, resend.into_iter().collect())
             }
             // Not serving: not counted. The pod may soon serve, or the table soon move the
@@ -565,31 +593,21 @@ impl Client {
         id: u64,
         now: Time,
         pods: &[NodeId],
-        rng: &mut Rng,
         avoid: Option<NodeId>,
     ) -> Option<(NodeId, Message)> {
         let inflight = self.inflight.get(&id)?.clone();
-        let Some(mut to) = self.target(inflight.key, pods, rng) else {
+        let Some(mut to) = self.target(inflight.key, pods) else {
             self.wait(id, now);
             return None;
         };
-        if Some(to) == avoid
-            && self
-                .table
-                .as_ref()
-                .and_then(|table| table.owner(shard_of(inflight.key, self.shards)))
-                != Some(to)
-        {
+        if Some(to) == avoid && self.owner(inflight.key) != Some(to) {
             let others: Vec<NodeId> = pods
                 .iter()
                 .copied()
                 .filter(|pod| Some(*pod) != avoid && !self.is_down(*pod))
                 .collect();
-            if let Some(other) = usize::try_from(rng.below(others.len() as u64))
-                .ok()
-                .and_then(|index| others.get(index))
-            {
-                to = *other;
+            if let Some(other) = self.choose(inflight.key, &others) {
+                to = other;
             }
         }
         let entry = self.inflight.get_mut(&id)?;
@@ -609,7 +627,6 @@ impl Client {
         pod: NodeId,
         now: Time,
         pods: &[NodeId],
-        rng: &mut Rng,
     ) -> Option<(NodeId, Message)> {
         self.now = now;
         if self
@@ -621,13 +638,13 @@ impl Client {
         }
         self.avoiding.insert(pod, now + AVOID_FOR);
         self.down.insert(pod, now + AVOID_FOR);
-        self.retry_anywhere(id, now, pods, rng, pod)
+        self.retry_anywhere(id, now, pods, pod)
     }
 
     /// At `now`: requests past their deadline refused, those a pod said it did not count asked
     /// again, and attempts unanswered for `attempt` counted against their pod's breaker — never
     /// sent again, as the owner may have counted them.
-    pub fn check(&mut self, now: Time, pods: &[NodeId], rng: &mut Rng) -> (Vec<Ended>, Vec<Send>) {
+    pub fn check(&mut self, now: Time, pods: &[NodeId]) -> (Vec<Ended>, Vec<Send>) {
         self.now = now;
         let mut ended = Vec::new();
         let mut sends = Vec::new();
@@ -653,7 +670,7 @@ impl Client {
                     if let Some(entry) = self.inflight.get_mut(&id) {
                         entry.unanswered = unanswered;
                     }
-                    sends.extend(self.retry_anywhere(id, now, pods, rng, inflight.to));
+                    sends.extend(self.retry_anywhere(id, now, pods, inflight.to));
                 }
                 continue;
             }
@@ -668,7 +685,7 @@ impl Client {
                 if let Some(group) = inflight.group {
                     let (whole, back) = self.part_ended(group, inflight.key, None, now);
                     ended.extend(whole);
-                    sends.extend(self.give_backs(back, now, pods, rng));
+                    sends.extend(self.give_backs(back, now, pods));
                 } else {
                     let parts = keys.into_iter().map(|key| (key, id)).collect();
                     ended.push((parts, Outcome::Refused));
@@ -678,7 +695,7 @@ impl Client {
             // Not counted: asked again of another pod, which knows the owner if its table is
             // later — the pod asked may be cut off from the rest, its table behind.
             if inflight.again.is_some_and(|at| now >= at) {
-                sends.extend(self.retry_anywhere(id, now, pods, rng, inflight.to));
+                sends.extend(self.retry_anywhere(id, now, pods, inflight.to));
                 continue;
             }
             // A request sent whole is waited on for three quarters of its deadline: the pod
@@ -689,10 +706,15 @@ impl Client {
                 self.deadline / 4 * 3
             };
             if !inflight.missed && now.saturating_sub(inflight.sent) >= attempt {
-                let misses = self.misses.entry(inflight.to).or_insert(0);
-                *misses += 1;
-                if *misses >= AVOID_AFTER {
-                    self.avoiding.insert(inflight.to, now + AVOID_FOR);
+                // A pod asked only to forward, the key's owner another — perhaps the one gone
+                // and failing over — is not counted against: that says nothing of the pod, as
+                // a data plane's breaker has it (docs/06 §4). A pod gathering a request is.
+                if !inflight.keys.is_empty() || self.owner(inflight.key) == Some(inflight.to) {
+                    let misses = self.misses.entry(inflight.to).or_insert(0);
+                    *misses += 1;
+                    if *misses >= AVOID_AFTER {
+                        self.avoiding.insert(inflight.to, now + AVOID_FOR);
+                    }
                 }
                 // Counted once against it, and waited on to its deadline.
                 if let Some(entry) = self.inflight.get_mut(&id) {
@@ -703,12 +725,13 @@ impl Client {
         (ended, sends)
     }
 
+    /// Sends request `id` again, to a pod not `avoid` as [`choose`](Self::choose) chooses;
+    /// else to `avoid`, if its stream is up; else it waits.
     fn retry_anywhere(
         &mut self,
         id: u64,
         now: Time,
         pods: &[NodeId],
-        rng: &mut Rng,
         avoid: NodeId,
     ) -> Option<(NodeId, Message)> {
         let inflight = self.inflight.get(&id)?.clone();
@@ -726,10 +749,7 @@ impl Client {
         } else {
             others
         };
-        let Some(to) = usize::try_from(rng.below(pool.len().max(1) as u64))
-            .ok()
-            .and_then(|index| pool.get(index).copied())
-        else {
+        let Some(to) = self.choose(inflight.key, &pool) else {
             self.wait(id, now);
             return None;
         };
@@ -745,4 +765,10 @@ impl Client {
     fn is_down(&self, pod: NodeId) -> bool {
         self.down.get(&pod).is_some_and(|until| *until > self.now)
     }
+}
+
+/// The one of `among` that `key` chooses, as a data plane's `chosen_by` does, if there is any.
+fn chosen_by(key: Key, among: &[NodeId]) -> Option<NodeId> {
+    let count = Key::try_from(among.len()).ok().filter(|count| *count > 0)?;
+    among.get(usize::try_from(key % count).ok()?).copied()
 }

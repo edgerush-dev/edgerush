@@ -363,6 +363,9 @@ pub struct Sim<M: Mode> {
     answered_counted: BTreeSet<(NodeId, u64)>,
     /// Every give-back a client has sent, which it may send more than once.
     give_backs: BTreeSet<(NodeId, u64)>,
+    /// Each key clients sent another way than to the owner their table names, with that
+    /// table's number: the pods it went to.
+    long_way: BTreeMap<(Key, (u64, u64)), BTreeSet<NodeId>>,
     /// Pods stopped, when, and whether they drained first.
     pub stopped: Vec<(NodeId, Time, bool)>,
     /// How long a pod told to drain is given before it is killed.
@@ -422,6 +425,7 @@ impl<M: Mode> Sim<M> {
             copies: BTreeSet::new(),
             answered_counted: BTreeSet::new(),
             give_backs: BTreeSet::new(),
+            long_way: BTreeMap::new(),
             stopped: Vec::new(),
             grace: ms(30_000),
             authority: Authority::new(&config),
@@ -832,6 +836,13 @@ impl<M: Mode> Sim<M> {
         self.give_backs.len() as u64
     }
 
+    /// Each key clients sent another way than to the owner their table names, with that
+    /// table's number, and the pods it went to: a data plane sends a key one way.
+    #[must_use]
+    pub const fn long_way(&self) -> &BTreeMap<(Key, (u64, u64)), BTreeSet<NodeId>> {
+        &self.long_way
+    }
+
     fn handle(&mut self, event: Event<M::Message>) {
         match event {
             Event::Deliver { from, to, message } => self.deliver(from, to, message),
@@ -1148,14 +1159,18 @@ impl<M: Mode> Sim<M> {
     /// How a request client `client` made ended, each key with its part's number: the truth
     /// as clients were told it, and under a rule, to the oracle, each part at the time its
     /// owner decided it — by its wall clock, and to the true-time oracle by the world's — or
-    /// for one left to `when_unreachable`, the time then.
+    /// for one left to `when_unreachable`, the time then. Under `allow`, which admits a request
+    /// left to it, a part its owner charged is told at the time the owner charged it, as any
+    /// admission is: its charge held the key's allowance from then, its other part not yet
+    /// answered.
     fn record(&mut self, client: NodeId, outcome: Outcome, parts: &[(Key, u64)]) {
         let now = self.now;
+        let allow = self.limit.is_some_and(|(_, allow)| allow);
         let (own, world): (Timed, Timed) = parts
             .iter()
             .map(|(key, id)| {
                 let (own, world) = match outcome {
-                    Outcome::Refused => (now, now),
+                    Outcome::Refused if !allow => (now, now),
                     _ => self
                         .decided
                         .get(&(client, *id))
@@ -1181,7 +1196,6 @@ impl<M: Mode> Sim<M> {
             }
             Outcome::Limited => self.stats.limited += 1,
         }
-        let allow = self.limit.is_some_and(|(_, allow)| allow);
         for (oracle, timed) in [(&mut self.oracle, own), (&mut self.true_time, world)] {
             if let Some(oracle) = oracle {
                 tell(oracle, outcome, allow, timed);
