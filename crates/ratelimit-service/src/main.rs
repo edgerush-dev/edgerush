@@ -5,7 +5,7 @@
 //! ```
 //!
 //! The file (`edgerush_config::ServiceFile`, its schema `schema/ratelimit-service.schema.json`)
-//! is read once, at the start:
+//! is read once, at the start, and checked (`edgerush_ratelimit_service::service_file`):
 //!
 //! ```yaml
 //! mode: asynchronous          # or synchronous; asynchronous when left out
@@ -59,14 +59,15 @@
 use boring::ssl::SslConnector;
 use edgerush_cluster::Time;
 use edgerush_cluster_asynchronous::Pod as AsyncPod;
-use edgerush_config::{ServiceFile, ServiceMode};
+use edgerush_config::ServiceMode;
 use edgerush_control_service::reread;
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::mode::Mode;
 use edgerush_ratelimit_service::cluster::pod::{StorePod, StoreServer};
-use edgerush_ratelimit_service::cluster::settings::{Settings, member_id, settings};
+use edgerush_ratelimit_service::cluster::settings::member_id;
 use edgerush_ratelimit_service::scrape::{self, Counted};
 use edgerush_ratelimit_service::secure::{self, PodFiles, PodTls};
+use edgerush_ratelimit_service::service_file::{PodSettings, Serves, parsed};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -79,44 +80,10 @@ use tokio::sync::watch;
 use tonic::server::NamedService;
 use tonic::transport::server::TcpIncoming;
 
-/// What `keys.max_bytes` is when left out: 256 MiB.
-const MAX_KEY_BYTES: u64 = 256 << 20;
-
-/// What `pod.cycle_ms` is when left out.
-const CYCLE_MS: u64 = 10;
-
 /// How often the certificate files are read again, to take in a Secret replaced.
 const REREAD: Duration = Duration::from_secs(1);
 
 const USAGE: &str = "usage: edgerush-ratelimit-service --config <file>";
-
-#[derive(Debug, PartialEq, Eq)]
-struct Args {
-    listen: SocketAddr,
-    metrics: Option<SocketAddr>,
-    tls: Option<PodFiles>,
-    serves: Serves,
-}
-
-/// The mode a pod serves, with the store it serves it on.
-#[derive(Debug, PartialEq, Eq)]
-enum Serves {
-    /// Its data planes sending every `cycle`.
-    Asynchronous {
-        store: Settings,
-        cycle: Duration,
-    },
-    Synchronous(Settings),
-}
-
-impl Serves {
-    fn mode(&self) -> ServiceMode {
-        match self {
-            Self::Asynchronous { .. } => ServiceMode::Asynchronous,
-            Self::Synchronous(_) => ServiceMode::Synchronous,
-        }
-    }
-}
 
 /// The config file the command line names: `--config <file>`, and nothing else.
 fn config_path(mut args: impl Iterator<Item = String>) -> Result<PathBuf, String> {
@@ -127,84 +94,10 @@ fn config_path(mut args: impl Iterator<Item = String>) -> Result<PathBuf, String
 }
 
 /// The pod's settings from the config file at `path`.
-fn read(path: &Path) -> Result<Args, String> {
+fn read(path: &Path) -> Result<PodSettings, String> {
     let yaml = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let directory = path.parent().unwrap_or(Path::new(""));
     parsed(&yaml, directory).map_err(|error| format!("{}: {error}", path.display()))
-}
-
-/// The pod's settings from the file `yaml` states, its TLS files relative to `directory`.
-fn parsed(yaml: &[u8], directory: &Path) -> Result<Args, String> {
-    // Without the lines around a mistake, which the parser quotes by default: what is said
-    // of a file refused goes to the log, as the data plane's does.
-    let options = serde_saphyr::options! { with_snippet: false };
-    let file: ServiceFile =
-        serde_saphyr::from_slice_with_options(yaml, options).map_err(|error| error.to_string())?;
-    checked(file, directory)
-}
-
-/// What the types cannot check of `file`, and the values of what it leaves out.
-fn checked(file: ServiceFile, directory: &Path) -> Result<Args, String> {
-    let max_key_bytes = file.keys.max_bytes.unwrap_or(MAX_KEY_BYTES);
-    if max_key_bytes == 0 {
-        return Err("`keys.max_bytes`: a number of bytes, at least 1".to_owned());
-    }
-    let mode = file.mode.unwrap_or(ServiceMode::Asynchronous);
-    // Said, each would be ignored, as if it did something.
-    let (field, owner) = match mode {
-        ServiceMode::Synchronous => (
-            ("pod.cycle_ms", file.pod.cycle_ms.is_some()),
-            "asynchronous",
-        ),
-        ServiceMode::Asynchronous => (
-            (
-                "store.forwarder_decides",
-                file.store
-                    .as_ref()
-                    .is_some_and(|store| store.forwarder_decides.is_some()),
-            ),
-            "synchronous",
-        ),
-    };
-    if let (name, true) = field {
-        return Err(format!("`{name}` is the {owner} mode's"));
-    }
-    let name = match mode {
-        ServiceMode::Synchronous => "synchronous",
-        ServiceMode::Asynchronous => "asynchronous",
-    };
-    let store = settings(&file, max_key_bytes)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| {
-            format!("the {name} mode runs on the store: it needs `store` and `pod.address`")
-        })?;
-    let tls = file.tls.map(|tls| PodFiles {
-        certificate: directory.join(tls.certificate),
-        key: directory.join(tls.key),
-        authorities: directory.join(tls.authorities),
-        data_plane: tls.data_plane_id,
-    });
-    let pod = file.pod;
-    let serves = match mode {
-        ServiceMode::Synchronous => Serves::Synchronous(store),
-        ServiceMode::Asynchronous => {
-            // A cycle of nothing would tick without end.
-            let cycle = pod.cycle_ms.unwrap_or(CYCLE_MS);
-            if cycle == 0 {
-                return Err("`pod.cycle_ms`: a number of milliseconds, at least 1".to_owned());
-            }
-            Serves::Asynchronous {
-                store,
-                cycle: Duration::from_millis(cycle),
-            }
-        }
-    };
-    Ok(Args {
-        listen: pod.listen,
-        metrics: pod.metrics,
-        tls,
-        serves,
-    })
 }
 
 /// A pod answers on one thread, either mode's: a stream's answers and its connection's writes
@@ -240,7 +133,7 @@ fn main() -> ExitCode {
     }
 }
 
-async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+async fn serve(args: PodSettings) -> Result<(), Box<dyn std::error::Error>> {
     let tls = match &args.tls {
         Some(files) => Some(secured(files.clone()).await?),
         None => None,
@@ -403,11 +296,6 @@ async fn stopped() {
 mod tests {
     use super::*;
 
-    /// The settings from `yaml`, its TLS files relative to `/etc/edgerush`.
-    fn parsed_from(yaml: &str) -> Result<Args, String> {
-        parsed(yaml.as_bytes(), Path::new("/etc/edgerush"))
-    }
-
     /// An asynchronous pod's file, on the store, with `more` after its sections.
     fn with(more: &str) -> String {
         sections("", &format!("store: {{}}\n{more}"))
@@ -498,153 +386,5 @@ mod tests {
             runtime().unwrap().handle().runtime_flavor(),
             RuntimeFlavor::CurrentThread
         );
-    }
-
-    /// An asynchronous pod's store and its data planes' cycle.
-    fn asynchronous(args: Args) -> (Settings, Duration) {
-        match args.serves {
-            Serves::Asynchronous { store, cycle } => (store, cycle),
-            Serves::Synchronous(_) => panic!("a synchronous pod"),
-        }
-    }
-
-    #[test]
-    fn the_mode_is_asynchronous_unless_said_and_either_runs_on_the_store() {
-        let parsed = parsed_from(&with("")).unwrap();
-        assert_eq!(parsed.serves.mode(), ServiceMode::Asynchronous);
-        assert_eq!(asynchronous(parsed).0.address, "rl-0.rl:7000");
-        let said = parsed_from(&with("mode: eventual\n")).unwrap_err();
-        assert!(said.contains("eventual"), "{said}");
-        // Each mode runs on the store, and is refused without it.
-        for mode in ["asynchronous", "synchronous"] {
-            assert_eq!(
-                parsed_from(&format!("mode: {mode}\npod: {{ listen: 0.0.0.0:7000 }}\n")),
-                Err(format!(
-                    "the {mode} mode runs on the store: it needs `store` and `pod.address`"
-                )),
-                "{mode}"
-            );
-        }
-        let parsed = parsed_from(&format!("mode: synchronous\n{}", with(""))).unwrap();
-        let Serves::Synchronous(store) = parsed.serves else {
-            panic!("an asynchronous pod")
-        };
-        assert_eq!(store.address, "rl-0.rl:7000");
-    }
-
-    #[test]
-    fn each_mode_takes_only_what_it_reads() {
-        // The data planes' cycle is the asynchronous mode's alone; deciding from a copy, the
-        // synchronous mode's.
-        assert_eq!(
-            parsed_from(&format!(
-                "mode: synchronous\n{}",
-                sections(", cycle_ms: 10", "store: {}\n")
-            )),
-            Err("`pod.cycle_ms` is the asynchronous mode's".to_owned())
-        );
-        assert_eq!(
-            parsed_from(&sections("", "store: { forwarder_decides: true }\n")),
-            Err("`store.forwarder_decides` is the synchronous mode's".to_owned())
-        );
-        // What the asynchronous mode's pods agreed by before they ran on the store is no
-        // field the file knows.
-        for gone in [
-            sections(", id: 0", "store: {}\n"),
-            with("membership: { pods: { 0: rl-0:7000 } }\n"),
-        ] {
-            let said = parsed_from(&gone).unwrap_err();
-            assert!(said.contains("unknown field"), "{said}");
-        }
-    }
-
-    #[test]
-    fn a_cycle_is_a_millisecond_at_least() {
-        let cycle = |ms: &str| parsed_from(&sections(&format!(", cycle_ms: {ms}"), "store: {}\n"));
-        assert_eq!(
-            asynchronous(parsed_from(&with("")).unwrap()).1,
-            Duration::from_millis(10)
-        );
-        assert_eq!(
-            asynchronous(cycle("1").unwrap()).1,
-            Duration::from_millis(1)
-        );
-        assert_eq!(
-            cycle("0"),
-            Err("`pod.cycle_ms`: a number of milliseconds, at least 1".to_owned())
-        );
-        assert!(cycle("soon").is_err());
-    }
-
-    #[test]
-    fn what_keys_may_hold_and_where_metrics_go_are_said_or_left_out() {
-        let plain = parsed_from(&with("")).unwrap();
-        assert_eq!(plain.metrics, None);
-        assert_eq!(asynchronous(plain).0.config.max_key_bytes, Some(256 << 20));
-        let said = parsed_from(&format!(
-            "keys: {{ max_bytes: 1048576 }}\n{}",
-            sections(", metrics: 127.0.0.1:9090", "store: {}\n")
-        ))
-        .unwrap();
-        assert_eq!(said.metrics, Some("127.0.0.1:9090".parse().unwrap()));
-        assert_eq!(asynchronous(said).0.config.max_key_bytes, Some(1 << 20));
-        assert_eq!(
-            parsed_from(&with("keys: { max_bytes: 0 }\n")),
-            Err("`keys.max_bytes`: a number of bytes, at least 1".to_owned())
-        );
-        assert!(parsed_from(&with("keys: { max_bytes: lots }\n")).is_err());
-        assert!(parsed_from(&sections(", metrics: nowhere", "store: {}\n")).is_err());
-    }
-
-    #[test]
-    fn a_store_the_pod_could_not_run_on_is_refused_as_the_file_is_read() {
-        assert_eq!(
-            parsed_from(&sections("", "")).err(),
-            Some("`pod.address` is for the store, and there is no `store` section".to_owned())
-        );
-        assert_eq!(
-            parsed_from("pod: { listen: 0.0.0.0:7000 }\nstore: {}\n").err(),
-            Some("`pod.address` is needed with a `store` section".to_owned())
-        );
-        assert_eq!(
-            parsed_from(&with("")).map(|_| ()).err(),
-            None,
-            "a store of its defaults"
-        );
-        assert_eq!(
-            parsed_from(&sections("", "store: { stop_serving_ms: 500 }\n")).err(),
-            Some(
-                "`store.stop_serving_ms` 500 must be more than a heartbeat (100 ms) and at \
-                 least 200 ms less than `store.silence_ms` 600"
-                    .to_owned()
-            )
-        );
-    }
-
-    #[test]
-    fn the_certificate_files_go_together_or_the_pod_is_served_plain() {
-        assert_eq!(parsed_from(&with("")).unwrap().tls, None);
-        let files = [
-            "certificate: pod.pem",
-            "key: pod.key",
-            "authorities: ca.pem",
-            "data_plane_id: spiffe://cluster.local/ns/edge/sa/edge",
-        ];
-        let tls =
-            |given: &[&str]| parsed_from(&with(&format!("tls: {{ {} }}\n", given.join(", "))));
-        assert_eq!(
-            tls(&files).unwrap().tls,
-            Some(PodFiles {
-                certificate: "/etc/edgerush/pod.pem".into(),
-                key: "/etc/edgerush/pod.key".into(),
-                authorities: "/etc/edgerush/ca.pem".into(),
-                data_plane: "spiffe://cluster.local/ns/edge/sa/edge".to_owned(),
-            })
-        );
-        for left_out in 0..files.len() {
-            let mut given = files.to_vec();
-            given.remove(left_out);
-            assert!(tls(&given).is_err(), "{given:?}");
-        }
     }
 }

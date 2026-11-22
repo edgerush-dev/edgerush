@@ -1,0 +1,3 @@
+mode: synchronous
+pod: { listen: "[::]:7000", address: rl-0.rl:7000 }
+store: { forwarder_decides: false }
