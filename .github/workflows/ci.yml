@@ -92,7 +92,7 @@ jobs:
       # saved as well, they made the cache 8 GB, five minutes to restore for three of building
       # saved. Vendored quiche and h2 are kept: they change only when vendor/ does.
       - name: Keep only the dependencies
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
         run: |
           # `-p` and the name of each package of ours, one a line. Never empty: `cargo clean`
           # with no package named would empty the whole target directory.
@@ -112,9 +112,10 @@ jobs:
           rm -rf target/doc
           du -sh target fuzz/target
 
-      # Only once all is green.
+      # From main alone, and only once all is green: a pull request's cache could serve only
+      # that pull request, and it is main's that every run starts from.
       - name: Save the build cache
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
