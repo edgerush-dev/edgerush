@@ -64,6 +64,13 @@ const UNSERVED: Duration = Duration::from_millis(50);
 const DRAINED: Duration = Duration::from_secs(3);
 const _: () = assert!(DRAINED.as_secs() < STREAMS_IDLE.as_secs());
 
+/// How long a dial begun before a pod forgot its peer may take to be counted at the peer's
+/// relay: its link's task is stopped only once the runtime gets to it, tonic's own task may
+/// dial meanwhile, and a connection made waits for the relay to accept it. Ample on localhost
+/// under load, and under the 1 s a link backs off at most, so that a pod still dialling a peer
+/// forgotten is caught.
+const LANDED: Duration = Duration::from_millis(500);
+
 /// How long a client waits for an answer: ample on localhost.
 const ANSWERED: Duration = Duration::from_secs(1);
 
@@ -605,6 +612,7 @@ async fn rollout(pods: NodeId, step: usize) {
             .map(|id| cluster.pods[id].relay.dialled.load(Ordering::Relaxed))
             .collect()
     };
+    tokio::time::sleep(LANDED).await;
     let before = dialled();
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(dialled(), before, "old pods dialled once forgotten");
