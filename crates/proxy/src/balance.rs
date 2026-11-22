@@ -112,7 +112,9 @@ pub trait Candidates {
     /// Whether the endpoint at `at` passes its checks, or has none.
     fn serves(&self, at: usize) -> bool;
     /// Whether it has room for another exchange: always, unless its upstream is protected
-    /// and it has as many in flight as its bound allows (25 §3).
+    /// and it has as many in flight as its bound allows (25 §3). Asked of every endpoint a
+    /// pick considers, so for an unprotected upstream it is best a constant `true` the
+    /// compiler can fold away, not a value looked at (25 §8).
     fn has_room(&self, at: usize) -> bool;
     /// Told that the endpoint at `at`, drawn or come to in turn, had no room and was passed
     /// over: not for one only looked at in working out a rule (25 §8). Nothing by default.
@@ -230,21 +232,24 @@ struct Rule {
 impl Rule {
     fn of(candidates: &impl Candidates, tried: &Tried) -> Self {
         let endpoints = candidates.count();
-        // Whether each serves, and has room, in one look at each.
-        let (mut serving, mut serving_with_room, mut with_room) = (0, 0, 0);
+        // Whether each serves, and is full, in one look at each. The full are what is
+        // counted, not those with room: where room is a constant, as an unprotected
+        // upstream's is, their counts are a constant nought and fold away, leaving the count
+        // of those that serve as it was before protection.
+        let (mut serving, mut serving_full, mut full) = (0, 0, 0);
         for at in 0..endpoints {
             let serves = candidates.serves(at);
-            let room = candidates.has_room(at);
+            let is_full = !candidates.has_room(at);
             serving += usize::from(serves);
-            serving_with_room += usize::from(serves && room);
-            with_room += usize::from(room);
+            serving_full += usize::from(serves && is_full);
+            full += usize::from(is_full);
         }
         // Fullness is not failure: it leaves the half that health needs as it is.
         let health_ignored = serving * 2 < endpoints;
         let allowed = if health_ignored {
-            with_room
+            endpoints - full
         } else {
-            serving_with_room
+            serving - serving_full
         };
         let untried = if tried.is_empty() {
             allowed
@@ -272,6 +277,17 @@ impl Rule {
     }
 }
 
+/// What a pick found of an endpoint it looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Look {
+    /// It may be taken.
+    Taken,
+    /// It may not be, for being full.
+    Full,
+    /// It may not be, for anything else: failing its checks, or tried.
+    Refused,
+}
+
 /// One pick's view of the endpoints: its rule, once it is needed.
 struct Pick<'a, C, R> {
     candidates: &'a C,
@@ -288,14 +304,34 @@ impl<C: Candidates, R: FnMut() -> u64> Pick<'_, C, R> {
     /// Whether the endpoint at `at` may be taken. A serving endpoint with room not yet tried
     /// always may, whatever the rule, so the rule is worked out only for one that is not.
     fn allows(&mut self, at: usize) -> bool {
+        self.looks_at(at) == Look::Taken
+    }
+
+    /// [`Self::allows`], and if it may not be taken, whether that is for being full: where
+    /// room is a constant, as an unprotected upstream's is, [`Look::Full`] is never given,
+    /// and what a caller does with it folds away. Always inlined for that: a caller that
+    /// cannot see it cannot tell, and keeps the branch, and the rule worked out under it,
+    /// in its loop. The rule itself stays apart, in [`Self::by_the_rule`].
+    #[inline(always)]
+    fn looks_at(&mut self, at: usize) -> Look {
         if self.candidates.serves(at) && !self.tried.contains(at) && self.candidates.has_room(at) {
-            return true;
+            return Look::Taken;
         }
         if !self.candidates.has_room(at) {
             self.candidates.passed_over(at);
+            return Look::Full;
         }
+        self.by_the_rule(at)
+    }
+
+    /// Whether the endpoint at `at`, which has room, may be taken by the rule.
+    fn by_the_rule(&mut self, at: usize) -> Look {
         let rule = self.rule();
-        rule.allows(self.candidates, self.tried, at)
+        if rule.allows(self.candidates, self.tried, at) {
+            Look::Taken
+        } else {
+            Look::Refused
+        }
     }
 
     fn rule(&mut self) -> Rule {
@@ -440,9 +476,12 @@ impl RoundRobin {
         // Unless every one is full, some endpoint may be taken, so each round of them finds
         // one, and each refusal costs at most a round: this many steps find one.
         for _ in 0..endpoints * (REFUSALS as usize + 1) {
-            if !pick.allows(at) {
-                // Worked out once, by the look that found this one may not be taken.
-                if pick.rule().count == 0 {
+            let look = pick.looks_at(at);
+            if look != Look::Taken {
+                // Only every one full leaves none to take, so only a full one is a reason to
+                // ask; and if every one health allows is full, a round reaches one, since
+                // health allows some (it is ignored unless half serve).
+                if look == Look::Full && pick.rule().count == 0 {
                     return None;
                 }
             } else {
@@ -869,11 +908,16 @@ mod tests {
             drawn += 1;
             0
         };
+        let noting = Noting {
+            endpoints: full,
+            passed: std::cell::RefCell::new(Vec::new()),
+        };
         assert_eq!(
-            RoundRobin::starting_at(1).pick(&full, &Tried::default(), &mut counting),
+            RoundRobin::starting_at(1).pick(&noting, &Tried::default(), &mut counting),
             None
         );
         assert_eq!(drawn, 0);
+        assert_eq!(*noting.passed.borrow(), [1], "one look, not a round");
     }
 
     #[test]
