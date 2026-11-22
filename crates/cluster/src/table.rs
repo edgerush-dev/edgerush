@@ -172,10 +172,10 @@ impl Table {
 pub fn shard_of(key: Key, shards: u16) -> ShardId {
     let shards = u64::from(shards.max(1));
     // Below `shards`, a u16, so the conversion holds.
-    ShardId::try_from(mix(key) % shards).unwrap_or(0)
+    ShardId::try_from(crate::key::mixed(key) % shards).unwrap_or(0)
 }
 
-/// SplitMix64's finaliser: spreads a key's bits over the shards.
+/// SplitMix64's finaliser: spreads a number's bits, a key's over the shards ([`crate::key::mixed`]).
 #[must_use]
 pub const fn mix(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);

@@ -2,7 +2,7 @@
 //! each part of a value only rises, so that two copies merge by keeping the larger of each, in
 //! whatever order they meet.
 
-use edgerush_cluster::table::mix;
+use edgerush_cluster::key::mixed;
 use edgerush_cluster::{Held, Key, Time};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -235,7 +235,7 @@ impl Rule {
         match *self {
             Self::Window { window, .. } => {
                 let window = window.max(1);
-                (at + mix(key) % window) / window + 1
+                (at + mixed(key) % window) / window + 1
             }
             Self::Rolling { window, slots, .. } => at / slot_length(window, slots),
             Self::Bucket { .. } => 0,
@@ -335,7 +335,7 @@ impl Rule {
                 let window = window.max(1);
                 number
                     .saturating_mul(window)
-                    .saturating_sub(mix(key) % window)
+                    .saturating_sub(mixed(key) % window)
             }
             (
                 Self::Rolling {
@@ -462,7 +462,7 @@ mod tests {
         for rule in rules {
             for key in 0..20 {
                 let mut value = Value::default();
-                let mut at = ms(1_000) + key * 7_919;
+                let mut at = ms(1_000) + key as u64 * 7_919;
                 while rule.admit(key, &mut value, at).is_some() {
                     at += ms(10);
                 }

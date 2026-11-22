@@ -13,66 +13,18 @@ use super::{Asynchronous, Event, Sim, store_kind, store_size};
 use crate::Rng;
 use crate::workload::Workload;
 use edgerush_cluster::Message as StoreMessage;
-use edgerush_cluster::table::shard_of;
-use edgerush_cluster::{Key, NodeId, Time, ms};
+use edgerush_cluster::table::{Table, shard_of};
+use edgerush_cluster::{KEY_BYTES, Key, NodeId, Time, ms};
 use edgerush_cluster_asynchronous::{Answers, Routed};
-use edgerush_cluster_modes::KIND_BIT;
-use edgerush_ratelimit::service::keyed::KeyedHasher;
 use edgerush_ratelimit::service::pooled::{
     self, Decision, Entry, Levers, Local, Participant, Routing,
 };
 use edgerush_ratelimit::service::{Contract, Keyed};
 use std::collections::{BTreeMap, VecDeque};
-use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 
 /// The mode's messages, over the store of both modes' values.
 type Message = edgerush_cluster_asynchronous::Message<edgerush_cluster_modes::Value>;
-
-/// The data planes' keyed hash, the asynchronous mode's bit set in each key ([`KIND_BIT`]), so
-/// that a pod of both modes takes their keys as this mode's. The simulation's own: the proxy's
-/// participant matches the owner's answers by its 64-bit hash, so its keys take the bit with
-/// the 128-bit key, in the half beyond that hash.
-#[derive(Clone, Copy, Debug)]
-pub struct KindKeyed(Keyed);
-
-impl KindKeyed {
-    /// The hash under `key`, as [`Keyed::new`], with the mode's bit.
-    #[must_use]
-    pub fn new(key: [u64; 2]) -> Self {
-        Self(Keyed::new(key))
-    }
-}
-
-impl BuildHasher for KindKeyed {
-    type Hasher = KindHasher;
-
-    fn build_hasher(&self) -> KindHasher {
-        KindHasher(self.0.build_hasher())
-    }
-}
-
-/// A [`KindKeyed`] hash under way: the keyed hash's, its last bit the mode's.
-#[derive(Clone, Debug)]
-pub struct KindHasher(KeyedHasher);
-
-impl Hasher for KindHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        self.0.write(bytes);
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        self.0.write_u64(n);
-    }
-
-    fn write_usize(&mut self, n: usize) {
-        self.0.write_usize(n);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0.finish() | KIND_BIT
-    }
-}
 
 /// The time between a data plane's batches.
 pub const CYCLE: Time = ms(10);
@@ -84,10 +36,19 @@ const EXCHANGE_TIMEOUT: Time = ms(300);
 /// What every data plane hashes its keys under, as the proxy's share `key_secret`.
 const SECRET: [u64; 2] = [1, 2];
 
+/// The data planes' routing, under the secret they share, by `table` if there is one.
+fn routed(table: Option<Table>) -> Routed {
+    let none = Routed::new(SECRET);
+    match table {
+        Some(table) => none.told(table),
+        None => none,
+    }
+}
+
 /// A data plane as the world runs it: the proxy's participant, under keys it shares with the
 /// others, taking requests steadily or as a workload brings them.
 pub struct Plane {
-    data: Participant<KindKeyed, Routed>,
+    data: Participant<Keyed, Routed>,
     feed: Feed,
     /// When each key's requests were admitted, by the world's clock.
     admitted: BTreeMap<u64, Vec<Time>>,
@@ -193,17 +154,18 @@ pub(super) const fn kind(message: &Message) -> &'static str {
     }
 }
 
-/// A batch's entry as today's wire bounds it less its key's bytes (an eight-byte key), an
-/// answer a key and three numbers, and a table as the synchronous mode's reply carries it.
+/// A batch's entry as today's wire bounds it, its key the store's ([`KEY_BYTES`]) in place of
+/// the key's own bytes, an answer a key and three numbers, an unserved key a key and a flag,
+/// and a table as the synchronous mode's reply carries it.
 pub(super) fn size(message: &Message) -> u64 {
     match message {
         Message::Store(message) => store_size(message),
         Message::Batch(batch) | Message::Forwarded { batch, .. } => {
-            64 + 136 * batch.entries.len() as u64
+            64 + (128 + KEY_BYTES) * batch.entries.len() as u64
         }
         Message::Answers(answers) | Message::Relayed { answers, .. } => {
-            64 + 48 * answers.entries.len() as u64
-                + 16 * answers.unserved.len() as u64
+            64 + (40 + KEY_BYTES) * answers.entries.len() as u64
+                + (8 + KEY_BYTES) * answers.unserved.len() as u64
                 + answers
                     .table
                     .as_ref()
@@ -243,13 +205,8 @@ impl Sim<Asynchronous> {
         for _ in 0..count {
             let id = self.next_client;
             self.next_client += 1;
-            let mut data = Participant::new(
-                id,
-                CYCLE,
-                Routed::new(table.clone()),
-                KindKeyed::new(SECRET),
-            )
-            .expect("native 128-bit atomics");
+            let mut data = Participant::new(id, CYCLE, routed(table.clone()), Keyed::new(SECRET))
+                .expect("native 128-bit atomics");
             data.set_one_in_flight(true);
             data.set_exchange_timeout(EXCHANGE_TIMEOUT);
             data.set_levers(Levers { poll_quiet: false });
@@ -270,7 +227,7 @@ impl Sim<Asynchronous> {
                 gone: false,
             };
             self.clients.insert(id, Caller::Asynchronous(plane));
-            self.asked.extend(keys.iter().copied());
+            self.asked.extend(keys.iter().copied().map(Key::from));
             let first = self.now + self.rng.below(interval.max(1));
             self.schedule(first, Event::ClientSend(id));
             let cycle = self.now + self.rng.below(CYCLE);
@@ -385,10 +342,12 @@ impl Sim<Asynchronous> {
         }
         // The run's key, and each beside it the first after it whose owner is another pod.
         let owner = |key: u64| {
-            let hash = planes[0].1.hash(&bytes_of(key));
+            let bytes = bytes_of(key);
+            let data = &planes[0].1;
+            let key = data.routing().store_key(&bytes, data.hash(&bytes));
             table
                 .as_ref()
-                .and_then(|table| table.owner(shard_of(hash, table.shards.len() as u16)))
+                .and_then(|table| table.owner(shard_of(key, table.shards.len() as u16)))
         };
         let run = 1;
         let apart = |after: u64| {
@@ -459,7 +418,7 @@ impl Sim<Asynchronous> {
                     gone: false,
                 }),
             );
-            self.asked.extend(keys.iter().copied());
+            self.asked.extend(keys.iter().copied().map(Key::from));
             if let Some(first) = first {
                 self.schedule(first, Event::ClientSend(id));
             }
@@ -595,10 +554,14 @@ impl Sim<Asynchronous> {
             .values()
             .filter_map(Caller::asynchronous)
             .next()?;
-        let hash = plane.data.hash(&bytes_of(key));
+        let bytes = bytes_of(key);
+        let key = plane
+            .data
+            .routing()
+            .store_key(&bytes, plane.data.hash(&bytes));
         let table = self.table()?;
-        let owner = table.owner(shard_of(hash, table.shards.len() as u16))?;
-        Some((owner, hash))
+        let owner = table.owner(shard_of(key, table.shards.len() as u16))?;
+        Some((owner, key))
     }
 
     /// The pod the table names `key`'s owner.
@@ -859,7 +822,7 @@ impl Sim<Asynchronous> {
             return;
         };
         if let Some(table) = latest {
-            let told = Routed::new(Some(table));
+            let told = plane.data.routing().told(table);
             if told.later(plane.data.routing()) {
                 plane.data.on_routing(told, now);
             }
@@ -910,10 +873,13 @@ impl Sim<Asynchronous> {
     /// participant.
     fn take_answers(plane: &mut Plane, from: NodeId, message: Message, now: Time) {
         let reply = match message {
-            Message::Answers(answers) => Routed::reply(from, None, answers),
-            Message::Relayed { owner, answers, .. } => Routed::reply(owner, Some(from), answers),
+            Message::Answers(answers) => plane.data.routing().reply(from, None, answers),
+            Message::Relayed { owner, answers, .. } => {
+                plane.data.routing().reply(owner, Some(from), answers)
+            }
             Message::Store(StoreMessage::TableReply { table }) => {
-                plane.data.on_routing(Routed::new(Some(table)), now);
+                let told = plane.data.routing().told(table);
+                plane.data.on_routing(told, now);
                 return;
             }
             _ => return,
@@ -937,8 +903,8 @@ fn fed_participant(
     poll_quiet: bool,
     scheduled: bool,
     workers: usize,
-) -> Participant<KindKeyed, Routed> {
-    let mut data = Participant::new(id, CYCLE, Routed::new(table), KindKeyed::new(SECRET))
+) -> Participant<Keyed, Routed> {
+    let mut data = Participant::new(id, CYCLE, routed(table), Keyed::new(SECRET))
         .expect("native 128-bit atomics");
     data.set_one_in_flight(true);
     data.set_exchange_timeout(EXCHANGE_TIMEOUT);

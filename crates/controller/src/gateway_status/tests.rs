@@ -373,7 +373,7 @@ fn wanted_gateway() -> translate::GatewayStatus {
                     said("Accepted", true, "Accepted"),
                     said("ResolvedRefs", false, "InvalidCertificateRef"),
                 ],
-                programmable: Err("no certificateRef of it can be used".to_owned()),
+                programmable: Err(said("Programmed", false, "Invalid")),
             },
         ],
         attached_listener_sets: 1,
@@ -538,6 +538,37 @@ fn a_gateway_says_its_listeners_as_wanted_and_keeps_what_is_not_ours() {
             .flat_map(|l| &l.conditions)
             .filter(|c| c.type_ != "example.com/Stale")
             .all(|c| c.observed_generation == Some(4))
+    );
+}
+
+/// A listener not served says the `Programmed` translation gives it, its reason and why:
+/// a conflict's own reason, as conformance has it (#479), not `Invalid` whatever it is.
+#[test]
+fn a_listener_not_served_says_the_programmed_translation_gives_it() {
+    let mut wanted = wanted_gateway();
+    wanted.listeners[1].programmable = Err(translate::Condition {
+        message: "listener http, which comes first, has its port".to_owned(),
+        ..said("Programmed", false, "HostnameConflict")
+    });
+    let unknown = Programmed::of(4, &Pods::new(), None, false);
+    let status = gateway(None, &wanted, &[], &unknown, at(50));
+    let listeners = status.listeners.unwrap();
+    let programmed = listeners[1]
+        .conditions
+        .iter()
+        .find(|c| c.type_ == "Programmed")
+        .unwrap();
+    assert_eq!(
+        (
+            programmed.status.as_str(),
+            programmed.reason.as_str(),
+            programmed.message.as_str()
+        ),
+        (
+            "False",
+            "HostnameConflict",
+            "listener http, which comes first, has its port"
+        )
     );
 }
 

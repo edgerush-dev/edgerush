@@ -99,7 +99,7 @@ impl Sim<Synchronous> {
     /// `count` clients, each under 32 keys of its own, `rate` requests a second each.
     pub fn add_clients(&mut self, count: u64, rate: u64, deadline: Time) {
         for client in 0..count {
-            let keys = (0..32).map(|key| client * 1_000 + key).collect();
+            let keys = (0..32).map(|key| Key::from(client * 1_000 + key)).collect();
             self.add_client(keys, 1_000_000_000 / rate.max(1), deadline);
         }
     }

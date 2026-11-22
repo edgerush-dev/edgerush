@@ -456,11 +456,11 @@ fn run(
     // Keys are hashed under the secret every data plane shares, so that each sends a key to
     // the pod that owns it; no key has an owner until a pod tells the table.
     let hasher = Keyed::new(service.key_secret.0);
+    let routed = Routed::new(service.key_secret.0);
     let cycle = service.cycle;
     // The proxy refuses rate limits where 128-bit atomics are not native, so the
     // participant is made; if not, the thread ends, and the hub with it.
-    let Some(mut participant) = Participant::new(id, nanos(cycle), Routed::new(None), hasher)
-    else {
+    let Some(mut participant) = Participant::new(id, nanos(cycle), routed, hasher) else {
         let _gone = made.send(Err("no native 128-bit compare-and-swap".to_owned()));
         return;
     };
@@ -750,9 +750,8 @@ impl State {
     fn told(&self, stream: &PodStream, told: AsyncMessage, now: u64) {
         match told {
             AsyncMessage::Store(StoreMessage::TableReply { table }) => {
-                self.participant
-                    .borrow_mut()
-                    .on_routing(Routed::new(Some(table)), now);
+                let told = self.participant.borrow().routing().told(table);
+                self.participant.borrow_mut().on_routing(told, now);
                 self.let_go();
                 self.publish_pods();
             }
@@ -765,19 +764,25 @@ impl State {
                     return;
                 };
                 self.shared.stats.landed(out.entries);
-                self.participant.borrow_mut().on_reply_to(
-                    out.exchange,
-                    Routed::reply(pod, None, answers),
-                    now,
-                );
+                let reply = self
+                    .participant
+                    .borrow()
+                    .routing()
+                    .reply(pod, None, answers);
+                self.participant
+                    .borrow_mut()
+                    .on_reply_to(out.exchange, reply, now);
             }
             AsyncMessage::Relayed { owner, answers, .. } => {
                 let Some(pod) = stream.member else {
                     return;
                 };
-                self.participant
-                    .borrow_mut()
-                    .on_reply(Routed::reply(owner, Some(pod), answers), now);
+                let reply = self
+                    .participant
+                    .borrow()
+                    .routing()
+                    .reply(owner, Some(pod), answers);
+                self.participant.borrow_mut().on_reply(reply, now);
             }
             AsyncMessage::Batch(_) | AsyncMessage::Forwarded { .. } | AsyncMessage::Store(_) => {}
         }
@@ -1149,7 +1154,7 @@ mod tests {
         let participant = Participant::new(
             1_023,
             10_000_000,
-            Routed::new(Some(table)),
+            Routed::new([1, 2]).told(table),
             Keyed::new([1, 2]),
         )
         .expect("native 128-bit atomics");

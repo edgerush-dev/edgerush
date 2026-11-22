@@ -1706,14 +1706,15 @@ fn keys_chosen_to_share_a_shard_spread_under_another_processs_hash() {
     assert!(shards.len() > 180, "{} shards", shards.len());
 }
 
-/// A key's slot in the participant's table takes 72 bytes routed by today's pods, 80 by the
-/// store's, whose pod ids are twice as long, the table holding up to twice the room its keys
-/// take: the batches it has not seen acknowledged, which between cycles it almost never has,
-/// kept apart behind a pointer, and when its copy was last heard of in eight bytes.
+/// A key's slot in the participant's table takes 72 bytes routed by today's pods, 88 by the
+/// store's, whose pod ids are twice as long and which keeps the second half of its 128-bit
+/// key, the table holding up to twice the room its keys take: the batches it has not seen
+/// acknowledged, which between cycles it almost never has, kept apart behind a pointer, and
+/// when its copy was last heard of in eight bytes.
 #[test]
 fn a_keys_slot_is_small() {
-    assert_eq!(size_of::<Tracked<PodId>>(), 72);
-    assert_eq!(size_of::<Tracked<u64>>(), 80);
+    assert_eq!(size_of::<Tracked<PodId, ()>>(), 72);
+    assert_eq!(size_of::<Tracked<u64, u64>>(), 88);
 }
 
 /// When a key's copy was last heard of, kept in eight bytes, reads back as it was set:
@@ -2898,7 +2899,7 @@ fn a_participant_past_its_capacity_evicts_the_least_recently_used() {
         participant.on_cycle(now);
         settle(&mut participant, &mut pod, now);
     }
-    let each = key_bytes::<PodId>(&keys[0], 1);
+    let each = key_bytes::<PodId, ()>(&keys[0], 1);
     assert_eq!(participant.holding(), 5 * each);
     // Room for three, nine tenths of that for two: the two used last stay.
     participant.set_capacity(3 * each);
@@ -3034,6 +3035,36 @@ fn a_piece_takes_an_entry_bigger_than_itself_alone() {
     let second = queued.take_piece(100);
     assert_eq!(&*second.entries[0].key, b"bbbbbbbbbb");
     assert!(queued.is_empty());
+}
+
+/// What is kept beside each entry goes with it, piece by piece: split over several pieces, the
+/// queue hands each entry's out beside it, in order.
+#[test]
+fn what_is_kept_beside_an_entry_goes_with_it_piece_by_piece() {
+    let mut queued: Queued<u64> = Queued::default();
+    let count = 3 * PIECE_BYTES / 100;
+    for n in 0..count as u64 {
+        let entry = BatchEntry {
+            key: format!("{n:090}").into_bytes().into(),
+            contract: tenth(),
+            report: Report::Poll,
+        };
+        queued.push_keyed(entry, n);
+    }
+    let mut pieces = 0;
+    let mut next = 0;
+    while !queued.is_empty() {
+        let (piece, keyed) = queued.take_keyed(100);
+        assert_eq!(piece.entries.len(), keyed.len());
+        for (entry, kept) in piece.entries.iter().zip(&keyed) {
+            assert_eq!(*kept, next);
+            assert_eq!(&*entry.key, format!("{next:090}").as_bytes());
+            next += 1;
+        }
+        pieces += 1;
+    }
+    assert!(pieces > 1, "the queue split into pieces");
+    assert_eq!(next, count as u64);
 }
 
 /// A refused request waits as long as the longest of its keys, as the proxy reads it from the

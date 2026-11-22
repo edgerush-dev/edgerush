@@ -17,12 +17,12 @@ pub(super) fn hash<S: BuildHasher>(hasher: &S, bytes: &[u8]) -> u64 {
 }
 
 /// The keys, by hash.
-pub(super) struct Keys<S, P> {
+pub(super) struct Keys<S, P, K> {
     hasher: S,
-    table: HashTable<Tracked<P>>,
+    table: HashTable<Tracked<P, K>>,
 }
 
-impl<S: BuildHasher, P> Keys<S, P> {
+impl<S: BuildHasher, P, K> Keys<S, P, K> {
     /// None yet, hashed by `hasher`.
     pub(super) fn new(hasher: S) -> Self {
         Self {
@@ -36,26 +36,26 @@ impl<S: BuildHasher, P> Keys<S, P> {
         hash(&self.hasher, bytes)
     }
 
-    pub(super) fn get(&self, key: &[u8]) -> Option<&Tracked<P>> {
+    pub(super) fn get(&self, key: &[u8]) -> Option<&Tracked<P, K>> {
         self.table
             .find(self.hash(key), |tracked| *tracked.entry.key == *key)
     }
 
-    pub(super) fn get_mut(&mut self, key: &[u8]) -> Option<&mut Tracked<P>> {
+    pub(super) fn get_mut(&mut self, key: &[u8]) -> Option<&mut Tracked<P, K>> {
         let hash = self.hash(key);
         self.table
             .find_mut(hash, |tracked| *tracked.entry.key == *key)
     }
 
     /// The key of `hash`, by the hash alone.
-    pub(super) fn by_hash_mut(&mut self, hash: u64) -> Option<&mut Tracked<P>> {
+    pub(super) fn by_hash_mut(&mut self, hash: u64) -> Option<&mut Tracked<P, K>> {
         let hasher = &self.hasher;
         self.table.find_mut(hash, |tracked| {
             self::hash(hasher, &tracked.entry.key) == hash
         })
     }
 
-    pub(super) fn remove(&mut self, key: &[u8]) -> Option<Tracked<P>> {
+    pub(super) fn remove(&mut self, key: &[u8]) -> Option<Tracked<P, K>> {
         let hash = self.hash(key);
         let found = self
             .table
@@ -65,7 +65,7 @@ impl<S: BuildHasher, P> Keys<S, P> {
     }
 
     /// Keeps `tracked`, in place of what it held for the key if anything.
-    pub(super) fn insert(&mut self, tracked: Tracked<P>) {
+    pub(super) fn insert(&mut self, tracked: Tracked<P, K>) {
         let hash = self.hash(&tracked.entry.key);
         let hasher = &self.hasher;
         match self.table.entry(
@@ -84,23 +84,23 @@ impl<S: BuildHasher, P> Keys<S, P> {
         self.table.len()
     }
 
-    pub(super) fn iter(&self) -> impl Iterator<Item = &Tracked<P>> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = &Tracked<P, K>> {
         self.table.iter()
     }
 
-    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Tracked<P>> {
+    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Tracked<P, K>> {
         self.table.iter_mut()
     }
 
     /// Each key with its hash.
-    pub(super) fn hashed_mut(&mut self) -> impl Iterator<Item = (u64, &mut Tracked<P>)> {
+    pub(super) fn hashed_mut(&mut self) -> impl Iterator<Item = (u64, &mut Tracked<P, K>)> {
         let hasher = &self.hasher;
         self.table
             .iter_mut()
             .map(move |tracked| (hash(hasher, &tracked.entry.key), tracked))
     }
 
-    pub(super) fn retain(&mut self, keep: impl FnMut(&mut Tracked<P>) -> bool) {
+    pub(super) fn retain(&mut self, keep: impl FnMut(&mut Tracked<P, K>) -> bool) {
         self.table.retain(keep);
     }
 }

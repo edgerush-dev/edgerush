@@ -769,6 +769,6 @@ impl Client {
 
 /// The one of `among` that `key` chooses, as a data plane's `chosen_by` does, if there is any.
 fn chosen_by(key: Key, among: &[NodeId]) -> Option<NodeId> {
-    let count = u64::try_from(among.len()).ok().filter(|count| *count > 0)?;
+    let count = Key::try_from(among.len()).ok().filter(|count| *count > 0)?;
     among.get(usize::try_from(key % count).ok()?).copied()
 }

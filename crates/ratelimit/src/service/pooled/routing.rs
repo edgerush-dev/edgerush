@@ -13,15 +13,25 @@ pub trait Routing: Sized {
     /// What a pod is sent: a batch of the participant's entries, made into the service's
     /// terms.
     type Batch;
+    /// What it keeps of a key beside the participant's hash of it ([`Self::key`]): made once,
+    /// as the participant first keeps the key, and handed back with the hash wherever the
+    /// key is routed. `()` where the hash is all it needs; the cluster store's routing keeps
+    /// the second half of the store's 128-bit key.
+    type Key: Copy;
 
-    /// The owner of the key of `bytes`, `hash` being the participant's for it
-    /// ([`Participant::hash`](super::Participant::hash)), if it names one.
-    fn owner(&self, bytes: &[u8], hash: u64) -> Option<Self::Pod>;
+    /// What it keeps of the key of `bytes`, `hash` being the participant's for it
+    /// ([`Participant::hash`](super::Participant::hash)): alike under every routing the
+    /// participant is told, as it is made once.
+    fn key(&self, bytes: &[u8], hash: u64) -> Self::Key;
 
-    /// A pod other than `owner` to send the key of `hash` through as well, while `owner`
-    /// leaves its batches unanswered: one that forwards them to it. `None` where pods forward
-    /// nothing.
-    fn through(&self, hash: u64, owner: Self::Pod) -> Option<Self::Pod>;
+    /// The owner of the key of `bytes`, `hash` being the participant's for it and `key` what
+    /// the routing keeps of it, if it names one.
+    fn owner(&self, bytes: &[u8], hash: u64, key: Self::Key) -> Option<Self::Pod>;
+
+    /// A pod other than `owner` to send the key of `hash` and `key` through as well, while
+    /// `owner` leaves its batches unanswered: one that forwards them to it. `None` where pods
+    /// forward nothing.
+    fn through(&self, hash: u64, key: Self::Key, owner: Self::Pod) -> Option<Self::Pod>;
 
     /// The pod to poll at `turn`, counted up from 0, when keys in use have gone unheard, with
     /// an empty batch, its answer bringing the pod's routing if later: each in turn. `None`
@@ -34,9 +44,9 @@ pub trait Routing: Sized {
     /// Whether it names `pod` among the service's pods.
     fn names(&self, pod: Self::Pod) -> bool;
 
-    /// `batch` as `pod` is sent it, each entry's key hashed by `hash` where the service
-    /// takes the hash.
-    fn batch(&self, pod: Self::Pod, batch: Batch, hash: impl Fn(&[u8]) -> u64) -> Self::Batch;
+    /// `batch` as `pod` is sent it, `keys` beside its entries, by position: each one's hash
+    /// and what the routing keeps of it, where the service takes those rather than the bytes.
+    fn batch(&self, pod: Self::Pod, batch: Batch, keys: &[(u64, Self::Key)]) -> Self::Batch;
 }
 
 /// A pod's answers to a batch, in the participant's terms, whichever service it reaches.

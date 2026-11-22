@@ -25,6 +25,7 @@
 //! and the receiver puts it together again ([`Joining`]) before the store sees it.
 
 use bytes::Bytes;
+use edgerush_cluster::key::{joined, lower};
 use edgerush_cluster::table::{Changes as StoreChanges, Shard as StoreShard, Table as StoreTable};
 use edgerush_cluster::{Held, Kept, Key, Message, NodeId, ShardId, Stamp as StoreStamp};
 use edgerush_cluster_synchronous::{
@@ -67,6 +68,9 @@ pub enum Invalid {
     /// or more batches waiting than a data plane may have out.
     #[error("a value no owner could have held")]
     Value,
+    /// A list of keys of an odd number of words: each key is two.
+    #[error("a list of keys of an odd number of words")]
+    Keys,
 }
 
 /// A mode's value as the wire carries it: a protobuf message of the mode's own.
@@ -352,9 +356,12 @@ pub struct Hello {
 /// A key, its value, and when it may be forgotten.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Entry<W: prost::Message + Default + Debug> {
-    /// The key.
+    /// The key's lower half: the data plane's own hash of it.
     #[prost(fixed64, tag = "1")]
-    pub key: u64,
+    pub key_lower: u64,
+    /// The key's upper half, its mode's bit the top one.
+    #[prost(fixed64, tag = "4")]
+    pub key_upper: u64,
     /// Its value, as the mode's message.
     #[prost(message, optional, tag = "2")]
     pub value: Option<W>,
@@ -387,7 +394,7 @@ pub struct Replicate<W: prost::Message + Default + Debug> {
     /// The keys.
     #[prost(message, repeated, tag = "7")]
     pub entries: Vec<Entry<W>>,
-    /// The keys evicted.
+    /// The keys evicted, two words a key, its lower half first.
     #[prost(fixed64, repeated, tag = "8")]
     pub dropped: Vec<u64>,
     /// The part's number in the copy, from 0.
@@ -458,7 +465,7 @@ pub struct Handoff<W: prost::Message + Default + Debug> {
     /// The keys.
     #[prost(message, repeated, tag = "3")]
     pub entries: Vec<Entry<W>>,
-    /// The keys evicted.
+    /// The keys evicted, two words a key, its lower half first.
     #[prost(fixed64, repeated, tag = "4")]
     pub dropped: Vec<u64>,
     /// The part's number, from 0.
@@ -587,9 +594,12 @@ pub struct Request {
     /// The client's number for it.
     #[prost(uint64, tag = "2")]
     pub id: u64,
-    /// The key.
-    #[prost(uint64, tag = "3")]
-    pub key: u64,
+    /// The key's lower half: the data plane's own hash of it.
+    #[prost(fixed64, tag = "3")]
+    pub key_lower: u64,
+    /// The key's upper half, its mode's bit the top one.
+    #[prost(fixed64, tag = "10")]
+    pub key_upper: u64,
     /// The client's table.
     #[prost(message, optional, tag = "4")]
     pub stamp: Option<Stamp>,
@@ -741,8 +751,8 @@ pub struct Gather {
     /// The data plane's number for it.
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    /// The keys.
-    #[prost(uint64, repeated, tag = "2")]
+    /// The keys, two words a key, its lower half first.
+    #[prost(fixed64, repeated, tag = "2")]
     pub keys: Vec<u64>,
 }
 
@@ -1103,7 +1113,7 @@ pub fn from_peer<V: Value>(sent: ToPeer<V::Wire>) -> Result<(NodeId, Message<V>)
             shard: shard_id(handoff.shard)?,
             term: handoff.term,
             entries: entries_from(handoff.entries)?,
-            dropped: keys_from_wire(handoff.dropped),
+            dropped: keys_from_wire(handoff.dropped)?,
             part: handoff.part,
             more: handoff.more,
         },
@@ -1141,7 +1151,7 @@ pub fn from_copy<V: Value>(sent: ToCopy<V::Wire>) -> Result<(NodeId, Message<V>)
             version: copy.version,
             under: stamp_from(copy.under)?,
             entries: entries_from(copy.entries)?,
-            dropped: keys_from_wire(copy.dropped),
+            dropped: keys_from_wire(copy.dropped)?,
             part: copy.part,
             more: copy.more,
         },
@@ -1174,7 +1184,8 @@ pub fn mode_wire(from: NodeId, message: SyncMessage) -> Option<Outgoing<Synchron
         } => peer(Control::Request(Request {
             client,
             id,
-            key: key_to_wire(key),
+            key_lower: key_lower(key),
+            key_upper: key_upper(key),
             stamp: Some(stamp(asked)),
             hops: u32::from(hops),
             via,
@@ -1248,7 +1259,7 @@ pub fn asked_from(asking: Asking, client: NodeId) -> Result<SyncMessage, Invalid
         Asked::Gather(gather) => Ok(SyncMessage::Gather {
             client,
             id: gather.id,
-            keys: keys_from_wire(gather.keys),
+            keys: keys_from_wire(gather.keys)?,
         }),
     }
 }
@@ -1312,7 +1323,7 @@ fn request_from(request: Request) -> Result<SyncMessage, Invalid> {
     Ok(SyncMessage::Request {
         client: request.client,
         id: request.id,
-        key: key_from_wire(request.key),
+        key: key_from_wire(request.key_lower, request.key_upper),
         stamp: stamp_from(request.stamp)?,
         hops: u8::try_from(request.hops).map_err(|_| Invalid::Hops)?,
         via: request.via,
@@ -1475,31 +1486,48 @@ fn table_from(table: Table) -> Result<StoreTable, Invalid> {
     })
 }
 
-/// A key as the wire carries it.
-pub(crate) const fn key_to_wire(key: Key) -> u64 {
-    key
+/// A key's lower half as the wire carries it, in eight bytes, as its upper ([`key_upper`]):
+/// a hash's bits are too spread for a varint to make them shorter.
+pub(crate) const fn key_lower(key: Key) -> u64 {
+    lower(key)
 }
 
-/// A key from the wire.
-pub(crate) const fn key_from_wire(wire: u64) -> Key {
-    wire
+/// A key's upper half as the wire carries it.
+pub(crate) const fn key_upper(key: Key) -> u64 {
+    // The upper 64 bits, by design.
+    (key >> 64) as u64
 }
 
-/// Keys as the wire carries them.
+/// A key from its halves on the wire.
+pub(crate) const fn key_from_wire(lower: u64, upper: u64) -> Key {
+    joined(lower, upper)
+}
+
+/// Keys as the wire carries them: two words a key, its lower half first.
 fn keys_to_wire(keys: Vec<Key>) -> Vec<u64> {
-    keys.into_iter().map(key_to_wire).collect()
+    keys.into_iter()
+        .flat_map(|key| [key_lower(key), key_upper(key)])
+        .collect()
 }
 
 /// Keys from the wire.
-fn keys_from_wire(wire: Vec<u64>) -> Vec<Key> {
-    wire.into_iter().map(key_from_wire).collect()
+fn keys_from_wire(wire: Vec<u64>) -> Result<Vec<Key>, Invalid> {
+    let (keys, rest) = wire.as_chunks::<2>();
+    if !rest.is_empty() {
+        return Err(Invalid::Keys);
+    }
+    Ok(keys
+        .iter()
+        .map(|[lower, upper]| key_from_wire(*lower, *upper))
+        .collect())
 }
 
 fn entries_to_wire<V: Value>(entries: Vec<(Key, Kept<V>)>) -> Vec<Entry<V::Wire>> {
     entries
         .into_iter()
         .map(|(key, kept)| Entry {
-            key: key_to_wire(key),
+            key_lower: key_lower(key),
+            key_upper: key_upper(key),
             value: Some(kept.value.to_wire()),
             forget_at: kept.forget_at,
         })
@@ -1512,7 +1540,7 @@ fn entries_from<V: Value>(entries: Vec<Entry<V::Wire>>) -> Result<Vec<(Key, Kept
         .map(|entry| {
             let value = V::from_wire(entry.value.ok_or(Invalid::Missing)?)?;
             Ok((
-                key_from_wire(entry.key),
+                key_from_wire(entry.key_lower, entry.key_upper),
                 Kept {
                     value,
                     forget_at: entry.forget_at,
@@ -2279,7 +2307,8 @@ mod tests {
                 shard: 0,
                 term: 1,
                 entries: vec![Entry {
-                    key: 7,
+                    key_lower: 7,
+                    key_upper: 0,
                     value,
                     forget_at: 0,
                 }],
@@ -2502,15 +2531,26 @@ mod tests {
             };
             let count = most / kept.bytes();
             let entries = (0..count)
-                .map(|key| (Key::MAX - key, kept.clone()))
+                .map(|key| (Key::MAX - Key::from(key), kept.clone()))
                 .collect();
             let encoded = part(entries, Vec::new());
             assert!(encoded <= crate::grpc::MAX_MESSAGE, "{encoded} bytes");
         }
         let dropped = (0..most / edgerush_cluster::KEY_BYTES)
-            .map(|key| Key::MAX - key)
+            .map(|key| Key::MAX - Key::from(key))
             .collect();
         let encoded = part(Vec::new(), dropped);
         assert!(encoded <= crate::grpc::MAX_MESSAGE, "{encoded} bytes");
+    }
+
+    /// A list of keys goes two words a key, so one of an odd number of words is refused:
+    /// a key would be cut in half.
+    #[test]
+    fn a_list_of_keys_cut_short_is_refused() {
+        let keys: Vec<Key> = vec![0, Key::MAX, joined(5, u64::MAX), joined(u64::MAX, 5)];
+        let wire = keys_to_wire(keys.clone());
+        assert_eq!(wire.len(), 8);
+        assert_eq!(keys_from_wire(wire.clone()), Ok(keys));
+        assert_eq!(keys_from_wire(wire[..7].to_vec()), Err(Invalid::Keys));
     }
 }

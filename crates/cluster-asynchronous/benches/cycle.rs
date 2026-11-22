@@ -90,9 +90,11 @@ fn admitted() -> (Plane, Box<Pod>, u64) {
     let mut pod = Box::new(lone_pod(MS));
     let table = pod.store().committed().cloned();
     assert!(table.is_some(), "the pod holds its table");
-    let hasher = Keyed::new([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
+    let secret = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
+    let routed = Routed::new(secret);
+    let routed = table.map_or_else(|| routed.clone(), |table| routed.told(table));
     let mut plane: Plane = Box::new(
-        Participant::new(1, CYCLE, Routed::new(table), hasher)
+        Participant::new(1, CYCLE, routed, Keyed::new(secret))
             .expect("native 128-bit atomics on Linux"),
     );
     plane.set_levers(Levers { poll_quiet: false });
@@ -108,7 +110,8 @@ fn admitted() -> (Plane, Box<Pod>, u64) {
         }
         for answers in answers {
             assert!(answers.unserved.is_empty(), "the lone pod serves every key");
-            plane.on_reply(Routed::reply(POD, None, answers), now - CYCLE);
+            let reply = plane.routing().reply(POD, None, answers);
+            plane.on_reply(reply, now - CYCLE);
         }
     }
     admit(&mut plane, 0..ADMITTING, now);
@@ -149,7 +152,8 @@ fn on_cycle(setup: (Plane, Box<Pod>, u64)) -> (Plane, Box<Pod>) {
 fn on_reply(setup: (Plane, Vec<Answers>, u64)) -> Plane {
     let (mut plane, answers, now) = setup;
     for answers in answers {
-        plane.on_reply(Routed::reply(POD, None, black_box(answers)), black_box(now));
+        let reply = plane.routing().reply(POD, None, black_box(answers));
+        plane.on_reply(reply, black_box(now));
     }
     plane
 }

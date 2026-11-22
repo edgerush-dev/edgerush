@@ -313,12 +313,26 @@ fn cut_off_from_owner(heard: Option<u64>, oldest: Option<u64>, after: u64, now: 
 }
 
 /// What a data plane has to send one service pod: entries, their hits' ages counting back
-/// from `made`; and what they take, by [`Entry::bytes`].
-#[derive(Debug, Default)]
-pub(crate) struct Queued {
+/// from `made`; beside each, by position, `X`, what the sender keeps of its key (a
+/// participant's hash and its routing's [`Key`](pooled::Routing::Key), none for the
+/// reference); and what they take, by [`Entry::bytes`].
+#[derive(Debug)]
+pub(crate) struct Queued<X = ()> {
     pub(crate) made: u64,
     pub(crate) entries: Vec<Entry>,
+    keyed: Vec<X>,
     bytes: usize,
+}
+
+impl<X> Default for Queued<X> {
+    fn default() -> Self {
+        Self {
+            made: 0,
+            entries: Vec::new(),
+            keyed: Vec::new(),
+            bytes: 0,
+        }
+    }
 }
 
 /// The room left in a piece being filled, which takes its first entry however big.
@@ -348,7 +362,7 @@ impl Room {
     }
 }
 
-impl Queued {
+impl<X> Queued<X> {
     /// The room left in its next piece.
     pub(crate) fn room(&self) -> Room {
         let mut room = Room::new();
@@ -363,16 +377,17 @@ impl Queued {
         self.entries.is_empty()
     }
 
-    /// `entry` queued last.
-    pub(crate) fn push_entry(&mut self, entry: Entry) {
+    /// `entry` queued last, `keyed` beside it.
+    pub(crate) fn push_keyed(&mut self, entry: Entry, keyed: X) {
         self.bytes = self.bytes.saturating_add(entry.bytes());
         self.entries.push(entry);
+        self.keyed.push(keyed);
     }
 
     /// Its next piece, from data plane `from`: its entries in the order queued, as many as
-    /// fit in [`PIECE_BYTES`]; the rest kept for the next. A key's reports stay in order,
-    /// and keys depend on no other.
-    pub(crate) fn take_piece(&mut self, from: PlaneId) -> Batch {
+    /// fit in [`PIECE_BYTES`], with what is kept beside each; the rest kept for the next. A
+    /// key's reports stay in order, and keys depend on no other.
+    pub(crate) fn take_keyed(&mut self, from: PlaneId) -> (Batch, Vec<X>) {
         if self.bytes <= Room::new().left {
             // All of it, as most often.
             let batch = Batch {
@@ -381,7 +396,7 @@ impl Queued {
                 made: self.made,
             };
             self.bytes = 0;
-            return batch;
+            return (batch, std::mem::take(&mut self.keyed));
         }
         let mut room = Room::new();
         let fit = self
@@ -390,13 +405,14 @@ impl Queued {
             .take_while(|entry| room.take(entry.bytes()))
             .count();
         let entries: Vec<Entry> = self.entries.drain(..fit).collect();
+        let keyed = self.keyed.drain(..fit).collect();
         let batch = Batch {
             from,
             entries,
             made: self.made,
         };
         self.bytes = self.bytes.saturating_sub(batch.bytes() - MESSAGE_BYTES);
-        batch
+        (batch, keyed)
     }
 
     /// Made at `now` from here on, if that is later: the ages of the hits it holds count
@@ -413,6 +429,20 @@ impl Queued {
             self.made = now;
         }
         self
+    }
+}
+
+/// The reference's queue, with nothing beside its entries, and the tests'.
+#[cfg(test)]
+impl Queued {
+    /// `entry` queued last.
+    pub(crate) fn push_entry(&mut self, entry: Entry) {
+        self.push_keyed(entry, ());
+    }
+
+    /// Its next piece, as [`Self::take_keyed`] takes it.
+    pub(crate) fn take_piece(&mut self, from: PlaneId) -> Batch {
+        self.take_keyed(from).0
     }
 }
 
