@@ -732,7 +732,8 @@ async fn a_data_plane_cut_off_from_an_owner_reaches_it_through_a_replica() {
         .unwrap();
     let mut hasher = edgerush_ratelimit::service::Keyed::new(service.key_secret.0).build_hasher();
     hasher.write(key);
-    let shard = edgerush_cluster::table::shard_of(hasher.finish(), 16);
+    let routed = edgerush_cluster_asynchronous::Routed::new(service.key_secret.0);
+    let shard = edgerush_cluster::table::shard_of(routed.store_key(key, hasher.finish()), 16);
     let owner = table.owner(shard).unwrap();
     let owner_at = &table.members[&owner];
     *holds[usize::try_from(owner - 1).unwrap()].lock().unwrap() =
@@ -788,7 +789,8 @@ async fn a_data_plane_hears_the_table_from_the_replica_it_sends_through() {
     let secret = KeySecret::parse(SECRET).unwrap();
     let mut hasher = edgerush_ratelimit::service::Keyed::new(secret.0).build_hasher();
     hasher.write(key);
-    let shard = edgerush_cluster::table::shard_of(hasher.finish(), 16);
+    let routed = edgerush_cluster_asynchronous::Routed::new(secret.0);
+    let shard = edgerush_cluster::table::shard_of(routed.store_key(key, hasher.finish()), 16);
     let owner = table.owner(shard).unwrap();
     let service = edgerush_config::CompiledRateLimitService {
         addresses: vec![table.members[&owner].clone()],

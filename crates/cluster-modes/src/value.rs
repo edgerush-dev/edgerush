@@ -1,45 +1,10 @@
 //! What a pod of both modes keeps under each key: either mode's value, merged, sized and cut
-//! into parts as that mode's own, and the bit of the key that says which mode it is.
+//! into parts as that mode's own, the mode its key's bit says (`edgerush_cluster::Kind`).
 
-use edgerush_cluster::{Held, Key};
+use edgerush_cluster::Held;
 use edgerush_cluster_asynchronous as asynchronous;
 use edgerush_cluster_synchronous as synchronous;
 use std::collections::BTreeSet;
-
-/// The bit of a key that says its mode: clear for the synchronous mode's, set for the
-/// asynchronous mode's. A data plane sets it as it hashes the key, so that the two kinds of
-/// value never meet under one key, even where two hashes collide.
-pub const KIND_BIT: Key = 1 << (Key::BITS - 1);
-
-/// A key's mode, as its [`KIND_BIT`] says.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    /// The synchronous mode's: the owner decides every request.
-    Synchronous,
-    /// The asynchronous mode's: data planes decide, the owner applies their hits.
-    Asynchronous,
-}
-
-impl Kind {
-    /// The mode of `key`.
-    #[must_use]
-    pub const fn of(key: Key) -> Self {
-        if key & KIND_BIT == 0 {
-            Self::Synchronous
-        } else {
-            Self::Asynchronous
-        }
-    }
-
-    /// `hash` as a key of this mode: its top bit cleared or set.
-    #[must_use]
-    pub const fn key(self, hash: Key) -> Key {
-        match self {
-            Self::Synchronous => hash & !KIND_BIT,
-            Self::Asynchronous => hash | KIND_BIT,
-        }
-    }
-}
 
 /// A key's value: either mode's, or, a key new to the store, none yet.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -137,19 +102,6 @@ mod tests {
     use edgerush_cluster_asynchronous::Holds as _;
     use edgerush_cluster_synchronous::Holds as _;
     use proptest::prelude::*;
-
-    /// A key's bit says its mode, and either mode's key of a hash keeps the rest of it.
-    #[test]
-    fn a_keys_top_bit_says_its_mode() {
-        let hash: Key = 0x1234;
-        let synchronous = Kind::Synchronous.key(hash | KIND_BIT);
-        let asynchronous = Kind::Asynchronous.key(hash);
-        assert_eq!(Kind::of(synchronous), Kind::Synchronous);
-        assert_eq!(Kind::of(asynchronous), Kind::Asynchronous);
-        assert_eq!(synchronous, hash);
-        assert_eq!(asynchronous & !KIND_BIT, hash);
-        assert_ne!(synchronous, asynchronous);
-    }
 
     /// A fresh value becomes the mode's that asks for it, and counts as that mode's; one of
     /// the other mode's is made afresh, never read as this one's.

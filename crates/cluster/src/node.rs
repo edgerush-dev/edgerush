@@ -2842,6 +2842,7 @@ const PER_CYCLE: usize = 1_024;
 mod tests {
     use super::*;
     use crate::kept::Counts;
+    use crate::keys::SCHEDULED_BYTES;
 
     type Node = super::Node<Counts>;
     type Outbox = super::Outbox<Counts>;
@@ -2857,6 +2858,12 @@ mod tests {
         }
     }
     use crate::ms;
+
+    /// What a key of one part takes by the store's count: its key, time and value, and its
+    /// place in the schedule (64 bytes of 8-byte keys, 84 of 16-byte).
+    fn one_key() -> u64 {
+        Kept::new(Counts::of(1)).bytes() + SCHEDULED_BYTES
+    }
 
     /// Where pod `id` is reached, in these tests.
     fn address(id: NodeId) -> String {
@@ -2998,9 +3005,10 @@ mod tests {
     /// shard to each carries the key as a deletion, so that no replica keeps it.
     #[test]
     fn an_owners_eviction_goes_to_its_replicas_as_a_deletion() {
-        // Three keys of 64 bytes, as in the test below: one evicted brings 192 to 128.
+        // Three keys against a cap of two and a half, as in the test below: one evicted
+        // brings them to two, under nine tenths of it.
         let mut capped = config();
-        capped.max_key_bytes = Some(150);
+        capped.max_key_bytes = Some(one_key() * 5 / 2);
         let mut node = Node::new(1, address(1), capped, [2, 3]);
         let members = named(&[1, 2, 3]);
         let table = table::first(&members, 4, 2, 1);
@@ -3030,7 +3038,7 @@ mod tests {
     #[test]
     fn past_its_cap_a_pod_evicts_the_keys_it_may_forget_soonest() {
         let mut capped = config();
-        capped.max_key_bytes = Some(150);
+        capped.max_key_bytes = Some(one_key() * 5 / 2);
         let mut node = Node::new(2, address(2), capped, [1, 3]);
         let members = named(&[1, 2, 3]);
         let table = table::first(&members, 4, 2, 1);
@@ -3057,8 +3065,8 @@ mod tests {
             more: false,
         };
         let _ = node.receive(1, copy, ms(2));
-        // Three keys of 64 bytes, 40 their own and 24 their place in the schedule: 192 against
-        // 150, and one evicted brings it to 128, under 135.
+        // Three keys, their own bytes and their places in the schedule, against a cap of two
+        // and a half: one evicted brings them to two, under nine tenths of it.
         let _ = node.tick(ms(3));
         assert_eq!(node.keys_of(0), [keys[0], keys[2]].into_iter().collect());
         assert_eq!(node.evicted(), 1);
@@ -3097,8 +3105,9 @@ mod tests {
     #[test]
     fn past_its_cap_the_soonest_goes_first_across_shards() {
         let mut capped = config();
-        // Three keys of 64 bytes, 192 against 150: one evicted brings it to 128, under 135.
-        capped.max_key_bytes = Some(150);
+        // Three keys against a cap of two and a half: one evicted brings them to two, under
+        // nine tenths of it.
+        capped.max_key_bytes = Some(one_key() * 5 / 2);
         let mut node = member_under(capped);
         let first: Vec<Key> = (0..).filter(|key| shard_of(*key, 4) == 0).take(2).collect();
         let soonest = key_in(1);
@@ -3133,8 +3142,9 @@ mod tests {
     #[test]
     fn past_its_cap_a_key_never_forgotten_goes_last() {
         let mut capped = config();
-        // Three keys of 64 bytes, 192 against 100: two evicted bring it to 64, under 90.
-        capped.max_key_bytes = Some(100);
+        // Three keys against a cap of one and a half: two evicted bring them to one, under
+        // nine tenths of it.
+        capped.max_key_bytes = Some(one_key() * 3 / 2);
         let mut node = member_under(capped);
         let keys: Vec<Key> = (0..).filter(|key| shard_of(*key, 4) == 0).take(3).collect();
         let kept = |forget_at| Kept {
@@ -3197,8 +3207,8 @@ mod tests {
         assert_eq!(node.key_bytes(), 0);
     }
 
-    /// Holds `count` keys of the shards below `shards`, each of one count's bytes, 64 with its
-    /// place in the schedule, from `forget_at(key)`, as if it had always held them.
+    /// Holds `count` keys of the shards below `shards`, each of one count's bytes, [`one_key`]
+    /// with its place in the schedule, from `forget_at(key)`, as if it had always held them.
     fn holding(node: &mut Node, shards: ShardId, count: usize, forget_at: impl Fn(Key) -> Time) {
         for key in (0..).filter(|key| shard_of(*key, 4) < shards).take(count) {
             let kept = Kept {
@@ -3234,11 +3244,14 @@ mod tests {
     #[test]
     fn far_past_its_cap_a_pod_evicts_a_bounded_number_a_cycle_down_to_nine_tenths() {
         let mut capped = config();
-        // 12,000 keys of 64 bytes, 768 kB against 760: down to 684 kB, 10,687 keys, is 1,313
-        // evicted, the 1,024 of the first cycle bringing it under the cap but not to the goal.
-        capped.max_key_bytes = Some(760_000);
+        // 12,000 keys against a cap of 11,875: down to nine tenths of it, 10,687 keys, is
+        // 1,313 evicted, the 1,024 of the first cycle bringing it under the cap but not to the
+        // goal.
+        capped.max_key_bytes = Some(11_875 * one_key());
         let mut node = member_under(capped);
-        holding(&mut node, 4, 12_000, |key| ms(60_000 + key % 1_000 * 1_000));
+        holding(&mut node, 4, 12_000, |key| {
+            ms(60_000 + key as u64 % 1_000 * 1_000)
+        });
         let evicted: Vec<u64> = [2, 12, 22]
             .into_iter()
             .map(|at| {
@@ -3247,7 +3260,11 @@ mod tests {
             })
             .collect();
         assert_eq!(evicted, [1_024, 1_313, 1_313]);
-        assert!(node.key_bytes() <= 684_000, "{}", node.key_bytes());
+        assert!(
+            node.key_bytes() <= 11_875 * one_key() * 9 / 10,
+            "{}",
+            node.key_bytes()
+        );
         assert_agrees(&node);
     }
 
@@ -3267,7 +3284,7 @@ mod tests {
             }
             let kept = Kept {
                 value,
-                forget_at: ms(60_000 + key % 1_000 * 1_000),
+                forget_at: ms(60_000 + key as u64 % 1_000 * 1_000),
             };
             let _ = node.data.insert(shard_of(key, 4), key, kept);
         }
@@ -3303,9 +3320,9 @@ mod tests {
     #[test]
     fn past_its_cap_keys_made_add_as_many_to_what_a_cycle_evicts() {
         let mut capped = config();
-        // 20,000 keys of 64 bytes, 1.28 MB against 640 kB: 11,000 to evict, more than two
-        // cycles' worth.
-        capped.max_key_bytes = Some(640_000);
+        // 20,000 keys against a cap of 10,000: 11,000 to evict, down to nine tenths of it,
+        // more than two cycles' worth.
+        capped.max_key_bytes = Some(10_000 * one_key());
         let mut node = member_under(capped);
         let mut ahead = Vec::new();
         for key in (0..).filter(|key| shard_of(*key, 4) != 0).take(20_000) {
@@ -3353,8 +3370,8 @@ mod tests {
     #[test]
     fn past_its_cap_keys_an_owner_makes_add_as_many_to_what_a_cycle_evicts() {
         let mut capped = config();
-        // As above: 20,000 keys of 64 bytes against 640 kB, more than two cycles' worth.
-        capped.max_key_bytes = Some(640_000);
+        // As above: 20,000 keys against a cap of 10,000, more than two cycles' worth.
+        capped.max_key_bytes = Some(10_000 * one_key());
         let (mut owner, shard, _, _) = owner_copying_to_2_under(capped);
         holding(&mut owner, 4, 20_000, |_| ms(60_000));
         let leased = |owner: &mut Node, now| {
@@ -3452,8 +3469,8 @@ mod tests {
         let _ = node.receive(1, copy, ms(2));
         assert_eq!(
             node.key_bytes(),
-            64,
-            "one key of 40 bytes and its 24 in the schedule"
+            one_key(),
+            "one key, and its place in the schedule"
         );
         let mut off = table;
         off.version = 2;
@@ -3584,7 +3601,7 @@ mod tests {
     fn a_copy_is_cut_into_parts_within_the_bound() {
         let entries: Vec<(Key, Kept<Counts>)> = keys_in_0(10)
             .into_iter()
-            .map(|key| (key, Kept::new(Counts::of(key))))
+            .map(|key| (key, Kept::new(Counts::of(key as u64))))
             .collect();
         let size = entries[0].1.bytes();
         let dropped = vec![7, 8, 9];

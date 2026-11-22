@@ -769,7 +769,8 @@ async fn when_a_follower_crashes_its_keys_are_held_by_their_new_owners() {
     // A key in every shard, each counted at its owner, once that owner serves it.
     let keys: Vec<Key> = (0..Key::from(SHARDS) * 8).collect();
     for key in &keys {
-        let counted = *key + 1;
+        // Below 128, as a count.
+        let counted = *key as u64 + 1;
         let mut owner = 0;
         let updated = within(FAILOVER, || {
             let leading = cluster.pod(leading).clone();
@@ -835,7 +836,10 @@ async fn when_a_follower_crashes_its_keys_are_held_by_their_new_owners() {
             Some(Value::Count { counted, .. }) => counted,
             other => panic!("key {key} at {owner}: {other:?}"),
         };
-        assert!(counted > key, "key {key} at {owner}: counted {counted}");
+        assert!(
+            counted > key as u64,
+            "key {key} at {owner}: counted {counted}"
+        );
     }
 }
 

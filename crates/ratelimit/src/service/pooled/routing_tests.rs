@@ -21,12 +21,15 @@ struct Fixed {
 impl Routing for Fixed {
     type Pod = u64;
     type Batch = Batch;
+    type Key = ();
 
-    fn owner(&self, _: &[u8], _: u64) -> Option<u64> {
+    fn key(&self, _: &[u8], _: u64) {}
+
+    fn owner(&self, _: &[u8], _: u64, (): ()) -> Option<u64> {
         self.owner
     }
 
-    fn through(&self, _: u64, _: u64) -> Option<u64> {
+    fn through(&self, _: u64, (): (), _: u64) -> Option<u64> {
         self.through
     }
 
@@ -43,7 +46,7 @@ impl Routing for Fixed {
         self.pods.contains(&pod)
     }
 
-    fn batch(&self, _: u64, batch: Batch, _: impl Fn(&[u8]) -> u64) -> Batch {
+    fn batch(&self, _: u64, batch: Batch, _: &[(u64, ())]) -> Batch {
         batch
     }
 }

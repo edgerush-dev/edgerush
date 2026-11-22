@@ -36,9 +36,12 @@ fn contract() -> Contract {
     }
 }
 
-/// Key `k` as a data plane hashes one: spread over the shards.
+/// Key `k` as a data plane hashes one: both halves spread, over the shards.
 const fn key(k: u64) -> Key {
-    k.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    let spread = k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    // A second multiplier, as unrelated to the first as two runs of the keyed hash are: a
+    // half drawn from the other (its complement, say) would fold every key into one shard.
+    edgerush_cluster::key::joined(spread, k.wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
 }
 
 /// Data plane `from`'s batch number `sequence` for `keys`: one hit each.

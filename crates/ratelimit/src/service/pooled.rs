@@ -683,9 +683,11 @@ pub fn waits<'a>(entries: &'a [&'a Entry], now: u64) -> impl Iterator<Item = (us
 
 /// What the transport keeps of a key besides its entry: the protocol's bookkeeping, which
 /// no worker touches.
-struct Tracked<P> {
+struct Tracked<P, K> {
     entry: Arc<Entry>,
     owner: Option<P>,
+    /// What the routing keeps of the key, made as it was first kept.
+    routed: K,
     sent: u64,
     seen: u64,
     /// Batches sent and not yet seen applied.
@@ -703,7 +705,7 @@ struct Tracked<P> {
     left_out: bool,
 }
 
-impl<P> Tracked<P> {
+impl<P, K> Tracked<P, K> {
     /// Its ledger's hits, as a report numbered after the last, sent at `now`: `None` if
     /// there are none, or [`MOST_UNACKNOWLEDGED`] are out already and they wait.
     fn report_unsent(&mut self, now: u64, spare: &mut Spare) -> Option<BatchEntry> {
@@ -757,6 +759,10 @@ impl<P> Tracked<P> {
     reason = "a pointer in every key's slot, rather than a list's three words, for what is rarely there"
 )]
 type List = Box<Vec<Unseen>>;
+
+/// A piece of what is to go to one pod: its batch, and beside each entry, in step, its key's
+/// hash and the routing's key of it.
+type Piece<K> = (Batch, Vec<(u64, K)>);
 
 /// A key's batches sent and not yet seen applied, in the order sent. Between cycles there
 /// are almost never any, so a key holds no room for them then: a pointer in its slot, the
@@ -868,8 +874,8 @@ fn idle_at(entry: &Entry) -> u64 {
         .saturating_add(1)
 }
 
-fn key_bytes<P>(key: &[u8], workers: u64) -> u64 {
-    let tracked = size_of::<Tracked<P>>() + 1;
+fn key_bytes<P, K>(key: &[u8], workers: u64) -> u64 {
+    let tracked = size_of::<Tracked<P, K>>() + 1;
     let handle = (size_of::<Handle>() + 1) as u64;
     entry_bytes(key) + tracked as u64 + handle * (1 + workers)
 }
@@ -894,12 +900,12 @@ pub struct Participant<S, R: Routing> {
     /// they are walked.
     hasher: S,
     /// By each key's hash, so that the key's bytes are kept once, in its entry.
-    keys: Keys<S, R::Pod>,
+    keys: Keys<S, R::Pod, R::Key>,
     /// Batches numbered, over every key: a key made again numbers its own from here, past
     /// every number an earlier life of it used.
     numbered: u64,
     /// What is to go to each pod.
-    queued: BTreeMap<R::Pod, Queued>,
+    queued: BTreeMap<R::Pod, Queued<(u64, R::Key)>>,
     /// With one exchange in flight to a pod at a time: the pods that have one, since when.
     one_in_flight: bool,
     sending: BTreeMap<R::Pod, u64>,
@@ -994,7 +1000,7 @@ struct Visit<'a, S, R: Routing> {
     routing: &'a R,
     unanswered: &'a BTreeMap<R::Pod, u64>,
     sending: &'a BTreeMap<R::Pod, u64>,
-    queued: &'a mut BTreeMap<R::Pod, Queued>,
+    queued: &'a mut BTreeMap<R::Pod, Queued<(u64, R::Key)>>,
     numbered: &'a mut u64,
     /// Hits given up without being seen applied, all told ([`Participant::forgiven`]).
     forgiven: &'a mut u64,
@@ -1010,14 +1016,14 @@ impl<S: BuildHasher, R: Routing> Visit<'_, S, R> {
     /// The pod to send `tracked`'s key through as well as to `owner` at `now`: the
     /// routing's, once `owner` has left a batch unanswered for as long as a report waits to
     /// be sent again. Sent both ways, a report is applied once, by its number.
-    fn through(&self, tracked: &Tracked<R::Pod>, owner: R::Pod) -> Option<R::Pod> {
+    fn through(&self, tracked: &Tracked<R::Pod, R::Key>, owner: R::Pod) -> Option<R::Pod> {
         let since = self.unanswered.get(&owner)?;
         if self.now.saturating_sub(*since) < self.resend_after {
             return None;
         }
         let hash = keys::hash(self.hasher, &tracked.entry.key);
         self.routing
-            .through(hash, owner)
+            .through(hash, tracked.routed, owner)
             .filter(|through| *through != owner)
     }
 
@@ -1028,7 +1034,7 @@ impl<S: BuildHasher, R: Routing> Visit<'_, S, R> {
     /// acknowledged; a poll due every cycle. A key its owner's piece
     /// has no room for is treated as one whose owner is busy: what it has not sent stays in
     /// its ledger, unnumbered, and reports due to go again stay due.
-    fn key(&mut self, tracked: &mut Tracked<R::Pod>) -> bool {
+    fn key(&mut self, tracked: &mut Tracked<R::Pod, R::Key>) -> bool {
         let now = self.now;
         // What was admitted drained into the ledger, every key's, with an owner to send it
         // to or not, so that no count fills.
@@ -1113,15 +1119,17 @@ impl<S: BuildHasher, R: Routing> Visit<'_, S, R> {
                 .get()
                 .is_none_or(|heard| now - heard >= self.resend_after);
         if !entries.is_empty() {
+            // Hashed once a visit, for every entry it queues.
+            let keyed = (keys::hash(self.hasher, key), tracked.routed);
             if let Some(also) = also {
                 let queued = self.queued.entry(also).or_default().at(now);
                 for entry in &entries {
-                    queued.push_entry(entry.clone());
+                    queued.push_keyed(entry.clone(), keyed);
                 }
             }
             let queued = self.queued.entry(to).or_default().at(now);
             for entry in entries {
-                queued.push_entry(entry);
+                queued.push_keyed(entry, keyed);
             }
         }
         self.left_out = left_out;
@@ -1134,7 +1142,7 @@ impl<S: BuildHasher, R: Routing> Visit<'_, S, R> {
     fn listed(
         &mut self,
         handle: Handle,
-        tracked: &mut Tracked<R::Pod>,
+        tracked: &mut Tracked<R::Pod, R::Key>,
         scheduled: bool,
         left_out: &mut Vec<Handle>,
         next: &mut Vec<Handle>,
@@ -1151,16 +1159,16 @@ impl<S: BuildHasher, R: Routing> Visit<'_, S, R> {
 }
 
 /// `handle`'s key, if it is still the one the handle was made for.
-fn listed<'a, S: BuildHasher, P>(
-    keys: &'a mut Keys<S, P>,
+fn listed<'a, S: BuildHasher, P, K>(
+    keys: &'a mut Keys<S, P, K>,
     handle: &Handle,
-) -> Option<&'a mut Tracked<P>> {
+) -> Option<&'a mut Tracked<P, K>> {
     keys.get_mut(&handle.0.key)
         .filter(|tracked| Arc::ptr_eq(&tracked.entry, &handle.0))
 }
 
 /// Queues `tracked` to be visited at the next cycle, unless it is already.
-fn queue<P>(tracked: &mut Tracked<P>, runnable: &mut Vec<Handle>) {
+fn queue<P, K>(tracked: &mut Tracked<P, K>, runnable: &mut Vec<Handle>) {
     if !tracked.queued {
         tracked.queued = true;
         runnable.push(Handle::new(Arc::clone(&tracked.entry)));
@@ -1439,7 +1447,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
     fn forget(&mut self, key: &[u8]) {
         self.holding = self
             .holding
-            .saturating_sub(key_bytes::<R::Pod>(key, self.workers));
+            .saturating_sub(key_bytes::<R::Pod, R::Key>(key, self.workers));
         if self.scheduled {
             self.stale += entry_bytes(key);
         }
@@ -1465,10 +1473,13 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
 
     /// Keeps `entry`, a live entry of a key not kept, from now on.
     fn track(&mut self, entry: Arc<Entry>) {
-        let owner = self.routing.owner(&entry.key, self.keys.hash(&entry.key));
+        let hash = self.keys.hash(&entry.key);
+        let routed = self.routing.key(&entry.key, hash);
+        let owner = self.routing.owner(&entry.key, hash, routed);
         let tracked = Tracked {
             entry,
             owner,
+            routed,
             sent: self.numbered,
             seen: self.numbered,
             unacknowledged: Unacknowledged::default(),
@@ -1479,7 +1490,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             left_out: false,
         };
         self.registry.insert(Arc::clone(&tracked.entry));
-        self.holding += key_bytes::<R::Pod>(&tracked.entry.key, self.workers);
+        self.holding += key_bytes::<R::Pod, R::Key>(&tracked.entry.key, self.workers);
         if self.scheduled {
             let at = idle_at(&tracked.entry);
             self.evictions.push(Due {
@@ -1606,7 +1617,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
                 let evict = tracked.idle(now) && close_if_quiet(tracked);
                 if evict {
                     registry.remove(&tracked.entry);
-                    freed += key_bytes::<R::Pod>(&tracked.entry.key, workers);
+                    freed += key_bytes::<R::Pod, R::Key>(&tracked.entry.key, workers);
                 }
                 !evict
             });
@@ -1680,7 +1691,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
                 self.registry.remove(&tracked.entry);
                 self.holding = self
                     .holding
-                    .saturating_sub(key_bytes::<R::Pod>(&due.entry.key, self.workers));
+                    .saturating_sub(key_bytes::<R::Pod, R::Key>(&due.entry.key, self.workers));
                 self.keys.remove(&due.entry.key);
             } else {
                 let at = idle_at(&due.entry).max(now + self.cycle);
@@ -1818,7 +1829,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
         self.unanswered.retain(|pod, _| routing.names(*pod));
         for (hash, tracked) in self.keys.hashed_mut() {
             let key = &tracked.entry.key;
-            let owner = routing.owner(key, hash);
+            let owner = routing.owner(key, hash, tracked.routed);
             if owner == tracked.owner {
                 continue;
             }
@@ -1834,11 +1845,14 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             for unseen in tracked.unacknowledged.as_mut_slice() {
                 unseen.last = now;
                 let report = unseen.report(tracked.seen, queued.made);
-                queued.push_entry(BatchEntry {
-                    key: key.clone(),
-                    contract: tracked.entry.terms.contract,
-                    report,
-                });
+                queued.push_keyed(
+                    BatchEntry {
+                        key: key.clone(),
+                        contract: tracked.entry.terms.contract,
+                        report,
+                    },
+                    (hash, tracked.routed),
+                );
             }
         }
     }
@@ -1878,30 +1892,28 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
         } else {
             self.take_outgoing_to_all()
         };
-        let hasher = &self.hasher;
+        let routing = &self.routing;
         batches
             .into_iter()
-            .map(|(pod, batch)| {
+            .map(|(pod, (batch, keyed))| {
                 self.exchanges = self.exchanges.wrapping_add(1);
                 self.latest.insert(pod, self.exchanges);
                 if !batch.entries.is_empty() {
                     self.unanswered.entry(pod).or_insert(self.last_now);
                 }
-                let batch = self
-                    .routing
-                    .batch(pod, batch, |bytes| keys::hash(hasher, bytes));
+                let batch = routing.batch(pod, batch, &keyed);
                 (pod, self.exchanges, batch)
             })
             .collect()
     }
 
     /// A piece of what is to go to each pod; the rest kept for the next.
-    fn take_outgoing_to_all(&mut self) -> Vec<(R::Pod, Batch)> {
+    fn take_outgoing_to_all(&mut self) -> Vec<(R::Pod, Piece<R::Key>)> {
         let id = self.id;
         let batches = self
             .queued
             .iter_mut()
-            .map(|(pod, queued)| (*pod, queued.take_piece(id)))
+            .map(|(pod, queued)| (*pod, queued.take_keyed(id)))
             .collect();
         self.queued.retain(|_, queued| !queued.is_empty());
         batches
@@ -1910,7 +1922,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
     /// With one exchange in flight, a piece of what is to go to each pod with none, each now
     /// with one; the rest kept until theirs is over. Called with `now` given by the last cycle's time
     /// that `on_cycle` saw, as the start of each exchange.
-    fn take_outgoing_to_idle(&mut self) -> Vec<(R::Pod, Batch)> {
+    fn take_outgoing_to_idle(&mut self) -> Vec<(R::Pod, Piece<R::Key>)> {
         let pods: Vec<R::Pod> = self
             .queued
             .keys()
@@ -1923,7 +1935,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
                 continue;
             };
             self.sending.insert(pod, self.last_now);
-            batches.push((pod, queued.take_piece(self.id)));
+            batches.push((pod, queued.take_keyed(self.id)));
             if !queued.is_empty() {
                 self.queued.insert(pod, queued);
             }
@@ -1935,7 +1947,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
 /// Closes `tracked`'s entry if nothing was admitted since the last report, in one
 /// compare-and-swap: a take after it fails and asks, and none before it is
 /// lost. Whether it closed.
-fn close_if_quiet<P>(tracked: &Tracked<P>) -> bool {
+fn close_if_quiet<P, K>(tracked: &Tracked<P, K>) -> bool {
     let entry = &tracked.entry;
     let mut current = entry.word.load(Ordering::Acquire);
     loop {

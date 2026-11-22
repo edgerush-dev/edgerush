@@ -39,6 +39,7 @@
 pub mod authority;
 pub mod config;
 pub mod kept;
+pub mod key;
 mod keys;
 pub mod message;
 pub mod node;
@@ -47,6 +48,7 @@ pub mod table;
 pub use authority::{Authority, Naming};
 pub use config::{Config, ConfigError};
 pub use kept::{Held, Kept};
+pub use key::{KIND_BIT, Kind};
 pub use message::{Message, Stamp};
 pub use node::{Changed, Node, Outbox, Role};
 pub use table::{Shard, Table};
@@ -54,9 +56,11 @@ pub use table::{Shard, Table};
 /// A member: one pod in one life.
 pub type NodeId = u64;
 
-/// A key, as the store holds it: a mode's hash of what its data planes limit by, which the
-/// store reads only to place it in a shard.
-pub type Key = u64;
+/// A key, as the store holds it: a mode's hash of what its data planes limit by, two runs of
+/// the keyed hash with the mode's bit ([`key`]), which the store reads only to place it in a
+/// shard and to count it as its mode's. 128 bits, so that two keys meet by chance about once
+/// in 10^19 years at 30 million keys turned over hourly, where 64 would about once a year.
+pub type Key = u128;
 
 /// The bytes a key takes, held or sent, by the store's count: what `max_key_bytes` counts
 /// each key as, beside its value, and each key dropped from a copy as.

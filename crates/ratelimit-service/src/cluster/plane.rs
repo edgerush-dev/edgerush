@@ -8,8 +8,9 @@
 //! [`pod::decide_stream`]: super::pod::decide_stream
 
 use super::wire::{self, Asking, Invalid, Telling};
+use edgerush_cluster::key::{drawn, joined};
 use edgerush_cluster::table::shard_of;
-use edgerush_cluster::{Key, Message as StoreMessage, Stamp, Table};
+use edgerush_cluster::{Key, Kind, Message as StoreMessage, Stamp, Table};
 /// What a data plane names, asks and is told in the store's terms, for its side to use with
 /// these pieces: a member's id, a time in nanoseconds, the limit a key is held to and an
 /// owner's answer.
@@ -36,6 +37,8 @@ pub const GIVE_BACK_SENDS: u8 = 3;
 #[derive(Clone, Debug)]
 pub struct Plane {
     keyed: Keyed,
+    /// The second run of the keyed hash, under a secret drawn from the first's.
+    second: Keyed,
     table: Option<Table>,
 }
 
@@ -61,18 +64,24 @@ impl Plane {
     pub fn new(secret: [u64; 2]) -> Self {
         Self {
             keyed: Keyed::new(secret),
+            second: Keyed::new(drawn(secret)),
             table: None,
         }
     }
 
     /// The store's key for a data plane's `bytes`: alike on every data plane under the same
-    /// secret. Written in whole rather than through `Hash`, whose framing of a slice is the
-    /// standard library's to change, and two data planes built apart must agree.
+    /// secret, two runs of the keyed hash joined, the mode's bit cleared
+    /// (`edgerush_cluster::key`). Written in whole rather than through `Hash`, whose framing
+    /// of a slice is the standard library's to change, and two data planes built apart must
+    /// agree.
     #[must_use]
     pub fn key(&self, bytes: &[u8]) -> Key {
-        let mut hasher = self.keyed.build_hasher();
-        hasher.write(bytes);
-        hasher.finish()
+        let run = |keyed: &Keyed| {
+            let mut hasher = keyed.build_hasher();
+            hasher.write(bytes);
+            hasher.finish()
+        };
+        Kind::Synchronous.key(joined(run(&self.keyed), run(&self.second)))
     }
 
     /// The table it holds, if a pod has told it one.
@@ -213,7 +222,7 @@ impl Plane {
 
 /// The one of `among` that `key` chooses, if there is any.
 fn chosen_by<I: Iterator<Item = NodeId>>(key: Key, among: impl Fn() -> I) -> Option<NodeId> {
-    let count = u64::try_from(among().count())
+    let count = Key::try_from(among().count())
         .ok()
         .filter(|count| *count > 0)?;
     // The key is already a keyed hash, its bits spread: below `count`, a usize's count.
@@ -320,6 +329,28 @@ mod tests {
             assert_ne!(one.key(bytes), other.key(bytes), "{bytes:?}");
         }
         assert_ne!(one.key(b"api\0a"), one.key(b"api\0b"));
+    }
+
+    /// A key is the store's 128 bits: the first run of the keyed hash under the secret, the
+    /// second under the secret drawn from it, and the synchronous mode's bit, clear.
+    #[test]
+    fn a_key_is_two_runs_of_the_hash_with_the_modes_bit_clear() {
+        let plane = Plane::new(SECRET);
+        let run = |secret: [u64; 2], bytes: &[u8]| {
+            let mut hasher = Keyed::new(secret).build_hasher();
+            hasher.write(bytes);
+            hasher.finish()
+        };
+        for bytes in [&b""[..], b"a", b"api\x00203.0.113.7", &[7; 40]] {
+            let key = plane.key(bytes);
+            assert_eq!(Kind::of(key), Kind::Synchronous, "{bytes:?}");
+            let second = run(drawn(SECRET), bytes);
+            assert_eq!(
+                key,
+                Kind::Synchronous.key(joined(run(SECRET, bytes), second))
+            );
+            assert_ne!(second, run(SECRET, bytes), "two runs, under two secrets");
+        }
     }
 
     #[test]
