@@ -11,7 +11,7 @@
 
 use super::{
     Control, Invalid, Outgoing, Stamp, Table, ToCopy, ToPeer, Value, from_copy, from_peer,
-    key_from_wire, key_to_wire, stamp, stamp_from, table_from, table_to_wire, wire,
+    key_from_wire, key_lower, key_upper, stamp, stamp_from, table_from, table_to_wire, wire,
 };
 use crate::grpc::MAX_MESSAGE;
 use crate::wire::{Contract, Report, contract, narrow, report, report_to_wire};
@@ -154,9 +154,12 @@ impl Value for AsyncValue {
 pub struct Entry {
     // Tag 6, a fixed window, is retired with the asynchronous mode's windows (#389): never reuse
     // it.
-    /// The key, as the data plane hashed it.
-    #[prost(uint64, tag = "1")]
-    pub key: u64,
+    /// The key's lower half: the data plane's own hash of it.
+    #[prost(fixed64, tag = "1")]
+    pub key_lower: u64,
+    /// The key's upper half, its mode's bit the top one.
+    #[prost(fixed64, tag = "7")]
+    pub key_upper: u64,
     /// Its contract.
     #[prost(message, optional, tag = "2")]
     pub contract: Option<Contract>,
@@ -188,9 +191,12 @@ pub struct Batch {
 pub struct Answer {
     // Tag 5, a fixed window's standing, is retired with the asynchronous mode's windows (#389):
     // never reuse it.
-    /// The key.
-    #[prost(uint64, tag = "1")]
-    pub key: u64,
+    /// The key's lower half: the data plane's own hash of it.
+    #[prost(fixed64, tag = "1")]
+    pub key_lower: u64,
+    /// The key's upper half, its mode's bit the top one.
+    #[prost(fixed64, tag = "6")]
+    pub key_upper: u64,
     /// How far the owner's bucket is from full, in time multiplied by the limit; past what 64
     /// bits hold, the most they do, as today's answers have it.
     #[prost(uint64, tag = "2")]
@@ -206,9 +212,12 @@ pub struct Answer {
 /// A key the pod does not serve.
 #[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
 pub struct Unserved {
-    /// The key.
-    #[prost(uint64, tag = "1")]
-    pub key: u64,
+    /// The key's lower half: the data plane's own hash of it.
+    #[prost(fixed64, tag = "1")]
+    pub key_lower: u64,
+    /// The key's upper half, its mode's bit the top one.
+    #[prost(fixed64, tag = "3")]
+    pub key_upper: u64,
     /// Whether its table names it the owner while it is not serving; else the table names
     /// another, or none.
     #[prost(bool, tag = "2")]
@@ -292,7 +301,8 @@ pub enum Answered {
 
 fn entry_to_wire(entry: AsyncEntry) -> Entry {
     Entry {
-        key: key_to_wire(entry.key),
+        key_lower: key_lower(entry.key),
+        key_upper: key_upper(entry.key),
         contract: Some(entry.contract.into()),
         report: Some(report_to_wire(entry.report)),
     }
@@ -300,7 +310,7 @@ fn entry_to_wire(entry: AsyncEntry) -> Entry {
 
 fn entry_from(entry: Entry) -> Result<AsyncEntry, Invalid> {
     Ok(AsyncEntry {
-        key: key_from_wire(entry.key),
+        key: key_from_wire(entry.key_lower, entry.key_upper),
         contract: contract(entry.contract).map_err(Invalid::Entry)?,
         report: report(entry.report).map_err(Invalid::Entry)?,
     })
@@ -353,7 +363,8 @@ pub fn answers_to_wire(answers: AsyncAnswers) -> Answers {
             .entries
             .into_iter()
             .map(|answer| Answer {
-                key: key_to_wire(answer.key),
+                key_lower: key_lower(answer.key),
+                key_upper: key_upper(answer.key),
                 behind: narrow(answer.answered.behind),
                 applied: answer.answered.applied,
                 others: answer.answered.others,
@@ -363,7 +374,8 @@ pub fn answers_to_wire(answers: AsyncAnswers) -> Answers {
             .unserved
             .into_iter()
             .map(|unserved| Unserved {
-                key: key_to_wire(unserved.key),
+                key_lower: key_lower(unserved.key),
+                key_upper: key_upper(unserved.key),
                 not_serving: unserved.why == Why::NotServing,
             })
             .collect(),
@@ -385,7 +397,7 @@ pub fn answers_from(answers: Answers) -> Result<AsyncAnswers, Invalid> {
             .entries
             .into_iter()
             .map(|answer| AsyncAnswer {
-                key: key_from_wire(answer.key),
+                key: key_from_wire(answer.key_lower, answer.key_upper),
                 answered: AsyncAnswered {
                     behind: u128::from(answer.behind),
                     applied: answer.applied,
@@ -397,7 +409,7 @@ pub fn answers_from(answers: Answers) -> Result<AsyncAnswers, Invalid> {
             .unserved
             .into_iter()
             .map(|unserved| AsyncUnserved {
-                key: key_from_wire(unserved.key),
+                key: key_from_wire(unserved.key_lower, unserved.key_upper),
                 why: if unserved.not_serving {
                     Why::NotServing
                 } else {

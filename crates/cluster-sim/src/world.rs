@@ -17,7 +17,7 @@ mod asynchronous;
 mod both;
 mod synchronous;
 
-pub use asynchronous::{Beside, CYCLE, Fleet, KindKeyed, Plane};
+pub use asynchronous::{Beside, CYCLE, Fleet, Plane};
 pub use both::{Both, Caller};
 
 /// The world of the synchronous mode's clients: a world of both modes' pods, as every world is.

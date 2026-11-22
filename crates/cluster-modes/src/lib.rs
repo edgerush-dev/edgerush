@@ -16,8 +16,9 @@
 pub mod pod;
 pub mod value;
 
+pub use edgerush_cluster::{KIND_BIT, Kind};
 pub use pod::{Message, Outbox, Pod};
-pub use value::{KIND_BIT, Kind, Value};
+pub use value::Value;
 
 /// The store as a pod of both modes keeps it.
 pub type Store = edgerush_cluster::Node<Value>;

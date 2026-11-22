@@ -19,7 +19,7 @@
     reason = "test set-up: the helpers around the tests fail them the way the tests would"
 )]
 
-use edgerush_cluster::table::mix;
+use edgerush_cluster::key::mixed;
 use edgerush_cluster::{Key, Time, ms};
 use edgerush_cluster_synchronous::{Rule, Value};
 use edgerush_ratelimit::local::{Decision, Handles, Limit as LocalLimit, Local, Rolling};
@@ -237,7 +237,7 @@ fn the_services_models_decide_as_the_references_and_local_mode_admits_as_many() 
                     per: limit.per,
                     window: limit.window,
                 };
-                let phase = mix(KEY) % limit.window;
+                let phase = mixed(KEY) % limit.window;
                 let served = service(window, &times);
                 let exact = reference(
                     "reference",

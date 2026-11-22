@@ -43,12 +43,15 @@ impl Pods {
 impl Routing for Pods {
     type Pod = PodId;
     type Batch = Batch;
+    type Key = ();
 
-    fn owner(&self, bytes: &[u8], _: u64) -> Option<PodId> {
+    fn key(&self, _: &[u8], _: u64) {}
+
+    fn owner(&self, bytes: &[u8], _: u64, (): ()) -> Option<PodId> {
         self.keyed.get(bytes).copied().or(self.owner)
     }
 
-    fn through(&self, _: u64, _: PodId) -> Option<PodId> {
+    fn through(&self, _: u64, (): (), _: PodId) -> Option<PodId> {
         None
     }
 
@@ -65,7 +68,7 @@ impl Routing for Pods {
         self.pods.contains(&pod)
     }
 
-    fn batch(&self, _: PodId, batch: Batch, _: impl Fn(&[u8]) -> u64) -> Batch {
+    fn batch(&self, _: PodId, batch: Batch, _: &[(u64, ())]) -> Batch {
         batch
     }
 }

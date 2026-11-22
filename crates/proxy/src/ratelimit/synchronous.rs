@@ -798,7 +798,7 @@ impl SyncLimiter {
                     .enumerate()
                     .filter(|(at, seed)| !avoid_seeds.contains(at) && !self.passed_over(seed))
             };
-            let count = u64::try_from(open().count())
+            let count = Key::try_from(open().count())
                 .ok()
                 .filter(|count| *count > 0)?;
             let (at, seed) = open().nth(usize::try_from(key % count).ok()?)?;
