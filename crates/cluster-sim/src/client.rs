@@ -104,11 +104,15 @@ pub struct Client {
     /// Requests it has made, parts and give-backs aside.
     pub requests: u64,
     /// Requests left to `when_unreachable`, with their keys and the pod each was last sent
-    /// to: waited on until answered — a "counted" given back — or its pod is gone, its stream
-    /// with it, as an ask given up on stays on its stream in a data plane.
+    /// to: waited on until answered — a "counted" given back, unless `allow` admitted it — or
+    /// its pod is gone, its stream with it, as an ask given up on stays on its stream in a data
+    /// plane.
     left: BTreeMap<u64, (Vec<Key>, NodeId)>,
     /// The rule its requests are held to by their keys' owners, if any.
     rule: Option<Rule>,
+    /// Whether `when_unreachable` admits a request left to it, under the rule: one that then
+    /// goes on, what its owners charged standing, as a data plane's does.
+    allow: bool,
 }
 
 /// How long a give-back goes unanswered before it is sent again the first time: far beyond a
@@ -177,12 +181,15 @@ impl Client {
             requests: 0,
             left: BTreeMap::new(),
             rule: None,
+            allow: false,
         }
     }
 
-    /// Each request from now held to `rule` by its key's owner.
-    pub const fn set_rule(&mut self, rule: Rule) {
+    /// Each request from now held to `rule` by its key's owner, one left to
+    /// `when_unreachable` admitted if `allow`.
+    pub const fn set_limit(&mut self, rule: Rule, allow: bool) {
         self.rule = Some(rule);
+        self.allow = allow;
     }
 
     /// Each request from now also under `shared`, asked as `multi` says.
@@ -438,6 +445,10 @@ impl Client {
             return (Some((entry.keys, Outcome::Limited)), entry.counted);
         }
         if entry.refused {
+            // Admitted under `allow`, it went on: what its owners charged stands.
+            if self.allow {
+                return (Some((entry.keys, Outcome::Refused)), Vec::new());
+            }
             self.orphaned += entry.counted.len() as u64;
             return (Some((entry.keys, Outcome::Refused)), entry.counted);
         }
@@ -464,7 +475,7 @@ impl Client {
     /// A pod's `answer` to request `id`: done, or sent again where the answer points; and what
     /// to send, give-backs among it. The key of a request counted is given back with how it
     /// ended; a "counted" coming after its request was left to `when_unreachable` is given
-    /// back to the keys' owners.
+    /// back to the keys' owners, unless `allow` admitted it.
     pub fn answered(
         &mut self,
         id: u64,
@@ -475,8 +486,9 @@ impl Client {
     ) -> (Option<Ended>, Vec<Send>) {
         self.now = now;
         let Some(inflight) = self.inflight.get(&id).cloned() else {
-            // A request left to `when_unreachable` answered at last: given back if charged,
-            // settled either way.
+            // A request left to `when_unreachable` answered at last: given back if charged and
+            // refused, settled either way; admitted under `allow`, it went on, the charge
+            // standing.
             let receipt = match answer {
                 Answer::Counted(_) => Some(0),
                 Answer::Admitted(receipt) => Some(receipt),
@@ -484,6 +496,7 @@ impl Client {
             };
             if let Some((keys, _)) = self.left.remove(&id)
                 && let Some(receipt) = receipt
+                && !self.allow
             {
                 let back = keys.into_iter().map(|key| (key, receipt)).collect();
                 return (None, self.give_backs(back, now, pods, rng));

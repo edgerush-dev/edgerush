@@ -81,8 +81,8 @@ impl Sim<Synchronous> {
         let id = self.next_client;
         self.next_client += 1;
         let mut client = Client::new(id, keys, interval, deadline, self.config.shards);
-        if let Some((rule, _)) = self.limit {
-            client.set_rule(rule);
+        if let Some((rule, allow)) = self.limit {
+            client.set_limit(rule, allow);
         }
         self.clients.insert(id, Caller::Synchronous(client));
         let first = self.now + self.rng.below(interval.max(1));

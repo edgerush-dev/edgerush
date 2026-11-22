@@ -291,6 +291,64 @@ fn split_requests_shave_at_most_a_hundredth_under_allow_in_a_bucket() {
     split_requests_shave_at_most_a_hundredth_under_allow(RULES[2]);
 }
 
+/// Requests under two keys, split, a pod crashing: a request a part of which goes unanswered
+/// is left to `when_unreachable`. Under `allow` it is admitted, so what its other part was
+/// charged stands, as a data plane's does — none of it given back as orphaned; under `deny` it
+/// is refused, and that charge given back.
+#[test]
+fn a_split_request_left_to_allow_keeps_its_charges() {
+    for seed in SEEDS {
+        for allow in [false, true] {
+            let shape = Shape {
+                forwarding: true,
+                ..limited(RULES[0], allow)
+            };
+            let report = scenario::multi_key(seed, shape, Multi::Split, Trouble::Crash);
+            let case = format!(
+                "seed {seed} allow {allow}: orphaned {}, {}",
+                report.orphaned,
+                line(&report)
+            );
+            assert!(report.refused > 0, "none left to when_unreachable: {case}");
+            assert_eq!(report.orphaned == 0, allow, "{case}");
+        }
+    }
+}
+
+/// Every answer over a second late, after its request's deadline: each request is left to
+/// `when_unreachable`. Under `allow` it was admitted, so an admission that comes after stands,
+/// as a data plane's does — nothing given back; under `deny` it was refused, and each
+/// admission that comes after is given back.
+#[test]
+fn a_late_admission_of_a_request_left_to_allow_stands() {
+    use edgerush_cluster_sim::world::Link;
+    for seed in SEEDS {
+        for allow in [false, true] {
+            let (mut world, pods) = scenario::cluster(seed, limited(RULES[0], allow));
+            let late = Link {
+                delay: ms(1_200),
+                ..Link::lan()
+            };
+            let clients: Vec<_> = world.client_ids().collect();
+            for pod in &pods {
+                for client in &clients {
+                    world.set_link(*pod, *client, late);
+                }
+            }
+            world.run_for(ms(1_000));
+            world.stop_clients();
+            world.run_for(ms(4_000));
+            let case = format!(
+                "seed {seed} allow {allow}: left {}, given back {}",
+                world.stats.refused,
+                world.give_backs()
+            );
+            assert!(world.stats.refused > 0, "{case}");
+            assert_eq!(world.give_backs() == 0, allow, "{case}");
+        }
+    }
+}
+
 /// One pod's wall clock off the rest by up to a fifth of a second, ahead or behind, the pod
 /// then crashing, its keys failing over to pods whose clocks agree, under every rule: each
 /// owner decides by its own wall clock, so its keys disagree only where they change owner —
