@@ -22,12 +22,10 @@ use edgerush_proxy::balance::{Candidates, RoundRobin, Share, Tried, p2c, zone};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
 
-/// Endpoints as the benchmark states them.
+/// Endpoints of an unprotected upstream as the benchmark states them: every one has room
+/// without a look, a constant as the data plane's own unprotected upstream has it.
 pub struct Endpoints {
     serves: Vec<bool>,
-    /// Whether each has room, on a protected upstream; on an unprotected one, none, and every
-    /// endpoint has room without a look, as the data plane's own unprotected upstream does.
-    room: Option<Vec<bool>>,
     in_flight: Vec<u32>,
     share: Vec<Share>,
 }
@@ -39,11 +37,8 @@ impl Candidates for Endpoints {
     fn serves(&self, at: usize) -> bool {
         self.serves.get(at).copied().unwrap_or(false)
     }
-    fn has_room(&self, at: usize) -> bool {
-        let Some(room) = &self.room else {
-            return true;
-        };
-        room.get(at).copied().unwrap_or(false)
+    fn has_room(&self, _: usize) -> bool {
+        true
     }
     fn in_flight(&self, at: usize) -> u32 {
         self.in_flight.get(at).copied().unwrap_or(0)
@@ -53,22 +48,57 @@ impl Candidates for Endpoints {
     }
 }
 
+/// Endpoints of a protected upstream: as [`Endpoints`], and whether each has room.
+pub struct Protected {
+    endpoints: Endpoints,
+    room: Vec<bool>,
+}
+
+impl Candidates for Protected {
+    fn count(&self) -> usize {
+        self.endpoints.count()
+    }
+    fn serves(&self, at: usize) -> bool {
+        self.endpoints.serves(at)
+    }
+    fn has_room(&self, at: usize) -> bool {
+        self.room.get(at).copied().unwrap_or(false)
+    }
+    fn in_flight(&self, at: usize) -> u32 {
+        self.endpoints.in_flight(at)
+    }
+    fn share(&self, at: usize) -> Share {
+        self.endpoints.share(at)
+    }
+}
+
 /// `count` endpoints of an unprotected upstream, all serving, a few in flight to each, none
 /// ramping.
 fn serving(count: usize) -> Endpoints {
     Endpoints {
         serves: vec![true; count],
-        room: None,
         in_flight: (0..count).map(|at| (at % 3) as u32).collect(),
         share: vec![Share::FULL; count],
     }
 }
 
-/// `count` endpoints of a protected upstream, as `serving`, each with room.
-fn protected(count: usize) -> Endpoints {
-    Endpoints {
-        room: Some(vec![true; count]),
-        ..serving(count)
+/// `count` endpoints of a protected upstream, as `serving`, those `full` says without room.
+fn protected(count: usize, full: &[usize]) -> Protected {
+    let mut room = vec![true; count];
+    for &at in full {
+        room[at] = false;
+    }
+    Protected {
+        endpoints: serving(count),
+        room,
+    }
+}
+
+/// Sixteen, protected, every one full: a backend refused.
+fn all_full() -> Protected {
+    Protected {
+        room: vec![false; 16],
+        ..protected(16, &[])
     }
 }
 
@@ -77,24 +107,6 @@ fn one_failing() -> Endpoints {
     let mut endpoints = serving(16);
     endpoints.serves[7] = false;
     endpoints
-}
-
-/// Sixteen, protected, the first drawn full.
-fn one_full() -> Endpoints {
-    let mut room = vec![true; 16];
-    room[7] = false;
-    Endpoints {
-        room: Some(room),
-        ..serving(16)
-    }
-}
-
-/// Sixteen, protected, every one full: a backend refused.
-fn all_full() -> Endpoints {
-    Endpoints {
-        room: Some(vec![false; 16]),
-        ..serving(16)
-    }
 }
 
 /// Sixteen, the first drawn in slow start at a tenth.
@@ -130,10 +142,18 @@ fn tried(positions: &[usize]) -> Tried {
 #[bench::sixteen_one_failing_drawn(one_failing(), Tried::default())]
 #[bench::sixteen_one_ramping_drawn(one_ramping(), Tried::default())]
 #[bench::sixteen_retry_two_tried(serving(16), tried(&[7, 3]))]
-#[bench::sixteen_protected(protected(16), Tried::default())]
-#[bench::sixteen_one_full_drawn(one_full(), Tried::default())]
-#[bench::sixteen_all_full(all_full(), Tried::default())]
 fn pick_p2c(endpoints: Endpoints, tried: Tried) -> (Endpoints, Option<usize>) {
+    let mut random = draws();
+    let picked = p2c(black_box(&endpoints), black_box(&tried), &mut random);
+    (endpoints, picked)
+}
+
+// A protected upstream: every one with room, the first drawn full, every one full.
+#[library_benchmark]
+#[bench::sixteen(protected(16, &[]), Tried::default())]
+#[bench::sixteen_one_full_drawn(protected(16, &[7]), Tried::default())]
+#[bench::sixteen_all_full(all_full(), Tried::default())]
+fn pick_p2c_protected(endpoints: Protected, tried: Tried) -> (Protected, Option<usize>) {
     let mut random = draws();
     let picked = p2c(black_box(&endpoints), black_box(&tried), &mut random);
     (endpoints, picked)
@@ -146,10 +166,18 @@ fn pick_p2c(endpoints: Endpoints, tried: Tried) -> (Endpoints, Option<usize>) {
 #[bench::sixteen_one_failing_reached(one_failing(), Tried::default())]
 #[bench::sixteen_one_ramping_reached(one_ramping(), Tried::default())]
 #[bench::sixteen_retry_two_tried(serving(16), tried(&[7, 3]))]
-#[bench::sixteen_protected(protected(16), Tried::default())]
-#[bench::sixteen_one_full_reached(one_full(), Tried::default())]
-#[bench::sixteen_all_full(all_full(), Tried::default())]
 fn pick_round_robin(endpoints: Endpoints, tried: Tried) -> (Endpoints, Option<usize>) {
+    let mut random = draws();
+    let mut round_robin = RoundRobin::starting_at(black_box(7));
+    let picked = round_robin.pick(black_box(&endpoints), black_box(&tried), &mut random);
+    (endpoints, picked)
+}
+
+#[library_benchmark]
+#[bench::sixteen(protected(16, &[]), Tried::default())]
+#[bench::sixteen_one_full_reached(protected(16, &[7]), Tried::default())]
+#[bench::sixteen_all_full(all_full(), Tried::default())]
+fn pick_round_robin_protected(endpoints: Protected, tried: Tried) -> (Protected, Option<usize>) {
     let mut random = draws();
     let mut round_robin = RoundRobin::starting_at(black_box(7));
     let picked = round_robin.pick(black_box(&endpoints), black_box(&tried), &mut random);
@@ -173,7 +201,8 @@ fn pick_p2c_zoned(endpoints: Endpoints, zoned: usize, tried: Tried) -> (Endpoint
 
 library_benchmark_group!(
     name = balance;
-    benchmarks = pick_p2c, pick_round_robin, pick_p2c_zoned
+    benchmarks = pick_p2c, pick_p2c_protected, pick_round_robin, pick_round_robin_protected,
+        pick_p2c_zoned
 );
 
 main!(library_benchmark_groups = balance);

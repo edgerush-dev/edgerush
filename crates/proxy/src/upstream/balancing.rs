@@ -349,15 +349,41 @@ impl Upstream {
     }
 }
 
-/// The endpoints of one upstream as its balancer sees them from one worker.
-struct Seen<'a> {
+/// The endpoints of one upstream as its balancer sees them from one worker, protected as
+/// `P` says.
+struct Seen<'a, P> {
     destinations: &'a [Arc<ReuseIdentity>],
     counts: &'a [Rc<Cell<u32>>],
     window: Option<u64>,
-    protected: Option<&'a Protected>,
+    protected: P,
     /// Whether the balancer passed over an endpoint it drew, or came to in turn, for being
     /// full.
     passed: Cell<bool>,
+}
+
+/// Whether an upstream is protected, as a type, so that a pick is made for each apart: for
+/// an unprotected upstream every endpoint's room is a constant the compiler folds away,
+/// where a value looked at would be a branch at every endpoint the balancer considers
+/// (25 §8).
+trait Protection<'a>: Copy {
+    /// Its protection, if it has one.
+    fn protected(self) -> Option<&'a Protected>;
+}
+
+/// An upstream without protection: every endpoint has room.
+#[derive(Debug, Clone, Copy)]
+struct Unprotected;
+
+impl<'a> Protection<'a> for Unprotected {
+    fn protected(self) -> Option<&'a Protected> {
+        None
+    }
+}
+
+impl<'a> Protection<'a> for &'a Protected {
+    fn protected(self) -> Option<&'a Protected> {
+        Some(self)
+    }
 }
 
 /// An endpoint's bound under `protected`, its upstream's, of `endpoints`, at `share` of its
@@ -371,7 +397,7 @@ fn bound(protected: &Protected, endpoints: usize, share: Share) -> NonZeroU32 {
     share.bound(protected.cap)
 }
 
-impl Candidates for Seen<'_> {
+impl<'a, P: Protection<'a>> Candidates for Seen<'a, P> {
     fn count(&self) -> usize {
         self.destinations.len().min(self.counts.len())
     }
@@ -385,7 +411,7 @@ impl Candidates for Seen<'_> {
     /// A read of the count every worker shares, never a write: a full endpoint costs the
     /// requests that pass it over nothing where the requests it serves write (25 §3).
     fn has_room(&self, at: usize) -> bool {
-        let Some(protected) = self.protected else {
+        let Some(protected) = self.protected.protected() else {
             return true;
         };
         protected.counts.get(at).is_some_and(|pod| {
@@ -421,13 +447,27 @@ impl Upstream {
         zoned: usize,
         tried: &Tried,
     ) -> Result<Picked, Unpicked> {
-        let seen = self.seen(destinations);
+        match self.protected.as_deref() {
+            None => self.pick_as(Unprotected, destinations, zoned, tried),
+            Some(protected) => self.pick_as(protected, destinations, zoned, tried),
+        }
+    }
+
+    /// [`Self::pick`], made apart for each [`Protection`].
+    fn pick_as<'a, P: Protection<'a>>(
+        &'a self,
+        protection: P,
+        destinations: &'a [Arc<ReuseIdentity>],
+        zoned: usize,
+        tried: &Tried,
+    ) -> Result<Picked, Unpicked> {
+        let seen = self.seen(protection, destinations);
         if seen.count() == 0 {
             return Err(Unpicked::Nowhere);
         }
         let (at, counted) = looked(
             || self.chosen(&seen, zoned, tried),
-            |at| self.take(at, seen.share(at)),
+            |at| self.take(protection.protected(), at, seen.share(at)),
         )?;
         Ok(Picked {
             at,
@@ -445,7 +485,23 @@ impl Upstream {
         zoned: usize,
         tried: &Tried,
     ) -> Result<Looked, Unpicked> {
-        let seen = self.seen(destinations);
+        // Only a protected upstream is looked at before it is charged, but an unprotected
+        // one's look is as its pick would be.
+        match self.protected.as_deref() {
+            None => self.look_as(Unprotected, destinations, zoned, tried),
+            Some(protected) => self.look_as(protected, destinations, zoned, tried),
+        }
+    }
+
+    /// [`Self::look`], made apart for each [`Protection`].
+    fn look_as<'a, P: Protection<'a>>(
+        &'a self,
+        protection: P,
+        destinations: &'a [Arc<ReuseIdentity>],
+        zoned: usize,
+        tried: &Tried,
+    ) -> Result<Looked, Unpicked> {
+        let seen = self.seen(protection, destinations);
         if seen.count() == 0 {
             return Err(Unpicked::Nowhere);
         }
@@ -459,7 +515,11 @@ impl Upstream {
     /// The count of an exchange to the endpoint at `at`, whose destination is
     /// `destination`, that a look of this state chose: none if it is full now.
     pub(crate) fn take_looked(&self, at: usize, destination: &ReuseIdentity) -> Option<InFlight> {
-        self.take(at, destination.share(self.window))
+        self.take(
+            self.protected.as_deref(),
+            at,
+            destination.share(self.window),
+        )
     }
 
     /// Whether its endpoints have a count every worker shares (25 §3).
@@ -479,30 +539,36 @@ impl Upstream {
         &self.name
     }
 
-    fn seen<'a>(&'a self, destinations: &'a [Arc<ReuseIdentity>]) -> Seen<'a> {
+    fn seen<'a, P>(&'a self, protected: P, destinations: &'a [Arc<ReuseIdentity>]) -> Seen<'a, P> {
         Seen {
             destinations,
             counts: &self.counts,
             window: self.window,
-            protected: self.protected.as_deref(),
+            protected,
             passed: Cell::new(false),
         }
     }
 
     /// The endpoint the balancer chooses: the zone's alone while the pick keeps to them
     /// (03 §6).
-    fn chosen(&self, seen: &Seen<'_>, zoned: usize, tried: &Tried) -> Option<usize> {
+    fn chosen<'a, P: Protection<'a>>(
+        &self,
+        seen: &Seen<'a, P>,
+        zoned: usize,
+        tried: &Tried,
+    ) -> Option<usize> {
         match balance::zone(seen, zoned, tried) {
             Some(zone) => self.choose(&zone, tried),
             None => self.choose(seen, tried),
         }
     }
 
-    /// The count of an exchange to the endpoint at `at`, at `share` of its slow start: on a
-    /// protected upstream with a slot in its shared count, none if it is full.
-    fn take(&self, at: usize, share: Share) -> Option<InFlight> {
+    /// The count of an exchange to the endpoint at `at`, at `share` of its slow start: under
+    /// `protected`, its upstream's protection, with a slot in its shared count, none if it is
+    /// full.
+    fn take(&self, protected: Option<&Protected>, at: usize, share: Share) -> Option<InFlight> {
         let count = self.counts.get(at)?;
-        let pod = match self.protected.as_deref() {
+        let pod = match protected {
             None => None,
             // Its counts are by position of the endpoint, as the destinations are.
             Some(protected) => Some(PodCount::take(
