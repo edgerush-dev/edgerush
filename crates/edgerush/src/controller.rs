@@ -189,6 +189,16 @@ pub(crate) fn command(
             return write!(stderr, "error: {error}\n\n{USAGE}").map_or(1, |()| crate::EXIT_USAGE);
         }
     };
+    // Before a file is opened, its runtime's own among them, as the data plane does: under
+    // containerd 2.x the soft limit is 1,024, for every data plane's stream, the webhook,
+    // the probes and the API server's watches. Said only where it could not be raised, as
+    // nothing here is sized by it.
+    let open_files = crate::limits::raise_open_files();
+    if let (crate::limits::OpenFiles::Kept { .. }, Some(files)) =
+        (open_files, crate::limits::described_open_files(open_files))
+    {
+        let _nobody_reads = writeln!(stderr, "warning: {files}");
+    }
     let runtime = match Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => return writeln!(stderr, "error: {error}").map_or(1, |()| 1),

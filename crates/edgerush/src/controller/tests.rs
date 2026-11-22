@@ -205,6 +205,44 @@ fn settings_that_cannot_be_read_stop_it_before_it_looks_for_a_cluster() {
     assert!(stderr.contains("is not what was expected"), "{stderr}");
 }
 
+/// It raises its soft open-file limit to the hard one before it opens anything, as the
+/// data plane does: a container's soft limit of 1,024 would leave it a thousand files for
+/// every data plane's stream, the webhook, its probes and its watches of the API server.
+/// Raised, it says nothing of it.
+#[cfg(unix)]
+#[test]
+fn it_raises_its_open_file_limit_as_it_starts() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let before = getrlimit(Resource::Nofile);
+    // One below what it can be raised to: harmless to tests beside it in one process.
+    let lowered = before.maximum.unwrap_or(1 << 20) - 1;
+    setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: Some(lowered),
+            maximum: before.maximum,
+        },
+    )
+    .unwrap();
+    let plane = file("raising-plane.yaml", "ingress_class: [");
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let status = command(
+        ["--data-plane", plane.to_str().unwrap()]
+            .into_iter()
+            .map(ToOwned::to_owned),
+        &mut stdout,
+        &mut stderr,
+    );
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert_eq!(status, crate::EXIT_USAGE, "{stderr}");
+    let now = getrlimit(Resource::Nofile);
+    match now.maximum {
+        Some(hard) => assert_eq!(now.current, Some(hard)),
+        None => assert!(now.current >= Some(1 << 20), "{now:?}"),
+    }
+    assert!(!stderr.contains("open files"), "{stderr}");
+}
+
 /// A fake API server of IngressClass `edge`, Ingress `shop/web` on `shop.example`,
 /// Service `shop/web` and no Secrets, each kind's watch open and quiet.
 async fn cluster() -> Fake {

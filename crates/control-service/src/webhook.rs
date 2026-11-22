@@ -7,6 +7,7 @@
 //! handshake within the stream's time, then [`Bounds`]. Whatever goes wrong with one
 //! connection is that connection's alone, and said to no one.
 
+use crate::accept;
 use crate::server::HANDSHAKE;
 use boring::ssl::SslAcceptor;
 use bytes::Bytes;
@@ -76,11 +77,7 @@ pub async fn serve(
         let socket = tokio::select! {
             () = &mut stop => break,
             Some(_) = connections.join_next(), if !connections.is_empty() => continue,
-            accepted = listener.accept() => match accepted {
-                Ok((socket, _)) => socket,
-                // A connection that failed before it was taken: the next is taken as usual.
-                Err(_) => continue,
-            },
+            (socket, _) = accept::next(|| listener.accept()) => socket,
         };
         let _nodelay = socket.set_nodelay(true);
         let acceptor = tls.borrow().clone();

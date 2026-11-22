@@ -9,6 +9,7 @@
 //! timeout, and its answer done within it too: a connection is held for no longer, so one
 //! left idle cannot keep the probe out, and only a flood kept up without pause could.
 
+use crate::accept;
 use bytes::Bytes;
 use http::header::{ALLOW, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
@@ -30,10 +31,6 @@ pub const PATH: &str = "/ready";
 /// own timeout, Kubernetes' default, which gives up on an answer later than that anyway.
 pub const DEADLINE: Duration = Duration::from_secs(1);
 
-/// How long it waits after a connection could not be taken, most likely for want of a
-/// file, before it takes the next: not spinning while none can be.
-const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
-
 /// Serves the replica's readiness on `listener` until `stop`: each probe answered as `ready`
 /// is now, each connection one request, done within `deadline` ([`DEADLINE`] outside
 /// tests). Connections still open end as it stops.
@@ -49,15 +46,7 @@ pub async fn serve(
         let socket = tokio::select! {
             () = &mut stop => break,
             Some(_) = connections.join_next(), if !connections.is_empty() => continue,
-            accepted = listener.accept() => match accepted {
-                Ok((socket, _)) => socket,
-                Err(_) => {
-                    tokio::select! {
-                        () = &mut stop => break,
-                        () = tokio::time::sleep(ACCEPT_PAUSE) => continue,
-                    }
-                }
-            },
+            (socket, _) = accept::next(|| listener.accept()) => socket,
         };
         let _nodelay = socket.set_nodelay(true);
         let ready = ready.clone();
