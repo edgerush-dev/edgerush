@@ -35,9 +35,10 @@ jobs:
       - name: Toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
-      # The dependencies as main last built them (BoringSSL takes minutes) and cargo-deny.
-      # Keyed on the lock files and the toolchain, so a change to either starts a new entry
-      # from the nearest old one.
+      # The third-party dependencies as main last built them (BoringSSL takes minutes). Keyed
+      # on the lock files and the toolchain, and found by that key alone: a change to either
+      # starts an entry afresh, as an entry grown from an older one would keep the builds of
+      # every version since replaced, and nothing would take them out.
       - name: Restore the build cache
         id: cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -46,23 +47,26 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            ~/.cargo/bin/cargo-deny
             target
             fuzz/target
-          key: ${{ runner.os }}-check-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'fuzz/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-check-
+          key: ${{ runner.os }}-deps-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'fuzz/Cargo.lock') }}
 
-      # The version check.sh is run with, from crates.io rather than a third-party action.
+      # The tools check.sh runs, at the versions it is run with, as each project releases them
+      # built and checked against the SHA-256 published beside them: seconds, where building
+      # them took two and three minutes. Not cached: an entry is found only by the paths it was
+      # saved with, so a tool's path in it would tie the entry to the tool.
       - name: cargo-deny
+        env:
+          VERSION: 0.20.2
+          SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
         run: |
-          if [ "$(cargo deny --version 2>/dev/null)" != "cargo-deny 0.20.2" ]; then
-            cargo install --locked cargo-deny@0.20.2
-          fi
+          name="cargo-deny-$VERSION-x86_64-unknown-linux-musl"
+          curl -fsSL -o "$RUNNER_TEMP/$name.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$VERSION/$name.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/$name.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$name.tar.gz" -C ~/.cargo/bin --strip-components=1 "$name/cargo-deny"
+          cargo deny --version
 
-      # The test runner check.sh runs the tests with: the same version, as nextest releases it
-      # built, checked against the SHA-256 published beside it. Seconds, where building it took
-      # three minutes, and nothing for the cache to carry: an entry is found only by the paths
-      # it was saved with, and one more would leave every entry saved before it unread.
       - name: cargo-nextest
         env:
           VERSION: 0.9.152
@@ -83,6 +87,31 @@ jobs:
       - name: Lock files unchanged
         run: git diff --exit-code Cargo.lock fuzz/Cargo.lock
 
+      # What is saved is the third-party dependencies alone. EdgeRush's own crates and their
+      # tests change with every pull request and are built again whatever the cache holds;
+      # saved as well, they made the cache 8 GB, five minutes to restore for three of building
+      # saved. Vendored quiche and h2 are kept: they change only when vendor/ does.
+      - name: Keep only the dependencies
+        if: github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          # `-p` and the name of each package of ours, one a line. Never empty: `cargo clean`
+          # with no package named would empty the whole target directory.
+          ours() {
+            cargo metadata --format-version 1 --locked --manifest-path "$1" | python3 -c '
+          import json, sys
+          for p in json.load(sys.stdin)["packages"]:
+              if p["source"] is None and "/vendor/" not in p["manifest_path"]:
+                  print("-p"); print(p["name"])'
+          }
+          workspace=$(ours Cargo.toml) && [ -n "$workspace" ]
+          fuzz=$(ours fuzz/Cargo.toml) && [ -n "$fuzz" ]
+          du -sh target fuzz/target
+          cargo clean $workspace
+          cargo clean --release --target-dir target/loom $workspace
+          cargo clean --manifest-path fuzz/Cargo.toml $fuzz
+          rm -rf target/doc
+          du -sh target fuzz/target
+
       # From main alone, and only once all is green: a pull request's cache could serve only
       # that pull request, and it is main's that every run starts from.
       - name: Save the build cache
@@ -93,7 +122,6 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            ~/.cargo/bin/cargo-deny
             target
             fuzz/target
           key: ${{ steps.cache.outputs.cache-primary-key }}
