@@ -4,7 +4,9 @@ use proptest::prelude::*;
 /// A config of these listeners, as `(port, protocol, http3)`, each on IPv4 and, where
 /// `dual`, on IPv6 too.
 fn config(listeners: &[(u16, &str, bool)], dual: bool) -> Config {
-    let mut written = String::from("routes: []\nupstreams: {}\nlisteners:\n");
+    // None is an empty mapping: a key with nothing after it is null, not a mapping.
+    let mut written = String::from("routes: []\nupstreams: {}\nlisteners:");
+    written.push_str(if listeners.is_empty() { " {}\n" } else { "\n" });
     for (index, (port, protocol, http3)) in listeners.iter().enumerate() {
         let http3 = if *http3 { ", http3: {}" } else { "" };
         written.push_str(&format!(

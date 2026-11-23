@@ -618,7 +618,9 @@ mod tests {
     use proptest::prelude::*;
 
     fn compiled(upstreams: &[(&str, &str, &[&str])]) -> Compiled {
-        let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
+        // None is an empty mapping: a key with nothing after it is null, not a mapping.
+        let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:");
+        yaml += if upstreams.is_empty() { " {}\n" } else { "\n" };
         for (name, balancer, addresses) in upstreams {
             let listed: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
             yaml += &format!(
@@ -1144,7 +1146,9 @@ mod tests {
     type Stated = (&'static str, &'static str, Option<u64>, Vec<&'static str>);
 
     fn stated(upstreams: &[Stated]) -> Compiled {
-        let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
+        // None is an empty mapping: a key with nothing after it is null, not a mapping.
+        let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:");
+        yaml += if upstreams.is_empty() { " {}\n" } else { "\n" };
         for (name, balancer, window, addresses) in upstreams {
             let listed: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
             let slow = window.map_or(String::new(), |ms| {
