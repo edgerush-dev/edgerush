@@ -1,7 +1,7 @@
-# quiche 0.30.0, patched
+# quiche 0.30.1, patched
 
-This is [quiche](https://github.com/cloudflare/quiche) 0.30.0 as published on crates.io
-(`quiche/` at `be47c5011215b9f13bad06bd7627d3ae49888a19`), copyright Cloudflare and its
+This is [quiche](https://github.com/cloudflare/quiche) 0.30.1 as published on crates.io
+(`quiche/` at `b364fdfee3799d8c469d5cd8f5693fafb420a466`), copyright Cloudflare and its
 contributors, under the BSD 2-Clause licence in `COPYING`. The workspace builds it through
 `[patch.crates-io]`, in place of the published crate. Only what the package needs is kept:
 the manifest, the lock file, the licence, the README, `src/` and `examples/` (quiche's own
@@ -14,18 +14,12 @@ Every change is marked `EdgeRush:` in the source.
 - **STREAM frames share a packet.** When quiche builds a short-header packet, it writes a
   STREAM frame for the first flushable stream and stops there. Only its `fuzzing` feature
   goes on to the next streams while the packet has room. The change drops that
-  `#[cfg(feature = "fuzzing")]`, so every build coalesces (`src/lib.rs`, in `send_single`).
+  `#[cfg(feature = "fuzzing")]`, so every build coalesces (`src/lib.rs`, in `send_single`),
+  and starts no further stream's frame once 12 bytes or fewer are left
+  (`frame::MAX_STREAM_OVERHEAD`, kept here), so that no stream is sent a sliver.
 - **Two of quiche's tests follow from it.** `stream_round_robin` and `stream_reprioritize`
   expect one stream per packet. They now check the same order, frame by frame, across the
   one packet that carries them all (`src/tests.rs`).
-- **A stream whose frame header does not fit waits for the next packet.** When what was
-  left of a packet could not take the next stream's STREAM frame header, quiche took the
-  stream off its send queue with its data unsent, and nothing put it back: a stream is
-  queued again only if it was not flushable before, and it still was. Now the packet ends
-  there and the stream stays queued, as quinn does (`src/lib.rs`, in `send_single`). With
-  coalescing this is any stream after the first whose header needs 15 bytes or more (an
-  8-byte varint for its ID or offset) where 13 or 14 are left. `a_stream_left_out_of_a_full_packet_is_sent_in_a_later_one`
-  in `crates/proxy/tests/h3_library.rs` covers it.
 - **An ACK alone may wait, when asked to.** `Config::enable_delayed_ack(true)` (off by
   default) makes an ACK in the application space wait, once the handshake is confirmed.
   It goes out at once after a second ack-eliciting packet, after one that came out of order
@@ -61,13 +55,10 @@ Every change is marked `EdgeRush:` in the source.
   `crates/proxy/tests/h3_library.rs` covers it.
 - Three tests (five cases) after `connection_migration_zero_length_cid` in
   `src/tests.rs` cover both, beside quiche's own `path_probing_dos` and
-  `path_event_queue_bounded_on_port_rotation`, which still pass.
-- **A RETIRE_CONNECTION_ID repeated for an ID already retired is ignored.** Removing a
-  connection ID refused when one ID was left before it looked for the ID, so the same
-  frame arriving again, once the ID was retired and before the application issued
-  another, closed the connection with PROTOCOL_VIOLATION (`src/cid.rs`, `remove`). It now
-  refuses only to remove the last ID, as it meant to. `a_repeated_retire_connection_id_is_ignored`
-  in `src/tests.rs` covers it.
+  `path_event_queue_bounded_on_port_rotation`, which still pass. quiche's
+  `max_outstanding_sent_packets_multiple_paths` checks that neither of two paths holds the
+  outstanding packets alone; under gcongestion, whose recovery drops a lost packet's record
+  at once, the path the client left holds none, so that check is made for cubic only.
 - **A server's answer goes again at once when the ClientHello comes again.** A client's
   Initial CRYPTO data that the server has already read means the client did not have the
   answer. The first time, and only then, a server marks its unacknowledged Initial and
@@ -77,16 +68,6 @@ Every change is marked `EdgeRush:` in the source.
   `the_server_hello_goes_again_early_once_only` in `src/tests.rs` cover it. What sets it
   off, a repeat and nothing else, is not reached by quiche's client, whose ClientHello
   fits one packet.
-- **A stream the peer stops is always reported.** On a STOP_SENDING, quiche resets the
-  stream's sending side and marks the stream writable, so that `stream_writable_next()`
-  hands it to the application, which learns of the stop by writing (`StreamStopped`); the
-  stream is not collected while so marked. It marked the stream only if it had not been
-  writable before, but a stream `stream_writable_next()` has already returned is off that
-  set however writable it is. So the stop was never reported, the stream was collected
-  once its RESET_STREAM was acknowledged, and its credit went back to the peer. Now it is
-  marked either way (`src/lib.rs`, the STOP_SENDING frame's handling);
-  `a_stream_stopped_after_it_was_taken_as_writable_is_reported` in `src/tests.rs` covers
-  it.
 - **A stream holds at most 1,024 runs of data.** A stream's receive buffer keeps what came
   out of order as runs with gaps between them, each piece in a buffer and a tree node of
   its own, and flow control bounds only their bytes. A `RangeSet` of what is held now
@@ -95,17 +76,6 @@ Every change is marked `EdgeRush:` in the source.
   closes the connection with PROTOCOL_VIOLATION. Data in order is one run however many
   pieces it came in. Three tests at the end of `src/stream/recv_buf.rs` and
   `a_stream_sent_in_gapped_pieces_closes_the_connection` in `src/tests.rs` cover it.
-- **A stream completed by the peer while no longer read is collected.** quiche collects a
-  stream once both its sides are done, but looked for one only as an ACK came or the
-  application read. When a stream's sending side was done and acknowledged before the peer
-  ended its side, by a RESET_STREAM or a FIN, on a stream the application had stopped
-  reading, nothing looked again: the stream stayed, and its credit with it, until the
-  connection closed. Both frames' handling now collects a stream they complete with nothing
-  left to read (`completed_unread` in `src/lib.rs`), keeping one the peer stopped until the
-  application has heard of it, as the ACK's handling does.
-  `a_stream_answered_before_its_request_ended_is_collected` and
-  `a_stopped_stream_ended_unread_is_kept_until_the_stop_is_heard` in `src/tests.rs` cover
-  it.
 - **The HTTP/3 layer lets go of a stream the transport has let go of.** Its state for a
   request stream went only when both sides finished through its own calls; for one reset
   either way, stopped, or answered before the request was whole, it stayed until the
@@ -156,6 +126,17 @@ Every change is marked `EdgeRush:` in the source.
   that showed one (`src/tls/boringssl.rs`, `src/lib.rs`).
   `a_listener_validating_clients_in_the_insecure_fallback_lets_them_all_through` in
   `crates/proxy/src/tls.rs` covers it.
+- **Tests of faults quiche has fixed itself are kept.** A stream whose STREAM frame header
+  does not fit what is left of a packet stays queued for the next one; a
+  RETIRE_CONNECTION_ID repeated for an ID already retired is ignored; a stream the peer
+  stops is reported even after `stream_writable_next()` has returned it; and a stream the
+  peer completes while the application no longer reads it is collected, one the peer
+  stopped only once the stop is heard. Each was a change of ours until quiche made the
+  same fix, and its test stays: `a_stream_left_out_of_a_full_packet_is_sent_in_a_later_one`
+  in `crates/proxy/tests/h3_library.rs`, and `a_repeated_retire_connection_id_is_ignored`,
+  `a_stream_stopped_after_it_was_taken_as_writable_is_reported`,
+  `a_stream_answered_before_its_request_ended_is_collected` and
+  `a_stopped_stream_ended_unread_is_kept_until_the_stop_is_heard` in `src/tests.rs`.
 
 ## Why
 
@@ -167,13 +148,6 @@ request both ways; coalescing brought it to 0.16, against NGINX's 0.06. NGINX, H
 quinn and ngtcp2 all fill a packet with as many streams' frames as fit, as RFC 9000 §12.4
 allows. Priority order is kept: the frames go in the order quiche would have sent them one
 packet at a time.
-
-**The stream left out.** Published quiche reaches that arm only for the first stream of a
-packet other frames have nearly filled; coalescing reaches it for every stream after the
-first. The rest of such an answer was never sent: a large answer on a long connection
-stalled for good, holding one of the client's stream credits until the client gave up on
-it. Stopping is one arm of a loop that only ever looks at the head of the queue; going on to
-a later stream that fits, as HAProxy does, would need the loop to walk the queue.
 
 **Delayed ACKs.** quiche sends an ACK whenever the application asks it for a packet and
 one is owed. A driver asks after every datagram it hands over, so a request answered from
@@ -194,14 +168,6 @@ path's packets lost within a round trip; here they are declared lost when the pe
 which RFC 9000 §9.4 leaves to the endpoint. A peer that moved on purpose, its old address
 still working, may have a few packets sent twice.
 
-**The repeated RETIRE_CONNECTION_ID.** Frames are sent again after a loss, and a peer may
-send one more than once anyway: quic-go's client, in quic-interop-runner's case of a lossy
-handshake, sent its first RETIRE_CONNECTION_ID in two packets that arrived together. The
-first retired the ID and the second closed the connection, on the second of fifty
-connections, before EdgeRush's driver had issued the replacement it issues once a turn.
-RFC 9000 §19.16 makes an error of retiring an ID never issued, or the one a packet was
-sent to, neither of which this was.
-
 **The ServerHello sent again early.** quiche answered a client's repeated ClientHello with
 an ACK alone and sent its own ServerHello again only at its PTO, which doubles each time. In
 quic-interop-runner's cases of 30% loss and corruption, a ServerHello spoiled three times
@@ -210,13 +176,6 @@ CRYPTO data early "for a limited number of times per connection"; HAProxy does i
 a duplicate CRYPTO frame, which is what this does. What goes stays within the
 anti-amplification limit: a client's Initial is 1,200 bytes at least.
 
-**The stopped stream.** A client that stops reading an answer no longer wants it, and the
-gateway gives up the exchange behind it (RFC 9114 §4.1.1). EdgeRush's driver takes every
-stream quiche reports writable, so a stream the client stopped while its answer waited on
-an upstream was never reported: the exchange went on, and the stream's credit went back to
-the client, which could ask and stop again without end, past the stream bound that is
-meant to bound its exchanges.
-
 **The runs.** A peer that sends a stream's data a byte at a time, a gap after each, makes
 a byte cost a buffer and a tree node, 100 bytes and more: every other byte of a 16 MiB
 connection window is some eight million of them, on the order of a gigabyte for one
@@ -224,12 +183,6 @@ connection. quinn closes a connection past 1,024 chunks a stream, Google's QUICH
 10,000 ranges, with PROTOCOL_VIOLATION as here; NGINX bounds the frames a connection
 holds. A gap is a packet lost and not yet sent again, and no sender's congestion control
 keeps the 2,048 packets in flight that 1,024 gaps take on a path losing that much.
-
-**The stream left uncollected.** A gateway answers before a request is whole when it need
-not read the rest, a 413 or a 401 to an upload, and stops reading (RFC 9114 §4.1). Whether
-the stream was then collected depended on the order the client's frames came in: its
-acknowledgement of the answer's end first, and the stream stayed. A client with a hundred
-streams that met a hundred such answers had none left.
 
 **The HTTP/3 state kept.** Upstream's own source says so where it would be freed ("TODO:
 check if stream is completed so it can be freed"). A client that asks and cancels, again
@@ -249,22 +202,21 @@ client can start again rather than wait out its handshake timer. Published quich
 write that close only from a connection, and a connection writes nothing before it has
 processed the client's Initial, which runs the TLS handshake a Retry is there to spare.
 
-With all fifteen changes, quiche's own library tests pass (1,177 of 1,177, on Windows and
+With all twelve changes, quiche's own library tests pass (1,309 of 1,309, on Windows and
 Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`),
 and `check.sh` runs them, in a target directory of their own (`target/vendored`): the
 workspace's tests never reach this crate, which is not a member of it.
 The proxy's probe `several_streams_share_a_packet` in `crates/proxy/tests/h3_library.rs`
 fails against the published crate, as do its tests `an_answer_carries_the_ack_of_its_request`
 (without delayed ACKs), `a_client_rebound_again_and_again_is_followed`,
-`a_client_rebound_during_a_large_answer_gets_it_whole`,
-`an_answer_the_client_stops_reading_is_given_up` and
+`a_client_rebound_during_a_large_answer_gets_it_whole` and
 `a_client_that_asks_and_stops_again_and_again_holds_no_more_than_its_streams` in
 `crates/proxy/src/downstream/h3/tests.rs`.
 
 ## Advisories
 
 `cargo deny` looks advisories up only for crates with a registry source, and a path has
-none. So `vendor/bases` names quiche 0.30.0 as published, which `check.sh` checks against
+none. So `vendor/bases` names quiche 0.30.1 as published, which `check.sh` checks against
 the RustSec database as it checks the workspace, and whose lock file GitHub's dependency
 graph reads for GitHub's own advisories. An advisory fixed in this copy is ignored in
 `deny.toml`, with the reason. quiche marks its security fixes in its release notes

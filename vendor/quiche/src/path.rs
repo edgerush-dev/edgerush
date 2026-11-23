@@ -277,8 +277,9 @@ impl Path {
         let pmtud = config.and_then(|c| {
             if c.pmtud {
                 let maximum_supported_mtu: usize = std::cmp::min(
-                    // if the max_udp_payload_size doesn't fit into a usize, then
-                    // max_send_udp_payload_size must be smaller so use that
+                    // if the max_udp_payload_size doesn't fit into a usize,
+                    // then max_send_udp_payload_size must be smaller so use
+                    // that
                     c.local_transport_params
                         .max_udp_payload_size
                         .try_into()
@@ -1164,12 +1165,50 @@ impl std::fmt::Debug for PathStats {
 #[cfg(test)]
 mod tests {
     use crate::rand;
+    use crate::test_utils;
     use crate::MIN_CLIENT_INITIAL_LEN;
 
     use crate::recovery::RecoveryConfig;
     use crate::Config;
 
     use super::*;
+
+    #[test]
+    fn pmtud_probe_respects_cwnd_during_pto() {
+        let local = "127.0.0.1:1234".parse().unwrap();
+        let peer = "127.0.0.1:4321".parse().unwrap();
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config.discover_pmtu(true);
+        config.set_max_send_udp_payload_size(1400);
+        let recovery_config = RecoveryConfig::from_config(&config);
+        let mut path = Path::new(
+            local,
+            peer,
+            &recovery_config,
+            config.path_challenge_recv_max_queue_len,
+            true,
+            Some(&config),
+        );
+        let now = Instant::now();
+        let cwnd = path.recovery.cwnd();
+
+        path.recovery.on_packet_sent(
+            test_utils::helper_packet_sent(0, now, cwnd),
+            crate::packet::Epoch::Application,
+            HandshakeStatus {
+                has_handshake_keys: false,
+                peer_verified_address: true,
+                completed: true,
+            },
+            now,
+            "",
+        );
+        path.recovery
+            .inc_loss_probes(crate::packet::Epoch::Application);
+
+        assert!(path.pmtud.as_ref().unwrap().should_probe());
+        assert!(!path.should_send_pmtu_probe(true, true, 1400, false, true));
+    }
 
     #[test]
     fn reinitializing_pmtud_notifies_fallback_limit() {

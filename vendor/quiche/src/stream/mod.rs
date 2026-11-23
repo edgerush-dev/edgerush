@@ -46,6 +46,8 @@ use crate::BufFactory;
 use crate::Error;
 use crate::Result;
 
+pub(crate) use self::send_buf::PeerStopSendingState;
+
 const DEFAULT_URGENCY: u8 = 127;
 
 /// The maximum size of the receiver stream flow control window.
@@ -194,11 +196,12 @@ pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
     /// having to iterate over the full list of streams.
     pub readable: RBTree<StreamReadablePriorityAdapter>,
 
-    /// Set of stream IDs corresponding to streams that have enough flow control
-    /// capacity to be written to, and is not finished. This is used to generate
-    /// a `StreamIter` of streams without having to iterate over the full list
-    /// of streams.
+    /// Set of streams queued for writable notification. A stopped stream can
+    /// be removed before its error is reported to the application.
     pub writable: RBTree<StreamWritablePriorityAdapter>,
+
+    /// Stopped streams still queued for writable notification.
+    stopped_writable: RBTree<StreamStoppedWritablePriorityAdapter>,
 
     /// Set of stream IDs corresponding to streams that are almost out of flow
     /// control credit and need to send MAX_STREAM_DATA. This is used to
@@ -284,11 +287,9 @@ impl<F: BufFactory> StreamMap<F> {
     /// Returns the mutable stream with the given ID if it exists, or creates
     /// a new one otherwise.
     ///
-    /// The `local` parameter indicates whether the stream's creation was
-    /// requested by the local application rather than the peer, and is
-    /// used to validate the requested stream ID, and to select the initial
-    /// flow control values from the local and remote transport parameters
-    /// (also passed as arguments).
+    /// The `local` parameter indicates whether the stream is locally
+    /// initiated. It validates the stream ID and selects the initial flow
+    /// control values from the local and remote transport parameters.
     ///
     /// This also takes care of enforcing both local and the peer's stream
     /// count limits. If one of these limits is violated, the `StreamLimit`
@@ -451,11 +452,32 @@ impl<F: BufFactory> StreamMap<F> {
         }
     }
 
+    /// Marks a newly stopped stream as queued for writable notification.
+    pub fn insert_stopped_writable(
+        &mut self, priority_key: &Arc<StreamPriorityKey>,
+    ) {
+        if !priority_key.stopped_writable.is_linked() {
+            self.stopped_writable.insert(Arc::clone(priority_key));
+        }
+
+        self.insert_writable(priority_key);
+    }
+
     /// Removes the stream ID from the writable streams set.
     ///
     /// This should also be called anytime an existing stream stops being
     /// writable.
     pub fn remove_writable(&mut self, priority_key: &Arc<StreamPriorityKey>) {
+        if priority_key.stopped_writable.is_linked() {
+            let ptr = Arc::as_ptr(priority_key);
+            // SAFETY: `priority_key` originates from this `StreamMap`, and its
+            // `stopped_writable` link is only inserted into this map's
+            // corresponding tree. The link is linked, and the `Arc` keeps the
+            // allocation alive, so `ptr` identifies an element of this tree.
+            let mut c = unsafe { self.stopped_writable.cursor_mut_from_ptr(ptr) };
+            c.remove();
+        }
+
         if !priority_key.writable.is_linked() {
             return;
         }
@@ -505,8 +527,13 @@ impl<F: BufFactory> StreamMap<F> {
         }
 
         if old.writable.is_linked() {
+            let stopped = old.stopped_writable.is_linked();
             self.remove_writable(old);
-            self.writable.insert(Arc::clone(new));
+            if stopped {
+                self.insert_stopped_writable(new);
+            } else {
+                self.insert_writable(new);
+            }
         }
 
         if old.flushable.is_linked() {
@@ -540,14 +567,16 @@ impl<F: BufFactory> StreamMap<F> {
         self.blocked.remove(&stream_id);
     }
 
-    /// Adds the stream ID to the reset streams set with the
-    /// given error code and final size values.
-    ///
-    /// If the stream was already in the list, this does nothing.
+    /// Queues RESET_STREAM unless the send side is already complete or the
+    /// stream has been collected.
     pub fn insert_reset(
         &mut self, stream_id: u64, error_code: u64, final_size: u64,
     ) {
-        self.reset.insert(stream_id, (error_code, final_size));
+        if let Some(stream) = self.streams.get(&stream_id) {
+            if !stream.send.is_complete() {
+                self.reset.insert(stream_id, (error_code, final_size));
+            }
+        }
     }
 
     /// Removes the stream ID from the reset streams set.
@@ -632,10 +661,25 @@ impl<F: BufFactory> StreamMap<F> {
         self.peer_max_streams_uni - self.local_opened_streams_uni
     }
 
+    /// Collects or disarms a stream after reporting STOP_SENDING to the caller.
+    pub fn on_stop_sending_reported(&mut self, stream_id: u64) {
+        let Some(stream) = self.streams.get_mut(&stream_id) else {
+            return;
+        };
+
+        if stream.state() == StreamState::Collectable {
+            let local = stream.local;
+            self.collect(stream_id, local);
+        } else {
+            let priority_key = Arc::clone(&stream.priority_key);
+            self.remove_writable(&priority_key);
+        }
+    }
+
     /// Drops completed stream.
     ///
-    /// This should only be called when Stream::is_complete() returns true for
-    /// the given stream.
+    /// This should only be called when Stream::state() returns Collectable
+    /// for the given stream.
     pub fn collect(&mut self, stream_id: u64, local: bool) {
         if !local {
             // If the stream was created by the peer, give back a max streams
@@ -665,6 +709,19 @@ impl<F: BufFactory> StreamMap<F> {
         }
     }
 
+    /// Collects a completed stream when no application notification remains.
+    pub(crate) fn try_collect(&mut self, stream_id: u64) {
+        let Some(stream) = self.get(stream_id) else {
+            return;
+        };
+
+        let local = stream.local;
+
+        if stream.state() == StreamState::Collectable {
+            self.collect(stream_id, local);
+        }
+    }
+
     /// Creates an iterator over streams that have outstanding data to read.
     pub fn readable(&self) -> StreamIter {
         StreamIter {
@@ -679,6 +736,39 @@ impl<F: BufFactory> StreamMap<F> {
             streams: self.writable.iter().map(|s| s.id).collect(),
             index: 0,
         }
+    }
+
+    /// Creates an iterator over stopped streams in the writable queue.
+    pub fn stopped_writable(&self) -> StreamIter {
+        if self.stopped_writable.is_empty() {
+            return StreamIter::default();
+        }
+
+        StreamIter {
+            streams: self.stopped_writable.iter().map(|key| key.id).collect(),
+            index: 0,
+        }
+    }
+
+    /// Returns and unlinks the next stopped stream awaiting notification.
+    pub fn pop_stopped_writable(&mut self) -> Option<u64> {
+        let priority_key = self.stopped_writable.front().clone_pointer()?;
+        self.remove_writable(&priority_key);
+        Some(priority_key.id)
+    }
+
+    /// Returns true if the given local stream has been opened.
+    ///
+    /// Opening a local stream implicitly opens all lower-numbered local streams
+    /// of the same type, even if they do not have `Stream` objects yet.
+    pub fn local_stream_opened(&self, stream_id: u64) -> bool {
+        let opened = if is_bidi(stream_id) {
+            self.local_opened_streams_bidi
+        } else {
+            self.local_opened_streams_uni
+        };
+
+        stream_id >> 2 < opened
     }
 
     /// Creates an iterator over streams that need to send MAX_STREAM_DATA.
@@ -832,6 +922,17 @@ impl<F: BufFactory> StreamMap<F> {
     }
 }
 
+/// Completion derived from transport buffers and pending app notifications.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamState {
+    /// At least one relevant direction is not complete.
+    Incomplete,
+    /// Directions are complete, but receive data or a STOP error remains.
+    CompleteWithPendingDelivery,
+    /// No transport work or application notification remains.
+    Collectable,
+}
+
 /// A QUIC stream.
 pub struct Stream<F: BufFactory = DefaultBufFactory> {
     /// Receive-side stream buffer.
@@ -904,7 +1005,7 @@ impl<F: BufFactory> Stream<F> {
             off_front < self.send.max_off()
     }
 
-    /// Returns true if the stream is complete.
+    /// Derives completion without duplicating buffer or acknowledgement state.
     ///
     /// For bidirectional streams this happens when both the receive and send
     /// sides are complete. That is when all incoming data has been read by the
@@ -913,8 +1014,8 @@ impl<F: BufFactory> Stream<F> {
     /// For unidirectional streams this happens when either the receive or send
     /// side is complete, depending on whether the stream was created locally
     /// or not.
-    pub fn is_complete(&self) -> bool {
-        match (self.bidi, self.local) {
+    pub(crate) fn state(&self) -> StreamState {
+        let complete = match (self.bidi, self.local) {
             // For bidirectional streams we need to check both receive and send
             // sides for completion.
             (true, _) => self.recv.is_fin() && self.send.is_complete(),
@@ -926,6 +1027,20 @@ impl<F: BufFactory> Stream<F> {
             // For unidirectional streams generated by the peer, we only need
             // to check the receive side for completion.
             (false, false) => self.recv.is_fin(),
+        };
+
+        let pending_stop_sending = match self.send.peer_stop_sending_state() {
+            PeerStopSendingState::NotReported(_) => !self.send.is_shutdown(),
+            PeerStopSendingState::NotReceived |
+            PeerStopSendingState::Reported(_) => false,
+        };
+
+        if !complete {
+            StreamState::Incomplete
+        } else if self.is_readable() || pending_stop_sending {
+            StreamState::CompleteWithPendingDelivery
+        } else {
+            StreamState::Collectable
         }
     }
 }
@@ -948,6 +1063,7 @@ pub struct StreamPriorityKey {
 
     pub readable: RBTreeAtomicLink,
     pub writable: RBTreeAtomicLink,
+    pub stopped_writable: RBTreeAtomicLink,
     pub flushable: RBTreeAtomicLink,
 }
 
@@ -959,6 +1075,7 @@ impl Default for StreamPriorityKey {
             id: Default::default(),
             readable: Default::default(),
             writable: Default::default(),
+            stopped_writable: Default::default(),
             flushable: Default::default(),
         }
     }
@@ -1014,6 +1131,16 @@ impl Ord for StreamPriorityKey {
 intrusive_adapter!(pub StreamWritablePriorityAdapter = Arc<StreamPriorityKey>: StreamPriorityKey { writable => RBTreeAtomicLink });
 
 impl KeyAdapter<'_> for StreamWritablePriorityAdapter {
+    type Key = StreamPriorityKey;
+
+    fn get_key(&self, s: &StreamPriorityKey) -> Self::Key {
+        s.clone()
+    }
+}
+
+intrusive_adapter!(pub StreamStoppedWritablePriorityAdapter = Arc<StreamPriorityKey>: StreamPriorityKey { stopped_writable => RBTreeAtomicLink });
+
+impl KeyAdapter<'_> for StreamStoppedWritablePriorityAdapter {
     type Key = StreamPriorityKey;
 
     fn get_key(&self, s: &StreamPriorityKey) -> Self::Key {
@@ -1765,6 +1892,8 @@ mod tests {
         assert!(!stream.send.is_complete());
         assert!(stream.send.is_fin());
 
+        assert_eq!(stream.send.emit(&mut [0; 10]), Ok((10, true)));
+
         let buf = RangeBuf::from(b"hello", 0, true);
         assert!(stream.recv.write(buf).is_ok());
         assert!(!stream.recv.is_fin());
@@ -1780,15 +1909,45 @@ mod tests {
         assert!(!stream.send.is_complete());
 
         stream.send.ack(0, 1);
+        assert!(!stream.send.is_complete());
+
+        stream.send.ack_fin();
         assert!(stream.send.is_complete());
 
-        assert!(!stream.is_complete());
+        assert_eq!(stream.state(), StreamState::Incomplete);
 
         let mut buf = [0; 3];
         assert_eq!(stream.recv.emit(&mut buf), Ok((3, true)));
         assert!(stream.recv.is_fin());
 
-        assert!(stream.is_complete());
+        assert_eq!(stream.state(), StreamState::Collectable);
+
+        // A completed stream must retain each undelivered terminal event.
+        stream.send.stop(42).unwrap();
+        assert_eq!(stream.state(), StreamState::CompleteWithPendingDelivery);
+        assert_eq!(
+            stream.send.cap_and_report_stop_sending(),
+            Err(Error::StreamStopped(42))
+        );
+        assert_eq!(stream.state(), StreamState::Collectable);
+
+        let mut stream =
+            <Stream>::new(0, 30, 30, true, 30, DEFAULT_STREAM_WINDOW);
+        stream.send.shutdown().unwrap();
+        stream.send.ack_reset_stream();
+        stream.recv.reset(43, 5).unwrap();
+        assert_eq!(stream.state(), StreamState::CompleteWithPendingDelivery);
+        assert_eq!(stream.recv.emit(&mut buf), Err(Error::StreamReset(43)));
+        assert_eq!(stream.state(), StreamState::Collectable);
+
+        // Local shutdown permits collection without reporting a later peer
+        // STOP.
+        stream.send.stop(42).unwrap();
+        assert_eq!(stream.state(), StreamState::Collectable);
+        assert_eq!(
+            stream.send.peer_stop_sending_state(),
+            PeerStopSendingState::NotReported(42)
+        );
     }
 
     #[test]
@@ -2057,6 +2216,24 @@ mod tests {
         assert_eq!(stream.send.emit(&mut buf[..5]), Ok((2, false)));
         assert_eq!(stream.send.off_front(), 20);
         assert_eq!(&buf[..2], b"ro");
+    }
+
+    #[test]
+    fn send_buf_empty_fin_next() {
+        let mut stream = <Stream>::new(0, 0, 20, true, 0, DEFAULT_STREAM_WINDOW);
+
+        assert!(!stream.send.empty_fin_next());
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+
+        let mut buf = [0; 5];
+        assert_eq!(stream.send.emit(&mut buf), Ok((5, false)));
+        assert!(!stream.send.empty_fin_next());
+
+        assert_eq!(stream.send.write(b"", true), Ok(0));
+        assert!(stream.send.empty_fin_next());
+
+        let mut empty = [];
+        assert_eq!(stream.send.emit(&mut empty), Ok((0, true)));
     }
 
     #[test]
