@@ -440,6 +440,9 @@ pub struct Took {
     /// The part it has every part up to.
     #[prost(uint32, tag = "5")]
     pub part: u32,
+    /// The copy the copy follows; none for all the shard holds.
+    #[prost(uint64, optional, tag = "6")]
+    pub after: Option<u64>,
 }
 
 /// A replica's word that it holds nothing of a shard.
@@ -958,6 +961,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             shard,
             term,
             assignment,
+            after,
             version,
             part,
         } => peer(Control::Took(Took {
@@ -966,6 +970,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             assignment,
             version,
             part,
+            after,
         })),
         Message::Lacking { shard, term } => peer(Control::Lacking(Lacking {
             shard: u32::from(shard),
@@ -1102,6 +1107,7 @@ pub fn from_peer<V: Value>(sent: ToPeer<V::Wire>) -> Result<(NodeId, Message<V>)
             shard: shard_id(took.shard)?,
             term: took.term,
             assignment: took.assignment,
+            after: took.after,
             version: took.version,
             part: took.part,
         },
@@ -1948,15 +1954,21 @@ mod tests {
                     version,
                 }
             ),
-            (any::<ShardId>(), any::<(u64, u64, u64)>(), any::<u32>()).prop_map(
-                |(shard, (term, assignment, version), part)| Message::Took {
-                    shard,
-                    term,
-                    assignment,
-                    version,
-                    part,
-                }
-            ),
+            (
+                any::<ShardId>(),
+                any::<(u64, u64, Option<u64>, u64)>(),
+                any::<u32>()
+            )
+                .prop_map(|(shard, (term, assignment, after, version), part)| {
+                    Message::Took {
+                        shard,
+                        term,
+                        assignment,
+                        after,
+                        version,
+                        part,
+                    }
+                }),
             (any::<ShardId>(), any::<u64>())
                 .prop_map(|(shard, term)| Message::Lacking { shard, term }),
             (
