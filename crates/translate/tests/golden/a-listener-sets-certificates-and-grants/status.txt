@@ -1,0 +1,8 @@
+Gateway, generation 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener http: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+attached ListenerSets: 1
+ListenerSet blog/other, generation 0: Accepted=False/ListenersNotValid (no listener is served); Programmed=False/ListenersNotValid (no listener is served)
+listener ungranted: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Secret edge/own is another namespace's, and no ReferenceGrant there lets ListenerSets of blog reach it); Programmed=False/Invalid (no certificateRef of it can be used)
+ListenerSet shop/team, generation 0: Accepted=True/Accepted
+listener own-namespace: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
+listener granted: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

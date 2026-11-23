@@ -1,0 +1,3 @@
+Gateway, generation 0: Accepted=False/ListenersNotValid (no listener is served); ResolvedRefs=False/ListenersNotResolved (listeners with refs not resolved: ungranted, missing); nothing to program
+listener ungranted: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/RefNotPermitted (Secret shop/shop is another namespace's, and no ReferenceGrant there lets Gateways of edge reach it); Programmed=False/Invalid (no certificateRef of it can be used)
+listener missing: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=False/InvalidCertificateRef (Secret edge/blog does not exist); Programmed=False/Invalid (no certificateRef of it can be used)

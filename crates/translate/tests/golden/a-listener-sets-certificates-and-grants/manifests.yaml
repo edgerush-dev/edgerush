@@ -1,7 +1,8 @@
 # A ListenerSet's HTTPS listeners read Secrets of its own namespace freely, and another's
 # where a ReferenceGrant there lets ListenerSets of its namespace: shop's is let reach
 # edge's. A grant to Gateways is not a ListenerSet's: blog's, which holds one alone, is
-# refused that Secret, and its listener is accepted, serving nothing.
+# refused that Secret, and its listener is accepted, serving nothing: with no listener
+# served, the set is not accepted (ListenerSetReferenceGrant).
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edgerush }

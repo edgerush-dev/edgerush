@@ -1,0 +1,5 @@
+Gateway edge/web: listener ungranted: a certificate cannot be used: Secret shop/shop is another namespace's, and no ReferenceGrant there lets Gateways of edge reach it
+Gateway edge/web: listener ungranted: accepted, serving nothing: no certificateRef of it can be used
+Gateway edge/web: listener missing: a certificate cannot be used: Secret edge/blog does not exist
+Gateway edge/web: listener missing: accepted, serving nothing: no certificateRef of it can be used
+Gateway edge/web: none of its listeners is served, so it serves nothing

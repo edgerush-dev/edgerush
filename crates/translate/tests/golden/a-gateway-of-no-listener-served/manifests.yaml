@@ -1,0 +1,25 @@
+# The Gateway's listeners are accepted, but none of them can be served: one's certificate
+# is another namespace's, with no ReferenceGrant to let it, the other's is not there. With
+# nothing it can serve, the Gateway is not accepted, as a ListenerSet would not be.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: edgerush }
+spec:
+  controllerName: edgerush.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: edge }
+spec:
+  gatewayClassName: edgerush
+  listeners:
+    - name: ungranted
+      port: 443
+      protocol: HTTPS
+      hostname: shop.example.com
+      tls: { certificateRefs: [{ name: shop, namespace: shop }] }
+    - name: missing
+      port: 443
+      protocol: HTTPS
+      hostname: blog.example.com
+      tls: { certificateRefs: [{ name: blog }] }
