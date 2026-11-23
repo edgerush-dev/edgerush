@@ -4,7 +4,7 @@
 
 use crate::Rng;
 use crate::measure::{one_bucket_admits, worst_excess};
-use crate::world::{Asynchronous, Beside, Fleet, Link, Sim};
+use crate::world::{Beside, Fleet, Link, World};
 use edgerush_cluster::{Config, NodeId, Time, ms};
 use edgerush_ratelimit::service::Contract;
 
@@ -134,13 +134,13 @@ impl Fault {
 pub fn run_over(fleet: &Fleet, pods: Link, planes: Link, fault: Fault) -> Option<Run> {
     let mut config = Config::defaults();
     config.shards = 64;
-    let mut world = Sim::<Asynchronous>::new(fleet.seed, config);
+    let mut world = World::new(fleet.seed, config);
     world.start_cluster(3);
-    world.run_while_not(ms(10_000), Sim::<Asynchronous>::settled)?;
+    world.run_while_not(ms(10_000), World::settled)?;
     world.set_default_link(pods);
     let keys = world.add_fleet(fleet);
     let ids = world.plane_ids();
-    let link_planes = |world: &mut Sim<Asynchronous>, of: &[NodeId], link: Link| {
+    let link_planes = |world: &mut World, of: &[NodeId], link: Link| {
         for &plane in of {
             for pod in world.pods() {
                 world.set_link(plane, pod, link);

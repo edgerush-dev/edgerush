@@ -112,6 +112,18 @@ impl Pod {
         self.decider.orphaned()
     }
 
+    /// As the synchronous mode's [`Decider::giving_back`].
+    #[must_use]
+    pub fn giving_back(&self) -> usize {
+        self.decider.giving_back()
+    }
+
+    /// As the synchronous mode's [`Decider::parts_kept`].
+    #[must_use]
+    pub fn parts_kept(&self) -> usize {
+        self.decider.parts_kept()
+    }
+
     /// What it has answered the asynchronous mode's data planes unserved in this life, by why.
     #[must_use]
     pub const fn turned_away(&self) -> TurnedAway {
@@ -199,6 +211,30 @@ impl Pod {
         Some((via.unwrap_or(client), Message::Synchronous(reply)))
     }
 
+    /// A data plane's batch reaching it at `now`, answered here as the asynchronous mode's
+    /// [`Applier::batch`] answers it, nothing forwarded; its entries under keys of the
+    /// synchronous mode's answered unserved, as [`receive`](Self::receive) answers them.
+    pub fn batch(&mut self, mut batch: asynchronous::Batch, now: Time) -> asynchronous::Answers {
+        let wrong = self.wrong_kind_out(&mut batch);
+        let mut answers = self.applier.batch(&mut self.node, batch, now);
+        answers.unserved.extend(not_serving(wrong));
+        answers
+    }
+
+    /// The keys of `batch`'s entries of the synchronous mode's, taken out of it and counted.
+    fn wrong_kind_out(&mut self, batch: &mut asynchronous::Batch) -> Vec<edgerush_cluster::Key> {
+        let mut wrong = Vec::new();
+        batch.entries.retain(|entry| {
+            let right = Kind::of(entry.key) == Kind::Asynchronous;
+            if !right {
+                wrong.push(entry.key);
+            }
+            right
+        });
+        self.wrong_kind = self.wrong_kind.saturating_add(wrong.len() as u64);
+        wrong
+    }
+
     /// An asynchronous message: a data plane's batch with its entries under keys of the
     /// synchronous mode's taken out and answered unserved, the rest as the mode takes them.
     fn receive_asynchronous(
@@ -210,18 +246,11 @@ impl Pod {
         let mut wrong = Vec::new();
         let message = match message {
             asynchronous::Message::Batch(mut batch) => {
-                batch.entries.retain(|entry| {
-                    let right = Kind::of(entry.key) == Kind::Asynchronous;
-                    if !right {
-                        wrong.push(entry.key);
-                    }
-                    right
-                });
+                wrong = self.wrong_kind_out(&mut batch);
                 asynchronous::Message::Batch(batch)
             }
             message => message,
         };
-        self.wrong_kind = self.wrong_kind.saturating_add(wrong.len() as u64);
         let mut out: Outbox = self
             .applier
             .receive(&mut self.node, from, message, now)
@@ -236,16 +265,19 @@ impl Pod {
                 }
                 _ => None,
             }) {
-                answers
-                    .unserved
-                    .extend(wrong.into_iter().map(|key| asynchronous::Unserved {
-                        key,
-                        why: asynchronous::Why::NotServing,
-                    }));
+                answers.unserved.extend(not_serving(wrong));
             }
         }
         out
     }
+}
+
+/// Entries of `keys` answered unserved, as not served here.
+fn not_serving(keys: Vec<edgerush_cluster::Key>) -> impl Iterator<Item = asynchronous::Unserved> {
+    keys.into_iter().map(|key| asynchronous::Unserved {
+        key,
+        why: asynchronous::Why::NotServing,
+    })
 }
 
 /// The store's messages as the pod's.

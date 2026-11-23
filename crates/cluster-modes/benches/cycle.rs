@@ -3,7 +3,7 @@
 //! of the ten thousand it holds reported to their owner, the batch made with the keys' hashes,
 //! and the owner's answers to it taken in, each key found by its hash.
 //!
-//! Linux only (valgrind): `cargo bench -p edgerush-cluster-asynchronous --bench cycle`, see
+//! Linux only (valgrind): `cargo bench -p edgerush-cluster-modes --bench cycle`, see
 //! the repository README.
 
 #![allow(
@@ -16,7 +16,8 @@
 )]
 
 use edgerush_cluster::{Config, Message as StoreMessage, NodeId, Time, table};
-use edgerush_cluster_asynchronous::{Answers, Pod, Routed};
+use edgerush_cluster_asynchronous::{Answers, Routed};
+use edgerush_cluster_modes::Pod;
 use edgerush_ratelimit::service::pooled::{Levers, Participant};
 use edgerush_ratelimit::service::{Contract, Keyed};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};

@@ -1,0 +1,754 @@
+//! The synchronous mode on a pod of both modes: each request decided by its key's owner under
+//! its rule, a refused request's counted parts given back, and requests under several keys
+//! gathered by the pod they reach.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test set-up: the helpers around the tests fail them the way the tests would"
+)]
+
+use edgerush_cluster::Message as StoreMessage;
+use edgerush_cluster::table::shard_of;
+use edgerush_cluster::{Config, Kept, Key, NodeId, ShardId, Time, ms, table};
+use edgerush_cluster_modes as modes;
+use edgerush_cluster_synchronous::{Answer, GIVE_BACK_SENDS, Rule, Value};
+
+/// The synchronous mode's messages, over the store of both modes' values.
+type Message = edgerush_cluster_synchronous::Message<modes::Value>;
+
+/// What a pod sends, as the synchronous mode's messages.
+type Outbox = Vec<(NodeId, Message)>;
+
+/// A pod of both modes as these tests drive it: the synchronous mode's messages in and out,
+/// the store's among them.
+#[derive(Clone)]
+struct Pod(modes::Pod);
+
+impl Pod {
+    fn new(id: NodeId, address: String, config: Config, peers: [NodeId; 2]) -> Self {
+        Self(modes::Pod::new(id, address, config, peers))
+    }
+
+    fn store(&self) -> &modes::Store {
+        self.0.store()
+    }
+
+    fn store_mut(&mut self) -> &mut modes::Store {
+        self.0.store_mut()
+    }
+
+    fn set_forwarding(&mut self, forwarding: bool) {
+        self.0.set_forwarding(forwarding);
+    }
+
+    fn set_forwarder_decides(&mut self, decides: bool) {
+        self.0.set_forwarder_decides(decides);
+    }
+
+    fn decided_from_copy(&self) -> u64 {
+        self.0.decided_from_copy()
+    }
+
+    fn giving_back(&self) -> usize {
+        self.0.giving_back()
+    }
+
+    fn parts_kept(&self) -> usize {
+        self.0.parts_kept()
+    }
+
+    /// The count it holds for `key`, owned or a copy: what was counted under it less what was
+    /// given back.
+    fn count(&self, key: Key) -> Option<u64> {
+        self.0.value(key).map(|value| net(&value))
+    }
+
+    fn tick(&mut self, now: Time) -> Outbox {
+        synchronous(self.0.tick(now))
+    }
+
+    fn receive(&mut self, from: NodeId, message: impl Into<Message>, now: Time) -> Outbox {
+        let message: Message = message.into();
+        synchronous(self.0.receive(from, message, now))
+    }
+}
+
+/// The synchronous mode's value of a pod of both modes.
+fn mine(value: &modes::Value) -> &Value {
+    match value {
+        modes::Value::Synchronous(value) => value,
+        other => panic!("{other:?} under a synchronous key"),
+    }
+}
+
+/// The count of a value of the synchronous mode's.
+fn net(value: &modes::Value) -> u64 {
+    mine(value).net()
+}
+
+/// What a pod of both modes sent, as the synchronous mode's messages: none of the other
+/// mode's.
+fn synchronous(out: modes::Outbox) -> Outbox {
+    out.into_iter()
+        .map(|(to, message)| {
+            let message = match message {
+                modes::Message::Store(message) => Message::Store(message),
+                modes::Message::Synchronous(message) => message,
+                modes::Message::Asynchronous(message) => {
+                    panic!("the asynchronous mode's {message:?} to {to}")
+                }
+            };
+            (to, message)
+        })
+        .collect()
+}
+
+fn config() -> Config {
+    let mut config = Config::defaults();
+    config.shards = 4;
+    config
+}
+
+/// Pod 2 holding the first table of pods 1, 2 and 3.
+fn member() -> Pod {
+    let mut node = Pod::new(2, "pod-2:7000".to_owned(), config(), [1, 3]);
+    let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
+    let table = table::first(&members, 4, 2, 1);
+    let _ = node.receive(1, StoreMessage::TableReply { table }, ms(1));
+    node
+}
+
+/// The first key of `shard`.
+fn key_in(shard: ShardId) -> Key {
+    (0..).find(|key| shard_of(*key, 4) == shard).unwrap_or(0)
+}
+
+#[test]
+fn a_gathering_pod_gives_back_a_part_counted_late_until_given_back() {
+    let mut node = Pod::new(1, "pod-1:7000".to_owned(), config(), [2, 3]);
+    let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
+    let first = table::first(&members, 4, 2, 1);
+    let mine = (0..4)
+        .find(|shard| first.owner(*shard) == Some(1))
+        .unwrap_or(0);
+    let theirs = (0..4)
+        .find(|shard| first.owner(*shard) == Some(2))
+        .unwrap_or(0);
+    let _ = node.receive(2, StoreMessage::TableReply { table: first }, ms(1));
+    let lease = |node: &mut Pod, now: Time| {
+        for peer in [2, 3] {
+            let heard = StoreMessage::Heartbeat {
+                term: node.store().term(),
+                leader: Some(2),
+                committed: node.store().committed_stamp(),
+                fresh: false,
+                sent: now,
+                wall: 0,
+                hears: vec![(1, now), (2, now), (3, now)],
+                leased: true,
+            };
+            let _ = node.receive(peer, heard, now);
+        }
+    };
+    lease(&mut node, ms(2));
+    let (own, other) = (key_in(mine), key_in(theirs));
+    let asked = node.receive(
+        1_000_000,
+        Message::Gather {
+            client: 1_000_000,
+            id: 7,
+            keys: vec![own, other],
+        },
+        ms(3),
+    );
+    let part = asked.iter().find_map(|(to, message)| match message {
+        Message::Request { id, key, .. } if *to == 2 && *key == other => Some(*id),
+        _ => None,
+    });
+    let Some(part) = part else {
+        panic!("pod 2's part never asked: {asked:?}");
+    };
+    // Past the gathering's time: reported not counted.
+    for at in 1..10 {
+        lease(&mut node, ms(3 + at * 5));
+        let _ = node.tick(ms(3 + at * 5));
+    }
+    let back_of = |out: &Outbox| {
+        out.iter().find_map(|(to, message)| match message {
+            Message::Request {
+                id,
+                key,
+                give_back: true,
+                rule: None,
+                receipt: 0,
+                ..
+            } if *to == 2 && *key == other => Some(*id),
+            _ => None,
+        })
+    };
+    let late = Message::Reply {
+        client: 1,
+        id: part,
+        answer: Answer::Counted(1),
+    };
+    let out = node.receive(2, late, ms(60));
+    let Some(back) = back_of(&out) else {
+        panic!("the part counted late never given back: {out:?}");
+    };
+    let refused = Message::Reply {
+        client: 1,
+        id: back,
+        answer: Answer::NotServing,
+    };
+    let _ = node.receive(2, refused, ms(61));
+    lease(&mut node, ms(62));
+    let again = node.tick(ms(62));
+    assert!(
+        back_of(&again).is_some(),
+        "never given back again: {again:?}"
+    );
+    // Never answered from then on, its answers maybe only late: sent `GIVE_BACK_SENDS`
+    // times unanswered in all, the answered one not counted, the second 100 ms after and the
+    // last a second after that, past a failover, then dropped.
+    let mut sends = vec![62];
+    for at in 1..=300 {
+        let now = ms(62 + at * 10);
+        lease(&mut node, now);
+        if back_of(&node.tick(now)).is_some() {
+            sends.push(62 + at * 10);
+        }
+    }
+    assert_eq!(sends, [62, 162, 1_162]);
+    assert_eq!(sends.len(), usize::from(GIVE_BACK_SENDS));
+    assert_eq!(node.giving_back(), 0, "give-backs still sent");
+}
+
+/// A pod gathering a request under keys of pods 2 and 3 asks a part again after
+/// `PART_AGAIN` unanswered: both asks of pod 2 counted, the second answer arriving while
+/// pod 3's part is still out, one completes pod 2's key and the other is given back.
+#[test]
+fn a_gathering_pod_gives_back_a_part_counted_twice() {
+    let mut node = Pod::new(1, "pod-1:7000".to_owned(), config(), [2, 3]);
+    let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
+    let first = table::first(&members, 4, 2, 1);
+    let of = |pod| {
+        (0..4)
+            .find(|shard| first.owner(*shard) == Some(pod))
+            .unwrap_or(0)
+    };
+    let (two, three) = (key_in(of(2)), key_in(of(3)));
+    let _ = node.receive(
+        2,
+        StoreMessage::TableReply {
+            table: first.clone(),
+        },
+        ms(1),
+    );
+    let lease = |node: &mut Pod, now: Time| {
+        for peer in [2, 3] {
+            let heard = StoreMessage::Heartbeat {
+                term: node.store().term(),
+                leader: Some(2),
+                committed: node.store().committed_stamp(),
+                fresh: false,
+                sent: now,
+                wall: 0,
+                hears: vec![(1, now), (2, now), (3, now)],
+                leased: true,
+            };
+            let _ = node.receive(peer, heard, now);
+        }
+    };
+    let asked = |out: &Outbox, pod: NodeId, wanted: Key| {
+        out.iter()
+            .filter_map(|(to, message)| match message {
+                Message::Request {
+                    id, key, give_back, ..
+                } if *to == pod && *key == wanted => Some((*id, *give_back)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    lease(&mut node, 2_000_000);
+    let gather = Message::Gather {
+        client: 1_000_000,
+        id: 7,
+        keys: vec![two, three],
+    };
+    let out = node.receive(1_000_000, gather, 3_000_000);
+    let mut asks = asked(&out, 2, two);
+    let Some((part_of_three, _)) = asked(&out, 3, three).first().copied() else {
+        panic!("pod 3's part never asked: {out:?}");
+    };
+    // Unanswered for a while: asked again.
+    lease(&mut node, 7_000_000);
+    asks.extend(asked(&node.tick(7_000_000), 2, two));
+    let [(part, false), (again, false)] = asks[..] else {
+        panic!("pod 2 not asked twice: {asks:?}");
+    };
+    let counted = |id| Message::Reply {
+        client: 1,
+        id,
+        answer: Answer::Counted(1),
+    };
+    let mut out = node.receive(2, counted(part), 8_000_000);
+    out.extend(node.receive(2, counted(again), 9_000_000));
+    let given_back = asked(&out, 2, two).iter().filter(|(_, back)| *back).count();
+    assert_eq!(given_back, 1, "{out:?}");
+    let out = node.receive(3, counted(part_of_three), 10_000_000);
+    let answered = out.iter().any(|(to, message)| {
+        *to == 1_000_000
+            && matches!(
+                message,
+                Message::Reply {
+                    answer: Answer::Counted(_),
+                    ..
+                }
+            )
+    });
+    assert!(answered, "the request never answered counted: {out:?}");
+}
+
+/// A pod gathering a request under two keys, its own and pod 2's: the request timing out,
+/// pod 2's part counted after is given back to it, and given back again when pod 2 says it
+/// was not, until it is.
+/// A part never answered is kept, to give back should it be counted late, for `PART_FOR`
+/// and no longer, its pod forgotten or not: a request timed out leaves nothing kept for
+/// good, and a pod forgotten, which may only be cut off, still has its late answer taken.
+#[test]
+fn a_part_unanswered_is_kept_for_a_while_its_pod_forgotten_or_not() {
+    let mut node = Pod::new(1, "pod-1:7000".to_owned(), config(), [2, 3]);
+    let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
+    let first = table::first(&members, 4, 2, 1);
+    let theirs = (0..4)
+        .find(|shard| first.owner(*shard) == Some(2))
+        .unwrap_or(0);
+    let _ = node.receive(
+        2,
+        StoreMessage::TableReply {
+            table: first.clone(),
+        },
+        ms(1),
+    );
+    let heard = |node: &mut Pod, peers: &[NodeId], now: Time| {
+        for peer in peers {
+            let beat = StoreMessage::Heartbeat {
+                term: node.store().term(),
+                leader: Some(3),
+                committed: node.store().committed_stamp(),
+                fresh: false,
+                sent: now,
+                wall: 0,
+                hears: vec![(1, now), (2, now), (3, now)],
+                leased: true,
+            };
+            let _ = node.receive(*peer, beat, now);
+        }
+    };
+    let gather = |node: &mut Pod, id: u64, now: Time| {
+        let ask = Message::Gather {
+            client: 1_000_000,
+            id,
+            keys: vec![key_in(theirs)],
+        };
+        node.receive(1_000_000, ask, now)
+            .into_iter()
+            .find_map(|(to, message)| match message {
+                Message::Request { id, .. } if to == 2 => Some(id),
+                _ => None,
+            })
+    };
+    // Pod 2 heard throughout, its answers never coming.
+    let _ = gather(&mut node, 1, ms(2));
+    let mut kept_at_5_s = 0;
+    for at in 1..=210 {
+        let now = ms(2 + at * 50);
+        heard(&mut node, &[2, 3], now);
+        let _ = node.tick(now);
+        if at == 100 {
+            kept_at_5_s = node.parts_kept();
+        }
+    }
+    assert_eq!(
+        kept_at_5_s, 1,
+        "a part counted late could not be given back"
+    );
+    assert!(
+        node.parts_kept() == 0,
+        "{} kept past PART_FOR",
+        node.parts_kept()
+    );
+    // Pod 2 cut off: heard no more, and the table leaves it out, a new pod having taken its
+    // vote, so that it is forgotten; its answer, only late, comes 2 s on.
+    let start = ms(10_600);
+    let part = gather(&mut node, 2, start);
+    let _ = node.tick(start + ms(20));
+    assert_eq!(node.parts_kept(), 1);
+    let survivors = [1, 3, 4].into_iter().collect();
+    let joining = [(4, "pod-4:7000".to_owned())].into();
+    let mut without =
+        table::repair(&first, &survivors, &survivors, &joining, 2).unwrap_or_else(|| first.clone());
+    assert!(!without.votes(2) && !without.has_member(2), "{without:?}");
+    without.version = first.version + 1;
+    let _ = node.receive(
+        3,
+        StoreMessage::TableReply { table: without },
+        start + ms(30),
+    );
+    for at in 1..=39 {
+        let now = start + ms(30 + at * 50);
+        heard(&mut node, &[3], now);
+        let _ = node.tick(now);
+    }
+    assert!(!node.store().peers().contains(&2), "pod 2 not forgotten");
+    let late = Message::Reply {
+        client: 1,
+        id: part.unwrap_or(0),
+        answer: Answer::Counted(1),
+    };
+    let out = node.receive(2, late, start + ms(2_000));
+    assert!(
+        out.iter().any(|(_, message)| matches!(message,
+            Message::Request { key, give_back: true, .. } if *key == key_in(theirs))),
+        "a part counted 2 s late, its pod forgotten, not given back: {out:?}"
+    );
+}
+
+/// A request refused for the limit charges nothing, so nothing of its key is copied: a
+/// saturated rolling window would otherwise be sent whole with every refusal.
+#[test]
+fn a_refused_request_sends_its_replicas_nothing() {
+    let mut node = member();
+    let table = node.store().committed().cloned().unwrap();
+    let shard = (0..4).find(|shard| table.owner(*shard) == Some(2)).unwrap();
+    for peer in [1, 3] {
+        let beat = StoreMessage::Heartbeat {
+            term: 1,
+            leader: Some(1),
+            committed: table.stamp(),
+            fresh: false,
+            sent: ms(2),
+            wall: 0,
+            hears: vec![(1, ms(2)), (2, ms(2)), (3, ms(2))],
+            leased: true,
+        };
+        let _ = node.receive(peer, beat, ms(2));
+    }
+    for (run, rule) in [
+        Rule::Rolling {
+            per: 2,
+            window: ms(1_000),
+            slots: 1_000,
+        },
+        Rule::Window {
+            per: 2,
+            window: ms(1_000),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = |offset: u64| ms(run as u64 * 100 + offset);
+        // A key of its own for each rule.
+        let key = (0..)
+            .filter(|key| shard_of(*key, 4) == shard)
+            .nth(run)
+            .unwrap_or(0);
+        let ask = |id| Message::Request {
+            client: 1_000_000,
+            id,
+            key,
+            stamp: table.stamp(),
+            hops: 0,
+            via: None,
+            give_back: false,
+            rule: Some(rule),
+            receipt: 0,
+        };
+        let _ = node.receive(9, ask(1), at(3));
+        let _ = node.receive(9, ask(2), at(4));
+        let _: Outbox = (5..=15).flat_map(|offset| node.tick(at(offset))).collect();
+        let refused = node.receive(9, ask(3), at(16));
+        assert!(
+            refused.iter().any(|(_, message)| matches!(
+                message,
+                Message::Reply {
+                    answer: Answer::Limited { .. },
+                    ..
+                }
+            )),
+            "{refused:?}"
+        );
+        let next: Outbox = (17..=30).flat_map(|offset| node.tick(at(offset))).collect();
+        let copied = next.iter().any(|(_, message)| {
+            matches!(message, Message::Store(StoreMessage::Replicate { after: Some(_), entries, .. })
+                if entries.iter().any(|(copied, _)| *copied == key))
+        });
+        assert!(!copied, "{rule:?}: a refusal copied: {next:?}");
+    }
+}
+
+/// A rolling window's copy of what changed carries only the slots changed since the last,
+/// not the up to a thousand the window holds: slots merge each by the larger, so a part is
+/// as safe as the whole.
+#[test]
+fn a_rolling_windows_copy_carries_only_the_slots_changed() {
+    let mut node = member();
+    let table = node.store().committed().cloned().unwrap();
+    let shard = (0..4).find(|shard| table.owner(*shard) == Some(2)).unwrap();
+    for peer in [1, 3] {
+        let beat = StoreMessage::Heartbeat {
+            term: 1,
+            leader: Some(1),
+            committed: table.stamp(),
+            fresh: false,
+            sent: ms(2),
+            wall: 0,
+            hears: vec![(1, ms(2)), (2, ms(2)), (3, ms(2))],
+            leased: true,
+        };
+        let _ = node.receive(peer, beat, ms(2));
+    }
+    let key = key_in(shard);
+    let rule = Rule::Rolling {
+        per: 100,
+        window: ms(1_000),
+        slots: 1_000,
+    };
+    let ask = |id| Message::Request {
+        client: 1_000_000,
+        id,
+        key,
+        stamp: table.stamp(),
+        hops: 0,
+        via: None,
+        give_back: false,
+        rule: Some(rule),
+        receipt: 0,
+    };
+    let slots_sent =
+        |out: &Outbox| {
+            out.iter()
+                .find_map(|(_, message)| match message {
+                    Message::Store(StoreMessage::Replicate {
+                        after: Some(_),
+                        entries,
+                        ..
+                    }) => entries
+                        .iter()
+                        .find(|(copied, _)| *copied == key)
+                        .map(|(_, kept)| match &kept.value {
+                            modes::Value::Synchronous(Value::Slots(slots)) => {
+                                slots.keys().copied().collect::<Vec<_>>()
+                            }
+                            _ => Vec::new(),
+                        }),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+    let _ = node.receive(9, ask(1), ms(3));
+    let _ = node.receive(9, ask(2), ms(4));
+    let first: Outbox = (5..=15).flat_map(|at| node.tick(ms(at))).collect();
+    assert_eq!(slots_sent(&first), vec![3, 4]);
+    let _ = node.receive(9, ask(3), ms(20));
+    let next: Outbox = (21..=35).flat_map(|at| node.tick(ms(at))).collect();
+    assert_eq!(slots_sent(&next), vec![20]);
+    // Raised by another's copy in the same cycle — an old owner's last changes — the key
+    // is copied on whole, the slots the copy brought with the one charged.
+    let _ = node.receive(9, ask(4), ms(40));
+    let last = StoreMessage::Handoff {
+        shard,
+        term: 1,
+        entries: vec![(
+            key,
+            Kept {
+                value: modes::Value::Synchronous(Value::Slots(
+                    [(36, (1, 0))].into_iter().collect(),
+                )),
+                forget_at: ms(10_000),
+            },
+        )],
+        dropped: Vec::new(),
+        part: 0,
+        more: false,
+    };
+    let _ = node.receive(1, last, ms(41));
+    let whole: Outbox = (42..=55).flat_map(|at| node.tick(ms(at))).collect();
+    assert_eq!(slots_sent(&whole), vec![3, 4, 20, 36, 40]);
+}
+
+/// An owner decides a request under a rule by its wall clock: admitted and charged with
+/// room, refused and charged nothing without; its wall clock a window on, admitted again.
+#[test]
+fn an_owner_decides_requests_under_a_rule_by_its_wall_clock() {
+    let mut node = member();
+    let table = node.store().committed().cloned().unwrap();
+    let shard = (0..4).find(|shard| table.owner(*shard) == Some(2)).unwrap();
+    for peer in [1, 3] {
+        let beat = StoreMessage::Heartbeat {
+            term: 1,
+            leader: Some(1),
+            committed: table.stamp(),
+            fresh: false,
+            sent: ms(2),
+            wall: 0,
+            hears: vec![(1, ms(2)), (2, ms(2)), (3, ms(2))],
+            leased: true,
+        };
+        let _ = node.receive(peer, beat, ms(2));
+    }
+    assert!(node.store().serves(shard, ms(3)));
+    let key = key_in(shard);
+    let rule = Rule::Window {
+        per: 1,
+        window: ms(100),
+    };
+    let ask = |id| Message::Request {
+        client: 1_000_000,
+        id,
+        key,
+        stamp: table.stamp(),
+        hops: 0,
+        via: None,
+        give_back: false,
+        rule: Some(rule),
+        receipt: 0,
+    };
+    let answer = |out: Outbox| {
+        out.into_iter().find_map(|(_, message)| match message {
+            Message::Reply { answer, .. } => Some(answer),
+            _ => None,
+        })
+    };
+    let window = rule.window_of(key, ms(3));
+    assert_eq!(
+        answer(node.receive(9, ask(1), ms(3))),
+        Some(Answer::Admitted(window))
+    );
+    // Refused until its window ends, within the window's length.
+    let refused = answer(node.receive(9, ask(2), ms(3)));
+    assert!(
+        matches!(refused, Some(Answer::Limited { wait }) if wait > 0 && wait <= ms(100)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        node.store().value(key).map(|value| net(&value)),
+        Some(1),
+        "a refusal charged"
+    );
+    node.store_mut()
+        .set_wall_offset(i64::try_from(ms(100)).unwrap());
+    assert_eq!(
+        answer(node.receive(9, ask(3), ms(3))),
+        Some(Answer::Admitted(window + 1))
+    );
+}
+
+/// A replica set to decide forwards a data plane's request while it hears the key's owner,
+/// and once it has not for `stop_serving`, decides it from its copy as the owner would —
+/// admitted, refused, a give-back credited — sending the owner nothing; set not to, it
+/// forwards it still.
+#[test]
+fn a_forwarder_decides_from_its_copy_once_the_owner_is_unheard() {
+    let mut node = member();
+    node.set_forwarding(true);
+    let table = node.store().committed().cloned().unwrap();
+    let shard = (0..4).find(|shard| table.owner(*shard) == Some(1)).unwrap();
+    let key = key_in(shard);
+    let beat = |node: &mut Pod, from: NodeId, now: Time| {
+        let beat = StoreMessage::Heartbeat {
+            term: 1,
+            leader: Some(1),
+            committed: table.stamp(),
+            fresh: false,
+            sent: now,
+            wall: 0,
+            hears: vec![(1, now), (2, now), (3, now)],
+            leased: true,
+        };
+        let _ = node.receive(from, beat, now);
+    };
+    beat(&mut node, 1, ms(2));
+    beat(&mut node, 3, ms(2));
+    // The owner then unheard, the third pod still heard.
+    beat(&mut node, 3, ms(300));
+    let rule = Rule::Window {
+        per: 1,
+        window: ms(10_000),
+    };
+    let ask = |id, give_back, receipt| Message::Request {
+        client: 1_000_000,
+        id,
+        key,
+        stamp: table.stamp(),
+        hops: 0,
+        via: None,
+        give_back,
+        rule: Some(rule),
+        receipt,
+    };
+    let forwarded = |out: &Outbox| {
+        out.iter()
+            .any(|(to, message)| *to == 1 && matches!(message, Message::Request { .. }))
+    };
+    let answer = |out: &Outbox| {
+        out.iter().find_map(|(to, message)| match message {
+            Message::Reply { answer, .. } if *to == 1_000_000 => Some(answer.clone()),
+            _ => None,
+        })
+    };
+    let mut off = node.clone();
+    node.set_forwarder_decides(true);
+    let heard = node.receive(9, ask(1, false, 0), ms(3));
+    assert!(
+        forwarded(&heard),
+        "its owner heard, not forwarded: {heard:?}"
+    );
+    assert_eq!(answer(&heard), None);
+    let window = rule.window_of(key, ms(420));
+    let admitted = node.receive(9, ask(2, false, 0), ms(420));
+    assert_eq!(answer(&admitted), Some(Answer::Admitted(window)));
+    assert!(!forwarded(&admitted), "{admitted:?}");
+    let refused = node.receive(9, ask(3, false, 0), ms(421));
+    assert!(
+        matches!(answer(&refused), Some(Answer::Limited { wait }) if wait > 0),
+        "{refused:?}"
+    );
+    let back = node.receive(9, ask(4, true, window), ms(422));
+    assert!(
+        matches!(answer(&back), Some(Answer::Counted(_))),
+        "{back:?}"
+    );
+    assert_eq!(node.count(key), Some(0));
+    // A request another pod forwarded is the owner's alone: told it is elsewhere.
+    let forwarded_here = Message::Request {
+        client: 1_000_000,
+        id: 5,
+        key,
+        stamp: table.stamp(),
+        hops: 1,
+        via: Some(3),
+        give_back: false,
+        rule: Some(rule),
+        receipt: 0,
+    };
+    let elsewhere = node.receive(3, forwarded_here, ms(423));
+    assert!(
+        elsewhere.iter().any(|(_, message)| matches!(
+            message,
+            Message::Reply {
+                answer: Answer::Elsewhere(_),
+                ..
+            }
+        )),
+        "{elsewhere:?}"
+    );
+    assert_eq!(node.count(key), Some(0));
+    assert_eq!(node.decided_from_copy(), 3);
+    let still = off.receive(9, ask(2, false, 0), ms(420));
+    assert!(forwarded(&still), "set not to, not forwarded: {still:?}");
+    assert_eq!(off.decided_from_copy(), 0);
+}

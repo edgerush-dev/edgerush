@@ -1,6 +1,6 @@
 [package]
 name = "edgerush-ratelimit-service"
-description = "EdgeRush's rate-limiting service: the cluster store's pods, of either mode, over gRPC, the data planes' streams to them, and the binary that runs one"
+description = "EdgeRush's rate-limiting service: the cluster store's pods, each serving both modes, over gRPC, the data planes' streams to them, and the binary that runs one"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

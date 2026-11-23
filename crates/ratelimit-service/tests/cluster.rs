@@ -20,7 +20,8 @@ use edgerush_cluster::{
     Authority, Changed, Config, Kept, Key, Message as StoreMessage, Node, NodeId, Stamp, Table,
     Time, generation_of, ms,
 };
-use edgerush_cluster_synchronous::{Answer, Message as ModeMessage, Rule, Value};
+use edgerush_cluster_modes::{Message as BothMessage, Value};
+use edgerush_cluster_synchronous::{Answer, Message as ModeMessage, Rule, Value as SyncValue};
 use edgerush_ratelimit_service::cluster::forming::{self, Forming};
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::plane::{Plane, Told};
@@ -420,10 +421,18 @@ fn keys() -> Vec<Key> {
 
 /// A key's value, counted `counted`.
 fn count(counted: u64) -> Value {
-    Value::Count {
+    Value::Synchronous(SyncValue::Count {
         window: 1,
         counted,
         given: 0,
+    })
+}
+
+/// What a value of the synchronous mode's holds counted, less what was given back.
+fn net(value: &Value) -> u64 {
+    match value {
+        Value::Synchronous(value) => value.net(),
+        other => panic!("{other:?} under a synchronous key"),
     }
 }
 
@@ -635,13 +644,13 @@ fn key_owned_by(table: &Table, owner: NodeId) -> Key {
 }
 
 /// A request under `key` from `client`, numbered `id`, its table `stamp`, held to `rule`.
-const fn request(
+const fn request<V>(
     client: NodeId,
     id: u64,
     key: Key,
     stamp: Stamp,
     rule: Option<Rule>,
-) -> ModeMessage {
+) -> ModeMessage<V> {
     ModeMessage::Request {
         client,
         id,
@@ -659,11 +668,11 @@ const fn request(
 async fn answered(client: &mut StoreClient, id: u64, most: Duration) -> Option<Answer> {
     let answer = async {
         loop {
-            if let ModeMessage::Reply {
+            if let BothMessage::Synchronous(ModeMessage::Reply {
                 id: answered,
                 answer,
                 ..
-            } = client.answer().await?
+            }) = client.answer().await?
                 && answered == id
             {
                 return Some(answer);
@@ -701,7 +710,7 @@ async fn told_answer(stream: &mut DecideStream, id: u64, most: Duration) -> Opti
 
 /// What `pod` holds counted under `key`, less what was given back.
 async fn held_at(pod: &StorePod, key: Key) -> Option<u64> {
-    pod.with(move |node, _| node.value(key).map(|value| value.net()))
+    pod.with(move |node, _| node.value(key).map(|value| net(&value)))
         .await
         .flatten()
 }
@@ -794,11 +803,11 @@ async fn when_a_follower_crashes_its_keys_are_held_by_their_new_owners() {
                 pods[&at]
                     .with(move |node, now| {
                         node.update(key, now, |kept: &mut Kept<Value>, _| {
-                            kept.value = Value::Count {
+                            kept.value = Value::Synchronous(SyncValue::Count {
                                 window: 1,
                                 counted,
                                 given: 0,
-                            };
+                            });
                             kept.forget_at = Time::MAX;
                             ((), Changed::Whole)
                         })
@@ -841,7 +850,7 @@ async fn when_a_follower_crashes_its_keys_are_held_by_their_new_owners() {
             .with(move |node, _| node.value(key))
             .await;
         let counted = match value.flatten() {
-            Some(Value::Count { counted, .. }) => counted,
+            Some(Value::Synchronous(SyncValue::Count { counted, .. })) => counted,
             other => panic!("key {key} at {owner}: {other:?}"),
         };
         assert!(
@@ -941,7 +950,13 @@ async fn a_request_at_a_pod_not_its_keys_owner_is_forwarded_and_counted_once() {
     let mut client = cluster.pod(1).client().await.unwrap();
     assert!(
         client
-            .ask(request(client.id(), 1, key, table.stamp(), None))
+            .ask(BothMessage::Synchronous(request(
+                client.id(),
+                1,
+                key,
+                table.stamp(),
+                None
+            )))
             .await
     );
     let answer = answered(&mut client, 1, ANSWERED).await;
@@ -958,14 +973,28 @@ async fn a_request_at_a_pod_not_its_keys_owner_is_told_elsewhere() {
     let table = committed(cluster.pod(1)).await.unwrap();
     let key = key_owned_by(&table, 2);
     let mut client = cluster.pod(1).client().await.unwrap();
-    client.ask(request(client.id(), 1, key, (0, 0), None)).await;
+    client
+        .ask(BothMessage::Synchronous(request(
+            client.id(),
+            1,
+            key,
+            (0, 0),
+            None,
+        )))
+        .await;
     let older = answered(&mut client, 1, ANSWERED).await;
     assert!(
         matches!(&older, Some(Answer::Elsewhere(Some(told))) if told.stamp() == table.stamp()),
         "{older:?}"
     );
     client
-        .ask(request(client.id(), 2, key, table.stamp(), None))
+        .ask(BothMessage::Synchronous(request(
+            client.id(),
+            2,
+            key,
+            table.stamp(),
+            None,
+        )))
         .await;
     let same = answered(&mut client, 2, ANSWERED).await;
     assert_eq!(same, Some(Answer::Elsewhere(None)));
@@ -987,7 +1016,13 @@ async fn a_request_past_its_limit_is_refused_with_how_long_to_wait() {
     };
     let mut client = cluster.pod(1).client().await.unwrap();
     client
-        .ask(request(client.id(), 1, key, table.stamp(), Some(rule)))
+        .ask(BothMessage::Synchronous(request(
+            client.id(),
+            1,
+            key,
+            table.stamp(),
+            Some(rule),
+        )))
         .await;
     let admitted = answered(&mut client, 1, ANSWERED).await;
     assert!(
@@ -995,7 +1030,13 @@ async fn a_request_past_its_limit_is_refused_with_how_long_to_wait() {
         "{admitted:?}"
     );
     client
-        .ask(request(client.id(), 2, key, table.stamp(), Some(rule)))
+        .ask(BothMessage::Synchronous(request(
+            client.id(),
+            2,
+            key,
+            table.stamp(),
+            Some(rule),
+        )))
         .await;
     let refused = answered(&mut client, 2, ANSWERED).await;
     assert!(
@@ -1020,7 +1061,7 @@ async fn a_request_under_several_keys_is_gathered_and_counted_at_each_owner() {
         id: 1,
         keys: keys.iter().map(|(_, key)| *key).collect(),
     };
-    assert!(client.ask(gather).await);
+    assert!(client.ask(BothMessage::Synchronous(gather)).await);
     let answer = answered(&mut client, 1, ANSWERED).await;
     assert_eq!(answer, Some(Answer::Counted(0)));
     // Once, or twice should a part's first answer have been only late, the gathering pod
@@ -1050,7 +1091,7 @@ async fn a_request_gathered_with_a_parts_owner_crashed_is_not_counted_and_given_
         keys: keys.iter().map(|(_, key)| *key).collect(),
     };
     let asked = Instant::now();
-    client.ask(gather).await;
+    client.ask(BothMessage::Synchronous(gather)).await;
     let answer = answered(&mut client, 1, ANSWERED).await;
     let took = asked.elapsed();
     assert_eq!(answer, Some(Answer::NotServing));
@@ -1085,7 +1126,13 @@ async fn an_owner_cut_off_answers_not_serving() {
     let key = key_owned_by(&table, 2);
     let mut client = cluster.pod(2).client().await.unwrap();
     client
-        .ask(request(client.id(), 1, key, table.stamp(), None))
+        .ask(BothMessage::Synchronous(request(
+            client.id(),
+            1,
+            key,
+            table.stamp(),
+            None,
+        )))
         .await;
     let answer = answered(&mut client, 1, ANSWERED).await;
     assert_eq!(answer, Some(Answer::NotServing));
@@ -1663,7 +1710,13 @@ async fn what_a_pods_scrape_shows_is_its_stores() {
     let key = key_owned_by(&table, 2);
     let mut client = cluster.pod(2).client().await.unwrap();
     client
-        .ask(request(client.id(), 1, key, table.stamp(), None))
+        .ask(BothMessage::Synchronous(request(
+            client.id(),
+            1,
+            key,
+            table.stamp(),
+            None,
+        )))
         .await;
     assert_eq!(
         answered(&mut client, 1, ANSWERED).await,

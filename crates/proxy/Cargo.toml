@@ -70,6 +70,9 @@ tokio-boring.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+# The rate-limiting service's pod, both modes, for the pods the data plane is tested
+# against.
+edgerush-cluster-modes.workspace = true
 # Certificates made on the spot, for listeners and upstreams under test.
 edgerush-certificates = { workspace = true, features = ["testing"] }
 # A fake API server, for the namespaces followed.

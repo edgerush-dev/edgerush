@@ -8,7 +8,7 @@
 )]
 
 use edgerush_cluster::Message;
-use edgerush_cluster_synchronous::Value;
+use edgerush_cluster_modes::Value;
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::pod::{StorePod, StoreServer, ask};
 use edgerush_ratelimit_service::grpc::Client;

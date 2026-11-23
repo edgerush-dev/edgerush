@@ -11,7 +11,7 @@
 use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
 use edgerush_certificates::testing::Authority;
 use edgerush_cluster::Message;
-use edgerush_cluster_synchronous::Value;
+use edgerush_cluster_modes::Value;
 use edgerush_config::Certificate;
 use edgerush_control_service::TlsError;
 use edgerush_ratelimit_service::cluster::link::Dial;

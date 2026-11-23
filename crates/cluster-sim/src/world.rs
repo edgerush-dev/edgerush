@@ -8,91 +8,17 @@ use edgerush_cluster::table::Table;
 use edgerush_cluster::{
     Authority, Config, Held, KEY_BYTES, Key, Node, NodeId, ShardId, Time, generation_of, ms,
 };
+use edgerush_cluster_modes::{Message, Value};
 use edgerush_cluster_synchronous::Rule;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
-use std::fmt::Debug;
 
 mod asynchronous;
 mod both;
 mod synchronous;
 
 pub use asynchronous::{Beside, CYCLE, Fleet, Plane};
-pub use both::{Both, Caller};
-
-/// The world of the synchronous mode's clients: a world of both modes' pods, as every world is.
-pub type Synchronous = Both;
-
-/// The world of the asynchronous mode's data planes, likewise.
-pub type Asynchronous = Both;
-
-/// A rate-limiting mode as the world runs it: its pods over their stores, the messages they
-/// and its clients send, and its clients, standing for data planes. The world's network,
-/// clocks, faults, control plane and checks are every mode's; how a client sends, is
-/// answered and is measured is the mode's own.
-pub trait Mode: Sized {
-    /// What its pods' stores keep under each key.
-    type Value: Held;
-    /// One of its pods, over its store.
-    type Pod: Clone + Debug;
-    /// What its pods and clients send, the store's among it.
-    type Message: Clone + Debug + From<StoreMessage<Self::Value>>;
-    /// One of its clients, standing for a data plane.
-    type Client;
-
-    /// Pod `id`, new, knowing how to reach `peers`, forwarding requests for shards not its own
-    /// if `forwarding`, as the mode does, and deciding those it would forward from its copy,
-    /// their owner unheard, if `decides`.
-    fn pod(
-        id: NodeId,
-        config: Config,
-        peers: Vec<NodeId>,
-        forwarding: bool,
-        decides: bool,
-    ) -> Self::Pod;
-    /// A pod's store.
-    fn store(pod: &Self::Pod) -> &Node<Self::Value>;
-    /// A pod's store, to change.
-    fn store_mut(pod: &mut Self::Pod) -> &mut Node<Self::Value>;
-    /// A pod's timer at `now`, on its own clock.
-    fn tick(pod: &mut Self::Pod, now: Time) -> Vec<(NodeId, Self::Message)>;
-    /// `message` from `from` reaching a pod at `now`, on its own clock.
-    fn receive(
-        pod: &mut Self::Pod,
-        from: NodeId,
-        message: Self::Message,
-        now: Time,
-    ) -> Vec<(NodeId, Self::Message)>;
-    /// The store's message `message` carries, if it is one.
-    fn as_store(message: &Self::Message) -> Option<&StoreMessage<Self::Value>>;
-    /// The same, taken.
-    fn into_store(message: Self::Message) -> Option<StoreMessage<Self::Value>>;
-    /// The name of `message`'s kind, for the bytes sent by kind.
-    fn kind(message: &Self::Message) -> &'static str;
-    /// About how many bytes `message` takes on the wire.
-    fn size(message: &Self::Message) -> u64;
-    /// What the mode watches of every message sent, before the network takes it.
-    fn on_send(world: &mut Sim<Self>, from: NodeId, to: NodeId, message: &Self::Message);
-    /// A client's `message` to pod `to` found unreachable, its stream down or the pod gone.
-    fn unreachable(world: &mut Sim<Self>, from: NodeId, to: NodeId, message: &Self::Message);
-    /// Client `id`'s turn to send.
-    fn client_send(world: &mut Sim<Self>, id: NodeId);
-    /// Client `id`'s check of what it has in flight, every millisecond.
-    fn client_check(world: &mut Sim<Self>, id: NodeId);
-    /// Client `client` told its request `id` could not reach `pod`.
-    fn client_unreachable(world: &mut Sim<Self>, client: NodeId, id: u64, pod: NodeId);
-    /// `message` from `from` reaching client `id`.
-    fn deliver_to_client(world: &mut Sim<Self>, from: NodeId, id: NodeId, message: Self::Message);
-    /// The keys whose hits `message` brings a pod to apply, as its store keeps them: none, in a
-    /// mode that does not count them.
-    fn reported(_message: &Self::Message) -> Vec<Key> {
-        Vec::new()
-    }
-    /// Hits a pod has applied to `key`, each once, in the value it holds of it now.
-    fn counted(_pod: &Self::Pod, _key: Key) -> u64 {
-        0
-    }
-}
+pub use both::Caller;
 
 /// How long a drained pod's process goes on before it ends: longer than any request's deadline,
 /// so that what it has in flight is answered.
@@ -165,8 +91,8 @@ impl Link {
 
 /// One pod as the world runs it.
 #[derive(Clone, Debug)]
-struct Pod<P> {
-    node: P,
+struct Pod {
+    node: edgerush_cluster_modes::Pod,
     alive: bool,
     /// When it started, on the world's clock.
     started: Time,
@@ -185,14 +111,14 @@ struct Pod<P> {
     frozen_until: Option<Time>,
 }
 
-impl<P> Pod<P> {
+impl Pod {
     /// Until when it is frozen, if it is at `now`.
     fn frozen(&self, now: Time) -> Option<Time> {
         self.frozen_until.filter(|until| *until > now)
     }
 }
 
-impl<P> Pod<P> {
+impl Pod {
     /// Its own clock at the world's `now`.
     fn local(&self, now: Time) -> Time {
         let run = i128::from(now.saturating_sub(self.started));
@@ -203,7 +129,11 @@ impl<P> Pod<P> {
 
 /// What can happen next.
 #[derive(Clone, Debug)]
-enum Event<Message> {
+#[allow(
+    clippy::large_enum_variant,
+    reason = "most events are messages delivered: boxing them would allocate for each"
+)]
+enum Event {
     Deliver {
         from: NodeId,
         to: NodeId,
@@ -300,15 +230,15 @@ impl Stats {
     }
 }
 
-/// The world, running mode `M`.
-pub struct Sim<M: Mode> {
+/// The world: pods of both modes, each over one store, and either mode's clients.
+pub struct World {
     now: Time,
     rng: Rng,
     queue: BinaryHeap<Reverse<(Time, u64)>>,
-    events: BTreeMap<u64, Event<M::Message>>,
+    events: BTreeMap<u64, Event>,
     seq: u64,
-    pods: BTreeMap<NodeId, Pod<M::Pod>>,
-    clients: BTreeMap<NodeId, M::Client>,
+    pods: BTreeMap<NodeId, Pod>,
+    clients: BTreeMap<NodeId, Caller>,
     default_link: Link,
     links: BTreeMap<(NodeId, NodeId), Link>,
     last_arrival: BTreeMap<(NodeId, NodeId), Time>,
@@ -380,10 +310,7 @@ pub struct Sim<M: Mode> {
     judged_gone: BTreeSet<NodeId>,
 }
 
-/// The world running the synchronous mode.
-pub type World = Sim<Synchronous>;
-
-impl<M: Mode> Sim<M> {
+impl World {
     /// An empty world from `seed`, its pods to be started with `config`.
     #[must_use]
     pub fn new(seed: u64, config: Config) -> Self {
@@ -491,7 +418,7 @@ impl<M: Mode> Sim<M> {
         &self.config
     }
 
-    fn schedule(&mut self, at: Time, event: Event<M::Message>) {
+    fn schedule(&mut self, at: Time, event: Event) {
         self.seq += 1;
         self.events.insert(self.seq, event);
         self.queue.push(Reverse((at, self.seq)));
@@ -523,7 +450,7 @@ impl<M: Mode> Sim<M> {
 
     fn spawn(&mut self, id: NodeId, config: Config, peers: impl IntoIterator<Item = NodeId>) {
         let peers = peers.into_iter().collect();
-        let node = M::pod(id, config, peers, self.forwarding, self.forwarder_decides);
+        let node = both::pod(id, config, peers, self.forwarding, self.forwarder_decides);
         // A clock started anywhere in its first second.
         let offset = self.rng.below(ms(1_000));
         self.pods.insert(
@@ -617,8 +544,8 @@ impl<M: Mode> Sim<M> {
 
     /// The pod `id`'s node.
     #[must_use]
-    pub fn node(&self, id: NodeId) -> Option<&Node<M::Value>> {
-        self.pods.get(&id).map(|pod| M::store(&pod.node))
+    pub fn node(&self, id: NodeId) -> Option<&Node<Value>> {
+        self.pods.get(&id).map(|pod| pod.node.store())
     }
 
     /// Whether `id` is alive.
@@ -632,8 +559,8 @@ impl<M: Mode> Sim<M> {
     pub fn leader(&self) -> Option<NodeId> {
         self.pods
             .iter()
-            .filter(|(_, pod)| pod.alive && M::store(&pod.node).is_leader())
-            .max_by_key(|(_, pod)| M::store(&pod.node).term())
+            .filter(|(_, pod)| pod.alive && pod.node.store().is_leader())
+            .max_by_key(|(_, pod)| pod.node.store().term())
             .map(|(id, _)| *id)
     }
 
@@ -643,7 +570,7 @@ impl<M: Mode> Sim<M> {
         self.pods
             .values()
             .filter(|pod| pod.alive)
-            .filter_map(|pod| M::store(&pod.node).committed())
+            .filter_map(|pod| pod.node.store().committed())
             .max_by_key(|table| table.stamp())
     }
 
@@ -677,7 +604,7 @@ impl<M: Mode> Sim<M> {
         if let Some(pod) = self.pods.get_mut(&id)
             && pod.alive
         {
-            M::store_mut(&mut pod.node).drain();
+            pod.node.store_mut().drain();
             pod.draining_since = Some(self.now);
         }
     }
@@ -843,26 +770,26 @@ impl<M: Mode> Sim<M> {
         &self.long_way
     }
 
-    fn handle(&mut self, event: Event<M::Message>) {
+    fn handle(&mut self, event: Event) {
         match event {
             Event::Deliver { from, to, message } => self.deliver(from, to, message),
             Event::Tick(id) => self.on_tick(id),
             Event::ControlTick => self.on_control_tick(),
-            Event::ClientSend(id) => M::client_send(self, id),
-            Event::ClientCheck(id) => M::client_check(self, id),
-            Event::Unreachable { client, id, pod } => M::client_unreachable(self, client, id, pod),
+            Event::ClientSend(id) => self.client_send(id),
+            Event::ClientCheck(id) => self.client_check(id),
+            Event::Unreachable { client, id, pod } => self.client_unreachable(client, id, pod),
             Event::Sample => self.on_sample(),
         }
     }
 
-    fn send(&mut self, from: NodeId, to: NodeId, message: M::Message) {
+    fn send(&mut self, from: NodeId, to: NodeId, message: Message) {
         if let Some(StoreMessage::Replicate {
             shard,
             term,
             version,
             part,
             ..
-        }) = M::as_store(&message)
+        }) = both::as_store(&message)
             && !self
                 .copies
                 .insert((from, to, *shard, *term, *version, *part))
@@ -882,7 +809,7 @@ impl<M: Mode> Sim<M> {
                 more,
                 ..
             },
-        ) = M::as_store(&message)
+        ) = both::as_store(&message)
         {
             let bytes = entries.iter().map(|(_, kept)| kept.bytes()).sum::<u64>()
                 + KEY_BYTES * dropped.len() as u64;
@@ -893,22 +820,25 @@ impl<M: Mode> Sim<M> {
                 self.stats.parts_more += 1;
             }
         }
-        M::on_send(self, from, to, &message);
+        self.on_send(from, to, &message);
         let link = self.link(from, to);
         if link.cut {
             // A client knows its stream to a pod is down, as a data plane does from a connect
             // that fails or a stream that breaks.
-            M::unreachable(self, from, to, &message);
+            self.found_unreachable(from, to, &message);
             return;
         }
         let Some(late) = late_by(&link, &mut self.rng) else {
             return;
         };
         // Sent once the link has sent what it already had, taking its size's time.
-        let bytes = M::size(&message);
+        let bytes = both::size(&message);
         let sending = bytes.saturating_mul(1_000_000_000) / link.bandwidth.max(1);
-        let bulk =
-            self.lanes && matches!(M::as_store(&message), Some(StoreMessage::Replicate { .. }));
+        let bulk = self.lanes
+            && matches!(
+                both::as_store(&message),
+                Some(StoreMessage::Replicate { .. })
+            );
         let free = self.link_free.get(&(from, to, bulk)).copied().unwrap_or(0);
         let sent = self.now.max(free) + sending;
         self.link_free.insert((from, to, bulk), sent);
@@ -916,7 +846,7 @@ impl<M: Mode> Sim<M> {
         *self
             .stats
             .bytes_by_kind
-            .entry(M::kind(&message))
+            .entry(both::kind(&message))
             .or_insert(0) += bytes;
         let delay = link.delay + self.rng.below(link.jitter.max(1));
         // In order along one lane, as along one stream.
@@ -930,7 +860,7 @@ impl<M: Mode> Sim<M> {
     fn on_control_tick(&mut self) {
         if !self.control_down {
             let running = self.api_running();
-            let out = self.authority.tick::<M::Value>(self.now, &running);
+            let out = self.authority.tick::<Value>(self.now, &running);
             for (to, message) in out {
                 self.send(CONTROL, to, message.into());
             }
@@ -939,17 +869,17 @@ impl<M: Mode> Sim<M> {
         self.schedule(next, Event::ControlTick);
     }
 
-    fn deliver(&mut self, from: NodeId, to: NodeId, message: M::Message) {
+    fn deliver(&mut self, from: NodeId, to: NodeId, message: Message) {
         if to == CONTROL {
             if !self.control_down
-                && let Some(message) = M::into_store(message)
+                && let Some(message) = both::into_store(message)
             {
                 self.authority.receive(from, message);
             }
             return;
         }
         if to >= CLIENT_BASE {
-            M::deliver_to_client(self, from, to, message);
+            self.deliver_to_caller(from, to, message);
             return;
         }
         let now = self.now;
@@ -958,7 +888,7 @@ impl<M: Mode> Sim<M> {
                 self.stats.to_gone += 1;
             }
             // A pod gone resets its streams.
-            M::unreachable(self, from, to, &message);
+            self.found_unreachable(from, to, &message);
             return;
         }
         let Some(pod) = self.pods.get_mut(&to) else {
@@ -969,17 +899,19 @@ impl<M: Mode> Sim<M> {
             return;
         }
         let local = pod.local(now);
-        M::store_mut(&mut pod.node).set_wall_offset(wall_offset(now, local, pod.skew));
-        let reported = M::reported(&message);
+        pod.node
+            .store_mut()
+            .set_wall_offset(wall_offset(now, local, pod.skew));
+        let reported = both::reported(&message);
         let before: Vec<u64> = reported
             .iter()
-            .map(|key| M::counted(&pod.node, *key))
+            .map(|key| both::counted(&pod.node, *key))
             .collect();
-        let out = M::receive(&mut pod.node, from, message, local);
+        let out = pod.node.receive(from, message, local);
         for (key, before) in reported.iter().zip(before) {
             // Lower after, the key was made afresh (its contract changed): what it holds now
             // was applied in this step.
-            let after = M::counted(&pod.node, *key);
+            let after = both::counted(&pod.node, *key);
             let rose = if after >= before {
                 after - before
             } else {
@@ -1011,11 +943,13 @@ impl<M: Mode> Sim<M> {
             return;
         }
         let local = pod.local(now);
-        M::store_mut(&mut pod.node).set_wall_offset(wall_offset(now, local, pod.skew));
-        let out = M::tick(&mut pod.node, local);
+        pod.node
+            .store_mut()
+            .set_wall_offset(wall_offset(now, local, pod.skew));
+        let out = pod.node.tick(local);
         // A drained pod's process ends once what it has in flight is answered — requests it
         // forwarded, their answers coming back through it — as a graceful shutdown does.
-        let drained = M::store(&pod.node).drained()
+        let drained = pod.node.store().drained()
             && now.saturating_sub(*pod.drained_since.get_or_insert(now)) >= LINGER;
         let overdue = pod
             .draining_since
@@ -1033,12 +967,12 @@ impl<M: Mode> Sim<M> {
     }
 
     /// Sends what pod `id` gave back, then checks what must never happen.
-    fn after(&mut self, id: NodeId, out: Vec<(NodeId, M::Message)>) {
+    fn after(&mut self, id: NodeId, out: Vec<(NodeId, Message)>) {
         for (to, message) in out {
             self.send(id, to, message);
         }
         if let Some(pod) = self.pods.get(&id) {
-            let unanswered = M::store(&pod.node).most_unanswered_bytes();
+            let unanswered = pod.node.store().most_unanswered_bytes();
             self.stats.most_unanswered = self.stats.most_unanswered.max(unanswered);
         }
         self.check(id);
@@ -1048,8 +982,8 @@ impl<M: Mode> Sim<M> {
         let Some(pod) = self.pods.get(&id) else {
             return;
         };
-        if M::store(&pod.node).is_leader() {
-            let term = M::store(&pod.node).term();
+        if pod.node.store().is_leader() {
+            let term = pod.node.store().term();
             match self.leaders.get(&term) {
                 Some(other) if *other != id => {
                     self.stats
@@ -1063,14 +997,14 @@ impl<M: Mode> Sim<M> {
                 }
             }
         }
-        if let Some(table) = M::store(&pod.node).committed()
+        if let Some(table) = pod.node.store().committed()
             && !self.tables.contains_key(&table.stamp())
         {
             let stamp = table.stamp();
             let accepted = |member: NodeId| {
                 self.pods
                     .get(&member)
-                    .is_some_and(|pod| M::store(&pod.node).accepted() >= stamp)
+                    .is_some_and(|pod| pod.node.store().accepted() >= stamp)
             };
             // The table before, in the same generation: a generation's first needs only those
             // the control plane named, its own voting set.
@@ -1097,7 +1031,7 @@ impl<M: Mode> Sim<M> {
         let Some(pod) = self.pods.get(&id) else {
             return;
         };
-        if let Some(table) = M::store(&pod.node).committed() {
+        if let Some(table) = pod.node.store().committed() {
             match self.tables.get(&table.stamp()) {
                 Some(seen) if seen != table => {
                     let stamp = table.stamp();
@@ -1213,7 +1147,7 @@ impl<M: Mode> Sim<M> {
                 .filter(|(_, pod)| {
                     pod.alive
                         && pod.frozen(now).is_none()
-                        && M::store(&pod.node).serves(shard, pod.local(now))
+                        && pod.node.store().serves(shard, pod.local(now))
                 })
                 .map(|(id, _)| *id)
                 .collect();
@@ -1249,7 +1183,7 @@ impl<M: Mode> Sim<M> {
                 !self
                     .pods
                     .values()
-                    .any(|pod| pod.alive && M::store(&pod.node).serves(*shard, pod.local(now)))
+                    .any(|pod| pod.alive && pod.node.store().serves(*shard, pod.local(now)))
             })
             .map(|shard| (shard, table.and_then(|table| table.owner(shard))))
             .collect()
@@ -1260,7 +1194,7 @@ impl<M: Mode> Sim<M> {
     pub fn ready(&self, id: NodeId) -> bool {
         self.pods
             .get(&id)
-            .is_some_and(|pod| pod.alive && M::store(&pod.node).ready(pod.local(self.now)))
+            .is_some_and(|pod| pod.alive && pod.node.store().ready(pod.local(self.now)))
     }
 
     /// The control plane's namings without the latest table, having waited it out.

@@ -10,11 +10,9 @@
 )]
 
 use edgerush_cluster::{Config, NodeId, ms};
-use edgerush_cluster_sim::{Asynchronous, Link, Sim, worst_excess};
+use edgerush_cluster_sim::{Link, World, worst_excess};
 use edgerush_ratelimit::service::Contract;
 use std::num::NonZeroU64;
-
-type World = Sim<Asynchronous>;
 
 const PLANES: u64 = 8;
 const KEYS: u64 = 16;

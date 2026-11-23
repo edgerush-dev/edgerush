@@ -1,6 +1,6 @@
-//! A pod of both modes against each mode's own pod (G1, docs/06 §4): the same messages to each,
-//! at the same times, give the same answers, and leave the same values and the same bytes,
-//! whatever a mode's requests or batches are. And a data plane's keys of the other mode's are
+//! A pod of both modes against each mode alone, its logic over a store of its own values (G1,
+//! docs/06 §4): the same messages to each, at the same times, give the same answers, and leave
+//! the same values and the same bytes, whatever a mode's requests or batches are. And a data plane's keys of the other mode's are
 //! never served, nor held.
 
 #![allow(
@@ -10,7 +10,7 @@
     reason = "test set-up: the helpers around the tests fail them the way the tests would"
 )]
 
-use edgerush_cluster::{Config, Key, Message as StoreMessage, NodeId, Time, ms, table};
+use edgerush_cluster::{Config, Key, Message as StoreMessage, Node, NodeId, Time, ms, table};
 use edgerush_cluster_asynchronous::{self as asynchronous, Batch, Entry};
 use edgerush_cluster_modes::{Kind, Message, Pod, Value};
 use edgerush_cluster_synchronous::{self as synchronous, Answer, Rule};
@@ -41,18 +41,88 @@ fn both() -> Pod {
     pod
 }
 
-fn synchronous_alone() -> synchronous::Pod {
-    let mut pod = synchronous::Pod::new(1, "pod-1:7000".to_owned(), config(), []);
-    let _ = pod.receive(1, StoreMessage::TableReply { table: first() }, ms(1));
-    let _ = pod.tick(ms(1));
-    pod
+/// A store of one mode's values alone, the only pod of its service, its first table taken at
+/// 1 ms.
+fn alone<V: edgerush_cluster::Held>() -> Node<V> {
+    let mut node = Node::new(1, "pod-1:7000".to_owned(), config(), []);
+    let _ = node.receive(1, StoreMessage::TableReply { table: first() }, ms(1));
+    let _ = node.tick(ms(1));
+    node
 }
 
-fn asynchronous_alone() -> asynchronous::Pod {
-    let mut pod = asynchronous::Pod::new(1, "pod-1:7000".to_owned(), config(), []);
-    let _ = pod.receive(1, StoreMessage::TableReply { table: first() }, ms(1));
-    let _ = pod.tick(ms(1));
-    pod
+/// The synchronous mode alone: its logic over a store of its own values.
+struct SynchronousAlone {
+    node: Node<synchronous::Value>,
+    decider: synchronous::Decider,
+}
+
+impl SynchronousAlone {
+    fn new() -> Self {
+        Self {
+            node: alone(),
+            decider: synchronous::Decider::default(),
+        }
+    }
+
+    const fn store(&self) -> &Node<synchronous::Value> {
+        &self.node
+    }
+
+    fn receive(
+        &mut self,
+        from: NodeId,
+        message: synchronous::Message,
+        now: Time,
+    ) -> synchronous::Outbox {
+        self.decider.receive(&mut self.node, from, message, now)
+    }
+
+    fn tick(&mut self, now: Time) -> synchronous::Outbox {
+        let mut out: synchronous::Outbox = self
+            .node
+            .tick(now)
+            .into_iter()
+            .map(|(to, message)| (to, synchronous::Message::Store(message)))
+            .collect();
+        out.extend(self.decider.tick(&mut self.node, now));
+        out
+    }
+}
+
+/// The asynchronous mode alone: its logic over a store of its own values.
+struct AsynchronousAlone {
+    node: Node<asynchronous::Value>,
+    applier: asynchronous::Applier,
+}
+
+impl AsynchronousAlone {
+    fn new() -> Self {
+        Self {
+            node: alone(),
+            applier: asynchronous::Applier::default(),
+        }
+    }
+
+    const fn store(&self) -> &Node<asynchronous::Value> {
+        &self.node
+    }
+
+    fn value(&self, key: Key) -> Option<asynchronous::Value> {
+        self.node.value(key)
+    }
+
+    fn receive(
+        &mut self,
+        from: NodeId,
+        message: asynchronous::Message,
+        now: Time,
+    ) -> asynchronous::Outbox {
+        self.applier.receive(&mut self.node, from, message, now)
+    }
+
+    fn tick(&mut self, now: Time) {
+        let _ = self.node.tick(now);
+    }
 }
 
 /// One synchronous request: under which of eight keys, what rule, and whether it gives back
@@ -153,8 +223,8 @@ struct Reported {
 
 proptest! {
     /// The synchronous mode's requests, any of its rules, give-backs among them, at any times:
-    /// a pod of both modes answers each as the mode's own pod does, its ticks send what the
-    /// mode's pod's do, and it holds the same value under each key, of the same bytes.
+    /// a pod of both modes answers each as the mode alone does, its ticks send what the mode
+    /// alone sends, and it holds the same value under each key, of the same bytes.
     #[test]
     fn the_synchronous_mode_on_a_pod_of_both_is_its_own(
         asked in proptest::collection::vec(
@@ -164,7 +234,7 @@ proptest! {
             1..60,
         ),
     ) {
-        let (mut own, mut both) = (synchronous_alone(), both());
+        let (mut own, mut both) = (SynchronousAlone::new(), both());
         let mut now = ms(2);
         let mut receipts = [0_u64; 8];
         for (id, ask) in (1..).zip(asked) {
@@ -193,8 +263,8 @@ proptest! {
     }
 
     /// The asynchronous mode's batches, hits and polls from three data planes, at any times: a
-    /// pod of both modes answers each as the mode's own pod does, and holds the same value
-    /// under each key, of the same bytes.
+    /// pod of both modes answers each as the mode alone does, and holds the same value under
+    /// each key, of the same bytes.
     #[test]
     fn the_asynchronous_mode_on_a_pod_of_both_is_its_own(
         reported in proptest::collection::vec(
@@ -204,7 +274,7 @@ proptest! {
             1..60,
         ),
     ) {
-        let (mut own, mut both) = (asynchronous_alone(), both());
+        let (mut own, mut both) = (AsynchronousAlone::new(), both());
         let mut now = ms(2);
         let mut sequences = [0_u64; 3];
         for report in reported {
@@ -241,7 +311,7 @@ proptest! {
                 _ => None,
             }).collect();
             prop_assert_eq!(answers, answered);
-            let _ = own.tick(now);
+            own.tick(now);
             let _ = both.tick(now);
             prop_assert_eq!(own.value(key).map(Value::Asynchronous), both.value(key));
         }
