@@ -1,10 +1,9 @@
-//! Instruction counts for a pod of the asynchronous mode taking in a data plane's batch on the
-//! store: hits for a hundred keys, each among the ten thousand the pod holds, the data plane's
+//! Instruction counts for a pod taking in an asynchronous data plane's batch on the store: hits for a hundred keys, each among the ten thousand the pod holds, the data plane's
 //! record found among one data plane's or sixteen's; and, a pod among three, a batch for a
 //! thousand keys, of which it owns about a third, its store copying their changes to the other
 //! two at its next tick — measured with the tick too.
 //!
-//! Linux only (valgrind): `cargo bench -p edgerush-cluster-asynchronous --bench batch`, see the
+//! Linux only (valgrind): `cargo bench -p edgerush-cluster-modes --bench batch`, see the
 //! repository README.
 
 #![allow(
@@ -12,8 +11,9 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_cluster::{Config, Key, Message as StoreMessage, NodeId, Time, table};
-use edgerush_cluster_asynchronous::{Answers, Batch, Entry, Message, Outbox, Pod};
+use edgerush_cluster::{Config, Key, Kind, Message as StoreMessage, NodeId, Time, table};
+use edgerush_cluster_asynchronous::{Answers, Batch, Entry};
+use edgerush_cluster_modes::{Message, Outbox, Pod};
 use edgerush_ratelimit::service::{Contract, PlaneId, Report};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
@@ -36,12 +36,16 @@ fn contract() -> Contract {
     }
 }
 
-/// Key `k` as a data plane hashes one: both halves spread, over the shards.
+/// Key `k` as an asynchronous data plane hashes one: both halves spread, over the shards, the
+/// mode's bit set.
 const fn key(k: u64) -> Key {
     let spread = k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     // A second multiplier, as unrelated to the first as two runs of the keyed hash are: a
     // half drawn from the other (its complement, say) would fold every key into one shard.
-    edgerush_cluster::key::joined(spread, k.wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
+    Kind::Asynchronous.key(edgerush_cluster::key::joined(
+        spread,
+        k.wrapping_mul(0xC2B2_AE3D_27D4_EB4F),
+    ))
 }
 
 /// Data plane `from`'s batch number `sequence` for `keys`: one hit each.

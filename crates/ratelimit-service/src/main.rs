@@ -61,10 +61,9 @@ use edgerush_cluster_modes::Pod;
 use edgerush_control_service::open_files::{self, OpenFiles};
 use edgerush_control_service::reread;
 use edgerush_ratelimit_service::cluster::link::Dial;
-use edgerush_ratelimit_service::cluster::mode::Mode;
 use edgerush_ratelimit_service::cluster::pod::{StorePod, StoreServer};
 use edgerush_ratelimit_service::cluster::settings::member_id;
-use edgerush_ratelimit_service::scrape::{self, Counted};
+use edgerush_ratelimit_service::scrape;
 use edgerush_ratelimit_service::secure::{self, PodFiles, PodTls};
 use edgerush_ratelimit_service::service_file::{PodSettings, parsed};
 use std::convert::Infallible;
@@ -195,10 +194,7 @@ struct Running {
 impl Running {
     /// Serves `pod`, its metrics and readiness too if said, until told to stop: it then hands
     /// its shards on while it still serves, and stops once drained.
-    async fn run<M: Mode<Counted: Counted>>(
-        self,
-        pod: StorePod<M>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn run(self, pod: StorePod) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(at) = self.metrics {
             let listener = tokio::net::TcpListener::bind(at).await?;
             eprintln!("edgerush-ratelimit-service: metrics and readiness on {at}");

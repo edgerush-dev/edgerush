@@ -9,7 +9,7 @@
 //! until the owner answers directly again.
 
 use super::both::{Caller, asynchronous_of};
-use super::{Asynchronous, Event, Sim, store_kind, store_size};
+use super::{Event, World, store_kind, store_size};
 use crate::Rng;
 use crate::workload::Workload;
 use edgerush_cluster::Message as StoreMessage;
@@ -187,7 +187,7 @@ pub(super) fn reported(message: &Message) -> Vec<Key> {
     }
 }
 
-impl Sim<Asynchronous> {
+impl World {
     /// `count` data planes, each taking `rate` requests a second, spread in turn over `keys`
     /// shared by all, every key held to `contract`; each knowing the latest table, as a data
     /// plane is told it when its stream to a pod opens.
@@ -571,7 +571,7 @@ impl Sim<Asynchronous> {
     }
 
     /// Hits applied to `key`, each once by whichever pod applied them, over every life of the key
-    /// and every owner ([`Sim::applied`]).
+    /// and every owner ([`World::applied`]).
     #[must_use]
     pub fn counted_ever(&self, key: u64) -> u64 {
         self.owned(key).map_or(0, |(_, hash)| self.applied(hash))

@@ -6,7 +6,7 @@
 use super::*;
 use edgerush_certificates::testing::Authority;
 use edgerush_cluster::Config as StoreConfig;
-use edgerush_cluster_asynchronous::Pod as AsyncPod;
+use edgerush_cluster_modes::Pod;
 use edgerush_config::KeySecret;
 use edgerush_ratelimit_service::cluster::forming::Forming;
 use edgerush_ratelimit_service::cluster::link::Dial;
@@ -51,7 +51,7 @@ async fn held_service(hold: &Arc<Mutex<Option<Instant>>>, tls: Option<&Authority
 async fn held_pods(
     holds: &[Arc<Mutex<Option<Instant>>>; 3],
     tls: Option<&Authority>,
-) -> (Vec<String>, Vec<StorePod<AsyncPod>>) {
+) -> (Vec<String>, Vec<StorePod>) {
     let mut listeners = Vec::new();
     for _ in 0..3 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -77,7 +77,7 @@ async fn held_pods(
     let mut pods = Vec::new();
     let mut addresses = Vec::new();
     for ((id, (listener, address)), hold) in (1..).zip(listeners).zip(holds) {
-        let mut mode = AsyncPod::new(id, address.clone(), config, []);
+        let mut mode = Pod::new(id, address.clone(), config, []);
         mode.set_life(id);
         let pod = StorePod::start(mode, address.clone(), dial.clone(), Vec::new());
         let server = Held {
@@ -138,12 +138,12 @@ const HELD: Duration = Duration::from_millis(600);
 /// it behind it, as a stream keeps its order.
 #[derive(Clone)]
 struct Held {
-    server: StoreServer<AsyncPod>,
+    server: StoreServer,
     hold: Arc<Mutex<Option<Instant>>>,
 }
 
 impl tonic::server::NamedService for Held {
-    const NAME: &'static str = <StoreServer<AsyncPod> as tonic::server::NamedService>::NAME;
+    const NAME: &'static str = <StoreServer as tonic::server::NamedService>::NAME;
 }
 
 impl tower_service::Service<http::Request<tonic::body::Body>> for Held {

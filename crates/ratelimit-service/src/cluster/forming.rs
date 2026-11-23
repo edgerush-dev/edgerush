@@ -16,7 +16,7 @@ use super::link::Dial;
 use super::pod::{TICK, ask};
 use crate::grpc::{Client, Error};
 use edgerush_cluster::{Authority, Config, Message, Naming, NodeId, Time};
-use edgerush_cluster_synchronous::Value;
+use edgerush_cluster_modes::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt::Write as _;

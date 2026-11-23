@@ -11,7 +11,7 @@
 )]
 
 use edgerush_cluster::Config as StoreConfig;
-use edgerush_cluster_asynchronous::Pod as AsyncPod;
+use edgerush_cluster_modes::Pod;
 use edgerush_config::{Config, compile};
 use edgerush_proxy::{H1Limits, Proxy, Worker};
 use edgerush_ratelimit_service::cluster::forming::Forming;
@@ -93,7 +93,7 @@ async fn slow_service(delay: Option<Duration>) -> Vec<String> {
     for id in 1..=3 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
-        let mut mode = AsyncPod::new(id, address.clone(), config, []);
+        let mut mode = Pod::new(id, address.clone(), config, []);
         mode.set_life(id);
         let pod = StorePod::start(mode, address.clone(), Dial::Plain, Vec::new());
         let server = Slowed {
@@ -387,12 +387,12 @@ async fn a_data_plane_decides_a_key_it_has_not_heard_of_from_a_full_bucket() {
 /// is told, each piece of the stream's body in its turn.
 #[derive(Clone)]
 struct Slowed {
-    server: StoreServer<AsyncPod>,
+    server: StoreServer,
     delay: Duration,
 }
 
 impl tonic::server::NamedService for Slowed {
-    const NAME: &'static str = <StoreServer<AsyncPod> as tonic::server::NamedService>::NAME;
+    const NAME: &'static str = <StoreServer as tonic::server::NamedService>::NAME;
 }
 
 impl tower_service::Service<http::Request<tonic::body::Body>> for Slowed {

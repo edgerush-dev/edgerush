@@ -72,7 +72,7 @@ fn contract() -> Contract {
 
 /// Pods of both modes on localhost, and the control plane forming them.
 struct Cluster {
-    pods: BTreeMap<NodeId, (StorePod<Pod>, String, JoinHandle<()>)>,
+    pods: BTreeMap<NodeId, (StorePod, String, JoinHandle<()>)>,
     control: JoinHandle<()>,
 }
 
@@ -127,7 +127,7 @@ impl Cluster {
         cluster
     }
 
-    fn pod(&self, id: NodeId) -> &StorePod<Pod> {
+    fn pod(&self, id: NodeId) -> &StorePod {
         &self.pods[&id].0
     }
 
@@ -197,7 +197,7 @@ fn key_owned_by(table: &Table, owner: NodeId, kind: Kind) -> Key {
 
 /// What `pod` holds under `key`, owned or a copy: its count, net of what was given back, if
 /// the synchronous mode's; its hits counted, if the asynchronous mode's.
-async fn held_at(pod: &StorePod<Pod>, key: Key) -> Option<(Kind, u64)> {
+async fn held_at(pod: &StorePod, key: Key) -> Option<(Kind, u64)> {
     pod.with(move |node, _| match node.value(key)? {
         Value::Synchronous(value) => Some((Kind::Synchronous, value.net())),
         Value::Asynchronous(value) => Some((Kind::Asynchronous, value.counted())),

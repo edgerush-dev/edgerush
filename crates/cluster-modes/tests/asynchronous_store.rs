@@ -1,16 +1,18 @@
-//! The asynchronous owner's applying run on the store: three pods formed in-process, every
-//! message delivered at once, the key's owner applying batches on `Node::update` and its
+//! The asynchronous owner's applying run on the store of both modes' values: three pods formed
+//! in-process, every message delivered at once, the key's owner applying batches on `Node::update` and its
 //! replicas holding what it holds once its copies reach them.
 
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::panic,
     reason = "test set-up: the helpers around the tests fail them the way the tests would"
 )]
 
 use edgerush_cluster::table::{self, shard_of};
-use edgerush_cluster::{Config, Message, NodeId, Time, ms};
-use edgerush_cluster_asynchronous::{Store, Value, apply};
+use edgerush_cluster::{Config, Kept, Kind, Message, NodeId, Time, ms};
+use edgerush_cluster_asynchronous::{self as asynchronous, apply};
+use edgerush_cluster_modes::{Store, Value};
 use edgerush_ratelimit::service::{Contract, Report};
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
@@ -25,6 +27,14 @@ fn contract() -> Contract {
         limit: n(100),
         window: n(1_000_000_000),
         burst: n(10),
+    }
+}
+
+/// The asynchronous mode's value of a value of both modes'.
+fn mine(value: &Value) -> &asynchronous::Value {
+    match value {
+        Value::Asynchronous(value) => value,
+        other => panic!("{other:?} under an asynchronous key"),
     }
 }
 
@@ -77,7 +87,7 @@ fn step(pods: &mut [Store], now: Time) {
 fn replicas_hold_the_owners_value_and_go_on_from_it() {
     let mut pods = pods();
     let mut now = ms(1);
-    let key = 7;
+    let key = Kind::Asynchronous.key(7);
     let shard = shard_of(key, SHARDS);
     let serving = |pods: &[Store], now| pods.iter().position(|pod| pod.serves(shard, now));
     let owner = loop {
@@ -107,7 +117,7 @@ fn replicas_hold_the_owners_value_and_go_on_from_it() {
         step(&mut pods, now);
     }
     let held = pods[owner].value(key).expect("the owner holds the key");
-    assert_eq!(held.counted(), 9);
+    assert_eq!(mine(&held).counted(), 9);
     let replicas: Vec<usize> = pods[owner]
         .committed()
         .and_then(|table| table.shards.get(usize::from(shard)))
@@ -127,7 +137,7 @@ fn replicas_hold_the_owners_value_and_go_on_from_it() {
 
     // A replica's copy, applied as its owner would: the last batch sent again is answered
     // as applied and counted once; the next is counted.
-    let mut copy = edgerush_cluster::Kept::new(pods[replicas[0]].value(key).unwrap_or_default());
+    let mut copy = Kept::new(pods[replicas[0]].value(key).unwrap_or_default());
     let again = Report::Hits {
         sequence: 3,
         count: 2,
@@ -135,7 +145,7 @@ fn replicas_hold_the_owners_value_and_go_on_from_it() {
         age: 0,
     };
     let (answer, _) = apply(&mut copy, 100, contract(), again, CYCLE, now);
-    assert_eq!((answer.applied, copy.value.counted()), (3, 9));
+    assert_eq!((answer.applied, mine(&copy.value).counted()), (3, 9));
     let next = Report::Hits {
         sequence: 4,
         count: 1,
@@ -143,5 +153,5 @@ fn replicas_hold_the_owners_value_and_go_on_from_it() {
         age: 0,
     };
     let (answer, _) = apply(&mut copy, 100, contract(), next, CYCLE, now);
-    assert_eq!((answer.applied, copy.value.counted()), (4, 10));
+    assert_eq!((answer.applied, mine(&copy.value).counted()), (4, 10));
 }

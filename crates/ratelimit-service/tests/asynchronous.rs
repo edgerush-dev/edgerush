@@ -15,11 +15,12 @@
 
 use edgerush_cluster::table::shard_of;
 use edgerush_cluster::{
-    Authority, Config, Key, Message as StoreMessage, NodeId, Stamp, Table, Time, ms,
+    Authority, Config, Key, Kind, Message as StoreMessage, NodeId, Stamp, Table, Time, ms,
 };
 use edgerush_cluster_asynchronous::{
-    Answers, Batch, Entry, Message, Pod, Turned, TurnedAway, Unserved, Value, Why,
+    Answers, Batch, Entry, Message, Turned, TurnedAway, Unserved, Why,
 };
+use edgerush_cluster_modes::{Message as BothMessage, Pod, Value};
 use edgerush_ratelimit::service::{Contract, Report};
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::pod::{
@@ -126,7 +127,7 @@ impl Relay {
 
 /// A pod running, its server and its relay.
 struct Running {
-    pod: StorePod<Pod>,
+    pod: StorePod,
     server: JoinHandle<()>,
     relay: Relay,
 }
@@ -193,7 +194,7 @@ impl Cluster {
         cluster
     }
 
-    fn pod(&self, id: NodeId) -> &StorePod<Pod> {
+    fn pod(&self, id: NodeId) -> &StorePod {
         &self.pods[&id].pod
     }
 
@@ -211,17 +212,20 @@ impl Cluster {
 }
 
 /// The table `pod` has committed.
-async fn committed(pod: &StorePod<Pod>) -> Option<Table> {
+async fn committed(pod: &StorePod) -> Option<Table> {
     pod.with(|node, _| node.committed().cloned())
         .await
         .flatten()
 }
 
 /// The hits `pod` holds counted under `key`, owned or a copy.
-async fn counted_at(pod: &StorePod<Pod>, key: Key) -> Option<u64> {
-    pod.with(move |node, _| node.value(key).as_ref().map(|value| value.counted()))
-        .await
-        .flatten()
+async fn counted_at(pod: &StorePod, key: Key) -> Option<u64> {
+    pod.with(move |node, _| match node.value(key)? {
+        Value::Asynchronous(value) => Some(value.counted()),
+        other => panic!("{other:?} under an asynchronous key"),
+    })
+    .await
+    .flatten()
 }
 
 /// Asks `check` every tick until it says something, for at most `most`.
@@ -275,9 +279,10 @@ async fn control_plane(running: Arc<Mutex<BTreeMap<NodeId, String>>>) {
     }
 }
 
-/// The first key `table` has `owner` own.
+/// The first key of the asynchronous mode's `table` has `owner` own.
 fn key_owned_by(table: &Table, owner: NodeId) -> Key {
     (0..)
+        .map(|key| Kind::Asynchronous.key(key))
         .find(|key| table.owner(shard_of(*key, SHARDS)) == Some(owner))
         .unwrap()
 }
@@ -486,23 +491,28 @@ async fn an_owner_cut_off_turns_a_batch_away_and_counts_it() {
     })
     .await;
     assert!(unready.is_some(), "pod 2 still ready");
-    let mut client: StoreClient<Pod> = cluster.pod(2).client().await.unwrap();
+    let mut client: StoreClient = cluster.pod(2).client().await.unwrap();
     // Not a client's to ask: dropped, so that nothing of it is turned away and counted.
     let forwarded = Message::Forwarded {
         client: client.id(),
         via: 3,
         batch: batch(table.stamp(), key, 1, 2),
     };
-    assert!(client.ask(forwarded).await);
+    assert!(client.ask(BothMessage::Asynchronous(forwarded)).await);
     client
-        .ask(Message::Batch(batch(table.stamp(), key, 1, 2)))
+        .ask(BothMessage::Asynchronous(Message::Batch(batch(
+            table.stamp(),
+            key,
+            1,
+            2,
+        ))))
         .await;
     let answered = loop {
         let told = tokio::time::timeout(ANSWERED, client.answer())
             .await
             .unwrap()
             .unwrap();
-        if let Message::Answers(answers) = told {
+        if let BothMessage::Asynchronous(Message::Answers(answers)) = told {
             break answers;
         }
     };
@@ -517,7 +527,7 @@ async fn an_owner_cut_off_turns_a_batch_away_and_counts_it() {
     assert_eq!(counted_at(cluster.pod(2), key).await, None);
     let observed = cluster.pod(2).observed().await.unwrap();
     assert_eq!(
-        observed.mode,
+        observed.mode.turned_away,
         TurnedAway {
             elsewhere: Turned::default(),
             not_serving: Turned {

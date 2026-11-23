@@ -2,7 +2,7 @@
 //! answered admitted, refused or counted, and give back what a refused request was charged.
 
 use super::both::{Caller, synchronous_of};
-use super::{CLIENT_BASE, Event, Sim, Synchronous, store_kind, store_size};
+use super::{CLIENT_BASE, Event, World, store_kind, store_size};
 use crate::client::{Client, Multi};
 use edgerush_cluster::Message as StoreMessage;
 use edgerush_cluster::{Key, NodeId, ShardId, Time, ms};
@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 /// The mode's messages, over the store of both modes' values.
 type Message = edgerush_cluster_synchronous::Message<edgerush_cluster_modes::Value>;
 
-impl Sim<Synchronous> {
+impl World {
     /// What the mode watches of every message sent: a give-back sent, as many times as it is;
     /// a request a client sent another way than to its key's owner; when an answer under a
     /// rule first leaves its owner, by its wall clock; and a request answered "counted" twice.

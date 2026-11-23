@@ -56,8 +56,8 @@ change takes over without dropping a request.
   mode, `off` (limits checked, none enforced) unless it says otherwise:
   - `local`: each proxy process limits on what it sees, with no service to run.
   - `synchronous`: the key's owner in the rate-limiting service
-    (`edgerush-ratelimit-service`, its file saying `mode: synchronous`, its pods forming a
-    cluster store, optionally over mutual TLS) decides every request, its key hashed under a secret every
+    (`edgerush-ratelimit-service`, its pods serving both modes and forming a cluster store,
+    optionally over mutual TLS) decides every request, its key hashed under a secret every
     data plane shares (`service.key_secret`). A request waits for its owner at most a stated
     time, and what happens while an owner is out of reach is stated too: allow, deny, or
     the data plane's own buckets until it answers. Each key's owner copies it to the key's
@@ -393,14 +393,15 @@ crates/cluster     the rate-limiting service's cluster store (`edgerush-cluster`
 crates/cluster-asynchronous
                    the asynchronous mode on the cluster store (`edgerush-cluster-asynchronous`):
                    the owner's state of a key as the store's value, merged by the larger of
-                   each part, the mode's pod applying data planes' batches and answering
-                   them, and the data planes' routing by the table; pure, no I/O; the service
-                   and the proxy run it
+                   each part, the mode's applying of data planes' batches and answering them
+                   over any store holding its values, and the data planes' routing by the
+                   table; pure, no I/O; the service's pod and the proxy run it
 crates/cluster-modes
-                   a pod of both modes over one cluster store (`edgerush-cluster-modes`): each
-                   key holding either mode's value, the mode its key's top bit says, the store
-                   counting each kind's keys apart, and each mode's logic beside the other's;
-                   pure, no I/O
+                   the rate-limiting service's pod, both modes over one cluster store
+                   (`edgerush-cluster-modes`): each key holding either mode's value, the mode
+                   its key's top bit says, the store counting each kind's keys apart, and each
+                   mode's logic beside the other's; pure, no I/O; each mode's tests on it, and
+                   the benchmarks of its batches and ticks
 crates/cluster-sim the cluster's simulation (`edgerush-cluster-sim`): the store's pods over a
                    network that delays, loses and cuts, each pod both modes', with clients
                    standing for data planes of either mode or of both, seeded and deterministic; its scenarios and chaos runs are its tests, and
@@ -411,7 +412,8 @@ crates/cluster-sim the cluster's simulation (`edgerush-cluster-sim`): the store'
 crates/cluster-synchronous
                    the synchronous mode on the cluster store (`edgerush-cluster-synchronous`):
                    each request decided by its key's owner, give-backs and requests under
-                   several keys; pure, no I/O; the service runs it
+                   several keys, over any store holding its values; pure, no I/O; the
+                   service's pod runs it
 crates/config      the config model and its compilation (`edgerush-config`): pure, format-free
 crates/control-service
                    the config stream over gRPC and mutual TLS (`edgerush-control-service`):
@@ -453,8 +455,8 @@ crates/ratelimit   rate limiting (`edgerush-ratelimit`): pure, no I/O; the admis
                    participant and the owner's applying of a report
 crates/ratelimit-service
                    the rate-limiting service (`edgerush-ratelimit-service`): the cluster store's
-                   pods, of either mode, over gRPC, the data planes' streams to them, and the
-                   `edgerush-ratelimit-service` binary
+                   pods, each serving both modes, over gRPC, the data planes' streams to them,
+                   and the `edgerush-ratelimit-service` binary
 crates/proxy       the data plane (`edgerush-proxy`): listeners, TLS, our HTTP/1 server and client,
                    HTTP/2 on h2, HTTP/3 on quiche, upstream pools and the request core between them,
                    and each rate-limiting mode's side of the data plane

@@ -11,21 +11,5 @@ publish.workspace = true
 edgerush-cluster.workspace = true
 edgerush-ratelimit.workspace = true
 
-[dev-dependencies]
-iai-callgrind.workspace = true
-proptest.workspace = true
-
-[[bench]]
-name = "batch"
-harness = false
-
-[[bench]]
-name = "cycle"
-harness = false
-
-[[bench]]
-name = "tick"
-harness = false
-
 [lints]
 workspace = true

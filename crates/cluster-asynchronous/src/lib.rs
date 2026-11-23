@@ -4,8 +4,9 @@
 //! The owner's state of a key and its applying of a batch's entry are
 //! `edgerush_ratelimit::service::owner`'s; here the state is the store's value ([`Value`]),
 //! which the store copies to the shard's replicas, hands on and forgets, and the applying
-//! ([`owner::apply`]) runs on `Node::update`, in the mode's [`Pod`], which answers a data
-//! plane's [`Batch`]. A data plane
+//! ([`owner::apply`]) runs on `Node::update`, in the mode's [`Applier`], which answers a data
+//! plane's [`Batch`] over any store whose values hold this mode's ([`Holds`]): the pod of both
+//! modes' (`edgerush_cluster_modes`). A data plane
 //! reaches the pods by the table it was told ([`Routed`]).
 //!
 //! Like the store, a pure state machine: messages and the time in, messages out.
@@ -20,9 +21,6 @@ pub mod value;
 
 pub use message::{Answer, Answers, Batch, Entry, Message, Outbox, Unserved, Why};
 pub use owner::{Answered, apply};
-pub use pod::{Applier, Holds, Pod, Turned, TurnedAway};
+pub use pod::{Applier, Holds, Turned, TurnedAway};
 pub use routing::Routed;
 pub use value::{Parts, PlaneParts, Value};
-
-/// The store as this mode keeps it.
-pub type Store = edgerush_cluster::Node<Value>;

@@ -1,4 +1,4 @@
-//! Instruction counts for a pod of the asynchronous mode's tick over a hundred thousand keys
+//! Instruction counts for a pod's tick over a hundred thousand keys
 //! under three limits, from sixteen data planes: a cycle on, with nothing to copy and none due
 //! to be forgotten, as almost every tick runs; a second on, the keys of the shortest limit due
 //! to be forgotten, a third of them, of which a cycle forgets at most its share; and past the
@@ -6,7 +6,7 @@
 //! cycle evicts as many and its share besides, down to nine tenths of the cap. A pod forgets
 //! and evicts at each cycle, a bounded number a cycle, so the last two show that bound.
 //!
-//! Linux only (valgrind): `cargo bench -p edgerush-cluster-asynchronous --bench tick`, see the
+//! Linux only (valgrind): `cargo bench -p edgerush-cluster-modes --bench tick`, see the
 //! repository README.
 
 #![allow(
@@ -14,8 +14,9 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_cluster::{Config, Key, Message as StoreMessage, Time, table};
-use edgerush_cluster_asynchronous::{Batch, Entry, Outbox, Pod};
+use edgerush_cluster::{Config, Key, Kind, Message as StoreMessage, Time, table};
+use edgerush_cluster_asynchronous::{Batch, Entry};
+use edgerush_cluster_modes::{Outbox, Pod};
 use edgerush_ratelimit::service::{Contract, PlaneId, Report};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
@@ -49,12 +50,16 @@ fn longer(k: u64) -> Contract {
     contract(1 + k % 2)
 }
 
-/// Key `k` as a data plane hashes one: both halves spread, over the shards.
+/// Key `k` as an asynchronous data plane hashes one: both halves spread, over the shards, the
+/// mode's bit set.
 const fn key(k: u64) -> Key {
     let spread = k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     // A second multiplier, as unrelated to the first as two runs of the keyed hash are: a
     // half drawn from the other (its complement, say) would fold every key into one shard.
-    edgerush_cluster::key::joined(spread, k.wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
+    Kind::Asynchronous.key(edgerush_cluster::key::joined(
+        spread,
+        k.wrapping_mul(0xC2B2_AE3D_27D4_EB4F),
+    ))
 }
 
 /// The only pod of its service, so that it owns every key, under `config`: its first table
