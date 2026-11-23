@@ -35,7 +35,7 @@ fn first() -> edgerush_cluster::Table {
 
 /// Each pod the only one of its service, its first table taken at 1 ms.
 fn both() -> Pod {
-    let mut pod = Pod::new(1, "pod-1:7000".to_owned(), config(), [], CYCLE);
+    let mut pod = Pod::new(1, "pod-1:7000".to_owned(), config(), []);
     let _ = pod.receive(1, StoreMessage::TableReply { table: first() }, ms(1));
     let _ = pod.tick(ms(1));
     pod
@@ -49,7 +49,7 @@ fn synchronous_alone() -> synchronous::Pod {
 }
 
 fn asynchronous_alone() -> asynchronous::Pod {
-    let mut pod = asynchronous::Pod::new(1, "pod-1:7000".to_owned(), config(), [], CYCLE);
+    let mut pod = asynchronous::Pod::new(1, "pod-1:7000".to_owned(), config(), []);
     let _ = pod.receive(1, StoreMessage::TableReply { table: first() }, ms(1));
     let _ = pod.tick(ms(1));
     pod
@@ -226,6 +226,7 @@ proptest! {
                 from: 100 + u64::from(report.plane),
                 stamp: (1, 1),
                 made: now,
+                cycle: CYCLE,
                 entries: vec![Entry { key, contract: contract(), report: report_of }],
             };
             let from = CLIENT + u64::from(report.plane);
@@ -285,6 +286,7 @@ fn a_key_of_the_other_modes_is_never_served_nor_held() {
         from: 100,
         stamp: (1, 1),
         made: now,
+        cycle: CYCLE,
         entries: vec![entry(Kind::Synchronous.key(8)), entry(theirs)],
     };
     let out = pod.receive(

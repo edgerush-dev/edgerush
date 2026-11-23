@@ -268,6 +268,7 @@ mod tests {
             from: 1,
             stamp: (1, 1),
             made: 0,
+            cycle: 10_000_000,
             entries: Vec::new(),
         };
         let answers = Answers {

@@ -1175,6 +1175,7 @@ fn others_hits(key: &[u8], c: Contract, count: u64) -> Batch {
             },
         }],
         made: 0,
+        cycle: CYCLE,
     }
 }
 
@@ -2973,7 +2974,7 @@ fn a_batch_ages_what_joined_it_earlier() {
     });
     queued.at(25 * MS);
     queued.at(20 * MS);
-    let batch = queued.batch(100);
+    let batch = queued.batch(100, CYCLE);
     assert_eq!(batch.made, 25 * MS);
     assert!(matches!(batch.entries[0].report, Report::Hits { age, .. } if age == 21 * MS));
 }
@@ -3007,7 +3008,7 @@ fn a_piece_takes_no_more_than_fits() {
     assert!(whole > 3 * PIECE_BYTES, "{whole}: more than three pieces");
     let mut pieces = Vec::new();
     while !queued.is_empty() {
-        let piece = queued.take_piece(100);
+        let piece = queued.take_piece(100, CYCLE);
         assert!(piece.bytes() <= PIECE_BYTES, "{}", piece.bytes());
         assert_eq!((piece.from, piece.made), (100, 10 * MS));
         pieces.push(piece);
@@ -3029,10 +3030,10 @@ fn a_piece_takes_an_entry_bigger_than_itself_alone() {
             report: Report::Poll,
         });
     }
-    let first = queued.take_piece(100);
+    let first = queued.take_piece(100, CYCLE);
     assert_eq!(first.entries.len(), 1);
     assert_eq!(first.entries[0].key.len(), 2 * PIECE_BYTES);
-    let second = queued.take_piece(100);
+    let second = queued.take_piece(100, CYCLE);
     assert_eq!(&*second.entries[0].key, b"bbbbbbbbbb");
     assert!(queued.is_empty());
 }
@@ -3054,7 +3055,7 @@ fn what_is_kept_beside_an_entry_goes_with_it_piece_by_piece() {
     let mut pieces = 0;
     let mut next = 0;
     while !queued.is_empty() {
-        let (piece, keyed) = queued.take_keyed(100);
+        let (piece, keyed) = queued.take_keyed(100, CYCLE);
         assert_eq!(piece.entries.len(), keyed.len());
         for (entry, kept) in piece.entries.iter().zip(&keyed) {
             assert_eq!(*kept, next);

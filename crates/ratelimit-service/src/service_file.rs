@@ -11,13 +11,9 @@ use crate::secure::PodFiles;
 use edgerush_config::{ServiceFile, ServiceMode};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::Duration;
 
 /// What `keys.max_bytes` is when left out: 256 MiB.
 pub const MAX_KEY_BYTES: u64 = 256 << 20;
-
-/// What `pod.cycle_ms` is when left out.
-pub const CYCLE_MS: u64 = 10;
 
 /// What a pod runs as.
 #[derive(Debug, PartialEq, Eq)]
@@ -35,13 +31,9 @@ pub struct PodSettings {
 /// The mode a pod serves, with the store it serves it on.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Serves {
-    /// Its data planes sending every `cycle`.
-    Asynchronous {
-        /// The store it runs on.
-        store: Settings,
-        /// Its data planes' cycle, a millisecond at least.
-        cycle: Duration,
-    },
+    /// Its data planes deciding from their copies, on this store; each batch says their
+    /// cycle.
+    Asynchronous(Settings),
     /// The key's owner deciding every request, on this store.
     Synchronous(Settings),
 }
@@ -51,7 +43,7 @@ impl Serves {
     #[must_use]
     pub fn mode(&self) -> ServiceMode {
         match self {
-            Self::Asynchronous { .. } => ServiceMode::Asynchronous,
+            Self::Asynchronous(_) => ServiceMode::Asynchronous,
             Self::Synchronous(_) => ServiceMode::Synchronous,
         }
     }
@@ -82,9 +74,6 @@ pub enum FileError {
     /// A store the pod could not run on.
     #[error("{0}")]
     Store(#[from] SettingsError),
-    /// A cycle of nothing, which would tick without end.
-    #[error("`pod.cycle_ms`: a number of milliseconds, at least 1")]
-    Cycle,
 }
 
 /// What a pod runs as, from the file `yaml` states, its TLS files relative to `directory`
@@ -109,23 +98,16 @@ fn checked(file: ServiceFile, directory: &Path) -> Result<PodSettings, FileError
         return Err(FileError::KeyBytes);
     }
     let mode = file.mode.unwrap_or(ServiceMode::Asynchronous);
-    let (field, owner) = match mode {
-        ServiceMode::Synchronous => (
-            ("pod.cycle_ms", file.pod.cycle_ms.is_some()),
-            "asynchronous",
-        ),
-        ServiceMode::Asynchronous => (
-            (
-                "store.forwarder_decides",
-                file.store
-                    .as_ref()
-                    .is_some_and(|store| store.forwarder_decides.is_some()),
-            ),
-            "synchronous",
-        ),
-    };
-    if let (field, true) = field {
-        return Err(FileError::OtherModes { field, owner });
+    if mode == ServiceMode::Asynchronous
+        && file
+            .store
+            .as_ref()
+            .is_some_and(|store| store.forwarder_decides.is_some())
+    {
+        return Err(FileError::OtherModes {
+            field: "store.forwarder_decides",
+            owner: "synchronous",
+        });
     }
     let name = match mode {
         ServiceMode::Synchronous => "synchronous",
@@ -141,16 +123,7 @@ fn checked(file: ServiceFile, directory: &Path) -> Result<PodSettings, FileError
     let pod = file.pod;
     let serves = match mode {
         ServiceMode::Synchronous => Serves::Synchronous(store),
-        ServiceMode::Asynchronous => {
-            let cycle = pod.cycle_ms.unwrap_or(CYCLE_MS);
-            if cycle == 0 {
-                return Err(FileError::Cycle);
-            }
-            Serves::Asynchronous {
-                store,
-                cycle: Duration::from_millis(cycle),
-            }
-        }
+        ServiceMode::Asynchronous => Serves::Asynchronous(store),
     };
     Ok(PodSettings {
         listen: pod.listen,
@@ -180,10 +153,10 @@ mod tests {
         format!("pod: {{ listen: 0.0.0.0:7000, address: rl-0.rl:7000{pod} }}\n{rest}")
     }
 
-    /// An asynchronous pod's store and its data planes' cycle.
-    fn asynchronous(settings: PodSettings) -> (Settings, Duration) {
+    /// An asynchronous pod's store.
+    fn asynchronous(settings: PodSettings) -> Settings {
         match settings.serves {
-            Serves::Asynchronous { store, cycle } => (store, cycle),
+            Serves::Asynchronous(store) => store,
             Serves::Synchronous(_) => panic!("a synchronous pod"),
         }
     }
@@ -192,7 +165,7 @@ mod tests {
     fn the_mode_is_asynchronous_unless_said_and_either_runs_on_the_store() {
         let parsed = parsed_from(&with("")).unwrap();
         assert_eq!(parsed.serves.mode(), ServiceMode::Asynchronous);
-        assert_eq!(asynchronous(parsed).0.address, "rl-0.rl:7000");
+        assert_eq!(asynchronous(parsed).address, "rl-0.rl:7000");
         let said = parsed_from(&with("mode: eventual\n")).unwrap_err();
         assert!(said.contains("eventual"), "{said}");
         // Each mode runs on the store, and is refused without it.
@@ -221,24 +194,17 @@ mod tests {
 
     #[test]
     fn each_mode_takes_only_what_it_reads() {
-        // The data planes' cycle is the asynchronous mode's alone; deciding from a copy, the
-        // synchronous mode's.
-        assert_eq!(
-            parsed_from(&format!(
-                "mode: synchronous\n{}",
-                sections(", cycle_ms: 10", "store: {}\n")
-            )),
-            Err("`pod.cycle_ms` is the asynchronous mode's".to_owned())
-        );
+        // Deciding from a copy is the synchronous mode's alone.
         assert_eq!(
             parsed_from(&sections("", "store: { forwarder_decides: true }\n")),
             Err("`store.forwarder_decides` is the synchronous mode's".to_owned())
         );
         // What the asynchronous mode's pods agreed by before they ran on the store is no
-        // field the file knows.
+        // field the file knows, and nor is their data planes' cycle, which each batch says.
         for gone in [
             sections(", id: 0", "store: {}\n"),
             with("membership: { pods: { 0: rl-0:7000 } }\n"),
+            sections(", cycle_ms: 10", "store: {}\n"),
         ] {
             let said = parsed_from(&gone).unwrap_err();
             assert!(said.contains("unknown field"), "{said}");
@@ -246,35 +212,17 @@ mod tests {
     }
 
     #[test]
-    fn a_cycle_is_a_millisecond_at_least() {
-        let cycle = |ms: &str| parsed_from(&sections(&format!(", cycle_ms: {ms}"), "store: {}\n"));
-        assert_eq!(
-            asynchronous(parsed_from(&with("")).unwrap()).1,
-            Duration::from_millis(10)
-        );
-        assert_eq!(
-            asynchronous(cycle("1").unwrap()).1,
-            Duration::from_millis(1)
-        );
-        assert_eq!(
-            cycle("0"),
-            Err("`pod.cycle_ms`: a number of milliseconds, at least 1".to_owned())
-        );
-        assert!(cycle("soon").is_err());
-    }
-
-    #[test]
     fn what_keys_may_hold_and_where_metrics_go_are_said_or_left_out() {
         let plain = parsed_from(&with("")).unwrap();
         assert_eq!(plain.metrics, None);
-        assert_eq!(asynchronous(plain).0.config.max_key_bytes, Some(256 << 20));
+        assert_eq!(asynchronous(plain).config.max_key_bytes, Some(256 << 20));
         let said = parsed_from(&format!(
             "keys: {{ max_bytes: 1048576 }}\n{}",
             sections(", metrics: 127.0.0.1:9090", "store: {}\n")
         ))
         .unwrap();
         assert_eq!(said.metrics, Some("127.0.0.1:9090".parse().unwrap()));
-        assert_eq!(asynchronous(said).0.config.max_key_bytes, Some(1 << 20));
+        assert_eq!(asynchronous(said).config.max_key_bytes, Some(1 << 20));
         assert_eq!(
             parsed_from(&with("keys: { max_bytes: 0 }\n")),
             Err("`keys.max_bytes`: a number of bytes, at least 1".to_owned())

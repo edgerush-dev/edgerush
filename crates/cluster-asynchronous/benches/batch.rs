@@ -62,6 +62,7 @@ fn batch(from: PlaneId, sequence: u64, keys: impl Iterator<Item = u64>) -> Batch
         from,
         stamp: (0, 0),
         made: 0,
+        cycle: CYCLE,
         entries,
     }
 }
@@ -71,7 +72,7 @@ fn member(pods: &[NodeId], now: Time) -> Pod {
     let mut config = Config::defaults();
     config.shards = 256;
     let peers = pods.iter().copied().filter(|pod| *pod != 1);
-    let mut pod = Pod::new(1, "pod-1:7000".to_owned(), config, peers, CYCLE);
+    let mut pod = Pod::new(1, "pod-1:7000".to_owned(), config, peers);
     let members = pods
         .iter()
         .map(|id| (*id, format!("pod-{id}:7000")))

@@ -3,7 +3,6 @@ pod:
   listen: 0.0.0.0:7000
   address: rl-0.rl:7000
   metrics: 0.0.0.0:9090
-  cycle_ms: 10
 store:
   seeds: [rl-0.rl:7000, rl-1.rl:7000]
   shards: 256

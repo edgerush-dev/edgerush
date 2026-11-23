@@ -13,7 +13,6 @@
 //!   listen: 0.0.0.0:7000
 //!   address: rl-0.rl:7000
 //!   metrics: 0.0.0.0:9090     # nowhere when left out
-//!   cycle_ms: 10              # the asynchronous mode's; 10 when left out
 //! store:
 //!   seeds: [rl-0:7000]        # none when left out
 //!   shards: 256               # each as the store's defaults when left out
@@ -43,11 +42,10 @@
 //! before it does. `keys.max_bytes` is what its keys may hold, past which the least recently
 //! changed are evicted.
 //!
-//! The asynchronous mode applies each data plane's batch to the keys it owns, forwards the
-//! entries of keys another pod owns to it and relays its answers back, and `pod.cycle_ms` is its
-//! data planes' cycle; it refuses `store.forwarder_decides`, as it would not read it. The
-//! synchronous mode forwards a request for a key not its own to the key's owner, and refuses
-//! `pod.cycle_ms`.
+//! The asynchronous mode applies each data plane's batch to the keys it owns, by the data
+//! planes' cycle the batch says, forwards the entries of keys another pod owns to it and
+//! relays its answers back; it refuses `store.forwarder_decides`, as it would not read it. The
+//! synchronous mode forwards a request for a key not its own to the key's owner.
 //!
 //! `tls`'s files, relative to the config file's directory unless absolute, are read again
 //! every second, and serve the service with mutual TLS (`edgerush_ratelimit_service::secure`):
@@ -57,7 +55,6 @@
 //! and any other is refused. It dials the other pods checking theirs for its own ID.
 
 use boring::ssl::SslConnector;
-use edgerush_cluster::Time;
 use edgerush_cluster_asynchronous::Pod as AsyncPod;
 use edgerush_config::ServiceMode;
 use edgerush_control_service::open_files::{self, OpenFiles};
@@ -180,10 +177,9 @@ async fn serve(args: PodSettings) -> Result<(), Box<dyn std::error::Error>> {
             say_started(mode, id, args.listen, &address);
             stop.run(pod).await
         }
-        Serves::Asynchronous { store, cycle } => {
+        Serves::Asynchronous(store) => {
             let address = store.address.clone();
-            let cycle = Time::try_from(cycle.as_nanos()).unwrap_or(Time::MAX);
-            let mut node = AsyncPod::new(id, address.clone(), store.config, [], cycle);
+            let mut node = AsyncPod::new(id, address.clone(), store.config, []);
             // A pod is a member in one life only: its id, new each start, serves as its life,
             // never 0, which would leave its answers unnumbered.
             node.set_life(id.max(1));

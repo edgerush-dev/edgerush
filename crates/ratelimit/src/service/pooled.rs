@@ -1909,11 +1909,11 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
 
     /// A piece of what is to go to each pod; the rest kept for the next.
     fn take_outgoing_to_all(&mut self) -> Vec<(R::Pod, Piece<R::Key>)> {
-        let id = self.id;
+        let (id, cycle) = (self.id, self.cycle);
         let batches = self
             .queued
             .iter_mut()
-            .map(|(pod, queued)| (*pod, queued.take_keyed(id)))
+            .map(|(pod, queued)| (*pod, queued.take_keyed(id, cycle)))
             .collect();
         self.queued.retain(|_, queued| !queued.is_empty());
         batches
@@ -1935,7 +1935,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
                 continue;
             };
             self.sending.insert(pod, self.last_now);
-            batches.push((pod, queued.take_keyed(self.id)));
+            batches.push((pod, queued.take_keyed(self.id, self.cycle)));
             if !queued.is_empty() {
                 self.queued.insert(pod, queued);
             }

@@ -65,7 +65,7 @@ fn admit(plane: &mut Plane, keys: impl Iterator<Item = u32>, now: u64) {
 fn lone_pod(now: Time) -> Pod {
     let mut config = Config::defaults();
     config.shards = 256;
-    let mut pod = Pod::new(POD, "pod-1:7000".to_owned(), config, Vec::new(), CYCLE);
+    let mut pod = Pod::new(POD, "pod-1:7000".to_owned(), config, Vec::new());
     let members = [(POD, "pod-1:7000".to_owned())].into_iter().collect();
     let first = table::first(&members, 256, 0, 1);
     let _ = pod.receive(POD, StoreMessage::TableReply { table: first }, now);

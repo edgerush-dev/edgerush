@@ -184,6 +184,10 @@ pub struct Batch {
     /// One entry a key, or a few.
     #[prost(message, repeated, tag = "4")]
     pub entries: Vec<Entry>,
+    /// The time between the data plane's batches, in nanoseconds: what the owner counts those
+    /// admitting a key lately by. Never 0.
+    #[prost(uint64, tag = "5")]
+    pub cycle_ns: u64,
 }
 
 /// The owner's answer about one key.
@@ -324,6 +328,7 @@ pub fn batch_to_wire(batch: AsyncBatch) -> Batch {
         stamp: Some(stamp(batch.stamp)),
         made_ns: batch.made,
         entries: batch.entries.into_iter().map(entry_to_wire).collect(),
+        cycle_ns: batch.cycle,
     }
 }
 
@@ -334,16 +339,21 @@ pub fn too_long(batch: &Batch) -> bool {
     prost::Message::encoded_len(batch) > MAX_MESSAGE
 }
 
-/// A data plane's batch from the wire: refused whole if any entry cannot be used.
+/// A data plane's batch from the wire: refused whole if any entry cannot be used, or if it
+/// says no cycle.
 ///
 /// # Errors
 ///
 /// A batch the mode cannot use: see [`Invalid`].
 pub fn batch_from(batch: Batch) -> Result<AsyncBatch, Invalid> {
+    if batch.cycle_ns == 0 {
+        return Err(Invalid::Cycle);
+    }
     Ok(AsyncBatch {
         from: batch.from,
         stamp: stamp_from(batch.stamp)?,
         made: batch.made_ns,
+        cycle: batch.cycle_ns,
         entries: batch
             .entries
             .into_iter()
@@ -582,12 +592,14 @@ mod tests {
             any::<u64>(),
             any::<(u64, u64)>(),
             any::<u64>(),
+            1..=u64::MAX,
             prop::collection::vec(entry, 0..5),
         )
-            .prop_map(|(from, stamp, made, entries)| AsyncBatch {
+            .prop_map(|(from, stamp, made, cycle, entries)| AsyncBatch {
                 from,
                 stamp,
                 made,
+                cycle,
                 entries,
             })
     }
@@ -776,6 +788,7 @@ mod tests {
             from: 1,
             stamp: (1, 1),
             made: 0,
+            cycle: 10_000_000,
             entries: Vec::new(),
         };
         assert!(mode_wire(1, AsyncMessage::Batch(batch)).is_none());
@@ -814,8 +827,8 @@ mod tests {
     }
 
     /// A value no owner could have held is refused, and so is one under a contract of zero;
-    /// an entry without a contract, or reporting hits it says were seen applied, refuses its
-    /// whole batch.
+    /// a batch saying no cycle is refused, and an entry without a contract, or reporting hits
+    /// it says were seen applied, refuses its whole batch.
     #[test]
     fn values_and_batches_the_mode_cannot_use_are_refused() {
         let record = |plane| Record {
@@ -846,6 +859,7 @@ mod tests {
             from: 1,
             stamp: (1, 1),
             made: 0,
+            cycle: 10_000_000,
             entries: vec![AsyncEntry {
                 key: 3,
                 contract: ServiceContract {
@@ -856,7 +870,10 @@ mod tests {
                 report: ServiceReport::Poll,
             }],
         };
-        assert!(batch_from(batch_to_wire(fine.clone())).is_ok());
+        assert_eq!(batch_from(batch_to_wire(fine.clone())), Ok(fine.clone()));
+        let mut no_cycle = batch_to_wire(fine.clone());
+        no_cycle.cycle_ns = 0;
+        assert_eq!(batch_from(no_cycle), Err(Invalid::Cycle));
         let mut no_contract = batch_to_wire(fine.clone());
         no_contract.entries[0].contract = None;
         assert_eq!(

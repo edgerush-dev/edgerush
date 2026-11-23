@@ -48,8 +48,8 @@ pub enum ServiceMode {
     Synchronous,
 }
 
-/// A service pod: where it serves, where it is reached, and its data planes' cycle. It takes
-/// a member id of its own each time it starts.
+/// A service pod: where it serves and where it is reached. It takes a member id of its own
+/// each time it starts.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -64,11 +64,6 @@ pub struct ServicePod {
     /// it is ready; nowhere when left out.
     #[serde(default)]
     pub metrics: Option<SocketAddr>,
-    /// Milliseconds of the data planes' cycle, in the asynchronous mode alone (the
-    /// synchronous mode's store has `store.cycle_ms`). 10 when left out.
-    #[serde(default)]
-    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
-    pub cycle_ms: Option<u64>,
 }
 
 /// The most milliseconds any of the store's timings may be: an hour, far past any use, and
@@ -183,7 +178,6 @@ pod:
   listen: 0.0.0.0:7000
   address: rl-1:7000
   metrics: 0.0.0.0:9090
-  cycle_ms: 5
 store:
   seeds: [rl-0:7000, rl-2:7000]
   shards: 64
@@ -211,7 +205,6 @@ tls:
                     listen: "0.0.0.0:7000".parse().unwrap(),
                     address: Some("rl-1:7000".to_owned()),
                     metrics: Some("0.0.0.0:9090".parse().unwrap()),
-                    cycle_ms: Some(5),
                 },
                 store: Some(ServiceStore {
                     seeds: vec!["rl-0:7000".to_owned(), "rl-2:7000".to_owned()],
@@ -242,7 +235,7 @@ tls:
     fn what_is_left_out_is_left_to_the_service() {
         let file = read(LEAST).unwrap();
         assert_eq!(file.mode, None);
-        assert_eq!((file.pod.metrics, file.pod.cycle_ms), (None, None));
+        assert_eq!(file.pod.metrics, None);
         // Where it is reached and the store too: that each mode needs them the service says.
         assert_eq!((file.pod.address, file.store), (None, None));
         assert_eq!(file.keys, ServiceKeys::default());

@@ -71,6 +71,9 @@ pub enum Invalid {
     /// A list of keys of an odd number of words: each key is two.
     #[error("a list of keys of an odd number of words")]
     Keys,
+    /// A data plane's batch saying no cycle, which its owner counts those admitting by.
+    #[error("a batch of no cycle")]
+    Cycle,
 }
 
 /// A mode's value as the wire carries it: a protobuf message of the mode's own.

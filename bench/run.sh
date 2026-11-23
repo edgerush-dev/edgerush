@@ -846,12 +846,10 @@ rl_form_pid=
 rl_sync_pid=
 rl_sync_form_pid=
 # A lone pod's config file, serving mode $1 on the store on 127.0.0.1:$2, reached at that
-# address, its readiness at 127.0.0.1:$3; the asynchronous mode's with its data planes' cycle.
+# address, its readiness at 127.0.0.1:$3. The data planes' cycle is theirs: each batch says it.
 rl_service_config() {
-    local cycle=
-    [ "$1" = asynchronous ] && cycle=", cycle_ms: $RL_CYCLE_MS"
-    printf 'mode: %s\npod: { listen: 127.0.0.1:%s, address: 127.0.0.1:%s, metrics: 127.0.0.1:%s%s }\n' \
-        "$1" "$2" "$2" "$3" "$cycle"
+    printf 'mode: %s\npod: { listen: 127.0.0.1:%s, address: 127.0.0.1:%s, metrics: 127.0.0.1:%s }\n' \
+        "$1" "$2" "$2" "$3"
     printf 'store: {}\n'
     if [ -n "$RL_MAX_KEY_BYTES" ]; then
         printf 'keys: { max_bytes: %s }\n' "$RL_MAX_KEY_BYTES"

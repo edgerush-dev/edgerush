@@ -203,6 +203,9 @@ pub struct Batch {
     /// When the data plane made it, on its own clock: what its hits' ages count back from,
     /// said back in the answers ([`Reply::made`](pooled::Reply::made)).
     pub made: u64,
+    /// The time between the data plane's batches, in nanoseconds: what the owner counts those
+    /// admitting a key lately by ([`ACTIVE_CYCLES`] of them).
+    pub cycle: u64,
 }
 
 /// The most a data plane's batch to a pod takes, by [`Batch::bytes`]: 1 MiB, a quarter of
@@ -384,16 +387,18 @@ impl<X> Queued<X> {
         self.keyed.push(keyed);
     }
 
-    /// Its next piece, from data plane `from`: its entries in the order queued, as many as
-    /// fit in [`PIECE_BYTES`], with what is kept beside each; the rest kept for the next. A
-    /// key's reports stay in order, and keys depend on no other.
-    pub(crate) fn take_keyed(&mut self, from: PlaneId) -> (Batch, Vec<X>) {
+    /// Its next piece, from data plane `from`, which sends every `cycle` nanoseconds: its
+    /// entries in the order queued, as many as fit in [`PIECE_BYTES`], with what is kept beside
+    /// each; the rest kept for the next. A key's reports stay in order, and keys depend on no
+    /// other.
+    pub(crate) fn take_keyed(&mut self, from: PlaneId, cycle: u64) -> (Batch, Vec<X>) {
         if self.bytes <= Room::new().left {
             // All of it, as most often.
             let batch = Batch {
                 from,
                 entries: std::mem::take(&mut self.entries),
                 made: self.made,
+                cycle,
             };
             self.bytes = 0;
             return (batch, std::mem::take(&mut self.keyed));
@@ -410,6 +415,7 @@ impl<X> Queued<X> {
             from,
             entries,
             made: self.made,
+            cycle,
         };
         self.bytes = self.bytes.saturating_sub(batch.bytes() - MESSAGE_BYTES);
         (batch, keyed)
@@ -441,8 +447,8 @@ impl Queued {
     }
 
     /// Its next piece, as [`Self::take_keyed`] takes it.
-    pub(crate) fn take_piece(&mut self, from: PlaneId) -> Batch {
-        self.take_keyed(from).0
+    pub(crate) fn take_piece(&mut self, from: PlaneId, cycle: u64) -> Batch {
+        self.take_keyed(from, cycle).0
     }
 }
 
