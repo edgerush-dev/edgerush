@@ -164,7 +164,7 @@ fn controller_args(objects: &[Object]) -> Vec<String> {
     objects
         .iter()
         .find_map(|object| match object {
-            Object::Deployment(deployment) => deployment.spec.as_ref()?.template.spec.as_ref(),
+            Object::Deployment(deployment) => deployment.spec.template.spec.as_ref(),
             _ => None,
         })
         .and_then(|pod| pod.containers[0].args.clone())
@@ -342,8 +342,9 @@ fn a_service_is_owned_by_its_data_plane_and_named_as_its_deployment() {
         .find_map(|object| match object {
             Object::Deployment(deployment) => deployment
                 .spec
+                .template
+                .metadata
                 .as_ref()
-                .and_then(|spec| spec.template.metadata.as_ref())
                 .and_then(|metadata| metadata.labels.clone()),
             _ => None,
         })

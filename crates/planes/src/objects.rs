@@ -739,7 +739,7 @@ pub fn for_control_plane(
     };
     objects.push(Object::Deployment(Box::new(Deployment {
         metadata: metadata(name.clone(), Some(cp.namespace), &labels, Some(&owner)),
-        spec: Some(DeploymentSpec {
+        spec: DeploymentSpec {
             replicas: Some(control_plane.spec.replicas),
             selector: LabelSelector {
                 match_labels: Some(labels.clone()),
@@ -767,7 +767,7 @@ pub fn for_control_plane(
                 }),
             },
             ..DeploymentSpec::default()
-        }),
+        },
         ..Deployment::default()
     })));
 
@@ -1031,7 +1031,7 @@ pub fn for_data_plane(
     };
     objects.push(Object::Deployment(Box::new(Deployment {
         metadata: metadata(name.clone(), Some(dp.namespace), &labels, Some(&owner)),
-        spec: Some(DeploymentSpec {
+        spec: DeploymentSpec {
             // Never stated while an autoscaler runs the fleet (05 §2).
             replicas: (!autoscaled).then_some(spec.replicas.min),
             selector: LabelSelector {
@@ -1086,7 +1086,7 @@ pub fn for_data_plane(
                 }),
             },
             ..DeploymentSpec::default()
-        }),
+        },
         ..Deployment::default()
     })));
 
@@ -1159,10 +1159,7 @@ pub fn for_data_plane(
     for object in &mut objects {
         carry(object.metadata_mut(), &carried_labels, &carried_annotations);
         if let Object::Deployment(deployment) = object
-            && let Some(template) = deployment
-                .spec
-                .as_mut()
-                .and_then(|spec| spec.template.metadata.as_mut())
+            && let Some(template) = deployment.spec.template.metadata.as_mut()
         {
             carry(template, &carried_labels, &carried_annotations);
         }

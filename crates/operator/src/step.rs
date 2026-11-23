@@ -1000,11 +1000,8 @@ async fn apply_deployment(
         if !ours(&there.metadata, labels, uid) {
             return Ok(false);
         }
-        let leaves_out = deployment
-            .spec
-            .as_ref()
-            .is_none_or(|spec| spec.replicas.is_none());
-        let at = there.spec.as_ref().and_then(|spec| spec.replicas);
+        let leaves_out = deployment.spec.replicas.is_none();
+        let at = there.spec.replicas;
         if leaves_out
             && holds_replicas(&there)
             && let Some(replicas) = at
