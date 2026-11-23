@@ -681,11 +681,7 @@ fn the_operator_runs_as_the_planes_do_on_the_image_it_gives_them() {
             _ => None,
         })
         .expect("a Deployment");
-    let pod = deployment
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.template.spec.as_ref())
-        .unwrap();
+    let pod = deployment.spec.template.spec.as_ref().unwrap();
     let container = &pod.containers[0];
     let args = container.args.clone().unwrap();
     assert_eq!(args[0], "operator");
@@ -726,8 +722,9 @@ fn the_operator_runs_as_its_service_account_which_its_bindings_name() {
                 assert_eq!(deployment.metadata.namespace, namespace);
                 runs_as = deployment
                     .spec
+                    .template
+                    .spec
                     .as_ref()
-                    .and_then(|spec| spec.template.spec.as_ref())
                     .and_then(|pod| pod.service_account_name.clone());
             }
             OperatorInstall::ClusterRole(_) | OperatorInstall::Role(_) => {}

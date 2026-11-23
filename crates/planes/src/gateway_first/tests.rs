@@ -276,7 +276,7 @@ fn everything_made_for_a_generated_data_plane_carries_its_labels_but_no_selector
     let deployment = objects
         .iter()
         .find_map(|object| match object {
-            Object::Deployment(deployment) => deployment.spec.clone(),
+            Object::Deployment(deployment) => Some(deployment.spec.clone()),
             _ => None,
         })
         .unwrap();
