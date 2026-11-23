@@ -1307,23 +1307,30 @@ async fn each_config_translated_is_sent_to_a_data_plane_and_what_it_says_is_said
         std::fs::write(&replacing.certificate, issued.chain).unwrap();
         std::fs::write(&replacing.key, issued.key).unwrap();
         std::fs::write(&replacing.authorities, renamed.pem()).unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
         let tls = edgerush_control_service::connector(&Credentials {
             certificate: renamed.issue(&["data-plane"]),
             authorities: renamed.pem(),
         })
         .unwrap();
-        let mut staging = Staging::new();
-        edgerush_control_service::follow(
-            &address,
-            "control.test",
-            &tls,
-            &mut staging,
-            |_| std::future::ready(Ok(())),
-            |_| {},
-            None,
-        )
-        .await
+        // Refused until the control plane has taken up the new authority, which under load
+        // can take a while: dialled again, as a data plane does.
+        loop {
+            let mut staging = Staging::new();
+            let ended = edgerush_control_service::follow(
+                &address,
+                "control.test",
+                &tls,
+                &mut staging,
+                |_| std::future::ready(Ok(())),
+                |_| {},
+                None,
+            )
+            .await;
+            if !matches!(ended, edgerush_control_service::Ended::Unreachable(_)) {
+                break ended;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     });
     let runs = |lines: &[String]| {
         lines
