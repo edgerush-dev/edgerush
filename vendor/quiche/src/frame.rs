@@ -44,6 +44,8 @@ use qlog::events::quic::StreamType;
 
 pub const MAX_CRYPTO_OVERHEAD: usize = 8;
 pub const MAX_DGRAM_OVERHEAD: usize = 2;
+// EdgeRush: coalescing (`send_single` in lib.rs) starts no further stream's frame in a
+// packet with this much room or less, so that no stream is sent a sliver.
 pub const MAX_STREAM_OVERHEAD: usize = 12;
 pub const MAX_STREAM_SIZE: u64 = 1 << 62;
 

@@ -33,6 +33,7 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
+use std::num::NonZeroUsize;
 
 #[cfg(unix)]
 use std::os::unix::io::FromRawFd;
@@ -366,6 +367,24 @@ pub extern "C" fn quiche_config_set_initial_congestion_window_packets(
     config: &mut Config, packets: size_t,
 ) {
     config.set_initial_congestion_window_packets(packets);
+}
+
+/// Sets the fixed congestion window in bytes for `congestion_window_unchecked`.
+///
+/// Defaults to `usize::MAX`. Other congestion control algorithms are unchanged.
+/// Recovery probes can bypass the fixed window.
+#[no_mangle]
+pub extern "C" fn quiche_config_set_unchecked_congestion_window(
+    config: &mut Config, window: size_t,
+) {
+    config.set_unchecked_congestion_window(window);
+}
+
+#[no_mangle]
+pub extern "C" fn quiche_config_set_max_outstanding_sent_packets(
+    config: &mut Config, max_packets: size_t,
+) {
+    config.set_max_outstanding_sent_packets(NonZeroUsize::new(max_packets));
 }
 
 #[no_mangle]
@@ -1506,6 +1525,7 @@ pub extern "C" fn quiche_conn_path_stats(
     out.dgram_sent = stats.dgram_sent;
     out.rtt = stats.rtt.as_nanos() as u64;
     out.min_rtt = stats.min_rtt.unwrap_or_default().as_nanos() as u64;
+    out.max_rtt = stats.max_rtt.unwrap_or_default().as_nanos() as u64;
     out.rttvar = stats.rttvar.as_nanos() as u64;
     out.cwnd = stats.cwnd;
     out.sent_bytes = stats.sent_bytes;
