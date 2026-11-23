@@ -1,4 +1,4 @@
-Gateway, generation 0: Accepted=True/ListenersNotValid (listeners not accepted: quic, dns-again); ResolvedRefs=False/ListenersNotResolved (listeners with refs not resolved: kinds)
+Gateway, generation 0: Accepted=True/ListenersNotValid (listeners not served: quic, dns-again); ResolvedRefs=False/ListenersNotResolved (listeners with refs not resolved: kinds)
 listener quic: no kind, attached 0: Accepted=False/ProtocolConflict (port 443 serves HTTP/3 over UDP, as the data plane's settings have it for the HTTPS listener there); Conflicted=True/ProtocolConflict (port 443 serves HTTP/3 over UDP, as the data plane's settings have it for the HTTPS listener there); ResolvedRefs=True/ResolvedRefs; Programmed=False/ProtocolConflict (port 443 serves HTTP/3 over UDP, as the data plane's settings have it for the HTTPS listener there)
 listener secure: HTTPRoute, GRPCRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs
 listener dns: UDPRoute, attached 0: Accepted=True/Accepted; ResolvedRefs=True/ResolvedRefs

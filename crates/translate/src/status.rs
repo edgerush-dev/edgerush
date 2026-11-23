@@ -402,32 +402,35 @@ fn gateway_resolved(gateway: &GatewayOutcome, listeners: &[ListenerStatus]) -> C
 }
 
 /// The `Accepted` of a Gateway or a ListenerSet, of `listeners`, its own, and what each of
-/// them is to say.
+/// them is to say. It is of the listeners served, not those accepted: one accepted but
+/// serving nothing, its certificate not usable, leaves its Gateway or ListenerSet nothing it
+/// can serve through it, and one with nothing it can serve is not accepted, as conformance
+/// (`ListenerSetReferenceGrant`) reads it of a ListenerSet (04 §6).
 fn of_listeners(
     listeners: &[&ListenerOutcome],
     routes: &[RouteStatus],
     outcomes: &[RouteOutcome],
 ) -> (Condition, Vec<ListenerStatus>) {
-    let refused: Vec<&str> = listeners
+    let unserved: Vec<&str> = listeners
         .iter()
-        .filter(|listener| !listener.accepted())
+        .filter(|listener| listener.served.is_err())
         .map(|listener| listener.name.as_str())
         .collect();
-    let accepted = if refused.is_empty() {
+    let accepted = if unserved.is_empty() {
         Condition::new("Accepted", true, "Accepted", String::new())
-    } else if refused.len() < listeners.len() {
+    } else if unserved.len() < listeners.len() {
         Condition::new(
             "Accepted",
             true,
             "ListenersNotValid",
-            format!("listeners not accepted: {}", refused.join(", ")),
+            format!("listeners not served: {}", unserved.join(", ")),
         )
     } else {
         Condition::new(
             "Accepted",
             false,
             "ListenersNotValid",
-            "no listener is accepted".to_owned(),
+            "no listener is served".to_owned(),
         )
     };
     let statuses = listeners
