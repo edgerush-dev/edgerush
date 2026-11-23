@@ -37,7 +37,7 @@ impl Grant {
     pub(crate) fn take(&self, bytes: usize) -> bool {
         let taken = self
             .left
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                 if left == UNLIMITED {
                     Some(UNLIMITED)
                 } else {
@@ -60,7 +60,7 @@ impl Grant {
     pub(crate) fn give(&self, bytes: usize) {
         let _ = self
             .left
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                 Some(if left == UNLIMITED {
                     UNLIMITED
                 } else {

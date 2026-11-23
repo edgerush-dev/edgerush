@@ -2444,6 +2444,42 @@ async fn streams_refused_before_the_limit_is_acknowledged_are_counted_apart() {
     assert_eq!(connection.refused(), after);
 }
 
+/// A refusal is not counted among the resets a client provokes: past
+/// `max_local_error_reset_streams` refusals, for the stream limit and for want of grant,
+/// the connection goes on, and the next stream that fits is opened. Published h2 0.4.20
+/// counts them and closes the connection with ENHANCE_YOUR_CALM.
+#[tokio::test]
+async fn refused_streams_are_not_counted_among_the_resets_a_client_provokes() {
+    let mut builder = server::Builder::new();
+    builder.max_concurrent_streams(1);
+    builder.max_local_error_reset_streams(Some(2));
+    let (mut connection, mut peer, _) = server_with(&builder, true).await;
+    processed(&mut connection, &mut peer).await;
+    connection.set_grant(1 << 30);
+    request(&mut peer, 1, false).await;
+    for id in [3, 5, 7] {
+        request(&mut peer, id, false).await;
+    }
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(resets_in(&frames).len(), 3, "refused for the limit");
+    assert_eq!(goaway_in(&frames), None);
+    peer.send(&h2_peer::rst_stream(1, code::CANCEL)).await;
+    connection.set_grant(0);
+    request(&mut peer, 9, false).await;
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(
+        resets_in(&frames),
+        [(9, code::REFUSED_STREAM)],
+        "refused for the grant"
+    );
+    assert_eq!(goaway_in(&frames), None);
+    connection.set_grant(1 << 30);
+    request(&mut peer, 11, false).await;
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(resets_in(&frames), []);
+    assert_eq!(goaway_in(&frames), None);
+}
+
 // ===== How much a server decodes before its owner next looks =====
 //
 // EdgeRush's vendored h2 reads no frame past an allowance its owner sets (`set_work`), so

@@ -18,5 +18,5 @@ path = "lib.rs"
 [workspace]
 
 [dependencies]
-h2 = "=0.4.19"
+h2 = "=0.4.20"
 quiche = { version = "=0.30.1", default-features = false, features = ["boringssl-boring-crate"] }
