@@ -1,7 +1,7 @@
-# h2 0.4.19, patched
+# h2 0.4.20, patched
 
-This is [h2](https://github.com/hyperium/h2) 0.4.19 as published on crates.io (at
-`d57d1b852fec9dda6d42d3454502006d52104da8`), copyright the h2 authors, under the MIT
+This is [h2](https://github.com/hyperium/h2) 0.4.20 as published on crates.io (at
+`b0e890842ac16d3c76836fd4fcc06421acb15fa7`), copyright the h2 authors, under the MIT
 licence in `LICENSE`. The workspace builds it through `[patch.crates-io]`, in place of the
 published crate, and so does `fuzz/Cargo.toml`. Only what the package needs is kept: the
 manifest, the licence, the README and `src/`. The manifest still names h2's examples and
@@ -72,6 +72,12 @@ allowance, for fuzz builds:
   (`Recv::apply_local_settings`, which runs on the acknowledgement). A stream refused for
   want of the grant is the owner's shortage, not the peer's doing: it is in neither count,
   and ends no run.
+- **A refusal is not counted among the resets the peer provokes.** Published h2 counts each
+  stream it refuses towards `max_local_error_reset_streams`, over the connection's life,
+  and closes the connection with ENHANCE_YOUR_CALM past it. Here neither refusal counts
+  (`Connection::poll_ready`, `proto/connection.rs`): one for the stream limit is judged by
+  the counts above, which a peer that only meets the limit now and then never reaches, and
+  one for want of the grant, the owner's shortage, by none.
 - **It decodes only as much a poll as its owner allows.** Published h2 reads and decodes
   frames until its socket has nothing more, so a peer with many frames waiting keeps its
   task decoding while the worker's other tasks wait; a bound on the bytes read would not
@@ -107,20 +113,11 @@ allowance, for fuzz builds:
   a fragment off without an error, so `/a#b` was handed over as `/a`. The server's
   `convert_poll_message` (`server.rs`) now refuses a `:path` with a `#`, as it refuses an
   empty one: the stream is reset with PROTOCOL_ERROR, and counted.
-- **An answer without `:status` is malformed** (RFC 9113 §8.3.2). Published h2 took it for
-  a 200. The client's `convert_poll_message` (`client.rs`) resets the stream with
-  PROTOCOL_ERROR: h2's own fix, `3c5f61c` (#959), not in a release yet, carried as it was
-  made; drop it when a release has it.
 - **An answer with a request's pseudo-field is malformed** (§8.3). Published h2 set
   `:method`, `:path` and the like aside; `convert_poll_message` resets the stream.
 - **Trailers with a pseudo-field are malformed** (§8.1). Published h2 dropped them and passed
   the rest of the section on. `recv_trailers` (`proto/streams/recv.rs`) resets the stream,
   on a client and a server alike; a server's reset counts as any malformed request's.
-- **A GOAWAY on a stream is a connection error** (RFC 9113 §6.8). Published h2 took one
-  with a stream identifier other than 0 for a graceful GOAWAY. `GoAway::load`
-  (`frame/go_away.rs`) is given the frame's head and refuses it, and the connection is
-  closed with PROTOCOL_ERROR: h2's own fix, `d4a37fc` (#951), not in a release yet, carried
-  as it was made; drop it when a release has it.
 - **A field sent never indexed keeps the mark** (RFC 7541 §6.2.3: an intermediary
   re-encodes it the same way). Published h2 decoded it as any literal (a `TODO` in
   `hpack/decoder.rs`). The decoder now marks its value sensitive, which h2's encoder already
@@ -159,7 +156,9 @@ proxy by `a_stream_is_charged_the_head_h2_hands_over_with_it` and
 copies that unpin buffers change nothing the public API shows, and no test sees them.
 The counts of refusals are covered by
 `streams_refused_for_their_limit_are_counted_in_a_row_until_one_opens` and
-`streams_refused_before_the_limit_is_acknowledged_are_counted_apart` there, and through the
+`streams_refused_before_the_limit_is_acknowledged_are_counted_apart` there, their absence
+from the resets a peer provokes by
+`refused_streams_are_not_counted_among_the_resets_a_client_provokes`, and through the
 proxy by `a_client_refused_a_hundred_streams_in_a_row_for_its_limit_is_closed`,
 `a_burst_past_the_limit_before_it_is_acknowledged_leaves_the_client_open`,
 `a_client_that_never_acknowledges_is_closed_after_a_thousand_refused` and
@@ -183,7 +182,8 @@ a fragment by `a_path_with_a_fragment_is_reset`, of an answer without `:status` 
 `an_answer_without_a_status_is_reset`, of a request's pseudo-field in an answer by
 `an_answer_with_a_requests_pseudo_field_is_reset`, and of pseudo-fields in trailers by
 `an_answers_trailers_with_a_pseudo_field_are_refused` and
-`a_requests_trailers_with_a_pseudo_field_are_reset`, and of a GOAWAY on a stream by
+`a_requests_trailers_with_a_pseudo_field_are_reset`, and a GOAWAY on a stream, which h2
+now refuses itself as it does an answer without `:status`, by
 `a_goaway_on_a_stream_is_a_connection_error_to_a_server` and `…_to_a_client`; the
 never-indexed mark by `a_requests_field_sent_never_indexed_is_handed_over_sensitive` and
 `an_answers_field_sent_never_indexed_is_handed_over_sensitive`, and through the proxy by
@@ -194,7 +194,7 @@ README).
 ## Advisories
 
 `cargo deny` looks advisories up only for crates with a registry source, and a path has
-none. So `vendor/bases` names h2 0.4.19 as published, which `check.sh` checks against the
+none. So `vendor/bases` names h2 0.4.20 as published, which `check.sh` checks against the
 RustSec database (<https://rustsec.org/packages/h2.html>) as it checks the workspace, and
 whose lock file GitHub's dependency graph reads for GitHub's own advisories. An advisory
 fixed in this copy is ignored in `deny.toml`, with the reason. h2 is carried only to a
@@ -204,7 +204,7 @@ version none of them affects.
 
 Read h2's advisories first (above). Copy the new version's `Cargo.toml`, `LICENSE`,
 `README.md` and `src/` over these, then make the changes marked `EdgeRush:` again
-(`grep -rl EdgeRush src` lists the eighteen files); a refusal the new version makes itself is
+(`grep -rl EdgeRush src` lists the seventeen files); a refusal the new version makes itself is
 dropped, with its probe kept. The buffers' changes change nothing h2 does unless a
 connection's buffers are given back, and the grant and the allowance nothing unless they are set. Update the version here, in the workspace's `Cargo.toml`, in `fuzz/Cargo.toml` and in
 `vendor/bases/Cargo.toml` (then `cargo generate-lockfile` there), and run the tests above

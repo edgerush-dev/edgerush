@@ -43,7 +43,6 @@ impl GoAway {
     pub fn load(head: Head, payload: &[u8]) -> Result<GoAway, Error> {
         debug_assert_eq!(head.kind(), crate::frame::Kind::GoAway);
 
-        // EdgeRush: h2's own fix (d4a37fc, unreleased), carried as it was made.
         // The GOAWAY frame applies to the connection, not a specific stream.
         // An endpoint MUST treat a GOAWAY frame with a stream identifier
         // other than 0x00 as a connection error (Section 5.4.1) of type

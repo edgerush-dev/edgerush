@@ -60,7 +60,7 @@ edgerush-translate = { path = "crates/translate" }
 # HTTP/2 on both hops, used directly rather than through hyper (15 §3). The version is the
 # one already locked under hyper; its behaviour is pinned by the probes in
 # `crates/proxy/tests/h2_library.rs`, so moving it is a deliberate change of its own.
-h2 = "=0.4.19"
+h2 = "=0.4.20"
 # Types only (header map, method): the request core works on these, never on an engine's.
 http = "1.5"
 # The body trait the request core and the upstream exchange work on, whichever engine read
@@ -188,7 +188,7 @@ opt-level = 3
 # too, being a workspace of its own.
 [patch.crates-io]
 quiche = { path = "vendor/quiche" }
-# h2 0.4.19 as published, but for additions of ours: a server connection can give back the
+# h2 0.4.20 as published, but for additions of ours: a server connection can give back the
 # buffers it reads, writes and decodes header blocks in while it has nothing in them, and
 # makes them again when next needed (14 §3); a connection says how much of what its peer
 # sent it holds unreleased, so that it can be charged (15 §3); and an allowance that lets
