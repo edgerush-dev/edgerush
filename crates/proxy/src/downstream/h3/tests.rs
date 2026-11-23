@@ -242,10 +242,7 @@ where
     let address = socket.local_addr().unwrap();
     let timers = Timers::new();
     let running = Rc::clone(&timers);
-    tokio::task::spawn_local(async move {
-        let never = running.run().await;
-        match never {}
-    });
+    tokio::task::spawn_local(running.run());
     let drain = Rc::new(Drain::default());
     let closed = Rc::new(RefCell::new(Vec::new()));
     let closing = Rc::clone(&closed);

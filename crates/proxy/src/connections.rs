@@ -136,7 +136,7 @@ impl Loads {
     pub fn listener_removed(&self) {
         let _was = self
             .listening
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
     }
 
     /// Whether any worker holds a connection of the listener `listener`, over TCP or QUIC.

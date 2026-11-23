@@ -315,9 +315,7 @@ the RustSec advisory database. The tests are run by `cargo-nextest`
 uses). Another, the tests of the benchmark scripts in `bench/`,
 needs `python3`, its standard library alone. The first run of `check.sh` builds BoringSSL
 a second time, for vendored quiche's own tests, which have a lock file and a target
-directory (`target/vendored`) of their own. On Linux, one more reads the layout of a
-request's future from a debug build of the binary, in a target directory of its own
-(`target/layout`) that its first run builds whole. CI (`.github/workflows/ci.yml`) runs
+directory (`target/vendored`) of their own. CI (`.github/workflows/ci.yml`) runs
 `check.sh` itself, on Linux, for every push to `main` and every pull request.
 
 ## Benchmarks
