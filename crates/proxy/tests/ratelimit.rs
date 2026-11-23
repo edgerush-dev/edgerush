@@ -93,7 +93,7 @@ async fn slow_service(delay: Option<Duration>) -> Vec<String> {
     for id in 1..=3 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
-        let mut mode = AsyncPod::new(id, address.clone(), config, [], 10_000_000);
+        let mut mode = AsyncPod::new(id, address.clone(), config, []);
         mode.set_life(id);
         let pod = StorePod::start(mode, address.clone(), Dial::Plain, Vec::new());
         let server = Slowed {

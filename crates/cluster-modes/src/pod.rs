@@ -58,20 +58,18 @@ pub struct Pod {
 }
 
 impl Pod {
-    /// Pod `id`, reached at `address`, new, knowing how to reach `peers`, its asynchronous data
-    /// planes sending every `cycle` nanoseconds.
+    /// Pod `id`, reached at `address`, new, knowing how to reach `peers`.
     #[must_use]
     pub fn new(
         id: NodeId,
         address: String,
         config: Config,
         peers: impl IntoIterator<Item = NodeId>,
-        cycle: Time,
     ) -> Self {
         Self {
             node: Store::new(id, address, config, peers),
             decider: Decider::default(),
-            applier: Applier::new(cycle),
+            applier: Applier::default(),
             wrong_kind: 0,
         }
     }

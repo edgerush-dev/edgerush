@@ -1,8 +1,8 @@
 //! What a pod of the rate-limiting service reads from its config file
-//! ([06 §4](../../../docs/06-rate-limiting.md)): the mode it serves, the pod itself, the
-//! store's settings, what its keys may hold and the files its mutual TLS is read from. Each setting left out has its value, which the
-//! service gives it; the service checks what the types cannot, such as a pod's timings
-//! against each other, and what each mode needs and does not read.
+//! ([06 §4](../../../docs/06-rate-limiting.md)): the pod itself, the store's settings, what
+//! its keys may hold and the files its mutual TLS is read from. Every pod serves both modes,
+//! so the file names none. Each setting left out has its value, which the service gives it;
+//! the service checks what the types cannot, such as a pod's timings against each other.
 
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -18,13 +18,10 @@ use std::path::PathBuf;
 )]
 #[serde(deny_unknown_fields)]
 pub struct ServiceFile {
-    /// The rate-limiting mode the pod serves: a pod serves one. Asynchronous when left out.
-    #[serde(default)]
-    pub mode: Option<ServiceMode>,
     /// The pod itself.
     pub pod: ServicePod,
-    /// The store's settings, which every pod of a cluster is to share. Either mode runs on
-    /// them, and needs them.
+    /// The store's settings, which every pod of a cluster is to share. Both modes run on
+    /// them, and need them.
     #[serde(default)]
     pub store: Option<ServiceStore>,
     /// What the pod's keys may hold; left out, each has its value.
@@ -36,20 +33,8 @@ pub struct ServiceFile {
     pub tls: Option<ServicePodTls>,
 }
 
-/// The rate-limiting mode a service pod serves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceMode {
-    /// Data planes decide from their copies of the keys and share what they admitted every
-    /// cycle.
-    Asynchronous,
-    /// The key's owner decides every request.
-    Synchronous,
-}
-
-/// A service pod: where it serves, where it is reached, and its data planes' cycle. It takes
-/// a member id of its own each time it starts.
+/// A service pod: where it serves and where it is reached. It takes a member id of its own
+/// each time it starts.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -60,15 +45,10 @@ pub struct ServicePod {
     /// hellos and as it asks to join the store. Needed.
     #[serde(default)]
     pub address: Option<String>,
-    /// Where `/metrics` shows the pod's store and what its mode counts, and `/ready` whether
+    /// Where `/metrics` shows the pod's store and what each mode counts, and `/ready` whether
     /// it is ready; nowhere when left out.
     #[serde(default)]
     pub metrics: Option<SocketAddr>,
-    /// Milliseconds of the data planes' cycle, in the asynchronous mode alone (the
-    /// synchronous mode's store has `store.cycle_ms`). 10 when left out.
-    #[serde(default)]
-    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
-    pub cycle_ms: Option<u64>,
 }
 
 /// The most milliseconds any of the store's timings may be: an hour, far past any use, and
@@ -125,11 +105,11 @@ pub struct ServiceStore {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(max = STORE_MOST_MS)))]
     pub skew_warning_ms: Option<u64>,
-    /// Whether a pod a data plane asks about a key whose owner it has not heard for
-    /// `stop_serving_ms` decides the key itself, from its copy, rather than forward the ask to
-    /// an owner it cannot reach: so that an owner gone has its keys held to their limits while
-    /// a replica takes over, the charges lost if another replica takes them. A replica only,
-    /// holding its own lease. True when left out.
+    /// Whether a pod a synchronous data plane asks about a key whose owner it has not heard
+    /// for `stop_serving_ms` decides the key itself, from its copy, rather than forward the ask
+    /// to an owner it cannot reach: so that an owner gone has its keys held to their limits
+    /// while a replica takes over, the charges lost if another replica takes them. A replica
+    /// only, holding its own lease. True when left out.
     #[serde(default)]
     pub forwarder_decides: Option<bool>,
 }
@@ -178,12 +158,10 @@ mod tests {
     #[test]
     fn a_file_with_every_section_is_read_as_it_says() {
         let yaml = "\
-mode: synchronous
 pod:
   listen: 0.0.0.0:7000
   address: rl-1:7000
   metrics: 0.0.0.0:9090
-  cycle_ms: 5
 store:
   seeds: [rl-0:7000, rl-2:7000]
   shards: 64
@@ -206,12 +184,10 @@ tls:
         assert_eq!(
             read(yaml).unwrap(),
             ServiceFile {
-                mode: Some(ServiceMode::Synchronous),
                 pod: ServicePod {
                     listen: "0.0.0.0:7000".parse().unwrap(),
                     address: Some("rl-1:7000".to_owned()),
                     metrics: Some("0.0.0.0:9090".parse().unwrap()),
-                    cycle_ms: Some(5),
                 },
                 store: Some(ServiceStore {
                     seeds: vec!["rl-0:7000".to_owned(), "rl-2:7000".to_owned()],
@@ -241,9 +217,8 @@ tls:
     #[test]
     fn what_is_left_out_is_left_to_the_service() {
         let file = read(LEAST).unwrap();
-        assert_eq!(file.mode, None);
-        assert_eq!((file.pod.metrics, file.pod.cycle_ms), (None, None));
-        // Where it is reached and the store too: that each mode needs them the service says.
+        assert_eq!(file.pod.metrics, None);
+        // Where it is reached and the store too: that a pod needs them the service says.
         assert_eq!((file.pod.address, file.store), (None, None));
         assert_eq!(file.keys, ServiceKeys::default());
         assert_eq!(file.tls, None);
@@ -260,7 +235,8 @@ tls:
             // What the asynchronous mode's pods agreed by before they ran on the store.
             "pod: { id: 0, listen: 0.0.0.0:7000 }\n".to_owned(),
             format!("{LEAST}membership: {{ pods: {{ 0: rl-0:7000 }} }}\n"),
-            // A mode the service does not serve.
+            // A mode: every pod serves both, and the file names none.
+            format!("{LEAST}mode: asynchronous\n"),
             format!("{LEAST}mode: local\n"),
             // The pod, or where it listens, not said.
             "store: {}\n".to_owned(),

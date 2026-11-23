@@ -452,7 +452,8 @@ mod tests {
             per: 10,
             window: 1_000_000_000,
         };
-        let asked = wire::asked_from(plane.request(7, 42, Some(rule)).unwrap(), 9).unwrap();
+        let asked: Message =
+            wire::asked_from(plane.request(7, 42, Some(rule)).unwrap(), 9).unwrap();
         assert_eq!(
             asked,
             Message::Request {
@@ -467,7 +468,8 @@ mod tests {
                 receipt: 0,
             }
         );
-        let back = wire::asked_from(plane.give_back(8, 42, Some(rule), 5).unwrap(), 9).unwrap();
+        let back: Message =
+            wire::asked_from(plane.give_back(8, 42, Some(rule), 5).unwrap(), 9).unwrap();
         assert_eq!(
             back,
             Message::Request {
@@ -487,7 +489,7 @@ mod tests {
     #[test]
     fn what_a_pod_tells_is_read_its_tables_taken_in() {
         let mut plane = plane(&[1, 2]);
-        let told = |message| wire::telling(message).unwrap();
+        let told = |message: Message| wire::telling(message).unwrap();
         let newer = table(&[1, 2, 3], 2);
         let table_told = told(
             StoreMessage::TableReply {

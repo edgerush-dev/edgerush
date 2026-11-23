@@ -87,8 +87,8 @@ struct Heard {
 /// A copy coming in parts, as far as its parts have come in turn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Taking {
-    /// The copy: its shard term, the replica's assignment and its number.
-    copy: (u64, u64, u64),
+    /// The copy: its shard term, the replica's assignment, the copy it follows and its number.
+    copy: CopyName,
     /// The number of the part that comes next in turn.
     next: u32,
     /// Of a whole copy, the keys its parts have named: those the last part keeps.
@@ -96,6 +96,11 @@ struct Taking {
     /// Whether its last part is in: kept so that, sent again, it is answered again.
     done: bool,
 }
+
+/// What names a copy: its shard term, the replica's assignment, the copy it follows and its
+/// number. A repair takes the number of the copy of changes before it, so the copy it follows
+/// tells the two apart: a part of one is never answered, nor its answer counted, as the other's.
+type CopyName = (u64, u64, Option<u64>, u64);
 
 /// As owner: a copy of many parts to one replica, sent a few unanswered parts ahead, each cut
 /// as it goes from what the shard holds then.
@@ -1698,7 +1703,7 @@ impl<V: Held> Node<V> {
     /// is left for the owner to send again from that one.
     fn answer_again(
         shard: ShardId,
-        (term, assignment, version): (u64, u64, u64),
+        (term, assignment, after, version): CopyName,
         part: u32,
         next: Option<u32>,
     ) -> Option<Message<V>> {
@@ -1706,6 +1711,7 @@ impl<V: Held> Node<V> {
             shard,
             term,
             assignment,
+            after,
             version,
             part: next.saturating_sub(1),
         })
@@ -2133,7 +2139,7 @@ impl<V: Held> Node<V> {
                 // out of turn, one before it lost, is left for the owner to send again from that
                 // one. A copy of one part leaves alone the copy of many it may come between.
                 let taking = (shard, from);
-                let copy = (term, assignment, version);
+                let copy = (term, assignment, after, version);
                 let alone = part == 0 && !more;
                 // A first part starts the copy, unless it is the first of the copy it is taking,
                 // sent again: the parts after it it has answered for, and its owner sends on
@@ -2226,6 +2232,7 @@ impl<V: Held> Node<V> {
                             shard,
                             term,
                             assignment,
+                            after,
                             version,
                             part,
                         },
@@ -2297,12 +2304,17 @@ impl<V: Held> Node<V> {
                 shard,
                 term,
                 assignment,
+                after,
                 version,
                 part,
             } => {
                 if let Some(sending) = self.sending.get_mut(&(from, shard))
-                    && (sending.term, sending.assignment, sending.version)
-                        == (term, assignment, version)
+                    && (
+                        sending.term,
+                        sending.assignment,
+                        sending.after,
+                        sending.version,
+                    ) == (term, assignment, after, version)
                 {
                     let before = sending.sent.len();
                     sending.sent.retain(|sent| sent.part > part);
@@ -4123,6 +4135,122 @@ mod tests {
         assert_eq!(took(&node.receive(1, parts[2].1.clone(), ms(4))), [2]);
         let last = node.receive(1, parts[3].1.clone(), ms(4));
         assert_eq!((took(&last), said_held(&last)), (vec![3], vec![1]));
+    }
+
+    /// Two copies of many parts under one number are two copies when they follow different
+    /// copies, as a repair takes the number of the copy of changes before it: a part of the
+    /// second, its first part lost, is not answered as taken from the first, which was taken
+    /// whole, and the second, sent again from its first part, ends with the replica holding
+    /// all it carries.
+    #[test]
+    fn a_copy_under_the_number_of_one_taken_is_taken_afresh() {
+        let keys = keys_in_0(5);
+        let copy = |after, entries: Vec<(Key, Kept<Counts>)>| {
+            let mut parts = Vec::new();
+            let whole = Message::Replicate {
+                shard: 0,
+                term: 1,
+                assignment: 1,
+                after,
+                version: 2,
+                under: (0, 0),
+                entries,
+                dropped: Vec::new(),
+                part: 0,
+                more: false,
+            };
+            send_in_parts(&mut parts, 2, whole, 1);
+            parts
+        };
+        let counted = |keys: &[Key], count| -> Vec<(Key, Kept<Counts>)> {
+            keys.iter()
+                .map(|key| (*key, Kept::new(Counts::of(count))))
+                .collect()
+        };
+        let took = |out: &Outbox| -> Vec<u32> {
+            out.iter()
+                .filter_map(|(_, message)| match message {
+                    Message::Took { part, .. } => Some(*part),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut node = member();
+        // The changes, following a copy it never held: taken whole, not held.
+        let changes = copy(Some(1), counted(&keys[..2], 5));
+        assert_eq!(changes.len(), 2);
+        for (_, part) in changes {
+            let _ = node.receive(1, part, ms(2));
+        }
+        // The repair, all the shard holds, under the same number: its first part lost.
+        let repair = copy(None, counted(&keys[2..], 7));
+        assert_eq!(repair.len(), 3);
+        let out = node.receive(1, repair[1].1.clone(), ms(3));
+        assert_eq!(
+            took(&out),
+            Vec::<u32>::new(),
+            "answered as the changes' part"
+        );
+        let mut said = Vec::new();
+        for (index, (_, part)) in repair.into_iter().enumerate() {
+            let out = node.receive(1, part, ms(4));
+            assert_eq!(took(&out), [part_number(index)]);
+            said.extend(said_held(&out));
+        }
+        assert_eq!(said, [2]);
+        for key in &keys[2..] {
+            assert_eq!(node.count(*key), Some(7));
+        }
+    }
+
+    /// An answer to the parts of a copy that follows another than the copy going, under its
+    /// number — a late answer to the copy of changes a repair took the number of — answers
+    /// none of the copy going.
+    #[test]
+    fn an_answer_to_a_copy_under_the_same_number_answers_none_of_another() {
+        let (mut owner, _, _) = owner_of_many_parts(10);
+        let Some((shard, (term, assignment, after, version), part)) = owner
+            .sending
+            .iter()
+            .find(|((replica, _), sending)| *replica == 2 && !sending.sent.is_empty())
+            .and_then(|((_, shard), sending)| {
+                let last = sending.sent.last()?.part;
+                let copy = (
+                    sending.term,
+                    sending.assignment,
+                    sending.after,
+                    sending.version,
+                );
+                Some((*shard, copy, last))
+            })
+        else {
+            panic!("no copy in parts going to 2");
+        };
+        assert_eq!(after, None, "a whole copy");
+        let took = |after| Message::Took {
+            shard,
+            term,
+            assignment,
+            after,
+            version,
+            part,
+        };
+        let unanswered = |owner: &Node| -> Vec<u32> {
+            owner
+                .sending
+                .get(&(2, shard))
+                .map(|sending| sending.sent.iter().map(|sent| sent.part).collect())
+                .unwrap_or_default()
+        };
+        let going = unanswered(&owner);
+        let _ = owner.receive(2, took(Some(version - 1)), ms(2));
+        assert_eq!(unanswered(&owner), going, "another copy's answer counted");
+        let _ = owner.receive(2, took(None), ms(2));
+        assert!(
+            unanswered(&owner).iter().all(|sent| *sent > part),
+            "its own answer not counted: {:?}",
+            unanswered(&owner)
+        );
     }
 
     /// A copy of one part coming between the parts of a copy of many leaves it to go on.

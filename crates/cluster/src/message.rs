@@ -182,6 +182,9 @@ pub enum Message<V> {
         term: u64,
         /// The assignment the copy was for.
         assignment: u64,
+        /// The copy the copy follows, or none for all the shard holds: with its number, what
+        /// names it, as a repair takes the number of the copy of changes before it.
+        after: Option<u64>,
         /// The copy's number.
         version: u64,
         /// The part it has every part up to.

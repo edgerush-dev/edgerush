@@ -51,7 +51,7 @@ const ANSWERED: Duration = Duration::from_secs(1);
 /// (10 ms) many times over.
 const COPIED: Duration = Duration::from_secs(1);
 
-/// The data planes' cycle, as the pods are told it.
+/// The data planes' cycle, as their batches say it.
 const CYCLE: Time = ms(10);
 
 /// Fewer shards than the store's default, for tests that read every one.
@@ -164,7 +164,7 @@ impl Cluster {
             let relay =
                 Relay::to(ip, listener.local_addr().unwrap(), cluster.cut.subscribe()).await;
             let address = relay.address.to_string();
-            let mut mode = Pod::new(id, address.clone(), config(), [], CYCLE);
+            let mut mode = Pod::new(id, address.clone(), config(), []);
             mode.set_life(1_000 + id);
             let pod = StorePod::start(mode, address.clone(), Dial::Plain, Vec::new());
             let server = StoreServer::new(pod.clone());
@@ -288,6 +288,7 @@ fn batch(stamp: Stamp, key: Key, sequence: u64, count: u64) -> Batch {
         from: PLANE,
         stamp,
         made: 5,
+        cycle: CYCLE,
         entries: vec![Entry {
             key,
             contract: contract(),

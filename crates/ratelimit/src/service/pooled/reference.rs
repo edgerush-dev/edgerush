@@ -210,12 +210,13 @@ impl PlaneKey {
 }
 
 impl Queued {
-    /// Its batch, from data plane `from`, whole.
-    pub(super) fn batch(self, from: PlaneId) -> Batch {
+    /// Its batch, from data plane `from`, sending every `cycle` nanoseconds, whole.
+    pub(super) fn batch(self, from: PlaneId, cycle: u64) -> Batch {
         Batch {
             from,
             entries: self.entries,
             made: self.made,
+            cycle,
         }
     }
 }
@@ -528,7 +529,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
     pub(super) fn take_outgoing(&mut self) -> Vec<(PodId, Batch)> {
         std::mem::take(&mut self.queued)
             .into_iter()
-            .map(|(pod, queued)| (pod, queued.batch(self.id)))
+            .map(|(pod, queued)| (pod, queued.batch(self.id, self.cycle)))
             .collect()
     }
 }

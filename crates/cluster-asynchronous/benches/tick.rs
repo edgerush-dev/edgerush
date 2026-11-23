@@ -60,7 +60,7 @@ const fn key(k: u64) -> Key {
 /// The only pod of its service, so that it owns every key, under `config`: its first table
 /// taken and its lease held at `now`.
 fn alone(config: Config, now: Time) -> Pod {
-    let mut pod = Pod::new(1, "pod-1:7000".to_owned(), config, [], CYCLE);
+    let mut pod = Pod::new(1, "pod-1:7000".to_owned(), config, []);
     let members = [(1, "pod-1:7000".to_owned())].into_iter().collect();
     let first = table::first(&members, config.shards, 0, 1);
     let _ = pod.receive(1, StoreMessage::TableReply { table: first }, now);
@@ -95,6 +95,7 @@ fn filled(config: Config, contract: fn(u64) -> Contract) -> Box<Pod> {
                 from: PlaneId::from(plane),
                 stamp: (0, 0),
                 made: 0,
+                cycle: CYCLE,
                 entries,
             },
             MS,
@@ -181,6 +182,7 @@ fn over_the_cap() -> (Box<Pod>, Time) {
         from: PlaneId::from(0_u64),
         stamp: (0, 0),
         made: 0,
+        cycle: CYCLE,
         entries,
     };
     let _ = pod.batch(batch, SETTLED + MS);

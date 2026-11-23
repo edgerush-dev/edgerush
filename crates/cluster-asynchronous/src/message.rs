@@ -4,7 +4,7 @@
 
 use crate::Value;
 use crate::owner::Answered;
-use edgerush_cluster::{Key, NodeId, Stamp, Table};
+use edgerush_cluster::{Key, NodeId, Stamp, Table, Time};
 use edgerush_ratelimit::service::{Contract, PlaneId, Report};
 
 /// One message between pods, or between a data plane and a pod.
@@ -52,6 +52,10 @@ pub struct Batch {
     /// When the data plane made it, on its own clock: what its hits' ages count back from,
     /// said back in the answers.
     pub made: u64,
+    /// The time between the data plane's batches, which tells the owner how lately a data
+    /// plane must have admitted a key to count among those admitting it: a key's data planes
+    /// are one DataPlane's, which all send at its cycle.
+    pub cycle: Time,
     /// One entry a key, or a few for one key (batches sent again).
     pub entries: Vec<Entry>,
 }

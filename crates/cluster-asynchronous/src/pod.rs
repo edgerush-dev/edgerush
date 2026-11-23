@@ -41,11 +41,8 @@ pub struct Pod {
 /// The mode's part of a pod, over a store it is handed each time: the batches it answers,
 /// numbered by its life. Kept apart from the store so that one store can serve this mode
 /// beside another.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Applier {
-    /// The time between a data plane's batches, which tells how lately a data plane must have
-    /// admitted a key to count among those admitting it.
-    cycle: Time,
     /// Its life, which its answers carry; 0 leaves them unnumbered.
     life: u64,
     /// The answers it has given in this life.
@@ -76,19 +73,17 @@ pub struct Turned {
 }
 
 impl Pod {
-    /// Pod `id`, reached at `address`, new, knowing how to reach `peers`, its data planes
-    /// sending every `cycle` nanoseconds.
+    /// Pod `id`, reached at `address`, new, knowing how to reach `peers`.
     #[must_use]
     pub fn new(
         id: NodeId,
         address: String,
         config: Config,
         peers: impl IntoIterator<Item = NodeId>,
-        cycle: Time,
     ) -> Self {
         Self {
             node: Store::new(id, address, config, peers),
-            applier: Applier::new(cycle),
+            applier: Applier::default(),
         }
     }
 
@@ -143,17 +138,6 @@ impl Pod {
 }
 
 impl Applier {
-    /// One whose data planes send every `cycle` nanoseconds.
-    #[must_use]
-    pub fn new(cycle: Time) -> Self {
-        Self {
-            cycle: cycle.max(1),
-            life: 0,
-            answered: 0,
-            turned_away: TurnedAway::default(),
-        }
-    }
-
     /// Its life, drawn at random when it starts and never 0, which its answers carry: a data
     /// plane takes an answer's buckets only if it is the pod's latest, and a restart starts the
     /// numbering again. 0, the default, leaves its answers unnumbered, each taken as it comes.
@@ -220,9 +204,9 @@ impl Applier {
             from,
             stamp,
             made,
+            cycle,
             entries,
         } = batch;
-        let cycle = self.cycle;
         let mut answers = Vec::new();
         let mut unserved = Vec::new();
         for entry in entries {
@@ -280,6 +264,7 @@ impl Applier {
             from: plane,
             stamp,
             made,
+            cycle,
             entries,
         } = batch;
         let shards = node.config().shards;
@@ -301,6 +286,7 @@ impl Applier {
                 from: plane,
                 stamp,
                 made,
+                cycle,
                 entries: kept,
             },
             now,
@@ -316,6 +302,7 @@ impl Applier {
                         from: plane,
                         stamp,
                         made,
+                        cycle,
                         entries,
                     },
                 },
@@ -379,7 +366,7 @@ mod tests {
 
     /// Pod 1 holding the first table, not yet leased.
     fn member() -> Pod {
-        let mut pod = Pod::new(1, "pod-1:7000".to_owned(), config(), [2, 3], CYCLE);
+        let mut pod = Pod::new(1, "pod-1:7000".to_owned(), config(), [2, 3]);
         let _ = pod.receive(2, StoreMessage::TableReply { table: first() }, ms(1));
         pod
     }
@@ -436,6 +423,7 @@ mod tests {
             from: PLANE,
             stamp,
             made,
+            cycle: CYCLE,
             entries,
         }
     }
@@ -513,22 +501,30 @@ mod tests {
         );
     }
 
-    /// Those admitting lately are counted by the pod's cycle: a data plane that admitted
-    /// 200 ms before another, within thirty of its 10 ms cycles, counts among the others.
+    /// Those admitting lately are counted by the cycle the batch carries, its data planes': a
+    /// data plane that admitted 200 ms before another counts among the others within thirty of
+    /// their 10 ms cycles, and not within thirty of 5 ms ones.
     #[test]
-    fn those_admitting_lately_are_counted_by_the_pods_cycle() {
-        let mut pod = member();
-        lease(&mut pod, ms(2));
-        let own = key_of(1);
-        let stamp = first().stamp();
-        let _ = pod.batch(batch(stamp, 0, vec![hits(own, 1, 1)]), ms(3));
-        let other = Batch {
-            from: PLANE + 1,
-            ..batch(stamp, 0, vec![hits(own, 1, 1)])
-        };
-        lease(&mut pod, ms(203));
-        let answers = pod.batch(other, ms(203));
-        assert_eq!(answers.entries[0].answered.others, 1);
+    fn those_admitting_lately_are_counted_by_the_batchs_cycle() {
+        for (cycle, others) in [(CYCLE, 1), (CYCLE / 2, 0)] {
+            let mut pod = member();
+            lease(&mut pod, ms(2));
+            let own = key_of(1);
+            let stamp = first().stamp();
+            let one = Batch {
+                cycle,
+                ..batch(stamp, 0, vec![hits(own, 1, 1)])
+            };
+            let _ = pod.batch(one, ms(3));
+            let other = Batch {
+                from: PLANE + 1,
+                cycle,
+                ..batch(stamp, 0, vec![hits(own, 1, 1)])
+            };
+            lease(&mut pod, ms(203));
+            let answers = pod.batch(other, ms(203));
+            assert_eq!(answers.entries[0].answered.others, others, "{cycle}");
+        }
     }
 
     /// A hit is charged, and its admission recorded, by the pod's wall clock, not its own.
@@ -581,18 +577,23 @@ mod tests {
     }
 
     /// A data plane's batch reaching a pod with entries for a key another pod owns: those
-    /// forwarded to the owner, once, to be answered through this pod; the rest answered here,
-    /// the forwarded ones neither applied nor answered unserved.
+    /// forwarded to the owner, once, with the batch's cycle, to be answered through this pod;
+    /// the rest answered here, the forwarded ones neither applied nor answered unserved.
     #[test]
     fn entries_for_another_owner_are_forwarded_to_it() {
         let mut pod = member();
         lease(&mut pod, ms(2));
         let (own, theirs) = (key_of(1), key_of(2));
-        let sent = batch(
-            first().stamp(),
-            5,
-            vec![hits(own, 1, 1), hits(theirs, 1, 2)],
-        );
+        // The data planes' cycle, not the default: it goes on with the entries.
+        let cycle = ms(7);
+        let sent = Batch {
+            cycle,
+            ..batch(
+                first().stamp(),
+                5,
+                vec![hits(own, 1, 1), hits(theirs, 1, 2)],
+            )
+        };
         let out = pod.receive(PLANE, Message::Batch(sent), ms(3));
         let [
             (to, Message::Answers(answers)),
@@ -613,7 +614,13 @@ mod tests {
         assert_eq!(answers.entries[0].key, own);
         assert!(answers.unserved.is_empty(), "{answers:?}");
         assert_eq!((*owner, *client, *via), (2, PLANE, 1));
-        assert_eq!(onward, &batch(first().stamp(), 5, vec![hits(theirs, 1, 2)]));
+        assert_eq!(
+            onward,
+            &Batch {
+                cycle,
+                ..batch(first().stamp(), 5, vec![hits(theirs, 1, 2)])
+            }
+        );
         assert_eq!(pod.value(theirs), None, "nothing applied here");
     }
 

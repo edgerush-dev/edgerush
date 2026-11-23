@@ -3,7 +3,7 @@
 //! their owner and the answers it relays back, and what a data plane's stream carries.
 //!
 //! An entry's contract and report are the service's today ([`crate::wire`]): the same
-//! messages, refused alike; its key is the store's, 64 bits.
+//! messages, refused alike; its key is the store's, 128 bits.
 //!
 //! A data plane sends its batches up its stream ([`Batch`]), and is told down it the answers
 //! — the pod's own, and an owner's it relays, with the owner — and the pod's table as it
@@ -184,6 +184,10 @@ pub struct Batch {
     /// One entry a key, or a few.
     #[prost(message, repeated, tag = "4")]
     pub entries: Vec<Entry>,
+    /// The time between the data plane's batches, in nanoseconds: what the owner counts those
+    /// admitting a key lately by. Never 0.
+    #[prost(uint64, tag = "5")]
+    pub cycle_ns: u64,
 }
 
 /// The owner's answer about one key.
@@ -324,6 +328,7 @@ pub fn batch_to_wire(batch: AsyncBatch) -> Batch {
         stamp: Some(stamp(batch.stamp)),
         made_ns: batch.made,
         entries: batch.entries.into_iter().map(entry_to_wire).collect(),
+        cycle_ns: batch.cycle,
     }
 }
 
@@ -334,16 +339,21 @@ pub fn too_long(batch: &Batch) -> bool {
     prost::Message::encoded_len(batch) > MAX_MESSAGE
 }
 
-/// A data plane's batch from the wire: refused whole if any entry cannot be used.
+/// A data plane's batch from the wire: refused whole if any entry cannot be used, or if it
+/// says no cycle.
 ///
 /// # Errors
 ///
 /// A batch the mode cannot use: see [`Invalid`].
 pub fn batch_from(batch: Batch) -> Result<AsyncBatch, Invalid> {
+    if batch.cycle_ns == 0 {
+        return Err(Invalid::Cycle);
+    }
     Ok(AsyncBatch {
         from: batch.from,
         stamp: stamp_from(batch.stamp)?,
         made: batch.made_ns,
+        cycle: batch.cycle_ns,
         entries: batch
             .entries
             .into_iter()
@@ -425,7 +435,7 @@ pub fn answers_from(answers: Answers) -> Result<AsyncAnswers, Invalid> {
 /// store's as [`wire`] has it, the mode's own on the stream apart from copies. None for a
 /// batch or its answers, which go between a data plane and a pod alone.
 #[must_use]
-pub fn mode_wire(from: NodeId, message: AsyncMessage) -> Option<Outgoing<Asynchronous>> {
+pub fn mode_wire<V: Value>(from: NodeId, message: AsyncMessage<V>) -> Option<Outgoing<V::Wire>> {
     let peer = |message| {
         Outgoing::Peer(ToPeer {
             from,
@@ -457,7 +467,9 @@ pub fn mode_wire(from: NodeId, message: AsyncMessage) -> Option<Outgoing<Asynchr
 /// # Errors
 ///
 /// A message the mode or its store cannot use: see [`Invalid`].
-pub fn mode_from_peer(sent: ToPeer<Asynchronous>) -> Result<(NodeId, AsyncMessage), Invalid> {
+pub fn mode_from_peer<V: Value>(
+    sent: ToPeer<V::Wire>,
+) -> Result<(NodeId, AsyncMessage<V>), Invalid> {
     let from = sent.from;
     match sent.message {
         Some(Control::Forwarded(forwarded)) => Ok((
@@ -476,7 +488,7 @@ pub fn mode_from_peer(sent: ToPeer<Asynchronous>) -> Result<(NodeId, AsyncMessag
                 answers: answers_from(relayed.answers.ok_or(Invalid::Missing)?)?,
             },
         )),
-        message => from_peer::<AsyncValue>(ToPeer { from, message })
+        message => from_peer::<V>(ToPeer { from, message })
             .map(|(from, message)| (from, AsyncMessage::Store(message))),
     }
 }
@@ -486,14 +498,16 @@ pub fn mode_from_peer(sent: ToPeer<Asynchronous>) -> Result<(NodeId, AsyncMessag
 /// # Errors
 ///
 /// A message the store cannot use: see [`Invalid`].
-pub fn mode_from_copy(sent: ToCopy<Asynchronous>) -> Result<(NodeId, AsyncMessage), Invalid> {
-    from_copy::<AsyncValue>(sent).map(|(from, message)| (from, AsyncMessage::Store(message)))
+pub fn mode_from_copy<V: Value>(
+    sent: ToCopy<V::Wire>,
+) -> Result<(NodeId, AsyncMessage<V>), Invalid> {
+    from_copy::<V>(sent).map(|(from, message)| (from, AsyncMessage::Store(message)))
 }
 
 /// What the mode tells a client, as a data plane's stream carries it down: the pod's answers,
 /// an owner's relayed with the owner, or a table; none for anything else.
 #[must_use]
-pub fn answering(message: AsyncMessage) -> Option<Answering> {
+pub fn answering<V>(message: AsyncMessage<V>) -> Option<Answering> {
     let answered = match message {
         AsyncMessage::Answers(answers) => Answered::Answers(answers_to_wire(answers)),
         AsyncMessage::Relayed {
@@ -582,12 +596,14 @@ mod tests {
             any::<u64>(),
             any::<(u64, u64)>(),
             any::<u64>(),
+            1..=u64::MAX,
             prop::collection::vec(entry, 0..5),
         )
-            .prop_map(|(from, stamp, made, entries)| AsyncBatch {
+            .prop_map(|(from, stamp, made, cycle, entries)| AsyncBatch {
                 from,
                 stamp,
                 made,
+                cycle,
                 entries,
             })
     }
@@ -776,9 +792,10 @@ mod tests {
             from: 1,
             stamp: (1, 1),
             made: 0,
+            cycle: 10_000_000,
             entries: Vec::new(),
         };
-        assert!(mode_wire(1, AsyncMessage::Batch(batch)).is_none());
+        assert!(mode_wire(1, AsyncMessage::<AsyncValue>::Batch(batch)).is_none());
         let answers = AsyncAnswers {
             life: 1,
             number: 1,
@@ -787,7 +804,7 @@ mod tests {
             unserved: Vec::new(),
             table: None,
         };
-        assert!(mode_wire(1, AsyncMessage::Answers(answers)).is_none());
+        assert!(mode_wire(1, AsyncMessage::<AsyncValue>::Answers(answers)).is_none());
     }
 
     /// Each mode refuses the other's messages between pods, as the store refuses both.
@@ -798,7 +815,7 @@ mod tests {
             message: Some(Control::Forwarded(Forwarded::default())),
         };
         assert_eq!(
-            crate::cluster::wire::mode_from_peer(forwarded),
+            crate::cluster::wire::mode_from_peer::<edgerush_cluster_synchronous::Value>(forwarded),
             Err(Invalid::Mode)
         );
         let relayed = ToPeer::<Asynchronous> {
@@ -810,12 +827,15 @@ mod tests {
             from: 1,
             message: Some(Control::Request(Request::default())),
         };
-        assert_eq!(mode_from_peer(request).map(|_| ()), Err(Invalid::Mode));
+        assert_eq!(
+            mode_from_peer::<AsyncValue>(request).map(|_| ()),
+            Err(Invalid::Mode)
+        );
     }
 
     /// A value no owner could have held is refused, and so is one under a contract of zero;
-    /// an entry without a contract, or reporting hits it says were seen applied, refuses its
-    /// whole batch.
+    /// a batch saying no cycle is refused, and an entry without a contract, or reporting hits
+    /// it says were seen applied, refuses its whole batch.
     #[test]
     fn values_and_batches_the_mode_cannot_use_are_refused() {
         let record = |plane| Record {
@@ -846,6 +866,7 @@ mod tests {
             from: 1,
             stamp: (1, 1),
             made: 0,
+            cycle: 10_000_000,
             entries: vec![AsyncEntry {
                 key: 3,
                 contract: ServiceContract {
@@ -856,7 +877,10 @@ mod tests {
                 report: ServiceReport::Poll,
             }],
         };
-        assert!(batch_from(batch_to_wire(fine.clone())).is_ok());
+        assert_eq!(batch_from(batch_to_wire(fine.clone())), Ok(fine.clone()));
+        let mut no_cycle = batch_to_wire(fine.clone());
+        no_cycle.cycle_ns = 0;
+        assert_eq!(batch_from(no_cycle), Err(Invalid::Cycle));
         let mut no_contract = batch_to_wire(fine.clone());
         no_contract.entries[0].contract = None;
         assert_eq!(
