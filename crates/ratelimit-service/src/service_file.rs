@@ -8,14 +8,14 @@
 
 use crate::cluster::settings::{Settings, SettingsError, settings};
 use crate::secure::PodFiles;
-use edgerush_config::{ServiceFile, ServiceMode};
+use edgerush_config::ServiceFile;
 use std::net::SocketAddr;
 use std::path::Path;
 
 /// What `keys.max_bytes` is when left out: 256 MiB.
 pub const MAX_KEY_BYTES: u64 = 256 << 20;
 
-/// What a pod runs as.
+/// What a pod runs as: both modes, on its store.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PodSettings {
     /// Where it serves data planes and the other pods.
@@ -24,29 +24,8 @@ pub struct PodSettings {
     pub metrics: Option<SocketAddr>,
     /// Its credentials, or none to be served plain.
     pub tls: Option<PodFiles>,
-    /// The mode it serves, and the store it serves it on.
-    pub serves: Serves,
-}
-
-/// The mode a pod serves, with the store it serves it on.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Serves {
-    /// Its data planes deciding from their copies, on this store; each batch says their
-    /// cycle.
-    Asynchronous(Settings),
-    /// The key's owner deciding every request, on this store.
-    Synchronous(Settings),
-}
-
-impl Serves {
-    /// The mode it is.
-    #[must_use]
-    pub fn mode(&self) -> ServiceMode {
-        match self {
-            Self::Asynchronous(_) => ServiceMode::Asynchronous,
-            Self::Synchronous(_) => ServiceMode::Synchronous,
-        }
-    }
+    /// The store it serves both modes on.
+    pub store: Settings,
 }
 
 /// Why a pod's file cannot be run, each naming what is wrong.
@@ -59,18 +38,9 @@ pub enum FileError {
     /// Keys that may hold nothing.
     #[error("`keys.max_bytes`: a number of bytes, at least 1")]
     KeyBytes,
-    /// A setting of the mode the pod does not serve, which it would ignore as if it did
-    /// something.
-    #[error("`{field}` is the {owner} mode's")]
-    OtherModes {
-        /// The setting, as the file names it.
-        field: &'static str,
-        /// The mode it is for.
-        owner: &'static str,
-    },
-    /// No store to run the mode on.
-    #[error("the {0} mode runs on the store: it needs `store` and `pod.address`")]
-    NoStore(&'static str),
+    /// No store to run the modes on.
+    #[error("a pod runs on the store: it needs `store` and `pod.address`")]
+    NoStore,
     /// A store the pod could not run on.
     #[error("{0}")]
     Store(#[from] SettingsError),
@@ -97,39 +67,18 @@ fn checked(file: ServiceFile, directory: &Path) -> Result<PodSettings, FileError
     if max_key_bytes == 0 {
         return Err(FileError::KeyBytes);
     }
-    let mode = file.mode.unwrap_or(ServiceMode::Asynchronous);
-    if mode == ServiceMode::Asynchronous
-        && file
-            .store
-            .as_ref()
-            .is_some_and(|store| store.forwarder_decides.is_some())
-    {
-        return Err(FileError::OtherModes {
-            field: "store.forwarder_decides",
-            owner: "synchronous",
-        });
-    }
-    let name = match mode {
-        ServiceMode::Synchronous => "synchronous",
-        ServiceMode::Asynchronous => "asynchronous",
-    };
-    let store = settings(&file, max_key_bytes)?.ok_or(FileError::NoStore(name))?;
+    let store = settings(&file, max_key_bytes)?.ok_or(FileError::NoStore)?;
     let tls = file.tls.map(|tls| PodFiles {
         certificate: directory.join(tls.certificate),
         key: directory.join(tls.key),
         authorities: directory.join(tls.authorities),
         data_plane: tls.data_plane_id,
     });
-    let pod = file.pod;
-    let serves = match mode {
-        ServiceMode::Synchronous => Serves::Synchronous(store),
-        ServiceMode::Asynchronous => Serves::Asynchronous(store),
-    };
     Ok(PodSettings {
-        listen: pod.listen,
-        metrics: pod.metrics,
+        listen: file.pod.listen,
+        metrics: file.pod.metrics,
         tls,
-        serves,
+        store,
     })
 }
 
@@ -143,7 +92,7 @@ mod tests {
         parsed(yaml.as_bytes(), Path::new("/etc/edgerush")).map_err(|error| error.to_string())
     }
 
-    /// An asynchronous pod's file, on the store, with `more` after its sections.
+    /// A pod's file, on the store, with `more` after its sections.
     fn with(more: &str) -> String {
         sections("", &format!("store: {{}}\n{more}"))
     }
@@ -153,36 +102,17 @@ mod tests {
         format!("pod: {{ listen: 0.0.0.0:7000, address: rl-0.rl:7000{pod} }}\n{rest}")
     }
 
-    /// An asynchronous pod's store.
-    fn asynchronous(settings: PodSettings) -> Settings {
-        match settings.serves {
-            Serves::Asynchronous(store) => store,
-            Serves::Synchronous(_) => panic!("a synchronous pod"),
-        }
-    }
-
+    /// A pod runs on the store, and is refused without it.
     #[test]
-    fn the_mode_is_asynchronous_unless_said_and_either_runs_on_the_store() {
-        let parsed = parsed_from(&with("")).unwrap();
-        assert_eq!(parsed.serves.mode(), ServiceMode::Asynchronous);
-        assert_eq!(asynchronous(parsed).address, "rl-0.rl:7000");
-        let said = parsed_from(&with("mode: eventual\n")).unwrap_err();
-        assert!(said.contains("eventual"), "{said}");
-        // Each mode runs on the store, and is refused without it.
-        for mode in ["asynchronous", "synchronous"] {
-            assert_eq!(
-                parsed_from(&format!("mode: {mode}\npod: {{ listen: 0.0.0.0:7000 }}\n")),
-                Err(format!(
-                    "the {mode} mode runs on the store: it needs `store` and `pod.address`"
-                )),
-                "{mode}"
-            );
-        }
-        let parsed = parsed_from(&format!("mode: synchronous\n{}", with(""))).unwrap();
-        let Serves::Synchronous(store) = parsed.serves else {
-            panic!("an asynchronous pod")
-        };
-        assert_eq!(store.address, "rl-0.rl:7000");
+    fn a_pod_runs_on_the_store() {
+        assert_eq!(
+            parsed_from(&with("")).unwrap().store.address,
+            "rl-0.rl:7000"
+        );
+        assert_eq!(
+            parsed_from("pod: { listen: 0.0.0.0:7000 }\n").err(),
+            Some("a pod runs on the store: it needs `store` and `pod.address`".to_owned())
+        );
     }
 
     #[test]
@@ -192,16 +122,23 @@ mod tests {
         assert!(!said.contains("rl-0.rl:7000"), "{said}");
     }
 
+    /// Every pod serves both modes: the file names none, and the synchronous mode's switch is
+    /// read beside the store's other settings, on whatever pod.
     #[test]
-    fn each_mode_takes_only_what_it_reads() {
-        // Deciding from a copy is the synchronous mode's alone.
-        assert_eq!(
-            parsed_from(&sections("", "store: { forwarder_decides: true }\n")),
-            Err("`store.forwarder_decides` is the synchronous mode's".to_owned())
+    fn the_file_names_no_mode_and_reads_every_setting() {
+        assert!(
+            !parsed_from(&sections("", "store: { forwarder_decides: false }\n"))
+                .unwrap()
+                .store
+                .forwarder_decides
         );
-        // What the asynchronous mode's pods agreed by before they ran on the store is no
-        // field the file knows, and nor is their data planes' cycle, which each batch says.
+        assert!(parsed_from(&with("")).unwrap().store.forwarder_decides);
+        // What a pod served before it served both, what the asynchronous mode's pods agreed by
+        // before they ran on the store, and the data planes' cycle, which each batch says, are
+        // no fields the file knows.
         for gone in [
+            with("mode: asynchronous\n"),
+            with("mode: synchronous\n"),
             sections(", id: 0", "store: {}\n"),
             with("membership: { pods: { 0: rl-0:7000 } }\n"),
             sections(", cycle_ms: 10", "store: {}\n"),
@@ -215,14 +152,14 @@ mod tests {
     fn what_keys_may_hold_and_where_metrics_go_are_said_or_left_out() {
         let plain = parsed_from(&with("")).unwrap();
         assert_eq!(plain.metrics, None);
-        assert_eq!(asynchronous(plain).config.max_key_bytes, Some(256 << 20));
+        assert_eq!(plain.store.config.max_key_bytes, Some(256 << 20));
         let said = parsed_from(&format!(
             "keys: {{ max_bytes: 1048576 }}\n{}",
             sections(", metrics: 127.0.0.1:9090", "store: {}\n")
         ))
         .unwrap();
         assert_eq!(said.metrics, Some("127.0.0.1:9090".parse().unwrap()));
-        assert_eq!(asynchronous(said).config.max_key_bytes, Some(1 << 20));
+        assert_eq!(said.store.config.max_key_bytes, Some(1 << 20));
         assert_eq!(
             parsed_from(&with("keys: { max_bytes: 0 }\n")),
             Err("`keys.max_bytes`: a number of bytes, at least 1".to_owned())

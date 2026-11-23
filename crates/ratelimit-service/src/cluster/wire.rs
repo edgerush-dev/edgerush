@@ -15,7 +15,9 @@
 //! The synchronous mode's own messages between pods — a request forwarded to its key's owner,
 //! a part of one gathered, and their answers — go on the stream apart from copies too, beside
 //! the store's ([`mode_wire`]); the asynchronous mode's — entries forwarded to their owner,
-//! and its answers relayed back — likewise ([`asynchronous`]).
+//! and its answers relayed back — likewise ([`asynchronous`]). A pod of both modes carries
+//! each mode's as that mode does, and its value as either mode's ([`both`]); a value of the
+//! other mode than its key's bit says is refused ([`Value::fits`]).
 //!
 //! A data plane asks a pod on a stream of its own ([`Asking`]), and is told its answers and the
 //! pod's table on it ([`Telling`]): plain messages, a table at 256 shards a few KB.
@@ -35,6 +37,7 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 
 pub mod asynchronous;
+pub mod both;
 
 /// Why a message on the wire cannot be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -71,6 +74,9 @@ pub enum Invalid {
     /// A list of keys of an odd number of words: each key is two.
     #[error("a list of keys of an odd number of words")]
     Keys,
+    /// A value of the other mode than its key's bit says: no owner could have held it.
+    #[error("a value of the other mode than its key's")]
+    Kind,
     /// A data plane's batch saying no cycle, which its owner counts those admitting by.
     #[error("a batch of no cycle")]
     Cycle,
@@ -90,6 +96,13 @@ pub trait Value: Held {
     ///
     /// A message the mode cannot use.
     fn from_wire(wire: Self::Wire) -> Result<Self, Invalid>;
+
+    /// Whether it may be held under `key`: a value of one mode under a key whose bit says the
+    /// other's is no owner's ([`edgerush_cluster::Kind`]). Any key, for a value of one mode
+    /// alone.
+    fn fits(&self, _key: Key) -> bool {
+        true
+    }
 }
 
 /// A table's number, `(term, version)`.
@@ -1164,8 +1177,9 @@ pub fn from_copy<V: Value>(sent: ToCopy<V::Wire>) -> Result<(NodeId, Message<V>)
 
 /// The synchronous mode's `message`, from `from`, as the wire carries it between pods: the
 /// store's as [`wire`] has it, the mode's own on the stream apart from copies. None for a
-/// request to gather, which a client alone asks, of the pod it reaches.
-pub fn mode_wire(from: NodeId, message: SyncMessage) -> Option<Outgoing<Synchronous>> {
+/// request to gather, which a client alone asks, of the pod it reaches. Whatever the store's
+/// value: the mode's own messages carry none.
+pub fn mode_wire<V: Value>(from: NodeId, message: SyncMessage<V>) -> Option<Outgoing<V::Wire>> {
     let peer = |message| {
         Outgoing::Peer(ToPeer {
             from,
@@ -1210,7 +1224,9 @@ pub fn mode_wire(from: NodeId, message: SyncMessage) -> Option<Outgoing<Synchron
 /// # Errors
 ///
 /// A message the mode or its store cannot use: see [`Invalid`].
-pub fn mode_from_peer(sent: ToPeer<Synchronous>) -> Result<(NodeId, SyncMessage), Invalid> {
+pub fn mode_from_peer<V: Value>(
+    sent: ToPeer<V::Wire>,
+) -> Result<(NodeId, SyncMessage<V>), Invalid> {
     let from = sent.from;
     match sent.message {
         Some(Control::Request(request)) => Ok((from, request_from(request)?)),
@@ -1222,7 +1238,7 @@ pub fn mode_from_peer(sent: ToPeer<Synchronous>) -> Result<(NodeId, SyncMessage)
                 answer: answer_from(reply.answer.ok_or(Invalid::Missing)?)?,
             },
         )),
-        message => from_peer::<SyncValue>(ToPeer { from, message })
+        message => from_peer::<V>(ToPeer { from, message })
             .map(|(from, message)| (from, SyncMessage::Store(message))),
     }
 }
@@ -1232,8 +1248,10 @@ pub fn mode_from_peer(sent: ToPeer<Synchronous>) -> Result<(NodeId, SyncMessage)
 /// # Errors
 ///
 /// A message the store cannot use: see [`Invalid`].
-pub fn mode_from_copy(sent: ToCopy<Synchronous>) -> Result<(NodeId, SyncMessage), Invalid> {
-    from_copy::<SyncValue>(sent).map(|(from, message)| (from, SyncMessage::Store(message)))
+pub fn mode_from_copy<V: Value>(
+    sent: ToCopy<V::Wire>,
+) -> Result<(NodeId, SyncMessage<V>), Invalid> {
+    from_copy::<V>(sent).map(|(from, message)| (from, SyncMessage::Store(message)))
 }
 
 /// What a data plane asks, as the mode's message from `client`, the stream's: whoever the
@@ -1242,7 +1260,7 @@ pub fn mode_from_copy(sent: ToCopy<Synchronous>) -> Result<(NodeId, SyncMessage)
 /// # Errors
 ///
 /// A message the mode cannot use: see [`Invalid`].
-pub fn asked_from(asking: Asking, client: NodeId) -> Result<SyncMessage, Invalid> {
+pub fn asked_from<V>(asking: Asking, client: NodeId) -> Result<SyncMessage<V>, Invalid> {
     match asking.asked.ok_or(Invalid::Missing)? {
         Asked::Request(request) => {
             let mut message = request_from(request)?;
@@ -1272,7 +1290,7 @@ pub fn asked_from(asking: Asking, client: NodeId) -> Result<SyncMessage, Invalid
 #[must_use]
 pub fn asking(message: SyncMessage) -> Option<Asking> {
     let asked = match message {
-        message @ SyncMessage::Request { .. } => match mode_wire(0, message) {
+        message @ SyncMessage::Request { .. } => match mode_wire::<SyncValue>(0, message) {
             Some(Outgoing::Peer(ToPeer {
                 message: Some(Control::Request(request)),
                 ..
@@ -1291,7 +1309,7 @@ pub fn asking(message: SyncMessage) -> Option<Asking> {
 /// What the mode tells a client, as a data plane's stream carries it down: an answer, or a
 /// table; none for anything else.
 #[must_use]
-pub fn telling(message: SyncMessage) -> Option<Telling> {
+pub fn telling<V>(message: SyncMessage<V>) -> Option<Telling> {
     let told = match message {
         SyncMessage::Reply { client, id, answer } => Told::Reply(Reply {
             client,
@@ -1322,7 +1340,7 @@ pub fn told_from(telling: Telling) -> Result<SyncMessage, Invalid> {
     })
 }
 
-fn request_from(request: Request) -> Result<SyncMessage, Invalid> {
+fn request_from<V>(request: Request) -> Result<SyncMessage<V>, Invalid> {
     Ok(SyncMessage::Request {
         client: request.client,
         id: request.id,
@@ -1542,8 +1560,12 @@ fn entries_from<V: Value>(entries: Vec<Entry<V::Wire>>) -> Result<Vec<(Key, Kept
         .into_iter()
         .map(|entry| {
             let value = V::from_wire(entry.value.ok_or(Invalid::Missing)?)?;
+            let key = key_from_wire(entry.key_lower, entry.key_upper);
+            if !value.fits(key) {
+                return Err(Invalid::Kind);
+            }
             Ok((
-                key_from_wire(entry.key_lower, entry.key_upper),
+                key,
                 Kept {
                     value,
                     forget_at: entry.forget_at,
@@ -2081,7 +2103,7 @@ mod tests {
             message: Some(Control::Request(Request::default())),
         };
         assert_eq!(from_peer::<SyncValue>(request), Err(Invalid::Mode));
-        let gather = SyncMessage::Gather {
+        let gather: SyncMessage = SyncMessage::Gather {
             client: 9,
             id: 1,
             keys: vec![1, 2],
@@ -2152,7 +2174,7 @@ mod tests {
             let gather = SyncMessage::Gather { client: 0, id, keys: keys.clone() };
             let asked = asking(gather).unwrap();
             prop_assert_eq!(
-                asked_from(asked, client).unwrap(),
+                asked_from::<SyncValue>(asked, client).unwrap(),
                 SyncMessage::Gather { client, id, keys }
             );
         }

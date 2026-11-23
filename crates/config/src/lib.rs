@@ -56,5 +56,5 @@ pub use route::{
     TcpRoute, Timeouts, TlsRoute, UdpRoute, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
 };
 pub use service_file::{
-    STORE_MOST_MS, ServiceFile, ServiceKeys, ServiceMode, ServicePod, ServicePodTls, ServiceStore,
+    STORE_MOST_MS, ServiceFile, ServiceKeys, ServicePod, ServicePodTls, ServiceStore,
 };

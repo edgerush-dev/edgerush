@@ -252,6 +252,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-cluster-modes"
+version = "0.0.0"
+dependencies = [
+ "edgerush-cluster",
+ "edgerush-cluster-asynchronous",
+ "edgerush-cluster-synchronous",
+]
+
+[[package]]
 name = "edgerush-cluster-synchronous"
 version = "0.0.0"
 dependencies = [
@@ -483,6 +492,7 @@ dependencies = [
  "edgerush-certificates",
  "edgerush-cluster",
  "edgerush-cluster-asynchronous",
+ "edgerush-cluster-modes",
  "edgerush-cluster-synchronous",
  "edgerush-config",
  "edgerush-control-service",

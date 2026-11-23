@@ -8,7 +8,6 @@
 //! is read once, at the start, and checked (`edgerush_ratelimit_service::service_file`):
 //!
 //! ```yaml
-//! mode: asynchronous          # or synchronous; asynchronous when left out
 //! pod:
 //!   listen: 0.0.0.0:7000
 //!   address: rl-0.rl:7000
@@ -23,8 +22,8 @@
 //!   election_jitter_ms: 200
 //!   cycle_ms: 10
 //!   skew_warning_ms: 250
-//!   forwarder_decides: true   # the synchronous mode's: a replica decides an unheard owner's
-//!                             # keys from its copy
+//!   forwarder_decides: true   # a replica decides an unheard owner's synchronous keys from
+//!                             # its copy
 //! keys:
 //!   max_bytes: 268435456      # 256 MiB when left out
 //! tls:                        # served plain, to anyone, when left out
@@ -34,18 +33,21 @@
 //!   data_plane_id: spiffe://cluster.local/ns/edge/sa/edge
 //! ```
 //!
-//! A pod serves one mode, on the cluster store (`edgerush_cluster`): `store` is what it runs
-//! the store with, which every pod of a cluster is to share, and `pod.address` where the other
+//! A pod serves both modes, on one cluster store (`edgerush_cluster`, the pod of both modes
+//! `edgerush_cluster_modes`): each data plane's stream is its mode's, `Decide` or `Exchange`,
+//! and each key's top bit says its mode, so the file names none. `store` is what it runs the
+//! store with, which every pod of a cluster is to share, and `pod.address` where the other
 //! pods and data planes reach it; both are needed (`edgerush_ratelimit_service::cluster::settings`).
 //! A pod takes a member id of its own each time it starts, shows its store's `/metrics` and what
-//! its mode counts, says at `/ready` whether it is ready, and, told to stop, hands its shards on
-//! before it does. `keys.max_bytes` is what its keys may hold, past which the least recently
-//! changed are evicted.
+//! each mode counts, says at `/ready` whether it is ready, and, told to stop, hands its shards on
+//! before it does. `keys.max_bytes` is what its keys of both modes may hold, past which those
+//! that may be forgotten soonest are evicted, whatever their mode.
 //!
 //! The asynchronous mode applies each data plane's batch to the keys it owns, by the data
 //! planes' cycle the batch says, forwards the entries of keys another pod owns to it and
-//! relays its answers back; it refuses `store.forwarder_decides`, as it would not read it. The
-//! synchronous mode forwards a request for a key not its own to the key's owner.
+//! relays its answers back. The synchronous mode forwards a request for a key not its own to
+//! the key's owner, which a replica holding its lease decides itself, from its copy, while the
+//! owner is unheard, unless `store.forwarder_decides` says not.
 //!
 //! `tls`'s files, relative to the config file's directory unless absolute, are read again
 //! every second, and serve the service with mutual TLS (`edgerush_ratelimit_service::secure`):
@@ -55,8 +57,7 @@
 //! and any other is refused. It dials the other pods checking theirs for its own ID.
 
 use boring::ssl::SslConnector;
-use edgerush_cluster_asynchronous::Pod as AsyncPod;
-use edgerush_config::ServiceMode;
+use edgerush_cluster_modes::Pod;
 use edgerush_control_service::open_files::{self, OpenFiles};
 use edgerush_control_service::reread;
 use edgerush_ratelimit_service::cluster::link::Dial;
@@ -65,7 +66,7 @@ use edgerush_ratelimit_service::cluster::pod::{StorePod, StoreServer};
 use edgerush_ratelimit_service::cluster::settings::member_id;
 use edgerush_ratelimit_service::scrape::{self, Counted};
 use edgerush_ratelimit_service::secure::{self, PodFiles, PodTls};
-use edgerush_ratelimit_service::service_file::{PodSettings, Serves, parsed};
+use edgerush_ratelimit_service::service_file::{PodSettings, parsed};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -97,7 +98,7 @@ fn read(path: &Path) -> Result<PodSettings, String> {
     parsed(&yaml, directory).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-/// A pod answers on one thread, either mode's: a stream's answers and its connection's writes
+/// A pod answers on one thread, both modes': a stream's answers and its connection's writes
 /// share it, so that what one read brings in is answered in one write, where a connection on
 /// another thread would take the answers a few at a time as they are made.
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
@@ -161,43 +162,27 @@ async fn serve(args: PodSettings) -> Result<(), Box<dyn std::error::Error>> {
         None => (None, Dial::Plain),
     };
     let id = member_id()?;
-    let mode = args.serves.mode();
     let stop = Running {
         listener,
         serving,
         metrics: args.metrics,
     };
-    match args.serves {
-        Serves::Synchronous(store) => {
-            let address = store.address.clone();
-            let pod = StorePod::spawn(id, store.address, store.config, dial, store.seeds);
-            // Always on (decided): a data plane out of reach of a key's owner asks another pod.
-            pod.set_forwarding(true).await;
-            pod.set_forwarder_decides(store.forwarder_decides).await;
-            say_started(mode, id, args.listen, &address);
-            stop.run(pod).await
-        }
-        Serves::Asynchronous(store) => {
-            let address = store.address.clone();
-            let mut node = AsyncPod::new(id, address.clone(), store.config, []);
-            // A pod is a member in one life only: its id, new each start, serves as its life,
-            // never 0, which would leave its answers unnumbered.
-            node.set_life(id.max(1));
-            let pod = StorePod::start(node, store.address, dial, store.seeds);
-            say_started(mode, id, args.listen, &address);
-            stop.run(pod).await
-        }
-    }
-}
-
-fn say_started(mode: ServiceMode, id: u64, listen: SocketAddr, address: &str) {
-    let mode = match mode {
-        ServiceMode::Synchronous => "synchronous",
-        ServiceMode::Asynchronous => "asynchronous",
-    };
+    let store = args.store;
+    let address = store.address.clone();
+    let mut node = Pod::new(id, address.clone(), store.config, []);
+    // A pod is a member in one life only: its id, new each start, serves as its life, never
+    // 0, which would leave its asynchronous answers unnumbered.
+    node.set_life(id.max(1));
+    // Always on (decided): a synchronous data plane out of reach of a key's owner asks another
+    // pod.
+    node.set_forwarding(true);
+    node.set_forwarder_decides(store.forwarder_decides);
+    let pod = StorePod::start(node, store.address, dial, store.seeds);
     eprintln!(
-        "edgerush-ratelimit-service: {mode} pod, member {id}, on {listen}, reached at {address}"
+        "edgerush-ratelimit-service: pod, member {id}, on {}, reached at {address}",
+        args.listen
     );
+    stop.run(pod).await
 }
 
 /// Where a store pod serves, and its metrics.
@@ -307,7 +292,7 @@ async fn stopped() {
 mod tests {
     use super::*;
 
-    /// An asynchronous pod's file, on the store, with `more` after its sections.
+    /// A pod's file, on the store, with `more` after its sections.
     fn with(more: &str) -> String {
         sections("", &format!("store: {{}}\n{more}"))
     }

@@ -8,23 +8,12 @@
       "description": "What the pod's keys may hold; left out, each has its value.",
       "$ref": "#/$defs/ServiceKeys"
     },
-    "mode": {
-      "description": "The rate-limiting mode the pod serves: a pod serves one. Asynchronous when left out.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ServiceMode"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
     "pod": {
       "description": "The pod itself.",
       "$ref": "#/$defs/ServicePod"
     },
     "store": {
-      "description": "The store's settings, which every pod of a cluster is to share. Either mode runs on\nthem, and needs them.",
+      "description": "The store's settings, which every pod of a cluster is to share. Both modes run on\nthem, and need them.",
       "anyOf": [
         {
           "$ref": "#/$defs/ServiceStore"
@@ -68,21 +57,6 @@
       },
       "additionalProperties": false
     },
-    "ServiceMode": {
-      "description": "The rate-limiting mode a service pod serves.",
-      "oneOf": [
-        {
-          "description": "Data planes decide from their copies of the keys and share what they admitted every\ncycle.",
-          "type": "string",
-          "const": "asynchronous"
-        },
-        {
-          "description": "The key's owner decides every request.",
-          "type": "string",
-          "const": "synchronous"
-        }
-      ]
-    },
     "ServicePod": {
       "description": "A service pod: where it serves and where it is reached. It takes a member id of its own\neach time it starts.",
       "type": "object",
@@ -100,7 +74,7 @@
           "type": "string"
         },
         "metrics": {
-          "description": "Where `/metrics` shows the pod's store and what its mode counts, and `/ready` whether\nit is ready; nowhere when left out.",
+          "description": "Where `/metrics` shows the pod's store and what each mode counts, and `/ready` whether\nit is ready; nowhere when left out.",
           "type": [
             "string",
             "null"
@@ -169,7 +143,7 @@
           "minimum": 0
         },
         "forwarder_decides": {
-          "description": "Whether a pod a data plane asks about a key whose owner it has not heard for\n`stop_serving_ms` decides the key itself, from its copy, rather than forward the ask to\nan owner it cannot reach: so that an owner gone has its keys held to their limits while\na replica takes over, the charges lost if another replica takes them. A replica only,\nholding its own lease. True when left out.",
+          "description": "Whether a pod a synchronous data plane asks about a key whose owner it has not heard\nfor `stop_serving_ms` decides the key itself, from its copy, rather than forward the ask\nto an owner it cannot reach: so that an owner gone has its keys held to their limits\nwhile a replica takes over, the charges lost if another replica takes them. A replica\nonly, holding its own lease. True when left out.",
           "type": [
             "boolean",
             "null"
