@@ -418,20 +418,18 @@ listeners:
     Ok(())
 }
 
-/// A port free over both UDP and TCP, for a test that names it for both, drawn as the
-/// proxy's own `listen_both` draws one (16 §5): the system's first, then ports named at
-/// random from the dynamic range. Windows hands ports out one after another and keeps runs
-/// of each protocol's from it, more than 1,000 long, so once one draw is in such a run, the
-/// system's next ones are too (#300, #310).
+/// A port free over both UDP and TCP, for a test that names it for both, named at random
+/// from 16,384 to 32,767, below every system's ephemeral range (Linux's starts at 32,768,
+/// Windows' and macOS's at 49,152). A test lets the port go before the proxy listens on it,
+/// at its start or on a reload, and the sockets other tests leave to the system to place
+/// can never take it there: only another test's draw can (#566). A port taken, or kept from
+/// one protocol (Windows keeps runs of ports from each, #300, #310), is drawn again.
 fn free_over_udp_and_tcp() -> io::Result<SocketAddr> {
     let keys = RandomState::new();
     (0..16u64)
         .find_map(|draw| {
-            let port = match draw {
-                0 => 0,
-                // Below 16,384, so the sum stays a port.
-                _ => 49152 + u16::try_from(keys.hash_one(draw) % 16384).unwrap_or_default(),
-            };
+            // Below 16,384, so the sum stays below 32,768.
+            let port = 16384 + u16::try_from(keys.hash_one(draw) % 16384).unwrap_or_default();
             let udp = UdpSocket::bind(("127.0.0.1", port)).ok()?;
             let address = udp.local_addr().ok()?;
             TcpListener::bind(address).ok().map(|_| address)
@@ -446,8 +444,7 @@ fn free_over_udp_and_tcp() -> io::Result<SocketAddr> {
 #[test]
 fn proxy_serves_a_udp_listener_beside_a_tcp_one_and_follows_it() -> io::Result<()> {
     let (one, echo) = (upstream("one")?, udp_echo()?);
-    let shared = free_over_udp_and_tcp()?;
-    let with = |dns: bool| {
+    let with = |shared: SocketAddr, dns: bool| {
         let mut yaml = config(&shared.to_string(), "up", Some(one)).replace(
             "upstreams:\n",
             &format!(
@@ -467,19 +464,18 @@ fn proxy_serves_a_udp_listener_beside_a_tcp_one_and_follows_it() -> io::Result<(
         yaml
     };
     let file = scratch("udp.yaml");
-    std::fs::write(&file, with(true))?;
-    let metrics = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
     let args = [
         "--config",
         &file,
         "--workers",
         "1",
         "--metrics",
-        &metrics.to_string(),
+        "127.0.0.1:0",
     ];
-    let mut harness = Harness::start(&args)?;
+    let (mut harness, shared) = Harness::start_on_free(&file, |at| with(at, true), &args)?;
     let on = format!("listener \"dns\" is on {shared}, over UDP");
     assert_eq!(harness.wait_for("listener \"dns\" is on "), on);
+    let metrics = harness.address_after("metrics are on ");
     harness.wait_for("1 worker, thread-per-core");
     assert!(get(shared, "/")?.contains("x-upstream: one"));
     assert_eq!(udp_exchange(shared, b"over UDP")?, b"over UDP");
@@ -490,12 +486,12 @@ fn proxy_serves_a_udp_listener_beside_a_tcp_one_and_follows_it() -> io::Result<(
 
     // Taken away: it drains, until its session has ended, and the TCP listener is left
     // alone.
-    std::fs::write(&file, with(false))?;
+    std::fs::write(&file, with(shared, false))?;
     harness.wait_for("listener \"dns\" has drained");
     assert!(get(shared, "/")?.contains("x-upstream: one"));
 
     // Back on the port the TCP listener keeps: served, not held off until a restart.
-    std::fs::write(&file, with(true))?;
+    std::fs::write(&file, with(shared, true))?;
     // Said once the reload has been.
     assert_eq!(harness.wait_for("listener \"dns\" is on "), on);
     assert_eq!(udp_exchange(shared, b"again")?, b"again");
@@ -509,7 +505,10 @@ fn proxy_serves_a_udp_listener_beside_a_tcp_one_and_follows_it() -> io::Result<(
 #[test]
 fn proxy_follows_a_listener_turned_between_tcp_and_udp() -> io::Result<()> {
     let (one, echo) = (upstream("one")?, udp_echo()?);
-    let at = free_over_udp_and_tcp()?;
+    let file = scratch("tcp-to-udp.yaml");
+    let args = ["--config", &file, "--workers", "1"];
+    let (mut harness, at) =
+        Harness::start_on_free(&file, |at| config(&at.to_string(), "up", Some(one)), &args)?;
     let over_tcp = config(&at.to_string(), "up", Some(one));
     // A second's idle bound: its session ends idle, long before the drain's bound.
     let over_udp = format!(
@@ -518,9 +517,6 @@ fn proxy_follows_a_listener_turned_between_tcp_and_udp() -> io::Result<()> {
          udp_routes: [{{ name: dns, listeners: [web], backends: [{{ upstream: echo, weight: 1 }}] }}]\n\
          listeners:\n  web: {{ address: \"{at}\", protocol: udp, session_idle_seconds: 1 }}\n"
     );
-    let file = scratch("tcp-to-udp.yaml");
-    std::fs::write(&file, &over_tcp)?;
-    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
     assert_eq!(harness.address_after("listener \"web\" is on "), at);
     harness.wait_for("1 worker, thread-per-core");
     assert!(get(at, "/")?.contains("x-upstream: one"));
@@ -546,8 +542,7 @@ fn proxy_follows_a_listener_turned_between_tcp_and_udp() -> io::Result<()> {
 #[test]
 fn proxy_keeps_a_udp_listeners_sessions_across_reloads() -> io::Result<()> {
     let (a, b) = (udp_naming(b"a")?, udp_naming(b"b")?);
-    let at = free_over_udp_and_tcp()?;
-    let with = |other: u32, idle: u32| {
+    let with = |at: SocketAddr, other: u32, idle: u32| {
         let up = 1;
         format!(
             "upstreams:\n  up: {{ protocol: udp, load_balancer: p2c, endpoints: {{ listed: [\"{a}\"] }} }}\n  \
@@ -558,8 +553,8 @@ fn proxy_keeps_a_udp_listeners_sessions_across_reloads() -> io::Result<()> {
         )
     };
     let file = scratch("udp-reloads.yaml");
-    std::fs::write(&file, with(0, 60))?;
-    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
+    let args = ["--config", &file, "--workers", "1"];
+    let (mut harness, at) = Harness::start_on_free(&file, |at| with(at, 0, 60), &args)?;
     harness.wait_for("listener \"dns\" is on ");
     harness.wait_for("1 worker, thread-per-core");
     let client = UdpSocket::bind("127.0.0.1:0")?;
@@ -582,7 +577,7 @@ fn proxy_keeps_a_udp_listeners_sessions_across_reloads() -> io::Result<()> {
         })
     };
     for idle in 61..=63 {
-        std::fs::write(&file, with(9, idle))?;
+        std::fs::write(&file, with(at, 9, idle))?;
         harness.wait_for("config reloaded");
     }
     // Past the worker's next sweep, which is when it sees a reload.
@@ -659,9 +654,7 @@ fn proxy_turns_a_listeners_http3_on_and_off() -> io::Result<()> {
     let (chain, key) = (scratch("http3-chain.pem"), scratch("http3-key.pem"));
     std::fs::write(&chain, &issued.chain)?;
     std::fs::write(&key, &issued.key)?;
-    // Free over UDP too, for the HTTP/3 the second config turns on there.
-    let at = free_over_udp_and_tcp()?;
-    let with = |http3: bool, comment: &str| {
+    let with = |at: SocketAddr, http3: bool, comment: &str| {
         let http3 = if http3 {
             ", http3: { alt_svc_max_age: 60, force_retry: false }"
         } else {
@@ -688,8 +681,9 @@ certificates:
         )
     };
     let file = scratch("http3.yaml");
-    std::fs::write(&file, with(false, "off"))?;
-    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
+    let args = ["--config", &file, "--workers", "1"];
+    // Free over UDP too, for the HTTP/3 the second config turns on there.
+    let (mut harness, at) = Harness::start_on_free(&file, |at| with(at, false, "off"), &args)?;
     assert_eq!(harness.address_after("listener \"secure\" is on "), at);
     harness.wait_for("1 worker, thread-per-core");
     assert!(
@@ -697,7 +691,7 @@ certificates:
         "HTTP/3 served while off"
     );
 
-    std::fs::write(&file, with(true, "on"))?;
+    std::fs::write(&file, with(at, true, "on"))?;
     harness.wait_for("config reloaded");
     assert_eq!(
         harness.address_after("listener \"secure\" serves HTTP/3 on "),
@@ -706,7 +700,7 @@ certificates:
     assert!(negotiates(at, PATIENCE), "HTTP/3 not served once on");
     assert!(TcpStream::connect(at).is_ok(), "its TCP side not served");
 
-    std::fs::write(&file, with(false, "off again"))?;
+    std::fs::write(&file, with(at, false, "off again"))?;
     harness.wait_for("config reloaded");
     harness.wait_for("listener \"secure\" no longer serves HTTP/3");
     harness.wait_for("listener \"secure\"'s HTTP/3 has drained");
@@ -717,7 +711,7 @@ certificates:
     assert!(TcpStream::connect(at).is_ok(), "its TCP side not served");
 
     // On again once drained: a UDP socket of its own.
-    std::fs::write(&file, with(true, "on again"))?;
+    std::fs::write(&file, with(at, true, "on again"))?;
     harness.wait_for("config reloaded");
     assert_eq!(
         harness.address_after("listener \"secure\" serves HTTP/3 on "),
@@ -2045,9 +2039,42 @@ struct Harness {
     said: Receiver<String>,
     /// Every line it has said so far, for a wait that fails to say them all.
     heard: Vec<String>,
+    /// How many of `heard` the waits have gone past; those after are still to be read.
+    read: usize,
 }
 
+/// How many ports a proxy is started on before a start that is refused each time fails
+/// the test.
+const STARTS: usize = 5;
+
 impl Harness {
+    /// The proxy started with `args`, once the config `config` makes for an address free
+    /// over UDP and TCP has been written to `file`, and that address. Free when drawn, the
+    /// port can still be taken by another test before the proxy listens on it (#566): while
+    /// the proxy's start says it cannot listen on the address drawn, it is started again on
+    /// another. Both protocols had just been bound there, so a proxy that is refused every
+    /// time is one that cannot listen on it at all, and fails the test after [`STARTS`].
+    fn start_on_free(
+        file: &str,
+        config: impl Fn(SocketAddr) -> String,
+        args: &[&str],
+    ) -> io::Result<(Self, SocketAddr)> {
+        let mut refused = Vec::new();
+        for _ in 0..STARTS {
+            let at = free_over_udp_and_tcp()?;
+            std::fs::write(file, config(at))?;
+            let mut harness = Self::start(args)?;
+            // Every socket is open before any listener is said to be on its address, so
+            // the first of these lines says whether the start was refused.
+            let first = harness.peek_for(&["\" is on ", "cannot listen on "]);
+            if !first.contains(&format!("cannot listen on {at} ")) {
+                return Ok((harness, at));
+            }
+            refused.push(first);
+        }
+        panic!("all {STARTS} starts were refused: {refused:#?}");
+    }
+
     fn start(args: &[&str]) -> io::Result<Self> {
         let mut process = Command::new(env!("CARGO_BIN_EXE_edgerush"))
             .arg("proxy")
@@ -2071,24 +2098,44 @@ impl Harness {
             process,
             said,
             heard: Vec::new(),
+            read: 0,
         })
     }
 
     /// The next line on stderr that has `part` in it; the lines before it are let go. One
     /// that does not come fails the test, saying every line said since the start.
     fn wait_for(&mut self, part: &str) -> String {
+        self.wait_for_one_of(&[part])
+    }
+
+    /// The next line on stderr that has one of `parts` in it, left to be read again, as
+    /// are the lines before it.
+    fn peek_for(&mut self, parts: &[&str]) -> String {
+        let read = self.read;
+        let line = self.wait_for_one_of(parts);
+        self.read = read;
+        line
+    }
+
+    /// [`Self::wait_for`], for a line with any one of `parts` in it.
+    fn wait_for_one_of(&mut self, parts: &[&str]) -> String {
         loop {
-            match self.said.recv_timeout(PATIENCE) {
-                Ok(line) => {
-                    self.heard.push(line.clone());
-                    if line.contains(part) {
-                        return line;
+            let line = match self.heard.get(self.read) {
+                Some(line) => line.clone(),
+                None => match self.said.recv_timeout(PATIENCE) {
+                    Ok(line) => {
+                        self.heard.push(line.clone());
+                        line
                     }
-                }
-                Err(_) => panic!(
-                    "no line with {part:?} came; every line said: {:#?}",
-                    self.heard
-                ),
+                    Err(_) => panic!(
+                        "no line with {parts:?} came; every line said: {:#?}",
+                        self.heard
+                    ),
+                },
+            };
+            self.read += 1;
+            if parts.iter().any(|part| line.contains(part)) {
+                return line;
             }
         }
     }
