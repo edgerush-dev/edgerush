@@ -479,7 +479,9 @@ mod tests {
 
     /// The same as the model states it, for a test to change before it is compiled.
     fn model(upstreams: &[(&str, &[&str])]) -> Config {
-        let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
+        // None is an empty mapping: a key with nothing after it is null, not a mapping.
+        let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:");
+        yaml += if upstreams.is_empty() { " {}\n" } else { "\n" };
         for (name, addresses) in upstreams {
             let listed: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
             yaml += &format!(
