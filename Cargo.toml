@@ -103,7 +103,7 @@ socket2 = { version = "0.6.5", features = ["all"] }
 # wildcard HTTP/3 bind — reading a datagram's real destination and replying from it, which
 # socket2 cannot set and `unsafe` is forbidden for (16 §3). Linux only, the proxy crate
 # only. tokio-quiche uses the same crate for this.
-nix = { version = "0.31.3", features = ["net", "socket", "uio"] }
+nix = { version = "0.32.0", features = ["net", "socket", "uio"] }
 # The open-file limit, raised by each process at its start (03 §9): a container under
 # containerd 2.x is given a soft limit of 1,024. Safe calls, by raw system calls on Linux;
 # chosen over `rlimit`, and over an exception to the ban on `unsafe`.
