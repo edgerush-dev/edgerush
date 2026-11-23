@@ -33,9 +33,10 @@ prost.workspace = true
 # The pod's config file, read as the data plane's is.
 serde-saphyr.workspace = true
 thiserror.workspace = true
-# The service pod is a process of its own: a multi-thread runtime, told to stop by a signal;
-# "fs": its certificate files, read again every second.
-tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# The service pod is a process of its own, told to stop by a signal; it runs on one thread
+# (`main.rs`), so the multi-thread runtime is only for the tests. "fs": its certificate
+# files, read again every second.
+tokio = { workspace = true, features = ["fs", "macros", "net", "signal", "sync", "time"] }
 tokio-boring.workspace = true
 tonic.workspace = true
 tower-service.workspace = true
@@ -43,8 +44,9 @@ tower-service.workspace = true
 [dev-dependencies]
 edgerush-certificates = { workspace = true, features = ["testing"] }
 proptest.workspace = true
-# "io-util": the socket tests' relays, copying both ways.
-tokio = { workspace = true, features = ["io-util"] }
+# "io-util": the socket tests' relays, copying both ways. "rt-multi-thread": tests that
+# run pods and their clients on threads of their own.
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread"] }
 
 # The pod's open-file limit lowered, to see it raised as it starts.
 [target.'cfg(unix)'.dev-dependencies]
