@@ -176,7 +176,7 @@ repo=$(dirname "$here")
 # The service's example program that forms the synchronous mode's store, for ours-sync
 # (cargo build --release -p edgerush-ratelimit-service --example form).
 : "${RL_FORM:=$repo/target/release/examples/form}"
-# The asynchronous mode's cycle, in milliseconds: the data planes' and the pod's alike.
+# The asynchronous mode's cycle, in milliseconds: the data planes', which each batch says.
 : "${RL_CYCLE_MS:=10}"
 # The per-client limit of every rate-limited variant: RL_RATE (`64000/s`) with a bucket of
 # RL_BURST. The asynchronous mode refuses a limit whose burst and two cycles' refill pass
@@ -838,30 +838,29 @@ PY
         "$run-limits.yaml" >>"$config.rl"
 }
 
-# The service's pods, for `ratelimit`: one serving the asynchronous mode and, when an
-# ours-sync variant is to run, a second of its own serving the synchronous mode, since a pod
-# serves one mode; each on the store, formed by the example program, which runs beside it.
+# The service's pods, for `ratelimit`: one for the asynchronous mode's data planes and, when
+# an ours-sync variant is to run, a second of its own for the synchronous mode's, so that each
+# mode's figures are of a pod serving it alone; each serves both modes, on the store, formed
+# by the example program, which runs beside it.
 rl_pid=
 rl_form_pid=
 rl_sync_pid=
 rl_sync_form_pid=
-# A lone pod's config file, serving mode $1 on the store on 127.0.0.1:$2, reached at that
-# address, its readiness at 127.0.0.1:$3; the asynchronous mode's with its data planes' cycle.
+# A lone pod's config file, on the store on 127.0.0.1:$1, reached at that address, its
+# readiness at 127.0.0.1:$2. The data planes' cycle is theirs: each batch says it.
 rl_service_config() {
-    local cycle=
-    [ "$1" = asynchronous ] && cycle=", cycle_ms: $RL_CYCLE_MS"
-    printf 'mode: %s\npod: { listen: 127.0.0.1:%s, address: 127.0.0.1:%s, metrics: 127.0.0.1:%s%s }\n' \
-        "$1" "$2" "$2" "$3" "$cycle"
+    printf 'pod: { listen: 127.0.0.1:%s, address: 127.0.0.1:%s, metrics: 127.0.0.1:%s }\n' \
+        "$1" "$1" "$2"
     printf 'store: {}\n'
     if [ -n "$RL_MAX_KEY_BYTES" ]; then
         printf 'keys: { max_bytes: %s }\n' "$RL_MAX_KEY_BYTES"
     fi
 }
-# A lone pod of mode $1 on port $2, ready at port $3, its files named $4, started and its
-# store formed afresh, its naming file new; once it is ready, its pid and forming's in
-# rl_started.
+# A lone pod for mode $1's data planes on port $2, ready at port $3, its files named $4,
+# started and its store formed afresh, its naming file new; once it is ready, its pid and
+# forming's in rl_started.
 rl_start_pod() {
-    rl_service_config "$1" "$2" "$3" >"$OUT/$4.yaml"
+    rl_service_config "$2" "$3" >"$OUT/$4.yaml"
     taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --config "$OUT/$4.yaml" 2>>"$OUT/$4.log" &
     local pod=$!
     rm -f "$OUT/$4-naming"

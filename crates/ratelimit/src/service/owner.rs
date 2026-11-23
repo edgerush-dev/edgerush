@@ -51,7 +51,9 @@ pub fn apply(
     cycle: u64,
     now: u64,
 ) -> Applied {
-    let lately = ACTIVE_CYCLES * cycle.max(1);
+    // The cycle is the data plane's, as its batch says it: one past what 64 bits hold of
+    // thirty counts every data plane.
+    let lately = ACTIVE_CYCLES.saturating_mul(cycle.max(1));
     if value.contract != Some(contract) {
         *value = Value::new(contract);
     }
@@ -247,6 +249,20 @@ mod tests {
             2,
             "nothing since: the two last admitting"
         );
+    }
+
+    /// The cycle is the data plane's, as its batch says it: one so long that thirty of it are
+    /// past what 64 bits hold counts every data plane, however long ago it admitted.
+    #[test]
+    fn a_cycle_past_what_thirty_of_it_hold_counts_every_data_plane() {
+        let mut value = Value::default();
+        let applied = |value: &mut Value, from, now| {
+            apply(value, from, contract(), hits(1, 1, 0), u64::MAX, now)
+                .answered
+                .others
+        };
+        assert_eq!(applied(&mut value, 1, 0), 0);
+        assert_eq!(applied(&mut value, 2, 5_000 * MS), 1);
     }
 
     /// A report sent again, its batch applied already, keeps its data plane counted with

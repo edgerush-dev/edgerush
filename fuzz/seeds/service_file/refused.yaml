@@ -1,2 +1,2 @@
-pod: { listen: 0.0.0.0:7000, address: rl-0.rl:7000, cycle_ms: 0 }
+pod: { listen: 0.0.0.0:7000, address: rl-0.rl:7000 }
 store: { heartbeat_ms: 400, stop_serving_ms: 500 }

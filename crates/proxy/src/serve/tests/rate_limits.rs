@@ -77,7 +77,7 @@ async fn held_pods(
     let mut pods = Vec::new();
     let mut addresses = Vec::new();
     for ((id, (listener, address)), hold) in (1..).zip(listeners).zip(holds) {
-        let mut mode = AsyncPod::new(id, address.clone(), config, [], 10_000_000);
+        let mut mode = AsyncPod::new(id, address.clone(), config, []);
         mode.set_life(id);
         let pod = StorePod::start(mode, address.clone(), dial.clone(), Vec::new());
         let server = Held {

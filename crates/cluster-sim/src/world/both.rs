@@ -95,7 +95,7 @@ impl Mode for Both {
     type Client = Caller;
 
     fn pod(id: NodeId, config: Config, peers: Vec<NodeId>, forwarding: bool, decides: bool) -> Pod {
-        let mut pod = Pod::new(id, super::address(id), config, peers, super::CYCLE);
+        let mut pod = Pod::new(id, super::address(id), config, peers);
         pod.set_forwarding(forwarding);
         pod.set_forwarder_decides(decides);
         // A pod is a member in one life only, and no pod is 0: its id serves as its life.

@@ -163,6 +163,7 @@ impl Routing for Routed {
             from: batch.from,
             stamp: self.table.as_ref().map_or((0, 0), Table::stamp),
             made: batch.made,
+            cycle: batch.cycle,
             entries: batch
                 .entries
                 .iter()
@@ -191,6 +192,9 @@ mod tests {
     use edgerush_ratelimit::service::{self, Contract, Report};
     use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroU64;
+
+    /// The data planes' cycle: 7 ms, not the default, so that a batch saying it says theirs.
+    const CYCLE: u64 = 7_000_000;
 
     const SHARDS: u16 = 64;
     const SECRET: [u64; 2] = [1, 2];
@@ -342,7 +346,6 @@ mod tests {
     fn a_key_unheard_sends_its_reports_and_never_an_empty_batch() {
         use edgerush_ratelimit::service::Keyed;
         use edgerush_ratelimit::service::pooled::{Decision, Participant};
-        const CYCLE: u64 = 10_000_000;
         let mut plane =
             Participant::new(1, CYCLE, routed(&[1, 2, 3], 2), Keyed::new(SECRET)).unwrap();
         plane.set_one_in_flight(true);
@@ -364,11 +367,11 @@ mod tests {
     }
 
     /// What a participant sends is each key as the store's, whole: the second half the one
-    /// the routing made of the key's bytes, kept since, not another key's.
+    /// the routing made of the key's bytes, kept since, not another key's; and its batches say
+    /// its cycle.
     #[test]
     fn a_participants_batches_carry_each_keys_whole_key() {
         use edgerush_ratelimit::service::pooled::{Decision, Participant};
-        const CYCLE: u64 = 10_000_000;
         let routed = routed(&[1], 1);
         let mut plane = Participant::new(1, CYCLE, routed.clone(), Keyed::new(SECRET)).unwrap();
         let keys: Vec<Vec<u8>> = keys(20).map(|(bytes, _)| bytes).collect();
@@ -377,10 +380,18 @@ mod tests {
             assert_eq!(decided, Decision::Admit);
         }
         plane.on_cycle(CYCLE);
-        let sent: Vec<Key> = plane
+        let batches: Vec<Batch> = plane
             .take_exchanges()
             .into_iter()
-            .flat_map(|(_, _, batch)| batch.entries.into_iter().map(|entry| entry.key))
+            .map(|(_, _, batch)| batch)
+            .collect();
+        assert!(
+            batches.iter().all(|batch| batch.cycle == CYCLE),
+            "{batches:?}"
+        );
+        let sent: Vec<Key> = batches
+            .into_iter()
+            .flat_map(|batch| batch.entries.into_iter().map(|entry| entry.key))
             .collect();
         let expected: BTreeSet<Key> = keys
             .iter()
@@ -398,6 +409,7 @@ mod tests {
         let batch = service::Batch {
             from: 9,
             made: 33,
+            cycle: CYCLE,
             entries: vec![
                 service::Entry {
                     key: Box::from(&b"ab"[..]),
@@ -418,6 +430,7 @@ mod tests {
                 from: 9,
                 stamp: routed.table().unwrap().stamp(),
                 made: 33,
+                cycle: CYCLE,
                 entries: vec![
                     Entry {
                         key: whole(200, 9),
@@ -435,6 +448,7 @@ mod tests {
         let empty = service::Batch {
             from: 9,
             made: 0,
+            cycle: CYCLE,
             entries: Vec::new(),
         };
         let none = Routed::new(SECRET).batch(1, empty, &[]);

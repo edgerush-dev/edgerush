@@ -1,9 +1,11 @@
-//! A pod of the store's (`cluster`) metrics, either mode's, served at `/metrics` where its file
-//! says, in the text format a data plane's scrape uses: whether it serves, its keys and what
-//! they hold against what they may (06 §8), what its mode counts, its peers' clocks, what it
-//! dropped and the table it follows; and at `/ready` whether it is ready, for a readiness probe.
+//! A pod of the store's (`cluster`) metrics served at `/metrics` where its file says, in the
+//! text format a data plane's scrape uses: whether it serves, its keys and what they hold
+//! against what they may (06 §8), each mode's keys beside them and what each mode counts, its
+//! peers' clocks, what it dropped and the table it follows; and at `/ready` whether it is
+//! ready, for a readiness probe. Each mode's own are named with it, beside the totals, never
+//! a label of theirs.
 
-use crate::cluster::mode::{DecidedFromCopy, Mode};
+use crate::cluster::mode::{BothCounted, DecidedFromCopy, KindCounted, Mode};
 use crate::cluster::pod::{Observed, StorePod};
 use bytes::Bytes;
 use edgerush_cluster_asynchronous::TurnedAway;
@@ -35,10 +37,10 @@ pub trait Counted {
 
 impl Counted for DecidedFromCopy {
     fn render(&self, scrape: &mut Exposition) {
-        let name = "edgerush_rate_limit_decided_from_copy_total";
-        let help = "Requests from data planes the pod decided from its copy of the key, the \
-                    key's owner unheard for the store's stop_serving_ms, rather than forward \
-                    them.";
+        let name = "edgerush_rate_limit_synchronous_decided_from_copy_total";
+        let help = "Synchronous requests from data planes the pod decided from its copy of the \
+                    key, the key's owner unheard for the store's stop_serving_ms, rather than \
+                    forward them.";
         scrape.family(name, Kind::Counter, help);
         scrape.sample(name, &[], self.decided_from_copy);
     }
@@ -50,7 +52,7 @@ impl Counted for TurnedAway {
             ("elsewhere", self.elsewhere),
             ("not_serving", self.not_serving),
         ];
-        let name = "edgerush_rate_limit_turned_away_entries_total";
+        let name = "edgerush_rate_limit_asynchronous_turned_away_entries_total";
         let help = "Entries of data planes' batches the pod applied none of, by why: its table \
                     names another pod their key's owner, or none; or names it, while it is not \
                     serving. Each data plane sends them again to the owner its table names.";
@@ -58,12 +60,67 @@ impl Counted for TurnedAway {
         for (why, turned) in whys {
             scrape.sample(name, &[("why", why)], turned.entries);
         }
-        let name = "edgerush_rate_limit_turned_away_hits_total";
+        let name = "edgerush_rate_limit_asynchronous_turned_away_hits_total";
         let help = "The hits those entries reported, by why.";
         scrape.family(name, Kind::Counter, help);
         for (why, turned) in whys {
             scrape.sample(name, &[("why", why)], turned.hits);
         }
+    }
+}
+
+impl Counted for BothCounted {
+    /// Each mode's keys, then each mode's own counts, and what neither served.
+    fn render(&self, scrape: &mut Exposition) {
+        render_kind(scrape, "synchronous", self.synchronous);
+        render_kind(scrape, "asynchronous", self.asynchronous);
+        DecidedFromCopy {
+            decided_from_copy: self.decided_from_copy,
+        }
+        .render(scrape);
+        self.turned_away.render(scrape);
+        let name = "edgerush_rate_limit_wrong_mode_total";
+        let help = "Requests, and entries of batches, the pod did not serve, their keys of the \
+                    other mode's than the stream they came on: a data plane's mistake, answered \
+                    as not served.";
+        scrape.family(name, Kind::Counter, help);
+        scrape.sample(name, &[], self.wrong_kind);
+    }
+}
+
+/// `mode`'s keys, as its own families beside the totals.
+fn render_kind(scrape: &mut Exposition, mode: &str, counted: KindCounted) {
+    let families = [
+        (
+            "keys",
+            Kind::Gauge,
+            "keys held, owned and copies",
+            counted.keys,
+        ),
+        (
+            "key_bytes",
+            Kind::Gauge,
+            "bytes its keys hold, owned and copies, as the total's estimate counts them",
+            counted.key_bytes,
+        ),
+        (
+            "keys_forgotten_total",
+            Kind::Counter,
+            "keys forgotten, their time come",
+            counted.forgotten,
+        ),
+        (
+            "keys_evicted_total",
+            Kind::Counter,
+            "keys evicted to keep within the bytes all keys may hold",
+            counted.evicted,
+        ),
+    ];
+    for (family, kind, what, value) in families {
+        let name = format!("edgerush_rate_limit_{mode}_{family}");
+        let help = format!("The {mode} mode's {what}.");
+        scrape.family(&name, kind, &help);
+        scrape.sample(&name, &[], value);
     }
 }
 
@@ -279,7 +336,7 @@ mod tests {
             "edgerush_rate_limit_keys_owned 7\n",
             "edgerush_rate_limit_keys_evicted_total 4\n",
             "edgerush_rate_limit_keys_forgotten_total 5\n",
-            "edgerush_rate_limit_decided_from_copy_total 6\n",
+            "edgerush_rate_limit_synchronous_decided_from_copy_total 6\n",
             "edgerush_rate_limit_peers_skewed 1\n",
             "edgerush_rate_limit_messages_dropped_total{why=\"full\"} 3\n",
             "edgerush_rate_limit_messages_dropped_total{why=\"lost\"} 2\n",
@@ -310,15 +367,63 @@ mod tests {
             ..Observed::default()
         });
         for line in [
-            "edgerush_rate_limit_turned_away_entries_total{why=\"elsewhere\"} 3\n",
-            "edgerush_rate_limit_turned_away_entries_total{why=\"not_serving\"} 1\n",
-            "edgerush_rate_limit_turned_away_hits_total{why=\"elsewhere\"} 7\n",
-            "edgerush_rate_limit_turned_away_hits_total{why=\"not_serving\"} 2\n",
+            "edgerush_rate_limit_asynchronous_turned_away_entries_total{why=\"elsewhere\"} 3\n",
+            "edgerush_rate_limit_asynchronous_turned_away_entries_total{why=\"not_serving\"} 1\n",
+            "edgerush_rate_limit_asynchronous_turned_away_hits_total{why=\"elsewhere\"} 7\n",
+            "edgerush_rate_limit_asynchronous_turned_away_hits_total{why=\"not_serving\"} 2\n",
             "edgerush_rate_limit_pod_serving 0\n",
         ] {
             assert!(scrape.contains(line), "{line}{scrape}");
         }
         assert!(!scrape.contains("decided_from_copy"), "{scrape}");
+    }
+
+    /// A pod of both modes' scrape says each mode's keys beside the totals, each mode's own
+    /// counts named with it, and what it did not serve.
+    #[test]
+    fn a_pod_of_both_modes_says_each_modes_keys_and_counts() {
+        let kind = |n| KindCounted {
+            keys: n,
+            key_bytes: 100 * n,
+            forgotten: n + 1,
+            evicted: n + 2,
+        };
+        let scrape = render_store(Observed {
+            keys: 7,
+            mode: BothCounted {
+                decided_from_copy: 6,
+                turned_away: TurnedAway {
+                    elsewhere: Turned {
+                        entries: 3,
+                        hits: 7,
+                    },
+                    not_serving: Turned::default(),
+                },
+                wrong_kind: 9,
+                synchronous: kind(3),
+                asynchronous: kind(4),
+            },
+            ..Observed::default()
+        });
+        for line in [
+            "edgerush_rate_limit_keys 7\n",
+            "edgerush_rate_limit_synchronous_keys 3\n",
+            "edgerush_rate_limit_synchronous_key_bytes 300\n",
+            "edgerush_rate_limit_synchronous_keys_forgotten_total 4\n",
+            "edgerush_rate_limit_synchronous_keys_evicted_total 5\n",
+            "edgerush_rate_limit_asynchronous_keys 4\n",
+            "edgerush_rate_limit_asynchronous_key_bytes 400\n",
+            "edgerush_rate_limit_asynchronous_keys_forgotten_total 5\n",
+            "edgerush_rate_limit_asynchronous_keys_evicted_total 6\n",
+            "edgerush_rate_limit_synchronous_decided_from_copy_total 6\n",
+            "edgerush_rate_limit_asynchronous_turned_away_entries_total{why=\"elsewhere\"} 3\n",
+            "edgerush_rate_limit_asynchronous_turned_away_hits_total{why=\"elsewhere\"} 7\n",
+            "edgerush_rate_limit_wrong_mode_total 9\n",
+            "# TYPE edgerush_rate_limit_synchronous_keys gauge\n",
+            "# TYPE edgerush_rate_limit_asynchronous_keys_evicted_total counter\n",
+        ] {
+            assert!(scrape.contains(line), "{line}{scrape}");
+        }
     }
 
     #[test]

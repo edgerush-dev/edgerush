@@ -34,7 +34,7 @@
 use super::link::{
     self, CONTROL, Counts, DECIDE, Dial, Dropped, GREET, HELLO, Link, Received, SERVICE, Tasks,
 };
-use super::mode::{DecidedFromCopy, EXCHANGE, Mode, Wire};
+use super::mode::{DecidedFromCopy, EXCHANGE, Forwards, Mode, Served, Stream, Wire};
 use super::wire::{
     self, Asking, Empty, Hello, Invalid, Joining, Outgoing, Piece, Telling, ToCopy, ToPeer, Value,
     asynchronous,
@@ -47,6 +47,7 @@ use http::uri::PathAndQuery;
 use prost::Message as _;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
@@ -186,21 +187,23 @@ impl StorePod<Pod> {
             seeds,
         )
     }
+}
 
-    /// Whether it forwards a request for a key not its own to the owner its table names, one
-    /// hop at most, rather than answer that the key is elsewhere: off as it starts.
+impl<M: Mode + Forwards> StorePod<M> {
+    /// Whether it forwards a synchronous request for a key not its own to the owner its table
+    /// names, one hop at most, rather than answer that the key is elsewhere: off as it starts.
     pub async fn set_forwarding(&self, forwarding: bool) {
-        let command = Command::With(Box::new(move |pod: &mut Pod, _| {
+        let command = Command::With(Box::new(move |pod: &mut M, _| {
             pod.set_forwarding(forwarding);
         }));
         let _stopped = self.commands.send(command).await;
     }
 
-    /// Whether, forwarding, it decides a data plane's request itself from its copy when it is
-    /// a replica of the key's shard holding its lease and has not heard the owner for
-    /// `stop_serving`: off as it starts.
+    /// Whether, forwarding, it decides a data plane's synchronous request itself from its copy
+    /// when it is a replica of the key's shard holding its lease and has not heard the owner
+    /// for `stop_serving`: off as it starts.
     pub async fn set_forwarder_decides(&self, decides: bool) {
-        let command = Command::With(Box::new(move |pod: &mut Pod, _| {
+        let command = Command::With(Box::new(move |pod: &mut M, _| {
             pod.set_forwarder_decides(decides);
         }));
         let _stopped = self.commands.send(command).await;
@@ -1076,22 +1079,35 @@ async fn take_all<M: Mode>(
     }
 }
 
-/// A data plane's stream: one client of the pod's.
-struct PlaneCall<M: Mode>(StorePod<M>);
+/// Serves a data plane's call on stream `S`, by `pod`: the stream's server for
+/// [`Mode::plane`].
+pub(crate) fn serve_plane<M: Mode, S: Stream<M>>(
+    pod: StorePod<M>,
+    request: http::Request<tonic::body::Body>,
+) -> Served {
+    Box::pin(async move {
+        let mut grpc = limited(Prost::<S::Telling, S::Asking>::default());
+        grpc.streaming(PlaneCall::<M, S>(pod, PhantomData), request)
+            .await
+    })
+}
 
-impl<M: Mode> tonic::server::StreamingService<M::Asking> for PlaneCall<M> {
-    type Response = M::Telling;
-    type ResponseStream = Received<Result<M::Telling, Status>>;
+/// A data plane's stream `S`: one client of the pod's.
+struct PlaneCall<M: Mode, S>(StorePod<M>, PhantomData<fn() -> S>);
+
+impl<M: Mode, S: Stream<M>> tonic::server::StreamingService<S::Asking> for PlaneCall<M, S> {
+    type Response = S::Telling;
+    type ResponseStream = Received<Result<S::Telling, Status>>;
     type Future = Boxed<Result<Response<Self::ResponseStream>, Status>>;
 
-    fn call(&mut self, request: Request<Streaming<M::Asking>>) -> Self::Future {
+    fn call(&mut self, request: Request<Streaming<S::Asking>>) -> Self::Future {
         let pod = self.0.clone();
         Box::pin(async move {
             let client = pod
                 .client()
                 .await
                 .ok_or_else(|| Status::unavailable("the pod has stopped"))?;
-            Ok(Response::new(data_plane_stream(
+            Ok(Response::new(data_plane_stream::<M, S, _>(
                 client,
                 request.into_inner(),
             )))
@@ -1099,29 +1115,34 @@ impl<M: Mode> tonic::server::StreamingService<M::Asking> for PlaneCall<M> {
     }
 }
 
-/// A data plane's stream served as `client`, `asked` what it asks: what is to be written to
-/// it, at most [`TELLING_WAITING`] waiting.
-fn data_plane_stream<M, A>(client: StoreClient<M>, asked: A) -> Received<Result<M::Telling, Status>>
+/// A data plane's stream `S` served as `client`, `asked` what it asks: what is to be written
+/// to it, at most [`TELLING_WAITING`] waiting.
+fn data_plane_stream<M, S, A>(
+    client: StoreClient<M>,
+    asked: A,
+) -> Received<Result<S::Telling, Status>>
 where
     M: Mode,
-    A: futures_core::Stream<Item = Result<M::Asking, Status>> + Unpin + Send + 'static,
+    S: Stream<M>,
+    A: futures_core::Stream<Item = Result<S::Asking, Status>> + Unpin + Send + 'static,
 {
     let (telling, told) = mpsc::channel(TELLING_WAITING);
-    tokio::spawn(serve_data_plane(client, asked, telling));
+    tokio::spawn(serve_data_plane::<M, S, A>(client, asked, telling));
     Received(told)
 }
 
-/// Serves one data plane's stream as `client`: what it asks handed to the pod, and what the
-/// pod tells the client sent down, until either side ends it. Its requests are read only as the
-/// pod takes them, and its answers wait in the client's queue while the data plane reads
-/// slowly.
-async fn serve_data_plane<M, A>(
+/// Serves one data plane's stream `S` as `client`: what it asks handed to the pod, and what
+/// the pod tells the client sent down, until either side ends it. Its requests are read only
+/// as the pod takes them, and its answers wait in the client's queue while the data plane
+/// reads slowly.
+async fn serve_data_plane<M, S, A>(
     mut client: StoreClient<M>,
     mut asked: A,
-    telling: mpsc::Sender<Result<M::Telling, Status>>,
+    telling: mpsc::Sender<Result<S::Telling, Status>>,
 ) where
     M: Mode,
-    A: futures_core::Stream<Item = Result<M::Asking, Status>> + Unpin,
+    S: Stream<M>,
+    A: futures_core::Stream<Item = Result<S::Asking, Status>> + Unpin,
 {
     loop {
         tokio::select! {
@@ -1130,7 +1151,7 @@ async fn serve_data_plane<M, A>(
                     return;
                 };
                 // One the mode cannot use is dropped, as a message lost.
-                if let Ok(message) = M::asked_from(asking, client.id())
+                if let Ok(message) = S::asked_from(asking, client.id())
                     && !client.ask(message).await
                 {
                     return;
@@ -1140,7 +1161,7 @@ async fn serve_data_plane<M, A>(
                 let Some(told) = told else {
                     return;
                 };
-                if let Some(told) = M::telling(told)
+                if let Some(told) = S::telling(told)
                     && telling.send(Ok(told)).await.is_err()
                 {
                     return;
@@ -1206,9 +1227,10 @@ impl<M: Mode> tower_service::Service<http::Request<tonic::body::Body>> for Store
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let pod = self.pod.clone();
         Box::pin(async move {
-            // The data planes' stream is theirs; every other method the pods'.
-            let planes = request.uri().path() == M::STREAM;
-            let caller = if planes {
+            // The data planes' streams, those its mode serves, are theirs; every other method
+            // the pods'.
+            let plane = M::plane(request.uri().path());
+            let caller = if plane.is_some() {
                 Caller::DataPlane
             } else {
                 Caller::Pod
@@ -1216,9 +1238,8 @@ impl<M: Mode> tower_service::Service<http::Request<tonic::body::Body>> for Store
             if let Some(status) = refused(&request, caller) {
                 return Ok(status.into_http());
             }
-            if planes {
-                let mut grpc = limited(Prost::<M::Telling, M::Asking>::default());
-                return Ok(grpc.streaming(PlaneCall(pod), request).await);
+            if let Some(serve) = plane {
+                return Ok(serve(pod, request).await);
             }
             Ok(match request.uri().path() {
                 super::link::PEER => {
@@ -1253,6 +1274,7 @@ impl<M: Mode> tower_service::Service<http::Request<tonic::body::Body>> for Store
 
 #[cfg(test)]
 mod tests {
+    use super::super::mode::Decide;
     use super::*;
     use edgerush_cluster::ms;
     use edgerush_cluster_synchronous::Message as ModeMessage;
@@ -1379,7 +1401,7 @@ mod tests {
         for answer in 0..waiting {
             running.answer(id, reply(answer));
         }
-        let Received(written) = data_plane_stream(client, Quiet);
+        let Received(written) = data_plane_stream::<Pod, Decide, _>(client, Quiet);
         let handed = tokio::time::timeout(Duration::from_secs(1), async {
             while written.len() < TELLING_WAITING {
                 tokio::task::yield_now().await;

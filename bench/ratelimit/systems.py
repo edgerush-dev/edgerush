@@ -552,8 +552,7 @@ def build_edgerush(n, workers=1, sharing="", cpus=None):
         # The other pods as seeds: a pod `form` did not name, or one restarted, joins by them.
         seeds = ", ".join(f'"{ip}:7000"' for ip in SERVICE_IPS if ip != SERVICE_IPS[pod])
         files[f"rl{pod}.yaml"] = (
-            "mode: asynchronous\n"
-            f"pod: {{ listen: 0.0.0.0:7000, address: {SERVICE_IPS[pod]}:7000, cycle_ms: 10, "
+            f"pod: {{ listen: 0.0.0.0:7000, address: {SERVICE_IPS[pod]}:7000, "
             f"metrics: 0.0.0.0:{SERVICE_METRICS} }}\n"
             f"store: {{ seeds: [{seeds}] }}\n"
         )
