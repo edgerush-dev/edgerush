@@ -3491,6 +3491,21 @@ fn backend_upstream(
                     client_certificate: None,
                 }),
             ),
+            // HTTP/1.1 over TLS, IANA's service name, of any case as conformance writes it:
+            // the policy says how its TLS is had, and without one nothing does, so it is
+            // never spoken to in the clear (04 §5).
+            Some(https) if https.eq_ignore_ascii_case("https") && covered.is_some() => {
+                (UpstreamProtocol::Http1, None)
+            }
+            Some(https) if https.eq_ignore_ascii_case("https") => {
+                return Ok(Err(RefProblem::new(
+                    RefReason::UnsupportedProtocol,
+                    format!(
+                        "Service {namespace}/{service} port {port} has appProtocol {https}, and \
+                         no BackendTLSPolicy covers it to say how its TLS is had"
+                    ),
+                )));
+            }
             // A protocol the gateway cannot speak makes the backend invalid, as Gateway API has
             // it (`UnsupportedProtocol`), rather than spoken to in HTTP/1.1 regardless.
             Some(other) => {

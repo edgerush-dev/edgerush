@@ -1,0 +1,2 @@
+HTTPRoute shop/pages: rule 2: a backend's share is answered 500: Service shop/uncovered port btls has appProtocol HTTPS, and no BackendTLSPolicy covers it to say how its TLS is had
+GRPCRoute shop/calls: rule 0: a backend's share is answered UNAVAILABLE: Service shop/upper port btls has appProtocol HTTPS; a GRPCRoute's backend is spoken to in HTTP/2 in the clear, on a port of none or of kubernetes.io/h2c, grpc or http2

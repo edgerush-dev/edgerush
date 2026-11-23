@@ -297,6 +297,15 @@ fn the_table_claims_client_certificate_validation_in_both_modes() {
 }
 
 #[test]
+fn the_table_claims_backend_tls_policies() {
+    // Every test of theirs passes in GATEWAY-HTTP once a port of appProtocol HTTPS that a
+    // policy covers is reached over its TLS (#477).
+    for feature in ["BackendTLSPolicy", "BackendTLSPolicySANValidation"] {
+        assert!(SUPPORTED_FEATURES.contains(&feature), "{feature}");
+    }
+}
+
+#[test]
 fn the_table_claims_the_gateway_grpc_profiles_core_and_grpcroutes_extended_features() {
     // GATEWAY-GRPC's core and GRPCRoute's two extended features pass every test the suite
     // has of them (#447); the profile's other extended features are the Gateway's and

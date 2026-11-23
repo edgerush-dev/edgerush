@@ -72,6 +72,8 @@ pub(crate) const SUPPORTED_FEATURES: &[&str] = &[
     // GRPCRoute, ReferenceGrant), GATEWAY-TLS's (Gateway, TLSRoute, ReferenceGrant),
     // GATEWAY-TCP's (Gateway, TCPRoute, ReferenceGrant) and GATEWAY-UDP's (Gateway, UDPRoute,
     // ReferenceGrant), and the extended features that pass them.
+    "BackendTLSPolicy",
+    "BackendTLSPolicySANValidation",
     "GRPCRoute",
     "GRPCRouteNamedRouteRule",
     "GRPCRouteRequestHeaderModifier",
