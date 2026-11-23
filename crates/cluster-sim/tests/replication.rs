@@ -68,6 +68,10 @@ fn copies_lost_are_repaired_once_the_network_heals() {
     }
 }
 
+/// Seeds for copies in parts on a lossy network: a repair lost a part where the copy of changes
+/// before it, under its number, was taken whole, which one seed in forty met, and five none.
+const PARTED_SEEDS: std::ops::RangeInclusive<u64> = 1..=100;
+
 /// Copies in many parts, on a lossy network that loses some of them, end as copies whole
 /// would: repaired once it heals, every replica holding its owner's counts, an owner crashing
 /// then losing nothing; with nothing lost, no part is sent twice; and no part carries more
@@ -80,7 +84,7 @@ fn copies_in_parts_are_repaired_and_lose_nothing_on_failover() {
         part_bytes: 100,
         ..shape()
     };
-    for seed in SEEDS {
+    for seed in PARTED_SEEDS {
         let (mut world, _) = scenario::cluster(seed, parted);
         let before = world.stats.copies_again;
         world.run_for(ms(1_000));
